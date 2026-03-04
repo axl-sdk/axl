@@ -1,0 +1,23 @@
+{
+  "name": "axl-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run --config e2e/vitest.config.ts && vitest run --config studio/vitest.config.ts",
+    "test:e2e": "vitest run --config e2e/vitest.config.ts",
+    "test:studio": "vitest run --config studio/vitest.config.ts",
+    "test:smoke": "vitest run --config smoke/vitest.config.ts"
+  },
+  "dependencies": {
+    "@axlsdk/axl": "workspace:*",
+    "@axlsdk/testing": "workspace:*",
+    "@axlsdk/eval": "workspace:*",
+    "@axlsdk/studio": "workspace:*"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0",
+    "zod": "^3.24.0",
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}

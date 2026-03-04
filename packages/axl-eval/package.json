@@ -1,0 +1,66 @@
+{
+  "name": "@axlsdk/eval",
+  "version": "0.3.0",
+  "description": "Evaluation framework for Axl agentic workflows",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "bin": {
+    "axl-eval": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@axlsdk/axl": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0",
+    "zod": "^3.24.0"
+  },
+  "keywords": [
+    "ai",
+    "evaluation",
+    "scoring",
+    "agents"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/axl-sdk/axl.git",
+    "directory": "packages/axl-eval"
+  },
+  "homepage": "https://github.com/axl-sdk/axl#readme",
+  "bugs": {
+    "url": "https://github.com/axl-sdk/axl/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

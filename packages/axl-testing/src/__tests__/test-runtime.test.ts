@@ -1,0 +1,657 @@
+import { describe, it, expect } from 'vitest';
+import { z } from 'zod';
+import { workflow, agent, tool } from '@axlsdk/axl';
+import { AxlTestRuntime, MockProvider } from '../index.js';
+
+// ── Test Fixtures ────────────────────────────────────────────────────────────
+
+const getOrder = tool({
+  name: 'get_order',
+  description: 'Look up an order',
+  input: z.object({ orderId: z.string() }),
+  handler: async ({ orderId }) => ({ id: orderId, status: 'delivered', amount: 49.99 }),
+});
+
+const SupportBot = agent({
+  model: 'openai:gpt-4-turbo',
+  system: 'You are a helpful support agent.',
+  tools: [getOrder],
+  temperature: 0.7,
+});
+
+const HandleSupport = workflow({
+  name: 'HandleSupport',
+  input: z.object({ msg: z.string() }),
+  handler: async (ctx) => {
+    const response = await ctx.ask(SupportBot, ctx.input.msg);
+    return response;
+  },
+});
+
+// A workflow with output schema for output validation tests
+const StrictWorkflow = workflow({
+  name: 'StrictWorkflow',
+  input: z.object({ value: z.number() }),
+  output: z.object({ doubled: z.number() }),
+  handler: async (ctx) => {
+    // The handler simply returns a computed value
+    return { doubled: ctx.input.value * 2 };
+  },
+});
+
+// A workflow that returns an invalid output (for testing output validation failure)
+const BadOutputWorkflow = workflow({
+  name: 'BadOutputWorkflow',
+  input: z.object({ value: z.number() }),
+  output: z.object({ doubled: z.number() }),
+  handler: async (_ctx) => {
+    // Returns a string instead of the expected object shape
+    return 'not an object' as any;
+  },
+});
+
+// A simple workflow with no agent calls for basic registration tests
+const SimpleWorkflow = workflow({
+  name: 'SimpleWorkflow',
+  input: z.object({ greeting: z.string() }),
+  handler: async (ctx) => {
+    ctx.log('received_input', { greeting: ctx.input.greeting });
+    return `Hello, ${ctx.input.greeting}!`;
+  },
+});
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+describe('AxlTestRuntime', () => {
+  describe('register and execute', () => {
+    it('registers workflow and executes with mock provider', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([{ content: 'I can help you with that!' }]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      const result = await runtime.execute('HandleSupport', { msg: 'Help me!' });
+
+      expect(result).toBe('I can help you with that!');
+    });
+
+    it('throws when executing an unregistered workflow', async () => {
+      const runtime = new AxlTestRuntime();
+
+      await expect(runtime.execute('NonExistent', {})).rejects.toThrow(
+        /Workflow "NonExistent" not registered/,
+      );
+    });
+
+    it('executes a simple workflow without agent calls', async () => {
+      const runtime = new AxlTestRuntime();
+      runtime.register(SimpleWorkflow);
+
+      const result = await runtime.execute('SimpleWorkflow', { greeting: 'World' });
+
+      expect(result).toBe('Hello, World!');
+    });
+  });
+
+  describe('tool calls', () => {
+    it('records tool calls when agent returns tool_calls', async () => {
+      const runtime = new AxlTestRuntime();
+
+      const provider = MockProvider.sequence([
+        {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call-1',
+              type: 'function',
+              function: { name: 'get_order', arguments: '{"orderId": "123"}' },
+            },
+          ],
+        },
+        { content: 'Your order 123 is delivered.' },
+      ]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      const result = await runtime.execute('HandleSupport', { msg: 'Where is order 123?' });
+
+      expect(result).toBe('Your order 123 is delivered.');
+
+      const toolCalls = runtime.toolCalls();
+      expect(toolCalls).toHaveLength(1);
+      expect(toolCalls[0].name).toBe('get_order');
+      expect(toolCalls[0].args).toEqual({ orderId: '123' });
+      expect(toolCalls[0].result).toEqual({
+        id: '123',
+        status: 'delivered',
+        amount: 49.99,
+      });
+    });
+
+    it('filters tool calls by name', async () => {
+      const runtime = new AxlTestRuntime();
+
+      const provider = MockProvider.sequence([
+        {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call-1',
+              type: 'function',
+              function: { name: 'get_order', arguments: '{"orderId": "abc"}' },
+            },
+          ],
+        },
+        { content: 'Done.' },
+      ]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('HandleSupport', { msg: 'check' });
+
+      expect(runtime.toolCalls('get_order')).toHaveLength(1);
+      expect(runtime.toolCalls('non_existent_tool')).toHaveLength(0);
+    });
+  });
+
+  describe('agent calls', () => {
+    it('records agent calls', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([{ content: 'Sure, I can help.' }]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('HandleSupport', { msg: 'I need help' });
+
+      const agentCalls = runtime.agentCalls();
+      expect(agentCalls).toHaveLength(1);
+      expect(agentCalls[0].prompt).toBe('I need help');
+      expect(agentCalls[0].response).toBe('Sure, I can help.');
+      // Agent name defaults to model string when no name is provided
+      expect(agentCalls[0].agent).toBe('openai:gpt-4-turbo');
+    });
+
+    it('filters agent calls by name', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([{ content: 'response' }]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('HandleSupport', { msg: 'test' });
+
+      const calls = runtime.agentCalls();
+      expect(calls).toHaveLength(1);
+
+      // Filter by the actual name
+      const agentName = calls[0].agent;
+      expect(runtime.agentCalls(agentName)).toHaveLength(1);
+      expect(runtime.agentCalls('NonExistentAgent')).toHaveLength(0);
+    });
+  });
+
+  describe('totalCost()', () => {
+    it('returns 0 for mocked providers', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([{ content: 'free response' }]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('HandleSupport', { msg: 'hello' });
+
+      expect(runtime.totalCost()).toBe(0);
+    });
+
+    it('accumulates cost from replay responses', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.replay([
+        {
+          content: 'r1',
+          usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+          cost: 0.05,
+        },
+      ]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('HandleSupport', { msg: 'hi' });
+
+      expect(runtime.totalCost()).toBe(0.05);
+    });
+  });
+
+  describe('steps()', () => {
+    it('returns workflow_start and workflow_end steps', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([{ content: 'done' }]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('HandleSupport', { msg: 'check steps' });
+
+      const steps = runtime.steps();
+      expect(steps.length).toBeGreaterThanOrEqual(2);
+      expect(steps[0].type).toBe('workflow_start');
+      expect(steps[0].data).toMatchObject({
+        workflow: 'HandleSupport',
+        input: { msg: 'check steps' },
+      });
+
+      const last = steps[steps.length - 1];
+      expect(last.type).toBe('workflow_end');
+      expect(last.data).toMatchObject({
+        workflow: 'HandleSupport',
+        result: 'done',
+      });
+    });
+
+    it('includes agent_call steps', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([{ content: 'hi' }]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('HandleSupport', { msg: 'test' });
+
+      const agentSteps = runtime.steps().filter((s) => s.type === 'agent_call');
+      expect(agentSteps).toHaveLength(1);
+    });
+
+    it('includes tool_call steps when tools are invoked', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([
+        {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call-1',
+              type: 'function',
+              function: { name: 'get_order', arguments: '{"orderId":"x1"}' },
+            },
+          ],
+        },
+        { content: 'Order found.' },
+      ]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('HandleSupport', { msg: 'find order' });
+
+      const toolSteps = runtime.steps().filter((s) => s.type === 'tool_call');
+      expect(toolSteps).toHaveLength(1);
+      expect(toolSteps[0].data).toMatchObject({
+        args: { orderId: 'x1' },
+      });
+    });
+
+    it('assigns incrementing step numbers', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([{ content: 'ok' }]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('HandleSupport', { msg: 'go' });
+
+      const steps = runtime.steps();
+      // Steps should be monotonically increasing
+      for (let i = 1; i < steps.length; i++) {
+        expect(steps[i].step).toBeGreaterThan(steps[i - 1].step);
+      }
+    });
+  });
+
+  describe('traceLog()', () => {
+    it('records log events from the workflow', async () => {
+      const runtime = new AxlTestRuntime();
+      runtime.register(SimpleWorkflow);
+
+      await runtime.execute('SimpleWorkflow', { greeting: 'Test' });
+
+      const logs = runtime.traceLog();
+      expect(logs.length).toBeGreaterThanOrEqual(1);
+
+      const receivedLog = logs.find(
+        (l) => l.type === 'log' && (l.data as any)?.event === 'received_input',
+      );
+      expect(receivedLog).toBeDefined();
+      expect((receivedLog!.data as any).greeting).toEqual('Test');
+      expect(receivedLog!.timestamp).toBeGreaterThan(0);
+    });
+
+    it('resets trace log between executions', async () => {
+      const runtime = new AxlTestRuntime();
+      runtime.register(SimpleWorkflow);
+
+      await runtime.execute('SimpleWorkflow', { greeting: 'First' });
+      const firstLogs = runtime.traceLog();
+      expect(firstLogs.length).toBeGreaterThanOrEqual(1);
+
+      await runtime.execute('SimpleWorkflow', { greeting: 'Second' });
+      const secondLogs = runtime.traceLog();
+
+      // Second execution should not include first execution's logs
+      const inputs = secondLogs
+        .filter((l) => l.type === 'log' && (l.data as any)?.event === 'received_input')
+        .map((l) => (l.data as any).greeting);
+      expect(inputs).toEqual(['Second']);
+    });
+  });
+
+  describe('mockTool()', () => {
+    it('overrides real tool handlers', async () => {
+      const runtime = new AxlTestRuntime();
+
+      const provider = MockProvider.sequence([
+        {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call-1',
+              type: 'function',
+              function: { name: 'get_order', arguments: '{"orderId":"999"}' },
+            },
+          ],
+        },
+        { content: 'Order is pending.' },
+      ]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      // Override the real get_order tool with a mock that returns different data
+      runtime.mockTool('get_order', (input: { orderId: string }) => ({
+        id: input.orderId,
+        status: 'pending',
+        amount: 0,
+      }));
+
+      await runtime.execute('HandleSupport', { msg: 'check order 999' });
+
+      const toolCalls = runtime.toolCalls('get_order');
+      expect(toolCalls).toHaveLength(1);
+      expect(toolCalls[0].result).toEqual({
+        id: '999',
+        status: 'pending',
+        amount: 0,
+      });
+    });
+
+    it('mock tool calls are recorded in toolCalls()', async () => {
+      const runtime = new AxlTestRuntime();
+
+      const provider = MockProvider.sequence([
+        {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call-mock',
+              type: 'function',
+              function: { name: 'get_order', arguments: '{"orderId":"abc"}' },
+            },
+          ],
+        },
+        { content: 'done' },
+      ]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+      runtime.mockTool('get_order', () => ({ mocked: true }));
+
+      await runtime.execute('HandleSupport', { msg: 'go' });
+
+      expect(runtime.toolCalls()).toHaveLength(1);
+      expect(runtime.toolCalls()[0].name).toBe('get_order');
+      expect(runtime.toolCalls()[0].result).toEqual({ mocked: true });
+    });
+  });
+
+  describe('input validation', () => {
+    it('validates workflow input against schema (throws on invalid)', async () => {
+      const runtime = new AxlTestRuntime();
+      runtime.register(HandleSupport);
+
+      // HandleSupport expects { msg: string }, passing a number should fail
+      await expect(runtime.execute('HandleSupport', { msg: 123 })).rejects.toThrow();
+    });
+
+    it('throws when required input fields are missing', async () => {
+      const runtime = new AxlTestRuntime();
+      runtime.register(HandleSupport);
+
+      await expect(runtime.execute('HandleSupport', {})).rejects.toThrow();
+    });
+
+    it('passes validation for correct input', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([{ content: 'valid!' }]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      const result = await runtime.execute('HandleSupport', { msg: 'valid input' });
+      expect(result).toBe('valid!');
+    });
+  });
+
+  describe('output validation', () => {
+    it('validates workflow output against schema if provided', async () => {
+      const runtime = new AxlTestRuntime();
+      runtime.register(StrictWorkflow);
+
+      const result = await runtime.execute('StrictWorkflow', { value: 5 });
+      expect(result).toEqual({ doubled: 10 });
+    });
+
+    it('throws when output does not match schema', async () => {
+      const runtime = new AxlTestRuntime();
+      runtime.register(BadOutputWorkflow);
+
+      await expect(runtime.execute('BadOutputWorkflow', { value: 5 })).rejects.toThrow();
+    });
+  });
+
+  describe('provider resolution', () => {
+    it('resolves provider by model prefix', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([{ content: 'from openai' }]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      const result = await runtime.execute('HandleSupport', { msg: 'test' });
+      expect(result).toBe('from openai');
+    });
+
+    it('falls back to default provider', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([{ content: 'from default' }]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('default', provider);
+
+      const result = await runtime.execute('HandleSupport', { msg: 'test' });
+      expect(result).toBe('from default');
+    });
+
+    it('uses single registered provider as fallback', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([{ content: 'only provider' }]);
+
+      runtime.register(HandleSupport);
+      // Register under an arbitrary name -- since it is the only one, it should be used
+      runtime.mockProvider('anything', provider);
+
+      const result = await runtime.execute('HandleSupport', { msg: 'test' });
+      expect(result).toBe('only provider');
+    });
+
+    it('throws when no matching provider is found', async () => {
+      const runtime = new AxlTestRuntime();
+      // Register two providers but neither matches "openai"
+      const p1 = MockProvider.sequence([{ content: 'a' }]);
+      const p2 = MockProvider.sequence([{ content: 'b' }]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('anthropic', p1);
+      runtime.mockProvider('google', p2);
+
+      await expect(runtime.execute('HandleSupport', { msg: 'test' })).rejects.toThrow(
+        /Unknown provider "openai"/,
+      );
+    });
+  });
+
+  describe('state reset between executions', () => {
+    it('resets toolCalls, agentCalls, steps, and traceLog between executions', async () => {
+      const runtime = new AxlTestRuntime();
+
+      runtime.register(HandleSupport);
+
+      // First execution
+      const provider1 = MockProvider.sequence([
+        {
+          content: '',
+          tool_calls: [
+            {
+              id: 'c1',
+              type: 'function',
+              function: { name: 'get_order', arguments: '{"orderId":"1"}' },
+            },
+          ],
+        },
+        { content: 'first' },
+      ]);
+      runtime.mockProvider('openai', provider1);
+      await runtime.execute('HandleSupport', { msg: 'first' });
+
+      expect(runtime.toolCalls()).toHaveLength(1);
+      expect(runtime.agentCalls()).toHaveLength(1);
+
+      // Second execution (re-register provider since first was exhausted)
+      const provider2 = MockProvider.sequence([{ content: 'second' }]);
+      runtime.mockProvider('openai', provider2);
+      await runtime.execute('HandleSupport', { msg: 'second' });
+
+      // Should only reflect second execution
+      expect(runtime.toolCalls()).toHaveLength(0);
+      expect(runtime.agentCalls()).toHaveLength(1);
+      expect(runtime.agentCalls()[0].response).toBe('second');
+    });
+
+    it('resets totalCost between executions', async () => {
+      const runtime = new AxlTestRuntime();
+      runtime.register(HandleSupport);
+
+      const provider1 = MockProvider.replay([
+        {
+          content: 'expensive',
+          usage: { prompt_tokens: 100, completion_tokens: 100, total_tokens: 200 },
+          cost: 1.5,
+        },
+      ]);
+      runtime.mockProvider('openai', provider1);
+      await runtime.execute('HandleSupport', { msg: 'a' });
+      expect(runtime.totalCost()).toBe(1.5);
+
+      const provider2 = MockProvider.sequence([{ content: 'cheap' }]);
+      runtime.mockProvider('openai', provider2);
+      await runtime.execute('HandleSupport', { msg: 'b' });
+      expect(runtime.totalCost()).toBe(0);
+    });
+  });
+
+  describe('context properties', () => {
+    it('provides executionId and metadata on context', async () => {
+      let capturedCtx: any;
+
+      const InspectWorkflow = workflow({
+        name: 'InspectWorkflow',
+        input: z.object({ x: z.number() }),
+        handler: async (ctx) => {
+          capturedCtx = ctx;
+          return 'inspected';
+        },
+      });
+
+      const runtime = new AxlTestRuntime();
+      runtime.register(InspectWorkflow);
+
+      await runtime.execute(
+        'InspectWorkflow',
+        { x: 42 },
+        {
+          metadata: { env: 'test' },
+        },
+      );
+
+      expect(capturedCtx.executionId).toMatch(/^test-/);
+      expect(capturedCtx.metadata).toEqual({ env: 'test' });
+      expect(capturedCtx.input).toEqual({ x: 42 });
+    });
+
+    it('metadata defaults to empty object', async () => {
+      let capturedCtx: any;
+
+      const InspectWorkflow2 = workflow({
+        name: 'InspectWorkflow2',
+        input: z.object({ x: z.number() }),
+        handler: async (ctx) => {
+          capturedCtx = ctx;
+          return 'ok';
+        },
+      });
+
+      const runtime = new AxlTestRuntime();
+      runtime.register(InspectWorkflow2);
+
+      await runtime.execute('InspectWorkflow2', { x: 1 });
+
+      expect(capturedCtx.metadata).toEqual({});
+    });
+  });
+
+  describe('multiple tool calls in one turn', () => {
+    it('handles multiple tool calls returned in a single response', async () => {
+      const runtime = new AxlTestRuntime();
+
+      const provider = MockProvider.sequence([
+        {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call-a',
+              type: 'function',
+              function: { name: 'get_order', arguments: '{"orderId":"A"}' },
+            },
+            {
+              id: 'call-b',
+              type: 'function',
+              function: { name: 'get_order', arguments: '{"orderId":"B"}' },
+            },
+          ],
+        },
+        { content: 'Both orders found.' },
+      ]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      const result = await runtime.execute('HandleSupport', { msg: 'check orders A and B' });
+
+      expect(result).toBe('Both orders found.');
+      expect(runtime.toolCalls()).toHaveLength(2);
+      expect(runtime.toolCalls()[0].args).toEqual({ orderId: 'A' });
+      expect(runtime.toolCalls()[1].args).toEqual({ orderId: 'B' });
+    });
+  });
+});

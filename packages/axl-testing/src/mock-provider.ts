@@ -1,0 +1,163 @@
+import { readFileSync } from 'node:fs';
+import type {
+  ChatMessage,
+  ChatOptions,
+  ToolCallMessage,
+  ProviderResponse,
+  StreamChunk,
+  Provider,
+} from '@axlsdk/axl';
+
+function randomAlphanumeric(length: number): string {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return result;
+}
+
+function generateFromSchema(schema: unknown): unknown {
+  const def = (schema as Record<string, unknown> | null)?._def as
+    | Record<string, unknown>
+    | undefined;
+  if (!def) return {};
+  switch (def.typeName) {
+    case 'ZodString': {
+      const length = 8 + Math.floor(Math.random() * 13); // 8-20 chars
+      return randomAlphanumeric(length);
+    }
+    case 'ZodNumber': {
+      const checks: Array<{ kind: string; value: number }> =
+        (def.checks as Array<{ kind: string; value: number }>) ?? [];
+      let min = 0;
+      let max = 100;
+      for (const check of checks) {
+        if (check.kind === 'min') min = check.value;
+        if (check.kind === 'max') max = check.value;
+      }
+      return min + Math.random() * (max - min);
+    }
+    case 'ZodBoolean':
+      return Math.random() < 0.5;
+    case 'ZodArray': {
+      const count = 1 + Math.floor(Math.random() * 3); // 1-3 items
+      const items: unknown[] = [];
+      for (let i = 0; i < count; i++) {
+        items.push(generateFromSchema(def.type));
+      }
+      return items;
+    }
+    case 'ZodObject': {
+      const shapeFn = def.shape as (() => Record<string, unknown>) | undefined;
+      const shape = shapeFn?.() ?? {};
+      const obj: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(shape)) {
+        obj[key] = generateFromSchema(value);
+      }
+      return obj;
+    }
+    case 'ZodOptional': {
+      if (Math.random() < 0.5) return undefined;
+      return generateFromSchema(def.innerType);
+    }
+    case 'ZodDefault':
+      return (def.defaultValue as () => unknown)();
+    case 'ZodEnum': {
+      const values: unknown[] = (def.values as unknown[]) ?? [];
+      if (values.length === 0) return '';
+      return values[Math.floor(Math.random() * values.length)];
+    }
+    case 'ZodNullable':
+      return null;
+    default:
+      return {};
+  }
+}
+
+export class MockProvider implements Provider {
+  readonly name = 'mock';
+  private _calls: { messages: ChatMessage[]; options: ChatOptions }[] = [];
+
+  private constructor(
+    private responseFn: (messages: ChatMessage[], callIndex: number) => ProviderResponse,
+  ) {}
+
+  get calls() {
+    return this._calls;
+  }
+
+  async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
+    this._calls.push({ messages, options });
+    return this.responseFn(messages, this._calls.length - 1);
+  }
+
+  async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
+    const response = await this.chat(messages, options);
+    yield { type: 'text_delta', content: response.content };
+    yield { type: 'done', usage: response.usage };
+  }
+
+  static sequence(
+    responses: Array<{ content: string; tool_calls?: ToolCallMessage[] }>,
+  ): MockProvider {
+    return new MockProvider((_messages, callIndex) => {
+      if (callIndex >= responses.length) {
+        throw new Error(
+          `MockProvider.sequence: no response for call index ${callIndex}. Only ${responses.length} responses defined.`,
+        );
+      }
+      return {
+        content: responses[callIndex].content,
+        tool_calls: responses[callIndex].tool_calls,
+        usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+        cost: 0,
+      };
+    });
+  }
+
+  static echo(): MockProvider {
+    return new MockProvider((messages) => {
+      const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+      return {
+        content: lastUser?.content ?? '',
+        usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+        cost: 0,
+      };
+    });
+  }
+
+  static json(schema: unknown): MockProvider {
+    return new MockProvider(() => ({
+      content: JSON.stringify(generateFromSchema(schema)),
+      usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+      cost: 0,
+    }));
+  }
+
+  static replay(source: string | ProviderResponse[]): MockProvider {
+    const data =
+      typeof source === 'string'
+        ? (JSON.parse(readFileSync(source, 'utf-8')) as ProviderResponse[])
+        : source;
+    return new MockProvider((_messages, callIndex) => {
+      if (callIndex >= data.length) {
+        throw new Error(`MockProvider.replay: no recorded response for call index ${callIndex}`);
+      }
+      return data[callIndex];
+    });
+  }
+
+  static fn(
+    handler: (
+      messages: ChatMessage[],
+      callIndex: number,
+    ) => { content: string; tool_calls?: ToolCallMessage[] },
+  ): MockProvider {
+    return new MockProvider((messages, callIndex) => ({
+      ...handler(messages, callIndex),
+      usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+      cost: 0,
+    }));
+  }
+}

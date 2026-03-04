@@ -1,0 +1,95 @@
+{
+  "name": "@axlsdk/studio",
+  "version": "0.3.0",
+  "description": "Local development UI for debugging, testing, and iterating on Axl agents and workflows",
+  "type": "module",
+  "main": "./dist/server/index.cjs",
+  "module": "./dist/server/index.js",
+  "types": "./dist/server/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/server/index.d.ts",
+        "default": "./dist/server/index.js"
+      },
+      "require": {
+        "types": "./dist/server/index.d.cts",
+        "default": "./dist/server/index.cjs"
+      }
+    }
+  },
+  "bin": {
+    "axl-studio": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "pnpm build:client && pnpm build:server",
+    "build:server": "tsup",
+    "build:client": "vite build",
+    "dev": "concurrently \"vite\" \"tsx watch src/cli.ts -- --port 4400\"",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@axlsdk/axl": "workspace:*",
+    "hono": "^4.7.0",
+    "@hono/node-server": "^1.13.0",
+    "@hono/node-ws": "^1.1.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "@axlsdk/testing": "workspace:*",
+    "@tailwindcss/vite": "^4.1.0",
+    "@tanstack/react-query": "^5.64.0",
+    "@types/node": "^25.2.3",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "concurrently": "^9.1.0",
+    "lucide-react": "^0.474.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.1.0",
+    "tailwindcss": "^4.1.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "vitest": "^3.0.0",
+    "zod": "^3.24.0"
+  },
+  "peerDependencies": {
+    "@axlsdk/eval": "workspace:*"
+  },
+  "peerDependenciesMeta": {
+    "@axlsdk/eval": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "ai",
+    "studio",
+    "developer-tools",
+    "agents",
+    "debugging"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/axl-sdk/axl.git",
+    "directory": "packages/axl-studio"
+  },
+  "homepage": "https://github.com/axl-sdk/axl#readme",
+  "bugs": {
+    "url": "https://github.com/axl-sdk/axl/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

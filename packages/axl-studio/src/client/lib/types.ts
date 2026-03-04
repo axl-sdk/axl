@@ -1,0 +1,176 @@
+/** API response envelope */
+export type ApiResponse<T> =
+  | { ok: true; data: T }
+  | { ok: false; error: { code: string; message: string } };
+
+/** Workflow summary */
+export type WorkflowSummary = {
+  name: string;
+  hasInputSchema: boolean;
+  hasOutputSchema: boolean;
+};
+
+/** Tool summary */
+export type ToolSummary = {
+  name: string;
+  description: string;
+  inputSchema: unknown;
+  sensitive: boolean;
+  requireApproval: boolean;
+};
+
+/** Tool detail (from GET /api/tools/:name) */
+export type ToolDetail = {
+  name: string;
+  description: string;
+  inputSchema: unknown;
+  sensitive: boolean;
+  requireApproval: boolean;
+  retry: { attempts?: number; backoff?: string };
+  hasHooks: boolean;
+  hooks: { hasBefore: boolean; hasAfter: boolean } | null;
+};
+
+/** Agent summary */
+export type AgentSummary = {
+  name: string;
+  model: string;
+  system: string;
+  tools: string[];
+  handoffs: string[];
+  maxTurns?: number;
+  temperature?: number;
+};
+
+/** Agent detail (from GET /api/agents/:name) */
+export type AgentDetail = {
+  name: string;
+  model: string;
+  system: string;
+  tools: Array<{ name: string; description: string; inputSchema: unknown }>;
+  handoffs: Array<{ agent: string; description?: string; mode: 'oneway' | 'roundtrip' }>;
+  maxTurns?: number;
+  temperature?: number;
+  timeout?: string;
+  maxContext?: number;
+  version?: string;
+  mcp?: string[];
+  mcpTools?: string[];
+  hasGuardrails: boolean;
+  guardrails: {
+    hasInput: boolean;
+    hasOutput: boolean;
+    onBlock: string;
+    maxRetries?: number;
+  } | null;
+};
+
+/** Execution info */
+export type ExecutionInfo = {
+  executionId: string;
+  workflow: string;
+  status: 'running' | 'completed' | 'failed';
+  steps: TraceEvent[];
+  totalCost: number;
+  startedAt: number;
+  completedAt?: number;
+  duration: number;
+  error?: string;
+};
+
+/** Trace event */
+export type TraceEvent = {
+  executionId: string;
+  workflow?: string;
+  step: number;
+  type: string;
+  agent?: string;
+  tool?: string;
+  model?: string;
+  promptVersion?: string;
+  timestamp: number;
+  duration?: number;
+  cost?: number;
+  tokens?: { input: number; output: number; reasoning?: number };
+  data?: unknown;
+};
+
+/** Cost data */
+export type CostData = {
+  totalCost: number;
+  totalTokens: { input: number; output: number; reasoning: number };
+  byAgent: Record<string, { cost: number; calls: number }>;
+  byModel: Record<
+    string,
+    { cost: number; calls: number; tokens: { input: number; output: number } }
+  >;
+  byWorkflow: Record<string, { cost: number; executions: number }>;
+};
+
+/** Session summary */
+export type SessionSummary = {
+  id: string;
+  messageCount: number;
+};
+
+/** Session detail */
+export type SessionDetail = {
+  id: string;
+  history: ChatMessage[];
+  handoffHistory?: HandoffRecord[];
+};
+
+/** Chat message */
+export type ChatMessage = {
+  role: string;
+  content: string;
+  tool_calls?: Array<{
+    id: string;
+    function: { name: string; arguments: string };
+  }>;
+};
+
+/** Handoff record */
+export type HandoffRecord = {
+  source: string;
+  target: string;
+  mode: 'oneway' | 'roundtrip';
+  timestamp: number;
+  duration?: number;
+};
+
+/** Memory entry */
+export type MemoryEntry = {
+  key: string;
+  value: unknown;
+};
+
+/** Pending decision */
+export type PendingDecision = {
+  executionId: string;
+  channel: string;
+  prompt: string;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+};
+
+/** Health check response */
+export type HealthData = {
+  status: string;
+  workflows: number;
+  agents: number;
+  tools: number;
+};
+
+/** Stream event (from WS) */
+export type StreamEvent =
+  | { type: 'token'; data: string }
+  | { type: 'tool_call'; name: string; args: unknown }
+  | { type: 'tool_result'; name: string; result: unknown }
+  | { type: 'tool_approval'; name: string; args: unknown; approved: boolean; reason?: string }
+  | { type: 'agent_start'; agent: string; model?: string }
+  | { type: 'agent_end'; agent: string; cost?: number; duration?: number }
+  | { type: 'handoff'; source: string; target: string; mode?: 'oneway' | 'roundtrip' }
+  | { type: 'step'; step: number; data: TraceEvent }
+  | { type: 'done'; result: unknown }
+  | { type: 'error'; message: string };

@@ -1,0 +1,66 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm build *)",
+      "Bash(pnpm build)",
+      "Bash(pnpm run build *)",
+      "Bash(pnpm run build)",
+      "Bash(pnpm test *)",
+      "Bash(pnpm test)",
+      "Bash(pnpm test:watch *)",
+      "Bash(pnpm test:watch)",
+      "Bash(pnpm test:e2e *)",
+      "Bash(pnpm test:e2e)",
+      "Bash(pnpm test:studio *)",
+      "Bash(pnpm test:studio)",
+      "Bash(pnpm test:smoke *)",
+      "Bash(pnpm test:smoke)",
+      "Bash(pnpm typecheck *)",
+      "Bash(pnpm typecheck)",
+      "Bash(pnpm lint *)",
+      "Bash(pnpm lint)",
+      "Bash(pnpm format *)",
+      "Bash(pnpm format)",
+      "Bash(pnpm format:check *)",
+      "Bash(pnpm format:check)",
+      "Bash(pnpm install *)",
+      "Bash(pnpm install)",
+      "Bash(pnpm add *)",
+      "Bash(pnpm -r *)",
+      "Bash(pnpm -F *)",
+      "Bash(pnpm --filter *)",
+      "Bash(npx vitest *)",
+      "Bash(npx vitest)",
+      "Bash(npx tsc *)",
+      "Bash(npx tsc)",
+      "Bash(npx tsup *)",
+      "Bash(npx tsup)"
+    ]
+  },
+  "hooks": {
+    "TeammateIdle": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/ts-teammate-idle.sh",
+            "timeout": 120,
+            "statusMessage": "Running typecheck + lint on workspace..."
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/ts-task-completed.sh",
+            "timeout": 180,
+            "statusMessage": "Verifying typecheck and tests..."
+          }
+        ]
+      }
+    ]
+  }
+}

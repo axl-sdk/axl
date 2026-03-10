@@ -40,6 +40,11 @@ export type AgentSummary = {
   handoffs: string[];
   maxTurns?: number;
   temperature?: number;
+  maxTokens?: number;
+  thinking?: 'low' | 'medium' | 'high' | 'max' | { budgetTokens: number };
+  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  toolChoice?: 'auto' | 'none' | 'required' | { type: 'function'; function: { name: string } };
+  stop?: string[];
 };
 
 /** Agent detail (from GET /api/agents/:name) */
@@ -51,6 +56,11 @@ export type AgentDetail = {
   handoffs: Array<{ agent: string; description?: string; mode: 'oneway' | 'roundtrip' }>;
   maxTurns?: number;
   temperature?: number;
+  maxTokens?: number;
+  thinking?: 'low' | 'medium' | 'high' | 'max' | { budgetTokens: number };
+  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  toolChoice?: 'auto' | 'none' | 'required' | { type: 'function'; function: { name: string } };
+  stop?: string[];
   timeout?: string;
   maxContext?: number;
   version?: string;

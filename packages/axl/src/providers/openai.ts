@@ -1,4 +1,12 @@
-import type { Provider, ChatOptions, ChatMessage, ProviderResponse, StreamChunk } from './types.js';
+import type {
+  Provider,
+  ChatOptions,
+  ChatMessage,
+  ProviderResponse,
+  StreamChunk,
+  Thinking,
+  ReasoningEffort,
+} from './types.js';
 import { fetchWithRetry } from './retry.js';
 
 // ---------------------------------------------------------------------------
@@ -62,6 +70,28 @@ export function estimateOpenAICost(
 /** Returns true for reasoning models (o1, o3, o4-mini) that require special handling. */
 export function isReasoningModel(model: string): boolean {
   return /^(o1|o3|o4-mini)/.test(model);
+}
+
+/** Map unified Thinking to OpenAI reasoning_effort. */
+export function thinkingToReasoningEffort(thinking: Thinking): ReasoningEffort {
+  if (typeof thinking === 'object') {
+    // Map budget to nearest effort level
+    const budget = thinking.budgetTokens;
+    if (budget <= 1024) return 'low';
+    if (budget <= 8192) return 'medium';
+    return 'high';
+  }
+  // Exhaustive string mapping — compiler error if Thinking gains a new level
+  switch (thinking) {
+    case 'low':
+      return 'low';
+    case 'medium':
+      return 'medium';
+    case 'high':
+      return 'high';
+    case 'max':
+      return 'xhigh';
+  }
 }
 
 /**
@@ -213,7 +243,10 @@ export class OpenAIProvider implements Provider {
 
     if (options.tools && options.tools.length > 0) {
       body.tools = options.tools;
-      body.parallel_tool_calls = true;
+      // Reasoning models (o1/o3/o4-mini) don't support parallel_tool_calls
+      if (!reasoning) {
+        body.parallel_tool_calls = true;
+      }
     }
 
     if (options.toolChoice !== undefined) {
@@ -224,8 +257,16 @@ export class OpenAIProvider implements Provider {
       body.response_format = options.responseFormat;
     }
 
-    if (options.reasoningEffort) {
-      body.reasoning_effort = options.reasoningEffort;
+    // thinking/reasoningEffort only apply to reasoning models (o1/o3/o4-mini).
+    // Non-reasoning models (gpt-4o, gpt-4.1, etc.) reject reasoning_effort.
+    // thinking takes precedence over reasoningEffort when both are set.
+    if (reasoning) {
+      const effort = options.thinking
+        ? thinkingToReasoningEffort(options.thinking)
+        : options.reasoningEffort;
+      if (effort) {
+        body.reasoning_effort = effort;
+      }
     }
 
     if (stream) {

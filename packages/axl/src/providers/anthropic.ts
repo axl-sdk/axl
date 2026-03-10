@@ -6,6 +6,7 @@ import type {
   StreamChunk,
   ToolDefinition,
   ToolCallMessage,
+  Thinking,
 } from './types.js';
 import { fetchWithRetry } from './retry.js';
 
@@ -59,6 +60,39 @@ function estimateAnthropicCost(
     cacheRead * inputRate * 0.1 +
     cacheWrite * inputRate * 1.25;
   return inputCost + outputTokens * outputRate;
+}
+
+/** Default thinking budget tokens for each Thinking level (manual mode). */
+const THINKING_BUDGETS: Record<string, number> = {
+  low: 1024,
+  medium: 5000,
+  high: 10000,
+  // 30000 (not 32000) to stay under the 32K max_tokens limit on Opus 4/4.1.
+  // With auto-bump (+1024), max_tokens becomes 31024 which fits all models.
+  max: 30000,
+};
+
+/** Map unified Thinking to Anthropic budget_tokens (manual mode). */
+function thinkingToBudgetTokens(thinking: Thinking): number {
+  if (typeof thinking === 'string') return THINKING_BUDGETS[thinking] ?? 5000;
+  return thinking.budgetTokens;
+}
+
+/**
+ * Check if a model supports Anthropic's adaptive thinking mode.
+ * Adaptive thinking is supported on Claude Opus 4.6 and Sonnet 4.6.
+ */
+function supportsAdaptiveThinking(model: string): boolean {
+  return model.startsWith('claude-opus-4-6') || model.startsWith('claude-sonnet-4-6');
+}
+
+/**
+ * Check if a model supports effort: 'max' in adaptive thinking mode.
+ * Only Opus 4.6 supports max effort. Sonnet 4.6 supports adaptive mode
+ * but not the 'max' effort level.
+ */
+function supportsMaxEffort(model: string): boolean {
+  return model.startsWith('claude-opus-4-6');
 }
 
 /**
@@ -189,7 +223,9 @@ export class AnthropicProvider implements Provider {
       body.system = systemText;
     }
 
-    if (options.temperature !== undefined) {
+    // Anthropic rejects temperature when extended thinking is enabled.
+    // Strip it silently (same pattern as OpenAI stripping temperature for reasoning models).
+    if (options.temperature !== undefined && !options.thinking) {
       body.temperature = options.temperature;
     }
 
@@ -199,6 +235,39 @@ export class AnthropicProvider implements Provider {
 
     if (options.tools && options.tools.length > 0) {
       body.tools = options.tools.map((t) => this.mapToolDefinition(t));
+    }
+
+    if (options.toolChoice !== undefined) {
+      body.tool_choice = this.mapToolChoice(options.toolChoice);
+    }
+
+    // Map unified thinking to Anthropic's extended thinking.
+    // Claude 4.6 models (Opus 4.6, Sonnet 4.6) support adaptive thinking mode,
+    // which dynamically allocates thinking depth. For string levels, we use
+    // adaptive mode with effort. For explicit budgetTokens, we use manual mode
+    // with budget_tokens (still supported, user wants precise control).
+    // Older models always use manual mode with budget_tokens.
+    if (options.thinking) {
+      if (
+        typeof options.thinking === 'string' &&
+        supportsAdaptiveThinking(options.model) &&
+        // 'max' effort is only supported on Opus 4.6; Sonnet 4.6 falls back to manual mode
+        (options.thinking !== 'max' || supportsMaxEffort(options.model))
+      ) {
+        // Adaptive mode: let Claude decide thinking depth, guided by effort level
+        body.thinking = { type: 'adaptive' };
+        body.output_config = { effort: options.thinking };
+      } else {
+        // Manual mode: explicit budget_tokens
+        // Anthropic requires max_tokens >= budget_tokens (max_tokens includes both
+        // thinking and output tokens), so auto-bump if needed.
+        const budgetTokens = thinkingToBudgetTokens(options.thinking);
+        body.thinking = { type: 'enabled', budget_tokens: budgetTokens };
+        const currentMax = body.max_tokens as number;
+        if (currentMax < budgetTokens + 1024) {
+          body.max_tokens = budgetTokens + 1024;
+        }
+      }
     }
 
     // Anthropic doesn't have a native JSON mode like OpenAI's json_object.
@@ -319,6 +388,24 @@ export class AnthropicProvider implements Provider {
       description: tool.function.description,
       input_schema: tool.function.parameters as Record<string, unknown>,
     };
+  }
+
+  /**
+   * Map Axl's ToolChoice to Anthropic's tool_choice format.
+   *
+   * Axl (OpenAI format)          → Anthropic format
+   * 'auto'                       → { type: 'auto' }
+   * 'none'                       → { type: 'none' }
+   * 'required'                   → { type: 'any' }
+   * { type:'function', function: { name } } → { type: 'tool', name }
+   */
+  private mapToolChoice(choice: NonNullable<ChatOptions['toolChoice']>): Record<string, unknown> {
+    if (typeof choice === 'string') {
+      if (choice === 'required') return { type: 'any' };
+      return { type: choice };
+    }
+    // Specific function: { type: 'function', function: { name } } → { type: 'tool', name }
+    return { type: 'tool', name: choice.function.name };
   }
 
   // ---------------------------------------------------------------------------

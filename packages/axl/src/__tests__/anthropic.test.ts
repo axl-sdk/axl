@@ -312,6 +312,457 @@ describe('AnthropicProvider', () => {
       expect(fetchMock.mock.calls[0][1].signal).toBe(controller.signal);
     });
 
+    it('maps toolChoice "required" to Anthropic tool_choice {type:"any"}', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-tc',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 1024,
+        toolChoice: 'required',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.tool_choice).toEqual({ type: 'any' });
+    });
+
+    it('maps toolChoice "auto" to Anthropic tool_choice {type:"auto"}', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-tc2',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 1024,
+        toolChoice: 'auto',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.tool_choice).toEqual({ type: 'auto' });
+    });
+
+    it('maps specific function toolChoice to Anthropic {type:"tool", name}', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-tc3',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 1024,
+        toolChoice: { type: 'function', function: { name: 'search' } },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.tool_choice).toEqual({ type: 'tool', name: 'search' });
+    });
+
+    it('maps thinking "high" to manual mode with budget_tokens on older models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th1',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 1024,
+        thinking: 'high',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 10000 });
+      expect(body.output_config).toBeUndefined();
+    });
+
+    it('maps thinking "high" to adaptive mode with effort on 4.6 models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th1a',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4-6',
+        maxTokens: 4096,
+        thinking: 'high',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.thinking).toEqual({ type: 'adaptive' });
+      expect(body.output_config).toEqual({ effort: 'high' });
+    });
+
+    it('maps thinking "low" to adaptive mode with effort on opus 4.6', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th1b',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-4-6',
+        maxTokens: 4096,
+        thinking: 'low',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.thinking).toEqual({ type: 'adaptive' });
+      expect(body.output_config).toEqual({ effort: 'low' });
+    });
+
+    it('adaptive mode does not auto-bump max_tokens', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th1c',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4-6',
+        maxTokens: 4096,
+        thinking: 'high',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      // Adaptive mode has no budget_tokens, so max_tokens stays as-is
+      expect(body.max_tokens).toBe(4096);
+    });
+
+    it('uses manual mode with budget_tokens for budgetTokens form on 4.6 models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th1d',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4-6',
+        maxTokens: 4096,
+        thinking: { budgetTokens: 3000 },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      // Budget form always uses manual mode for precise control
+      expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 3000 });
+      expect(body.output_config).toBeUndefined();
+    });
+
+    it('maps thinking "max" to adaptive mode with effort "max" on 4.6 models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th-max-adaptive',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-4-6',
+        maxTokens: 4096,
+        thinking: 'max',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.thinking).toEqual({ type: 'adaptive' });
+      expect(body.output_config).toEqual({ effort: 'max' });
+    });
+
+    it('maps thinking "max" to manual mode on Sonnet 4.6 (max effort not supported)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th-max-sonnet46',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4-6',
+        maxTokens: 4096,
+        thinking: 'max',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      // Sonnet 4.6 does NOT support effort: 'max', so falls back to manual mode
+      expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 30000 });
+      expect(body.output_config).toBeUndefined();
+      // Should auto-bump max_tokens
+      expect(body.max_tokens).toBe(31024);
+    });
+
+    it('maps thinking "max" to manual mode with budget_tokens 30000 on older models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th-max-manual',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 4096,
+        thinking: 'max',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 30000 });
+      // Should auto-bump max_tokens since 4096 < 30000 + 1024
+      expect(body.max_tokens).toBe(31024);
+    });
+
+    it('maps thinking budget form to Anthropic thinking with exact budget_tokens', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th2',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 1024,
+        thinking: { budgetTokens: 3000 },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 3000 });
+    });
+
+    it('does not include thinking when thinking is undefined', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th3',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 1024,
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.thinking).toBeUndefined();
+    });
+
+    it('auto-bumps max_tokens when thinking budget exceeds it (manual mode)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th-bump',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      // maxTokens 4096 < budget_tokens 10000 for 'high'
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 4096,
+        thinking: 'high',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 10000 });
+      // Should be auto-bumped to budget_tokens + 1024
+      expect(body.max_tokens).toBe(11024);
+    });
+
+    it('does not bump max_tokens when already sufficient for thinking budget (manual mode)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th-nobump',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      // maxTokens 4096 > budget_tokens 1024 + 1024 for 'low'
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 4096,
+        thinking: 'low',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 1024 });
+      expect(body.max_tokens).toBe(4096);
+    });
+
+    it('strips temperature when thinking is enabled', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-temp',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 4096,
+        temperature: 0.7,
+        thinking: 'low',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.temperature).toBeUndefined();
+      expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 1024 });
+    });
+
+    it('allows temperature when thinking is not set', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-temp2',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 4096,
+        temperature: 0.7,
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.temperature).toBe(0.7);
+      expect(body.thinking).toBeUndefined();
+    });
+
+    it('does not include tool_choice when toolChoice is undefined', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-tc4',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 1024,
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.tool_choice).toBeUndefined();
+    });
+
     it('merges consecutive same-role messages', async () => {
       const fetchMock = mockFetch({
         json: () =>

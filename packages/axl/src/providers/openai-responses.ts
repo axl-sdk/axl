@@ -1,5 +1,5 @@
 import type { Provider, ChatOptions, ChatMessage, ProviderResponse, StreamChunk } from './types.js';
-import { estimateOpenAICost, isReasoningModel } from './openai.js';
+import { estimateOpenAICost, isReasoningModel, thinkingToReasoningEffort } from './openai.js';
 import { fetchWithRetry } from './retry.js';
 
 /**
@@ -139,8 +139,16 @@ export class OpenAIResponsesProvider implements Provider {
       }
     }
 
-    if (options.reasoningEffort) {
-      body.reasoning = { effort: options.reasoningEffort };
+    // thinking/reasoningEffort only apply to reasoning models (o1/o3/o4-mini).
+    // Non-reasoning models (gpt-4o, gpt-4.1, etc.) reject reasoning params.
+    // thinking takes precedence over reasoningEffort when both are set.
+    if (reasoning) {
+      const effort = options.thinking
+        ? thinkingToReasoningEffort(options.thinking)
+        : options.reasoningEffort;
+      if (effort) {
+        body.reasoning = { effort };
+      }
     }
 
     if (options.responseFormat) {

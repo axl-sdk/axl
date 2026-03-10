@@ -15,6 +15,11 @@ app.get('/agents', (c) => {
     handoffs: a._config.handoffs?.map((h) => h.agent._name) ?? [],
     maxTurns: a._config.maxTurns,
     temperature: a._config.temperature,
+    maxTokens: a._config.maxTokens,
+    thinking: a._config.thinking,
+    reasoningEffort: a._config.reasoningEffort,
+    toolChoice: a._config.toolChoice,
+    stop: a._config.stop,
   }));
   return c.json({ ok: true, data: agents });
 });
@@ -52,6 +57,11 @@ app.get('/agents/:name', (c) => {
         })) ?? [],
       maxTurns: cfg.maxTurns,
       temperature: cfg.temperature,
+      maxTokens: cfg.maxTokens,
+      thinking: cfg.thinking,
+      reasoningEffort: cfg.reasoningEffort,
+      toolChoice: cfg.toolChoice,
+      stop: cfg.stop,
       timeout: cfg.timeout,
       maxContext: cfg.maxContext,
       version: cfg.version,

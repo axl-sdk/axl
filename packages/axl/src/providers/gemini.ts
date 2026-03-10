@@ -6,6 +6,7 @@ import type {
   StreamChunk,
   ToolDefinition,
   ToolCallMessage,
+  Thinking,
 } from './types.js';
 import { fetchWithRetry } from './retry.js';
 
@@ -47,6 +48,20 @@ function estimateGeminiCost(
   // Gemini charges 10% of input rate for cached tokens (90% discount)
   const inputCost = (inputTokens - cached) * inputRate + cached * inputRate * 0.1;
   return inputCost + outputTokens * outputRate;
+}
+
+/** Default thinking budget tokens for each Thinking level. */
+const THINKING_BUDGETS: Record<string, number> = {
+  low: 1024,
+  medium: 5000,
+  high: 10000,
+  max: 24576,
+};
+
+/** Map unified Thinking to Gemini thinkingBudget. */
+function thinkingToBudgetTokens(thinking: Thinking): number {
+  if (typeof thinking === 'string') return THINKING_BUDGETS[thinking] ?? 5000;
+  return thinking.budgetTokens;
 }
 
 /**
@@ -208,6 +223,22 @@ export class GeminiProvider implements Provider {
       body.generationConfig = generationConfig;
     }
 
+    // Map unified thinking to Gemini's thinkingConfig
+    if (options.thinking) {
+      generationConfig.thinkingConfig = {
+        thinkingBudget: thinkingToBudgetTokens(options.thinking),
+      };
+      // Ensure generationConfig is included even if nothing else was set
+      if (!body.generationConfig) {
+        body.generationConfig = generationConfig;
+      }
+    }
+
+    // Map toolChoice to Gemini's toolConfig.functionCallingConfig
+    if (options.toolChoice !== undefined) {
+      body.toolConfig = { functionCallingConfig: this.mapToolChoice(options.toolChoice) };
+    }
+
     return body;
   }
 
@@ -314,6 +345,27 @@ export class GeminiProvider implements Provider {
     }
 
     return merged;
+  }
+
+  /**
+   * Map Axl's ToolChoice to Gemini's functionCallingConfig format.
+   *
+   * - 'auto'     → { mode: 'AUTO' }
+   * - 'none'     → { mode: 'NONE' }
+   * - 'required' → { mode: 'ANY' }
+   * - { type: 'function', function: { name } } → { mode: 'ANY', allowedFunctionNames: [name] }
+   */
+  private mapToolChoice(choice: NonNullable<ChatOptions['toolChoice']>): Record<string, unknown> {
+    if (typeof choice === 'string') {
+      const modeMap: Record<string, string> = {
+        auto: 'AUTO',
+        none: 'NONE',
+        required: 'ANY',
+      };
+      return { mode: modeMap[choice] ?? 'AUTO' };
+    }
+    // Specific function choice
+    return { mode: 'ANY', allowedFunctionNames: [choice.function.name] };
   }
 
   private mapToolDefinition(tool: ToolDefinition): {

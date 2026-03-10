@@ -456,6 +456,60 @@ describe('OpenAIResponsesProvider', () => {
       expect(body.reasoning).toEqual({ effort: 'high' });
     });
 
+    it('maps thinking "max" to reasoning { effort: "xhigh" }', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [
+              {
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'ok' }],
+              },
+            ],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        thinking: 'max',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning).toEqual({ effort: 'xhigh' });
+    });
+
+    it('ignores thinking on non-reasoning models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [
+              {
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'ok' }],
+              },
+            ],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-4o',
+        maxTokens: 1024,
+        thinking: 'high',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning).toBeUndefined();
+    });
+
     it('maps object toolChoice to flat Responses API format', async () => {
       const fetchMock = mockFetch({
         json: () =>

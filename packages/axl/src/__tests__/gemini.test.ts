@@ -415,6 +415,156 @@ describe('GeminiProvider', () => {
       expect(frParts).toHaveLength(2);
     });
 
+    it('maps toolChoice "required" to toolConfig with mode ANY', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.0-flash',
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'search',
+              description: 'Search',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ],
+        toolChoice: 'required',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.toolConfig).toEqual({
+        functionCallingConfig: { mode: 'ANY' },
+      });
+    });
+
+    it('maps toolChoice "none" to toolConfig with mode NONE', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.0-flash',
+        toolChoice: 'none',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.toolConfig).toEqual({
+        functionCallingConfig: { mode: 'NONE' },
+      });
+    });
+
+    it('maps specific function toolChoice to allowedFunctionNames', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.0-flash',
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'search',
+              description: 'Search',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ],
+        toolChoice: { type: 'function', function: { name: 'search' } },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.toolConfig).toEqual({
+        functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['search'] },
+      });
+    });
+
+    it('maps thinking "high" to thinkingConfig in generationConfig', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-pro',
+        thinking: 'high',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingBudget: 10000,
+      });
+    });
+
+    it('maps thinking "max" to thinkingBudget 24576', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-pro',
+        thinking: 'max',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingBudget: 24576,
+      });
+    });
+
+    it('maps thinking budget form to exact thinkingBudget', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-flash',
+        thinking: { budgetTokens: 4000 },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingBudget: 4000,
+      });
+    });
+
+    it('does not include thinkingConfig when thinking is undefined', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-pro',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig).toBeUndefined();
+    });
+
+    it('does not include toolConfig when toolChoice is undefined', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.0-flash',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.toolConfig).toBeUndefined();
+    });
+
     it('maps tool definitions to functionDeclarations', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),

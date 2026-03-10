@@ -291,6 +291,112 @@ describe('OpenAIProvider', () => {
       expect(body.reasoning_effort).toBe('high');
     });
 
+    it('maps thinking "high" to reasoning_effort "high"', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-1',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        thinking: 'high',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('high');
+    });
+
+    it('maps thinking "max" to reasoning_effort "xhigh"', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-1',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        thinking: 'max',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('xhigh');
+    });
+
+    it('maps thinking budget to nearest reasoning_effort level', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-1',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        thinking: { budgetTokens: 500 },
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('low');
+    });
+
+    it('thinking takes precedence over reasoningEffort', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-1',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        thinking: 'low',
+        reasoningEffort: 'xhigh',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('low');
+    });
+
+    it('ignores thinking on non-reasoning models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-1',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-4o',
+        maxTokens: 1024,
+        thinking: 'high',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBeUndefined();
+    });
+
     it('passes tool_choice when set', async () => {
       const fetchMock = mockFetch({
         json: () =>

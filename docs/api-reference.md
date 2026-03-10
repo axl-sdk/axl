@@ -66,6 +66,8 @@ const myAgent = agent({
   system: 'You are a helpful assistant.',
   tools: [search, calculator],
   temperature: 0.7,
+  maxTokens: 8192,
+  reasoningEffort: 'high',
   maxTurns: 10,
   timeout: '30s',
 });
@@ -81,6 +83,11 @@ const myAgent = agent({
 | `mcp` | `string[]` | `[]` | MCP server names to connect. Tools from these servers are merged into the agent's tool set |
 | `mcpTools` | `string[]` | — | Whitelist: only expose these specific MCP tools |
 | `temperature` | `number` | provider default | LLM sampling temperature |
+| `maxTokens` | `number` | `4096` | Maximum tokens in the LLM response |
+| `thinking` | `Thinking` | — | Thinking/reasoning level. `'low'` \| `'medium'` \| `'high'` \| `'max'` or `{ budgetTokens: number }`. Works across all providers |
+| `reasoningEffort` | `ReasoningEffort` | — | OpenAI-specific reasoning effort escape hatch. Values: `'none'` \| `'minimal'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'`. Prefer `thinking` |
+| `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool |
+| `stop` | `string[]` | — | Stop sequences — generation stops when any sequence is encountered. Not supported by the `openai-responses` provider (silently ignored) |
 | `maxTurns` | `number` | `25` | Maximum tool-call loop iterations before throwing `MaxTurnsError` |
 | `timeout` | `string` | none | Duration string (e.g., `'30s'`, `'5m'`, `'1h'`). Throws `TimeoutError` when exceeded |
 | `maxContext` | `number` | — | Estimated token limit for context window management |
@@ -148,6 +155,14 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 | `schema` | `ZodType` | — | Validates and parses the response as structured output. On validation failure, feeds the Zod error back to the LLM for self-correction |
 | `retries` | `number` | `3` | Number of schema validation retries |
 | `metadata` | `Record<string, unknown>` | — | Merged with workflow metadata and passed to dynamic `model`/`system` selector functions |
+| `temperature` | `number` | agent config | Override sampling temperature for this call |
+| `maxTokens` | `number` | agent config or `4096` | Override max tokens for this call |
+| `thinking` | `Thinking` | agent config | Override thinking level for this call |
+| `reasoningEffort` | `ReasoningEffort` | agent config | Override reasoning effort (OpenAI-specific) |
+| `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | agent config | Override tool choice for this call |
+| `stop` | `string[]` | agent config | Override stop sequences for this call |
+
+**Precedence:** Per-call `AskOptions` > agent-level `AgentConfig` > internal defaults.
 
 **Returns:** `Promise<T>` — parsed output if `schema` is provided, otherwise `string`.
 

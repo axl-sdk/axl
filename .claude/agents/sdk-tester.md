@@ -8,6 +8,8 @@ tools:
   - Glob
   - Grep
   - Bash
+  - Task
+  - SendMessage
 ---
 
 You are a testing specialist for Axl, a TypeScript SDK for agentic systems.

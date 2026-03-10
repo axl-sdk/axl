@@ -8,6 +8,8 @@ tools:
   - Glob
   - Grep
   - Bash
+  - Task
+  - SendMessage
 ---
 
 You are a developer for Axl, a TypeScript SDK for orchestrating agentic systems.

@@ -35,7 +35,10 @@ import { Session, SessionOptions } from '@axlsdk/axl';
 import { GuardrailError } from '@axlsdk/axl';
 
 // Tier 2 types
-import type { ToolHooks, HandoffRecord } from '@axlsdk/axl';
+import type { ToolHooks, HandoffRecord, AgentCallInfo } from '@axlsdk/axl';
+
+// Provider types
+import type { Thinking, ReasoningEffort, ToolChoice, ChatOptions } from '@axlsdk/axl';
 
 // Testing
 import { AxlTestRuntime, MockProvider, MockTool } from '@axlsdk/testing';
@@ -223,7 +226,9 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - Provider adapters use raw `fetch` (no SDK dependencies) with automatic retry on 429/503/529 via `fetchWithRetry` (exponential backoff, 3 total attempts)
 - Two OpenAI providers: `openai` (Chat Completions API) and `openai-responses` (Responses API)
 - Reasoning model support (o1/o3/o4-mini): developer role, temperature stripping, reasoning_effort
-- ChatOptions includes `reasoningEffort`, `toolChoice`; ToolDefinition supports `strict`
+- ChatOptions includes `thinking`, `reasoningEffort`, `toolChoice`, `maxTokens`, `stop`; all configurable on `AgentConfig` and overridable per-call via `AskOptions` (precedence: AskOptions > AgentConfig > defaults, maxTokens default: 4096). ToolDefinition supports `strict`
+- `thinking` is the unified cross-provider param (`'low'|'medium'|'high'|'max'` or `{budgetTokens}`); maps to reasoning_effort (OpenAI, `'max'`→`'xhigh'`), adaptive mode + effort (Anthropic 4.6), budget_tokens (Anthropic older, `'max'`→30000), thinkingBudget (Gemini, `'max'`→24576). `reasoningEffort` is the OpenAI-specific escape hatch. `thinking` takes precedence when both set
+- Anthropic 4.6 models (Opus 4.6, Sonnet 4.6) use adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`) for string levels; budget form falls back to manual mode (`thinking: { type: "enabled", budget_tokens }`) for precise control
 - ProviderResponse.usage includes optional `reasoning_tokens` and `cached_tokens`
 - AxlStream requires `[Symbol.asyncDispose]` on iterator for TS 5.9+ compat
 - WorkflowContext.ask() implements tool calling loop with max turns, budget tracking, self-correction retry

@@ -55,6 +55,12 @@ const provider = MockProvider.sequence([
 ]);
 ```
 
+All model parameters (`thinking`, `temperature`, `maxTokens`, `toolChoice`, `stop`) flow through MockProvider transparently. They don't affect mock responses but are recorded in `provider.calls` for assertion:
+
+```typescript
+expect(provider.calls[0].options.thinking).toBe('high');
+```
+
 ### `MockTool`
 
 Create a mock tool to intercept and record calls:

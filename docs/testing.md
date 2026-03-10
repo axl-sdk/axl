@@ -68,6 +68,20 @@ const provider = MockProvider.sequence([
 ]);
 ```
 
+### Model Parameters in Tests
+
+All model parameters — including `thinking`, `temperature`, `maxTokens`, `toolChoice`, and `stop` — are passed through to MockProvider and recorded in test assertions. MockProvider ignores these parameters (it returns pre-configured responses), but they are captured in `agentCalls()` and `traceLog()` so you can verify your agent configuration:
+
+```typescript
+const runtime = new AxlTestRuntime();
+runtime.mockProvider('openai', MockProvider.sequence([{ content: 'done' }]));
+
+// After execution:
+const calls = runtime.agentCalls();
+expect(calls[0].thinking).toBe('high');
+expect(calls[0].temperature).toBe(0.5);
+```
+
 ## Snapshot Testing
 
 Record a real workflow execution and replay it in tests for deterministic, fast CI runs:

@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: February 2026
+> Last updated: March 2026
 
 ## Guiding Principles
 
@@ -22,6 +22,8 @@
 - **Streaming Improvements** — Typed `StreamEvent` variants, `stream.steps` filtered iterable
 - **Axl Studio** — Local development UI with 8 panels (Playground, Workflows, Traces, Costs, Memory, Sessions, Tools, Evals)
 - **Evaluation Framework** — `dataset()`, `scorer()`, `llmScorer()`, `evalCompare()`, CLI
+- **Configurable Model Parameters** — `temperature`, `maxTokens`, `thinking`, `reasoningEffort`, `toolChoice`, `stop` on `AgentConfig` and per-call via `AskOptions`
+- **Unified Thinking** — Cross-provider `thinking` parameter (`'low'` | `'medium'` | `'high'` | `'max'` or `{ budgetTokens }`) maps to reasoning_effort (OpenAI), adaptive/manual thinking (Anthropic), thinkingBudget (Gemini)
 
 ### Planned
 
@@ -41,27 +43,6 @@ const server = mcpServer({
 
 server.listen();
 ```
-
-#### Configurable Model Parameters
-
-Expose all `ChatOptions` parameters on `AgentConfig` and `AskOptions` so users can tune model behavior without workarounds:
-
-```typescript
-const agent = agent({
-  model: 'openai:gpt-4o',
-  system: 'You are a research assistant.',
-  temperature: 0.7,
-  maxTokens: 8192,
-  reasoningEffort: 'high',  // for o1/o3/o4-mini
-  toolChoice: 'auto',
-  stop: ['\n---'],
-});
-
-// Per-call overrides
-await ctx.ask(agent, prompt, { temperature: 0.2, maxTokens: 2048 });
-```
-
-Currently only `temperature` is configurable on agents. `maxTokens` is hardcoded to 4096 and `reasoningEffort`, `toolChoice`, and `stop` exist on the internal `ChatOptions` type but aren't wired through to userland.
 
 #### Additional Vector Store Adapters
 

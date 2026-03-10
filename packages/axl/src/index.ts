@@ -44,6 +44,7 @@ export type {
   GuardrailBlockHandler,
   GuardrailsConfig,
   HandoffRecord,
+  AgentCallInfo,
 } from './types.js';
 
 // Errors
@@ -73,6 +74,9 @@ export type {
   ProviderResponse,
   StreamChunk,
   ChatOptions,
+  Thinking,
+  ReasoningEffort,
+  ToolChoice,
 } from './providers/types.js';
 
 // MCP

@@ -1,6 +1,12 @@
 import { MockProvider } from './mock-provider.js';
 import { MockTool } from './mock-tool.js';
-import type { TraceEvent, AwaitHumanOptions, HumanDecision, ProviderResponse } from '@axlsdk/axl';
+import type {
+  TraceEvent,
+  AwaitHumanOptions,
+  HumanDecision,
+  ProviderResponse,
+  AgentCallInfo,
+} from '@axlsdk/axl';
 import { WorkflowContext, MemoryStore, ProviderRegistry } from '@axlsdk/axl';
 import type { WorkflowContextInit } from '@axlsdk/axl';
 
@@ -12,15 +18,8 @@ interface WorkflowLike {
 }
 
 export type RecordedToolCall = { name: string; args: unknown; result: unknown };
-export type RecordedAgentCall = {
-  agent: string;
-  prompt: string;
-  response: string;
-  model?: string;
-  cost?: number;
-  duration?: number;
-  promptVersion?: string;
-};
+export type RecordedAgentCall = Partial<AgentCallInfo> &
+  Pick<AgentCallInfo, 'agent' | 'prompt' | 'response'>;
 export type RecordedStep = { step: number; type: string; data: unknown };
 
 function generateExecutionId(): string {
@@ -152,24 +151,8 @@ export class AxlTestRuntime {
           }
         }
       },
-      onAgentCallComplete: (call: {
-        agent: string;
-        prompt: string;
-        response: string;
-        model: string;
-        cost: number;
-        duration: number;
-        promptVersion?: string;
-      }) => {
-        this._agentCalls.push({
-          agent: call.agent,
-          prompt: call.prompt,
-          response: call.response,
-          model: call.model,
-          cost: call.cost,
-          duration: call.duration,
-          promptVersion: call.promptVersion,
-        });
+      onAgentCallComplete: (call: AgentCallInfo) => {
+        this._agentCalls.push(call);
       },
     };
 

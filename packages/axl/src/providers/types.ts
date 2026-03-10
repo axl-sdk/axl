@@ -18,6 +18,41 @@ export type ToolDefinition = {
 };
 
 /**
+ * Unified thinking/reasoning level that works across all providers.
+ *
+ * Simple form (`'low' | 'medium' | 'high' | 'max'`) is portable across all providers:
+ * - **OpenAI** (o1/o3/o4-mini): maps to `reasoning_effort` (`'max'` → `'xhigh'`)
+ * - **OpenAI Responses**: maps to `reasoning.effort` (`'max'` → `'xhigh'`)
+ * - **Anthropic** (4.6): maps to adaptive mode + `output_config.effort`
+ * - **Anthropic** (older): maps to `thinking.budget_tokens` (`'max'` → `32000`)
+ * - **Gemini** (2.5+): maps to `generationConfig.thinkingConfig.thinkingBudget` (`'max'` → `24576`)
+ *
+ * Budget form (`{ budgetTokens: number }`) gives explicit control over thinking tokens.
+ * For OpenAI, budget is mapped to the nearest effort level.
+ */
+export type Thinking = 'low' | 'medium' | 'high' | 'max' | { budgetTokens: number };
+
+/**
+ * Reasoning effort level for OpenAI reasoning models.
+ *
+ * This is a low-level, OpenAI-specific escape hatch. Prefer `thinking` for cross-provider use.
+ *
+ * Supported values:
+ * - **OpenAI** (o1/o3/o4-mini): all values — `'none'`, `'minimal'`, `'low'`, `'medium'`, `'high'`, `'xhigh'`
+ * - **OpenAI Responses**: all values (via `reasoning.effort`)
+ * - **Anthropic**: not supported
+ * - **Gemini**: not supported
+ */
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+
+/** Tool choice strategy for LLM calls. */
+export type ToolChoice =
+  | 'auto'
+  | 'none'
+  | 'required'
+  | { type: 'function'; function: { name: string } };
+
+/**
  * Options passed to provider chat/stream calls.
  */
 export type ChatOptions = {
@@ -28,8 +63,9 @@ export type ChatOptions = {
   responseFormat?: ResponseFormat;
   stop?: string[];
   signal?: AbortSignal;
-  reasoningEffort?: 'low' | 'medium' | 'high';
-  toolChoice?: 'auto' | 'none' | 'required' | { type: 'function'; function: { name: string } };
+  thinking?: Thinking;
+  reasoningEffort?: ReasoningEffort;
+  toolChoice?: ToolChoice;
 };
 
 /**

@@ -16,6 +16,7 @@ import type {
   ChatMessage,
   ToolCallMessage,
   ProviderResponse,
+  AgentCallInfo,
 } from './types.js';
 import {
   VerifyError,
@@ -179,15 +180,7 @@ export type WorkflowContextInit = {
   /** Callback fired when an agent LLM call is about to start. */
   onAgentStart?: (info: { agent: string; model: string }) => void;
   /** Callback fired after each ctx.ask() completes (once per ask invocation). */
-  onAgentCallComplete?: (call: {
-    agent: string;
-    prompt: string;
-    response: string;
-    model: string;
-    cost: number;
-    duration: number;
-    promptVersion?: string;
-  }) => void;
+  onAgentCallComplete?: (call: AgentCallInfo) => void;
 };
 
 /**
@@ -228,15 +221,7 @@ export class WorkflowContext<TInput = unknown> {
     options: AwaitHumanOptions,
   ) => HumanDecision | Promise<HumanDecision>;
   private onAgentStart?: (info: { agent: string; model: string }) => void;
-  private onAgentCallComplete?: (call: {
-    agent: string;
-    prompt: string;
-    response: string;
-    model: string;
-    cost: number;
-    duration: number;
-    promptVersion?: string;
-  }) => void;
+  private onAgentCallComplete?: (call: AgentCallInfo) => void;
   constructor(init: WorkflowContextInit) {
     this.input = init.input as TInput;
     this.executionId = init.executionId;
@@ -345,6 +330,12 @@ export class WorkflowContext<TInput = unknown> {
         cost: costAfter - costBefore,
         duration: Date.now() - startTime,
         promptVersion: agent._config.version,
+        temperature: options?.temperature ?? agent._config.temperature,
+        maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
+        thinking: options?.thinking ?? agent._config.thinking,
+        reasoningEffort: options?.reasoningEffort ?? agent._config.reasoningEffort,
+        toolChoice: options?.toolChoice ?? agent._config.toolChoice,
+        stop: options?.stop ?? agent._config.stop,
       });
       return result;
     });
@@ -515,11 +506,24 @@ export class WorkflowContext<TInput = unknown> {
 
       turns++;
 
+      const thinking = options?.thinking ?? agent._config.thinking;
+
+      // Validate budget form
+      if (thinking && typeof thinking === 'object' && thinking.budgetTokens <= 0) {
+        throw new Error(
+          `thinking.budgetTokens must be a positive number, got ${thinking.budgetTokens}`,
+        );
+      }
+
       const chatOptions: ChatOptions = {
         model,
-        temperature: agent._config.temperature,
+        temperature: options?.temperature ?? agent._config.temperature,
         tools: toolDefs.length > 0 ? toolDefs : undefined,
-        maxTokens: 4096,
+        maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
+        thinking,
+        reasoningEffort: options?.reasoningEffort ?? agent._config.reasoningEffort,
+        toolChoice: options?.toolChoice ?? agent._config.toolChoice,
+        stop: options?.stop ?? agent._config.stop,
         signal: this.currentSignal,
       };
 
@@ -645,12 +649,16 @@ export class WorkflowContext<TInput = unknown> {
 
               const handoffStart = Date.now();
 
-              // Pass accumulated messages so the target agent can see the source agent's work
+              // Pass accumulated messages so the target agent can see the source agent's work.
+              // Only forward schema/retries/metadata — the target agent uses its own model params.
+              const handoffOptions = options
+                ? { schema: options.schema, retries: options.retries, metadata: options.metadata }
+                : undefined;
               const handoffFn = () =>
                 this.executeAgentCall(
                   descriptor.agent,
                   handoffPrompt,
-                  options,
+                  handoffOptions,
                   0,
                   undefined,
                   undefined,

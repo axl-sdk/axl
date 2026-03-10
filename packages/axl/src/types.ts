@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import type { Thinking, ReasoningEffort, ToolChoice } from './providers/types.js';
 
 /** Result type for concurrent operations (spawn, map) */
 export type Result<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -69,6 +70,18 @@ export type AskOptions<T = unknown> = {
   retries?: number;
   /** Per-call metadata passed to dynamic model/system selector functions. */
   metadata?: Record<string, unknown>;
+  /** Override temperature for this call. */
+  temperature?: number;
+  /** Override max tokens for this call (default: 4096). */
+  maxTokens?: number;
+  /** Thinking level — portable across all providers. Prefer this over `reasoningEffort`. */
+  thinking?: Thinking;
+  /** OpenAI-specific reasoning effort (escape hatch). Overridden by `thinking` if both are set. */
+  reasoningEffort?: ReasoningEffort;
+  /** Tool choice strategy for this call. */
+  toolChoice?: ToolChoice;
+  /** Stop sequences for this call. */
+  stop?: string[];
 };
 
 /** Race options */
@@ -182,6 +195,23 @@ export type HandoffRecord = {
   mode: 'oneway' | 'roundtrip';
   timestamp: number;
   duration?: number;
+};
+
+/** Information about a completed agent call, emitted via onAgentCallComplete. */
+export type AgentCallInfo = {
+  agent: string;
+  prompt: string;
+  response: string;
+  model: string;
+  cost: number;
+  duration: number;
+  promptVersion?: string;
+  temperature?: number;
+  maxTokens?: number;
+  thinking?: Thinking;
+  reasoningEffort?: ReasoningEffort;
+  toolChoice?: ToolChoice;
+  stop?: string[];
 };
 
 /** Chat message types for provider communication */

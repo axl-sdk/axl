@@ -1,5 +1,6 @@
 import type { Tool } from './tool.js';
 import type { AskOptions, GuardrailsConfig } from './types.js';
+import type { Thinking, ReasoningEffort, ToolChoice } from './providers/types.js';
 import { ProviderRegistry } from './providers/registry.js';
 import { WorkflowContext } from './context.js';
 import { randomUUID } from 'node:crypto';
@@ -23,6 +24,11 @@ export type AgentConfig = {
   mcp?: string[];
   mcpTools?: string[];
   temperature?: number;
+  maxTokens?: number;
+  thinking?: Thinking;
+  reasoningEffort?: ReasoningEffort;
+  toolChoice?: ToolChoice;
+  stop?: string[];
   maxTurns?: number;
   timeout?: string;
   maxContext?: number;

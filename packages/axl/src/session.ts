@@ -87,11 +87,15 @@ export class Session {
       },
     });
 
-    const assistantMessage: ChatMessage = {
-      role: 'assistant',
-      content: typeof result === 'string' ? result : JSON.stringify(result),
-    };
-    history.push(assistantMessage);
+    // executeAgentCall may have already pushed the assistant message (with
+    // providerMetadata for Gemini thought signatures etc.). Only add one if needed.
+    const lastMsg = history[history.length - 1];
+    if (!(lastMsg && lastMsg.role === 'assistant')) {
+      history.push({
+        role: 'assistant',
+        content: typeof result === 'string' ? result : JSON.stringify(result),
+      });
+    }
 
     if (this.options.persist !== false) {
       await this.store.saveSession(this.sessionId, history);
@@ -148,10 +152,15 @@ export class Session {
     });
 
     const updateHistory = async (result: unknown): Promise<void> => {
-      history.push({
-        role: 'assistant',
-        content: typeof result === 'string' ? result : JSON.stringify(result),
-      });
+      // executeAgentCall may have already pushed the assistant message (with
+      // providerMetadata for Gemini thought signatures etc.). Only add one if needed.
+      const lastMsg = history[history.length - 1];
+      if (!(lastMsg && lastMsg.role === 'assistant')) {
+        history.push({
+          role: 'assistant',
+          content: typeof result === 'string' ? result : JSON.stringify(result),
+        });
+      }
       if (this.options.persist !== false) {
         await this.store.saveSession(this.sessionId, history);
       }

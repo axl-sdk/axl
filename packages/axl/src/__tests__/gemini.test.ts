@@ -31,6 +31,7 @@ function makeGeminiResponse(
     candidatesTokenCount: number;
     totalTokenCount: number;
     cachedContentTokenCount?: number;
+    thoughtsTokenCount?: number;
   },
 ) {
   return {
@@ -319,6 +320,28 @@ describe('GeminiProvider', () => {
       });
     });
 
+    it('estimates cost for gemini-3.1 models', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve(
+            makeGeminiResponse('Hi', {
+              promptTokenCount: 100,
+              candidatesTokenCount: 50,
+              totalTokenCount: 150,
+            }),
+          ),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.1-flash-lite-preview',
+      });
+
+      // gemini-3.1-flash-lite-preview: [0.25e-6, 1.5e-6]
+      // Expected: 100 * 0.25e-6 + 50 * 1.5e-6 = 0.000025 + 0.000075 = 0.0001
+      expect(response.cost).toBeCloseTo(0.0001, 8);
+    });
+
     it('returns cost: 0 for unknown models (not undefined)', async () => {
       mockFetch({
         json: () =>
@@ -338,6 +361,31 @@ describe('GeminiProvider', () => {
 
       expect(response.cost).toBe(0);
       expect(response.cost).not.toBeUndefined();
+    });
+
+    it('prefers longer prefix matches for versioned model names', async () => {
+      // gemini-2.5-flash-lite-preview-0520 should match gemini-2.5-flash-lite (0.1e-6 input),
+      // not the shorter gemini-2.5-flash prefix (0.3e-6 input — a 3x overcharge).
+      mockFetch({
+        json: () =>
+          Promise.resolve(
+            makeGeminiResponse('Hi', {
+              promptTokenCount: 1000,
+              candidatesTokenCount: 0,
+              totalTokenCount: 1000,
+            }),
+          ),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-flash-lite-preview-0520',
+      });
+
+      // Should match gemini-2.5-flash-lite: [0.1e-6, 0.4e-6]
+      // NOT gemini-2.5-flash: [0.3e-6, 2.5e-6]
+      // Expected: 1000 * 0.1e-6 = 0.0001
+      expect(response.cost).toBeCloseTo(0.0001, 8);
     });
 
     it('handles API errors gracefully', async () => {
@@ -486,7 +534,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking "high" to thinkingConfig in generationConfig', async () => {
+    it('maps thinking "high" to thinkingBudget for 2.x models', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -503,7 +551,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking "max" to thinkingBudget 24576', async () => {
+    it('maps thinking "max" to thinkingBudget 32768 for gemini-2.5-pro', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -516,11 +564,45 @@ describe('GeminiProvider', () => {
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
       expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingBudget: 32768,
+      });
+    });
+
+    it('maps thinking "max" to thinkingBudget 32768 for gemini-2.5-pro-preview (prefix match)', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-pro-preview',
+        thinking: 'max',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingBudget: 32768,
+      });
+    });
+
+    it('maps thinking "max" to thinkingBudget 24576 for gemini-2.5-flash', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-flash',
+        thinking: 'max',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
         thinkingBudget: 24576,
       });
     });
 
-    it('maps thinking budget form to exact thinkingBudget', async () => {
+    it('maps thinking budget form to exact thinkingBudget for 2.x models', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -537,6 +619,175 @@ describe('GeminiProvider', () => {
       });
     });
 
+    it('maps thinking "high" to thinkingLevel for 3.x models', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.1-flash-lite-preview',
+        thinking: 'high',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'high',
+      });
+    });
+
+    it('maps thinking "low" to thinkingLevel for 3.x models', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3-flash-preview',
+        thinking: 'low',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'low',
+      });
+    });
+
+    it('maps thinking "max" to thinkingLevel "high" for 3.x models (caps at high)', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.1-pro-preview',
+        thinking: 'max',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'high',
+      });
+    });
+
+    it('maps thinking budget >5000 to thinkingLevel "high" for 3.x models', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.1-flash-lite-preview',
+        thinking: { budgetTokens: 8000 },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'high',
+      });
+    });
+
+    it('maps thinking budget <=1024 to thinkingLevel "low" for 3.x models', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3-pro-preview',
+        thinking: { budgetTokens: 512 },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'low',
+      });
+    });
+
+    it('maps thinking budget <=5000 to thinkingLevel "medium" for 3.x models', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.1-pro-preview',
+        thinking: { budgetTokens: 3000 },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'medium',
+      });
+    });
+
+    it('maps thinking budget at boundary 1024 to thinkingLevel "low" for 3.x models', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3-flash-preview',
+        thinking: { budgetTokens: 1024 },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'low',
+      });
+    });
+
+    it('maps thinking budget at boundary 5000 to thinkingLevel "medium" for 3.x models', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3-flash-preview',
+        thinking: { budgetTokens: 5000 },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'medium',
+      });
+    });
+
+    it('does not include thinkingConfig when thinking is empty object {}', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-flash',
+        thinking: {},
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig?.thinkingConfig).toBeUndefined();
+    });
+
+    it('sends includeThoughts with thinkingLevel for 3.x models when budgetTokens also set', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3-flash-preview',
+        thinking: { budgetTokens: 3000, includeThoughts: true },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'medium',
+        includeThoughts: true,
+      });
+    });
+
     it('does not include thinkingConfig when thinking is undefined', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
@@ -549,6 +800,53 @@ describe('GeminiProvider', () => {
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
       expect(body.generationConfig).toBeUndefined();
+    });
+
+    it('parses thoughtsTokenCount into reasoning_tokens', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            candidates: [
+              {
+                content: { role: 'model', parts: [{ text: 'thought result' }] },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: {
+              promptTokenCount: 100,
+              candidatesTokenCount: 50,
+              totalTokenCount: 200,
+              thoughtsTokenCount: 50,
+            },
+          }),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Think' }], {
+        model: 'gemini-3.1-flash-lite-preview',
+      });
+
+      expect(response.usage?.reasoning_tokens).toBe(50);
+    });
+
+    it('omits reasoning_tokens when thoughtsTokenCount is 0 or absent', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve(
+            makeGeminiResponse('Hi', {
+              promptTokenCount: 10,
+              candidatesTokenCount: 5,
+              totalTokenCount: 15,
+            }),
+          ),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.0-flash',
+      });
+
+      expect(response.usage?.reasoning_tokens).toBeUndefined();
     });
 
     it('does not include toolConfig when toolChoice is undefined', async () => {
@@ -590,6 +888,114 @@ describe('GeminiProvider', () => {
       expect(body.tools[0].functionDeclarations).toHaveLength(1);
       expect(body.tools[0].functionDeclarations[0].name).toBe('search');
       expect(body.tools[0].functionDeclarations[0].description).toBe('Search the web');
+    });
+
+    it('sends includeThoughts in thinkingConfig when { includeThoughts: true }', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-flash',
+        thinking: { includeThoughts: true },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        includeThoughts: true,
+      });
+    });
+
+    it('sends both budgetTokens and includeThoughts in thinkingConfig', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-flash',
+        thinking: { budgetTokens: 5000, includeThoughts: true },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingBudget: 5000,
+        includeThoughts: true,
+      });
+    });
+
+    it('populates thinking_content from response parts with thought: true', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [
+                    { text: 'Let me think about this...', thought: true },
+                    { text: 'Here is my answer.' },
+                  ],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 20, totalTokenCount: 30 },
+          }),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Think about this' }], {
+        model: 'gemini-2.5-flash',
+      });
+
+      expect(response.thinking_content).toBe('Let me think about this...');
+      expect(response.content).toBe('Here is my answer.');
+    });
+
+    it('does not set thinking_content when no thought parts are present', async () => {
+      mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('Just a normal response')),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-flash',
+      });
+
+      expect(response.thinking_content).toBeUndefined();
+      expect(response.content).toBe('Just a normal response');
+    });
+
+    it('concatenates multiple thought parts into thinking_content', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [
+                    { text: 'First thought. ', thought: true },
+                    { text: 'Second thought.', thought: true },
+                    { text: 'Final answer.' },
+                  ],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 30, totalTokenCount: 40 },
+          }),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Think hard' }], {
+        model: 'gemini-2.5-flash',
+      });
+
+      expect(response.thinking_content).toBe('First thought. Second thought.');
+      expect(response.content).toBe('Final answer.');
     });
   });
 
@@ -696,6 +1102,269 @@ describe('GeminiProvider', () => {
         name: 'search',
         arguments: '{"q":"test"}',
       });
+    });
+
+    it('yields thinking_delta for thought parts and text_delta for regular parts', async () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const thoughtChunk = {
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [{ text: 'Reasoning about the problem...', thought: true }],
+                },
+              },
+            ],
+          };
+          const textChunk = {
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [{ text: 'Here is the answer.' }],
+                },
+              },
+            ],
+            usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 15, totalTokenCount: 25 },
+          };
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(thoughtChunk)}\n\n`));
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(textChunk)}\n\n`));
+          controller.close();
+        },
+      });
+
+      mockFetch({ body: stream });
+
+      const provider = new GeminiProvider();
+      const gen = provider.stream([{ role: 'user', content: 'Think' }], {
+        model: 'gemini-2.5-flash',
+      });
+
+      const chunks: any[] = [];
+      for await (const c of gen) {
+        chunks.push(c);
+      }
+
+      expect(chunks[0]).toEqual({
+        type: 'thinking_delta',
+        content: 'Reasoning about the problem...',
+      });
+      expect(chunks[1]).toEqual({ type: 'text_delta', content: 'Here is the answer.' });
+      expect(chunks[2].type).toBe('done');
+    });
+
+    it('includes accumulated raw parts in done chunk providerMetadata', async () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const chunk = {
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [{ text: 'Hello', thoughtSignature: 'opaque-sig-data' }],
+                },
+              },
+            ],
+            usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 3, totalTokenCount: 8 },
+          };
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+          controller.close();
+        },
+      });
+
+      mockFetch({ body: stream });
+
+      const provider = new GeminiProvider();
+      const gen = provider.stream([{ role: 'user', content: 'Hi' }], {
+        model: 'gemini-3-pro-preview',
+      });
+
+      const chunks: any[] = [];
+      for await (const c of gen) {
+        chunks.push(c);
+      }
+
+      const done = chunks[chunks.length - 1];
+      expect(done.type).toBe('done');
+      expect(done.providerMetadata).toBeDefined();
+      expect(done.providerMetadata.geminiParts).toHaveLength(1);
+      expect(done.providerMetadata.geminiParts[0].thoughtSignature).toBe('opaque-sig-data');
+    });
+  });
+
+  describe('providerMetadata / thought signature round-trip', () => {
+    it('parseResponse includes providerMetadata.geminiParts when response has parts', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [{ text: 'Hello', thoughtSignature: 'sig-abc-123' }],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+          }),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gemini-3-pro-preview',
+      });
+
+      expect(response.content).toBe('Hello');
+      expect(response.providerMetadata).toBeDefined();
+      expect(response.providerMetadata!.geminiParts).toEqual([
+        { text: 'Hello', thoughtSignature: 'sig-abc-123' },
+      ]);
+    });
+
+    it('parseResponse includes providerMetadata for functionCall parts with signatures', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [
+                    {
+                      functionCall: { name: 'search', args: { q: 'test' } },
+                      thoughtSignature: 'sig-fc-456',
+                    },
+                  ],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+          }),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Search' }], {
+        model: 'gemini-3-pro-preview',
+      });
+
+      expect(response.tool_calls).toHaveLength(1);
+      expect(response.providerMetadata!.geminiParts).toEqual([
+        { functionCall: { name: 'search', args: { q: 'test' } }, thoughtSignature: 'sig-fc-456' },
+      ]);
+    });
+
+    it('mapMessages uses raw geminiParts from providerMetadata when available', async () => {
+      const rawParts = [
+        { text: '', thoughtSignature: 'sig-round-trip' },
+        { functionCall: { name: 'search', args: { q: 'test' } }, thoughtSignature: 'sig-fc' },
+      ];
+
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('Done')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat(
+        [
+          { role: 'user', content: 'Hello' },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'tc_1',
+                type: 'function' as const,
+                function: { name: 'search', arguments: '{"q":"test"}' },
+              },
+            ],
+            providerMetadata: { geminiParts: rawParts },
+          },
+          { role: 'tool', content: '{"result":"data"}', tool_call_id: 'tc_1' },
+        ],
+        { model: 'gemini-3-pro-preview' },
+      );
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      const modelMsg = body.contents.find((c: any) => c.role === 'model');
+      expect(modelMsg).toBeDefined();
+      // Should use raw parts directly, preserving thoughtSignature
+      expect(modelMsg.parts).toEqual(rawParts);
+    });
+
+    it('mapMessages reconstructs parts when providerMetadata is absent (backward compat)', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('Done')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat(
+        [
+          { role: 'user', content: 'Hello' },
+          {
+            role: 'assistant',
+            content: 'Some text',
+            tool_calls: [
+              {
+                id: 'tc_1',
+                type: 'function' as const,
+                function: { name: 'get_data', arguments: '{}' },
+              },
+            ],
+            // No providerMetadata — backward compatibility
+          },
+          { role: 'tool', content: '{"result":"data"}', tool_call_id: 'tc_1' },
+        ],
+        { model: 'gemini-2.0-flash' },
+      );
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      const modelMsg = body.contents.find((c: any) => c.role === 'model');
+      expect(modelMsg).toBeDefined();
+      // Should reconstruct parts from content + tool_calls
+      expect(modelMsg.parts[0].text).toBe('Some text');
+      expect(modelMsg.parts[1].functionCall).toEqual({ name: 'get_data', args: {} });
+      // No thoughtSignature or other opaque fields
+      expect(modelMsg.parts[0].thoughtSignature).toBeUndefined();
+    });
+
+    it('preserves multiple opaque fields through round-trip', async () => {
+      const rawParts = [
+        {
+          text: 'I will help you.',
+          thoughtSignature: 'sig-1',
+          inlineDataSignature: 'data-sig-2',
+        },
+      ];
+
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('Done')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat(
+        [
+          { role: 'user', content: 'Hello' },
+          {
+            role: 'assistant',
+            content: 'I will help you.',
+            providerMetadata: { geminiParts: rawParts },
+          },
+          { role: 'user', content: 'Thanks' },
+        ],
+        { model: 'gemini-3-pro-preview' },
+      );
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      const modelMsg = body.contents.find((c: any) => c.role === 'model');
+      expect(modelMsg.parts).toEqual(rawParts);
+      // Both opaque fields preserved
+      expect(modelMsg.parts[0].thoughtSignature).toBe('sig-1');
+      expect(modelMsg.parts[0].inlineDataSignature).toBe('data-sig-2');
     });
   });
 });

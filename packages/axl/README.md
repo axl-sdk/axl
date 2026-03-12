@@ -26,8 +26,20 @@ const calculator = tool({
     const result = new Function(`return (${expression})`)();
     return { result };
   },
+  // handler also accepts (input, ctx) for nested agent invocations — see below
   retry: { attempts: 3, backoff: 'exponential' },
   sensitive: false,
+});
+```
+
+Tool handlers receive a second parameter `ctx: WorkflowContext` (a child context), enabling the "agent-as-tool" composition pattern:
+
+```typescript
+const researchTool = tool({
+  name: 'research',
+  description: 'Delegate to a specialist',
+  input: z.object({ question: z.string() }),
+  handler: async (input, ctx) => ctx.ask(researcher, input.question),
 });
 ```
 
@@ -61,6 +73,40 @@ const dynamicAgent = agent({
   system: (ctx) => `You are a ${ctx.metadata?.role ?? 'general'} assistant.`,
 });
 ```
+
+#### Dynamic Handoffs
+
+`handoffs` accepts a static array or a function for runtime-conditional routing:
+
+```typescript
+const router = agent({
+  model: 'openai:gpt-4o-mini',
+  system: 'Route to the right specialist.',
+  handoffs: (ctx) => {
+    const base = [
+      { agent: billingAgent, description: 'Billing issues' },
+      { agent: shippingAgent, description: 'Shipping questions' },
+    ];
+    if (ctx.metadata?.tier === 'enterprise') {
+      base.push({ agent: priorityAgent, description: 'Priority support' });
+    }
+    return base;
+  },
+});
+```
+
+#### Workflow-Level Routing with `ctx.delegate()`
+
+When your workflow (not an agent's LLM) needs to pick the best agent:
+
+```typescript
+const result = await ctx.delegate(
+  [billingAgent, shippingAgent, returnsAgent],
+  customerMessage,
+);
+```
+
+`ctx.delegate()` creates a temporary router agent that uses handoffs to select the best candidate. For a single agent, it calls `ctx.ask()` directly with no routing overhead.
 
 #### Thinking (cross-provider reasoning control)
 

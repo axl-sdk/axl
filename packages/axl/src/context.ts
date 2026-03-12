@@ -11,6 +11,7 @@ import type {
   VerifyOptions,
   AwaitHumanOptions,
   AskOptions,
+  DelegateOptions,
   RaceOptions,
   TraceEvent,
   ChatMessage,
@@ -252,6 +253,38 @@ export class WorkflowContext<TInput = unknown> {
   }
 
   /**
+   * Create a child context for nested agent invocations (e.g., agent-as-tool).
+   * Shares: budget tracking, abort signals, trace emission, provider registry,
+   *         state store, span manager, memory manager, MCP manager, config,
+   *         awaitHuman handler, pending decisions, tool overrides.
+   * Isolates: session history, step counter, streaming callbacks (onToken, onAgentStart, onToolCall).
+   */
+  createChildContext(): WorkflowContext {
+    return new WorkflowContext({
+      input: this.input,
+      executionId: this.executionId,
+      config: this.config,
+      providerRegistry: this.providerRegistry,
+      metadata: { ...this.metadata },
+      // Shared infrastructure
+      budgetContext: this.budgetContext,
+      stateStore: this.stateStore,
+      mcpManager: this.mcpManager,
+      spanManager: this.spanManager,
+      memoryManager: this.memoryManager,
+      onTrace: this.onTrace,
+      onAgentCallComplete: this.onAgentCallComplete,
+      awaitHumanHandler: this.awaitHumanHandler,
+      pendingDecisions: this.pendingDecisions,
+      toolOverrides: this.toolOverrides,
+      signal: this.signal,
+      workflowName: this.workflowName,
+      // Isolated: sessionHistory (empty), stepCounter (0),
+      // onToken (null), onAgentStart (null), onToolCall (null)
+    });
+  }
+
+  /**
    * Resolve the current abort signal.
    * Branch-scoped signals (from race/spawn/map/budget) in AsyncLocalStorage
    * take priority over the instance-level signal.
@@ -383,8 +416,15 @@ export class WorkflowContext<TInput = unknown> {
     const systemPrompt = agent.resolveSystem(resolveCtx);
     const { provider, model } = this.providerRegistry.resolve(modelUri, this.config);
 
+    // Resolve dynamic handoffs once per call to ensure consistency
+    // between tool definitions and handoff lookup within the same turn.
+    const resolvedHandoffs =
+      typeof agent._config.handoffs === 'function'
+        ? agent._config.handoffs({ metadata: this.metadata })
+        : agent._config.handoffs;
+
     // Build tool definitions
-    const toolDefs = this.buildToolDefs(agent);
+    const toolDefs = this.buildToolDefs(agent, resolvedHandoffs);
 
     // Build messages
     const messages: ChatMessage[] = [];
@@ -509,7 +549,12 @@ export class WorkflowContext<TInput = unknown> {
       const thinking = options?.thinking ?? agent._config.thinking;
 
       // Validate budget form
-      if (thinking && typeof thinking === 'object' && thinking.budgetTokens <= 0) {
+      if (
+        thinking &&
+        typeof thinking === 'object' &&
+        thinking.budgetTokens !== undefined &&
+        thinking.budgetTokens <= 0
+      ) {
         throw new Error(
           `thinking.budgetTokens must be a positive number, got ${thinking.budgetTokens}`,
         );
@@ -541,11 +586,16 @@ export class WorkflowContext<TInput = unknown> {
         let content = '';
         const toolCalls: ToolCallMessage[] = [];
         const toolCallBuffers = new Map<string, { id: string; name: string; arguments: string }>();
+        let streamProviderMetadata: Record<string, unknown> | undefined;
+
+        let thinkingContent = '';
 
         for await (const chunk of provider.stream(currentMessages, chatOptions)) {
           if (chunk.type === 'text_delta') {
             content += chunk.content;
             this.onToken(chunk.content);
+          } else if (chunk.type === 'thinking_delta') {
+            thinkingContent += chunk.content;
           } else if (chunk.type === 'tool_call_delta') {
             let buffer = toolCallBuffers.get(chunk.id);
             if (!buffer) {
@@ -555,6 +605,7 @@ export class WorkflowContext<TInput = unknown> {
             if (chunk.name) buffer.name = chunk.name;
             if (chunk.arguments) buffer.arguments += chunk.arguments;
           } else if (chunk.type === 'done') {
+            streamProviderMetadata = chunk.providerMetadata;
             // Usage info from done chunk if available
             if (chunk.usage) {
               response = {
@@ -584,6 +635,12 @@ export class WorkflowContext<TInput = unknown> {
         };
         if (toolCalls.length > 0) {
           response.tool_calls = toolCalls;
+        }
+        if (streamProviderMetadata) {
+          response.providerMetadata = streamProviderMetadata;
+        }
+        if (thinkingContent) {
+          response.thinking_content = thinkingContent;
         }
       } else {
         response = await provider.chat(currentMessages, chatOptions);
@@ -624,6 +681,7 @@ export class WorkflowContext<TInput = unknown> {
           role: 'assistant',
           content: response.content || '',
           tool_calls: response.tool_calls,
+          ...(response.providerMetadata ? { providerMetadata: response.providerMetadata } : {}),
         });
 
         for (const toolCall of response.tool_calls) {
@@ -632,7 +690,7 @@ export class WorkflowContext<TInput = unknown> {
           // Check for handoff
           if (toolName.startsWith('handoff_to_')) {
             const targetName = toolName.replace('handoff_to_', '');
-            const descriptor = agent._config.handoffs?.find((h) => h.agent._name === targetName);
+            const descriptor = resolvedHandoffs?.find((h) => h.agent._name === targetName);
             if (descriptor) {
               const mode = descriptor.mode ?? 'oneway';
 
@@ -933,9 +991,10 @@ export class WorkflowContext<TInput = unknown> {
                 resultContent = JSON.stringify(toolResult);
               }
             } else if (tool) {
-              // Execute local tool
+              // Execute local tool with a child context for nested agent invocations
+              const childCtx = this.createChildContext();
               try {
-                toolResult = await tool._execute(toolArgs);
+                toolResult = await tool._execute(toolArgs, childCtx);
               } catch (err) {
                 toolResult = { error: err instanceof Error ? err.message : String(err) };
               }
@@ -1048,6 +1107,9 @@ export class WorkflowContext<TInput = unknown> {
               currentMessages.push({
                 role: 'assistant',
                 content,
+                ...(response.providerMetadata
+                  ? { providerMetadata: response.providerMetadata }
+                  : {}),
               });
               currentMessages.push({
                 role: 'system',
@@ -1071,6 +1133,8 @@ export class WorkflowContext<TInput = unknown> {
         try {
           const parsed = JSON.parse(stripMarkdownFences(content));
           const validated = (options.schema as z.ZodTypeAny).parse(parsed);
+          // Push only on successful validation — retries must not leak invalid responses
+          this.pushAssistantToSessionHistory(content, response.providerMetadata);
           return validated;
         } catch (err) {
           const maxRetries = options.retries ?? 3;
@@ -1101,13 +1165,34 @@ export class WorkflowContext<TInput = unknown> {
         }
       }
 
+      // Push final assistant message to session history (preserves providerMetadata
+      // for multi-turn Gemini thought signatures and other provider-specific context).
+      this.pushAssistantToSessionHistory(content, response.providerMetadata);
       return content;
     }
 
     throw new MaxTurnsError('ctx.ask()', maxTurns);
   }
 
-  private buildToolDefs(agent: Agent): ToolDefinition[] {
+  /**
+   * Push the final assistant message into session history, preserving providerMetadata
+   * (e.g., Gemini thought signatures needed for multi-turn reasoning context).
+   */
+  private pushAssistantToSessionHistory(
+    content: string,
+    providerMetadata?: Record<string, unknown>,
+  ): void {
+    this.sessionHistory.push({
+      role: 'assistant',
+      content,
+      ...(providerMetadata ? { providerMetadata } : {}),
+    });
+  }
+
+  private buildToolDefs(
+    agent: Agent,
+    resolvedHandoffs?: Array<{ agent: Agent; description?: string; mode?: 'oneway' | 'roundtrip' }>,
+  ): ToolDefinition[] {
     const defs: ToolDefinition[] = [];
 
     if (agent._config.tools) {
@@ -1123,9 +1208,9 @@ export class WorkflowContext<TInput = unknown> {
       }
     }
 
-    // Add handoff tools
-    if (agent._config.handoffs) {
-      for (const { agent: handoffAgent, description, mode } of agent._config.handoffs) {
+    // Add handoff tools (already resolved by caller)
+    if (resolvedHandoffs) {
+      for (const { agent: handoffAgent, description, mode } of resolvedHandoffs) {
         const isRoundtrip = mode === 'roundtrip';
         const defaultDesc = isRoundtrip
           ? `Delegate a task to ${handoffAgent._name} and receive the result back`
@@ -1997,6 +2082,93 @@ export class WorkflowContext<TInput = unknown> {
     }
     const sessionId = this.metadata?.sessionId as string | undefined;
     await this.memoryManager.forget(key, this.stateStore, sessionId, options);
+  }
+
+  // ── ctx.delegate() ──────────────────────────────────────────────────
+
+  /**
+   * Select the best agent from a list of candidates and invoke it.
+   * Creates a temporary router agent that uses handoffs to pick the right specialist.
+   *
+   * This is convenience sugar over creating a router agent with dynamic handoffs.
+   * For full control over the router's behavior, create the router agent explicitly.
+   *
+   * @param agents - Candidate agents to choose from (at least 1)
+   * @param prompt - The prompt to send to the selected agent
+   * @param options - Optional: schema, routerModel, metadata, retries
+   */
+  async delegate<T = string>(
+    agents: Agent[],
+    prompt: string,
+    options?: DelegateOptions<T>,
+  ): Promise<T> {
+    if (agents.length === 0) {
+      throw new Error('ctx.delegate() requires at least one candidate agent');
+    }
+
+    if (agents.length === 1) {
+      return this.ask(agents[0], prompt, {
+        schema: options?.schema,
+        retries: options?.retries,
+        metadata: options?.metadata,
+      });
+    }
+
+    // Resolve the router model: explicit option > first candidate's model
+    const resolveCtx = options?.metadata
+      ? { metadata: { ...this.metadata, ...options.metadata } }
+      : { metadata: this.metadata };
+    const routerModelUri = options?.routerModel ?? agents[0].resolveModel(resolveCtx);
+
+    // Build handoff descriptors from candidates.
+    // Use the agent's system prompt (truncated) as the handoff description
+    // so the router LLM understands each candidate's capability.
+    const handoffs = agents.map((a) => {
+      let description: string;
+      try {
+        description = a.resolveSystem(resolveCtx).slice(0, 200);
+      } catch {
+        description = `Agent: ${a._name}`;
+      }
+      return { agent: a, description };
+    });
+
+    const routerSystem =
+      'Route to the best agent for this task. Always hand off; never answer directly.';
+
+    // Create a temporary router agent (inline to avoid circular import with agent.ts).
+    // maxTurns: 2 allows one turn for the LLM to pick a handoff, plus one retry
+    // if the first response is text instead of a tool call.
+    const routerAgent: Agent = {
+      _config: {
+        model: routerModelUri,
+        system: routerSystem,
+        temperature: 0,
+        handoffs,
+        maxTurns: 2,
+      },
+      _name: '_delegate_router',
+      ask: async () => {
+        throw new Error('Direct invocation not supported on delegate router');
+      },
+      resolveModel: () => routerModelUri,
+      resolveSystem: () => routerSystem,
+    };
+
+    this.emitTrace({
+      type: 'delegate',
+      agent: '_delegate_router',
+      data: {
+        candidates: agents.map((a) => a._name),
+        routerModel: routerModelUri,
+      },
+    });
+
+    return this.ask(routerAgent, prompt, {
+      schema: options?.schema,
+      retries: options?.retries,
+      metadata: options?.metadata,
+    });
   }
 
   // ── Private ───────────────────────────────────────────────────────────

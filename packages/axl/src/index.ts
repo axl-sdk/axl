@@ -30,6 +30,7 @@ export type {
   TraceEvent,
   StreamEvent,
   AskOptions,
+  DelegateOptions,
   RaceOptions,
   VoteOptions,
   VerifyOptions,

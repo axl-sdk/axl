@@ -48,3 +48,7 @@ You are a developer for Axl, a TypeScript SDK for orchestrating agentic systems.
 2. Follow existing naming and file structure
 3. After changes: `pnpm typecheck && pnpm lint`
 4. Run tests: `pnpm test` or `pnpm -F @axlsdk/<pkg> test`
+
+## Delivering results
+
+Your final response MUST summarize what you did — files changed, key decisions, and anything the parent agent needs to know. Do not rely solely on SendMessage — the parent agent only sees your final output.

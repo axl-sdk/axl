@@ -30,7 +30,12 @@ export type ToolDefinition = {
  * Budget form (`{ budgetTokens: number }`) gives explicit control over thinking tokens.
  * For OpenAI, budget is mapped to the nearest effort level.
  */
-export type Thinking = 'low' | 'medium' | 'high' | 'max' | { budgetTokens: number };
+export type Thinking =
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'max'
+  | { budgetTokens?: number; includeThoughts?: boolean };
 
 /**
  * Reasoning effort level for OpenAI reasoning models.
@@ -81,6 +86,7 @@ export type ResponseFormat =
  */
 export type StreamChunk =
   | { type: 'text_delta'; content: string }
+  | { type: 'thinking_delta'; content: string }
   | { type: 'tool_call_delta'; id: string; name?: string; arguments?: string }
   | {
       type: 'done';
@@ -91,6 +97,8 @@ export type StreamChunk =
         reasoning_tokens?: number;
         cached_tokens?: number;
       };
+      /** Provider-specific opaque metadata (e.g. raw Gemini parts with thought signatures). */
+      providerMetadata?: Record<string, unknown>;
     };
 
 /**

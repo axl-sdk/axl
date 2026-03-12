@@ -143,9 +143,14 @@ export class OpenAIResponsesProvider implements Provider {
     // Non-reasoning models (gpt-4o, gpt-4.1, etc.) reject reasoning params.
     // thinking takes precedence over reasoningEffort when both are set.
     if (reasoning) {
-      const effort = options.thinking
-        ? thinkingToReasoningEffort(options.thinking)
-        : options.reasoningEffort;
+      // includeThoughts is Gemini-only; skip if that's the only field set
+      const hasThinkingLevel =
+        typeof options.thinking === 'string' ||
+        (typeof options.thinking === 'object' && options.thinking?.budgetTokens !== undefined);
+      const effort =
+        options.thinking && hasThinkingLevel
+          ? thinkingToReasoningEffort(options.thinking)
+          : options.reasoningEffort;
       if (effort) {
         body.reasoning = { effort };
       }

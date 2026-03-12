@@ -84,6 +84,18 @@ export type AskOptions<T = unknown> = {
   stop?: string[];
 };
 
+/** Delegate options */
+export type DelegateOptions<T = unknown> = {
+  /** Zod schema for structured output from the selected agent. */
+  schema?: z.ZodType<T>;
+  /** Model URI for the internal router agent (default: first candidate's model). */
+  routerModel?: string;
+  /** Additional metadata passed to the router and selected agent. */
+  metadata?: Record<string, unknown>;
+  /** Number of retries for structured output validation (passed to the final ask). */
+  retries?: number;
+};
+
 /** Race options */
 export type RaceOptions<T = unknown> = {
   /** Schema to validate each result. Invalid results are discarded and the race continues. */
@@ -102,6 +114,7 @@ export type TraceEvent = {
     | 'tool_call'
     | 'verify'
     | 'handoff'
+    | 'delegate'
     | 'tool_denied'
     | 'log'
     | 'workflow_start'
@@ -223,6 +236,8 @@ export type ChatMessage = {
   name?: string;
   tool_calls?: ToolCallMessage[];
   tool_call_id?: string;
+  /** Provider-specific opaque metadata that must round-trip through conversation history. */
+  providerMetadata?: Record<string, unknown>;
 };
 
 export type ToolCallMessage = {
@@ -237,6 +252,7 @@ export type ToolCallMessage = {
 /** Provider response */
 export type ProviderResponse = {
   content: string;
+  thinking_content?: string;
   tool_calls?: ToolCallMessage[];
   usage?: {
     prompt_tokens: number;
@@ -246,4 +262,6 @@ export type ProviderResponse = {
     cached_tokens?: number;
   };
   cost?: number;
+  /** Provider-specific opaque metadata that needs to round-trip through conversation history. */
+  providerMetadata?: Record<string, unknown>;
 };

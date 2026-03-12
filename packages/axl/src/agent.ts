@@ -20,7 +20,9 @@ export type AgentConfig = {
   system: string | ((ctx: { metadata?: Record<string, unknown> }) => string);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   tools?: Tool<any, any>[];
-  handoffs?: HandoffDescriptor[];
+  handoffs?:
+    | HandoffDescriptor[]
+    | ((ctx: { metadata?: Record<string, unknown> }) => HandoffDescriptor[]);
   mcp?: string[];
   mcpTools?: string[];
   temperature?: number;

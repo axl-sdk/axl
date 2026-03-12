@@ -38,7 +38,7 @@ import { GuardrailError } from '@axlsdk/axl';
 import type { ToolHooks, HandoffRecord, AgentCallInfo } from '@axlsdk/axl';
 
 // Provider types
-import type { Thinking, ReasoningEffort, ToolChoice, ChatOptions } from '@axlsdk/axl';
+import type { Thinking, ReasoningEffort, ToolChoice, ChatOptions, DelegateOptions } from '@axlsdk/axl';
 
 // Testing
 import { AxlTestRuntime, MockProvider, MockTool } from '@axlsdk/testing';
@@ -54,7 +54,7 @@ import { createServer, ConnectionManager, CostAggregator } from '@axlsdk/studio'
 All docs (`docs/`), READMEs (`packages/*/README.md`), specs (`.internal/spec/`), and `CLAUDE.md` are living documents. **Always update relevant documentation after making code changes.** If you add, rename, or remove APIs, features, files, or conventions, update the corresponding docs in the same PR.
 
 ## Key Conventions
-- All agentic primitives are on `ctx`: `ctx.ask()`, `ctx.spawn()`, `ctx.vote()`, `ctx.verify()`, `ctx.budget()`, `ctx.race()`, `ctx.parallel()`, `ctx.map()`, `ctx.awaitHuman()`, `ctx.remember()`, `ctx.recall()`, `ctx.forget()`, `ctx.log()`
+- All agentic primitives are on `ctx`: `ctx.ask()`, `ctx.delegate()`, `ctx.spawn()`, `ctx.vote()`, `ctx.verify()`, `ctx.budget()`, `ctx.race()`, `ctx.parallel()`, `ctx.map()`, `ctx.awaitHuman()`, `ctx.remember()`, `ctx.recall()`, `ctx.forget()`, `ctx.log()`
 - Provider URI scheme: `provider:model` (e.g., `openai:gpt-4o`, `openai-responses:gpt-4o`)
 - Tool definitions use Zod schemas for input validation
 - Agents are inert definitions until called via `ctx.ask()` or `agent.ask()`
@@ -74,7 +74,7 @@ packages/axl/src/
   workflow.ts        — workflow() factory
   config.ts          — defineConfig(), parseDuration(), parseCost(), resolveConfig()
   context.ts         — WorkflowContext with all ctx.* primitives (~700 lines)
-  runtime.ts         — AxlRuntime: register, execute, stream, session
+  runtime.ts         — AxlRuntime: register, execute, stream, session, createContext
   session.ts         — Session class for multi-turn conversations
   stream.ts          — AxlStream (Readable + EventEmitter + AsyncIterable)
   types.ts           — All shared types
@@ -227,7 +227,10 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - Two OpenAI providers: `openai` (Chat Completions API) and `openai-responses` (Responses API)
 - Reasoning model support (o1/o3/o4-mini): developer role, temperature stripping, reasoning_effort
 - ChatOptions includes `thinking`, `reasoningEffort`, `toolChoice`, `maxTokens`, `stop`; all configurable on `AgentConfig` and overridable per-call via `AskOptions` (precedence: AskOptions > AgentConfig > defaults, maxTokens default: 4096). ToolDefinition supports `strict`
-- `thinking` is the unified cross-provider param (`'low'|'medium'|'high'|'max'` or `{budgetTokens}`); maps to reasoning_effort (OpenAI, `'max'`→`'xhigh'`), adaptive mode + effort (Anthropic 4.6), budget_tokens (Anthropic older, `'max'`→30000), thinkingBudget (Gemini, `'max'`→24576). `reasoningEffort` is the OpenAI-specific escape hatch. `thinking` takes precedence when both set
+- `thinking` is the unified cross-provider param (`'low'|'medium'|'high'|'max'` or `{budgetTokens}`); maps to reasoning_effort (OpenAI, `'max'`→`'xhigh'`), adaptive mode + effort (Anthropic 4.6), budget_tokens (Anthropic older, `'max'`→30000), thinkingLevel (Gemini 3.x), thinkingBudget (Gemini 2.5, `'max'`→24576). `reasoningEffort` is the OpenAI-specific escape hatch. `thinking` takes precedence when both set
+- Gemini 3.x models (gemini-3-*, gemini-3.1-*) use `thinkingLevel` string enum ('low'|'medium'|'high') instead of `thinkingBudget` integer; `'max'` caps at `'high'`; budget form `{ budgetTokens }` maps to nearest `thinkingLevel` on 3.x (≤1024→low, ≤5000→medium, >5000→high). Gemini 2.5 Pro supports `thinkingBudget` up to 32768 (other 2.5 models: 24576). Usage includes `thoughtsTokenCount` → `reasoning_tokens`
+- `Thinking` object form: `{ budgetTokens?: number; includeThoughts?: boolean }` — both optional. `includeThoughts` returns thought summaries (Gemini only); response parts with `thought: true` populate `thinking_content` on ProviderResponse and `thinking_delta` stream chunks
+- `providerMetadata` on `ChatMessage` and `ProviderResponse`: opaque bag for provider-specific round-trip data. Gemini uses it to preserve `thoughtSignature` and other opaque fields across multi-turn conversations for reasoning context continuity
 - Anthropic 4.6 models (Opus 4.6, Sonnet 4.6) use adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`) for string levels; budget form falls back to manual mode (`thinking: { type: "enabled", budget_tokens }`) for precise control
 - ProviderResponse.usage includes optional `reasoning_tokens` and `cached_tokens`
 - AxlStream requires `[Symbol.asyncDispose]` on iterator for TS 5.9+ compat
@@ -237,10 +240,16 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - Memory: `ctx.remember()`/`ctx.recall()`/`ctx.forget()` backed by StateStore; semantic recall via VectorStore + embedder; `MemoryManager` coordinates both
 - Guardrails: `agent({ guardrails: { input, output, onBlock, maxRetries } })`; `GuardrailError` thrown on block; self-correcting retry on `'retry'` policy
 - Session options: `runtime.session(id, { history: { maxMessages, summarize }, persist })` for history management
+- Tool handlers receive `(input, ctx)` where `ctx` is a child `WorkflowContext` for nested agent invocations (agent-as-tool pattern)
+- `WorkflowContext.createChildContext()` creates isolated child contexts (shares budget/abort/traces, isolates session/streaming/steps)
 - Tool middleware: approval gate → hooks.before → handler → hooks.after; approval gate skipped for direct tool.run() calls
+- `AgentConfig.handoffs` accepts `HandoffDescriptor[] | ((ctx: { metadata? }) => HandoffDescriptor[])` for dynamic routing based on runtime metadata
 - Handoff modes: 'oneway' (default, exits source loop) and 'roundtrip' (returns result to source); roundtrip handoffs include a 'message' parameter
 - StreamEvent union includes 'tool_approval' and handoff 'mode' field
+- `ctx.delegate()` creates a temporary router agent with handoffs; single-agent case short-circuits to `ctx.ask()`. Router defaults to first candidate's model, `temperature: 0`, `maxTurns: 2`
 - Studio: Hono server wraps AxlRuntime with REST API (`/api/*`) + WebSocket (`/ws`); React SPA served from `dist/client/`
+- `AxlRuntime.createContext({ metadata? })` creates a lightweight `WorkflowContext` for ad-hoc tool testing and prototyping (has providers, state, MCP, telemetry — no session/streaming/budget)
+- Studio: `POST /api/tools/:name/test` uses `tool.run(ctx, input)` with a context from `runtime.createContext()` so agent-as-tool handlers work
 - Studio: AxlRuntime introspection via `registerTool()`, `registerAgent()`, `registerEval()`, `getWorkflows()`, `getTools()`, `getAgents()`, `getExecutions()`, `getRegisteredEvals()`
 - Studio: `zodToJsonSchema()` exported from core for tool schema rendering in Tool Inspector
 - Studio: WebSocket uses channel multiplexing (subscribe/unsubscribe); channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`

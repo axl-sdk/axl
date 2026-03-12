@@ -62,7 +62,8 @@ app.post('/tools/:name/test', async (c) => {
   }
 
   const body = await c.req.json<{ input: unknown }>();
-  const result = await tool._execute(body.input);
+  const ctx = runtime.createContext();
+  const result = await tool.run(ctx, body.input);
   return c.json({ ok: true, data: { result } });
 });
 

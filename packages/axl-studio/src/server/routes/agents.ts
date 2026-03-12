@@ -12,7 +12,10 @@ app.get('/agents', (c) => {
     model: a.resolveModel(),
     system: a.resolveSystem(),
     tools: a._config.tools?.map((t) => t.name) ?? [],
-    handoffs: a._config.handoffs?.map((h) => h.agent._name) ?? [],
+    handoffs:
+      typeof a._config.handoffs === 'function'
+        ? ['(dynamic)']
+        : (a._config.handoffs?.map((h) => h.agent._name) ?? []),
     maxTurns: a._config.maxTurns,
     temperature: a._config.temperature,
     maxTokens: a._config.maxTokens,
@@ -50,11 +53,19 @@ app.get('/agents/:name', (c) => {
           inputSchema: zodToJsonSchema(t.inputSchema),
         })) ?? [],
       handoffs:
-        cfg.handoffs?.map((h) => ({
-          agent: h.agent._name,
-          description: h.description,
-          mode: h.mode ?? 'oneway',
-        })) ?? [],
+        typeof cfg.handoffs === 'function'
+          ? [
+              {
+                agent: '(dynamic)',
+                description: 'Resolved at runtime from metadata',
+                mode: 'oneway' as const,
+              },
+            ]
+          : (cfg.handoffs?.map((h) => ({
+              agent: h.agent._name,
+              description: h.description,
+              mode: h.mode ?? 'oneway',
+            })) ?? []),
       maxTurns: cfg.maxTurns,
       temperature: cfg.temperature,
       maxTokens: cfg.maxTokens,

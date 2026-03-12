@@ -75,8 +75,9 @@ export function isReasoningModel(model: string): boolean {
 /** Map unified Thinking to OpenAI reasoning_effort. */
 export function thinkingToReasoningEffort(thinking: Thinking): ReasoningEffort {
   if (typeof thinking === 'object') {
-    // Map budget to nearest effort level
+    // Map budget to nearest effort level (default to 'medium' when only includeThoughts is set)
     const budget = thinking.budgetTokens;
+    if (budget === undefined) return 'medium';
     if (budget <= 1024) return 'low';
     if (budget <= 8192) return 'medium';
     return 'high';
@@ -261,9 +262,14 @@ export class OpenAIProvider implements Provider {
     // Non-reasoning models (gpt-4o, gpt-4.1, etc.) reject reasoning_effort.
     // thinking takes precedence over reasoningEffort when both are set.
     if (reasoning) {
-      const effort = options.thinking
-        ? thinkingToReasoningEffort(options.thinking)
-        : options.reasoningEffort;
+      // includeThoughts is Gemini-only; skip if that's the only field set
+      const hasThinkingLevel =
+        typeof options.thinking === 'string' ||
+        (typeof options.thinking === 'object' && options.thinking?.budgetTokens !== undefined);
+      const effort =
+        options.thinking && hasThinkingLevel
+          ? thinkingToReasoningEffort(options.thinking)
+          : options.reasoningEffort;
       if (effort) {
         body.reasoning_effort = effort;
       }

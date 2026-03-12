@@ -28,7 +28,7 @@ const search = tool({
 | `name` | `string` | **required** | Unique tool name |
 | `description` | `string` | **required** | Description shown to the LLM |
 | `input` | `ZodType` | **required** | Zod schema for input validation |
-| `handler` | `(input) => T \| Promise<T>` | **required** | Function that executes the tool |
+| `handler` | `(input, ctx) => T \| Promise<T>` | **required** | Function that executes the tool. `ctx` is a child `WorkflowContext` for nested agent invocations (see below) |
 | `retry` | `RetryPolicy` | see below | Retry configuration for the handler |
 | `sensitive` | `boolean` | `false` | When `true`, return value is redacted from LLM context in subsequent turns |
 | `maxStringLength` | `number` | `10000` | Max length for any string argument. Set to `0` to disable |
@@ -51,6 +51,23 @@ const search = tool({
 | `after` | `(output: TOutput, ctx: WorkflowContext) => TOutput \| Promise<TOutput>` | Transform output after handler runs |
 
 Execution order for agent-initiated calls: approval gate → `hooks.before` → handler → `hooks.after`. For direct `tool.run()` calls: `hooks.before` → handler → `hooks.after` (no approval gate).
+
+#### Child Context in Tool Handlers
+
+When a tool is invoked by an agent, the handler receives a child `WorkflowContext` as its second parameter. This enables the "agent-as-tool" composition pattern — tools can invoke other agents via `ctx.ask()`.
+
+```typescript
+const researchTool = tool({
+  name: 'research',
+  description: 'Delegate a research question to a specialist agent',
+  input: z.object({ question: z.string() }),
+  handler: async (input, ctx) => {
+    return ctx.ask(researcher, input.question);
+  },
+});
+```
+
+The child context shares budget tracking, abort signals, and trace emission with the parent, while isolating session history, step counters, and streaming callbacks. Created internally via `WorkflowContext.createChildContext()`.
 
 ---
 
@@ -79,12 +96,12 @@ const myAgent = agent({
 | `model` | `string \| (ctx) => string` | **required** | Provider URI (e.g., `'openai:gpt-4o'`, `'anthropic:claude-sonnet-4-5'`). Function form enables dynamic model routing |
 | `system` | `string \| (ctx) => string` | **required** | System prompt. Function form enables per-request customization |
 | `tools` | `Tool[]` | `[]` | Tools this agent can call. Acts as an ACL — the agent cannot call tools not in this list |
-| `handoffs` | `HandoffDescriptor[]` | `[]` | Agents this agent can hand off to (see below) |
+| `handoffs` | `HandoffDescriptor[] \| (ctx) => HandoffDescriptor[]` | `[]` | Agents this agent can hand off to. Function form receives `{ metadata?: Record<string, unknown> }` for dynamic routing (see below) |
 | `mcp` | `string[]` | `[]` | MCP server names to connect. Tools from these servers are merged into the agent's tool set |
 | `mcpTools` | `string[]` | — | Whitelist: only expose these specific MCP tools |
 | `temperature` | `number` | provider default | LLM sampling temperature |
 | `maxTokens` | `number` | `4096` | Maximum tokens in the LLM response |
-| `thinking` | `Thinking` | — | Thinking/reasoning level. `'low'` \| `'medium'` \| `'high'` \| `'max'` or `{ budgetTokens: number }`. Works across all providers |
+| `thinking` | `Thinking` | — | Thinking/reasoning level. `'low'` \| `'medium'` \| `'high'` \| `'max'` or `{ budgetTokens?: number, includeThoughts?: boolean }`. Works across all providers. `includeThoughts` returns thought summaries (Gemini only) |
 | `reasoningEffort` | `ReasoningEffort` | — | OpenAI-specific reasoning effort escape hatch. Values: `'none'` \| `'minimal'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'`. Prefer `thinking` |
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool |
 | `stop` | `string[]` | — | Stop sequences — generation stops when any sequence is encountered. Not supported by the `openai-responses` provider (silently ignored) |
@@ -101,6 +118,28 @@ const myAgent = agent({
 | `agent` | `Agent` | **required** | Target agent |
 | `description` | `string` | — | Description shown to the LLM to help it decide when to hand off |
 | `mode` | `'oneway' \| 'roundtrip'` | `'oneway'` | `oneway`: transfers the conversation — source agent's loop exits. `roundtrip`: delegates and returns the result to the source agent |
+
+#### Dynamic Handoffs
+
+The `handoffs` option accepts a function for runtime-conditional routing. The function receives `{ metadata?: Record<string, unknown> }` (from `AskOptions.metadata` or workflow metadata) and returns the handoff array:
+
+```typescript
+const router = agent({
+  name: 'support-router',
+  model: 'openai:gpt-4o-mini',
+  system: 'Route to the right specialist.',
+  handoffs: (ctx) => {
+    const base = [
+      { agent: billingAgent, description: 'Billing issues' },
+      { agent: shippingAgent, description: 'Shipping questions' },
+    ];
+    if (ctx.metadata?.tier === 'enterprise') {
+      base.push({ agent: priorityAgent, description: 'Priority support' });
+    }
+    return base;
+  },
+});
+```
 
 ---
 
@@ -129,6 +168,19 @@ const myWorkflow = workflow({
 | `input` | `ZodType` | **required** | Zod schema for workflow input |
 | `output` | `ZodType` | — | Optional Zod schema for output validation |
 | `handler` | `(ctx: WorkflowContext) => Promise<T>` | **required** | Async function receiving the workflow context |
+
+### `runtime.createContext(options?)`
+
+Create a lightweight `WorkflowContext` for ad-hoc use outside of workflows (e.g., tool testing, prototyping). The context has access to the runtime's providers, state store, MCP, telemetry, and memory — but no session history, streaming callbacks, or budget tracking.
+
+```typescript
+const ctx = runtime.createContext({ metadata: { env: 'test' } });
+const result = await myTool.run(ctx, { query: 'hello' });
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `metadata` | `Record<string, unknown>` | `{}` | Metadata passed to the context |
 
 ---
 
@@ -165,6 +217,49 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 **Precedence:** Per-call `AskOptions` > agent-level `AgentConfig` > internal defaults.
 
 **Returns:** `Promise<T>` — parsed output if `schema` is provided, otherwise `string`.
+
+---
+
+### `ctx.delegate(agents, prompt, options?)`
+
+Select the best agent from a list of candidates and invoke it. Creates a temporary router agent that uses handoffs to pick the right specialist.
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `agents` | `Agent[]` | Candidate agents to choose from (at least 1) |
+| `prompt` | `string` | The prompt to route and process |
+| `options.schema` | `z.ZodType<T>` | Zod schema for structured output from the selected agent |
+| `options.routerModel` | `string` | Model URI for the internal router (default: first candidate's model) |
+| `options.metadata` | `Record<string, unknown>` | Additional metadata passed to router and selected agent |
+| `options.retries` | `number` | Retries for structured output validation |
+
+**Returns:** `Promise<T>` — the selected agent's response.
+
+**Behavior:**
+- With 1 agent: calls `ctx.ask()` directly (no routing overhead)
+- With 2+ agents: creates a temporary router agent with `temperature: 0` and `maxTurns: 2` that hands off to the best candidate
+- Emits a `delegate` trace event with candidate names and router model
+
+**Example:**
+```typescript
+const result = await ctx.delegate(
+  [billingAgent, shippingAgent, generalAgent],
+  customerMessage,
+);
+```
+
+**With structured output:**
+```typescript
+const result = await ctx.delegate(
+  [billingAgent, shippingAgent],
+  customerMessage,
+  {
+    schema: z.object({ answer: z.string(), category: z.string() }),
+    routerModel: 'openai:gpt-4o-mini',
+  },
+);
+```
 
 ---
 
@@ -549,3 +644,49 @@ All errors extend `AxlError`.
 | `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.reason` |
 | `ToolDenied` | `ctx.ask()` | Agent attempted to call a tool not in its ACL |
+
+---
+
+## Multi-Agent Decision Tree
+
+A guide for choosing the right primitive for multi-agent coordination:
+
+```
+START: I need to coordinate multiple agents
+|
++-- Do I know WHICH agent to call?
+|   +-- YES -> ctx.ask(agent, prompt)
+|   |   +-- Need structured output? -> ctx.ask(agent, prompt, { schema })
+|   |
+|   +-- NO, I need to pick from candidates
+|       +-- The AGENT's LLM should decide (mid-conversation) -> Handoffs
+|       |   +-- Static candidate list -> handoffs: [{ agent, description }]
+|       |   +-- Context-dependent list -> handoffs: (ctx) => [...]
+|       |   +-- Transfer control permanently -> mode: 'oneway'
+|       |   +-- Get result back and continue -> mode: 'roundtrip'
+|       |
+|       +-- The WORKFLOW should decide (orchestration level)
+|           -> ctx.delegate(agents, prompt)
+|
++-- Do I need MULTIPLE agents working simultaneously?
+|   +-- Same task, different perspectives -> ctx.spawn(n, fn)
+|   |   +-- Need to pick a winner? -> ctx.vote(results, { strategy })
+|   |
+|   +-- Different items, same processing -> ctx.map(items, fn, { concurrency })
+|   |
+|   +-- First-to-finish wins -> ctx.race(fns)
+|   |
+|   +-- Different tasks, need typed results -> ctx.parallel(fns)
+|
++-- Do I need SEQUENTIAL agent stages?
+|   +-- YES -> Sequential ctx.ask() calls (imperative TypeScript)
+|       +-- Need to validate between stages? -> ctx.verify(fn, schema)
+|
++-- Do I need an AGENT to orchestrate other agents?
+|   +-- YES -> Agent-as-tool pattern:
+|       +-- Define tools whose handlers call ctx.ask(subAgent, ...)
+|           +-- Give those tools to the orchestrator agent
+|
++-- Do I need COST CONTROL across the whole workflow?
+    +-- YES -> Wrap with ctx.budget({ cost: '$10' }, fn)
+```

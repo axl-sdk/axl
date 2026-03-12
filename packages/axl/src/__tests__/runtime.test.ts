@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { AxlRuntime } from '../runtime.js';
 import { workflow } from '../workflow.js';
 import { agent } from '../agent.js';
+import { tool } from '../tool.js';
 import { Session } from '../session.js';
 import { AxlStream } from '../stream.js';
 import type { TraceEvent } from '../types.js';
@@ -1172,5 +1173,47 @@ describe('constructor', () => {
     const store = runtime.getStateStore();
     // Should be a MemoryStore (has no path property, unlike SQLiteStore)
     expect(store).toBeDefined();
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// createContext()
+// ═════════════════════════════════════════════════════════════════════════
+
+describe('createContext()', () => {
+  it('returns a WorkflowContext that can run tools', async () => {
+    const { runtime } = createRuntime();
+
+    const greetTool = tool({
+      name: 'greet',
+      description: 'Greets a person',
+      input: z.object({ name: z.string() }),
+      handler: async (input) => `Hello, ${input.name}!`,
+    });
+
+    const ctx = runtime.createContext();
+    const result = await greetTool.run(ctx, { name: 'Alice' });
+    expect(result).toBe('Hello, Alice!');
+  });
+
+  it('passes metadata to the context', () => {
+    const { runtime } = createRuntime();
+
+    const ctx = runtime.createContext({
+      metadata: { userId: 'u-42', role: 'admin' },
+    });
+
+    expect(ctx.metadata).toEqual({ userId: 'u-42', role: 'admin' });
+  });
+
+  it('generates unique executionIds', () => {
+    const { runtime } = createRuntime();
+
+    const ctx1 = runtime.createContext();
+    const ctx2 = runtime.createContext();
+
+    expect(ctx1.executionId).toBeDefined();
+    expect(ctx2.executionId).toBeDefined();
+    expect(ctx1.executionId).not.toBe(ctx2.executionId);
   });
 });

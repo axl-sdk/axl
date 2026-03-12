@@ -24,7 +24,14 @@ const GEMINI_PRICING: Record<string, [number, number]> = {
   'gemini-2.0-flash-lite': [0.1e-6, 0.4e-6],
   'gemini-3-pro-preview': [2e-6, 12e-6],
   'gemini-3-flash-preview': [0.5e-6, 3e-6],
+  'gemini-3.1-pro-preview': [2e-6, 12e-6],
+  'gemini-3.1-flash-lite-preview': [0.25e-6, 1.5e-6],
 };
+
+/** Pre-sorted keys (longest first) for prefix matching versioned model names. */
+const GEMINI_PRICING_KEYS_BY_LENGTH = Object.keys(GEMINI_PRICING).sort(
+  (a, b) => b.length - a.length,
+);
 
 function estimateGeminiCost(
   model: string,
@@ -34,9 +41,9 @@ function estimateGeminiCost(
 ): number {
   let pricing = GEMINI_PRICING[model];
   if (!pricing) {
-    for (const [key, value] of Object.entries(GEMINI_PRICING)) {
+    for (const key of GEMINI_PRICING_KEYS_BY_LENGTH) {
       if (model.startsWith(key)) {
-        pricing = value;
+        pricing = GEMINI_PRICING[key];
         break;
       }
     }
@@ -50,7 +57,7 @@ function estimateGeminiCost(
   return inputCost + outputTokens * outputRate;
 }
 
-/** Default thinking budget tokens for each Thinking level. */
+/** Default thinking budget tokens for each Thinking level (Gemini 2.x). */
 const THINKING_BUDGETS: Record<string, number> = {
   low: 1024,
   medium: 5000,
@@ -58,10 +65,63 @@ const THINKING_BUDGETS: Record<string, number> = {
   max: 24576,
 };
 
-/** Map unified Thinking to Gemini thinkingBudget. */
-function thinkingToBudgetTokens(thinking: Thinking): number {
-  if (typeof thinking === 'string') return THINKING_BUDGETS[thinking] ?? 5000;
-  return thinking.budgetTokens;
+/** Gemini 3.x thinkingLevel values mapped from unified Thinking levels. */
+const THINKING_LEVELS: Record<string, string> = {
+  low: 'low',
+  medium: 'medium',
+  high: 'high',
+  max: 'high', // 3.x caps at 'high'
+};
+
+/** Check if a model is Gemini 3.x generation (uses thinkingLevel instead of thinkingBudget). */
+function isGemini3x(model: string): boolean {
+  return /^gemini-3[.-]/.test(model);
+}
+
+/**
+ * Map unified Thinking to Gemini thinkingConfig.
+ *
+ * Gemini 3.x uses `thinkingLevel` (string enum: 'low' | 'medium' | 'high').
+ * Gemini 2.x uses `thinkingBudget` (integer token count).
+ * Budget form `{ budgetTokens }` maps to nearest `thinkingLevel` on 3.x,
+ * exact `thinkingBudget` on 2.x.
+ */
+function budgetToThinkingLevel(budgetTokens: number): string {
+  if (budgetTokens <= 1024) return 'low';
+  if (budgetTokens <= 5000) return 'medium';
+  return 'high';
+}
+
+function buildThinkingConfig(thinking: Thinking, model: string): Record<string, unknown> {
+  // Object form: may have budgetTokens, includeThoughts, or both
+  if (typeof thinking !== 'string') {
+    const config: Record<string, unknown> = {};
+
+    if (thinking.budgetTokens !== undefined) {
+      if (isGemini3x(model)) {
+        config.thinkingLevel = budgetToThinkingLevel(thinking.budgetTokens);
+      } else {
+        config.thinkingBudget = thinking.budgetTokens;
+      }
+    }
+
+    if (thinking.includeThoughts) {
+      config.includeThoughts = true;
+    }
+
+    return config;
+  }
+
+  // String levels: branch by generation
+  if (isGemini3x(model)) {
+    return { thinkingLevel: THINKING_LEVELS[thinking] ?? 'medium' };
+  }
+
+  // 2.5 Pro supports a higher max budget (32768) than other 2.5 models (24576)
+  if (thinking === 'max' && model.startsWith('gemini-2.5-pro')) {
+    return { thinkingBudget: 32768 };
+  }
+  return { thinkingBudget: THINKING_BUDGETS[thinking] ?? 5000 };
 }
 
 /**
@@ -223,11 +283,15 @@ export class GeminiProvider implements Provider {
       body.generationConfig = generationConfig;
     }
 
-    // Map unified thinking to Gemini's thinkingConfig
-    if (options.thinking) {
-      generationConfig.thinkingConfig = {
-        thinkingBudget: thinkingToBudgetTokens(options.thinking),
-      };
+    // Map unified thinking to Gemini's thinkingConfig (generation-aware)
+    // Skip empty object {} which produces an empty thinkingConfig
+    if (
+      options.thinking &&
+      (typeof options.thinking === 'string' ||
+        options.thinking.budgetTokens !== undefined ||
+        options.thinking.includeThoughts)
+    ) {
+      generationConfig.thinkingConfig = buildThinkingConfig(options.thinking, options.model);
       // Ensure generationConfig is included even if nothing else was set
       if (!body.generationConfig) {
         body.generationConfig = generationConfig;
@@ -269,31 +333,39 @@ export class GeminiProvider implements Provider {
 
     for (const msg of messages) {
       if (msg.role === 'assistant') {
-        const parts: GeminiPart[] = [];
+        // If we have raw Gemini parts from a previous response, use them directly.
+        // This preserves thoughtSignature and other opaque fields that Gemini requires
+        // in subsequent turns for multi-turn reasoning context.
+        const rawParts = msg.providerMetadata?.geminiParts as GeminiPart[] | undefined;
+        if (rawParts && rawParts.length > 0) {
+          result.push({ role: 'model', parts: rawParts });
+        } else {
+          const parts: GeminiPart[] = [];
 
-        if (msg.content) {
-          parts.push({ text: msg.content });
-        }
-
-        if (msg.tool_calls && msg.tool_calls.length > 0) {
-          for (const tc of msg.tool_calls) {
-            let parsedArgs: Record<string, unknown>;
-            try {
-              parsedArgs = JSON.parse(tc.function.arguments) as Record<string, unknown>;
-            } catch {
-              parsedArgs = {};
-            }
-            parts.push({
-              functionCall: {
-                name: tc.function.name,
-                args: parsedArgs,
-              },
-            });
+          if (msg.content) {
+            parts.push({ text: msg.content });
           }
-        }
 
-        if (parts.length > 0) {
-          result.push({ role: 'model', parts });
+          if (msg.tool_calls && msg.tool_calls.length > 0) {
+            for (const tc of msg.tool_calls) {
+              let parsedArgs: Record<string, unknown>;
+              try {
+                parsedArgs = JSON.parse(tc.function.arguments) as Record<string, unknown>;
+              } catch {
+                parsedArgs = {};
+              }
+              parts.push({
+                functionCall: {
+                  name: tc.function.name,
+                  args: parsedArgs,
+                },
+              });
+            }
+          }
+
+          if (parts.length > 0) {
+            result.push({ role: 'model', parts });
+          }
         }
       } else if (msg.role === 'tool') {
         const functionName = toolCallIdToName.get(msg.tool_call_id!) ?? 'unknown';
@@ -387,11 +459,14 @@ export class GeminiProvider implements Provider {
   private parseResponse(json: GeminiResponse, model: string): ProviderResponse {
     const candidate = json.candidates?.[0];
     let content = '';
+    let thinkingContent = '';
     const toolCalls: ToolCallMessage[] = [];
 
     if (candidate?.content?.parts) {
       for (const part of candidate.content.parts) {
-        if (part.text) {
+        if (part.thought && part.text) {
+          thinkingContent += part.text;
+        } else if (part.text) {
           content += part.text;
         } else if (part.functionCall) {
           toolCalls.push({
@@ -407,12 +482,14 @@ export class GeminiProvider implements Provider {
     }
 
     const cachedTokens = json.usageMetadata?.cachedContentTokenCount;
+    const reasoningTokens = json.usageMetadata?.thoughtsTokenCount;
     const usage = json.usageMetadata
       ? {
           prompt_tokens: json.usageMetadata.promptTokenCount ?? 0,
           completion_tokens: json.usageMetadata.candidatesTokenCount ?? 0,
           total_tokens: json.usageMetadata.totalTokenCount ?? 0,
           cached_tokens: cachedTokens && cachedTokens > 0 ? cachedTokens : undefined,
+          reasoning_tokens: reasoningTokens && reasoningTokens > 0 ? reasoningTokens : undefined,
         }
       : undefined;
 
@@ -420,11 +497,18 @@ export class GeminiProvider implements Provider {
       ? estimateGeminiCost(model, usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens)
       : undefined;
 
+    // Attach raw Gemini parts as providerMetadata so they can be sent back
+    // verbatim in subsequent turns, preserving thoughtSignature and other opaque fields.
+    const rawParts = candidate?.content?.parts;
+    const providerMetadata = rawParts ? { geminiParts: rawParts } : undefined;
+
     return {
       content,
+      thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       usage,
       cost,
+      providerMetadata,
     };
   }
 
@@ -442,8 +526,11 @@ export class GeminiProvider implements Provider {
           completion_tokens: number;
           total_tokens: number;
           cached_tokens?: number;
+          reasoning_tokens?: number;
         }
       | undefined;
+    // Accumulate raw parts across stream chunks for providerMetadata round-tripping
+    const accumulatedParts: Array<Record<string, unknown>> = [];
 
     try {
       while (true) {
@@ -471,18 +558,25 @@ export class GeminiProvider implements Provider {
           // Extract usage from this chunk (accumulate from final chunk)
           if (chunk.usageMetadata) {
             const cached = chunk.usageMetadata.cachedContentTokenCount;
+            const reasoning = chunk.usageMetadata.thoughtsTokenCount;
             usage = {
               prompt_tokens: chunk.usageMetadata.promptTokenCount ?? 0,
               completion_tokens: chunk.usageMetadata.candidatesTokenCount ?? 0,
               total_tokens: chunk.usageMetadata.totalTokenCount ?? 0,
               cached_tokens: cached && cached > 0 ? cached : undefined,
+              reasoning_tokens: reasoning && reasoning > 0 ? reasoning : undefined,
             };
           }
 
           const candidate = chunk.candidates?.[0];
           if (candidate?.content?.parts) {
             for (const part of candidate.content.parts) {
-              if (part.text) {
+              // Accumulate raw parts for providerMetadata
+              accumulatedParts.push(part);
+
+              if (part.thought && part.text) {
+                yield { type: 'thinking_delta', content: part.text };
+              } else if (part.text) {
                 yield { type: 'text_delta', content: part.text };
               } else if (part.functionCall) {
                 // Gemini sends complete functionCall objects (not incremental deltas)
@@ -498,7 +592,9 @@ export class GeminiProvider implements Provider {
         }
       }
 
-      yield { type: 'done', usage };
+      const providerMetadata =
+        accumulatedParts.length > 0 ? { geminiParts: accumulatedParts } : undefined;
+      yield { type: 'done', usage, providerMetadata };
     } finally {
       reader.releaseLock();
     }
@@ -509,18 +605,18 @@ export class GeminiProvider implements Provider {
 // Gemini API types (internal)
 // ---------------------------------------------------------------------------
 
-type GeminiPart =
-  | { text: string; functionCall?: undefined; functionResponse?: undefined }
-  | {
-      functionCall: { name: string; args: Record<string, unknown> };
-      text?: undefined;
-      functionResponse?: undefined;
-    }
-  | {
-      functionResponse: { name: string; response: Record<string, unknown> };
-      text?: undefined;
-      functionCall?: undefined;
-    };
+/**
+ * Gemini part type for request building.
+ *
+ * Uses an index signature to allow opaque provider fields (e.g. thoughtSignature)
+ * to round-trip through conversation history without being stripped.
+ */
+type GeminiPart = {
+  text?: string;
+  functionCall?: { name: string; args: Record<string, unknown> };
+  functionResponse?: { name: string; response: Record<string, unknown> };
+  [key: string]: unknown;
+};
 
 type GeminiContent = {
   role: 'user' | 'model';
@@ -533,7 +629,9 @@ type GeminiResponse = {
       role: string;
       parts: Array<{
         text?: string;
+        thought?: boolean;
         functionCall?: { name: string; args: Record<string, unknown> };
+        [key: string]: unknown;
       }>;
     };
     finishReason?: string;
@@ -543,5 +641,6 @@ type GeminiResponse = {
     candidatesTokenCount?: number;
     totalTokenCount?: number;
     cachedContentTokenCount?: number;
+    thoughtsTokenCount?: number;
   };
 };

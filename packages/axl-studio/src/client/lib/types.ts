@@ -41,7 +41,12 @@ export type AgentSummary = {
   maxTurns?: number;
   temperature?: number;
   maxTokens?: number;
-  thinking?: 'low' | 'medium' | 'high' | 'max' | { budgetTokens: number };
+  thinking?:
+    | 'low'
+    | 'medium'
+    | 'high'
+    | 'max'
+    | { budgetTokens?: number; includeThoughts?: boolean };
   reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
   toolChoice?: 'auto' | 'none' | 'required' | { type: 'function'; function: { name: string } };
   stop?: string[];
@@ -57,7 +62,12 @@ export type AgentDetail = {
   maxTurns?: number;
   temperature?: number;
   maxTokens?: number;
-  thinking?: 'low' | 'medium' | 'high' | 'max' | { budgetTokens: number };
+  thinking?:
+    | 'low'
+    | 'medium'
+    | 'high'
+    | 'max'
+    | { budgetTokens?: number; includeThoughts?: boolean };
   reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
   toolChoice?: 'auto' | 'none' | 'required' | { type: 'function'; function: { name: string } };
   stop?: string[];

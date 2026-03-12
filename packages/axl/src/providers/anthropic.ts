@@ -32,6 +32,11 @@ const ANTHROPIC_PRICING: Record<string, [number, number]> = {
   'claude-3-haiku': [0.25e-6, 1.25e-6],
 };
 
+/** Pre-sorted keys (longest first) for prefix matching versioned model names. */
+const ANTHROPIC_PRICING_KEYS_BY_LENGTH = Object.keys(ANTHROPIC_PRICING).sort(
+  (a, b) => b.length - a.length,
+);
+
 function estimateAnthropicCost(
   model: string,
   inputTokens: number,
@@ -42,9 +47,9 @@ function estimateAnthropicCost(
   // Try exact match first, then prefix match for versioned models
   let pricing = ANTHROPIC_PRICING[model];
   if (!pricing) {
-    for (const [key, value] of Object.entries(ANTHROPIC_PRICING)) {
+    for (const key of ANTHROPIC_PRICING_KEYS_BY_LENGTH) {
       if (model.startsWith(key)) {
-        pricing = value;
+        pricing = ANTHROPIC_PRICING[key];
         break;
       }
     }
@@ -75,7 +80,7 @@ const THINKING_BUDGETS: Record<string, number> = {
 /** Map unified Thinking to Anthropic budget_tokens (manual mode). */
 function thinkingToBudgetTokens(thinking: Thinking): number {
   if (typeof thinking === 'string') return THINKING_BUDGETS[thinking] ?? 5000;
-  return thinking.budgetTokens;
+  return thinking.budgetTokens ?? 5000;
 }
 
 /**
@@ -247,7 +252,11 @@ export class AnthropicProvider implements Provider {
     // adaptive mode with effort. For explicit budgetTokens, we use manual mode
     // with budget_tokens (still supported, user wants precise control).
     // Older models always use manual mode with budget_tokens.
-    if (options.thinking) {
+    // includeThoughts is Gemini-only; skip thinking setup if that's the only field set
+    const hasThinkingLevel =
+      typeof options.thinking === 'string' ||
+      (typeof options.thinking === 'object' && options.thinking.budgetTokens !== undefined);
+    if (options.thinking && hasThinkingLevel) {
       if (
         typeof options.thinking === 'string' &&
         supportsAdaptiveThinking(options.model) &&

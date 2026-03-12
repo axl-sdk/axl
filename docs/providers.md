@@ -155,9 +155,14 @@ const answer = await ctx.ask(reasoner, problem, {
 | **OpenAI Responses** | `reasoning.effort: 'low'` | `reasoning.effort: 'medium'` | `reasoning.effort: 'high'` | `reasoning.effort: 'xhigh'` | nearest effort level* |
 | **Anthropic** (4.6) | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'max'`† | manual `budget_tokens` |
 | **Anthropic** (older) | `thinking.budget_tokens: 1024` | `thinking.budget_tokens: 5000` | `thinking.budget_tokens: 10000` | `thinking.budget_tokens: 30000` | exact budget |
-| **Gemini** (2.5+) | `thinkingConfig.thinkingBudget: 1024` | `thinkingConfig.thinkingBudget: 5000` | `thinkingConfig.thinkingBudget: 10000` | `thinkingConfig.thinkingBudget: 24576` | exact budget |
+| **Gemini** (3.x) | `thinkingConfig.thinkingLevel: 'low'` | `thinkingConfig.thinkingLevel: 'medium'` | `thinkingConfig.thinkingLevel: 'high'` | `thinkingConfig.thinkingLevel: 'high'`‡ | nearest `thinkingLevel`‡ |
+| **Gemini** (2.5) | `thinkingConfig.thinkingBudget: 1024` | `thinkingConfig.thinkingBudget: 5000` | `thinkingConfig.thinkingBudget: 10000` | `thinkingConfig.thinkingBudget: 24576`§ | exact budget |
 
-† Anthropic `effort: 'max'` is only supported on Opus 4.6. On Sonnet 4.6, `thinking: 'max'` automatically falls back to manual mode with `budget_tokens: 30000`. The budget values for `'max'` (30000 for Anthropic, 24576 for Gemini) are sensible defaults, not hard provider limits. For the absolute maximum your model supports, use `{ budgetTokens: N }` with the model's actual limit.
+† Anthropic `effort: 'max'` is only supported on Opus 4.6. On Sonnet 4.6, `thinking: 'max'` automatically falls back to manual mode with `budget_tokens: 30000`. The budget values for `'max'` (30000 for Anthropic, 24576 for Gemini 2.5) are sensible defaults, not hard provider limits. For the absolute maximum your model supports, use `{ budgetTokens: N }` with the model's actual limit.
+
+‡ Gemini 3.x uses `thinkingLevel` (string enum) instead of `thinkingBudget` (integer). The maximum level is `'high'`, so `thinking: 'max'` maps to `'high'`. Budget form `{ budgetTokens: N }` maps to the nearest `thinkingLevel` on 3.x: ≤1024 → `'low'`, ≤5000 → `'medium'`, >5000 → `'high'`.
+
+§ Gemini 2.5 Pro supports up to 32768 thinking tokens; other 2.5 models cap at 24576.
 
 \* OpenAI does not support explicit token budgets for reasoning. The budget form `{ budgetTokens: N }` is mapped to the nearest effort level: ≤1024 → `low`, ≤8192 → `medium`, >8192 → `high`. Note: budget form never maps to `'xhigh'` — use `thinking: 'max'` explicitly for maximum reasoning effort. For precise token budget control, use Anthropic or Gemini.
 
@@ -168,6 +173,9 @@ const answer = await ctx.ask(reasoner, problem, {
 - **Anthropic older models** (Sonnet 4.5, Opus 4.5, Haiku 4.5, etc.): Always use manual mode (`thinking: { type: "enabled", budget_tokens: N }`).
 - **Anthropic + `temperature`**: Anthropic rejects `temperature` when extended thinking is enabled. Axl automatically strips `temperature` when `thinking` is set (same pattern as OpenAI stripping temperature for reasoning models).
 - **Anthropic + `maxTokens`**: Anthropic requires `max_tokens ≥ budget_tokens`. When your `maxTokens` (default: 4096) is too low for the thinking budget, Axl auto-bumps it to `budget_tokens + 1024`. For example, `thinking: 'high'` (budget 10000) with default `maxTokens` results in `max_tokens: 11024` being sent to the API.
+- **Gemini 3.x models** (gemini-3-*, gemini-3.1-*): Use `thinkingLevel` (string enum: `'low'`, `'medium'`, `'high'`) instead of `thinkingBudget`. Axl detects the model generation automatically. Budget form `{ budgetTokens: N }` maps to the nearest `thinkingLevel` (≤1024→low, ≤5000→medium, >5000→high). Usage metadata includes `thoughtsTokenCount` which Axl maps to `reasoning_tokens`. Thought signatures are automatically preserved across multi-turn conversations via `providerMetadata`.
+- **Gemini 2.5 models**: Use `thinkingBudget` (integer token count). `gemini-2.5-pro` supports up to 32768; other 2.5 models cap at 24576.
+- **`includeThoughts`**: Gemini-only feature. Use `thinking: { includeThoughts: true }` to receive thought summaries in responses (`thinking_content` on ProviderResponse, `thinking_delta` stream chunks). Can be combined with `budgetTokens`. Silently ignored by OpenAI and Anthropic.
 
 #### `reasoningEffort` (advanced)
 

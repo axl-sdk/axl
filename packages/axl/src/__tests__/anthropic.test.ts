@@ -636,6 +636,31 @@ describe('AnthropicProvider', () => {
       expect(body.thinking).toBeUndefined();
     });
 
+    it('ignores includeThoughts-only thinking (Gemini-only feature)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th4',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4-6',
+        maxTokens: 1024,
+        thinking: { includeThoughts: true },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      // includeThoughts is Gemini-only; should not trigger Anthropic thinking
+      expect(body.thinking).toBeUndefined();
+    });
+
     it('auto-bumps max_tokens when thinking budget exceeds it (manual mode)', async () => {
       const fetchMock = mockFetch({
         json: () =>

@@ -21,7 +21,7 @@ export type ToolConfig<TInput extends z.ZodTypeAny, TOutput = unknown> = {
   name: string;
   description: string;
   input: TInput;
-  handler: (input: z.infer<TInput>) => TOutput | Promise<TOutput>;
+  handler: (input: z.infer<TInput>, ctx: WorkflowContext) => TOutput | Promise<TOutput>;
   retry?: RetryPolicy;
   sensitive?: boolean;
   /** Maximum string length for any string argument. Default: 10000. Set to 0 to disable. */
@@ -44,7 +44,7 @@ export type Tool<TInput extends z.ZodTypeAny = z.ZodTypeAny, TOutput = unknown> 
   /** Run the tool directly from workflow code */
   run(ctx: WorkflowContext, input: z.infer<TInput>): Promise<TOutput>;
   /** Execute the handler (internal use — includes retry logic) */
-  _execute(input: z.infer<TInput>): Promise<TOutput>;
+  _execute(input: z.infer<TInput>, ctx?: WorkflowContext): Promise<TOutput>;
 };
 
 const DEFAULT_MAX_STRING_LENGTH = 10_000;
@@ -102,7 +102,7 @@ export function tool<TInput extends z.ZodTypeAny, TOutput = unknown>(
 
   const maxStringLen = config.maxStringLength ?? DEFAULT_MAX_STRING_LENGTH;
 
-  const execute = async (input: z.infer<TInput>): Promise<TOutput> => {
+  const execute = async (input: z.infer<TInput>, ctx?: WorkflowContext): Promise<TOutput> => {
     // Validate input against schema
     const parsed = config.input.parse(input);
 
@@ -116,7 +116,10 @@ export function tool<TInput extends z.ZodTypeAny, TOutput = unknown>(
     let lastError: Error | undefined;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        return await config.handler(parsed);
+        // ctx is optional on _execute but required on handler. In practice, all runtime
+        // call sites (agent tool loop, tool.run) always provide ctx. The undefined case
+        // only occurs when _execute is called directly in tests or internal code.
+        return await config.handler(parsed, ctx as WorkflowContext);
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
 
@@ -156,7 +159,7 @@ export function tool<TInput extends z.ZodTypeAny, TOutput = unknown>(
           processedInput = await config.hooks.before(processedInput, ctx);
         }
 
-        let result = await execute(processedInput);
+        let result = await execute(processedInput, ctx);
 
         // Apply after hook
         if (config.hooks?.after) {

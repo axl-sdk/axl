@@ -107,6 +107,57 @@ describe('Handoffs E2E', () => {
     expect(result).toBe('Source got target data and finished.');
   });
 
+  it('ctx.delegate() selects best agent via inline router and returns its response', async () => {
+    const billingAgent = agent({
+      name: 'billing',
+      model: 'mock:specialist',
+      system: 'You handle billing inquiries.',
+    });
+
+    const shippingAgent = agent({
+      name: 'shipping',
+      model: 'mock:specialist',
+      system: 'You handle shipping inquiries.',
+    });
+
+    // Call 0: router picks billing via handoff tool call
+    // Call 1: billing agent answers
+    const provider = MockProvider.fn((_msgs, callIndex) => {
+      if (callIndex === 0) {
+        return {
+          content: '',
+          tool_calls: [
+            {
+              id: 'delegate_1',
+              type: 'function' as const,
+              function: {
+                name: 'handoff_to_billing',
+                arguments: JSON.stringify({}),
+              },
+            },
+          ],
+        };
+      }
+      return { content: 'Your balance is $100' };
+    });
+
+    const { runtime, traces } = createTestRuntime(provider);
+    const wf = workflow({
+      name: 'delegate-wf',
+      input: z.object({ question: z.string() }),
+      handler: async (ctx) => ctx.delegate([billingAgent, shippingAgent], ctx.input.question),
+    });
+    runtime.register(wf);
+
+    const result = await runtime.execute('delegate-wf', { question: 'What is my balance?' });
+    expect(result).toBe('Your balance is $100');
+
+    const delegateTraces = traces.filter((t) => t.type === 'delegate');
+    expect(delegateTraces.length).toBe(1);
+    const data = delegateTraces[0].data as Record<string, unknown>;
+    expect(data.candidates).toEqual(['billing', 'shipping']);
+  });
+
   it('handoff trace events include correct target', async () => {
     const targetAgent = agent({
       name: 'trace-target',

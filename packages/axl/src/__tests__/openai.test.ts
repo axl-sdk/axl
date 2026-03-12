@@ -376,6 +376,28 @@ describe('OpenAIProvider', () => {
       expect(body.reasoning_effort).toBe('low');
     });
 
+    it('ignores includeThoughts-only thinking on reasoning models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-1',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        thinking: { includeThoughts: true },
+      });
+
+      const body = getRequestBody(fetchMock);
+      // includeThoughts is Gemini-only; should not set reasoning_effort
+      expect(body.reasoning_effort).toBeUndefined();
+    });
+
     it('ignores thinking on non-reasoning models', async () => {
       const fetchMock = mockFetch({
         json: () =>

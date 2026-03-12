@@ -267,6 +267,25 @@ export class AxlRuntime extends EventEmitter {
     return [...this.executions.values()];
   }
 
+  /**
+   * Create a lightweight WorkflowContext for ad-hoc use (tool testing, prototyping).
+   * The context has access to the runtime's providers, state store, and MCP manager
+   * but no session history, streaming callbacks, or budget tracking.
+   */
+  createContext(options?: { metadata?: Record<string, unknown> }): WorkflowContext {
+    return new WorkflowContext({
+      input: undefined,
+      executionId: randomUUID(),
+      metadata: options?.metadata,
+      config: this.config,
+      providerRegistry: this.providerRegistry,
+      stateStore: this.stateStore,
+      mcpManager: this.mcpManager,
+      spanManager: this.spanManager,
+      memoryManager: this.memoryManager,
+    });
+  }
+
   /** Register a custom provider instance. */
   registerProvider(name: string, provider: Provider): void {
     this.providerRegistry.registerInstance(name, provider);

@@ -141,6 +141,51 @@ describe('Session', () => {
       expect(history[1].content).toBe('{"status":"ok","count":42}');
     });
 
+    it('preserves providerMetadata when executeAgentCall pushes assistant message', async () => {
+      // Simulate what executeAgentCall does: push assistant message with providerMetadata
+      // to session history before returning the result.
+      const executeFn = vi.fn().mockImplementation((_name: string, _input: unknown, opts: any) => {
+        const history = opts.metadata.sessionHistory as ChatMessage[];
+        history.push({
+          role: 'assistant',
+          content: 'response with metadata',
+          providerMetadata: {
+            geminiParts: [{ text: 'thought', thought: true, thoughtSignature: 'abc' }],
+          },
+        });
+        return Promise.resolve('response with metadata');
+      });
+      runtime = createMockRuntime({ execute: executeFn });
+      const session = new Session('sess-meta', runtime, store);
+
+      await session.send('chat', 'hello');
+
+      const history = await store.getSession('sess-meta');
+      expect(history).toHaveLength(2);
+      expect(history[0]).toEqual({ role: 'user', content: 'hello' });
+      expect(history[1]).toMatchObject({
+        role: 'assistant',
+        content: 'response with metadata',
+        providerMetadata: { geminiParts: expect.any(Array) },
+      });
+      // Ensure no duplicate assistant message was added
+      expect(history.filter((m: ChatMessage) => m.role === 'assistant')).toHaveLength(1);
+    });
+
+    it('falls back to adding plain assistant message when executeAgentCall does not push', async () => {
+      // When the runtime does NOT push an assistant message (e.g., non-session contexts),
+      // Session should still add the assistant message itself.
+      const executeFn = vi.fn().mockResolvedValue('plain response');
+      runtime = createMockRuntime({ execute: executeFn });
+      const session = new Session('sess-fallback', runtime, store);
+
+      await session.send('chat', 'hello');
+
+      const history = await store.getSession('sess-fallback');
+      expect(history).toHaveLength(2);
+      expect(history[1]).toEqual({ role: 'assistant', content: 'plain response' });
+    });
+
     it('passes cached summaryCache from session metadata', async () => {
       let capturedMetadata: Record<string, unknown> | undefined;
       let capturedHistory: ChatMessage[] | undefined;

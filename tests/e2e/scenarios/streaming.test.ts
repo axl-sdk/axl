@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { agent, workflow } from '@axlsdk/axl';
+import { agent, tool, workflow } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
 import type { StreamEvent } from '@axlsdk/axl';
 import { createTestRuntime } from '../helpers/setup.js';
@@ -77,6 +77,95 @@ describe('Streaming E2E', () => {
       (e) => (e as { data: { type?: string } }).data?.type === 'agent_call',
     );
     expect(agentCallStep).toBeDefined();
+  });
+
+  it('streams tokens only from outer agent, not from sub-agent in tool handler', async () => {
+    const researcher = agent({
+      name: 'researcher',
+      model: 'mock:researcher',
+      system: 'You are a research assistant.',
+    });
+
+    const researchTool = tool({
+      name: 'research',
+      description: 'Research a topic using a sub-agent',
+      input: z.object({ query: z.string() }),
+      handler: async (input, ctx) => {
+        const result = await ctx.ask(researcher, input.query);
+        return result;
+      },
+    });
+
+    const coordinator = agent({
+      name: 'coordinator',
+      model: 'mock:coordinator',
+      system: 'You coordinate research tasks.',
+      tools: [researchTool],
+    });
+
+    const provider = MockProvider.sequence([
+      // First call (coordinator): return a tool_call for the research tool
+      {
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_research_1',
+            type: 'function' as const,
+            function: {
+              name: 'research',
+              arguments: JSON.stringify({ query: 'topic X' }),
+            },
+          },
+        ],
+      },
+      // Second call (researcher sub-agent): return research findings
+      { content: 'research findings about topic X' },
+      // Third call (coordinator): return final answer incorporating tool result
+      { content: 'Based on my research: final answer' },
+    ]);
+
+    const { runtime } = createTestRuntime(provider);
+
+    const wf = workflow({
+      name: 'nested-agent-stream-wf',
+      input: z.object({ message: z.string() }),
+      handler: async (ctx) => ctx.ask(coordinator, ctx.input.message),
+    });
+    runtime.register(wf);
+
+    const stream = runtime.stream('nested-agent-stream-wf', {
+      message: 'Research topic X',
+    });
+    const allEvents: StreamEvent[] = [];
+    for await (const event of stream) {
+      allEvents.push(event);
+      if (event.type === 'done') break;
+    }
+
+    // Token events should only contain text from the coordinator's final response
+    const tokenEvents = allEvents.filter((e) => e.type === 'token');
+    const streamedText = tokenEvents.map((e) => (e as { data: string }).data).join('');
+    expect(streamedText).toBe('Based on my research: final answer');
+    expect(streamedText).not.toContain('research findings about topic X');
+
+    // tool_call event should include the research tool call
+    const toolCallEvents = allEvents.filter((e) => e.type === 'tool_call');
+    expect(toolCallEvents.length).toBeGreaterThanOrEqual(1);
+    const researchCall = toolCallEvents.find((e) => (e as { name: string }).name === 'research');
+    expect(researchCall).toBeDefined();
+
+    // tool_result event should include the research result
+    const toolResultEvents = allEvents.filter((e) => e.type === 'tool_result');
+    expect(toolResultEvents.length).toBeGreaterThanOrEqual(1);
+    const researchResult = toolResultEvents.find(
+      (e) => (e as { name: string }).name === 'research',
+    );
+    expect(researchResult).toBeDefined();
+    expect((researchResult as { result: unknown }).result).toBe('research findings about topic X');
+
+    // Stream should complete with a done event
+    const doneEvents = allEvents.filter((e) => e.type === 'done');
+    expect(doneEvents.length).toBe(1);
   });
 
   it('stream rejects with error when workflow throws', async () => {

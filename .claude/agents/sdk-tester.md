@@ -46,3 +46,7 @@ npx vitest run         # Direct vitest
 - ESM imports with `.js` extensions
 - No `any` types in tests
 - TypeScript strict mode applies to test files too
+
+## Delivering results
+
+Your final response MUST summarize what you did — tests added/fixed, pass/fail counts, and anything the parent agent needs to know. Do not rely solely on SendMessage — the parent agent only sees your final output.

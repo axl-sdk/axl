@@ -94,12 +94,28 @@ export class MockProvider implements Provider {
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
     const response = await this.chat(messages, options);
-    yield { type: 'text_delta', content: response.content };
-    yield { type: 'done', usage: response.usage };
+    if (response.content) {
+      yield { type: 'text_delta', content: response.content };
+    }
+    if (response.tool_calls) {
+      for (const tc of response.tool_calls) {
+        yield {
+          type: 'tool_call_delta',
+          id: tc.id,
+          name: tc.function.name,
+          arguments: tc.function.arguments,
+        };
+      }
+    }
+    yield { type: 'done', usage: response.usage, providerMetadata: response.providerMetadata };
   }
 
   static sequence(
-    responses: Array<{ content: string; tool_calls?: ToolCallMessage[] }>,
+    responses: Array<{
+      content: string;
+      tool_calls?: ToolCallMessage[];
+      providerMetadata?: Record<string, unknown>;
+    }>,
   ): MockProvider {
     return new MockProvider((_messages, callIndex) => {
       if (callIndex >= responses.length) {
@@ -110,6 +126,7 @@ export class MockProvider implements Provider {
       return {
         content: responses[callIndex].content,
         tool_calls: responses[callIndex].tool_calls,
+        providerMetadata: responses[callIndex].providerMetadata,
         usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
         cost: 0,
       };
@@ -152,7 +169,11 @@ export class MockProvider implements Provider {
     handler: (
       messages: ChatMessage[],
       callIndex: number,
-    ) => { content: string; tool_calls?: ToolCallMessage[] },
+    ) => {
+      content: string;
+      tool_calls?: ToolCallMessage[];
+      providerMetadata?: Record<string, unknown>;
+    },
   ): MockProvider {
     return new MockProvider((messages, callIndex) => ({
       ...handler(messages, callIndex),

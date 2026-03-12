@@ -81,7 +81,7 @@ describe('tool()', () => {
     });
 
     const result = await t._execute({ x: 10 });
-    expect(handler).toHaveBeenCalledWith({ x: 10 });
+    expect(handler).toHaveBeenCalledWith({ x: 10 }, undefined);
     expect(result).toEqual({ data: 42 });
   });
 

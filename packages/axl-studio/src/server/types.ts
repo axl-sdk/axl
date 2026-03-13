@@ -49,13 +49,9 @@ export type AgentSummary = {
   maxTurns?: number;
   temperature?: number;
   maxTokens?: number;
-  thinking?:
-    | 'low'
-    | 'medium'
-    | 'high'
-    | 'max'
-    | { budgetTokens?: number; includeThoughts?: boolean };
-  reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  effort?: 'none' | 'low' | 'medium' | 'high' | 'max';
+  thinkingBudget?: number;
+  includeThoughts?: boolean;
   toolChoice?: 'auto' | 'none' | 'required' | { type: 'function'; function: { name: string } };
   stop?: string[];
 };

@@ -1,5 +1,5 @@
 import type { z } from 'zod';
-import type { Thinking, ReasoningEffort, ToolChoice } from './providers/types.js';
+import type { Effort, ToolChoice } from './providers/types.js';
 
 /** Result type for concurrent operations (spawn, map) */
 export type Result<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -74,14 +74,18 @@ export type AskOptions<T = unknown> = {
   temperature?: number;
   /** Override max tokens for this call (default: 4096). */
   maxTokens?: number;
-  /** Thinking level — portable across all providers. Prefer this over `reasoningEffort`. */
-  thinking?: Thinking;
-  /** OpenAI-specific reasoning effort (escape hatch). Overridden by `thinking` if both are set. */
-  reasoningEffort?: ReasoningEffort;
+  /** How hard should the model try? Primary param for cost/quality tradeoff. */
+  effort?: Effort;
+  /** Precise thinking token budget (advanced). Overrides effort-based thinking allocation. */
+  thinkingBudget?: number;
+  /** Show reasoning summaries in responses. */
+  includeThoughts?: boolean;
   /** Tool choice strategy for this call. */
   toolChoice?: ToolChoice;
   /** Stop sequences for this call. */
   stop?: string[];
+  /** Provider-specific options merged into API requests. Not portable across providers. */
+  providerOptions?: Record<string, unknown>;
 };
 
 /** Delegate options */
@@ -221,10 +225,13 @@ export type AgentCallInfo = {
   promptVersion?: string;
   temperature?: number;
   maxTokens?: number;
-  thinking?: Thinking;
-  reasoningEffort?: ReasoningEffort;
+  effort?: Effort;
+  thinkingBudget?: number;
+  includeThoughts?: boolean;
   toolChoice?: ToolChoice;
   stop?: string[];
+  /** Provider-specific options merged into API requests. Not portable across providers. */
+  providerOptions?: Record<string, unknown>;
 };
 
 /** Chat message types for provider communication */

@@ -75,10 +75,10 @@ export type {
   ProviderResponse,
   StreamChunk,
   ChatOptions,
-  Thinking,
-  ReasoningEffort,
+  Effort,
   ToolChoice,
 } from './providers/types.js';
+export { resolveThinkingOptions, type ResolvedThinkingOptions } from './providers/types.js';
 
 // MCP
 export { McpManager } from './mcp/manager.js';

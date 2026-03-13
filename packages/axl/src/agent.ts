@@ -1,6 +1,6 @@
 import type { Tool } from './tool.js';
 import type { AskOptions, GuardrailsConfig } from './types.js';
-import type { Thinking, ReasoningEffort, ToolChoice } from './providers/types.js';
+import type { Effort, ToolChoice } from './providers/types.js';
 import { ProviderRegistry } from './providers/registry.js';
 import { WorkflowContext } from './context.js';
 import { randomUUID } from 'node:crypto';
@@ -27,10 +27,13 @@ export type AgentConfig = {
   mcpTools?: string[];
   temperature?: number;
   maxTokens?: number;
-  thinking?: Thinking;
-  reasoningEffort?: ReasoningEffort;
+  effort?: Effort;
+  thinkingBudget?: number;
+  includeThoughts?: boolean;
   toolChoice?: ToolChoice;
   stop?: string[];
+  /** Provider-specific options merged into API requests. Not portable across providers. */
+  providerOptions?: Record<string, unknown>;
   maxTurns?: number;
   timeout?: string;
   maxContext?: number;

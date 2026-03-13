@@ -365,10 +365,12 @@ export class WorkflowContext<TInput = unknown> {
         promptVersion: agent._config.version,
         temperature: options?.temperature ?? agent._config.temperature,
         maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
-        thinking: options?.thinking ?? agent._config.thinking,
-        reasoningEffort: options?.reasoningEffort ?? agent._config.reasoningEffort,
+        effort: options?.effort ?? agent._config.effort,
+        thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
+        includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
         toolChoice: options?.toolChoice ?? agent._config.toolChoice,
         stop: options?.stop ?? agent._config.stop,
+        providerOptions: options?.providerOptions ?? agent._config.providerOptions,
       });
       return result;
     });
@@ -546,29 +548,17 @@ export class WorkflowContext<TInput = unknown> {
 
       turns++;
 
-      const thinking = options?.thinking ?? agent._config.thinking;
-
-      // Validate budget form
-      if (
-        thinking &&
-        typeof thinking === 'object' &&
-        thinking.budgetTokens !== undefined &&
-        thinking.budgetTokens <= 0
-      ) {
-        throw new Error(
-          `thinking.budgetTokens must be a positive number, got ${thinking.budgetTokens}`,
-        );
-      }
-
       const chatOptions: ChatOptions = {
         model,
         temperature: options?.temperature ?? agent._config.temperature,
         tools: toolDefs.length > 0 ? toolDefs : undefined,
         maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
-        thinking,
-        reasoningEffort: options?.reasoningEffort ?? agent._config.reasoningEffort,
+        effort: options?.effort ?? agent._config.effort,
+        thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
+        includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
         toolChoice: options?.toolChoice ?? agent._config.toolChoice,
         stop: options?.stop ?? agent._config.stop,
+        providerOptions: options?.providerOptions ?? agent._config.providerOptions,
         signal: this.currentSignal,
       };
 

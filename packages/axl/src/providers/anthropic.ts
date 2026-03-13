@@ -6,8 +6,8 @@ import type {
   StreamChunk,
   ToolDefinition,
   ToolCallMessage,
-  Thinking,
 } from './types.js';
+import { resolveThinkingOptions } from './types.js';
 import { fetchWithRetry } from './retry.js';
 
 const ANTHROPIC_API_VERSION = '2023-06-01';
@@ -19,9 +19,12 @@ const ANTHROPIC_API_VERSION = '2023-06-01';
 // ---------------------------------------------------------------------------
 
 const ANTHROPIC_PRICING: Record<string, [number, number]> = {
-  'claude-opus-4-6': [15e-6, 75e-6],
+  'claude-opus-4-6': [5e-6, 25e-6],
+  'claude-sonnet-4-6': [3e-6, 15e-6],
+  'claude-opus-4-5': [5e-6, 25e-6],
+  'claude-opus-4-1': [15e-6, 75e-6],
   'claude-sonnet-4-5': [3e-6, 15e-6],
-  'claude-haiku-4-5': [0.8e-6, 4e-6],
+  'claude-haiku-4-5': [1e-6, 5e-6],
   'claude-sonnet-4': [3e-6, 15e-6],
   'claude-opus-4': [15e-6, 75e-6],
   'claude-3-7-sonnet': [3e-6, 15e-6],
@@ -67,7 +70,7 @@ function estimateAnthropicCost(
   return inputCost + outputTokens * outputRate;
 }
 
-/** Default thinking budget tokens for each Thinking level (manual mode). */
+/** Default thinking budget tokens for each effort level (manual mode fallback). */
 const THINKING_BUDGETS: Record<string, number> = {
   low: 1024,
   medium: 5000,
@@ -76,12 +79,6 @@ const THINKING_BUDGETS: Record<string, number> = {
   // With auto-bump (+1024), max_tokens becomes 31024 which fits all models.
   max: 30000,
 };
-
-/** Map unified Thinking to Anthropic budget_tokens (manual mode). */
-function thinkingToBudgetTokens(thinking: Thinking): number {
-  if (typeof thinking === 'string') return THINKING_BUDGETS[thinking] ?? 5000;
-  return thinking.budgetTokens ?? 5000;
-}
 
 /**
  * Check if a model supports Anthropic's adaptive thinking mode.
@@ -98,6 +95,15 @@ function supportsAdaptiveThinking(model: string): boolean {
  */
 function supportsMaxEffort(model: string): boolean {
   return model.startsWith('claude-opus-4-6');
+}
+
+/** Models that support output_config.effort (Opus 4.6, Sonnet 4.6, Opus 4.5). */
+function supportsEffort(model: string): boolean {
+  return (
+    model.startsWith('claude-opus-4-6') ||
+    model.startsWith('claude-sonnet-4-6') ||
+    model.startsWith('claude-opus-4-5')
+  );
 }
 
 /**
@@ -228,12 +234,6 @@ export class AnthropicProvider implements Provider {
       body.system = systemText;
     }
 
-    // Anthropic rejects temperature when extended thinking is enabled.
-    // Strip it silently (same pattern as OpenAI stripping temperature for reasoning models).
-    if (options.temperature !== undefined && !options.thinking) {
-      body.temperature = options.temperature;
-    }
-
     if (options.stop) {
       body.stop_sequences = options.stop;
     }
@@ -246,37 +246,53 @@ export class AnthropicProvider implements Provider {
       body.tool_choice = this.mapToolChoice(options.toolChoice);
     }
 
-    // Map unified thinking to Anthropic's extended thinking.
-    // Claude 4.6 models (Opus 4.6, Sonnet 4.6) support adaptive thinking mode,
-    // which dynamically allocates thinking depth. For string levels, we use
-    // adaptive mode with effort. For explicit budgetTokens, we use manual mode
-    // with budget_tokens (still supported, user wants precise control).
-    // Older models always use manual mode with budget_tokens.
-    // includeThoughts is Gemini-only; skip thinking setup if that's the only field set
-    const hasThinkingLevel =
-      typeof options.thinking === 'string' ||
-      (typeof options.thinking === 'object' && options.thinking.budgetTokens !== undefined);
-    if (options.thinking && hasThinkingLevel) {
-      if (
-        typeof options.thinking === 'string' &&
-        supportsAdaptiveThinking(options.model) &&
-        // 'max' effort is only supported on Opus 4.6; Sonnet 4.6 falls back to manual mode
-        (options.thinking !== 'max' || supportsMaxEffort(options.model))
-      ) {
-        // Adaptive mode: let Claude decide thinking depth, guided by effort level
-        body.thinking = { type: 'adaptive' };
-        body.output_config = { effort: options.thinking };
-      } else {
-        // Manual mode: explicit budget_tokens
-        // Anthropic requires max_tokens >= budget_tokens (max_tokens includes both
-        // thinking and output tokens), so auto-bump if needed.
-        const budgetTokens = thinkingToBudgetTokens(options.thinking);
-        body.thinking = { type: 'enabled', budget_tokens: budgetTokens };
-        const currentMax = body.max_tokens as number;
-        if (currentMax < budgetTokens + 1024) {
-          body.max_tokens = budgetTokens + 1024;
-        }
+    // Build thinking/effort config
+    const { thinkingBudget, thinkingDisabled, activeEffort, hasBudgetOverride } =
+      resolveThinkingOptions(options);
+    let resolvedEffort = activeEffort;
+    if (resolvedEffort === 'max' && !supportsMaxEffort(options.model)) {
+      resolvedEffort = 'high';
+    }
+
+    if (hasBudgetOverride) {
+      // Explicit budget → manual mode (precise override), regardless of model
+      body.thinking = { type: 'enabled', budget_tokens: thinkingBudget! };
+      const currentMax = body.max_tokens as number;
+      if (currentMax < thinkingBudget! + 1024) {
+        body.max_tokens = thinkingBudget! + 1024;
       }
+      // If effort also set on a model that supports it, send output_config alongside
+      if (resolvedEffort && supportsEffort(options.model)) {
+        body.output_config = { effort: resolvedEffort };
+      }
+    } else if (thinkingDisabled) {
+      // effort: 'none' or thinkingBudget: 0 → no thinking block
+      // thinkingBudget: 0 + effort → standalone effort (Anthropic optimization)
+      if (resolvedEffort && supportsEffort(options.model)) {
+        body.output_config = { effort: resolvedEffort };
+      }
+    } else if (resolvedEffort && supportsAdaptiveThinking(options.model)) {
+      // 4.6 models (default): adaptive thinking + effort (recommended combo)
+      body.thinking = { type: 'adaptive' };
+      body.output_config = { effort: resolvedEffort };
+    } else if (resolvedEffort && supportsEffort(options.model)) {
+      // Opus 4.5: supports effort but not adaptive thinking → effort only
+      body.output_config = { effort: resolvedEffort };
+    } else if (resolvedEffort) {
+      // Older models: no effort support → map effort to thinking budget as fallback
+      const budget = THINKING_BUDGETS[resolvedEffort] ?? 5000;
+      body.thinking = { type: 'enabled', budget_tokens: budget };
+      const currentMax = body.max_tokens as number;
+      if (currentMax < budget + 1024) {
+        body.max_tokens = budget + 1024;
+      }
+    }
+    // No effort, no budget → no thinking, no effort sent
+
+    // Anthropic rejects temperature when thinking is enabled.
+    // Strip when any thinking block is present in the built body.
+    if (options.temperature !== undefined && !body.thinking) {
+      body.temperature = options.temperature;
     }
 
     // Anthropic doesn't have a native JSON mode like OpenAI's json_object.
@@ -285,6 +301,10 @@ export class AnthropicProvider implements Provider {
       const jsonInstruction =
         'You must respond with valid JSON only. No markdown fences, no extra text.';
       body.system = body.system ? `${body.system}\n\n${jsonInstruction}` : jsonInstruction;
+    }
+
+    if (options.providerOptions) {
+      Object.assign(body, options.providerOptions);
     }
 
     return body;
@@ -423,10 +443,13 @@ export class AnthropicProvider implements Provider {
 
   private parseResponse(json: AnthropicMessageResponse): ProviderResponse {
     let content = '';
+    let thinkingContent = '';
     const toolCalls: ToolCallMessage[] = [];
 
     for (const block of json.content) {
-      if (block.type === 'text') {
+      if (block.type === 'thinking') {
+        thinkingContent += block.thinking;
+      } else if (block.type === 'text') {
         content += block.text;
       } else if (block.type === 'tool_use') {
         toolCalls.push({
@@ -466,6 +489,7 @@ export class AnthropicProvider implements Provider {
 
     return {
       content,
+      thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       usage,
       cost,
@@ -481,7 +505,7 @@ export class AnthropicProvider implements Provider {
     const decoder = new TextDecoder();
     let buffer = '';
 
-    // Track current tool_use block being streamed
+    // Track current content block type being streamed
     let currentToolId = '';
     let currentToolName = '';
     let usage:
@@ -535,7 +559,9 @@ export class AnthropicProvider implements Provider {
 
             case 'content_block_delta': {
               const delta = event.delta;
-              if (delta?.type === 'text_delta' && delta.text) {
+              if (delta?.type === 'thinking_delta' && delta.thinking) {
+                yield { type: 'thinking_delta', content: delta.thinking };
+              } else if (delta?.type === 'text_delta' && delta.text) {
                 yield { type: 'text_delta', content: delta.text };
               } else if (delta?.type === 'input_json_delta' && delta.partial_json) {
                 yield {
@@ -548,7 +574,7 @@ export class AnthropicProvider implements Provider {
             }
 
             case 'content_block_stop': {
-              // Reset tool tracking
+              // Reset block tracking
               currentToolId = '';
               currentToolName = '';
               break;
@@ -634,7 +660,9 @@ type AnthropicMessageResponse = {
   type: 'message';
   role: 'assistant';
   content: Array<
-    { type: 'text'; text: string } | { type: 'tool_use'; id: string; name: string; input: unknown }
+    | { type: 'thinking'; thinking: string }
+    | { type: 'text'; text: string }
+    | { type: 'tool_use'; id: string; name: string; input: unknown }
   >;
   stop_reason: string | null;
   usage: {
@@ -663,14 +691,15 @@ type AnthropicStreamEvent = {
     };
   };
   content_block?: {
-    type?: 'text' | 'tool_use';
+    type?: 'text' | 'thinking' | 'tool_use';
     id?: string;
     name?: string;
     text?: string;
   };
   delta?: {
-    type?: 'text_delta' | 'input_json_delta';
+    type?: 'text_delta' | 'thinking_delta' | 'input_json_delta';
     text?: string;
+    thinking?: string;
     partial_json?: string;
   };
   usage?: {

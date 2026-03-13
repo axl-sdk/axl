@@ -6,8 +6,8 @@ import type {
   StreamChunk,
   ToolDefinition,
   ToolCallMessage,
-  Thinking,
 } from './types.js';
+import { resolveThinkingOptions } from './types.js';
 import { fetchWithRetry } from './retry.js';
 
 // ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ function estimateGeminiCost(
   return inputCost + outputTokens * outputRate;
 }
 
-/** Default thinking budget tokens for each Thinking level (Gemini 2.x). */
+/** Default thinking budget tokens for each effort level (Gemini 2.x). */
 const THINKING_BUDGETS: Record<string, number> = {
   low: 1024,
   medium: 5000,
@@ -65,7 +65,7 @@ const THINKING_BUDGETS: Record<string, number> = {
   max: 24576,
 };
 
-/** Gemini 3.x thinkingLevel values mapped from unified Thinking levels. */
+/** Gemini 3.x thinkingLevel values mapped from unified effort levels. */
 const THINKING_LEVELS: Record<string, string> = {
   low: 'low',
   medium: 'medium',
@@ -79,7 +79,7 @@ function isGemini3x(model: string): boolean {
 }
 
 /**
- * Map unified Thinking to Gemini thinkingConfig.
+ * Map thinkingBudget to Gemini thinkingLevel.
  *
  * Gemini 3.x uses `thinkingLevel` (string enum: 'low' | 'medium' | 'high').
  * Gemini 2.x uses `thinkingBudget` (integer token count).
@@ -92,36 +92,22 @@ function budgetToThinkingLevel(budgetTokens: number): string {
   return 'high';
 }
 
-function buildThinkingConfig(thinking: Thinking, model: string): Record<string, unknown> {
-  // Object form: may have budgetTokens, includeThoughts, or both
-  if (typeof thinking !== 'string') {
-    const config: Record<string, unknown> = {};
+/** Get the minimum supported thinkingLevel for a 3.x model. */
+function minThinkingLevel(model: string): string {
+  // 3.1 Pro doesn't support 'minimal' — 'low' is the floor
+  if (model.startsWith('gemini-3.1-pro')) return 'low';
+  return 'minimal';
+}
 
-    if (thinking.budgetTokens !== undefined) {
-      if (isGemini3x(model)) {
-        config.thinkingLevel = budgetToThinkingLevel(thinking.budgetTokens);
-      } else {
-        config.thinkingBudget = thinking.budgetTokens;
-      }
-    }
-
-    if (thinking.includeThoughts) {
-      config.includeThoughts = true;
-    }
-
-    return config;
-  }
-
-  // String levels: branch by generation
-  if (isGemini3x(model)) {
-    return { thinkingLevel: THINKING_LEVELS[thinking] ?? 'medium' };
-  }
-
-  // 2.5 Pro supports a higher max budget (32768) than other 2.5 models (24576)
-  if (thinking === 'max' && model.startsWith('gemini-2.5-pro')) {
-    return { thinkingBudget: 32768 };
-  }
-  return { thinkingBudget: THINKING_BUDGETS[thinking] ?? 5000 };
+/** Warn once per model that effort: 'none' cannot fully disable thinking on Gemini 3.x. */
+const _warned3xEffortNone = new Set<string>();
+function warnGemini3xEffortNone(model: string): void {
+  if (_warned3xEffortNone.has(model)) return;
+  _warned3xEffortNone.add(model);
+  console.warn(
+    `[axl] effort: 'none' on Gemini 3.x (${model}) maps to the model's minimum thinking level ` +
+      `('${minThinkingLevel(model)}'), not fully disabled. Gemini 3.x models cannot disable thinking entirely.`,
+  );
 }
 
 /**
@@ -283,24 +269,66 @@ export class GeminiProvider implements Provider {
       body.generationConfig = generationConfig;
     }
 
-    // Map unified thinking to Gemini's thinkingConfig (generation-aware)
-    // Skip empty object {} which produces an empty thinkingConfig
-    if (
-      options.thinking &&
-      (typeof options.thinking === 'string' ||
-        options.thinking.budgetTokens !== undefined ||
-        options.thinking.includeThoughts)
-    ) {
-      generationConfig.thinkingConfig = buildThinkingConfig(options.thinking, options.model);
-      // Ensure generationConfig is included even if nothing else was set
-      if (!body.generationConfig) {
-        body.generationConfig = generationConfig;
+    // Map effort/thinkingBudget/includeThoughts to Gemini's thinkingConfig
+    const {
+      effort,
+      thinkingBudget,
+      includeThoughts,
+      thinkingDisabled,
+      activeEffort,
+      hasBudgetOverride,
+    } = resolveThinkingOptions(options);
+
+    if (thinkingDisabled) {
+      // effort: 'none' or thinkingBudget: 0 → minimize thinking
+      if (isGemini3x(options.model)) {
+        if (effort === 'none') {
+          warnGemini3xEffortNone(options.model);
+        }
+        generationConfig.thinkingConfig = { thinkingLevel: minThinkingLevel(options.model) };
+      } else {
+        generationConfig.thinkingConfig = { thinkingBudget: 0 };
       }
+      if (!body.generationConfig) body.generationConfig = generationConfig;
+    } else if (hasBudgetOverride) {
+      // Explicit budget takes precedence over effort
+      const config: Record<string, unknown> = {};
+      if (isGemini3x(options.model)) {
+        config.thinkingLevel = budgetToThinkingLevel(thinkingBudget!);
+      } else {
+        config.thinkingBudget = thinkingBudget!;
+      }
+      if (includeThoughts) config.includeThoughts = true;
+      generationConfig.thinkingConfig = config;
+      if (!body.generationConfig) body.generationConfig = generationConfig;
+    } else if (activeEffort) {
+      const config: Record<string, unknown> = {};
+      if (isGemini3x(options.model)) {
+        config.thinkingLevel = THINKING_LEVELS[activeEffort] ?? 'medium';
+      } else {
+        // 2.5 Pro supports a higher max budget (32768) than other 2.5 models (24576)
+        if (activeEffort === 'max' && options.model.startsWith('gemini-2.5-pro')) {
+          config.thinkingBudget = 32768;
+        } else {
+          config.thinkingBudget = THINKING_BUDGETS[activeEffort] ?? 5000;
+        }
+      }
+      if (includeThoughts) config.includeThoughts = true;
+      generationConfig.thinkingConfig = config;
+      if (!body.generationConfig) body.generationConfig = generationConfig;
+    } else if (includeThoughts) {
+      generationConfig.thinkingConfig = { includeThoughts: true };
+      if (!body.generationConfig) body.generationConfig = generationConfig;
     }
+    // No effort, no budget, no includeThoughts → no thinkingConfig (provider defaults)
 
     // Map toolChoice to Gemini's toolConfig.functionCallingConfig
     if (options.toolChoice !== undefined) {
       body.toolConfig = { functionCallingConfig: this.mapToolChoice(options.toolChoice) };
+    }
+
+    if (options.providerOptions) {
+      Object.assign(body, options.providerOptions);
     }
 
     return body;

@@ -1,5 +1,14 @@
 import type { Provider, ChatOptions, ChatMessage, ProviderResponse, StreamChunk } from './types.js';
-import { estimateOpenAICost, isReasoningModel, thinkingToReasoningEffort } from './openai.js';
+import {
+  estimateOpenAICost,
+  isOSeriesModel,
+  supportsReasoningEffort,
+  effortToReasoningEffort,
+  budgetToReasoningEffort,
+  clampReasoningEffort,
+} from './openai.js';
+import type { ReasoningEffort } from './openai.js';
+import { resolveThinkingOptions } from './types.js';
 import { fetchWithRetry } from './retry.js';
 
 /**
@@ -93,7 +102,27 @@ export class OpenAIResponsesProvider implements Provider {
     options: ChatOptions,
     stream: boolean,
   ): Record<string, unknown> {
-    const reasoning = isReasoningModel(options.model);
+    const oSeries = isOSeriesModel(options.model);
+    const reasoningCapable = supportsReasoningEffort(options.model);
+    const { thinkingBudget, includeThoughts, thinkingDisabled, activeEffort, hasBudgetOverride } =
+      resolveThinkingOptions(options);
+
+    // Compute effective reasoning effort for wire format
+    let wireEffort: ReasoningEffort | undefined;
+    if (reasoningCapable) {
+      if (hasBudgetOverride) {
+        // Explicit budget always takes precedence (consistent with Anthropic/Gemini)
+        wireEffort = clampReasoningEffort(options.model, budgetToReasoningEffort(thinkingBudget!));
+      } else if (!thinkingDisabled && activeEffort) {
+        wireEffort = clampReasoningEffort(options.model, effortToReasoningEffort(activeEffort));
+      } else if (thinkingDisabled) {
+        // Disable reasoning: covers both effort='none' and thinkingBudget=0
+        wireEffort = clampReasoningEffort(options.model, 'none');
+      }
+    }
+
+    // Temperature: always strip for o-series; for GPT-5.x, strip only when reasoning active
+    const stripTemp = oSeries || (reasoningCapable && wireEffort !== undefined);
 
     // Extract system messages → instructions
     const systemMessages = messages.filter((m) => m.role === 'system');
@@ -114,8 +143,7 @@ export class OpenAIResponsesProvider implements Provider {
       body.max_output_tokens = options.maxTokens;
     }
 
-    // Reasoning models reject temperature
-    if (options.temperature !== undefined && !reasoning) {
+    if (options.temperature !== undefined && !stripTemp) {
       body.temperature = options.temperature;
     }
 
@@ -130,8 +158,6 @@ export class OpenAIResponsesProvider implements Provider {
     }
 
     if (options.toolChoice !== undefined) {
-      // Responses API uses flat {type:'function', name} instead of Chat Completions'
-      // nested {type:'function', function:{name}} format
       if (typeof options.toolChoice === 'object' && 'function' in options.toolChoice) {
         body.tool_choice = { type: 'function', name: options.toolChoice.function.name };
       } else {
@@ -139,28 +165,26 @@ export class OpenAIResponsesProvider implements Provider {
       }
     }
 
-    // thinking/reasoningEffort only apply to reasoning models (o1/o3/o4-mini).
-    // Non-reasoning models (gpt-4o, gpt-4.1, etc.) reject reasoning params.
-    // thinking takes precedence over reasoningEffort when both are set.
-    if (reasoning) {
-      // includeThoughts is Gemini-only; skip if that's the only field set
-      const hasThinkingLevel =
-        typeof options.thinking === 'string' ||
-        (typeof options.thinking === 'object' && options.thinking?.budgetTokens !== undefined);
-      const effort =
-        options.thinking && hasThinkingLevel
-          ? thinkingToReasoningEffort(options.thinking)
-          : options.reasoningEffort;
-      if (effort) {
-        body.reasoning = { effort };
-      }
+    // Build reasoning config for models that support it
+    if (reasoningCapable && (wireEffort !== undefined || includeThoughts)) {
+      const reasoning: Record<string, unknown> = {};
+      if (wireEffort !== undefined) reasoning.effort = wireEffort;
+      if (includeThoughts) reasoning.summary = 'detailed';
+      if (Object.keys(reasoning).length > 0) body.reasoning = reasoning;
+    }
+
+    // Request encrypted reasoning content for round-tripping
+    if (reasoningCapable) {
+      body.include = ['reasoning.encrypted_content'];
     }
 
     if (options.responseFormat) {
       body.text = { format: this.mapResponseFormat(options.responseFormat) };
     }
 
-    // options.stop is not supported in the Responses API — omit silently
+    if (options.providerOptions) {
+      Object.assign(body, options.providerOptions);
+    }
 
     return body;
   }
@@ -174,14 +198,22 @@ export class OpenAIResponsesProvider implements Provider {
 
     for (const msg of messages) {
       if (msg.role === 'tool') {
-        // Tool result → function_call_output
         input.push({
           type: 'function_call_output',
           call_id: msg.tool_call_id ?? '',
           output: msg.content,
         });
       } else if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
-        // Assistant with tool calls → message + function_call items
+        // Inject reasoning items from providerMetadata if present (round-trip)
+        const reasoningItems = msg.providerMetadata?.openaiReasoningItems as
+          | ResponsesInputItem[]
+          | undefined;
+        if (reasoningItems) {
+          for (const item of reasoningItems) {
+            input.push(item);
+          }
+        }
+
         if (msg.content) {
           input.push({ type: 'message', role: 'assistant', content: msg.content });
         }
@@ -194,6 +226,14 @@ export class OpenAIResponsesProvider implements Provider {
           });
         }
       } else if (msg.role === 'user' || msg.role === 'assistant') {
+        // Inject reasoning items for assistant messages without tool calls too
+        if (msg.role === 'assistant' && msg.providerMetadata?.openaiReasoningItems) {
+          const reasoningItems = msg.providerMetadata.openaiReasoningItems as ResponsesInputItem[];
+          for (const item of reasoningItems) {
+            input.push(item);
+          }
+        }
+
         input.push({
           type: 'message',
           role: msg.role,
@@ -233,7 +273,9 @@ export class OpenAIResponsesProvider implements Provider {
 
   private parseResponse(json: ResponsesAPIResponse, model: string): ProviderResponse {
     let content = '';
+    let thinkingContent = '';
     const toolCalls: ProviderResponse['tool_calls'] = [];
+    const reasoningItems: unknown[] = [];
 
     for (const item of json.output) {
       if (item.type === 'message') {
@@ -251,6 +293,17 @@ export class OpenAIResponsesProvider implements Provider {
             arguments: item.arguments,
           },
         });
+      } else if (item.type === 'reasoning') {
+        // Capture reasoning items for round-tripping via providerMetadata
+        reasoningItems.push(item);
+        // Extract summary text if present
+        if (item.summary) {
+          for (const s of item.summary) {
+            if (s.type === 'summary_text' && s.text) {
+              thinkingContent += s.text;
+            }
+          }
+        }
       }
     }
 
@@ -268,11 +321,16 @@ export class OpenAIResponsesProvider implements Provider {
       ? estimateOpenAICost(model, usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens)
       : undefined;
 
+    const providerMetadata =
+      reasoningItems.length > 0 ? { openaiReasoningItems: reasoningItems } : undefined;
+
     return {
       content,
+      thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       usage,
       cost,
+      providerMetadata,
     };
   }
 
@@ -349,6 +407,9 @@ export class OpenAIResponsesProvider implements Provider {
       case 'response.output_text.delta':
         return { type: 'text_delta', content: data.delta ?? '' };
 
+      case 'response.reasoning_summary_text.delta':
+        return { type: 'thinking_delta', content: data.delta ?? '' };
+
       case 'response.output_item.added':
         if (data.item?.type === 'function_call') {
           const callId = data.item.call_id ?? data.item.id ?? '';
@@ -383,7 +444,13 @@ export class OpenAIResponsesProvider implements Provider {
               cached_tokens: response.usage.input_tokens_details?.cached_tokens,
             }
           : undefined;
-        return { type: 'done', usage };
+
+        // Capture reasoning items from completed response for providerMetadata
+        const reasoningItems = response?.output?.filter((item) => item.type === 'reasoning') ?? [];
+        const providerMetadata =
+          reasoningItems.length > 0 ? { openaiReasoningItems: reasoningItems } : undefined;
+
+        return { type: 'done', usage, providerMetadata };
       }
 
       case 'response.failed': {
@@ -434,7 +501,8 @@ type ResponsesStreamEventData = {
 type ResponsesInputItem =
   | { type: 'message'; role: 'user' | 'assistant'; content: string }
   | { type: 'function_call'; call_id: string; name: string; arguments: string }
-  | { type: 'function_call_output'; call_id: string; output: string };
+  | { type: 'function_call_output'; call_id: string; output: string }
+  | { type: 'reasoning'; id: string; encrypted_content: string; [key: string]: unknown };
 
 type ResponsesAPIResponse = {
   id: string;
@@ -450,6 +518,13 @@ type ResponsesAPIResponse = {
         call_id: string;
         name: string;
         arguments: string;
+      }
+    | {
+        type: 'reasoning';
+        id: string;
+        summary?: Array<{ type: 'summary_text'; text: string }>;
+        encrypted_content?: string;
+        [key: string]: unknown;
       }
   >;
   usage?: {

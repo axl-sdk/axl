@@ -4,9 +4,9 @@ import type {
   ChatMessage,
   ProviderResponse,
   StreamChunk,
-  Thinking,
-  ReasoningEffort,
+  Effort,
 } from './types.js';
+import { resolveThinkingOptions } from './types.js';
 import { fetchWithRetry } from './retry.js';
 
 // ---------------------------------------------------------------------------
@@ -27,6 +27,9 @@ export const OPENAI_PRICING: Record<string, [number, number]> = {
   'gpt-5-nano': [0.05e-6, 0.4e-6],
   'gpt-5.1': [1.25e-6, 10e-6],
   'gpt-5.2': [1.75e-6, 14e-6],
+  'gpt-5.3': [1.75e-6, 14e-6],
+  'gpt-5.4': [2.5e-6, 15e-6],
+  'gpt-5.4-pro': [30e-6, 180e-6],
   o1: [15e-6, 60e-6],
   'o1-mini': [3e-6, 12e-6],
   'o1-pro': [150e-6, 600e-6],
@@ -67,32 +70,65 @@ export function estimateOpenAICost(
   return inputCost + completionTokens * outputRate;
 }
 
-/** Returns true for reasoning models (o1, o3, o4-mini) that require special handling. */
-export function isReasoningModel(model: string): boolean {
+/** Returns true for o-series models (o1, o3, o4-mini) that always reason. */
+export function isOSeriesModel(model: string): boolean {
   return /^(o1|o3|o4-mini)/.test(model);
 }
 
-/** Map unified Thinking to OpenAI reasoning_effort. */
-export function thinkingToReasoningEffort(thinking: Thinking): ReasoningEffort {
-  if (typeof thinking === 'object') {
-    // Map budget to nearest effort level (default to 'medium' when only includeThoughts is set)
-    const budget = thinking.budgetTokens;
-    if (budget === undefined) return 'medium';
-    if (budget <= 1024) return 'low';
-    if (budget <= 8192) return 'medium';
-    return 'high';
-  }
-  // Exhaustive string mapping — compiler error if Thinking gains a new level
-  switch (thinking) {
-    case 'low':
-      return 'low';
-    case 'medium':
-      return 'medium';
-    case 'high':
-      return 'high';
-    case 'max':
-      return 'xhigh';
-  }
+/** Returns true for models that accept reasoning_effort. */
+export function supportsReasoningEffort(model: string): boolean {
+  return isOSeriesModel(model) || /^gpt-5/.test(model);
+}
+
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+
+/** Returns true for models that support reasoning_effort: 'none' (gpt-5.1+). */
+export function supportsReasoningNone(model: string): boolean {
+  return /^gpt-5\.[1-9]/.test(model);
+}
+
+/**
+ * Returns true for models that support reasoning_effort: 'xhigh'.
+ * Per OpenAI docs: "xhigh is supported for all models after gpt-5.1-codex-max."
+ * This means gpt-5.2+ (gpt-5.1 itself does NOT support xhigh).
+ */
+export function supportsXhigh(model: string): boolean {
+  // gpt-5.2+ — models after gpt-5.1-codex-max
+  return /^gpt-5\.([2-9]|\d{2,})/.test(model);
+}
+
+/**
+ * Clamp reasoning_effort to model-supported range.
+ *
+ * Model constraints (from OpenAI API reference):
+ * - gpt-5-pro: only supports 'high'
+ * - gpt-5.1+: supports 'none', 'low', 'medium', 'high'
+ * - Pre-gpt-5.1 (o-series, gpt-5, gpt-5-mini, gpt-5-nano): no 'none', default 'medium'
+ * - xhigh: only models after gpt-5.1-codex-max (gpt-5.2+)
+ */
+export function clampReasoningEffort(model: string, effort: ReasoningEffort): ReasoningEffort {
+  // gpt-5-pro only supports 'high'
+  if (model.startsWith('gpt-5-pro')) return 'high';
+
+  // 'none' only supported on gpt-5.1+; clamp to 'minimal' (closest to 'none')
+  if (effort === 'none' && !supportsReasoningNone(model)) return 'minimal';
+
+  // 'xhigh' only supported on gpt-5.2+
+  if (effort === 'xhigh' && !supportsXhigh(model)) return 'high';
+
+  return effort;
+}
+
+/** Map Effort to OpenAI reasoning_effort wire value. */
+export function effortToReasoningEffort(effort: Exclude<Effort, 'none'>): ReasoningEffort {
+  return effort === 'max' ? 'xhigh' : effort;
+}
+
+/** Map budgetTokens to nearest OpenAI reasoning_effort. */
+export function budgetToReasoningEffort(budget: number): ReasoningEffort {
+  if (budget <= 1024) return 'low';
+  if (budget <= 8192) return 'medium';
+  return 'high';
 }
 
 /**
@@ -222,16 +258,35 @@ export class OpenAIProvider implements Provider {
     options: ChatOptions,
     stream: boolean,
   ): Record<string, unknown> {
-    const reasoning = isReasoningModel(options.model);
+    const oSeries = isOSeriesModel(options.model);
+    const reasoningCapable = supportsReasoningEffort(options.model);
+    const { thinkingBudget, thinkingDisabled, activeEffort, hasBudgetOverride } =
+      resolveThinkingOptions(options);
+
+    // Compute effective reasoning effort for OpenAI wire format
+    let wireEffort: ReasoningEffort | undefined;
+    if (reasoningCapable) {
+      if (hasBudgetOverride) {
+        // Explicit budget always takes precedence (consistent with Anthropic/Gemini)
+        wireEffort = clampReasoningEffort(options.model, budgetToReasoningEffort(thinkingBudget!));
+      } else if (!thinkingDisabled && activeEffort) {
+        wireEffort = clampReasoningEffort(options.model, effortToReasoningEffort(activeEffort));
+      } else if (thinkingDisabled) {
+        // Disable reasoning: covers both effort='none' and thinkingBudget=0
+        wireEffort = clampReasoningEffort(options.model, 'none');
+      }
+    }
+
+    // Temperature: always strip for o-series; for GPT-5.x, strip only when reasoning active
+    const stripTemp = oSeries || (reasoningCapable && wireEffort !== undefined);
 
     const body: Record<string, unknown> = {
       model: options.model,
-      messages: messages.map((m) => this.formatMessage(m, reasoning)),
+      messages: messages.map((m) => this.formatMessage(m, oSeries)),
       stream,
     };
 
-    // Reasoning models reject temperature; only pass for non-reasoning models
-    if (options.temperature !== undefined && !reasoning) {
+    if (options.temperature !== undefined && !stripTemp) {
       body.temperature = options.temperature;
     }
 
@@ -244,8 +299,8 @@ export class OpenAIProvider implements Provider {
 
     if (options.tools && options.tools.length > 0) {
       body.tools = options.tools;
-      // Reasoning models (o1/o3/o4-mini) don't support parallel_tool_calls
-      if (!reasoning) {
+      // o-series models don't support parallel_tool_calls; GPT-5.x and others do
+      if (!oSeries) {
         body.parallel_tool_calls = true;
       }
     }
@@ -258,25 +313,14 @@ export class OpenAIProvider implements Provider {
       body.response_format = options.responseFormat;
     }
 
-    // thinking/reasoningEffort only apply to reasoning models (o1/o3/o4-mini).
-    // Non-reasoning models (gpt-4o, gpt-4.1, etc.) reject reasoning_effort.
-    // thinking takes precedence over reasoningEffort when both are set.
-    if (reasoning) {
-      // includeThoughts is Gemini-only; skip if that's the only field set
-      const hasThinkingLevel =
-        typeof options.thinking === 'string' ||
-        (typeof options.thinking === 'object' && options.thinking?.budgetTokens !== undefined);
-      const effort =
-        options.thinking && hasThinkingLevel
-          ? thinkingToReasoningEffort(options.thinking)
-          : options.reasoningEffort;
-      if (effort) {
-        body.reasoning_effort = effort;
-      }
-    }
+    if (wireEffort) body.reasoning_effort = wireEffort;
 
     if (stream) {
       body.stream_options = { include_usage: true };
+    }
+
+    if (options.providerOptions) {
+      Object.assign(body, options.providerOptions);
     }
 
     return body;
@@ -295,9 +339,9 @@ export class OpenAIProvider implements Provider {
     return `OpenAI API error (${status}): ${body}`;
   }
 
-  private formatMessage(msg: ChatMessage, reasoning: boolean): Record<string, unknown> {
+  private formatMessage(msg: ChatMessage, oSeries: boolean): Record<string, unknown> {
     const out: Record<string, unknown> = {
-      role: msg.role === 'system' && reasoning ? 'developer' : msg.role,
+      role: msg.role === 'system' && oSeries ? 'developer' : msg.role,
       content: msg.content,
     };
     if (msg.name) out.name = msg.name;

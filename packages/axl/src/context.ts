@@ -420,10 +420,22 @@ export class WorkflowContext<TInput = unknown> {
 
     // Resolve dynamic handoffs once per call to ensure consistency
     // between tool definitions and handoff lookup within the same turn.
-    const resolvedHandoffs =
-      typeof agent._config.handoffs === 'function'
-        ? agent._config.handoffs({ metadata: this.metadata })
-        : agent._config.handoffs;
+    let resolvedHandoffs:
+      | Array<{ agent: Agent; description?: string; mode?: 'oneway' | 'roundtrip' }>
+      | undefined;
+    if (typeof agent._config.handoffs === 'function') {
+      try {
+        resolvedHandoffs = agent._config.handoffs(resolveCtx);
+      } catch (err) {
+        this.log('handoff_resolve_error', {
+          agent: agent._name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        resolvedHandoffs = undefined;
+      }
+    } else {
+      resolvedHandoffs = agent._config.handoffs;
+    }
 
     // Build tool definitions
     const toolDefs = this.buildToolDefs(agent, resolvedHandoffs);
@@ -2094,6 +2106,18 @@ export class WorkflowContext<TInput = unknown> {
   ): Promise<T> {
     if (agents.length === 0) {
       throw new Error('ctx.delegate() requires at least one candidate agent');
+    }
+
+    // Validate no duplicate agent names — duplicates produce duplicate tool names
+    // which violates LLM API contracts and makes the second agent unreachable.
+    const names = new Set<string>();
+    for (const a of agents) {
+      if (names.has(a._name)) {
+        throw new Error(
+          `ctx.delegate() received duplicate agent name '${a._name}'. All candidate agents must have unique names.`,
+        );
+      }
+      names.add(a._name);
     }
 
     if (agents.length === 1) {

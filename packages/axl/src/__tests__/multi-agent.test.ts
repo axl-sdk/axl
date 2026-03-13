@@ -3,6 +3,7 @@ import { agent } from '../agent.js';
 import { tool } from '../tool.js';
 import { z } from 'zod';
 import { createSequenceProvider, createTestCtx } from './helpers.js';
+import type { Provider } from '../providers/types.js';
 
 describe('child context', () => {
   it('createChildContext() isolates session history', async () => {
@@ -714,6 +715,54 @@ describe('edge cases', () => {
     const innerToolTraces = traces.filter((t) => t.type === 'tool_call' && t.tool === 'inner_tool');
     expect(innerToolTraces).toHaveLength(1);
     expect((innerToolTraces[0].data as Record<string, unknown>).result).toBe('MOCKED');
+  });
+
+  it('dynamic handoff function that throws is handled gracefully', async () => {
+    const sourceAgent = agent({
+      name: 'error_handoff_source',
+      model: 'mock:test',
+      system: 'You route.',
+      handoffs: () => {
+        throw new Error('handoff resolver exploded');
+      },
+    });
+
+    // Agent should still work — just without handoff tools
+    let capturedTools: Array<{ function: { name: string } }> = [];
+    const captureProvider: Provider = {
+      name: 'mock',
+      chat: async (_messages, options) => {
+        capturedTools = (options?.tools ?? []) as typeof capturedTools;
+        return {
+          content: 'worked without handoffs',
+          usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+          cost: 0.001,
+        };
+      },
+      stream: async function* () {
+        yield {
+          type: 'done' as const,
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+      },
+    };
+
+    const { ctx, traces } = createTestCtx({ provider: captureProvider });
+    const result = await ctx.ask(sourceAgent, 'Try to route');
+
+    expect(result).toBe('worked without handoffs');
+
+    // No handoff tools should be present
+    const handoffTools = capturedTools.filter((t) => t.function.name.startsWith('handoff_to_'));
+    expect(handoffTools).toHaveLength(0);
+
+    // A log trace about the error should have been emitted
+    const errorLogs = traces.filter(
+      (t) =>
+        t.type === 'log' &&
+        (t.data as Record<string, unknown>)?.error === 'handoff resolver exploded',
+    );
+    expect(errorLogs).toHaveLength(1);
   });
 
   it('dynamic handoff function that returns empty array prevents handoffs', async () => {

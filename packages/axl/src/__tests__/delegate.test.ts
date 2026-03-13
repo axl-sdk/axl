@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { agent } from '../agent.js';
+import { tool } from '../tool.js';
 import { z } from 'zod';
 import { ProviderRegistry } from '../providers/registry.js';
 import { createSequenceProvider, createTestCtx, type SequenceProvider } from './helpers.js';
@@ -9,6 +10,15 @@ describe('ctx.delegate()', () => {
     const { ctx } = createTestCtx();
     await expect(ctx.delegate([], 'hello')).rejects.toThrow(
       'ctx.delegate() requires at least one candidate agent',
+    );
+  });
+
+  it('throws on duplicate agent names', async () => {
+    const agentA = agent({ name: 'specialist', model: 'mock:test', system: 'A.' });
+    const agentB = agent({ name: 'specialist', model: 'mock:test', system: 'B.' });
+    const { ctx } = createTestCtx();
+    await expect(ctx.delegate([agentA, agentB], 'hello')).rejects.toThrow(
+      "duplicate agent name 'specialist'",
     );
   });
 
@@ -379,6 +389,67 @@ describe('ctx.delegate()', () => {
     expect(result).toBe('I can help you directly without routing.');
     // Only 1 call made — the router responded with text so the loop exits
     expect(provider.calls).toHaveLength(1);
+  });
+
+  it('nested delegate within tool handler works via child context', async () => {
+    const expertA = agent({ name: 'expert_a', model: 'mock:test', system: 'Expert A.' });
+    const expertB = agent({ name: 'expert_b', model: 'mock:test', system: 'Expert B.' });
+
+    const delegateTool = tool({
+      name: 'route_to_expert',
+      description: 'Route to the best expert',
+      input: z.object({ task: z.string() }),
+      handler: async (input, ctx) => {
+        return ctx.delegate([expertA, expertB], input.task);
+      },
+    });
+
+    const outerAgent = agent({
+      name: 'outer',
+      model: 'mock:test',
+      system: 'You coordinate.',
+      tools: [delegateTool],
+    });
+
+    // Call 1 (outer): calls route_to_expert tool
+    // Call 2 (delegate router in child ctx): handoff to expert_a
+    // Call 3 (expert_a in child ctx): returns "expert answer"
+    // Call 4 (outer after tool result): returns final text
+    const provider = createSequenceProvider([
+      {
+        tool_calls: [
+          {
+            id: 'tc1',
+            type: 'function',
+            function: { name: 'route_to_expert', arguments: '{"task":"analyze data"}' },
+          },
+        ],
+      },
+      {
+        tool_calls: [
+          {
+            id: 'tc2',
+            type: 'function',
+            function: { name: 'handoff_to_expert_a', arguments: '{}' },
+          },
+        ],
+      },
+      'expert analysis complete',
+      'Outer: expert analysis complete',
+    ]);
+
+    const { ctx, traces } = createTestCtx({ provider });
+    const result = await ctx.ask(outerAgent, 'Analyze this data');
+
+    expect(result).toBe('Outer: expert analysis complete');
+
+    // Should have delegate trace from the nested delegate call
+    const delegateTraces = traces.filter((t) => t.type === 'delegate');
+    expect(delegateTraces).toHaveLength(1);
+    expect((delegateTraces[0].data as Record<string, unknown>).candidates).toEqual([
+      'expert_a',
+      'expert_b',
+    ]);
   });
 
   it('resolveSystem failure falls back to agent name', async () => {

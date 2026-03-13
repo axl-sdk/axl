@@ -84,7 +84,7 @@ const myAgent = agent({
   tools: [search, calculator],
   temperature: 0.7,
   maxTokens: 8192,
-  reasoningEffort: 'high',
+  effort: 'high',
   maxTurns: 10,
   timeout: '30s',
 });
@@ -101,10 +101,12 @@ const myAgent = agent({
 | `mcpTools` | `string[]` | — | Whitelist: only expose these specific MCP tools |
 | `temperature` | `number` | provider default | LLM sampling temperature |
 | `maxTokens` | `number` | `4096` | Maximum tokens in the LLM response |
-| `thinking` | `Thinking` | — | Thinking/reasoning level. `'low'` \| `'medium'` \| `'high'` \| `'max'` or `{ budgetTokens?: number, includeThoughts?: boolean }`. Works across all providers. `includeThoughts` returns thought summaries (Gemini only) |
-| `reasoningEffort` | `ReasoningEffort` | — | OpenAI-specific reasoning effort escape hatch. Values: `'none'` \| `'minimal'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'`. Prefer `thinking` |
+| `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'max'`. Controls reasoning depth across all providers |
+| `thinkingBudget` | `number` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. Set to `0` to disable thinking while keeping effort |
+| `includeThoughts` | `boolean` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini |
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool |
 | `stop` | `string[]` | — | Stop sequences — generation stops when any sequence is encountered. Not supported by the `openai-responses` provider (silently ignored) |
+| `providerOptions` | `Record<string, unknown>` | — | Provider-specific options shallow-merged into the raw API request body via `Object.assign`. Not portable across providers. See [shallow merge caveat](providers.md#provideroptions) |
 | `maxTurns` | `number` | `25` | Maximum tool-call loop iterations before throwing `MaxTurnsError` |
 | `timeout` | `string` | none | Duration string (e.g., `'30s'`, `'5m'`, `'1h'`). Throws `TimeoutError` when exceeded |
 | `maxContext` | `number` | — | Estimated token limit for context window management |
@@ -209,10 +211,12 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 | `metadata` | `Record<string, unknown>` | — | Merged with workflow metadata and passed to dynamic `model`/`system` selector functions |
 | `temperature` | `number` | agent config | Override sampling temperature for this call |
 | `maxTokens` | `number` | agent config or `4096` | Override max tokens for this call |
-| `thinking` | `Thinking` | agent config | Override thinking level for this call |
-| `reasoningEffort` | `ReasoningEffort` | agent config | Override reasoning effort (OpenAI-specific) |
+| `effort` | `Effort` | agent config | Override effort level for this call |
+| `thinkingBudget` | `number` | agent config | Override thinking budget for this call |
+| `includeThoughts` | `boolean` | agent config | Override includeThoughts for this call |
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | agent config | Override tool choice for this call |
 | `stop` | `string[]` | agent config | Override stop sequences for this call |
+| `providerOptions` | `Record<string, unknown>` | agent config | Override provider-specific options for this call. Shallow-merged; see [caveat](providers.md#provideroptions) |
 
 **Precedence:** Per-call `AskOptions` > agent-level `AgentConfig` > internal defaults.
 

@@ -17,7 +17,7 @@ const researcher = agent({
   model: 'openai:gpt-4o',
   system: 'You are a research assistant. Use the search tool to find information.',
   tools: [searchTool],
-  thinking: 'high',
+  effort: 'high',
 });
 
 const researchWorkflow = workflow({
@@ -58,7 +58,7 @@ Every agentic primitive is a TypeScript function on `ctx`. The type safety comes
 - **Streaming**: `AxlStream` (Readable + AsyncIterable + EventEmitter)
 - **Sessions**: Multi-turn conversations with fork and persistent history
 - **Providers**: OpenAI (Chat Completions + Responses API), Anthropic, and Google Gemini adapters (raw fetch, zero SDK dependencies)
-- **Thinking**: Unified `thinking` parameter (`'low' | 'medium' | 'high' | 'max'` or `{ budgetTokens: N }`) — works identically across OpenAI, Anthropic, and Gemini
+- **Effort**: Unified `effort` parameter (`'none' | 'low' | 'medium' | 'high' | 'max'`) — controls reasoning depth identically across OpenAI, Anthropic, and Gemini. Advanced: `thinkingBudget` for precise token control, `includeThoughts` for reasoning summaries
 - **MCP**: Model Context Protocol support with stdio and HTTP transports
 - **Context window management**: Automatic summarization when history exceeds limits
 - **OpenTelemetry**: Automatic span emission for all primitives with cost-per-span attribution
@@ -144,7 +144,7 @@ const mathAgent = agent({
   model: 'openai:gpt-4o',
   system: 'You are a math assistant. Use the calculator for all arithmetic.',
   tools: [calculator],
-  thinking: 'high',   // portable across all providers: maps to reasoning_effort (OpenAI), budget_tokens (Anthropic), thinkingBudget (Gemini)
+  effort: 'high',   // portable across all providers: maps to reasoning_effort (OpenAI), budget_tokens (Anthropic), thinkingBudget (Gemini)
 });
 ```
 

@@ -38,7 +38,7 @@ import { GuardrailError } from '@axlsdk/axl';
 import type { ToolHooks, HandoffRecord, AgentCallInfo } from '@axlsdk/axl';
 
 // Provider types
-import type { Thinking, ReasoningEffort, ToolChoice, ChatOptions, DelegateOptions } from '@axlsdk/axl';
+import type { Effort, ToolChoice, ChatOptions, DelegateOptions } from '@axlsdk/axl';
 
 // Testing
 import { AxlTestRuntime, MockProvider, MockTool } from '@axlsdk/testing';
@@ -225,13 +225,15 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - tsup bundles ESM + CJS + DTS for each package
 - Provider adapters use raw `fetch` (no SDK dependencies) with automatic retry on 429/503/529 via `fetchWithRetry` (exponential backoff, 3 total attempts)
 - Two OpenAI providers: `openai` (Chat Completions API) and `openai-responses` (Responses API)
-- Reasoning model support (o1/o3/o4-mini): developer role, temperature stripping, reasoning_effort
-- ChatOptions includes `thinking`, `reasoningEffort`, `toolChoice`, `maxTokens`, `stop`; all configurable on `AgentConfig` and overridable per-call via `AskOptions` (precedence: AskOptions > AgentConfig > defaults, maxTokens default: 4096). ToolDefinition supports `strict`
-- `thinking` is the unified cross-provider param (`'low'|'medium'|'high'|'max'` or `{budgetTokens}`); maps to reasoning_effort (OpenAI, `'max'`→`'xhigh'`), adaptive mode + effort (Anthropic 4.6), budget_tokens (Anthropic older, `'max'`→30000), thinkingLevel (Gemini 3.x), thinkingBudget (Gemini 2.5, `'max'`→24576). `reasoningEffort` is the OpenAI-specific escape hatch. `thinking` takes precedence when both set
-- Gemini 3.x models (gemini-3-*, gemini-3.1-*) use `thinkingLevel` string enum ('low'|'medium'|'high') instead of `thinkingBudget` integer; `'max'` caps at `'high'`; budget form `{ budgetTokens }` maps to nearest `thinkingLevel` on 3.x (≤1024→low, ≤5000→medium, >5000→high). Gemini 2.5 Pro supports `thinkingBudget` up to 32768 (other 2.5 models: 24576). Usage includes `thoughtsTokenCount` → `reasoning_tokens`
-- `Thinking` object form: `{ budgetTokens?: number; includeThoughts?: boolean }` — both optional. `includeThoughts` returns thought summaries (Gemini only); response parts with `thought: true` populate `thinking_content` on ProviderResponse and `thinking_delta` stream chunks
-- `providerMetadata` on `ChatMessage` and `ProviderResponse`: opaque bag for provider-specific round-trip data. Gemini uses it to preserve `thoughtSignature` and other opaque fields across multi-turn conversations for reasoning context continuity
-- Anthropic 4.6 models (Opus 4.6, Sonnet 4.6) use adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`) for string levels; budget form falls back to manual mode (`thinking: { type: "enabled", budget_tokens }`) for precise control
+- Reasoning model support: o-series (o1/o3/o4-mini) use developer role, temperature stripping; GPT-5.x also supports reasoning but uses system role. `isOSeriesModel()` detects o-series, `supportsReasoningEffort()` detects o-series + GPT-5.x
+- ChatOptions includes `effort`, `thinkingBudget`, `includeThoughts`, `toolChoice`, `maxTokens`, `stop`, `providerOptions`; all configurable on `AgentConfig` and overridable per-call via `AskOptions` (precedence: AskOptions > AgentConfig > defaults, maxTokens default: 4096). ToolDefinition supports `strict`
+- `providerOptions` (`Record<string, unknown>`) is an escape hatch for provider-specific wire options. Merged last into the raw API request body via `Object.assign`, so it can override any computed field. Not portable across providers. Visible in `AgentCallInfo` traces
+- `effort` is the unified cross-provider param (`'none'|'low'|'medium'|'high'|'max'`); `'none'` disables thinking/reasoning. Maps to: reasoning_effort (OpenAI o-series + GPT-5.x, `'max'`→`'xhigh'`), adaptive thinking + output_config.effort (Anthropic 4.6), output_config.effort only (Anthropic 4.5), budget_tokens fallback (Anthropic older), thinkingLevel (Gemini 3.x), thinkingBudget (Gemini 2.x). OpenAI effort values are clamped per model: `'none'`→`'minimal'` on pre-gpt-5.1 (which don't support `'none'`), `'xhigh'`→`'high'` on pre-gpt-5.4, and always `'high'` on gpt-5-pro
+- `thinkingBudget` is the precise token budget override. Set to 0 to disable thinking while keeping `effort` for output control (Anthropic standalone optimization). On OpenAI, mapped to nearest effort level (≤1024→low, ≤8192→medium, >8192→high)
+- `includeThoughts` returns reasoning summaries: OpenAI Responses API (`reasoning.summary: 'detailed'`), Gemini (`includeThoughts` in thinkingConfig). No-op on Anthropic and OpenAI Chat Completions
+- Gemini 3.x models (gemini-3-*, gemini-3.1-*) use `thinkingLevel` string enum ('low'|'medium'|'high') instead of `thinkingBudget` integer; `'max'` caps at `'high'`; cannot fully disable thinking (`'none'` maps to model minimum: `'minimal'` or `'low'` for 3.1 Pro). Gemini 2.5 Pro supports `thinkingBudget` up to 32768 (other 2.5 models: 24576). Usage includes `thoughtsTokenCount` → `reasoning_tokens`
+- `providerMetadata` on `ChatMessage` and `ProviderResponse`: opaque bag for provider-specific round-trip data. Gemini uses it to preserve `thoughtSignature` for reasoning context. OpenAI Responses API uses `providerMetadata.openaiReasoningItems` to round-trip encrypted reasoning content across multi-turn conversations
+- Anthropic 4.6 models (Opus 4.6, Sonnet 4.6) use adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`) when `effort` is set. Opus 4.5 supports `output_config.effort` but not adaptive thinking. `thinkingBudget` falls back to manual mode (`thinking: { type: "enabled", budget_tokens }`) for precise control. `effort` + `thinkingBudget: 0` sends standalone `output_config.effort` without thinking block
 - ProviderResponse.usage includes optional `reasoning_tokens` and `cached_tokens`
 - AxlStream requires `[Symbol.asyncDispose]` on iterator for TS 5.9+ compat
 - WorkflowContext.ask() implements tool calling loop with max turns, budget tracking, self-correction retry

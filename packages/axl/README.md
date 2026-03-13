@@ -55,7 +55,7 @@ const researcher = agent({
   model: 'openai:gpt-4o',
   system: 'You are a research assistant.',
   tools: [calculator],
-  thinking: 'high',
+  effort: 'high',
   maxTurns: 10,
   timeout: '30s',
   temperature: 0.7,
@@ -108,30 +108,30 @@ const result = await ctx.delegate(
 
 `ctx.delegate()` creates a temporary router agent that uses handoffs to select the best candidate. For a single agent, it calls `ctx.ask()` directly with no routing overhead.
 
-#### Thinking (cross-provider reasoning control)
+#### Effort (cross-provider reasoning control)
 
-The `thinking` parameter provides a unified way to control reasoning depth across all providers:
+The `effort` parameter provides a unified way to control reasoning depth across all providers:
 
 ```typescript
 // Simple levels — works on any provider
 const reasoner = agent({
-  model: 'anthropic:claude-sonnet-4-5',
+  model: 'anthropic:claude-opus-4-6',
   system: 'You are a careful analyst.',
-  thinking: 'high',  // 'low' | 'medium' | 'high' | 'max'
+  effort: 'high',  // 'none' | 'low' | 'medium' | 'high' | 'max'
 });
 
-// Explicit budget (in tokens)
+// Explicit thinking budget (in tokens)
 const budgetReasoner = agent({
   model: 'google:gemini-2.5-flash',
   system: 'Think step by step.',
-  thinking: { budgetTokens: 5000 },
+  thinkingBudget: 5000,
 });
 
 // Per-call override
-const result = await reasoner.ask('Analyze this data', { thinking: 'low' });
+const result = await reasoner.ask('Analyze this data', { effort: 'low' });
 ```
 
-Each provider maps `thinking` to its native API: `reasoning_effort` (OpenAI), `budget_tokens` (Anthropic), `thinkingBudget` (Gemini). See [docs/providers.md](../../docs/providers.md) for the full mapping table.
+Each provider maps `effort` to its native API: `reasoning_effort` (OpenAI), adaptive thinking + `output_config.effort` (Anthropic 4.6), `thinkingLevel` (Gemini 3.x), `thinkingBudget` (Gemini 2.x). See [docs/providers.md](../../docs/providers.md) for the full mapping table.
 
 ### `workflow(config)`
 

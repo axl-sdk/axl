@@ -17,6 +17,9 @@ openai:gpt-5-mini               # GPT-5 small
 openai:gpt-5-nano               # GPT-5 cheapest
 openai:gpt-5.1                  # GPT-5.1
 openai:gpt-5.2                  # GPT-5.2
+openai:gpt-5.3                  # GPT-5.3
+openai:gpt-5.4                  # GPT-5.4
+openai:gpt-5.4-pro              # GPT-5.4 (pro)
 openai:o1                       # Reasoning
 openai:o1-mini                  # Reasoning (small)
 openai:o1-pro                   # Reasoning (pro)
@@ -29,7 +32,7 @@ openai:gpt-4                    # Legacy
 openai:gpt-3.5-turbo            # Legacy
 ```
 
-Reasoning model support (o1/o3/o4-mini): uses `developer` role instead of `system`, strips `temperature`, supports `reasoningEffort` option.
+Reasoning model support (o1/o3/o4-mini): uses `developer` role instead of `system`, strips `temperature`, supports `effort` option. GPT-5.x models also support `effort` (reasoning) but use `system` role.
 
 ## OpenAI — Responses API
 
@@ -38,14 +41,17 @@ openai-responses:gpt-4o
 openai-responses:o3
 ```
 
-Same models as Chat Completions, with better prompt caching and native reasoning support. Shares the `openai` provider config by default.
+Same models as Chat Completions, with better prompt caching, native reasoning support, and automatic reasoning context round-tripping via `providerMetadata`. Shares the `openai` provider config by default.
 
 ## Anthropic
 
 ```
 anthropic:claude-opus-4-6       # Most capable
+anthropic:claude-sonnet-4-6     # Balanced (latest)
 anthropic:claude-sonnet-4-5     # Balanced
 anthropic:claude-haiku-4-5      # Fast and affordable
+anthropic:claude-opus-4-5       # Previous gen (most capable)
+anthropic:claude-opus-4-1       # Previous gen
 anthropic:claude-sonnet-4       # Previous gen
 anthropic:claude-opus-4         # Previous gen
 anthropic:claude-3-7-sonnet     # Legacy
@@ -64,6 +70,9 @@ google:gemini-2.5-flash         # Fast
 google:gemini-2.5-flash-lite    # Cheapest 2.5
 google:gemini-2.0-flash         # Previous gen
 google:gemini-2.0-flash-lite    # Previous gen (lite)
+google:gemini-3-flash            # Fast (3.x gen)
+google:gemini-3.1-pro            # Most capable (3.x gen)
+google:gemini-3.1-flash-lite     # Cheapest (3.x gen)
 google:gemini-3-pro-preview     # Next gen (preview)
 google:gemini-3-flash-preview   # Next gen fast (preview)
 ```
@@ -96,9 +105,9 @@ const creative = agent({
 });
 
 const reasoner = agent({
-  model: 'anthropic:claude-sonnet-4-5',
+  model: 'anthropic:claude-opus-4-6',
   system: 'Solve complex problems step by step.',
-  thinking: 'high',   // works across all providers
+  effort: 'high',   // works across all providers
 });
 
 const precise = agent({
@@ -110,87 +119,155 @@ const precise = agent({
 
 // Per-call overrides
 const answer = await ctx.ask(creative, prompt, { temperature: 0.2, maxTokens: 2048 });
-const solution = await ctx.ask(reasoner, problem, { thinking: 'low' });
+const solution = await ctx.ask(reasoner, problem, { effort: 'low' });
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `temperature` | provider default | Controls randomness (0.0–2.0). Stripped automatically for reasoning models. |
+| `temperature` | provider default | Controls randomness (0.0–2.0). Stripped automatically for reasoning models and when thinking is active on Anthropic. |
 | `maxTokens` | `4096` | Maximum completion tokens per call. |
-| `thinking` | — | Thinking/reasoning level — works across all providers (see below). |
-| `reasoningEffort` | — | OpenAI-specific reasoning effort escape hatch. Prefer `thinking`. |
+| `effort` | — | Unified effort level controlling reasoning depth across all providers (see below). |
+| `thinkingBudget` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. Set to `0` to disable thinking while keeping `effort` for output control (Anthropic). |
+| `includeThoughts` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini. No-op on Anthropic. |
 | `toolChoice` | — | Controls whether and how the model uses tools (see below). |
 | `stop` | — | Stop sequences — generation stops when any sequence is encountered (see below). |
 
-### `thinking`
+### `effort`
 
-The `thinking` parameter provides a unified way to control extended thinking / reasoning across all providers. You don't need to know the provider-specific API — just set the level and Axl handles the rest.
-
-**Simple form** — portable across all providers:
+The `effort` parameter provides a unified way to control reasoning depth across all providers. Values: `'none'` | `'low'` | `'medium'` | `'high'` | `'max'`.
 
 ```typescript
+// Most users — just effort:
 const reasoner = agent({
-  model: 'anthropic:claude-sonnet-4-5',
+  model: 'anthropic:claude-opus-4-6',
   system: 'Solve complex math problems.',
-  thinking: 'high',   // 'low' | 'medium' | 'high' | 'max'
+  effort: 'high',
 });
 
-// Per-call override
-const answer = await ctx.ask(reasoner, problem, { thinking: 'low' });
+// Disable thinking entirely:
+agent({ model: 'anthropic:claude-opus-4-6', effort: 'none' });
+
+// Per-call override:
+const answer = await ctx.ask(reasoner, problem, { effort: 'low' });
 ```
 
-**Budget form** — explicit control over thinking tokens:
+**`thinkingBudget` — precise control (advanced):**
 
 ```typescript
-const answer = await ctx.ask(reasoner, problem, {
-  thinking: { budgetTokens: 8000 },
-});
+// Explicit token budget:
+const answer = await ctx.ask(reasoner, problem, { thinkingBudget: 8000 });
+
+// Disable thinking but keep effort for output control (Anthropic optimization):
+agent({ model: 'anthropic:claude-opus-4-6', effort: 'low', thinkingBudget: 0 });
 ```
 
-#### How `thinking` maps to each provider
+**`includeThoughts` — reasoning summaries:**
 
-| Provider | `'low'` | `'medium'` | `'high'` | `'max'` | `{ budgetTokens: N }` |
-|----------|---------|-----------|----------|---------|----------------------|
-| **OpenAI** (o1/o3/o4-mini) | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | nearest effort level* |
-| **OpenAI Responses** | `reasoning.effort: 'low'` | `reasoning.effort: 'medium'` | `reasoning.effort: 'high'` | `reasoning.effort: 'xhigh'` | nearest effort level* |
-| **Anthropic** (4.6) | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'max'`† | manual `budget_tokens` |
-| **Anthropic** (older) | `thinking.budget_tokens: 1024` | `thinking.budget_tokens: 5000` | `thinking.budget_tokens: 10000` | `thinking.budget_tokens: 30000` | exact budget |
-| **Gemini** (3.x) | `thinkingConfig.thinkingLevel: 'low'` | `thinkingConfig.thinkingLevel: 'medium'` | `thinkingConfig.thinkingLevel: 'high'` | `thinkingConfig.thinkingLevel: 'high'`‡ | nearest `thinkingLevel`‡ |
-| **Gemini** (2.5) | `thinkingConfig.thinkingBudget: 1024` | `thinkingConfig.thinkingBudget: 5000` | `thinkingConfig.thinkingBudget: 10000` | `thinkingConfig.thinkingBudget: 24576`§ | exact budget |
+```typescript
+// OpenAI Responses API: returns reasoning summaries
+agent({ model: 'openai-responses:o3', effort: 'high', includeThoughts: true });
 
-† Anthropic `effort: 'max'` is only supported on Opus 4.6. On Sonnet 4.6, `thinking: 'max'` automatically falls back to manual mode with `budget_tokens: 30000`. The budget values for `'max'` (30000 for Anthropic, 24576 for Gemini 2.5) are sensible defaults, not hard provider limits. For the absolute maximum your model supports, use `{ budgetTokens: N }` with the model's actual limit.
+// Gemini: returns thought summaries
+agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true });
+```
 
-‡ Gemini 3.x uses `thinkingLevel` (string enum) instead of `thinkingBudget` (integer). The maximum level is `'high'`, so `thinking: 'max'` maps to `'high'`. Budget form `{ budgetTokens: N }` maps to the nearest `thinkingLevel` on 3.x: ≤1024 → `'low'`, ≤5000 → `'medium'`, >5000 → `'high'`.
+#### How `effort` maps to each provider
 
-§ Gemini 2.5 Pro supports up to 32768 thinking tokens; other 2.5 models cap at 24576.
+| Provider | `'none'` | `'low'` | `'medium'` | `'high'` | `'max'` | `thinkingBudget: N` |
+|----------|----------|---------|-----------|----------|---------|---------------------|
+| **OpenAI** (o-series) | `'minimal'`⁑ | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | capped to `'high'`⁂ | nearest effort level* |
+| **OpenAI** (GPT-5.x pre-5.1) | `'minimal'`⁑ | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | capped to `'high'`⁂ | nearest effort level* |
+| **OpenAI** (GPT-5.1+) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | capped to `'high'`⁂ | nearest effort level* |
+| **OpenAI** (GPT-5.2+) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | nearest effort level* |
+| **OpenAI Responses** | same clamping as above | `reasoning.effort: 'low'` | `reasoning.effort: 'medium'` | `reasoning.effort: 'high'` | same clamping | nearest effort level* |
+| **Anthropic** (4.6) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'max'`† | manual `budget_tokens` |
+| **Anthropic** (4.5) | disabled | `output_config.effort: 'low'` | `output_config.effort: 'medium'` | `output_config.effort: 'high'` | capped to `'high'` | manual `budget_tokens` |
+| **Anthropic** (older) | disabled | `budget_tokens: 1024` | `budget_tokens: 5000` | `budget_tokens: 10000` | `budget_tokens: 30000` | exact budget |
+| **Gemini** (3.x) | model minimum‡ | `thinkingLevel: 'low'` | `thinkingLevel: 'medium'` | `thinkingLevel: 'high'` | `thinkingLevel: 'high'` | nearest `thinkingLevel` |
+| **Gemini** (2.x) | `thinkingBudget: 0` | `thinkingBudget: 1024` | `thinkingBudget: 5000` | `thinkingBudget: 10000` | `thinkingBudget: 24576`§ | exact budget |
 
-\* OpenAI does not support explicit token budgets for reasoning. The budget form `{ budgetTokens: N }` is mapped to the nearest effort level: ≤1024 → `low`, ≤8192 → `medium`, >8192 → `high`. Note: budget form never maps to `'xhigh'` — use `thinking: 'max'` explicitly for maximum reasoning effort. For precise token budget control, use Anthropic or Gemini.
+† Anthropic `effort: 'max'` only supported on Opus 4.6. On Sonnet 4.6 and Opus 4.5, capped to `'high'`.
+
+⁑ OpenAI pre-gpt-5.1 models (o-series, gpt-5, gpt-5-mini, gpt-5-nano) do not support `reasoning_effort: 'none'`. Axl clamps to `'minimal'` — the lowest supported value.
+
+⁂ `reasoning_effort: 'xhigh'` is only supported on models after gpt-5.1-codex-max (gpt-5.2+). On earlier models, `effort: 'max'` is clamped to `'high'`. Additionally, `gpt-5-pro` only supports `'high'` — all effort values are clamped to `'high'`.
+
+‡ Gemini 3.x cannot fully disable thinking. `effort: 'none'` maps to the model's minimum: `'minimal'` for most models, `'low'` for 3.1 Pro (which doesn't support `'minimal'`).
+
+§ Gemini 2.5 Pro supports up to 32768; other 2.5 models cap at 24576.
+
+\* OpenAI doesn't support explicit token budgets. `thinkingBudget` is mapped to nearest effort: ≤1024 → `low`, ≤8192 → `medium`, >8192 → `high`.
 
 #### Provider-specific behavior
 
-- **Non-reasoning OpenAI models** (gpt-4o, gpt-4.1, etc.): `thinking` is silently ignored. It only applies to reasoning models (o1/o3/o4-mini).
-- **Anthropic 4.6 models** (Opus 4.6, Sonnet 4.6): String levels use adaptive thinking mode (`thinking: { type: "adaptive" }` + `output_config: { effort }`), which lets Claude dynamically allocate thinking depth. `'max'` is natively supported in adaptive mode (Opus 4.6 only). Budget form `{ budgetTokens: N }` falls back to manual mode with explicit `budget_tokens` for precise control. Adaptive mode also automatically enables interleaved thinking (thinking between tool calls).
-- **Anthropic older models** (Sonnet 4.5, Opus 4.5, Haiku 4.5, etc.): Always use manual mode (`thinking: { type: "enabled", budget_tokens: N }`).
-- **Anthropic + `temperature`**: Anthropic rejects `temperature` when extended thinking is enabled. Axl automatically strips `temperature` when `thinking` is set (same pattern as OpenAI stripping temperature for reasoning models).
-- **Anthropic + `maxTokens`**: Anthropic requires `max_tokens ≥ budget_tokens`. When your `maxTokens` (default: 4096) is too low for the thinking budget, Axl auto-bumps it to `budget_tokens + 1024`. For example, `thinking: 'high'` (budget 10000) with default `maxTokens` results in `max_tokens: 11024` being sent to the API.
-- **Gemini 3.x models** (gemini-3-*, gemini-3.1-*): Use `thinkingLevel` (string enum: `'low'`, `'medium'`, `'high'`) instead of `thinkingBudget`. Axl detects the model generation automatically. Budget form `{ budgetTokens: N }` maps to the nearest `thinkingLevel` (≤1024→low, ≤5000→medium, >5000→high). Usage metadata includes `thoughtsTokenCount` which Axl maps to `reasoning_tokens`. Thought signatures are automatically preserved across multi-turn conversations via `providerMetadata`.
-- **Gemini 2.5 models**: Use `thinkingBudget` (integer token count). `gemini-2.5-pro` supports up to 32768; other 2.5 models cap at 24576.
-- **`includeThoughts`**: Gemini-only feature. Use `thinking: { includeThoughts: true }` to receive thought summaries in responses (`thinking_content` on ProviderResponse, `thinking_delta` stream chunks). Can be combined with `budgetTokens`. Silently ignored by OpenAI and Anthropic.
-
-#### `reasoningEffort` (advanced)
-
-`reasoningEffort` is an OpenAI-specific escape hatch that supports all 6 granular values: `'none'` \| `'minimal'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'`. It only works with OpenAI reasoning models (o1/o3/o4-mini). If both `thinking` and `reasoningEffort` are set, `thinking` takes precedence.
+- **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
+- **OpenAI GPT-5.x**: Supports `reasoning_effort` like o-series, strips temperature when reasoning active. Uses `system` role (not `developer`). Supports parallel tool calls. Model-specific constraints: `gpt-5-pro` only supports `'high'`; `gpt-5.1+` supports `'none'`; `gpt-5.2+` supports `'xhigh'`.
+- **OpenAI Responses API**: Same effort mapping via `reasoning: { effort }`. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
+- **Anthropic 4.6** (Opus 4.6, Sonnet 4.6): `effort` enables adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`). Temperature stripped when thinking active. `thinkingBudget: 0` + `effort` sends only `output_config.effort` (no thinking block, temperature allowed).
+- **Anthropic 4.5** (Opus 4.5): Supports `output_config.effort` but not adaptive thinking. Temperature passes through.
+- **Anthropic older**: Falls back to manual thinking (`budget_tokens`). No `effort` support.
+- **Anthropic + maxTokens**: Auto-bumps `max_tokens` when thinking budget exceeds it (`budget + 1024`).
+- **Gemini 3.x** (gemini-3-*, gemini-3.1-*): Uses `thinkingLevel` string enum. **Cannot fully disable thinking** — `effort: 'none'` maps to the model's minimum level (`'minimal'` for most models, `'low'` for 3.1 Pro). Axl emits a one-time console warning when this happens. `thinkingBudget: N` maps to nearest level (≤1024→low, ≤5000→medium, >5000→high).
+- **Gemini 2.x**: Uses integer `thinkingBudget`. Can be set to 0 to disable.
+- **`includeThoughts`**: Returns thought/reasoning summaries. Works on Gemini (`includeThoughts` in `thinkingConfig`) and OpenAI Responses API (`reasoning.summary: 'detailed'`). No-op on Anthropic (thoughts always returned when thinking active) and OpenAI Chat Completions.
 
 ### Provider Support Matrix
 
 | Parameter | OpenAI Chat | OpenAI Responses | Anthropic | Google Gemini |
 |-----------|:-----------:|:----------------:|:---------:|:-------------:|
-| `temperature` | ✅ (stripped for reasoning models) | ✅ (stripped for reasoning models) | ✅ (stripped when `thinking` set) | ✅ |
+| `temperature` | ✅ (stripped for reasoning) | ✅ (stripped for reasoning) | ✅ (stripped when thinking active) | ✅ |
 | `maxTokens` | ✅ | ✅ | ✅ | ✅ |
-| `thinking` | ✅ reasoning models only | ✅ reasoning models only | ✅ | ✅ |
-| `reasoningEffort` | ✅ all 6 values | ✅ all 6 values | ❌ | ❌ |
+| `effort` | ✅ o-series + GPT-5.x | ✅ o-series + GPT-5.x | ✅ | ✅ |
+| `thinkingBudget` | ✅ (mapped to effort) | ✅ (mapped to effort) | ✅ (exact budget) | ✅ |
+| `includeThoughts` | ❌ | ✅ | ❌ (no-op) | ✅ |
 | `toolChoice` | ✅ | ✅ | ✅ | ✅ |
 | `stop` | ✅ | ❌ silently ignored | ✅ | ✅ |
+| `providerOptions` | ✅ | ✅ | ✅ | ✅ |
+
+### `providerOptions`
+
+Provider-specific options merged directly into the raw API request body. Use this as an escape hatch for provider features that don't fit the unified API.
+
+```typescript
+const agent = agent({
+  model: 'anthropic:claude-opus-4-6',
+  system: 'You are helpful.',
+  providerOptions: {
+    // Sent directly to the Anthropic API body
+    output_config: { effort: 'max' },
+  },
+});
+```
+
+`providerOptions` is spread **last** into the request body, so it can override any computed field. This is not portable across providers — use `effort`/`thinkingBudget`/`includeThoughts` for cross-provider behavior. Available on `AgentConfig` (agent-level default) and `AskOptions` (per-call override).
+
+> **Warning: shallow merge.** `providerOptions` is applied via `Object.assign(body, providerOptions)`, which is a **shallow merge**. Nested objects in `providerOptions` will **replace** the corresponding top-level key entirely, not deep-merge with it.
+>
+> This matters most for **Google Gemini**, where the request body nests `temperature`, `maxOutputTokens`, and `thinkingConfig` inside a `generationConfig` object. If you pass `providerOptions: { generationConfig: { ... } }`, it will replace the entire `generationConfig` that Axl built — including thinking configuration, temperature, and max tokens.
+>
+> ```typescript
+> // WRONG — replaces the entire generationConfig, losing thinkingConfig and temperature:
+> agent({
+>   model: 'google:gemini-2.5-pro',
+>   effort: 'high',
+>   temperature: 0.7,
+>   providerOptions: {
+>     generationConfig: { responseMimeType: 'application/json' },
+>   },
+> });
+>
+> // CORRECT — set top-level fields that don't collide with nested objects:
+> agent({
+>   model: 'google:gemini-2.5-pro',
+>   effort: 'high',
+>   temperature: 0.7,
+>   providerOptions: {
+>     safetySettings: [{ category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' }],
+>   },
+> });
+> ```
+>
+> For **OpenAI** and **Anthropic**, most options are top-level keys in the request body, so shallow merge rarely causes issues. If you do need to override a nested Gemini field, include all sibling fields in your `generationConfig` to avoid losing Axl's computed values.
 
 ### `toolChoice`
 

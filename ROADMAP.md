@@ -22,8 +22,8 @@
 - **Streaming Improvements** — Typed `StreamEvent` variants, `stream.steps` filtered iterable
 - **Axl Studio** — Local development UI with 8 panels (Playground, Workflows, Traces, Costs, Memory, Sessions, Tools, Evals)
 - **Evaluation Framework** — `dataset()`, `scorer()`, `llmScorer()`, `evalCompare()`, CLI
-- **Configurable Model Parameters** — `temperature`, `maxTokens`, `thinking`, `reasoningEffort`, `toolChoice`, `stop` on `AgentConfig` and per-call via `AskOptions`
-- **Unified Thinking** — Cross-provider `thinking` parameter (`'low'` | `'medium'` | `'high'` | `'max'` or `{ budgetTokens }`) maps to reasoning_effort (OpenAI), adaptive/manual thinking (Anthropic), thinkingBudget (Gemini)
+- **Configurable Model Parameters** — `temperature`, `maxTokens`, `effort`, `thinkingBudget`, `includeThoughts`, `toolChoice`, `stop` on `AgentConfig` and per-call via `AskOptions`
+- **Unified Effort** — Cross-provider `effort` parameter (`'none'` | `'low'` | `'medium'` | `'high'` | `'max'`) maps to reasoning_effort (OpenAI o-series + GPT-5.x), adaptive thinking + output_config.effort (Anthropic 4.6), thinkingLevel (Gemini 3.x), thinkingBudget (Gemini 2.x)
 
 ### Planned
 

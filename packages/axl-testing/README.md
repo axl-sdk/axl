@@ -55,10 +55,10 @@ const provider = MockProvider.sequence([
 ]);
 ```
 
-All model parameters (`thinking`, `temperature`, `maxTokens`, `toolChoice`, `stop`) flow through MockProvider transparently. They don't affect mock responses but are recorded in `provider.calls` for assertion:
+All model parameters (`effort`, `thinkingBudget`, `includeThoughts`, `temperature`, `maxTokens`, `toolChoice`, `stop`) flow through MockProvider transparently. They don't affect mock responses but are recorded in `provider.calls` for assertion:
 
 ```typescript
-expect(provider.calls[0].options.thinking).toBe('high');
+expect(provider.calls[0].options.effort).toBe('high');
 ```
 
 ### `MockTool`

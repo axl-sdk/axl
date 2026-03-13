@@ -534,7 +534,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking "high" to thinkingBudget for 2.x models', async () => {
+    it('maps effort "high" to thinkingBudget for 2.x models', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -542,7 +542,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-2.5-pro',
-        thinking: 'high',
+        effort: 'high',
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -551,7 +551,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking "max" to thinkingBudget 32768 for gemini-2.5-pro', async () => {
+    it('maps effort "max" to thinkingBudget 32768 for gemini-2.5-pro', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -559,7 +559,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-2.5-pro',
-        thinking: 'max',
+        effort: 'max',
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -568,7 +568,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking "max" to thinkingBudget 32768 for gemini-2.5-pro-preview (prefix match)', async () => {
+    it('maps effort "max" to thinkingBudget 32768 for gemini-2.5-pro-preview (prefix match)', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -576,7 +576,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-2.5-pro-preview',
-        thinking: 'max',
+        effort: 'max',
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -585,7 +585,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking "max" to thinkingBudget 24576 for gemini-2.5-flash', async () => {
+    it('maps effort "max" to thinkingBudget 24576 for gemini-2.5-flash', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -593,7 +593,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-2.5-flash',
-        thinking: 'max',
+        effort: 'max',
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -602,7 +602,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking budget form to exact thinkingBudget for 2.x models', async () => {
+    it('maps thinkingBudget to exact thinkingBudget for 2.x models', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -610,7 +610,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-2.5-flash',
-        thinking: { budgetTokens: 4000 },
+        thinkingBudget: 4000,
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -619,7 +619,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking "high" to thinkingLevel for 3.x models', async () => {
+    it('maps effort "high" to thinkingLevel for 3.x models', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -627,7 +627,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-3.1-flash-lite-preview',
-        thinking: 'high',
+        effort: 'high',
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -636,7 +636,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking "low" to thinkingLevel for 3.x models', async () => {
+    it('maps effort "low" to thinkingLevel for 3.x models', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -644,7 +644,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-3-flash-preview',
-        thinking: 'low',
+        effort: 'low',
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -653,7 +653,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking "max" to thinkingLevel "high" for 3.x models (caps at high)', async () => {
+    it('maps effort "max" to thinkingLevel "high" for 3.x models (caps at high)', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -661,7 +661,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-3.1-pro-preview',
-        thinking: 'max',
+        effort: 'max',
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -670,7 +670,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking budget >5000 to thinkingLevel "high" for 3.x models', async () => {
+    it('maps thinkingBudget >5000 to thinkingLevel "high" for 3.x models', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -678,7 +678,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-3.1-flash-lite-preview',
-        thinking: { budgetTokens: 8000 },
+        thinkingBudget: 8000,
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -687,7 +687,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking budget <=1024 to thinkingLevel "low" for 3.x models', async () => {
+    it('maps thinkingBudget <=1024 to thinkingLevel "low" for 3.x models', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -695,7 +695,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-3-pro-preview',
-        thinking: { budgetTokens: 512 },
+        thinkingBudget: 512,
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -704,7 +704,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking budget <=5000 to thinkingLevel "medium" for 3.x models', async () => {
+    it('maps thinkingBudget <=5000 to thinkingLevel "medium" for 3.x models', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -712,7 +712,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-3.1-pro-preview',
-        thinking: { budgetTokens: 3000 },
+        thinkingBudget: 3000,
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -721,7 +721,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking budget at boundary 1024 to thinkingLevel "low" for 3.x models', async () => {
+    it('maps thinkingBudget at boundary 1024 to thinkingLevel "low" for 3.x models', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -729,7 +729,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-3-flash-preview',
-        thinking: { budgetTokens: 1024 },
+        thinkingBudget: 1024,
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -738,7 +738,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps thinking budget at boundary 5000 to thinkingLevel "medium" for 3.x models', async () => {
+    it('maps thinkingBudget at boundary 5000 to thinkingLevel "medium" for 3.x models', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -746,7 +746,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-3-flash-preview',
-        thinking: { budgetTokens: 5000 },
+        thinkingBudget: 5000,
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -755,22 +755,25 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('does not include thinkingConfig when thinking is empty object {}', async () => {
+    it('maps effort "none" to thinkingLevel "low" on gemini-3.1-pro', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
 
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
-        model: 'gemini-2.5-flash',
-        thinking: {},
+        model: 'gemini-3.1-pro-preview',
+        effort: 'none',
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-      expect(body.generationConfig?.thinkingConfig).toBeUndefined();
+      // 3.1 Pro doesn't support 'minimal' — floor is 'low'
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'low',
+      });
     });
 
-    it('sends includeThoughts with thinkingLevel for 3.x models when budgetTokens also set', async () => {
+    it('maps effort "none" to thinkingLevel "minimal" on gemini-3-flash', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -778,7 +781,153 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-3-flash-preview',
-        thinking: { budgetTokens: 3000, includeThoughts: true },
+        effort: 'none',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'minimal',
+      });
+    });
+
+    it('maps effort "none" to thinkingBudget 0 on gemini-2.5-pro', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-pro',
+        effort: 'none',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingBudget: 0,
+      });
+    });
+
+    it('maps thinkingBudget 0 to thinkingLevel "low" on gemini-3.1-pro', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.1-pro-preview',
+        thinkingBudget: 0,
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      // Same as effort: 'none' — 3.1 Pro floors at 'low'
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'low',
+      });
+    });
+
+    it('maps thinkingBudget 0 to thinkingLevel "minimal" on gemini-3-flash', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3-flash-preview',
+        thinkingBudget: 0,
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'minimal',
+      });
+    });
+
+    it('positive thinkingBudget overrides effort "none" on 3.x', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3-flash-preview',
+        effort: 'none',
+        thinkingBudget: 5000,
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      // Positive budget wins over effort: 'none' → maps to nearest thinkingLevel
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'medium',
+      });
+    });
+
+    it('positive thinkingBudget overrides effort "none" on 2.x', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-pro',
+        effort: 'none',
+        thinkingBudget: 5000,
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      // Positive budget wins over effort: 'none'
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingBudget: 5000,
+      });
+    });
+
+    it('merges providerOptions into request body (shallow merge)', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-flash',
+        temperature: 0.5,
+        providerOptions: {
+          generationConfig: { topK: 40 },
+          safetySettings: [{ category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' }],
+        },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      // Shallow merge: providerOptions.generationConfig REPLACES the computed one
+      expect(body.generationConfig).toEqual({ topK: 40 });
+      // Additional fields are added
+      expect(body.safetySettings).toEqual([
+        { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+      ]);
+    });
+
+    it('does not include thinkingConfig when no effort/thinkingBudget/includeThoughts set', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-flash',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig?.thinkingConfig).toBeUndefined();
+    });
+
+    it('sends includeThoughts with thinkingLevel for 3.x models when thinkingBudget also set', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3-flash-preview',
+        thinkingBudget: 3000,
+        includeThoughts: true,
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -890,7 +1039,7 @@ describe('GeminiProvider', () => {
       expect(body.tools[0].functionDeclarations[0].description).toBe('Search the web');
     });
 
-    it('sends includeThoughts in thinkingConfig when { includeThoughts: true }', async () => {
+    it('sends includeThoughts in thinkingConfig when includeThoughts: true', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -898,7 +1047,7 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-2.5-flash',
-        thinking: { includeThoughts: true },
+        includeThoughts: true,
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -907,7 +1056,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('sends both budgetTokens and includeThoughts in thinkingConfig', async () => {
+    it('sends both thinkingBudget and includeThoughts in thinkingConfig', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -915,7 +1064,8 @@ describe('GeminiProvider', () => {
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gemini-2.5-flash',
-        thinking: { budgetTokens: 5000, includeThoughts: true },
+        thinkingBudget: 5000,
+        includeThoughts: true,
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);

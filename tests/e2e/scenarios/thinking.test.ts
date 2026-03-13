@@ -5,7 +5,7 @@ import { MockProvider } from '@axlsdk/testing';
 import { createTestRuntime } from '../helpers/setup.js';
 
 describe('Thinking E2E', () => {
-  it('thinking flows from AgentConfig through runtime to provider', async () => {
+  it('effort flows from AgentConfig through runtime to provider', async () => {
     const provider = MockProvider.sequence([{ content: 'solved' }]);
     const { runtime } = createTestRuntime(provider);
 
@@ -13,7 +13,7 @@ describe('Thinking E2E', () => {
       name: 'thinker',
       model: 'mock:test',
       system: 'Think deeply.',
-      thinking: 'high',
+      effort: 'high',
     });
 
     const wf = workflow({
@@ -26,12 +26,12 @@ describe('Thinking E2E', () => {
     const result = await runtime.execute('thinking-wf', { message: 'solve this' });
     expect(result).toBe('solved');
 
-    // Verify thinking was passed to provider
+    // Verify effort was passed to provider
     expect(provider.calls.length).toBe(1);
-    expect(provider.calls[0].options.thinking).toBe('high');
+    expect(provider.calls[0].options.effort).toBe('high');
   });
 
-  it('per-call AskOptions thinking overrides agent-level thinking', async () => {
+  it('per-call AskOptions effort overrides agent-level effort', async () => {
     const provider = MockProvider.sequence([{ content: 'quick answer' }]);
     const { runtime } = createTestRuntime(provider);
 
@@ -39,21 +39,21 @@ describe('Thinking E2E', () => {
       name: 'override-thinker',
       model: 'mock:test',
       system: 'Think.',
-      thinking: 'high',
+      effort: 'high',
     });
 
     const wf = workflow({
       name: 'override-thinking-wf',
       input: z.object({ message: z.string() }),
-      handler: async (ctx) => ctx.ask(reasoner, ctx.input.message, { thinking: 'low' }),
+      handler: async (ctx) => ctx.ask(reasoner, ctx.input.message, { effort: 'low' }),
     });
     runtime.register(wf);
 
     await runtime.execute('override-thinking-wf', { message: 'quick question' });
-    expect(provider.calls[0].options.thinking).toBe('low');
+    expect(provider.calls[0].options.effort).toBe('low');
   });
 
-  it('budget form { budgetTokens } flows through to provider', async () => {
+  it('thinkingBudget flows through to provider', async () => {
     const provider = MockProvider.sequence([{ content: 'done' }]);
     const { runtime } = createTestRuntime(provider);
 
@@ -61,7 +61,7 @@ describe('Thinking E2E', () => {
       name: 'budget-thinker',
       model: 'mock:test',
       system: 'Think.',
-      thinking: { budgetTokens: 3000 },
+      thinkingBudget: 3000,
     });
 
     const wf = workflow({
@@ -72,10 +72,10 @@ describe('Thinking E2E', () => {
     runtime.register(wf);
 
     await runtime.execute('budget-thinking-wf', { message: 'think about this' });
-    expect(provider.calls[0].options.thinking).toEqual({ budgetTokens: 3000 });
+    expect(provider.calls[0].options.thinkingBudget).toBe(3000);
   });
 
-  it('thinking "max" flows through runtime to provider', async () => {
+  it('effort "max" flows through runtime to provider', async () => {
     const provider = MockProvider.sequence([{ content: 'maximum thought' }]);
     const { runtime } = createTestRuntime(provider);
 
@@ -83,7 +83,7 @@ describe('Thinking E2E', () => {
       name: 'max-thinker',
       model: 'mock:test',
       system: 'Think maximally.',
-      thinking: 'max',
+      effort: 'max',
     });
 
     const wf = workflow({
@@ -95,10 +95,10 @@ describe('Thinking E2E', () => {
 
     const result = await runtime.execute('max-thinking-wf', { message: 'go hard' });
     expect(result).toBe('maximum thought');
-    expect(provider.calls[0].options.thinking).toBe('max');
+    expect(provider.calls[0].options.effort).toBe('max');
   });
 
-  it('thinking does not leak from source agent to handoff target', async () => {
+  it('effort does not leak from source agent to handoff target', async () => {
     const provider = MockProvider.sequence([
       // Source agent response: handoff to target
       { content: '' },
@@ -111,14 +111,14 @@ describe('Thinking E2E', () => {
       name: 'target',
       model: 'mock:test',
       system: 'I am the target.',
-      // No thinking configured
+      // No effort configured
     });
 
     const source = agent({
       name: 'source',
       model: 'mock:test',
       system: 'I am the source.',
-      thinking: 'high',
+      effort: 'high',
       handoffs: [{ agent: target }],
     });
 
@@ -129,12 +129,12 @@ describe('Thinking E2E', () => {
     });
     runtime.register(wf);
 
-    // This test verifies the source agent has thinking, but the target should use its own config
-    expect(source._config.thinking).toBe('high');
-    expect(target._config.thinking).toBeUndefined();
+    // This test verifies the source agent has effort, but the target should use its own config
+    expect(source._config.effort).toBe('high');
+    expect(target._config.effort).toBeUndefined();
   });
 
-  it('thinking works with streaming execution', async () => {
+  it('effort works with streaming execution', async () => {
     const provider = MockProvider.sequence([{ content: 'streamed thought' }]);
     const { runtime } = createTestRuntime(provider);
 
@@ -142,7 +142,7 @@ describe('Thinking E2E', () => {
       name: 'stream-thinker',
       model: 'mock:test',
       system: 'Think.',
-      thinking: 'medium',
+      effort: 'medium',
     });
 
     const wf = workflow({
@@ -155,10 +155,10 @@ describe('Thinking E2E', () => {
     const stream = runtime.stream('stream-thinking-wf', { message: 'think' });
     const result = await stream.promise;
     expect(result).toBe('streamed thought');
-    expect(provider.calls[0].options.thinking).toBe('medium');
+    expect(provider.calls[0].options.effort).toBe('medium');
   });
 
-  it('thinking coexists with other model params (temperature, maxTokens, toolChoice)', async () => {
+  it('effort coexists with other model params (temperature, maxTokens, toolChoice)', async () => {
     const provider = MockProvider.sequence([{ content: 'done' }]);
     const { runtime } = createTestRuntime(provider);
 
@@ -166,7 +166,7 @@ describe('Thinking E2E', () => {
       name: 'full-config',
       model: 'mock:test',
       system: 'test',
-      thinking: 'high',
+      effort: 'high',
       temperature: 0.5,
       maxTokens: 2048,
       toolChoice: 'none',
@@ -182,14 +182,14 @@ describe('Thinking E2E', () => {
 
     await runtime.execute('full-config-wf', { message: 'test' });
     const opts = provider.calls[0].options;
-    expect(opts.thinking).toBe('high');
+    expect(opts.effort).toBe('high');
     expect(opts.temperature).toBe(0.5);
     expect(opts.maxTokens).toBe(2048);
     expect(opts.toolChoice).toBe('none');
     expect(opts.stop).toEqual(['END']);
   });
 
-  it('thinking flows through spawn() to all concurrent agents', async () => {
+  it('effort flows through spawn() to all concurrent agents', async () => {
     const provider = MockProvider.sequence([
       { content: 'result-1' },
       { content: 'result-2' },
@@ -201,7 +201,7 @@ describe('Thinking E2E', () => {
       name: 'spawn-thinker',
       model: 'mock:test',
       system: 'Think.',
-      thinking: 'high',
+      effort: 'high',
     });
 
     const wf = workflow({
@@ -217,14 +217,14 @@ describe('Thinking E2E', () => {
     const results = await runtime.execute('spawn-thinking-wf', { message: 'think' });
     expect(results).toHaveLength(3);
 
-    // All 3 provider calls should have thinking: 'high'
+    // All 3 provider calls should have effort: 'high'
     expect(provider.calls).toHaveLength(3);
     for (const call of provider.calls) {
-      expect(call.options.thinking).toBe('high');
+      expect(call.options.effort).toBe('high');
     }
   });
 
-  it('thinking flows through race() to competing agents', async () => {
+  it('effort flows through race() to competing agents', async () => {
     const provider = MockProvider.sequence([{ content: 'winner' }, { content: 'loser' }]);
     const { runtime } = createTestRuntime(provider);
 
@@ -232,14 +232,14 @@ describe('Thinking E2E', () => {
       name: 'fast-thinker',
       model: 'mock:test',
       system: 'Be fast.',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const slow = agent({
       name: 'slow-thinker',
       model: 'mock:test',
       system: 'Be thorough.',
-      thinking: 'high',
+      effort: 'high',
     });
 
     const wf = workflow({
@@ -253,14 +253,14 @@ describe('Thinking E2E', () => {
     const result = await runtime.execute('race-thinking-wf', { message: 'go' });
     expect(result).toBe('winner');
 
-    // Each agent should have its own thinking level
-    const fastCall = provider.calls.find((c) => c.options.thinking === 'low');
-    const highCall = provider.calls.find((c) => c.options.thinking === 'high');
-    expect(fastCall).toBeDefined();
+    // Each agent should have its own effort level
+    const lowCall = provider.calls.find((c) => c.options.effort === 'low');
+    const highCall = provider.calls.find((c) => c.options.effort === 'high');
+    expect(lowCall).toBeDefined();
     expect(highCall).toBeDefined();
   });
 
-  it('thinking flows through parallel() to independent agents', async () => {
+  it('effort flows through parallel() to independent agents', async () => {
     const provider = MockProvider.sequence([{ content: 'answer-a' }, { content: 'answer-b' }]);
     const { runtime } = createTestRuntime(provider);
 
@@ -268,14 +268,14 @@ describe('Thinking E2E', () => {
       name: 'parallel-a',
       model: 'mock:test',
       system: 'Agent A.',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const agentB = agent({
       name: 'parallel-b',
       model: 'mock:test',
       system: 'Agent B.',
-      thinking: 'high',
+      effort: 'high',
     });
 
     const wf = workflow({
@@ -296,14 +296,14 @@ describe('Thinking E2E', () => {
     expect(a).toBe('answer-a');
     expect(b).toBe('answer-b');
 
-    // Each call should retain its agent's thinking config
+    // Each call should retain its agent's effort config
     expect(provider.calls).toHaveLength(2);
-    const thinkingValues = provider.calls.map((c) => c.options.thinking);
-    expect(thinkingValues).toContain('low');
-    expect(thinkingValues).toContain('high');
+    const effortValues = provider.calls.map((c) => c.options.effort);
+    expect(effortValues).toContain('low');
+    expect(effortValues).toContain('high');
   });
 
-  it('thinking with per-call override inside spawn()', async () => {
+  it('effort with per-call override inside spawn()', async () => {
     const provider = MockProvider.sequence([{ content: 'r1' }, { content: 'r2' }]);
     const { runtime } = createTestRuntime(provider);
 
@@ -311,14 +311,14 @@ describe('Thinking E2E', () => {
       name: 'spawn-override',
       model: 'mock:test',
       system: 'Think.',
-      thinking: 'high',
+      effort: 'high',
     });
 
     const wf = workflow({
       name: 'spawn-override-wf',
       input: z.object({ message: z.string() }),
       handler: async (ctx) =>
-        ctx.spawn(2, async () => ctx.ask(a, ctx.input.message, { thinking: 'low' })),
+        ctx.spawn(2, async () => ctx.ask(a, ctx.input.message, { effort: 'low' })),
     });
     runtime.register(wf);
 
@@ -326,11 +326,11 @@ describe('Thinking E2E', () => {
 
     // Per-call override should take precedence
     for (const call of provider.calls) {
-      expect(call.options.thinking).toBe('low');
+      expect(call.options.effort).toBe('low');
     }
   });
 
-  it('trace events include thinking in agent_call data', async () => {
+  it('trace events include effort in agent_call data', async () => {
     const provider = MockProvider.sequence([{ content: 'traced' }]);
     const { runtime, traces } = createTestRuntime(provider);
 
@@ -338,7 +338,7 @@ describe('Thinking E2E', () => {
       name: 'traced-thinker',
       model: 'mock:test',
       system: 'test',
-      thinking: 'high',
+      effort: 'high',
     });
 
     const wf = workflow({

@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { OpenAIProvider, isReasoningModel } from '../providers/openai.js';
+import {
+  OpenAIProvider,
+  isOSeriesModel,
+  supportsReasoningNone,
+  supportsXhigh,
+  clampReasoningEffort,
+} from '../providers/openai.js';
 
 // ── Mock fetch ──────────────────────────────────────────────────────────
 
@@ -51,27 +57,101 @@ describe('OpenAIProvider', () => {
     expect(provider.name).toBe('openai');
   });
 
-  describe('isReasoningModel()', () => {
+  describe('isOSeriesModel()', () => {
     it('detects o1 models', () => {
-      expect(isReasoningModel('o1')).toBe(true);
-      expect(isReasoningModel('o1-mini')).toBe(true);
-      expect(isReasoningModel('o1-pro')).toBe(true);
+      expect(isOSeriesModel('o1')).toBe(true);
+      expect(isOSeriesModel('o1-mini')).toBe(true);
+      expect(isOSeriesModel('o1-pro')).toBe(true);
     });
 
     it('detects o3 models', () => {
-      expect(isReasoningModel('o3')).toBe(true);
-      expect(isReasoningModel('o3-mini')).toBe(true);
-      expect(isReasoningModel('o3-pro')).toBe(true);
+      expect(isOSeriesModel('o3')).toBe(true);
+      expect(isOSeriesModel('o3-mini')).toBe(true);
+      expect(isOSeriesModel('o3-pro')).toBe(true);
     });
 
     it('detects o4-mini', () => {
-      expect(isReasoningModel('o4-mini')).toBe(true);
+      expect(isOSeriesModel('o4-mini')).toBe(true);
     });
 
     it('does not match GPT models', () => {
-      expect(isReasoningModel('gpt-4o')).toBe(false);
-      expect(isReasoningModel('gpt-4-turbo')).toBe(false);
-      expect(isReasoningModel('gpt-5')).toBe(false);
+      expect(isOSeriesModel('gpt-4o')).toBe(false);
+      expect(isOSeriesModel('gpt-4-turbo')).toBe(false);
+      expect(isOSeriesModel('gpt-5')).toBe(false);
+    });
+  });
+
+  describe('supportsReasoningNone()', () => {
+    it('returns true for gpt-5.1+', () => {
+      expect(supportsReasoningNone('gpt-5.1')).toBe(true);
+      expect(supportsReasoningNone('gpt-5.2')).toBe(true);
+      expect(supportsReasoningNone('gpt-5.4')).toBe(true);
+    });
+
+    it('returns false for pre-gpt-5.1 models', () => {
+      expect(supportsReasoningNone('o3')).toBe(false);
+      expect(supportsReasoningNone('o4-mini')).toBe(false);
+      expect(supportsReasoningNone('gpt-5')).toBe(false);
+      expect(supportsReasoningNone('gpt-5-mini')).toBe(false);
+      expect(supportsReasoningNone('gpt-5-nano')).toBe(false);
+      expect(supportsReasoningNone('gpt-5-pro')).toBe(false);
+    });
+  });
+
+  describe('supportsXhigh()', () => {
+    it('returns true for gpt-5.2+ (after gpt-5.1-codex-max)', () => {
+      expect(supportsXhigh('gpt-5.2')).toBe(true);
+      expect(supportsXhigh('gpt-5.3')).toBe(true);
+      expect(supportsXhigh('gpt-5.4')).toBe(true);
+      expect(supportsXhigh('gpt-5.5')).toBe(true);
+    });
+
+    it('returns false for gpt-5.1 and earlier', () => {
+      expect(supportsXhigh('o3')).toBe(false);
+      expect(supportsXhigh('gpt-5')).toBe(false);
+      expect(supportsXhigh('gpt-5.1')).toBe(false);
+    });
+  });
+
+  describe('clampReasoningEffort()', () => {
+    it('clamps none to minimal on o-series', () => {
+      expect(clampReasoningEffort('o3', 'none')).toBe('minimal');
+      expect(clampReasoningEffort('o4-mini', 'none')).toBe('minimal');
+    });
+
+    it('clamps none to minimal on pre-gpt-5.1', () => {
+      expect(clampReasoningEffort('gpt-5', 'none')).toBe('minimal');
+      expect(clampReasoningEffort('gpt-5-nano', 'none')).toBe('minimal');
+    });
+
+    it('allows none on gpt-5.1+', () => {
+      expect(clampReasoningEffort('gpt-5.1', 'none')).toBe('none');
+      expect(clampReasoningEffort('gpt-5.4', 'none')).toBe('none');
+    });
+
+    it('clamps xhigh to high on gpt-5.1 and earlier', () => {
+      expect(clampReasoningEffort('o3', 'xhigh')).toBe('high');
+      expect(clampReasoningEffort('gpt-5', 'xhigh')).toBe('high');
+      expect(clampReasoningEffort('gpt-5.1', 'xhigh')).toBe('high');
+    });
+
+    it('allows xhigh on gpt-5.2+ (after gpt-5.1-codex-max)', () => {
+      expect(clampReasoningEffort('gpt-5.2', 'xhigh')).toBe('xhigh');
+      expect(clampReasoningEffort('gpt-5.4', 'xhigh')).toBe('xhigh');
+    });
+
+    it('clamps any effort to high on gpt-5-pro', () => {
+      expect(clampReasoningEffort('gpt-5-pro', 'low')).toBe('high');
+      expect(clampReasoningEffort('gpt-5-pro', 'medium')).toBe('high');
+      expect(clampReasoningEffort('gpt-5-pro', 'none')).toBe('high');
+      expect(clampReasoningEffort('gpt-5-pro', 'xhigh')).toBe('high');
+    });
+
+    it('passes through valid effort levels unchanged', () => {
+      expect(clampReasoningEffort('o3', 'low')).toBe('low');
+      expect(clampReasoningEffort('o3', 'medium')).toBe('medium');
+      expect(clampReasoningEffort('o3', 'high')).toBe('high');
+      expect(clampReasoningEffort('gpt-5', 'low')).toBe('low');
     });
   });
 
@@ -271,7 +351,7 @@ describe('OpenAIProvider', () => {
       expect(body).not.toHaveProperty('temperature');
     });
 
-    it('passes reasoning_effort when set', async () => {
+    it('passes reasoning_effort for effort "high" on o-series', async () => {
       const fetchMock = mockFetch({
         json: () =>
           Promise.resolve({
@@ -284,14 +364,14 @@ describe('OpenAIProvider', () => {
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'o3',
         maxTokens: 1024,
-        reasoningEffort: 'high',
+        effort: 'high',
       });
 
       const body = getRequestBody(fetchMock);
       expect(body.reasoning_effort).toBe('high');
     });
 
-    it('maps thinking "high" to reasoning_effort "high"', async () => {
+    it('maps effort "max" to "high" on o3 (xhigh not supported pre-gpt-5.4)', async () => {
       const fetchMock = mockFetch({
         json: () =>
           Promise.resolve({
@@ -305,14 +385,14 @@ describe('OpenAIProvider', () => {
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'o3',
         maxTokens: 1024,
-        thinking: 'high',
+        effort: 'max',
       });
 
       const body = getRequestBody(fetchMock);
       expect(body.reasoning_effort).toBe('high');
     });
 
-    it('maps thinking "max" to reasoning_effort "xhigh"', async () => {
+    it('maps effort "max" to "xhigh" on gpt-5.4 (xhigh supported)', async () => {
       const fetchMock = mockFetch({
         json: () =>
           Promise.resolve({
@@ -324,16 +404,16 @@ describe('OpenAIProvider', () => {
 
       const provider = new OpenAIProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
-        model: 'o3',
+        model: 'gpt-5.4',
         maxTokens: 1024,
-        thinking: 'max',
+        effort: 'max',
       });
 
       const body = getRequestBody(fetchMock);
       expect(body.reasoning_effort).toBe('xhigh');
     });
 
-    it('maps thinking budget to nearest reasoning_effort level', async () => {
+    it('maps thinkingBudget to nearest reasoning_effort level', async () => {
       const fetchMock = mockFetch({
         json: () =>
           Promise.resolve({
@@ -347,14 +427,14 @@ describe('OpenAIProvider', () => {
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'o3',
         maxTokens: 1024,
-        thinking: { budgetTokens: 500 },
+        thinkingBudget: 500,
       });
 
       const body = getRequestBody(fetchMock);
       expect(body.reasoning_effort).toBe('low');
     });
 
-    it('thinking takes precedence over reasoningEffort', async () => {
+    it('does not set reasoning_effort when includeThoughts only', async () => {
       const fetchMock = mockFetch({
         json: () =>
           Promise.resolve({
@@ -368,37 +448,15 @@ describe('OpenAIProvider', () => {
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'o3',
         maxTokens: 1024,
-        thinking: 'low',
-        reasoningEffort: 'xhigh',
+        includeThoughts: true,
       });
 
       const body = getRequestBody(fetchMock);
-      expect(body.reasoning_effort).toBe('low');
-    });
-
-    it('ignores includeThoughts-only thinking on reasoning models', async () => {
-      const fetchMock = mockFetch({
-        json: () =>
-          Promise.resolve({
-            id: 'resp-1',
-            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-          }),
-      });
-
-      const provider = new OpenAIProvider();
-      await provider.chat([{ role: 'user', content: 'Hello' }], {
-        model: 'o3',
-        maxTokens: 1024,
-        thinking: { includeThoughts: true },
-      });
-
-      const body = getRequestBody(fetchMock);
-      // includeThoughts is Gemini-only; should not set reasoning_effort
+      // includeThoughts alone should not set reasoning_effort
       expect(body.reasoning_effort).toBeUndefined();
     });
 
-    it('ignores thinking on non-reasoning models', async () => {
+    it('ignores effort on non-reasoning-capable models', async () => {
       const fetchMock = mockFetch({
         json: () =>
           Promise.resolve({
@@ -412,11 +470,32 @@ describe('OpenAIProvider', () => {
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gpt-4o',
         maxTokens: 1024,
-        thinking: 'high',
+        effort: 'high',
       });
 
       const body = getRequestBody(fetchMock);
       expect(body.reasoning_effort).toBeUndefined();
+    });
+
+    it('sends reasoning_effort for GPT-5 models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-1',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5',
+        maxTokens: 1024,
+        effort: 'high',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('high');
     });
 
     it('passes tool_choice when set', async () => {
@@ -444,6 +523,321 @@ describe('OpenAIProvider', () => {
       const body = getRequestBody(fetchMock);
       expect(body.tool_choice).toBe('required');
       expect(body.parallel_tool_calls).toBe(true);
+    });
+
+    it('clamps effort "none" to "minimal" on o-series (none not supported)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        effort: 'none',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('minimal');
+    });
+
+    it('clamps effort "none" to "minimal" on pre-gpt-5.1 (none not supported)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5',
+        maxTokens: 1024,
+        effort: 'none',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('minimal');
+    });
+
+    it('sends reasoning_effort "none" on gpt-5.1 (none supported)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5.1',
+        maxTokens: 1024,
+        effort: 'none',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('none');
+    });
+
+    it('does not send reasoning_effort for effort "none" on non-reasoning models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-4o',
+        maxTokens: 1024,
+        effort: 'none',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBeUndefined();
+    });
+
+    it('clamps thinkingBudget 0 to "minimal" on o-series (none not supported)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        thinkingBudget: 0,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('minimal');
+    });
+
+    it('clamps effort+thinkingBudget:0 to "minimal" on o-series', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        effort: 'low',
+        thinkingBudget: 0,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('minimal');
+    });
+
+    it('clamps any effort to "high" on gpt-5-pro (only supports high)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5-pro',
+        maxTokens: 1024,
+        effort: 'low',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('high');
+    });
+
+    it('thinkingBudget overrides effort when both set', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        effort: 'high',
+        thinkingBudget: 500,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('low');
+    });
+
+    it('positive thinkingBudget overrides effort "none"', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        effort: 'none',
+        thinkingBudget: 5000,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('medium');
+    });
+
+    it('uses system role (not developer) for GPT-5 models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat(
+        [
+          { role: 'system', content: 'You are helpful.' },
+          { role: 'user', content: 'Hello' },
+        ],
+        { model: 'gpt-5', maxTokens: 1024 },
+      );
+
+      const body = getRequestBody(fetchMock);
+      const messages = body.messages as Array<{ role: string; content: string }>;
+      expect(messages[0].role).toBe('system');
+    });
+
+    it('sends parallel_tool_calls for GPT-5 with tools', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5',
+        maxTokens: 1024,
+        tools: [
+          {
+            type: 'function',
+            function: { name: 'test', description: 'test', parameters: {} },
+          },
+        ],
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.parallel_tool_calls).toBe(true);
+    });
+
+    it('strips temperature for GPT-5 when reasoning active', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5',
+        maxTokens: 1024,
+        effort: 'high',
+        temperature: 0.7,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body).not.toHaveProperty('temperature');
+      expect(body.reasoning_effort).toBe('high');
+    });
+
+    it('allows temperature for GPT-5 with no effort', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5',
+        maxTokens: 1024,
+        temperature: 0.7,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.temperature).toBe(0.7);
+    });
+
+    it('merges providerOptions into request body', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-4o',
+        maxTokens: 1024,
+        providerOptions: { logprobs: true, top_logprobs: 3 },
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.logprobs).toBe(true);
+      expect(body.top_logprobs).toBe(3);
+    });
+
+    it('providerOptions can override computed fields', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        providerOptions: { temperature: 0.5 },
+      });
+
+      const body = getRequestBody(fetchMock);
+      // providerOptions is merged last, so it can override stripped temperature
+      expect(body.temperature).toBe(0.5);
     });
 
     it('captures reasoning and cached tokens from usage', async () => {

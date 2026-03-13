@@ -449,14 +449,14 @@ describe('OpenAIResponsesProvider', () => {
       await provider.chat([{ role: 'user', content: 'Hi' }], {
         model: 'o3',
         maxTokens: 1024,
-        reasoningEffort: 'high',
+        effort: 'high',
       });
 
       const body = getRequestBody(fetchMock);
       expect(body.reasoning).toEqual({ effort: 'high' });
     });
 
-    it('maps thinking "max" to reasoning { effort: "xhigh" }', async () => {
+    it('maps effort "max" to "high" on o3 (xhigh not supported pre-gpt-5.4)', async () => {
       const fetchMock = mockFetch({
         json: () =>
           Promise.resolve({
@@ -476,14 +476,14 @@ describe('OpenAIResponsesProvider', () => {
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'o3',
         maxTokens: 1024,
-        thinking: 'max',
+        effort: 'max',
       });
 
       const body = getRequestBody(fetchMock);
-      expect(body.reasoning).toEqual({ effort: 'xhigh' });
+      expect(body.reasoning).toEqual({ effort: 'high' });
     });
 
-    it('ignores thinking on non-reasoning models', async () => {
+    it('ignores effort on non-reasoning models', async () => {
       const fetchMock = mockFetch({
         json: () =>
           Promise.resolve({
@@ -503,7 +503,7 @@ describe('OpenAIResponsesProvider', () => {
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'gpt-4o',
         maxTokens: 1024,
-        thinking: 'high',
+        effort: 'high',
       });
 
       const body = getRequestBody(fetchMock);
@@ -718,6 +718,342 @@ describe('OpenAIResponsesProvider', () => {
       expect(body.text).toEqual({ format: { type: 'text' } });
     });
 
+    it('clamps effort "none" to "minimal" on o-series (none not supported)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        effort: 'none',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning).toEqual({ effort: 'minimal' });
+    });
+
+    it('does not send reasoning for effort "none" on non-reasoning models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gpt-4o',
+        maxTokens: 1024,
+        effort: 'none',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning).toBeUndefined();
+    });
+
+    it('maps thinkingBudget to nearest reasoning effort', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        thinkingBudget: 500,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning).toEqual({ effort: 'low' });
+    });
+
+    it('clamps thinkingBudget 0 to "minimal" on o-series (none not supported)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        thinkingBudget: 0,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning).toEqual({ effort: 'minimal' });
+    });
+
+    it('clamps effort+thinkingBudget:0 to "minimal" on o-series', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        effort: 'low',
+        thinkingBudget: 0,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning).toEqual({ effort: 'minimal' });
+    });
+
+    it('thinkingBudget overrides effort when both set', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        effort: 'high',
+        thinkingBudget: 500,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning).toEqual({ effort: 'low' });
+    });
+
+    it('positive thinkingBudget overrides effort "none"', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        effort: 'none',
+        thinkingBudget: 5000,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning).toEqual({ effort: 'medium' });
+    });
+
+    it('sends reasoning summary "detailed" for includeThoughts on reasoning models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        effort: 'high',
+        includeThoughts: true,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning).toEqual({ effort: 'high', summary: 'detailed' });
+    });
+
+    it('sends reasoning summary for includeThoughts-only on reasoning models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'o3',
+        maxTokens: 1024,
+        includeThoughts: true,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning).toEqual({ summary: 'detailed' });
+    });
+
+    it('captures reasoning items in providerMetadata from response', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [
+              {
+                type: 'reasoning',
+                id: 'rs_1',
+                encrypted_content: 'encrypted-data',
+              },
+              {
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'ok' }],
+              },
+            ],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'o3',
+        maxTokens: 1024,
+      });
+
+      expect(response.providerMetadata).toBeDefined();
+      expect(response.providerMetadata!.openaiReasoningItems).toEqual([
+        { type: 'reasoning', id: 'rs_1', encrypted_content: 'encrypted-data' },
+      ]);
+    });
+
+    it('injects reasoning items from providerMetadata into input', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [
+              {
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'ok' }],
+              },
+            ],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat(
+        [
+          { role: 'user', content: 'Hi' },
+          {
+            role: 'assistant',
+            content: 'Sure',
+            providerMetadata: {
+              openaiReasoningItems: [
+                { type: 'reasoning', id: 'rs_1', encrypted_content: 'encrypted-data' },
+              ],
+            },
+          },
+          { role: 'user', content: 'Thanks' },
+        ],
+        { model: 'o3', maxTokens: 1024 },
+      );
+
+      const body = getRequestBody(fetchMock);
+      const input = body.input as any[];
+      // Reasoning item should be injected before the assistant message
+      expect(input[1]).toEqual({
+        type: 'reasoning',
+        id: 'rs_1',
+        encrypted_content: 'encrypted-data',
+      });
+      expect(input[2]).toEqual({
+        type: 'message',
+        role: 'assistant',
+        content: 'Sure',
+      });
+    });
+
+    it('merges providerOptions into request body', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gpt-4o',
+        maxTokens: 1024,
+        providerOptions: { truncation: 'auto' },
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.truncation).toBe('auto');
+    });
+
+    it('requests reasoning.encrypted_content for reasoning models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'o3',
+        maxTokens: 1024,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.include).toEqual(['reasoning.encrypted_content']);
+    });
+
+    it('does not request reasoning.encrypted_content for non-reasoning models', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gpt-4o',
+        maxTokens: 1024,
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.include).toBeUndefined();
+    });
+
     it('handles API errors gracefully', async () => {
       mockFetch({
         ok: false,
@@ -839,6 +1175,91 @@ describe('OpenAIResponsesProvider', () => {
         arguments: ':"SF"}',
       });
       expect(chunks[3].type).toBe('done');
+    });
+
+    it('emits thinking_delta from reasoning_summary_text.delta events', async () => {
+      const sseBody = makeSSEStream([
+        {
+          event: 'response.reasoning_summary_text.delta',
+          data: { delta: 'Let me think...' },
+        },
+        {
+          event: 'response.output_text.delta',
+          data: { delta: 'Hello!' },
+        },
+        {
+          event: 'response.completed',
+          data: {
+            response: {
+              output: [],
+              usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+            },
+          },
+        },
+      ]);
+
+      mockFetch({ body: sseBody });
+
+      const provider = new OpenAIResponsesProvider();
+      const chunks: any[] = [];
+      for await (const chunk of provider.stream([{ role: 'user', content: 'Hi' }], {
+        model: 'o3',
+        maxTokens: 1024,
+      })) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks[0]).toEqual({ type: 'thinking_delta', content: 'Let me think...' });
+      expect(chunks[1]).toEqual({ type: 'text_delta', content: 'Hello!' });
+      expect(chunks[2].type).toBe('done');
+    });
+
+    it('captures reasoning items in stream done providerMetadata', async () => {
+      const sseBody = makeSSEStream([
+        {
+          event: 'response.output_text.delta',
+          data: { delta: 'Hello!' },
+        },
+        {
+          event: 'response.completed',
+          data: {
+            response: {
+              output: [
+                {
+                  type: 'reasoning',
+                  id: 'rs_1',
+                  encrypted_content: 'encrypted-data',
+                },
+                {
+                  type: 'message',
+                  role: 'assistant',
+                  content: [{ type: 'output_text', text: 'Hello!' }],
+                },
+              ],
+              usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+            },
+          },
+        },
+      ]);
+
+      mockFetch({ body: sseBody });
+
+      const provider = new OpenAIResponsesProvider();
+      const chunks: any[] = [];
+      for await (const chunk of provider.stream([{ role: 'user', content: 'Hi' }], {
+        model: 'o3',
+        maxTokens: 1024,
+      })) {
+        chunks.push(chunk);
+      }
+
+      const doneChunk = chunks.find((c) => c.type === 'done');
+      expect(doneChunk).toBeDefined();
+      expect(doneChunk.providerMetadata).toEqual({
+        openaiReasoningItems: [
+          { type: 'reasoning', id: 'rs_1', encrypted_content: 'encrypted-data' },
+        ],
+      });
     });
 
     it('throws on response.failed events', async () => {

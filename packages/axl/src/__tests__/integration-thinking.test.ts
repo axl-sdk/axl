@@ -4,6 +4,10 @@ import { tool } from '../tool.js';
 import { agent } from '../agent.js';
 import { workflow } from '../workflow.js';
 import { AxlRuntime } from '../runtime.js';
+import { AnthropicProvider } from '../providers/anthropic.js';
+import { OpenAIResponsesProvider } from '../providers/openai-responses.js';
+import { GeminiProvider } from '../providers/gemini.js';
+import type { StreamChunk } from '../providers/types.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -42,7 +46,7 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: OpenAI', () => {
     const reasoner = agent({
       model: reasoningModel,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const result = await reasoner.ask('What is 7 + 5?');
@@ -54,7 +58,7 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: OpenAI', () => {
     const reasoner = agent({
       model: reasoningModel,
       system: 'You are a math assistant. Keep answers very short.',
-      thinking: 'high',
+      effort: 'high',
     });
 
     const result = await reasoner.ask('What is the square root of 144?');
@@ -68,7 +72,7 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: OpenAI', () => {
       system:
         'You are a math assistant. Always use the calculator tool for arithmetic. Return only the final numeric answer.',
       tools: [calculatorTool],
-      thinking: 'medium',
+      effort: 'medium',
     });
 
     const runtime = new AxlRuntime();
@@ -85,13 +89,11 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: OpenAI', () => {
     expect(String(result)).toContain('221');
   }, 30_000);
 
-  it('thinking takes precedence over reasoningEffort', async () => {
-    // thinking: 'low' should override reasoningEffort: 'xhigh'
+  it('effort "low" produces a valid response', async () => {
     const reasoner = agent({
       model: reasoningModel,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: 'low',
-      reasoningEffort: 'xhigh',
+      effort: 'low',
     });
 
     const result = await reasoner.ask('What is 2 + 2?');
@@ -103,11 +105,11 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: OpenAI', () => {
     const reasoner = agent({
       model: reasoningModel,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: 'high',
+      effort: 'high',
     });
 
     // Override to 'low' for this call
-    const result = await reasoner.ask('What is 3 + 3?', { thinking: 'low' });
+    const result = await reasoner.ask('What is 3 + 3?', { effort: 'low' });
     expect(typeof result).toBe('string');
     expect(result).toContain('6');
   }, 30_000);
@@ -124,7 +126,7 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: OpenAI Responses', () => {
     const reasoner = agent({
       model: reasoningModel,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: 'medium',
+      effort: 'medium',
     });
 
     const result = await reasoner.ask('What is the capital of France?');
@@ -144,7 +146,7 @@ describe.skipIf(!hasAnthropic)('Thinking Integration: Anthropic', () => {
     const thinker = agent({
       model,
       system: 'You are a helpful assistant. Keep answers very short (one sentence max).',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const result = await thinker.ask('What is the capital of Germany?');
@@ -156,7 +158,7 @@ describe.skipIf(!hasAnthropic)('Thinking Integration: Anthropic', () => {
     const thinker = agent({
       model,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: 'high',
+      effort: 'high',
       // maxTokens defaults to 4096 which is < budget_tokens 10000
       // Provider should auto-bump to 11024
     });
@@ -170,7 +172,7 @@ describe.skipIf(!hasAnthropic)('Thinking Integration: Anthropic', () => {
     const thinker = agent({
       model,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: { budgetTokens: 2000 },
+      thinkingBudget: 2000,
     });
 
     const result = await thinker.ask('What is the largest planet in our solar system?');
@@ -184,7 +186,7 @@ describe.skipIf(!hasAnthropic)('Thinking Integration: Anthropic', () => {
       system:
         'You are a math assistant. Always use the calculator tool for arithmetic. Return only the final numeric answer.',
       tools: [calculatorTool],
-      thinking: 'low',
+      effort: 'low',
     });
 
     const runtime = new AxlRuntime();
@@ -205,7 +207,7 @@ describe.skipIf(!hasAnthropic)('Thinking Integration: Anthropic', () => {
     const thinker = agent({
       model,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const runtime = new AxlRuntime();
@@ -243,7 +245,7 @@ describe.skipIf(!hasAnthropic)('Thinking Integration: Anthropic', () => {
       model,
       system:
         'You are a data extraction assistant. Always respond with valid JSON matching the requested schema.',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const result = await thinker.ask(
@@ -271,7 +273,7 @@ describe.skipIf(!hasAnthropic)('Thinking Integration: Anthropic Adaptive', () =>
     const thinker = agent({
       model,
       system: 'You are a helpful assistant. Keep answers very short (one sentence max).',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const result = await thinker.ask('What is the capital of Italy?');
@@ -283,7 +285,7 @@ describe.skipIf(!hasAnthropic)('Thinking Integration: Anthropic Adaptive', () =>
     const thinker = agent({
       model,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: 'high',
+      effort: 'high',
     });
 
     const result = await thinker.ask('What is 6 * 9?');
@@ -295,7 +297,7 @@ describe.skipIf(!hasAnthropic)('Thinking Integration: Anthropic Adaptive', () =>
     const thinker = agent({
       model,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: { budgetTokens: 2000 },
+      thinkingBudget: 2000,
     });
 
     const result = await thinker.ask('What is the chemical symbol for gold?');
@@ -315,7 +317,7 @@ describe.skipIf(!hasGoogle)('Thinking Integration: Google Gemini', () => {
     const thinker = agent({
       model,
       system: 'You are a helpful assistant. Keep answers very short (one sentence max).',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const result = await thinker.ask('What is the capital of Japan?');
@@ -327,7 +329,7 @@ describe.skipIf(!hasGoogle)('Thinking Integration: Google Gemini', () => {
     const thinker = agent({
       model,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: 'high',
+      effort: 'high',
     });
 
     const result = await thinker.ask('What is 11 * 11?');
@@ -339,7 +341,7 @@ describe.skipIf(!hasGoogle)('Thinking Integration: Google Gemini', () => {
     const thinker = agent({
       model,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: { budgetTokens: 2000 },
+      thinkingBudget: 2000,
     });
 
     const result = await thinker.ask('What is the chemical symbol for water?');
@@ -353,7 +355,7 @@ describe.skipIf(!hasGoogle)('Thinking Integration: Google Gemini', () => {
       system:
         'You are a math assistant. Always use the calculator tool for arithmetic. Return only the final numeric answer.',
       tools: [calculatorTool],
-      thinking: 'low',
+      effort: 'low',
     });
 
     const runtime = new AxlRuntime();
@@ -374,7 +376,7 @@ describe.skipIf(!hasGoogle)('Thinking Integration: Google Gemini', () => {
     const thinker = agent({
       model,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const runtime = new AxlRuntime();
@@ -419,19 +421,19 @@ describe.skipIf(!hasOpenAI || !hasAnthropic || !hasGoogle)(
       const openaiAgent = agent({
         model: 'openai:o4-mini',
         system: 'You are a math assistant. Respond with valid JSON only.',
-        thinking: 'low',
+        effort: 'low',
       });
 
       const anthropicAgent = agent({
         model: 'anthropic:claude-haiku-4-5',
         system: 'You are a math assistant. Respond with valid JSON only.',
-        thinking: 'low',
+        effort: 'low',
       });
 
       const geminiAgent = agent({
         model: 'google:gemini-2.5-flash',
         system: 'You are a math assistant. Respond with valid JSON only.',
-        thinking: 'low',
+        effort: 'low',
       });
 
       const [oaiResult, antResult, gemResult] = await Promise.all([
@@ -469,7 +471,7 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: OpenAI Structured Output', ()
       model: reasoningModel,
       system:
         'You are an astronomy assistant. Always respond with valid JSON matching the requested schema.',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const result = await reasoner.ask('Give me information about Saturn. Position from sun is 6.', {
@@ -489,7 +491,7 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: OpenAI Structured Output', ()
     const reasoner = agent({
       model: reasoningModel,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const runtime = new AxlRuntime();
@@ -529,7 +531,7 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: OpenAI Responses Expanded', (
       system:
         'You are a math assistant. Always use the calculator tool for arithmetic. Return only the final numeric answer.',
       tools: [calculatorTool],
-      thinking: 'low',
+      effort: 'low',
     });
 
     const runtime = new AxlRuntime();
@@ -550,7 +552,7 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: OpenAI Responses Expanded', (
     const reasoner = agent({
       model: reasoningModel,
       system: 'You are a helpful assistant. Keep answers very short.',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const runtime = new AxlRuntime();
@@ -586,7 +588,7 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: OpenAI Responses Expanded', (
     const reasoner = agent({
       model: reasoningModel,
       system: 'You are a color expert. Respond with valid JSON matching the requested schema.',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const result = await reasoner.ask('Tell me about the color red. Its hex code is #FF0000.', {
@@ -619,7 +621,7 @@ describe.skipIf(!hasGoogle)('Thinking Integration: Gemini Structured Output', ()
     const thinker = agent({
       model,
       system: 'You are a zoology assistant. Respond with valid JSON matching the requested schema.',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const result = await thinker.ask('Tell me about a penguin.', {
@@ -648,7 +650,7 @@ describe.skipIf(!hasAnthropic)('Thinking Integration: Sessions', () => {
       model,
       system:
         'You are a helpful assistant with perfect memory. Keep answers very short (one sentence max).',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const runtime = new AxlRuntime();
@@ -684,7 +686,7 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: Sessions OpenAI', () => {
       model: reasoningModel,
       system:
         'You are a helpful assistant with perfect memory. Keep answers very short (one sentence max).',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const runtime = new AxlRuntime();
@@ -722,7 +724,7 @@ describe.skipIf(!hasGoogle)('Thinking Integration: Sessions Gemini', () => {
       model,
       system:
         'You are a helpful assistant with perfect memory. Keep answers very short (one sentence max).',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const runtime = new AxlRuntime();
@@ -760,7 +762,7 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: Sessions OpenAI Responses', (
       model,
       system:
         'You are a helpful assistant with perfect memory. Keep answers very short (one sentence max).',
-      thinking: 'low',
+      effort: 'low',
     });
 
     const runtime = new AxlRuntime();
@@ -784,4 +786,138 @@ describe.skipIf(!hasOpenAI)('Thinking Integration: Sessions OpenAI Responses', (
     expect(String(answer).toLowerCase()).toContain('nimbus');
     await session.end();
   }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// Thought Visibility — verify thinking_content and thinking_delta
+//
+// Uses provider instances directly to access the full ProviderResponse
+// (agent.ask() only returns the string content).
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!hasAnthropic)('Thought Visibility: Anthropic', () => {
+  it('thinking_content is returned when thinking is active', async () => {
+    const provider = new AnthropicProvider();
+    const response = await provider.chat(
+      [
+        { role: 'system', content: 'You are a helpful assistant. Keep answers short.' },
+        { role: 'user', content: 'What is 15 * 17?' },
+      ],
+      { model: 'claude-haiku-4-5', effort: 'low', maxTokens: 16000 },
+    );
+
+    expect(response.content).toBeTruthy();
+    expect(response.content).toContain('255');
+    // Anthropic returns thinking blocks when thinking is enabled
+    expect(response.thinking_content).toBeDefined();
+    expect(typeof response.thinking_content).toBe('string');
+    expect(response.thinking_content!.length).toBeGreaterThan(0);
+  }, 30_000);
+
+  it('thinking_delta chunks are emitted during streaming', async () => {
+    const provider = new AnthropicProvider();
+    const chunks: StreamChunk[] = [];
+    for await (const chunk of provider.stream(
+      [
+        { role: 'system', content: 'You are a helpful assistant. Keep answers short.' },
+        { role: 'user', content: 'What is 12 + 8?' },
+      ],
+      { model: 'claude-haiku-4-5', effort: 'low', maxTokens: 16000 },
+    )) {
+      chunks.push(chunk);
+    }
+
+    const thinkingChunks = chunks.filter((c) => c.type === 'thinking_delta');
+    const textChunks = chunks.filter((c) => c.type === 'text_delta');
+
+    // Should have both thinking and text chunks
+    expect(thinkingChunks.length).toBeGreaterThan(0);
+    expect(textChunks.length).toBeGreaterThan(0);
+  }, 30_000);
+});
+
+describe.skipIf(!hasOpenAI)('Thought Visibility: OpenAI Responses', () => {
+  it('thinking_content is returned with includeThoughts on reasoning model', async () => {
+    const provider = new OpenAIResponsesProvider();
+    const response = await provider.chat(
+      [
+        { role: 'system', content: 'You are a helpful assistant. Keep answers short.' },
+        { role: 'user', content: 'What is 15 * 17?' },
+      ],
+      { model: 'o4-mini', effort: 'low', includeThoughts: true },
+    );
+
+    expect(response.content).toBeTruthy();
+    expect(response.content).toContain('255');
+    // Reasoning summaries should be returned
+    expect(response.thinking_content).toBeDefined();
+    expect(typeof response.thinking_content).toBe('string');
+    expect(response.thinking_content!.length).toBeGreaterThan(0);
+  }, 30_000);
+
+  // Note: reasoning summary deltas are only emitted for non-trivial reasoning.
+  // Simple arithmetic may not produce summary events, so we use a harder question.
+  it('thinking_delta chunks are emitted during streaming with includeThoughts', async () => {
+    const provider = new OpenAIResponsesProvider();
+    const chunks: StreamChunk[] = [];
+    for await (const chunk of provider.stream(
+      [
+        { role: 'system', content: 'You are a math tutor. Show your reasoning.' },
+        {
+          role: 'user',
+          content:
+            'A train leaves at 3pm going 60mph. Another leaves at 4pm going 80mph in the same direction. When does the second catch the first?',
+        },
+      ],
+      { model: 'o4-mini', effort: 'medium', includeThoughts: true, maxTokens: 4096 },
+    )) {
+      chunks.push(chunk);
+    }
+
+    const thinkingChunks = chunks.filter((c) => c.type === 'thinking_delta');
+    const textChunks = chunks.filter((c) => c.type === 'text_delta');
+
+    expect(thinkingChunks.length).toBeGreaterThan(0);
+    expect(textChunks.length).toBeGreaterThan(0);
+  }, 60_000);
+});
+
+describe.skipIf(!hasGoogle)('Thought Visibility: Gemini', () => {
+  it('thinking_content is returned with includeThoughts', async () => {
+    const provider = new GeminiProvider();
+    const response = await provider.chat(
+      [
+        { role: 'system', content: 'You are a helpful assistant. Keep answers short.' },
+        { role: 'user', content: 'What is 15 * 17?' },
+      ],
+      { model: 'gemini-2.5-flash', effort: 'low', includeThoughts: true },
+    );
+
+    expect(response.content).toBeTruthy();
+    expect(response.content).toContain('255');
+    // Gemini returns thought summaries with includeThoughts
+    expect(response.thinking_content).toBeDefined();
+    expect(typeof response.thinking_content).toBe('string');
+    expect(response.thinking_content!.length).toBeGreaterThan(0);
+  }, 30_000);
+
+  it('thinking_delta chunks are emitted during streaming with includeThoughts', async () => {
+    const provider = new GeminiProvider();
+    const chunks: StreamChunk[] = [];
+    for await (const chunk of provider.stream(
+      [
+        { role: 'system', content: 'You are a helpful assistant. Keep answers short.' },
+        { role: 'user', content: 'What is 12 + 8?' },
+      ],
+      { model: 'gemini-2.5-flash', effort: 'low', includeThoughts: true },
+    )) {
+      chunks.push(chunk);
+    }
+
+    const thinkingChunks = chunks.filter((c) => c.type === 'thinking_delta');
+    const textChunks = chunks.filter((c) => c.type === 'text_delta');
+
+    expect(thinkingChunks.length).toBeGreaterThan(0);
+    expect(textChunks.length).toBeGreaterThan(0);
+  }, 30_000);
 });

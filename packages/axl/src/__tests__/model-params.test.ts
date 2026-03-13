@@ -66,7 +66,7 @@ describe('Configurable Model Parameters', () => {
 
       expect(provider.calls[0].options.maxTokens).toBe(4096);
       expect(provider.calls[0].options.temperature).toBeUndefined();
-      expect(provider.calls[0].options.reasoningEffort).toBeUndefined();
+      expect(provider.calls[0].options.effort).toBeUndefined();
       expect(provider.calls[0].options.toolChoice).toBeUndefined();
       expect(provider.calls[0].options.stop).toBeUndefined();
     });
@@ -80,7 +80,7 @@ describe('Configurable Model Parameters', () => {
         system: 'sys',
         temperature: 0.7,
         maxTokens: 8192,
-        reasoningEffort: 'high',
+        effort: 'high',
         toolChoice: 'required',
         stop: ['\n---'],
       });
@@ -91,7 +91,7 @@ describe('Configurable Model Parameters', () => {
       const opts = provider.calls[0].options;
       expect(opts.temperature).toBe(0.7);
       expect(opts.maxTokens).toBe(8192);
-      expect(opts.reasoningEffort).toBe('high');
+      expect(opts.effort).toBe('high');
       expect(opts.toolChoice).toBe('required');
       expect(opts.stop).toEqual(['\n---']);
     });
@@ -105,7 +105,7 @@ describe('Configurable Model Parameters', () => {
         system: 'sys',
         temperature: 0.7,
         maxTokens: 8192,
-        reasoningEffort: 'high',
+        effort: 'high',
         toolChoice: 'auto',
         stop: ['\n---'],
       });
@@ -114,7 +114,7 @@ describe('Configurable Model Parameters', () => {
       await ctx.ask(a, 'hi', {
         temperature: 0.2,
         maxTokens: 2048,
-        reasoningEffort: 'low',
+        effort: 'low',
         toolChoice: 'none',
         stop: ['END'],
       });
@@ -122,7 +122,7 @@ describe('Configurable Model Parameters', () => {
       const opts = provider.calls[0].options;
       expect(opts.temperature).toBe(0.2);
       expect(opts.maxTokens).toBe(2048);
-      expect(opts.reasoningEffort).toBe('low');
+      expect(opts.effort).toBe('low');
       expect(opts.toolChoice).toBe('none');
       expect(opts.stop).toEqual(['END']);
     });
@@ -143,7 +143,7 @@ describe('Configurable Model Parameters', () => {
       const opts = provider.calls[0].options;
       expect(opts.temperature).toBe(0.1);
       expect(opts.maxTokens).toBe(16384);
-      expect(opts.reasoningEffort).toBeUndefined();
+      expect(opts.effort).toBeUndefined();
     });
   });
 
@@ -185,7 +185,7 @@ describe('Configurable Model Parameters', () => {
 
       expect(captured.maxTokens).toBe(4096);
       expect(captured.temperature).toBeUndefined();
-      expect(captured.reasoningEffort).toBeUndefined();
+      expect(captured.effort).toBeUndefined();
     });
   });
 

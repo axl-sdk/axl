@@ -16,12 +16,12 @@ function createThinkingTestServer() {
     handler: (input) => `Hello, ${input.name}!`,
   });
 
-  const thinkingAgent = agent({
-    name: 'thinking-agent',
+  const effortAgent = agent({
+    name: 'effort-agent',
     model: 'mock:test',
     system: 'You think deeply.',
     tools: [greet],
-    thinking: 'high',
+    effort: 'high',
     temperature: 0.3,
     maxTokens: 2048,
   });
@@ -30,25 +30,25 @@ function createThinkingTestServer() {
     name: 'budget-agent',
     model: 'mock:test',
     system: 'You think with a budget.',
-    thinking: { budgetTokens: 5000 },
+    thinkingBudget: 5000,
   });
 
   const maxAgent = agent({
     name: 'max-agent',
     model: 'mock:test',
     system: 'You think maximally.',
-    thinking: 'max',
+    effort: 'max',
   });
 
   runtime.registerTool(greet);
-  runtime.registerAgent(thinkingAgent);
+  runtime.registerAgent(effortAgent);
   runtime.registerAgent(budgetAgent);
   runtime.registerAgent(maxAgent);
 
   const wf = workflow({
     name: 'test-wf',
     input: z.object({ message: z.string() }),
-    handler: async (ctx) => ctx.ask(thinkingAgent, ctx.input.message),
+    handler: async (ctx) => ctx.ask(effortAgent, ctx.input.message),
   });
   runtime.register(wf);
 
@@ -57,7 +57,7 @@ function createThinkingTestServer() {
 }
 
 describe('Studio API: Thinking', () => {
-  it('GET /api/agents lists agents with thinking field (string form)', async () => {
+  it('GET /api/agents lists agents with effort field', async () => {
     const { app } = createThinkingTestServer();
     const res = await app.request('/api/agents');
     expect(res.status).toBe(200);
@@ -65,65 +65,65 @@ describe('Studio API: Thinking', () => {
     const body = await res.json();
     expect(body.ok).toBe(true);
 
-    const thinkingAgent = body.data.find((a: any) => a.name === 'thinking-agent');
-    expect(thinkingAgent).toBeDefined();
-    expect(thinkingAgent.thinking).toBe('high');
-    expect(thinkingAgent.temperature).toBe(0.3);
-    expect(thinkingAgent.maxTokens).toBe(2048);
+    const effortAgent = body.data.find((a: any) => a.name === 'effort-agent');
+    expect(effortAgent).toBeDefined();
+    expect(effortAgent.effort).toBe('high');
+    expect(effortAgent.temperature).toBe(0.3);
+    expect(effortAgent.maxTokens).toBe(2048);
   });
 
-  it('GET /api/agents lists agents with thinking field (budget form)', async () => {
+  it('GET /api/agents lists agents with thinkingBudget field', async () => {
     const { app } = createThinkingTestServer();
     const res = await app.request('/api/agents');
     const body = await res.json();
 
     const budgetAgent = body.data.find((a: any) => a.name === 'budget-agent');
     expect(budgetAgent).toBeDefined();
-    expect(budgetAgent.thinking).toEqual({ budgetTokens: 5000 });
+    expect(budgetAgent.thinkingBudget).toBe(5000);
   });
 
-  it('GET /api/agents/:name returns thinking in agent detail', async () => {
+  it('GET /api/agents/:name returns effort in agent detail', async () => {
     const { app } = createThinkingTestServer();
-    const res = await app.request('/api/agents/thinking-agent');
+    const res = await app.request('/api/agents/effort-agent');
     expect(res.status).toBe(200);
 
     const body = await res.json();
     expect(body.ok).toBe(true);
-    expect(body.data.name).toBe('thinking-agent');
-    expect(body.data.thinking).toBe('high');
+    expect(body.data.name).toBe('effort-agent');
+    expect(body.data.effort).toBe('high');
   });
 
-  it('GET /api/agents/:name returns budget thinking in agent detail', async () => {
+  it('GET /api/agents/:name returns thinkingBudget in agent detail', async () => {
     const { app } = createThinkingTestServer();
     const res = await app.request('/api/agents/budget-agent');
     expect(res.status).toBe(200);
 
     const body = await res.json();
     expect(body.ok).toBe(true);
-    expect(body.data.thinking).toEqual({ budgetTokens: 5000 });
+    expect(body.data.thinkingBudget).toBe(5000);
   });
 
-  it('GET /api/agents lists agents with thinking "max"', async () => {
+  it('GET /api/agents lists agents with effort "max"', async () => {
     const { app } = createThinkingTestServer();
     const res = await app.request('/api/agents');
     const body = await res.json();
 
     const maxAgent = body.data.find((a: any) => a.name === 'max-agent');
     expect(maxAgent).toBeDefined();
-    expect(maxAgent.thinking).toBe('max');
+    expect(maxAgent.effort).toBe('max');
   });
 
-  it('GET /api/agents/:name returns thinking "max" in agent detail', async () => {
+  it('GET /api/agents/:name returns effort "max" in agent detail', async () => {
     const { app } = createThinkingTestServer();
     const res = await app.request('/api/agents/max-agent');
     expect(res.status).toBe(200);
 
     const body = await res.json();
     expect(body.ok).toBe(true);
-    expect(body.data.thinking).toBe('max');
+    expect(body.data.effort).toBe('max');
   });
 
-  it('agents without thinking return undefined for thinking field', async () => {
+  it('agents without effort return undefined for effort field', async () => {
     const runtime = new AxlRuntime();
     runtime.registerProvider('mock', MockProvider.echo());
 
@@ -140,6 +140,7 @@ describe('Studio API: Thinking', () => {
 
     const a = body.data.find((a: any) => a.name === 'plain-agent');
     expect(a).toBeDefined();
-    expect(a.thinking).toBeUndefined();
+    expect(a.effort).toBeUndefined();
+    expect(a.thinkingBudget).toBeUndefined();
   });
 });

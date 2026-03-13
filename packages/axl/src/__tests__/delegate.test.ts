@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { agent } from '../agent.js';
 import { z } from 'zod';
+import { ProviderRegistry } from '../providers/registry.js';
 import { createSequenceProvider, createTestCtx, type SequenceProvider } from './helpers.js';
 
 describe('ctx.delegate()', () => {

@@ -1,6 +1,8 @@
-# axl
+# @axlsdk/axl
 
-Core SDK for orchestrating agentic systems in TypeScript.
+[![npm version](https://img.shields.io/npm/v/@axlsdk/axl)](https://www.npmjs.com/package/@axlsdk/axl)
+
+Core SDK for orchestrating agentic systems in TypeScript. Part of the [Axl](https://github.com/axl-sdk/axl) monorepo.
 
 ## Installation
 
@@ -52,7 +54,7 @@ import { agent } from '@axlsdk/axl';
 
 const researcher = agent({
   name: 'researcher',
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You are a research assistant.',
   tools: [calculator],
   effort: 'high',
@@ -68,8 +70,8 @@ Dynamic model and system prompt selection:
 ```typescript
 const dynamicAgent = agent({
   model: (ctx) => ctx.metadata?.tier === 'premium'
-    ? 'openai:gpt-4o'
-    : 'openai:gpt-4.1-nano',
+    ? 'openai-responses:gpt-5.4'
+    : 'openai-responses:gpt-5-nano',
   system: (ctx) => `You are a ${ctx.metadata?.role ?? 'general'} assistant.`,
 });
 ```
@@ -80,7 +82,7 @@ const dynamicAgent = agent({
 
 ```typescript
 const router = agent({
-  model: 'openai:gpt-4o-mini',
+  model: 'openai-responses:gpt-5-mini',
   system: 'Route to the right specialist.',
   handoffs: (ctx) => {
     const base = [
@@ -312,7 +314,7 @@ const containsPII = (text: string) => /\b\d{3}-\d{2}-\d{4}\b/.test(text);
 const isOffTopic = (text: string) => !text.toLowerCase().includes('support');
 
 const safe = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You are a helpful assistant.',
   guardrails: {
     input: async (prompt, ctx) => {
@@ -338,7 +340,7 @@ const session = runtime.session('user-123', {
   history: {
     maxMessages: 100,          // Trim oldest messages when exceeded
     summarize: true,           // Auto-summarize trimmed messages
-    summaryModel: 'openai:gpt-4o-mini',  // Model for summarization
+    summaryModel: 'openai-responses:gpt-5-mini',  // Model for summarization
   },
   persist: true,               // Save to StateStore (default: true)
 });
@@ -393,9 +395,9 @@ const runtime = new AxlRuntime({
 Four built-in providers using the `provider:model` URI scheme:
 
 ```
-openai:gpt-4o                          # OpenAI Chat Completions
-openai-responses:gpt-4o                # OpenAI Responses API
-anthropic:claude-sonnet-4-5            # Anthropic
+openai-responses:gpt-5.4               # OpenAI Responses API (recommended)
+openai:gpt-5.4                         # OpenAI Chat Completions
+anthropic:claude-sonnet-4-6            # Anthropic
 google:gemini-2.5-pro                  # Google Gemini
 ```
 

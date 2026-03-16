@@ -1,6 +1,8 @@
-# axl-eval
+# @axlsdk/eval
 
-Evaluation framework for Axl agentic workflows. Define datasets, scoring functions, and run evaluations to measure and compare agent performance.
+[![npm version](https://img.shields.io/npm/v/@axlsdk/eval)](https://www.npmjs.com/package/@axlsdk/eval)
+
+Evaluation framework for [Axl](https://github.com/axl-sdk/axl) agentic workflows. Define datasets, scoring functions, and run evaluations to measure and compare agent performance.
 
 ## Installation
 
@@ -73,7 +75,7 @@ import { z } from 'zod';
 const qualityJudge = llmScorer({
   name: 'quality',
   description: 'Rates output quality on a 0-1 scale',
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You are an expert evaluator. Rate the quality of AI outputs.',
   schema: z.object({
     score: z.number().min(0).max(1),

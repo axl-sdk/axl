@@ -1,5 +1,7 @@
 # @axlsdk/studio
 
+[![npm version](https://img.shields.io/npm/v/@axlsdk/studio)](https://www.npmjs.com/package/@axlsdk/studio)
+
 Local development UI for debugging, testing, and iterating on [Axl](https://github.com/axl-sdk/axl) agents and workflows.
 
 ## Installation
@@ -36,7 +38,7 @@ const getWeather = tool({
 
 const assistant = agent({
   name: 'assistant',
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You are a helpful assistant.',
   tools: [getWeather],
 });

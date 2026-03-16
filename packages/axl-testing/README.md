@@ -1,6 +1,8 @@
-# axl-testing
+# @axlsdk/testing
 
-Testing utilities for Axl agentic workflows. Provides deterministic mocks and assertions for unit testing workflows without hitting real LLM APIs.
+[![npm version](https://img.shields.io/npm/v/@axlsdk/testing)](https://www.npmjs.com/package/@axlsdk/testing)
+
+Testing utilities for [Axl](https://github.com/axl-sdk/axl) agentic workflows. Provides deterministic mocks and assertions for unit testing workflows without hitting real LLM APIs.
 
 ## Installation
 

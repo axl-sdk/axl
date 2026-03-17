@@ -12,7 +12,6 @@ function loadDotEnv(dir: string): Record<string, string> {
     for (const line of content.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) continue;
-      // Strip optional "export " prefix
       const stripped = trimmed.startsWith('export ') ? trimmed.slice(7) : trimmed;
       const eqIndex = stripped.indexOf('=');
       if (eqIndex === -1) continue;
@@ -29,6 +28,6 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     env: loadDotEnv(root),
-    exclude: ['src/__tests__/integration*.test.ts', 'node_modules/**'],
+    include: ['src/__tests__/integration*.test.ts'],
   },
 });

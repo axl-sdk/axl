@@ -7,12 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-03-17
+
 ### Changed
 
-- **`RedisStore` migrated from `ioredis` to `redis` (node-redis v5)** — the official Redis client maintained by Redis Ltd. Install `redis` instead of `ioredis`: `npm install redis`
-- **`StateConfig.store` no longer accepts `'redis'` as a string** — pass a `RedisStore` instance directly instead. The `'memory'` and `'sqlite'` shorthands are unchanged
-- **`StateConfig.redis` sub-config removed** — URL is now passed directly to `RedisStore.create(url?)`
-- **`RedisStore` constructor is now private** — use the async `RedisStore.create(url?)` factory, which connects before returning and surfaces connection errors at startup
+- **Breaking:** `RedisStore` migrated from `ioredis` to `redis` (node-redis v5)** — the official Redis client maintained by Redis Ltd. Install `redis` instead of `ioredis`: `npm install redis`
+- **Breaking:** `StateConfig.store` no longer accepts `'redis'` as a string** — pass a `RedisStore` instance directly instead. The `'memory'` and `'sqlite'` shorthands are unchanged
+- **Breaking:** `StateConfig.redis` sub-config removed** — URL is now passed directly to `RedisStore.create(url?)`
+- **Breaking:** `RedisStore` constructor is now private** — use the async `RedisStore.create(url?)` factory, which connects before returning and surfaces connection errors at startup
 
 Migration:
 
@@ -159,7 +161,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/axl-sdk/axl/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/axl-sdk/axl/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/axl-sdk/axl/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/axl-sdk/axl/compare/v0.3.0...v0.4.0

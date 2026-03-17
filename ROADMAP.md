@@ -27,6 +27,14 @@
 
 ### Planned
 
+#### Configurable Session Summarization
+
+The session summarization system (triggered when `maxMessages` is exceeded with `summarize: true`) currently uses a hardcoded prompt and a fixed `maxTokens: 1024` limit. Planned improvements:
+
+- Configurable `summaryMaxTokens` on `SessionOptions.history`
+- Custom `summaryPrompt` for domain-specific summarization (e.g., preserving medical terms, legal context)
+- Pluggable summarization function for full control over the summarization strategy
+
 #### MCP Server Exposure
 
 Axl can consume MCP tools (client). Next step: expose agents and tools as MCP servers so other AI systems can use them.
@@ -57,7 +65,7 @@ Currently: `InMemoryVectorStore` (testing) and `SqliteVectorStore` (production).
 | Provider | URI | Priority |
 |----------|-----|----------|
 | Ollama (local models) | `ollama:llama3` | High |
-| AWS Bedrock | `bedrock:anthropic.claude-sonnet-4-5` | Medium |
+| AWS Bedrock | `bedrock:anthropic.claude-sonnet-4-6` | Medium |
 | Azure OpenAI | `azure:gpt-4o` | Medium |
 | Groq | `groq:llama3-70b` | Low |
 | Mistral | `mistral:mistral-large` | Low |

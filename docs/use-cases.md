@@ -25,7 +25,7 @@ const refundOrder = tool({
 });
 
 const SupportBot = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You are a helpful customer support agent. Be concise.',
   tools: [getOrder, refundOrder],
   timeout: '30s',
@@ -53,7 +53,7 @@ const UserProfile = z.object({
 });
 
 const Extractor = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'Extract structured user profile data from the given text.',
   temperature: 0.1,
 });
@@ -113,7 +113,7 @@ const ReviewScore = z.object({
 });
 
 const Reviewer = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'Review the document and provide a score from 1-10 with reasoning.',
   temperature: 0.7,  // some randomness so each call produces a different review
 });
@@ -133,7 +133,7 @@ const PeerReview = workflow({
     );
     // vote picks the result with the highest 'score' field.
     // No LLM call here — it just compares the numeric values.
-    return ctx.vote(reviews, { strategy: 'highest', key: 'score' });
+    return await ctx.vote(reviews, { strategy: 'highest', key: 'score' });
   },
 });
 ```
@@ -161,9 +161,9 @@ const PeerReview = workflow({
 Use different models as reviewers to reduce correlated errors:
 
 ```typescript
-const ReviewerGPT = agent({ model: 'openai:gpt-4o', system: 'Review the document...', temperature: 0.7 });
-const ReviewerClaude = agent({ model: 'anthropic:claude-sonnet-4-5', system: 'Review the document...', temperature: 0.7 });
-const ReviewerGemini = agent({ model: 'google:gemini-2.5-pro', system: 'Review the document...', temperature: 0.7 });
+const ReviewerGPT = agent({ model: 'openai-responses:gpt-5.4', system: 'Review the document...', temperature: 0.7 });
+const ReviewerClaude = agent({ model: 'anthropic:claude-sonnet-4-6', system: 'Review the document...', temperature: 0.7 });
+const ReviewerGemini = agent({ model: 'google:gemini-3.1-pro-preview', system: 'Review the document...', temperature: 0.7 });
 
 const reviewers = [ReviewerGPT, ReviewerClaude, ReviewerGemini];
 
@@ -178,7 +178,7 @@ const CrossModelReview = workflow({
       (i) => ctx.ask(reviewers[i], ctx.input.doc, { schema: ReviewScore }),
       { quorum: 2 },  // succeed when any 2 models respond
     );
-    return ctx.vote(reviews, { strategy: 'highest', key: 'score' });
+    return await ctx.vote(reviews, { strategy: 'highest', key: 'score' });
   },
 });
 ```
@@ -189,7 +189,7 @@ Use `scorer` to have an LLM evaluate each candidate. The scorer runs on every re
 
 ```typescript
 const Judge = agent({
-  model: 'anthropic:claude-sonnet-4-5',
+  model: 'anthropic:claude-sonnet-4-6',
   system: 'You are an expert writing evaluator. Score the given text on clarity, depth, and accuracy.',
   temperature: 0.1,
 });
@@ -210,7 +210,7 @@ const BestDraft = workflow({
 
     // Each draft is scored by the Judge agent.
     // scorer is called once per successful result — here, up to 3 LLM calls.
-    return ctx.vote(drafts, {
+    return await ctx.vote(drafts, {
       strategy: 'highest',
       scorer: async (draft) => {
         const result = await ctx.ask(Judge, `Score this text:\n\n${draft}`, {
@@ -241,7 +241,7 @@ const MergedResearch = workflow({
 
     // Combine all findings into a single summary using an LLM.
     // The reducer receives the array of successful values.
-    return ctx.vote(findings, {
+    return await ctx.vote(findings, {
       strategy: 'custom',
       reducer: async (allFindings) => {
         return ctx.ask(
@@ -262,14 +262,14 @@ Deep research task that could consume unlimited tokens, capped at a fixed cost. 
 
 ```typescript
 const Researcher = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'Research the given topic thoroughly.',
   tools: [webSearch, readUrl],
   maxTurns: 20,
 });
 
 const Summarizer = agent({
-  model: 'anthropic:claude-sonnet-4-5',
+  model: 'anthropic:claude-sonnet-4-6',
   system: 'Summarize the research into a concise brief.',
   temperature: 0.3,
 });
@@ -294,7 +294,7 @@ A customer chats back and forth with a support agent. Axl maintains conversation
 
 ```typescript
 const SupportBot = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You are a helpful support agent. Be concise and friendly.',
   tools: [getOrder, getCustomer, refundOrder],
   maxTurns: 10,
@@ -321,8 +321,8 @@ app.post('/api/chat/:sessionId', async (req, res) => {
 Try multiple models in parallel, take the first valid response:
 
 ```typescript
-const FastModel = agent({ model: 'openai:gpt-4o-mini', system: 'Answer the question concisely.' });
-const SmartModel = agent({ model: 'anthropic:claude-sonnet-4-5', system: 'Answer the question concisely.' });
+const FastModel = agent({ model: 'openai-responses:gpt-5-mini', system: 'Answer the question concisely.' });
+const SmartModel = agent({ model: 'anthropic:claude-sonnet-4-6', system: 'Answer the question concisely.' });
 
 const QuickAnswer = workflow({
   name: 'QuickAnswer',
@@ -342,19 +342,19 @@ A triage agent routes to specialist agents. Each specialist has its own scoped t
 
 ```typescript
 const BillingBot = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You handle billing and payment questions.',
   tools: [getInvoice, processPayment, applyCredit],
 });
 
 const ShippingBot = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You handle shipping and delivery questions.',
   tools: [trackPackage, updateAddress, scheduleRedelivery],
 });
 
 const TriageBot = agent({
-  model: 'openai:gpt-4o-mini',  // Cheap model for routing
+  model: 'openai-responses:gpt-5-mini',  // Cheap model for routing
   system: `Route the customer to the right specialist:
 - BillingBot: billing, payments, invoices, credits
 - ShippingBot: shipping, delivery, tracking, addresses`,
@@ -377,7 +377,7 @@ A coding assistant that uses tools from external MCP servers alongside local too
 
 ```typescript
 const DevAssistant = agent({
-  model: 'anthropic:claude-sonnet-4-5',
+  model: 'anthropic:claude-sonnet-4-6',
   system: 'You are a senior developer assistant.',
   mcp: ['github', 'linear'],
   tools: [readFile, writeFile, runTests],
@@ -406,7 +406,7 @@ const SentimentScore = z.object({
 });
 
 const Analyst = agent({
-  model: 'openai:gpt-4o-mini',
+  model: 'openai-responses:gpt-5-mini',
   system: 'Analyze the sentiment of the given customer review.',
   temperature: 0.1,
 });
@@ -449,7 +449,7 @@ import { dataset, scorer, llmScorer, defineEval } from '@axlsdk/eval';
 
 // The workflow under evaluation — this is what we're iterating on
 const FitnessCoach = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You are a certified personal trainer. Generate a workout plan for the given profile.',
 });
 
@@ -495,7 +495,7 @@ const structuralValidity = scorer({
 // LLM-as-judge scorer
 const planQuality = llmScorer({
   name: 'plan-quality',
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You are an expert fitness coach evaluating workout plans. Rate on a 0-1 scale.',
   schema: z.object({ score: z.number().min(0).max(1), reasoning: z.string() }),
 });

@@ -22,40 +22,39 @@ npx @axlsdk/studio
 
 ### 1. Create a config file
 
-Studio needs an `axl.config.ts` that exports an `AxlRuntime` as the default export. Register your workflows, agents, and tools so Studio can discover them:
+Studio needs an `axl.config.ts` at your project root that default-exports an `AxlRuntime`. The recommended pattern is to keep your tools, agents, workflows, and runtime in your application code, then re-export the runtime for Studio to discover:
+
+```
+src/
+  config.ts              — defineConfig (providers, state, trace)
+  runtime.ts             — creates AxlRuntime, registers everything
+  tools/                 — tool definitions (wrap your services)
+  agents/                — agent definitions (import their tools)
+  workflows/             — workflow definitions (orchestrate agents)
+axl.config.ts            — re-exports runtime for Studio
+```
 
 ```typescript
-// axl.config.ts
-import { AxlRuntime, agent, tool, workflow } from '@axlsdk/axl';
-import { z } from 'zod';
+// src/runtime.ts
+import { AxlRuntime } from '@axlsdk/axl';
+import { config } from './config.js';
+import { handleTicket } from './workflows/handle-ticket.js';
+import { supportAgent } from './agents/support.js';
+import { lookupOrder } from './tools/db.js';
 
-const getWeather = tool({
-  name: 'get_weather',
-  description: 'Get weather for a city',
-  input: z.object({ city: z.string() }),
-  handler: async ({ city }) => ({ city, temp: 72, condition: 'sunny' }),
-});
+export const runtime = new AxlRuntime(config);
+runtime.register(handleTicket);
+runtime.registerAgent(supportAgent);
+runtime.registerTool(lookupOrder);
+```
 
-const assistant = agent({
-  name: 'assistant',
-  model: 'openai-responses:gpt-5.4',
-  system: 'You are a helpful assistant.',
-  tools: [getWeather],
-});
-
-const chat = workflow({
-  name: 'chat',
-  input: z.object({ message: z.string() }),
-  handler: async (ctx) => ctx.ask(assistant, ctx.input.message),
-});
-
-const runtime = new AxlRuntime();
-runtime.register(chat);
-runtime.registerAgent(assistant);
-runtime.registerTool(getWeather);
-
+```typescript
+// axl.config.ts — thin entry point for Studio
+import { runtime } from './src/runtime.js';
 export default runtime;
 ```
+
+Your application imports from `src/runtime.ts` directly. Studio discovers everything via `axl.config.ts`. See the [`@axlsdk/axl` README](../axl/README.md#project-structure) for the full recommended project structure.
 
 ### 2. Start Studio
 

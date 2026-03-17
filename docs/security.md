@@ -6,7 +6,7 @@ Agents can **only** invoke tools listed in their `tools` configuration. This is 
 
 ```typescript
 const SupportBot = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   tools: [getOrder, refundOrder],
   // SupportBot CANNOT call deleteUser — runtime will reject the call
 });
@@ -92,7 +92,7 @@ const containsPII = (text: string) => /\b\d{3}-\d{2}-\d{4}\b/.test(text);
 const isOffTopic = (text: string) => !text.toLowerCase().includes('support');
 
 const safe = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You are a helpful assistant.',
   guardrails: {
     input: async (prompt, ctx) => {

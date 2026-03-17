@@ -29,7 +29,7 @@ import { z } from 'zod';
 
 // 1. Define
 const myTool = tool({ name: 'search', description: '...', input: z.object({ q: z.string() }), handler: async ({ q }) => ({ results: [] }) });
-const myAgent = agent({ model: 'openai:gpt-4o', system: '...', tools: [myTool] });
+const myAgent = agent({ model: 'openai-responses:gpt-5.4', system: '...', tools: [myTool] });
 const myWorkflow = workflow({ name: 'research', input: z.object({ topic: z.string() }), handler: async (ctx) => ctx.ask(myAgent, ctx.input.topic) });
 
 // 2. Create Runtime

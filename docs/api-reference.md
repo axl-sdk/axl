@@ -79,7 +79,7 @@ Define an agent with a model, system prompt, tools, and optional handoffs.
 import { agent } from '@axlsdk/axl';
 
 const myAgent = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You are a helpful assistant.',
   tools: [search, calculator],
   temperature: 0.7,
@@ -93,7 +93,7 @@ const myAgent = agent({
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `name` | `string` | model string or `Agent_N` | Display name used in traces |
-| `model` | `string \| (ctx) => string` | **required** | Provider URI (e.g., `'openai:gpt-4o'`, `'anthropic:claude-sonnet-4-5'`). Function form enables dynamic model routing |
+| `model` | `string \| (ctx) => string` | **required** | Provider URI (e.g., `'openai:gpt-4o'`, `'anthropic:claude-sonnet-4-6'`). Function form enables dynamic model routing |
 | `system` | `string \| (ctx) => string` | **required** | System prompt. Function form enables per-request customization |
 | `tools` | `Tool[]` | `[]` | Tools this agent can call. Acts as an ACL — the agent cannot call tools not in this list |
 | `handoffs` | `HandoffDescriptor[] \| (ctx) => HandoffDescriptor[]` | `[]` | Agents this agent can hand off to. Function form receives `{ metadata?: Record<string, unknown> }` for dynamic routing (see below) |
@@ -128,7 +128,7 @@ The `handoffs` option accepts a function for runtime-conditional routing. The fu
 ```typescript
 const router = agent({
   name: 'support-router',
-  model: 'openai:gpt-4o-mini',
+  model: 'openai-responses:gpt-5-mini',
   system: 'Route to the right specialist.',
   handoffs: (ctx) => {
     const base = [
@@ -260,7 +260,7 @@ const result = await ctx.delegate(
   customerMessage,
   {
     schema: z.object({ answer: z.string(), category: z.string() }),
-    routerModel: 'openai:gpt-4o-mini',
+    routerModel: 'openai-responses:gpt-5-mini',
   },
 );
 ```
@@ -292,7 +292,7 @@ const results = await ctx.spawn(3, (i) => ctx.ask(agent, prompts[i]), { quorum: 
 Pick a winner from an array of `Result<T>` values. All built-in strategies are deterministic — no LLM involved. Use `scorer` or `reducer` for async/LLM-based judging.
 
 ```typescript
-const winner = ctx.vote(results, { strategy: 'majority', key: 'answer' });
+const winner = await ctx.vote(results, { strategy: 'majority', key: 'answer' });
 ```
 
 | Option | Type | Default | Description |
@@ -543,7 +543,7 @@ User-defined validation functions that run at the agent boundary, before and aft
 
 ```typescript
 const safe = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You are a helpful assistant.',
   guardrails: {
     input: async (prompt, ctx) => {
@@ -604,7 +604,7 @@ const session = runtime.session('user-123', {
   history: {
     maxMessages: 100,
     summarize: true,
-    summaryModel: 'openai:gpt-4o-mini',
+    summaryModel: 'openai-responses:gpt-5-mini',
   },
   persist: true,
 });

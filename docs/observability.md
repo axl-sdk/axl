@@ -37,9 +37,9 @@ AXL_TRACE_ENABLED=true AXL_TRACE_LEVEL=full node server.js
 
 ```
 [axl] execution:abc-123 | workflow:HandleSupport | started
-[axl] execution:abc-123 | step:1 agent_call | agent:SupportBot | model:openai:gpt-4o | 1.2s | $0.003
+[axl] execution:abc-123 | step:1 agent_call | agent:SupportBot | model:openai-responses:gpt-5.4 | 1.2s | $0.003
 [axl] execution:abc-123 | step:2 tool_call  | tool:get_order | args:["ORD-456"] | 45ms
-[axl] execution:abc-123 | step:3 agent_call | agent:SupportBot | model:openai:gpt-4o | 0.8s | $0.002
+[axl] execution:abc-123 | step:3 agent_call | agent:SupportBot | model:openai-responses:gpt-5.4 | 0.8s | $0.002
 [axl] execution:abc-123 | step:4 tool_call  | tool:refund_order | args:["ORD-456"] | 120ms
 [axl] execution:abc-123 | workflow:HandleSupport | completed | 2.4s | $0.005
 ```
@@ -163,14 +163,14 @@ When an agent has a `version` field, it appears in trace events and OTel span at
 
 ```typescript
 const PlanGenerator = agent({
-  model: 'anthropic:claude-sonnet-4-5',
+  model: 'anthropic:claude-sonnet-4-6',
   system: 'You are an expert fitness coach.',
   version: 'plan-v2.1',
 });
 ```
 
 ```
-[axl] step:1 agent_call | agent:PlanGenerator | version:plan-v2.1 | model:anthropic:claude-sonnet-4-5 | 2.1s | $0.008
+[axl] step:1 agent_call | agent:PlanGenerator | version:plan-v2.1 | model:anthropic:claude-sonnet-4-6 | 2.1s | $0.008
 ```
 
 This lets you correlate trace output to specific prompt versions, which is especially useful when comparing eval results.

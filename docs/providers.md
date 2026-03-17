@@ -4,44 +4,51 @@ Agents reference models using the `provider:model` URI scheme. Four built-in pro
 
 All providers include automatic retry with exponential backoff on `429` (rate limit), `503` (service unavailable), and `529` (overloaded) responses.
 
-## OpenAI — Chat Completions API
+## OpenAI — Responses API (preferred)
+
+The Responses API is the preferred OpenAI integration — it supports prompt caching, native reasoning, and automatic reasoning context round-tripping via `providerMetadata`. All models listed below are available with the `openai-responses:` prefix. Shares the `openai` provider config by default.
 
 ```
-openai:gpt-4o                   # Flagship multimodal
-openai:gpt-4o-mini              # Fast and affordable
-openai:gpt-4.1                  # GPT-4.1
-openai:gpt-4.1-mini             # GPT-4.1 small
-openai:gpt-4.1-nano             # GPT-4.1 cheapest
-openai:gpt-5                    # GPT-5
-openai:gpt-5-mini               # GPT-5 small
-openai:gpt-5-nano               # GPT-5 cheapest
-openai:gpt-5.1                  # GPT-5.1
-openai:gpt-5.2                  # GPT-5.2
-openai:gpt-5.3                  # GPT-5.3
-openai:gpt-5.4                  # GPT-5.4
-openai:gpt-5.4-pro              # GPT-5.4 (pro)
-openai:o1                       # Reasoning
-openai:o1-mini                  # Reasoning (small)
-openai:o1-pro                   # Reasoning (pro)
-openai:o3                       # Reasoning
-openai:o3-mini                  # Reasoning (small)
-openai:o3-pro                   # Reasoning (pro)
-openai:o4-mini                  # Reasoning (small)
+openai-responses:gpt-5.4        # General-purpose, complex reasoning, agentic tasks
+openai-responses:gpt-5.4-pro    # Deeper reasoning for tough problems
+openai-responses:gpt-5-mini     # Cost-optimized reasoning and chat
+openai-responses:gpt-5-nano     # High-throughput, straightforward tasks
+openai-responses:o4-mini        # Dedicated reasoning (small)
+openai-responses:o3              # Dedicated reasoning
+openai-responses:o3-pro          # Dedicated reasoning (pro)
+```
+
+## OpenAI — Chat Completions API
+
+Same models available with the `openai:` prefix. Use this when you need features not yet supported on the Responses API (e.g., stop sequences).
+
+```
+openai:gpt-5.4                  # General-purpose, complex reasoning, agentic tasks
+openai:gpt-5.4-pro              # Deeper reasoning for tough problems
+openai:gpt-5-mini               # Cost-optimized reasoning and chat
+openai:gpt-5-nano               # High-throughput, straightforward tasks
+openai:gpt-5.3                  # Previous gen
+openai:gpt-5.2                  # Previous gen
+openai:gpt-5.1                  # Previous gen
+openai:gpt-5                    # Previous gen
+openai:o4-mini                  # Dedicated reasoning (small)
+openai:o3                       # Dedicated reasoning
+openai:o3-mini                  # Dedicated reasoning (small)
+openai:o3-pro                   # Dedicated reasoning (pro)
+openai:o1                       # Legacy reasoning
+openai:o1-mini                  # Legacy reasoning (small)
+openai:o1-pro                   # Legacy reasoning (pro)
+openai:gpt-4.1                  # Previous gen
+openai:gpt-4.1-mini             # Previous gen (small)
+openai:gpt-4.1-nano             # Previous gen (cheapest)
+openai:gpt-4o                   # Legacy
+openai:gpt-4o-mini              # Legacy
 openai:gpt-4-turbo              # Legacy
 openai:gpt-4                    # Legacy
 openai:gpt-3.5-turbo            # Legacy
 ```
 
-Reasoning model support (o1/o3/o4-mini): uses `developer` role instead of `system`, strips `temperature`, supports `effort` option. GPT-5.x models also support `effort` (reasoning) but use `system` role.
-
-## OpenAI — Responses API
-
-```
-openai-responses:gpt-4o
-openai-responses:o3
-```
-
-Same models as Chat Completions, with better prompt caching, native reasoning support, and automatic reasoning context round-tripping via `providerMetadata`. Shares the `openai` provider config by default.
+Reasoning model support (o-series): uses `developer` role instead of `system`, strips `temperature`, supports `effort` option. GPT-5.x models also support `effort` (reasoning) but use `system` role.
 
 ## Anthropic
 
@@ -65,16 +72,15 @@ anthropic:claude-3-haiku        # Legacy
 ## Google Gemini
 
 ```
-google:gemini-2.5-pro           # Most capable
-google:gemini-2.5-flash         # Fast
-google:gemini-2.5-flash-lite    # Cheapest 2.5
-google:gemini-2.0-flash         # Previous gen
-google:gemini-2.0-flash-lite    # Previous gen (lite)
-google:gemini-3-flash            # Fast (3.x gen)
-google:gemini-3.1-pro            # Most capable (3.x gen)
-google:gemini-3.1-flash-lite     # Cheapest (3.x gen)
-google:gemini-3-pro-preview     # Next gen (preview)
-google:gemini-3-flash-preview   # Next gen fast (preview)
+google:gemini-3.1-pro-preview        # Most capable (preview)
+google:gemini-3-flash-preview        # Fast (preview)
+google:gemini-3.1-flash-lite-preview # Cheapest (preview)
+google:gemini-2.5-pro                # Previous gen (most capable)
+google:gemini-2.5-flash              # Previous gen (fast)
+google:gemini-2.5-flash-lite         # Previous gen (cheapest)
+google:gemini-2.0-flash              # Legacy
+google:gemini-2.0-flash-lite         # Legacy
+google:gemini-3-pro-preview          # Deprecated (shut down March 9, 2026)
 ```
 
 ## Configuration
@@ -98,7 +104,7 @@ All model parameters are configurable on `AgentConfig` (agent-level defaults) an
 
 ```typescript
 const creative = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'Write creative stories.',
   temperature: 0.9,   // higher = more creative (0.0–2.0)
   maxTokens: 8192,
@@ -111,7 +117,7 @@ const reasoner = agent({
 });
 
 const precise = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'Extract structured data.',
   temperature: 0.1,   // lower = more deterministic
   toolChoice: 'required',
@@ -282,7 +288,7 @@ Controls whether the model calls tools when tools are available:
 
 ```typescript
 const coder = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'You are a coding assistant.',
   tools: [runTests, writeCode],
 });
@@ -309,7 +315,7 @@ Stop sequences tell the model to stop generating when it produces any of the spe
 
 ```typescript
 const agent = agent({
-  model: 'openai:gpt-4o',
+  model: 'openai-responses:gpt-5.4',
   system: 'Generate markdown sections.',
   stop: ['\n---', '\n## '],  // stop at section breaks
 });
@@ -338,7 +344,14 @@ class MyProvider implements Provider {
 Register in config:
 
 ```typescript
-const runtime = new AxlRuntime();
+import { AxlRuntime, defineConfig } from '@axlsdk/axl';
+
+const runtime = new AxlRuntime(defineConfig({
+  providers: {
+    openai: { apiKey: process.env.OPENAI_API_KEY },
+  },
+}));
+
 runtime.registerProvider('my-provider', new MyProvider());
 // Now use: 'my-provider:model-name'
 ```

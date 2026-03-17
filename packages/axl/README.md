@@ -10,6 +10,120 @@ Core SDK for orchestrating agentic systems in TypeScript. Part of the [Axl](http
 npm install @axlsdk/axl zod
 ```
 
+## Project Structure
+
+The recommended pattern separates config, tools, agents, workflows, and runtime into their own modules. Dependencies flow one direction: tools → agents → workflows → runtime.
+
+```
+src/
+  config.ts              — defineConfig (providers, state, trace)
+  runtime.ts             — creates AxlRuntime, registers everything
+
+  tools/
+    db.ts                — tool wrapping database queries
+    email.ts             — tool wrapping email service
+
+  agents/
+    support.ts           — support agent (imports its tools)
+    billing.ts           — billing agent
+
+  workflows/
+    handle-ticket.ts     — orchestrates support + billing agents
+
+axl.config.ts            — re-exports runtime for Axl Studio
+```
+
+### Config
+
+Use `defineConfig` to create a typed configuration. Keep this separate from your runtime so you can swap configs per environment:
+
+```typescript
+// src/config.ts
+import { defineConfig } from '@axlsdk/axl';
+
+export const config = defineConfig({
+  providers: {
+    openai: { apiKey: process.env.OPENAI_API_KEY },
+    anthropic: { apiKey: process.env.ANTHROPIC_API_KEY },
+    google: { apiKey: process.env.GOOGLE_API_KEY },
+  },
+  state: { store: 'sqlite', sqlite: { path: './data/axl.db' } },
+  trace: { enabled: true, level: 'steps' },
+});
+```
+
+Provider API keys are also read automatically from environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`/`GEMINI_API_KEY`), so for local development you can skip the `providers` block entirely.
+
+State store options: `'memory'` (default), `'sqlite'` (requires `better-sqlite3`), `'redis'` (requires `ioredis`).
+
+### Tools, Agents, and Workflows
+
+Define each in its own module. Tools wrap your services, agents import the tools they need, workflows orchestrate agents:
+
+```typescript
+// src/tools/db.ts
+import { tool } from '@axlsdk/axl';
+import { z } from 'zod';
+import { db } from '../services/db.js';
+
+export const lookupOrder = tool({
+  name: 'lookup_order',
+  description: 'Look up an order by ID',
+  input: z.object({ orderId: z.string() }),
+  handler: async ({ orderId }) => db.orders.findById(orderId),
+});
+```
+
+```typescript
+// src/agents/support.ts
+import { agent } from '@axlsdk/axl';
+import { lookupOrder } from '../tools/db.js';
+
+export const supportAgent = agent({
+  name: 'support',
+  model: 'openai-responses:gpt-5.4',
+  system: 'You are a customer support agent. Use tools to look up order information.',
+  tools: [lookupOrder],
+});
+```
+
+```typescript
+// src/workflows/handle-ticket.ts
+import { workflow } from '@axlsdk/axl';
+import { z } from 'zod';
+import { supportAgent } from '../agents/support.js';
+
+export const handleTicket = workflow({
+  name: 'handle-ticket',
+  input: z.object({ message: z.string() }),
+  handler: async (ctx) => ctx.ask(supportAgent, ctx.input.message),
+});
+```
+
+### Runtime
+
+The runtime is the composition root — it imports the config and registers all workflows. Your application and [Axl Studio](https://github.com/axl-sdk/axl/tree/main/packages/axl-studio) both import this module:
+
+```typescript
+// src/runtime.ts
+import { AxlRuntime } from '@axlsdk/axl';
+import { config } from './config.js';
+import { handleTicket } from './workflows/handle-ticket.js';
+import { supportAgent } from './agents/support.js';
+import { lookupOrder } from './tools/db.js';
+
+export const runtime = new AxlRuntime(config);
+runtime.register(handleTicket);
+runtime.registerAgent(supportAgent);
+runtime.registerTool(lookupOrder);
+```
+
+```typescript
+// axl.config.ts — thin entry point for Axl Studio
+import { runtime } from './src/runtime.js';
+export default runtime;
+```
+
 ## API
 
 ### `tool(config)`
@@ -69,9 +183,10 @@ Dynamic model and system prompt selection:
 
 ```typescript
 const dynamicAgent = agent({
-  model: (ctx) => ctx.metadata?.tier === 'premium'
-    ? 'openai-responses:gpt-5.4'
-    : 'openai-responses:gpt-5-nano',
+  model: (ctx) =>
+    ctx.metadata?.tier === 'premium'
+      ? 'openai-responses:gpt-5.4'
+      : 'openai-responses:gpt-5-nano',
   system: (ctx) => `You are a ${ctx.metadata?.role ?? 'general'} assistant.`,
 });
 ```
@@ -119,12 +234,12 @@ The `effort` parameter provides a unified way to control reasoning depth across 
 const reasoner = agent({
   model: 'anthropic:claude-opus-4-6',
   system: 'You are a careful analyst.',
-  effort: 'high',  // 'none' | 'low' | 'medium' | 'high' | 'max'
+  effort: 'high', // 'none' | 'low' | 'medium' | 'high' | 'max'
 });
 
-// Explicit thinking budget (in tokens)
+// Explicit thinking budget (in tokens — supported on Gemini 2.x and Anthropic)
 const budgetReasoner = agent({
-  model: 'google:gemini-2.5-flash',
+  model: 'google:gemini-2.5-pro',
   system: 'Think step by step.',
   thinkingBudget: 5000,
 });
@@ -133,11 +248,11 @@ const budgetReasoner = agent({
 const result = await reasoner.ask('Analyze this data', { effort: 'low' });
 ```
 
-Each provider maps `effort` to its native API: `reasoning_effort` (OpenAI), adaptive thinking + `output_config.effort` (Anthropic 4.6), `thinkingLevel` (Gemini 3.x), `thinkingBudget` (Gemini 2.x). See [docs/providers.md](../../docs/providers.md) for the full mapping table.
+Each provider maps `effort` to its native API: reasoning effort (OpenAI), adaptive thinking (Anthropic), thinking level/budget (Gemini). See [docs/providers.md](../../docs/providers.md) for the full mapping table.
 
 ### `workflow(config)`
 
-Define a named workflow with typed input/output:
+Define a named workflow with typed input:
 
 ```typescript
 import { workflow } from '@axlsdk/axl';
@@ -146,10 +261,28 @@ import { z } from 'zod';
 const myWorkflow = workflow({
   name: 'my-workflow',
   input: z.object({ query: z.string() }),
-  output: z.object({ answer: z.string() }),
   handler: async (ctx) => {
-    const answer = await ctx.ask(researcher, ctx.input.query);
-    return { answer };
+    return ctx.ask(researcher, ctx.input.query, {
+      schema: z.object({ answer: z.string() }),
+    });
+  },
+});
+```
+
+For single-ask workflows, use `schema` on `ctx.ask()` — it instructs the LLM and retries automatically on invalid output. The optional `output` field validates your handler's return value *after* it runs (no LLM retry), which is useful for multi-step workflows where your orchestration logic (spawn, vote, transform) could assemble the wrong shape:
+
+```typescript
+const answerSchema = z.object({ answer: z.number() });
+
+const reliable = workflow({
+  name: 'reliable',
+  input: z.object({ question: z.string() }),
+  output: answerSchema, // validates the spawn+vote result, not the LLM
+  handler: async (ctx) => {
+    const results = await ctx.spawn(3, async (_i) =>
+      ctx.ask(mathAgent, ctx.input.question, { schema: answerSchema }),
+    );
+    return ctx.vote(results, { strategy: 'majority', key: 'answer' });
   },
 });
 ```
@@ -159,9 +292,6 @@ const myWorkflow = workflow({
 Register and execute workflows:
 
 ```typescript
-import { AxlRuntime } from '@axlsdk/axl';
-
-const runtime = new AxlRuntime();
 runtime.register(myWorkflow);
 
 // Execute
@@ -177,7 +307,12 @@ for await (const event of stream) {
 const session = runtime.session('user-123');
 await session.send('my-workflow', { query: 'Hello' });
 await session.send('my-workflow', { query: 'Follow-up' });
-const history = await session.history();
+
+// Stream a session turn
+const sessionStream = await session.stream('my-workflow', { query: 'Hello' });
+for await (const event of sessionStream) {
+  if (event.type === 'token') process.stdout.write(event.data);
+}
 ```
 
 ### Context Primitives
@@ -191,8 +326,8 @@ const answer = await ctx.ask(agent, 'prompt', { schema, retries });
 // Run 3 agents in parallel — each gets the same question independently
 const results = await ctx.spawn(3, async (i) => ctx.ask(agent, prompts[i]));
 
-// Pick the answer that appeared most often (pure aggregation, no LLM involved)
-const winner = ctx.vote(results, { strategy: 'majority', key: 'answer' });
+// Pick the answer that appeared most often — also supports LLM-as-judge via scorer
+const winner = await ctx.vote(results, { strategy: 'majority', key: 'answer' });
 
 // Self-correcting validation
 const valid = await ctx.verify(
@@ -201,16 +336,17 @@ const valid = await ctx.verify(
   { retries: 3, fallback: defaultValue },
 );
 
-// Cost control
-const budgeted = await ctx.budget({ cost: '$1.00', onExceed: 'hard_stop' }, async () => {
-  return ctx.ask(agent, prompt);
-});
+// Cost control — returns { value, budgetExceeded, totalCost }
+const { value } = await ctx.budget(
+  { cost: '$1.00', onExceed: 'hard_stop' },
+  async () => ctx.ask(agent, prompt),
+);
 
 // First to complete
-const fastest = await ctx.race([
-  () => ctx.ask(agentA, prompt),
-  () => ctx.ask(agentB, prompt),
-], { schema });
+const fastest = await ctx.race(
+  [() => ctx.ask(agentA, prompt), () => ctx.ask(agentB, prompt)],
+  { schema },
+);
 
 // Concurrent independent tasks
 const [a, b] = await ctx.parallel([
@@ -224,14 +360,16 @@ const mapped = await ctx.map(items, async (item) => ctx.ask(agent, item), {
   quorum: 3,
 });
 
-// Human-in-the-loop
+// Human-in-the-loop — suspends until resolved via API or Studio
 const decision = await ctx.awaitHuman({
-  channel: 'slack',
+  channel: 'approvals',
   prompt: 'Approve this action?',
 });
 
-// Durable checkpoint
-const value = await ctx.checkpoint(async () => expensiveOperation());
+// Durable checkpoint — on first run, executes and saves the result.
+// On replay after a restart, returns the saved result without re-executing,
+// preventing duplicate side effects (double API calls, double charges, etc.)
+const checkpointed = await ctx.checkpoint(async () => expensiveOperation());
 ```
 
 ### OpenTelemetry Observability
@@ -240,13 +378,18 @@ Automatic span emission for every `ctx.*` primitive with cost-per-span attributi
 
 ```typescript
 import { defineConfig, AxlRuntime } from '@axlsdk/axl';
-import { BasicTracerProvider, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import {
+  BasicTracerProvider,
+  SimpleSpanProcessor,
+} from '@opentelemetry/sdk-trace-base';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 
 const tracerProvider = new BasicTracerProvider();
-tracerProvider.addSpanProcessor(new SimpleSpanProcessor(
-  new OTLPTraceExporter({ url: 'http://localhost:4318/v1/traces' }),
-));
+tracerProvider.addSpanProcessor(
+  new SimpleSpanProcessor(
+    new OTLPTraceExporter({ url: 'http://localhost:4318/v1/traces' }),
+  ),
+);
 
 const config = defineConfig({
   telemetry: {
@@ -270,7 +413,7 @@ import { createSpanManager, NoopSpanManager } from '@axlsdk/axl';
 
 ### Memory Primitives
 
-Working memory backed by the existing `StateStore` interface:
+Working memory backed by the `StateStore` interface:
 
 ```typescript
 // Store and retrieve structured state
@@ -283,17 +426,19 @@ await ctx.remember('user-profile', data, { scope: 'global' });
 const profile = await ctx.recall('user-profile', { scope: 'global' });
 ```
 
-Semantic recall requires a vector store and embedder configured on the runtime:
+Semantic recall requires a vector store and embedder on the config:
 
 ```typescript
-import { AxlRuntime, InMemoryVectorStore, OpenAIEmbedder } from '@axlsdk/axl';
+import { defineConfig, AxlRuntime, InMemoryVectorStore, OpenAIEmbedder } from '@axlsdk/axl';
 
-const runtime = new AxlRuntime({
+const config = defineConfig({
   memory: {
     vectorStore: new InMemoryVectorStore(),
     embedder: new OpenAIEmbedder({ model: 'text-embedding-3-small' }),
   },
 });
+
+const runtime = new AxlRuntime(config);
 
 // In a workflow:
 const relevant = await ctx.recall('knowledge-base', {
@@ -322,10 +467,11 @@ const safe = agent({
       return { block: false };
     },
     output: async (response, ctx) => {
-      if (isOffTopic(response)) return { block: true, reason: 'Off-topic response' };
+      if (isOffTopic(response))
+        return { block: true, reason: 'Off-topic response' };
       return { block: false };
     },
-    onBlock: 'retry',   // 'retry' | 'throw' | (reason, ctx) => fallbackResponse
+    onBlock: 'retry', // 'retry' | 'throw' | (reason, ctx) => fallbackResponse
     maxRetries: 2,
   },
 });
@@ -338,56 +484,40 @@ When `onBlock` is `'retry'`, the LLM sees the block reason and self-corrects (sa
 ```typescript
 const session = runtime.session('user-123', {
   history: {
-    maxMessages: 100,          // Trim oldest messages when exceeded
-    summarize: true,           // Auto-summarize trimmed messages
-    summaryModel: 'openai-responses:gpt-5-mini',  // Model for summarization
+    maxMessages: 100,
+    summarize: true,
+    summaryModel: 'openai-responses:gpt-5-mini',
   },
-  persist: true,               // Save to StateStore (default: true)
+  persist: true,
 });
 ```
 
-`SessionOptions` type:
+When `maxMessages` is exceeded:
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `history.maxMessages` | `number` | unlimited | Max messages to retain |
-| `history.summarize` | `boolean` | `false` | Summarize trimmed messages |
-| `history.summaryModel` | `string` | — | Model URI for summarization (required when `summarize: true`) |
-| `persist` | `boolean` | `true` | Persist history to StateStore |
+- **`summarize: false`** (default) — oldest messages beyond the limit are dropped. Only the most recent `maxMessages` are kept.
+- **`summarize: true`** — before dropping, the overflow messages are sent to `summaryModel` for summarization. The summary is saved to session metadata and included as context on subsequent turns. Each time the limit is exceeded again, the new overflow is summarized together with the previous summary, so context accumulates incrementally.
+
+| Option                 | Type      | Default   | Description                                                   |
+| ---------------------- | --------- | --------- | ------------------------------------------------------------- |
+| `history.maxMessages`  | `number`  | unlimited | Max messages to retain in history                             |
+| `history.summarize`    | `boolean` | `false`   | Summarize overflow messages instead of dropping them           |
+| `history.summaryModel` | `string`  | —         | Model URI for summarization (required when `summarize: true`) |
+| `persist`              | `boolean` | `true`    | Persist history to StateStore                                 |
 
 ### Error Hierarchy
 
 ```typescript
 import {
-  AxlError,        // Base class
-  VerifyError,     // Schema validation failed after retries
-  QuorumNotMet,    // Quorum threshold not reached
-  NoConsensus,     // Vote could not reach consensus
-  TimeoutError,    // Operation exceeded timeout
-  MaxTurnsError,   // Agent exceeded max tool-calling turns
+  AxlError, // Base class
+  VerifyError, // Schema validation failed after retries
+  QuorumNotMet, // Quorum threshold not reached
+  NoConsensus, // Vote could not reach consensus
+  TimeoutError, // Operation exceeded timeout
+  MaxTurnsError, // Agent exceeded max tool-calling turns
   BudgetExceededError, // Budget limit exceeded
-  GuardrailError,  // Guardrail blocked input or output
-  ToolDenied,      // Agent tried to call unauthorized tool
+  GuardrailError, // Guardrail blocked input or output
+  ToolDenied, // Agent tried to call unauthorized tool
 } from '@axlsdk/axl';
-```
-
-### State Stores
-
-```typescript
-import { MemoryStore, SQLiteStore, RedisStore } from '@axlsdk/axl';
-
-// In-memory (default)
-const runtime = new AxlRuntime();
-
-// SQLite (requires better-sqlite3)
-const runtime = new AxlRuntime({
-  state: { store: 'sqlite', sqlite: { path: './data/axl.db' } },
-});
-
-// Redis (requires ioredis)
-const runtime = new AxlRuntime({
-  state: { store: 'redis', redis: { url: 'redis://localhost:6379' } },
-});
 ```
 
 ### Provider URIs
@@ -395,10 +525,10 @@ const runtime = new AxlRuntime({
 Four built-in providers using the `provider:model` URI scheme:
 
 ```
-openai-responses:gpt-5.4               # OpenAI Responses API (recommended)
+openai-responses:gpt-5.4               # OpenAI Responses API (preferred over Chat Completions)
 openai:gpt-5.4                         # OpenAI Chat Completions
 anthropic:claude-sonnet-4-6            # Anthropic
-google:gemini-2.5-pro                  # Google Gemini
+google:gemini-3.1-pro-preview          # Google Gemini
 ```
 
 See [docs/providers.md](../../docs/providers.md) for the full model list including reasoning models.

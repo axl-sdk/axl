@@ -206,7 +206,7 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `schema` | `ZodType` | — | Validates and parses the response as structured output. On validation failure, feeds the Zod error back to the LLM for self-correction |
+| `schema` | `ZodType` | — | Validates and parses the response as structured output. On validation failure, retries the entire agent call with the error appended to the prompt (see retry details below) |
 | `retries` | `number` | `3` | Number of schema validation retries |
 | `metadata` | `Record<string, unknown>` | — | Merged with workflow metadata and passed to dynamic `model`/`system` selector functions |
 | `temperature` | `number` | agent config | Override sampling temperature for this call |
@@ -221,6 +221,10 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 **Precedence:** Per-call `AskOptions` > agent-level `AgentConfig` > internal defaults.
 
 **Returns:** `Promise<T>` — parsed output if `schema` is provided, otherwise `string`.
+
+**Schema retry mechanics:** When `schema` is provided and the LLM's response fails Zod validation, `ctx.ask()` retries the entire agent call from scratch. The most recent failed output and the Zod error message are appended to the user prompt (e.g., *"Your previous response was invalid: {output}. Error: {error}. Please fix and try again."*), and a fresh conversation is built from the system prompt + session history + augmented user prompt. On multiple retries, only the **latest** failed output and error are included — previous failures do not accumulate. Each retry is a clean LLM call. Failed responses are **not** persisted to session history; only the final successful response is recorded. Throws `VerifyError` if all retries are exhausted.
+
+This is distinct from **guardrail retries** (which accumulate all blocked outputs + corrections in the same conversation — see [Guardrails](#guardrails)) and from **`ctx.verify()`** (which is a generic retry loop that passes errors to your callback — see below).
 
 ---
 
@@ -320,7 +324,7 @@ const winner = await ctx.vote(results, { strategy: 'majority', key: 'answer' });
 
 ### `ctx.verify(fn, schema, options?)`
 
-Self-correcting validation loop. Calls `fn`, validates against `schema`. On failure, passes the last output and error message back to `fn` for correction.
+Generic retry-until-valid loop. Calls `fn`, validates the result against `schema`. On failure, calls `fn` again with the last output and error message as arguments.
 
 ```typescript
 const valid = await ctx.verify(
@@ -336,6 +340,8 @@ const valid = await ctx.verify(
 | `fallback` | `T` | — | Return this value instead of throwing when retries are exhausted |
 
 **Throws:** `VerifyError` (includes last output and Zod error) if retries exhausted and no fallback provided.
+
+**Retry mechanics:** Unlike `ctx.ask()` schema retries and guardrail retries, `ctx.verify()` is **not** conversation-aware. It is a plain loop that calls your function, validates the return value, and on failure passes `lastOutput` and `errorMessage` as arguments to your next call. What you do with those arguments is entirely up to you — `ctx.verify()` does not modify any LLM conversation or session history. This makes it suitable for retrying any async operation, not just LLM calls (e.g., API calls, multi-step pipelines, aggregation logic).
 
 ---
 
@@ -573,9 +579,13 @@ const safe = agent({
 
 | Policy | Behavior |
 |--------|----------|
-| `'retry'` | Feed the block reason back to the LLM as a correction prompt. The agent self-corrects and tries again |
+| `'retry'` | Append the LLM's blocked output (as an assistant message) and the block reason (as a system correction prompt) to the conversation, then re-call the LLM so it can self-correct. Only applies to **output** guardrails — input guardrails always throw since the prompt is user-supplied |
 | `'throw'` | Throw a `GuardrailError` immediately |
-| `(reason, ctx) => string` | Custom function that receives the block reason and returns a correction prompt for the LLM |
+| `(reason, ctx) => string` | Custom function that receives the block reason and returns a fallback response (does not retry the LLM) |
+
+**Retry mechanics:** On each retry, the LLM's blocked response is appended to the conversation as an assistant message, followed by a system message: *"Your previous response was blocked by a safety guardrail: {reason}. Please provide a different response that complies with the guidelines."* These messages **accumulate** across retries — if the guardrail blocks twice, the LLM sees both failed attempts and both correction prompts before its third try, giving it increasing context about what to avoid. All retry messages are ephemeral — they exist only within the `ctx.ask()` call and are **not** persisted to session history. Only the final successful response is recorded in the session, so subsequent turns never see the blocked attempts.
+
+This is distinct from **`ctx.ask()` schema retries**, which rebuild the call from scratch on each attempt and only include the most recent failure (see [`ctx.ask()`](#ctxaskagent-prompt-options)).
 
 ### Callback Signatures
 

@@ -320,7 +320,7 @@ for await (const event of sessionStream) {
 All available on `ctx` inside workflow handlers. See the [API Reference](../../docs/api-reference.md) for complete option types, valid values, and defaults.
 
 ```typescript
-// Invoke an agent
+// Invoke an agent (schema retries rebuild the call with the failed output + error in the prompt)
 const answer = await ctx.ask(agent, 'prompt', { schema, retries });
 
 // Run 3 agents in parallel — each gets the same question independently
@@ -329,9 +329,9 @@ const results = await ctx.spawn(3, async (i) => ctx.ask(agent, prompts[i]));
 // Pick the answer that appeared most often — also supports LLM-as-judge via scorer
 const winner = await ctx.vote(results, { strategy: 'majority', key: 'answer' });
 
-// Self-correcting validation
+// Generic retry-until-valid loop (not conversation-aware — you decide how to use the error)
 const valid = await ctx.verify(
-  async (lastOutput, error) => ctx.ask(agent, prompt),
+  async (lastOutput, error) => ctx.ask(agent, error ? `Fix: ${error}` : prompt),
   schema,
   { retries: 3, fallback: defaultValue },
 );
@@ -477,7 +477,7 @@ const safe = agent({
 });
 ```
 
-When `onBlock` is `'retry'`, the LLM sees the block reason and self-corrects (same pattern as `ctx.verify()`). Throws `GuardrailError` if retries are exhausted or `onBlock` is `'throw'`.
+When `onBlock` is `'retry'`, the LLM's blocked output is appended to the conversation (as an assistant message) along with a system message containing the block reason, then the LLM is re-called so it can self-correct. These messages **accumulate** across retries — if the guardrail blocks multiple times, the LLM sees all prior failed attempts and corrections before its next try. All retry messages are ephemeral — they are **not** persisted to session history, so subsequent session turns never see the blocked attempts. Note: `ctx.ask()` schema retries work differently — each retry rebuilds the call from scratch and only includes the most recent failed output and error (previous failures do not accumulate). Input guardrails always throw since the prompt is user-supplied. Throws `GuardrailError` if retries are exhausted or `onBlock` is `'throw'`.
 
 ### Session Options
 

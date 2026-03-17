@@ -109,4 +109,4 @@ const safe = agent({
 });
 ```
 
-When `onBlock` is `'retry'`, the LLM sees the block reason and self-corrects. Throws `GuardrailError` if retries are exhausted.
+When `onBlock` is `'retry'`, the LLM's blocked output is appended to the conversation as an assistant message, followed by a system message containing the block reason. These messages **accumulate** across retries — if the guardrail blocks multiple times, the LLM sees all prior failed attempts and corrections, giving it increasing context about what to avoid. These retry messages are ephemeral — they only exist within the `ctx.ask()` call and are **not** persisted to session history, so subsequent turns never see the blocked attempts. Input guardrails always throw (the prompt is user-supplied and can't be retried by the LLM). Throws `GuardrailError` if retries are exhausted.

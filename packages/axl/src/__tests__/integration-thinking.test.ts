@@ -841,20 +841,22 @@ describe.skipIf(!hasOpenAI)('Thought Visibility: OpenAI Responses', () => {
     const provider = new OpenAIResponsesProvider();
     const response = await provider.chat(
       [
-        { role: 'system', content: 'You are a helpful assistant. Keep answers short.' },
-        { role: 'user', content: 'What is 15 * 17?' },
+        { role: 'system', content: 'You are a math tutor. Show your reasoning step by step.' },
+        {
+          role: 'user',
+          content:
+            'A store offers 20% off, then an additional 15% off the discounted price. What single discount percentage is equivalent? Show your work.',
+        },
       ],
-      { model: 'o4-mini', effort: 'low', includeThoughts: true },
+      { model: 'o4-mini', effort: 'medium', includeThoughts: true },
     );
 
     expect(response.content).toBeTruthy();
-    expect(response.content).toContain('255');
-    // Reasoning summaries may not be returned for trivial questions —
-    // OpenAI only emits them when reasoning is non-trivial.
-    if (response.thinking_content !== undefined) {
-      expect(typeof response.thinking_content).toBe('string');
-      expect(response.thinking_content!.length).toBeGreaterThan(0);
-    }
+    expect(response.content).toContain('32');
+    // Non-trivial reasoning should produce a reasoning summary
+    expect(response.thinking_content).toBeDefined();
+    expect(typeof response.thinking_content).toBe('string');
+    expect(response.thinking_content!.length).toBeGreaterThan(0);
   }, 30_000);
 
   // Note: reasoning summary deltas are only emitted for non-trivial reasoning.

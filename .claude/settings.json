@@ -36,31 +36,5 @@
       "Bash(npx tsup *)",
       "Bash(npx tsup)"
     ]
-  },
-  "hooks": {
-    "TeammateIdle": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/ts-teammate-idle.sh",
-            "timeout": 120,
-            "statusMessage": "Running typecheck + lint on workspace..."
-          }
-        ]
-      }
-    ],
-    "TaskCompleted": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/ts-task-completed.sh",
-            "timeout": 180,
-            "statusMessage": "Verifying typecheck and tests..."
-          }
-        ]
-      }
-    ]
   }
 }

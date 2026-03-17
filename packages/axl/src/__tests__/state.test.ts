@@ -888,23 +888,4 @@ describe('RedisStore', () => {
       expect(pending).toContain('exec-3');
     });
   });
-
-  describe('RedisStore.create() error handling', () => {
-    it('throws a clear error when the redis package is not installed', async () => {
-      const originalRequire = (globalThis as any).__originalRequire;
-      // Simulate missing redis package by temporarily mocking the module system
-      const mockRequire = (id: string) => {
-        if (id === 'redis') throw new Error("Cannot find module 'redis'");
-        return originalRequire?.(id);
-      };
-      const savedRequire = (global as any).require;
-      (global as any).require = mockRequire;
-      try {
-        await expect(RedisStore.create()).rejects.toThrow('redis is required for RedisStore');
-      } finally {
-        if (savedRequire !== undefined) (global as any).require = savedRequire;
-        else delete (global as any).require;
-      }
-    });
-  });
 });

@@ -101,6 +101,7 @@ packages/axl/src/
     types.ts         — StateStore interface
     memory.ts        — MemoryStore (in-memory Maps)
     sqlite.ts        — SQLiteStore (file-based JSON placeholder)
+    redis.ts         — RedisStore (node-redis; created via async `RedisStore.create(url)` factory)
   __tests__/         — Vitest test files
 
 packages/axl-testing/src/
@@ -239,6 +240,7 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - WorkflowContext.ask() implements tool calling loop with max turns, budget tracking, self-correction retry
 - zodToJsonSchema helper in context.ts converts Zod schemas to JSON Schema for tool definitions
 - Telemetry: `@opentelemetry/api` is optional peer dep; `NoopSpanManager` used when disabled; `runtime.initializeTelemetry()` activates span emission; cost-per-span on all agent/workflow spans
+- State: `StateConfig.store` accepts `'memory'` | `'sqlite'` | `StateStore` instance. `'redis'` is NOT a valid string — pass `await RedisStore.create(url)` as the instance. RedisStore requires the `redis` peer dep (node-redis v5, not ioredis). Private constructor enforces async factory usage.
 - Memory: `ctx.remember()`/`ctx.recall()`/`ctx.forget()` backed by StateStore; semantic recall via VectorStore + embedder; `MemoryManager` coordinates both
 - Guardrails: `agent({ guardrails: { input, output, onBlock, maxRetries } })`; `GuardrailError` thrown on block; self-correcting retry on `'retry'` policy
 - Session options: `runtime.session(id, { history: { maxMessages, summarize }, persist })` for history management

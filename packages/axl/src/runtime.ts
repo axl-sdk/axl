@@ -12,7 +12,6 @@ import { ProviderRegistry } from './providers/registry.js';
 import type { StateStore, PendingDecision } from './state/types.js';
 import { MemoryStore } from './state/memory.js';
 import { SQLiteStore } from './state/sqlite.js';
-import { RedisStore } from './state/redis.js';
 import { WorkflowContext } from './context.js';
 import { Session, type SessionOptions } from './session.js';
 import { AxlStream } from './stream.js';
@@ -108,12 +107,11 @@ export class AxlRuntime extends EventEmitter {
   }
 
   private createStateStore(): StateStore {
-    const storeType = this.config.state?.store ?? 'memory';
-    switch (storeType) {
+    const storeOption = this.config.state?.store ?? 'memory';
+    if (typeof storeOption !== 'string') return storeOption;
+    switch (storeOption) {
       case 'sqlite':
         return new SQLiteStore(this.config.state?.sqlite?.path ?? './data/axl.db');
-      case 'redis':
-        return new RedisStore(this.config.state?.redis?.url);
       case 'memory':
       default:
         return new MemoryStore();

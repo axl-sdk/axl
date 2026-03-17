@@ -54,7 +54,7 @@ export const config = defineConfig({
 
 Provider API keys are also read automatically from environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`/`GEMINI_API_KEY`), so for local development you can skip the `providers` block entirely.
 
-State store options: `'memory'` (default), `'sqlite'` (requires `better-sqlite3`), `'redis'` (requires `ioredis`).
+State store options: `'memory'` (default), `'sqlite'` (requires `better-sqlite3`), or a `RedisStore` instance for multi-process deployments. See [State Stores](#state-stores).
 
 ### Tools, Agents, and Workflows
 
@@ -478,6 +478,46 @@ const safe = agent({
 ```
 
 When `onBlock` is `'retry'`, the LLM's blocked output is appended to the conversation (as an assistant message) along with a system message containing the block reason, then the LLM is re-called so it can self-correct. These messages **accumulate** across retries — if the guardrail blocks multiple times, the LLM sees all prior failed attempts and corrections before its next try. All retry messages are ephemeral — they are **not** persisted to session history, so subsequent session turns never see the blocked attempts. Note: `ctx.ask()` schema retries work differently — each retry rebuilds the call from scratch and only includes the most recent failed output and error (previous failures do not accumulate). Input guardrails always throw since the prompt is user-supplied. Throws `GuardrailError` if retries are exhausted or `onBlock` is `'throw'`.
+
+### State Stores
+
+Three built-in implementations. All persist the same data: workflow execution checkpoints, `awaitHuman` decisions, session history, memory entries, and the execution state needed for suspend/resume.
+
+**Memory** (default) — in-process, no persistence. Use for development and stateless workflows.
+
+```typescript
+const runtime = new AxlRuntime();
+```
+
+**SQLite** — file-based persistence. Use for single-process deployments that need durable state across restarts.
+
+```bash
+npm install better-sqlite3
+```
+
+```typescript
+const runtime = new AxlRuntime({
+  state: { store: 'sqlite', sqlite: { path: './data/axl.db' } },
+});
+```
+
+**Redis** — shared state across multiple processes. Use for multi-replica deployments or any setup where more than one process runs `AxlRuntime`.
+
+```bash
+npm install redis
+```
+
+```typescript
+import { AxlRuntime, RedisStore } from '@axlsdk/axl';
+
+const store = await RedisStore.create('redis://localhost:6379');
+const runtime = new AxlRuntime({ state: { store } });
+
+// Graceful shutdown — closes the Redis connection
+await runtime.shutdown();
+```
+
+`RedisStore.create()` connects before returning, so any connection error surfaces at startup rather than on first use. The runtime's `shutdown()` closes the connection automatically.
 
 ### Session Options
 

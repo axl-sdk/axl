@@ -35,7 +35,7 @@
   "peerDependencies": {
     "@opentelemetry/api": "^1.0.0",
     "better-sqlite3": "^9.0.0 || ^10.0.0 || ^11.0.0 || ^12.0.0",
-    "ioredis": "^5.0.0"
+    "redis": "^5.0.0"
   },
   "peerDependenciesMeta": {
     "@opentelemetry/api": {
@@ -44,7 +44,7 @@
     "better-sqlite3": {
       "optional": true
     },
-    "ioredis": {
+    "redis": {
       "optional": true
     }
   },

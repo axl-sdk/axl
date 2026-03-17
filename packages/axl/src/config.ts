@@ -21,11 +21,12 @@ export type TraceConfig = {
   redact?: boolean;
 };
 
+import type { StateStore } from './state/types.js';
+
 /** State store configuration */
 export type StateConfig = {
-  store?: 'memory' | 'sqlite' | 'redis';
+  store?: StateStore | 'memory' | 'sqlite';
   sqlite?: { path: string };
-  redis?: { url: string };
 };
 
 /** Global defaults */
@@ -107,10 +108,13 @@ export function resolveConfig(config: AxlConfig): AxlConfig {
     resolved.defaultProvider = process.env.AXL_DEFAULT_PROVIDER;
   }
   if (process.env.AXL_STATE_STORE) {
-    resolved.state = {
-      ...resolved.state,
-      store: process.env.AXL_STATE_STORE as 'memory' | 'sqlite' | 'redis',
-    };
+    const envStore = process.env.AXL_STATE_STORE;
+    if (envStore === 'memory' || envStore === 'sqlite') {
+      resolved.state = {
+        ...resolved.state,
+        store: envStore,
+      };
+    }
   }
   if (process.env.AXL_TRACE_ENABLED !== undefined) {
     resolved.trace = { ...resolved.trace, enabled: process.env.AXL_TRACE_ENABLED === 'true' };

@@ -547,29 +547,33 @@ describe('SQLiteStore', () => {
 describe('RedisStore', () => {
   /**
    * Create a RedisStore with a mock in-memory client, bypassing the
-   * constructor's `require('ioredis')` call via Object.create.
+   * private constructor via Object.create and injecting a mock client.
    */
   function createRedisStoreWithMockClient() {
     const data = new Map<string, string>();
     const hashData = new Map<string, Map<string, string>>();
 
+    const setData = new Map<string, Set<string>>();
+
     const mockClient = {
-      hset: vi.fn(async (key: string, field: string, value: string) => {
+      hSet: vi.fn(async (key: string, field: string, value: string) => {
         if (!hashData.has(key)) hashData.set(key, new Map());
         hashData.get(key)!.set(field, value);
         return 1;
       }),
-      hget: vi.fn(async (key: string, field: string) => {
-        return hashData.get(key)?.get(field) ?? null;
+      // node-redis returns undefined (not null) for missing hash fields
+      hGet: vi.fn(async (key: string, field: string): Promise<string | undefined> => {
+        return hashData.get(key)?.get(field);
       }),
-      hgetall: vi.fn(async (key: string) => {
+      hGetAll: vi.fn(async (key: string) => {
         const map = hashData.get(key);
         if (!map || map.size === 0) return {};
         return Object.fromEntries(map.entries());
       }),
-      hdel: vi.fn(async (key: string, ...fields: string[]) => {
+      hDel: vi.fn(async (key: string, field: string | string[]) => {
         const map = hashData.get(key);
         if (!map) return 0;
+        const fields = Array.isArray(field) ? field : [field];
         let count = 0;
         for (const f of fields) {
           if (map.delete(f)) count++;
@@ -583,18 +587,44 @@ describe('RedisStore', () => {
       get: vi.fn(async (key: string) => {
         return data.get(key) ?? null;
       }),
-      del: vi.fn(async (...keys: string[]) => {
+      del: vi.fn(async (key: string | string[]) => {
+        const keys = Array.isArray(key) ? key : [key];
         let count = 0;
-        for (const key of keys) {
-          if (data.delete(key)) count++;
-          if (hashData.delete(key)) count++;
+        for (const k of keys) {
+          if (data.delete(k)) count++;
+          if (hashData.delete(k)) count++;
         }
         return count;
       }),
-      quit: vi.fn(async () => 'OK' as const),
+      sAdd: vi.fn(async (key: string, member: string | string[]) => {
+        if (!setData.has(key)) setData.set(key, new Set());
+        const members = Array.isArray(member) ? member : [member];
+        let count = 0;
+        for (const m of members) {
+          if (!setData.get(key)!.has(m)) {
+            setData.get(key)!.add(m);
+            count++;
+          }
+        }
+        return count;
+      }),
+      sRem: vi.fn(async (key: string, member: string | string[]) => {
+        const set = setData.get(key);
+        if (!set) return 0;
+        const members = Array.isArray(member) ? member : [member];
+        let count = 0;
+        for (const m of members) {
+          if (set.delete(m)) count++;
+        }
+        return count;
+      }),
+      sMembers: vi.fn(async (key: string) => {
+        return [...(setData.get(key) ?? [])];
+      }),
+      quit: vi.fn(async () => undefined),
     };
 
-    // Bypass the constructor (which requires ioredis) and inject the mock client
+    // Bypass the private constructor and inject the mock client
     const store = Object.create(RedisStore.prototype) as RedisStore;
     (store as any).client = mockClient;
 
@@ -642,6 +672,239 @@ describe('RedisStore', () => {
       await store.close();
 
       expect(mockClient.quit).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('checkpoints', () => {
+    it('save and load a checkpoint', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveCheckpoint('exec-1', 0, { progress: 'step 0' });
+
+      const loaded = await store.getCheckpoint('exec-1', 0);
+      expect(loaded).toEqual({ progress: 'step 0' });
+    });
+
+    it('returns null for non-existent checkpoint', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      expect(await store.getCheckpoint('nonexistent', 0)).toBeNull();
+    });
+
+    it('handles undefined from hGet (node-redis returns undefined for missing fields)', async () => {
+      // node-redis returns undefined (not null) for missing hash fields.
+      // The store must normalize this to null — verified here to guard against regressions.
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      mockClient.hGet.mockResolvedValueOnce(undefined);
+
+      expect(await store.getCheckpoint('exec-1', 99)).toBeNull();
+    });
+
+    it('save multiple checkpoints and get latest', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveCheckpoint('exec-1', 0, 'first');
+      await store.saveCheckpoint('exec-1', 5, 'latest');
+      await store.saveCheckpoint('exec-1', 3, 'middle');
+
+      const latest = await store.getLatestCheckpoint('exec-1');
+      expect(latest).toEqual({ step: 5, data: 'latest' });
+    });
+
+    it('getLatestCheckpoint returns null for unknown execution', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      expect(await store.getLatestCheckpoint('unknown')).toBeNull();
+    });
+  });
+
+  describe('sessions', () => {
+    it('save and get a session', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      const history = [
+        { role: 'user' as const, content: 'Hello' },
+        { role: 'assistant' as const, content: 'Hi!' },
+      ];
+      await store.saveSession('session-1', history);
+      expect(await store.getSession('session-1')).toEqual(history);
+    });
+
+    it('returns empty array for unknown session', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      expect(await store.getSession('unknown')).toEqual([]);
+    });
+
+    it('deleteSession removes session and session-ids set entry', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveSession('session-1', [{ role: 'user', content: 'hi' }]);
+      await store.deleteSession('session-1');
+
+      expect(await store.getSession('session-1')).toEqual([]);
+      expect(await store.listSessions()).not.toContain('session-1');
+    });
+
+    it('listSessions tracks saved sessions', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveSession('session-1', []);
+      await store.saveSession('session-2', []);
+
+      const sessions = await store.listSessions();
+      expect(sessions).toContain('session-1');
+      expect(sessions).toContain('session-2');
+    });
+  });
+
+  describe('session metadata', () => {
+    it('save and get session meta', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveSessionMeta('session-1', 'agentName', 'support-bot');
+
+      const val = await store.getSessionMeta('session-1', 'agentName');
+      expect(val).toBe('support-bot');
+    });
+
+    it('returns null for missing meta key', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      expect(await store.getSessionMeta('session-1', 'missing')).toBeNull();
+    });
+
+    it('handles undefined from hGet for missing meta (node-redis behavior)', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      mockClient.hGet.mockResolvedValueOnce(undefined);
+
+      expect(await store.getSessionMeta('session-1', 'key')).toBeNull();
+    });
+  });
+
+  describe('pending decisions', () => {
+    it('save and get pending decisions', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.savePendingDecision('exec-1', {
+        executionId: 'exec-1',
+        channel: 'slack',
+        prompt: 'Approve?',
+        createdAt: '2024-01-01T00:00:00Z',
+      });
+
+      const decisions = await store.getPendingDecisions();
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0].executionId).toBe('exec-1');
+    });
+
+    it('returns empty array when no pending decisions', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      expect(await store.getPendingDecisions()).toEqual([]);
+    });
+
+    it('resolveDecision removes the decision', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.savePendingDecision('exec-1', {
+        executionId: 'exec-1',
+        channel: 'slack',
+        prompt: 'Approve?',
+        createdAt: '2024-01-01T00:00:00Z',
+      });
+
+      await store.resolveDecision('exec-1', { approved: true });
+      expect(await store.getPendingDecisions()).toEqual([]);
+    });
+  });
+
+  describe('execution state', () => {
+    it('save and load execution state', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveExecutionState('exec-1', {
+        workflow: 'my-workflow',
+        input: { foo: 'bar' },
+        step: 2,
+        status: 'waiting',
+      });
+
+      const state = await store.getExecutionState('exec-1');
+      expect(state).toEqual({
+        workflow: 'my-workflow',
+        input: { foo: 'bar' },
+        step: 2,
+        status: 'waiting',
+      });
+    });
+
+    it('returns null for unknown execution', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      expect(await store.getExecutionState('unknown')).toBeNull();
+    });
+
+    it('waiting status adds to pending set', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveExecutionState('exec-1', {
+        workflow: 'wf',
+        input: null,
+        step: 0,
+        status: 'waiting',
+      });
+
+      const pending = await store.listPendingExecutions();
+      expect(pending).toContain('exec-1');
+    });
+
+    it('non-waiting status removes from pending set', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveExecutionState('exec-1', {
+        workflow: 'wf',
+        input: null,
+        step: 0,
+        status: 'waiting',
+      });
+      await store.saveExecutionState('exec-1', {
+        workflow: 'wf',
+        input: null,
+        step: 0,
+        status: 'running',
+      });
+
+      expect(await store.listPendingExecutions()).not.toContain('exec-1');
+    });
+
+    it('listPendingExecutions returns only waiting executions', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveExecutionState('exec-1', {
+        workflow: 'wf',
+        input: null,
+        step: 0,
+        status: 'waiting',
+      });
+      await store.saveExecutionState('exec-2', {
+        workflow: 'wf',
+        input: null,
+        step: 0,
+        status: 'running',
+      });
+      await store.saveExecutionState('exec-3', {
+        workflow: 'wf',
+        input: null,
+        step: 0,
+        status: 'waiting',
+      });
+
+      const pending = await store.listPendingExecutions();
+      expect(pending).toContain('exec-1');
+      expect(pending).not.toContain('exec-2');
+      expect(pending).toContain('exec-3');
+    });
+  });
+
+  describe('RedisStore.create() error handling', () => {
+    it('throws a clear error when the redis package is not installed', async () => {
+      const originalRequire = (globalThis as any).__originalRequire;
+      // Simulate missing redis package by temporarily mocking the module system
+      const mockRequire = (id: string) => {
+        if (id === 'redis') throw new Error("Cannot find module 'redis'");
+        return originalRequire?.(id);
+      };
+      const savedRequire = (global as any).require;
+      (global as any).require = mockRequire;
+      try {
+        await expect(RedisStore.create()).rejects.toThrow('redis is required for RedisStore');
+      } finally {
+        if (savedRequire !== undefined) (global as any).require = savedRequire;
+        else delete (global as any).require;
+      }
     });
   });
 });

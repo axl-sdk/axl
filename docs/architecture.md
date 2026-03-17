@@ -82,6 +82,23 @@ The `StateStore` interface abstracts persistence. Three built-in implementations
 |-------|----------|
 | `MemoryStore` | In-memory (default, development) |
 | `SQLiteStore` | File-based persistence (requires `better-sqlite3`) |
-| `RedisStore` | Multi-process deployments (requires `ioredis`) |
+| `RedisStore` | Multi-process deployments (requires `redis`) |
 
 State stores handle workflow execution state (for `checkpoint`/resume), session history, memory entries, and pending human decisions.
+
+```typescript
+// Memory — zero config, no persistence (default)
+const runtime = new AxlRuntime();
+
+// SQLite — file-based, single-process (npm install better-sqlite3)
+const runtime = new AxlRuntime({
+  state: { store: 'sqlite', sqlite: { path: './data/axl.db' } },
+});
+
+// Redis — shared state, multi-process (npm install redis)
+import { RedisStore } from '@axlsdk/axl';
+const store = await RedisStore.create('redis://localhost:6379');
+const runtime = new AxlRuntime({ state: { store } });
+```
+
+`RedisStore.create()` is async and connects before returning — wire it up before constructing the runtime. `runtime.shutdown()` closes the connection automatically.

@@ -195,7 +195,7 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
   });
 
   // Set up WebSocket
-  const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app: undefined as never });
+  const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
   const wsHandlers = createWsHandlers();
   app.get(
     '/ws',

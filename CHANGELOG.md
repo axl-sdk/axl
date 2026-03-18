@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-03-17
+
+### Fixed
+
+- **Studio CLI:** Restore `--help` / `-h` flag and port validation, both lost during refactor
+- **Studio CLI:** ESM-forcing resolve hook no longer fires for `.mts`/`.cts` files (fix from 0.7.3 now properly tested)
+
 ## [0.7.3] - 2026-03-17
 
 ### Fixed

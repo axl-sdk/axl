@@ -6,80 +6,13 @@ import { serve } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
 import { createServer } from './server/index.js';
 import { resolveRuntime } from './resolve-runtime.js';
-
-// ── Config auto-detection ──────────────────────────────────────────
-
-const CONFIG_CANDIDATES = ['axl.config.mts', 'axl.config.ts', 'axl.config.mjs', 'axl.config.js'];
-
-function findConfig(cwd: string): string | undefined {
-  for (const name of CONFIG_CANDIDATES) {
-    const p = resolve(cwd, name);
-    if (existsSync(p)) return p;
-  }
-  return undefined;
-}
-
-// ── Parse CLI args ──────────────────────────────────────────────────
-
-interface CliArgs {
-  port: number;
-  config?: string;
-  open: boolean;
-  conditions: string[];
-}
-
-function parseArgs(argv: string[]): CliArgs {
-  let port = 4400;
-  let config: string | undefined;
-  let open = false;
-  let conditions: string[] = [];
-
-  for (let i = 2; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === '--port' && argv[i + 1]) {
-      port = parseInt(argv[i + 1], 10);
-      i++;
-    } else if (arg === '--config' && argv[i + 1]) {
-      config = argv[i + 1];
-      i++;
-    } else if (arg === '--conditions' && argv[i + 1]) {
-      conditions = argv[i + 1]
-        .split(',')
-        .map((c) => c.trim())
-        .filter(Boolean);
-      i++;
-    } else if (arg === '--open') {
-      open = true;
-    } else if (arg === '--help' || arg === '-h') {
-      console.log(`
-Axl Studio — Local development UI for Axl agents and workflows
-
-Usage:
-  axl-studio [options]
-
-Options:
-  --port <number>          Server port (default: 4400)
-  --config <path>          Path to config file (default: auto-detect)
-  --conditions <list>      Comma-separated Node.js import conditions (e.g., development)
-  --open                   Auto-open browser
-  -h, --help               Show this help message
-
-Config auto-detection order:
-  ${CONFIG_CANDIDATES.join(' → ')}
-
-Tip: Use .mts for configs with top-level await or in projects without "type": "module".
-`);
-      process.exit(0);
-    }
-  }
-
-  if (isNaN(port) || port < 1 || port > 65535) {
-    console.error(`Invalid port: ${port}. Must be between 1 and 65535.`);
-    process.exit(1);
-  }
-
-  return { port, config, open, conditions };
-}
+import {
+  parseArgs,
+  findConfig,
+  needsEsmForcing,
+  needsTsxLoader,
+  CONFIG_CANDIDATES,
+} from './cli-utils.js';
 
 // ── Main ────────────────────────────────────────────────────────────
 
@@ -108,7 +41,7 @@ async function main() {
   // Both ESM and CJS hooks are needed: if the config's nearest package.json
   // lacks "type": "module", Node routes the import through CJS where the ESM
   // hook alone can't intercept .ts resolution.
-  if (/\.[mc]?tsx?$/.test(configPath)) {
+  if (needsTsxLoader(configPath)) {
     let tsxLoaded = false;
     try {
       const tsxEsm = await import('tsx/esm/api');
@@ -139,8 +72,7 @@ async function main() {
   // the format for the config file specifically.
   // .mts/.cts have explicit format built into their extension; .mjs/.cjs
   // are plain JS with explicit format. Only .ts/.tsx are ambiguous.
-  const ext = extname(configPath);
-  if (ext === '.ts' || ext === '.tsx') {
+  if (needsEsmForcing(configPath)) {
     try {
       const nodeModule = await import('node:module');
       const configUrl = pathToFileURL(configPath).href;
@@ -185,6 +117,7 @@ async function main() {
 
   // Import the user's config
   let runtime: import('@axlsdk/axl').AxlRuntime;
+  const ext = extname(configPath);
   try {
     const mod = await import(pathToFileURL(configPath).href);
     // resolveRuntime handles ESM default, CJS-to-ESM interop, and named exports

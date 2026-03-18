@@ -62,7 +62,10 @@ function estimateAnthropicCost(
   const [inputRate, outputRate] = pricing;
   const cacheRead = cacheReadTokens ?? 0;
   const cacheWrite = cacheWriteTokens ?? 0;
-  // Anthropic cache reads cost 10% of base input rate, writes cost 125%
+  // Anthropic cache reads cost 10% of base input rate (uniform across all models).
+  // Cache writes cost 125% for the default 5-minute TTL, or 200% for the 1-hour TTL.
+  // The API response does not distinguish between TTLs in cache_creation_input_tokens,
+  // so we conservatively assume 5-minute writes (1.25x) for all cache creation tokens.
   const inputCost =
     (inputTokens - cacheRead - cacheWrite) * inputRate +
     cacheRead * inputRate * 0.1 +
@@ -185,7 +188,7 @@ export class AnthropicProvider implements Provider {
       throw new Error('Anthropic stream response has no body');
     }
 
-    yield* this.parseSSEStream(res.body);
+    yield* this.parseSSEStream(res.body, options.model);
   }
 
   // ---------------------------------------------------------------------------
@@ -500,7 +503,10 @@ export class AnthropicProvider implements Provider {
   // Internal: SSE stream parsing
   // ---------------------------------------------------------------------------
 
-  private async *parseSSEStream(body: ReadableStream<Uint8Array>): AsyncGenerator<StreamChunk> {
+  private async *parseSSEStream(
+    body: ReadableStream<Uint8Array>,
+    model: string,
+  ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -516,6 +522,7 @@ export class AnthropicProvider implements Provider {
           cached_tokens?: number;
         }
       | undefined;
+    let cacheWrite = 0;
 
     try {
       while (true) {
@@ -584,7 +591,7 @@ export class AnthropicProvider implements Provider {
               // message_start arrives first in the SSE stream with input token counts
               if (event.message?.usage) {
                 const cacheRead = event.message.usage.cache_read_input_tokens ?? 0;
-                const cacheWrite = event.message.usage.cache_creation_input_tokens ?? 0;
+                cacheWrite = event.message.usage.cache_creation_input_tokens ?? 0;
                 const inputTokens =
                   (event.message.usage.input_tokens ?? 0) + cacheRead + cacheWrite;
                 usage = {
@@ -620,7 +627,19 @@ export class AnthropicProvider implements Provider {
               if (usage) {
                 usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
               }
-              yield { type: 'done', usage };
+              yield {
+                type: 'done',
+                usage,
+                cost: usage
+                  ? estimateAnthropicCost(
+                      model,
+                      usage.prompt_tokens,
+                      usage.completion_tokens,
+                      usage.cached_tokens,
+                      cacheWrite,
+                    )
+                  : undefined,
+              };
               return;
             }
           }
@@ -628,7 +647,19 @@ export class AnthropicProvider implements Provider {
       }
 
       // If we exit without a message_stop, still emit done
-      yield { type: 'done', usage };
+      yield {
+        type: 'done',
+        usage,
+        cost: usage
+          ? estimateAnthropicCost(
+              model,
+              usage.prompt_tokens,
+              usage.completion_tokens,
+              usage.cached_tokens,
+              cacheWrite,
+            )
+          : undefined,
+      };
     } finally {
       reader.releaseLock();
     }

@@ -98,6 +98,8 @@ export type StreamChunk =
         reasoning_tokens?: number;
         cached_tokens?: number;
       };
+      /** Estimated cost in USD for this call, computed the same way as ProviderResponse.cost. */
+      cost?: number;
       /** Provider-specific opaque metadata (e.g. raw Gemini parts with thought signatures). */
       providerMetadata?: Record<string, unknown>;
     };

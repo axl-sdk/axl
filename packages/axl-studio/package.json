@@ -1,6 +1,6 @@
 {
   "name": "@axlsdk/studio",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "description": "Local development UI for debugging, testing, and iterating on Axl agents and workflows",
   "type": "module",
   "main": "./dist/server/index.cjs",

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-03-18
+
+### Fixed
+
+- OpenAI cached token pricing now uses per-model multipliers instead of a flat 50%: gpt-4o era = 50%, gpt-4.1/o3/o4 era = 25%, gpt-5 era = 10%
+- Streaming calls now correctly report cost and contribute to `ctx.budget()` tracking; previously `response.cost` was always `undefined` for streamed responses
+- OpenAI Responses API streaming now correctly handles `event:` and `data:` lines split across read chunks; previously `response.completed` was silently dropped for reasoning models with larger payloads, losing usage and cost data
+
 ## [0.7.5] - 2026-03-18
 
 ### Fixed
@@ -203,7 +211,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.7.6...HEAD
+[0.7.6]: https://github.com/axl-sdk/axl/compare/v0.7.5...v0.7.6
 [0.7.0]: https://github.com/axl-sdk/axl/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/axl-sdk/axl/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/axl-sdk/axl/compare/v0.4.0...v0.5.0

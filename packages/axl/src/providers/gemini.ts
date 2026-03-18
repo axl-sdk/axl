@@ -194,7 +194,7 @@ export class GeminiProvider implements Provider {
       throw new Error('Gemini stream response has no body');
     }
 
-    yield* this.parseSSEStream(res.body);
+    yield* this.parseSSEStream(res.body, options.model);
   }
 
   // ---------------------------------------------------------------------------
@@ -544,7 +544,10 @@ export class GeminiProvider implements Provider {
   // Internal: SSE stream parsing
   // ---------------------------------------------------------------------------
 
-  private async *parseSSEStream(body: ReadableStream<Uint8Array>): AsyncGenerator<StreamChunk> {
+  private async *parseSSEStream(
+    body: ReadableStream<Uint8Array>,
+    model: string,
+  ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -622,7 +625,19 @@ export class GeminiProvider implements Provider {
 
       const providerMetadata =
         accumulatedParts.length > 0 ? { geminiParts: accumulatedParts } : undefined;
-      yield { type: 'done', usage, providerMetadata };
+      yield {
+        type: 'done',
+        usage,
+        cost: usage
+          ? estimateGeminiCost(
+              model,
+              usage.prompt_tokens,
+              usage.completion_tokens,
+              usage.cached_tokens,
+            )
+          : undefined,
+        providerMetadata,
+      };
     } finally {
       reader.releaseLock();
     }

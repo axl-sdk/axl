@@ -11,35 +11,39 @@ import { fetchWithRetry } from './retry.js';
 
 // ---------------------------------------------------------------------------
 // Approximate per-token pricing (USD) for common OpenAI models.
-// Format: [promptCostPerToken, completionCostPerToken]
+// Format: [promptCostPerToken, completionCostPerToken, cacheMultiplier]
+// cacheMultiplier is the fraction of input rate charged for cached tokens.
 // These are approximations for budget estimation, not billing.
 // Actual pricing may differ; check OpenAI's pricing page for current rates.
 // ---------------------------------------------------------------------------
 
-export const OPENAI_PRICING: Record<string, [number, number]> = {
-  'gpt-4o': [2.5e-6, 10e-6],
-  'gpt-4o-mini': [0.15e-6, 0.6e-6],
-  'gpt-4-turbo': [10e-6, 30e-6],
-  'gpt-4': [30e-6, 60e-6],
-  'gpt-3.5-turbo': [0.5e-6, 1.5e-6],
-  'gpt-5': [1.25e-6, 10e-6],
-  'gpt-5-mini': [0.25e-6, 2e-6],
-  'gpt-5-nano': [0.05e-6, 0.4e-6],
-  'gpt-5.1': [1.25e-6, 10e-6],
-  'gpt-5.2': [1.75e-6, 14e-6],
-  'gpt-5.3': [1.75e-6, 14e-6],
-  'gpt-5.4': [2.5e-6, 15e-6],
-  'gpt-5.4-pro': [30e-6, 180e-6],
-  o1: [15e-6, 60e-6],
-  'o1-mini': [3e-6, 12e-6],
-  'o1-pro': [150e-6, 600e-6],
-  o3: [10e-6, 40e-6],
-  'o3-mini': [1.1e-6, 4.4e-6],
-  'o3-pro': [20e-6, 80e-6],
-  'o4-mini': [1.1e-6, 4.4e-6],
-  'gpt-4.1': [2e-6, 8e-6],
-  'gpt-4.1-mini': [0.4e-6, 1.6e-6],
-  'gpt-4.1-nano': [0.1e-6, 0.4e-6],
+export const OPENAI_PRICING: Record<string, [number, number, number]> = {
+  // gpt-4o era — cache reads at 50% of input rate
+  'gpt-4o': [2.5e-6, 10e-6, 0.5],
+  'gpt-4o-mini': [0.15e-6, 0.6e-6, 0.5],
+  'gpt-4-turbo': [10e-6, 30e-6, 0.5],
+  'gpt-4': [30e-6, 60e-6, 0.5],
+  'gpt-3.5-turbo': [0.5e-6, 1.5e-6, 0.5],
+  o1: [15e-6, 60e-6, 0.5],
+  'o1-mini': [3e-6, 12e-6, 0.5],
+  'o1-pro': [150e-6, 600e-6, 0.5],
+  // gpt-4.1 / o3 / o4 era — cache reads at 25% of input rate
+  'gpt-4.1': [2e-6, 8e-6, 0.25],
+  'gpt-4.1-mini': [0.4e-6, 1.6e-6, 0.25],
+  'gpt-4.1-nano': [0.1e-6, 0.4e-6, 0.25],
+  o3: [10e-6, 40e-6, 0.25],
+  'o3-mini': [1.1e-6, 4.4e-6, 0.25],
+  'o3-pro': [20e-6, 80e-6, 0.25],
+  'o4-mini': [1.1e-6, 4.4e-6, 0.25],
+  // gpt-5 era — cache reads at 10% of input rate
+  'gpt-5': [1.25e-6, 10e-6, 0.1],
+  'gpt-5-mini': [0.25e-6, 2e-6, 0.1],
+  'gpt-5-nano': [0.05e-6, 0.4e-6, 0.1],
+  'gpt-5.1': [1.25e-6, 10e-6, 0.1],
+  'gpt-5.2': [1.75e-6, 14e-6, 0.1],
+  'gpt-5.3': [1.75e-6, 14e-6, 0.1],
+  'gpt-5.4': [2.5e-6, 15e-6, 0.1],
+  'gpt-5.4-pro': [30e-6, 180e-6, 0.1],
 };
 
 // Pre-sorted keys for prefix matching (longest first so "gpt-5-mini" matches before "gpt-5")
@@ -63,10 +67,9 @@ export function estimateOpenAICost(
   }
   if (!pricing) return 0;
 
-  const [inputRate, outputRate] = pricing;
+  const [inputRate, outputRate, cacheMultiplier] = pricing;
   const cached = cachedTokens ?? 0;
-  // OpenAI charges 50% of input rate for cached tokens
-  const inputCost = (promptTokens - cached) * inputRate + cached * inputRate * 0.5;
+  const inputCost = (promptTokens - cached) * inputRate + cached * inputRate * cacheMultiplier;
   return inputCost + completionTokens * outputRate;
 }
 
@@ -246,7 +249,7 @@ export class OpenAIProvider implements Provider {
       throw new Error('OpenAI stream response has no body');
     }
 
-    yield* this.parseSSEStream(res.body);
+    yield* this.parseSSEStream(res.body, options.model);
   }
 
   // ---------------------------------------------------------------------------
@@ -350,7 +353,10 @@ export class OpenAIProvider implements Provider {
     return out;
   }
 
-  private async *parseSSEStream(body: ReadableStream<Uint8Array>): AsyncGenerator<StreamChunk> {
+  private async *parseSSEStream(
+    body: ReadableStream<Uint8Array>,
+    model: string,
+  ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -383,7 +389,18 @@ export class OpenAIProvider implements Provider {
           if (!trimmed || trimmed.startsWith(':')) continue;
 
           if (trimmed === 'data: [DONE]') {
-            yield { type: 'done', usage: usageData };
+            yield {
+              type: 'done',
+              usage: usageData,
+              cost: usageData
+                ? estimateOpenAICost(
+                    model,
+                    usageData.prompt_tokens,
+                    usageData.completion_tokens,
+                    usageData.cached_tokens,
+                  )
+                : undefined,
+            };
             return;
           }
 
@@ -438,7 +455,18 @@ export class OpenAIProvider implements Provider {
       }
 
       // If we exit the loop without a [DONE], still emit done with whatever usage we have
-      yield { type: 'done', usage: usageData };
+      yield {
+        type: 'done',
+        usage: usageData,
+        cost: usageData
+          ? estimateOpenAICost(
+              model,
+              usageData.prompt_tokens,
+              usageData.completion_tokens,
+              usageData.cached_tokens,
+            )
+          : undefined,
+      };
     } finally {
       reader.releaseLock();
     }

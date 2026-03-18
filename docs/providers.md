@@ -323,6 +323,56 @@ const agent = agent({
 
 **Provider support:** The `openai-responses` provider (`openai-responses:*`) does not support stop sequences — the OpenAI Responses API has no `stop` parameter. Axl silently ignores it for this provider. All other built-in providers (OpenAI Chat Completions, Anthropic, Google Gemini) support stop sequences.
 
+## Cost Estimation
+
+Axl tracks approximate USD cost for every LLM call and surfaces it via `ctx.budget()`, span attributes, and `ProviderResponse.cost`. Costs are **estimates for budget tracking**, not guaranteed to match your invoice — always check your provider's billing dashboard for exact figures.
+
+### How it works
+
+Each provider adapter maintains a pricing table (input and output rates per token). After every call, Axl computes:
+
+```
+cost = (non_cached_input_tokens × input_rate)
+     + (cached_input_tokens × input_rate × cache_multiplier)
+     + (output_tokens × output_rate)
+```
+
+If a model is not in the pricing table (including all versioned snapshots not explicitly listed), cost is returned as `0` rather than an incorrect estimate.
+
+### Prompt caching rates
+
+Providers charge less for tokens served from cache. The rates differ by provider and, for OpenAI, by model generation.
+
+#### OpenAI — cache multipliers vary by model era
+
+| Model era | Models | Cache multiplier |
+|-----------|--------|-----------------|
+| gpt-4o / o1 | `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`, `o1-pro` | **50%** of input rate |
+| gpt-4.1 / o3 / o4 | `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `o3`, `o3-mini`, `o3-pro`, `o4-mini` | **25%** of input rate |
+| gpt-5 | `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5.1`–`gpt-5.4`, `gpt-5.4-pro` | **10%** of input rate |
+
+Versioned model names (e.g. `gpt-4o-2024-05-13`) are matched by prefix to the base model entry.
+
+#### Anthropic — uniform rates, write TTL caveat
+
+| Operation | Multiplier |
+|-----------|-----------|
+| Cache read (hit) | **10%** of input rate |
+| Cache write — 5-minute TTL (default) | **125%** of input rate |
+| Cache write — 1-hour TTL | **200%** of input rate |
+
+Axl always applies **125%** for cache writes because the API response (`cache_creation_input_tokens`) does not indicate which TTL was used. If you are using 1-hour TTL caching, your actual write costs will be higher than what Axl reports.
+
+Multipliers are uniform across all Anthropic models.
+
+#### Google Gemini — uniform 10% rate
+
+Cached tokens are charged at **10% of the standard input rate** across all Gemini models. A separate per-hour storage fee applies (charged by Google, not reflected in Axl's per-call estimate).
+
+### Custom providers
+
+Custom providers that implement the `Provider` interface return `cost` from `chat()` and `stream()`. Axl does not impose any pricing logic on custom providers — cost estimation is entirely up to the implementation.
+
 ## Custom Providers
 
 Implement the `Provider` interface and register via `ProviderRegistry`:

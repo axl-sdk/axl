@@ -1117,6 +1117,9 @@ describe('OpenAIResponsesProvider', () => {
             reasoning_tokens: undefined,
             cached_tokens: undefined,
           },
+          // gpt-4o: [2.5e-6, 10e-6, 0.5] → 10 * 2.5e-6 + 5 * 10e-6 = 0.000025 + 0.00005 = 0.000075
+          cost: expect.closeTo(0.000075, 8),
+          providerMetadata: undefined,
         },
       ]);
     });

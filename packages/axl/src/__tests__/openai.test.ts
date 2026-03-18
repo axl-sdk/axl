@@ -186,7 +186,7 @@ describe('OpenAIProvider', () => {
       });
     });
 
-    it('discounts cached tokens at 50% of input rate', async () => {
+    it('discounts cached tokens at 50% for gpt-4o era models', async () => {
       mockFetch({
         json: () =>
           Promise.resolve({
@@ -211,12 +211,78 @@ describe('OpenAIProvider', () => {
         maxTokens: 1024,
       });
 
-      // gpt-4o: [2.5e-6, 10e-6]
+      // gpt-4o: [2.5e-6, 10e-6, 0.5]
       // Non-cached input: 200 * 2.5e-6 = 0.0005
       // Cached input:     800 * 2.5e-6 * 0.5 = 0.001
       // Output:           50 * 10e-6 = 0.0005
       // Total: 0.002
       expect(response.cost).toBeCloseTo(0.002, 5);
+    });
+
+    it('discounts cached tokens at 25% for gpt-4.1 era models', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [
+              {
+                message: { content: 'Hi', tool_calls: undefined },
+                finish_reason: 'stop',
+              },
+            ],
+            usage: {
+              prompt_tokens: 1000,
+              completion_tokens: 50,
+              total_tokens: 1050,
+              prompt_tokens_details: { cached_tokens: 800 },
+            },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-4.1',
+        maxTokens: 1024,
+      });
+
+      // gpt-4.1: [2e-6, 8e-6, 0.25]
+      // Non-cached input: 200 * 2e-6 = 0.0004
+      // Cached input:     800 * 2e-6 * 0.25 = 0.0004
+      // Output:           50 * 8e-6 = 0.0004
+      // Total: 0.0012
+      expect(response.cost).toBeCloseTo(0.0012, 5);
+    });
+
+    it('discounts cached tokens at 10% for gpt-5 era models', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [
+              {
+                message: { content: 'Hi', tool_calls: undefined },
+                finish_reason: 'stop',
+              },
+            ],
+            usage: {
+              prompt_tokens: 1000,
+              completion_tokens: 50,
+              total_tokens: 1050,
+              prompt_tokens_details: { cached_tokens: 800 },
+            },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5.4',
+        maxTokens: 1024,
+      });
+
+      // gpt-5.4: [2.5e-6, 15e-6, 0.1]
+      // Non-cached input: 200 * 2.5e-6 = 0.0005
+      // Cached input:     800 * 2.5e-6 * 0.1 = 0.0002
+      // Output:           50 * 15e-6 = 0.00075
+      // Total: 0.00145
+      expect(response.cost).toBeCloseTo(0.00145, 5);
     });
 
     it('returns cost: 0 for unknown models (not undefined)', async () => {

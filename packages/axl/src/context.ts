@@ -608,12 +608,13 @@ export class WorkflowContext<TInput = unknown> {
             if (chunk.arguments) buffer.arguments += chunk.arguments;
           } else if (chunk.type === 'done') {
             streamProviderMetadata = chunk.providerMetadata;
-            // Usage info from done chunk if available
+            // Usage and cost info from done chunk if available
             if (chunk.usage) {
               response = {
                 content,
                 tool_calls: undefined,
                 usage: chunk.usage,
+                cost: chunk.cost,
               };
             }
           }

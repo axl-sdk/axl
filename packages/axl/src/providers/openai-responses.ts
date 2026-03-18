@@ -348,6 +348,8 @@ export class OpenAIResponsesProvider implements Provider {
 
     // Track current function_call item for argument deltas
     const callIdMap = new Map<number, string>();
+    // Must persist across read() calls — event: and data: lines may arrive in separate chunks
+    let eventType = '';
 
     try {
       while (true) {
@@ -357,8 +359,6 @@ export class OpenAIResponsesProvider implements Provider {
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() ?? '';
-
-        let eventType = '';
 
         for (const line of lines) {
           const trimmed = line.trim();
@@ -450,7 +450,19 @@ export class OpenAIResponsesProvider implements Provider {
         const providerMetadata =
           reasoningItems.length > 0 ? { openaiReasoningItems: reasoningItems } : undefined;
 
-        return { type: 'done', usage, providerMetadata };
+        return {
+          type: 'done',
+          usage,
+          cost: usage
+            ? estimateOpenAICost(
+                model,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.cached_tokens,
+              )
+            : undefined,
+          providerMetadata,
+        };
       }
 
       case 'response.failed': {

@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import { serve } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
 import { createServer } from './server/index.js';
+import { resolveRuntime } from './resolve-runtime.js';
 
 // ── Parse CLI args ──────────────────────────────────────────────────
 
@@ -59,13 +60,31 @@ async function main() {
     process.exit(1);
   }
 
-  // Register tsx as a TypeScript loader so .ts config files can be imported
-  if (configPath.endsWith('.ts') || configPath.endsWith('.tsx')) {
+  // Register tsx as a TypeScript loader so .ts config files can be imported.
+  // Both ESM and CJS hooks are needed: if the config's nearest package.json
+  // lacks "type": "module", Node routes the import through CJS where the ESM
+  // hook alone can't intercept .ts resolution.
+  if (/\.[mc]?tsx?$/.test(configPath)) {
+    let tsxLoaded = false;
     try {
-      const { register } = await import('tsx/esm/api');
-      register();
+      const tsxEsm = await import('tsx/esm/api');
+      tsxEsm.register();
+      tsxLoaded = true;
     } catch {
-      // tsx not available — user may be on Node 22.6+ with native TS stripping
+      // ESM hook not available
+    }
+    try {
+      const tsxCjs = await import('tsx/cjs/api');
+      tsxCjs.register();
+      tsxLoaded = true;
+    } catch {
+      // CJS hook not available
+    }
+    if (!tsxLoaded) {
+      console.warn(
+        `[axl-studio] Warning: tsx is not installed. TypeScript config files require tsx as a dependency.\n` +
+          `  Install it with: npm install -D tsx`,
+      );
     }
   }
 
@@ -75,7 +94,7 @@ async function main() {
   let runtime: import('@axlsdk/axl').AxlRuntime;
   try {
     const mod = await import(configPath);
-    runtime = mod.default ?? mod.runtime;
+    runtime = resolveRuntime(mod) as typeof runtime;
 
     if (!runtime || typeof runtime.execute !== 'function') {
       console.error(`Config must export a default AxlRuntime instance.`);

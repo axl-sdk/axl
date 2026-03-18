@@ -19,6 +19,33 @@ import {
 async function main() {
   const args = parseArgs(process.argv);
 
+  if (args.help) {
+    console.log(`
+Axl Studio — Local development UI for Axl agents and workflows
+
+Usage:
+  axl-studio [options]
+
+Options:
+  --port <number>          Server port (default: 4400)
+  --config <path>          Path to config file (default: auto-detect)
+  --conditions <list>      Comma-separated Node.js import conditions (e.g., development)
+  --open                   Auto-open browser
+  -h, --help               Show this help message
+
+Config auto-detection order:
+  ${CONFIG_CANDIDATES.join(' → ')}
+
+Tip: Use .mts for configs with top-level await or in projects without "type": "module".
+`);
+    process.exit(0);
+  }
+
+  if (args.portError) {
+    console.error(args.portError);
+    process.exit(1);
+  }
+
   // Resolve config path: explicit --config or auto-detect
   let configPath: string;
   if (args.config) {

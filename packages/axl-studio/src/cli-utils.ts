@@ -25,12 +25,15 @@ export interface CliArgs {
   config?: string;
   open: boolean;
   conditions: string[];
+  help: boolean;
+  portError?: string;
 }
 
 export function parseArgs(argv: string[]): CliArgs {
   let port = 4400;
   let config: string | undefined;
   let open = false;
+  let help = false;
   let conditions: string[] = [];
 
   for (let i = 2; i < argv.length; i++) {
@@ -49,10 +52,18 @@ export function parseArgs(argv: string[]): CliArgs {
       i++;
     } else if (arg === '--open') {
       open = true;
+    } else if (arg === '--help' || arg === '-h') {
+      help = true;
     }
   }
 
-  return { port, config, open, conditions };
+  const result: CliArgs = { port, config, open, help, conditions };
+
+  if (isNaN(port) || port < 1 || port > 65535) {
+    result.portError = `Invalid port: ${port}. Must be between 1 and 65535.`;
+  }
+
+  return result;
 }
 
 // ── Extension helpers ──────────────────────────────────────────────

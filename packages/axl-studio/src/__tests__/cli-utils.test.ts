@@ -18,7 +18,13 @@ describe('parseArgs', () => {
 
   it('returns defaults when no args provided', () => {
     const result = parseArgs(argv());
-    expect(result).toEqual({ port: 4400, config: undefined, open: false, conditions: [] });
+    expect(result).toEqual({
+      port: 4400,
+      config: undefined,
+      open: false,
+      help: false,
+      conditions: [],
+    });
   });
 
   it('parses --port', () => {
@@ -60,6 +66,7 @@ describe('parseArgs', () => {
       port: 8080,
       config: 'app.mts',
       open: true,
+      help: false,
       conditions: ['development'],
     });
   });
@@ -78,6 +85,42 @@ describe('parseArgs', () => {
   it('ignores flag without value for --conditions', () => {
     const result = parseArgs(argv('--conditions'));
     expect(result.conditions).toEqual([]);
+  });
+
+  it('parses --help', () => {
+    expect(parseArgs(argv('--help')).help).toBe(true);
+  });
+
+  it('parses -h', () => {
+    expect(parseArgs(argv('-h')).help).toBe(true);
+  });
+
+  it('sets portError for NaN port', () => {
+    const result = parseArgs(argv('--port', 'abc'));
+    expect(result.portError).toMatch(/Invalid port/);
+  });
+
+  it('sets portError for port 0', () => {
+    const result = parseArgs(argv('--port', '0'));
+    expect(result.portError).toMatch(/Invalid port/);
+  });
+
+  it('sets portError for port > 65535', () => {
+    const result = parseArgs(argv('--port', '99999'));
+    expect(result.portError).toMatch(/Invalid port/);
+  });
+
+  it('sets portError for negative port', () => {
+    const result = parseArgs(argv('--port', '-1'));
+    expect(result.portError).toMatch(/Invalid port/);
+  });
+
+  it('no portError for valid port', () => {
+    expect(parseArgs(argv('--port', '8080')).portError).toBeUndefined();
+  });
+
+  it('no portError for default port', () => {
+    expect(parseArgs(argv()).portError).toBeUndefined();
   });
 });
 

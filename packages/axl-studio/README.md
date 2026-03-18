@@ -166,6 +166,7 @@ Channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`.
 ```
 src/
   cli.ts                  CLI entry — loads config, starts server
+  resolve-runtime.ts      Config module interop (ESM default, CJS wrapping, named exports)
   server/
     index.ts              createServer() — Hono app composition
     types.ts              API types, WebSocket message types

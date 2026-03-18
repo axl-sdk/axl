@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { resolve } from 'node:path';
+import { resolve, extname } from 'node:path';
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { serve } from '@hono/node-server';
@@ -139,7 +139,8 @@ async function main() {
   // the format for the config file specifically.
   // .mts/.cts have explicit format built into their extension; .mjs/.cjs
   // are plain JS with explicit format. Only .ts/.tsx are ambiguous.
-  if (configPath.endsWith('.ts') || configPath.endsWith('.tsx')) {
+  const ext = extname(configPath);
+  if (ext === '.ts' || ext === '.tsx') {
     try {
       const nodeModule = await import('node:module');
       const configUrl = pathToFileURL(configPath).href;
@@ -191,6 +192,12 @@ async function main() {
 
     if (!runtime || typeof runtime.execute !== 'function') {
       console.error(`Config must export a default AxlRuntime instance.`);
+      if (runtime) {
+        const keys = Object.keys(runtime as object)
+          .slice(0, 5)
+          .join(', ');
+        console.error(`  Got: ${typeof runtime}${keys ? ` with keys: { ${keys} }` : ''}`);
+      }
       console.error(
         `Example:\n  import { AxlRuntime } from '@axlsdk/axl';\n  export default new AxlRuntime({ ... });`,
       );
@@ -204,10 +211,10 @@ async function main() {
       )
     ) {
       console.error(`[axl-studio] Config failed to load due to a CJS/ESM compatibility issue.`);
-      if (configPath.endsWith('.ts')) {
+      if (ext === '.ts' || ext === '.tsx') {
+        const mtsPath = configPath.slice(0, -ext.length) + '.mts';
         console.error(
-          `  Tip: rename to .mts to force ESM format:\n` +
-            `    mv ${configPath} ${configPath.replace(/\.ts$/, '.mts')}`,
+          `  Tip: rename to .mts to force ESM format:\n` + `    mv ${configPath} ${mtsPath}`,
         );
       } else {
         console.error(`  Tip: add "type": "module" to your package.json.`);

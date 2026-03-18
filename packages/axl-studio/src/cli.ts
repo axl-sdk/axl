@@ -1,17 +1,38 @@
 #!/usr/bin/env node
 import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { serve } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
 import { createServer } from './server/index.js';
 import { resolveRuntime } from './resolve-runtime.js';
 
+// ── Config auto-detection ──────────────────────────────────────────
+
+const CONFIG_CANDIDATES = ['axl.config.mts', 'axl.config.ts', 'axl.config.mjs', 'axl.config.js'];
+
+function findConfig(cwd: string): string | undefined {
+  for (const name of CONFIG_CANDIDATES) {
+    const p = resolve(cwd, name);
+    if (existsSync(p)) return p;
+  }
+  return undefined;
+}
+
 // ── Parse CLI args ──────────────────────────────────────────────────
 
-function parseArgs(argv: string[]): { port: number; config: string; open: boolean } {
+interface CliArgs {
+  port: number;
+  config?: string;
+  open: boolean;
+  conditions: string[];
+}
+
+function parseArgs(argv: string[]): CliArgs {
   let port = 4400;
-  let config = './axl.config.ts';
+  let config: string | undefined;
   let open = false;
+  let conditions: string[] = [];
 
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
@@ -20,6 +41,12 @@ function parseArgs(argv: string[]): { port: number; config: string; open: boolea
       i++;
     } else if (arg === '--config' && argv[i + 1]) {
       config = argv[i + 1];
+      i++;
+    } else if (arg === '--conditions' && argv[i + 1]) {
+      conditions = argv[i + 1]
+        .split(',')
+        .map((c) => c.trim())
+        .filter(Boolean);
       i++;
     } else if (arg === '--open') {
       open = true;
@@ -31,10 +58,16 @@ Usage:
   axl-studio [options]
 
 Options:
-  --port <number>    Server port (default: 4400)
-  --config <path>    Path to axl.config.ts (default: ./axl.config.ts)
-  --open             Auto-open browser
-  -h, --help         Show this help message
+  --port <number>          Server port (default: 4400)
+  --config <path>          Path to config file (default: auto-detect)
+  --conditions <list>      Comma-separated Node.js import conditions (e.g., development)
+  --open                   Auto-open browser
+  -h, --help               Show this help message
+
+Config auto-detection order:
+  ${CONFIG_CANDIDATES.join(' → ')}
+
+Tip: Use .mts for configs with top-level await or in projects without "type": "module".
 `);
       process.exit(0);
     }
@@ -45,19 +78,30 @@ Options:
     process.exit(1);
   }
 
-  return { port, config, open };
+  return { port, config, open, conditions };
 }
 
 // ── Main ────────────────────────────────────────────────────────────
 
 async function main() {
   const args = parseArgs(process.argv);
-  const configPath = resolve(process.cwd(), args.config);
 
-  if (!existsSync(configPath)) {
-    console.error(`Config file not found: ${configPath}`);
-    console.error(`Create an axl.config.ts that exports a default AxlRuntime instance.`);
-    process.exit(1);
+  // Resolve config path: explicit --config or auto-detect
+  let configPath: string;
+  if (args.config) {
+    configPath = resolve(process.cwd(), args.config);
+    if (!existsSync(configPath)) {
+      console.error(`Config file not found: ${configPath}`);
+      process.exit(1);
+    }
+  } else {
+    const found = findConfig(process.cwd());
+    if (!found) {
+      console.error(`No config file found. Searched for: ${CONFIG_CANDIDATES.join(', ')}`);
+      console.error(`Create an axl.config.mts that exports a default AxlRuntime instance.`);
+      process.exit(1);
+    }
+    configPath = found;
   }
 
   // Register tsx as a TypeScript loader so .ts config files can be imported.
@@ -88,12 +132,61 @@ async function main() {
     }
   }
 
+  // Force ESM format for .ts/.tsx config files so top-level await works
+  // regardless of the nearest package.json "type" field. Without this,
+  // tsx decides CJS vs ESM based on package.json — CJS doesn't support
+  // top-level await. We register a resolve hook after tsx that overrides
+  // the format for the config file specifically.
+  // .mts/.cts have explicit format built into their extension; .mjs/.cjs
+  // are plain JS with explicit format. Only .ts/.tsx are ambiguous.
+  if (configPath.endsWith('.ts') || configPath.endsWith('.tsx')) {
+    try {
+      const nodeModule = await import('node:module');
+      const configUrl = pathToFileURL(configPath).href;
+      const hookCode = [
+        `export async function resolve(specifier, context, nextResolve) {`,
+        `  const result = await nextResolve(specifier, context);`,
+        `  if (result.url === ${JSON.stringify(configUrl)}) result.format = 'module';`,
+        `  return result;`,
+        `}`,
+      ].join('\n');
+      nodeModule.register(`data:text/javascript,${encodeURIComponent(hookCode)}`);
+    } catch {
+      // module.register() not available (Node < 20.6) — fall through,
+      // error handler below will suggest .mts if loading fails
+    }
+  }
+
+  // Register custom import conditions (e.g., --conditions development).
+  // In monorepos, package.json "exports" often use the "development" condition
+  // to point at source (.ts) instead of built dist. Without this, Studio
+  // configs that import workspace packages resolve to dist files, which may
+  // not exist or be stale.
+  if (args.conditions.length > 0) {
+    try {
+      const nodeModule = await import('node:module');
+      const hookCode = [
+        `const extra = ${JSON.stringify(args.conditions)};`,
+        `export async function resolve(specifier, context, nextResolve) {`,
+        `  return nextResolve(specifier, {`,
+        `    ...context,`,
+        `    conditions: [...new Set([...context.conditions, ...extra])],`,
+        `  });`,
+        `}`,
+      ].join('\n');
+      nodeModule.register(`data:text/javascript,${encodeURIComponent(hookCode)}`);
+    } catch {
+      console.warn(`[axl-studio] Warning: --conditions requires Node.js 20.6+`);
+    }
+  }
+
   console.log(`[axl-studio] Loading config from ${configPath}`);
 
   // Import the user's config
   let runtime: import('@axlsdk/axl').AxlRuntime;
   try {
-    const mod = await import(configPath);
+    const mod = await import(pathToFileURL(configPath).href);
+    // resolveRuntime handles ESM default, CJS-to-ESM interop, and named exports
     runtime = resolveRuntime(mod) as typeof runtime;
 
     if (!runtime || typeof runtime.execute !== 'function') {
@@ -104,6 +197,23 @@ async function main() {
       process.exit(1);
     }
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      /Cannot use import statement|Unexpected reserved word|top-level await|exports is not defined/.test(
+        msg,
+      )
+    ) {
+      console.error(`[axl-studio] Config failed to load due to a CJS/ESM compatibility issue.`);
+      if (configPath.endsWith('.ts')) {
+        console.error(
+          `  Tip: rename to .mts to force ESM format:\n` +
+            `    mv ${configPath} ${configPath.replace(/\.ts$/, '.mts')}`,
+        );
+      } else {
+        console.error(`  Tip: add "type": "module" to your package.json.`);
+      }
+      console.error();
+    }
     console.error(`Failed to load config:`, err);
     process.exit(1);
   }

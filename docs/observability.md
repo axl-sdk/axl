@@ -7,7 +7,7 @@ Every workflow execution produces a structured trace. In development, this is yo
 ### Configuration
 
 ```typescript
-// axl.config.ts
+// axl.config.mts
 import { defineConfig } from '@axlsdk/axl';
 
 export default defineConfig({

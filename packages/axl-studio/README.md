@@ -22,7 +22,9 @@ npx @axlsdk/studio
 
 ### 1. Create a config file
 
-Studio needs an `axl.config.ts` at your project root that default-exports an `AxlRuntime`. The recommended pattern is to keep your tools, agents, workflows, and runtime in your application code, then re-export the runtime for Studio to discover:
+Studio needs a config file at your project root that default-exports an `AxlRuntime`. It auto-detects in this order: `axl.config.mts` → `axl.config.ts` → `axl.config.mjs` → `axl.config.js`. Use `.mts` for configs with top-level `await` or in projects without `"type": "module"` in package.json.
+
+The recommended pattern is to keep your tools, agents, workflows, and runtime in your application code, then re-export the runtime for Studio to discover:
 
 ```
 src/
@@ -31,7 +33,7 @@ src/
   tools/                 — tool definitions (wrap your services)
   agents/                — agent definitions (import their tools)
   workflows/             — workflow definitions (orchestrate agents)
-axl.config.ts            — re-exports runtime for Studio
+axl.config.mts           — re-exports runtime for Studio
 ```
 
 ```typescript
@@ -49,12 +51,12 @@ runtime.registerTool(lookupOrder);
 ```
 
 ```typescript
-// axl.config.ts — thin entry point for Studio
+// axl.config.mts — thin entry point for Studio
 import { runtime } from './src/runtime.js';
 export default runtime;
 ```
 
-Your application imports from `src/runtime.ts` directly. Studio discovers everything via `axl.config.ts`. See the [`@axlsdk/axl` README](../axl/README.md#project-structure) for the full recommended project structure.
+Your application imports from `src/runtime.ts` directly. Studio discovers everything via `axl.config.mts`. See the [`@axlsdk/axl` README](../axl/README.md#project-structure) for the full recommended project structure.
 
 ### 2. Start Studio
 
@@ -70,11 +72,14 @@ This loads your config, starts the server on `http://localhost:4400`, and opens 
 axl-studio [options]
 
 Options:
-  --port <number>    Server port (default: 4400)
-  --config <path>    Path to config file (default: ./axl.config.ts)
-  --open             Auto-open browser
-  -h, --help         Show help
+  --port <number>          Server port (default: 4400)
+  --config <path>          Path to config file (default: auto-detect)
+  --conditions <list>      Comma-separated Node.js import conditions (e.g., development)
+  --open                   Auto-open browser
+  -h, --help               Show help
 ```
+
+The `--conditions` flag is useful in monorepos where workspace packages use the `"development"` export condition to point at source instead of built dist files. Pass `--conditions development` to resolve imports through source paths.
 
 ## Panels
 
@@ -183,7 +188,7 @@ src/
 
 **Client:** React 19 SPA with Tailwind CSS v4, TanStack Query, and react-router-dom. Pre-built at publish time and served as static assets.
 
-**CLI:** Loads the user's `.ts` config via `tsx`, validates the runtime, starts the server, and optionally opens the browser.
+**CLI:** Auto-detects and loads the user's config via `tsx` (with ESM-forcing resolve hook for `.ts` files), validates the runtime, starts the server, and optionally opens the browser.
 
 ## Development
 

@@ -30,7 +30,7 @@ src/
   workflows/
     handle-ticket.ts     — orchestrates support + billing agents
 
-axl.config.ts            — re-exports runtime for Axl Studio
+axl.config.mts           — re-exports runtime for Axl Studio
 ```
 
 ### Config
@@ -119,7 +119,7 @@ runtime.registerTool(lookupOrder);
 ```
 
 ```typescript
-// axl.config.ts — thin entry point for Axl Studio
+// axl.config.mts — thin entry point for Axl Studio
 import { runtime } from './src/runtime.js';
 export default runtime;
 ```

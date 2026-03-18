@@ -122,7 +122,8 @@ packages/axl-eval/src/
   cli.ts             — CLI entry point
 
 packages/axl-studio/src/
-  cli.ts             — CLI entry: --port, --config, --open flags
+  cli.ts             — CLI entry: --port, --config, --conditions, --open flags
+  resolve-runtime.ts — Config module interop (ESM default, CJS wrapping, named exports)
   server/
     index.ts         — createServer() factory, Hono app composition
     types.ts         — API types, WS message types, env bindings
@@ -258,4 +259,4 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - Studio: `zodToJsonSchema()` exported from core for tool schema rendering in Tool Inspector
 - Studio: WebSocket uses channel multiplexing (subscribe/unsubscribe); channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`
 - Studio: `StateStore.listSessions()` optional method for session browsing (implemented in MemoryStore, SQLiteStore, RedisStore)
-- Studio: CLI (`axl-studio`) loads user's `axl.config.ts` via dynamic import, expects `export default runtime`
+- Studio: CLI (`axl-studio`) auto-detects config (`axl.config.mts` → `.ts` → `.mjs` → `.js`), expects `export default runtime`. For `.ts`/`.tsx` configs, registers a `module.register()` resolve hook that forces `format: 'module'` so top-level `await` works in non-`"type":"module"` projects. `--conditions` flag adds custom import conditions via resolve hook (e.g., `--conditions development` for monorepo source exports)

@@ -52,10 +52,10 @@ Axl Studio provides a browser-based development UI for any Axl project.
 
 ### Setup
 
-Create an `axl.config.ts` that exports your runtime:
+Create an `axl.config.mts` that exports your runtime (`.mts` ensures ESM semantics, including top-level `await`, regardless of your project's package.json):
 
 ```typescript
-// axl.config.ts
+// axl.config.mts
 import { AxlRuntime } from '@axlsdk/axl';
 import { HandleSupport } from './workflows/support';
 import { researcher, writer } from './agents';
@@ -81,7 +81,7 @@ npx @axlsdk/studio --open
 ### Development Workflow
 
 1. **Define** agents, tools, and workflows in your project
-2. **Export** the runtime from `axl.config.ts`
+2. **Export** the runtime from `axl.config.mts`
 3. **Start** Studio (`npx @axlsdk/studio --open`)
 4. **Iterate** using the Agent Playground for quick prompt testing
 5. **Debug** execution traces in the Trace Explorer with waterfall visualization

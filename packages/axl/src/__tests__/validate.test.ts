@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { agent } from '../agent.js';
 import { WorkflowContext } from '../context.js';
 import { ProviderRegistry } from '../providers/registry.js';
-import { ValidationError } from '../errors.js';
+import { ValidationError, VerifyError } from '../errors.js';
 import { randomUUID } from 'node:crypto';
 import type { TraceEvent } from '../types.js';
 import type { Provider, ProviderResponse } from '../providers/types.js';
@@ -1092,6 +1092,112 @@ describe('validate (post-schema business rule validation)', () => {
       // Call 2: fn repairs to {value: 65}, schema passes, verify validate passes
       expect(result).toEqual({ value: 65 });
       expect(fnCalls).toBe(2);
+    });
+  });
+
+  describe('verify retry fields when fn() throws errors with structured output', () => {
+    it('populates retry.parsed and retry.output from ValidationError.lastOutput', async () => {
+      const retries: Array<{ error: string; output: unknown; parsed: unknown } | undefined> = [];
+      const { ctx } = createCtx();
+
+      await ctx.verify(
+        async (retry) => {
+          retries.push(
+            retry ? { error: retry.error, output: retry.output, parsed: retry.parsed } : undefined,
+          );
+          if (retry?.parsed) return retry.parsed; // return as-is to pass
+          // Simulate ctx.ask() exhausting validate retries — fn never returns, it throws
+          throw new ValidationError({ value: 42 }, 'business rule failed', 2);
+        },
+        ValueSchema,
+        { retries: 1 },
+      );
+
+      // First call: no retry context
+      expect(retries[0]).toBeUndefined();
+      // Second call: verify extracted lastOutput from the caught ValidationError
+      expect(retries[1]).toBeDefined();
+      expect(retries[1]!.error).toBe('business rule failed');
+      expect(retries[1]!.parsed).toEqual({ value: 42 }); // from err.lastOutput
+      expect(retries[1]!.output).toEqual({ value: 42 }); // falls back to err.lastOutput
+    });
+
+    it('populates retry.output from VerifyError.lastOutput (e.g., ctx.ask schema failure)', async () => {
+      const retries: Array<{ error: string; output: unknown; hasParsed: boolean } | undefined> = [];
+      const { ctx } = createCtx();
+
+      const result = await ctx.verify(
+        async (retry) => {
+          retries.push(
+            retry
+              ? { error: retry.error, output: retry.output, hasParsed: retry.parsed !== undefined }
+              : undefined,
+          );
+          if (retry?.output) {
+            // Repair the raw output from the inner verify's failure
+            return { value: (retry.output as { value: string }).value === 'not-a-number' ? 99 : 0 };
+          }
+          // Simulate a nested ctx.verify() that failed schema validation
+          throw new VerifyError(
+            { value: 'not-a-number' },
+            new (await import('zod')).ZodError([
+              { code: 'custom', path: ['value'], message: 'Expected number' },
+            ]),
+            2,
+          );
+        },
+        ValueSchema,
+        { retries: 1 },
+      );
+
+      expect(retries[0]).toBeUndefined();
+      expect(retries[1]).toBeDefined();
+      expect(retries[1]!.output).toEqual({ value: 'not-a-number' }); // from err.lastOutput
+      expect(retries[1]!.hasParsed).toBe(false); // schema failed — no parsed
+      expect(result).toEqual({ value: 99 });
+    });
+
+    it('VerifyError from fn is re-thrown after retries exhausted', async () => {
+      const { ctx } = createCtx();
+
+      const err = await ctx
+        .verify(
+          async () => {
+            throw new VerifyError(
+              { raw: 'data' },
+              new (await import('zod')).ZodError([
+                { code: 'custom', path: [], message: 'Schema failed' },
+              ]),
+              1,
+            );
+          },
+          ValueSchema,
+          { retries: 0 },
+        )
+        .catch((e) => e);
+
+      expect(err).toBeInstanceOf(VerifyError);
+      expect(err.lastOutput).toEqual({ raw: 'data' });
+    });
+
+    it('VerifyError from fn uses fallback when provided', async () => {
+      const { ctx } = createCtx();
+
+      const result = await ctx.verify(
+        async () => {
+          throw new VerifyError(
+            'bad',
+            new (await import('zod')).ZodError([
+              { code: 'custom', path: [], message: 'Schema failed' },
+            ]),
+            1,
+          );
+        },
+        ValueSchema,
+        { retries: 0, fallback: { value: -1 } },
+      );
+
+      expect(result).toEqual({ value: -1 });
     });
   });
 });

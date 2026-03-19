@@ -1668,11 +1668,24 @@ export class WorkflowContext<TInput = unknown> {
         if (err instanceof ValidationError) {
           // ValidationError from our own validate block or from fn (e.g., ctx.ask() validate
           // exhausted). Extract the parsed object so the next retry can repair it.
+          // When fn() throws, rawOutput is undefined — fall back to the error's lastOutput.
           lastRetry = {
             error: err.reason,
-            output: rawOutput,
+            output: rawOutput ?? err.lastOutput,
             parsed: err.lastOutput as T,
           };
+          if (attempt === maxRetries) {
+            if (options?.fallback !== undefined) return options.fallback;
+            throw err;
+          }
+          continue;
+        }
+
+        // VerifyError from fn (e.g., ctx.ask() with schema exhausted retries, or nested
+        // ctx.verify()). Extract lastOutput so fn can attempt repair — output is the raw
+        // LLM response that failed parsing, parsed stays undefined.
+        if (err instanceof VerifyError) {
+          lastRetry = { error: err.message, output: rawOutput ?? err.lastOutput };
           if (attempt === maxRetries) {
             if (options?.fallback !== undefined) return options.fallback;
             throw err;

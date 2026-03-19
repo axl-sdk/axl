@@ -55,10 +55,12 @@ export type VoteOptions<T> = {
 export type VerifyRetry<T> = {
   /** Error message from the failed attempt (schema or validate). */
   error: string;
-  /** Raw return value from the previous fn call. */
+  /** Raw return value from the previous fn call. When fn() throws a ValidationError
+   *  or VerifyError, falls back to err.lastOutput so the retry has data to repair. */
   output: unknown;
   /** Schema-parsed object — only present when schema passed but validate failed.
-   *  Safe to modify and return as the next attempt. */
+   *  Also populated from ValidationError.lastOutput when fn() throws (e.g., inner
+   *  ctx.ask() exhausted its validate retries). Safe to modify and return. */
   parsed?: T;
 };
 

@@ -375,13 +375,19 @@ On the first call, `retry` is `undefined`. On retries, it contains:
 
 See [Validated Data Extraction](use-cases.md#validated-data-extraction) for more patterns including API data repair and non-LLM use cases.
 
+**Error extraction from `fn()` throws:** When `fn()` throws instead of returning, `verify` inspects the error and extracts structured output so the next retry has data to work with. Since `fn()` never returned a value, `retry.output` would normally be `undefined` — but `verify` recovers it from the error's `lastOutput` property:
+
+- **`ValidationError`** (e.g., `ctx.ask()` with `validate` exhausted its retries): `retry.parsed` and `retry.output` are both populated from `err.lastOutput` — the schema-valid, parsed object that passed schema but failed business rules. Use `retry?.parsed` to repair it programmatically.
+- **`VerifyError`** (e.g., `ctx.ask()` with `schema` exhausted its retries, or nested `ctx.verify()`): `retry.output` is populated from `err.lastOutput` — the raw LLM response string that failed schema parsing. `retry.parsed` remains `undefined` since the output couldn't be parsed.
+- **Other errors**: `retry.output` and `retry.parsed` are both `undefined` (no structured output to extract).
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `retries` | `number` | `3` | Maximum retry attempts |
 | `fallback` | `T` | — | Return this value instead of throwing when retries are exhausted |
 | `validate` | `OutputValidator<T>` | — | Post-schema business rule validation. Runs after schema parse succeeds |
 
-**Throws:** `VerifyError` (schema failure) or `ValidationError` (validate failure) if retries exhausted and no fallback provided.
+**Throws:** `VerifyError` (schema failure) or `ValidationError` (validate failure) if retries exhausted and no fallback provided. When `fn()` throws a `VerifyError` or `ValidationError`, `verify` re-throws the original error (not a new wrapper) after retries are exhausted.
 
 **Retry mechanics:** `ctx.verify()` is **not** conversation-aware. It is a plain loop that calls your function, validates the return value (schema then validate), and on failure passes a `VerifyRetry` context to your next call. What you do with that context is entirely up to you — `ctx.verify()` does not modify any LLM conversation or session history. This makes it suitable for retrying any async operation, not just LLM calls.
 

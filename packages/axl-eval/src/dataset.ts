@@ -7,10 +7,7 @@ export type DatasetItem<TInput, TAnnotations = undefined> = {
   annotations?: TAnnotations;
 };
 
-export type DatasetConfig<
-  TInput extends z.ZodTypeAny,
-  TAnnotations extends z.ZodTypeAny = z.ZodTypeAny,
-> = {
+export type DatasetConfig<TInput extends z.ZodType, TAnnotations extends z.ZodType = z.ZodType> = {
   name: string;
   schema: TInput;
   annotations?: TAnnotations;
@@ -22,12 +19,12 @@ export type DatasetConfig<
 
 export type Dataset<TInput = unknown, TAnnotations = unknown> = {
   readonly name: string;
-  readonly schema: z.ZodTypeAny;
-  readonly annotationsSchema?: z.ZodTypeAny;
+  readonly schema: z.ZodType;
+  readonly annotationsSchema?: z.ZodType;
   getItems(): Promise<DatasetItem<TInput, TAnnotations>[]>;
 };
 
-export function dataset<TInput extends z.ZodTypeAny, TAnnotations extends z.ZodTypeAny>(
+export function dataset<TInput extends z.ZodType, TAnnotations extends z.ZodType>(
   config: DatasetConfig<TInput, TAnnotations>,
 ): Dataset<z.infer<TInput>, z.infer<TAnnotations>> {
   return {

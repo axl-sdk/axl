@@ -10,7 +10,7 @@ TypeScript SDK for orchestrating agentic systems. Treats concurrency, structured
 ## Install
 
 ```bash
-npm install @axlsdk/axl zod
+npm install @axlsdk/axl zod@^4
 ```
 
 Set an API key for at least one provider:

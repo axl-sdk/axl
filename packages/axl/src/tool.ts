@@ -17,7 +17,7 @@ export type ToolHooks<TInput = unknown, TOutput = unknown> = {
 };
 
 /** Tool configuration */
-export type ToolConfig<TInput extends z.ZodTypeAny, TOutput = unknown> = {
+export type ToolConfig<TInput extends z.ZodType, TOutput = unknown> = {
   name: string;
   description: string;
   input: TInput;
@@ -33,7 +33,7 @@ export type ToolConfig<TInput extends z.ZodTypeAny, TOutput = unknown> = {
 };
 
 /** A defined tool instance */
-export type Tool<TInput extends z.ZodTypeAny = z.ZodTypeAny, TOutput = unknown> = {
+export type Tool<TInput extends z.ZodType = z.ZodType, TOutput = unknown> = {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: TInput;
@@ -91,7 +91,7 @@ function getBackoffMs(attempt: number, strategy: 'none' | 'linear' | 'exponentia
  * @param config - Tool configuration: name, description, input schema, handler, retry, and sensitivity options.
  * @returns A Tool instance that can be attached to agents and invoked via `tool.run()` or agent tool calling.
  */
-export function tool<TInput extends z.ZodTypeAny, TOutput = unknown>(
+export function tool<TInput extends z.ZodType, TOutput = unknown>(
   config: ToolConfig<TInput, TOutput>,
 ): Tool<TInput, TOutput> {
   const retryPolicy: RetryPolicy = {

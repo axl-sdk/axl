@@ -13,6 +13,12 @@ describe('Studio API: Tools', () => {
     expect(body.data[0].name).toBe('greet');
     expect(body.data[0].description).toBe('Greet someone by name');
     expect(body.data[0].inputSchema).toBeDefined();
+    // Verify JSON Schema structure (not just existence)
+    expect(body.data[0].inputSchema.type).toBe('object');
+    expect(body.data[0].inputSchema.properties).toHaveProperty('name');
+    expect(body.data[0].inputSchema.properties.name.type).toBe('string');
+    expect(body.data[0].inputSchema.additionalProperties).toBe(false);
+    expect(body.data[0].inputSchema).not.toHaveProperty('$schema');
   });
 
   it('POST /api/tools/greet/test executes the tool and returns result', async () => {

@@ -1,6 +1,6 @@
 {
   "name": "@axlsdk/eval",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Evaluation framework for Axl agentic workflows",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -39,7 +39,7 @@
     "tsup": "^8.3.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0",
-    "zod": "^3.24.0"
+    "zod": "^4.0.0"
   },
   "keywords": [
     "ai",

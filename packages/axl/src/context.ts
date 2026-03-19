@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { type z, ZodError } from 'zod';
+import { z, ZodError } from 'zod';
 import type {
   Result,
   BudgetResult,
@@ -50,72 +50,13 @@ import type { RememberOptions, RecallOptions, VectorResult } from './memory/type
  */
 const signalStorage = new AsyncLocalStorage<AbortSignal>();
 
-/**
- * Convert a Zod schema to a JSON Schema object for tool definitions.
- *
- * Handles: string, number, boolean, array, object, optional, default, enum,
- * literal, union, nullable.
- *
- * Not handled: discriminated unions, branded types, transforms, refinements,
- * lazy, record, map, set, tuple, intersection. These fall through to an
- * empty object `{}`.
- */
-/** Internal Zod _def shape used by zodToJsonSchema to traverse schemas. */
-interface ZodDef {
-  typeName: string;
-  type?: z.ZodTypeAny;
-  shape?: () => Record<string, z.ZodTypeAny>;
-  innerType?: z.ZodTypeAny;
-  values?: string[];
-  value?: unknown;
-  options?: z.ZodTypeAny[];
-}
-
-/** Convert a Zod schema to JSON Schema (subset). Exported for Studio tool introspection. */
-export function zodToJsonSchema(schema: z.ZodTypeAny): unknown {
-  const def = (schema as unknown as { _def: ZodDef })._def;
-  if (!def || !def.typeName) return {};
-
-  switch (def.typeName) {
-    case 'ZodString':
-      return { type: 'string' };
-    case 'ZodNumber':
-      return { type: 'number' };
-    case 'ZodBoolean':
-      return { type: 'boolean' };
-    case 'ZodArray':
-      return { type: 'array', items: zodToJsonSchema(def.type!) };
-    case 'ZodObject': {
-      const shape = def.shape?.() ?? {};
-      const properties: Record<string, unknown> = {};
-      const required: string[] = [];
-      for (const [key, value] of Object.entries(shape)) {
-        properties[key] = zodToJsonSchema(value);
-        const innerDef = (value as unknown as { _def: ZodDef })._def;
-        if (innerDef?.typeName !== 'ZodOptional' && innerDef?.typeName !== 'ZodDefault') {
-          required.push(key);
-        }
-      }
-      return { type: 'object', properties, required: required.length > 0 ? required : undefined };
-    }
-    case 'ZodOptional':
-      return zodToJsonSchema(def.innerType!);
-    case 'ZodDefault':
-      return zodToJsonSchema(def.innerType!);
-    case 'ZodEnum':
-      return { type: 'string', enum: def.values };
-    case 'ZodLiteral': {
-      const v = def.value;
-      const t = v === null ? 'null' : typeof v;
-      return { type: t, const: v };
-    }
-    case 'ZodUnion':
-      return { oneOf: def.options!.map((o: z.ZodTypeAny) => zodToJsonSchema(o)) };
-    case 'ZodNullable':
-      return { ...(zodToJsonSchema(def.innerType!) as object), nullable: true };
-    default:
-      return {};
-  }
+/** Convert a Zod schema to JSON Schema. Exported for Studio tool introspection.
+ *  Wraps Zod v4's built-in `z.toJSONSchema()`, stripping the `$schema` key
+ *  since tool parameter schemas are embedded objects, not standalone documents. */
+export function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
+  const result = z.toJSONSchema(schema, { unrepresentable: 'any' }) as Record<string, unknown>;
+  delete result.$schema;
+  return result;
 }
 
 /** Simple token estimator: ~4 chars per token. Good enough for context management. */
@@ -479,7 +420,7 @@ export class WorkflowContext<TInput = unknown> {
     // Build user prompt
     let userContent = prompt;
     if (options?.schema) {
-      const jsonSchema = zodToJsonSchema(options.schema as z.ZodTypeAny);
+      const jsonSchema = zodToJsonSchema(options.schema as z.ZodType);
       userContent += `\n\nRespond with valid JSON matching this schema:\n${JSON.stringify(jsonSchema, null, 2)}`;
     }
 
@@ -1144,7 +1085,7 @@ export class WorkflowContext<TInput = unknown> {
       if (options?.schema) {
         try {
           const parsed = JSON.parse(stripMarkdownFences(content));
-          validated = (options.schema as z.ZodTypeAny).parse(parsed);
+          validated = (options.schema as z.ZodType).parse(parsed);
         } catch (err) {
           const maxSchemaRetries = options.retries ?? 3;
           if (schemaRetries < maxSchemaRetries) {
@@ -1868,7 +1809,7 @@ export class WorkflowContext<TInput = unknown> {
   private async _raceImpl<T>(fns: Array<() => Promise<T>>, options?: RaceOptions<T>): Promise<T> {
     const controller = new AbortController();
     let lastError: Error | undefined;
-    const schema = options?.schema as z.ZodTypeAny | undefined;
+    const schema = options?.schema as z.ZodType | undefined;
 
     const parentSignal = this.currentSignal;
     const composedSignal = parentSignal

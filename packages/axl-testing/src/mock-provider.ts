@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { z } from 'zod';
 import type {
   ChatMessage,
   ChatOptions,
@@ -18,61 +19,38 @@ function randomAlphanumeric(length: number): string {
 }
 
 function generateFromSchema(schema: unknown): unknown {
-  const def = (schema as Record<string, unknown> | null)?._def as
-    | Record<string, unknown>
-    | undefined;
-  if (!def) return {};
-  switch (def.typeName) {
-    case 'ZodString': {
-      const length = 8 + Math.floor(Math.random() * 13); // 8-20 chars
-      return randomAlphanumeric(length);
-    }
-    case 'ZodNumber': {
-      const checks: Array<{ kind: string; value: number }> =
-        (def.checks as Array<{ kind: string; value: number }>) ?? [];
-      let min = 0;
-      let max = 100;
-      for (const check of checks) {
-        if (check.kind === 'min') min = check.value;
-        if (check.kind === 'max') max = check.value;
-      }
-      return min + Math.random() * (max - min);
-    }
-    case 'ZodBoolean':
-      return Math.random() < 0.5;
-    case 'ZodArray': {
-      const count = 1 + Math.floor(Math.random() * 3); // 1-3 items
-      const items: unknown[] = [];
-      for (let i = 0; i < count; i++) {
-        items.push(generateFromSchema(def.type));
-      }
-      return items;
-    }
-    case 'ZodObject': {
-      const shapeFn = def.shape as (() => Record<string, unknown>) | undefined;
-      const shape = shapeFn?.() ?? {};
-      const obj: Record<string, unknown> = {};
-      for (const [key, value] of Object.entries(shape)) {
-        obj[key] = generateFromSchema(value);
-      }
-      return obj;
-    }
-    case 'ZodOptional': {
-      if (Math.random() < 0.5) return undefined;
-      return generateFromSchema(def.innerType);
-    }
-    case 'ZodDefault':
-      return (def.defaultValue as () => unknown)();
-    case 'ZodEnum': {
-      const values: unknown[] = (def.values as unknown[]) ?? [];
-      if (values.length === 0) return '';
-      return values[Math.floor(Math.random() * values.length)];
-    }
-    case 'ZodNullable':
-      return null;
-    default:
-      return {};
+  if (schema instanceof z.ZodString) return randomAlphanumeric(8 + Math.floor(Math.random() * 13));
+  if (schema instanceof z.ZodNumber) {
+    const min = Number.isFinite(schema.minValue) ? schema.minValue! : 0;
+    const max = Number.isFinite(schema.maxValue) ? schema.maxValue! : 100;
+    return min + Math.random() * (max - min);
   }
+  if (schema instanceof z.ZodBoolean) return Math.random() < 0.5;
+  if (schema instanceof z.ZodArray) {
+    const count = 1 + Math.floor(Math.random() * 3);
+    return Array.from({ length: count }, () => generateFromSchema(schema.element));
+  }
+  if (schema instanceof z.ZodObject) {
+    const obj: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(schema.shape)) obj[key] = generateFromSchema(value);
+    return obj;
+  }
+  if (schema instanceof z.ZodOptional) {
+    if (Math.random() < 0.5) return undefined;
+    return generateFromSchema(schema.unwrap());
+  }
+  if (schema instanceof z.ZodDefault) return schema.parse(undefined);
+  if (schema instanceof z.ZodEnum) {
+    const values = schema.options;
+    return values.length > 0 ? values[Math.floor(Math.random() * values.length)] : '';
+  }
+  if (schema instanceof z.ZodLiteral) return [...schema.values][0];
+  if (schema instanceof z.ZodNullable) return null;
+  if (schema instanceof z.ZodUnion) {
+    const options = schema.options;
+    return generateFromSchema(options[Math.floor(Math.random() * options.length)]);
+  }
+  return {};
 }
 
 export class MockProvider implements Provider {

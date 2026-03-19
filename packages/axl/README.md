@@ -7,8 +7,10 @@ Core SDK for orchestrating agentic systems in TypeScript. Part of the [Axl](http
 ## Installation
 
 ```bash
-npm install @axlsdk/axl zod
+npm install @axlsdk/axl zod@^4
 ```
+
+> **Note:** `zod` is a peer dependency — your application and Axl share a single Zod instance. Zod v4 (`^4.0.0`) is required.
 
 ## Project Structure
 

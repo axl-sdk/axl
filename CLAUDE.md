@@ -12,7 +12,7 @@ Axl is an open-source TypeScript SDK for orchestrating agentic systems. It treat
 
 ## Tech Stack
 - TypeScript (strict mode)
-- Zod for schema validation
+- Zod v4 for schema validation (peer dependency `zod@^4.0.0`)
 - Vitest for testing
 - pnpm workspaces for monorepo management
 - Node.js 20+
@@ -240,7 +240,7 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - ProviderResponse.usage includes optional `reasoning_tokens` and `cached_tokens`
 - AxlStream requires `[Symbol.asyncDispose]` on iterator for TS 5.9+ compat
 - WorkflowContext.ask() implements tool calling loop with max turns, budget tracking, self-correction retry
-- zodToJsonSchema helper in context.ts converts Zod schemas to JSON Schema for tool definitions
+- zodToJsonSchema helper in context.ts wraps Zod v4's built-in `z.toJSONSchema()` for tool definitions
 - Telemetry: `@opentelemetry/api` is optional peer dep; `NoopSpanManager` used when disabled; `runtime.initializeTelemetry()` activates span emission; cost-per-span on all agent/workflow spans
 - State: `StateConfig.store` accepts `'memory'` | `'sqlite'` | `StateStore` instance. `'redis'` is NOT a valid string — pass `await RedisStore.create(url)` as the instance. RedisStore requires the `redis` peer dep (node-redis v5, not ioredis). Private constructor enforces async factory usage.
 - Memory: `ctx.remember()`/`ctx.recall()`/`ctx.forget()` backed by StateStore; semantic recall via VectorStore + embedder; `MemoryManager` coordinates both
@@ -258,7 +258,7 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - `AxlRuntime.createContext({ metadata? })` creates a lightweight `WorkflowContext` for ad-hoc tool testing and prototyping (has providers, state, MCP, telemetry — no session/streaming/budget)
 - Studio: `POST /api/tools/:name/test` uses `tool.run(ctx, input)` with a context from `runtime.createContext()` so agent-as-tool handlers work
 - Studio: AxlRuntime introspection via `registerTool()`, `registerAgent()`, `registerEval()`, `getWorkflows()`, `getTools()`, `getAgents()`, `getExecutions()`, `getRegisteredEvals()`
-- Studio: `zodToJsonSchema()` exported from core for tool schema rendering in Tool Inspector
+- Studio: `zodToJsonSchema()` exported from core for tool schema rendering in Tool Inspector (wraps `z.toJSONSchema()`)
 - Studio: WebSocket uses channel multiplexing (subscribe/unsubscribe); channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`
 - Studio: `StateStore.listSessions()` optional method for session browsing (implemented in MemoryStore, SQLiteStore, RedisStore)
 - Studio: CLI (`axl-studio`) auto-detects config (`axl.config.mts` → `.ts` → `.mjs` → `.js`), expects `export default runtime`. For `.ts`/`.tsx` configs, registers a `module.register()` resolve hook that forces `format: 'module'` so top-level `await` works in non-`"type":"module"` projects. `--conditions` flag adds custom import conditions via resolve hook (e.g., `--conditions development` for monorepo source exports)

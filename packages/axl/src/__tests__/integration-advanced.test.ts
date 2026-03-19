@@ -856,10 +856,10 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
         input: z.object({ prompt: z.string() }),
         handler: async (ctx) => {
           return ctx.verify(
-            async (lastOutput, errorMessage) => {
+            async (retry) => {
               let msg = ctx.input.prompt;
-              if (lastOutput && errorMessage) {
-                msg += `\n\nYour previous response was invalid: ${JSON.stringify(lastOutput)}\nError: ${errorMessage}\nPlease fix and try again.`;
+              if (retry) {
+                msg += `\n\nYour previous response was invalid: ${JSON.stringify(retry.output)}\nError: ${retry.error}\nPlease fix and try again.`;
               }
               const raw = await ctx.ask(extractAgent, msg);
               return JSON.parse(raw as string);

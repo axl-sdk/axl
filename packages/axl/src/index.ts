@@ -33,6 +33,7 @@ export type {
   DelegateOptions,
   RaceOptions,
   VoteOptions,
+  VerifyRetry,
   VerifyOptions,
   BudgetOptions,
   SpawnOptions,
@@ -44,6 +45,8 @@ export type {
   OutputGuardrail,
   GuardrailBlockHandler,
   GuardrailsConfig,
+  ValidateResult,
+  OutputValidator,
   HandoffRecord,
   AgentCallInfo,
 } from './types.js';
@@ -59,6 +62,7 @@ export {
   ToolDenied,
   BudgetExceededError,
   GuardrailError,
+  ValidationError,
 } from './errors.js';
 
 // Provider

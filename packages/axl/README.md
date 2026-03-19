@@ -320,7 +320,7 @@ for await (const event of sessionStream) {
 All available on `ctx` inside workflow handlers. See the [API Reference](../../docs/api-reference.md) for complete option types, valid values, and defaults.
 
 ```typescript
-// Invoke an agent (schema retries rebuild the call with the failed output + error in the prompt)
+// Invoke an agent (schema/validate retries accumulate — LLM sees all previous failed attempts)
 const answer = await ctx.ask(agent, 'prompt', { schema, retries });
 
 // Run 3 agents in parallel — each gets the same question independently
@@ -329,11 +329,11 @@ const results = await ctx.spawn(3, async (i) => ctx.ask(agent, prompts[i]));
 // Pick the answer that appeared most often — also supports LLM-as-judge via scorer
 const winner = await ctx.vote(results, { strategy: 'majority', key: 'answer' });
 
-// Generic retry-until-valid loop (not conversation-aware — you decide how to use the error)
+// Retry-until-valid loop — for APIs, pipelines, or as a repair fallback for ctx.ask()
 const valid = await ctx.verify(
-  async (lastOutput, error) => ctx.ask(agent, error ? `Fix: ${error}` : prompt),
-  schema,
-  { retries: 3, fallback: defaultValue },
+  async () => fetchRouteFromAPI(origin, destination),
+  RouteSchema,
+  { retries: 3, fallback: defaultRoute },
 );
 
 // Cost control — returns { value, budgetExceeded, totalCost }
@@ -477,7 +477,29 @@ const safe = agent({
 });
 ```
 
-When `onBlock` is `'retry'`, the LLM's blocked output is appended to the conversation (as an assistant message) along with a system message containing the block reason, then the LLM is re-called so it can self-correct. These messages **accumulate** across retries — if the guardrail blocks multiple times, the LLM sees all prior failed attempts and corrections before its next try. All retry messages are ephemeral — they are **not** persisted to session history, so subsequent session turns never see the blocked attempts. Note: `ctx.ask()` schema retries work differently — each retry rebuilds the call from scratch and only includes the most recent failed output and error (previous failures do not accumulate). Input guardrails always throw since the prompt is user-supplied. Throws `GuardrailError` if retries are exhausted or `onBlock` is `'throw'`.
+When `onBlock` is `'retry'`, the LLM's blocked output is appended to the conversation (as an assistant message) along with a system message containing the block reason, then the LLM is re-called so it can self-correct. These messages **accumulate** across retries — if the guardrail blocks multiple times, the LLM sees all prior failed attempts and corrections before its next try. All retry messages are ephemeral — they are **not** persisted to session history, so subsequent session turns never see the blocked attempts. Schema retries and validate retries use the same accumulating pattern. Input guardrails always throw since the prompt is user-supplied. Throws `GuardrailError` if retries are exhausted or `onBlock` is `'throw'`.
+
+For **business rule validation** on the parsed typed object (not raw text), use `validate` on `ctx.ask()`:
+
+```typescript
+const UserSchema = z.object({
+  name: z.string(),
+  email: z.string(),
+  role: z.enum(['admin', 'editor', 'viewer']),
+});
+
+const result = await ctx.ask(extractAgent, 'Extract user from this text', {
+  schema: UserSchema,
+  validate: (user) => {
+    if (user.role === 'admin' && !user.email.endsWith('@company.com')) {
+      return { valid: false, reason: 'Admin users must have a company email' };
+    }
+    return { valid: true };
+  },
+});
+```
+
+`validate` is per-call, co-located with the `schema` it validates. It runs **after** schema parsing succeeds, receiving the fully typed object. On failure, the LLM sees all previous attempts (accumulating context) and the validation reason. Requires `schema` — without it, validate is skipped (use guardrails for raw text). Throws `ValidationError` after retries are exhausted. Also supported on `ctx.delegate()`, `ctx.race()`, and `ctx.verify()`.
 
 ### State Stores
 
@@ -556,6 +578,7 @@ import {
   MaxTurnsError, // Agent exceeded max tool-calling turns
   BudgetExceededError, // Budget limit exceeded
   GuardrailError, // Guardrail blocked input or output
+  ValidationError, // Post-schema business rule validation failed after retries
   ToolDenied, // Agent tried to call unauthorized tool
 } from '@axlsdk/axl';
 ```

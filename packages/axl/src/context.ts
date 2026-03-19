@@ -18,8 +18,11 @@ import type {
   ToolCallMessage,
   ProviderResponse,
   AgentCallInfo,
+  ValidateResult,
+  VerifyRetry,
 } from './types.js';
 import {
+  AxlError,
   VerifyError,
   QuorumNotMet,
   NoConsensus,
@@ -27,6 +30,7 @@ import {
   MaxTurnsError,
   BudgetExceededError,
   GuardrailError,
+  ValidationError,
 } from './errors.js';
 import type { Agent } from './agent.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
@@ -318,10 +322,7 @@ export class WorkflowContext<TInput = unknown> {
         const result = await this.executeAgentCall(
           agent,
           prompt,
-          options,
-          0,
-          undefined,
-          undefined,
+          options as AskOptions<unknown>,
           undefined,
           usageCapture,
         );
@@ -380,9 +381,6 @@ export class WorkflowContext<TInput = unknown> {
     agent: Agent,
     prompt: string,
     options?: AskOptions<unknown>,
-    retryCount = 0,
-    previousOutput?: string,
-    previousError?: string,
     handoffMessages?: ChatMessage[],
     usageCapture?: {
       value?: {
@@ -485,11 +483,6 @@ export class WorkflowContext<TInput = unknown> {
       userContent += `\n\nRespond with valid JSON matching this schema:\n${JSON.stringify(jsonSchema, null, 2)}`;
     }
 
-    // Self-correction: include previous failed output
-    if (previousOutput && previousError) {
-      userContent += `\n\nYour previous response was invalid:\n${previousOutput}\n\nError: ${previousError}\n\nPlease fix and try again.`;
-    }
-
     messages.push({ role: 'user', content: userContent });
 
     // If this agent was reached via handoff, include the source agent's conversation
@@ -548,9 +541,21 @@ export class WorkflowContext<TInput = unknown> {
     const timeoutMs = parseDuration(agent._config.timeout ?? '60s');
     const startTime = Date.now();
 
+    // Streaming + validate is not supported: validate requires schema (JSON output),
+    // and on retry the token stream would contain tokens from multiple attempts
+    // concatenated together with no separator, producing garbled output.
+    if (this.onToken && options?.validate) {
+      throw new AxlError(
+        'INVALID_CONFIG',
+        'Cannot use validate with streaming. Validate requires schema (JSON output) which does not benefit from token streaming. Use a non-streaming call instead.',
+      );
+    }
+
     const currentMessages = [...messages];
     let turns = 0;
     let guardrailOutputRetries = 0;
+    let schemaRetries = 0;
+    let validateRetries = 0;
 
     while (turns < maxTurns) {
       // Timeout check
@@ -711,18 +716,21 @@ export class WorkflowContext<TInput = unknown> {
               const handoffStart = Date.now();
 
               // Pass accumulated messages so the target agent can see the source agent's work.
-              // Only forward schema/retries/metadata — the target agent uses its own model params.
+              // Forward schema/retries/validate/metadata — the target agent uses its own model params.
               const handoffOptions = options
-                ? { schema: options.schema, retries: options.retries, metadata: options.metadata }
+                ? {
+                    schema: options.schema,
+                    retries: options.retries,
+                    metadata: options.metadata,
+                    validate: options.validate,
+                    validateRetries: options.validateRetries,
+                  }
                 : undefined;
               const handoffFn = () =>
                 this.executeAgentCall(
                   descriptor.agent,
                   handoffPrompt,
                   handoffOptions,
-                  0,
-                  undefined,
-                  undefined,
                   currentMessages,
                   usageCapture,
                 );
@@ -1084,7 +1092,7 @@ export class WorkflowContext<TInput = unknown> {
       // No tool calls — we have the final response
       const content = response.content;
 
-      // -- Output guardrail --
+      // -- Gate 1: Output guardrail (raw text — content safety) --
       if (guardrails?.output) {
         const outputResult = await guardrails.output(content, { metadata: this.metadata });
         this.emitTrace({
@@ -1131,28 +1139,27 @@ export class WorkflowContext<TInput = unknown> {
         }
       }
 
-      // Schema validation if requested
+      // -- Gate 2: Schema validation (parse + Zod) --
+      let validated: unknown = undefined;
       if (options?.schema) {
         try {
           const parsed = JSON.parse(stripMarkdownFences(content));
-          const validated = (options.schema as z.ZodTypeAny).parse(parsed);
-          // Push only on successful validation — retries must not leak invalid responses
-          this.pushAssistantToSessionHistory(content, response.providerMetadata);
-          return validated;
+          validated = (options.schema as z.ZodTypeAny).parse(parsed);
         } catch (err) {
-          const maxRetries = options.retries ?? 3;
-          if (retryCount < maxRetries) {
+          const maxSchemaRetries = options.retries ?? 3;
+          if (schemaRetries < maxSchemaRetries) {
+            schemaRetries++;
             const errorMsg = err instanceof Error ? err.message : String(err);
-            return this.executeAgentCall(
-              agent,
-              prompt,
-              options,
-              retryCount + 1,
+            currentMessages.push({
+              role: 'assistant',
               content,
-              errorMsg,
-              undefined,
-              usageCapture,
-            );
+              ...(response.providerMetadata ? { providerMetadata: response.providerMetadata } : {}),
+            });
+            currentMessages.push({
+              role: 'system',
+              content: `Your response was not valid JSON or did not match the required schema: ${errorMsg}. Please fix and try again.`,
+            });
+            continue; // Re-enter the while loop for another LLM turn
           }
           const zodErr =
             err instanceof ZodError
@@ -1164,14 +1171,65 @@ export class WorkflowContext<TInput = unknown> {
                     message: err instanceof Error ? err.message : String(err),
                   },
                 ]);
-          throw new VerifyError(content, zodErr, maxRetries);
+          throw new VerifyError(content, zodErr, maxSchemaRetries);
         }
       }
 
-      // Push final assistant message to session history (preserves providerMetadata
-      // for multi-turn Gemini thought signatures and other provider-specific context).
+      // -- Gate 3: Business rule validation (typed object) --
+      // Only runs when both a schema and validate function are provided.
+      // Without a schema, use output guardrails for raw text validation instead.
+      if (options?.schema && options.validate) {
+        // Wrap user-supplied validator in try/catch — treat exceptions as validation failures
+        // so they get the same retry semantics instead of crashing the pipeline.
+        let validateResult: ValidateResult;
+        try {
+          validateResult = await options.validate(validated, {
+            metadata: this.metadata,
+          });
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          validateResult = { valid: false, reason: `Validator error: ${reason}` };
+        }
+
+        this.emitTrace({
+          type: 'validate',
+          agent: agent._name,
+          data: {
+            valid: validateResult.valid,
+            ...(validateResult.reason ? { reason: validateResult.reason } : {}),
+          },
+        });
+        this.spanManager?.addEventToActiveSpan('axl.validate.check', {
+          'axl.validate.valid': validateResult.valid,
+          ...(validateResult.reason ? { 'axl.validate.reason': validateResult.reason } : {}),
+        });
+
+        if (!validateResult.valid) {
+          const maxValidateRetries = options.validateRetries ?? 2;
+          if (validateRetries < maxValidateRetries) {
+            validateRetries++;
+            currentMessages.push({
+              role: 'assistant',
+              content,
+              ...(response.providerMetadata ? { providerMetadata: response.providerMetadata } : {}),
+            });
+            currentMessages.push({
+              role: 'system',
+              content: `Your response parsed correctly but failed validation: ${validateResult.reason ?? 'Validation failed'}. Previous attempts are visible above. Please fix and try again.`,
+            });
+            continue; // Re-enter the while loop — goes through all gates again
+          }
+          throw new ValidationError(
+            validated,
+            validateResult.reason ?? 'Validation failed',
+            maxValidateRetries,
+          );
+        }
+      }
+
+      // All gates passed — push to session history and return
       this.pushAssistantToSessionHistory(content, response.providerMetadata);
-      return content;
+      return validated ?? content;
     }
 
     throw new MaxTurnsError('ctx.ask()', maxTurns);
@@ -1630,43 +1688,75 @@ export class WorkflowContext<TInput = unknown> {
   // ── ctx.verify() ──────────────────────────────────────────────────────
 
   async verify<T>(
-    fn: (lastOutput?: unknown, errorMessage?: string) => Promise<unknown>,
+    fn: (retry?: VerifyRetry<T>) => Promise<unknown>,
     schema: z.ZodType<T>,
     options?: VerifyOptions<T>,
   ): Promise<T> {
     const maxRetries = options?.retries ?? 3;
-    let lastOutput: unknown = undefined;
-    let lastErrorMessage: string | undefined = undefined;
+    let lastRetry: VerifyRetry<T> | undefined = undefined;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      let result: unknown;
+      let rawOutput: unknown;
       try {
-        result = await fn(lastOutput, lastErrorMessage);
-        lastOutput = result;
-        return schema.parse(result) as T;
-      } catch (err) {
-        if (err instanceof ZodError) {
-          lastErrorMessage = err.message;
-        } else if (err instanceof Error) {
-          lastErrorMessage = err.message;
-        } else {
-          lastErrorMessage = String(err);
+        const result = await fn(lastRetry);
+        rawOutput = result;
+        const parsed = schema.parse(result) as T;
+
+        // Post-schema business rule validation
+        if (options?.validate) {
+          let validateResult: ValidateResult;
+          try {
+            validateResult = await options.validate(parsed, { metadata: this.metadata });
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
+            validateResult = { valid: false, reason: `Validator error: ${reason}` };
+          }
+          if (!validateResult.valid) {
+            const errorMsg = validateResult.reason ?? 'Validation failed';
+            lastRetry = { error: errorMsg, output: rawOutput, parsed };
+            if (attempt === maxRetries) {
+              if (options?.fallback !== undefined) return options.fallback;
+              throw new ValidationError(parsed, errorMsg, maxRetries);
+            }
+            continue;
+          }
         }
+
+        return parsed;
+      } catch (err) {
+        if (err instanceof ValidationError) {
+          // ValidationError from our own validate block or from fn (e.g., ctx.ask() validate
+          // exhausted). Extract the parsed object so the next retry can repair it.
+          lastRetry = {
+            error: err.reason,
+            output: rawOutput,
+            parsed: err.lastOutput as T,
+          };
+          if (attempt === maxRetries) {
+            if (options?.fallback !== undefined) return options.fallback;
+            throw err;
+          }
+          continue;
+        }
+
+        const errorMsg =
+          err instanceof ZodError ? err.message : err instanceof Error ? err.message : String(err);
+        lastRetry = { error: errorMsg, output: rawOutput };
 
         if (attempt === maxRetries) {
           if (options?.fallback !== undefined) return options.fallback;
           const zodErr =
             err instanceof ZodError
               ? err
-              : new ZodError([{ code: 'custom', path: [], message: lastErrorMessage }]);
-          throw new VerifyError(lastOutput, zodErr, maxRetries);
+              : new ZodError([{ code: 'custom', path: [], message: errorMsg }]);
+          throw new VerifyError(rawOutput, zodErr, maxRetries);
         }
       }
     }
 
     if (options?.fallback !== undefined) return options.fallback;
     throw new VerifyError(
-      lastOutput,
+      lastRetry?.output,
       new ZodError([{ code: 'custom', path: [], message: 'Verify failed' }]),
       maxRetries,
     );
@@ -1794,7 +1884,7 @@ export class WorkflowContext<TInput = unknown> {
         // This ensures the signal persists through all awaits in the branch.
         const p = signalStorage.run(composedSignal, fn);
 
-        p.then((value) => {
+        p.then(async (value) => {
           if (settled) return;
           // If a schema is provided, validate the result.
           // Invalid results are discarded and the race continues.
@@ -1809,6 +1899,35 @@ export class WorkflowContext<TInput = unknown> {
               }
               return;
             }
+            // Post-schema business rule validation — invalid results discarded like schema failures
+            if (options?.validate) {
+              try {
+                const validateResult = await options.validate(parsed.data as T, {
+                  metadata: this.metadata,
+                });
+                if (!validateResult.valid) {
+                  remaining--;
+                  lastError = new Error(
+                    `Validation failed: ${validateResult.reason ?? 'Validation failed'}`,
+                  );
+                  if (remaining === 0 && !settled) {
+                    settled = true;
+                    reject(lastError);
+                  }
+                  return;
+                }
+              } catch (err) {
+                remaining--;
+                lastError =
+                  err instanceof Error ? err : new Error(`Validator error: ${String(err)}`);
+                if (remaining === 0 && !settled) {
+                  settled = true;
+                  reject(lastError);
+                }
+                return;
+              }
+            }
+            if (settled) return; // another branch may have won during async validate
             settled = true;
             controller.abort();
             resolve(parsed.data as T);
@@ -2126,6 +2245,8 @@ export class WorkflowContext<TInput = unknown> {
         schema: options?.schema,
         retries: options?.retries,
         metadata: options?.metadata,
+        validate: options?.validate,
+        validateRetries: options?.validateRetries,
       });
     }
 
@@ -2183,6 +2304,8 @@ export class WorkflowContext<TInput = unknown> {
       schema: options?.schema,
       retries: options?.retries,
       metadata: options?.metadata,
+      validate: options?.validate,
+      validateRetries: options?.validateRetries,
     });
   }
 

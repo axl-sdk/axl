@@ -32,7 +32,7 @@ import { MemoryManager, OpenAIEmbedder, InMemoryVectorStore, SqliteVectorStore }
 import { Session, SessionOptions } from '@axlsdk/axl';
 
 // Errors
-import { GuardrailError } from '@axlsdk/axl';
+import { GuardrailError, ValidationError } from '@axlsdk/axl';
 
 // Tier 2 types
 import type { ToolHooks, HandoffRecord, AgentCallInfo } from '@axlsdk/axl';
@@ -60,10 +60,11 @@ All docs (`docs/`), READMEs (`packages/*/README.md`), specs (`.internal/spec/`),
 - Agents are inert definitions until called via `ctx.ask()` or `agent.ask()`
 - Workflows are named async functions receiving `WorkflowContext`
 - Agent `guardrails` config: `input`/`output` validators with `onBlock` policy (`'retry'` | `'throw'` | custom fn) and `maxRetries`
+- `validate` on `AskOptions`: per-call post-schema business rule validation on typed object, co-located with the `schema` it validates. Requires schema (skipped without one). `validateRetries` (default 2). Output pipeline: guardrail (raw text) → schema (parse+Zod) → validate (typed object), each with independent retry counters and accumulating context
 - Tool `requireApproval` triggers `ctx.awaitHuman()` before agent-initiated tool execution; `hooks.before`/`hooks.after` transform input/output
 
 ## Error Hierarchy
-- `AxlError` (base) → `VerifyError`, `QuorumNotMet`, `NoConsensus`, `TimeoutError`, `GuardrailError`, `ToolDenied`
+- `AxlError` (base) → `VerifyError`, `ValidationError`, `QuorumNotMet`, `NoConsensus`, `TimeoutError`, `MaxTurnsError`, `BudgetExceededError`, `GuardrailError`, `ToolDenied`
 
 ## File Structure
 ```
@@ -73,7 +74,7 @@ packages/axl/src/
   agent.ts           — agent() factory with dynamic model/system
   workflow.ts        — workflow() factory
   config.ts          — defineConfig(), parseDuration(), parseCost(), resolveConfig()
-  context.ts         — WorkflowContext with all ctx.* primitives (~700 lines)
+  context.ts         — WorkflowContext with all ctx.* primitives (~2300 lines)
   runtime.ts         — AxlRuntime: register, execute, stream, session, createContext
   session.ts         — Session class for multi-turn conversations
   stream.ts          — AxlStream (Readable + EventEmitter + AsyncIterable)
@@ -244,6 +245,7 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - State: `StateConfig.store` accepts `'memory'` | `'sqlite'` | `StateStore` instance. `'redis'` is NOT a valid string — pass `await RedisStore.create(url)` as the instance. RedisStore requires the `redis` peer dep (node-redis v5, not ioredis). Private constructor enforces async factory usage.
 - Memory: `ctx.remember()`/`ctx.recall()`/`ctx.forget()` backed by StateStore; semantic recall via VectorStore + embedder; `MemoryManager` coordinates both
 - Guardrails: `agent({ guardrails: { input, output, onBlock, maxRetries } })`; `GuardrailError` thrown on block; self-correcting retry on `'retry'` policy
+- Validate: `ctx.ask(agent, prompt, { schema, validate, validateRetries })` — per-call post-schema business rule validation on typed object; requires schema (skipped without); `ValidationError` thrown after retries; output pipeline: guardrail → schema → validate, all with accumulating context and independent retry counters. Also supported on `ctx.delegate()` (forwarded to final ask), `ctx.race()` (invalid results discarded), and `ctx.verify()` (runs after schema parse)
 - Session options: `runtime.session(id, { history: { maxMessages, summarize }, persist })` for history management
 - Tool handlers receive `(input, ctx)` where `ctx` is a child `WorkflowContext` for nested agent invocations (agent-as-tool pattern)
 - `WorkflowContext.createChildContext()` creates isolated child contexts (shares budget/abort/traces, isolates session/streaming/steps)

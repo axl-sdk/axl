@@ -71,6 +71,122 @@ const GenerateProfile = workflow({
 });
 ```
 
+## Validated Data Extraction
+
+When extracted data must satisfy business rules beyond what a Zod schema can express (cross-field relationships, computed values, referential integrity), use `validate` on `ctx.ask()`. The LLM gets accumulating feedback about what's wrong and can self-correct.
+
+### Basic: LLM with business rule validation
+
+```typescript
+const OrderSchema = z.object({
+  items: z.array(z.object({
+    productId: z.string(),
+    quantity: z.number(),
+    unitPrice: z.number(),
+  })),
+  total: z.number(),
+  currency: z.enum(['USD', 'EUR', 'GBP']),
+});
+
+const order = await ctx.ask(extractAgent, 'Extract the order from this email', {
+  schema: OrderSchema,
+  validate: (order) => {
+    // Zod ensures the right fields and types — validate checks business rules
+    const computedTotal = order.items.reduce((sum, i) => sum + i.quantity * i.unitPrice, 0);
+    if (Math.abs(computedTotal - order.total) > 0.01) {
+      return { valid: false, reason: `Total ${order.total} doesn't match computed ${computedTotal}` };
+    }
+    if (order.items.some(i => i.quantity <= 0)) {
+      return { valid: false, reason: 'Item quantities must be positive' };
+    }
+    return { valid: true };
+  },
+  validateRetries: 3,
+});
+```
+
+If the LLM produces `{ items: [{productId: "A1", quantity: 2, unitPrice: 10}], total: 25, currency: "USD" }`, validate rejects it with "Total 25 doesn't match computed 20." The LLM sees this feedback with all previous attempts and can self-correct.
+
+### Verify: retrying a non-LLM data source
+
+When the data comes from an API instead of an LLM, use `ctx.verify()`. The `retry.parsed` field lets you distinguish schema failures (malformed response) from validate failures (structurally valid but business-invalid), and repair the data programmatically:
+
+```typescript
+const PricingSchema = z.object({
+  productId: z.string(),
+  cost: z.number(),
+  price: z.number(),
+  currency: z.enum(['USD', 'EUR', 'GBP']),
+});
+
+const pricing = await ctx.verify(
+  async (retry) => {
+    if (retry?.parsed) {
+      // Validate failed — data is structurally valid but breaks business rules.
+      // Repair: enforce 20% minimum margin by adjusting the price.
+      const minPrice = retry.parsed.cost * 1.2;
+      return { ...retry.parsed, price: Math.max(retry.parsed.price, minPrice) };
+    }
+    // First call or schema failure — fetch from pricing API
+    if (retry) console.log(`Bad API response: ${retry.error}`);
+    const res = await fetch(`https://pricing.internal/${productId}`);
+    return res.json();
+  },
+  PricingSchema,
+  {
+    retries: 3,
+    validate: (pricing) => {
+      const margin = (pricing.price - pricing.cost) / pricing.price;
+      if (margin < 0.2) {
+        return { valid: false, reason: `Margin ${(margin * 100).toFixed(1)}% is below 20% minimum` };
+      }
+      return { valid: true };
+    },
+  },
+);
+```
+
+If the API returns `{ cost: 10, price: 11 }` (9% margin), validate rejects it. On retry, `retry.parsed` contains the typed object, so `fn` repairs it directly — clamping the price to `cost * 1.2 = 12`.
+
+### Advanced: LLM-first with programmatic repair fallback
+
+The most powerful pattern composes `ctx.ask()` inside `ctx.verify()`. The LLM gets multiple attempts with accumulating context. If it still can't satisfy the business rules, `ctx.verify()` catches the `ValidationError` and gives you the typed object to repair programmatically:
+
+```typescript
+const OrderSchema = z.object({
+  items: z.array(z.object({ sku: z.string(), qty: z.number() })),
+  shipping: z.enum(['standard', 'express']),
+});
+
+const orderValidator = (order: z.infer<typeof OrderSchema>) => {
+  if (order.items.some(i => i.qty <= 0)) {
+    return { valid: false, reason: 'All quantities must be positive' } as const;
+  }
+  return { valid: true } as const;
+};
+
+// ctx.ask() retries internally (schema: 3, validate: 2 by default).
+// If it still fails, ctx.verify() catches the error and provides retry.parsed.
+const order = await ctx.verify(
+  async (retry) => {
+    if (retry?.parsed) {
+      // LLM couldn't get it right — repair programmatically
+      return { ...retry.parsed, items: retry.parsed.items.filter(i => i.qty > 0) };
+    }
+    return ctx.ask(extractAgent, 'Extract the order from this email', {
+      schema: OrderSchema,
+      validate: orderValidator,
+    });
+  },
+  OrderSchema,
+  { retries: 1, validate: orderValidator },
+);
+```
+
+This gives you the best of both worlds: the LLM tries to get it right with accumulating feedback (`ctx.ask` retries), and if it can't, you have a typed object to repair programmatically (`ctx.verify` retry).
+
+See the [API reference](api-reference.md#validate) for the full type signatures, output pipeline, and retry mechanics.
+
 ## Human-in-the-Loop
 
 High-stakes actions (e.g., refunding > $500) require human approval. The workflow suspends, persists state, and resumes after review.

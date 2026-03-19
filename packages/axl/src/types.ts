@@ -51,10 +51,23 @@ export type VoteOptions<T> = {
   reducer?: (values: T[]) => T | Promise<T>;
 };
 
+/** Context passed to the verify function on retry (undefined on first call). */
+export type VerifyRetry<T> = {
+  /** Error message from the failed attempt (schema or validate). */
+  error: string;
+  /** Raw return value from the previous fn call. */
+  output: unknown;
+  /** Schema-parsed object — only present when schema passed but validate failed.
+   *  Safe to modify and return as the next attempt. */
+  parsed?: T;
+};
+
 /** Verify options */
 export type VerifyOptions<T> = {
   retries?: number;
   fallback?: T;
+  /** Post-schema business rule validation on the parsed object. */
+  validate?: OutputValidator<T>;
 };
 
 /** AwaitHuman options */
@@ -68,6 +81,12 @@ export type AwaitHumanOptions = {
 export type AskOptions<T = unknown> = {
   schema?: z.ZodType<T>;
   retries?: number;
+  /** Post-schema business rule validation. Receives the parsed typed object after schema
+   *  validation succeeds. Only runs when `schema` is set. Retries with accumulating context
+   *  on failure (LLM sees all previous failed attempts). Throws `ValidationError` on exhaustion. */
+  validate?: OutputValidator<T>;
+  /** Maximum retries for validate failures (default: 2). */
+  validateRetries?: number;
   /** Per-call metadata passed to dynamic model/system selector functions. */
   metadata?: Record<string, unknown>;
   /** Override temperature for this call. */
@@ -98,12 +117,18 @@ export type DelegateOptions<T = unknown> = {
   metadata?: Record<string, unknown>;
   /** Number of retries for structured output validation (passed to the final ask). */
   retries?: number;
+  /** Post-schema business rule validation. Passed through to the final `ctx.ask()` call. */
+  validate?: OutputValidator<T>;
+  /** Maximum retries for validate failures (default: 2). Passed through to the final `ctx.ask()` call. */
+  validateRetries?: number;
 };
 
 /** Race options */
 export type RaceOptions<T = unknown> = {
   /** Schema to validate each result. Invalid results are discarded and the race continues. */
   schema?: z.ZodType<T>;
+  /** Post-schema business rule validation. Results that fail are discarded (same as schema failures). */
+  validate?: OutputValidator<T>;
 };
 
 /** Execution status */
@@ -123,7 +148,8 @@ export type TraceEvent = {
     | 'log'
     | 'workflow_start'
     | 'workflow_end'
-    | 'guardrail';
+    | 'guardrail'
+    | 'validate';
   workflow?: string;
   agent?: string;
   tool?: string;
@@ -166,6 +192,21 @@ export type GuardrailsConfig = {
   onBlock?: GuardrailBlockHandler;
   maxRetries?: number;
 };
+
+/** Result of a validate check (post-schema business rule validation).
+ *  Note: uses `valid: true` = pass, unlike `GuardrailResult` which uses `block: true` = fail. */
+export type ValidateResult = {
+  valid: boolean;
+  reason?: string;
+};
+
+/** Output validator function. Runs after schema parsing on the typed object.
+ *  Only invoked when a schema is provided on the `ctx.ask()` call — without a schema,
+ *  use output guardrails for raw text validation instead. */
+export type OutputValidator<T = unknown> = (
+  output: T,
+  ctx: { metadata: Record<string, unknown> },
+) => ValidateResult | Promise<ValidateResult>;
 
 /** Execution info */
 export type ExecutionInfo = {

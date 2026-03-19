@@ -206,8 +206,10 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `schema` | `ZodType` | — | Validates and parses the response as structured output. On validation failure, retries the entire agent call with the error appended to the prompt (see retry details below) |
+| `schema` | `ZodType<T>` | — | Validates and parses the response as structured output. On validation failure, retries with accumulating context |
 | `retries` | `number` | `3` | Number of schema validation retries |
+| `validate` | `OutputValidator<T>` | — | Post-schema business rule validation. Receives the parsed typed object. Only runs when `schema` is set. See [Validate](#validate) |
+| `validateRetries` | `number` | `2` | Maximum retries for `validate` failures |
 | `metadata` | `Record<string, unknown>` | — | Merged with workflow metadata and passed to dynamic `model`/`system` selector functions |
 | `temperature` | `number` | agent config | Override sampling temperature for this call |
 | `maxTokens` | `number` | agent config or `4096` | Override max tokens for this call |
@@ -222,9 +224,9 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 
 **Returns:** `Promise<T>` — parsed output if `schema` is provided, otherwise `string`.
 
-**Schema retry mechanics:** When `schema` is provided and the LLM's response fails Zod validation, `ctx.ask()` retries the entire agent call from scratch. The most recent failed output and the Zod error message are appended to the user prompt (e.g., *"Your previous response was invalid: {output}. Error: {error}. Please fix and try again."*), and a fresh conversation is built from the system prompt + session history + augmented user prompt. On multiple retries, only the **latest** failed output and error are included — previous failures do not accumulate. Each retry is a clean LLM call. Failed responses are **not** persisted to session history; only the final successful response is recorded. Throws `VerifyError` if all retries are exhausted.
+**Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a system message explaining the error. On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
 
-This is distinct from **guardrail retries** (which accumulate all blocked outputs + corrections in the same conversation — see [Guardrails](#guardrails)) and from **`ctx.verify()`** (which is a generic retry loop that passes errors to your callback — see below).
+**Streaming:** `validate` cannot be used with streaming (`runtime.stream()`). Validate requires `schema`, which means the output is structured JSON — not text that benefits from progressive rendering. Using both throws an error. For structured output with validation, use a non-streaming call and work with the parsed result directly.
 
 ---
 
@@ -241,6 +243,8 @@ Select the best agent from a list of candidates and invoke it. Creates a tempora
 | `options.routerModel` | `string` | Model URI for the internal router (default: first candidate's model) |
 | `options.metadata` | `Record<string, unknown>` | Additional metadata passed to router and selected agent |
 | `options.retries` | `number` | Retries for structured output validation |
+| `options.validate` | `OutputValidator<T>` | Post-schema business rule validation. Forwarded to the final `ctx.ask()` call |
+| `options.validateRetries` | `number` | Maximum retries for validate failures (default: 2) |
 
 **Returns:** `Promise<T>` — the selected agent's response.
 
@@ -324,24 +328,62 @@ const winner = await ctx.vote(results, { strategy: 'majority', key: 'answer' });
 
 ### `ctx.verify(fn, schema, options?)`
 
-Generic retry-until-valid loop. Calls `fn`, validates the result against `schema`. On failure, calls `fn` again with the last output and error message as arguments.
+Retry-until-valid loop with schema and business rule validation. Calls `fn`, validates the result against `schema` (and optionally `validate`). On failure, calls `fn` again with a retry context describing what went wrong.
+
+Use `ctx.verify()` to validate and retry any async operation — API calls, data transformations, multi-step pipelines — or to wrap `ctx.ask()` as a programmatic repair fallback when the LLM can't satisfy business rules on its own:
 
 ```typescript
-const valid = await ctx.verify(
-  async (lastOutput, error) => ctx.ask(agent, error ? `Fix: ${error}` : prompt),
-  UserProfile,
-  { retries: 3, fallback: defaultProfile },
+const OrderSchema = z.object({
+  items: z.array(z.object({ sku: z.string(), qty: z.number() })),
+  shipping: z.enum(['standard', 'express']),
+});
+
+const orderValidator = (order: z.infer<typeof OrderSchema>) => {
+  if (order.items.some(i => i.qty <= 0)) {
+    return { valid: false, reason: 'All quantities must be positive' } as const;
+  }
+  return { valid: true } as const;
+};
+
+// ctx.ask() retries internally (schema: 3, validate: 2 by default).
+// If it still fails, ctx.verify() catches the error and provides retry.parsed.
+const order = await ctx.verify(
+  async (retry) => {
+    if (retry?.parsed) {
+      // LLM couldn't get it right — repair programmatically
+      return { ...retry.parsed, items: retry.parsed.items.filter(i => i.qty > 0) };
+    }
+    return ctx.ask(extractAgent, 'Extract the order from this email', {
+      schema: OrderSchema,
+      validate: orderValidator,
+    });
+  },
+  OrderSchema,
+  { retries: 1, validate: orderValidator },
 );
 ```
+
+**`fn` signature:** `(retry?: VerifyRetry<T>) => Promise<unknown>`
+
+On the first call, `retry` is `undefined`. On retries, it contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `retry.error` | `string` | Error message from the failed attempt |
+| `retry.output` | `unknown` | Raw return value from the previous `fn` call |
+| `retry.parsed` | `T \| undefined` | Schema-parsed object — **only present when schema passed but validate failed**. Safe to modify and return. Absent on schema failures |
+
+See [Validated Data Extraction](use-cases.md#validated-data-extraction) for more patterns including API data repair and non-LLM use cases.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `retries` | `number` | `3` | Maximum retry attempts |
 | `fallback` | `T` | — | Return this value instead of throwing when retries are exhausted |
+| `validate` | `OutputValidator<T>` | — | Post-schema business rule validation. Runs after schema parse succeeds |
 
-**Throws:** `VerifyError` (includes last output and Zod error) if retries exhausted and no fallback provided.
+**Throws:** `VerifyError` (schema failure) or `ValidationError` (validate failure) if retries exhausted and no fallback provided.
 
-**Retry mechanics:** Unlike `ctx.ask()` schema retries and guardrail retries, `ctx.verify()` is **not** conversation-aware. It is a plain loop that calls your function, validates the return value, and on failure passes `lastOutput` and `errorMessage` as arguments to your next call. What you do with those arguments is entirely up to you — `ctx.verify()` does not modify any LLM conversation or session history. This makes it suitable for retrying any async operation, not just LLM calls (e.g., API calls, multi-step pipelines, aggregation logic).
+**Retry mechanics:** `ctx.verify()` is **not** conversation-aware. It is a plain loop that calls your function, validates the return value (schema then validate), and on failure passes a `VerifyRetry` context to your next call. What you do with that context is entirely up to you — `ctx.verify()` does not modify any LLM conversation or session history. This makes it suitable for retrying any async operation, not just LLM calls.
 
 ---
 
@@ -392,6 +434,7 @@ const fastest = await ctx.race([
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `schema` | `ZodType` | — | Validate each result. Invalid results are discarded and the race continues until a valid result is produced |
+| `validate` | `OutputValidator<T>` | — | Post-schema business rule validation. Results that fail are discarded like schema failures. Requires `schema` |
 
 **Returns:** `Promise<T>` — the first valid result.
 
@@ -572,8 +615,8 @@ const safe = agent({
 |--------|------|---------|-------------|
 | `input` | `InputGuardrail` | — | Runs before each LLM call |
 | `output` | `OutputGuardrail` | — | Runs after each LLM response |
-| `onBlock` | `'retry' \| 'throw' \| BlockHandler` | `'throw'` | What to do when a guardrail blocks. See policies below |
-| `maxRetries` | `number` | — | Maximum retries when `onBlock` is `'retry'` |
+| `onBlock` | `'retry' \| 'throw' \| GuardrailBlockHandler` | `'throw'` | What to do when a guardrail blocks. See policies below |
+| `maxRetries` | `number` | `2` | Maximum retries when `onBlock` is `'retry'` |
 
 ### `onBlock` Policies
 
@@ -585,7 +628,7 @@ const safe = agent({
 
 **Retry mechanics:** On each retry, the LLM's blocked response is appended to the conversation as an assistant message, followed by a system message: *"Your previous response was blocked by a safety guardrail: {reason}. Please provide a different response that complies with the guidelines."* These messages **accumulate** across retries — if the guardrail blocks twice, the LLM sees both failed attempts and both correction prompts before its third try, giving it increasing context about what to avoid. All retry messages are ephemeral — they exist only within the `ctx.ask()` call and are **not** persisted to session history. Only the final successful response is recorded in the session, so subsequent turns never see the blocked attempts.
 
-This is distinct from **`ctx.ask()` schema retries**, which rebuild the call from scratch on each attempt and only include the most recent failure (see [`ctx.ask()`](#ctxaskagent-prompt-options)).
+Schema retries and validate retries use the same accumulating pattern — see [Validate](#validate) and the [Output Pipeline](#output-pipeline) for the full flow.
 
 ### Callback Signatures
 
@@ -602,6 +645,71 @@ type OutputGuardrail = (
 
 type GuardrailResult = { block: boolean; reason?: string };
 ```
+
+---
+
+## Validate
+
+Post-schema business rule validation that receives the **parsed, typed object** — not the raw LLM string. Configured per-call on `AskOptions`, co-located with the `schema` it validates. Designed for domain-specific constraints that can't be expressed in a Zod schema (e.g., cross-field relationships, computed totals, referential integrity).
+
+```typescript
+const result = await ctx.ask(agent, prompt, {
+  schema: MySchema,
+  validate: (data) => {
+    if (!isValid(data)) return { valid: false, reason: 'explain what is wrong' };
+    return { valid: true };
+  },
+});
+```
+
+**Requires `schema`.** Without a schema, `validate` is silently skipped — use output guardrails for raw text validation instead. This enforces a clean separation: guardrails own content safety (raw text, per-agent), validate owns business rules (typed object, per-call).
+
+**Supported on:** `ctx.ask()`, `ctx.delegate()`, `ctx.race()`, and `ctx.verify()`. On delegate and handoffs, validate is forwarded to the final agent call. On race, results that fail validate are discarded (same as schema failures).
+
+See [Validated Data Extraction](use-cases.md#validated-data-extraction) for complete examples.
+
+### `OutputValidator`
+
+```typescript
+type OutputValidator<T = unknown> = (
+  output: T,
+  ctx: { metadata: Record<string, unknown> },
+) => ValidateResult | Promise<ValidateResult>;
+
+// Note: uses `valid: true` = pass, unlike GuardrailResult which uses `block: true` = fail
+type ValidateResult = { valid: boolean; reason?: string };
+```
+
+| AskOptions field | Type | Default | Description |
+|--------|------|---------|-------------|
+| `validate` | `OutputValidator<T>` | — | Validation function. Receives the schema-parsed object. `T` is inferred from `schema` |
+| `validateRetries` | `number` | `2` | Maximum retries before throwing `ValidationError` |
+
+**Retry mechanics:** The LLM's failed response and the validation error are appended to the conversation history as assistant + system messages. Context **accumulates** across retries, so the LLM sees all previous failed attempts and can reason about what to fix. The validation `reason` is fed back in the system message: *"Your response parsed correctly but failed validation: {reason}."* If the validator throws an exception, it's treated as a validation failure — the error message is fed back and the retry counter is incremented.
+
+On retry, the new LLM response goes through the **full output pipeline** again (guardrail → schema → validate). See [Output Pipeline](#output-pipeline) below.
+
+### Output Pipeline
+
+Every LLM response passes through three gates in order. Each gate has its own retry counter. On any failure, the loop restarts from the LLM call — the new response goes through **all gates** again:
+
+```
+LLM response (raw string)
+  → Gate 1: Output guardrail  (raw text — content safety)
+  → Gate 2: Schema validation (JSON parse + Zod — structural correctness)
+  → Gate 3: Validate          (typed object — business rules)
+  → Return result
+```
+
+| Gate | Receives | Configured by | Default retries | Error on exhaustion |
+|------|----------|---------------|-----------------|---------------------|
+| Output guardrail | Raw string | `AgentConfig.guardrails.maxRetries` | 2 | `GuardrailError` |
+| Schema validation | Raw string | `AskOptions.retries` | 3 | `VerifyError` |
+| Validate | Parsed object | `AskOptions.validateRetries` | 2 | `ValidationError` |
+
+Retry counts refer to **retries only** — the initial LLM call does not count. With the defaults (guardrail: 2, schema: 3, validate: 2), the worst case is `1 + 2 + 3 + 2 = 8` total LLM calls: 1 initial call plus up to 7 retries across all gates.
+
+Retries are **additive, not multiplicative** — each gate has its own counter that only increments when *that gate* fails. A response that passes gate 1 but fails gate 2 only increments the gate 2 counter. Counters are persistent across the entire `ctx.ask()` call and do not reset when a different gate fails. The `maxTurns` limit (default 25) provides a hard ceiling on total LLM calls regardless of gate failures.
 
 ---
 
@@ -650,14 +758,15 @@ All errors extend `AxlError`.
 
 | Error | Thrown by | Description |
 |-------|----------|-------------|
-| `VerifyError` | `ctx.verify()` | Schema validation failed after all retries. Includes `.lastOutput` and `.zodError` |
-| `QuorumNotMet` | `ctx.spawn()`, `ctx.map()` | Fewer tasks succeeded than the required quorum. Includes `.required`, `.actual`, and `.results` |
+| `VerifyError` | `ctx.ask()`, `ctx.verify()` | Schema validation failed after all retries. Includes `.lastOutput`, `.zodError`, `.retries` |
+| `ValidationError` | `ctx.ask()`, `ctx.verify()` | Post-schema business rule validation failed after all retries. Includes `.lastOutput`, `.reason`, `.retries` |
+| `QuorumNotMet` | `ctx.spawn()`, `ctx.map()` | Fewer tasks succeeded than the required quorum. Includes `.results` |
 | `NoConsensus` | `ctx.vote()` | No successful results to vote on, unanimous vote failed, or invalid strategy/option combination |
 | `TimeoutError` | `ctx.ask()` | Agent exceeded its configured `timeout` |
 | `MaxTurnsError` | `ctx.ask()` | Agent exceeded its configured `maxTurns` |
-| `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy |
-| `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.reason` |
-| `ToolDenied` | `ctx.ask()` | Agent attempted to call a tool not in its ACL |
+| `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy. Includes `.limit`, `.spent`, `.policy` |
+| `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
+| `ToolDenied` | `ctx.ask()` | Agent attempted to call a tool not in its ACL. Includes `.toolName`, `.agentName` |
 
 ---
 
@@ -670,7 +779,8 @@ START: I need to coordinate multiple agents
 |
 +-- Do I know WHICH agent to call?
 |   +-- YES -> ctx.ask(agent, prompt)
-|   |   +-- Need structured output? -> ctx.ask(agent, prompt, { schema })
+|   |   +-- Need structured output? -> { schema }
+|   |   +-- Need business rule validation? -> { schema, validate }
 |   |
 |   +-- NO, I need to pick from candidates
 |       +-- The AGENT's LLM should decide (mid-conversation) -> Handoffs
@@ -680,7 +790,7 @@ START: I need to coordinate multiple agents
 |       |   +-- Get result back and continue -> mode: 'roundtrip'
 |       |
 |       +-- The WORKFLOW should decide (orchestration level)
-|           -> ctx.delegate(agents, prompt)
+|           -> ctx.delegate(agents, prompt, { schema, validate })
 |
 +-- Do I need MULTIPLE agents working simultaneously?
 |   +-- Same task, different perspectives -> ctx.spawn(n, fn)
@@ -688,13 +798,17 @@ START: I need to coordinate multiple agents
 |   |
 |   +-- Different items, same processing -> ctx.map(items, fn, { concurrency })
 |   |
-|   +-- First-to-finish wins -> ctx.race(fns)
+|   +-- First-to-finish wins -> ctx.race(fns, { schema, validate })
 |   |
 |   +-- Different tasks, need typed results -> ctx.parallel(fns)
 |
++-- Do I need to VALIDATE and RETRY non-LLM operations?
+|   +-- YES -> ctx.verify(fn, schema, { validate })
+|       +-- LLM can't satisfy rules? -> Wrap ctx.ask() in ctx.verify()
+|           for programmatic repair via retry.parsed
+|
 +-- Do I need SEQUENTIAL agent stages?
 |   +-- YES -> Sequential ctx.ask() calls (imperative TypeScript)
-|       +-- Need to validate between stages? -> ctx.verify(fn, schema)
 |
 +-- Do I need an AGENT to orchestrate other agents?
 |   +-- YES -> Agent-as-tool pattern:

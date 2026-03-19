@@ -96,6 +96,21 @@ export class GuardrailError extends AxlError {
   }
 }
 
+/** Thrown when post-schema business rule validation fails after all retries exhausted */
+export class ValidationError extends AxlError {
+  readonly lastOutput: unknown;
+  readonly reason: string;
+  readonly retries: number;
+
+  constructor(lastOutput: unknown, reason: string, retries: number) {
+    super('VALIDATION_ERROR', `Validation failed after ${retries} retries: ${reason}`);
+    this.name = 'ValidationError';
+    this.lastOutput = lastOutput;
+    this.reason = reason;
+    this.retries = retries;
+  }
+}
+
 /** Internal: thrown when an agent tries to call a tool not in its ACL */
 export class ToolDenied extends AxlError {
   readonly toolName: string;

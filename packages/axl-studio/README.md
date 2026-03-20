@@ -214,16 +214,112 @@ studio.upgradeWebSocket(server);
 
 **Note:** `upgradeWebSocket(server)` is required for real-time features (trace streaming, cost updates, execution events, decision resolution). Without it, the Studio SPA loads but panels relying on live data will show no updates. If your framework manages WebSocket connections itself (NestJS gateway, Fastify plugin), use `handleWebSocket()` instead.
 
-### Framework support
+### Framework examples
 
-Works with Express, Fastify (via `@fastify/middie`), Koa (via `koa-mount`), NestJS, raw `http.Server`, and Hono-in-Hono.
+#### NestJS
+
+```typescript
+import { Module, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { HttpAdapterHost } from '@nestjs/core';
+import { createStudioMiddleware } from '@axlsdk/studio/middleware';
+
+@Module({ /* ... */ })
+export class AppModule implements OnModuleInit, OnModuleDestroy {
+  private studio: ReturnType<typeof createStudioMiddleware>;
+
+  constructor(
+    private readonly httpAdapterHost: HttpAdapterHost,
+    private readonly runtime: AxlRuntime, // injected via custom provider
+  ) {
+    this.studio = createStudioMiddleware({
+      runtime: this.runtime,
+      basePath: '/studio',
+      verifyUpgrade: (req) => req.headers['authorization'] === `Bearer ${process.env.STUDIO_TOKEN}`,
+    });
+  }
+
+  onModuleInit() {
+    const expressApp = this.httpAdapterHost.httpAdapter.getInstance();
+    expressApp.use('/studio', this.studio.handler);
+    this.studio.upgradeWebSocket(this.httpAdapterHost.httpAdapter.getHttpServer());
+  }
+
+  onModuleDestroy() {
+    this.studio.close();
+  }
+}
+```
+
+#### Fastify
+
+```typescript
+import Fastify from 'fastify';
+import { createStudioMiddleware } from '@axlsdk/studio/middleware';
+
+const studio = createStudioMiddleware({ runtime, basePath: '/studio' });
+const fastify = Fastify();
+
+await fastify.register(import('@fastify/middie'));
+fastify.use('/studio', studio.handler);
+
+await fastify.listen({ port: 3000 });
+studio.upgradeWebSocket(fastify.server);
+```
+
+#### Raw Node.js
+
+```typescript
+import { createServer } from 'node:http';
+import { createStudioMiddleware } from '@axlsdk/studio/middleware';
+
+const studio = createStudioMiddleware({ runtime });
+const server = createServer(studio.handler);
+studio.upgradeWebSocket(server);
+server.listen(3000);
+```
+
+#### Hono-in-Hono
+
+```typescript
+import { Hono } from 'hono';
+import { createStudioMiddleware, handleWsMessage } from '@axlsdk/studio/middleware';
+
+const studio = createStudioMiddleware({ runtime, basePath: '/studio' });
+const app = new Hono();
+app.route('/studio', studio.app);
+// Wire WebSocket via Hono's native WS support — see spec for full example
+```
+
+### Important: `basePath` must match your mount path
+
+`basePath` tells the SPA where it's mounted in the browser URL. It must match the path in your framework's mount call:
+
+```typescript
+// These must match:
+createStudioMiddleware({ basePath: '/studio' })  // tells the SPA
+app.use('/studio', studio.handler)                // tells Express
+```
+
+If they don't match, the SPA will load but API calls will fail (the SPA sends requests to the wrong path).
 
 ### Security
 
-- **Always** provide `verifyUpgrade` — WebSocket upgrades bypass framework middleware
-- Consider `readOnly: true` for production monitoring
+- **Always** provide `verifyUpgrade` — WebSocket upgrades bypass Express/Fastify/Koa middleware, so your auth middleware does NOT protect WebSocket connections
+- Consider `readOnly: true` for production monitoring — view traces, costs, and schemas without execution capability
 - CORS is not applied in embedded mode — the host framework owns CORS policy
 - `basePath` is validated against unsafe characters and path traversal
+
+### Migrating from the standalone CLI
+
+If you currently use `npx @axlsdk/studio` with a config file:
+
+1. Move runtime creation from `axl.config.ts` into your app's initialization code
+2. Register workflows, agents, and tools on the runtime where they have access to your services
+3. Call `createStudioMiddleware({ runtime, basePath: '/studio' })` and mount the handler
+4. Call `upgradeWebSocket(server)` for WebSocket support
+5. Remove the `axl-studio` CLI from your dev scripts
+
+The `axl.config.ts` file is no longer needed. The standalone CLI continues to work for projects that don't need embedded middleware.
 
 ## Architecture
 

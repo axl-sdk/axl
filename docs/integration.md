@@ -103,3 +103,43 @@ npx @axlsdk/studio --open
 | **Eval Runner** | Run evals, view per-item results, compare runs for regressions. |
 
 See the [@axlsdk/studio README](../packages/axl-studio/README.md) for full documentation.
+
+### Embedded Middleware
+
+For applications where workflows depend on injected services (database repos, message queues, auth), Studio can be mounted as middleware inside your existing HTTP server instead of running as a separate CLI process. This gives Studio direct access to your `AxlRuntime` — single process, shared object references.
+
+```typescript
+import { createStudioMiddleware } from '@axlsdk/studio/middleware';
+
+const studio = createStudioMiddleware({
+  runtime,           // your existing AxlRuntime
+  basePath: '/studio',
+  verifyUpgrade: (req) => validateAuth(req),  // WS auth
+});
+
+// Express
+app.use('/studio', studio.handler);
+studio.upgradeWebSocket(server);
+
+// NestJS (in onModuleInit)
+const expressApp = httpAdapterHost.httpAdapter.getInstance();
+expressApp.use('/studio', studio.handler);
+studio.upgradeWebSocket(httpAdapterHost.httpAdapter.getHttpServer());
+
+// Fastify (with @fastify/middie)
+await fastify.register(import('@fastify/middie'));
+fastify.use('/studio', studio.handler);
+studio.upgradeWebSocket(fastify.server);
+
+// Raw Node.js
+const server = createServer(studio.handler);
+studio.upgradeWebSocket(server);
+```
+
+Key points:
+- `basePath` must match the path where you mount the handler (e.g., `'/studio'` for `app.use('/studio', ...)`)
+- `verifyUpgrade` is critical — WebSocket upgrade requests bypass Express/Fastify/Koa middleware, so auth must be explicitly checked
+- Call `studio.close()` during shutdown to remove event listeners and close WebSocket connections
+- Use `readOnly: true` for production monitoring (disables workflow execution, tool testing, and other mutating endpoints)
+
+See the [@axlsdk/studio README](../packages/axl-studio/README.md) for the full API reference and framework-specific examples.

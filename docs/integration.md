@@ -126,8 +126,8 @@ const expressApp = httpAdapterHost.httpAdapter.getInstance();
 expressApp.use('/studio', studio.handler);
 studio.upgradeWebSocket(httpAdapterHost.httpAdapter.getHttpServer());
 
-// Fastify (with @fastify/middie)
-await fastify.register(import('@fastify/middie'));
+// Fastify (with @fastify/middie — npm i @fastify/middie)
+await fastify.register(middie);
 fastify.use('/studio', studio.handler);
 studio.upgradeWebSocket(fastify.server);
 

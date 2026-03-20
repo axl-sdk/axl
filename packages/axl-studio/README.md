@@ -254,12 +254,13 @@ export class AppModule implements OnModuleInit, OnModuleDestroy {
 
 ```typescript
 import Fastify from 'fastify';
+import middie from '@fastify/middie';
 import { createStudioMiddleware } from '@axlsdk/studio/middleware';
 
 const studio = createStudioMiddleware({ runtime, basePath: '/studio' });
 const fastify = Fastify();
 
-await fastify.register(import('@fastify/middie'));
+await fastify.register(middie);
 fastify.use('/studio', studio.handler);
 
 await fastify.listen({ port: 3000 });

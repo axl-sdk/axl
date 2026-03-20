@@ -11,12 +11,13 @@ function createTestApp() {
 }
 
 describe('Studio Server', () => {
-  it('createServer returns app, connMgr, costAggregator, createWsHandlers', () => {
+  it('createServer returns app, connMgr, costAggregator, createWsHandlers, traceListener', () => {
     const result = createTestApp();
     expect(result.app).toBeDefined();
     expect(result.connMgr).toBeDefined();
     expect(result.costAggregator).toBeDefined();
     expect(result.createWsHandlers).toBeTypeOf('function');
+    expect(result.traceListener).toBeTypeOf('function');
   });
 
   it('GET /api/health returns 200 with healthy status', async () => {
@@ -53,6 +54,41 @@ describe('Studio Server', () => {
     const body = await res.json();
     expect(body.ok).toBe(true);
     expect(body.data).toEqual([]);
+  });
+
+  it('readOnly blocks mutating POST endpoints', async () => {
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('mock', MockProvider.echo());
+    const { app } = createServer({ runtime, readOnly: true });
+
+    const res = await app.request('/api/playground/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'hello' }),
+    });
+    expect(res.status).toBe(405);
+    const body = await res.json();
+    expect(body.error).toContain('read-only');
+  });
+
+  it('readOnly allows GET endpoints', async () => {
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('mock', MockProvider.echo());
+    const { app } = createServer({ runtime, readOnly: true });
+
+    const res = await app.request('/api/workflows');
+    expect(res.status).toBe(200);
+  });
+
+  it('cors: false disables CORS headers', async () => {
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('mock', MockProvider.echo());
+    const { app } = createServer({ runtime, cors: false });
+
+    const res = await app.request('/api/health', {
+      headers: { Origin: 'http://example.com' },
+    });
+    expect(res.headers.get('access-control-allow-origin')).toBeNull();
   });
 
   it('error handler converts errors to JSON error response', async () => {

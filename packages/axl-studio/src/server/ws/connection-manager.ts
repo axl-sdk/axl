@@ -1,4 +1,12 @@
-import type { WSContext } from 'hono/ws';
+/**
+ * Minimal interface for a connection that can receive broadcast messages.
+ * Satisfied by WSContext (Hono), ws.WebSocket (Node.js), and the middleware's
+ * adapted socket. Internal to ConnectionManager — not part of the public API.
+ */
+export interface BroadcastTarget {
+  send(data: string): void;
+  close?(): void;
+}
 
 /**
  * Manages WebSocket connections and channel subscriptions.
@@ -7,17 +15,22 @@ import type { WSContext } from 'hono/ws';
  */
 export class ConnectionManager {
   /** channel -> set of WS connections */
-  private channels = new Map<string, Set<WSContext>>();
+  private channels = new Map<string, Set<BroadcastTarget>>();
   /** ws -> set of subscribed channels (for cleanup) */
-  private connections = new Map<WSContext, Set<string>>();
+  private connections = new Map<BroadcastTarget, Set<string>>();
+  private maxConnections = 100;
 
   /** Register a new WS connection. */
-  add(ws: WSContext): void {
+  add(ws: BroadcastTarget): void {
+    if (this.connections.size >= this.maxConnections) {
+      ws.close?.();
+      return;
+    }
     this.connections.set(ws, new Set());
   }
 
   /** Remove a WS connection and all its subscriptions. */
-  remove(ws: WSContext): void {
+  remove(ws: BroadcastTarget): void {
     const channels = this.connections.get(ws);
     if (channels) {
       for (const ch of channels) {
@@ -31,7 +44,7 @@ export class ConnectionManager {
   }
 
   /** Subscribe a connection to a channel. */
-  subscribe(ws: WSContext, channel: string): void {
+  subscribe(ws: BroadcastTarget, channel: string): void {
     let subs = this.channels.get(channel);
     if (!subs) {
       subs = new Set();
@@ -42,7 +55,7 @@ export class ConnectionManager {
   }
 
   /** Unsubscribe a connection from a channel. */
-  unsubscribe(ws: WSContext, channel: string): void {
+  unsubscribe(ws: BroadcastTarget, channel: string): void {
     this.channels.get(channel)?.delete(ws);
     if (this.channels.get(channel)?.size === 0) {
       this.channels.delete(channel);
@@ -87,6 +100,15 @@ export class ConnectionManager {
         }
       }
     }
+  }
+
+  /** Close all connections and clear all state. Used during shutdown. */
+  closeAll(): void {
+    for (const ws of this.connections.keys()) {
+      ws.close?.();
+    }
+    this.connections.clear();
+    this.channels.clear();
   }
 
   /** Get the number of active connections. */

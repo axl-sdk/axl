@@ -48,6 +48,10 @@ import { dataset, scorer, llmScorer, defineEval } from '@axlsdk/eval';
 
 // Studio (server API)
 import { createServer, ConnectionManager, CostAggregator } from '@axlsdk/studio';
+
+// Studio (embeddable middleware)
+import { createStudioMiddleware, handleWsMessage } from '@axlsdk/studio/middleware';
+import type { StudioMiddleware, StudioMiddlewareOptions, StudioWebSocket } from '@axlsdk/studio/middleware';
 ```
 
 ## Living Documentation
@@ -124,9 +128,10 @@ packages/axl-eval/src/
 
 packages/axl-studio/src/
   cli.ts             — CLI entry: --port, --config, --conditions, --open flags
+  middleware.ts      — Embeddable middleware: createStudioMiddleware(), Node.js adapter
   resolve-runtime.ts — Config module interop (ESM default, CJS wrapping, named exports)
   server/
-    index.ts         — createServer() factory, Hono app composition
+    index.ts         — createServer() factory, Hono app composition (basePath, readOnly, cors)
     types.ts         — API types, WS message types, env bindings
     cost-aggregator.ts — Accumulates cost from trace events
     middleware/
@@ -144,8 +149,9 @@ packages/axl-studio/src/
       evals.ts       — GET /api/evals, POST /api/evals/:name/run, POST /api/evals/compare
       playground.ts  — POST /api/playground/chat
     ws/
-      handler.ts     — WebSocket message routing
-      connection-manager.ts — Channel subscriptions + broadcast
+      handler.ts     — WebSocket message routing (Hono adapter)
+      connection-manager.ts — Channel subscriptions + broadcast (BroadcastTarget)
+      protocol.ts    — Shared WS protocol: handleWsMessage(), channel validation
   client/
     main.tsx         — React entry point
     App.tsx          — BrowserRouter + Sidebar + Routes (8 panels)
@@ -185,9 +191,9 @@ pnpm test:smoke    # Pack validation smoke tests (tests/smoke/)
 
 Test infrastructure lives in `tests/` workspace:
 - `tests/e2e/` — Cross-package E2E scenarios (basic workflow, streaming, sessions, handoffs, structured output, error handling, eval)
-- `tests/studio/` — Studio REST API tests using Hono's `app.request()` (health, workflows, executions, sessions, agents, tools, memory, costs, decisions, evals, playground)
+- `tests/studio/` — Studio REST API + middleware integration tests (health, workflows, executions, sessions, agents, tools, memory, costs, decisions, evals, playground, middleware)
 - `tests/smoke/` — Tarball content validation via `pnpm pack`
-- `packages/axl-studio/src/__tests__/` — Inline studio unit tests (server, cost-aggregator, connection-manager, ws-handler)
+- `packages/axl-studio/src/__tests__/` — Inline studio unit tests (server, cost-aggregator, connection-manager, ws-handler, protocol, middleware)
 
 All tests use `MockProvider` — no API keys needed.
 
@@ -255,11 +261,12 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - Handoff modes: 'oneway' (default, exits source loop) and 'roundtrip' (returns result to source); roundtrip handoffs include a 'message' parameter
 - StreamEvent union includes 'tool_approval' and handoff 'mode' field
 - `ctx.delegate()` creates a temporary router agent with handoffs; single-agent case short-circuits to `ctx.ask()`. Router defaults to first candidate's model, `temperature: 0`, `maxTurns: 2`
-- Studio: Hono server wraps AxlRuntime with REST API (`/api/*`) + WebSocket (`/ws`); React SPA served from `dist/client/`
+- Studio: Hono server wraps AxlRuntime with REST API (`/api/*`) + WebSocket (`/ws`); React SPA served from `dist/client/`. Two modes: standalone CLI (`axl-studio`) and embeddable middleware (`createStudioMiddleware()` from `@axlsdk/studio/middleware`)
 - `AxlRuntime.createContext({ metadata? })` creates a lightweight `WorkflowContext` for ad-hoc tool testing and prototyping (has providers, state, MCP, telemetry — no session/streaming/budget)
 - Studio: `POST /api/tools/:name/test` uses `tool.run(ctx, input)` with a context from `runtime.createContext()` so agent-as-tool handlers work
 - Studio: AxlRuntime introspection via `registerTool()`, `registerAgent()`, `registerEval()`, `getWorkflows()`, `getTools()`, `getAgents()`, `getExecutions()`, `getRegisteredEvals()`
 - Studio: `zodToJsonSchema()` exported from core for tool schema rendering in Tool Inspector (wraps `z.toJSONSchema()`)
-- Studio: WebSocket uses channel multiplexing (subscribe/unsubscribe); channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`
+- Studio: WebSocket uses channel multiplexing (subscribe/unsubscribe); channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`. Protocol logic in `ws/protocol.ts`, shared between Hono handler and Node.js middleware. Channel names validated against allowlist, 256-char max, 64KB message size limit
+- Studio: Embeddable middleware (`@axlsdk/studio/middleware`): `createStudioMiddleware({ runtime, basePath?, serveClient?, verifyUpgrade?, readOnly? })` returns `{ handler, handleWebSocket, upgradeWebSocket, app, connectionManager, close }`. Works with Express, Fastify, Koa, NestJS, raw `http.Server`, Hono-in-Hono. `verifyUpgrade` callback for WS auth (WS upgrades bypass framework middleware). `readOnly: true` disables mutating endpoints. CORS not applied (host framework responsibility). `basePath` injected at runtime into index.html via `<base>` tag + `window.__AXL_STUDIO_BASE__`
 - Studio: `StateStore.listSessions()` optional method for session browsing (implemented in MemoryStore, SQLiteStore, RedisStore)
 - Studio: CLI (`axl-studio`) auto-detects config (`axl.config.mts` → `.ts` → `.mjs` → `.js`), expects `export default runtime`. For `.ts`/`.tsx` configs, registers a `module.register()` resolve hook that forces `format: 'module'` so top-level `await` works in non-`"type":"module"` projects. `--conditions` flag adds custom import conditions via resolve hook (e.g., `--conditions development` for monorepo source exports)

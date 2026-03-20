@@ -163,35 +163,99 @@ Single endpoint at `ws://localhost:4400/ws` with channel multiplexing:
 
 Channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`.
 
+## Embeddable Middleware
+
+For applications using dependency injection (NestJS, etc.) or existing HTTP servers, Studio can be mounted as middleware instead of running as a standalone CLI.
+
+```typescript
+import express from 'express';
+import { AxlRuntime } from '@axlsdk/axl';
+import { createStudioMiddleware } from '@axlsdk/studio/middleware';
+
+const runtime = new AxlRuntime({ providers: ['openai'] });
+// ... register workflows, agents, tools ...
+
+const studio = createStudioMiddleware({
+  runtime,
+  basePath: '/studio',
+  verifyUpgrade: (req) => {
+    const url = new URL(req.url!, `http://${req.headers.host}`);
+    return url.searchParams.get('token') === process.env.STUDIO_TOKEN;
+  },
+});
+
+const app = express();
+app.use('/studio', studio.handler);
+
+const server = app.listen(3000);
+studio.upgradeWebSocket(server);
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `runtime` | `AxlRuntime` | required | The runtime instance to observe and control |
+| `basePath` | `string` | `''` | URL path prefix (e.g., `'/studio'`) |
+| `serveClient` | `boolean` | `true` | Serve the pre-built SPA |
+| `verifyUpgrade` | `(req) => boolean \| Promise<boolean>` | — | Auth callback for WebSocket upgrades |
+| `readOnly` | `boolean` | `false` | Disable all mutating endpoints |
+
+### Return value
+
+| Property | Description |
+|----------|-------------|
+| `handler` | Node.js `(req, res)` handler for Express/Fastify/Koa/raw HTTP |
+| `handleWebSocket(ws)` | Handle an individual WebSocket (framework-agnostic) |
+| `upgradeWebSocket(server)` | Attach WS upgrade handling to an `http.Server` |
+| `app` | Underlying Hono app (for Hono-in-Hono mounting) |
+| `connectionManager` | WS connection/channel manager |
+| `close()` | Shut down middleware (removes listeners, closes connections) |
+
+### Framework support
+
+Works with Express, Fastify (via `@fastify/middie`), Koa (via `koa-mount`), NestJS, raw `http.Server`, and Hono-in-Hono. See the [spec](.internal/spec/14-embeddable-studio.md) for integration examples for each framework.
+
+### Security
+
+- **Always** provide `verifyUpgrade` — WebSocket upgrades bypass framework middleware
+- Consider `readOnly: true` for production monitoring
+- CORS is not applied in embedded mode — the host framework owns CORS policy
+- `basePath` is validated against unsafe characters and path traversal
+
 ## Architecture
 
 ```
 src/
   cli.ts                  CLI entry — loads config, starts server
+  middleware.ts           Embeddable middleware: createStudioMiddleware()
   resolve-runtime.ts      Config module interop (ESM default, CJS wrapping, named exports)
   server/
-    index.ts              createServer() — Hono app composition
+    index.ts              createServer() — Hono app composition (basePath, readOnly, cors)
     types.ts              API types, WebSocket message types
     cost-aggregator.ts    Accumulates cost from trace events
     middleware/
       error-handler.ts    Axl errors → JSON error envelope
     routes/               One file per resource (health, workflows, agents, tools, etc.)
     ws/
-      handler.ts          WebSocket message routing
-      connection-manager.ts  Channel subscriptions + broadcast
+      handler.ts          WebSocket message routing (Hono adapter)
+      connection-manager.ts  Channel subscriptions + broadcast (BroadcastTarget)
+      protocol.ts         Shared WS protocol: handleWsMessage(), channel validation
   client/
     App.tsx               React SPA — sidebar + 8 panel routes
     lib/
-      api.ts              Typed fetch wrappers for all endpoints
-      ws.ts               WebSocket client with channel subscriptions
+      api.ts              Typed fetch wrappers (reads window.__AXL_STUDIO_BASE__)
+      ws.ts               WebSocket client with channel subscriptions (reads base path)
     panels/               One directory per panel
 ```
 
-**Server:** Hono HTTP server wrapping the user's `AxlRuntime`. REST endpoints for CRUD, WebSocket for live streaming.
+**Server:** Hono HTTP server wrapping the user's `AxlRuntime`. REST endpoints for CRUD, WebSocket for live streaming. Supports standalone CLI and embeddable middleware modes.
 
-**Client:** React 19 SPA with Tailwind CSS v4, TanStack Query, and react-router-dom. Pre-built at publish time and served as static assets.
+**Client:** React 19 SPA with Tailwind CSS v4, TanStack Query, and react-router-dom. Pre-built at publish time and served as static assets. Reads `window.__AXL_STUDIO_BASE__` for runtime base path configuration.
 
 **CLI:** Auto-detects and loads the user's config via `tsx` (with ESM-forcing resolve hook for `.ts` files), validates the runtime, starts the server, and optionally opens the browser.
+
+**Middleware:** `createStudioMiddleware()` wraps the Hono app as a Node.js `(req, res)` handler via `@hono/node-server`. Adds `verifyUpgrade` for WS auth, `readOnly` mode, and `basePath` injection into the SPA.
 
 ## Development
 

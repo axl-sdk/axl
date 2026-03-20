@@ -1,3 +1,9 @@
+declare global {
+  interface Window {
+    __AXL_STUDIO_BASE__?: string;
+  }
+}
+
 /** API response envelope */
 export type ApiResponse<T> =
   | { ok: true; data: T }

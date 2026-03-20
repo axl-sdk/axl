@@ -11,7 +11,8 @@ class WsClient {
 
   constructor() {
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    this.url = `${proto}//${window.location.host}/ws`;
+    const base = window.__AXL_STUDIO_BASE__ ?? '';
+    this.url = `${proto}//${window.location.host}${base}/ws`;
   }
 
   connect(): void {

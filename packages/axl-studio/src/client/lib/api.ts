@@ -14,7 +14,7 @@ import type {
   HealthData,
 } from './types';
 
-const BASE = '/api';
+const BASE = (window.__AXL_STUDIO_BASE__ ?? '') + '/api';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {

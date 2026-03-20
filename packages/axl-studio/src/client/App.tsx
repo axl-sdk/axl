@@ -11,7 +11,7 @@ import { EvalRunnerPanel } from './panels/eval-runner/EvalRunnerPanel';
 
 export function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={window.__AXL_STUDIO_BASE__ || '/'}>
       <div className="flex h-screen overflow-hidden">
         <Sidebar />
         <div className="flex-1 overflow-hidden">

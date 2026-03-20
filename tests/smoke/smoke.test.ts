@@ -56,10 +56,17 @@ describe('Smoke: Package Tarballs', () => {
     expect(hasSrc).toBe(false);
   });
 
-  it('@axlsdk/studio tarball contains server, CLI, and client', () => {
+  it('@axlsdk/studio tarball contains server, CLI, middleware, and client', () => {
     const files = packAndList(join(ROOT, 'packages/axl-studio'));
+    // Server entry (default export)
     expect(files).toContainEqual(expect.stringContaining('dist/server/index.js'));
+    expect(files).toContainEqual(expect.stringContaining('dist/server/index.d.ts'));
+    // CLI
     expect(files).toContainEqual(expect.stringContaining('dist/cli.js'));
+    // Middleware entry (./middleware export)
+    expect(files).toContainEqual(expect.stringContaining('dist/middleware.js'));
+    expect(files).toContainEqual(expect.stringContaining('dist/middleware.d.ts'));
+    // Pre-built SPA
     expect(files).toContainEqual(expect.stringContaining('dist/client/index.html'));
     expect(files).toContainEqual(expect.stringContaining('package.json'));
 

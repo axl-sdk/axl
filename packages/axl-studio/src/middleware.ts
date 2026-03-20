@@ -129,7 +129,12 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
       console.error('[axl-studio] Unhandled error in request handler:', err);
       if (!res.headersSent) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Internal server error' }));
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error: { code: 'INTERNAL_ERROR', message: 'Internal server error' },
+          }),
+        );
       }
     });
   }
@@ -137,6 +142,10 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
   // Handle an individual WebSocket using the Studio protocol.
   // Adapts any StudioWebSocket to ConnectionManager's internal BroadcastTarget.
   function handleWebSocket(ws: StudioWebSocket) {
+    if (closed) {
+      ws.close();
+      return;
+    }
     const socket = {
       send: (data: string) => ws.send(data),
       close: () => ws.close(),

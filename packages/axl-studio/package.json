@@ -16,6 +16,16 @@
         "types": "./dist/server/index.d.cts",
         "default": "./dist/server/index.cjs"
       }
+    },
+    "./middleware": {
+      "import": {
+        "types": "./dist/middleware.d.ts",
+        "default": "./dist/middleware.js"
+      },
+      "require": {
+        "types": "./dist/middleware.d.cts",
+        "default": "./dist/middleware.cjs"
+      }
     }
   },
   "bin": {
@@ -39,13 +49,15 @@
     "hono": "^4.7.0",
     "@hono/node-server": "^1.13.0",
     "@hono/node-ws": "^1.1.0",
-    "tsx": "^4.19.0"
+    "tsx": "^4.19.0",
+    "ws": "^8.0.0"
   },
   "devDependencies": {
     "@axlsdk/testing": "workspace:*",
     "@tailwindcss/vite": "^4.1.0",
     "@tanstack/react-query": "^5.64.0",
     "@types/node": "^25.2.3",
+    "@types/ws": "^8.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.0",

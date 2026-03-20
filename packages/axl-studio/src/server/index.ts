@@ -77,7 +77,13 @@ export function createServer(options: CreateServerOptions) {
       const apiPath = apiIdx >= 0 ? c.req.path.slice(apiIdx) : c.req.path;
       const key = `${c.req.method} ${apiPath}`;
       if (blocked.some((b) => key.startsWith(b))) {
-        return c.json({ error: 'Studio is mounted in read-only mode' }, 405);
+        return c.json(
+          {
+            ok: false,
+            error: { code: 'READ_ONLY', message: 'Studio is mounted in read-only mode' },
+          },
+          405,
+        );
       }
       await next();
     });

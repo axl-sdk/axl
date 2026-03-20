@@ -78,6 +78,21 @@ describe('Studio Middleware Integration', () => {
     expect(body.data.tools).toBe(1);
   });
 
+  it('handler responds to HTTP requests through http.Server', async () => {
+    const runtime = createTestRuntime();
+    studio = createStudioMiddleware({ runtime, serveClient: false });
+
+    server = createHttpServer(studio.handler);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+
+    const res = await fetch(`http://localhost:${port}/api/health`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.ok).toBe(true);
+    expect(body.data.status).toBe('healthy');
+  });
+
   it('serves API via Hono app with basePath', async () => {
     const runtime = createTestRuntime();
     studio = createStudioMiddleware({ runtime, basePath: '/studio', serveClient: false });

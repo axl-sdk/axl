@@ -54,7 +54,9 @@ describe('createStudioMiddleware', () => {
     });
     expect(postRes.status).toBe(405);
     const body = await postRes.json();
-    expect(body.error).toContain('read-only');
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('READ_ONLY');
+    expect(body.error.message).toContain('read-only');
 
     studio.close();
   });

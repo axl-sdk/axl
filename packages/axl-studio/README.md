@@ -214,7 +214,7 @@ studio.upgradeWebSocket(server);
 
 ### Framework support
 
-Works with Express, Fastify (via `@fastify/middie`), Koa (via `koa-mount`), NestJS, raw `http.Server`, and Hono-in-Hono. See the [spec](.internal/spec/14-embeddable-studio.md) for integration examples for each framework.
+Works with Express, Fastify (via `@fastify/middie`), Koa (via `koa-mount`), NestJS, raw `http.Server`, and Hono-in-Hono.
 
 ### Security
 

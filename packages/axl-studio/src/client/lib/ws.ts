@@ -31,9 +31,19 @@ class WsClient {
       try {
         const msg = JSON.parse(event.data);
         if (msg.type === 'event' && msg.channel) {
+          // Exact channel match
           const cbs = this.listeners.get(msg.channel);
           if (cbs) {
             for (const cb of cbs) cb(msg.data);
+          }
+          // Wildcard match: "trace:abc" also fires "trace:*" listeners
+          const colonIdx = msg.channel.indexOf(':');
+          if (colonIdx > 0) {
+            const wildcard = msg.channel.substring(0, colonIdx) + ':*';
+            const wcbs = this.listeners.get(wildcard);
+            if (wcbs) {
+              for (const cb of wcbs) cb(msg.data);
+            }
           }
         }
       } catch {

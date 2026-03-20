@@ -110,7 +110,19 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
     overrideGlobalObjects: false,
   });
 
+  let closed = false;
+
   function handler(req: IncomingMessage, res: ServerResponse) {
+    if (closed) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: { code: 'CLOSED', message: 'Studio middleware has been shut down' },
+        }),
+      );
+      return;
+    }
     // listener returns Promise<void>. Catch async errors to prevent
     // unhandled rejections from crashing the host process.
     listener(req, res).catch((err) => {
@@ -197,6 +209,8 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
 
   // Cleanup function for lifecycle management.
   function close() {
+    closed = true;
+
     // Close all WebSocket connections
     connMgr.closeAll();
 

@@ -235,6 +235,28 @@ describe('Studio Middleware Integration', () => {
     expect(ws.readyState).not.toBe(WebSocket.OPEN);
   });
 
+  it('handler returns 503 after close()', async () => {
+    const runtime = createTestRuntime();
+    studio = createStudioMiddleware({ runtime, serveClient: false });
+
+    server = createHttpServer(studio.handler);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+
+    // Works before close
+    const res1 = await fetch(`http://localhost:${port}/api/health`);
+    expect(res1.status).toBe(200);
+
+    studio.close();
+
+    // Returns 503 after close
+    const res2 = await fetch(`http://localhost:${port}/api/health`);
+    expect(res2.status).toBe(503);
+    const body = (await res2.json()) as any;
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('CLOSED');
+  });
+
   it('close() shuts down WebSocket connections', async () => {
     const runtime = createTestRuntime();
     studio = createStudioMiddleware({ runtime, serveClient: false });

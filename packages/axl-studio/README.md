@@ -212,6 +212,8 @@ studio.upgradeWebSocket(server);
 | `connectionManager` | WS connection/channel manager |
 | `close()` | Shut down middleware (removes listeners, closes connections) |
 
+**Note:** `upgradeWebSocket(server)` is required for real-time features (trace streaming, cost updates, execution events, decision resolution). Without it, the Studio SPA loads but panels relying on live data will show no updates. If your framework manages WebSocket connections itself (NestJS gateway, Fastify plugin), use `handleWebSocket()` instead.
+
 ### Framework support
 
 Works with Express, Fastify (via `@fastify/middie`), Koa (via `koa-mount`), NestJS, raw `http.Server`, and Hono-in-Hono.

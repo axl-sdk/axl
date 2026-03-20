@@ -142,6 +142,9 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
 
   // Internal WebSocketServer — created lazily by upgradeWebSocket()
   let wss: InstanceType<typeof WebSocketServer> | undefined;
+  // References for cleanup: the upgrade handler and server it's attached to
+  let upgradeHandler: ((...args: any[]) => void) | undefined;
+  let serverRef: Server | undefined;
 
   // Convenience: attach WS handling to an http.Server.
   function upgradeWebSocket(server: Server, path?: string) {
@@ -155,8 +158,9 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
     const wsPath = path ?? (basePath ? `${basePath}/ws` : '/ws');
 
     wss = new WebSocketServer({ noServer: true });
+    serverRef = server;
 
-    server.on('upgrade', async (req, socket, head) => {
+    upgradeHandler = async (req: IncomingMessage, socket: any, head: Buffer) => {
       // Match path, ignoring query string
       const pathname = new URL(req.url!, `http://${req.headers.host}`).pathname;
       if (pathname !== wsPath) return; // Let other upgrade handlers run
@@ -177,16 +181,31 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
         }
       }
 
-      wss!.handleUpgrade(req, socket, head, (ws) => {
+      // Guard against close() being called during async verifyUpgrade
+      if (!wss) {
+        socket.destroy();
+        return;
+      }
+
+      wss.handleUpgrade(req, socket, head, (ws) => {
         handleWebSocket(ws);
       });
-    });
+    };
+
+    server.on('upgrade', upgradeHandler);
   }
 
   // Cleanup function for lifecycle management.
   function close() {
     // Close all WebSocket connections
     connMgr.closeAll();
+
+    // Remove the upgrade listener from the server before closing WSS
+    if (upgradeHandler && serverRef) {
+      serverRef.removeListener('upgrade', upgradeHandler);
+      upgradeHandler = undefined;
+      serverRef = undefined;
+    }
 
     // Shut down the internal WebSocketServer if one was created
     if (wss) {

@@ -43,15 +43,16 @@ export class ConnectionManager {
     this.connections.delete(ws);
   }
 
-  /** Subscribe a connection to a channel. */
+  /** Subscribe a connection to a channel. No-op if the connection was not added. */
   subscribe(ws: BroadcastTarget, channel: string): void {
+    if (!this.connections.has(ws)) return;
     let subs = this.channels.get(channel);
     if (!subs) {
       subs = new Set();
       this.channels.set(channel, subs);
     }
     subs.add(ws);
-    this.connections.get(ws)?.add(channel);
+    this.connections.get(ws)!.add(channel);
   }
 
   /** Unsubscribe a connection from a channel. */

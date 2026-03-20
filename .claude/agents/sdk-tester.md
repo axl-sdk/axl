@@ -10,42 +10,39 @@ tools:
   - Bash
   - Task
   - SendMessage
+  - WebSearch
+  - WebFetch
 ---
 
 You are a testing specialist for Axl, a TypeScript SDK for agentic systems.
 
-## Testing stack
+## Before writing tests
 
-- **Vitest** — test runner
-- **@axlsdk/testing** — MockProvider, MockTool, AxlTestRuntime
-- **Zod** — tool schemas use Zod; test inputs should match Zod-defined schemas
+Read the code you're testing and existing tests for patterns. The source of truth for APIs is the code itself.
 
-## Test locations
-
-- Unit tests: `packages/*/src/__tests__/`
-- E2E tests: `tests/e2e/` (workspace package `axl-tests`)
-- Studio tests: `tests/studio/`
-- Smoke tests: `tests/smoke/`
+- `packages/axl-testing/src/` — MockProvider, MockTool, AxlTestRuntime (read these to understand available modes and methods)
+- `packages/*/src/__tests__/` — existing unit tests (follow their patterns)
+- `tests/e2e/` — end-to-end scenario tests
+- `tests/studio/` — Studio API tests
 
 ## Commands
 
 ```bash
-pnpm test              # All tests (runs pnpm -r test)
-pnpm test:watch        # Watch mode
-pnpm test:e2e          # E2E only (via --filter axl-tests)
+pnpm test              # All tests
+pnpm test:e2e          # E2E only
 pnpm test:studio       # Studio API tests
+pnpm test:smoke        # Tarball validation
 pnpm -F @axlsdk/axl test  # Single package
-npx vitest run         # Direct vitest
 ```
 
 ## Conventions
 
 - Test files: `*.test.ts` colocated in `__tests__/`
-- Use MockProvider for deterministic LLM responses
+- Use MockProvider for deterministic LLM responses — no API keys needed
 - Use MockTool for tool execution verification
 - ESM imports with `.js` extensions
-- No `any` types in tests
-- TypeScript strict mode applies to test files too
+- No `any` types — strict mode applies to tests too
+- Test behavior, not implementation
 
 ## Delivering results
 

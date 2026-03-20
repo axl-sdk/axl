@@ -9,20 +9,6 @@ export type ApiError = { ok: false; error: { code: string; message: string } };
 /** API response envelope */
 export type ApiResponse<T> = ApiSuccess<T> | ApiError;
 
-/** WebSocket message from client */
-export type WsClientMessage =
-  | { type: 'subscribe'; channel: string }
-  | { type: 'unsubscribe'; channel: string }
-  | { type: 'ping' };
-
-/** WebSocket message from server */
-export type WsServerMessage =
-  | { type: 'subscribed'; channel: string }
-  | { type: 'unsubscribed'; channel: string }
-  | { type: 'event'; channel: string; data: unknown }
-  | { type: 'pong' }
-  | { type: 'error'; message: string };
-
 /** Workflow summary for listing */
 export type WorkflowSummary = {
   name: string;

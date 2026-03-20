@@ -146,6 +146,27 @@ describe('handleWsMessage', () => {
     expect(parsed.message).toContain('256');
   });
 
+  it('rejects channels that start with valid names but are not exact matches', () => {
+    const { socket } = createMockSocket();
+    connMgr.add(socket);
+
+    // 'costsomething' is not valid — 'costs' requires exact match
+    const reply1 = handleWsMessage(
+      JSON.stringify({ type: 'subscribe', channel: 'costsomething' }),
+      socket,
+      connMgr,
+    );
+    expect(JSON.parse(reply1!).type).toBe('error');
+
+    // 'decisionsbanana' is not valid — 'decisions' requires exact match
+    const reply2 = handleWsMessage(
+      JSON.stringify({ type: 'subscribe', channel: 'decisionsbanana' }),
+      socket,
+      connMgr,
+    );
+    expect(JSON.parse(reply2!).type).toBe('error');
+  });
+
   it('allows valid channel prefixes: execution:, trace:, costs, decisions', () => {
     const { socket } = createMockSocket();
     connMgr.add(socket);

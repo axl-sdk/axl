@@ -198,6 +198,26 @@ describe('normalizeBasePath (via createStudioMiddleware)', () => {
     studio.close();
   });
 
+  it('single slash normalizes to root mount', async () => {
+    const runtime = createTestRuntime();
+    const studio = createStudioMiddleware({ runtime, basePath: '/', serveClient: false });
+
+    const res = await studio.app.request('/api/health');
+    expect(res.status).toBe(200);
+
+    studio.close();
+  });
+
+  it('multiple slashes normalize to root mount', async () => {
+    const runtime = createTestRuntime();
+    const studio = createStudioMiddleware({ runtime, basePath: '///', serveClient: false });
+
+    const res = await studio.app.request('/api/health');
+    expect(res.status).toBe(200);
+
+    studio.close();
+  });
+
   it('throws on missing leading slash', () => {
     const runtime = createTestRuntime();
     expect(() =>
@@ -210,6 +230,13 @@ describe('normalizeBasePath (via createStudioMiddleware)', () => {
     expect(() =>
       createStudioMiddleware({ runtime, basePath: '/studio/../etc', serveClient: false }),
     ).toThrow("must not contain '..'");
+  });
+
+  it('throws on consecutive slashes', () => {
+    const runtime = createTestRuntime();
+    expect(() =>
+      createStudioMiddleware({ runtime, basePath: '/studio//admin', serveClient: false }),
+    ).toThrow('consecutive slashes');
   });
 
   it('throws on invalid characters', () => {
@@ -252,6 +279,16 @@ describe('upgradeWebSocket with http.Server', () => {
 
     // The server should have an upgrade listener
     expect(server.listenerCount('upgrade')).toBeGreaterThanOrEqual(1);
+  });
+
+  it('throws on double upgradeWebSocket call', () => {
+    const runtime = createTestRuntime();
+    studio = createStudioMiddleware({ runtime, serveClient: false });
+
+    server = createHttpServer(studio.handler);
+    studio.upgradeWebSocket(server);
+
+    expect(() => studio.upgradeWebSocket(server)).toThrow('already been called');
   });
 
   it('uses custom path when provided', () => {

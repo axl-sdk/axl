@@ -145,6 +145,13 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
 
   // Convenience: attach WS handling to an http.Server.
   function upgradeWebSocket(server: Server, path?: string) {
+    if (wss) {
+      throw new Error(
+        '[axl-studio] upgradeWebSocket() has already been called. ' +
+          'Call close() first if you need to re-attach.',
+      );
+    }
+
     const wsPath = path ?? (basePath ? `${basePath}/ws` : '/ws');
 
     wss = new WebSocketServer({ noServer: true });
@@ -222,9 +229,12 @@ function normalizeBasePath(raw?: string): string {
     throw new Error(`basePath must start with '/' (got '${raw}'). Example: '/studio'`);
   }
 
-  // Reject path traversal and unsafe characters
+  // Reject path traversal, consecutive slashes, and unsafe characters
   if (normalized.includes('..')) {
     throw new Error(`basePath must not contain '..' segments (got '${raw}')`);
+  }
+  if (normalized.includes('//')) {
+    throw new Error(`basePath must not contain consecutive slashes (got '${raw}')`);
   }
   if (!/^\/[a-zA-Z0-9/_-]*$/.test(normalized)) {
     throw new Error(

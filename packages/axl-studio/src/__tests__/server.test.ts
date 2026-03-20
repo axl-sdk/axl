@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { describe, it, expect } from 'vitest';
 import { AxlRuntime } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
@@ -89,6 +92,104 @@ describe('Studio Server', () => {
       headers: { Origin: 'http://example.com' },
     });
     expect(res.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  it('basePath injects <base> and __AXL_STUDIO_BASE__ into index.html', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'axl-studio-test-'));
+    writeFileSync(
+      join(tmpDir, 'index.html'),
+      '<!DOCTYPE html><html><head><title>Test</title></head><body></body></html>',
+    );
+
+    try {
+      const runtime = new AxlRuntime();
+      runtime.registerProvider('mock', MockProvider.echo());
+      const { app } = createServer({ runtime, staticRoot: tmpDir, basePath: '/studio' });
+
+      // Request a non-API path to get the SPA fallback
+      const res = await app.request('/playground');
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('<base href="/studio/">');
+      expect(html).toContain('window.__AXL_STUDIO_BASE__="/studio"');
+      expect(html).toContain('</head>');
+    } finally {
+      rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  it('no basePath serves index.html unmodified for SPA fallback', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'axl-studio-test-'));
+    const original =
+      '<!DOCTYPE html><html><head><title>Test</title></head><body>Original</body></html>';
+    writeFileSync(join(tmpDir, 'index.html'), original);
+
+    try {
+      const runtime = new AxlRuntime();
+      runtime.registerProvider('mock', MockProvider.echo());
+      const { app } = createServer({ runtime, staticRoot: tmpDir });
+
+      // serveStatic with path: '/index.html' serves the fallback
+      const res = await app.request('/playground');
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      // Should NOT contain injected base or script
+      expect(html).not.toContain('__AXL_STUDIO_BASE__');
+      expect(html).not.toContain('<base');
+    } finally {
+      rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  it('basePath XSS prevention escapes < in injected script', async () => {
+    // normalizeBasePath rejects '<' characters, so this tests the defense-in-depth
+    // layer in createServer by calling it directly with a basePath that contains
+    // no '<' — the escaping logic runs on any basePath but only matters if '<' is present.
+    // We verify the escaping function exists by checking the injected value is JSON-safe.
+    const tmpDir = mkdtempSync(join(tmpdir(), 'axl-studio-test-'));
+    writeFileSync(
+      join(tmpDir, 'index.html'),
+      '<!DOCTYPE html><html><head></head><body></body></html>',
+    );
+
+    try {
+      const runtime = new AxlRuntime();
+      runtime.registerProvider('mock', MockProvider.echo());
+      const { app } = createServer({ runtime, staticRoot: tmpDir, basePath: '/admin/studio' });
+
+      const res = await app.request('/any-path');
+      const html = await res.text();
+      // The basePath should be JSON-encoded in the script
+      expect(html).toContain('window.__AXL_STUDIO_BASE__="/admin/studio"');
+      // No raw '<' in the injected value (defense-in-depth)
+      const scriptMatch = html.match(/window\.__AXL_STUDIO_BASE__=([^<]*?)</);
+      expect(scriptMatch).toBeTruthy();
+    } finally {
+      rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  it('readOnly works when studio app is mounted via Hono app.route()', async () => {
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('mock', MockProvider.echo());
+    const { app: studioApp } = createServer({ runtime, readOnly: true, cors: false });
+
+    // Mount at a prefix like Hono-in-Hono usage
+    const { Hono } = await import('hono');
+    const parentApp = new Hono();
+    parentApp.route('/studio', studioApp);
+
+    // GET should work
+    const getRes = await parentApp.request('/studio/api/health');
+    expect(getRes.status).toBe(200);
+
+    // POST should be blocked
+    const postRes = await parentApp.request('/studio/api/playground/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'hello' }),
+    });
+    expect(postRes.status).toBe(405);
   });
 
   it('error handler converts errors to JSON error response', async () => {

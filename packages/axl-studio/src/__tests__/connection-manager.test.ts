@@ -98,6 +98,58 @@ describe('ConnectionManager', () => {
     expect(connMgr.hasSubscribers('channel-x')).toBe(false);
   });
 
+  it('closeAll closes all connections and clears subscriptions', () => {
+    const closed: boolean[] = [];
+    const mockWsWithClose = () => {
+      const messages: string[] = [];
+      return {
+        ws: {
+          send: (msg: string) => messages.push(msg),
+          close: () => closed.push(true),
+        } as unknown as Parameters<ConnectionManager['add']>[0],
+        messages,
+      };
+    };
+
+    const { ws: ws1 } = mockWsWithClose();
+    const { ws: ws2 } = mockWsWithClose();
+
+    connMgr.add(ws1);
+    connMgr.add(ws2);
+    connMgr.subscribe(ws1, 'trace:abc');
+    connMgr.subscribe(ws2, 'costs');
+
+    expect(connMgr.connectionCount).toBe(2);
+    expect(connMgr.hasSubscribers('trace:abc')).toBe(true);
+    expect(connMgr.hasSubscribers('costs')).toBe(true);
+
+    connMgr.closeAll();
+
+    expect(connMgr.connectionCount).toBe(0);
+    expect(connMgr.hasSubscribers('trace:abc')).toBe(false);
+    expect(connMgr.hasSubscribers('costs')).toBe(false);
+    expect(closed.length).toBe(2);
+  });
+
+  it('maxConnections rejects connections beyond the limit', () => {
+    const closed: boolean[] = [];
+    // Fill to capacity (maxConnections = 100)
+    for (let i = 0; i < 100; i++) {
+      const { ws } = createMockWs();
+      connMgr.add(ws);
+    }
+    expect(connMgr.connectionCount).toBe(100);
+
+    // 101st connection should be rejected
+    const { ws: rejected } = createMockWs();
+    // Override close to track rejection
+    (rejected as any).close = () => closed.push(true);
+    connMgr.add(rejected);
+
+    expect(connMgr.connectionCount).toBe(100); // Not 101
+    expect(closed.length).toBe(1); // close() was called on the rejected socket
+  });
+
   it('remove cleans up all subscriptions for a connection', () => {
     const { ws } = createMockWs();
     connMgr.add(ws);

@@ -70,7 +70,12 @@ export function createServer(options: CreateServerOptions) {
       'POST /api/playground',
     ];
     app.use('/api/*', async (c, next) => {
-      const key = `${c.req.method} ${c.req.path}`;
+      // c.req.path returns the full path including any parent route prefix
+      // (e.g., /studio/api/workflows when mounted via app.route('/studio', ...)).
+      // Extract just the /api/... portion for matching.
+      const apiIdx = c.req.path.indexOf('/api/');
+      const apiPath = apiIdx >= 0 ? c.req.path.slice(apiIdx) : c.req.path;
+      const key = `${c.req.method} ${apiPath}`;
       if (blocked.some((b) => key.startsWith(b))) {
         return c.json({ error: 'Studio is mounted in read-only mode' }, 405);
       }

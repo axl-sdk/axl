@@ -221,24 +221,26 @@ studio.upgradeWebSocket(server);
 ```typescript
 import { Module, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
-import { createStudioMiddleware } from '@axlsdk/studio/middleware';
+import { createStudioMiddleware, type StudioMiddleware } from '@axlsdk/studio/middleware';
 
 @Module({ /* ... */ })
 export class AppModule implements OnModuleInit, OnModuleDestroy {
-  private studio: ReturnType<typeof createStudioMiddleware>;
+  private studio!: StudioMiddleware;
 
   constructor(
     private readonly httpAdapterHost: HttpAdapterHost,
     private readonly runtime: AxlRuntime, // injected via custom provider
-  ) {
+  ) {}
+
+  onModuleInit() {
     this.studio = createStudioMiddleware({
       runtime: this.runtime,
       basePath: '/studio',
       verifyUpgrade: (req) => req.headers['authorization'] === `Bearer ${process.env.STUDIO_TOKEN}`,
     });
-  }
 
-  onModuleInit() {
+    // Mount on the underlying Express instance — this is the recommended
+    // NestJS pattern for sub-application mounting (see NestJS HTTP adapter docs).
     const expressApp = this.httpAdapterHost.httpAdapter.getInstance();
     expressApp.use('/studio', this.studio.handler);
     this.studio.upgradeWebSocket(this.httpAdapterHost.httpAdapter.getHttpServer());

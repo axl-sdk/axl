@@ -178,9 +178,11 @@ const runtime = new AxlRuntime({ providers: ['openai'] });
 const studio = createStudioMiddleware({
   runtime,
   basePath: '/studio',
+  // Your auth logic here — check a token, cookie, or header.
+  // This runs on WebSocket upgrades, which bypass Express middleware.
   verifyUpgrade: (req) => {
     const url = new URL(req.url!, `http://${req.headers.host}`);
-    return url.searchParams.get('token') === process.env.STUDIO_TOKEN;
+    return url.searchParams.get('token') === process.env.MY_SECRET;
   },
 });
 
@@ -236,7 +238,7 @@ export class AppModule implements OnModuleInit, OnModuleDestroy {
     this.studio = createStudioMiddleware({
       runtime: this.runtime,
       basePath: '/studio',
-      verifyUpgrade: (req) => req.headers['authorization'] === `Bearer ${process.env.STUDIO_TOKEN}`,
+      verifyUpgrade: (req) => req.headers['authorization'] === `Bearer ${process.env.MY_SECRET}`,
     });
 
     // Mount on the underlying Express instance — this is the recommended

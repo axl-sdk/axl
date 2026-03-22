@@ -355,4 +355,37 @@ describe('runEval()', () => {
     expect(receivedAnnotations).toEqual({ answer: '2' });
     expect(result.items[0].scores['ann-scorer']).toBe(1);
   });
+
+  it('passes runtime to executeWorkflow as second argument', async () => {
+    let receivedRuntime: unknown;
+
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      async (input: any, runtime?: unknown) => {
+        receivedRuntime = runtime;
+        if (input.question === 'What is 1+1?') return { output: '2' };
+        if (input.question === 'What is 2+2?') return { output: '4' };
+        return { output: '6' };
+      },
+      undefined,
+      'mock-runtime',
+    );
+
+    expect(receivedRuntime).toBe('mock-runtime');
+    expect(result.items).toHaveLength(3);
+  });
+
+  it('runtime is undefined when not provided', async () => {
+    let receivedRuntime: unknown = 'sentinel';
+
+    await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      async (input: any, runtime?: unknown) => {
+        receivedRuntime = runtime;
+        return { output: '2' };
+      },
+    );
+
+    expect(receivedRuntime).toBeUndefined();
+  });
 });

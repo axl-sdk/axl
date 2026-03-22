@@ -85,7 +85,7 @@ const qualityJudge = llmScorer({
 });
 ```
 
-### `runEval(config, executeFn)`
+### `runEval(config, executeFn, provider?, runtime?)`
 
 Run an evaluation:
 
@@ -162,11 +162,12 @@ By default, the eval runner calls `runtime.execute(workflow, input)` for each da
 
 For self-contained evals, export an `executeWorkflow` function alongside the config. This is called instead of `runtime.execute()` for each dataset item.
 
-The function receives `(input, runtime?)` — the second argument is the `AxlRuntime` instance when running via Studio or `runtime.runRegisteredEval()`. Use it to call agents without needing a registered workflow:
+The function receives `(input, runtime?)` — the second argument is the `AxlRuntime` instance when running via Studio or `runtime.runRegisteredEval()`. It is `undefined` when running via the CLI. Use it to call agents without needing a registered workflow:
 
 ```typescript
 // evals/qa-quality.eval.ts — calls an agent directly via the runtime
 import { defineEval, dataset, scorer } from '@axlsdk/eval';
+import type { AxlRuntime } from '@axlsdk/axl';
 import { z } from 'zod';
 import { qaAgent } from '../src/agents/qa.js'; // import your agent definition
 
@@ -191,15 +192,15 @@ export default defineEval({
   scorers: [notEmpty],
 });
 
-export async function executeWorkflow(input: { question: string }, runtime?: any) {
-  // runtime is the AxlRuntime instance — use it to call agents
+export async function executeWorkflow(input: { question: string }, runtime?: AxlRuntime) {
+  if (!runtime) throw new Error('This eval requires a runtime — run via Studio or runtime.runRegisteredEval()');
   const ctx = runtime.createContext();
   const output = await ctx.ask(qaAgent, input.question);
   return { output };
 }
 ```
 
-When no runtime is needed (e.g., testing a pure function), just ignore the second argument:
+When no runtime is needed (e.g., testing a pure function), just ignore the second argument — these evals work from both the CLI and Studio:
 
 ```typescript
 // evals/parser.eval.ts — tests a pure function, no runtime needed
@@ -208,6 +209,10 @@ export async function executeWorkflow(input: { raw: string }) {
   return { output: result };
 }
 ```
+
+> **Note:** The CLI (`npx axl eval`) does not provide a runtime to `executeWorkflow`. Eval files that call agents via `runtime.createContext()` must be run through Studio or `runtime.runRegisteredEval()`.
+
+> **Cost tracking:** The default path (no `executeWorkflow` export) tracks cost automatically via runtime trace events. Custom `executeWorkflow` functions must return `{ output, cost }` manually if cost tracking is needed — `createContext()` does not capture cost automatically.
 
 ## CLI
 

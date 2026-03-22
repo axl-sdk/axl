@@ -276,8 +276,8 @@ Most LLM frameworks treat agents as sequential pipelines. Real agentic systems n
 | ------------------------------------------- | -------------------------------------------------------------------------------- |
 | [`@axlsdk/axl`](./packages/axl)             | Core SDK: tools, agents, workflows, runtime, providers, state stores             |
 | [`@axlsdk/testing`](./packages/axl-testing) | Test utilities: MockProvider, MockTool, AxlTestRuntime                           |
-| [`@axlsdk/eval`](./packages/axl-eval)       | Evaluation framework: datasets, scorers, LLM-as-judge, CLI                       |
-| [`@axlsdk/studio`](./packages/axl-studio)   | Local development UI: Hono server + React SPA for debugging agents and workflows |
+| [`@axlsdk/eval`](./packages/axl-eval)       | Evaluation framework: datasets, scorers, LLM-as-judge, CLI + Studio integration  |
+| [`@axlsdk/studio`](./packages/axl-studio)   | Development UI + embeddable middleware for debugging agents, workflows, and evals |
 
 ## Documentation
 

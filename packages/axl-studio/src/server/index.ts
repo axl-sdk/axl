@@ -18,7 +18,7 @@ import toolRoutes from './routes/tools.js';
 import memoryRoutes from './routes/memory.js';
 import decisionRoutes from './routes/decisions.js';
 import { createCostRoutes } from './routes/costs.js';
-import evalRoutes from './routes/evals.js';
+import { createEvalRoutes } from './routes/evals.js';
 import { createPlaygroundRoutes } from './routes/playground.js';
 
 export type { StudioEnv } from './types.js';
@@ -36,6 +36,8 @@ export type CreateServerOptions = {
   readOnly?: boolean;
   /** Apply CORS headers. Default: true (standalone CLI). Set false for embedded middleware. */
   cors?: boolean;
+  /** Lazy eval file loader. Called before eval routes access the runtime's registered evals. */
+  evalLoader?: () => Promise<void>;
 };
 
 export function createServer(options: CreateServerOptions) {
@@ -100,7 +102,7 @@ export function createServer(options: CreateServerOptions) {
   api.route('/', memoryRoutes);
   api.route('/', decisionRoutes);
   api.route('/', createCostRoutes(costAggregator));
-  api.route('/', evalRoutes);
+  api.route('/', createEvalRoutes(options.evalLoader));
   api.route('/', createPlaygroundRoutes(connMgr));
 
   app.route('/api', api);

@@ -5,8 +5,12 @@ import { getRequestListener } from '@hono/node-server';
 import { WebSocketServer } from 'ws';
 import { createServer } from './server/index.js';
 import { handleWsMessage } from './server/ws/protocol.js';
+import { createEvalLoader } from './eval-loader.js';
+import type { EvalLoaderConfig } from './eval-loader.js';
 import type { AxlRuntime } from '@axlsdk/axl';
 import type { IncomingMessage, ServerResponse, Server } from 'node:http';
+
+export type { EvalLoaderConfig } from './eval-loader.js';
 
 export type StudioMiddlewareOptions = {
   /** The AxlRuntime instance to observe and control. */
@@ -49,6 +53,40 @@ export type StudioMiddlewareOptions = {
    * @default false
    */
   readOnly?: boolean;
+
+  /**
+   * Lazy-load eval files for the Eval Runner panel.
+   *
+   * Eval files are dynamically imported on first access to eval endpoints,
+   * not at middleware construction time. This means:
+   * - Zero cost during normal API operation
+   * - Eval files can import from any module without creating circular deps
+   *   in the static module graph (they're loaded as standalone entry points)
+   * - `@axlsdk/eval` can remain a devDependency — eval files never enter
+   *   the production bundle since bundlers can't see dynamic imports
+   *
+   * Accepts glob patterns, explicit file paths, or an object with
+   * `conditions` for monorepo source export resolution.
+   *
+   * Eval files are loaded once and cached for the middleware's lifetime.
+   * Changes to eval files require a server restart.
+   *
+   * @example
+   * // Single glob pattern
+   * evals: 'evals/*.eval.ts'
+   *
+   * @example
+   * // Multiple patterns
+   * evals: ['libs/api/evals/*.eval.ts', 'libs/ai/evals/*.eval.ts']
+   *
+   * @example
+   * // With import conditions for monorepo source exports
+   * evals: {
+   *   files: 'libs/api/evals/*.eval.ts',
+   *   conditions: ['development'],
+   * }
+   */
+  evals?: EvalLoaderConfig;
 };
 
 /**
@@ -86,12 +124,16 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
     );
   }
 
+  // Create lazy eval loader if eval files are configured
+  const evalLoader = options.evals ? createEvalLoader(options.evals, runtime) : undefined;
+
   const { app, connMgr, traceListener } = createServer({
     runtime,
     staticRoot,
     basePath,
     readOnly,
     cors: false, // Host framework owns CORS policy
+    evalLoader,
   });
 
   // Log production safety warning

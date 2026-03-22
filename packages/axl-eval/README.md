@@ -127,16 +127,73 @@ console.log(comparison.improvements);
 
 ### `defineEval(config)`
 
-Register an eval for CLI discovery:
+Define an eval file for discovery by the CLI or Studio middleware:
 
 ```typescript
-import { defineEval } from '@axlsdk/eval';
+// evals/math.eval.ts
+import { defineEval, dataset, scorer } from '@axlsdk/eval';
+import { z } from 'zod';
+
+const mathDataset = dataset({
+  name: 'math-basics',
+  schema: z.object({ question: z.string() }),
+  annotations: z.object({ answer: z.number() }),
+  items: [
+    { input: { question: '2+2' }, annotations: { answer: 4 } },
+    { input: { question: '3*5' }, annotations: { answer: 15 } },
+  ],
+});
+
+const correctAnswer = scorer({
+  name: 'correct-answer',
+  description: 'Checks if the output contains the expected numeric answer',
+  score: (output, _input, annotations) =>
+    String(output).includes(String(annotations?.answer)) ? 1 : 0,
+});
 
 export default defineEval({
   workflow: 'math-workflow',
-  dataset: ds,
-  scorers: [exactMatch],
+  dataset: mathDataset,
+  scorers: [correctAnswer],
 });
+```
+
+By default, the eval runner calls `runtime.execute(workflow, input)` for each dataset item, which requires the workflow to be registered on the runtime.
+
+For self-contained evals — where you want to call your own code directly instead of going through a registered workflow — export an `executeWorkflow` function alongside the config. This is especially useful in monorepos where importing the runtime would create circular dependencies:
+
+```typescript
+// evals/translate.eval.ts
+import { defineEval, dataset, scorer } from '@axlsdk/eval';
+import { z } from 'zod';
+import { translate } from '../src/services/translation.js'; // import your code directly
+
+const translationDataset = dataset({
+  name: 'translations',
+  schema: z.object({ text: z.string(), targetLang: z.string() }),
+  items: [
+    { input: { text: 'Hello', targetLang: 'es' } },
+    { input: { text: 'Goodbye', targetLang: 'fr' } },
+  ],
+});
+
+const notEmpty = scorer({
+  name: 'not-empty',
+  description: 'Output is non-empty',
+  score: (output) => (String(output).length > 0 ? 1 : 0),
+});
+
+export default defineEval({
+  workflow: 'translation', // label for results (not a runtime lookup)
+  dataset: translationDataset,
+  scorers: [notEmpty],
+});
+
+// Called instead of runtime.execute() — the eval is fully self-contained
+export async function executeWorkflow(input: { text: string; targetLang: string }) {
+  const result = await translate(input.text, input.targetLang);
+  return { output: result };
+}
 ```
 
 ## CLI
@@ -145,14 +202,32 @@ Run evaluations from the command line:
 
 ```bash
 # Run an eval file
-npx axl eval ./evals/math.ts
+npx axl eval ./evals/math.eval.ts
+
+# Run all evals in a directory
+npx axl eval ./evals/
 
 # Save results to a file
-npx axl eval ./evals/math.ts --output ./results/baseline.json
+npx axl eval ./evals/math.eval.ts --output ./results/baseline.json
 
 # Compare two results
 npx axl eval compare ./results/baseline.json ./results/candidate.json
 ```
+
+## Studio Integration
+
+Eval files can also be lazy-loaded by the Studio middleware, enabling the Eval Runner panel without static imports that would create circular dependencies:
+
+```typescript
+import { createStudioMiddleware } from '@axlsdk/studio/middleware';
+
+const studio = createStudioMiddleware({
+  runtime,
+  evals: 'evals/**/*.eval.ts',
+});
+```
+
+See the [@axlsdk/studio README](../axl-studio/README.md#lazy-eval-loading) for details.
 
 ## Integration with AxlRuntime
 

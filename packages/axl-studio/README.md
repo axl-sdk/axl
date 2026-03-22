@@ -202,6 +202,7 @@ studio.upgradeWebSocket(server);
 | `serveClient` | `boolean` | `true` | Serve the pre-built SPA |
 | `verifyUpgrade` | `(req) => boolean \| Promise<boolean>` | — | Auth callback for WebSocket upgrades |
 | `readOnly` | `boolean` | `false` | Disable all mutating endpoints |
+| `evals` | `string \| string[] \| { files, conditions? }` | — | Lazy-load eval files for the Eval Runner panel |
 
 ### Return value
 
@@ -306,6 +307,56 @@ app.use('/studio', studio.handler)                // tells Express
 ```
 
 If they don't match, the SPA will load but API calls will fail (the SPA sends requests to the wrong path).
+
+### Lazy eval loading
+
+In monorepos, eval files often import from domain modules (prompt builders, validators, fixture datasets) that would create circular dependencies if statically imported from the module that owns the runtime. The `evals` option solves this by dynamically importing eval files on first access to the Eval Runner panel — never during normal API operation.
+
+```typescript
+const studio = createStudioMiddleware({
+  runtime,
+  basePath: '/studio',
+  evals: 'evals/**/*.eval.ts',
+});
+```
+
+Eval files are standalone entry points (like `axl.config.ts`). They can import from any module without creating circular deps in the static module graph, and `@axlsdk/eval` can remain a `devDependency` since bundlers can't see dynamic `import()` calls.
+
+**Multiple patterns or explicit paths:**
+
+```typescript
+evals: ['evals/*.eval.ts', 'tests/evals/*.eval.ts']
+```
+
+**Monorepo import conditions** (process-wide via `module.register()`):
+
+```typescript
+evals: {
+  files: 'libs/api/evals/*.eval.ts',
+  conditions: ['development'],
+}
+```
+
+Each file should `export default` a config with `{ workflow, dataset, scorers }` (the result of `defineEval()`). By default, the runtime executes the named workflow for each dataset item. For self-contained evals that don't depend on a registered workflow, export an `executeWorkflow` function — it will be called instead of `runtime.execute()`. See the [`@axlsdk/eval` README](../axl-eval/README.md#defineevalconfig) for details.
+
+Eval names are the file's path relative to the project root (`cwd`), minus the `.eval.*` suffix:
+
+```
+evals/suggestions.eval.ts        → "evals/suggestions"
+evals/api/accuracy.eval.ts       → "evals/api/accuracy"
+libs/search/accuracy.eval.ts     → "libs/search/accuracy"
+```
+
+This makes names completely stable — a file's name never changes regardless of what other files or patterns exist. You can look at a file path and know its eval name.
+
+Lazy-loaded evals coexist with evals registered directly via `runtime.registerEval()`.
+
+**Important notes:**
+
+- **Caching**: Eval files are loaded once on first access and cached for the lifetime of the middleware. Changes to eval files require a server restart to take effect (both the loader and Node.js module cache are one-shot).
+- **Running nested evals**: Names containing `/` must be URL-encoded in the run endpoint: `POST /api/evals/api%2Faccuracy/run`.
+- **Name stability**: Names are project-relative paths, so they never change when other files or patterns are added/removed.
+- **Supported glob patterns**: `dir/*.eval.ts` (single directory), `dir/**/*.eval.ts` (recursive), `**/*.eval.ts` (recursive from cwd). Multi-segment `**` (e.g., `a/**/b/**/*.ts`) is not supported.
 
 ### Security
 

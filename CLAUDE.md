@@ -51,7 +51,7 @@ import { createServer, ConnectionManager, CostAggregator } from '@axlsdk/studio'
 
 // Studio (embeddable middleware)
 import { createStudioMiddleware, handleWsMessage } from '@axlsdk/studio/middleware';
-import type { StudioMiddleware, StudioMiddlewareOptions, StudioWebSocket } from '@axlsdk/studio/middleware';
+import type { StudioMiddleware, StudioMiddlewareOptions, StudioWebSocket, EvalLoaderConfig } from '@axlsdk/studio/middleware';
 ```
 
 ## Living Documentation
@@ -129,6 +129,7 @@ packages/axl-eval/src/
 packages/axl-studio/src/
   cli.ts             — CLI entry: --port, --config, --conditions, --open flags
   middleware.ts      — Embeddable middleware: createStudioMiddleware(), Node.js adapter
+  eval-loader.ts     — Lazy eval file discovery: createEvalLoader(), glob resolution, tsx/conditions
   resolve-runtime.ts — Config module interop (ESM default, CJS wrapping, named exports)
   server/
     index.ts         — createServer() factory, Hono app composition (basePath, readOnly, cors)
@@ -267,6 +268,7 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - Studio: AxlRuntime introspection via `registerTool()`, `registerAgent()`, `registerEval()`, `getWorkflows()`, `getTools()`, `getAgents()`, `getExecutions()`, `getRegisteredEvals()`
 - Studio: `zodToJsonSchema()` exported from core for tool schema rendering in Tool Inspector (wraps `z.toJSONSchema()`)
 - Studio: WebSocket uses channel multiplexing (subscribe/unsubscribe); channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`. Protocol logic in `ws/protocol.ts`, shared between Hono handler and Node.js middleware. Channel names validated against allowlist, 256-char max, 64KB message size limit
-- Studio: Embeddable middleware (`@axlsdk/studio/middleware`): `createStudioMiddleware({ runtime, basePath?, serveClient?, verifyUpgrade?, readOnly? })` returns `{ handler, handleWebSocket, upgradeWebSocket, app, connectionManager, close }`. Works with Express, Fastify, Koa, NestJS, raw `http.Server`, Hono-in-Hono. `verifyUpgrade` callback for WS auth (WS upgrades bypass framework middleware). `readOnly: true` disables mutating endpoints. CORS not applied (host framework responsibility). `basePath` injected at runtime into index.html via `<base>` tag + `window.__AXL_STUDIO_BASE__`
+- Studio: Embeddable middleware (`@axlsdk/studio/middleware`): `createStudioMiddleware({ runtime, basePath?, serveClient?, verifyUpgrade?, readOnly?, evals? })` returns `{ handler, handleWebSocket, upgradeWebSocket, app, connectionManager, close }`. Works with Express, Fastify, Koa, NestJS, raw `http.Server`, Hono-in-Hono. `verifyUpgrade` callback for WS auth (WS upgrades bypass framework middleware). `readOnly: true` disables mutating endpoints. CORS not applied (host framework responsibility). `basePath` injected at runtime into index.html via `<base>` tag + `window.__AXL_STUDIO_BASE__`
+- Studio: Lazy eval loading (`evals` option on middleware): `evals: 'path/*.eval.ts'` or `evals: { files: '...', conditions: ['development'] }`. Dynamically imports eval files on first eval route access (not at startup). Eval files are standalone entry points — can import from any module without circular deps. Supports glob patterns, explicit paths, and monorepo import conditions (process-wide via `module.register()`). Eval names are the file's cwd-relative path minus `.eval.*` suffix: `evals/api/accuracy.eval.ts` → `"evals/api/accuracy"`. Completely stable — names never change when other patterns or files change. Nested names with `/` must be URL-encoded in run endpoint. Coexists with `runtime.registerEval()`. Files cached for middleware lifetime (restart to pick up changes)
 - Studio: `StateStore.listSessions()` optional method for session browsing (implemented in MemoryStore, SQLiteStore, RedisStore)
 - Studio: CLI (`axl-studio`) auto-detects config (`axl.config.mts` → `.ts` → `.mjs` → `.js`), expects `export default runtime`. For `.ts`/`.tsx` configs, registers a `module.register()` resolve hook that forces `format: 'module'` so top-level `await` works in non-`"type":"module"` projects. `--conditions` flag adds custom import conditions via resolve hook (e.g., `--conditions development` for monorepo source exports)

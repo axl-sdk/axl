@@ -141,5 +141,6 @@ Key points:
 - `verifyUpgrade` is critical — WebSocket upgrade requests bypass Express/Fastify/Koa middleware, so auth must be explicitly checked
 - Call `studio.close()` during shutdown to remove event listeners and close WebSocket connections
 - Use `readOnly: true` for production monitoring (disables workflow execution, tool testing, and other mutating endpoints)
+- Use `evals: 'path/to/evals/*.eval.ts'` to lazy-load eval files that would otherwise create circular dependencies (see [Studio README](../packages/axl-studio/README.md#lazy-eval-loading))
 
 See the [@axlsdk/studio README](../packages/axl-studio/README.md) for the full API reference and framework-specific examples.

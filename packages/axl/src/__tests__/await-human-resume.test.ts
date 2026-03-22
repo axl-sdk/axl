@@ -1,4 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { unlinkSync } from 'node:fs';
 import { z } from 'zod';
 import { AxlRuntime } from '../runtime.js';
 import { workflow } from '../workflow.js';
@@ -30,7 +33,30 @@ class TestProvider {
 // Tests
 // ═════════════════════════════════════════════════════════════════════════
 
+/** Poll until at least one pending decision appears (avoids flaky fixed-time sleeps). */
+async function waitForPendingDecision(runtime: AxlRuntime, timeout = 2000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const pending = await runtime.getPendingDecisions();
+    if (pending.length > 0) return pending;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error('Timed out waiting for pending decision');
+}
+
 describe('awaitHuman suspend/resume', () => {
+  // MemoryStore persists awaitHuman state to a shared temp file.
+  // Clean it up before each test to prevent cross-run contamination.
+  const TEMP_FILE = join(tmpdir(), 'axl-memory-store', 'await-human-state.json');
+
+  beforeEach(() => {
+    try {
+      unlinkSync(TEMP_FILE);
+    } catch {
+      // File may not exist
+    }
+  });
+
   it('awaitHuman persists execution state to store', async () => {
     const provider = new TestProvider();
 
@@ -55,8 +81,8 @@ describe('awaitHuman suspend/resume', () => {
     // Start execution in background (it will block on awaitHuman)
     const resultPromise = runtime.execute('approval-flow', { action: 'deploy' });
 
-    // Give it a tick to reach the awaitHuman
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Wait for the workflow to reach awaitHuman
+    await waitForPendingDecision(runtime);
 
     // Check that pending decisions exist
     const pending = await runtime.getPendingDecisions();
@@ -108,9 +134,8 @@ describe('awaitHuman suspend/resume', () => {
     runtime.register(wf);
 
     const resultPromise = runtime.execute('review-flow', { pr: 42 });
-    await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const pending = await runtime.getPendingDecisions();
+    const pending = await waitForPendingDecision(runtime);
     expect(pending).toHaveLength(1);
 
     // Approve the PR
@@ -142,9 +167,8 @@ describe('awaitHuman suspend/resume', () => {
     runtime.register(wf);
 
     const resultPromise = runtime.execute('gate-flow', { item: 'release' });
-    await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const pending = await runtime.getPendingDecisions();
+    const pending = await waitForPendingDecision(runtime);
     await runtime.resolveDecision(pending[0].executionId, {
       approved: false,
       reason: 'not ready',

@@ -116,7 +116,9 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
   const staticRoot = serveClient ? resolveClientDist() : undefined;
 
   if (serveClient && !staticRoot) {
-    const dir = import.meta.dirname ?? dirname(fileURLToPath(import.meta.url));
+    const dir =
+      import.meta.dirname ??
+      (typeof __dirname !== 'undefined' ? __dirname : dirname(fileURLToPath(import.meta.url)));
     console.warn(
       '[axl-studio] serveClient is true but no pre-built client found at ' +
         `${resolve(dir, 'client')}. Studio UI will not be available. ` +
@@ -332,7 +334,9 @@ function normalizeBasePath(raw?: string): string {
 
 function resolveClientDist(): string | undefined {
   // Resolve the directory of this file (dist/ in published package).
-  const dir = import.meta.dirname ?? dirname(fileURLToPath(import.meta.url));
+  const dir =
+    import.meta.dirname ??
+    (typeof __dirname !== 'undefined' ? __dirname : dirname(fileURLToPath(import.meta.url)));
   const candidate = resolve(dir, 'client');
   return existsSync(resolve(candidate, 'index.html')) ? candidate : undefined;
 }

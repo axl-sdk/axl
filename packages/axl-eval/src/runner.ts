@@ -38,8 +38,12 @@ type LlmScorerProvider = {
 
 export async function runEval(
   config: EvalConfig,
-  executeWorkflow: (input: unknown) => Promise<{ output: unknown; cost?: number }>,
+  executeWorkflow: (
+    input: unknown,
+    runtime?: unknown,
+  ) => Promise<{ output: unknown; cost?: number }>,
   provider?: LlmScorerProvider,
+  runtime?: unknown,
 ): Promise<EvalResult> {
   const startTime = Date.now();
   const id = randomUUID();
@@ -78,7 +82,7 @@ export async function runEval(
       scores: {},
     };
     try {
-      const result = await executeWorkflow(item.input);
+      const result = await executeWorkflow(item.input, runtime);
       evalItem.output = result.output;
       if (result.cost != null) {
         totalCost += result.cost;

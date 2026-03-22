@@ -62,7 +62,10 @@ export class AxlRuntime extends EventEmitter {
     string,
     {
       config: unknown;
-      executeWorkflow?: (input: unknown) => Promise<{ output: unknown; cost?: number }>;
+      executeWorkflow?: (
+        input: unknown,
+        runtime?: AxlRuntime,
+      ) => Promise<{ output: unknown; cost?: number }>;
     }
   >();
   private mcpManager?: McpManager;
@@ -185,7 +188,10 @@ export class AxlRuntime extends EventEmitter {
   registerEval(
     name: string,
     config: unknown,
-    executeWorkflow?: (input: unknown) => Promise<{ output: unknown; cost?: number }>,
+    executeWorkflow?: (
+      input: unknown,
+      runtime?: AxlRuntime,
+    ) => Promise<{ output: unknown; cost?: number }>,
   ): void {
     this.registeredEvals.set(name, { config, executeWorkflow });
   }
@@ -219,7 +225,10 @@ export class AxlRuntime extends EventEmitter {
   getRegisteredEval(name: string):
     | {
         config: unknown;
-        executeWorkflow?: (input: unknown) => Promise<{ output: unknown; cost?: number }>;
+        executeWorkflow?: (
+          input: unknown,
+          runtime?: AxlRuntime,
+        ) => Promise<{ output: unknown; cost?: number }>;
       }
     | undefined {
     return this.registeredEvals.get(name);
@@ -231,10 +240,15 @@ export class AxlRuntime extends EventEmitter {
     if (!entry) throw new Error(`Eval "${name}" is not registered`);
 
     if (entry.executeWorkflow) {
-      // Use custom executeWorkflow if provided
+      // Use custom executeWorkflow if provided, injecting this runtime as second arg
       let runEvalFn: (
         config: unknown,
-        executeFn: (input: unknown) => Promise<{ output: unknown; cost?: number }>,
+        executeFn: (
+          input: unknown,
+          runtime?: unknown,
+        ) => Promise<{ output: unknown; cost?: number }>,
+        provider?: unknown,
+        runtime?: unknown,
       ) => Promise<unknown>;
       try {
         // @ts-expect-error — @axlsdk/eval is an optional peer dependency
@@ -244,7 +258,11 @@ export class AxlRuntime extends EventEmitter {
           'axl-eval is required for AxlRuntime.runRegisteredEval(). Install it with: npm install @axlsdk/eval',
         );
       }
-      return runEvalFn(entry.config, entry.executeWorkflow);
+      const executeFn = entry.executeWorkflow as (
+        input: unknown,
+        runtime?: unknown,
+      ) => Promise<{ output: unknown; cost?: number }>;
+      return runEvalFn(entry.config, executeFn, undefined, this);
     }
 
     // Default: use runtime.eval() which creates its own executeWorkflow
@@ -744,7 +762,9 @@ export class AxlRuntime extends EventEmitter {
   }): Promise<unknown> {
     let runEval: (
       config: unknown,
-      executeFn: (input: unknown) => Promise<{ output: unknown; cost?: number }>,
+      executeFn: (input: unknown, runtime?: unknown) => Promise<{ output: unknown; cost?: number }>,
+      provider?: unknown,
+      runtime?: unknown,
     ) => Promise<unknown>;
     try {
       // @ts-expect-error — @axlsdk/eval is an optional peer dependency
@@ -769,7 +789,7 @@ export class AxlRuntime extends EventEmitter {
       }
     };
 
-    return runEval(config, executeWorkflow);
+    return runEval(config, executeWorkflow, undefined, this);
   }
 
   /**

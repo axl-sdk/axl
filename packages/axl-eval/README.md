@@ -160,20 +160,22 @@ export default defineEval({
 
 By default, the eval runner calls `runtime.execute(workflow, input)` for each dataset item, which requires the workflow to be registered on the runtime.
 
-For self-contained evals — where you want to call your own code directly instead of going through a registered workflow — export an `executeWorkflow` function alongside the config. This is especially useful in monorepos where importing the runtime would create circular dependencies:
+For self-contained evals, export an `executeWorkflow` function alongside the config. This is called instead of `runtime.execute()` for each dataset item.
+
+The function receives `(input, runtime?)` — the second argument is the `AxlRuntime` instance when running via Studio or `runtime.runRegisteredEval()`. Use it to call agents without needing a registered workflow:
 
 ```typescript
-// evals/translate.eval.ts
+// evals/qa-quality.eval.ts — calls an agent directly via the runtime
 import { defineEval, dataset, scorer } from '@axlsdk/eval';
 import { z } from 'zod';
-import { translate } from '../src/services/translation.js'; // import your code directly
+import { qaAgent } from '../src/agents/qa.js'; // import your agent definition
 
-const translationDataset = dataset({
-  name: 'translations',
-  schema: z.object({ text: z.string(), targetLang: z.string() }),
+const qaDataset = dataset({
+  name: 'qa-pairs',
+  schema: z.object({ question: z.string() }),
   items: [
-    { input: { text: 'Hello', targetLang: 'es' } },
-    { input: { text: 'Goodbye', targetLang: 'fr' } },
+    { input: { question: 'What is TypeScript?' } },
+    { input: { question: 'How do promises work?' } },
   ],
 });
 
@@ -184,14 +186,25 @@ const notEmpty = scorer({
 });
 
 export default defineEval({
-  workflow: 'translation', // label for results (not a runtime lookup)
-  dataset: translationDataset,
+  workflow: 'qa-quality', // label for results (not a runtime lookup)
+  dataset: qaDataset,
   scorers: [notEmpty],
 });
 
-// Called instead of runtime.execute() — the eval is fully self-contained
-export async function executeWorkflow(input: { text: string; targetLang: string }) {
-  const result = await translate(input.text, input.targetLang);
+export async function executeWorkflow(input: { question: string }, runtime?: any) {
+  // runtime is the AxlRuntime instance — use it to call agents
+  const ctx = runtime.createContext();
+  const output = await ctx.ask(qaAgent, input.question);
+  return { output };
+}
+```
+
+When no runtime is needed (e.g., testing a pure function), just ignore the second argument:
+
+```typescript
+// evals/parser.eval.ts — tests a pure function, no runtime needed
+export async function executeWorkflow(input: { raw: string }) {
+  const result = parseDocument(input.raw);
   return { output: result };
 }
 ```

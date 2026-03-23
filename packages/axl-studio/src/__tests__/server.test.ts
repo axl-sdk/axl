@@ -120,6 +120,76 @@ describe('Studio Server', () => {
     }
   });
 
+  it('basePath injection works for root path (no trailing slash)', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'axl-studio-test-'));
+    writeFileSync(
+      join(tmpDir, 'index.html'),
+      '<!DOCTYPE html><html><head><title>Test</title></head><body></body></html>',
+    );
+
+    try {
+      const runtime = new AxlRuntime();
+      runtime.registerProvider('mock', MockProvider.echo());
+      const { app } = createServer({ runtime, staticRoot: tmpDir, basePath: '/studio' });
+
+      // Root path — previously served raw index.html via serveStatic,
+      // missing the injected <base> tag and __AXL_STUDIO_BASE__
+      const res = await app.request('/');
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('<base href="/studio/">');
+      expect(html).toContain('window.__AXL_STUDIO_BASE__="/studio"');
+    } finally {
+      rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  it('basePath injection works for /index.html direct request', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'axl-studio-test-'));
+    writeFileSync(
+      join(tmpDir, 'index.html'),
+      '<!DOCTYPE html><html><head><title>Test</title></head><body></body></html>',
+    );
+
+    try {
+      const runtime = new AxlRuntime();
+      runtime.registerProvider('mock', MockProvider.echo());
+      const { app } = createServer({ runtime, staticRoot: tmpDir, basePath: '/studio' });
+
+      const res = await app.request('/index.html');
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('<base href="/studio/">');
+      expect(html).toContain('window.__AXL_STUDIO_BASE__="/studio"');
+    } finally {
+      rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  it('static assets still served correctly with basePath', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'axl-studio-test-'));
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(join(tmpDir, 'assets'));
+    writeFileSync(join(tmpDir, 'assets', 'main.js'), 'console.log("hello")');
+    writeFileSync(
+      join(tmpDir, 'index.html'),
+      '<!DOCTYPE html><html><head></head><body></body></html>',
+    );
+
+    try {
+      const runtime = new AxlRuntime();
+      runtime.registerProvider('mock', MockProvider.echo());
+      const { app } = createServer({ runtime, staticRoot: tmpDir, basePath: '/studio' });
+
+      const res = await app.request('/assets/main.js');
+      expect(res.status).toBe(200);
+      const body = await res.text();
+      expect(body).toBe('console.log("hello")');
+    } finally {
+      rmSync(tmpDir, { recursive: true });
+    }
+  });
+
   it('no basePath serves index.html unmodified for SPA fallback', async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'axl-studio-test-'));
     const original =
@@ -131,7 +201,7 @@ describe('Studio Server', () => {
       runtime.registerProvider('mock', MockProvider.echo());
       const { app } = createServer({ runtime, staticRoot: tmpDir });
 
-      // serveStatic with path: '/index.html' serves the fallback
+      // SPA fallback serves the raw index.html (no basePath injection)
       const res = await app.request('/playground');
       expect(res.status).toBe(200);
       const html = await res.text();
@@ -166,6 +236,44 @@ describe('Studio Server', () => {
       // No raw '<' in the injected value (defense-in-depth)
       const scriptMatch = html.match(/window\.__AXL_STUDIO_BASE__=([^<]*?)</);
       expect(scriptMatch).toBeTruthy();
+    } finally {
+      rmSync(tmpDir, { recursive: true });
+    }
+  });
+
+  it('basePath injection works when mounted via Hono app.route()', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'axl-studio-test-'));
+    writeFileSync(
+      join(tmpDir, 'index.html'),
+      '<!DOCTYPE html><html><head><title>Test</title></head><body></body></html>',
+    );
+
+    try {
+      const runtime = new AxlRuntime();
+      runtime.registerProvider('mock', MockProvider.echo());
+      const { app: studioApp } = createServer({
+        runtime,
+        staticRoot: tmpDir,
+        basePath: '/studio',
+        cors: false,
+      });
+
+      const { Hono } = await import('hono');
+      const parentApp = new Hono();
+      parentApp.route('/studio', studioApp);
+
+      // Root of mounted app — the real deployment scenario
+      const rootRes = await parentApp.request('/studio');
+      expect(rootRes.status).toBe(200);
+      const rootHtml = await rootRes.text();
+      expect(rootHtml).toContain('<base href="/studio/">');
+      expect(rootHtml).toContain('window.__AXL_STUDIO_BASE__="/studio"');
+
+      // Sub-path also gets injected HTML
+      const subRes = await parentApp.request('/studio/playground');
+      expect(subRes.status).toBe(200);
+      const subHtml = await subRes.text();
+      expect(subHtml).toContain('<base href="/studio/">');
     } finally {
       rmSync(tmpDir, { recursive: true });
     }

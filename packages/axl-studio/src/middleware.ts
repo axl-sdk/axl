@@ -18,7 +18,12 @@ export type StudioMiddlewareOptions = {
 
   /**
    * URL path prefix where Studio is mounted.
-   * Must match the mount path in your framework.
+   * Must match the mount path in your framework (Express `app.use()`,
+   * Fastify `register()`, Hono `app.route()`, etc.). The framework is
+   * expected to strip the prefix from `req.url` before calling the handler.
+   *
+   * Do not set basePath when using a raw `http.Server` as the root handler —
+   * leave it empty and mount at root instead.
    *
    * Must start with '/' when non-empty. Trailing slashes are stripped.
    * Only URL-safe characters allowed: [a-zA-Z0-9/_-]

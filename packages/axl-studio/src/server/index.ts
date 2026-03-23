@@ -136,55 +136,65 @@ export function createServer(options: CreateServerOptions) {
 
   // ── Static SPA serving (production) ────────────────────────────────
   if (staticRoot) {
-    // Serve static assets (JS, CSS, images).
-    // When basePath is set and this app is mounted via Hono's app.route(),
-    // c.req.path may include the full prefix. rewriteRequestPath strips it
-    // so serveStatic resolves files relative to staticRoot correctly.
-    app.use(
-      '/*',
-      serveStatic({
-        root: staticRoot,
-        rewriteRequestPath: basePath
-          ? (path) => (path.startsWith(basePath) ? path.slice(basePath.length) || '/' : path)
-          : undefined,
-      }),
-    );
+    // Read index.html once at startup. When basePath is set, inject the <base>
+    // tag and runtime config so asset paths and client-side routing work
+    // regardless of whether the mount URL has a trailing slash.
+    const indexPath = resolve(staticRoot, 'index.html');
+    let spaHtml: string | undefined;
 
-    if (basePath) {
-      // Read and inject base path into index.html at startup (not per-request).
-      const indexPath = resolve(staticRoot, 'index.html');
-      if (!existsSync(indexPath)) {
-        console.warn(`[axl-studio] index.html not found at ${indexPath}`);
-      } else {
-        const indexHtml = readFileSync(indexPath, 'utf-8');
+    if (!existsSync(indexPath)) {
+      console.warn(`[axl-studio] index.html not found at ${indexPath}`);
+    } else {
+      const rawHtml = readFileSync(indexPath, 'utf-8');
 
-        // Escape all '<' as '\u003c' to prevent </script> in basePath from
-        // breaking out of the script tag. JSON.stringify alone is insufficient
-        // because the HTML parser processes </script> before JavaScript runs.
+      if (basePath) {
+        // Escape '<' to prevent </script> in basePath from breaking out of
+        // the script tag. JSON.stringify alone is insufficient because the
+        // HTML parser processes </script> before JavaScript runs.
         const safeBasePath = JSON.stringify(basePath).replace(/</g, '\\u003c');
-
-        // Inject both:
-        // 1. <base> tag so relative asset paths (./assets/main.js) resolve
-        //    correctly regardless of trailing slash on the mount URL.
-        // 2. Runtime config script for React Router, API client, and WS client.
-        const injectedHtml = indexHtml.replace(
+        const injected = rawHtml.replace(
           '</head>',
           `<base href="${basePath}/">\n` +
             `<script>window.__AXL_STUDIO_BASE__=${safeBasePath}</script>\n</head>`,
         );
 
-        if (injectedHtml === indexHtml) {
+        if (injected === rawHtml) {
           console.warn(
             '[axl-studio] Could not inject basePath into index.html — ' +
               '</head> tag not found. The SPA may not route correctly.',
           );
         }
-
-        app.get('*', (c) => c.html(injectedHtml));
+        spaHtml = injected;
+      } else {
+        spaHtml = rawHtml;
       }
-    } else {
-      // SPA fallback: serve index.html for non-API, non-WS routes
-      app.get('*', serveStatic({ root: staticRoot, path: '/index.html' }));
+    }
+
+    // Serve static assets (JS, CSS, images). index.html is excluded so the
+    // SPA fallback below always serves the version with basePath injection.
+    // Without this guard, serveStatic would serve the raw index.html for root
+    // requests (/ or /index.html), missing <base> and __AXL_STUDIO_BASE__.
+    const staticHandler = serveStatic({
+      root: staticRoot,
+      rewriteRequestPath: basePath
+        ? (path) => (path.startsWith(basePath) ? path.slice(basePath.length) || '/' : path)
+        : undefined,
+    });
+
+    app.use('/*', async (c, next) => {
+      const reqPath = c.req.path;
+      const resolved =
+        basePath && reqPath.startsWith(basePath) ? reqPath.slice(basePath.length) || '/' : reqPath;
+      if (resolved === '/' || resolved === '/index.html') {
+        return next();
+      }
+      return staticHandler(c, next);
+    });
+
+    // SPA fallback: serve the (possibly injected) index.html for all
+    // non-API, non-static-asset routes so React Router handles routing.
+    if (spaHtml) {
+      app.get('*', (c) => c.html(spaHtml!));
     }
   }
 

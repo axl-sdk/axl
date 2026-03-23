@@ -138,6 +138,15 @@ export class WorkflowContext<TInput = unknown> {
   readonly executionId: string;
   readonly metadata: Record<string, unknown>;
 
+  /**
+   * Total cost accumulated by agent calls in this context.
+   * Inside a `ctx.budget()` block, returns only that block's cost.
+   * After the block completes, the nested cost is rolled up into the parent total.
+   */
+  get totalCost(): number {
+    return this.budgetContext?.totalCost ?? 0;
+  }
+
   private config: AxlConfig;
   private providerRegistry: ProviderRegistry;
   private sessionHistory: ChatMessage[];
@@ -2037,6 +2046,13 @@ export class WorkflowContext<TInput = unknown> {
       return decision;
     }
 
+    if (!this.pendingDecisions) {
+      throw new Error(
+        'Tool requires approval but no approval handler is configured. ' +
+          'Provide awaitHumanHandler to createContext() or use runtime.execute() with workflow infrastructure.',
+      );
+    }
+
     if (this.stateStore) {
       await this.stateStore.savePendingDecision(this.executionId, {
         executionId: this.executionId,
@@ -2066,7 +2082,7 @@ export class WorkflowContext<TInput = unknown> {
     });
 
     const decision = await new Promise<HumanDecision>((resolve) => {
-      this.pendingDecisions?.set(this.executionId, resolve);
+      this.pendingDecisions!.set(this.executionId, resolve);
     });
 
     // Update execution state to running after decision is received

@@ -196,7 +196,7 @@ export async function executeWorkflow(input: { question: string }, runtime?: Axl
   if (!runtime) throw new Error('This eval requires a runtime — run via Studio or runtime.runRegisteredEval()');
   const ctx = runtime.createContext();
   const output = await ctx.ask(qaAgent, input.question);
-  return { output };
+  return { output }; // cost tracked automatically via runtime.trackCost()
 }
 ```
 
@@ -212,7 +212,79 @@ export async function executeWorkflow(input: { raw: string }) {
 
 > **Note:** The CLI (`npx axl eval`) does not provide a runtime to `executeWorkflow`. Eval files that call agents via `runtime.createContext()` must be run through Studio or `runtime.runRegisteredEval()`.
 
-> **Cost tracking:** The default path (no `executeWorkflow` export) tracks cost automatically via runtime trace events. Custom `executeWorkflow` functions must return `{ output, cost }` manually if cost tracking is needed — `createContext()` does not capture cost automatically.
+### Cost Tracking
+
+Cost is tracked automatically. You don't need to return `cost` from your `executeWorkflow` — the eval runner wraps each item with `runtime.trackCost()`, which captures cost from all `createContext()` and `execute()` calls.
+
+```typescript
+export async function executeWorkflow(input: { question: string }, runtime?: AxlRuntime) {
+  const ctx = runtime!.createContext();
+  const output = await ctx.ask(myAgent, input.question);
+  return { output }; // cost captured automatically
+}
+```
+
+To override the automatic cost (e.g., to exclude setup calls), return it explicitly:
+
+```typescript
+return { output, cost: ctx.totalCost };
+```
+
+You can also read `ctx.totalCost` at any point to inspect accumulated cost.
+
+### Common Patterns
+
+**Budget per item** — cap cost to prevent runaway evals:
+
+```typescript
+export async function executeWorkflow(input: { question: string }, runtime?: AxlRuntime) {
+  const ctx = runtime!.createContext({ budget: '$0.50' });
+  const output = await ctx.ask(myAgent, input.question);
+  return { output };
+}
+```
+
+**Timeout per item** — cancel items that take too long:
+
+```typescript
+export async function executeWorkflow(input: { question: string }, runtime?: AxlRuntime) {
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 30_000);
+  const ctx = runtime!.createContext({ signal: controller.signal });
+  const output = await ctx.ask(myAgent, input.question);
+  return { output };
+}
+```
+
+**Auto-approve tools** — when testing agents that have tools with `requireApproval`:
+
+```typescript
+export async function executeWorkflow(input: { question: string }, runtime?: AxlRuntime) {
+  const ctx = runtime!.createContext({
+    awaitHumanHandler: async () => ({ approved: true }),
+  });
+  const output = await ctx.ask(myAgent, input.question);
+  return { output };
+}
+```
+
+**Multi-turn evaluation** — test follow-up responses with conversation history:
+
+```typescript
+export async function executeWorkflow(
+  input: { setupPrompt: string; setupResponse: string; followUp: string },
+  runtime?: AxlRuntime,
+) {
+  const ctx = runtime!.createContext({
+    sessionHistory: [
+      { role: 'user', content: input.setupPrompt },
+      { role: 'assistant', content: input.setupResponse },
+    ],
+  });
+  const output = await ctx.ask(myAgent, input.followUp);
+  return { output };
+}
+```
 
 ## CLI
 

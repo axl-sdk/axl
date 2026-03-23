@@ -38,7 +38,7 @@ import { GuardrailError, ValidationError } from '@axlsdk/axl';
 import type { ToolHooks, HandoffRecord, AgentCallInfo } from '@axlsdk/axl';
 
 // Provider types
-import type { Effort, ToolChoice, ChatOptions, DelegateOptions } from '@axlsdk/axl';
+import type { Effort, ToolChoice, ChatOptions, DelegateOptions, CreateContextOptions } from '@axlsdk/axl';
 
 // Testing
 import { AxlTestRuntime, MockProvider, MockTool } from '@axlsdk/testing';
@@ -263,7 +263,8 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - StreamEvent union includes 'tool_approval' and handoff 'mode' field
 - `ctx.delegate()` creates a temporary router agent with handoffs; single-agent case short-circuits to `ctx.ask()`. Router defaults to first candidate's model, `temperature: 0`, `maxTurns: 2`
 - Studio: Hono server wraps AxlRuntime with REST API (`/api/*`) + WebSocket (`/ws`); React SPA served from `dist/client/`. Two modes: standalone CLI (`axl-studio`) and embeddable middleware (`createStudioMiddleware()` from `@axlsdk/studio/middleware`)
-- `AxlRuntime.createContext({ metadata? })` creates a lightweight `WorkflowContext` for ad-hoc tool testing and prototyping (has providers, state, MCP, telemetry — no session/streaming/budget)
+- `AxlRuntime.createContext(options?)` creates a `WorkflowContext` for ad-hoc tool testing, evals, and prototyping. Options: `metadata`, `budget`, `signal`, `sessionHistory`, `onToken`, `awaitHumanHandler`. Auto-wires `onTrace` to the runtime's `EventEmitter` and always creates a `budgetContext` (`limit: Infinity` by default) for cost accumulation. `ctx.totalCost` getter returns accumulated cost
+- `runtime.trackCost(fn)` wraps an async function with `AsyncLocalStorage`-based cost attribution; returns `{ result, cost }`. Used internally by eval runner for per-item cost scoping
 - Studio: `POST /api/tools/:name/test` uses `tool.run(ctx, input)` with a context from `runtime.createContext()` so agent-as-tool handlers work
 - Studio: AxlRuntime introspection via `registerTool()`, `registerAgent()`, `registerEval()`, `getWorkflows()`, `getTools()`, `getAgents()`, `getExecutions()`, `getRegisteredEvals()`
 - Studio: `zodToJsonSchema()` exported from core for tool schema rendering in Tool Inspector (wraps `z.toJSONSchema()`)

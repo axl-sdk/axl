@@ -1,9 +1,10 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { AxlConfig } from './config.js';
-import { resolveConfig } from './config.js';
+import { parseCost, resolveConfig } from './config.js';
 import type { Workflow } from './workflow.js';
 import type { Tool } from './tool.js';
 import type { Agent } from './agent.js';
@@ -21,6 +22,7 @@ import type {
   TraceEvent,
   ExecutionInfo,
   HumanDecision,
+  AwaitHumanOptions,
   ChatMessage,
   HandoffRecord,
 } from './types.js';
@@ -41,6 +43,29 @@ function hashInput(input: unknown): string {
 export type ExecuteOptions = {
   metadata?: Record<string, unknown>;
 };
+
+export type CreateContextOptions = {
+  metadata?: Record<string, unknown>;
+  /** Cost budget for the context (e.g., '$0.50'). Enforced via finish_and_stop policy. */
+  budget?: string;
+  /** Abort signal for cancellation/timeouts. */
+  signal?: AbortSignal;
+  /** Prior conversation history for multi-turn eval testing. */
+  sessionHistory?: ChatMessage[];
+  /** Token streaming callback. */
+  onToken?: (token: string) => void;
+  /** Handler for tool approval requests. Called when an agent invokes a tool with requireApproval. */
+  awaitHumanHandler?: (options: AwaitHumanOptions) => Promise<HumanDecision>;
+};
+
+/** Cost scope for tracking cost across async boundaries via AsyncLocalStorage. */
+type CostScope = {
+  totalCost: number;
+  trackedIds: Set<string>;
+  parent?: CostScope;
+};
+
+const costScopeStorage = new AsyncLocalStorage<CostScope>();
 
 /**
  * The main entry point for executing Axl workflows.
@@ -258,11 +283,24 @@ export class AxlRuntime extends EventEmitter {
           'axl-eval is required for AxlRuntime.runRegisteredEval(). Install it with: npm install @axlsdk/eval',
         );
       }
-      const executeFn = entry.executeWorkflow as (
+      const originalExecuteFn = entry.executeWorkflow as (
         input: unknown,
         runtime?: unknown,
       ) => Promise<{ output: unknown; cost?: number }>;
-      return runEvalFn(entry.config, executeFn, undefined, this);
+
+      // Wrap with trackCost for transparent cost capture
+      const wrappedExecuteFn = async (
+        input: unknown,
+        runtime?: unknown,
+      ): Promise<{ output: unknown; cost?: number }> => {
+        const { result, cost: trackedCost } = await this.trackCost(async () => {
+          return originalExecuteFn(input, runtime);
+        });
+        // Prefer user-supplied cost if present, fall back to tracked cost
+        return { output: result.output, cost: result.cost ?? trackedCost };
+      };
+
+      return runEvalFn(entry.config, wrappedExecuteFn, undefined, this);
     }
 
     // Default: use runtime.eval() which creates its own executeWorkflow
@@ -284,14 +322,20 @@ export class AxlRuntime extends EventEmitter {
   }
 
   /**
-   * Create a lightweight WorkflowContext for ad-hoc use (tool testing, prototyping).
-   * The context has access to the runtime's providers, state store, and MCP manager
-   * but no session history, streaming callbacks, or budget tracking.
+   * Create a WorkflowContext for ad-hoc use (evals, tool testing, prototyping).
+   * The context has access to the runtime's providers, state store, MCP manager,
+   * and automatically emits trace events and tracks cost.
    */
-  createContext(options?: { metadata?: Record<string, unknown> }): WorkflowContext {
+  createContext(options?: CreateContextOptions): WorkflowContext {
+    const executionId = randomUUID();
+    const budgetLimit = options?.budget ? parseCost(options.budget) : Infinity;
+
+    // Register with active cost scope for trackCost() attribution
+    this.registerWithCostScope(executionId);
+
     return new WorkflowContext({
       input: undefined,
-      executionId: randomUUID(),
+      executionId,
       metadata: options?.metadata,
       config: this.config,
       providerRegistry: this.providerRegistry,
@@ -299,6 +343,20 @@ export class AxlRuntime extends EventEmitter {
       mcpManager: this.mcpManager,
       spanManager: this.spanManager,
       memoryManager: this.memoryManager,
+      sessionHistory: options?.sessionHistory,
+      signal: options?.signal,
+      onToken: options?.onToken,
+      awaitHumanHandler: options?.awaitHumanHandler,
+      onTrace: (event: TraceEvent) => {
+        this.emit('trace', event);
+        this.outputTraceEvent(event);
+      },
+      budgetContext: {
+        totalCost: 0,
+        limit: budgetLimit,
+        exceeded: false,
+        policy: 'finish_and_stop',
+      },
     });
   }
 
@@ -321,6 +379,9 @@ export class AxlRuntime extends EventEmitter {
     const executionId = randomUUID();
     const controller = new AbortController();
     this.abortControllers.set(executionId, controller);
+
+    // Register with active cost scope for trackCost() attribution
+    this.registerWithCostScope(executionId);
 
     // Create execution info
     const execInfo: ExecutionInfo = {
@@ -373,6 +434,12 @@ export class AxlRuntime extends EventEmitter {
       memoryManager: this.memoryManager,
       resumeMode: !!options?.metadata?.resumeMode,
       spanManager: this.spanManager,
+      budgetContext: {
+        totalCost: 0,
+        limit: Infinity,
+        exceeded: false,
+        policy: 'finish_and_stop',
+      },
     });
 
     // Emit workflow start trace
@@ -445,6 +512,9 @@ export class AxlRuntime extends EventEmitter {
       const executionId = randomUUID();
       this.abortControllers.set(executionId, controller);
       const sessionHistory = (options?.metadata?.sessionHistory as ChatMessage[]) ?? undefined;
+
+      // Register with active cost scope for trackCost() attribution
+      this.registerWithCostScope(executionId);
 
       // Create execution info for stream executions
       execInfo = {
@@ -544,6 +614,12 @@ export class AxlRuntime extends EventEmitter {
         memoryManager: this.memoryManager,
         resumeMode: !!options?.metadata?.resumeMode,
         spanManager: this.spanManager,
+        budgetContext: {
+          totalCost: 0,
+          limit: Infinity,
+          exceeded: false,
+          policy: 'finish_and_stop',
+        },
       });
 
       return this.spanManager.withSpanAsync(
@@ -776,17 +852,10 @@ export class AxlRuntime extends EventEmitter {
     }
 
     const executeWorkflow = async (input: unknown): Promise<{ output: unknown; cost?: number }> => {
-      let cost = 0;
-      const costListener = (event: TraceEvent) => {
-        if (event.cost) cost += event.cost;
-      };
-      this.on('trace', costListener);
-      try {
-        const output = await this.execute(config.workflow, input);
-        return { output, cost };
-      } finally {
-        this.off('trace', costListener);
-      }
+      const { result, cost } = await this.trackCost(async () => {
+        return this.execute(config.workflow, input);
+      });
+      return { output: result, cost };
     };
 
     return runEval(config, executeWorkflow, undefined, this);
@@ -810,6 +879,51 @@ export class AxlRuntime extends EventEmitter {
     }
 
     return evalCompareFn(baseline, candidate);
+  }
+
+  /**
+   * Track cost across any runtime operations within the given function.
+   * Uses AsyncLocalStorage to scope cost attribution to specific execution IDs,
+   * making it correct with concurrent calls.
+   *
+   * Works with both `createContext()` and `execute()` calls inside `fn`.
+   */
+  async trackCost<T>(fn: () => Promise<T>): Promise<{ result: T; cost: number }> {
+    const parentScope = costScopeStorage.getStore();
+    const scope: CostScope = {
+      totalCost: 0,
+      trackedIds: new Set(),
+      parent: parentScope,
+    };
+
+    const costListener = (event: TraceEvent) => {
+      if (event.cost && scope.trackedIds.has(event.executionId)) {
+        scope.totalCost += event.cost;
+      }
+    };
+
+    // Temporarily increase maxListeners to avoid warnings at high concurrency
+    this.setMaxListeners(this.getMaxListeners() + 1);
+    this.on('trace', costListener);
+    try {
+      const result = await costScopeStorage.run(scope, fn);
+      return { result, cost: scope.totalCost };
+    } finally {
+      this.off('trace', costListener);
+      this.setMaxListeners(this.getMaxListeners() - 1);
+    }
+  }
+
+  /** Register an execution ID with the active cost scope for trackCost() attribution. */
+  private registerWithCostScope(executionId: string): void {
+    const costScope = costScopeStorage.getStore();
+    if (costScope) {
+      let scope: CostScope | undefined = costScope;
+      while (scope) {
+        scope.trackedIds.add(executionId);
+        scope = scope.parent;
+      }
+    }
   }
 
   /**

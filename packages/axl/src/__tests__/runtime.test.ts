@@ -1216,4 +1216,285 @@ describe('createContext()', () => {
     expect(ctx2.executionId).toBeDefined();
     expect(ctx1.executionId).not.toBe(ctx2.executionId);
   });
+
+  it('emits trace events to the runtime EventEmitter', async () => {
+    const { runtime } = createRuntime();
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const traces: TraceEvent[] = [];
+    runtime.on('trace', (event: TraceEvent) => traces.push(event));
+
+    const ctx = runtime.createContext();
+    await ctx.ask(testAgent, 'hello');
+
+    expect(traces.length).toBeGreaterThan(0);
+    expect(traces.some((t) => t.type === 'agent_call')).toBe(true);
+  });
+
+  it('tracks cost via totalCost getter', async () => {
+    const provider = new TestProvider([{ content: 'result', cost: 0.05 }]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const ctx = runtime.createContext();
+    expect(ctx.totalCost).toBe(0);
+
+    await ctx.ask(testAgent, 'hello');
+    expect(ctx.totalCost).toBe(0.05);
+  });
+
+  it('accumulates cost across multiple asks', async () => {
+    const provider = new TestProvider([
+      { content: 'a', cost: 0.03 },
+      { content: 'b', cost: 0.07 },
+    ]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const ctx = runtime.createContext();
+    await ctx.ask(testAgent, 'first');
+    await ctx.ask(testAgent, 'second');
+    expect(ctx.totalCost).toBeCloseTo(0.1);
+  });
+
+  it('enforces budget limit', async () => {
+    const provider = new TestProvider([
+      { content: 'a', cost: 0.3 },
+      { content: 'b', cost: 0.3 },
+    ]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const ctx = runtime.createContext({ budget: '$0.50' });
+    await ctx.ask(testAgent, 'first');
+    expect(ctx.totalCost).toBeCloseTo(0.3);
+
+    const status = ctx.getBudgetStatus();
+    expect(status).not.toBeNull();
+    expect(status!.limit).toBe(0.5);
+    expect(status!.spent).toBeCloseTo(0.3);
+    expect(status!.remaining).toBeCloseTo(0.2);
+
+    // Second call pushes past the $0.50 limit — finish_and_stop lets it complete
+    // but marks budget as exceeded
+    await ctx.ask(testAgent, 'second');
+    expect(ctx.totalCost).toBeCloseTo(0.6);
+    expect(ctx.getBudgetStatus()!.remaining).toBe(0);
+  });
+
+  it('accepts signal option without error', () => {
+    const { runtime } = createRuntime();
+    const controller = new AbortController();
+
+    const ctx = runtime.createContext({ signal: controller.signal });
+    expect(ctx).toBeDefined();
+    expect(ctx.executionId).toBeDefined();
+  });
+
+  it('passes sessionHistory to the context', async () => {
+    const provider = new TestProvider([{ content: 'follow-up answer' }]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const ctx = runtime.createContext({
+      sessionHistory: [
+        { role: 'user', content: 'prior question' },
+        { role: 'assistant', content: 'prior answer' },
+      ],
+    });
+    await ctx.ask(testAgent, 'follow-up');
+
+    // The provider should receive the session history + new message
+    expect(provider.calls[0].messages.length).toBeGreaterThan(1);
+    expect(provider.calls[0].messages.some((m: any) => m.content === 'prior question')).toBe(true);
+  });
+
+  it('accepts onToken option without error', async () => {
+    const { runtime } = createRuntime();
+
+    const ctx = runtime.createContext({
+      onToken: () => {},
+    });
+    expect(ctx).toBeDefined();
+  });
+
+  it('passes awaitHumanHandler to the context', async () => {
+    const provider = new TestProvider([
+      {
+        content: '',
+        tool_calls: [
+          { id: 'tc1', type: 'function', function: { name: 'danger', arguments: '{}' } },
+        ],
+      },
+      { content: 'done' },
+    ]);
+    const { runtime } = createRuntime(provider);
+
+    const dangerTool = tool({
+      name: 'danger',
+      description: 'dangerous action',
+      input: z.object({}),
+      requireApproval: true,
+      handler: async () => 'executed',
+    });
+
+    const testAgent = agent({
+      name: 'test',
+      model: 'test:default',
+      system: 'test',
+      tools: [dangerTool],
+    });
+
+    const approvalCalls: any[] = [];
+    const ctx = runtime.createContext({
+      awaitHumanHandler: async (options) => {
+        approvalCalls.push(options);
+        return { approved: true };
+      },
+    });
+
+    await ctx.ask(testAgent, 'do the dangerous thing');
+    expect(approvalCalls.length).toBe(1);
+    expect(approvalCalls[0].channel).toBe('tool_approval');
+  });
+
+  it('throws when tool requires approval but no handler is configured', async () => {
+    const provider = new TestProvider([
+      {
+        content: '',
+        tool_calls: [
+          { id: 'tc1', type: 'function', function: { name: 'danger', arguments: '{}' } },
+        ],
+      },
+    ]);
+    const { runtime } = createRuntime(provider);
+
+    const dangerTool = tool({
+      name: 'danger',
+      description: 'dangerous action',
+      input: z.object({}),
+      requireApproval: true,
+      handler: async () => 'executed',
+    });
+
+    const testAgent = agent({
+      name: 'test',
+      model: 'test:default',
+      system: 'test',
+      tools: [dangerTool],
+    });
+
+    const ctx = runtime.createContext();
+    await expect(ctx.ask(testAgent, 'do the dangerous thing')).rejects.toThrow(
+      /no approval handler/i,
+    );
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// trackCost()
+// ═════════════════════════════════════════════════════════════════════════
+
+describe('trackCost()', () => {
+  it('captures cost from createContext + ctx.ask()', async () => {
+    const provider = new TestProvider([{ content: 'answer', cost: 0.05 }]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const { result, cost } = await runtime.trackCost(async () => {
+      const ctx = runtime.createContext();
+      return ctx.ask(testAgent, 'hello');
+    });
+
+    expect(result).toBe('answer');
+    expect(cost).toBeCloseTo(0.05);
+  });
+
+  it('captures cost from runtime.execute()', async () => {
+    const provider = new TestProvider([{ content: 'result', cost: 0.1 }]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const wf = workflow({
+      name: 'test-wf',
+      input: z.object({ q: z.string() }),
+      handler: async (ctx) => ctx.ask(testAgent, ctx.input.q),
+    });
+    runtime.register(wf);
+
+    const { result, cost } = await runtime.trackCost(async () => {
+      return runtime.execute('test-wf', { q: 'hello' });
+    });
+
+    expect(result).toBe('result');
+    expect(cost).toBeCloseTo(0.1);
+  });
+
+  it('isolates cost between concurrent trackCost calls', async () => {
+    const provider = new TestProvider([
+      { content: 'a', cost: 0.01 },
+      { content: 'b', cost: 0.02 },
+    ]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const [r1, r2] = await Promise.all([
+      runtime.trackCost(async () => {
+        const ctx = runtime.createContext();
+        return ctx.ask(testAgent, 'first');
+      }),
+      runtime.trackCost(async () => {
+        const ctx = runtime.createContext();
+        return ctx.ask(testAgent, 'second');
+      }),
+    ]);
+
+    // Total cost across both scopes equals the sum of individual costs (no double-counting)
+    expect(r1.cost + r2.cost).toBeCloseTo(0.03);
+    // Neither scope saw both costs — each saw exactly one agent call
+    expect(r1.cost).not.toBeCloseTo(0.03);
+    expect(r2.cost).not.toBeCloseTo(0.03);
+  });
+
+  it('supports nested trackCost with correct rollup', async () => {
+    const provider = new TestProvider([
+      { content: 'inner', cost: 0.05 },
+      { content: 'outer', cost: 0.1 },
+    ]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const { cost: outerCost } = await runtime.trackCost(async () => {
+      const { cost: innerCost } = await runtime.trackCost(async () => {
+        const ctx = runtime.createContext();
+        return ctx.ask(testAgent, 'inner');
+      });
+      expect(innerCost).toBeCloseTo(0.05);
+
+      const ctx = runtime.createContext();
+      return ctx.ask(testAgent, 'outer');
+    });
+
+    // Outer scope should include both inner and outer costs
+    expect(outerCost).toBeCloseTo(0.15);
+  });
+
+  it('propagates errors and cleans up listeners', async () => {
+    const provider = new TestProvider([{ content: 'partial', cost: 0.05 }]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const listenersBefore = runtime.listenerCount('trace');
+
+    await expect(
+      runtime.trackCost(async () => {
+        const ctx = runtime.createContext();
+        await ctx.ask(testAgent, 'hello');
+        throw new Error('mid-execution failure');
+      }),
+    ).rejects.toThrow('mid-execution failure');
+
+    // Listener should be cleaned up even after error
+    expect(runtime.listenerCount('trace')).toBe(listenersBefore);
+  });
 });

@@ -173,16 +173,58 @@ const myWorkflow = workflow({
 
 ### `runtime.createContext(options?)`
 
-Create a lightweight `WorkflowContext` for ad-hoc use outside of workflows (e.g., tool testing, prototyping). The context has access to the runtime's providers, state store, MCP, telemetry, and memory — but no session history, streaming callbacks, or budget tracking.
+Create a `WorkflowContext` for ad-hoc use outside of workflows — evals, tool testing, prototyping. The context automatically emits trace events to the runtime's EventEmitter and tracks cost. Traces from ad-hoc contexts are visible in Studio's cost dashboard and trace explorer.
 
 ```typescript
-const ctx = runtime.createContext({ metadata: { env: 'test' } });
-const result = await myTool.run(ctx, { query: 'hello' });
+const ctx = runtime.createContext();
+const answer = await ctx.ask(myAgent, 'hello');
+console.log(ctx.totalCost); // accumulated cost from all agent calls
 ```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `metadata` | `Record<string, unknown>` | `{}` | Metadata passed to the context |
+| `budget` | `string` | — | Cost budget (e.g., `'$0.50'`). Enforced via `finish_and_stop` policy |
+| `signal` | `AbortSignal` | — | Abort signal for cancellation/timeouts |
+| `sessionHistory` | `ChatMessage[]` | — | Prior conversation history for multi-turn testing |
+| `onToken` | `(token: string) => void` | — | Token streaming callback |
+| `awaitHumanHandler` | `(options) => Promise<HumanDecision>` | — | Handler for tool approval requests. Required when the agent uses tools with `requireApproval` — without it, the call throws a clear error |
+
+**When to use vs. workflows:** Use `createContext()` when you want to call agents without registering a workflow — eval files, one-off scripts, tests, API endpoints. Use `runtime.execute()` when you want execution lifecycle tracking (status, duration, history in Studio's executions panel).
+
+**Budget and timeout:**
+
+```typescript
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 30_000);
+
+const ctx = runtime.createContext({
+  budget: '$1.00',
+  signal: controller.signal,
+});
+```
+
+**Tool approval in evals:**
+
+```typescript
+const ctx = runtime.createContext({
+  awaitHumanHandler: async () => ({ approved: true }), // auto-approve in evals
+});
+```
+
+### `runtime.trackCost(fn)`
+
+Track cost across any runtime operations within `fn`. Returns `{ result, cost }`. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
+
+```typescript
+const { result, cost } = await runtime.trackCost(async () => {
+  const ctx = runtime.createContext();
+  return ctx.ask(myAgent, 'hello');
+});
+console.log(`Cost: $${cost}`);
+```
+
+The eval runner uses `trackCost` internally to capture cost automatically for each eval item, including evals that use custom `executeWorkflow` functions.
 
 ---
 
@@ -423,6 +465,16 @@ if (result.budgetExceeded) {
 **Returns:** `BudgetResult<T>`: `{ value: T | null, budgetExceeded: boolean, totalCost: number }`
 
 **Nesting:** Budget blocks can be nested. Inner budgets roll their costs up to the parent.
+
+### `ctx.totalCost`
+
+Read-only getter returning the total cost accumulated by agent calls in this context. Inside a `ctx.budget()` block, returns only that block's accumulated cost; after the block completes, the nested cost is rolled up into the parent total.
+
+```typescript
+const ctx = runtime.createContext();
+await ctx.ask(agent, 'hello');
+console.log(ctx.totalCost); // e.g. 0.05
+```
 
 ---
 

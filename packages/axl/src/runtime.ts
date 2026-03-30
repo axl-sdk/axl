@@ -270,10 +270,10 @@ export class AxlRuntime extends EventEmitter {
         config: unknown,
         executeFn: (
           input: unknown,
-          runtime?: unknown,
+          runtime: unknown,
         ) => Promise<{ output: unknown; cost?: number }>,
-        provider?: unknown,
-        runtime?: unknown,
+        provider: unknown,
+        runtime: unknown,
       ) => Promise<unknown>;
       try {
         // @ts-expect-error — @axlsdk/eval is an optional peer dependency
@@ -285,13 +285,13 @@ export class AxlRuntime extends EventEmitter {
       }
       const originalExecuteFn = entry.executeWorkflow as (
         input: unknown,
-        runtime?: unknown,
+        runtime: unknown,
       ) => Promise<{ output: unknown; cost?: number }>;
 
       // Wrap with trackCost for transparent cost capture
       const wrappedExecuteFn = async (
         input: unknown,
-        runtime?: unknown,
+        runtime: unknown,
       ): Promise<{ output: unknown; cost?: number }> => {
         const { result, cost: trackedCost } = await this.trackCost(async () => {
           return originalExecuteFn(input, runtime);
@@ -836,15 +836,15 @@ export class AxlRuntime extends EventEmitter {
     budget?: string;
     metadata?: Record<string, unknown>;
   }): Promise<unknown> {
-    let runEval: (
+    let runEvalFn: (
       config: unknown,
-      executeFn: (input: unknown, runtime?: unknown) => Promise<{ output: unknown; cost?: number }>,
-      provider?: unknown,
-      runtime?: unknown,
+      executeFn: (input: unknown, runtime: unknown) => Promise<{ output: unknown; cost?: number }>,
+      provider: unknown,
+      runtime: unknown,
     ) => Promise<unknown>;
     try {
       // @ts-expect-error — @axlsdk/eval is an optional peer dependency
-      ({ runEval } = await import('@axlsdk/eval'));
+      ({ runEval: runEvalFn } = await import('@axlsdk/eval'));
     } catch {
       throw new Error(
         'axl-eval is required for AxlRuntime.eval(). Install it with: npm install @axlsdk/eval',
@@ -858,7 +858,7 @@ export class AxlRuntime extends EventEmitter {
       return { output: result, cost };
     };
 
-    return runEval(config, executeWorkflow, undefined, this);
+    return runEvalFn(config, executeWorkflow, undefined, this);
   }
 
   /**

@@ -124,7 +124,8 @@ packages/axl-eval/src/
   define-eval.ts     — defineEval() (identity, for CLI discovery)
   runner.ts          — runEval() with concurrent execution
   compare.ts         — evalCompare() regression/improvement detection
-  cli.ts             — CLI entry point
+  cli.ts             — CLI entry: --config, --conditions, --output flags
+  cli-utils.ts       — Config detection, tsx loader, ESM forcing, conditions, resolveRuntime
 
 packages/axl-studio/src/
   cli.ts             — CLI entry: --port, --config, --conditions, --open flags
@@ -272,4 +273,5 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - Studio: Embeddable middleware (`@axlsdk/studio/middleware`): `createStudioMiddleware({ runtime, basePath?, serveClient?, verifyUpgrade?, readOnly?, evals? })` returns `{ handler, handleWebSocket, upgradeWebSocket, app, connectionManager, close }`. Works with Express, Fastify, Koa, NestJS, raw `http.Server`, Hono-in-Hono. `verifyUpgrade` callback for WS auth (WS upgrades bypass framework middleware). `readOnly: true` disables mutating endpoints. CORS not applied (host framework responsibility). `basePath` injected at runtime into index.html via `<base>` tag + `window.__AXL_STUDIO_BASE__`
 - Studio: Lazy eval loading (`evals` option on middleware): `evals: 'path/*.eval.ts'` or `evals: { files: '...', conditions: ['development'] }`. Dynamically imports eval files on first eval route access (not at startup). Eval files are standalone entry points — can import from any module without circular deps. Supports glob patterns, explicit paths, and monorepo import conditions (process-wide via `module.register()`). Eval names are the file's cwd-relative path minus `.eval.*` suffix: `evals/api/accuracy.eval.ts` → `"evals/api/accuracy"`. Completely stable — names never change when other patterns or files change. Nested names with `/` must be URL-encoded in run endpoint. Coexists with `runtime.registerEval()`. Files cached for middleware lifetime (restart to pick up changes)
 - Studio: `StateStore.listSessions()` optional method for session browsing (implemented in MemoryStore, SQLiteStore, RedisStore)
+- Eval CLI: `axl-eval` binary resolves runtime via three-tier: `--config <path>` → auto-detect `axl.config.*` → bare `new AxlRuntime()`. Supports `--conditions` for monorepo imports. Wraps `executeWorkflow` with `runtime.trackCost()`. Calls `runtime.shutdown()` on completion. Config resolution utilities (tsx loader, ESM forcing, conditions) are copied from studio (can't import from studio due to dependency direction)
 - Studio: CLI (`axl-studio`) auto-detects config (`axl.config.mts` → `.ts` → `.mjs` → `.js`), expects `export default runtime`. For `.ts`/`.tsx` configs, registers a `module.register()` resolve hook that forces `format: 'module'` so top-level `await` works in non-`"type":"module"` projects. `--conditions` flag adds custom import conditions via resolve hook (e.g., `--conditions development` for monorepo source exports)

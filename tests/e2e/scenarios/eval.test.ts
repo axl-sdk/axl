@@ -9,6 +9,8 @@ import type { EvalResult } from '@axlsdk/eval';
 import { AxlRuntime } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
 
+const mockRuntime = {} as AxlRuntime;
+
 describe('Eval E2E', () => {
   it('dataset + scorer + runEval returns valid EvalResult', async () => {
     const ds = dataset({
@@ -34,6 +36,8 @@ describe('Eval E2E', () => {
     const result = await runEval(
       { workflow: 'test-wf', dataset: ds, scorers: [exactMatch] },
       executeFn,
+      undefined,
+      mockRuntime,
     );
 
     expect(result.id).toBeDefined();
@@ -65,12 +69,16 @@ describe('Eval E2E', () => {
     const baselineResult = await runEval(
       { workflow: 'test', dataset: ds, scorers: [qualityScorer] },
       async () => ({ output: 'bad result' }),
+      undefined,
+      mockRuntime,
     );
 
     // Candidate: all good
     const candidateResult = await runEval(
       { workflow: 'test', dataset: ds, scorers: [qualityScorer] },
       async () => ({ output: 'good result' }),
+      undefined,
+      mockRuntime,
     );
 
     const comparison = evalCompare(baselineResult as EvalResult, candidateResult as EvalResult);
@@ -97,6 +105,8 @@ describe('Eval E2E', () => {
     const result = await runEval(
       { workflow: 'test', dataset: ds, scorers: [badScorer] },
       async () => ({ output: 'anything' }),
+      undefined,
+      mockRuntime,
     );
 
     expect(result.items[0].errors).toBeDefined();
@@ -126,6 +136,8 @@ describe('Eval E2E', () => {
         metadata: { version: '1.0' },
       },
       async () => ({ output: 'ok' }),
+      undefined,
+      mockRuntime,
     )) as EvalResult;
 
     expect(result.id).toBeTruthy();
@@ -156,6 +168,8 @@ describe('Eval E2E', () => {
     const result = await runEval(
       { workflow: 'test', dataset: ds, scorers: [annotationScorer] },
       async () => ({ output: 'some output' }),
+      undefined,
+      mockRuntime,
     );
 
     expect(result.items[0].scores['annotation-check']).toBe(1);

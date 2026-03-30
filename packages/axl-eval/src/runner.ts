@@ -1,3 +1,4 @@
+import type { AxlRuntime } from '@axlsdk/axl';
 import type { EvalConfig, EvalResult, EvalItem, EvalSummary } from './types.js';
 import { randomUUID } from 'node:crypto';
 
@@ -40,10 +41,10 @@ export async function runEval(
   config: EvalConfig,
   executeWorkflow: (
     input: unknown,
-    runtime?: unknown,
+    runtime: AxlRuntime,
   ) => Promise<{ output: unknown; cost?: number }>,
-  provider?: LlmScorerProvider,
-  runtime?: unknown,
+  provider: LlmScorerProvider | undefined,
+  runtime: AxlRuntime,
 ): Promise<EvalResult> {
   const startTime = Date.now();
   const id = randomUUID();

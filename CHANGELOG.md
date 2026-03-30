@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ctx.totalCost` getter** on `WorkflowContext` — returns the accumulated cost from the context's `budgetContext`
 - **`runtime.trackCost(fn)`** — scoped cost attribution using `AsyncLocalStorage`. Wraps an async function and returns `{ result, cost }` with the total cost of all agent calls made within
 - **`CreateContextOptions` type** exported from `@axlsdk/axl`
+- **Eval CLI runtime support**: `axl-eval` now resolves an `AxlRuntime` and passes it to `executeWorkflow`. Three-tier resolution: `--config <path>` (explicit), auto-detect `axl.config.*` in cwd, or fallback to bare `new AxlRuntime()` (providers from env vars)
+- **Eval CLI `--conditions` flag**: comma-separated Node.js import conditions for monorepo source exports
+- **Eval CLI cost tracking**: custom `executeWorkflow` calls are wrapped with `runtime.trackCost()` for automatic per-item cost attribution
 
 ### Fixed
 
@@ -314,7 +317,7 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.7.6...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.10.4...HEAD
 [0.7.6]: https://github.com/axl-sdk/axl/compare/v0.7.5...v0.7.6
 [0.7.0]: https://github.com/axl-sdk/axl/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/axl-sdk/axl/compare/v0.5.0...v0.6.0

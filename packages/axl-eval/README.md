@@ -85,7 +85,7 @@ const qualityJudge = llmScorer({
 });
 ```
 
-### `runEval(config, executeFn, provider?, runtime?)`
+### `runEval(config, executeFn, provider, runtime)`
 
 Run an evaluation:
 
@@ -103,6 +103,8 @@ const results = await runEval(
     const output = await runtime.execute('my-workflow', input);
     return { output };
   },
+  undefined,  // provider (only needed for llmScorer)
+  runtime,
 );
 
 console.log(results.summary);
@@ -158,11 +160,11 @@ export default defineEval({
 });
 ```
 
-By default, the eval runner calls `runtime.execute(workflow, input)` for each dataset item, which requires the workflow to be registered on the runtime.
+When running via `runtime.eval()` or `runtime.runRegisteredEval()`, the runner calls `runtime.execute(workflow, input)` by default, which requires the workflow to be registered on the runtime.
 
-For self-contained evals, export an `executeWorkflow` function alongside the config. This is called instead of `runtime.execute()` for each dataset item.
+When running via the CLI, the eval runner resolves the execution function in order: (1) the exported `executeWorkflow` function, (2) `runtime.execute(workflow, input)` if the workflow is registered on the runtime, or (3) a passthrough that returns the input as the output (with a warning).
 
-The function receives `(input, runtime?)` — the second argument is the `AxlRuntime` instance when running via Studio or `runtime.runRegisteredEval()`. It is `undefined` when running via the CLI. Use it to call agents without needing a registered workflow:
+The function receives `(input, runtime)` — the second argument is the `AxlRuntime` instance, always provided by the CLI, Studio, and `runtime.runRegisteredEval()`. Use it to call agents without needing a registered workflow:
 
 ```typescript
 // evals/qa-quality.eval.ts — calls an agent directly via the runtime
@@ -192,15 +194,14 @@ export default defineEval({
   scorers: [notEmpty],
 });
 
-export async function executeWorkflow(input: { question: string }, runtime?: AxlRuntime) {
-  if (!runtime) throw new Error('This eval requires a runtime — run via Studio or runtime.runRegisteredEval()');
+export async function executeWorkflow(input: { question: string }, runtime: AxlRuntime) {
   const ctx = runtime.createContext();
   const output = await ctx.ask(qaAgent, input.question);
   return { output }; // cost tracked automatically via runtime.trackCost()
 }
 ```
 
-When no runtime is needed (e.g., testing a pure function), just ignore the second argument — these evals work from both the CLI and Studio:
+When no runtime is needed (e.g., testing a pure function), omit the runtime parameter — these evals work from both the CLI and Studio:
 
 ```typescript
 // evals/parser.eval.ts — tests a pure function, no runtime needed
@@ -210,15 +211,15 @@ export async function executeWorkflow(input: { raw: string }) {
 }
 ```
 
-> **Note:** The CLI (`npx axl eval`) does not provide a runtime to `executeWorkflow`. Eval files that call agents via `runtime.createContext()` must be run through Studio or `runtime.runRegisteredEval()`.
+> **Note:** The CLI always provides a runtime to `executeWorkflow`. By default it auto-detects `axl.config.*` in the working directory or falls back to a bare `AxlRuntime` (providers resolved from environment variables). Use `--config` for explicit config files.
 
 ### Cost Tracking
 
 Cost is tracked automatically. You don't need to return `cost` from your `executeWorkflow` — the eval runner wraps each item with `runtime.trackCost()`, which captures cost from all `createContext()` and `execute()` calls.
 
 ```typescript
-export async function executeWorkflow(input: { question: string }, runtime?: AxlRuntime) {
-  const ctx = runtime!.createContext();
+export async function executeWorkflow(input: { question: string }, runtime: AxlRuntime) {
+  const ctx = runtime.createContext();
   const output = await ctx.ask(myAgent, input.question);
   return { output }; // cost captured automatically
 }
@@ -237,8 +238,8 @@ You can also read `ctx.totalCost` at any point to inspect accumulated cost.
 **Budget per item** — cap cost to prevent runaway evals:
 
 ```typescript
-export async function executeWorkflow(input: { question: string }, runtime?: AxlRuntime) {
-  const ctx = runtime!.createContext({ budget: '$0.50' });
+export async function executeWorkflow(input: { question: string }, runtime: AxlRuntime) {
+  const ctx = runtime.createContext({ budget: '$0.50' });
   const output = await ctx.ask(myAgent, input.question);
   return { output };
 }
@@ -247,10 +248,10 @@ export async function executeWorkflow(input: { question: string }, runtime?: Axl
 **Timeout per item** — cancel items that take too long:
 
 ```typescript
-export async function executeWorkflow(input: { question: string }, runtime?: AxlRuntime) {
+export async function executeWorkflow(input: { question: string }, runtime: AxlRuntime) {
   const controller = new AbortController();
   setTimeout(() => controller.abort(), 30_000);
-  const ctx = runtime!.createContext({ signal: controller.signal });
+  const ctx = runtime.createContext({ signal: controller.signal });
   const output = await ctx.ask(myAgent, input.question);
   return { output };
 }
@@ -259,8 +260,8 @@ export async function executeWorkflow(input: { question: string }, runtime?: Axl
 **Auto-approve tools** — when testing agents that have tools with `requireApproval`:
 
 ```typescript
-export async function executeWorkflow(input: { question: string }, runtime?: AxlRuntime) {
-  const ctx = runtime!.createContext({
+export async function executeWorkflow(input: { question: string }, runtime: AxlRuntime) {
+  const ctx = runtime.createContext({
     awaitHumanHandler: async () => ({ approved: true }),
   });
   const output = await ctx.ask(myAgent, input.question);
@@ -273,9 +274,9 @@ export async function executeWorkflow(input: { question: string }, runtime?: Axl
 ```typescript
 export async function executeWorkflow(
   input: { setupPrompt: string; setupResponse: string; followUp: string },
-  runtime?: AxlRuntime,
+  runtime: AxlRuntime,
 ) {
-  const ctx = runtime!.createContext({
+  const ctx = runtime.createContext({
     sessionHistory: [
       { role: 'user', content: input.setupPrompt },
       { role: 'assistant', content: input.setupResponse },
@@ -292,17 +293,38 @@ Run evaluations from the command line:
 
 ```bash
 # Run an eval file
-npx axl eval ./evals/math.eval.ts
+npx axl-eval ./evals/math.eval.ts
 
 # Run all evals in a directory
-npx axl eval ./evals/
+npx axl-eval ./evals/
 
 # Save results to a file
-npx axl eval ./evals/math.eval.ts --output ./results/baseline.json
+npx axl-eval ./evals/math.eval.ts --output ./results/baseline.json
+
+# Use a config file for runtime access
+npx axl-eval ./evals/ --config ./axl.config.ts
+
+# Use custom import conditions (monorepo source exports)
+npx axl-eval ./evals/ --config ./axl.config.ts --conditions development
 
 # Compare two results
-npx axl eval compare ./results/baseline.json ./results/candidate.json
+npx axl-eval compare ./results/baseline.json ./results/candidate.json
+
+# Fail CI if regressions detected
+npx axl-eval compare baseline.json candidate.json --fail-on-regression
 ```
+
+TypeScript config and eval files require [tsx](https://github.com/privatenumber/tsx) as a dev dependency (`npm install -D tsx`).
+
+### Runtime Resolution
+
+The CLI resolves an `AxlRuntime` to pass to `executeWorkflow`:
+
+1. **`--config <path>`** — use an explicit config file
+2. **Auto-detect** — search for `axl.config.mts` → `.ts` → `.mjs` → `.js` in cwd
+3. **Fallback** — create a bare `new AxlRuntime()` (providers resolve from environment variables)
+
+When a runtime is available, each `executeWorkflow` call is wrapped with `runtime.trackCost()` for automatic cost attribution.
 
 ## Studio Integration
 

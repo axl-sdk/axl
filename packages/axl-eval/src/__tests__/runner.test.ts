@@ -1,8 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
+import type { AxlRuntime } from '@axlsdk/axl';
 import { dataset } from '../dataset.js';
 import { scorer } from '../scorer.js';
 import { runEval } from '../runner.js';
+
+const mockRuntime = {} as AxlRuntime;
 
 const testDataset = dataset({
   name: 'test-ds',
@@ -37,6 +40,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
       executeWorkflow,
+      undefined,
+      mockRuntime,
     );
 
     expect(result.items).toHaveLength(3);
@@ -49,6 +54,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'math-solver', dataset: testDataset, scorers: [exactScorer] },
       executeWorkflow,
+      undefined,
+      mockRuntime,
     );
 
     expect(result.id).toBeDefined();
@@ -70,6 +77,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
       executeWorkflow,
+      undefined,
+      mockRuntime,
     );
 
     for (const item of result.items) {
@@ -91,6 +100,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
       failingWorkflow,
+      undefined,
+      mockRuntime,
     );
 
     expect(result.summary.failures).toBe(1);
@@ -109,6 +120,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
       failingWorkflow,
+      undefined,
+      mockRuntime,
     );
 
     expect(result.summary.failures).toBe(3);
@@ -133,6 +146,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [variableScorer] },
       executeWorkflow,
+      undefined,
+      mockRuntime,
     );
 
     const stats = result.summary.scorers.variable;
@@ -155,6 +170,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer, lengthScorer] },
       executeWorkflow,
+      undefined,
+      mockRuntime,
     );
 
     expect(result.summary.scorers.exact).toBeDefined();
@@ -172,6 +189,8 @@ describe('runEval()', () => {
         metadata: { version: '1.0', model: 'gpt-4' },
       },
       executeWorkflow,
+      undefined,
+      mockRuntime,
     );
 
     expect(result.metadata).toEqual({ version: '1.0', model: 'gpt-4' });
@@ -187,6 +206,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: emptyDataset, scorers: [exactScorer] },
       executeWorkflow,
+      undefined,
+      mockRuntime,
     );
 
     expect(result.items).toHaveLength(0);
@@ -206,6 +227,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [throwingScorer] },
       executeWorkflow,
+      undefined,
+      mockRuntime,
     );
 
     for (const item of result.items) {
@@ -223,6 +246,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [outOfRangeScorer] },
       executeWorkflow,
+      undefined,
+      mockRuntime,
     );
 
     for (const item of result.items) {
@@ -240,6 +265,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [negativeScorer] },
       executeWorkflow,
+      undefined,
+      mockRuntime,
     );
 
     for (const item of result.items) {
@@ -263,6 +290,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: largeDataset, scorers: [simpleScorer], concurrency: 3 },
       async (input: any) => ({ output: input.n }),
+      undefined,
+      mockRuntime,
     );
 
     expect(result.items).toHaveLength(20);
@@ -295,6 +324,8 @@ describe('runEval()', () => {
         currentConcurrent--;
         return { output: input.id };
       },
+      undefined,
+      mockRuntime,
     );
 
     expect(result.items).toHaveLength(10);
@@ -324,6 +355,7 @@ describe('runEval()', () => {
       { workflow: 'test', dataset: singleItemDataset, scorers: [mockLlmScorer as any] },
       async () => ({ output: 'output' }),
       mockProvider,
+      mockRuntime,
     );
 
     expect(mockLlmScorer._provider).toBe(mockProvider);
@@ -350,6 +382,8 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: annotatedDataset, scorers: [annotationScorer] },
       async () => ({ output: '2' }),
+      undefined,
+      mockRuntime,
     );
 
     expect(receivedAnnotations).toEqual({ answer: '2' });
@@ -358,34 +392,21 @@ describe('runEval()', () => {
 
   it('passes runtime to executeWorkflow as second argument', async () => {
     let receivedRuntime: unknown;
+    const testRuntime = { marker: 'test-runtime' } as unknown as AxlRuntime;
 
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
-      async (input: any, runtime?: unknown) => {
+      async (input: any, runtime: any) => {
         receivedRuntime = runtime;
         if (input.question === 'What is 1+1?') return { output: '2' };
         if (input.question === 'What is 2+2?') return { output: '4' };
         return { output: '6' };
       },
       undefined,
-      'mock-runtime',
+      testRuntime,
     );
 
-    expect(receivedRuntime).toBe('mock-runtime');
+    expect(receivedRuntime).toBe(testRuntime);
     expect(result.items).toHaveLength(3);
-  });
-
-  it('runtime is undefined when not provided', async () => {
-    let receivedRuntime: unknown = 'sentinel';
-
-    await runEval(
-      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
-      async (input: any, runtime?: unknown) => {
-        receivedRuntime = runtime;
-        return { output: '2' };
-      },
-    );
-
-    expect(receivedRuntime).toBeUndefined();
   });
 });

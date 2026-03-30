@@ -627,13 +627,13 @@ export default defineEval({
 
 ```bash
 # Run baseline eval
-npx axl eval ./evals/workout-plan.ts --output results/baseline.json
+npx axl-eval ./evals/workout-plan.ts --output results/baseline.json
 
 # Edit the agent's system prompt...
 
 # Run candidate eval
-npx axl eval ./evals/workout-plan.ts --output results/candidate.json
+npx axl-eval ./evals/workout-plan.ts --output results/candidate.json
 
 # Compare — catch regressions before deploying
-npx axl eval compare results/baseline.json results/candidate.json
+npx axl-eval compare results/baseline.json results/candidate.json
 ```

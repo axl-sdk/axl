@@ -3,20 +3,43 @@
 import { readdirSync, statSync } from 'node:fs';
 import { readFile as readFileAsync, writeFile as writeFileAsync, mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import type { AxlRuntime } from '@axlsdk/axl';
 import { evalCompare } from './compare.js';
 import { runEval } from './runner.js';
 import type { EvalConfig, EvalResult } from './types.js';
+import {
+  findConfig,
+  needsEsmForcing,
+  needsTsxLoader,
+  resolveRuntime,
+  ensureTsxLoader,
+  forceEsmForConfig,
+  registerConditions,
+  CONFIG_CANDIDATES,
+} from './cli-utils.js';
+
+const KNOWN_FLAGS = new Set(['--output', '--config', '--conditions', '--fail-on-regression']);
 
 async function main() {
   const args = process.argv.slice(2);
 
-  if (args.length === 0 || args[0] === '--help') {
+  if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
     console.log(`
 Usage:
-  npx axl eval <path>              Run eval file(s)
-  npx axl eval <path> --output <f> Run eval and save results to JSON
-  npx axl eval compare <a> <b>     Compare two eval result files
-  npx axl eval compare <a> <b> --fail-on-regression  Exit 1 if regressions
+  axl-eval <path>                         Run eval file(s)
+  axl-eval <path> --output <file>         Save results to JSON
+  axl-eval <path> --config <file>         Use config file for runtime
+  axl-eval <path> --conditions <list>     Node.js import conditions (comma-separated)
+  axl-eval compare <a> <b>                Compare two eval result files
+  axl-eval compare <a> <b> --fail-on-regression  Exit 1 if regressions
+
+Config auto-detection (when --config is not specified):
+  ${CONFIG_CANDIDATES.join(' -> ')}
+
+When a config is found, the exported AxlRuntime is passed to executeWorkflow
+and cost is tracked automatically via runtime.trackCost().
+When no config is found, a bare AxlRuntime is created (providers from env vars).
 `);
     process.exit(0);
   }
@@ -34,7 +57,7 @@ async function runCompare(args: string[]) {
   const files = args.filter((a) => !a.startsWith('--'));
 
   if (files.length !== 2) {
-    console.error('Usage: npx axl eval compare <baseline.json> <candidate.json>');
+    console.error('Usage: axl-eval compare <baseline.json> <candidate.json>');
     process.exit(1);
   }
 
@@ -80,7 +103,7 @@ function collectEvalFiles(p: string): string[] {
     if (stat.isDirectory()) {
       const entries = readdirSync(resolved);
       return entries
-        .filter((e) => e.endsWith('.eval.ts') || e.endsWith('.eval.js'))
+        .filter((e) => /\.eval\.[mc]?[jt]sx?$/.test(e))
         .map((e) => path.join(resolved, e));
     }
     return [resolved];
@@ -120,16 +143,137 @@ function formatTable(result: EvalResult): string {
   return lines.join('\n');
 }
 
-async function runEvalCommand(args: string[]) {
+// ── Runtime resolution ─────────────────────────────────────────────
+
+async function resolveRuntimeFromConfig(configPath: string): Promise<AxlRuntime> {
+  // Register tsx loader for TypeScript config files
+  if (needsTsxLoader(configPath)) {
+    await ensureTsxLoader();
+  }
+
+  // Force ESM format for .ts/.tsx files so top-level await works
+  if (needsEsmForcing(configPath)) {
+    await forceEsmForConfig(configPath);
+  }
+
+  try {
+    const mod = await import(pathToFileURL(configPath).href);
+    const runtime = resolveRuntime(mod) as AxlRuntime;
+
+    if (!runtime || typeof runtime.execute !== 'function') {
+      console.error(`Config must export a default AxlRuntime instance.`);
+      if (runtime) {
+        const keys = Object.keys(runtime as object)
+          .slice(0, 5)
+          .join(', ');
+        console.error(`  Got: ${typeof runtime}${keys ? ` with keys: { ${keys} }` : ''}`);
+      }
+      console.error(
+        `Example:\n  import { AxlRuntime } from '@axlsdk/axl';\n  export default new AxlRuntime({ ... });`,
+      );
+      process.exit(1);
+    }
+
+    return runtime;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      /Cannot use import statement|Unexpected reserved word|top-level await|exports is not defined/.test(
+        msg,
+      )
+    ) {
+      const ext = path.extname(configPath);
+      console.error(`[axl-eval] Config failed to load due to a CJS/ESM compatibility issue.`);
+      if (ext === '.ts' || ext === '.tsx') {
+        const mtsPath = configPath.slice(0, -ext.length) + '.mts';
+        console.error(
+          `  Tip: rename to .mts to force ESM format:\n` + `    mv ${configPath} ${mtsPath}`,
+        );
+      } else {
+        console.error(`  Tip: add "type": "module" to your package.json.`);
+      }
+      console.error();
+    }
+    console.error(`Failed to load config:`, err);
+    process.exit(1);
+  }
+}
+
+async function getRuntime(configArg?: string, conditions?: string[]): Promise<AxlRuntime> {
+  // Register import conditions before any config loading
+  if (conditions && conditions.length > 0) {
+    await registerConditions(conditions);
+  }
+
+  // 1. Explicit --config
+  if (configArg) {
+    const configPath = path.resolve(process.cwd(), configArg);
+    const stat = statSync(configPath, { throwIfNoEntry: false });
+    if (!stat?.isFile()) {
+      console.error(`Config file not found: ${configPath}`);
+      process.exit(1);
+    }
+    console.error(`[axl-eval] Loading config from ${configPath}`);
+    return resolveRuntimeFromConfig(configPath);
+  }
+
+  // 2. Auto-detect
+  const found = findConfig(process.cwd());
+  if (found) {
+    console.error(`[axl-eval] Auto-detected config: ${found}`);
+    return resolveRuntimeFromConfig(found);
+  }
+
+  // 3. Bare runtime (providers from env vars)
+  const { AxlRuntime } = await import('@axlsdk/axl');
+  return new AxlRuntime();
+}
+
+// ── Arg parsing ────────────────────────────────────────────────────
+
+function parseEvalArgs(args: string[]): {
+  outputPath?: string;
+  configArg?: string;
+  conditions: string[];
+  paths: string[];
+} {
   let outputPath: string | undefined;
+  let configArg: string | undefined;
+  let conditions: string[] = [];
   const paths: string[] = [];
+
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--output' && i + 1 < args.length) {
-      outputPath = args[++i];
-    } else if (!args[i].startsWith('--')) {
-      paths.push(args[i]);
+    const arg = args[i];
+    if (arg === '--output' || arg === '--config' || arg === '--conditions') {
+      if (i + 1 >= args.length) {
+        console.error(`Error: ${arg} requires a value`);
+        process.exit(1);
+      }
+      const value = args[++i];
+      if (arg === '--output') outputPath = value;
+      else if (arg === '--config') configArg = value;
+      else
+        conditions = value
+          .split(',')
+          .map((c) => c.trim())
+          .filter(Boolean);
+    } else if (arg.startsWith('--')) {
+      if (!KNOWN_FLAGS.has(arg)) {
+        console.error(`Unknown flag: ${arg}`);
+        process.exit(1);
+      }
+    } else {
+      paths.push(arg);
     }
   }
+
+  return { outputPath, configArg, conditions, paths };
+}
+
+// ── Main eval command ──────────────────────────────────────────────
+
+async function runEvalCommand(args: string[]) {
+  const { outputPath, configArg, conditions, paths } = parseEvalArgs(args);
 
   if (paths.length === 0) {
     console.error('Error: No eval file path provided');
@@ -146,41 +290,81 @@ async function runEvalCommand(args: string[]) {
     process.exit(1);
   }
 
-  const results: EvalResult[] = [];
-
-  for (const filePath of evalFiles) {
-    try {
-      const mod = await import(path.resolve(filePath));
-      const evalConfig: EvalConfig = mod.default ?? mod.config ?? mod;
-
-      if (!evalConfig.workflow || !evalConfig.dataset || !evalConfig.scorers) {
-        console.error(
-          `Error: ${filePath} does not export a valid eval config (missing workflow, dataset, or scorers)`,
-        );
-        continue;
-      }
-
-      const executeWorkflow =
-        mod.executeWorkflow ?? (async (input: unknown) => ({ output: input }));
-
-      const result = await runEval(evalConfig, executeWorkflow, mod.provider);
-      results.push(result);
-
-      console.log('\n' + formatTable(result) + '\n');
-    } catch (err) {
-      console.error(
-        `Error running eval ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+  // Register tsx for TypeScript eval files (before config loading, which may also register tsx)
+  if (evalFiles.some((f) => /\.[mc]?tsx?$/.test(f))) {
+    await ensureTsxLoader();
   }
 
-  if (outputPath && results.length > 0) {
-    const output = results.length === 1 ? results[0] : results;
-    // Ensure output directory exists
-    const outputDir = path.dirname(path.resolve(outputPath));
-    await mkdir(outputDir, { recursive: true });
-    await writeFileAsync(outputPath, JSON.stringify(output, null, 2), 'utf-8');
-    console.log(`Results saved to ${outputPath}`);
+  const runtime = await getRuntime(configArg, conditions);
+  const results: EvalResult[] = [];
+
+  try {
+    for (const filePath of evalFiles) {
+      try {
+        const mod = await import(pathToFileURL(path.resolve(filePath)).href);
+        const evalConfig: EvalConfig = mod.default ?? mod.config ?? mod;
+
+        if (!evalConfig.workflow || !evalConfig.dataset || !evalConfig.scorers) {
+          console.error(
+            `Error: ${filePath} does not export a valid eval config (missing workflow, dataset, or scorers)`,
+          );
+          continue;
+        }
+
+        // Resolve executeWorkflow: custom export > registered workflow > passthrough
+        let executeWorkflow: (
+          input: unknown,
+          rt?: unknown,
+        ) => Promise<{ output: unknown; cost?: number }>;
+
+        if (mod.executeWorkflow) {
+          // Wrap custom executeWorkflow with trackCost for automatic cost attribution
+          executeWorkflow = async (input, rt) => {
+            const { result, cost: trackedCost } = await runtime.trackCost(async () => {
+              return mod.executeWorkflow(input, rt);
+            });
+            return { output: result.output, cost: result.cost ?? trackedCost };
+          };
+        } else if (runtime.getWorkflow(evalConfig.workflow)) {
+          // No executeWorkflow exported but workflow is registered — use runtime.execute()
+          executeWorkflow = async (input) => {
+            const { result, cost } = await runtime.trackCost(async () => {
+              return runtime.execute(evalConfig.workflow, input);
+            });
+            return { output: result, cost };
+          };
+        } else {
+          console.warn(
+            `[axl-eval] Warning: ${filePath} does not export executeWorkflow — using input passthrough`,
+          );
+          executeWorkflow = async (input) => ({ output: input });
+        }
+
+        const result = await runEval(evalConfig, executeWorkflow, mod.provider, runtime);
+        results.push(result);
+
+        console.log('\n' + formatTable(result) + '\n');
+      } catch (err) {
+        console.error(
+          `Error running eval ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    if (outputPath && results.length > 0) {
+      const output = results.length === 1 ? results[0] : results;
+      const outputDir = path.dirname(path.resolve(outputPath));
+      await mkdir(outputDir, { recursive: true });
+      await writeFileAsync(outputPath, JSON.stringify(output, null, 2), 'utf-8');
+      console.log(`Results saved to ${outputPath}`);
+    }
+  } finally {
+    await runtime.shutdown().catch(() => {});
+  }
+
+  // Exit with non-zero code if no evals succeeded
+  if (results.length === 0) {
+    process.exit(1);
   }
 }
 

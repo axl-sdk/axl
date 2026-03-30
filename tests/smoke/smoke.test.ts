@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { execSync } from 'node:child_process';
-import { mkdtempSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -74,5 +74,17 @@ describe('Smoke: Package Tarballs', () => {
     const hasEnv = files.some((f) => f.includes('.env'));
     expect(hasSrc).toBe(false);
     expect(hasEnv).toBe(false);
+  });
+
+  it('@axlsdk/studio CJS middleware bundle has __filename fallback for import.meta.url', () => {
+    // tsup stubs import.meta as {} in CJS output, so import.meta.url is
+    // undefined. The eval loader must fall back to __filename to build a
+    // valid parentURL for tsImport(). This test reads the built CJS bundle
+    // to verify the fallback is present.
+    const cjs = readFileSync(join(ROOT, 'packages/axl-studio/dist/middleware.cjs'), 'utf-8');
+    // The parentURL computation should reference __filename as a fallback
+    expect(cjs).toContain('__filename');
+    // And it should use pathToFileURL to convert __filename to a file:// URL
+    expect(cjs).toMatch(/pathToFileURL.*__filename/);
   });
 });

@@ -28,10 +28,30 @@ describe('Studio API: Evals', () => {
 
     const body = await res.json();
     expect(body.ok).toBe(true);
-    expect(body.data.items.length).toBe(1);
-    expect(body.data.items[0].output).toBe('eval output');
-    expect(body.data.items[0].scores['always-pass']).toBe(1);
-    expect(body.data.summary.scorers['always-pass'].mean).toBe(1);
+
+    // Validate the full EvalResult shape that the Eval Runner panel depends on
+    const data = body.data;
+    expect(data).toHaveProperty('id');
+    expect(data).toHaveProperty('workflow');
+    expect(data).toHaveProperty('timestamp');
+    expect(typeof data.totalCost).toBe('number');
+    expect(typeof data.duration).toBe('number');
+
+    // Items
+    expect(data.items.length).toBe(1);
+    expect(data.items[0].output).toBe('eval output');
+    expect(data.items[0].scores['always-pass']).toBe(1);
+
+    // Summary — the panel reads summary.count, summary.failures, summary.scorers
+    expect(typeof data.summary.count).toBe('number');
+    expect(typeof data.summary.failures).toBe('number');
+    expect(data.summary.scorers).toBeDefined();
+    const scorerStats = data.summary.scorers['always-pass'];
+    expect(typeof scorerStats.mean).toBe('number');
+    expect(typeof scorerStats.min).toBe('number');
+    expect(typeof scorerStats.max).toBe('number');
+    expect(typeof scorerStats.p50).toBe('number');
+    expect(typeof scorerStats.p95).toBe('number');
   });
 
   it('POST /api/evals/:name/run returns 404 for unregistered eval', async () => {

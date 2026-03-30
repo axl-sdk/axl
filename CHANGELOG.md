@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-03-30
+
 ### Added
 
 - **`createContext()` options**: `budget`, `signal`, `sessionHistory`, `onToken`, `awaitHumanHandler` — contexts created via `runtime.createContext()` can now participate in cost tracking, cancellation, session history, streaming, and human-in-the-loop approval
@@ -17,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Eval CLI runtime support**: `axl-eval` now resolves an `AxlRuntime` and passes it to `executeWorkflow`. Three-tier resolution: `--config <path>` (explicit), auto-detect `axl.config.*` in cwd, or fallback to bare `new AxlRuntime()` (providers from env vars)
 - **Eval CLI `--conditions` flag**: comma-separated Node.js import conditions for monorepo source exports
 - **Eval CLI cost tracking**: custom `executeWorkflow` calls are wrapped with `runtime.trackCost()` for automatic per-item cost attribution
+
+### Changed
+
+- **Breaking: `runEval()` signature** (`@axlsdk/eval`): `runtime` and `provider` are now required positional parameters. `runtime` is typed as `AxlRuntime` instead of `unknown`
 
 ### Fixed
 
@@ -317,7 +323,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.10.4...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/axl-sdk/axl/compare/v0.10.4...v0.11.0
 [0.7.6]: https://github.com/axl-sdk/axl/compare/v0.7.5...v0.7.6
 [0.7.0]: https://github.com/axl-sdk/axl/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/axl-sdk/axl/compare/v0.5.0...v0.6.0

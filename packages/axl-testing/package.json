@@ -1,6 +1,6 @@
 {
   "name": "@axlsdk/testing",
-  "version": "0.11.3",
+  "version": "0.11.4",
   "description": "Testing utilities for Axl agentic workflows",
   "type": "module",
   "main": "./dist/index.cjs",

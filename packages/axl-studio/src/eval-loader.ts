@@ -1,7 +1,14 @@
 import { resolve, relative, dirname, basename } from 'node:path';
 import { readdirSync, statSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import type { AxlRuntime } from '@axlsdk/axl';
 import { importModule } from './cli-utils.js';
+
+// In the CJS bundle, tsup stubs import.meta as {} so import.meta.url is
+// undefined. Fall back to __filename (which CJS defines) converted to a
+// file:// URL so tsImport() gets a valid parentURL.
+const parentURL: string =
+  import.meta.url ?? pathToFileURL(typeof __filename !== 'undefined' ? __filename : __dirname).href;
 
 /**
  * Configuration for lazy eval file discovery.
@@ -89,7 +96,7 @@ async function loadEvalFiles(
 
   for (const file of files) {
     try {
-      const mod = await importModule(file, import.meta.url);
+      const mod = await importModule(file, parentURL);
       const evalConfig = mod.default?.default ?? mod.default ?? mod.config ?? mod;
 
       if (!evalConfig.workflow || !evalConfig.dataset || !evalConfig.scorers) {

@@ -7,28 +7,54 @@ import { JsonViewer } from '../../components/shared/JsonViewer';
 import { fetchEvals, runRegisteredEval, compareEvals } from '../../lib/api';
 import type { RegisteredEval } from '../../lib/types';
 
-type EvalScoreResult = {
+// ── Types matching @axlsdk/eval's EvalResult shape ───────────────
+
+type EvalItem = {
   input: unknown;
+  annotations?: unknown;
   output: unknown;
+  error?: string;
   scores: Record<string, number>;
 };
 
-type EvalSummary = {
-  items?: EvalScoreResult[];
-  summary?: Record<string, { mean: number; min: number; max: number; count: number }>;
-  [key: string]: unknown;
+type ScorerStats = {
+  mean: number;
+  min: number;
+  max: number;
+  p50: number;
+  p95: number;
 };
 
-type EvalResult = {
+type EvalResultData = {
+  id: string;
+  workflow: string;
+  dataset: string;
+  timestamp: string;
+  totalCost: number;
+  duration: number;
+  items: EvalItem[];
+  summary: {
+    count: number;
+    failures: number;
+    scorers: Record<string, ScorerStats>;
+  };
+};
+
+type HistoryEntry = {
   id: string;
   timestamp: number;
   eval: string;
-  data: EvalSummary;
+  data: EvalResultData;
 };
 
 type ComparisonResult = {
   regressions?: Array<{ scorer: string; delta: number; baseline: number; candidate: number }>;
   improvements?: Array<{ scorer: string; delta: number; baseline: number; candidate: number }>;
+  scorers?: Record<
+    string,
+    { baselineMean: number; candidateMean: number; delta: number; deltaPercent: number }
+  >;
+  summary?: string;
   [key: string]: unknown;
 };
 
@@ -36,8 +62,8 @@ export function EvalRunnerPanel() {
   const [tab, setTab] = useState<'run' | 'history' | 'compare'>('run');
   const [selectedEval, setSelectedEval] = useState('');
   const [running, setRunning] = useState(false);
-  const [results, setResults] = useState<EvalResult[]>([]);
-  const [currentResult, setCurrentResult] = useState<EvalSummary | null>(null);
+  const [results, setResults] = useState<HistoryEntry[]>([]);
+  const [currentResult, setCurrentResult] = useState<EvalResultData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [compareResult, setCompareResult] = useState<ComparisonResult | null>(null);
 
@@ -55,11 +81,11 @@ export function EvalRunnerPanel() {
     setCurrentResult(null);
 
     try {
-      const result = (await runRegisteredEval(selectedEval)) as EvalSummary;
+      const result = (await runRegisteredEval(selectedEval)) as EvalResultData;
       setCurrentResult(result);
       setResults((prev) => [
         {
-          id: `eval-${Date.now()}`,
+          id: result.id ?? `eval-${Date.now()}`,
           timestamp: Date.now(),
           eval: selectedEval,
           data: result,
@@ -82,6 +108,10 @@ export function EvalRunnerPanel() {
       setError(err instanceof Error ? err.message : String(err));
     }
   }, [results]);
+
+  const scorerEntries = currentResult?.summary?.scorers
+    ? Object.entries(currentResult.summary.scorers)
+    : [];
 
   return (
     <PanelShell title="Eval Runner" description="Run evaluations, view results, and compare runs">
@@ -181,8 +211,21 @@ export function EvalRunnerPanel() {
             )}
             {currentResult ? (
               <div className="space-y-4">
+                {/* Run metadata */}
+                <div className="flex items-center gap-4 text-xs text-[hsl(var(--muted-foreground))]">
+                  <span>
+                    {currentResult.summary.count} items, {currentResult.summary.failures} failures
+                  </span>
+                  {currentResult.duration > 0 && (
+                    <span>{(currentResult.duration / 1000).toFixed(1)}s</span>
+                  )}
+                  {currentResult.totalCost > 0 && (
+                    <span>${currentResult.totalCost.toFixed(4)}</span>
+                  )}
+                </div>
+
                 {/* Summary stats table */}
-                {currentResult.summary && Object.keys(currentResult.summary).length > 0 && (
+                {scorerEntries.length > 0 && (
                   <div>
                     <h3 className="text-sm font-medium mb-2">Summary</h3>
                     <table className="w-full text-xs">
@@ -190,19 +233,21 @@ export function EvalRunnerPanel() {
                         <tr className="border-b border-[hsl(var(--border))]">
                           <th className="text-left py-2 font-medium">Scorer</th>
                           <th className="text-right py-2 font-medium">Mean</th>
+                          <th className="text-right py-2 font-medium">P50</th>
+                          <th className="text-right py-2 font-medium">P95</th>
                           <th className="text-right py-2 font-medium">Min</th>
                           <th className="text-right py-2 font-medium">Max</th>
-                          <th className="text-right py-2 font-medium">Count</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {Object.entries(currentResult.summary).map(([scorer, stats]) => (
+                        {scorerEntries.map(([scorer, stats]) => (
                           <tr key={scorer} className="border-b border-[hsl(var(--border))]">
                             <td className="py-2 font-mono">{scorer}</td>
                             <td className="py-2 text-right font-mono">{stats.mean.toFixed(3)}</td>
+                            <td className="py-2 text-right font-mono">{stats.p50.toFixed(3)}</td>
+                            <td className="py-2 text-right font-mono">{stats.p95.toFixed(3)}</td>
                             <td className="py-2 text-right font-mono">{stats.min.toFixed(3)}</td>
                             <td className="py-2 text-right font-mono">{stats.max.toFixed(3)}</td>
-                            <td className="py-2 text-right">{stats.count}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -220,7 +265,12 @@ export function EvalRunnerPanel() {
                       {currentResult.items.map((item, i) => (
                         <details key={i} className="border border-[hsl(var(--border))] rounded-md">
                           <summary className="flex items-center justify-between px-3 py-2 text-xs cursor-pointer hover:bg-[hsl(var(--accent))]">
-                            <span className="font-mono">Item #{i + 1}</span>
+                            <span className="font-mono">
+                              Item #{i + 1}
+                              {item.error && (
+                                <span className="ml-2 text-red-600 dark:text-red-400">(error)</span>
+                              )}
+                            </span>
                             <div className="flex items-center gap-2">
                               {Object.entries(item.scores).map(([scorer, score]) => (
                                 <span
@@ -247,18 +297,18 @@ export function EvalRunnerPanel() {
                               <span className="font-medium">Output:</span>
                               <JsonViewer data={item.output} collapsed />
                             </div>
+                            {item.error && (
+                              <div>
+                                <span className="font-medium text-red-600 dark:text-red-400">
+                                  Error:
+                                </span>
+                                <span className="ml-1">{item.error}</span>
+                              </div>
+                            )}
                           </div>
                         </details>
                       ))}
                     </div>
-                  </div>
-                )}
-
-                {/* Fallback: raw JSON for non-standard shapes */}
-                {!currentResult.summary && !currentResult.items && (
-                  <div>
-                    <h3 className="text-sm font-medium mb-2">Results</h3>
-                    <JsonViewer data={currentResult} />
                   </div>
                 )}
               </div>
@@ -284,7 +334,8 @@ export function EvalRunnerPanel() {
                   <th className="text-left py-2 font-medium">Eval</th>
                   <th className="text-left py-2 font-medium">Timestamp</th>
                   <th className="text-right py-2 font-medium">Items</th>
-                  <th className="text-right py-2 font-medium">Scorers</th>
+                  <th className="text-right py-2 font-medium">Failures</th>
+                  <th className="text-right py-2 font-medium">Cost</th>
                 </tr>
               </thead>
               <tbody>
@@ -299,9 +350,18 @@ export function EvalRunnerPanel() {
                   >
                     <td className="py-2 font-mono">{r.eval}</td>
                     <td className="py-2">{new Date(r.timestamp).toLocaleString()}</td>
-                    <td className="py-2 text-right">{r.data.items?.length ?? '?'}</td>
+                    <td className="py-2 text-right">{r.data.summary.count}</td>
                     <td className="py-2 text-right">
-                      {r.data.summary ? Object.keys(r.data.summary).length : '?'}
+                      {r.data.summary.failures > 0 ? (
+                        <span className="text-red-600 dark:text-red-400">
+                          {r.data.summary.failures}
+                        </span>
+                      ) : (
+                        0
+                      )}
+                    </td>
+                    <td className="py-2 text-right font-mono">
+                      {r.data.totalCost > 0 ? `$${r.data.totalCost.toFixed(4)}` : '-'}
                     </td>
                   </tr>
                 ))}
@@ -331,11 +391,10 @@ export function EvalRunnerPanel() {
               </button>
               {compareResult && (
                 <div className="space-y-4">
-                  {compareResult.regressions && compareResult.regressions.length > 0 && (
+                  {compareResult.summary && <p className="text-sm">{compareResult.summary}</p>}
+                  {compareResult.scorers && Object.keys(compareResult.scorers).length > 0 && (
                     <div>
-                      <h3 className="text-sm font-medium mb-2 text-red-600 dark:text-red-400">
-                        Regressions
-                      </h3>
+                      <h3 className="text-sm font-medium mb-2">Scorer Comparison</h3>
                       <table className="w-full text-xs">
                         <thead>
                           <tr className="border-b border-[hsl(var(--border))]">
@@ -343,59 +402,90 @@ export function EvalRunnerPanel() {
                             <th className="text-right py-2 font-medium">Baseline</th>
                             <th className="text-right py-2 font-medium">Candidate</th>
                             <th className="text-right py-2 font-medium">Delta</th>
+                            <th className="text-right py-2 font-medium">%</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {compareResult.regressions.map((r) => (
-                            <tr key={r.scorer} className="border-b border-[hsl(var(--border))]">
-                              <td className="py-2 font-mono">{r.scorer}</td>
-                              <td className="py-2 text-right font-mono">{r.baseline.toFixed(3)}</td>
+                          {Object.entries(compareResult.scorers).map(([scorer, stats]) => (
+                            <tr key={scorer} className="border-b border-[hsl(var(--border))]">
+                              <td className="py-2 font-mono">{scorer}</td>
                               <td className="py-2 text-right font-mono">
-                                {r.candidate.toFixed(3)}
+                                {stats.baselineMean.toFixed(3)}
                               </td>
-                              <td className="py-2 text-right font-mono text-red-600 dark:text-red-400">
-                                {r.delta.toFixed(3)}
+                              <td className="py-2 text-right font-mono">
+                                {stats.candidateMean.toFixed(3)}
+                              </td>
+                              <td
+                                className={`py-2 text-right font-mono ${
+                                  stats.delta > 0
+                                    ? 'text-green-600 dark:text-green-400'
+                                    : stats.delta < 0
+                                      ? 'text-red-600 dark:text-red-400'
+                                      : ''
+                                }`}
+                              >
+                                {stats.delta > 0 ? '+' : ''}
+                                {stats.delta.toFixed(3)}
+                              </td>
+                              <td
+                                className={`py-2 text-right font-mono ${
+                                  stats.deltaPercent > 0
+                                    ? 'text-green-600 dark:text-green-400'
+                                    : stats.deltaPercent < 0
+                                      ? 'text-red-600 dark:text-red-400'
+                                      : ''
+                                }`}
+                              >
+                                {stats.deltaPercent > 0 ? '+' : ''}
+                                {stats.deltaPercent.toFixed(1)}%
                               </td>
                             </tr>
                           ))}
                         </tbody>
                       </table>
+                    </div>
+                  )}
+                  {compareResult.regressions && compareResult.regressions.length > 0 && (
+                    <div>
+                      <h3 className="text-sm font-medium mb-2 text-red-600 dark:text-red-400">
+                        Regressions ({compareResult.regressions.length})
+                      </h3>
+                      <div className="space-y-1">
+                        {compareResult.regressions.map((r, i) => (
+                          <div
+                            key={i}
+                            className="flex items-center justify-between px-3 py-1.5 text-xs border border-[hsl(var(--border))] rounded"
+                          >
+                            <span className="font-mono">{r.scorer}</span>
+                            <span className="font-mono text-red-600 dark:text-red-400">
+                              {r.baseline.toFixed(2)} → {r.candidate.toFixed(2)} (
+                              {r.delta.toFixed(2)})
+                            </span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   )}
                   {compareResult.improvements && compareResult.improvements.length > 0 && (
                     <div>
                       <h3 className="text-sm font-medium mb-2 text-green-600 dark:text-green-400">
-                        Improvements
+                        Improvements ({compareResult.improvements.length})
                       </h3>
-                      <table className="w-full text-xs">
-                        <thead>
-                          <tr className="border-b border-[hsl(var(--border))]">
-                            <th className="text-left py-2 font-medium">Scorer</th>
-                            <th className="text-right py-2 font-medium">Baseline</th>
-                            <th className="text-right py-2 font-medium">Candidate</th>
-                            <th className="text-right py-2 font-medium">Delta</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {compareResult.improvements.map((r) => (
-                            <tr key={r.scorer} className="border-b border-[hsl(var(--border))]">
-                              <td className="py-2 font-mono">{r.scorer}</td>
-                              <td className="py-2 text-right font-mono">{r.baseline.toFixed(3)}</td>
-                              <td className="py-2 text-right font-mono">
-                                {r.candidate.toFixed(3)}
-                              </td>
-                              <td className="py-2 text-right font-mono text-green-600 dark:text-green-400">
-                                +{r.delta.toFixed(3)}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+                      <div className="space-y-1">
+                        {compareResult.improvements.map((r, i) => (
+                          <div
+                            key={i}
+                            className="flex items-center justify-between px-3 py-1.5 text-xs border border-[hsl(var(--border))] rounded"
+                          >
+                            <span className="font-mono">{r.scorer}</span>
+                            <span className="font-mono text-green-600 dark:text-green-400">
+                              {r.baseline.toFixed(2)} → {r.candidate.toFixed(2)} (+
+                              {r.delta.toFixed(2)})
+                            </span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
-                  )}
-                  {/* Fallback for non-standard shape */}
-                  {!compareResult.regressions && !compareResult.improvements && (
-                    <JsonViewer data={compareResult} />
                   )}
                 </div>
               )}

@@ -172,6 +172,14 @@ export type PendingDecision = {
   createdAt: string;
 };
 
+/** Registered eval summary */
+export type RegisteredEval = {
+  name: string;
+  workflow: string;
+  dataset: string;
+  scorers: string[];
+};
+
 /** Health check response */
 export type HealthData = {
   status: string;

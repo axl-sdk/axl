@@ -3,10 +3,9 @@ import { useQuery } from '@tanstack/react-query';
 import { FlaskConical } from 'lucide-react';
 import { PanelShell } from '../../components/layout/PanelShell';
 import { EmptyState } from '../../components/shared/EmptyState';
-import { JsonEditor } from '../../components/shared/JsonEditor';
 import { JsonViewer } from '../../components/shared/JsonViewer';
-import { fetchWorkflows, runEval, compareEvals } from '../../lib/api';
-import type { WorkflowSummary } from '../../lib/types';
+import { fetchEvals, runRegisteredEval, compareEvals } from '../../lib/api';
+import type { RegisteredEval } from '../../lib/types';
 
 type EvalScoreResult = {
   input: unknown;
@@ -23,7 +22,7 @@ type EvalSummary = {
 type EvalResult = {
   id: string;
   timestamp: number;
-  workflow: string;
+  eval: string;
   data: EvalSummary;
 };
 
@@ -35,40 +34,34 @@ type ComparisonResult = {
 
 export function EvalRunnerPanel() {
   const [tab, setTab] = useState<'run' | 'history' | 'compare'>('run');
-  const [selectedWorkflow, setSelectedWorkflow] = useState('');
-  const [datasetJson, setDatasetJson] = useState('[]');
-  const [scorersJson, setScorersJson] = useState('[]');
+  const [selectedEval, setSelectedEval] = useState('');
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<EvalResult[]>([]);
   const [currentResult, setCurrentResult] = useState<EvalSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [compareResult, setCompareResult] = useState<ComparisonResult | null>(null);
 
-  const { data: workflows = [] } = useQuery({
-    queryKey: ['workflows'],
-    queryFn: fetchWorkflows,
+  const { data: evals = [] } = useQuery({
+    queryKey: ['evals'],
+    queryFn: fetchEvals,
   });
 
+  const selectedMeta = evals.find((e: RegisteredEval) => e.name === selectedEval);
+
   const handleRun = useCallback(async () => {
-    if (!selectedWorkflow) return;
+    if (!selectedEval) return;
     setRunning(true);
     setError(null);
     setCurrentResult(null);
 
     try {
-      const dataset = JSON.parse(datasetJson);
-      const scorers = JSON.parse(scorersJson);
-      const result = (await runEval({
-        workflow: selectedWorkflow,
-        dataset,
-        scorers,
-      })) as EvalSummary;
+      const result = (await runRegisteredEval(selectedEval)) as EvalSummary;
       setCurrentResult(result);
       setResults((prev) => [
         {
           id: `eval-${Date.now()}`,
           timestamp: Date.now(),
-          workflow: selectedWorkflow,
+          eval: selectedEval,
           data: result,
         },
         ...prev,
@@ -78,7 +71,7 @@ export function EvalRunnerPanel() {
     } finally {
       setRunning(false);
     }
-  }, [selectedWorkflow, datasetJson, scorersJson]);
+  }, [selectedEval]);
 
   const handleCompare = useCallback(async () => {
     if (results.length < 2) return;
@@ -113,38 +106,67 @@ export function EvalRunnerPanel() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <div className="space-y-4">
             <div>
-              <label className="block text-sm font-medium mb-1">Workflow</label>
-              <select
-                value={selectedWorkflow}
-                onChange={(e) => setSelectedWorkflow(e.target.value)}
-                className="w-full px-3 py-2 text-sm rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
-              >
-                <option value="">Select a workflow...</option>
-                {workflows.map((w: WorkflowSummary) => (
-                  <option key={w.name} value={w.name}>
-                    {w.name}
-                  </option>
-                ))}
-              </select>
+              <label className="block text-sm font-medium mb-1">Eval</label>
+              {evals.length === 0 ? (
+                <p className="text-sm text-[hsl(var(--muted-foreground))]">
+                  No evals registered. Define evals with{' '}
+                  <code className="text-xs bg-[hsl(var(--muted))] px-1 py-0.5 rounded">
+                    defineEval()
+                  </code>{' '}
+                  and load them via the{' '}
+                  <code className="text-xs bg-[hsl(var(--muted))] px-1 py-0.5 rounded">evals</code>{' '}
+                  middleware option or{' '}
+                  <code className="text-xs bg-[hsl(var(--muted))] px-1 py-0.5 rounded">
+                    runtime.registerEval()
+                  </code>
+                  .
+                </p>
+              ) : (
+                <select
+                  value={selectedEval}
+                  onChange={(e) => setSelectedEval(e.target.value)}
+                  className="w-full px-3 py-2 text-sm rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
+                >
+                  <option value="">Select an eval...</option>
+                  {evals.map((e: RegisteredEval) => (
+                    <option key={e.name} value={e.name}>
+                      {e.name}
+                    </option>
+                  ))}
+                </select>
+              )}
             </div>
 
-            <div>
-              <label className="block text-sm font-medium mb-1">Dataset (JSON array)</label>
-              <JsonEditor
-                value={datasetJson}
-                onChange={setDatasetJson}
-                placeholder="[{ ... }, { ... }]"
-              />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium mb-1">Scorers (JSON array)</label>
-              <JsonEditor value={scorersJson} onChange={setScorersJson} placeholder="[]" />
-            </div>
+            {/* Eval metadata */}
+            {selectedMeta && (
+              <div className="space-y-2 text-xs">
+                <div className="flex items-center gap-2">
+                  <span className="font-medium text-[hsl(var(--muted-foreground))]">Workflow:</span>
+                  <span className="font-mono">{selectedMeta.workflow}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="font-medium text-[hsl(var(--muted-foreground))]">Dataset:</span>
+                  <span className="font-mono">{selectedMeta.dataset}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="font-medium text-[hsl(var(--muted-foreground))]">Scorers:</span>
+                  <div className="flex flex-wrap gap-1">
+                    {selectedMeta.scorers.map((s) => (
+                      <span
+                        key={s}
+                        className="px-1.5 py-0.5 rounded bg-[hsl(var(--muted))] font-mono"
+                      >
+                        {s}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
 
             <button
               onClick={handleRun}
-              disabled={!selectedWorkflow || running}
+              disabled={!selectedEval || running}
               className="px-4 py-2 text-sm font-medium rounded-md bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] hover:opacity-90 disabled:opacity-50"
             >
               {running ? 'Running...' : 'Run Eval'}
@@ -244,7 +266,7 @@ export function EvalRunnerPanel() {
               <EmptyState
                 icon={<FlaskConical size={32} />}
                 title="No results"
-                description="Configure and run an eval to see results."
+                description="Select an eval and run it to see results."
               />
             )}
           </div>
@@ -259,7 +281,7 @@ export function EvalRunnerPanel() {
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-[hsl(var(--border))]">
-                  <th className="text-left py-2 font-medium">Workflow</th>
+                  <th className="text-left py-2 font-medium">Eval</th>
                   <th className="text-left py-2 font-medium">Timestamp</th>
                   <th className="text-right py-2 font-medium">Items</th>
                   <th className="text-right py-2 font-medium">Scorers</th>
@@ -275,7 +297,7 @@ export function EvalRunnerPanel() {
                       setTab('run');
                     }}
                   >
-                    <td className="py-2 font-mono">{r.workflow}</td>
+                    <td className="py-2 font-mono">{r.eval}</td>
                     <td className="py-2">{new Date(r.timestamp).toLocaleString()}</td>
                     <td className="py-2 text-right">{r.data.items?.length ?? '?'}</td>
                     <td className="py-2 text-right">

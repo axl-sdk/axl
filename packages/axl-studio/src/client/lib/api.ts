@@ -12,6 +12,7 @@ import type {
   MemoryEntry,
   PendingDecision,
   HealthData,
+  RegisteredEval,
 } from './types';
 
 const BASE = (window.__AXL_STUDIO_BASE__ ?? '') + '/api';
@@ -118,8 +119,9 @@ export const fetchCosts = () => request<CostData>('/costs');
 export const resetCosts = () => request<{ reset: boolean }>('/costs/reset', { method: 'POST' });
 
 // ── Evals ──────────────────────────────────────────────────────────
-export const runEval = (config: { workflow: string; dataset: unknown; scorers: unknown[] }) =>
-  request<unknown>('/evals/run', { method: 'POST', body: JSON.stringify(config) });
+export const fetchEvals = () => request<RegisteredEval[]>('/evals');
+export const runRegisteredEval = (name: string) =>
+  request<unknown>(`/evals/${encodeURIComponent(name)}/run`, { method: 'POST' });
 export const compareEvals = (baseline: unknown, candidate: unknown) =>
   request<unknown>('/evals/compare', {
     method: 'POST',

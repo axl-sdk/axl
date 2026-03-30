@@ -2,13 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import {
-  CONFIG_CANDIDATES,
-  findConfig,
-  needsEsmForcing,
-  needsTsxLoader,
-  resolveRuntime,
-} from '../cli-utils.js';
+import { CONFIG_CANDIDATES, findConfig, needsTsxLoader, resolveRuntime } from '../cli-utils.js';
 
 describe('CONFIG_CANDIDATES', () => {
   it('contains 4 candidates in priority order', () => {
@@ -18,36 +12,6 @@ describe('CONFIG_CANDIDATES', () => {
       'axl.config.mjs',
       'axl.config.js',
     ]);
-  });
-});
-
-describe('needsEsmForcing()', () => {
-  it('returns true for .ts', () => {
-    expect(needsEsmForcing('axl.config.ts')).toBe(true);
-  });
-
-  it('returns true for .tsx', () => {
-    expect(needsEsmForcing('axl.config.tsx')).toBe(true);
-  });
-
-  it('returns false for .mts', () => {
-    expect(needsEsmForcing('axl.config.mts')).toBe(false);
-  });
-
-  it('returns false for .cts', () => {
-    expect(needsEsmForcing('axl.config.cts')).toBe(false);
-  });
-
-  it('returns false for .js', () => {
-    expect(needsEsmForcing('axl.config.js')).toBe(false);
-  });
-
-  it('returns false for .mjs', () => {
-    expect(needsEsmForcing('axl.config.mjs')).toBe(false);
-  });
-
-  it('returns true for full path ending in .ts', () => {
-    expect(needsEsmForcing('/path/to/config.ts')).toBe(true);
   });
 });
 

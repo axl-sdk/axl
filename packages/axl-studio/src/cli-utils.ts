@@ -1,5 +1,6 @@
-import { resolve, extname } from 'node:path';
+import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 
 // ── Config auto-detection ──────────────────────────────────────────
 
@@ -69,17 +70,48 @@ export function parseArgs(argv: string[]): CliArgs {
 // ── Extension helpers ──────────────────────────────────────────────
 
 /**
- * Returns true if the config path has an ambiguous TypeScript extension (.ts/.tsx)
- * that needs ESM forcing. Explicit extensions (.mts/.cts) are excluded.
- */
-export function needsEsmForcing(configPath: string): boolean {
-  const ext = extname(configPath);
-  return ext === '.ts' || ext === '.tsx';
-}
-
-/**
- * Returns true if the config path is a TypeScript file that needs tsx loader hooks.
+ * Returns true if the file is TypeScript and needs tsx to load.
  */
 export function needsTsxLoader(configPath: string): boolean {
   return /\.[mc]?tsx?$/.test(configPath);
+}
+
+// ── Module loading ────────────────────────────────────────────────
+
+// Lazily resolved tsImport function from tsx. `undefined` = not yet checked,
+// `null` = tsx not available.
+let tsImportFn:
+  | ((specifier: string, parentURL: string) => Promise<Record<string, any>>)
+  | null
+  | undefined;
+
+/**
+ * Import a module, using tsx's `tsImport()` for TypeScript files.
+ *
+ * `tsImport()` handles ESM/CJS format correctly without process-wide side effects —
+ * no need for `register()` hooks or ESM-forcing workarounds. Falls back to regular
+ * `import()` for non-TypeScript files or when tsx is not installed.
+ */
+export async function importModule(
+  filePath: string,
+  parentURL: string,
+): Promise<Record<string, any>> {
+  if (needsTsxLoader(filePath)) {
+    if (tsImportFn === undefined) {
+      try {
+        const mod = await import('tsx/esm/api');
+        tsImportFn = mod.tsImport ?? null;
+      } catch {
+        tsImportFn = null;
+        console.warn(
+          '[axl-studio] Warning: tsx is not installed. TypeScript config files require tsx as a dependency.\n' +
+            '  Install it with: npm install -D tsx',
+        );
+      }
+    }
+    if (tsImportFn) {
+      return (await tsImportFn(pathToFileURL(filePath).href, parentURL)) as Record<string, any>;
+    }
+  }
+  return await import(pathToFileURL(filePath).href);
 }

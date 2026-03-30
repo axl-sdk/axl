@@ -3,18 +3,14 @@
 import { readdirSync, statSync } from 'node:fs';
 import { readFile as readFileAsync, writeFile as writeFileAsync, mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import type { AxlRuntime } from '@axlsdk/axl';
 import { evalCompare } from './compare.js';
 import { runEval } from './runner.js';
 import type { EvalConfig, EvalResult } from './types.js';
 import {
   findConfig,
-  needsEsmForcing,
-  needsTsxLoader,
   resolveRuntime,
-  ensureTsxLoader,
-  forceEsmForConfig,
+  importModule,
   registerConditions,
   CONFIG_CANDIDATES,
 } from './cli-utils.js';
@@ -146,18 +142,8 @@ function formatTable(result: EvalResult): string {
 // ── Runtime resolution ─────────────────────────────────────────────
 
 async function resolveRuntimeFromConfig(configPath: string): Promise<AxlRuntime> {
-  // Register tsx loader for TypeScript config files
-  if (needsTsxLoader(configPath)) {
-    await ensureTsxLoader();
-  }
-
-  // Force ESM format for .ts/.tsx files so top-level await works
-  if (needsEsmForcing(configPath)) {
-    await forceEsmForConfig(configPath);
-  }
-
   try {
-    const mod = await import(pathToFileURL(configPath).href);
+    const mod = await importModule(configPath, import.meta.url);
     const runtime = resolveRuntime(mod) as AxlRuntime;
 
     if (!runtime || typeof runtime.execute !== 'function') {
@@ -185,9 +171,8 @@ async function resolveRuntimeFromConfig(configPath: string): Promise<AxlRuntime>
       const ext = path.extname(configPath);
       console.error(`[axl-eval] Config failed to load due to a CJS/ESM compatibility issue.`);
       if (ext === '.ts' || ext === '.tsx') {
-        const mtsPath = configPath.slice(0, -ext.length) + '.mts';
         console.error(
-          `  Tip: rename to .mts to force ESM format:\n` + `    mv ${configPath} ${mtsPath}`,
+          `  Tip: try renaming to .mts to force ESM format, or ensure tsx is installed and up to date.`,
         );
       } else {
         console.error(`  Tip: add "type": "module" to your package.json.`);
@@ -290,18 +275,13 @@ async function runEvalCommand(args: string[]) {
     process.exit(1);
   }
 
-  // Register tsx for TypeScript eval files (before config loading, which may also register tsx)
-  if (evalFiles.some((f) => /\.[mc]?tsx?$/.test(f))) {
-    await ensureTsxLoader();
-  }
-
   const runtime = await getRuntime(configArg, conditions);
   const results: EvalResult[] = [];
 
   try {
     for (const filePath of evalFiles) {
       try {
-        const mod = await import(pathToFileURL(path.resolve(filePath)).href);
+        const mod = await importModule(path.resolve(filePath), import.meta.url);
         const evalConfig: EvalConfig = mod.default ?? mod.config ?? mod;
 
         if (!evalConfig.workflow || !evalConfig.dataset || !evalConfig.scorers) {

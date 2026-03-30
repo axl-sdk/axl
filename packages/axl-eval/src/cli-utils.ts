@@ -6,7 +6,7 @@
  * Keep in sync with the studio versions if either changes.
  */
 
-import { resolve, extname } from 'node:path';
+import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
@@ -29,18 +29,9 @@ export function findConfig(cwd: string): string | undefined {
 
 // ── Extension helpers ──────────────────────────────────────────────
 
-/**
- * Returns true if the config path has an ambiguous TypeScript extension (.ts/.tsx)
- * that needs ESM forcing. Explicit extensions (.mts/.cts) are excluded.
- */
-export function needsEsmForcing(configPath: string): boolean {
-  const ext = extname(configPath);
-  return ext === '.ts' || ext === '.tsx';
-}
-
-/** Returns true if the config path is a TypeScript file that needs tsx loader hooks. */
-export function needsTsxLoader(configPath: string): boolean {
-  return /\.[mc]?tsx?$/.test(configPath);
+/** Returns true if the file is TypeScript and needs tsx to load. */
+export function needsTsxLoader(filePath: string): boolean {
+  return /\.[mc]?tsx?$/.test(filePath);
 }
 
 // ── Runtime resolution ─────────────────────────────────────────────
@@ -54,64 +45,53 @@ export function needsTsxLoader(configPath: string): boolean {
  * - CJS `module.exports = runtime` → mod.default is the runtime
  * - Named `export { runtime }` → mod.runtime is the runtime
  */
-export function resolveRuntime(mod: Record<string, unknown>): unknown {
-  const def = mod.default as Record<string, unknown> | undefined;
+export function resolveRuntime(mod: Record<string, any>): unknown {
+  const def = mod.default as Record<string, any> | undefined;
   return def?.default ?? def ?? mod.runtime;
 }
 
-// ── Loader registration ────────────────────────────────────────────
+// ── Module loading ────────────────────────────────────────────────
 
-let tsxRegistered = false;
-
-export async function ensureTsxLoader(): Promise<void> {
-  if (tsxRegistered) return;
-  tsxRegistered = true;
-
-  let loaded = false;
-  try {
-    // @ts-expect-error — tsx is an optional runtime dependency
-    const tsxEsm = await import('tsx/esm/api');
-    tsxEsm.register();
-    loaded = true;
-  } catch {
-    // ESM hook not available
-  }
-  try {
-    // @ts-expect-error — tsx is an optional runtime dependency
-    const tsxCjs = await import('tsx/cjs/api');
-    tsxCjs.register();
-    loaded = true;
-  } catch {
-    // CJS hook not available
-  }
-  if (!loaded) {
-    console.warn(
-      '[axl-eval] Warning: tsx is not installed. TypeScript files require tsx.\n' +
-        '  Install it with: npm install -D tsx',
-    );
-  }
-}
+// Lazily resolved tsImport function from tsx. `undefined` = not yet checked,
+// `null` = tsx not available.
+let tsImportFn:
+  | ((specifier: string, parentURL: string) => Promise<Record<string, any>>)
+  | null
+  | undefined;
 
 /**
- * Force ESM format for a specific config file so top-level await works
- * regardless of the nearest package.json "type" field.
+ * Import a module, using tsx's `tsImport()` for TypeScript files.
+ *
+ * `tsImport()` handles ESM/CJS format correctly without process-wide side effects —
+ * no need for `register()` hooks or ESM-forcing workarounds. Falls back to regular
+ * `import()` for non-TypeScript files or when tsx is not installed.
  */
-export async function forceEsmForConfig(configPath: string): Promise<void> {
-  try {
-    const nodeModule = await import('node:module');
-    const configUrl = pathToFileURL(configPath).href;
-    const hookCode = [
-      `export async function resolve(specifier, context, nextResolve) {`,
-      `  const result = await nextResolve(specifier, context);`,
-      `  if (result.url === ${JSON.stringify(configUrl)}) result.format = 'module';`,
-      `  return result;`,
-      `}`,
-    ].join('\n');
-    nodeModule.register(`data:text/javascript,${encodeURIComponent(hookCode)}`);
-  } catch {
-    // module.register() not available (Node < 20.6)
+export async function importModule(
+  filePath: string,
+  parentURL: string,
+): Promise<Record<string, any>> {
+  if (needsTsxLoader(filePath)) {
+    if (tsImportFn === undefined) {
+      try {
+        // @ts-expect-error — tsx is an optional runtime dependency
+        const mod = await import('tsx/esm/api');
+        tsImportFn = mod.tsImport ?? null;
+      } catch {
+        tsImportFn = null;
+        console.warn(
+          '[axl-eval] Warning: tsx is not installed. TypeScript files require tsx.\n' +
+            '  Install it with: npm install -D tsx',
+        );
+      }
+    }
+    if (tsImportFn) {
+      return (await tsImportFn(pathToFileURL(filePath).href, parentURL)) as Record<string, any>;
+    }
   }
+  return await import(pathToFileURL(filePath).href);
 }
+
+// ── Conditions ────────────────────────────────────────────────────
 
 export async function registerConditions(conditions: string[]): Promise<void> {
   try {

@@ -407,7 +407,7 @@ src/
 
 **Client:** React 19 SPA with Tailwind CSS v4, TanStack Query, and react-router-dom. Pre-built at publish time and served as static assets. Reads `window.__AXL_STUDIO_BASE__` for runtime base path configuration.
 
-**CLI:** Auto-detects and loads the user's config via `tsx` (with ESM-forcing resolve hook for `.ts` files), validates the runtime, starts the server, and optionally opens the browser.
+**CLI:** Auto-detects and loads the user's config via tsx's `tsImport()` API (handles ESM/CJS correctly for TypeScript files without process-wide side effects), validates the runtime, starts the server, and optionally opens the browser.
 
 **Middleware:** `createStudioMiddleware()` wraps the Hono app as a Node.js `(req, res)` handler via `@hono/node-server`. Adds `verifyUpgrade` for WS auth, `readOnly` mode, and `basePath` injection into the SPA.
 

@@ -1,7 +1,7 @@
 import { resolve, relative, dirname, basename } from 'node:path';
 import { readdirSync, statSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
 import type { AxlRuntime } from '@axlsdk/axl';
+import { importModule } from './cli-utils.js';
 
 /**
  * Configuration for lazy eval file discovery.
@@ -87,14 +87,9 @@ async function loadEvalFiles(
     return;
   }
 
-  // Register tsx loader if any files are TypeScript
-  if (files.some((f) => /\.[mc]?tsx?$/.test(f))) {
-    await ensureTsxLoader();
-  }
-
   for (const file of files) {
     try {
-      const mod = await import(pathToFileURL(file).href);
+      const mod = await importModule(file, import.meta.url);
       const evalConfig = mod.default ?? mod.config ?? mod;
 
       if (!evalConfig.workflow || !evalConfig.dataset || !evalConfig.scorers) {
@@ -242,35 +237,6 @@ function findFiles(dir: string, fileGlob: string, recursive: boolean, depth = 0)
 function globToRegex(glob: string): RegExp {
   const escaped = glob.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
   return new RegExp(`^${escaped}$`);
-}
-
-let tsxRegistered = false;
-
-async function ensureTsxLoader(): Promise<void> {
-  if (tsxRegistered) return;
-  tsxRegistered = true;
-
-  let loaded = false;
-  try {
-    const tsxEsm = await import('tsx/esm/api');
-    tsxEsm.register();
-    loaded = true;
-  } catch {
-    // ESM hook not available
-  }
-  try {
-    const tsxCjs = await import('tsx/cjs/api');
-    tsxCjs.register();
-    loaded = true;
-  } catch {
-    // CJS hook not available
-  }
-  if (!loaded) {
-    console.warn(
-      '[axl-studio] Warning: tsx is not installed. TypeScript eval files require tsx.\n' +
-        '  Install it with: npm install -D tsx',
-    );
-  }
 }
 
 async function registerConditions(conditions: string[]): Promise<void> {

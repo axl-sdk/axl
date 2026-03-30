@@ -2,13 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import {
-  parseArgs,
-  findConfig,
-  needsEsmForcing,
-  needsTsxLoader,
-  CONFIG_CANDIDATES,
-} from '../cli-utils.js';
+import { parseArgs, findConfig, needsTsxLoader, CONFIG_CANDIDATES } from '../cli-utils.js';
 
 // ── parseArgs ──────────────────────────────────────────────────────
 
@@ -182,38 +176,6 @@ describe('findConfig', () => {
   it('falls back to .js when only .js exists', () => {
     writeFileSync(join(tmpDir, 'axl.config.js'), '');
     expect(findConfig(tmpDir)).toBe(join(tmpDir, 'axl.config.js'));
-  });
-});
-
-// ── needsEsmForcing ────────────────────────────────────────────────
-
-describe('needsEsmForcing', () => {
-  it('returns true for .ts', () => {
-    expect(needsEsmForcing('/project/axl.config.ts')).toBe(true);
-  });
-
-  it('returns true for .tsx', () => {
-    expect(needsEsmForcing('/project/axl.config.tsx')).toBe(true);
-  });
-
-  it('returns false for .mts (already ESM)', () => {
-    expect(needsEsmForcing('/project/axl.config.mts')).toBe(false);
-  });
-
-  it('returns false for .cts (intentionally CJS)', () => {
-    expect(needsEsmForcing('/project/axl.config.cts')).toBe(false);
-  });
-
-  it('returns false for .js', () => {
-    expect(needsEsmForcing('/project/axl.config.js')).toBe(false);
-  });
-
-  it('returns false for .mjs', () => {
-    expect(needsEsmForcing('/project/axl.config.mjs')).toBe(false);
-  });
-
-  it('returns false for .cjs', () => {
-    expect(needsEsmForcing('/project/axl.config.cjs')).toBe(false);
   });
 });
 

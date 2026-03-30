@@ -1,18 +1,11 @@
 #!/usr/bin/env node
 import { resolve, extname } from 'node:path';
 import { existsSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
 import { serve } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
 import { createServer } from './server/index.js';
 import { resolveRuntime } from './resolve-runtime.js';
-import {
-  parseArgs,
-  findConfig,
-  needsEsmForcing,
-  needsTsxLoader,
-  CONFIG_CANDIDATES,
-} from './cli-utils.js';
+import { parseArgs, findConfig, importModule, CONFIG_CANDIDATES } from './cli-utils.js';
 
 // ── Main ────────────────────────────────────────────────────────────
 
@@ -64,59 +57,6 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
     configPath = found;
   }
 
-  // Register tsx as a TypeScript loader so .ts config files can be imported.
-  // Both ESM and CJS hooks are needed: if the config's nearest package.json
-  // lacks "type": "module", Node routes the import through CJS where the ESM
-  // hook alone can't intercept .ts resolution.
-  if (needsTsxLoader(configPath)) {
-    let tsxLoaded = false;
-    try {
-      const tsxEsm = await import('tsx/esm/api');
-      tsxEsm.register();
-      tsxLoaded = true;
-    } catch {
-      // ESM hook not available
-    }
-    try {
-      const tsxCjs = await import('tsx/cjs/api');
-      tsxCjs.register();
-      tsxLoaded = true;
-    } catch {
-      // CJS hook not available
-    }
-    if (!tsxLoaded) {
-      console.warn(
-        `[axl-studio] Warning: tsx is not installed. TypeScript config files require tsx as a dependency.\n` +
-          `  Install it with: npm install -D tsx`,
-      );
-    }
-  }
-
-  // Force ESM format for .ts/.tsx config files so top-level await works
-  // regardless of the nearest package.json "type" field. Without this,
-  // tsx decides CJS vs ESM based on package.json — CJS doesn't support
-  // top-level await. We register a resolve hook after tsx that overrides
-  // the format for the config file specifically.
-  // .mts/.cts have explicit format built into their extension; .mjs/.cjs
-  // are plain JS with explicit format. Only .ts/.tsx are ambiguous.
-  if (needsEsmForcing(configPath)) {
-    try {
-      const nodeModule = await import('node:module');
-      const configUrl = pathToFileURL(configPath).href;
-      const hookCode = [
-        `export async function resolve(specifier, context, nextResolve) {`,
-        `  const result = await nextResolve(specifier, context);`,
-        `  if (result.url === ${JSON.stringify(configUrl)}) result.format = 'module';`,
-        `  return result;`,
-        `}`,
-      ].join('\n');
-      nodeModule.register(`data:text/javascript,${encodeURIComponent(hookCode)}`);
-    } catch {
-      // module.register() not available (Node < 20.6) — fall through,
-      // error handler below will suggest .mts if loading fails
-    }
-  }
-
   // Register custom import conditions (e.g., --conditions development).
   // In monorepos, package.json "exports" often use the "development" condition
   // to point at source (.ts) instead of built dist. Without this, Studio
@@ -142,11 +82,12 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
 
   console.log(`[axl-studio] Loading config from ${configPath}`);
 
-  // Import the user's config
+  // Import the user's config via tsImport (handles ESM/CJS correctly for
+  // TypeScript files without process-wide side effects)
   let runtime: import('@axlsdk/axl').AxlRuntime;
   const ext = extname(configPath);
   try {
-    const mod = await import(pathToFileURL(configPath).href);
+    const mod = await importModule(configPath, import.meta.url);
     // resolveRuntime handles ESM default, CJS-to-ESM interop, and named exports
     runtime = resolveRuntime(mod) as typeof runtime;
 
@@ -172,9 +113,8 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
     ) {
       console.error(`[axl-studio] Config failed to load due to a CJS/ESM compatibility issue.`);
       if (ext === '.ts' || ext === '.tsx') {
-        const mtsPath = configPath.slice(0, -ext.length) + '.mts';
         console.error(
-          `  Tip: rename to .mts to force ESM format:\n` + `    mv ${configPath} ${mtsPath}`,
+          `  Tip: try renaming to .mts to force ESM format, or ensure tsx is installed and up to date.`,
         );
       } else {
         console.error(`  Tip: add "type": "module" to your package.json.`);

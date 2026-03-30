@@ -90,7 +90,7 @@ async function loadEvalFiles(
   for (const file of files) {
     try {
       const mod = await importModule(file, import.meta.url);
-      const evalConfig = mod.default ?? mod.config ?? mod;
+      const evalConfig = mod.default?.default ?? mod.default ?? mod.config ?? mod;
 
       if (!evalConfig.workflow || !evalConfig.dataset || !evalConfig.scorers) {
         console.warn(

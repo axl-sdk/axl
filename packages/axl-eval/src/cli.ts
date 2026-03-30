@@ -282,7 +282,7 @@ async function runEvalCommand(args: string[]) {
     for (const filePath of evalFiles) {
       try {
         const mod = await importModule(path.resolve(filePath), import.meta.url);
-        const evalConfig: EvalConfig = mod.default ?? mod.config ?? mod;
+        const evalConfig: EvalConfig = mod.default?.default ?? mod.default ?? mod.config ?? mod;
 
         if (!evalConfig.workflow || !evalConfig.dataset || !evalConfig.scorers) {
           console.error(

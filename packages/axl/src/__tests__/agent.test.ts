@@ -79,19 +79,14 @@ describe('agent()', () => {
 
   it('direct ask() attempts provider invocation', async () => {
     const a = agent({
-      model: 'openai:gpt-4o',
+      model: 'nonexistent:test-model',
       system: 'Test',
     });
 
     // Direct ask() creates a lightweight context and calls the provider.
-    // With API keys: succeeds and returns a string.
-    // Without API keys: rejects at the provider level.
-    try {
-      const result = await a.ask('hello');
-      expect(typeof result).toBe('string');
-    } catch {
-      // Provider error (e.g. missing API key) — still proves invocation was attempted
-    }
+    // An unknown provider name rejects immediately — proves invocation was attempted
+    // without hitting a real API (avoids flaky timeouts).
+    await expect(a.ask('hello')).rejects.toThrow(/Unknown provider "nonexistent"/);
   });
 
   // ── _config ──────────────────────────────────────────────────────────────

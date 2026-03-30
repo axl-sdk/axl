@@ -153,15 +153,15 @@ export function createServer(options: CreateServerOptions) {
         // HTML parser processes </script> before JavaScript runs.
         const safeBasePath = JSON.stringify(basePath).replace(/</g, '\\u003c');
         const injected = rawHtml.replace(
-          '</head>',
-          `<base href="${basePath}/">\n` +
-            `<script>window.__AXL_STUDIO_BASE__=${safeBasePath}</script>\n</head>`,
+          '<head>',
+          `<head>\n<base href="${basePath}/">\n` +
+            `<script>window.__AXL_STUDIO_BASE__=${safeBasePath}</script>`,
         );
 
         if (injected === rawHtml) {
           console.warn(
             '[axl-studio] Could not inject basePath into index.html — ' +
-              '</head> tag not found. The SPA may not route correctly.',
+              '<head> tag not found. The SPA may not route correctly.',
           );
         }
         spaHtml = injected;

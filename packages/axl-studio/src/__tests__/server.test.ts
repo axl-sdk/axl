@@ -120,6 +120,35 @@ describe('Studio Server', () => {
     }
   });
 
+  it('basePath injects <base> before existing <script> and <link> tags', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'axl-studio-test-'));
+    writeFileSync(
+      join(tmpDir, 'index.html'),
+      '<!DOCTYPE html><html><head>' +
+        '<script type="module" src="./assets/index.js"></script>' +
+        '<link rel="stylesheet" href="./assets/index.css">' +
+        '</head><body></body></html>',
+    );
+
+    try {
+      const runtime = new AxlRuntime();
+      runtime.registerProvider('mock', MockProvider.echo());
+      const { app } = createServer({ runtime, staticRoot: tmpDir, basePath: '/studio' });
+
+      const res = await app.request('/playground');
+      const html = await res.text();
+      const baseIdx = html.indexOf('<base href="/studio/">');
+      const scriptIdx = html.indexOf('<script type="module"');
+      const linkIdx = html.indexOf('<link rel="stylesheet"');
+      // <base> must appear before any elements with relative URL attributes
+      expect(baseIdx).toBeGreaterThan(-1);
+      expect(baseIdx).toBeLessThan(scriptIdx);
+      expect(baseIdx).toBeLessThan(linkIdx);
+    } finally {
+      rmSync(tmpDir, { recursive: true });
+    }
+  });
+
   it('basePath injection works for root path (no trailing slash)', async () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'axl-studio-test-'));
     writeFileSync(

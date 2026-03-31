@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { agent, tool, workflow } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
-import type { StreamEvent } from '@axlsdk/axl';
+import type { StreamEvent, TraceEvent } from '@axlsdk/axl';
 import { createTestRuntime } from '../helpers/setup.js';
 
 describe('Streaming E2E', () => {
@@ -181,5 +181,58 @@ describe('Streaming E2E', () => {
 
     const stream = runtime.stream('error-stream-wf', { message: 'hello' });
     await expect(stream.promise).rejects.toThrow('workflow failed');
+  });
+
+  it('stream emits workflow_end with status completed on success', async () => {
+    const provider = MockProvider.sequence([{ content: 'success' }]);
+    const { runtime } = createTestRuntime(provider);
+    const a = agent({ name: 'wf-end-agent', model: 'mock:test', system: 'test' });
+    const wf = workflow({
+      name: 'wf-end-stream-wf',
+      input: z.object({ message: z.string() }),
+      handler: async (ctx) => ctx.ask(a, ctx.input.message),
+    });
+    runtime.register(wf);
+
+    const stream = runtime.stream('wf-end-stream-wf', { message: 'hello' });
+    const allEvents: StreamEvent[] = [];
+    for await (const event of stream) {
+      allEvents.push(event);
+      if (event.type === 'done') break;
+    }
+
+    const stepEvents = allEvents.filter((e) => e.type === 'step');
+    const workflowEndStep = stepEvents.find((e) => {
+      const data = (e as { data: TraceEvent }).data;
+      return data.type === 'log' && (data.data as { event?: string })?.event === 'workflow_end';
+    });
+    expect(workflowEndStep).toBeDefined();
+
+    const endData = (workflowEndStep as { data: TraceEvent }).data;
+    expect((endData.data as { status?: string })?.status).toBe('completed');
+  });
+
+  it('stream emits workflow_end with status failed on error', async () => {
+    const { runtime, traces } = createTestRuntime();
+    const wf = workflow({
+      name: 'wf-fail-stream-wf',
+      input: z.object({ message: z.string() }),
+      handler: async () => {
+        throw new Error('intentional failure');
+      },
+    });
+    runtime.register(wf);
+
+    const stream = runtime.stream('wf-fail-stream-wf', { message: 'hello' });
+    await expect(stream.promise).rejects.toThrow('intentional failure');
+
+    // Verify workflow_end trace was emitted via the runtime trace listener
+    const logTraces = traces.filter((t: TraceEvent) => t.type === 'log');
+    const workflowEndTrace = logTraces.find(
+      (t: TraceEvent) => (t.data as { event?: string })?.event === 'workflow_end',
+    );
+    expect(workflowEndTrace).toBeDefined();
+    expect((workflowEndTrace!.data as { status?: string })?.status).toBe('failed');
+    expect((workflowEndTrace!.data as { error?: string })?.error).toBe('intentional failure');
   });
 });

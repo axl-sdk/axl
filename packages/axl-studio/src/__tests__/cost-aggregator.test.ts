@@ -80,4 +80,21 @@ describe('CostAggregator', () => {
     expect(Object.keys(data.byModel)).toHaveLength(0);
     expect(Object.keys(data.byWorkflow)).toHaveLength(0);
   });
+
+  it('processes events with cost: 0 and does not skip them', () => {
+    aggregator.onTrace({
+      type: 'agent_call',
+      agent: 'test',
+      cost: 0,
+      tokens: { input: 10, output: 5 },
+    });
+
+    const data = aggregator.getData();
+    expect(data.totalCost).toBe(0);
+    expect(data.totalTokens.input).toBe(10);
+    expect(data.totalTokens.output).toBe(5);
+    expect(data.byAgent['test']).toBeDefined();
+    expect(data.byAgent['test'].calls).toBe(1);
+    expect(data.byAgent['test'].cost).toBe(0);
+  });
 });

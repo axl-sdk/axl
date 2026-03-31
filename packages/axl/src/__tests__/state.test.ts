@@ -267,6 +267,96 @@ describe('MemoryStore', () => {
       expect(decisions[0].channel).toBe('email');
     });
   });
+
+  // ── Execution History ────────────────────────────────────────────────
+
+  describe('execution history', () => {
+    const makeExec = (id: string, startedAt: number): import('../types.js').ExecutionInfo => ({
+      executionId: id,
+      workflow: 'test-wf',
+      status: 'completed',
+      steps: [{ executionId: id, step: 0, type: 'log', timestamp: startedAt, data: {} }],
+      totalCost: 0.01,
+      startedAt,
+      completedAt: startedAt + 100,
+      duration: 100,
+    });
+
+    it('saveExecution + getExecution round-trip', async () => {
+      const store = new MemoryStore();
+      const exec = makeExec('e1', 1000);
+      await store.saveExecution(exec);
+
+      const loaded = await store.getExecution('e1');
+      expect(loaded).toEqual(exec);
+    });
+
+    it('getExecution returns null for unknown id', async () => {
+      const store = new MemoryStore();
+      expect(await store.getExecution('unknown')).toBeNull();
+    });
+
+    it('listExecutions returns sorted by startedAt descending', async () => {
+      const store = new MemoryStore();
+      await store.saveExecution(makeExec('e1', 1000));
+      await store.saveExecution(makeExec('e2', 3000));
+      await store.saveExecution(makeExec('e3', 2000));
+
+      const list = await store.listExecutions();
+      expect(list.map((e) => e.executionId)).toEqual(['e2', 'e3', 'e1']);
+    });
+
+    it('listExecutions respects limit', async () => {
+      const store = new MemoryStore();
+      await store.saveExecution(makeExec('e1', 1000));
+      await store.saveExecution(makeExec('e2', 3000));
+      await store.saveExecution(makeExec('e3', 2000));
+
+      const list = await store.listExecutions(2);
+      expect(list).toHaveLength(2);
+      expect(list[0].executionId).toBe('e2');
+    });
+
+    it('stores deep copies', async () => {
+      const store = new MemoryStore();
+      const exec = makeExec('e1', 1000);
+      await store.saveExecution(exec);
+      exec.totalCost = 999;
+
+      const loaded = await store.getExecution('e1');
+      expect(loaded!.totalCost).toBe(0.01);
+    });
+  });
+
+  // ── Eval History ──────────────────────────────────────────────────
+
+  describe('eval history', () => {
+    it('saveEvalResult + listEvalResults round-trip', async () => {
+      const store = new MemoryStore();
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { score: 1 } });
+      await store.saveEvalResult({
+        id: 'ev2',
+        eval: 'test',
+        timestamp: 2000,
+        data: { score: 0.5 },
+      });
+
+      const list = await store.listEvalResults();
+      expect(list).toHaveLength(2);
+      expect(list[0].id).toBe('ev2'); // newest first
+      expect(list[1].id).toBe('ev1');
+    });
+
+    it('listEvalResults respects limit', async () => {
+      const store = new MemoryStore();
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: {} });
+      await store.saveEvalResult({ id: 'ev2', eval: 'test', timestamp: 2000, data: {} });
+
+      const list = await store.listEvalResults(1);
+      expect(list).toHaveLength(1);
+      expect(list[0].id).toBe('ev2');
+    });
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -536,6 +626,91 @@ describe('SQLiteStore', () => {
       expect(decisions).toHaveLength(1);
       expect(decisions[0].executionId).toBe('exec-2');
       store2.close();
+    });
+  });
+
+  // ── Execution History ────────────────────────────────────────────────
+
+  describe('execution history', () => {
+    const makeExec = (id: string, startedAt: number): import('../types.js').ExecutionInfo => ({
+      executionId: id,
+      workflow: 'test-wf',
+      status: 'completed',
+      steps: [{ executionId: id, step: 0, type: 'log', timestamp: startedAt, data: {} }],
+      totalCost: 0.01,
+      startedAt,
+      completedAt: startedAt + 100,
+      duration: 100,
+    });
+
+    it('saveExecution + getExecution round-trip', async () => {
+      const store = createStore();
+      const exec = makeExec('e1', 1000);
+      await store.saveExecution(exec);
+
+      const loaded = await store.getExecution('e1');
+      expect(loaded).toEqual(exec);
+      store.close();
+    });
+
+    it('listExecutions returns sorted and respects limit', async () => {
+      const store = createStore();
+      await store.saveExecution(makeExec('e1', 1000));
+      await store.saveExecution(makeExec('e2', 3000));
+      await store.saveExecution(makeExec('e3', 2000));
+
+      const all = await store.listExecutions();
+      expect(all.map((e) => e.executionId)).toEqual(['e2', 'e3', 'e1']);
+
+      const limited = await store.listExecutions(2);
+      expect(limited).toHaveLength(2);
+      store.close();
+    });
+
+    it('persists across instances', async () => {
+      const dbPath = join(tmpdir(), `axl-test-exec-hist-${randomUUID()}.db`);
+      dbFiles.push(dbPath);
+
+      const store1 = new SQLiteStore(dbPath);
+      await store1.saveExecution(makeExec('e1', 1000));
+      store1.close();
+
+      const store2 = new SQLiteStore(dbPath);
+      const loaded = await store2.getExecution('e1');
+      expect(loaded).toEqual(makeExec('e1', 1000));
+      store2.close();
+    });
+  });
+
+  // ── Eval History ──────────────────────────────────────────────────
+
+  describe('eval history', () => {
+    it('saveEvalResult + listEvalResults round-trip', async () => {
+      const store = createStore();
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { score: 1 } });
+      await store.saveEvalResult({
+        id: 'ev2',
+        eval: 'test',
+        timestamp: 2000,
+        data: { score: 0.5 },
+      });
+
+      const list = await store.listEvalResults();
+      expect(list).toHaveLength(2);
+      expect(list[0].id).toBe('ev2');
+      expect(list[1].data).toEqual({ score: 1 });
+      store.close();
+    });
+
+    it('listEvalResults respects limit', async () => {
+      const store = createStore();
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: {} });
+      await store.saveEvalResult({ id: 'ev2', eval: 'test', timestamp: 2000, data: {} });
+
+      const list = await store.listEvalResults(1);
+      expect(list).toHaveLength(1);
+      expect(list[0].id).toBe('ev2');
+      store.close();
     });
   });
 });

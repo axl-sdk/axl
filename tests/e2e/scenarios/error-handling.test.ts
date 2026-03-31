@@ -61,7 +61,7 @@ describe('Error Handling E2E', () => {
       'intentional failure',
     );
 
-    const executions = runtime.getExecutions();
+    const executions = await runtime.getExecutions();
     expect(executions.length).toBe(1);
     expect(executions[0].status).toBe('failed');
     expect(executions[0].error).toBe('intentional failure');

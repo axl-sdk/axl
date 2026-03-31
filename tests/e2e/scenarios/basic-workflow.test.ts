@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { agent, workflow } from '@axlsdk/axl';
+import type { TraceEvent } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
 import { createTestRuntime, testWorkflow, greetTool } from '../helpers/setup.js';
 
@@ -84,7 +85,6 @@ describe('Basic Workflow E2E', () => {
     const wf = testWorkflow();
     runtime.register(wf);
 
-    // @ts-expect-error intentionally wrong input
     await expect(runtime.execute('test-wf', { wrong: 'field' })).rejects.toThrow();
   });
 
@@ -146,5 +146,56 @@ describe('Basic Workflow E2E', () => {
     await runtime.execute('meta-wf', { message: 'hi' }, { metadata: { userId: '123' } });
     expect(receivedMeta).toBeDefined();
     expect(receivedMeta!.userId).toBe('123');
+  });
+
+  it('agent_call trace step includes tokens from provider usage', async () => {
+    const provider = MockProvider.replay([
+      {
+        content: 'response with usage',
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 50,
+          total_tokens: 150,
+          reasoning_tokens: 10,
+        },
+        cost: 0.01,
+      },
+    ]);
+    const { runtime, traces } = createTestRuntime(provider);
+    const a = agent({ name: 'token-agent', model: 'mock:test', system: 'test' });
+    const wf = workflow({
+      name: 'token-wf',
+      input: z.object({ message: z.string() }),
+      handler: async (ctx) => ctx.ask(a, ctx.input.message),
+    });
+    runtime.register(wf);
+
+    await runtime.execute('token-wf', { message: 'hello' });
+
+    const agentCall = traces.find((t: TraceEvent) => t.type === 'agent_call');
+    expect(agentCall).toBeDefined();
+    expect(agentCall!.tokens).toEqual({ input: 100, output: 50, reasoning: 10 });
+  });
+
+  it('agent_call trace step has undefined tokens when provider returns no usage', async () => {
+    const provider = MockProvider.replay([
+      {
+        content: 'response without usage',
+      },
+    ]);
+    const { runtime, traces } = createTestRuntime(provider);
+    const a = agent({ name: 'no-usage-agent', model: 'mock:test', system: 'test' });
+    const wf = workflow({
+      name: 'no-usage-wf',
+      input: z.object({ message: z.string() }),
+      handler: async (ctx) => ctx.ask(a, ctx.input.message),
+    });
+    runtime.register(wf);
+
+    await runtime.execute('no-usage-wf', { message: 'hello' });
+
+    const agentCall = traces.find((t: TraceEvent) => t.type === 'agent_call');
+    expect(agentCall).toBeDefined();
+    expect(agentCall!.tokens).toBeUndefined();
   });
 });

@@ -66,4 +66,35 @@ describe('Studio API: Evals', () => {
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('NOT_FOUND');
   });
+
+  it('GET /api/evals/history returns empty initially', async () => {
+    const { app } = createTestServer();
+    const res = await app.request('/api/evals/history');
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.data).toEqual([]);
+  });
+
+  it('GET /api/evals/history returns runs after execution', async () => {
+    const provider = MockProvider.sequence([{ content: 'eval output' }]);
+    const { app } = createTestServer(provider);
+
+    // Run an eval
+    const runRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
+    expect(runRes.status).toBe(200);
+
+    // Check history
+    const histRes = await app.request('/api/evals/history');
+    expect(histRes.status).toBe(200);
+
+    const body = await histRes.json();
+    expect(body.ok).toBe(true);
+    expect(body.data.length).toBe(1);
+    expect(body.data[0].eval).toBe('test-eval');
+    expect(body.data[0]).toHaveProperty('id');
+    expect(typeof body.data[0].timestamp).toBe('number');
+    expect(body.data[0].data).toHaveProperty('summary');
+  });
 });

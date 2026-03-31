@@ -144,3 +144,31 @@ Key points:
 - Use `evals: 'path/to/evals/*.eval.ts'` to lazy-load eval files that would otherwise create circular dependencies (see [Studio README](../packages/axl-studio/README.md#lazy-eval-loading))
 
 See the [@axlsdk/studio README](../packages/axl-studio/README.md) for the full API reference and framework-specific examples.
+
+## Troubleshooting
+
+### Type incompatibility across ESM and CJS packages (dual package hazard)
+
+**Symptom:** TypeScript reports that types like `WorkflowContext` or `AxlRuntime` from `@axlsdk/axl` are incompatible between two packages in your monorepo, even though both import from the same version. Errors typically mention private or protected members not being assignable.
+
+**Cause:** This is the [dual package hazard](https://nodejs.org/api/packages.html#dual-package-hazard) — a known Node.js/TypeScript limitation. When one package in your dependency graph resolves `@axlsdk/axl` via the `import` condition (because it has `"type": "module"`) and another resolves via the `require` condition (no `"type": "module"`), TypeScript loads two separate declaration files (`.d.ts` and `.d.cts`). Even though the files are identical, TypeScript conservatively treats classes from different declaration files as distinct types.
+
+**Fixes (pick one):**
+
+1. **Use consistent `"type"` fields across your monorepo** (recommended). Ensure all packages that share Axl types resolve through the same export condition. Either all have `"type": "module"` or none do.
+
+2. **Use `moduleResolution: "bundler"` in your tsconfig.** This avoids the dual `import`/`require` condition split entirely — TypeScript always resolves through the `import` condition.
+
+3. **Pin resolution with `paths` in your root tsconfig:**
+   ```json
+   {
+     "compilerOptions": {
+       "paths": {
+         "@axlsdk/axl": ["./node_modules/@axlsdk/axl/dist/index.d.ts"]
+       }
+     }
+   }
+   ```
+   This forces all packages to resolve the same declaration file regardless of their module type.
+
+This is not specific to Axl — any package that ships separate ESM and CJS type declarations can trigger this when consumed through mixed resolution modes in a monorepo.

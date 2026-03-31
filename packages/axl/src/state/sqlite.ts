@@ -1,5 +1,5 @@
-import type { ChatMessage, HumanDecision } from '../types.js';
-import type { StateStore, PendingDecision, ExecutionState } from './types.js';
+import type { ChatMessage, ExecutionInfo, HumanDecision } from '../types.js';
+import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } from './types.js';
 
 // Lazy-loaded better-sqlite3 types
 type Database = import('better-sqlite3').Database;
@@ -12,6 +12,32 @@ function safeJsonParse(data: string): unknown | null {
   } catch {
     return null;
   }
+}
+
+type ExecutionHistoryRow = {
+  execution_id: string;
+  workflow: string;
+  status: string;
+  total_cost: number;
+  started_at: number;
+  completed_at: number | null;
+  duration: number;
+  error: string | null;
+  steps: string;
+};
+
+function rowToExecutionInfo(row: ExecutionHistoryRow): ExecutionInfo {
+  return {
+    executionId: row.execution_id,
+    workflow: row.workflow,
+    status: row.status as ExecutionInfo['status'],
+    totalCost: row.total_cost,
+    startedAt: row.started_at,
+    completedAt: row.completed_at ?? undefined,
+    duration: row.duration,
+    error: row.error ?? undefined,
+    steps: (safeJsonParse(row.steps) as ExecutionInfo['steps']) ?? [],
+  };
 }
 
 /**
@@ -86,6 +112,28 @@ export class SQLiteStore implements StateStore {
         updated_at TEXT NOT NULL DEFAULT (datetime('now')),
         PRIMARY KEY (scope, key)
       );
+
+      CREATE TABLE IF NOT EXISTS execution_history (
+        execution_id TEXT PRIMARY KEY,
+        workflow TEXT NOT NULL,
+        status TEXT NOT NULL,
+        total_cost REAL NOT NULL DEFAULT 0,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        duration INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        steps TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS eval_history (
+        id TEXT PRIMARY KEY,
+        eval_name TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        data TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_exec_history_started ON execution_history (started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_eval_history_timestamp ON eval_history (timestamp DESC);
     `);
   }
 
@@ -235,6 +283,71 @@ export class SQLiteStore implements StateStore {
     );
     const rows = stmt.all() as Array<{ execution_id: string }>;
     return rows.map((r) => r.execution_id);
+  }
+
+  // ── Execution History ────────────────────────────────────────────────────
+
+  async saveExecution(execution: ExecutionInfo): Promise<void> {
+    this.db
+      .prepare(
+        'INSERT OR REPLACE INTO execution_history (execution_id, workflow, status, total_cost, started_at, completed_at, duration, error, steps) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        execution.executionId,
+        execution.workflow,
+        execution.status,
+        execution.totalCost,
+        execution.startedAt,
+        execution.completedAt ?? null,
+        execution.duration,
+        execution.error ?? null,
+        JSON.stringify(execution.steps),
+      );
+  }
+
+  async getExecution(executionId: string): Promise<ExecutionInfo | null> {
+    const row = this.db
+      .prepare('SELECT * FROM execution_history WHERE execution_id = ?')
+      .get(executionId) as ExecutionHistoryRow | undefined;
+    return row ? rowToExecutionInfo(row) : null;
+  }
+
+  async listExecutions(limit?: number): Promise<ExecutionInfo[]> {
+    const sql = limit
+      ? 'SELECT * FROM execution_history ORDER BY started_at DESC LIMIT ?'
+      : 'SELECT * FROM execution_history ORDER BY started_at DESC';
+    const rows = (
+      limit ? this.db.prepare(sql).all(limit) : this.db.prepare(sql).all()
+    ) as ExecutionHistoryRow[];
+    return rows.map(rowToExecutionInfo);
+  }
+
+  // ── Eval History ────────────────────────────────────────────────────────
+
+  async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
+    this.db
+      .prepare(
+        'INSERT OR REPLACE INTO eval_history (id, eval_name, timestamp, data) VALUES (?, ?, ?, ?)',
+      )
+      .run(entry.id, entry.eval, entry.timestamp, JSON.stringify(entry.data));
+  }
+
+  async listEvalResults(limit?: number): Promise<EvalHistoryEntry[]> {
+    const sql = limit
+      ? 'SELECT * FROM eval_history ORDER BY timestamp DESC LIMIT ?'
+      : 'SELECT * FROM eval_history ORDER BY timestamp DESC';
+    const rows = (limit ? this.db.prepare(sql).all(limit) : this.db.prepare(sql).all()) as Array<{
+      id: string;
+      eval_name: string;
+      timestamp: number;
+      data: string;
+    }>;
+    return rows.map((r) => ({
+      id: r.id,
+      eval: r.eval_name,
+      timestamp: r.timestamp,
+      data: safeJsonParse(r.data),
+    }));
   }
 
   // ── Sessions (Studio introspection) ────────────────────────────────────

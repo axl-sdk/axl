@@ -4,9 +4,9 @@ import type { StudioEnv } from '../types.js';
 const app = new Hono<StudioEnv>();
 
 // List all executions
-app.get('/executions', (c) => {
+app.get('/executions', async (c) => {
   const runtime = c.get('runtime');
-  const executions = runtime.getExecutions();
+  const executions = await runtime.getExecutions();
   return c.json({ ok: true, data: executions });
 });
 

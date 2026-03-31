@@ -1,8 +1,8 @@
 import { writeFileSync, readFileSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { ChatMessage, HumanDecision } from '../types.js';
-import type { StateStore, PendingDecision, ExecutionState } from './types.js';
+import type { ChatMessage, ExecutionInfo, HumanDecision } from '../types.js';
+import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } from './types.js';
 
 /**
  * Path to the MemoryStore temp file for awaitHuman state.
@@ -37,6 +37,8 @@ export class MemoryStore implements StateStore {
   private decisions = new Map<string, PendingDecision>();
   private executionStates = new Map<string, ExecutionState>();
   private memories = new Map<string, Map<string, unknown>>();
+  private executionHistory = new Map<string, ExecutionInfo>();
+  private evalHistory = new Map<string, EvalHistoryEntry>();
 
   constructor() {
     // Load any persisted awaitHuman state from previous process
@@ -155,11 +157,43 @@ export class MemoryStore implements StateStore {
   async getAllMemory(scope: string): Promise<Array<{ key: string; value: unknown }>> {
     const scopeMap = this.memories.get(scope);
     if (!scopeMap) return [];
-    return Array.from(scopeMap.entries()).map(([key, value]) => ({ key, value }));
+    return Array.from(scopeMap.entries()).map(([key, value]) => ({
+      key,
+      value: structuredClone(value),
+    }));
   }
 
   async deleteMemory(scope: string, key: string): Promise<void> {
     this.memories.get(scope)?.delete(key);
+  }
+
+  // ── Execution History ──────────────────────────────────────────────
+
+  async saveExecution(execution: ExecutionInfo): Promise<void> {
+    this.executionHistory.set(execution.executionId, structuredClone(execution));
+  }
+
+  async getExecution(executionId: string): Promise<ExecutionInfo | null> {
+    const exec = this.executionHistory.get(executionId);
+    return exec ? structuredClone(exec) : null;
+  }
+
+  async listExecutions(limit?: number): Promise<ExecutionInfo[]> {
+    const sorted = [...this.executionHistory.values()].sort((a, b) => b.startedAt - a.startedAt);
+    const result = limit ? sorted.slice(0, limit) : sorted;
+    return result.map((e) => structuredClone(e));
+  }
+
+  // ── Eval History ──────────────────────────────────────────────────
+
+  async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
+    this.evalHistory.set(entry.id, structuredClone(entry));
+  }
+
+  async listEvalResults(limit?: number): Promise<EvalHistoryEntry[]> {
+    const sorted = [...this.evalHistory.values()].sort((a, b) => b.timestamp - a.timestamp);
+    const result = limit ? sorted.slice(0, limit) : sorted;
+    return result.map((e) => structuredClone(e));
   }
 
   // ── Sessions (Studio introspection) ─────────────────────────────────

@@ -1,11 +1,11 @@
 import { useState, useCallback } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { FlaskConical } from 'lucide-react';
 import { PanelShell } from '../../components/layout/PanelShell';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { JsonViewer } from '../../components/shared/JsonViewer';
-import { fetchEvals, runRegisteredEval, compareEvals } from '../../lib/api';
-import type { RegisteredEval } from '../../lib/types';
+import { fetchEvals, fetchEvalHistory, runRegisteredEval, compareEvals } from '../../lib/api';
+import type { RegisteredEval, EvalHistoryEntry } from '../../lib/types';
 
 // ── Types matching @axlsdk/eval's EvalResult shape ───────────────
 
@@ -40,13 +40,6 @@ type EvalResultData = {
   };
 };
 
-type HistoryEntry = {
-  id: string;
-  timestamp: number;
-  eval: string;
-  data: EvalResultData;
-};
-
 type ComparisonResult = {
   regressions?: Array<{ scorer: string; delta: number; baseline: number; candidate: number }>;
   improvements?: Array<{ scorer: string; delta: number; baseline: number; candidate: number }>;
@@ -59,10 +52,10 @@ type ComparisonResult = {
 };
 
 export function EvalRunnerPanel() {
+  const queryClient = useQueryClient();
   const [tab, setTab] = useState<'run' | 'history' | 'compare'>('run');
   const [selectedEval, setSelectedEval] = useState('');
   const [running, setRunning] = useState(false);
-  const [results, setResults] = useState<HistoryEntry[]>([]);
   const [currentResult, setCurrentResult] = useState<EvalResultData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [compareResult, setCompareResult] = useState<ComparisonResult | null>(null);
@@ -70,6 +63,11 @@ export function EvalRunnerPanel() {
   const { data: evals = [] } = useQuery({
     queryKey: ['evals'],
     queryFn: fetchEvals,
+  });
+
+  const { data: history = [] } = useQuery({
+    queryKey: ['evalHistory'],
+    queryFn: fetchEvalHistory,
   });
 
   const selectedMeta = evals.find((e: RegisteredEval) => e.name === selectedEval);
@@ -83,31 +81,26 @@ export function EvalRunnerPanel() {
     try {
       const result = (await runRegisteredEval(selectedEval)) as EvalResultData;
       setCurrentResult(result);
-      setResults((prev) => [
-        {
-          id: result.id ?? `eval-${Date.now()}`,
-          timestamp: Date.now(),
-          eval: selectedEval,
-          data: result,
-        },
-        ...prev,
-      ]);
+      // Refresh server-side history
+      queryClient.invalidateQueries({ queryKey: ['evalHistory'] });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setRunning(false);
     }
-  }, [selectedEval]);
+  }, [selectedEval, queryClient]);
 
   const handleCompare = useCallback(async () => {
-    if (results.length < 2) return;
+    if (history.length < 2) return;
     try {
-      const res = (await compareEvals(results[1].data, results[0].data)) as ComparisonResult;
+      const baseline = history[1].data as EvalResultData;
+      const candidate = history[0].data as EvalResultData;
+      const res = (await compareEvals(baseline, candidate)) as ComparisonResult;
       setCompareResult(res);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [results]);
+  }, [history]);
 
   const scorerEntries = currentResult?.summary?.scorers
     ? Object.entries(currentResult.summary.scorers)
@@ -325,7 +318,7 @@ export function EvalRunnerPanel() {
 
       {tab === 'history' && (
         <div>
-          {results.length === 0 ? (
+          {history.length === 0 ? (
             <EmptyState title="No eval history" description="Run evaluations to build history." />
           ) : (
             <table className="w-full text-xs">
@@ -339,32 +332,35 @@ export function EvalRunnerPanel() {
                 </tr>
               </thead>
               <tbody>
-                {results.map((r) => (
-                  <tr
-                    key={r.id}
-                    className="border-b border-[hsl(var(--border))] cursor-pointer hover:bg-[hsl(var(--accent))]"
-                    onClick={() => {
-                      setCurrentResult(r.data);
-                      setTab('run');
-                    }}
-                  >
-                    <td className="py-2 font-mono">{r.eval}</td>
-                    <td className="py-2">{new Date(r.timestamp).toLocaleString()}</td>
-                    <td className="py-2 text-right">{r.data.summary.count}</td>
-                    <td className="py-2 text-right">
-                      {r.data.summary.failures > 0 ? (
-                        <span className="text-red-600 dark:text-red-400">
-                          {r.data.summary.failures}
-                        </span>
-                      ) : (
-                        0
-                      )}
-                    </td>
-                    <td className="py-2 text-right font-mono">
-                      {r.data.totalCost > 0 ? `$${r.data.totalCost.toFixed(4)}` : '-'}
-                    </td>
-                  </tr>
-                ))}
+                {history.map((r: EvalHistoryEntry) => {
+                  const data = r.data as EvalResultData;
+                  return (
+                    <tr
+                      key={r.id}
+                      className="border-b border-[hsl(var(--border))] cursor-pointer hover:bg-[hsl(var(--accent))]"
+                      onClick={() => {
+                        setCurrentResult(data);
+                        setTab('run');
+                      }}
+                    >
+                      <td className="py-2 font-mono">{r.eval}</td>
+                      <td className="py-2">{new Date(r.timestamp).toLocaleString()}</td>
+                      <td className="py-2 text-right">{data.summary.count}</td>
+                      <td className="py-2 text-right">
+                        {data.summary.failures > 0 ? (
+                          <span className="text-red-600 dark:text-red-400">
+                            {data.summary.failures}
+                          </span>
+                        ) : (
+                          0
+                        )}
+                      </td>
+                      <td className="py-2 text-right font-mono">
+                        {data.totalCost > 0 ? `$${data.totalCost.toFixed(4)}` : '-'}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )}
@@ -373,7 +369,7 @@ export function EvalRunnerPanel() {
 
       {tab === 'compare' && (
         <div className="space-y-4">
-          {results.length < 2 ? (
+          {history.length < 2 ? (
             <EmptyState
               title="Need at least 2 eval runs"
               description="Run evaluations to compare results."

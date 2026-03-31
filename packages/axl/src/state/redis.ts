@@ -1,5 +1,5 @@
-import type { ChatMessage, HumanDecision } from '../types.js';
-import type { StateStore, PendingDecision, ExecutionState } from './types.js';
+import type { ChatMessage, ExecutionInfo, HumanDecision } from '../types.js';
+import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } from './types.js';
 
 // Minimal interface for the node-redis client methods we use.
 // Avoids a hard compile-time dependency on the redis package.
@@ -78,6 +78,22 @@ export class RedisStore implements StateStore {
 
   private pendingExecSetKey(): string {
     return 'axl:pending-executions';
+  }
+
+  private execHistoryKey(executionId: string): string {
+    return `axl:exec-history:${executionId}`;
+  }
+
+  private execHistorySetKey(): string {
+    return 'axl:exec-history-ids';
+  }
+
+  private evalHistoryKey(id: string): string {
+    return `axl:eval-history:${id}`;
+  }
+
+  private evalHistorySetKey(): string {
+    return 'axl:eval-history-ids';
   }
 
   // ── Checkpoints ──────────────────────────────────────────────────────
@@ -170,6 +186,53 @@ export class RedisStore implements StateStore {
 
   async listPendingExecutions(): Promise<string[]> {
     return this.client.sMembers(this.pendingExecSetKey());
+  }
+
+  // ── Execution History ────────────────────────────────────────────────
+
+  async saveExecution(execution: ExecutionInfo): Promise<void> {
+    // Write set membership first — if we crash between the two writes,
+    // listExecutions gracefully skips IDs with missing values.
+    await this.client.sAdd(this.execHistorySetKey(), execution.executionId);
+    await this.client.set(this.execHistoryKey(execution.executionId), JSON.stringify(execution));
+  }
+
+  async getExecution(executionId: string): Promise<ExecutionInfo | null> {
+    const raw = await this.client.get(this.execHistoryKey(executionId));
+    return raw ? JSON.parse(raw) : null;
+  }
+
+  async listExecutions(limit?: number): Promise<ExecutionInfo[]> {
+    const ids = await this.client.sMembers(this.execHistorySetKey());
+    if (ids.length === 0) return [];
+
+    const entries: ExecutionInfo[] = [];
+    for (const id of ids) {
+      const raw = await this.client.get(this.execHistoryKey(id));
+      if (raw) entries.push(JSON.parse(raw));
+    }
+    entries.sort((a, b) => b.startedAt - a.startedAt);
+    return limit ? entries.slice(0, limit) : entries;
+  }
+
+  // ── Eval History ────────────────────────────────────────────────────
+
+  async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
+    await this.client.sAdd(this.evalHistorySetKey(), entry.id);
+    await this.client.set(this.evalHistoryKey(entry.id), JSON.stringify(entry));
+  }
+
+  async listEvalResults(limit?: number): Promise<EvalHistoryEntry[]> {
+    const ids = await this.client.sMembers(this.evalHistorySetKey());
+    if (ids.length === 0) return [];
+
+    const entries: EvalHistoryEntry[] = [];
+    for (const id of ids) {
+      const raw = await this.client.get(this.evalHistoryKey(id));
+      if (raw) entries.push(JSON.parse(raw));
+    }
+    entries.sort((a, b) => b.timestamp - a.timestamp);
+    return limit ? entries.slice(0, limit) : entries;
   }
 
   // ── Sessions (Studio introspection) ────────────────────────────────────

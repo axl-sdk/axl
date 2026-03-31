@@ -13,6 +13,7 @@ import type {
   PendingDecision,
   HealthData,
   RegisteredEval,
+  EvalHistoryEntry,
 } from './types';
 
 const BASE = (window.__AXL_STUDIO_BASE__ ?? '') + '/api';
@@ -120,6 +121,7 @@ export const resetCosts = () => request<{ reset: boolean }>('/costs/reset', { me
 
 // ── Evals ──────────────────────────────────────────────────────────
 export const fetchEvals = () => request<RegisteredEval[]>('/evals');
+export const fetchEvalHistory = () => request<EvalHistoryEntry[]>('/evals/history');
 export const runRegisteredEval = (name: string) =>
   request<unknown>(`/evals/${encodeURIComponent(name)}/run`, { method: 'POST' });
 export const compareEvals = (baseline: unknown, candidate: unknown) =>

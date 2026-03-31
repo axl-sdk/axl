@@ -1,4 +1,4 @@
-import type { ChatMessage, HumanDecision } from '../types.js';
+import type { ChatMessage, ExecutionInfo, HumanDecision } from '../types.js';
 
 /** A pending human decision awaiting resolution. */
 export type PendingDecision = {
@@ -59,6 +59,20 @@ export interface StateStore {
   /** Delete a memory entry by key. */
   deleteMemory?(scope: string, key: string): Promise<void>;
 
+  // Execution history
+  /** Save a completed/failed execution to history. */
+  saveExecution?(execution: ExecutionInfo): Promise<void>;
+  /** Get a specific execution by ID from history. */
+  getExecution?(executionId: string): Promise<ExecutionInfo | null>;
+  /** List recent executions (most recent first). */
+  listExecutions?(limit?: number): Promise<ExecutionInfo[]>;
+
+  // Eval history
+  /** Save an eval result to history. */
+  saveEvalResult?(entry: EvalHistoryEntry): Promise<void>;
+  /** List eval history entries (most recent first). */
+  listEvalResults?(limit?: number): Promise<EvalHistoryEntry[]>;
+
   // Sessions (Studio introspection)
   /** List all session IDs (used by Studio session browser). */
   listSessions?(): Promise<string[]>;
@@ -67,3 +81,11 @@ export interface StateStore {
   close?(): Promise<void>;
   deleteCheckpoints?(executionId: string): Promise<void>;
 }
+
+/** Persisted eval history entry. */
+export type EvalHistoryEntry = {
+  id: string;
+  eval: string;
+  timestamp: number;
+  data: unknown;
+};

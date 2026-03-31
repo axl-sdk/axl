@@ -12,6 +12,13 @@ export function createEvalRoutes(evalLoader?: () => Promise<void>) {
     return c.json({ ok: true, data: evals });
   });
 
+  // Get eval run history
+  app.get('/evals/history', async (c) => {
+    const runtime = c.get('runtime');
+    const history = await runtime.getEvalHistory();
+    return c.json({ ok: true, data: history });
+  });
+
   // Run a registered eval by name
   app.post('/evals/:name/run', async (c) => {
     if (evalLoader) await evalLoader();
@@ -27,6 +34,7 @@ export function createEvalRoutes(evalLoader?: () => Promise<void>) {
     }
 
     try {
+      // Runtime persists eval result to history automatically
       const result = await runtime.runRegisteredEval(name);
       return c.json({ ok: true, data: result });
     } catch (err) {

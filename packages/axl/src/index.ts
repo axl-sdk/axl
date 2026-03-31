@@ -90,7 +90,12 @@ export { McpManager } from './mcp/manager.js';
 export type { McpToolDefinition, McpServer, McpToolResult, McpServerConfig } from './mcp/types.js';
 
 // State
-export type { StateStore, ExecutionState, PendingDecision } from './state/types.js';
+export type {
+  StateStore,
+  ExecutionState,
+  PendingDecision,
+  EvalHistoryEntry,
+} from './state/types.js';
 export { MemoryStore } from './state/memory.js';
 export { SQLiteStore } from './state/sqlite.js';
 export { RedisStore } from './state/redis.js';

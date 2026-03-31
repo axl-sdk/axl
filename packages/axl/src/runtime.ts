@@ -10,7 +10,7 @@ import type { Tool } from './tool.js';
 import type { Agent } from './agent.js';
 import type { Provider } from './providers/types.js';
 import { ProviderRegistry } from './providers/registry.js';
-import type { StateStore, PendingDecision } from './state/types.js';
+import type { StateStore, PendingDecision, EvalHistoryEntry } from './state/types.js';
 import { MemoryStore } from './state/memory.js';
 import { SQLiteStore } from './state/sqlite.js';
 import { WorkflowContext } from './context.js';
@@ -96,6 +96,10 @@ export class AxlRuntime extends EventEmitter {
   private mcpManager?: McpManager;
   private memoryManager?: MemoryManager;
   private spanManager: SpanManager = new NoopSpanManager();
+  private historicalExecutions = new Map<string, ExecutionInfo>();
+  private historicalExecutionsLoadPromise: Promise<void> | null = null;
+  private evalHistory: EvalHistoryEntry[] = [];
+  private evalHistoryLoadPromise: Promise<void> | null = null;
 
   constructor(config?: AxlConfig) {
     super();
@@ -144,6 +148,26 @@ export class AxlRuntime extends EventEmitter {
       default:
         return new MemoryStore();
     }
+  }
+
+  /**
+   * Persist a completed/failed execution to the state store (fire-and-forget)
+   * and move it from the active executions map to the historical cache.
+   */
+  private persistExecution(execInfo: ExecutionInfo): void {
+    const snapshot = structuredClone(execInfo);
+
+    if (this.stateStore.saveExecution) {
+      this.stateStore.saveExecution(snapshot).catch(() => {
+        // Best-effort persistence — execution still succeeded/failed normally
+      });
+    }
+
+    // Move from active to historical cache to bound active map growth.
+    // Use the snapshot so the cached entry is not mutated by lingering closures.
+    const id = execInfo.executionId;
+    this.historicalExecutions.set(id, snapshot);
+    this.executions.delete(id);
   }
 
   /** Register a workflow with the runtime. */
@@ -264,6 +288,8 @@ export class AxlRuntime extends EventEmitter {
     const entry = this.registeredEvals.get(name);
     if (!entry) throw new Error(`Eval "${name}" is not registered`);
 
+    let result: unknown;
+
     if (entry.executeWorkflow) {
       // Use custom executeWorkflow if provided, injecting this runtime as second arg
       let runEvalFn: (
@@ -300,25 +326,68 @@ export class AxlRuntime extends EventEmitter {
         return { output: result.output, cost: result.cost ?? trackedCost };
       };
 
-      return runEvalFn(entry.config, wrappedExecuteFn, undefined, this);
+      result = await runEvalFn(entry.config, wrappedExecuteFn, undefined, this);
+    } else {
+      // Default: use runtime.eval() which creates its own executeWorkflow
+      result = await this.eval(
+        entry.config as {
+          workflow: string;
+          dataset: unknown;
+          scorers: unknown[];
+          concurrency?: number;
+          budget?: string;
+          metadata?: Record<string, unknown>;
+        },
+      );
     }
 
-    // Default: use runtime.eval() which creates its own executeWorkflow
-    return this.eval(
-      entry.config as {
-        workflow: string;
-        dataset: unknown;
-        scorers: unknown[];
-        concurrency?: number;
-        budget?: string;
-        metadata?: Record<string, unknown>;
-      },
-    );
+    // Persist eval result to history (best-effort — don't lose the result on store errors)
+    const resultObj = result as Record<string, unknown>;
+    try {
+      await this.saveEvalResult({
+        id: (resultObj.id as string) ?? randomUUID(),
+        eval: name,
+        timestamp: Date.now(),
+        data: structuredClone(result),
+      });
+    } catch {
+      // Best-effort persistence — eval still succeeded
+    }
+
+    return result;
   }
 
-  /** Get all execution info (running + completed). */
-  getExecutions(): ExecutionInfo[] {
-    return [...this.executions.values()];
+  /** Get all execution info (running + completed + historical). */
+  async getExecutions(): Promise<ExecutionInfo[]> {
+    // Lazy-load historical executions from store on first access (once-guard)
+    if (!this.historicalExecutionsLoadPromise && this.stateStore.listExecutions) {
+      this.historicalExecutionsLoadPromise = this.stateStore
+        .listExecutions()
+        .then((stored) => {
+          for (const exec of stored) {
+            if (
+              !this.executions.has(exec.executionId) &&
+              !this.historicalExecutions.has(exec.executionId)
+            ) {
+              this.historicalExecutions.set(exec.executionId, exec);
+            }
+          }
+        })
+        .catch(() => {
+          // Failed to load — reset so next call retries
+          this.historicalExecutionsLoadPromise = null;
+        });
+    }
+    if (this.historicalExecutionsLoadPromise) {
+      await this.historicalExecutionsLoadPromise;
+    }
+
+    // Merge: in-memory takes precedence (has live data)
+    const merged = new Map(this.historicalExecutions);
+    for (const [id, exec] of this.executions) {
+      merged.set(id, exec);
+    }
+    return [...merged.values()].sort((a, b) => b.startedAt - a.startedAt);
   }
 
   /**
@@ -477,6 +546,7 @@ export class AxlRuntime extends EventEmitter {
           span.setAttribute('axl.workflow.cost', execInfo.totalCost);
           span.setAttribute('axl.workflow.duration', execInfo.duration);
 
+          this.persistExecution(execInfo);
           return output;
         } catch (err) {
           execInfo.status = 'failed';
@@ -484,6 +554,7 @@ export class AxlRuntime extends EventEmitter {
           execInfo.duration = execInfo.completedAt - execInfo.startedAt;
           execInfo.error = err instanceof Error ? err.message : String(err);
           ctx.log('workflow_end', { workflow: name, status: 'failed', error: execInfo.error });
+          this.persistExecution(execInfo);
           throw err;
         } finally {
           this.abortControllers.delete(executionId);
@@ -500,9 +571,10 @@ export class AxlRuntime extends EventEmitter {
     // Cancel workflow when consumer disconnects (stops reading the stream)
     axlStream.on('close', () => controller.abort());
 
-    // Execute asynchronously, piping events to the stream
-    // execInfo is captured by the closure so the catch handler can update it on error.
+    // Execute asynchronously, piping events to the stream.
+    // execInfo and ctx are captured by the closure so the catch handler can update them on error.
     let execInfo: ExecutionInfo | undefined;
+    let ctx: WorkflowContext | undefined;
 
     const run = async () => {
       const workflow = this.workflows.get(name);
@@ -528,7 +600,7 @@ export class AxlRuntime extends EventEmitter {
       };
       this.executions.set(executionId, execInfo);
 
-      const ctx = new WorkflowContext({
+      const wfCtx = new WorkflowContext({
         input: validated,
         executionId,
         metadata: options?.metadata,
@@ -621,6 +693,7 @@ export class AxlRuntime extends EventEmitter {
           policy: 'finish_and_stop',
         },
       });
+      ctx = wfCtx;
 
       return this.spanManager.withSpanAsync(
         'axl.workflow.execute',
@@ -631,7 +704,7 @@ export class AxlRuntime extends EventEmitter {
         },
         async (span) => {
           try {
-            const rawResult = await workflow.handler(ctx);
+            const rawResult = await workflow.handler(wfCtx);
             const result = workflow.outputSchema
               ? workflow.outputSchema.parse(rawResult)
               : rawResult;
@@ -639,6 +712,12 @@ export class AxlRuntime extends EventEmitter {
             execInfo!.status = 'completed';
             execInfo!.completedAt = Date.now();
             execInfo!.duration = execInfo!.completedAt - execInfo!.startedAt;
+            wfCtx.log('workflow_end', {
+              workflow: name,
+              status: 'completed',
+              duration: execInfo!.duration,
+              cost: execInfo!.totalCost,
+            });
 
             // Clean up checkpoints for completed execution
             if (this.stateStore.deleteCheckpoints) {
@@ -648,6 +727,7 @@ export class AxlRuntime extends EventEmitter {
             span.setAttribute('axl.workflow.cost', execInfo!.totalCost);
             span.setAttribute('axl.workflow.duration', execInfo!.duration);
 
+            this.persistExecution(execInfo!);
             return result;
           } finally {
             this.abortControllers.delete(executionId);
@@ -665,6 +745,12 @@ export class AxlRuntime extends EventEmitter {
           execInfo.completedAt = Date.now();
           execInfo.duration = execInfo.completedAt - execInfo.startedAt;
           execInfo.error = err instanceof Error ? err.message : String(err);
+          ctx?.log('workflow_end', {
+            workflow: name,
+            status: 'failed',
+            error: execInfo.error,
+          });
+          this.persistExecution(execInfo);
         }
         axlStream._error(err instanceof Error ? err : new Error(String(err)));
       });
@@ -717,7 +803,63 @@ export class AxlRuntime extends EventEmitter {
 
   /** Get execution details by ID. */
   async getExecution(executionId: string): Promise<ExecutionInfo | undefined> {
-    return this.executions.get(executionId);
+    // Check active in-memory executions first
+    const inMemory = this.executions.get(executionId);
+    if (inMemory) return inMemory;
+
+    // Check historical cache
+    const cached = this.historicalExecutions.get(executionId);
+    if (cached) return cached;
+
+    // Fall through to store
+    if (this.stateStore.getExecution) {
+      const stored = await this.stateStore.getExecution(executionId);
+      if (stored) {
+        this.historicalExecutions.set(executionId, stored);
+        return stored;
+      }
+    }
+
+    return undefined;
+  }
+
+  /** Save an eval result to history. */
+  async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
+    // Add to in-memory cache (newest first)
+    this.evalHistory.unshift(entry);
+
+    // Persist to store
+    if (this.stateStore.saveEvalResult) {
+      await this.stateStore.saveEvalResult(entry);
+    }
+  }
+
+  /** Get eval result history (most recent first). */
+  async getEvalHistory(): Promise<EvalHistoryEntry[]> {
+    // Lazy-load from store on first access (once-guard)
+    if (!this.evalHistoryLoadPromise && this.stateStore.listEvalResults) {
+      this.evalHistoryLoadPromise = this.stateStore
+        .listEvalResults()
+        .then((stored) => {
+          // Merge: stored entries not already in memory
+          const ids = new Set(this.evalHistory.map((e) => e.id));
+          for (const entry of stored) {
+            if (!ids.has(entry.id)) {
+              this.evalHistory.push(entry);
+            }
+          }
+          // Re-sort by timestamp descending
+          this.evalHistory.sort((a, b) => b.timestamp - a.timestamp);
+        })
+        .catch(() => {
+          // Failed to load — reset so next call retries
+          this.evalHistoryLoadPromise = null;
+        });
+    }
+    if (this.evalHistoryLoadPromise) {
+      await this.evalHistoryLoadPromise;
+    }
+    return [...this.evalHistory];
   }
 
   /** List pending human decisions. */

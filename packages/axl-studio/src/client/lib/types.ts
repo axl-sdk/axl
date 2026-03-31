@@ -180,6 +180,14 @@ export type RegisteredEval = {
   scorers: string[];
 };
 
+/** Eval history entry */
+export type EvalHistoryEntry = {
+  id: string;
+  eval: string;
+  timestamp: number;
+  data: unknown;
+};
+
 /** Health check response */
 export type HealthData = {
   status: string;

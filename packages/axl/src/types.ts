@@ -158,6 +158,7 @@ export type TraceEvent = {
   promptVersion?: string;
   model?: string;
   cost?: number;
+  tokens?: { input?: number; output?: number; reasoning?: number };
   duration?: number;
   data?: unknown;
   timestamp: number;

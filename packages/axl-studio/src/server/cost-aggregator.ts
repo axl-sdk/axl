@@ -25,9 +25,9 @@ export class CostAggregator {
     cost?: number;
     tokens?: { input?: number; output?: number; reasoning?: number };
   }): void {
-    if (!event.cost && !event.tokens) return;
+    if (event.cost == null && !event.tokens) return;
 
-    const cost = event.cost ?? 0;
+    const cost = Number.isFinite(event.cost) ? event.cost! : 0;
     const tokens = event.tokens ?? {};
 
     this.data.totalCost += cost;

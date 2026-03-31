@@ -629,6 +629,13 @@ export class WorkflowContext<TInput = unknown> {
         model: modelUri,
         promptVersion: agent._config.version,
         cost: response.cost,
+        tokens: response.usage
+          ? {
+              input: response.usage.prompt_tokens,
+              output: response.usage.completion_tokens,
+              reasoning: response.usage.reasoning_tokens,
+            }
+          : undefined,
         duration: Date.now() - startTime,
         data: { prompt, response: response.content },
       });

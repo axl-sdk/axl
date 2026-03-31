@@ -505,7 +505,7 @@ const result = await ctx.ask(extractAgent, 'Extract user from this text', {
 
 ### State Stores
 
-Three built-in implementations. All persist the same data: workflow execution checkpoints, `awaitHuman` decisions, session history, memory entries, and the execution state needed for suspend/resume.
+Three built-in implementations. All persist the same data: workflow execution checkpoints, `awaitHuman` decisions, session history, memory entries, execution history, eval history, and the execution state needed for suspend/resume.
 
 **Memory** (default) — in-process, no persistence. Use for development and stateless workflows.
 

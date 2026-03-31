@@ -810,6 +810,251 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 
 ---
 
+## AxlRuntime
+
+The central orchestrator. Manages workflow registration, provider resolution, state storage, execution lifecycle, and eval history.
+
+```typescript
+import { AxlRuntime } from '@axlsdk/axl';
+
+const runtime = new AxlRuntime({
+  state: { store: 'sqlite', sqlite: { path: './data/axl.db' } },
+});
+```
+
+### Registration
+
+| Method | Description |
+|--------|-------------|
+| `register(workflow)` | Register a workflow |
+| `registerTool(...tools)` | Register one or more standalone tools |
+| `registerAgent(...agents)` | Register one or more standalone agents |
+| `registerProvider(name, provider)` | Register a custom provider instance |
+| `registerEval(name, config, executeWorkflow?)` | Register an eval configuration |
+
+### Execution
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `execute(name, input, options?)` | `Promise<unknown>` | Execute a workflow and return the full result. Tracks execution lifecycle (status, duration, cost, traces) |
+| `stream(name, input, options?)` | `AxlStream` | Execute a workflow and return a stream of events. Same lifecycle tracking as `execute()` |
+| `session(id, options?)` | `Session` | Create or resume a multi-turn session (see [Sessions](#sessions)) |
+| `abort(executionId)` | `void` | Abort a running execution by ID |
+| `resumeExecution(executionId)` | `Promise<unknown>` | Resume a suspended execution (after `awaitHuman` is resolved) |
+| `resumePending()` | `Promise<string[]>` | Resume all pending executions from the state store. Call on startup to recover suspended workflows |
+| `getPendingDecisions()` | `Promise<PendingDecision[]>` | List all pending human decisions |
+| `resolveDecision(executionId, decision)` | `Promise<void>` | Resolve a pending human decision. The suspended workflow resumes automatically |
+
+`ExecuteOptions`:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `metadata` | `Record<string, unknown>` | `{}` | Metadata passed to the workflow context. Reserved keys: `sessionId`, `sessionHistory`, `resumeMode` |
+
+### Execution History
+
+Completed and failed executions are automatically persisted to the state store (when the store implements `saveExecution`). Historical executions are lazy-loaded on first access.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getExecutions()` | `Promise<ExecutionInfo[]>` | All executions (active + historical), sorted by `startedAt` descending. Merges in-memory active executions with historical data from the state store |
+| `getExecution(id)` | `Promise<ExecutionInfo \| undefined>` | Look up a specific execution. Checks in-memory first, then falls through to the state store |
+
+`ExecutionInfo`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `executionId` | `string` | Unique execution ID |
+| `workflow` | `string` | Workflow name |
+| `status` | `'running' \| 'completed' \| 'failed' \| 'waiting'` | Current status |
+| `steps` | `TraceEvent[]` | All trace events for this execution |
+| `totalCost` | `number` | Accumulated cost in USD |
+| `startedAt` | `number` | Start timestamp (ms) |
+| `completedAt` | `number \| undefined` | Completion timestamp (ms) |
+| `duration` | `number` | Duration in ms |
+| `error` | `string \| undefined` | Error message (when `status === 'failed'`) |
+
+### Eval History
+
+Eval results are automatically persisted when using `runRegisteredEval()`. Historical results are lazy-loaded on first access.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `runRegisteredEval(name)` | `Promise<unknown>` | Run a registered eval by name. Automatically persists the result to eval history |
+| `getEvalHistory()` | `Promise<EvalHistoryEntry[]>` | All eval results, most recent first. Merges in-memory results with historical data from the state store |
+| `saveEvalResult(entry)` | `Promise<void>` | Manually save an eval result to history |
+| `eval(config)` | `Promise<unknown>` | Run an ad-hoc eval (not registered). Does **not** auto-persist to history |
+| `evalCompare(baseline, candidate)` | `Promise<unknown>` | Compare two eval results for regressions/improvements |
+
+`EvalHistoryEntry`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` | Unique result ID |
+| `eval` | `string` | Eval name |
+| `timestamp` | `number` | When the eval was run (ms) |
+| `data` | `unknown` | Full `EvalResult` object from `@axlsdk/eval` |
+
+### Introspection
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getWorkflows()` | `Workflow[]` | All registered workflows |
+| `getWorkflow(name)` | `Workflow \| undefined` | Look up a workflow by name |
+| `getWorkflowNames()` | `string[]` | All registered workflow names |
+| `getAgents()` | `Agent[]` | All registered agents |
+| `getAgent(name)` | `Agent \| undefined` | Look up an agent by name |
+| `getTools()` | `Tool[]` | All registered tools |
+| `getTool(name)` | `Tool \| undefined` | Look up a tool by name |
+| `getRegisteredEvals()` | `Array<{ name, workflow, dataset, scorers }>` | All registered eval configs |
+| `getRegisteredEval(name)` | `{ config, executeWorkflow? } \| undefined` | Look up a specific eval registration |
+| `getStateStore()` | `StateStore` | The runtime's state store instance |
+| `getMcpManager()` | `McpManager \| undefined` | The runtime's MCP manager (if initialized) |
+
+### Lifecycle
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `initializeTelemetry()` | `Promise<void>` | Enable OpenTelemetry span emission. Call before executing workflows |
+| `initializeMcp()` | `Promise<void>` | Connect to configured MCP servers |
+| `shutdown()` | `Promise<void>` | Abort all in-flight executions, close MCP connections, memory manager, state store, and span manager |
+
+### Ad-hoc Context and Cost Tracking
+
+See [`runtime.createContext()`](#runtimecreatecontextoptions) and [`runtime.trackCost()`](#runtimetrackcostfn) above.
+
+---
+
+## StateStore
+
+Pluggable persistence interface. Built-in implementations: `MemoryStore` (in-memory, for development), `SQLiteStore` (file-based, for single-process production), `RedisStore` (distributed, for multi-process production).
+
+```typescript
+import { AxlRuntime, SQLiteStore, RedisStore } from '@axlsdk/axl';
+
+// String shortcut
+const runtime = new AxlRuntime({ state: { store: 'sqlite' } });
+
+// Instance for full control
+const runtime2 = new AxlRuntime({
+  state: { store: await RedisStore.create('redis://localhost:6379') },
+});
+```
+
+### Required Methods
+
+Every `StateStore` implementation must provide these methods.
+
+**Checkpoints** (for `ctx.checkpoint()` / suspend-resume):
+
+| Method | Description |
+|--------|-------------|
+| `saveCheckpoint(executionId, step, data)` | Save a checkpoint |
+| `getCheckpoint(executionId, step)` | Get a specific checkpoint |
+| `getLatestCheckpoint(executionId)` | Get the most recent checkpoint for an execution |
+
+**Sessions**:
+
+| Method | Description |
+|--------|-------------|
+| `saveSession(sessionId, history)` | Save session message history |
+| `getSession(sessionId)` | Get session message history (returns `[]` if not found) |
+| `deleteSession(sessionId)` | Delete a session and its metadata |
+| `saveSessionMeta(sessionId, key, value)` | Save session metadata (e.g., context summaries) |
+| `getSessionMeta(sessionId, key)` | Get session metadata |
+
+**Human-in-the-loop decisions**:
+
+| Method | Description |
+|--------|-------------|
+| `savePendingDecision(executionId, decision)` | Persist a pending human decision |
+| `getPendingDecisions()` | List all pending decisions |
+| `resolveDecision(executionId, result)` | Resolve a pending decision |
+
+**Execution state** (for suspend/resume):
+
+| Method | Description |
+|--------|-------------|
+| `saveExecutionState(executionId, state)` | Save execution state for resume |
+| `getExecutionState(executionId)` | Get execution state |
+| `listPendingExecutions()` | List execution IDs with status `'waiting'` |
+
+### Optional Methods
+
+These methods are optional (`?` on the interface). The runtime checks for their existence before calling. All three built-in stores implement all optional methods.
+
+**Memory** (for `ctx.remember()` / `ctx.recall()` / `ctx.forget()`):
+
+| Method | Description |
+|--------|-------------|
+| `saveMemory?(scope, key, value)` | Save a memory entry |
+| `getMemory?(scope, key)` | Get a memory entry |
+| `getAllMemory?(scope)` | Get all entries for a scope |
+| `deleteMemory?(scope, key)` | Delete a memory entry |
+
+**Execution history** (for `runtime.getExecutions()`):
+
+| Method | Description |
+|--------|-------------|
+| `saveExecution?(execution)` | Save a completed/failed `ExecutionInfo` to history |
+| `getExecution?(executionId)` | Get a specific execution from history |
+| `listExecutions?(limit?)` | List recent executions, most recent first. Pass `undefined` for no limit |
+
+**Eval history** (for `runtime.getEvalHistory()`):
+
+| Method | Description |
+|--------|-------------|
+| `saveEvalResult?(entry)` | Save an `EvalHistoryEntry` to history |
+| `listEvalResults?(limit?)` | List eval results, most recent first. Pass `undefined` for no limit |
+
+**Introspection and lifecycle**:
+
+| Method | Description |
+|--------|-------------|
+| `listSessions?()` | List all session IDs (used by Studio's session browser) |
+| `close?()` | Close the underlying connection (called by `runtime.shutdown()`) |
+| `deleteCheckpoints?(executionId)` | Delete all checkpoints for an execution (called on successful completion) |
+
+### Implementing a Custom StateStore
+
+Implement the required methods. Optional methods are only called if they exist on the object — omitting them is safe.
+
+```typescript
+import type { StateStore } from '@axlsdk/axl';
+
+class MyStore implements StateStore {
+  // Required: implement all checkpoint, session, decision, and execution state methods
+  // Optional: implement saveExecution/listExecutions for execution history,
+  //           saveEvalResult/listEvalResults for eval history, etc.
+}
+
+const runtime = new AxlRuntime({ state: { store: new MyStore() } });
+```
+
+---
+
+## TraceEvent
+
+Every agent call, tool invocation, handoff, and system event emits a `TraceEvent`. These accumulate in `ExecutionInfo.steps` and are broadcast via WebSocket in Studio.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `executionId` | `string` | Execution this event belongs to |
+| `step` | `number` | Auto-incrementing step counter |
+| `type` | `string` | Event type: `'agent_call'`, `'tool_call'`, `'tool_denied'`, `'handoff'`, `'delegate'`, `'verify'`, `'guardrail'`, `'validate'`, `'log'`, `'workflow_start'`, `'workflow_end'` |
+| `workflow` | `string?` | Workflow name (on workflow events) |
+| `agent` | `string?` | Agent name |
+| `tool` | `string?` | Tool name (on tool events) |
+| `model` | `string?` | Model URI (on agent_call events) |
+| `promptVersion` | `string?` | Agent version (on agent_call events) |
+| `cost` | `number?` | Cost in USD for this step |
+| `tokens` | `{ input?, output?, reasoning? }?` | Token usage from the provider (on `agent_call` events). Maps from `ProviderResponse.usage` |
+| `duration` | `number?` | Duration in ms |
+| `data` | `unknown?` | Event-specific payload (prompt/response for agent_call, args/result for tool_call, etc.) |
+| `timestamp` | `number` | Event timestamp (ms) |
+
+---
+
 ## Error Types
 
 All errors extend `AxlError`.

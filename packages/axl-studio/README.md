@@ -145,6 +145,7 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `PUT /api/memory/:scope/:key` | Save memory entry |
 | `DELETE /api/memory/:scope/:key` | Delete memory entry |
 | `GET /api/evals` | List registered eval configs |
+| `GET /api/evals/history` | List eval run history |
 | `POST /api/evals/:name/run` | Run a registered eval by name |
 | `POST /api/evals/compare` | Compare two eval results |
 | `GET /api/decisions` | List pending decisions |

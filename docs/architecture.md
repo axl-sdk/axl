@@ -84,7 +84,7 @@ The `StateStore` interface abstracts persistence. Three built-in implementations
 | `SQLiteStore` | File-based persistence (requires `better-sqlite3`) |
 | `RedisStore` | Multi-process deployments (requires `redis`) |
 
-State stores handle workflow execution state (for `checkpoint`/resume), session history, memory entries, and pending human decisions.
+State stores handle workflow execution state (for `checkpoint`/resume), session history, memory entries, pending human decisions, execution history, and eval history.
 
 ```typescript
 // Memory — zero config, no persistence (default)

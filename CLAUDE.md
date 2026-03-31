@@ -37,6 +37,9 @@ import { GuardrailError, ValidationError } from '@axlsdk/axl';
 // Tier 2 types
 import type { ToolHooks, HandoffRecord, AgentCallInfo } from '@axlsdk/axl';
 
+// State types
+import type { StateStore, ExecutionState, PendingDecision, EvalHistoryEntry } from '@axlsdk/axl';
+
 // Provider types
 import type { Effort, ToolChoice, ChatOptions, DelegateOptions, CreateContextOptions } from '@axlsdk/axl';
 
@@ -103,7 +106,7 @@ packages/axl/src/
     vector-memory.ts — InMemoryVectorStore (testing)
     vector-sqlite.ts — SqliteVectorStore (sqlite-vec)
   state/
-    types.ts         — StateStore interface
+    types.ts         — StateStore interface, EvalHistoryEntry, PendingDecision, ExecutionState
     memory.ts        — MemoryStore (in-memory Maps)
     sqlite.ts        — SQLiteStore (file-based JSON placeholder)
     redis.ts         — RedisStore (node-redis; created via async `RedisStore.create(url)` factory)
@@ -246,11 +249,16 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - `providerMetadata` on `ChatMessage` and `ProviderResponse`: opaque bag for provider-specific round-trip data. Gemini uses it to preserve `thoughtSignature` for reasoning context. OpenAI Responses API uses `providerMetadata.openaiReasoningItems` to round-trip encrypted reasoning content across multi-turn conversations
 - Anthropic 4.6 models (Opus 4.6, Sonnet 4.6) use adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`) when `effort` is set. Opus 4.5 supports `output_config.effort` but not adaptive thinking. `thinkingBudget` falls back to manual mode (`thinking: { type: "enabled", budget_tokens }`) for precise control. `effort` + `thinkingBudget: 0` sends standalone `output_config.effort` without thinking block
 - ProviderResponse.usage includes optional `reasoning_tokens` and `cached_tokens`
+- TraceEvent includes optional `tokens: { input?, output?, reasoning? }` — emitted on `agent_call` events from `ProviderResponse.usage`. Used by Studio's CostAggregator for token tracking
 - AxlStream requires `[Symbol.asyncDispose]` on iterator for TS 5.9+ compat
 - WorkflowContext.ask() implements tool calling loop with max turns, budget tracking, self-correction retry
 - zodToJsonSchema helper in context.ts wraps Zod v4's built-in `z.toJSONSchema()` for tool definitions
 - Telemetry: `@opentelemetry/api` is optional peer dep; `NoopSpanManager` used when disabled; `runtime.initializeTelemetry()` activates span emission; cost-per-span on all agent/workflow spans
-- State: `StateConfig.store` accepts `'memory'` | `'sqlite'` | `StateStore` instance. `'redis'` is NOT a valid string — pass `await RedisStore.create(url)` as the instance. RedisStore requires the `redis` peer dep (node-redis v5, not ioredis). Private constructor enforces async factory usage.
+- State: `StateConfig.store` accepts `'memory'` | `'sqlite'` | `StateStore` instance. `'redis'` is NOT a valid string — pass `await RedisStore.create(url)` as the instance. RedisStore requires the `redis` peer dep (node-redis v5, not ioredis). Private constructor enforces async factory usage
+- StateStore optional methods: `saveExecution`/`getExecution`/`listExecutions` for execution history persistence, `saveEvalResult`/`listEvalResults` for eval history. All 3 built-in stores implement them. Completed/failed executions and eval results auto-persist; lazy-loaded on first access. With SQLite/Redis, history survives restarts
+- `AxlRuntime.getExecutions()` is async (`Promise<ExecutionInfo[]>`), lazy-loads historical from StateStore, merges with in-memory active executions. `getExecution(id)` falls through to store if not in memory
+- `AxlRuntime.getEvalHistory()` returns eval run history (most recent first); `saveEvalResult(entry)` persists to in-memory cache + StateStore. `runRegisteredEval()` auto-saves results
+- `EvalHistoryEntry` type: `{ id, eval, timestamp, data }` — exported from `@axlsdk/axl`
 - Memory: `ctx.remember()`/`ctx.recall()`/`ctx.forget()` backed by StateStore; semantic recall via VectorStore + embedder; `MemoryManager` coordinates both
 - Guardrails: `agent({ guardrails: { input, output, onBlock, maxRetries } })`; `GuardrailError` thrown on block; self-correcting retry on `'retry'` policy
 - Validate: `ctx.ask(agent, prompt, { schema, validate, validateRetries })` — per-call post-schema business rule validation on typed object; requires schema (skipped without); `ValidationError` thrown after retries; output pipeline: guardrail → schema → validate, all with accumulating context and independent retry counters. Also supported on `ctx.delegate()` (forwarded to final ask), `ctx.race()` (invalid results discarded), and `ctx.verify()` (runs after schema parse)

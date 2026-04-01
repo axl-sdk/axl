@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-03-31
+
 ### Added
 
 - **Core:** `AxlRuntime.resolveProvider(uri)` public method resolves a `provider:model` URI to `{ provider, model }` using the runtime's provider registry
@@ -394,7 +396,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/axl-sdk/axl/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/axl-sdk/axl/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/axl-sdk/axl/compare/v0.10.4...v0.11.0
 [0.7.6]: https://github.com/axl-sdk/axl/compare/v0.7.5...v0.7.6

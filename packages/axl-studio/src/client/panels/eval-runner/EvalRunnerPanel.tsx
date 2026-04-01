@@ -14,7 +14,8 @@ type EvalItem = {
   annotations?: unknown;
   output: unknown;
   error?: string;
-  scores: Record<string, number>;
+  errors?: string[];
+  scores: Record<string, number | null>;
 };
 
 type ScorerStats = {
@@ -233,16 +234,42 @@ export function EvalRunnerPanel() {
                         </tr>
                       </thead>
                       <tbody>
-                        {scorerEntries.map(([scorer, stats]) => (
-                          <tr key={scorer} className="border-b border-[hsl(var(--border))]">
-                            <td className="py-2 font-mono">{scorer}</td>
-                            <td className="py-2 text-right font-mono">{stats.mean.toFixed(3)}</td>
-                            <td className="py-2 text-right font-mono">{stats.p50.toFixed(3)}</td>
-                            <td className="py-2 text-right font-mono">{stats.p95.toFixed(3)}</td>
-                            <td className="py-2 text-right font-mono">{stats.min.toFixed(3)}</td>
-                            <td className="py-2 text-right font-mono">{stats.max.toFixed(3)}</td>
-                          </tr>
-                        ))}
+                        {scorerEntries.map(([scorer, stats]) => {
+                          const hasValidScores = currentResult.items.some(
+                            (i) => !i.error && i.scores[scorer] != null,
+                          );
+                          return (
+                            <tr key={scorer} className="border-b border-[hsl(var(--border))]">
+                              <td className="py-2 font-mono">{scorer}</td>
+                              {hasValidScores ? (
+                                <>
+                                  <td className="py-2 text-right font-mono">
+                                    {stats.mean.toFixed(3)}
+                                  </td>
+                                  <td className="py-2 text-right font-mono">
+                                    {stats.p50.toFixed(3)}
+                                  </td>
+                                  <td className="py-2 text-right font-mono">
+                                    {stats.p95.toFixed(3)}
+                                  </td>
+                                  <td className="py-2 text-right font-mono">
+                                    {stats.min.toFixed(3)}
+                                  </td>
+                                  <td className="py-2 text-right font-mono">
+                                    {stats.max.toFixed(3)}
+                                  </td>
+                                </>
+                              ) : (
+                                <td
+                                  colSpan={5}
+                                  className="py-2 text-center text-[hsl(var(--muted-foreground))]"
+                                >
+                                  No valid scores
+                                </td>
+                              )}
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -263,22 +290,29 @@ export function EvalRunnerPanel() {
                               {item.error && (
                                 <span className="ml-2 text-red-600 dark:text-red-400">(error)</span>
                               )}
+                              {item.errors && item.errors.length > 0 && !item.error && (
+                                <span className="ml-2 text-amber-600 dark:text-amber-400">
+                                  (scorer errors)
+                                </span>
+                              )}
                             </span>
                             <div className="flex items-center gap-2">
-                              {Object.entries(item.scores).map(([scorer, score]) => (
-                                <span
-                                  key={scorer}
-                                  className={`px-1.5 py-0.5 rounded font-mono ${
-                                    score >= 0.8
-                                      ? 'bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300'
-                                      : score >= 0.5
-                                        ? 'bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300'
-                                        : 'bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300'
-                                  }`}
-                                >
-                                  {scorer}: {score.toFixed(2)}
-                                </span>
-                              ))}
+                              {Object.entries(item.scores)
+                                .filter(([, score]) => score != null)
+                                .map(([scorer, score]) => (
+                                  <span
+                                    key={scorer}
+                                    className={`px-1.5 py-0.5 rounded font-mono ${
+                                      score! >= 0.8
+                                        ? 'bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300'
+                                        : score! >= 0.5
+                                          ? 'bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300'
+                                          : 'bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300'
+                                    }`}
+                                  >
+                                    {scorer}: {score!.toFixed(2)}
+                                  </span>
+                                ))}
                             </div>
                           </summary>
                           <div className="px-3 py-2 border-t border-[hsl(var(--border))] space-y-2 text-xs">
@@ -296,6 +330,20 @@ export function EvalRunnerPanel() {
                                   Error:
                                 </span>
                                 <span className="ml-1">{item.error}</span>
+                              </div>
+                            )}
+                            {item.errors && item.errors.length > 0 && (
+                              <div>
+                                <span className="font-medium text-amber-600 dark:text-amber-400">
+                                  Scorer errors:
+                                </span>
+                                <ul className="ml-4 mt-1 list-disc">
+                                  {item.errors.map((err, j) => (
+                                    <li key={j} className="text-amber-700 dark:text-amber-300">
+                                      {err}
+                                    </li>
+                                  ))}
+                                </ul>
                               </div>
                             )}
                           </div>

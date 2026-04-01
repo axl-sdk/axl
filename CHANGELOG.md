@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-04-01
+
 ### Changed
 
 - **Eval:** `EvalItem.errors` renamed to `EvalItem.scorerErrors` to distinguish from the workflow-level `error` field
@@ -400,7 +402,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/axl-sdk/axl/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/axl-sdk/axl/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/axl-sdk/axl/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/axl-sdk/axl/compare/v0.10.4...v0.11.0

@@ -478,6 +478,27 @@ describe('registerProvider()', () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
+// resolveProvider()
+// ═════════════════════════════════════════════════════════════════════════
+
+describe('resolveProvider()', () => {
+  it('resolves a provider:model URI to provider instance and model name', () => {
+    const runtime = new AxlRuntime();
+    const mockProvider = new TestProvider([{ content: 'echo' }]);
+    runtime.registerProvider('mock', mockProvider as any);
+
+    const result = runtime.resolveProvider('mock:test-model');
+    expect(result.provider).toBe(mockProvider);
+    expect(result.model).toBe('test-model');
+  });
+
+  it('throws for unknown provider', () => {
+    const runtime = new AxlRuntime();
+    expect(() => runtime.resolveProvider('unknown:model')).toThrow('Unknown provider "unknown"');
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════
 // Trace events
 // ═════════════════════════════════════════════════════════════════════════
 

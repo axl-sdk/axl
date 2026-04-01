@@ -1,3 +1,17 @@
+/** Context passed to scorers by the eval runner. */
+export type ScorerContext = {
+  /** Resolve a provider:model URI to a provider instance and model name. */
+  resolveProvider: (modelUri: string) => {
+    provider: {
+      chat(
+        messages: { role: string; content: string }[],
+        options: { model: string; temperature?: number },
+      ): Promise<{ content: string; cost?: number }>;
+    };
+    model: string;
+  };
+};
+
 export type ScorerFn<TOutput, TInput, TAnnotations> = (
   output: TOutput,
   input: TInput,
@@ -14,7 +28,12 @@ export type Scorer<TOutput = unknown, TInput = unknown, TAnnotations = unknown> 
   readonly name: string;
   readonly description: string;
   readonly isLlm: boolean;
-  score(output: TOutput, input: TInput, annotations?: TAnnotations): number | Promise<number>;
+  score(
+    output: TOutput,
+    input: TInput,
+    annotations?: TAnnotations,
+    context?: ScorerContext,
+  ): number | Promise<number>;
 };
 
 export function scorer<TOutput = unknown, TInput = unknown, TAnnotations = unknown>(

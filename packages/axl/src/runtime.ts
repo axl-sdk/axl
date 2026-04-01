@@ -298,7 +298,6 @@ export class AxlRuntime extends EventEmitter {
           input: unknown,
           runtime: unknown,
         ) => Promise<{ output: unknown; cost?: number }>,
-        provider: unknown,
         runtime: unknown,
       ) => Promise<unknown>;
       try {
@@ -326,7 +325,7 @@ export class AxlRuntime extends EventEmitter {
         return { output: result.output, cost: result.cost ?? trackedCost };
       };
 
-      result = await runEvalFn(entry.config, wrappedExecuteFn, undefined, this);
+      result = await runEvalFn(entry.config, wrappedExecuteFn, this);
     } else {
       // Default: use runtime.eval() which creates its own executeWorkflow
       result = await this.eval(
@@ -432,6 +431,11 @@ export class AxlRuntime extends EventEmitter {
   /** Register a custom provider instance. */
   registerProvider(name: string, provider: Provider): void {
     this.providerRegistry.registerInstance(name, provider);
+  }
+
+  /** Resolve a provider:model URI to a Provider instance and model name. */
+  resolveProvider(uri: string): { provider: Provider; model: string } {
+    return this.providerRegistry.resolve(uri, this.config);
   }
 
   /** Execute a workflow and return the result. */
@@ -981,7 +985,6 @@ export class AxlRuntime extends EventEmitter {
     let runEvalFn: (
       config: unknown,
       executeFn: (input: unknown, runtime: unknown) => Promise<{ output: unknown; cost?: number }>,
-      provider: unknown,
       runtime: unknown,
     ) => Promise<unknown>;
     try {
@@ -1000,7 +1003,7 @@ export class AxlRuntime extends EventEmitter {
       return { output: result, cost };
     };
 
-    return runEvalFn(config, executeWorkflow, undefined, this);
+    return runEvalFn(config, executeWorkflow, this);
   }
 
   /**

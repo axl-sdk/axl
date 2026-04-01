@@ -66,7 +66,17 @@ const partialMatch = scorer({
 
 ### `llmScorer(config)`
 
-Use an LLM as a judge. The scorer automatically constructs a prompt from the input, output, and annotations, then validates the response against your Zod schema:
+Use an LLM as a judge. The scorer automatically constructs a prompt from the input, output, and annotations, then validates the response against your Zod schema.
+
+The `model` field uses a `provider:model` URI. The provider is resolved automatically from the runtime's provider registry at eval time — you just need the relevant API key environment variable set:
+
+| Provider | URI prefix | Env var |
+|----------|-----------|---------|
+| OpenAI (Chat Completions) | `openai:` | `OPENAI_API_KEY` |
+| OpenAI (Responses API) | `openai-responses:` | `OPENAI_API_KEY` |
+| Anthropic | `anthropic:` | `ANTHROPIC_API_KEY` |
+| Google Gemini | `google:` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
+| Custom | `your-name:` | Via `runtime.registerProvider('your-name', provider)` |
 
 ```typescript
 import { llmScorer } from '@axlsdk/eval';
@@ -81,8 +91,15 @@ const qualityJudge = llmScorer({
     score: z.number().min(0).max(1),
     reasoning: z.string(),
   }),
-  temperature: 0.2,
+  temperature: 0.2, // default: 0.2
 });
+```
+
+Different LLM scorers can use different providers — each resolves independently:
+
+```typescript
+const qualityJudge = llmScorer({ model: 'openai:gpt-4o', ... });
+const safetyJudge = llmScorer({ model: 'anthropic:claude-sonnet-4-5-20250514', ... });
 ```
 
 ### `runEval(config, executeFn, runtime)`
@@ -157,6 +174,50 @@ export default defineEval({
   dataset: mathDataset,
   scorers: [correctAnswer],
 });
+```
+
+**With an LLM scorer** — use an LLM to judge output quality alongside deterministic checks:
+
+```typescript
+// evals/quality.eval.ts
+import { defineEval, dataset, scorer, llmScorer } from '@axlsdk/eval';
+import { z } from 'zod';
+
+const ds = dataset({
+  name: 'qa-pairs',
+  schema: z.object({ question: z.string() }),
+  annotations: z.object({ topic: z.string() }),
+  items: [
+    { input: { question: 'Explain closures in JS' }, annotations: { topic: 'closures' } },
+    { input: { question: 'What is a promise?' }, annotations: { topic: 'promises' } },
+  ],
+});
+
+export default defineEval({
+  workflow: 'qa-quality',
+  dataset: ds,
+  scorers: [
+    // Deterministic check — no LLM needed
+    scorer({
+      name: 'not-empty',
+      description: 'Output is non-empty',
+      score: (output) => (String(output).length > 10 ? 1 : 0),
+    }),
+    // LLM judge — provider resolved automatically from OPENAI_API_KEY
+    llmScorer({
+      name: 'relevance',
+      description: 'Is the answer relevant to the topic?',
+      model: 'openai:gpt-4o',
+      system: 'Rate whether the answer is relevant to the given topic.',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    }),
+  ],
+});
+```
+
+```bash
+# Run it — just needs OPENAI_API_KEY in the environment
+OPENAI_API_KEY=sk-... npx axl-eval ./evals/quality.eval.ts
 ```
 
 When running via `runtime.eval()` or `runtime.runRegisteredEval()`, the runner calls `runtime.execute(workflow, input)` by default, which requires the workflow to be registered on the runtime.

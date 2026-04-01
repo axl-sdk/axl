@@ -41,6 +41,7 @@ export function evalCompare(baseline: EvalResult, candidate: EvalResult): EvalCo
       const delta = round(cScore - bScore);
       if (delta < -0.1)
         regressions.push({
+          itemIndex: i,
           input: bItem.input,
           scorer: name,
           baselineScore: bScore,
@@ -49,6 +50,7 @@ export function evalCompare(baseline: EvalResult, candidate: EvalResult): EvalCo
         });
       else if (delta > 0.1)
         improvements.push({
+          itemIndex: i,
           input: bItem.input,
           scorer: name,
           baselineScore: bScore,

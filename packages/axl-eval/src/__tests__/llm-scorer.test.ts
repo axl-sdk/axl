@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { llmScorer } from '../llm-scorer.js';
-import type { ScorerContext } from '../scorer.js';
+import type { ScorerContext, ScorerResult } from '../scorer.js';
 
 /** Helper to create a ScorerContext that returns the given mock provider. */
 function mockContext(mockProvider: {
@@ -66,8 +66,15 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
-    expect(score).toBe(0.85);
+    const result = (await s.score(
+      'output',
+      'input',
+      undefined,
+      mockContext(mockProvider),
+    )) as ScorerResult;
+    expect(result.score).toBe(0.85);
+    expect(result.metadata).toEqual({ reasoning: 'Good output' });
+    expect(result.cost).toBeUndefined();
   });
 
   it('passes system message and formatted prompt to provider', async () => {
@@ -118,8 +125,14 @@ describe('llmScorer()', () => {
       system: 'Rate it',
     });
 
-    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
-    expect(score).toBe(0.85);
+    const result = (await s.score(
+      'output',
+      'input',
+      undefined,
+      mockContext(mockProvider),
+    )) as ScorerResult;
+    expect(result.score).toBe(0.85);
+    expect(result.metadata).toEqual({ reasoning: 'Good' });
   });
 
   it('rejects response missing score with default schema — readable error message', async () => {
@@ -409,8 +422,13 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
-    expect(score).toBe(0.75);
+    const result = (await s.score(
+      'output',
+      'input',
+      undefined,
+      mockContext(mockProvider),
+    )) as ScorerResult;
+    expect(result.score).toBe(0.75);
   });
 
   it('extracts JSON when wrapped in leading/trailing text', async () => {
@@ -430,8 +448,13 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
-    expect(score).toBe(0.6);
+    const result = (await s.score(
+      'output',
+      'input',
+      undefined,
+      mockContext(mockProvider),
+    )) as ScorerResult;
+    expect(result.score).toBe(0.6);
   });
 
   it('handles JSON with trailing text after closing brace', async () => {
@@ -452,8 +475,13 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
-    expect(score).toBe(0.7);
+    const result = (await s.score(
+      'output',
+      'input',
+      undefined,
+      mockContext(mockProvider),
+    )) as ScorerResult;
+    expect(result.score).toBe(0.7);
   });
 
   it('handles non-json fenced code blocks gracefully', async () => {
@@ -474,8 +502,13 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
-    expect(score).toBe(0.65);
+    const result = (await s.score(
+      'output',
+      'input',
+      undefined,
+      mockContext(mockProvider),
+    )) as ScorerResult;
+    expect(result.score).toBe(0.65);
   });
 
   it('handles JSON with nested braces in string values', async () => {
@@ -497,8 +530,13 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
-    expect(score).toBe(0.5);
+    const result = (await s.score(
+      'output',
+      'input',
+      undefined,
+      mockContext(mockProvider),
+    )) as ScorerResult;
+    expect(result.score).toBe(0.5);
   });
 
   it('passes annotations to LLM scorer so the judge has ground truth', async () => {

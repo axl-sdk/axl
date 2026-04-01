@@ -1,6 +1,7 @@
 import type { AxlRuntime } from '@axlsdk/axl';
 import type { EvalConfig, EvalResult, EvalItem, EvalSummary } from './types.js';
 import type { ScorerContext } from './scorer.js';
+import { normalizeScorerResult } from './scorer.js';
 import { randomUUID } from 'node:crypto';
 
 function computeStats(scores: number[]): {
@@ -79,13 +80,17 @@ export async function runEval(
       output: null,
       scores: {},
     };
+    const itemStart = Date.now();
     try {
       const result = await executeWorkflow(item.input, runtime);
+      evalItem.duration = Date.now() - itemStart;
       evalItem.output = result.output;
+      evalItem.cost = result.cost;
       if (result.cost != null) {
         totalCost += result.cost;
       }
     } catch (err) {
+      evalItem.duration = Date.now() - itemStart;
       evalItem.error = err instanceof Error ? err.message : String(err);
       evalItems.push(evalItem);
       return;
@@ -95,46 +100,72 @@ export async function runEval(
       budgetExceeded = true;
     }
 
+    evalItem.scoreDetails = {};
+    let itemScorerCost = 0;
+
     for (const scorer of config.scorers) {
+      const scorerStart = Date.now();
       try {
-        const score = await scorer.score(
+        const raw = await scorer.score(
           evalItem.output,
           item.input,
           item.annotations,
           scorerContext,
         );
-        // Accumulate LLM scorer cost if available
-        if (scorer.isLlm) {
-          const lastCost = (scorer as unknown as { _lastCost?: number })._lastCost;
-          if (lastCost != null) {
-            totalCost += lastCost;
-          }
+        const scorerResult = normalizeScorerResult(raw);
+
+        if (scorerResult.cost != null) {
+          itemScorerCost += scorerResult.cost;
+          totalCost += scorerResult.cost;
         }
-        if (!Number.isFinite(score) || score < 0 || score > 1) {
+
+        const scorerDuration = Date.now() - scorerStart;
+
+        if (
+          !Number.isFinite(scorerResult.score) ||
+          scorerResult.score < 0 ||
+          scorerResult.score > 1
+        ) {
           if (!evalItem.scorerErrors) evalItem.scorerErrors = [];
           evalItem.scorerErrors.push(
-            `Scorer "${scorer.name}" returned out-of-range score ${score} for input ${JSON.stringify(item.input)}`,
+            `Scorer "${scorer.name}" returned out-of-range score ${scorerResult.score} for input ${JSON.stringify(item.input)}`,
           );
           evalItem.scores[scorer.name] = null;
+          evalItem.scoreDetails[scorer.name] = {
+            score: null,
+            metadata: scorerResult.metadata,
+            duration: scorerDuration,
+            cost: scorerResult.cost,
+          };
         } else {
-          evalItem.scores[scorer.name] = round(score);
+          evalItem.scores[scorer.name] = round(scorerResult.score);
+          evalItem.scoreDetails[scorer.name] = {
+            score: round(scorerResult.score),
+            metadata: scorerResult.metadata,
+            duration: scorerDuration,
+            cost: scorerResult.cost,
+          };
         }
       } catch (err) {
-        // Accumulate cost even on failure — the LLM call may have succeeded
-        // before a downstream error (e.g., invalid JSON, schema validation)
-        if (scorer.isLlm) {
-          const lastCost = (scorer as unknown as { _lastCost?: number })._lastCost;
-          if (lastCost != null) {
-            totalCost += lastCost;
-          }
+        // Capture cost from error (LLM scorer attaches it)
+        const errCost = typeof (err as any)?.cost === 'number' ? (err as any).cost : undefined;
+        if (errCost != null) {
+          itemScorerCost += errCost;
+          totalCost += errCost;
         }
         if (!evalItem.scorerErrors) evalItem.scorerErrors = [];
         evalItem.scorerErrors.push(
           `Scorer "${scorer.name}" threw: ${err instanceof Error ? err.message : String(err)}`,
         );
         evalItem.scores[scorer.name] = null;
+        evalItem.scoreDetails[scorer.name] = {
+          score: null,
+          duration: Date.now() - scorerStart,
+          cost: errCost,
+        };
       }
     }
+    evalItem.scorerCost = itemScorerCost > 0 ? itemScorerCost : undefined;
     evalItems.push(evalItem);
   }
 
@@ -159,6 +190,9 @@ export async function runEval(
     scorerStats[name] = computeStats(scores);
   }
 
+  const durations = evalItems.filter((i) => !i.error && i.duration != null).map((i) => i.duration!);
+  const timing = durations.length > 0 ? computeStats(durations) : undefined;
+
   return {
     id,
     workflow: config.workflow,
@@ -168,6 +202,6 @@ export async function runEval(
     totalCost,
     duration: Date.now() - startTime,
     items: evalItems,
-    summary: { count: items.length, failures, scorers: scorerStats },
+    summary: { count: items.length, failures, scorers: scorerStats, timing },
   };
 }

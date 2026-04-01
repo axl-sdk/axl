@@ -22,6 +22,13 @@ export type EvalResult = {
   summary: EvalSummary;
 };
 
+export type ScorerDetail = {
+  score: number | null;
+  metadata?: Record<string, unknown>;
+  duration?: number;
+  cost?: number;
+};
+
 export type EvalItem = {
   input: unknown;
   annotations?: unknown;
@@ -29,6 +36,10 @@ export type EvalItem = {
   error?: string;
   scorerErrors?: string[];
   scores: Record<string, number | null>;
+  duration?: number;
+  cost?: number;
+  scorerCost?: number;
+  scoreDetails?: Record<string, ScorerDetail>;
 };
 
 export type EvalSummary = {
@@ -44,6 +55,13 @@ export type EvalSummary = {
       p95: number;
     }
   >;
+  timing?: {
+    mean: number;
+    min: number;
+    max: number;
+    p50: number;
+    p95: number;
+  };
 };
 
 export type EvalComparison = {
@@ -58,12 +76,25 @@ export type EvalComparison = {
       deltaPercent: number;
     }
   >;
+  timing?: {
+    baselineMean: number;
+    candidateMean: number;
+    delta: number;
+    deltaPercent: number;
+  };
+  cost?: {
+    baselineTotal: number;
+    candidateTotal: number;
+    delta: number;
+    deltaPercent: number;
+  };
   regressions: EvalRegression[];
   improvements: EvalImprovement[];
   summary: string;
 };
 
 export type EvalRegression = {
+  itemIndex: number;
   input: unknown;
   scorer: string;
   baselineScore: number;

@@ -1,3 +1,15 @@
+/** Result from a scorer that includes metadata beyond the numeric score. */
+export type ScorerResult = {
+  score: number;
+  metadata?: Record<string, unknown>;
+  cost?: number;
+};
+
+/** Normalize a scorer return value to a ScorerResult. */
+export function normalizeScorerResult(result: number | ScorerResult): ScorerResult {
+  return typeof result === 'number' ? { score: result } : result;
+}
+
 /** Context passed to scorers by the eval runner. */
 export type ScorerContext = {
   /** Resolve a provider:model URI to a provider instance and model name. */
@@ -37,7 +49,7 @@ export type Scorer<TOutput = unknown, TInput = unknown, TAnnotations = unknown> 
     input: TInput,
     annotations?: TAnnotations,
     context?: ScorerContext,
-  ): number | Promise<number>;
+  ): number | ScorerResult | Promise<number | ScorerResult>;
 };
 
 export function scorer<TOutput = unknown, TInput = unknown, TAnnotations = unknown>(

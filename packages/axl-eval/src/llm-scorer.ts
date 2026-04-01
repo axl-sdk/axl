@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { Scorer, ScorerContext } from './scorer.js';
+import type { Scorer, ScorerContext, ScorerResult } from './scorer.js';
 import { extractJson, zodToJsonSchema } from '@axlsdk/axl';
 
 export type LlmScorerConfig = {
@@ -18,7 +18,7 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
     config.schema ?? z.object({ score: z.number().min(0).max(1), reasoning: z.string() });
   const schemaJson = JSON.stringify(zodToJsonSchema(schema), null, 2);
 
-  const scorerInstance: Scorer & { _lastCost?: number } = {
+  return {
     name: config.name,
     description: config.description,
     isLlm: true,
@@ -27,7 +27,7 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
       input: unknown,
       annotations?: unknown,
       context?: ScorerContext,
-    ): Promise<number> {
+    ): Promise<ScorerResult> {
       if (!context?.resolveProvider) {
         throw new Error(
           `LLM scorer "${config.name}" has no provider. ` +
@@ -61,13 +61,17 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
         { model, temperature: config.temperature ?? 0.2, responseFormat: { type: 'json_object' } },
       );
 
-      scorerInstance._lastCost = response.cost;
+      const responseCost = response.cost;
 
-      const parsed = JSON.parse(extractJson(response.content));
       let validated: { score: number; [key: string]: unknown };
       try {
+        const parsed = JSON.parse(extractJson(response.content));
         validated = schema.parse(parsed) as { score: number; [key: string]: unknown };
       } catch (err) {
+        // Attach cost to all errors so the runner can capture it even on failure.
+        if (err && typeof err === 'object') {
+          (err as any).cost = responseCost;
+        }
         // Duck-type check instead of instanceof to handle potential dual-instance
         // scenarios where two copies of zod are present in the dependency tree.
         if (
@@ -83,13 +87,21 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
           const messages = issues
             .map((i) => `${i.path.length ? `${i.path.join('.')}: ` : ''}${i.message}`)
             .join('; ');
-          throw new Error(`LLM scorer "${config.name}" returned an invalid response: ${messages}`);
+          const error = new Error(
+            `LLM scorer "${config.name}" returned an invalid response: ${messages}`,
+          );
+          (error as any).cost = responseCost;
+          throw error;
         }
         throw err;
       }
-      return validated.score;
+
+      const { score, ...rest } = validated;
+      return {
+        score,
+        metadata: Object.keys(rest).length > 0 ? rest : undefined,
+        cost: responseCost,
+      };
     },
   };
-
-  return scorerInstance;
 }

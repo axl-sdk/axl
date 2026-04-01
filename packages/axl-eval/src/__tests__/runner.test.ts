@@ -838,6 +838,78 @@ describe('runEval()', () => {
     expect(result.items).toHaveLength(10);
   });
 
+  it('treats NaN score as an error', async () => {
+    const nanScorer = scorer({
+      name: 'nan',
+      description: 'Returns NaN',
+      score: () => NaN,
+    });
+
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [nanScorer] },
+      async () => ({ output: 'output' }),
+      mockRuntime,
+    );
+
+    // NaN should not be stored as a valid score
+    expect(result.items[0].scores['nan']).toBeNull();
+    expect(result.items[0].scorerErrors).toBeDefined();
+    // Summary mean should be 0 (no valid scores), not NaN
+    expect(Number.isNaN(result.summary.scorers['nan'].mean)).toBe(false);
+  });
+
+  it('score of exactly 0 is valid (not an error)', async () => {
+    const zeroScorer = scorer({
+      name: 'zero',
+      description: 'Always returns 0',
+      score: () => 0,
+    });
+
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [zeroScorer] },
+      async () => ({ output: 'output' }),
+      mockRuntime,
+    );
+
+    expect(result.items[0].scores['zero']).toBe(0);
+    expect(result.items[0].scorerErrors).toBeUndefined();
+  });
+
+  it('score of exactly 1 is valid (not an error)', async () => {
+    const oneScorer = scorer({
+      name: 'one',
+      description: 'Always returns 1',
+      score: () => 1,
+    });
+
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [oneScorer] },
+      async () => ({ output: 'output' }),
+      mockRuntime,
+    );
+
+    expect(result.items[0].scores['one']).toBe(1);
+    expect(result.items[0].scorerErrors).toBeUndefined();
+  });
+
   it('passes runtime to executeWorkflow as second argument', async () => {
     let receivedRuntime: unknown;
     const testRuntime = { marker: 'test-runtime' } as unknown as AxlRuntime;

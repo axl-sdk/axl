@@ -110,7 +110,7 @@ export async function runEval(
             totalCost += lastCost;
           }
         }
-        if (score < 0 || score > 1) {
+        if (!Number.isFinite(score) || score < 0 || score > 1) {
           if (!evalItem.scorerErrors) evalItem.scorerErrors = [];
           evalItem.scorerErrors.push(
             `Scorer "${scorer.name}" returned out-of-range score ${score} for input ${JSON.stringify(item.input)}`,

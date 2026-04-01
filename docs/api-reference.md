@@ -1088,8 +1088,8 @@ Per-item result from an eval run.
 | `annotations` | `unknown?` | Ground truth annotations |
 | `output` | `unknown` | Workflow output |
 | `error` | `string?` | Workflow-level error message |
-| `errors` | `string[]?` | Scorer-level error messages (thrown exceptions or out-of-range scores) |
-| `scores` | `Record<string, number \| null>` | Scorer results. `null` indicates a scorer error (see `errors` field) |
+| `scorerErrors` | `string[]?` | Scorer-level error messages (thrown exceptions or out-of-range scores) |
+| `scores` | `Record<string, number \| null>` | Scorer results. `null` indicates a scorer error (see `scorerErrors` field) |
 
 ### `EvalResult`
 

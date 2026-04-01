@@ -105,9 +105,9 @@ describe('Eval E2E', () => {
       mockRuntime,
     );
 
-    expect(result.items[0].errors).toBeDefined();
-    expect(result.items[0].errors!.length).toBeGreaterThan(0);
-    expect(result.items[0].errors![0]).toContain('out-of-range');
+    expect(result.items[0].scorerErrors).toBeDefined();
+    expect(result.items[0].scorerErrors!.length).toBeGreaterThan(0);
+    expect(result.items[0].scorerErrors![0]).toContain('out-of-range');
     expect(result.items[0].scores['bad-scorer']).toBeNull();
   });
 
@@ -250,7 +250,7 @@ describe('Eval E2E', () => {
 
     expect(result.items.length).toBe(1);
     expect(result.items[0].scores['quality']).toBe(0.95);
-    expect(result.items[0].errors).toBeUndefined();
+    expect(result.items[0].scorerErrors).toBeUndefined();
   });
 
   it('eval CLI runs eval file and produces formatted output', () => {

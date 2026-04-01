@@ -478,8 +478,8 @@ describe('runEval()', () => {
     );
 
     expect(result.items[0].scores['bad-scorer']).toBeNull();
-    expect(result.items[0].errors).toBeDefined();
-    expect(result.items[0].errors![0]).toContain('Unknown provider');
+    expect(result.items[0].scorerErrors).toBeDefined();
+    expect(result.items[0].scorerErrors![0]).toContain('Unknown provider');
   });
 
   it('accumulates LLM scorer cost in totalCost', async () => {
@@ -600,7 +600,7 @@ describe('runEval()', () => {
 
     // Scorer threw (invalid JSON) but the LLM call cost $0.005 was still incurred
     expect(result.items[0].scores['broken']).toBeNull();
-    expect(result.items[0].errors).toBeDefined();
+    expect(result.items[0].scorerErrors).toBeDefined();
     expect(result.totalCost).toBeCloseTo(0.006, 6); // $0.001 workflow + $0.005 scorer
   });
 
@@ -656,9 +656,9 @@ describe('runEval()', () => {
     );
 
     expect(result.items[0].scores['test-llm']).toBeNull();
-    expect(result.items[0].errors).toBeDefined();
-    expect(result.items[0].errors![0]).toContain('resolveProvider');
-    expect(result.items[0].errors![0]).toContain('real AxlRuntime');
+    expect(result.items[0].scorerErrors).toBeDefined();
+    expect(result.items[0].scorerErrors![0]).toContain('resolveProvider');
+    expect(result.items[0].scorerErrors![0]).toContain('real AxlRuntime');
   });
 
   it('stops processing when budget is exceeded', async () => {

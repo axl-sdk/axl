@@ -27,7 +27,7 @@ export type EvalItem = {
   annotations?: unknown;
   output: unknown;
   error?: string;
-  errors?: string[];
+  scorerErrors?: string[];
   scores: Record<string, number | null>;
 };
 

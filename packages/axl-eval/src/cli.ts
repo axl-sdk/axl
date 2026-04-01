@@ -144,9 +144,9 @@ function formatTable(result: EvalResult): string {
     `  Failures: ${result.summary.failures}/${result.summary.count} | Cost: ${costStr} | Duration: ${durationSec}s`,
   );
 
-  const itemsWithErrors = result.items.filter((i) => i.errors?.length);
+  const itemsWithErrors = result.items.filter((i) => i.scorerErrors?.length);
   if (itemsWithErrors.length > 0) {
-    const uniqueErrors = [...new Set(itemsWithErrors.flatMap((i) => i.errors!))];
+    const uniqueErrors = [...new Set(itemsWithErrors.flatMap((i) => i.scorerErrors!))];
     lines.push('');
     lines.push(
       `  Scorer errors (${itemsWithErrors.length}/${result.summary.count} items affected):`,

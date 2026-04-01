@@ -111,8 +111,8 @@ export async function runEval(
           }
         }
         if (score < 0 || score > 1) {
-          if (!evalItem.errors) evalItem.errors = [];
-          evalItem.errors.push(
+          if (!evalItem.scorerErrors) evalItem.scorerErrors = [];
+          evalItem.scorerErrors.push(
             `Scorer "${scorer.name}" returned out-of-range score ${score} for input ${JSON.stringify(item.input)}`,
           );
           evalItem.scores[scorer.name] = null;
@@ -128,8 +128,8 @@ export async function runEval(
             totalCost += lastCost;
           }
         }
-        if (!evalItem.errors) evalItem.errors = [];
-        evalItem.errors.push(
+        if (!evalItem.scorerErrors) evalItem.scorerErrors = [];
+        evalItem.scorerErrors.push(
           `Scorer "${scorer.name}" threw: ${err instanceof Error ? err.message : String(err)}`,
         );
         evalItem.scores[scorer.name] = null;

@@ -14,7 +14,7 @@ type EvalItem = {
   annotations?: unknown;
   output: unknown;
   error?: string;
-  errors?: string[];
+  scorerErrors?: string[];
   scores: Record<string, number | null>;
 };
 
@@ -290,7 +290,7 @@ export function EvalRunnerPanel() {
                               {item.error && (
                                 <span className="ml-2 text-red-600 dark:text-red-400">(error)</span>
                               )}
-                              {item.errors && item.errors.length > 0 && !item.error && (
+                              {item.scorerErrors && item.scorerErrors.length > 0 && !item.error && (
                                 <span className="ml-2 text-amber-600 dark:text-amber-400">
                                   (scorer errors)
                                 </span>
@@ -332,13 +332,13 @@ export function EvalRunnerPanel() {
                                 <span className="ml-1">{item.error}</span>
                               </div>
                             )}
-                            {item.errors && item.errors.length > 0 && (
+                            {item.scorerErrors && item.scorerErrors.length > 0 && (
                               <div>
                                 <span className="font-medium text-amber-600 dark:text-amber-400">
                                   Scorer errors:
                                 </span>
                                 <ul className="ml-4 mt-1 list-disc">
-                                  {item.errors.map((err, j) => (
+                                  {item.scorerErrors.map((err, j) => (
                                     <li key={j} className="text-amber-700 dark:text-amber-300">
                                       {err}
                                     </li>

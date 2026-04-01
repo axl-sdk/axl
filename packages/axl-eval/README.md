@@ -192,31 +192,40 @@ The CLI resolves a runtime automatically:
 
 ### Programmatic
 
-Use `runtime.eval()` when you want to run evals from your own code:
+Use `runtime.eval()` when you have a workflow registered on the runtime. The `workflow` field is the registered workflow name — the runner calls `runtime.execute(workflow, input)` for each item:
 
 ```typescript
-import { AxlRuntime } from '@axlsdk/axl';
+import { AxlRuntime, workflow, agent } from '@axlsdk/axl';
+import { z } from 'zod';
+
+const qaAgent = agent({ name: 'qa', model: 'openai:gpt-4o', system: 'Answer questions.' });
+const qaWorkflow = workflow({
+  name: 'qa-workflow',
+  input: z.object({ question: z.string() }),
+  handler: async (ctx) => ctx.ask(qaAgent, ctx.input.question),
+});
 
 const runtime = new AxlRuntime();
-runtime.register(myWorkflow);
+runtime.register(qaWorkflow);
 
 const results = await runtime.eval({
-  workflow: 'my-workflow',
+  workflow: 'qa-workflow',  // must match the registered workflow name
   dataset: ds,
   scorers: [exactMatch, qualityJudge],
-  concurrency: 3,
 });
 ```
 
-Or use `runEval()` directly for full control over the execution function:
+Or use `runEval()` directly when you want full control over how each input produces an output. The `workflow` field here is just a label for the results — the second argument is what actually runs:
 
 ```typescript
 import { runEval } from '@axlsdk/eval';
 
 const results = await runEval(
-  { workflow: 'my-workflow', dataset: ds, scorers: [exactMatch, qualityJudge] },
-  async (input) => {
-    const output = await runtime.execute('my-workflow', input);
+  { workflow: 'qa-eval', dataset: ds, scorers: [exactMatch, qualityJudge] },
+  async (input, runtime) => {
+    // You decide how to produce output — call an agent, a workflow, an API, anything
+    const ctx = runtime.createContext();
+    const output = await ctx.ask(qaAgent, input.question);
     return { output };
   },
   runtime,

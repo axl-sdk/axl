@@ -14,15 +14,17 @@ TypeScript eval files require [tsx](https://github.com/privatenumber/tsx) as a d
 
 ## Quick Start
 
-Create an eval file, define your dataset and scorers, and run it:
+An eval file defines what to test (dataset), how to run it (execution function), and how to score it (scorers):
 
 ```typescript
 // evals/qa.eval.ts
 import { defineEval, dataset, scorer, llmScorer } from '@axlsdk/eval';
+import type { AxlRuntime } from '@axlsdk/axl';
 import { z } from 'zod';
+import { qaAgent } from '../src/agents/qa.js';
 
 export default defineEval({
-  workflow: 'qa-workflow',
+  workflow: 'qa-eval',  // label for results (used in output table and comparisons)
   dataset: dataset({
     name: 'qa-basics',
     schema: z.object({ question: z.string() }),
@@ -32,7 +34,7 @@ export default defineEval({
     ],
   }),
   scorers: [
-    // Deterministic scorer — runs in-process, no LLM call
+    // Deterministic — runs in-process, no LLM call
     scorer({
       name: 'not-empty',
       description: 'Output is non-empty',
@@ -49,22 +51,21 @@ export default defineEval({
   ],
 });
 
-// Tell the runner how to get output for each input
+// How to produce output for each dataset item
 export async function executeWorkflow(input: { question: string }, runtime: AxlRuntime) {
   const ctx = runtime.createContext();
-  return { output: await ctx.ask(myAgent, input.question) };
+  return { output: await ctx.ask(qaAgent, input.question) };
 }
 ```
 
+Run it:
+
 ```bash
-# Run it — set the API key for whichever provider your LLM scorer uses
 OPENAI_API_KEY=sk-... npx axl-eval ./evals/qa.eval.ts
 ```
 
-Output:
-
 ```
-Eval: qa-workflow x qa-basics (2 items)
+Eval: qa-eval x qa-basics (2 items)
   Scorer     Mean      Min      Max      p50      p95
   ─────────────────────────────────────────────────────
   not-empty  1.00     1.00     1.00     1.00     1.00
@@ -73,32 +74,33 @@ Eval: qa-workflow x qa-basics (2 items)
   Failures: 0/2 | Cost: $0.01 | Duration: 3.2s
 ```
 
-## Datasets
+If an LLM scorer fails (wrong API key, provider down, invalid response), you'll see:
 
-Define evaluation datasets inline or from a file:
+```
+  relevance    --       --       --       --       --
+
+  Scorer errors (2/2 items affected):
+    - Scorer "relevance" threw: OpenAI API key is required. Set OPENAI_API_KEY or pass apiKey in options.
+```
+
+## Datasets
 
 ```typescript
 import { dataset } from '@axlsdk/eval';
 import { z } from 'zod';
 
-// Inline with annotations (ground truth)
 const ds = dataset({
   name: 'math-basics',
   schema: z.object({ question: z.string() }),
-  annotations: z.object({ answer: z.number() }),
+  annotations: z.object({ answer: z.number() }),  // optional ground truth
   items: [
     { input: { question: '2+2' }, annotations: { answer: 4 } },
     { input: { question: '3*5' }, annotations: { answer: 15 } },
   ],
 });
-
-// From a JSON file
-const ds = dataset({
-  name: 'math-advanced',
-  schema: z.object({ question: z.string() }),
-  file: './datasets/math.json',
-});
 ```
+
+You can also load from a file: `dataset({ name: 'large', schema, file: './data.json' })`.
 
 ## Scorers
 
@@ -106,16 +108,16 @@ Scorers rate each output on a 0-1 scale. You can mix deterministic and LLM score
 
 ### Deterministic scorers
 
-Pure functions — fast, free, and deterministic:
+Pure functions — fast, free, deterministic. The `score` callback receives `(output, input, annotations?)`:
 
 ```typescript
 import { scorer } from '@axlsdk/eval';
 
-const exactMatch = scorer({
-  name: 'exact-match',
-  description: 'Checks if output matches expected answer',
-  score: (output, input, annotations) =>
-    output.answer === annotations?.answer ? 1 : 0,
+const containsAnswer = scorer({
+  name: 'contains-answer',
+  description: 'Output contains the expected numeric answer',
+  score: (output, _input, annotations) =>
+    String(output).includes(String(annotations?.answer)) ? 1 : 0,
 });
 ```
 
@@ -140,7 +142,7 @@ const qualityJudge = llmScorer({
 });
 ```
 
-The `model` field uses a `provider:model` URI. The provider is resolved automatically from the runtime at eval time — you just need the right API key in your environment:
+The `model` field uses a `provider:model` URI. The provider is resolved automatically at eval time — just set the right API key:
 
 | Provider | URI prefix | Env var |
 |----------|-----------|---------|
@@ -153,13 +155,9 @@ The `model` field uses a `provider:model` URI. The provider is resolved automati
 Different LLM scorers can use different providers — each resolves independently:
 
 ```typescript
-const qualityJudge = llmScorer({ model: 'openai:gpt-4o', ... });
-const safetyJudge = llmScorer({ model: 'anthropic:claude-sonnet-4-5-20250514', ... });
+const qualityJudge = llmScorer({ name: 'quality', model: 'openai:gpt-4o', ... });
+const safetyJudge = llmScorer({ name: 'safety', model: 'anthropic:claude-sonnet-4-5-20250514', ... });
 ```
-
-### Score results
-
-Scores are `number | null` per scorer per item. `null` means the scorer failed (threw an error or returned out-of-range). Error details are in `item.scorerErrors`. Summary statistics (mean, p50, p95, etc.) exclude null scores.
 
 ## Running Evals
 
@@ -168,34 +166,21 @@ Scores are `number | null` per scorer per item. `null` means the scorer failed (
 The most common way to run evals:
 
 ```bash
-# Run a single eval file
-npx axl-eval ./evals/qa.eval.ts
-
-# Run all eval files in a directory
-npx axl-eval ./evals/
-
-# Save results to JSON
-npx axl-eval ./evals/qa.eval.ts --output ./results/baseline.json
-
-# Use a specific config file for runtime
-npx axl-eval ./evals/ --config ./axl.config.ts
-
-# Monorepo: use custom import conditions
-npx axl-eval ./evals/ --config ./axl.config.ts --conditions development
+npx axl-eval ./evals/qa.eval.ts                    # run a single file
+npx axl-eval ./evals/                               # run all *.eval.* files in a directory
+npx axl-eval ./evals/ --output ./results/v1.json    # save results to JSON
+npx axl-eval ./evals/ --config ./axl.config.ts      # use a specific runtime config
 ```
 
-The CLI resolves a runtime automatically:
-
-1. **`--config <path>`** — use an explicit config file
-2. **Auto-detect** — search for `axl.config.mts` → `.ts` → `.mjs` → `.js` in cwd
-3. **Fallback** — create a bare `new AxlRuntime()` (providers resolved from env vars)
+The CLI resolves a runtime automatically: `--config <path>` > auto-detect `axl.config.*` > bare `new AxlRuntime()` (providers from env vars).
 
 ### Programmatic
 
-Use `runtime.eval()` when you have a workflow registered on the runtime. The `workflow` field is the registered workflow name — the runner calls `runtime.execute(workflow, input)` for each item:
+**`runtime.eval()`** — when you have a workflow registered on the runtime. The `workflow` field must match the registered name:
 
 ```typescript
 import { AxlRuntime, workflow, agent } from '@axlsdk/axl';
+import { dataset, scorer } from '@axlsdk/eval';
 import { z } from 'zod';
 
 const qaAgent = agent({ name: 'qa', model: 'openai:gpt-4o', system: 'Answer questions.' });
@@ -211,22 +196,20 @@ runtime.register(qaWorkflow);
 const results = await runtime.eval({
   workflow: 'qa-workflow',  // must match the registered workflow name
   dataset: ds,
-  scorers: [exactMatch, qualityJudge],
+  scorers: [containsAnswer, qualityJudge],
 });
 ```
 
-Or use `runEval()` directly when you want full control over how each input produces an output. The `workflow` field here is just a label for the results — the second argument is what actually runs:
+**`runEval()`** — when you want full control. The `workflow` field is just a label; the second argument is the function that produces output:
 
 ```typescript
 import { runEval } from '@axlsdk/eval';
 
 const results = await runEval(
-  { workflow: 'qa-eval', dataset: ds, scorers: [exactMatch, qualityJudge] },
+  { workflow: 'my-eval', dataset: ds, scorers: [containsAnswer, qualityJudge] },
   async (input, runtime) => {
-    // You decide how to produce output — call an agent, a workflow, an API, anything
     const ctx = runtime.createContext();
-    const output = await ctx.ask(qaAgent, input.question);
-    return { output };
+    return { output: await ctx.ask(qaAgent, input.question) };
   },
   runtime,
 );
@@ -247,44 +230,74 @@ const studio = createStudioMiddleware({
 
 See the [@axlsdk/studio README](../axl-studio/README.md#lazy-eval-loading) for details.
 
+## Understanding Results
+
+Each eval run returns an `EvalResult` with per-item scores and aggregate statistics.
+
+**Scores** are `number | null` per scorer per item:
+- `0` to `1` — valid score from the scorer
+- `null` — the scorer failed (see `item.scorerErrors` for details)
+
+Summary statistics (mean, p50, p95, etc.) exclude `null` scores. If all scores for a scorer are `null`, the CLI shows `--` instead of misleading `0.00`.
+
+```typescript
+const results = await runtime.eval({ ... });
+
+// Aggregate stats
+console.log(results.summary.scorers['quality'].mean);  // 0.85
+console.log(results.summary.count);                     // 50 items
+console.log(results.summary.failures);                  // 2 workflow errors
+
+// Per-item inspection
+for (const item of results.items) {
+  if (item.error) continue;                              // workflow threw
+  if (item.scores['quality'] === null) {
+    console.log('Scorer failed:', item.scorerErrors);    // e.g., ["Scorer "quality" threw: ..."]
+  }
+}
+
+// Cost includes both workflow and LLM scorer calls
+console.log(results.totalCost);  // 0.42
+```
+
 ## Comparing Results
 
-Compare two eval runs to detect regressions and improvements:
+Compare two runs to detect regressions and improvements:
 
 ```bash
-# CLI
-npx axl-eval compare ./results/baseline.json ./results/candidate.json
-
-# Fail CI if regressions detected
-npx axl-eval compare baseline.json candidate.json --fail-on-regression
+npx axl-eval compare ./results/v1.json ./results/v2.json
+npx axl-eval compare v1.json v2.json --fail-on-regression  # exit 1 if worse
 ```
 
 ```typescript
-// Programmatic
 import { evalCompare } from '@axlsdk/eval';
 
-const comparison = evalCompare(baselineResults, candidateResults);
-console.log(comparison.regressions);  // items that got worse
-console.log(comparison.improvements); // items that got better
+const comparison = evalCompare(v1Results, v2Results);
+console.log(comparison.regressions);   // items that got worse
+console.log(comparison.improvements);  // items that got better
 ```
 
-## Eval Files
+## Eval Files in Detail
 
 ### Execution function
 
-By default, `runtime.execute(workflow, input)` runs the workflow. Export `executeWorkflow` to override:
+By default, the runner calls `runtime.execute(workflow, input)` for each item. Export `executeWorkflow` to override:
 
 ```typescript
 // evals/qa.eval.ts
+import { defineEval, dataset, scorer } from '@axlsdk/eval';
 import type { AxlRuntime } from '@axlsdk/axl';
 import { qaAgent } from '../src/agents/qa.js';
 
-export default defineEval({ ... });
+export default defineEval({
+  workflow: 'qa-eval',
+  dataset: dataset({ ... }),
+  scorers: [scorer({ ... })],
+});
 
 export async function executeWorkflow(input: { question: string }, runtime: AxlRuntime) {
   const ctx = runtime.createContext();
-  const output = await ctx.ask(qaAgent, input.question);
-  return { output }; // cost tracked automatically
+  return { output: await ctx.ask(qaAgent, input.question) };
 }
 ```
 
@@ -308,56 +321,27 @@ return { output, cost: ctx.totalCost };
 
 ### Common patterns
 
-**Budget per item** — cap cost to prevent runaway evals:
+**Budget** — cap cost per item with `runtime.createContext({ budget: '$0.50' })`.
+
+**Timeout** — abort slow items:
 
 ```typescript
-export async function executeWorkflow(input: { question: string }, runtime: AxlRuntime) {
-  const ctx = runtime.createContext({ budget: '$0.50' });
-  const output = await ctx.ask(myAgent, input.question);
-  return { output };
-}
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 30_000);
+const ctx = runtime.createContext({ signal: controller.signal });
 ```
 
-**Timeout per item** — cancel items that take too long:
+**Auto-approve tools** — skip human approval in evals: `runtime.createContext({ awaitHumanHandler: async () => ({ approved: true }) })`.
+
+**Multi-turn** — provide conversation history:
 
 ```typescript
-export async function executeWorkflow(input: { question: string }, runtime: AxlRuntime) {
-  const controller = new AbortController();
-  setTimeout(() => controller.abort(), 30_000);
-  const ctx = runtime.createContext({ signal: controller.signal });
-  const output = await ctx.ask(myAgent, input.question);
-  return { output };
-}
-```
-
-**Auto-approve tools** — when testing agents that have tools with `requireApproval`:
-
-```typescript
-export async function executeWorkflow(input: { question: string }, runtime: AxlRuntime) {
-  const ctx = runtime.createContext({
-    awaitHumanHandler: async () => ({ approved: true }),
-  });
-  const output = await ctx.ask(myAgent, input.question);
-  return { output };
-}
-```
-
-**Multi-turn evaluation** — test follow-up responses with conversation history:
-
-```typescript
-export async function executeWorkflow(
-  input: { setupPrompt: string; setupResponse: string; followUp: string },
-  runtime: AxlRuntime,
-) {
-  const ctx = runtime.createContext({
-    sessionHistory: [
-      { role: 'user', content: input.setupPrompt },
-      { role: 'assistant', content: input.setupResponse },
-    ],
-  });
-  const output = await ctx.ask(myAgent, input.followUp);
-  return { output };
-}
+const ctx = runtime.createContext({
+  sessionHistory: [
+    { role: 'user', content: input.setupPrompt },
+    { role: 'assistant', content: input.setupResponse },
+  ],
+});
 ```
 
 ## License

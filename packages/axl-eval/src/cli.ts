@@ -124,9 +124,17 @@ function formatTable(result: EvalResult): string {
 
   for (const name of scorerNames) {
     const s = result.summary.scorers[name];
-    lines.push(
-      `  ${name.padEnd(maxNameLen)}  ${s.mean.toFixed(2).padStart(colWidth)}  ${s.min.toFixed(2).padStart(colWidth)}  ${s.max.toFixed(2).padStart(colWidth)}  ${s.p50.toFixed(2).padStart(colWidth)}  ${s.p95.toFixed(2).padStart(colWidth)}`,
-    );
+    // Detect scorers with no valid scores (all items errored → computeStats([]) → all zeros)
+    const validScoreCount = result.items.filter((i) => !i.error && i.scores[name] != null).length;
+    if (validScoreCount === 0) {
+      lines.push(
+        `  ${name.padEnd(maxNameLen)}  ${'--'.padStart(colWidth)}  ${'--'.padStart(colWidth)}  ${'--'.padStart(colWidth)}  ${'--'.padStart(colWidth)}  ${'--'.padStart(colWidth)}`,
+      );
+    } else {
+      lines.push(
+        `  ${name.padEnd(maxNameLen)}  ${s.mean.toFixed(2).padStart(colWidth)}  ${s.min.toFixed(2).padStart(colWidth)}  ${s.max.toFixed(2).padStart(colWidth)}  ${s.p50.toFixed(2).padStart(colWidth)}  ${s.p95.toFixed(2).padStart(colWidth)}`,
+      );
+    }
   }
 
   const durationSec = (result.duration / 1000).toFixed(1);
@@ -135,6 +143,21 @@ function formatTable(result: EvalResult): string {
   lines.push(
     `  Failures: ${result.summary.failures}/${result.summary.count} | Cost: ${costStr} | Duration: ${durationSec}s`,
   );
+
+  const itemsWithErrors = result.items.filter((i) => i.errors?.length);
+  if (itemsWithErrors.length > 0) {
+    const uniqueErrors = [...new Set(itemsWithErrors.flatMap((i) => i.errors!))];
+    lines.push('');
+    lines.push(
+      `  Scorer errors (${itemsWithErrors.length}/${result.summary.count} items affected):`,
+    );
+    for (const err of uniqueErrors.slice(0, 5)) {
+      lines.push(`    - ${err}`);
+    }
+    if (uniqueErrors.length > 5) {
+      lines.push(`    ... and ${uniqueErrors.length - 5} more`);
+    }
+  }
 
   return lines.join('\n');
 }
@@ -320,7 +343,7 @@ async function runEvalCommand(args: string[]) {
           executeWorkflow = async (input) => ({ output: input });
         }
 
-        const result = await runEval(evalConfig, executeWorkflow, mod.provider, runtime);
+        const result = await runEval(evalConfig, executeWorkflow, runtime);
         results.push(result);
 
         console.log('\n' + formatTable(result) + '\n');

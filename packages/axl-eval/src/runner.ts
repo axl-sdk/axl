@@ -1,5 +1,6 @@
 import type { AxlRuntime } from '@axlsdk/axl';
 import type { EvalConfig, EvalResult, EvalItem, EvalSummary } from './types.js';
+import type { ScorerContext } from './scorer.js';
 import { randomUUID } from 'node:crypto';
 
 function computeStats(scores: number[]): {
@@ -29,21 +30,12 @@ function parseCost(cost: string): number {
   return parseFloat(match[1]);
 }
 
-/** Minimal provider interface for LLM scoring (avoids depending on core axl package). */
-type LlmScorerProvider = {
-  chat(
-    messages: { role: string; content: string }[],
-    options: { model: string; temperature?: number },
-  ): Promise<{ content: string }>;
-};
-
 export async function runEval(
   config: EvalConfig,
   executeWorkflow: (
     input: unknown,
     runtime: AxlRuntime,
   ) => Promise<{ output: unknown; cost?: number }>,
-  provider: LlmScorerProvider | undefined,
   runtime: AxlRuntime,
 ): Promise<EvalResult> {
   const startTime = Date.now();
@@ -52,13 +44,18 @@ export async function runEval(
   const concurrency = config.concurrency ?? 5;
   const budgetLimit = config.budget ? parseCost(config.budget) : undefined;
 
-  if (provider) {
-    for (const scorer of config.scorers) {
-      if (scorer.isLlm) {
-        (scorer as unknown as { _provider: LlmScorerProvider })._provider = provider;
+  // Create a scorer context that LLM scorers use to resolve providers.
+  const scorerContext: ScorerContext = {
+    resolveProvider: (uri: string) => {
+      if (typeof runtime.resolveProvider !== 'function') {
+        throw new Error(
+          `LLM scorers require a runtime with resolveProvider(). ` +
+            `Ensure you are using a real AxlRuntime instance, not a mock.`,
+        );
       }
-    }
-  }
+      return runtime.resolveProvider(uri);
+    },
+  };
 
   const evalItems: EvalItem[] = [];
   let totalCost = 0;
@@ -100,22 +97,42 @@ export async function runEval(
 
     for (const scorer of config.scorers) {
       try {
-        const score = await scorer.score(evalItem.output, item.input, item.annotations);
+        const score = await scorer.score(
+          evalItem.output,
+          item.input,
+          item.annotations,
+          scorerContext,
+        );
+        // Accumulate LLM scorer cost if available
+        if (scorer.isLlm) {
+          const lastCost = (scorer as unknown as { _lastCost?: number })._lastCost;
+          if (lastCost != null) {
+            totalCost += lastCost;
+          }
+        }
         if (score < 0 || score > 1) {
           if (!evalItem.errors) evalItem.errors = [];
           evalItem.errors.push(
             `Scorer "${scorer.name}" returned out-of-range score ${score} for input ${JSON.stringify(item.input)}`,
           );
-          evalItem.scores[scorer.name] = -1;
+          evalItem.scores[scorer.name] = null;
         } else {
           evalItem.scores[scorer.name] = round(score);
         }
       } catch (err) {
+        // Accumulate cost even on failure — the LLM call may have succeeded
+        // before a downstream error (e.g., invalid JSON, schema validation)
+        if (scorer.isLlm) {
+          const lastCost = (scorer as unknown as { _lastCost?: number })._lastCost;
+          if (lastCost != null) {
+            totalCost += lastCost;
+          }
+        }
         if (!evalItem.errors) evalItem.errors = [];
         evalItem.errors.push(
           `Scorer "${scorer.name}" threw: ${err instanceof Error ? err.message : String(err)}`,
         );
-        evalItem.scores[scorer.name] = -1;
+        evalItem.scores[scorer.name] = null;
       }
     }
     evalItems.push(evalItem);
@@ -137,8 +154,8 @@ export async function runEval(
   const scorerStats: EvalSummary['scorers'] = {};
   for (const name of scorerNames) {
     const scores = evalItems
-      .filter((i) => !i.error && i.scores[name] !== undefined && i.scores[name] >= 0)
-      .map((i) => i.scores[name]);
+      .filter((i) => !i.error && i.scores[name] != null)
+      .map((i) => i.scores[name] as number);
     scorerStats[name] = computeStats(scores);
   }
 

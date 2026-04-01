@@ -1,6 +1,19 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { llmScorer } from '../llm-scorer.js';
+import type { ScorerContext } from '../scorer.js';
+
+/** Helper to create a ScorerContext that returns the given mock provider. */
+function mockContext(mockProvider: {
+  chat: (...args: any[]) => Promise<{ content: string; cost?: number }>;
+}): ScorerContext {
+  return {
+    resolveProvider: (uri: string) => ({
+      provider: mockProvider,
+      model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
+    }),
+  };
+}
 
 describe('llmScorer()', () => {
   const defaultConfig = {
@@ -19,15 +32,26 @@ describe('llmScorer()', () => {
     expect(s.isLlm).toBe(true);
   });
 
-  it('throws when no provider is injected', async () => {
+  it('throws when no context is provided', async () => {
     const s = llmScorer(defaultConfig);
 
     await expect(s.score('output', 'input')).rejects.toThrow(
-      'LLM scorer "quality" requires a provider',
+      'LLM scorer "quality" has no provider. Ensure you are running via runEval() with a real AxlRuntime instance.',
     );
   });
 
-  it('scores correctly when provider is injected', async () => {
+  it('propagates error when resolver throws', async () => {
+    const s = llmScorer(defaultConfig);
+    const ctx: ScorerContext = {
+      resolveProvider: () => {
+        throw new Error('Unknown provider "openai"');
+      },
+    };
+
+    await expect(s.score('output', 'input', undefined, ctx)).rejects.toThrow('Unknown provider');
+  });
+
+  it('scores correctly when context is provided', async () => {
     const mockProvider = {
       async chat(_messages: any[], _options: any) {
         return { content: JSON.stringify({ score: 0.85, reasoning: 'Good output' }) };
@@ -42,9 +66,7 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    (s as any)._provider = mockProvider;
-
-    const score = await s.score('output', 'input');
+    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
     expect(score).toBe(0.85);
   });
 
@@ -68,9 +90,7 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    (s as any)._provider = mockProvider;
-
-    await s.score('test output', { question: 'test input' });
+    await s.score('test output', { question: 'test input' }, undefined, mockContext(mockProvider));
 
     expect(capturedMessages).toHaveLength(2);
     expect(capturedMessages[0].role).toBe('system');
@@ -78,7 +98,7 @@ describe('llmScorer()', () => {
     expect(capturedMessages[1].role).toBe('user');
     expect(capturedMessages[1].content).toContain('test output');
     expect(capturedMessages[1].content).toContain('test input');
-    // model should strip the provider prefix
+    // model should be stripped by the resolver
     expect(capturedOptions.model).toBe('gpt-4o');
   });
 
@@ -100,8 +120,7 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    (s as any)._provider = mockProvider;
-    await s.score('output', 'input');
+    await s.score('output', 'input', undefined, mockContext(mockProvider));
 
     expect(capturedOptions.model).toBe('claude-3-opus');
   });
@@ -124,8 +143,7 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    (s as any)._provider = mockProvider;
-    await s.score('output', 'input');
+    await s.score('output', 'input', undefined, mockContext(mockProvider));
 
     expect(capturedOptions.model).toBe('gpt-4');
   });
@@ -148,8 +166,7 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    (s as any)._provider = mockProvider;
-    await s.score('output', 'input');
+    await s.score('output', 'input', undefined, mockContext(mockProvider));
 
     expect(capturedOptions.temperature).toBe(0.2);
   });
@@ -173,8 +190,7 @@ describe('llmScorer()', () => {
       temperature: 0.8,
     });
 
-    (s as any)._provider = mockProvider;
-    await s.score('output', 'input');
+    await s.score('output', 'input', undefined, mockContext(mockProvider));
 
     expect(capturedOptions.temperature).toBe(0.8);
   });
@@ -195,9 +211,9 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    (s as any)._provider = mockProvider;
-
-    await expect(s.score('output', 'input')).rejects.toThrow();
+    await expect(
+      s.score('output', 'input', undefined, mockContext(mockProvider)),
+    ).rejects.toThrow();
   });
 
   it('throws when provider returns invalid JSON', async () => {
@@ -215,9 +231,9 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    (s as any)._provider = mockProvider;
-
-    await expect(s.score('output', 'input')).rejects.toThrow();
+    await expect(
+      s.score('output', 'input', undefined, mockContext(mockProvider)),
+    ).rejects.toThrow();
   });
 
   it('includes annotations in prompt when provided', async () => {
@@ -238,8 +254,7 @@ describe('llmScorer()', () => {
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    (s as any)._provider = mockProvider;
-    await s.score('output', 'input', { expectedAnswer: '42' });
+    await s.score('output', 'input', { expectedAnswer: '42' }, mockContext(mockProvider));
 
     const userMessage = capturedMessages[1].content;
     expect(userMessage).toContain('Annotations');

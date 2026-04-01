@@ -4,7 +4,7 @@ import { execSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { dataset, scorer, runEval, evalCompare } from '@axlsdk/eval';
+import { dataset, scorer, llmScorer, runEval, evalCompare } from '@axlsdk/eval';
 import type { EvalResult } from '@axlsdk/eval';
 import { AxlRuntime } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
@@ -36,7 +36,6 @@ describe('Eval E2E', () => {
     const result = await runEval(
       { workflow: 'test-wf', dataset: ds, scorers: [exactMatch] },
       executeFn,
-      undefined,
       mockRuntime,
     );
 
@@ -69,7 +68,6 @@ describe('Eval E2E', () => {
     const baselineResult = await runEval(
       { workflow: 'test', dataset: ds, scorers: [qualityScorer] },
       async () => ({ output: 'bad result' }),
-      undefined,
       mockRuntime,
     );
 
@@ -77,7 +75,6 @@ describe('Eval E2E', () => {
     const candidateResult = await runEval(
       { workflow: 'test', dataset: ds, scorers: [qualityScorer] },
       async () => ({ output: 'good result' }),
-      undefined,
       mockRuntime,
     );
 
@@ -105,14 +102,13 @@ describe('Eval E2E', () => {
     const result = await runEval(
       { workflow: 'test', dataset: ds, scorers: [badScorer] },
       async () => ({ output: 'anything' }),
-      undefined,
       mockRuntime,
     );
 
     expect(result.items[0].errors).toBeDefined();
     expect(result.items[0].errors!.length).toBeGreaterThan(0);
     expect(result.items[0].errors![0]).toContain('out-of-range');
-    expect(result.items[0].scores['bad-scorer']).toBe(-1);
+    expect(result.items[0].scores['bad-scorer']).toBeNull();
   });
 
   it('EvalResult has correct structure with metadata and timestamp', async () => {
@@ -136,7 +132,6 @@ describe('Eval E2E', () => {
         metadata: { version: '1.0' },
       },
       async () => ({ output: 'ok' }),
-      undefined,
       mockRuntime,
     )) as EvalResult;
 
@@ -168,7 +163,6 @@ describe('Eval E2E', () => {
     const result = await runEval(
       { workflow: 'test', dataset: ds, scorers: [annotationScorer] },
       async () => ({ output: 'some output' }),
-      undefined,
       mockRuntime,
     );
 
@@ -212,6 +206,51 @@ describe('Eval E2E', () => {
     expect(result.items[0].output).toBe('mock answer');
     expect(result.items[0].scores['pass']).toBe(1);
     expect(result.summary.scorers['pass'].mean).toBe(1);
+  });
+
+  it('runtime.eval() auto-resolves provider for LLM scorers', async () => {
+    // MockProvider that returns valid scorer JSON
+    const scorerProvider = MockProvider.fn(() => ({
+      content: JSON.stringify({ score: 0.95, reasoning: 'Excellent output' }),
+    }));
+
+    const provider = MockProvider.fn(() => ({ content: 'workflow output' }));
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('mock', provider);
+    runtime.registerProvider('scorer-mock', scorerProvider);
+
+    const { agent, workflow } = await import('@axlsdk/axl');
+    const a = agent({ name: 'eval-agent', model: 'mock:test', system: 'test' });
+    const wf = workflow({
+      name: 'llm-eval-wf',
+      input: z.object({ question: z.string() }),
+      handler: async (ctx) => ctx.ask(a, ctx.input.question),
+    });
+    runtime.register(wf);
+
+    const ds = dataset({
+      name: 'llm-eval-ds',
+      schema: z.object({ question: z.string() }),
+      items: [{ input: { question: 'q1' } }],
+    });
+
+    const judge = llmScorer({
+      name: 'quality',
+      description: 'Quality judge',
+      model: 'scorer-mock:judge-model',
+      system: 'Rate the quality',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const result = (await runtime.eval({
+      workflow: 'llm-eval-wf',
+      dataset: ds,
+      scorers: [judge],
+    })) as EvalResult;
+
+    expect(result.items.length).toBe(1);
+    expect(result.items[0].scores['quality']).toBe(0.95);
+    expect(result.items[0].errors).toBeUndefined();
   });
 
   it('eval CLI runs eval file and produces formatted output', () => {

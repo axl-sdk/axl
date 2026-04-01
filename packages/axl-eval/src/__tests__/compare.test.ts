@@ -363,9 +363,9 @@ describe('evalCompare()', () => {
     expect(comparison.regressions[0].candidateScore).toBe(0.3);
   });
 
-  it('skips items with negative scores (invalid scores)', () => {
+  it('skips items with null scores (invalid scores)', () => {
     const baseline = makeEvalResult({
-      items: [{ input: { q: '1' }, output: 'a', scores: { accuracy: -1 } }],
+      items: [{ input: { q: '1' }, output: 'a', scores: { accuracy: null } }],
     });
     const candidate = makeEvalResult({
       items: [{ input: { q: '1' }, output: 'a', scores: { accuracy: 0.9 } }],

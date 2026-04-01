@@ -28,7 +28,7 @@ export type EvalItem = {
   output: unknown;
   error?: string;
   errors?: string[];
-  scores: Record<string, number>;
+  scores: Record<string, number | null>;
 };
 
 export type EvalSummary = {

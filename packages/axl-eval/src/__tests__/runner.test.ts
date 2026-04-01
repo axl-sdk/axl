@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { AxlRuntime } from '@axlsdk/axl';
 import { dataset } from '../dataset.js';
 import { scorer } from '../scorer.js';
+import { llmScorer } from '../llm-scorer.js';
 import { runEval } from '../runner.js';
 
 const mockRuntime = {} as AxlRuntime;
@@ -40,7 +41,6 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
       executeWorkflow,
-      undefined,
       mockRuntime,
     );
 
@@ -54,7 +54,6 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'math-solver', dataset: testDataset, scorers: [exactScorer] },
       executeWorkflow,
-      undefined,
       mockRuntime,
     );
 
@@ -77,7 +76,6 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
       executeWorkflow,
-      undefined,
       mockRuntime,
     );
 
@@ -100,7 +98,6 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
       failingWorkflow,
-      undefined,
       mockRuntime,
     );
 
@@ -120,7 +117,6 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
       failingWorkflow,
-      undefined,
       mockRuntime,
     );
 
@@ -146,7 +142,6 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [variableScorer] },
       executeWorkflow,
-      undefined,
       mockRuntime,
     );
 
@@ -170,7 +165,6 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer, lengthScorer] },
       executeWorkflow,
-      undefined,
       mockRuntime,
     );
 
@@ -189,7 +183,6 @@ describe('runEval()', () => {
         metadata: { version: '1.0', model: 'gpt-4' },
       },
       executeWorkflow,
-      undefined,
       mockRuntime,
     );
 
@@ -206,7 +199,6 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: emptyDataset, scorers: [exactScorer] },
       executeWorkflow,
-      undefined,
       mockRuntime,
     );
 
@@ -215,7 +207,7 @@ describe('runEval()', () => {
     expect(result.summary.failures).toBe(0);
   });
 
-  it('marks score as -1 when scorer throws', async () => {
+  it('marks score as null when scorer throws', async () => {
     const throwingScorer = scorer({
       name: 'throws',
       description: 'Always throws',
@@ -227,16 +219,15 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [throwingScorer] },
       executeWorkflow,
-      undefined,
       mockRuntime,
     );
 
     for (const item of result.items) {
-      expect(item.scores.throws).toBe(-1);
+      expect(item.scores.throws).toBeNull();
     }
   });
 
-  it('marks score as -1 when score is out of range (> 1)', async () => {
+  it('marks score as null when score is out of range (> 1)', async () => {
     const outOfRangeScorer = scorer({
       name: 'bad-range',
       description: 'Returns out of range',
@@ -246,16 +237,15 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [outOfRangeScorer] },
       executeWorkflow,
-      undefined,
       mockRuntime,
     );
 
     for (const item of result.items) {
-      expect(item.scores['bad-range']).toBe(-1);
+      expect(item.scores['bad-range']).toBeNull();
     }
   });
 
-  it('marks score as -1 when score is out of range (< 0)', async () => {
+  it('marks score as null when score is out of range (< 0)', async () => {
     const negativeScorer = scorer({
       name: 'negative',
       description: 'Returns negative',
@@ -265,12 +255,11 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [negativeScorer] },
       executeWorkflow,
-      undefined,
       mockRuntime,
     );
 
     for (const item of result.items) {
-      expect(item.scores.negative).toBe(-1);
+      expect(item.scores.negative).toBeNull();
     }
   });
 
@@ -290,7 +279,6 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: largeDataset, scorers: [simpleScorer], concurrency: 3 },
       async (input: any) => ({ output: input.n }),
-      undefined,
       mockRuntime,
     );
 
@@ -324,7 +312,6 @@ describe('runEval()', () => {
         currentConcurrent--;
         return { output: input.id };
       },
-      undefined,
       mockRuntime,
     );
 
@@ -332,18 +319,25 @@ describe('runEval()', () => {
     expect(maxConcurrent).toBeLessThanOrEqual(2);
   });
 
-  it('injects provider into LLM scorers', async () => {
-    const mockLlmScorer = {
-      name: 'llm-score',
-      description: 'Mock LLM scorer',
-      isLlm: true,
-      _provider: undefined as any,
-      async score() {
-        return 0.9;
-      },
+  it('resolves provider for LLM scorers from runtime', async () => {
+    const mockProvider = {
+      chat: async () => ({ content: JSON.stringify({ score: 0.9, reasoning: 'Good' }) }),
     };
 
-    const mockProvider = { chat: async () => ({ content: '{}' }) };
+    const mockRuntimeWithResolver = {
+      resolveProvider: (uri: string) => ({
+        provider: mockProvider,
+        model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
+      }),
+    } as unknown as AxlRuntime;
+
+    const llmScore = llmScorer({
+      name: 'test-llm',
+      description: 'test',
+      model: 'mock:test-model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
 
     const singleItemDataset = dataset({
       name: 'single-ds',
@@ -351,14 +345,263 @@ describe('runEval()', () => {
       items: [{ input: { q: 'test' } }],
     });
 
-    await runEval(
-      { workflow: 'test', dataset: singleItemDataset, scorers: [mockLlmScorer as any] },
+    const result = await runEval(
+      { workflow: 'test', dataset: singleItemDataset, scorers: [llmScore] },
       async () => ({ output: 'output' }),
-      mockProvider,
-      mockRuntime,
+      mockRuntimeWithResolver,
     );
 
-    expect(mockLlmScorer._provider).toBe(mockProvider);
+    expect(result.items[0].scores['test-llm']).toBe(0.9);
+  });
+
+  it('handles mixed LLM and non-LLM scorers', async () => {
+    const mockProvider = {
+      chat: async () => ({ content: JSON.stringify({ score: 0.8, reasoning: 'OK' }) }),
+    };
+
+    const mockRuntimeWithResolver = {
+      resolveProvider: (uri: string) => ({
+        provider: mockProvider,
+        model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
+      }),
+    } as unknown as AxlRuntime;
+
+    const llmScore = llmScorer({
+      name: 'llm-judge',
+      description: 'LLM judge',
+      model: 'mock:test-model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const simpleScore = scorer({
+      name: 'length',
+      description: 'Check length',
+      score: (output) => (typeof output === 'string' && output.length > 0 ? 1 : 0),
+    });
+
+    const singleItemDataset = dataset({
+      name: 'single-ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: singleItemDataset, scorers: [simpleScore, llmScore] },
+      async () => ({ output: 'output' }),
+      mockRuntimeWithResolver,
+    );
+
+    expect(result.items[0].scores['length']).toBe(1);
+    expect(result.items[0].scores['llm-judge']).toBe(0.8);
+  });
+
+  it('resolves different providers for different LLM scorers', async () => {
+    const providers: Record<string, string> = {};
+
+    const mockRuntimeMultiProvider = {
+      resolveProvider: (uri: string) => {
+        const colonIdx = uri.indexOf(':');
+        const providerName = colonIdx > -1 ? uri.slice(0, colonIdx) : 'default';
+        const model = colonIdx > -1 ? uri.slice(colonIdx + 1) : uri;
+        return {
+          provider: {
+            chat: async () => {
+              providers[providerName] = model;
+              return { content: JSON.stringify({ score: 0.7, reasoning: 'Fine' }) };
+            },
+          },
+          model,
+        };
+      },
+    } as unknown as AxlRuntime;
+
+    const scorer1 = llmScorer({
+      name: 'judge-a',
+      description: 'test',
+      model: 'openai:gpt-4o',
+      system: 'Rate',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const scorer2 = llmScorer({
+      name: 'judge-b',
+      description: 'test',
+      model: 'google:gemini-flash',
+      system: 'Rate',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [scorer1, scorer2] },
+      async () => ({ output: 'output' }),
+      mockRuntimeMultiProvider,
+    );
+
+    expect(providers['openai']).toBe('gpt-4o');
+    expect(providers['google']).toBe('gemini-flash');
+    expect(result.items[0].scores['judge-a']).toBe(0.7);
+    expect(result.items[0].scores['judge-b']).toBe(0.7);
+  });
+
+  it('handles resolveProvider failure with null score and error message', async () => {
+    const mockRuntimeThatThrows = {
+      resolveProvider: () => {
+        throw new Error('Unknown provider "bad"');
+      },
+    } as unknown as AxlRuntime;
+
+    const llmScore = llmScorer({
+      name: 'bad-scorer',
+      description: 'test',
+      model: 'bad:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [llmScore] },
+      async () => ({ output: 'output' }),
+      mockRuntimeThatThrows,
+    );
+
+    expect(result.items[0].scores['bad-scorer']).toBeNull();
+    expect(result.items[0].errors).toBeDefined();
+    expect(result.items[0].errors![0]).toContain('Unknown provider');
+  });
+
+  it('accumulates LLM scorer cost in totalCost', async () => {
+    const mockProvider = {
+      chat: async () => ({
+        content: JSON.stringify({ score: 0.9, reasoning: 'Good' }),
+        cost: 0.002,
+      }),
+    };
+
+    const mockRuntimeWithResolver = {
+      resolveProvider: (uri: string) => ({
+        provider: mockProvider,
+        model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
+      }),
+    } as unknown as AxlRuntime;
+
+    const llmScore = llmScorer({
+      name: 'judge',
+      description: 'test',
+      model: 'mock:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const ds = dataset({
+      name: 'cost-ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'a' } }, { input: { q: 'b' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [llmScore] },
+      async () => ({ output: 'output', cost: 0.001 }),
+      mockRuntimeWithResolver,
+    );
+
+    // 2 items × $0.001 workflow + 2 items × $0.002 scorer = $0.006
+    expect(result.totalCost).toBeCloseTo(0.006, 6);
+  });
+
+  it('LLM scorer cost counts toward budget', async () => {
+    const mockProvider = {
+      chat: async () => ({
+        content: JSON.stringify({ score: 0.9, reasoning: 'Good' }),
+        cost: 0.003,
+      }),
+    };
+
+    const mockRuntimeWithResolver = {
+      resolveProvider: (uri: string) => ({
+        provider: mockProvider,
+        model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
+      }),
+    } as unknown as AxlRuntime;
+
+    const llmScore = llmScorer({
+      name: 'judge',
+      description: 'test',
+      model: 'mock:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const ds = dataset({
+      name: 'budget-ds',
+      schema: z.object({ q: z.string() }),
+      items: Array.from({ length: 5 }, (_, i) => ({ input: { q: String(i) } })),
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [llmScore], budget: '$0.010', concurrency: 1 },
+      async () => ({ output: 'output', cost: 0.001 }),
+      mockRuntimeWithResolver,
+    );
+
+    // Each item: $0.001 workflow + $0.003 scorer = $0.004
+    // After 3 items: $0.012 > $0.010 budget → remaining items budget-exceeded
+    const budgetExceeded = result.items.filter((i) => i.error === 'Budget exceeded');
+    expect(budgetExceeded.length).toBeGreaterThan(0);
+    expect(result.totalCost).toBeGreaterThan(0.008);
+  });
+
+  it('accumulates LLM scorer cost even when scorer throws after LLM call', async () => {
+    const mockProvider = {
+      chat: async () => ({
+        content: 'not valid json',
+        cost: 0.005,
+      }),
+    };
+
+    const mockRuntimeWithResolver = {
+      resolveProvider: (uri: string) => ({
+        provider: mockProvider,
+        model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
+      }),
+    } as unknown as AxlRuntime;
+
+    const llmScore = llmScorer({
+      name: 'broken',
+      description: 'test',
+      model: 'mock:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [llmScore] },
+      async () => ({ output: 'output', cost: 0.001 }),
+      mockRuntimeWithResolver,
+    );
+
+    // Scorer threw (invalid JSON) but the LLM call cost $0.005 was still incurred
+    expect(result.items[0].scores['broken']).toBeNull();
+    expect(result.items[0].errors).toBeDefined();
+    expect(result.totalCost).toBeCloseTo(0.006, 6); // $0.001 workflow + $0.005 scorer
   });
 
   it('passes annotations to scorer', async () => {
@@ -382,12 +625,72 @@ describe('runEval()', () => {
     const result = await runEval(
       { workflow: 'test', dataset: annotatedDataset, scorers: [annotationScorer] },
       async () => ({ output: '2' }),
-      undefined,
       mockRuntime,
     );
 
     expect(receivedAnnotations).toEqual({ answer: '2' });
     expect(result.items[0].scores['ann-scorer']).toBe(1);
+  });
+
+  it('gives descriptive error when runtime lacks resolveProvider', async () => {
+    const bareRuntime = {} as AxlRuntime;
+
+    const llmScore = llmScorer({
+      name: 'test-llm',
+      description: 'test',
+      model: 'mock:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [llmScore] },
+      async () => ({ output: 'output' }),
+      bareRuntime,
+    );
+
+    expect(result.items[0].scores['test-llm']).toBeNull();
+    expect(result.items[0].errors).toBeDefined();
+    expect(result.items[0].errors![0]).toContain('resolveProvider');
+    expect(result.items[0].errors![0]).toContain('real AxlRuntime');
+  });
+
+  it('stops processing when budget is exceeded', async () => {
+    const expensiveDataset = dataset({
+      name: 'expensive-ds',
+      schema: z.object({ id: z.number() }),
+      items: Array.from({ length: 5 }, (_, i) => ({ input: { id: i } })),
+    });
+
+    const simpleScorer = scorer({
+      name: 'pass',
+      description: 'Always passes',
+      score: () => 1,
+    });
+
+    const result = await runEval(
+      {
+        workflow: 'test',
+        dataset: expensiveDataset,
+        scorers: [simpleScorer],
+        budget: '$0.005',
+        concurrency: 1,
+      },
+      async () => ({ output: 'ok', cost: 0.003 }),
+      mockRuntime,
+    );
+
+    // First two items cost $0.003 each = $0.006 which exceeds $0.005
+    // Remaining items should have 'Budget exceeded' error
+    const budgetExceeded = result.items.filter((i) => i.error === 'Budget exceeded');
+    expect(budgetExceeded.length).toBeGreaterThan(0);
+    expect(result.totalCost).toBeGreaterThan(0);
   });
 
   it('passes runtime to executeWorkflow as second argument', async () => {
@@ -402,7 +705,6 @@ describe('runEval()', () => {
         if (input.question === 'What is 2+2?') return { output: '4' };
         return { output: '6' };
       },
-      undefined,
       testRuntime,
     );
 

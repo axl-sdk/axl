@@ -37,7 +37,7 @@ export function evalCompare(baseline: EvalResult, candidate: EvalResult): EvalCo
     for (const name of baselineScorerNames) {
       const bScore = bItem.scores[name];
       const cScore = cItem.scores[name];
-      if (bScore === undefined || cScore === undefined || bScore < 0 || cScore < 0) continue;
+      if (bScore == null || cScore == null) continue;
       const delta = round(cScore - bScore);
       if (delta < -0.1)
         regressions.push({

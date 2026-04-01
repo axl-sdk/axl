@@ -1,13 +1,5 @@
 import type { z } from 'zod';
-import type { Scorer } from './scorer.js';
-
-/** Minimal provider interface for LLM scoring (avoids depending on core axl package). */
-type LlmScorerProvider = {
-  chat(
-    messages: { role: string; content: string }[],
-    options: { model: string; temperature?: number },
-  ): Promise<{ content: string }>;
-};
+import type { Scorer, ScorerContext } from './scorer.js';
 
 export type LlmScorerConfig = {
   name: string;
@@ -19,17 +11,24 @@ export type LlmScorerConfig = {
 };
 
 export function llmScorer(config: LlmScorerConfig): Scorer {
-  const scorerInstance: Scorer & { _provider?: LlmScorerProvider } = {
+  const scorerInstance: Scorer & { _lastCost?: number } = {
     name: config.name,
     description: config.description,
     isLlm: true,
-    async score(output: unknown, input: unknown, annotations?: unknown): Promise<number> {
-      const injectedProvider = scorerInstance._provider;
-      if (!injectedProvider) {
+    async score(
+      output: unknown,
+      input: unknown,
+      annotations?: unknown,
+      context?: ScorerContext,
+    ): Promise<number> {
+      if (!context?.resolveProvider) {
         throw new Error(
-          `LLM scorer "${config.name}" requires a provider. Run via axl.eval() or the CLI.`,
+          `LLM scorer "${config.name}" has no provider. ` +
+            `Ensure you are running via runEval() with a real AxlRuntime instance.`,
         );
       }
+
+      const { provider, model } = context.resolveProvider(config.model);
 
       const prompt = [
         `Evaluate the following output.`,
@@ -46,16 +45,15 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
         `Respond with valid JSON matching the required schema with a score field (0-1) and reasoning.`,
       ].join('\n');
 
-      const colonIdx = config.model.indexOf(':');
-      const model = colonIdx > -1 ? config.model.slice(colonIdx + 1) : config.model;
-
-      const response = await injectedProvider.chat(
+      const response = await provider.chat(
         [
           { role: 'system', content: config.system },
           { role: 'user', content: prompt },
         ],
         { model, temperature: config.temperature ?? 0.2 },
       );
+
+      scorerInstance._lastCost = response.cost;
 
       const parsed = JSON.parse(response.content);
       const validated = config.schema.parse(parsed);

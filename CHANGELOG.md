@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-04-01
+
+### Fixed
+
+- **Eval:** LLM scorers now request JSON mode (`responseFormat: { type: 'json_object' }`) from providers, preventing Gemini and other models from wrapping JSON in markdown fences which caused 60-87% of scorer evaluations to fail with JSON.parse errors
+
+### Added
+
+- **Core:** `extractJson()` utility exported from `@axlsdk/axl` — robust JSON extraction from LLM responses that handles raw JSON, markdown fenced blocks, and JSON embedded in prose text. Used by both `ctx.ask()` schema parsing and `llmScorer`
+
+### Changed
+
+- **Core:** `stripMarkdownFences()` replaced by `extractJson()` in `ctx.ask()` structured output parsing — now handles balanced brace matching for JSON embedded in prose, not just markdown fences
+
 ## [0.13.1] - 2026-04-01
 
 ### Changed
@@ -402,7 +416,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.13.2...HEAD
+[0.13.2]: https://github.com/axl-sdk/axl/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/axl-sdk/axl/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/axl-sdk/axl/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/axl-sdk/axl/compare/v0.11.0...v0.12.0

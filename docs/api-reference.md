@@ -908,6 +908,7 @@ Eval results are automatically persisted when using `runRegisteredEval()`. Histo
 | `getTool(name)` | `Tool \| undefined` | Look up a tool by name |
 | `getRegisteredEvals()` | `Array<{ name, workflow, dataset, scorers }>` | All registered eval configs |
 | `getRegisteredEval(name)` | `{ config, executeWorkflow? } \| undefined` | Look up a specific eval registration |
+| `resolveProvider(uri)` | `{ provider, model }` | Resolve a `provider:model` URI to a Provider instance and model name |
 | `getStateStore()` | `StateStore` | The runtime's state store instance |
 | `getMcpManager()` | `McpManager \| undefined` | The runtime's MCP manager (if initialized) |
 
@@ -1070,6 +1071,74 @@ All errors extend `AxlError`.
 | `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy. Includes `.limit`, `.spent`, `.policy` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
 | `ToolDenied` | `ctx.ask()` | Agent attempted to call a tool not in its ACL. Includes `.toolName`, `.agentName` |
+
+---
+
+## Evaluation Types
+
+Types from `@axlsdk/eval` used by `runEval()`, `runtime.eval()`, and the CLI.
+
+### `EvalItem`
+
+Per-item result from an eval run.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `input` | `unknown` | The dataset input |
+| `annotations` | `unknown?` | Ground truth annotations |
+| `output` | `unknown` | Workflow output |
+| `error` | `string?` | Workflow-level error message |
+| `errors` | `string[]?` | Scorer-level error messages (thrown exceptions or out-of-range scores) |
+| `scores` | `Record<string, number \| null>` | Scorer results. `null` indicates a scorer error (see `errors` field) |
+
+### `EvalResult`
+
+Full result from an eval run.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` | Unique eval run ID |
+| `workflow` | `string` | Workflow name |
+| `dataset` | `string` | Dataset name |
+| `metadata` | `Record<string, any>` | User-provided metadata |
+| `timestamp` | `string` | ISO 8601 timestamp |
+| `totalCost` | `number` | Total LLM cost (workflow + LLM scorers) |
+| `duration` | `number` | Wall-clock time in ms |
+| `items` | `EvalItem[]` | Per-item results |
+| `summary` | `EvalSummary` | Aggregate statistics |
+
+### `EvalSummary`
+
+Aggregate statistics across all items.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `count` | `number` | Total items |
+| `failures` | `number` | Items where the workflow threw an error |
+| `scorers` | `Record<string, { mean, min, max, p50, p95 }>` | Per-scorer aggregate stats (all values 0-1) |
+
+### `Scorer`
+
+A scoring function returned by `scorer()` or `llmScorer()`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `string` | Unique scorer name |
+| `description` | `string` | What this scorer evaluates |
+| `isLlm` | `boolean` | `true` for LLM scorers |
+| `score` | `(output, input, annotations?, context?) => number \| Promise<number>` | Scoring function (returns 0-1). `context` is a `ScorerContext` passed by the eval runner |
+
+### `ScorerContext`
+
+Context passed to scorers by the eval runner.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `resolveProvider` | `(modelUri: string) => { provider, model }` | Resolves a `provider:model` URI to a provider instance and stripped model name. Used by LLM scorers to obtain their provider |
+
+### `runEval(config, executeWorkflow, runtime)`
+
+Run an evaluation. LLM scorer providers are auto-resolved from the runtime's provider registry using each scorer's `model` URI. No explicit provider export is needed from eval files -- ensure the relevant API key environment variable is set or register providers via `runtime.registerProvider()`.
 
 ---
 

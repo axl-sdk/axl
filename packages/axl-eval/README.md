@@ -85,9 +85,9 @@ const qualityJudge = llmScorer({
 });
 ```
 
-### `runEval(config, executeFn, provider, runtime)`
+### `runEval(config, executeFn, runtime)`
 
-Run an evaluation:
+Run an evaluation. LLM scorer providers are automatically resolved from the runtime's provider registry using each scorer's `model` URI (e.g., `google:gemini-3.1-flash`). Ensure the relevant API key environment variable is set (e.g., `OPENAI_API_KEY`, `GOOGLE_AI_API_KEY`) or register providers via `runtime.registerProvider()`:
 
 ```typescript
 import { runEval } from '@axlsdk/eval';
@@ -103,7 +103,6 @@ const results = await runEval(
     const output = await runtime.execute('my-workflow', input);
     return { output };
   },
-  undefined,  // provider (only needed for llmScorer)
   runtime,
 );
 

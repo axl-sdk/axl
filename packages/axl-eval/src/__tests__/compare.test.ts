@@ -376,4 +376,106 @@ describe('evalCompare()', () => {
     expect(comparison.regressions).toHaveLength(0);
     expect(comparison.improvements).toHaveLength(0);
   });
+
+  it('includes itemIndex in regressions and improvements', () => {
+    const baseline = makeEvalResult({
+      items: [
+        { input: { q: '1' }, output: 'a', scores: { accuracy: 0.9 } },
+        { input: { q: '2' }, output: 'b', scores: { accuracy: 0.3 } },
+      ],
+    });
+    const candidate = makeEvalResult({
+      items: [
+        { input: { q: '1' }, output: 'a', scores: { accuracy: 0.5 } },
+        { input: { q: '2' }, output: 'b', scores: { accuracy: 0.8 } },
+      ],
+    });
+
+    const comparison = evalCompare(baseline, candidate);
+
+    expect(comparison.regressions[0].itemIndex).toBe(0);
+    expect(comparison.improvements[0].itemIndex).toBe(1);
+  });
+
+  it('compares timing when both runs have duration data', () => {
+    const baseline = makeEvalResult({
+      items: [
+        { input: { q: '1' }, output: 'a', scores: { accuracy: 0.8 }, duration: 1000 },
+        { input: { q: '2' }, output: 'b', scores: { accuracy: 0.6 }, duration: 2000 },
+      ],
+    });
+    const candidate = makeEvalResult({
+      items: [
+        { input: { q: '1' }, output: 'a', scores: { accuracy: 0.8 }, duration: 2000 },
+        { input: { q: '2' }, output: 'b', scores: { accuracy: 0.6 }, duration: 4000 },
+      ],
+    });
+
+    const comparison = evalCompare(baseline, candidate);
+
+    expect(comparison.timing).toBeDefined();
+    expect(comparison.timing!.baselineMean).toBe(1500);
+    expect(comparison.timing!.candidateMean).toBe(3000);
+    expect(comparison.timing!.delta).toBe(1500);
+    expect(comparison.timing!.deltaPercent).toBe(100);
+  });
+
+  it('omits timing when neither run has duration data', () => {
+    const baseline = makeEvalResult();
+    const candidate = makeEvalResult();
+
+    const comparison = evalCompare(baseline, candidate);
+
+    expect(comparison.timing).toBeUndefined();
+  });
+
+  it('compares cost when either run has non-zero cost', () => {
+    const baseline = makeEvalResult({ totalCost: 1.0 });
+    const candidate = makeEvalResult({ totalCost: 0.4 });
+
+    const comparison = evalCompare(baseline, candidate);
+
+    expect(comparison.cost).toBeDefined();
+    expect(comparison.cost!.baselineTotal).toBe(1.0);
+    expect(comparison.cost!.candidateTotal).toBe(0.4);
+    expect(comparison.cost!.delta).toBe(-0.6);
+    expect(comparison.cost!.deltaPercent).toBe(-60);
+  });
+
+  it('omits cost when both runs have zero cost', () => {
+    const baseline = makeEvalResult({ totalCost: 0 });
+    const candidate = makeEvalResult({ totalCost: 0 });
+
+    const comparison = evalCompare(baseline, candidate);
+
+    expect(comparison.cost).toBeUndefined();
+  });
+
+  it('includes timing delta in summary string', () => {
+    const baseline = makeEvalResult({
+      items: [
+        { input: { q: '1' }, output: 'a', scores: { accuracy: 0.8 }, duration: 1000 },
+        { input: { q: '2' }, output: 'b', scores: { accuracy: 0.8 }, duration: 1000 },
+      ],
+    });
+    const candidate = makeEvalResult({
+      items: [
+        { input: { q: '1' }, output: 'a', scores: { accuracy: 0.8 }, duration: 3000 },
+        { input: { q: '2' }, output: 'b', scores: { accuracy: 0.8 }, duration: 3000 },
+      ],
+    });
+
+    const comparison = evalCompare(baseline, candidate);
+
+    expect(comparison.summary).toContain('slower');
+  });
+
+  it('includes cost delta in summary string', () => {
+    const baseline = makeEvalResult({ totalCost: 2.0 });
+    const candidate = makeEvalResult({ totalCost: 0.5 });
+
+    const comparison = evalCompare(baseline, candidate);
+
+    expect(comparison.summary).toContain('cheaper');
+  });
 });

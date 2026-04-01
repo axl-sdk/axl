@@ -79,6 +79,21 @@ async function runCompare(args: string[]) {
     );
   }
 
+  if (comparison.timing) {
+    const t = comparison.timing;
+    const sign = t.delta > 0 ? '+' : '';
+    console.log(
+      `\n  Timing: baseline ${(t.baselineMean / 1000).toFixed(2)}s -> candidate ${(t.candidateMean / 1000).toFixed(2)}s (${sign}${t.deltaPercent.toFixed(1)}%)`,
+    );
+  }
+  if (comparison.cost) {
+    const c = comparison.cost;
+    const sign = c.delta > 0 ? '+' : '';
+    console.log(
+      `  Cost: baseline $${c.baselineTotal.toFixed(2)} -> candidate $${c.candidateTotal.toFixed(2)} (${sign}${c.deltaPercent.toFixed(1)}%)`,
+    );
+  }
+
   const stable = Math.max(
     0,
     baseline.items.length - comparison.regressions.length - comparison.improvements.length,
@@ -135,6 +150,13 @@ function formatTable(result: EvalResult): string {
         `  ${name.padEnd(maxNameLen)}  ${s.mean.toFixed(2).padStart(colWidth)}  ${s.min.toFixed(2).padStart(colWidth)}  ${s.max.toFixed(2).padStart(colWidth)}  ${s.p50.toFixed(2).padStart(colWidth)}  ${s.p95.toFixed(2).padStart(colWidth)}`,
       );
     }
+  }
+
+  if (result.summary.timing) {
+    const t = result.summary.timing;
+    lines.push(
+      `  ${'Timing'.padEnd(maxNameLen)}  ${(t.mean / 1000).toFixed(2).padStart(colWidth)}s ${(t.p50 / 1000).toFixed(2).padStart(colWidth)}s ${(t.p95 / 1000).toFixed(2).padStart(colWidth)}s`,
+    );
   }
 
   const durationSec = (result.duration / 1000).toFixed(1);

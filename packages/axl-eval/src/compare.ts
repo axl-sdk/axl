@@ -60,6 +60,35 @@ export function evalCompare(baseline: EvalResult, candidate: EvalResult): EvalCo
     }
   }
 
+  // Timing comparison (only when both sides have timing data)
+  let timing: EvalComparison['timing'];
+  const bDurations = baseline.items
+    .filter((i) => !i.error && i.duration != null)
+    .map((i) => i.duration!);
+  const cDurations = candidate.items
+    .filter((i) => !i.error && i.duration != null)
+    .map((i) => i.duration!);
+  if (bDurations.length > 0 && cDurations.length > 0) {
+    const bMean = round(bDurations.reduce((a, b) => a + b, 0) / bDurations.length);
+    const cMean = round(cDurations.reduce((a, b) => a + b, 0) / cDurations.length);
+    const delta = round(cMean - bMean);
+    const deltaPercent = bMean > 0 ? round((delta / bMean) * 100) : 0;
+    timing = { baselineMean: bMean, candidateMean: cMean, delta, deltaPercent };
+  }
+
+  // Cost comparison
+  let cost: EvalComparison['cost'];
+  if (baseline.totalCost > 0 || candidate.totalCost > 0) {
+    const delta = round(candidate.totalCost - baseline.totalCost);
+    const deltaPercent = baseline.totalCost > 0 ? round((delta / baseline.totalCost) * 100) : 0;
+    cost = {
+      baselineTotal: baseline.totalCost,
+      candidateTotal: candidate.totalCost,
+      delta,
+      deltaPercent,
+    };
+  }
+
   const parts: string[] = [];
   for (const name of baselineScorerNames) {
     const s = scorers[name];
@@ -71,12 +100,22 @@ export function evalCompare(baseline: EvalResult, candidate: EvalResult): EvalCo
       );
     }
   }
+  if (timing && Math.abs(timing.deltaPercent) > 1) {
+    const dir = timing.delta > 0 ? 'slower' : 'faster';
+    parts.push(`${Math.abs(timing.deltaPercent).toFixed(0)}% ${dir}`);
+  }
+  if (cost && Math.abs(cost.deltaPercent) > 1) {
+    const dir = cost.delta > 0 ? 'more expensive' : 'cheaper';
+    parts.push(`${Math.abs(cost.deltaPercent).toFixed(0)}% ${dir}`);
+  }
   const summaryStr = `candidate ${parts.length > 0 ? parts.join(', ') : 'no significant changes'} with ${regressions.length} regressions and ${improvements.length} improvements`;
 
   return {
     baseline: { id: baseline.id, metadata: baseline.metadata },
     candidate: { id: candidate.id, metadata: candidate.metadata },
     scorers,
+    timing,
+    cost,
     regressions,
     improvements,
     summary: summaryStr,

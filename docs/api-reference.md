@@ -1127,7 +1127,7 @@ Per-scorer data stored on each `EvalItem`, providing richer detail than the `sco
 
 ### `EvalItem`
 
-Per-item result from an eval run.
+Per-item result from an eval run. `scores` provides quick numeric access; `scoreDetails` provides the full picture (metadata, per-scorer timing, per-scorer cost).
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1136,11 +1136,11 @@ Per-item result from an eval run.
 | `output` | `unknown` | Workflow output |
 | `error` | `string?` | Workflow-level error message |
 | `scorerErrors` | `string[]?` | Scorer-level error messages (thrown exceptions or out-of-range scores) |
-| `scores` | `Record<string, number \| null>` | Scorer results. `null` indicates a scorer error (see `scorerErrors` field) |
-| `duration` | `number?` | Workflow execution time in ms |
+| `scores` | `Record<string, number \| null>` | Quick numeric access to scores. `null` = scorer error (see `scorerErrors`) |
+| `duration` | `number?` | Workflow execution time in ms (set even when workflow errors) |
 | `cost` | `number?` | Workflow LLM cost |
-| `scorerCost` | `number?` | Total scorer cost for this item |
-| `scoreDetails` | `Record<string, ScorerDetail>?` | Rich per-scorer data (metadata, timing, cost) |
+| `scorerCost` | `number?` | Total scorer cost for this item (sum of all `scoreDetails[*].cost`) |
+| `scoreDetails` | `Record<string, ScorerDetail>?` | Rich per-scorer data — includes `metadata` (e.g., LLM reasoning), per-scorer `duration`, and `cost` |
 
 ### `EvalResult`
 
@@ -1151,7 +1151,7 @@ Full result from an eval run.
 | `id` | `string` | Unique eval run ID |
 | `workflow` | `string` | Workflow name |
 | `dataset` | `string` | Dataset name |
-| `metadata` | `Record<string, any>` | User-provided metadata |
+| `metadata` | `Record<string, unknown>` | User-provided metadata (from `EvalConfig.metadata`) |
 | `timestamp` | `string` | ISO 8601 timestamp |
 | `totalCost` | `number` | Total LLM cost (workflow + LLM scorers) |
 | `duration` | `number` | Wall-clock time in ms |

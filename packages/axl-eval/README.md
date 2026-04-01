@@ -145,7 +145,7 @@ const qualityJudge = llmScorer({
 });
 ```
 
-The default schema is `{ score: number, reasoning: string }` — the LLM returns a 0-1 score with an explanation. The returned `ScorerResult` includes the full schema response as `metadata` (e.g., `{ reasoning: "...", confidence: 0.9 }`) and the LLM cost. For custom scoring dimensions, provide your own schema:
+The default schema is `z.object({ score: z.number().min(0).max(1), reasoning: z.string() })` — the LLM returns a 0-1 score with an explanation. The reasoning (and any other schema fields) are available on each item via `scoreDetails` — see [Understanding Results](#understanding-results). For custom scoring dimensions, provide your own schema:
 
 ```typescript
 import { z } from 'zod';
@@ -194,9 +194,10 @@ npx axl-eval ./evals/qa.eval.ts                    # run a single file
 npx axl-eval ./evals/                               # run all *.eval.* files in a directory
 npx axl-eval ./evals/ --output ./results/v1.json    # save results to JSON
 npx axl-eval ./evals/ --config ./axl.config.ts      # use a specific runtime config
+npx axl-eval ./evals/ --conditions development      # add Node.js import conditions (monorepo source exports)
 ```
 
-The CLI resolves a runtime automatically: `--config <path>` > auto-detect `axl.config.*` > bare `new AxlRuntime()` (providers from env vars).
+The CLI resolves a runtime automatically: `--config <path>` > auto-detect `axl.config.*` > bare `new AxlRuntime()` (providers from env vars). Use `--conditions` when your eval file imports from monorepo packages that use conditional exports (e.g., `"development"` condition for source TypeScript instead of compiled dist).
 
 ### Programmatic
 
@@ -256,31 +257,38 @@ See the [@axlsdk/studio README](../axl-studio/README.md#lazy-eval-loading) for d
 
 ## Understanding Results
 
-Each eval run returns an `EvalResult` with per-item scores and aggregate statistics.
+Each eval run returns an `EvalResult` with per-item scores and aggregate statistics. Every item captures timing and cost alongside scores.
 
-**Scores** are `number | null` per scorer per item:
-- `0` to `1` — valid score from the scorer
-- `null` — the scorer failed (see `item.scorerErrors` for details)
+Each item has two ways to access scores:
+
+- **`item.scores`** — quick numeric lookup: `Record<string, number | null>`. Use this for simple checks and aggregation. `null` means the scorer failed (see `item.scorerErrors`).
+- **`item.scoreDetails`** — full context: `Record<string, ScorerDetail>`. Each detail has the numeric score plus `metadata` (e.g., LLM reasoning), per-scorer `duration`, and `cost`. Use this when you need to understand *why* a score is what it is.
 
 Summary statistics (mean, p50, p95, etc.) exclude `null` scores. If all scores for a scorer are `null`, the CLI shows `--` instead of misleading `0.00`.
 
 ```typescript
 const results = await runtime.eval({ ... });
 
-// Aggregate stats
+// ── Aggregate stats ──────────────────────────────────
 console.log(results.summary.scorers['quality'].mean);  // 0.85
 console.log(results.summary.count);                     // 50 items
 console.log(results.summary.failures);                  // 2 workflow errors
 console.log(results.summary.timing);                    // { mean, min, max, p50, p95 } in ms
+console.log(results.totalCost);                          // 0.42 (workflow + scorer LLM costs)
 
-// Per-item inspection
+// ── Per-item inspection ──────────────────────────────
 for (const item of results.items) {
   if (item.error) continue;                              // workflow threw
+
+  // Timing and cost
   console.log(item.duration);                            // workflow execution ms
   console.log(item.cost);                                // workflow LLM cost
   console.log(item.scorerCost);                          // total scorer cost for this item
 
-  // Rich per-scorer detail (metadata, timing, cost)
+  // Quick score access
+  console.log(item.scores['quality']);                    // 0.85 or null
+
+  // Rich per-scorer detail — reasoning, timing, cost
   const detail = item.scoreDetails?.['quality'];
   if (detail) {
     console.log(detail.score);                           // 0.85
@@ -289,13 +297,11 @@ for (const item of results.items) {
     console.log(detail.cost);                            // scorer LLM cost
   }
 
+  // Error handling
   if (item.scores['quality'] === null) {
-    console.log('Scorer failed:', item.scorerErrors);    // e.g., ["Scorer "quality" threw: ..."]
+    console.log('Scorer failed:', item.scorerErrors);    // ["Scorer "quality" threw: ..."]
   }
 }
-
-// Cost includes both workflow and LLM scorer calls
-console.log(results.totalCost);  // 0.42
 ```
 
 ## Comparing Results
@@ -308,7 +314,7 @@ npx axl-eval compare v1.json v2.json --fail-on-regression  # exit 1 if worse
 ```
 
 ```
-Compare: baseline (a1b2c3d4) -> candidate (e5f6g7h8)
+Compare: baseline (3f8a2b1c) -> candidate (9d4e7f6a)
 
   Scorer     Baseline  Candidate  Delta     Change
   ──────────────────────────────────────────────────
@@ -388,7 +394,26 @@ return { output, cost: ctx.totalCost };
 
 ### Common patterns
 
-**Budget** — cap cost per item with `runtime.createContext({ budget: '$0.50' })`.
+**Concurrency** — process items in parallel (default: 5):
+
+```typescript
+export default defineEval({
+  workflow: 'qa-eval',
+  dataset: ds,
+  scorers: [qualityJudge],
+  concurrency: 10,       // run 10 items in parallel
+  budget: '$5.00',        // stop if total cost exceeds $5
+});
+```
+
+**Per-item budget** — cap cost for a single workflow execution:
+
+```typescript
+export async function executeWorkflow(input: { question: string }, runtime: AxlRuntime) {
+  const ctx = runtime.createContext({ budget: '$0.50' });
+  return { output: await ctx.ask(qaAgent, input.question) };
+}
+```
 
 **Timeout** — abort slow items:
 

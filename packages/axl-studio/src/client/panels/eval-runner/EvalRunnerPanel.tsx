@@ -29,6 +29,9 @@ export function EvalRunnerPanel() {
   const [sortField, setSortField] = useState<string>('index');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
 
+  // History filter
+  const [historyEvalFilter, setHistoryEvalFilter] = useState('');
+
   // Compare state
   const [comparing, setComparing] = useState(false);
   const [compareResult, setCompareResult] = useState<ComparisonResult | null>(null);
@@ -256,6 +259,8 @@ export function EvalRunnerPanel() {
           ) : (
             <HistoryTable
               history={history}
+              evalFilter={historyEvalFilter}
+              onEvalFilterChange={setHistoryEvalFilter}
               onSelect={(data) => {
                 setCurrentResult(data);
                 setSelectedItem(null);
@@ -304,14 +309,24 @@ export function EvalRunnerPanel() {
 
 function HistoryTable({
   history,
+  evalFilter,
+  onEvalFilterChange,
   onSelect,
 }: {
   history: EvalHistoryEntry[];
+  evalFilter: string;
+  onEvalFilterChange: (value: string) => void;
   onSelect: (data: EvalResultData) => void;
 }) {
-  // Collect all scorer names across history entries for column headers
+  // Unique eval names for the filter dropdown
+  const evalNames = [...new Set(history.map((h) => h.eval))].sort();
+
+  // Filter entries by eval name
+  const filtered = evalFilter ? history.filter((h) => h.eval === evalFilter) : history;
+
+  // Collect scorer names only from filtered entries for column headers
   const allScorerNames = new Set<string>();
-  for (const entry of history) {
+  for (const entry of filtered) {
     const data = entry.data as EvalResultData;
     if (data.summary?.scorers) {
       for (const name of Object.keys(data.summary.scorers)) {
@@ -322,59 +337,82 @@ function HistoryTable({
   const scorerCols = [...allScorerNames].sort();
 
   return (
-    <table className="w-full text-xs">
-      <thead>
-        <tr className="border-b border-[hsl(var(--border))]">
-          <th className="text-left py-2 font-medium">Eval</th>
-          <th className="text-left py-2 font-medium">Timestamp</th>
-          <th className="text-right py-2 font-medium">Items</th>
-          <th className="text-right py-2 font-medium">Failures</th>
-          <th className="text-right py-2 font-medium">Duration</th>
-          <th className="text-right py-2 font-medium">Cost</th>
-          {scorerCols.map((name) => (
-            <th key={name} className="text-right py-2 font-medium font-mono">
-              {name}
-            </th>
-          ))}
-        </tr>
-      </thead>
-      <tbody>
-        {history.map((r: EvalHistoryEntry) => {
-          const data = r.data as EvalResultData;
-          return (
-            <tr
-              key={r.id}
-              className="border-b border-[hsl(var(--border))] cursor-pointer hover:bg-[hsl(var(--accent))]"
-              onClick={() => onSelect(data)}
-            >
-              <td className="py-2 font-mono">{r.eval}</td>
-              <td className="py-2">{new Date(r.timestamp).toLocaleString()}</td>
-              <td className="py-2 text-right">{data.summary.count}</td>
-              <td className="py-2 text-right">
-                {data.summary.failures > 0 ? (
-                  <span className="text-red-600 dark:text-red-400">{data.summary.failures}</span>
-                ) : (
-                  0
-                )}
-              </td>
-              <td className="py-2 text-right font-mono">
-                {data.duration > 0 ? formatDuration(data.duration) : '-'}
-              </td>
-              <td className="py-2 text-right font-mono">
-                {data.totalCost > 0 ? formatCost(data.totalCost) : '-'}
-              </td>
-              {scorerCols.map((name) => {
-                const stats = data.summary?.scorers?.[name];
-                return (
-                  <td key={name} className="py-2 text-right font-mono">
-                    {stats ? stats.mean.toFixed(3) : '-'}
-                  </td>
-                );
-              })}
-            </tr>
-          );
-        })}
-      </tbody>
-    </table>
+    <div>
+      {evalNames.length > 1 && (
+        <div className="flex items-center gap-2 mb-3">
+          <select
+            value={evalFilter}
+            onChange={(e) => onEvalFilterChange(e.target.value)}
+            className="px-2 py-1 text-xs rounded border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
+          >
+            <option value="">All evals</option>
+            {evalNames.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+          {evalFilter && (
+            <span className="text-xs text-[hsl(var(--muted-foreground))]">
+              {filtered.length} run{filtered.length !== 1 ? 's' : ''}
+            </span>
+          )}
+        </div>
+      )}
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="border-b border-[hsl(var(--border))]">
+            <th className="text-left py-2 font-medium">Eval</th>
+            <th className="text-left py-2 font-medium">Timestamp</th>
+            <th className="text-right py-2 font-medium">Items</th>
+            <th className="text-right py-2 font-medium">Failures</th>
+            <th className="text-right py-2 font-medium">Duration</th>
+            <th className="text-right py-2 font-medium">Cost</th>
+            {scorerCols.map((name) => (
+              <th key={name} className="text-right py-2 font-medium font-mono">
+                {name}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {filtered.map((r: EvalHistoryEntry) => {
+            const data = r.data as EvalResultData;
+            return (
+              <tr
+                key={r.id}
+                className="border-b border-[hsl(var(--border))] cursor-pointer hover:bg-[hsl(var(--accent))]"
+                onClick={() => onSelect(data)}
+              >
+                <td className="py-2 font-mono">{r.eval}</td>
+                <td className="py-2">{new Date(r.timestamp).toLocaleString()}</td>
+                <td className="py-2 text-right">{data.summary.count}</td>
+                <td className="py-2 text-right">
+                  {data.summary.failures > 0 ? (
+                    <span className="text-red-600 dark:text-red-400">{data.summary.failures}</span>
+                  ) : (
+                    0
+                  )}
+                </td>
+                <td className="py-2 text-right font-mono">
+                  {data.duration > 0 ? formatDuration(data.duration) : '-'}
+                </td>
+                <td className="py-2 text-right font-mono">
+                  {data.totalCost > 0 ? formatCost(data.totalCost) : '-'}
+                </td>
+                {scorerCols.map((name) => {
+                  const stats = data.summary?.scorers?.[name];
+                  return (
+                    <td key={name} className="py-2 text-right font-mono">
+                      {stats ? stats.mean.toFixed(3) : '-'}
+                    </td>
+                  );
+                })}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 }

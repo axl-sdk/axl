@@ -58,19 +58,19 @@ export async function runEval(
     },
   };
 
-  const evalItems: EvalItem[] = [];
+  const evalItems: EvalItem[] = new Array(items.length);
   let totalCost = 0;
   let budgetExceeded = false;
 
-  async function processItem(item: (typeof items)[0]): Promise<void> {
+  async function processItem(item: (typeof items)[0], itemIndex: number): Promise<void> {
     if (budgetExceeded) {
-      evalItems.push({
+      evalItems[itemIndex] = {
         input: item.input,
         annotations: item.annotations,
         output: null,
         error: 'Budget exceeded',
         scores: {},
-      });
+      };
       return;
     }
 
@@ -92,7 +92,7 @@ export async function runEval(
     } catch (err) {
       evalItem.duration = Date.now() - itemStart;
       evalItem.error = err instanceof Error ? err.message : String(err);
-      evalItems.push(evalItem);
+      evalItems[itemIndex] = evalItem;
       return;
     }
 
@@ -166,14 +166,14 @@ export async function runEval(
       }
     }
     evalItem.scorerCost = itemScorerCost > 0 ? itemScorerCost : undefined;
-    evalItems.push(evalItem);
+    evalItems[itemIndex] = evalItem;
   }
 
   let index = 0;
   async function runNext(): Promise<void> {
     while (index < items.length) {
       const currentIndex = index++;
-      await processItem(items[currentIndex]);
+      await processItem(items[currentIndex], currentIndex);
     }
   }
 

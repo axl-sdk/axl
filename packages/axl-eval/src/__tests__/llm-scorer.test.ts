@@ -569,6 +569,46 @@ describe('llmScorer()', () => {
     expect(capturedPrompt).toContain('capital of France');
   });
 
+  it('attaches cost to error on JSON parse failure', async () => {
+    const mockProvider = {
+      async chat() {
+        return { content: 'not valid json at all', cost: 0.003 };
+      },
+    };
+    const s = llmScorer({
+      name: 'test',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+    });
+    try {
+      await s.score('output', 'input', undefined, mockContext(mockProvider));
+      expect.fail('should have thrown');
+    } catch (err: unknown) {
+      expect((err as Record<string, unknown>).cost).toBe(0.003);
+    }
+  });
+
+  it('attaches cost to error on Zod validation failure', async () => {
+    const mockProvider = {
+      async chat() {
+        return { content: JSON.stringify({ reasoning: 'ok' }), cost: 0.004 }; // missing score
+      },
+    };
+    const s = llmScorer({
+      name: 'test',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+    });
+    try {
+      await s.score('output', 'input', undefined, mockContext(mockProvider));
+      expect.fail('should have thrown');
+    } catch (err: unknown) {
+      expect((err as Record<string, unknown>).cost).toBe(0.004);
+    }
+  });
+
   it('includes annotations in prompt when provided', async () => {
     let capturedMessages: any[] = [];
 

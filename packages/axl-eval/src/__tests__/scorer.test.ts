@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { scorer } from '../scorer.js';
+import { scorer, normalizeScorerResult } from '../scorer.js';
 
 describe('scorer()', () => {
   it('creates a scorer with name and description', () => {
@@ -94,5 +94,16 @@ describe('scorer()', () => {
 
     expect(s.score('good', 'any')).toBe(1);
     expect(s.score('bad', 'any')).toBe(0);
+  });
+});
+
+describe('normalizeScorerResult()', () => {
+  it('wraps number into ScorerResult', () => {
+    expect(normalizeScorerResult(0.5)).toEqual({ score: 0.5 });
+  });
+
+  it('passes through ScorerResult unchanged', () => {
+    const result = { score: 0.8, metadata: { reasoning: 'good' }, cost: 0.001 };
+    expect(normalizeScorerResult(result)).toBe(result);
   });
 });

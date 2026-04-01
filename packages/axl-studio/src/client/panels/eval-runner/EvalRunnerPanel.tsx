@@ -22,6 +22,13 @@ export function EvalRunnerPanel() {
   const [error, setError] = useState<string | null>(null);
   const [selectedItem, setSelectedItem] = useState<number | null>(null);
 
+  // EvalItemList filter/sort state (lifted so it survives navigate-back from detail view)
+  const [errorFilter, setErrorFilter] = useState<'all' | 'errors' | 'no-errors'>('all');
+  const [scorerFilter, setScorerFilter] = useState('');
+  const [threshold, setThreshold] = useState('');
+  const [sortField, setSortField] = useState<string>('index');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+
   // Compare state
   const [comparing, setComparing] = useState(false);
   const [compareResult, setCompareResult] = useState<ComparisonResult | null>(null);
@@ -216,6 +223,16 @@ export function EvalRunnerPanel() {
                         items={currentResult.items}
                         scorerNames={scorerNames}
                         onSelectItem={setSelectedItem}
+                        errorFilter={errorFilter}
+                        onErrorFilterChange={setErrorFilter}
+                        scorerFilter={scorerFilter}
+                        onScorerFilterChange={setScorerFilter}
+                        threshold={threshold}
+                        onThresholdChange={setThreshold}
+                        sortField={sortField}
+                        onSortFieldChange={setSortField}
+                        sortDir={sortDir}
+                        onSortDirChange={setSortDir}
                       />
                     )}
                   </>

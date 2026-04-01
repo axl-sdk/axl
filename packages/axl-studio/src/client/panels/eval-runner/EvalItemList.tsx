@@ -1,25 +1,42 @@
-import { useState, useMemo } from 'react';
+import { useMemo } from 'react';
 import { formatCost, formatDuration } from '../../lib/utils';
 import type { EvalItem } from './types';
 import { scoreColorClass } from './types';
+
+type ErrorFilter = 'all' | 'errors' | 'no-errors';
+type SortDir = 'asc' | 'desc';
 
 type Props = {
   items: EvalItem[];
   scorerNames: string[];
   onSelectItem: (index: number) => void;
+  errorFilter: ErrorFilter;
+  onErrorFilterChange: (value: ErrorFilter) => void;
+  scorerFilter: string;
+  onScorerFilterChange: (value: string) => void;
+  threshold: string;
+  onThresholdChange: (value: string) => void;
+  sortField: string;
+  onSortFieldChange: (value: string) => void;
+  sortDir: SortDir;
+  onSortDirChange: (value: SortDir) => void;
 };
 
-type ErrorFilter = 'all' | 'errors' | 'no-errors';
-type SortField = 'index' | 'duration' | 'cost' | string; // string for scorer names
-type SortDir = 'asc' | 'desc';
-
-export function EvalItemList({ items, scorerNames, onSelectItem }: Props) {
-  const [errorFilter, setErrorFilter] = useState<ErrorFilter>('all');
-  const [scorerFilter, setScorerFilter] = useState('');
-  const [threshold, setThreshold] = useState('');
-  const [sortField, setSortField] = useState<SortField>('index');
-  const [sortDir, setSortDir] = useState<SortDir>('asc');
-
+export function EvalItemList({
+  items,
+  scorerNames,
+  onSelectItem,
+  errorFilter,
+  onErrorFilterChange,
+  scorerFilter,
+  onScorerFilterChange,
+  threshold,
+  onThresholdChange,
+  sortField,
+  onSortFieldChange,
+  sortDir,
+  onSortDirChange,
+}: Props) {
   const thresholdNum = threshold !== '' ? parseFloat(threshold) : null;
   const hasActiveFilter =
     errorFilter !== 'all' || (scorerFilter !== '' && thresholdNum != null && !isNaN(thresholdNum));
@@ -92,7 +109,7 @@ export function EvalItemList({ items, scorerNames, onSelectItem }: Props) {
       <div className="flex items-center gap-2 mb-3 flex-wrap">
         <select
           value={errorFilter}
-          onChange={(e) => setErrorFilter(e.target.value as ErrorFilter)}
+          onChange={(e) => onErrorFilterChange(e.target.value as ErrorFilter)}
           className="px-2 py-1 text-xs rounded border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
         >
           <option value="all">All items</option>
@@ -104,7 +121,7 @@ export function EvalItemList({ items, scorerNames, onSelectItem }: Props) {
           <>
             <select
               value={scorerFilter}
-              onChange={(e) => setScorerFilter(e.target.value)}
+              onChange={(e) => onScorerFilterChange(e.target.value)}
               className="px-2 py-1 text-xs rounded border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
             >
               <option value="">Score filter...</option>
@@ -122,7 +139,7 @@ export function EvalItemList({ items, scorerNames, onSelectItem }: Props) {
                 max="1"
                 placeholder="< threshold"
                 value={threshold}
-                onChange={(e) => setThreshold(e.target.value)}
+                onChange={(e) => onThresholdChange(e.target.value)}
                 className="w-24 px-2 py-1 text-xs rounded border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
               />
             )}
@@ -133,7 +150,7 @@ export function EvalItemList({ items, scorerNames, onSelectItem }: Props) {
         <div className="flex items-center gap-1 ml-auto">
           <select
             value={sortField}
-            onChange={(e) => setSortField(e.target.value)}
+            onChange={(e) => onSortFieldChange(e.target.value)}
             className="px-2 py-1 text-xs rounded border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
           >
             {sortOptions.map((opt) => (
@@ -143,7 +160,7 @@ export function EvalItemList({ items, scorerNames, onSelectItem }: Props) {
             ))}
           </select>
           <button
-            onClick={() => setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))}
+            onClick={() => onSortDirChange(sortDir === 'asc' ? 'desc' : 'asc')}
             className="px-2 py-1 text-xs rounded border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))]"
             title={sortDir === 'asc' ? 'Ascending' : 'Descending'}
           >
@@ -160,15 +177,22 @@ export function EvalItemList({ items, scorerNames, onSelectItem }: Props) {
           </span>
           <button
             onClick={() => {
-              setErrorFilter('all');
-              setScorerFilter('');
-              setThreshold('');
+              onErrorFilterChange('all');
+              onScorerFilterChange('');
+              onThresholdChange('');
             }}
             className="text-[hsl(var(--primary))] hover:underline"
           >
             Reset filters
           </button>
         </div>
+      )}
+
+      {/* Empty state when filters match nothing */}
+      {sorted.length === 0 && hasActiveFilter && (
+        <p className="text-xs text-[hsl(var(--muted-foreground))] py-4 text-center">
+          No items match the current filters.
+        </p>
       )}
 
       {/* Item rows */}

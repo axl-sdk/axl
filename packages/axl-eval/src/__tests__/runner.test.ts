@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { AxlRuntime } from '@axlsdk/axl';
 import { dataset } from '../dataset.js';
 import { scorer } from '../scorer.js';
+import type { Scorer } from '../scorer.js';
 import { llmScorer } from '../llm-scorer.js';
 import { runEval } from '../runner.js';
 
@@ -1034,5 +1035,55 @@ describe('runEval()', () => {
     expect(typeof result.summary.timing!.p95).toBe('number');
     expect(typeof result.summary.timing!.min).toBe('number');
     expect(typeof result.summary.timing!.max).toBe('number');
+  });
+
+  it('preserves metadata in scoreDetails when score is out of range', async () => {
+    const richScorer: Scorer = {
+      name: 'rich-oor',
+      description: 'Returns out-of-range with metadata',
+      isLlm: false,
+      score: () => ({ score: 1.5, metadata: { reasoning: 'very confident' } }),
+    };
+
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [richScorer] },
+      async () => ({ output: 'output' }),
+      mockRuntime,
+    );
+
+    expect(result.items[0].scores['rich-oor']).toBeNull();
+    expect(result.items[0].scoreDetails!['rich-oor'].score).toBeNull();
+    expect(result.items[0].scoreDetails!['rich-oor'].metadata).toEqual({
+      reasoning: 'very confident',
+    });
+  });
+
+  it('scorer factory accepts ScorerResult return value', async () => {
+    const richScorer = scorer({
+      name: 'rich',
+      description: 'Returns ScorerResult',
+      score: () => ({ score: 0.8, metadata: { reasoning: 'good' } }),
+    });
+
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [richScorer] },
+      async () => ({ output: 'output' }),
+      mockRuntime,
+    );
+
+    expect(result.items[0].scores['rich']).toBe(0.8);
+    expect(result.items[0].scoreDetails!['rich'].metadata).toEqual({ reasoning: 'good' });
   });
 });

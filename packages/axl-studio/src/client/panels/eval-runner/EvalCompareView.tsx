@@ -14,10 +14,12 @@ function DeltaCell({
   value,
   percent,
   invert,
+  format,
 }: {
   value: number;
   percent: number;
   invert?: boolean;
+  format?: (v: number) => string;
 }) {
   // For timing and cost, positive delta means worse (invert=true flips the color)
   const isPositive = invert ? value < 0 : value > 0;
@@ -29,12 +31,13 @@ function DeltaCell({
       ? 'text-red-600 dark:text-red-400'
       : '';
 
+  const formatted = format
+    ? `${value > 0 ? '+' : value < 0 ? '-' : ''}${format(Math.abs(value))}`
+    : `${value > 0 ? '+' : ''}${Math.abs(value) < 100 ? value.toFixed(3) : value.toFixed(0)}`;
+
   return (
     <>
-      <td className={`py-2 text-right font-mono ${colorClass}`}>
-        {value > 0 ? '+' : ''}
-        {typeof value === 'number' && Math.abs(value) < 100 ? value.toFixed(3) : value.toFixed(0)}
-      </td>
+      <td className={`py-2 text-right font-mono ${colorClass}`}>{formatted}</td>
       <td className={`py-2 text-right font-mono ${colorClass}`}>
         {percent > 0 ? '+' : ''}
         {percent.toFixed(1)}%
@@ -100,6 +103,7 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
                     value={compareResult.timing.delta}
                     percent={compareResult.timing.deltaPercent}
                     invert
+                    format={formatDuration}
                   />
                 </tr>
               )}
@@ -120,6 +124,7 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
                     value={compareResult.cost.delta}
                     percent={compareResult.cost.deltaPercent}
                     invert
+                    format={formatCost}
                   />
                 </tr>
               )}

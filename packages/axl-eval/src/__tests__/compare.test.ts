@@ -433,6 +433,22 @@ describe('evalCompare()', () => {
     expect(comparison.timing).toBeUndefined();
   });
 
+  it('omits timing when only one side has timing data', () => {
+    const baseline = makeEvalResult({
+      summary: {
+        count: 2,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.7, min: 0.6, max: 0.8, p50: 0.7, p95: 0.8 } },
+        timing: { mean: 1000, min: 500, max: 1500, p50: 1000, p95: 1500 },
+      },
+    });
+    const candidate = makeEvalResult(); // no timing
+
+    const comparison = evalCompare(baseline, candidate);
+
+    expect(comparison.timing).toBeUndefined();
+  });
+
   it('compares cost when either run has non-zero cost', () => {
     const baseline = makeEvalResult({ totalCost: 1.0 });
     const candidate = makeEvalResult({ totalCost: 0.4 });

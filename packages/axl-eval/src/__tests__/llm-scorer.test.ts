@@ -280,6 +280,103 @@ describe('llmScorer()', () => {
     expect(score).toBe(0.6);
   });
 
+  it('handles JSON with trailing text after closing brace', async () => {
+    const mockProvider = {
+      async chat(_messages: any[], _options: any) {
+        // Some models return JSON followed by an explanation
+        return {
+          content: '{"score": 0.7, "reasoning": "Good"}\n\nI hope this helps!',
+        };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'test',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
+    expect(score).toBe(0.7);
+  });
+
+  it('handles non-json fenced code blocks gracefully', async () => {
+    const mockProvider = {
+      async chat(_messages: any[], _options: any) {
+        // Model wraps in a non-json fence — extractJson should still find the JSON inside
+        return {
+          content: '```\n{"score": 0.65, "reasoning": "Decent"}\n```',
+        };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'test',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
+    expect(score).toBe(0.65);
+  });
+
+  it('handles JSON with nested braces in string values', async () => {
+    const mockProvider = {
+      async chat(_messages: any[], _options: any) {
+        // Reasoning field contains braces — should not confuse the parser
+        return {
+          content:
+            'My analysis: {"score": 0.5, "reasoning": "The output uses {template} syntax which is incorrect"}',
+        };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'test',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
+    expect(score).toBe(0.5);
+  });
+
+  it('passes annotations to LLM scorer so the judge has ground truth', async () => {
+    let capturedPrompt = '';
+    const mockProvider = {
+      async chat(messages: any[], _options: any) {
+        capturedPrompt = messages[1].content;
+        return { content: JSON.stringify({ score: 1.0, reasoning: 'Matches ground truth' }) };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'test',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    await s.score(
+      'The capital of France is Paris',
+      'What is the capital of France?',
+      { expectedAnswer: 'Paris' },
+      mockContext(mockProvider),
+    );
+
+    // The LLM judge should see the ground truth annotations to compare against
+    expect(capturedPrompt).toContain('Ground Truth');
+    expect(capturedPrompt).toContain('Paris');
+    expect(capturedPrompt).toContain('capital of France');
+  });
+
   it('includes annotations in prompt when provided', async () => {
     let capturedMessages: any[] = [];
 

@@ -604,6 +604,50 @@ describe('runEval()', () => {
     expect(result.totalCost).toBeCloseTo(0.006, 6); // $0.001 workflow + $0.005 scorer
   });
 
+  it('does not double-count LLM scorer cost when provider returns no cost', async () => {
+    let callCount = 0;
+    const mockProvider = {
+      chat: async () => {
+        callCount++;
+        // First call has cost, second call has no cost field
+        return callCount === 1
+          ? { content: JSON.stringify({ score: 0.9, reasoning: 'Good' }), cost: 0.01 }
+          : { content: JSON.stringify({ score: 0.8, reasoning: 'OK' }) };
+      },
+    };
+
+    const mockRuntimeWithResolver = {
+      resolveProvider: (uri: string) => ({
+        provider: mockProvider,
+        model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
+      }),
+    } as unknown as AxlRuntime;
+
+    const llmScore = llmScorer({
+      name: 'judge',
+      description: 'test',
+      model: 'mock:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const ds = dataset({
+      name: 'two-items',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'a' } }, { input: { q: 'b' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [llmScore], concurrency: 1 },
+      async () => ({ output: 'output' }),
+      mockRuntimeWithResolver,
+    );
+
+    // Item 1: $0.01 scorer cost. Item 2: no scorer cost.
+    // Bug: if _lastCost isn't cleared, item 2 would re-add the $0.01 from item 1
+    expect(result.totalCost).toBeCloseTo(0.01, 6);
+  });
+
   it('passes annotations to scorer', async () => {
     const annotatedDataset = dataset({
       name: 'ann-ds',
@@ -691,6 +735,107 @@ describe('runEval()', () => {
     const budgetExceeded = result.items.filter((i) => i.error === 'Budget exceeded');
     expect(budgetExceeded.length).toBeGreaterThan(0);
     expect(result.totalCost).toBeGreaterThan(0);
+  });
+
+  it('one failing scorer does not prevent other scorers from running', async () => {
+    const goodScorer = scorer({
+      name: 'good',
+      description: 'Always passes',
+      score: () => 1,
+    });
+
+    const badScorer = scorer({
+      name: 'bad',
+      description: 'Always throws',
+      score: () => {
+        throw new Error('boom');
+      },
+    });
+
+    const anotherGoodScorer = scorer({
+      name: 'also-good',
+      description: 'Also passes',
+      score: () => 0.5,
+    });
+
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [goodScorer, badScorer, anotherGoodScorer] },
+      async () => ({ output: 'output' }),
+      mockRuntime,
+    );
+
+    // The bad scorer should not prevent good and also-good from running
+    expect(result.items[0].scores['good']).toBe(1);
+    expect(result.items[0].scores['bad']).toBeNull();
+    expect(result.items[0].scores['also-good']).toBe(0.5);
+    expect(result.items[0].scorerErrors).toHaveLength(1);
+    expect(result.items[0].scorerErrors![0]).toContain('boom');
+  });
+
+  it('workflow errors on some items do not affect other items', async () => {
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ id: z.number() }),
+      items: [{ input: { id: 1 } }, { input: { id: 2 } }, { input: { id: 3 } }],
+    });
+
+    const simpleScorer = scorer({
+      name: 'pass',
+      description: 'Always passes',
+      score: () => 1,
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [simpleScorer], concurrency: 1 },
+      async (input: any) => {
+        if (input.id === 2) throw new Error('item 2 failed');
+        return { output: `result-${input.id}` };
+      },
+      mockRuntime,
+    );
+
+    // Items 1 and 3 should succeed, item 2 should fail
+    expect(result.summary.failures).toBe(1);
+    const successful = result.items.filter((i) => !i.error);
+    expect(successful).toHaveLength(2);
+    expect(successful.every((i) => i.scores['pass'] === 1)).toBe(true);
+
+    const failed = result.items.find((i) => i.error);
+    expect(failed!.error).toBe('item 2 failed');
+    expect(Object.keys(failed!.scores)).toHaveLength(0);
+  });
+
+  it('eval results include correct item count even when some fail', async () => {
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: Array.from({ length: 10 }, (_, i) => ({ input: { q: String(i) } })),
+    });
+
+    const simpleScorer = scorer({
+      name: 'check',
+      description: 'Passes for even items',
+      score: (output) => (Number(output) % 2 === 0 ? 1 : 0),
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [simpleScorer] },
+      async (input: any) => {
+        if (Number(input.q) >= 8) throw new Error('too high');
+        return { output: input.q };
+      },
+      mockRuntime,
+    );
+
+    expect(result.summary.count).toBe(10);
+    expect(result.summary.failures).toBe(2);
+    expect(result.items).toHaveLength(10);
   });
 
   it('passes runtime to executeWorkflow as second argument', async () => {

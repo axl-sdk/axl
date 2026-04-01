@@ -72,9 +72,12 @@ function estimateTokens(text: string): number {
 export function extractJson(content: string): string {
   const trimmed = content.trim();
 
-  // Fast path: content starts with { or [
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    return trimmed;
+  // Content starts with { or [ — extract balanced JSON (handles trailing text)
+  if (trimmed.startsWith('{')) {
+    return extractBalanced(trimmed, 0, '{', '}') ?? trimmed;
+  }
+  if (trimmed.startsWith('[')) {
+    return extractBalanced(trimmed, 0, '[', ']') ?? trimmed;
   }
 
   // Extract from markdown fenced code block

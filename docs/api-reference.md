@@ -1128,6 +1128,19 @@ A scoring function returned by `scorer()` or `llmScorer()`.
 | `isLlm` | `boolean` | `true` for LLM scorers |
 | `score` | `(output, input, annotations?, context?) => number \| Promise<number>` | Scoring function (returns 0-1). `context` is a `ScorerContext` passed by the eval runner |
 
+### `LlmScorerConfig`
+
+Configuration for `llmScorer()`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | `string` | required | Unique scorer name |
+| `description` | `string` | required | What this scorer evaluates |
+| `model` | `string` | required | Provider:model URI (e.g., `openai:gpt-4o`) |
+| `system` | `string` | required | System prompt for the judge LLM |
+| `schema` | `z.ZodType<{ score: number; ... }>` | `z.object({ score: z.number(), reasoning: z.string() })` | Response schema — converted to JSON Schema and included in the prompt so the LLM knows the exact structure to produce |
+| `temperature` | `number` | `0.2` | Low for scoring consistency |
+
 ### `ScorerContext`
 
 Context passed to scorers by the eval runner.

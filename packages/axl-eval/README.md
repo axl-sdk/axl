@@ -46,7 +46,6 @@ export default defineEval({
       description: 'Is the answer relevant to the question?',
       model: 'openai:gpt-4o',
       system: 'Rate whether the answer is relevant to the question asked.',
-      schema: z.object({ score: z.number(), reasoning: z.string() }),
     }),
   ],
 });
@@ -123,24 +122,39 @@ const containsAnswer = scorer({
 
 ### LLM scorers
 
-Use an LLM as a judge. The scorer constructs a prompt from the input, output, and annotations, calls the LLM, and validates the response against your Zod schema:
+Use an LLM as a judge. The scorer constructs a prompt from the input, output, and annotations, calls the LLM, and validates the response:
 
 ```typescript
 import { llmScorer } from '@axlsdk/eval';
-import { z } from 'zod';
 
 const qualityJudge = llmScorer({
   name: 'quality',
   description: 'Rates overall output quality',
   model: 'openai:gpt-4o',           // provider:model URI
   system: 'Rate the quality of the AI output.',
+});
+```
+
+The default schema is `{ score: number, reasoning: string }` — the LLM returns a 0-1 score with an explanation. For custom scoring dimensions, provide your own schema:
+
+```typescript
+import { z } from 'zod';
+
+const detailedJudge = llmScorer({
+  name: 'detailed',
+  description: 'Rates quality with confidence',
+  model: 'openai:gpt-4o',
+  system: 'Rate quality and your confidence in the rating.',
   schema: z.object({
     score: z.number().min(0).max(1),
     reasoning: z.string(),
+    confidence: z.number().min(0).max(1),
   }),
   temperature: 0.2,                  // default: 0.2 (low for consistency)
 });
 ```
+
+The schema is converted to JSON Schema and included in the LLM prompt, so the judge knows exactly what structure to produce.
 
 The `model` field uses a `provider:model` URI. The provider is resolved automatically at eval time — just set the right API key:
 

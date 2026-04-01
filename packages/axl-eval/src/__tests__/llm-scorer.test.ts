@@ -104,6 +104,160 @@ describe('llmScorer()', () => {
     expect(capturedOptions.responseFormat).toEqual({ type: 'json_object' });
   });
 
+  it('uses default schema when none provided', async () => {
+    const mockProvider = {
+      async chat(_messages: any[], _options: any) {
+        return { content: JSON.stringify({ score: 0.85, reasoning: 'Good' }) };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'test',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+    });
+
+    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
+    expect(score).toBe(0.85);
+  });
+
+  it('rejects response missing score with default schema — readable error message', async () => {
+    const mockProvider = {
+      async chat(_messages: any[], _options: any) {
+        return { content: JSON.stringify({ reasoning: 'ok' }) };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'my-scorer',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+    });
+
+    await expect(s.score('output', 'input', undefined, mockContext(mockProvider))).rejects.toThrow(
+      'LLM scorer "my-scorer" returned an invalid response: score:',
+    );
+  });
+
+  it('includes JSON schema in prompt', async () => {
+    let capturedPrompt = '';
+    const mockProvider = {
+      async chat(messages: any[], _options: any) {
+        capturedPrompt = messages[1].content;
+        return { content: JSON.stringify({ score: 0.5, reasoning: 'OK' }) };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'test',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+    });
+
+    await s.score('output', 'input', undefined, mockContext(mockProvider));
+
+    expect(capturedPrompt).toContain('"type": "object"');
+    expect(capturedPrompt).toContain('"properties"');
+    expect(capturedPrompt).toContain('"score"');
+    expect(capturedPrompt).toContain('"reasoning"');
+    // Default schema includes 0-1 range constraint
+    expect(capturedPrompt).toContain('"minimum": 0');
+    expect(capturedPrompt).toContain('"maximum": 1');
+  });
+
+  it('includes custom schema fields in prompt', async () => {
+    let capturedPrompt = '';
+    const mockProvider = {
+      async chat(messages: any[], _options: any) {
+        capturedPrompt = messages[1].content;
+        return { content: JSON.stringify({ score: 0.5, reasoning: 'OK', confidence: 0.9 }) };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'test',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string(), confidence: z.number() }),
+    });
+
+    await s.score('output', 'input', undefined, mockContext(mockProvider));
+
+    expect(capturedPrompt).toContain('"confidence"');
+  });
+
+  it('includes Zod .describe() annotations and .min()/.max() constraints in prompt', async () => {
+    let capturedPrompt = '';
+    const mockProvider = {
+      async chat(messages: any[], _options: any) {
+        capturedPrompt = messages[1].content;
+        return { content: JSON.stringify({ score: 0.5, reasoning: 'OK' }) };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'test',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+      schema: z.object({
+        score: z.number().min(0).max(1).describe('0 = terrible, 1 = perfect'),
+        reasoning: z.string().describe('Brief explanation'),
+      }),
+    });
+
+    await s.score('output', 'input', undefined, mockContext(mockProvider));
+
+    expect(capturedPrompt).toContain('"description": "0 = terrible, 1 = perfect"');
+    expect(capturedPrompt).toContain('"minimum": 0');
+    expect(capturedPrompt).toContain('"maximum": 1');
+    expect(capturedPrompt).toContain('"description": "Brief explanation"');
+  });
+
+  it('formats ZodError as a readable message', async () => {
+    const mockProvider = {
+      async chat(_messages: any[], _options: any) {
+        // Missing required `reasoning` field
+        return { content: JSON.stringify({ score: 0.8 }) };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'quality',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+    });
+
+    await expect(s.score('output', 'input', undefined, mockContext(mockProvider))).rejects.toThrow(
+      'LLM scorer "quality" returned an invalid response: reasoning:',
+    );
+  });
+
+  it('formats ZodError for wrong type as a readable message', async () => {
+    const mockProvider = {
+      async chat(_messages: any[], _options: any) {
+        // score is a string, not a number
+        return { content: JSON.stringify({ score: '0.8', reasoning: 'OK' }) };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'quality',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+    });
+
+    await expect(s.score('output', 'input', undefined, mockContext(mockProvider))).rejects.toThrow(
+      'LLM scorer "quality" returned an invalid response: score:',
+    );
+  });
+
   it('strips provider prefix from model string', async () => {
     let capturedOptions: any = {};
 
@@ -197,7 +351,7 @@ describe('llmScorer()', () => {
     expect(capturedOptions.temperature).toBe(0.8);
   });
 
-  it('validates provider response against schema', async () => {
+  it('validates provider response against explicit schema — readable error message', async () => {
     const mockProvider = {
       async chat(_messages: any[], _options: any) {
         // Missing required 'reasoning' field
@@ -206,16 +360,16 @@ describe('llmScorer()', () => {
     };
 
     const s = llmScorer({
-      name: 'test',
+      name: 'explicit-schema-scorer',
       description: 'test',
       model: 'test:model',
       system: 'Rate it',
       schema: z.object({ score: z.number(), reasoning: z.string() }),
     });
 
-    await expect(
-      s.score('output', 'input', undefined, mockContext(mockProvider)),
-    ).rejects.toThrow();
+    await expect(s.score('output', 'input', undefined, mockContext(mockProvider))).rejects.toThrow(
+      'LLM scorer "explicit-schema-scorer" returned an invalid response: reasoning:',
+    );
   });
 
   it('throws when provider returns invalid JSON', async () => {

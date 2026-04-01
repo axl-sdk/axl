@@ -1,17 +1,23 @@
-import type { z } from 'zod';
+import { z } from 'zod';
 import type { Scorer, ScorerContext } from './scorer.js';
-import { extractJson } from '@axlsdk/axl';
+import { extractJson, zodToJsonSchema } from '@axlsdk/axl';
 
 export type LlmScorerConfig = {
   name: string;
   description: string;
   model: string;
   system: string;
-  schema: z.ZodType<{ score: number; [key: string]: unknown }>;
+  schema?: z.ZodType<{ score: number; [key: string]: unknown }>;
   temperature?: number;
 };
 
 export function llmScorer(config: LlmScorerConfig): Scorer {
+  // Resolve schema and its JSON representation once at construction time —
+  // both are fixed for the lifetime of this scorer instance.
+  const schema: z.ZodType<{ score: number; [key: string]: unknown }> =
+    config.schema ?? z.object({ score: z.number().min(0).max(1), reasoning: z.string() });
+  const schemaJson = JSON.stringify(zodToJsonSchema(schema), null, 2);
+
   const scorerInstance: Scorer & { _lastCost?: number } = {
     name: config.name,
     description: config.description,
@@ -43,7 +49,8 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
         `## Output to Evaluate`,
         `${JSON.stringify(output, null, 2)}`,
         ``,
-        `Respond with valid JSON matching the required schema with a score field (0-1) and reasoning.`,
+        `Respond with valid JSON matching this schema:`,
+        schemaJson,
       ].join('\n');
 
       const response = await provider.chat(
@@ -57,7 +64,29 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
       scorerInstance._lastCost = response.cost;
 
       const parsed = JSON.parse(extractJson(response.content));
-      const validated = config.schema.parse(parsed);
+      let validated: { score: number; [key: string]: unknown };
+      try {
+        validated = schema.parse(parsed) as { score: number; [key: string]: unknown };
+      } catch (err) {
+        // Duck-type check instead of instanceof to handle potential dual-instance
+        // scenarios where two copies of zod are present in the dependency tree.
+        if (
+          err &&
+          typeof err === 'object' &&
+          'issues' in err &&
+          Array.isArray((err as any).issues)
+        ) {
+          const issues = (err as any).issues as Array<{
+            path: (string | number)[];
+            message: string;
+          }>;
+          const messages = issues
+            .map((i) => `${i.path.length ? `${i.path.join('.')}: ` : ''}${i.message}`)
+            .join('; ');
+          throw new Error(`LLM scorer "${config.name}" returned an invalid response: ${messages}`);
+        }
+        throw err;
+      }
       return validated.score;
     },
   };

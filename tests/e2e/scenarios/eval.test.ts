@@ -253,6 +253,51 @@ describe('Eval E2E', () => {
     expect(result.items[0].scorerErrors).toBeUndefined();
   });
 
+  it('llmScorer uses default schema when none provided, through full runEval() pipeline', async () => {
+    const scorerProvider = MockProvider.fn(() => ({
+      // Returns only score+reasoning (the default schema fields)
+      content: JSON.stringify({ score: 0.8, reasoning: 'Good answer' }),
+    }));
+
+    const provider = MockProvider.fn(() => ({ content: 'workflow output' }));
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('mock', provider);
+    runtime.registerProvider('scorer-mock', scorerProvider);
+
+    const { agent, workflow } = await import('@axlsdk/axl');
+    const a = agent({ name: 'default-schema-agent', model: 'mock:test', system: 'test' });
+    const wf = workflow({
+      name: 'default-schema-wf',
+      input: z.object({ question: z.string() }),
+      handler: async (ctx) => ctx.ask(a, ctx.input.question),
+    });
+    runtime.register(wf);
+
+    const ds = dataset({
+      name: 'default-schema-ds',
+      schema: z.object({ question: z.string() }),
+      items: [{ input: { question: 'q1' } }],
+    });
+
+    // No schema — should use the default { score: z.number(), reasoning: z.string() }
+    const judge = llmScorer({
+      name: 'quality-default',
+      description: 'Quality judge with default schema',
+      model: 'scorer-mock:judge-model',
+      system: 'Rate the quality',
+    });
+
+    const result = (await runtime.eval({
+      workflow: 'default-schema-wf',
+      dataset: ds,
+      scorers: [judge],
+    })) as EvalResult;
+
+    expect(result.items.length).toBe(1);
+    expect(result.items[0].scores['quality-default']).toBe(0.8);
+    expect(result.items[0].scorerErrors).toBeUndefined();
+  });
+
   it('eval CLI runs eval file and produces formatted output', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'axl-eval-cli-'));
     const evalFile = join(tmpDir, 'test.eval.mjs');

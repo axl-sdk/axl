@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-04-01
+
+### Fixed
+
+- **Core:** `extractJson()` fast path no longer returns trailing text after JSON — content like `{"score": 0.7}\nI hope this helps!` is now correctly extracted
+- **Eval:** Scorer returning `NaN`, `Infinity`, or `-Infinity` is now treated as an error (`null` score) instead of being stored as a valid score that pollutes summary statistics
+
 ## [0.13.2] - 2026-04-01
 
 ### Fixed
@@ -416,7 +423,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.13.2...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.13.3...HEAD
+[0.13.3]: https://github.com/axl-sdk/axl/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/axl-sdk/axl/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/axl-sdk/axl/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/axl-sdk/axl/compare/v0.12.0...v0.13.0

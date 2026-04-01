@@ -300,19 +300,48 @@ console.log(results.totalCost);  // 0.42
 
 ## Comparing Results
 
-Compare two runs to detect regressions and improvements:
+Compare two runs to detect regressions and improvements. Runs must use the same dataset and scorers.
 
 ```bash
 npx axl-eval compare ./results/v1.json ./results/v2.json
 npx axl-eval compare v1.json v2.json --fail-on-regression  # exit 1 if worse
 ```
 
+```
+Compare: baseline (a1b2c3d4) -> candidate (e5f6g7h8)
+
+  Scorer     Baseline  Candidate  Delta     Change
+  ──────────────────────────────────────────────────
+  quality       0.750      0.850    +0.100   +13.3%
+  safety        0.900      0.900    +0.000    +0.0%
+
+  Timing: baseline 2.10s -> candidate 4.30s (+104.8%)
+  Cost: baseline $0.45 -> candidate $0.31 (-31.1%)
+
+  Regressions: 1 | Improvements: 3 | Stable: 16
+```
+
+Programmatically:
+
 ```typescript
 import { evalCompare } from '@axlsdk/eval';
 
 const comparison = evalCompare(v1Results, v2Results);
-console.log(comparison.regressions);   // items that got worse
-console.log(comparison.improvements);  // items that got better
+
+// Score changes
+console.log(comparison.scorers.quality.delta);      // +0.1
+console.log(comparison.scorers.quality.deltaPercent); // +13.3
+
+// Timing and cost tradeoffs
+console.log(comparison.timing?.deltaPercent);  // +104.8 (slower)
+console.log(comparison.cost?.deltaPercent);    // -31.1 (cheaper)
+
+// Per-item regressions/improvements (delta > 0.1 threshold)
+for (const r of comparison.regressions) {
+  console.log(`Item ${r.itemIndex}: ${r.scorer} dropped ${r.baselineScore} → ${r.candidateScore}`);
+}
+
+console.log(comparison.summary);  // human-readable one-liner
 ```
 
 ## Eval Files in Detail

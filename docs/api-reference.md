@@ -1078,6 +1078,32 @@ All errors extend `AxlError`.
 
 Types from `@axlsdk/eval` used by `runEval()`, `runtime.eval()`, and the CLI.
 
+### `EvalConfig`
+
+Configuration for `runEval()` and `runtime.eval()`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `workflow` | `string` | required | Workflow name (label for results; must match a registered workflow when using `runtime.eval()`) |
+| `dataset` | `Dataset` | required | Dataset to evaluate against |
+| `scorers` | `Scorer[]` | required | Scoring functions to apply to each output |
+| `concurrency` | `number` | `5` | Maximum parallel item executions |
+| `budget` | `string` | — | Cost limit (e.g., `"$10.00"`). Stops processing when exceeded |
+| `metadata` | `Record<string, unknown>` | — | Arbitrary metadata attached to the result (e.g., model version, prompt variant) |
+
+### `DatasetConfig`
+
+Configuration for `dataset()`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | `string` | required | Dataset name (appears in results and comparisons) |
+| `schema` | `z.ZodType` | required | Zod schema for dataset item inputs |
+| `annotations` | `z.ZodType` | — | Zod schema for ground-truth annotations |
+| `items` | `DatasetItem[]` | — | Inline dataset items (each has `input` and optional `annotations`) |
+| `file` | `string` | — | Path to a JSON file containing items (alternative to inline `items`) |
+| `basePath` | `string` | `cwd` | Base directory for resolving relative `file` paths |
+
 ### `ScorerResult`
 
 Rich result from a scorer, returned instead of a plain number when the scorer needs to convey metadata or cost.

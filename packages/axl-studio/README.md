@@ -107,7 +107,7 @@ Browse active sessions with conversation history. Replay sessions step by step. 
 Browse all registered tools with their schemas rendered as forms. Test any tool directly with custom input and see the result.
 
 ### Eval Runner
-Run evaluations from the UI. View per-item results with scores. Compare two eval runs side-by-side with regression/improvement detection. Requires `@axlsdk/eval` as an optional peer dependency.
+Run evaluations from the UI. View per-item results with scores, timing, and cost. Drill into individual items to see LLM scorer reasoning, per-scorer timing/cost, and annotations. Filter items by error state or score threshold, sort by score/duration/cost. Score distribution chart shows how scores are spread across bins. Compare two runs with timing/cost tradeoff analysis and expandable regression detail showing side-by-side outputs and reasoning. History tab tracks mean scores across runs with an eval name filter. Requires `@axlsdk/eval` as an optional peer dependency.
 
 ## What gets registered
 

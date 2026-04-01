@@ -22,7 +22,7 @@ export { Session } from './session.js';
 export type { SessionOptions } from './session.js';
 
 // Context
-export { WorkflowContext, zodToJsonSchema } from './context.js';
+export { WorkflowContext, zodToJsonSchema, extractJson } from './context.js';
 export type { WorkflowContextInit } from './context.js';
 export type {
   Result,

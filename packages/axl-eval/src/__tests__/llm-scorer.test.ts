@@ -100,6 +100,8 @@ describe('llmScorer()', () => {
     expect(capturedMessages[1].content).toContain('test input');
     // model should be stripped by the resolver
     expect(capturedOptions.model).toBe('gpt-4o');
+    // should request JSON mode for reliable parsing
+    expect(capturedOptions.responseFormat).toEqual({ type: 'json_object' });
   });
 
   it('strips provider prefix from model string', async () => {
@@ -219,7 +221,7 @@ describe('llmScorer()', () => {
   it('throws when provider returns invalid JSON', async () => {
     const mockProvider = {
       async chat(_messages: any[], _options: any) {
-        return { content: 'not valid json' };
+        return { content: 'not valid json at all' };
       },
     };
 
@@ -234,6 +236,48 @@ describe('llmScorer()', () => {
     await expect(
       s.score('output', 'input', undefined, mockContext(mockProvider)),
     ).rejects.toThrow();
+  });
+
+  it('extracts JSON from markdown fenced code blocks', async () => {
+    const mockProvider = {
+      async chat(_messages: any[], _options: any) {
+        return {
+          content: '```json\n{"score": 0.75, "reasoning": "Decent"}\n```',
+        };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'test',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
+    expect(score).toBe(0.75);
+  });
+
+  it('extracts JSON when wrapped in leading/trailing text', async () => {
+    const mockProvider = {
+      async chat(_messages: any[], _options: any) {
+        return {
+          content: 'Here is my evaluation:\n{"score": 0.6, "reasoning": "OK"}\nHope this helps!',
+        };
+      },
+    };
+
+    const s = llmScorer({
+      name: 'test',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+      schema: z.object({ score: z.number(), reasoning: z.string() }),
+    });
+
+    const score = await s.score('output', 'input', undefined, mockContext(mockProvider));
+    expect(score).toBe(0.6);
   });
 
   it('includes annotations in prompt when provided', async () => {

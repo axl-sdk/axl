@@ -5,7 +5,11 @@ export type ScorerContext = {
     provider: {
       chat(
         messages: { role: string; content: string }[],
-        options: { model: string; temperature?: number },
+        options: {
+          model: string;
+          temperature?: number;
+          responseFormat?: { type: string; json_schema?: unknown };
+        },
       ): Promise<{ content: string; cost?: number }>;
     };
     model: string;

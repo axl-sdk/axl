@@ -64,16 +64,74 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-/** Strip markdown code fences (```json ... ```) from LLM responses before JSON parsing. */
-function stripMarkdownFences(text: string): string {
-  const trimmed = text.trim();
-  if (trimmed.startsWith('```')) {
-    // Remove opening fence (```json, ```JSON, ``` etc.) and closing ```
-    const withoutOpening = trimmed.replace(/^```\w*\s*\n?/, '');
-    const withoutClosing = withoutOpening.replace(/\n?```\s*$/, '');
-    return withoutClosing.trim();
+/**
+ * Extract JSON from LLM response content.
+ * Handles: raw JSON, markdown fenced blocks (```json ... ```),
+ * and content with leading/trailing text around a JSON object/array.
+ */
+export function extractJson(content: string): string {
+  const trimmed = content.trim();
+
+  // Fast path: content starts with { or [
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    return trimmed;
   }
+
+  // Extract from markdown fenced code block
+  const fenceMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+  if (fenceMatch) {
+    return fenceMatch[1].trim();
+  }
+
+  // Find the first balanced { ... } or [ ... ]
+  const open = trimmed.indexOf('{');
+  if (open >= 0) {
+    const extracted = extractBalanced(trimmed, open, '{', '}');
+    if (extracted) return extracted;
+  }
+
+  const openBracket = trimmed.indexOf('[');
+  if (openBracket >= 0) {
+    const extracted = extractBalanced(trimmed, openBracket, '[', ']');
+    if (extracted) return extracted;
+  }
+
+  // Nothing found — return as-is and let JSON.parse produce the error
   return trimmed;
+}
+
+/** Extract a balanced substring from `start` matching open/close chars, respecting JSON strings. */
+function extractBalanced(
+  str: string,
+  start: number,
+  openChar: string,
+  closeChar: string,
+): string | null {
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < str.length; i++) {
+    const ch = str[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === openChar) depth++;
+    else if (ch === closeChar) {
+      depth--;
+      if (depth === 0) return str.slice(start, i + 1);
+    }
+  }
+  return null;
 }
 
 /** Estimate tokens for a message array. */
@@ -1100,7 +1158,7 @@ export class WorkflowContext<TInput = unknown> {
       let validated: unknown = undefined;
       if (options?.schema) {
         try {
-          const parsed = JSON.parse(stripMarkdownFences(content));
+          const parsed = JSON.parse(extractJson(content));
           validated = (options.schema as z.ZodType).parse(parsed);
         } catch (err) {
           const maxSchemaRetries = options.retries ?? 3;

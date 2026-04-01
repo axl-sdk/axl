@@ -1,5 +1,6 @@
 import type { z } from 'zod';
 import type { Scorer, ScorerContext } from './scorer.js';
+import { extractJson } from '@axlsdk/axl';
 
 export type LlmScorerConfig = {
   name: string;
@@ -50,12 +51,12 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
           { role: 'system', content: config.system },
           { role: 'user', content: prompt },
         ],
-        { model, temperature: config.temperature ?? 0.2 },
+        { model, temperature: config.temperature ?? 0.2, responseFormat: { type: 'json_object' } },
       );
 
       scorerInstance._lastCost = response.cost;
 
-      const parsed = JSON.parse(response.content);
+      const parsed = JSON.parse(extractJson(response.content));
       const validated = config.schema.parse(parsed);
       return validated.score;
     },

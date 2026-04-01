@@ -59,6 +59,14 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
         <JsonViewer data={item.input} collapsed />
       </div>
 
+      {/* Annotations (ground truth) */}
+      {item.annotations != null && (
+        <div className="text-xs">
+          <span className="font-medium">Expected:</span>
+          <JsonViewer data={item.annotations} collapsed />
+        </div>
+      )}
+
       {/* Output */}
       <div className="text-xs">
         <span className="font-medium">Output:</span>
@@ -107,7 +115,7 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
           {scorerNames.map((name) => {
             const score = item.scores[name];
             const detail = item.scoreDetails?.[name];
-            const scorerError = scorerErrors.find((err) => err.includes(name));
+            const scorerError = scorerErrors.find((err) => err.includes(`"${name}"`));
 
             return (
               <div

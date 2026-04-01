@@ -23,6 +23,7 @@ export function EvalRunnerPanel() {
   const [selectedItem, setSelectedItem] = useState<number | null>(null);
 
   // Compare state
+  const [comparing, setComparing] = useState(false);
   const [compareResult, setCompareResult] = useState<ComparisonResult | null>(null);
   const [compareBaseline, setCompareBaseline] = useState<EvalResultData | null>(null);
   const [compareCandidate, setCompareCandidate] = useState<EvalResultData | null>(null);
@@ -59,15 +60,22 @@ export function EvalRunnerPanel() {
 
   const handleCompare = useCallback(async () => {
     if (history.length < 2) return;
+    // Filter to same eval name to avoid comparing different evals
+    const firstEval = history[0].eval;
+    const sameEval = history.filter((h) => h.eval === firstEval);
+    if (sameEval.length < 2) return;
+    setComparing(true);
     try {
-      const baselineData = history[1].data as EvalResultData;
-      const candidateData = history[0].data as EvalResultData;
+      const candidateData = sameEval[0].data as EvalResultData;
+      const baselineData = sameEval[1].data as EvalResultData;
       setCompareBaseline(baselineData);
       setCompareCandidate(candidateData);
       const res = (await compareEvals(baselineData, candidateData)) as ComparisonResult;
       setCompareResult(res);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setComparing(false);
     }
   }, [history]);
 
@@ -255,9 +263,10 @@ export function EvalRunnerPanel() {
               </p>
               <button
                 onClick={handleCompare}
-                className="px-4 py-2 text-sm font-medium rounded-md bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] hover:opacity-90"
+                disabled={comparing}
+                className="px-4 py-2 text-sm font-medium rounded-md bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] hover:opacity-90 disabled:opacity-50"
               >
-                Compare
+                {comparing ? 'Comparing...' : 'Compare'}
               </button>
               {compareResult && (
                 <EvalCompareView

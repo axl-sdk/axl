@@ -298,32 +298,14 @@ export class AnthropicProvider implements Provider {
       body.temperature = options.temperature;
     }
 
-    // Anthropic supports structured outputs via output_config.format for json_schema.
-    // For json_object (no schema), fall back to a system prompt instruction.
+    // Anthropic's native structured outputs (output_config.format) use constrained
+    // decoding which can degrade quality and may reject complex schemas. Instead, we
+    // use a system prompt instruction for all JSON modes and rely on client-side
+    // validation (extractJson + Zod).
     if (options.responseFormat && options.responseFormat.type !== 'text') {
-      if (
-        options.responseFormat.type === 'json_schema' &&
-        'json_schema' in options.responseFormat &&
-        options.responseFormat.json_schema?.schema
-      ) {
-        // Native structured output — guaranteed valid JSON matching the schema
-        const existingConfig = (body.output_config as Record<string, unknown>) ?? {};
-        body.output_config = {
-          ...existingConfig,
-          format: {
-            type: 'json_schema',
-            schema: options.responseFormat.json_schema.schema,
-            ...(options.responseFormat.json_schema.name
-              ? { name: options.responseFormat.json_schema.name }
-              : {}),
-          },
-        };
-      } else {
-        // json_object mode (no schema) — use system prompt instruction as fallback
-        const jsonInstruction =
-          'You must respond with valid JSON only. No markdown fences, no extra text.';
-        body.system = body.system ? `${body.system}\n\n${jsonInstruction}` : jsonInstruction;
-      }
+      const jsonInstruction =
+        'You must respond with valid JSON only. No markdown fences, no extra text.';
+      body.system = body.system ? `${body.system}\n\n${jsonInstruction}` : jsonInstruction;
     }
 
     if (options.providerOptions) {

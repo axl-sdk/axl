@@ -298,6 +298,115 @@ describe('Eval E2E', () => {
     expect(result.items[0].scorerErrors).toBeUndefined();
   });
 
+  it('per-item duration and cost are captured', async () => {
+    const ds = dataset({
+      name: 'timing-ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const s = scorer({
+      name: 'pass',
+      description: 'Always passes',
+      score: () => 1,
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [s] },
+      async () => ({ output: 'ok', cost: 0.005 }),
+      mockRuntime,
+    );
+
+    const item = result.items[0];
+    expect(item.duration).toBeDefined();
+    expect(typeof item.duration).toBe('number');
+    expect(item.duration!).toBeGreaterThanOrEqual(0);
+    expect(item.cost).toBe(0.005);
+  });
+
+  it('scoreDetails are populated with metadata for LLM scorers through runtime.eval()', async () => {
+    const scorerProvider = MockProvider.fn(() => ({
+      content: JSON.stringify({ score: 0.9, reasoning: 'Well structured answer' }),
+      cost: 0.002,
+    }));
+
+    const provider = MockProvider.fn(() => ({ content: 'workflow output' }));
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('mock', provider);
+    runtime.registerProvider('scorer-mock', scorerProvider);
+
+    const { agent, workflow } = await import('@axlsdk/axl');
+    const a = agent({ name: 'detail-agent', model: 'mock:test', system: 'test' });
+    const wf = workflow({
+      name: 'detail-wf',
+      input: z.object({ question: z.string() }),
+      handler: async (ctx) => ctx.ask(a, ctx.input.question),
+    });
+    runtime.register(wf);
+
+    const ds = dataset({
+      name: 'detail-ds',
+      schema: z.object({ question: z.string() }),
+      items: [{ input: { question: 'q1' } }],
+    });
+
+    const judge = llmScorer({
+      name: 'quality',
+      description: 'Quality judge',
+      model: 'scorer-mock:judge-model',
+      system: 'Rate the quality',
+    });
+
+    const result = (await runtime.eval({
+      workflow: 'detail-wf',
+      dataset: ds,
+      scorers: [judge],
+    })) as EvalResult;
+
+    const item = result.items[0];
+
+    // scoreDetails should be populated
+    expect(item.scoreDetails).toBeDefined();
+    expect(item.scoreDetails!['quality']).toBeDefined();
+    expect(item.scoreDetails!['quality'].score).toBe(0.9);
+    expect(item.scoreDetails!['quality'].metadata).toEqual({ reasoning: 'Well structured answer' });
+    expect(item.scoreDetails!['quality'].cost).toBeDefined();
+    expect(typeof item.scoreDetails!['quality'].duration).toBe('number');
+
+    // scores still works for backwards compat
+    expect(item.scores['quality']).toBe(0.9);
+
+    // Per-item duration and scorerCost
+    expect(item.duration).toBeDefined();
+    // scorerCost depends on provider cost pass-through; just verify it's tracked
+    expect(item.scoreDetails!['quality'].duration).toBeGreaterThanOrEqual(0);
+  });
+
+  it('summary includes timing stats', async () => {
+    const ds = dataset({
+      name: 'timing-summary-ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'a' } }, { input: { q: 'b' } }],
+    });
+
+    const s = scorer({
+      name: 'pass',
+      description: 'Always passes',
+      score: () => 1,
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [s] },
+      async () => ({ output: 'ok' }),
+      mockRuntime,
+    );
+
+    expect(result.summary.timing).toBeDefined();
+    expect(typeof result.summary.timing!.mean).toBe('number');
+    expect(typeof result.summary.timing!.p50).toBe('number');
+    expect(typeof result.summary.timing!.p95).toBe('number');
+  });
+
   it('eval CLI runs eval file and produces formatted output', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'axl-eval-cli-'));
     const evalFile = join(tmpDir, 'test.eval.mjs');

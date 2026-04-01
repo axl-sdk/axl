@@ -397,18 +397,22 @@ describe('evalCompare()', () => {
     expect(comparison.improvements[0].itemIndex).toBe(1);
   });
 
-  it('compares timing when both runs have duration data', () => {
+  it('compares timing when both runs have summary.timing', () => {
     const baseline = makeEvalResult({
-      items: [
-        { input: { q: '1' }, output: 'a', scores: { accuracy: 0.8 }, duration: 1000 },
-        { input: { q: '2' }, output: 'b', scores: { accuracy: 0.6 }, duration: 2000 },
-      ],
+      summary: {
+        count: 2,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.7, min: 0.6, max: 0.8, p50: 0.7, p95: 0.8 } },
+        timing: { mean: 1500, min: 1000, max: 2000, p50: 1500, p95: 2000 },
+      },
     });
     const candidate = makeEvalResult({
-      items: [
-        { input: { q: '1' }, output: 'a', scores: { accuracy: 0.8 }, duration: 2000 },
-        { input: { q: '2' }, output: 'b', scores: { accuracy: 0.6 }, duration: 4000 },
-      ],
+      summary: {
+        count: 2,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.7, min: 0.6, max: 0.8, p50: 0.7, p95: 0.8 } },
+        timing: { mean: 3000, min: 2000, max: 4000, p50: 3000, p95: 4000 },
+      },
     });
 
     const comparison = evalCompare(baseline, candidate);
@@ -453,16 +457,20 @@ describe('evalCompare()', () => {
 
   it('includes timing delta in summary string', () => {
     const baseline = makeEvalResult({
-      items: [
-        { input: { q: '1' }, output: 'a', scores: { accuracy: 0.8 }, duration: 1000 },
-        { input: { q: '2' }, output: 'b', scores: { accuracy: 0.8 }, duration: 1000 },
-      ],
+      summary: {
+        count: 2,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.8, min: 0.8, max: 0.8, p50: 0.8, p95: 0.8 } },
+        timing: { mean: 1000, min: 1000, max: 1000, p50: 1000, p95: 1000 },
+      },
     });
     const candidate = makeEvalResult({
-      items: [
-        { input: { q: '1' }, output: 'a', scores: { accuracy: 0.8 }, duration: 3000 },
-        { input: { q: '2' }, output: 'b', scores: { accuracy: 0.8 }, duration: 3000 },
-      ],
+      summary: {
+        count: 2,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.8, min: 0.8, max: 0.8, p50: 0.8, p95: 0.8 } },
+        timing: { mean: 3000, min: 3000, max: 3000, p50: 3000, p95: 3000 },
+      },
     });
 
     const comparison = evalCompare(baseline, candidate);

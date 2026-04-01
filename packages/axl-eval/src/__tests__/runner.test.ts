@@ -644,7 +644,7 @@ describe('runEval()', () => {
     );
 
     // Item 1: $0.01 scorer cost. Item 2: no scorer cost.
-    // Bug: if _lastCost isn't cleared, item 2 would re-add the $0.01 from item 1
+    // Verify: provider with no cost on second call should not carry over first call's cost
     expect(result.totalCost).toBeCloseTo(0.01, 6);
   });
 
@@ -927,5 +927,112 @@ describe('runEval()', () => {
 
     expect(receivedRuntime).toBe(testRuntime);
     expect(result.items).toHaveLength(3);
+  });
+
+  it('populates per-item duration and cost', async () => {
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      executeWorkflow,
+      mockRuntime,
+    );
+
+    for (const item of result.items) {
+      expect(typeof item.duration).toBe('number');
+      expect(item.duration!).toBeGreaterThanOrEqual(0);
+    }
+    // executeWorkflow returns cost: 0.001 for all items
+    expect(result.items[0].cost).toBe(0.001);
+  });
+
+  it('captures duration even on workflow error', async () => {
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [exactScorer] },
+      async () => {
+        throw new Error('fail');
+      },
+      mockRuntime,
+    );
+
+    expect(result.items[0].error).toBe('fail');
+    expect(typeof result.items[0].duration).toBe('number');
+    expect(result.items[0].duration!).toBeGreaterThanOrEqual(0);
+  });
+
+  it('populates scoreDetails for deterministic scorers (no metadata)', async () => {
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      executeWorkflow,
+      mockRuntime,
+    );
+
+    const item = result.items[0];
+    expect(item.scoreDetails).toBeDefined();
+    expect(item.scoreDetails!['exact']).toBeDefined();
+    expect(item.scoreDetails!['exact'].score).toBe(1);
+    expect(item.scoreDetails!['exact'].metadata).toBeUndefined();
+    expect(typeof item.scoreDetails!['exact'].duration).toBe('number');
+  });
+
+  it('populates scoreDetails with metadata for LLM scorers', async () => {
+    const mockProvider = {
+      chat: async () => ({
+        content: JSON.stringify({ score: 0.9, reasoning: 'Good' }),
+        cost: 0.002,
+      }),
+    };
+
+    const mockRuntimeWithResolver = {
+      resolveProvider: (uri: string) => ({
+        provider: mockProvider,
+        model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
+      }),
+    } as unknown as AxlRuntime;
+
+    const llmScore = llmScorer({
+      name: 'judge',
+      description: 'test',
+      model: 'mock:model',
+      system: 'Rate it',
+    });
+
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'test' } }],
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [llmScore] },
+      async () => ({ output: 'output' }),
+      mockRuntimeWithResolver,
+    );
+
+    const detail = result.items[0].scoreDetails!['judge'];
+    expect(detail.score).toBe(0.9);
+    expect(detail.metadata).toEqual({ reasoning: 'Good' });
+    expect(detail.cost).toBe(0.002);
+    expect(typeof detail.duration).toBe('number');
+    expect(result.items[0].scorerCost).toBe(0.002);
+  });
+
+  it('computes summary.timing stats from item durations', async () => {
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      executeWorkflow,
+      mockRuntime,
+    );
+
+    expect(result.summary.timing).toBeDefined();
+    expect(typeof result.summary.timing!.mean).toBe('number');
+    expect(typeof result.summary.timing!.p50).toBe('number');
+    expect(typeof result.summary.timing!.p95).toBe('number');
+    expect(typeof result.summary.timing!.min).toBe('number');
+    expect(typeof result.summary.timing!.max).toBe('number');
   });
 });

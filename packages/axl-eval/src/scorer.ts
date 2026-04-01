@@ -32,7 +32,7 @@ export type ScorerFn<TOutput, TInput, TAnnotations> = (
   output: TOutput,
   input: TInput,
   annotations?: TAnnotations,
-) => number;
+) => number | ScorerResult;
 
 export type ScorerConfig<TOutput = unknown, TInput = unknown, TAnnotations = unknown> = {
   name: string;

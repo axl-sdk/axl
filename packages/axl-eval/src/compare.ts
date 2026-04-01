@@ -60,17 +60,11 @@ export function evalCompare(baseline: EvalResult, candidate: EvalResult): EvalCo
     }
   }
 
-  // Timing comparison (only when both sides have timing data)
+  // Timing comparison (use pre-computed summary.timing when available)
   let timing: EvalComparison['timing'];
-  const bDurations = baseline.items
-    .filter((i) => !i.error && i.duration != null)
-    .map((i) => i.duration!);
-  const cDurations = candidate.items
-    .filter((i) => !i.error && i.duration != null)
-    .map((i) => i.duration!);
-  if (bDurations.length > 0 && cDurations.length > 0) {
-    const bMean = round(bDurations.reduce((a, b) => a + b, 0) / bDurations.length);
-    const cMean = round(cDurations.reduce((a, b) => a + b, 0) / cDurations.length);
+  if (baseline.summary.timing && candidate.summary.timing) {
+    const bMean = baseline.summary.timing.mean;
+    const cMean = candidate.summary.timing.mean;
     const delta = round(cMean - bMean);
     const deltaPercent = bMean > 0 ? round((delta / bMean) * 100) : 0;
     timing = { baselineMean: bMean, candidateMean: cMean, delta, deltaPercent };

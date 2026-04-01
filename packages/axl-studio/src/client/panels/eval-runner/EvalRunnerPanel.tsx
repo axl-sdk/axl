@@ -3,54 +3,15 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { FlaskConical } from 'lucide-react';
 import { PanelShell } from '../../components/layout/PanelShell';
 import { EmptyState } from '../../components/shared/EmptyState';
-import { JsonViewer } from '../../components/shared/JsonViewer';
 import { fetchEvals, fetchEvalHistory, runRegisteredEval, compareEvals } from '../../lib/api';
+import { formatCost, formatDuration } from '../../lib/utils';
 import type { RegisteredEval, EvalHistoryEntry } from '../../lib/types';
-
-// ── Types matching @axlsdk/eval's EvalResult shape ───────────────
-
-type EvalItem = {
-  input: unknown;
-  annotations?: unknown;
-  output: unknown;
-  error?: string;
-  scorerErrors?: string[];
-  scores: Record<string, number | null>;
-};
-
-type ScorerStats = {
-  mean: number;
-  min: number;
-  max: number;
-  p50: number;
-  p95: number;
-};
-
-type EvalResultData = {
-  id: string;
-  workflow: string;
-  dataset: string;
-  timestamp: string;
-  totalCost: number;
-  duration: number;
-  items: EvalItem[];
-  summary: {
-    count: number;
-    failures: number;
-    scorers: Record<string, ScorerStats>;
-  };
-};
-
-type ComparisonResult = {
-  regressions?: Array<{ scorer: string; delta: number; baseline: number; candidate: number }>;
-  improvements?: Array<{ scorer: string; delta: number; baseline: number; candidate: number }>;
-  scorers?: Record<
-    string,
-    { baselineMean: number; candidateMean: number; delta: number; deltaPercent: number }
-  >;
-  summary?: string;
-  [key: string]: unknown;
-};
+import type { EvalResultData, ComparisonResult } from './types';
+import { EvalSummaryTable } from './EvalSummaryTable';
+import { EvalItemList } from './EvalItemList';
+import { EvalItemDetail } from './EvalItemDetail';
+import { ScoreDistribution } from './ScoreDistribution';
+import { EvalCompareView } from './EvalCompareView';
 
 export function EvalRunnerPanel() {
   const queryClient = useQueryClient();
@@ -59,7 +20,12 @@ export function EvalRunnerPanel() {
   const [running, setRunning] = useState(false);
   const [currentResult, setCurrentResult] = useState<EvalResultData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selectedItem, setSelectedItem] = useState<number | null>(null);
+
+  // Compare state
   const [compareResult, setCompareResult] = useState<ComparisonResult | null>(null);
+  const [compareBaseline, setCompareBaseline] = useState<EvalResultData | null>(null);
+  const [compareCandidate, setCompareCandidate] = useState<EvalResultData | null>(null);
 
   const { data: evals = [] } = useQuery({
     queryKey: ['evals'],
@@ -78,11 +44,11 @@ export function EvalRunnerPanel() {
     setRunning(true);
     setError(null);
     setCurrentResult(null);
+    setSelectedItem(null);
 
     try {
       const result = (await runRegisteredEval(selectedEval)) as EvalResultData;
       setCurrentResult(result);
-      // Refresh server-side history
       queryClient.invalidateQueries({ queryKey: ['evalHistory'] });
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -94,17 +60,19 @@ export function EvalRunnerPanel() {
   const handleCompare = useCallback(async () => {
     if (history.length < 2) return;
     try {
-      const baseline = history[1].data as EvalResultData;
-      const candidate = history[0].data as EvalResultData;
-      const res = (await compareEvals(baseline, candidate)) as ComparisonResult;
+      const baselineData = history[1].data as EvalResultData;
+      const candidateData = history[0].data as EvalResultData;
+      setCompareBaseline(baselineData);
+      setCompareCandidate(candidateData);
+      const res = (await compareEvals(baselineData, candidateData)) as ComparisonResult;
       setCompareResult(res);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
   }, [history]);
 
-  const scorerEntries = currentResult?.summary?.scorers
-    ? Object.entries(currentResult.summary.scorers)
+  const scorerNames = currentResult?.summary?.scorers
+    ? Object.keys(currentResult.summary.scorers)
     : [];
 
   return (
@@ -204,153 +172,45 @@ export function EvalRunnerPanel() {
               </div>
             )}
             {currentResult ? (
-              <div className="space-y-4">
+              <div className="space-y-6">
                 {/* Run metadata */}
                 <div className="flex items-center gap-4 text-xs text-[hsl(var(--muted-foreground))]">
                   <span>
                     {currentResult.summary.count} items, {currentResult.summary.failures} failures
                   </span>
                   {currentResult.duration > 0 && (
-                    <span>{(currentResult.duration / 1000).toFixed(1)}s</span>
+                    <span>{formatDuration(currentResult.duration)}</span>
                   )}
                   {currentResult.totalCost > 0 && (
-                    <span>${currentResult.totalCost.toFixed(4)}</span>
+                    <span>{formatCost(currentResult.totalCost)}</span>
                   )}
                 </div>
 
-                {/* Summary stats table */}
-                {scorerEntries.length > 0 && (
-                  <div>
-                    <h3 className="text-sm font-medium mb-2">Summary</h3>
-                    <table className="w-full text-xs">
-                      <thead>
-                        <tr className="border-b border-[hsl(var(--border))]">
-                          <th className="text-left py-2 font-medium">Scorer</th>
-                          <th className="text-right py-2 font-medium">Mean</th>
-                          <th className="text-right py-2 font-medium">P50</th>
-                          <th className="text-right py-2 font-medium">P95</th>
-                          <th className="text-right py-2 font-medium">Min</th>
-                          <th className="text-right py-2 font-medium">Max</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {scorerEntries.map(([scorer, stats]) => {
-                          const hasValidScores = currentResult.items.some(
-                            (i) => !i.error && i.scores[scorer] != null,
-                          );
-                          return (
-                            <tr key={scorer} className="border-b border-[hsl(var(--border))]">
-                              <td className="py-2 font-mono">{scorer}</td>
-                              {hasValidScores ? (
-                                <>
-                                  <td className="py-2 text-right font-mono">
-                                    {stats.mean.toFixed(3)}
-                                  </td>
-                                  <td className="py-2 text-right font-mono">
-                                    {stats.p50.toFixed(3)}
-                                  </td>
-                                  <td className="py-2 text-right font-mono">
-                                    {stats.p95.toFixed(3)}
-                                  </td>
-                                  <td className="py-2 text-right font-mono">
-                                    {stats.min.toFixed(3)}
-                                  </td>
-                                  <td className="py-2 text-right font-mono">
-                                    {stats.max.toFixed(3)}
-                                  </td>
-                                </>
-                              ) : (
-                                <td
-                                  colSpan={5}
-                                  className="py-2 text-center text-[hsl(var(--muted-foreground))]"
-                                >
-                                  No valid scores
-                                </td>
-                              )}
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
+                {selectedItem != null ? (
+                  <EvalItemDetail
+                    item={currentResult.items[selectedItem]}
+                    itemIndex={selectedItem}
+                    scorerNames={scorerNames}
+                    onBack={() => setSelectedItem(null)}
+                  />
+                ) : (
+                  <>
+                    <EvalSummaryTable
+                      summary={currentResult.summary}
+                      items={currentResult.items}
+                      totalCost={currentResult.totalCost}
+                    />
 
-                {/* Per-item results */}
-                {currentResult.items && currentResult.items.length > 0 && (
-                  <div>
-                    <h3 className="text-sm font-medium mb-2">
-                      Items ({currentResult.items.length})
-                    </h3>
-                    <div className="space-y-2">
-                      {currentResult.items.map((item, i) => (
-                        <details key={i} className="border border-[hsl(var(--border))] rounded-md">
-                          <summary className="flex items-center justify-between px-3 py-2 text-xs cursor-pointer hover:bg-[hsl(var(--accent))]">
-                            <span className="font-mono">
-                              Item #{i + 1}
-                              {item.error && (
-                                <span className="ml-2 text-red-600 dark:text-red-400">(error)</span>
-                              )}
-                              {item.scorerErrors && item.scorerErrors.length > 0 && !item.error && (
-                                <span className="ml-2 text-amber-600 dark:text-amber-400">
-                                  (scorer errors)
-                                </span>
-                              )}
-                            </span>
-                            <div className="flex items-center gap-2">
-                              {Object.entries(item.scores)
-                                .filter(([, score]) => score != null)
-                                .map(([scorer, score]) => (
-                                  <span
-                                    key={scorer}
-                                    className={`px-1.5 py-0.5 rounded font-mono ${
-                                      score! >= 0.8
-                                        ? 'bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300'
-                                        : score! >= 0.5
-                                          ? 'bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300'
-                                          : 'bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300'
-                                    }`}
-                                  >
-                                    {scorer}: {score!.toFixed(2)}
-                                  </span>
-                                ))}
-                            </div>
-                          </summary>
-                          <div className="px-3 py-2 border-t border-[hsl(var(--border))] space-y-2 text-xs">
-                            <div>
-                              <span className="font-medium">Input:</span>
-                              <JsonViewer data={item.input} collapsed />
-                            </div>
-                            <div>
-                              <span className="font-medium">Output:</span>
-                              <JsonViewer data={item.output} collapsed />
-                            </div>
-                            {item.error && (
-                              <div>
-                                <span className="font-medium text-red-600 dark:text-red-400">
-                                  Error:
-                                </span>
-                                <span className="ml-1">{item.error}</span>
-                              </div>
-                            )}
-                            {item.scorerErrors && item.scorerErrors.length > 0 && (
-                              <div>
-                                <span className="font-medium text-amber-600 dark:text-amber-400">
-                                  Scorer errors:
-                                </span>
-                                <ul className="ml-4 mt-1 list-disc">
-                                  {item.scorerErrors.map((err, j) => (
-                                    <li key={j} className="text-amber-700 dark:text-amber-300">
-                                      {err}
-                                    </li>
-                                  ))}
-                                </ul>
-                              </div>
-                            )}
-                          </div>
-                        </details>
-                      ))}
-                    </div>
-                  </div>
+                    <ScoreDistribution items={currentResult.items} scorerNames={scorerNames} />
+
+                    {currentResult.items.length > 0 && (
+                      <EvalItemList
+                        items={currentResult.items}
+                        scorerNames={scorerNames}
+                        onSelectItem={setSelectedItem}
+                      />
+                    )}
+                  </>
                 )}
               </div>
             ) : (
@@ -369,48 +229,14 @@ export function EvalRunnerPanel() {
           {history.length === 0 ? (
             <EmptyState title="No eval history" description="Run evaluations to build history." />
           ) : (
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-[hsl(var(--border))]">
-                  <th className="text-left py-2 font-medium">Eval</th>
-                  <th className="text-left py-2 font-medium">Timestamp</th>
-                  <th className="text-right py-2 font-medium">Items</th>
-                  <th className="text-right py-2 font-medium">Failures</th>
-                  <th className="text-right py-2 font-medium">Cost</th>
-                </tr>
-              </thead>
-              <tbody>
-                {history.map((r: EvalHistoryEntry) => {
-                  const data = r.data as EvalResultData;
-                  return (
-                    <tr
-                      key={r.id}
-                      className="border-b border-[hsl(var(--border))] cursor-pointer hover:bg-[hsl(var(--accent))]"
-                      onClick={() => {
-                        setCurrentResult(data);
-                        setTab('run');
-                      }}
-                    >
-                      <td className="py-2 font-mono">{r.eval}</td>
-                      <td className="py-2">{new Date(r.timestamp).toLocaleString()}</td>
-                      <td className="py-2 text-right">{data.summary.count}</td>
-                      <td className="py-2 text-right">
-                        {data.summary.failures > 0 ? (
-                          <span className="text-red-600 dark:text-red-400">
-                            {data.summary.failures}
-                          </span>
-                        ) : (
-                          0
-                        )}
-                      </td>
-                      <td className="py-2 text-right font-mono">
-                        {data.totalCost > 0 ? `$${data.totalCost.toFixed(4)}` : '-'}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+            <HistoryTable
+              history={history}
+              onSelect={(data) => {
+                setCurrentResult(data);
+                setSelectedItem(null);
+                setTab('run');
+              }}
+            />
           )}
         </div>
       )}
@@ -434,109 +260,95 @@ export function EvalRunnerPanel() {
                 Compare
               </button>
               {compareResult && (
-                <div className="space-y-4">
-                  {compareResult.summary && <p className="text-sm">{compareResult.summary}</p>}
-                  {compareResult.scorers && Object.keys(compareResult.scorers).length > 0 && (
-                    <div>
-                      <h3 className="text-sm font-medium mb-2">Scorer Comparison</h3>
-                      <table className="w-full text-xs">
-                        <thead>
-                          <tr className="border-b border-[hsl(var(--border))]">
-                            <th className="text-left py-2 font-medium">Scorer</th>
-                            <th className="text-right py-2 font-medium">Baseline</th>
-                            <th className="text-right py-2 font-medium">Candidate</th>
-                            <th className="text-right py-2 font-medium">Delta</th>
-                            <th className="text-right py-2 font-medium">%</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {Object.entries(compareResult.scorers).map(([scorer, stats]) => (
-                            <tr key={scorer} className="border-b border-[hsl(var(--border))]">
-                              <td className="py-2 font-mono">{scorer}</td>
-                              <td className="py-2 text-right font-mono">
-                                {stats.baselineMean.toFixed(3)}
-                              </td>
-                              <td className="py-2 text-right font-mono">
-                                {stats.candidateMean.toFixed(3)}
-                              </td>
-                              <td
-                                className={`py-2 text-right font-mono ${
-                                  stats.delta > 0
-                                    ? 'text-green-600 dark:text-green-400'
-                                    : stats.delta < 0
-                                      ? 'text-red-600 dark:text-red-400'
-                                      : ''
-                                }`}
-                              >
-                                {stats.delta > 0 ? '+' : ''}
-                                {stats.delta.toFixed(3)}
-                              </td>
-                              <td
-                                className={`py-2 text-right font-mono ${
-                                  stats.deltaPercent > 0
-                                    ? 'text-green-600 dark:text-green-400'
-                                    : stats.deltaPercent < 0
-                                      ? 'text-red-600 dark:text-red-400'
-                                      : ''
-                                }`}
-                              >
-                                {stats.deltaPercent > 0 ? '+' : ''}
-                                {stats.deltaPercent.toFixed(1)}%
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                  {compareResult.regressions && compareResult.regressions.length > 0 && (
-                    <div>
-                      <h3 className="text-sm font-medium mb-2 text-red-600 dark:text-red-400">
-                        Regressions ({compareResult.regressions.length})
-                      </h3>
-                      <div className="space-y-1">
-                        {compareResult.regressions.map((r, i) => (
-                          <div
-                            key={i}
-                            className="flex items-center justify-between px-3 py-1.5 text-xs border border-[hsl(var(--border))] rounded"
-                          >
-                            <span className="font-mono">{r.scorer}</span>
-                            <span className="font-mono text-red-600 dark:text-red-400">
-                              {r.baseline.toFixed(2)} → {r.candidate.toFixed(2)} (
-                              {r.delta.toFixed(2)})
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {compareResult.improvements && compareResult.improvements.length > 0 && (
-                    <div>
-                      <h3 className="text-sm font-medium mb-2 text-green-600 dark:text-green-400">
-                        Improvements ({compareResult.improvements.length})
-                      </h3>
-                      <div className="space-y-1">
-                        {compareResult.improvements.map((r, i) => (
-                          <div
-                            key={i}
-                            className="flex items-center justify-between px-3 py-1.5 text-xs border border-[hsl(var(--border))] rounded"
-                          >
-                            <span className="font-mono">{r.scorer}</span>
-                            <span className="font-mono text-green-600 dark:text-green-400">
-                              {r.baseline.toFixed(2)} → {r.candidate.toFixed(2)} (+
-                              {r.delta.toFixed(2)})
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
+                <EvalCompareView
+                  compareResult={compareResult}
+                  baseline={compareBaseline}
+                  candidate={compareCandidate}
+                />
               )}
             </>
           )}
         </div>
       )}
     </PanelShell>
+  );
+}
+
+// ── History table with duration and scorer columns ───────────────
+
+function HistoryTable({
+  history,
+  onSelect,
+}: {
+  history: EvalHistoryEntry[];
+  onSelect: (data: EvalResultData) => void;
+}) {
+  // Collect all scorer names across history entries for column headers
+  const allScorerNames = new Set<string>();
+  for (const entry of history) {
+    const data = entry.data as EvalResultData;
+    if (data.summary?.scorers) {
+      for (const name of Object.keys(data.summary.scorers)) {
+        allScorerNames.add(name);
+      }
+    }
+  }
+  const scorerCols = [...allScorerNames].sort();
+
+  return (
+    <table className="w-full text-xs">
+      <thead>
+        <tr className="border-b border-[hsl(var(--border))]">
+          <th className="text-left py-2 font-medium">Eval</th>
+          <th className="text-left py-2 font-medium">Timestamp</th>
+          <th className="text-right py-2 font-medium">Items</th>
+          <th className="text-right py-2 font-medium">Failures</th>
+          <th className="text-right py-2 font-medium">Duration</th>
+          <th className="text-right py-2 font-medium">Cost</th>
+          {scorerCols.map((name) => (
+            <th key={name} className="text-right py-2 font-medium font-mono">
+              {name}
+            </th>
+          ))}
+        </tr>
+      </thead>
+      <tbody>
+        {history.map((r: EvalHistoryEntry) => {
+          const data = r.data as EvalResultData;
+          return (
+            <tr
+              key={r.id}
+              className="border-b border-[hsl(var(--border))] cursor-pointer hover:bg-[hsl(var(--accent))]"
+              onClick={() => onSelect(data)}
+            >
+              <td className="py-2 font-mono">{r.eval}</td>
+              <td className="py-2">{new Date(r.timestamp).toLocaleString()}</td>
+              <td className="py-2 text-right">{data.summary.count}</td>
+              <td className="py-2 text-right">
+                {data.summary.failures > 0 ? (
+                  <span className="text-red-600 dark:text-red-400">{data.summary.failures}</span>
+                ) : (
+                  0
+                )}
+              </td>
+              <td className="py-2 text-right font-mono">
+                {data.duration > 0 ? formatDuration(data.duration) : '-'}
+              </td>
+              <td className="py-2 text-right font-mono">
+                {data.totalCost > 0 ? formatCost(data.totalCost) : '-'}
+              </td>
+              {scorerCols.map((name) => {
+                const stats = data.summary?.scorers?.[name];
+                return (
+                  <td key={name} className="py-2 text-right font-mono">
+                    {stats ? stats.mean.toFixed(3) : '-'}
+                  </td>
+                );
+              })}
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
   );
 }

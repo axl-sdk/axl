@@ -7,12 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.4] - 2026-04-01
+
 ### Changed
 
-- **Eval:** `llmScorer()` `schema` is now optional — defaults to `z.object({ score: z.number(), reasoning: z.string() })`, eliminating boilerplate for the common case
-- **Eval:** `llmScorer()` now injects the JSON Schema into the LLM prompt (via `zodToJsonSchema()`), so the judge LLM knows exactly what structure to produce — especially important for custom schemas with extra fields
+- **Eval:** `llmScorer()` `schema` is now optional — defaults to `z.object({ score: z.number().min(0).max(1), reasoning: z.string() })`, eliminating boilerplate for the common case
+- **Eval:** `llmScorer()` now injects the JSON Schema into the LLM prompt (via `zodToJsonSchema()`), so the judge LLM knows exactly what structure to produce — especially important for custom schemas with extra fields (e.g., `category`, `confidence`)
 - **Eval:** `zod` is now a peer dependency of `@axlsdk/eval` (was dev-only)
-- **Eval:** `llmScorer()` now formats Zod validation errors into human-readable messages (e.g., `reasoning: Required`) instead of exposing raw JSON arrays
+- **Eval:** `llmScorer()` now formats Zod validation errors into human-readable messages (e.g., `"reasoning: Required"`) instead of exposing raw JSON arrays
 
 ## [0.13.3] - 2026-04-01
 

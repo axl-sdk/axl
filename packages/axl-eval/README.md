@@ -107,7 +107,7 @@ Scorers rate each output on a 0-1 scale. You can mix deterministic and LLM score
 
 ### Deterministic scorers
 
-Pure functions — fast, free, deterministic. The `score` callback receives `(output, input, annotations?)`:
+Pure functions — fast, free, deterministic. The `score` callback receives `(output, input, annotations?)` and returns a number (0-1) or a `ScorerResult` with metadata:
 
 ```typescript
 import { scorer } from '@axlsdk/eval';
@@ -117,6 +117,16 @@ const containsAnswer = scorer({
   description: 'Output contains the expected numeric answer',
   score: (output, _input, annotations) =>
     String(output).includes(String(annotations?.answer)) ? 1 : 0,
+});
+
+// Returning rich metadata via ScorerResult
+const lengthScore = scorer({
+  name: 'length',
+  description: 'Rates output by character length',
+  score: (output) => {
+    const len = String(output).length;
+    return { score: Math.min(len / 500, 1), metadata: { charCount: len } };
+  },
 });
 ```
 
@@ -135,7 +145,7 @@ const qualityJudge = llmScorer({
 });
 ```
 
-The default schema is `{ score: number, reasoning: string }` — the LLM returns a 0-1 score with an explanation. For custom scoring dimensions, provide your own schema:
+The default schema is `{ score: number, reasoning: string }` — the LLM returns a 0-1 score with an explanation. The returned `ScorerResult` includes the full schema response as `metadata` (e.g., `{ reasoning: "...", confidence: 0.9 }`) and the LLM cost. For custom scoring dimensions, provide your own schema:
 
 ```typescript
 import { z } from 'zod';
@@ -261,10 +271,24 @@ const results = await runtime.eval({ ... });
 console.log(results.summary.scorers['quality'].mean);  // 0.85
 console.log(results.summary.count);                     // 50 items
 console.log(results.summary.failures);                  // 2 workflow errors
+console.log(results.summary.timing);                    // { mean, min, max, p50, p95 } in ms
 
 // Per-item inspection
 for (const item of results.items) {
   if (item.error) continue;                              // workflow threw
+  console.log(item.duration);                            // workflow execution ms
+  console.log(item.cost);                                // workflow LLM cost
+  console.log(item.scorerCost);                          // total scorer cost for this item
+
+  // Rich per-scorer detail (metadata, timing, cost)
+  const detail = item.scoreDetails?.['quality'];
+  if (detail) {
+    console.log(detail.score);                           // 0.85
+    console.log(detail.metadata?.reasoning);             // "The answer is relevant..."
+    console.log(detail.duration);                        // scorer execution ms
+    console.log(detail.cost);                            // scorer LLM cost
+  }
+
   if (item.scores['quality'] === null) {
     console.log('Scorer failed:', item.scorerErrors);    // e.g., ["Scorer "quality" threw: ..."]
   }

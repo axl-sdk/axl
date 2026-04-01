@@ -47,7 +47,8 @@ import type { Effort, ToolChoice, ChatOptions, DelegateOptions, CreateContextOpt
 import { AxlTestRuntime, MockProvider, MockTool } from '@axlsdk/testing';
 
 // Evaluation
-import { dataset, scorer, llmScorer, defineEval } from '@axlsdk/eval';
+import { dataset, scorer, llmScorer, defineEval, normalizeScorerResult } from '@axlsdk/eval';
+import type { ScorerResult, ScorerDetail } from '@axlsdk/eval';
 
 // Studio (server API)
 import { createServer, ConnectionManager, CostAggregator } from '@axlsdk/studio';
@@ -120,7 +121,7 @@ packages/axl-testing/src/
 
 packages/axl-eval/src/
   index.ts           — Exports
-  types.ts           — EvalConfig, EvalResult, EvalItem, EvalSummary, EvalComparison
+  types.ts           — EvalConfig, EvalResult, EvalItem, EvalSummary, EvalComparison, ScorerDetail
   dataset.ts         — dataset() factory with inline/file loading
   scorer.ts          — scorer() factory (deterministic)
   llm-scorer.ts      — llmScorer() factory (LLM-as-judge)
@@ -181,7 +182,7 @@ packages/axl-studio/src/
       memory-browser/ — Memory CRUD + semantic search
       session-manager/ — Session list, replay, handoff chain
       tool-inspector/ — Tool schemas + direct testing
-      eval-runner/   — Eval execution + comparison
+      eval-runner/   — Eval execution + comparison (EvalSummaryTable, EvalItemList, EvalItemDetail, ScoreDistribution, EvalCompareView)
 ```
 
 ## Testing
@@ -260,6 +261,8 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - `AxlRuntime.getExecutions()` is async (`Promise<ExecutionInfo[]>`), lazy-loads historical from StateStore, merges with in-memory active executions. `getExecution(id)` falls through to store if not in memory
 - `AxlRuntime.getEvalHistory()` returns eval run history (most recent first); `saveEvalResult(entry)` persists to in-memory cache + StateStore. `runRegisteredEval()` auto-saves results
 - `EvalHistoryEntry` type: `{ id, eval, timestamp, data }` — exported from `@axlsdk/axl`
+- Eval enriched results: `EvalItem` has `duration`, `cost`, `scorerCost`, `scoreDetails` (per-scorer `ScorerDetail` with metadata/timing/cost). `EvalSummary` has `timing` stats. `EvalComparison` has `timing`/`cost` deltas. `EvalRegression`/`EvalImprovement` include `itemIndex`
+- Scorer return type: `Scorer.score()` returns `number | ScorerResult | Promise<number | ScorerResult>`. `ScorerResult` is `{ score, metadata?, cost? }`. `llmScorer()` returns `ScorerResult` with schema metadata (e.g., reasoning) and LLM cost. `normalizeScorerResult()` converts `number | ScorerResult` to `ScorerResult`
 - Memory: `ctx.remember()`/`ctx.recall()`/`ctx.forget()` backed by StateStore; semantic recall via VectorStore + embedder; `MemoryManager` coordinates both
 - Guardrails: `agent({ guardrails: { input, output, onBlock, maxRetries } })`; `GuardrailError` thrown on block; self-correcting retry on `'retry'` policy
 - Validate: `ctx.ask(agent, prompt, { schema, validate, validateRetries })` — per-call post-schema business rule validation on typed object; requires schema (skipped without); `ValidationError` thrown after retries; output pipeline: guardrail → schema → validate, all with accumulating context and independent retry counters. Also supported on `ctx.delegate()` (forwarded to final ask), `ctx.race()` (invalid results discarded), and `ctx.verify()` (runs after schema parse)

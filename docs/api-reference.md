@@ -1078,6 +1078,27 @@ All errors extend `AxlError`.
 
 Types from `@axlsdk/eval` used by `runEval()`, `runtime.eval()`, and the CLI.
 
+### `ScorerResult`
+
+Rich result from a scorer, returned instead of a plain number when the scorer needs to convey metadata or cost.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `score` | `number` | Score value (0-1) |
+| `metadata` | `Record<string, unknown>?` | Arbitrary metadata (e.g., `reasoning`, `confidence`). LLM scorers populate this with the full schema response |
+| `cost` | `number?` | LLM cost incurred by this scorer invocation |
+
+### `ScorerDetail`
+
+Per-scorer data stored on each `EvalItem`, providing richer detail than the `scores` map.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `score` | `number \| null` | Score value, or `null` if the scorer failed |
+| `metadata` | `Record<string, unknown>?` | Scorer metadata (e.g., reasoning from LLM scorers) |
+| `duration` | `number?` | Scorer execution time in ms |
+| `cost` | `number?` | LLM cost for this scorer invocation |
+
 ### `EvalItem`
 
 Per-item result from an eval run.
@@ -1090,6 +1111,10 @@ Per-item result from an eval run.
 | `error` | `string?` | Workflow-level error message |
 | `scorerErrors` | `string[]?` | Scorer-level error messages (thrown exceptions or out-of-range scores) |
 | `scores` | `Record<string, number \| null>` | Scorer results. `null` indicates a scorer error (see `scorerErrors` field) |
+| `duration` | `number?` | Workflow execution time in ms |
+| `cost` | `number?` | Workflow LLM cost |
+| `scorerCost` | `number?` | Total scorer cost for this item |
+| `scoreDetails` | `Record<string, ScorerDetail>?` | Rich per-scorer data (metadata, timing, cost) |
 
 ### `EvalResult`
 
@@ -1116,6 +1141,7 @@ Aggregate statistics across all items.
 | `count` | `number` | Total items |
 | `failures` | `number` | Items where the workflow threw an error |
 | `scorers` | `Record<string, { mean, min, max, p50, p95 }>` | Per-scorer aggregate stats (all values 0-1) |
+| `timing` | `{ mean, min, max, p50, p95 }?` | Per-item duration statistics in ms |
 
 ### `Scorer`
 
@@ -1126,7 +1152,7 @@ A scoring function returned by `scorer()` or `llmScorer()`.
 | `name` | `string` | Unique scorer name |
 | `description` | `string` | What this scorer evaluates |
 | `isLlm` | `boolean` | `true` for LLM scorers |
-| `score` | `(output, input, annotations?, context?) => number \| Promise<number>` | Scoring function (returns 0-1). `context` is a `ScorerContext` passed by the eval runner |
+| `score` | `(output, input, annotations?, context?) => number \| ScorerResult \| Promise<number \| ScorerResult>` | Scoring function (returns 0-1 or a `ScorerResult` with metadata/cost). `context` is a `ScorerContext` passed by the eval runner |
 
 ### `LlmScorerConfig`
 
@@ -1148,6 +1174,38 @@ Context passed to scorers by the eval runner.
 | Field | Type | Description |
 |-------|------|-------------|
 | `resolveProvider` | `(modelUri: string) => { provider, model }` | Resolves a `provider:model` URI to a provider instance and stripped model name. Used by LLM scorers to obtain their provider |
+
+### `EvalComparison`
+
+Result from `evalCompare()` comparing a baseline and candidate eval run.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `baseline` | `{ id, metadata }` | Baseline run identity |
+| `candidate` | `{ id, metadata }` | Candidate run identity |
+| `scorers` | `Record<string, { baselineMean, candidateMean, delta, deltaPercent }>` | Per-scorer mean comparison |
+| `timing` | `{ baselineMean, candidateMean, delta, deltaPercent }?` | Per-item duration comparison |
+| `cost` | `{ baselineTotal, candidateTotal, delta, deltaPercent }?` | Total cost comparison |
+| `regressions` | `EvalRegression[]` | Items that got worse |
+| `improvements` | `EvalImprovement[]` | Items that got better |
+| `summary` | `string` | Human-readable summary |
+
+### `EvalRegression` / `EvalImprovement`
+
+Individual item that regressed or improved between runs.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `itemIndex` | `number` | Index into the items array for lookup |
+| `input` | `unknown` | The dataset input for this item |
+| `scorer` | `string` | Which scorer detected the change |
+| `baselineScore` | `number` | Score in the baseline run |
+| `candidateScore` | `number` | Score in the candidate run |
+| `delta` | `number` | Score difference (candidate - baseline) |
+
+### `normalizeScorerResult(result)`
+
+Converts a scorer return value (`number | ScorerResult`) to a `ScorerResult`. Returns the input as-is if already a `ScorerResult`, or wraps a plain number as `{ score: result }`.
 
 ### `runEval(config, executeWorkflow, runtime)`
 

@@ -15,6 +15,21 @@ function safeParseJson(str: string): unknown {
   }
 }
 
+function renderContent(content: string, role: string) {
+  if (role === 'assistant') {
+    const trimmed = content.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        return <JsonViewer data={parsed} collapsed />;
+      } catch {
+        // Not valid JSON, fall through to plain text
+      }
+    }
+  }
+  return <div className="whitespace-pre-wrap">{content}</div>;
+}
+
 export function SessionManagerPanel() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [replayIndex, setReplayIndex] = useState<number | null>(null);
@@ -199,7 +214,7 @@ export function SessionManagerPanel() {
                     }`}
                   >
                     <div className="text-xs font-medium mb-1 opacity-70">{msg.role}</div>
-                    <div className="whitespace-pre-wrap">{msg.content}</div>
+                    {renderContent(msg.content, msg.role)}
                     {msg.tool_calls && msg.tool_calls.length > 0 && (
                       <div className="mt-2 space-y-1">
                         {msg.tool_calls.map((tc) => (

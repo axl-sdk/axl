@@ -7,8 +7,9 @@ import { CostBadge } from '../../components/shared/CostBadge';
 import { TokenBadge } from '../../components/shared/TokenBadge';
 import { fetchCosts, resetCosts } from '../../lib/api';
 import { useWs } from '../../hooks/use-ws';
-import { formatCost, formatTokens } from '../../lib/utils';
+import { cn, formatCost, formatTokens } from '../../lib/utils';
 import type { CostData } from '../../lib/types';
+import { StatCard } from '../../components/shared/StatCard';
 
 export function CostDashboardPanel() {
   const [liveCosts, setLiveCosts] = useState<CostData | null>(null);
@@ -49,6 +50,8 @@ export function CostDashboardPanel() {
     );
   }
 
+  const showReasoning = costs.totalTokens.reasoning > 0;
+
   return (
     <PanelShell
       title="Cost Dashboard"
@@ -63,11 +66,30 @@ export function CostDashboardPanel() {
       }
     >
       {/* Summary Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <SummaryCard label="Total Cost" value={formatCost(costs.totalCost)} />
-        <SummaryCard label="Input Tokens" value={formatTokens(costs.totalTokens.input)} />
-        <SummaryCard label="Output Tokens" value={formatTokens(costs.totalTokens.output)} />
-        <SummaryCard label="Reasoning Tokens" value={formatTokens(costs.totalTokens.reasoning)} />
+      <div
+        className={cn(
+          'grid grid-cols-1 sm:grid-cols-2 gap-3 mb-8',
+          showReasoning ? 'lg:grid-cols-4' : 'lg:grid-cols-3',
+        )}
+      >
+        <StatCard label="Total Cost" value={formatCost(costs.totalCost)} subtitle="all time" />
+        <StatCard
+          label="Input Tokens"
+          value={formatTokens(costs.totalTokens.input)}
+          subtitle="prompt"
+        />
+        <StatCard
+          label="Output Tokens"
+          value={formatTokens(costs.totalTokens.output)}
+          subtitle="completion"
+        />
+        {showReasoning && (
+          <StatCard
+            label="Reasoning Tokens"
+            value={formatTokens(costs.totalTokens.reasoning)}
+            subtitle="thinking"
+          />
+        )}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -77,28 +99,21 @@ export function CostDashboardPanel() {
           {Object.keys(costs.byAgent).length === 0 ? (
             <p className="text-xs text-[hsl(var(--muted-foreground))]">No agent data</p>
           ) : (
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-[hsl(var(--border))]">
-                  <th className="text-left py-2 font-medium">Agent</th>
-                  <th className="text-right py-2 font-medium">Calls</th>
-                  <th className="text-right py-2 font-medium">Cost</th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(costs.byAgent)
-                  .sort(([, a], [, b]) => b.cost - a.cost)
-                  .map(([agent, data]) => (
-                    <tr key={agent} className="border-b border-[hsl(var(--border))]">
-                      <td className="py-2 font-mono">{agent}</td>
-                      <td className="py-2 text-right">{data.calls}</td>
-                      <td className="py-2 text-right">
-                        <CostBadge cost={data.cost} />
-                      </td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
+            <CostTable
+              headers={['Agent', 'Calls', 'Cost']}
+              rows={Object.entries(costs.byAgent)
+                .sort(([, a], [, b]) => b.cost - a.cost)
+                .map(([agent, data]) => ({
+                  key: agent,
+                  cells: [
+                    <span className="font-mono">{agent}</span>,
+                    <span>{data.calls}</span>,
+                    <CostBadge cost={data.cost} />,
+                  ],
+                  cost: data.cost,
+                }))}
+              maxCost={Math.max(...Object.values(costs.byAgent).map((d) => d.cost))}
+            />
           )}
         </div>
 
@@ -108,32 +123,22 @@ export function CostDashboardPanel() {
           {Object.keys(costs.byModel).length === 0 ? (
             <p className="text-xs text-[hsl(var(--muted-foreground))]">No model data</p>
           ) : (
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-[hsl(var(--border))]">
-                  <th className="text-left py-2 font-medium">Model</th>
-                  <th className="text-right py-2 font-medium">Calls</th>
-                  <th className="text-right py-2 font-medium">Tokens</th>
-                  <th className="text-right py-2 font-medium">Cost</th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(costs.byModel)
-                  .sort(([, a], [, b]) => b.cost - a.cost)
-                  .map(([model, data]) => (
-                    <tr key={model} className="border-b border-[hsl(var(--border))]">
-                      <td className="py-2 font-mono">{model}</td>
-                      <td className="py-2 text-right">{data.calls}</td>
-                      <td className="py-2 text-right">
-                        <TokenBadge tokens={data.tokens.input + data.tokens.output} />
-                      </td>
-                      <td className="py-2 text-right">
-                        <CostBadge cost={data.cost} />
-                      </td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
+            <CostTable
+              headers={['Model', 'Calls', 'Tokens', 'Cost']}
+              rows={Object.entries(costs.byModel)
+                .sort(([, a], [, b]) => b.cost - a.cost)
+                .map(([model, data]) => ({
+                  key: model,
+                  cells: [
+                    <span className="font-mono">{model}</span>,
+                    <span>{data.calls}</span>,
+                    <TokenBadge tokens={data.tokens.input + data.tokens.output} />,
+                    <CostBadge cost={data.cost} />,
+                  ],
+                  cost: data.cost,
+                }))}
+              maxCost={Math.max(...Object.values(costs.byModel).map((d) => d.cost))}
+            />
           )}
         </div>
 
@@ -143,32 +148,22 @@ export function CostDashboardPanel() {
           {Object.keys(costs.byWorkflow).length === 0 ? (
             <p className="text-xs text-[hsl(var(--muted-foreground))]">No workflow data</p>
           ) : (
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-[hsl(var(--border))]">
-                  <th className="text-left py-2 font-medium">Workflow</th>
-                  <th className="text-right py-2 font-medium">Executions</th>
-                  <th className="text-right py-2 font-medium">Total Cost</th>
-                  <th className="text-right py-2 font-medium">Avg Cost</th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(costs.byWorkflow)
-                  .sort(([, a], [, b]) => b.cost - a.cost)
-                  .map(([wf, data]) => (
-                    <tr key={wf} className="border-b border-[hsl(var(--border))]">
-                      <td className="py-2 font-mono">{wf}</td>
-                      <td className="py-2 text-right">{data.executions}</td>
-                      <td className="py-2 text-right">
-                        <CostBadge cost={data.cost} />
-                      </td>
-                      <td className="py-2 text-right">
-                        <CostBadge cost={data.executions > 0 ? data.cost / data.executions : 0} />
-                      </td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
+            <CostTable
+              headers={['Workflow', 'Executions', 'Total Cost', 'Avg Cost']}
+              rows={Object.entries(costs.byWorkflow)
+                .sort(([, a], [, b]) => b.cost - a.cost)
+                .map(([wf, data]) => ({
+                  key: wf,
+                  cells: [
+                    <span className="font-mono">{wf}</span>,
+                    <span>{data.executions}</span>,
+                    <CostBadge cost={data.cost} />,
+                    <CostBadge cost={data.executions > 0 ? data.cost / data.executions : 0} />,
+                  ],
+                  cost: data.cost,
+                }))}
+              maxCost={Math.max(...Object.values(costs.byWorkflow).map((d) => d.cost))}
+            />
           )}
         </div>
       </div>
@@ -176,11 +171,52 @@ export function CostDashboardPanel() {
   );
 }
 
-function SummaryCard({ label, value }: { label: string; value: string }) {
+function CostTable({
+  headers,
+  rows,
+  maxCost,
+}: {
+  headers: string[];
+  rows: { key: string; cells: React.ReactNode[]; cost: number }[];
+  maxCost: number;
+}) {
   return (
-    <div className="p-4 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--card))]">
-      <p className="text-xs text-[hsl(var(--muted-foreground))]">{label}</p>
-      <p className="text-2xl font-semibold mt-1">{value}</p>
+    <div className="rounded-xl border border-[hsl(var(--border))] overflow-hidden">
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]">
+            {headers.map((h, i) => (
+              <th
+                key={h}
+                className={cn('py-2 px-3 font-medium', i === 0 ? 'text-left' : 'text-right')}
+              >
+                {h}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.key} className="border-b last:border-b-0 border-[hsl(var(--border))]">
+              {row.cells.map((cell, i) => (
+                <td
+                  key={i}
+                  className={cn('py-2 px-3 relative', i === 0 ? 'text-left' : 'text-right')}
+                >
+                  {/* Proportion bar on cost column (last column) */}
+                  {i === row.cells.length - 1 && maxCost > 0 && (
+                    <div
+                      className="absolute inset-y-0 right-0 bg-[hsl(var(--primary)/0.08)] rounded-sm"
+                      style={{ width: `${(row.cost / maxCost) * 100}%` }}
+                    />
+                  )}
+                  <span className="relative">{cell}</span>
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

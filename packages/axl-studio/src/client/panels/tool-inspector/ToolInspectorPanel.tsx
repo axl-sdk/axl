@@ -1,18 +1,20 @@
 import { useState, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Wrench } from 'lucide-react';
+import { Wrench, ChevronRight, Loader2 } from 'lucide-react';
 import { PanelShell } from '../../components/layout/PanelShell';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { SchemaForm } from '../../components/shared/SchemaForm';
 import { JsonViewer } from '../../components/shared/JsonViewer';
+import { cn } from '../../lib/utils';
 import { fetchTools, fetchTool, testTool } from '../../lib/api';
 import type { ToolSummary } from '../../lib/types';
 
 export function ToolInspectorPanel() {
   const [selectedToolName, setSelectedToolName] = useState<string | null>(null);
-  const [result, setResult] = useState<unknown>(null);
+  const [result, setResult] = useState<unknown>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const [showRawSchema, setShowRawSchema] = useState(false);
 
   const { data: tools = [] } = useQuery({
     queryKey: ['tools'],
@@ -63,10 +65,11 @@ export function ToolInspectorPanel() {
                 key={t.name}
                 onClick={() => {
                   setSelectedToolName(t.name);
-                  setResult(null);
+                  setResult(undefined);
                   setError(null);
+                  setShowRawSchema(false);
                 }}
-                className={`w-full text-left px-3 py-2 text-xs rounded-md border ${
+                className={`w-full text-left px-3 py-2 text-xs rounded-xl border ${
                   selectedToolName === t.name
                     ? 'border-[hsl(var(--primary))] bg-[hsl(var(--accent))]'
                     : 'border-[hsl(var(--border))] hover:bg-[hsl(var(--accent))]'
@@ -101,7 +104,10 @@ export function ToolInspectorPanel() {
               description="Click a tool to view its schema and test it"
             />
           ) : !toolDetail ? (
-            <div className="text-sm text-[hsl(var(--muted-foreground))]">Loading...</div>
+            <div className="flex items-center gap-2 text-sm text-[hsl(var(--muted-foreground))]">
+              <Loader2 size={16} className="animate-spin" />
+              Loading tool details...
+            </div>
           ) : (
             <div className="space-y-6">
               <div>
@@ -138,33 +144,50 @@ export function ToolInspectorPanel() {
                 )}
               </div>
 
-              {/* Schema */}
+              {/* Schema — collapsed by default */}
               <div>
-                <h4 className="text-sm font-medium mb-2">Input Schema</h4>
-                <JsonViewer data={toolDetail.inputSchema} />
+                <button
+                  onClick={() => setShowRawSchema(!showRawSchema)}
+                  className="flex items-center gap-1.5 text-sm font-medium text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] transition-colors"
+                >
+                  <ChevronRight
+                    size={14}
+                    className={cn('transition-transform', showRawSchema && 'rotate-90')}
+                  />
+                  View raw schema
+                </button>
+                {showRawSchema && (
+                  <div className="mt-2">
+                    <JsonViewer data={toolDetail.inputSchema} />
+                  </div>
+                )}
               </div>
 
               {/* Test form */}
               <div>
                 <h4 className="text-sm font-medium mb-2">Test Tool</h4>
-                <SchemaForm
-                  schema={toolDetail.inputSchema as Record<string, unknown>}
-                  onSubmit={handleTest}
-                  submitLabel={running ? 'Running...' : 'Run Tool'}
-                />
+                <div className="rounded-xl border border-[hsl(var(--border))] p-4 bg-[hsl(var(--card))]">
+                  <SchemaForm
+                    schema={toolDetail.inputSchema as Record<string, unknown>}
+                    onSubmit={handleTest}
+                    submitLabel={running ? 'Running...' : 'Run Tool'}
+                  />
+                </div>
               </div>
 
               {/* Result */}
-              {result !== null && (
+              {result !== undefined && (
                 <div>
                   <h4 className="text-sm font-medium mb-2">Result</h4>
-                  <JsonViewer data={result} />
+                  <div className="rounded-xl border border-[hsl(var(--border))] p-4 bg-[hsl(var(--card))]">
+                    <JsonViewer data={result} />
+                  </div>
                 </div>
               )}
 
               {/* Error */}
               {error && (
-                <div className="p-3 rounded-md bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm">
+                <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm">
                   {error}
                 </div>
               )}

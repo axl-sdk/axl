@@ -1,4 +1,6 @@
 import { useMemo } from 'react';
+import { cn } from '../../lib/utils';
+import { scoreBarColor } from './types';
 import type { EvalItem } from './types';
 
 type Props = {
@@ -6,68 +8,59 @@ type Props = {
   scorerNames: string[];
 };
 
-const BUCKET_COUNT = 10;
-const BUCKET_LABELS = [
-  '[0, 0.1)',
-  '[0.1, 0.2)',
-  '[0.2, 0.3)',
-  '[0.3, 0.4)',
-  '[0.4, 0.5)',
-  '[0.5, 0.6)',
-  '[0.6, 0.7)',
-  '[0.7, 0.8)',
-  '[0.8, 0.9)',
-  '[0.9, 1.0]',
-];
-
-function bucketIndex(score: number): number {
-  // Clamp to [0, 1] and compute bucket; score of exactly 1.0 goes in last bucket
-  const clamped = Math.max(0, Math.min(1, score));
-  const idx = Math.floor(clamped * BUCKET_COUNT);
-  return Math.min(idx, BUCKET_COUNT - 1);
-}
-
-function Distribution({
-  name,
-  buckets,
-  maxCount,
-}: {
-  name: string;
-  buckets: number[];
-  maxCount: number;
-}) {
-  const hasScores = buckets.some((c) => c > 0);
+/** Compact strip chart — each scorer gets a single row with tick marks for each item's score. */
+function ScorerStrip({ name, scores, mean }: { name: string; scores: number[]; mean: number }) {
+  if (scores.length === 0) {
+    return (
+      <div className="flex items-center gap-3">
+        <span
+          className="w-28 text-xs font-mono truncate text-[hsl(var(--muted-foreground))]"
+          title={name}
+        >
+          {name}
+        </span>
+        <span className="text-xs text-[hsl(var(--muted-foreground))]">No valid scores</span>
+      </div>
+    );
+  }
 
   return (
-    <div>
-      <h4 className="text-xs font-mono font-medium mb-2">{name}</h4>
-      {hasScores ? (
-        <div className="space-y-0.5">
-          {buckets.map((count, i) => (
-            <div key={i} className="flex items-center gap-2 text-xs">
-              <span className="w-16 text-right font-mono text-[hsl(var(--muted-foreground))]">
-                {BUCKET_LABELS[i]}
-              </span>
-              <div className="flex-1 h-4 bg-[hsl(var(--secondary))] rounded overflow-hidden">
-                {count > 0 && (
-                  <div
-                    className="h-full bg-[hsl(var(--primary))] rounded"
-                    style={{
-                      width: `${(count / maxCount) * 100}%`,
-                      opacity: 0.8,
-                    }}
-                  />
-                )}
-              </div>
-              <span className="w-6 text-right font-mono text-[hsl(var(--muted-foreground))]">
-                {count}
-              </span>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <p className="text-xs text-[hsl(var(--muted-foreground))]">No valid scores</p>
-      )}
+    <div className="flex items-center gap-3">
+      <span className="w-28 text-xs font-mono truncate" title={name}>
+        {name}
+      </span>
+      <div className="flex-1 h-5 relative bg-[hsl(var(--secondary))] rounded">
+        {/* Scale markers */}
+        {[0.25, 0.5, 0.75].map((v) => (
+          <div
+            key={v}
+            className="absolute top-0 bottom-0 w-px bg-[hsl(var(--border))]"
+            style={{ left: `${v * 100}%` }}
+          />
+        ))}
+        {/* Score ticks */}
+        {scores.map((score, i) => (
+          <div
+            key={i}
+            className={cn('absolute w-1 top-[3px] bottom-[3px] rounded-sm', scoreBarColor(score))}
+            style={{
+              left: `${Math.max(1, Math.min(99, score * 100))}%`,
+              transform: 'translateX(-50%)',
+              opacity: 0.45,
+            }}
+            title={score.toFixed(3)}
+          />
+        ))}
+        {/* Mean marker */}
+        <div
+          className="absolute top-0 bottom-0 w-0.5 bg-[hsl(var(--foreground))]"
+          style={{ left: `${mean * 100}%`, opacity: 0.3 }}
+          title={`Mean: ${mean.toFixed(3)}`}
+        />
+      </div>
+      <span className="w-12 text-xs font-mono text-right text-[hsl(var(--muted-foreground))] tabular-nums">
+        {mean.toFixed(3)}
+      </span>
     </div>
   );
 }
@@ -75,31 +68,42 @@ function Distribution({
 export function ScoreDistribution({ items, scorerNames }: Props) {
   const distributions = useMemo(() => {
     return scorerNames.map((name) => {
-      const buckets = new Array<number>(BUCKET_COUNT).fill(0);
+      const scores: number[] = [];
       for (const item of items) {
         const score = item.scores[name];
         if (score != null && !item.error) {
-          buckets[bucketIndex(score)]++;
+          scores.push(score);
         }
       }
-      const maxCount = Math.max(...buckets, 1);
-      return { name, buckets, maxCount };
+      const mean = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
+      return { name, scores, mean };
     });
   }, [items, scorerNames]);
 
   if (scorerNames.length === 0) return null;
 
   return (
-    <div>
-      <h3 className="text-sm font-medium mb-3">Score Distribution</h3>
-      <div className="grid grid-cols-1 gap-4">
+    <div className="rounded-xl border border-[hsl(var(--border))] overflow-hidden">
+      <div className="px-4 py-2.5 bg-[hsl(var(--muted))] border-b border-[hsl(var(--border))]">
+        <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+          Score Distribution
+        </h3>
+      </div>
+      <div className="p-4 space-y-2">
+        {/* Scale labels */}
+        <div className="flex items-center gap-3 mb-1">
+          <span className="w-28" />
+          <div className="flex-1 flex justify-between text-[10px] font-mono text-[hsl(var(--muted-foreground))]">
+            <span>0</span>
+            <span>0.25</span>
+            <span>0.5</span>
+            <span>0.75</span>
+            <span>1.0</span>
+          </div>
+          <span className="w-12" />
+        </div>
         {distributions.map((dist) => (
-          <Distribution
-            key={dist.name}
-            name={dist.name}
-            buckets={dist.buckets}
-            maxCount={dist.maxCount}
-          />
+          <ScorerStrip key={dist.name} name={dist.name} scores={dist.scores} mean={dist.mean} />
         ))}
       </div>
     </div>

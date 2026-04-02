@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import { JsonViewer } from '../../components/shared/JsonViewer';
-import { formatCost, formatDuration } from '../../lib/utils';
+import { cn, formatCost, formatDuration } from '../../lib/utils';
 import type { EvalItem } from './types';
-import { scoreColorClass } from './types';
+import { scoreColorClass, scoreTextColor, scoreBarColor } from './types';
 
 type Props = {
   item: EvalItem;
@@ -19,17 +19,32 @@ function ReasoningBlock({ text }: { text: string }) {
 
   return (
     <div>
-      <pre className="text-xs font-mono p-3 rounded-md bg-[hsl(var(--secondary))] overflow-auto max-h-96 whitespace-pre-wrap">
-        {needsTruncation && !expanded ? text.slice(0, REASONING_TRUNCATE_LENGTH) + '...' : text}
+      <pre className="text-xs font-mono p-3 rounded-lg bg-[hsl(var(--secondary))] overflow-auto max-h-96 whitespace-pre-wrap leading-relaxed">
+        {needsTruncation && !expanded ? text.slice(0, REASONING_TRUNCATE_LENGTH) + '\u2026' : text}
       </pre>
       {needsTruncation && (
         <button
           onClick={() => setExpanded(!expanded)}
-          className="text-xs text-[hsl(var(--primary))] hover:underline mt-1"
+          className="text-xs text-[hsl(var(--primary))] hover:underline mt-1.5"
         >
           {expanded ? 'Show less' : 'Show more'}
         </button>
       )}
+    </div>
+  );
+}
+
+function DataCard({ label, data }: { label: string; data: unknown }) {
+  return (
+    <div className="rounded-xl border border-[hsl(var(--border))] overflow-hidden">
+      <div className="px-4 py-2.5 bg-[hsl(var(--muted))]/50 border-b border-[hsl(var(--border))]">
+        <span className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+          {label}
+        </span>
+      </div>
+      <div className="p-4">
+        <JsonViewer data={data} collapsed />
+      </div>
     </div>
   );
 }
@@ -43,74 +58,99 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
   const totalItemCost = workflowCost + scorerCost;
 
   return (
-    <div className="space-y-4">
-      <button
-        onClick={onBack}
-        className="px-3 py-1.5 text-xs rounded-md border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))]"
-      >
-        Back to list
-      </button>
-
-      <h3 className="text-sm font-medium">Item #{itemIndex + 1}</h3>
-
-      {/* Input */}
-      <div className="text-xs">
-        <span className="font-medium">Input:</span>
-        <JsonViewer data={item.input} collapsed />
+    <div className="space-y-5">
+      {/* ── Breadcrumb + badges ────────────────────────── */}
+      <div className="flex items-center justify-between">
+        <nav className="flex items-center gap-1.5 text-sm">
+          <button
+            onClick={onBack}
+            className="text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] transition-colors"
+          >
+            Overview
+          </button>
+          <span className="text-[hsl(var(--muted-foreground))]">/</span>
+          <span className="font-medium">Item #{itemIndex + 1}</span>
+          {item.error && (
+            <span className="ml-1 inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/30">
+              Error
+            </span>
+          )}
+        </nav>
+        <div className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))] font-mono">
+          {item.duration != null && <span>{formatDuration(item.duration)}</span>}
+          {totalItemCost > 0 && <span>{formatCost(totalItemCost)}</span>}
+        </div>
       </div>
 
-      {/* Annotations (ground truth) */}
-      {item.annotations != null && (
-        <div className="text-xs">
-          <span className="font-medium">Expected:</span>
-          <JsonViewer data={item.annotations} collapsed />
+      {/* ── Score overview strip ───────────────────────── */}
+      {scorerNames.length > 0 && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 py-3 px-4 rounded-xl bg-[hsl(var(--muted))]/50">
+          {scorerNames.map((name) => {
+            const score = item.scores[name];
+            return (
+              <div key={name} className="flex items-center gap-2">
+                <span className="text-xs text-[hsl(var(--muted-foreground))]">{name}</span>
+                {score != null ? (
+                  <div className="flex items-center gap-1.5">
+                    {/* Mini bar */}
+                    <div className="w-12 h-1.5 bg-[hsl(var(--secondary))] rounded-full overflow-hidden">
+                      <div
+                        className={cn('h-full rounded-full', scoreBarColor(score))}
+                        style={{ width: `${score * 100}%` }}
+                      />
+                    </div>
+                    <span
+                      className={cn(
+                        'text-xs font-mono font-medium tabular-nums',
+                        scoreTextColor(score),
+                      )}
+                    >
+                      {score.toFixed(2)}
+                    </span>
+                  </div>
+                ) : (
+                  <span className="text-xs text-[hsl(var(--muted-foreground))] font-mono">—</span>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
 
-      {/* Output */}
-      <div className="text-xs">
-        <span className="font-medium">Output:</span>
-        <JsonViewer data={item.output} collapsed />
-      </div>
-
-      {/* Error */}
+      {/* ── Error ─────────────────────────────────────── */}
       {item.error && (
-        <div className="text-xs">
-          <span className="font-medium text-red-600 dark:text-red-400">Error:</span>
-          <span className="ml-1">{item.error}</span>
+        <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-xs font-mono">
+          {item.error}
         </div>
       )}
 
-      {/* Duration & cost summary */}
-      {(item.duration != null || totalItemCost > 0) && (
-        <div className="flex items-center gap-3 text-xs text-[hsl(var(--muted-foreground))]">
-          {item.duration != null && (
-            <span>
-              Duration: <span className="font-mono">{formatDuration(item.duration)}</span>
-            </span>
-          )}
-          {totalItemCost > 0 && workflowCost > 0 && scorerCost > 0 && (
-            <span>
-              Cost: <span className="font-mono">{formatCost(workflowCost)}</span> workflow
-              {' + '}
-              <span className="font-mono">{formatCost(scorerCost)}</span> scoring
-              {' = '}
-              <span className="font-mono">{formatCost(totalItemCost)}</span>
-            </span>
-          )}
-          {totalItemCost > 0 && !(workflowCost > 0 && scorerCost > 0) && (
-            <span>
-              Cost: <span className="font-mono">{formatCost(totalItemCost)}</span>
-            </span>
-          )}
+      {/* ── Input / Output / Expected ─────────────────── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        <DataCard label="Input" data={item.input} />
+        <DataCard label="Output" data={item.output} />
+      </div>
+      {item.annotations != null && (
+        <DataCard label="Expected (Annotations)" data={item.annotations} />
+      )}
+
+      {/* ── Cost breakdown ────────────────────────────── */}
+      {totalItemCost > 0 && workflowCost > 0 && scorerCost > 0 && (
+        <div className="flex items-center gap-3 text-xs text-[hsl(var(--muted-foreground))] font-mono">
+          <span>Workflow: {formatCost(workflowCost)}</span>
+          <span>+</span>
+          <span>Scoring: {formatCost(scorerCost)}</span>
+          <span>=</span>
+          <span className="font-medium text-[hsl(var(--foreground))]">
+            {formatCost(totalItemCost)}
+          </span>
         </div>
       )}
 
-      {/* Per-scorer sections */}
+      {/* ── Scorer details ────────────────────────────── */}
       {scorerNames.length > 0 && (
         <div className="space-y-3">
-          <h4 className="text-xs font-medium text-[hsl(var(--muted-foreground))]">
-            Scorer Details
+          <h4 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+            Scorer Results
           </h4>
           {scorerNames.map((name) => {
             const score = item.scores[name];
@@ -120,68 +160,83 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
             return (
               <div
                 key={name}
-                className="border border-[hsl(var(--border))] rounded-md p-3 space-y-2"
+                className="rounded-xl border border-[hsl(var(--border))] overflow-hidden"
               >
-                <div className="flex items-center gap-2 text-xs">
-                  <span className="font-mono font-medium">{name}</span>
+                {/* Scorer header */}
+                <div className="flex items-center gap-2 px-4 py-2.5 bg-[hsl(var(--muted))]/50">
+                  <span className="font-mono text-xs font-medium">{name}</span>
                   {score != null && (
-                    <span className={`px-1.5 py-0.5 rounded font-mono ${scoreColorClass(score)}`}>
+                    <span
+                      className={cn(
+                        'px-2 py-0.5 rounded-full text-xs font-mono font-medium',
+                        scoreColorClass(score),
+                      )}
+                    >
                       {score.toFixed(3)}
                     </span>
                   )}
                   {score == null && !scorerError && (
-                    <span className="px-1.5 py-0.5 rounded font-mono bg-[hsl(var(--secondary))] text-[hsl(var(--muted-foreground))]">
+                    <span className="px-2 py-0.5 rounded-full text-xs font-mono bg-[hsl(var(--secondary))] text-[hsl(var(--muted-foreground))]">
                       null
                     </span>
                   )}
-                  {detail?.duration != null && (
-                    <span className="px-1.5 py-0.5 rounded font-mono bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]">
-                      {formatDuration(detail.duration)}
-                    </span>
-                  )}
-                  {detail?.cost != null && detail.cost > 0 && (
-                    <span className="px-1.5 py-0.5 rounded font-mono bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]">
-                      {formatCost(detail.cost)}
-                    </span>
-                  )}
+                  <div className="ml-auto flex items-center gap-2">
+                    {detail?.duration != null && (
+                      <span className="text-xs font-mono text-[hsl(var(--muted-foreground))]">
+                        {formatDuration(detail.duration)}
+                      </span>
+                    )}
+                    {detail?.cost != null && detail.cost > 0 && (
+                      <span className="text-xs font-mono text-[hsl(var(--muted-foreground))]">
+                        {formatCost(detail.cost)}
+                      </span>
+                    )}
+                  </div>
                 </div>
 
-                {/* Scorer reasoning */}
-                {detail?.metadata &&
-                  typeof detail.metadata.reasoning === 'string' &&
-                  detail.metadata.reasoning.length > 0 && (
-                    <div className="text-xs">
-                      <span className="font-medium text-[hsl(var(--muted-foreground))]">
-                        Reasoning:
-                      </span>
-                      <ReasoningBlock text={detail.metadata.reasoning} />
-                    </div>
-                  )}
+                {/* Scorer body */}
+                {(detail?.metadata || scorerError) && (
+                  <div className="px-4 py-3 space-y-2">
+                    {/* Reasoning */}
+                    {detail?.metadata &&
+                      typeof detail.metadata.reasoning === 'string' &&
+                      detail.metadata.reasoning.length > 0 && (
+                        <div>
+                          <span className="text-[11px] font-medium text-[hsl(var(--muted-foreground))] block mb-1.5 uppercase tracking-wider">
+                            Reasoning
+                          </span>
+                          <ReasoningBlock text={detail.metadata.reasoning} />
+                        </div>
+                      )}
 
-                {/* Other metadata (excluding reasoning if shown above) */}
-                {detail?.metadata &&
-                  (() => {
-                    const otherKeys = Object.keys(detail.metadata!).filter(
-                      (k) => k !== 'reasoning',
-                    );
-                    if (otherKeys.length === 0) return null;
-                    const otherMeta: Record<string, unknown> = {};
-                    for (const k of otherKeys) {
-                      otherMeta[k] = detail.metadata![k];
-                    }
-                    return (
-                      <div className="text-xs">
-                        <span className="font-medium text-[hsl(var(--muted-foreground))]">
-                          Metadata:
-                        </span>
-                        <JsonViewer data={otherMeta} collapsed />
+                    {/* Other metadata (excluding reasoning) */}
+                    {detail?.metadata &&
+                      (() => {
+                        const otherKeys = Object.keys(detail.metadata!).filter(
+                          (k) => k !== 'reasoning',
+                        );
+                        if (otherKeys.length === 0) return null;
+                        const otherMeta: Record<string, unknown> = {};
+                        for (const k of otherKeys) {
+                          otherMeta[k] = detail.metadata![k];
+                        }
+                        return (
+                          <div>
+                            <span className="text-[11px] font-medium text-[hsl(var(--muted-foreground))] block mb-1.5 uppercase tracking-wider">
+                              Metadata
+                            </span>
+                            <JsonViewer data={otherMeta} collapsed />
+                          </div>
+                        );
+                      })()}
+
+                    {/* Scorer error */}
+                    {scorerError && (
+                      <div className="text-xs text-amber-600 dark:text-amber-400 font-mono p-2.5 rounded-lg bg-amber-50 dark:bg-amber-950/30">
+                        {scorerError}
                       </div>
-                    );
-                  })()}
-
-                {/* Scorer error */}
-                {scorerError && (
-                  <div className="text-xs text-amber-600 dark:text-amber-400">{scorerError}</div>
+                    )}
+                  </div>
                 )}
               </div>
             );

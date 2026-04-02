@@ -10,3 +10,4 @@ coverage/
 !.claude/agents/
 .vscode/
 GEMINI.md
+axl.config.*

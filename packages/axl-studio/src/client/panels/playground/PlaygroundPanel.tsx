@@ -7,9 +7,10 @@ import { StreamingText } from '../../components/shared/StreamingText';
 import { JsonViewer } from '../../components/shared/JsonViewer';
 import { fetchAgents, playgroundChat } from '../../lib/api';
 import { useWsStream } from '../../hooks/use-ws-stream';
+import { formatCost, formatTokens } from '../../lib/utils';
 import type { AgentSummary } from '../../lib/types';
 
-type ToolCall = { name: string; args: unknown; result?: unknown };
+type ToolCall = { name: string; args: unknown; result?: unknown; callId?: string };
 type Handoff = { source: string; target: string; mode: string };
 
 type Message = {
@@ -27,7 +28,10 @@ export function PlaygroundPanel() {
   const [executionId, setExecutionId] = useState<string | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<string>('');
   const [isStreaming, setIsStreaming] = useState(false);
+  const [totalCost, setTotalCost] = useState(0);
+  const [totalTokens, setTotalTokens] = useState({ input: 0, output: 0 });
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const processedEventsCount = useRef(0);
 
   const { data: agents = [] } = useQuery({
     queryKey: ['agents'],
@@ -50,8 +54,19 @@ export function PlaygroundPanel() {
     if (stream.done) {
       setIsStreaming(false);
       setExecutionId(null);
+      // Show stream error as an assistant message
+      if (stream.error) {
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          // If the last message is an empty assistant placeholder, replace it
+          if (last?.role === 'assistant' && !last.content) {
+            return [...prev.slice(0, -1), { role: 'assistant', content: `Error: ${stream.error}` }];
+          }
+          return [...prev, { role: 'assistant', content: `Error: ${stream.error}` }];
+        });
+      }
     }
-  }, [stream.tokens, stream.done, isStreaming]);
+  }, [stream.tokens, stream.done, stream.error, isStreaming]);
 
   // Collect tool calls, handoffs, and approvals from stream events
   useEffect(() => {
@@ -61,10 +76,13 @@ export function PlaygroundPanel() {
 
     for (const event of stream.events) {
       if (event.type === 'tool_call') {
-        toolCalls.push({ name: event.name, args: event.args });
+        toolCalls.push({ name: event.name, args: event.args, callId: event.callId });
       }
       if (event.type === 'tool_result') {
-        const existing = toolCalls.find((tc) => tc.name === event.name && !tc.result);
+        // Match by callId when available (reliable), fall back to name (legacy)
+        const existing = event.callId
+          ? toolCalls.find((tc) => tc.callId === event.callId)
+          : toolCalls.find((tc) => tc.name === event.name && !tc.result);
         if (existing) existing.result = event.result;
       }
       // Handle handoff and approval events
@@ -92,6 +110,33 @@ export function PlaygroundPanel() {
         }
         return prev;
       });
+    }
+  }, [stream.events]);
+
+  // Track cost and tokens from stream events incrementally
+  useEffect(() => {
+    const newEvents = stream.events.slice(processedEventsCount.current);
+    if (newEvents.length === 0) return;
+    processedEventsCount.current = stream.events.length;
+
+    let addedCost = 0;
+    let addedInput = 0;
+    let addedOutput = 0;
+    for (const event of newEvents) {
+      if (event.type === 'agent_end' && event.cost) {
+        addedCost += event.cost;
+      }
+      if (event.type === 'step' && event.data.tokens) {
+        addedInput += event.data.tokens.input ?? 0;
+        addedOutput += event.data.tokens.output ?? 0;
+      }
+    }
+    if (addedCost > 0) setTotalCost((prev) => prev + addedCost);
+    if (addedInput > 0 || addedOutput > 0) {
+      setTotalTokens((prev) => ({
+        input: prev.input + addedInput,
+        output: prev.output + addedOutput,
+      }));
     }
   }, [stream.events]);
 
@@ -135,12 +180,28 @@ export function PlaygroundPanel() {
     }
   };
 
+  const hasCostData = totalCost > 0 || totalTokens.input > 0;
+
   return (
     <PanelShell
       title="Agent Playground"
       description="Chat with registered agents in real-time"
       actions={
         <div className="flex items-center gap-2">
+          {hasCostData && (
+            <div className="flex items-center gap-1.5">
+              {totalCost > 0 && (
+                <span className="px-1.5 py-0.5 rounded text-xs font-mono bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]">
+                  {formatCost(totalCost)}
+                </span>
+              )}
+              {totalTokens.input > 0 && (
+                <span className="px-1.5 py-0.5 rounded text-xs font-mono bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]">
+                  {formatTokens(totalTokens.input + totalTokens.output)} tok
+                </span>
+              )}
+            </div>
+          )}
           {agents.length > 0 && (
             <select
               value={selectedAgent}
@@ -160,6 +221,8 @@ export function PlaygroundPanel() {
               setMessages([]);
               setSessionId(null);
               setExecutionId(null);
+              setTotalCost(0);
+              setTotalTokens({ input: 0, output: 0 });
             }}
             className="px-3 py-1.5 text-sm rounded-md border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))]"
           >
@@ -183,7 +246,7 @@ export function PlaygroundPanel() {
               className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
             >
               <div
-                className={`max-w-[80%] rounded-lg px-4 py-2.5 text-sm ${
+                className={`max-w-[80%] rounded-xl px-4 py-2.5 text-sm ${
                   msg.role === 'user'
                     ? 'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))]'
                     : 'bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]'
@@ -228,13 +291,13 @@ export function PlaygroundPanel() {
                   </div>
                 )}
 
-                {/* Tool calls */}
+                {/* Tool calls — shown expanded by default */}
                 {msg.toolCalls && msg.toolCalls.length > 0 && (
                   <div className="mt-2 space-y-2 border-t border-[hsl(var(--border))] pt-2">
                     {msg.toolCalls.map((tc, j) => (
-                      <details key={j} className="text-xs">
-                        <summary className="cursor-pointer font-medium">Tool: {tc.name}</summary>
-                        <div className="mt-1 space-y-1">
+                      <div key={j} className="text-xs">
+                        <div className="font-medium mb-1">Tool: {tc.name}</div>
+                        <div className="space-y-1">
                           <div className="text-[hsl(var(--muted-foreground))]">Input:</div>
                           <JsonViewer data={tc.args} collapsed />
                           {tc.result !== undefined && (
@@ -244,7 +307,7 @@ export function PlaygroundPanel() {
                             </>
                           )}
                         </div>
-                      </details>
+                      </div>
                     ))}
                   </div>
                 )}
@@ -263,12 +326,12 @@ export function PlaygroundPanel() {
               onKeyDown={handleKeyDown}
               placeholder="Type a message..."
               rows={1}
-              className="flex-1 px-3 py-2.5 text-sm rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] resize-none focus:outline-none focus:ring-2 focus:ring-[hsl(var(--ring))]"
+              className="flex-1 px-3 py-2.5 text-sm rounded-xl border border-[hsl(var(--input))] bg-[hsl(var(--background))] resize-none focus:outline-none focus:ring-2 focus:ring-[hsl(var(--ring))]"
             />
             <button
               onClick={handleSend}
               disabled={!input.trim() || isStreaming}
-              className="p-2.5 rounded-md bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] hover:opacity-90 disabled:opacity-50 transition-opacity"
+              className="p-2.5 rounded-xl bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] hover:opacity-90 disabled:opacity-50 transition-opacity"
             >
               <Send size={16} />
             </button>

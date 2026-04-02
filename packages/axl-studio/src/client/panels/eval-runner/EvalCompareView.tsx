@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import { JsonViewer } from '../../components/shared/JsonViewer';
-import { formatCost, formatDuration } from '../../lib/utils';
+import { cn, formatCost, formatDuration } from '../../lib/utils';
 import type { ComparisonResult, EvalResultData } from './types';
-import { scoreColorClass } from './types';
+import { scoreColorClass, scoreTextColor } from './types';
 
 type Props = {
   compareResult: ComparisonResult;
@@ -21,15 +21,14 @@ function DeltaCell({
   invert?: boolean;
   format?: (v: number) => string;
 }) {
-  // For timing and cost, positive delta means worse (invert=true flips the color)
   const isPositive = invert ? value < 0 : value > 0;
   const isNegative = invert ? value > 0 : value < 0;
 
   const colorClass = isPositive
-    ? 'text-green-600 dark:text-green-400'
+    ? 'text-emerald-600 dark:text-emerald-400'
     : isNegative
       ? 'text-red-600 dark:text-red-400'
-      : '';
+      : 'text-[hsl(var(--muted-foreground))]';
 
   const formatted = format
     ? `${value > 0 ? '+' : value < 0 ? '-' : ''}${format(Math.abs(value))}`
@@ -37,8 +36,8 @@ function DeltaCell({
 
   return (
     <>
-      <td className={`py-2 text-right font-mono ${colorClass}`}>{formatted}</td>
-      <td className={`py-2 text-right font-mono ${colorClass}`}>
+      <td className={cn('py-2.5 text-right font-mono', colorClass)}>{formatted}</td>
+      <td className={cn('py-2.5 text-right font-mono', colorClass)}>
         {percent > 0 ? '+' : ''}
         {percent.toFixed(1)}%
       </td>
@@ -60,86 +59,105 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
   };
 
   return (
-    <div className="space-y-4">
-      {compareResult.summary && <p className="text-sm">{compareResult.summary}</p>}
+    <div className="space-y-6">
+      {compareResult.summary && (
+        <p className="text-sm text-[hsl(var(--muted-foreground))]">{compareResult.summary}</p>
+      )}
 
-      {/* Scorer comparison table */}
+      {/* ── Scorer comparison table ──────────────────────── */}
       {compareResult.scorers && Object.keys(compareResult.scorers).length > 0 && (
-        <div>
-          <h3 className="text-sm font-medium mb-2">Scorer Comparison</h3>
-          <table className="w-full text-xs">
-            <thead>
-              <tr className="border-b border-[hsl(var(--border))]">
-                <th className="text-left py-2 font-medium">Metric</th>
-                <th className="text-right py-2 font-medium">Baseline</th>
-                <th className="text-right py-2 font-medium">Candidate</th>
-                <th className="text-right py-2 font-medium">Delta</th>
-                <th className="text-right py-2 font-medium">%</th>
-              </tr>
-            </thead>
-            <tbody>
-              {Object.entries(compareResult.scorers).map(([scorer, stats]) => (
-                <tr key={scorer} className="border-b border-[hsl(var(--border))]">
-                  <td className="py-2 font-mono">{scorer}</td>
-                  <td className="py-2 text-right font-mono">{stats.baselineMean.toFixed(3)}</td>
-                  <td className="py-2 text-right font-mono">{stats.candidateMean.toFixed(3)}</td>
-                  <DeltaCell value={stats.delta} percent={stats.deltaPercent} />
-                </tr>
-              ))}
-
-              {/* Timing comparison */}
-              {compareResult.timing && (
+        <div className="border border-[hsl(var(--border))] rounded-xl overflow-hidden">
+          <div className="px-4 py-2.5 bg-[hsl(var(--muted))] border-b border-[hsl(var(--border))]">
+            <h3 className="text-xs font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+              Scorer Comparison
+            </h3>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
                 <tr className="border-b border-[hsl(var(--border))]">
-                  <td className="py-2 font-mono text-[hsl(var(--muted-foreground))]">
-                    Timing (mean)
-                  </td>
-                  <td className="py-2 text-right font-mono">
-                    {formatDuration(compareResult.timing.baselineMean)}
-                  </td>
-                  <td className="py-2 text-right font-mono">
-                    {formatDuration(compareResult.timing.candidateMean)}
-                  </td>
-                  <DeltaCell
-                    value={compareResult.timing.delta}
-                    percent={compareResult.timing.deltaPercent}
-                    invert
-                    format={formatDuration}
-                  />
+                  <th className="text-left px-4 py-2 font-medium">Metric</th>
+                  <th className="text-right px-3 py-2 font-medium">Baseline</th>
+                  <th className="text-right px-3 py-2 font-medium">Candidate</th>
+                  <th className="text-right px-3 py-2 font-medium">Delta</th>
+                  <th className="text-right px-3 py-2 font-medium">%</th>
                 </tr>
-              )}
+              </thead>
+              <tbody>
+                {Object.entries(compareResult.scorers).map(([scorer, stats]) => (
+                  <tr key={scorer} className="border-b border-[hsl(var(--border))] last:border-b-0">
+                    <td className="px-4 py-2.5 font-mono">{scorer}</td>
+                    <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">
+                      {stats.baselineMean.toFixed(3)}
+                    </td>
+                    <td
+                      className={cn(
+                        'px-3 py-2.5 text-right font-mono',
+                        scoreTextColor(stats.candidateMean),
+                      )}
+                    >
+                      {stats.candidateMean.toFixed(3)}
+                    </td>
+                    <DeltaCell value={stats.delta} percent={stats.deltaPercent} />
+                  </tr>
+                ))}
 
-              {/* Cost comparison */}
-              {compareResult.cost && (
-                <tr className="border-b border-[hsl(var(--border))]">
-                  <td className="py-2 font-mono text-[hsl(var(--muted-foreground))]">
-                    Cost (total)
-                  </td>
-                  <td className="py-2 text-right font-mono">
-                    {formatCost(compareResult.cost.baselineTotal)}
-                  </td>
-                  <td className="py-2 text-right font-mono">
-                    {formatCost(compareResult.cost.candidateTotal)}
-                  </td>
-                  <DeltaCell
-                    value={compareResult.cost.delta}
-                    percent={compareResult.cost.deltaPercent}
-                    invert
-                    format={formatCost}
-                  />
-                </tr>
-              )}
-            </tbody>
-          </table>
+                {/* Timing comparison */}
+                {compareResult.timing && (
+                  <tr className="border-t-2 border-[hsl(var(--border))]">
+                    <td className="px-4 py-2.5 font-mono text-[hsl(var(--muted-foreground))]">
+                      Timing (mean)
+                    </td>
+                    <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">
+                      {formatDuration(compareResult.timing.baselineMean)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">
+                      {formatDuration(compareResult.timing.candidateMean)}
+                    </td>
+                    <DeltaCell
+                      value={compareResult.timing.delta}
+                      percent={compareResult.timing.deltaPercent}
+                      invert
+                      format={formatDuration}
+                    />
+                  </tr>
+                )}
+
+                {/* Cost comparison */}
+                {compareResult.cost != null && (
+                  <tr className="border-t border-[hsl(var(--border))]">
+                    <td className="px-4 py-2.5 font-mono text-[hsl(var(--muted-foreground))]">
+                      Cost (total)
+                    </td>
+                    <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">
+                      {formatCost(compareResult.cost.baselineTotal)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">
+                      {formatCost(compareResult.cost.candidateTotal)}
+                    </td>
+                    <DeltaCell
+                      value={compareResult.cost.delta}
+                      percent={compareResult.cost.deltaPercent}
+                      invert
+                      format={formatCost}
+                    />
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
-      {/* Regressions */}
+      {/* ── Regressions ──────────────────────────────────── */}
       {compareResult.regressions && compareResult.regressions.length > 0 && (
-        <div>
-          <h3 className="text-sm font-medium mb-2 text-red-600 dark:text-red-400">
-            Regressions ({compareResult.regressions.length})
-          </h3>
-          <div className="space-y-1">
+        <div className="border border-red-200 dark:border-red-900 rounded-lg overflow-hidden">
+          <div className="px-4 py-2.5 bg-red-50 dark:bg-red-950/30 border-b border-red-200 dark:border-red-900">
+            <h3 className="text-xs font-medium text-red-700 dark:text-red-300">
+              Regressions ({compareResult.regressions.length})
+            </h3>
+          </div>
+          <div className="divide-y divide-[hsl(var(--border))]">
             {compareResult.regressions.map((r, i) => {
               const isExpanded = expanded?.type === 'regression' && expanded.index === i;
               const baselineItem = baseline?.items[r.itemIndex];
@@ -149,14 +167,17 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
                 <div key={i}>
                   <button
                     onClick={() => toggleExpand('regression', i)}
-                    className="w-full text-left flex items-center justify-between px-3 py-1.5 text-xs border border-[hsl(var(--border))] rounded hover:bg-[hsl(var(--accent))] cursor-pointer"
+                    className="w-full text-left flex items-center justify-between px-4 py-2.5 text-xs hover:bg-[hsl(var(--accent))] transition-colors"
                   >
                     <span className="font-mono">
-                      Item #{r.itemIndex + 1} - {r.scorer}
+                      Item #{r.itemIndex + 1}{' '}
+                      <span className="text-[hsl(var(--muted-foreground))]">{r.scorer}</span>
                     </span>
                     <span className="font-mono text-red-600 dark:text-red-400">
-                      {r.baselineScore.toFixed(2)} {'\u2192'} {r.candidateScore.toFixed(2)} (
-                      {r.delta.toFixed(2)})
+                      {r.baselineScore.toFixed(2)} {'\u2192'} {r.candidateScore.toFixed(2)}{' '}
+                      <span className="text-[hsl(var(--muted-foreground))]">
+                        ({r.delta.toFixed(2)})
+                      </span>
                     </span>
                   </button>
                   {isExpanded && baselineItem && candidateItem && (
@@ -173,13 +194,15 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
         </div>
       )}
 
-      {/* Improvements */}
+      {/* ── Improvements ─────────────────────────────────── */}
       {compareResult.improvements && compareResult.improvements.length > 0 && (
-        <div>
-          <h3 className="text-sm font-medium mb-2 text-green-600 dark:text-green-400">
-            Improvements ({compareResult.improvements.length})
-          </h3>
-          <div className="space-y-1">
+        <div className="border border-emerald-200 dark:border-emerald-900 rounded-lg overflow-hidden">
+          <div className="px-4 py-2.5 bg-emerald-50 dark:bg-emerald-950/30 border-b border-emerald-200 dark:border-emerald-900">
+            <h3 className="text-xs font-medium text-emerald-700 dark:text-emerald-300">
+              Improvements ({compareResult.improvements.length})
+            </h3>
+          </div>
+          <div className="divide-y divide-[hsl(var(--border))]">
             {compareResult.improvements.map((r, i) => {
               const isExpanded = expanded?.type === 'improvement' && expanded.index === i;
               const baselineItem = baseline?.items[r.itemIndex];
@@ -189,14 +212,17 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
                 <div key={i}>
                   <button
                     onClick={() => toggleExpand('improvement', i)}
-                    className="w-full text-left flex items-center justify-between px-3 py-1.5 text-xs border border-[hsl(var(--border))] rounded hover:bg-[hsl(var(--accent))] cursor-pointer"
+                    className="w-full text-left flex items-center justify-between px-4 py-2.5 text-xs hover:bg-[hsl(var(--accent))] transition-colors"
                   >
                     <span className="font-mono">
-                      Item #{r.itemIndex + 1} - {r.scorer}
+                      Item #{r.itemIndex + 1}{' '}
+                      <span className="text-[hsl(var(--muted-foreground))]">{r.scorer}</span>
                     </span>
-                    <span className="font-mono text-green-600 dark:text-green-400">
-                      {r.baselineScore.toFixed(2)} {'\u2192'} {r.candidateScore.toFixed(2)} (+
-                      {r.delta.toFixed(2)})
+                    <span className="font-mono text-emerald-600 dark:text-emerald-400">
+                      {r.baselineScore.toFixed(2)} {'\u2192'} {r.candidateScore.toFixed(2)}{' '}
+                      <span className="text-[hsl(var(--muted-foreground))]">
+                        (+{r.delta.toFixed(2)})
+                      </span>
                     </span>
                   </button>
                   {isExpanded && baselineItem && candidateItem && (
@@ -215,6 +241,8 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
     </div>
   );
 }
+
+// ── Side-by-side item comparison ───────────────────────────────
 
 function ItemComparison({
   baselineItem,
@@ -243,27 +271,32 @@ function ItemComparison({
       : null;
 
   return (
-    <div className="mt-1 mb-2 p-3 rounded bg-[hsl(var(--card))] border border-[hsl(var(--border))] grid grid-cols-2 gap-4 text-xs">
+    <div className="border-t border-[hsl(var(--border))] bg-[hsl(var(--card))] grid grid-cols-2 gap-0 text-xs">
       {/* Baseline side */}
-      <div className="space-y-2">
-        <h5 className="font-medium text-[hsl(var(--muted-foreground))]">Baseline Output</h5>
+      <div className="p-4 space-y-3 border-r border-[hsl(var(--border))]">
+        <h5 className="font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wider text-[10px]">
+          Baseline
+        </h5>
         <JsonViewer data={baselineItem.output} collapsed />
-        {baselineDetail && (
-          <div className="flex items-center gap-1">
+        {baselineDetail?.score != null && (
+          <div className="flex items-center gap-1.5">
             <span className="text-[hsl(var(--muted-foreground))]">Score:</span>
-            {baselineDetail.score != null && (
-              <span
-                className={`px-1.5 py-0.5 rounded font-mono ${scoreColorClass(baselineDetail.score)}`}
-              >
-                {baselineDetail.score.toFixed(3)}
-              </span>
-            )}
+            <span
+              className={cn(
+                'px-2 py-0.5 rounded-full font-mono font-medium',
+                scoreColorClass(baselineDetail.score),
+              )}
+            >
+              {baselineDetail.score.toFixed(3)}
+            </span>
           </div>
         )}
         {baselineReasoning && (
           <div>
-            <span className="font-medium text-[hsl(var(--muted-foreground))]">Reasoning:</span>
-            <pre className="text-xs font-mono p-2 rounded-md bg-[hsl(var(--secondary))] overflow-auto max-h-48 whitespace-pre-wrap mt-1">
+            <span className="font-medium text-[hsl(var(--muted-foreground))] text-[10px] uppercase tracking-wider block mb-1">
+              Reasoning
+            </span>
+            <pre className="text-xs font-mono p-2 rounded-md bg-[hsl(var(--secondary))] overflow-auto max-h-48 whitespace-pre-wrap leading-relaxed">
               {baselineReasoning}
             </pre>
           </div>
@@ -271,25 +304,30 @@ function ItemComparison({
       </div>
 
       {/* Candidate side */}
-      <div className="space-y-2">
-        <h5 className="font-medium text-[hsl(var(--muted-foreground))]">Candidate Output</h5>
+      <div className="p-4 space-y-3">
+        <h5 className="font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wider text-[10px]">
+          Candidate
+        </h5>
         <JsonViewer data={candidateItem.output} collapsed />
-        {candidateDetail && (
-          <div className="flex items-center gap-1">
+        {candidateDetail?.score != null && (
+          <div className="flex items-center gap-1.5">
             <span className="text-[hsl(var(--muted-foreground))]">Score:</span>
-            {candidateDetail.score != null && (
-              <span
-                className={`px-1.5 py-0.5 rounded font-mono ${scoreColorClass(candidateDetail.score)}`}
-              >
-                {candidateDetail.score.toFixed(3)}
-              </span>
-            )}
+            <span
+              className={cn(
+                'px-2 py-0.5 rounded-full font-mono font-medium',
+                scoreColorClass(candidateDetail.score),
+              )}
+            >
+              {candidateDetail.score.toFixed(3)}
+            </span>
           </div>
         )}
         {candidateReasoning && (
           <div>
-            <span className="font-medium text-[hsl(var(--muted-foreground))]">Reasoning:</span>
-            <pre className="text-xs font-mono p-2 rounded-md bg-[hsl(var(--secondary))] overflow-auto max-h-48 whitespace-pre-wrap mt-1">
+            <span className="font-medium text-[hsl(var(--muted-foreground))] text-[10px] uppercase tracking-wider block mb-1">
+              Reasoning
+            </span>
+            <pre className="text-xs font-mono p-2 rounded-md bg-[hsl(var(--secondary))] overflow-auto max-h-48 whitespace-pre-wrap leading-relaxed">
               {candidateReasoning}
             </pre>
           </div>

@@ -1,7 +1,8 @@
 import { useMemo } from 'react';
-import { formatCost, formatDuration } from '../../lib/utils';
+import { ChevronRight } from 'lucide-react';
+import { cn, formatCost, formatDuration, extractLabel } from '../../lib/utils';
 import type { EvalItem } from './types';
-import { scoreColorClass } from './types';
+import { scoreTextColor } from './types';
 
 type ErrorFilter = 'all' | 'errors' | 'no-errors';
 type SortDir = 'asc' | 'desc';
@@ -95,63 +96,83 @@ export function EvalItemList({
   }, [filtered, sortField, sortDir]);
 
   const sortOptions = [
-    { value: 'index', label: 'Item index' },
+    { value: 'index', label: 'Item #' },
     { value: 'duration', label: 'Duration' },
     { value: 'cost', label: 'Cost' },
-    ...scorerNames.map((name) => ({ value: name, label: `Score: ${name}` })),
+    ...scorerNames.map((name) => ({ value: name, label: name })),
   ];
 
   return (
     <div>
-      <h3 className="text-sm font-medium mb-2">Items ({items.length})</h3>
-
-      {/* Filter controls */}
-      <div className="flex items-center gap-2 mb-3 flex-wrap">
-        <select
-          value={errorFilter}
-          onChange={(e) => onErrorFilterChange(e.target.value as ErrorFilter)}
-          className="px-2 py-1 text-xs rounded border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
-        >
-          <option value="all">All items</option>
-          <option value="errors">Errors only</option>
-          <option value="no-errors">No errors</option>
-        </select>
-
-        {scorerNames.length > 0 && (
-          <>
-            <select
-              value={scorerFilter}
-              onChange={(e) => onScorerFilterChange(e.target.value)}
-              className="px-2 py-1 text-xs rounded border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
+      {/* ── Toolbar ──────────────────────────────────────── */}
+      <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+        <div className="flex items-center gap-2">
+          <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+            All Items
+          </h3>
+          <span className="text-xs text-[hsl(var(--muted-foreground))] font-mono tabular-nums">
+            {hasActiveFilter ? `${filtered.length} of ${items.length}` : String(items.length)}
+          </span>
+          {hasActiveFilter && (
+            <button
+              onClick={() => {
+                onErrorFilterChange('all');
+                onScorerFilterChange('');
+                onThresholdChange('');
+              }}
+              className="text-xs text-[hsl(var(--primary))] hover:underline"
             >
-              <option value="">Score filter...</option>
-              {scorerNames.map((name) => (
-                <option key={name} value={name}>
-                  {name}
-                </option>
-              ))}
-            </select>
-            {scorerFilter && (
-              <input
-                type="number"
-                step="0.1"
-                min="0"
-                max="1"
-                placeholder="< threshold"
-                value={threshold}
-                onChange={(e) => onThresholdChange(e.target.value)}
-                className="w-24 px-2 py-1 text-xs rounded border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
-              />
-            )}
-          </>
-        )}
+              Reset
+            </button>
+          )}
+        </div>
 
-        {/* Sort controls */}
-        <div className="flex items-center gap-1 ml-auto">
+        <div className="flex items-center gap-2 flex-wrap">
+          <select
+            value={errorFilter}
+            onChange={(e) => onErrorFilterChange(e.target.value as ErrorFilter)}
+            className="px-2 py-1 text-xs rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
+          >
+            <option value="all">All</option>
+            <option value="errors">Errors</option>
+            <option value="no-errors">Passed</option>
+          </select>
+
+          {scorerNames.length > 0 && (
+            <>
+              <select
+                value={scorerFilter}
+                onChange={(e) => onScorerFilterChange(e.target.value)}
+                className="px-2 py-1 text-xs rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
+              >
+                <option value="">Score filter…</option>
+                {scorerNames.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+              {scorerFilter && (
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  max="1"
+                  placeholder="< threshold"
+                  value={threshold}
+                  onChange={(e) => onThresholdChange(e.target.value)}
+                  className="w-20 px-2 py-1 text-xs rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
+                />
+              )}
+            </>
+          )}
+
+          <div className="w-px h-4 bg-[hsl(var(--border))]" />
+
           <select
             value={sortField}
             onChange={(e) => onSortFieldChange(e.target.value)}
-            className="px-2 py-1 text-xs rounded border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
+            className="px-2 py-1 text-xs rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
           >
             {sortOptions.map((opt) => (
               <option key={opt.value} value={opt.value}>
@@ -161,7 +182,7 @@ export function EvalItemList({
           </select>
           <button
             onClick={() => onSortDirChange(sortDir === 'asc' ? 'desc' : 'asc')}
-            className="px-2 py-1 text-xs rounded border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))]"
+            className="px-2 py-1 text-xs rounded-lg border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))] transition-colors"
             title={sortDir === 'asc' ? 'Ascending' : 'Descending'}
           >
             {sortDir === 'asc' ? '\u2191' : '\u2193'}
@@ -169,72 +190,94 @@ export function EvalItemList({
         </div>
       </div>
 
-      {/* Match count and reset */}
-      {hasActiveFilter && (
-        <div className="flex items-center gap-2 mb-2 text-xs text-[hsl(var(--muted-foreground))]">
-          <span>
-            {filtered.length} of {items.length} items
-          </span>
-          <button
-            onClick={() => {
-              onErrorFilterChange('all');
-              onScorerFilterChange('');
-              onThresholdChange('');
-            }}
-            className="text-[hsl(var(--primary))] hover:underline"
-          >
-            Reset filters
-          </button>
-        </div>
-      )}
-
-      {/* Empty state when filters match nothing */}
+      {/* ── Empty filter state ───────────────────────────── */}
       {sorted.length === 0 && hasActiveFilter && (
-        <p className="text-xs text-[hsl(var(--muted-foreground))] py-4 text-center">
+        <p className="text-xs text-[hsl(var(--muted-foreground))] py-6 text-center">
           No items match the current filters.
         </p>
       )}
 
-      {/* Item rows */}
-      <div className="space-y-1">
-        {sorted.map(({ item, index }) => (
-          <button
-            key={index}
-            onClick={() => onSelectItem(index)}
-            className="w-full text-left flex items-center justify-between px-3 py-2 text-xs rounded-md border border-[hsl(var(--border))] hover:bg-[hsl(var(--accent))] cursor-pointer"
-          >
-            <span className="font-mono">
-              Item #{index + 1}
-              {item.error && <span className="ml-2 text-red-600 dark:text-red-400">(error)</span>}
-              {item.scorerErrors && item.scorerErrors.length > 0 && !item.error && (
-                <span className="ml-2 text-amber-600 dark:text-amber-400">(scorer errors)</span>
-              )}
-            </span>
-            <div className="flex items-center gap-2">
-              {Object.entries(item.scores)
-                .filter(([, score]) => score != null)
-                .map(([scorer, score]) => (
-                  <span
-                    key={scorer}
-                    className={`px-1.5 py-0.5 rounded font-mono ${scoreColorClass(score!)}`}
+      {/* ── Data table ───────────────────────────────────── */}
+      {sorted.length > 0 && (
+        <div className="rounded-xl border border-[hsl(var(--border))] overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-[hsl(var(--muted))]">
+                  <th className="text-left px-3 py-2.5 font-medium w-10">#</th>
+                  <th className="text-left px-3 py-2.5 font-medium min-w-[180px]">Input</th>
+                  {scorerNames.map((name) => (
+                    <th
+                      key={name}
+                      className="text-right px-2 py-2.5 font-medium font-mono max-w-24 truncate"
+                      title={name}
+                    >
+                      {name}
+                    </th>
+                  ))}
+                  <th className="text-right px-3 py-2.5 font-medium w-16">Duration</th>
+                  <th className="text-right px-3 py-2.5 font-medium w-16">Cost</th>
+                  <th className="w-8" />
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map(({ item, index }) => (
+                  <tr
+                    key={index}
+                    onClick={() => onSelectItem(index)}
+                    className="border-t border-[hsl(var(--border))] hover:bg-[hsl(var(--accent))] cursor-pointer transition-colors group"
                   >
-                    {scorer}: {score!.toFixed(2)}
-                  </span>
+                    <td className="px-3 py-2 font-mono text-[hsl(var(--muted-foreground))]">
+                      {index + 1}
+                      {item.error && (
+                        <span className="ml-1 text-red-500" title="Workflow error">
+                          !
+                        </span>
+                      )}
+                      {!item.error && item.scorerErrors && item.scorerErrors.length > 0 && (
+                        <span className="ml-1 text-amber-500" title="Scorer errors">
+                          !
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 max-w-xs">
+                      <span className="text-[11px] leading-tight text-[hsl(var(--muted-foreground))] truncate block group-hover:text-[hsl(var(--foreground))] transition-colors">
+                        {extractLabel(item.input)}
+                      </span>
+                    </td>
+                    {scorerNames.map((name) => {
+                      const score = item.scores[name];
+                      return (
+                        <td key={name} className="text-right px-2 py-2 font-mono">
+                          {score != null ? (
+                            <span className={cn('font-medium tabular-nums', scoreTextColor(score))}>
+                              {score.toFixed(2)}
+                            </span>
+                          ) : (
+                            <span className="text-[hsl(var(--muted-foreground))]">—</span>
+                          )}
+                        </td>
+                      );
+                    })}
+                    <td className="text-right px-3 py-2 font-mono text-[hsl(var(--muted-foreground))]">
+                      {item.duration != null ? formatDuration(item.duration) : '\u2014'}
+                    </td>
+                    <td className="text-right px-3 py-2 font-mono text-[hsl(var(--muted-foreground))]">
+                      {item.cost != null && item.cost > 0 ? formatCost(item.cost) : '\u2014'}
+                    </td>
+                    <td className="px-2 py-2">
+                      <ChevronRight
+                        size={12}
+                        className="text-[hsl(var(--muted-foreground))] opacity-0 group-hover:opacity-60 transition-opacity"
+                      />
+                    </td>
+                  </tr>
                 ))}
-              {item.duration != null && (
-                <span className="px-1.5 py-0.5 rounded font-mono bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]">
-                  {formatDuration(item.duration)}
-                </span>
-              )}
-              {item.cost != null && item.cost > 0 && (
-                <span className="px-1.5 py-0.5 rounded font-mono bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]">
-                  {formatCost(item.cost)}
-                </span>
-              )}
-            </div>
-          </button>
-        ))}
-      </div>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

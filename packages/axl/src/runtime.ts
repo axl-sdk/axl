@@ -669,6 +669,7 @@ export class AxlRuntime extends EventEmitter {
               type: 'tool_result',
               name: event.tool ?? '',
               result: (event.data as Record<string, unknown>)?.result,
+              callId: (event.data as Record<string, unknown>)?.callId as string | undefined,
             });
           }
           // Always emit raw step event for backwards compat
@@ -677,8 +678,13 @@ export class AxlRuntime extends EventEmitter {
         onToken: (token: string) => {
           axlStream._push({ type: 'token', data: token });
         },
-        onToolCall: (call: { name: string; args: unknown }) => {
-          axlStream._push({ type: 'tool_call', name: call.name, args: call.args });
+        onToolCall: (call: { name: string; args: unknown; callId?: string }) => {
+          axlStream._push({
+            type: 'tool_call',
+            name: call.name,
+            args: call.args,
+            callId: call.callId,
+          });
         },
         onAgentStart: (info: { agent: string; model: string }) => {
           axlStream._push({ type: 'agent_start', agent: info.agent, model: info.model });

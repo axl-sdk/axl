@@ -31,6 +31,10 @@ export class AxlStream extends Readable {
     this.bus.on('__reject', (error: Error) => rejectPromise!(error));
     // Prevent unhandled 'error' events from crashing the process
     this.bus.on('error', () => {});
+    // Prevent unhandled promise rejection when _error() rejects the promise
+    // and no consumer has called stream.promise.catch(). Errors are delivered
+    // through the promise rejection and the EventEmitter 'error' event.
+    this.promise.catch(() => {});
   }
 
   private static readonly STREAM_EVENTS = new Set([

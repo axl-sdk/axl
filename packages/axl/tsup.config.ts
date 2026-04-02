@@ -6,4 +6,6 @@ export default defineConfig({
   dts: true,
   clean: true,
   sourcemap: true,
+  // @axlsdk/eval is dynamically imported at runtime (optional) — never bundle it
+  external: ['@axlsdk/eval'],
 });

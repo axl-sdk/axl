@@ -39,6 +39,9 @@ importers:
         specifier: ^5.0.0
         version: 5.11.0
     devDependencies:
+      '@axlsdk/eval':
+        specifier: workspace:*
+        version: link:../axl-eval
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.9.0

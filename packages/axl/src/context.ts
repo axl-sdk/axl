@@ -161,7 +161,7 @@ export type WorkflowContextInit = {
   sessionHistory?: ChatMessage[];
   onTrace?: (event: TraceEvent) => void;
   onToken?: (token: string) => void;
-  onToolCall?: (call: { name: string; args: unknown }) => void;
+  onToolCall?: (call: { name: string; args: unknown; callId?: string }) => void;
   pendingDecisions?: Map<string, (d: HumanDecision) => void>;
   budgetContext?: {
     totalCost: number;
@@ -213,7 +213,7 @@ export class WorkflowContext<TInput = unknown> {
   private sessionHistory: ChatMessage[];
   private onTrace?: (event: TraceEvent) => void;
   private onToken?: (token: string) => void;
-  private onToolCall?: (call: { name: string; args: unknown }) => void;
+  private onToolCall?: (call: { name: string; args: unknown; callId?: string }) => void;
   private pendingDecisions?: Map<string, (d: HumanDecision) => void>;
   private budgetContext?: {
     totalCost: number;
@@ -843,7 +843,7 @@ export class WorkflowContext<TInput = unknown> {
               });
               continue;
             }
-            this.onToolCall?.({ name: toolName, args: toolArgs });
+            this.onToolCall?.({ name: toolName, args: toolArgs, callId: toolCall.id });
             const toolStart = Date.now();
 
             const executeOverride = async () => {
@@ -882,7 +882,7 @@ export class WorkflowContext<TInput = unknown> {
               agent: agent._name,
               tool: toolName,
               duration: Date.now() - toolStart,
-              data: { args: toolArgs, result: toolResult },
+              data: { args: toolArgs, result: toolResult, callId: toolCall.id },
             });
             currentMessages.push({
               role: 'tool',
@@ -920,7 +920,7 @@ export class WorkflowContext<TInput = unknown> {
             continue;
           }
 
-          this.onToolCall?.({ name: toolName, args: toolArgs });
+          this.onToolCall?.({ name: toolName, args: toolArgs, callId: toolCall.id });
 
           const toolStart = Date.now();
 
@@ -1094,7 +1094,7 @@ export class WorkflowContext<TInput = unknown> {
             agent: agent._name,
             tool: traceName,
             duration: Date.now() - toolStart,
-            data: { args: toolArgs, result: toolResult },
+            data: { args: toolArgs, result: toolResult, callId: toolCall.id },
           });
 
           currentMessages.push({

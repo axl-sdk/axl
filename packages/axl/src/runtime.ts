@@ -535,6 +535,7 @@ export class AxlRuntime extends EventEmitter {
           execInfo.status = 'completed';
           execInfo.completedAt = Date.now();
           execInfo.duration = execInfo.completedAt - execInfo.startedAt;
+          execInfo.result = output;
           ctx.log('workflow_end', {
             workflow: name,
             status: 'completed',
@@ -722,6 +723,7 @@ export class AxlRuntime extends EventEmitter {
             execInfo!.status = 'completed';
             execInfo!.completedAt = Date.now();
             execInfo!.duration = execInfo!.completedAt - execInfo!.startedAt;
+            execInfo!.result = result;
             wfCtx.log('workflow_end', {
               workflow: name,
               status: 'completed',

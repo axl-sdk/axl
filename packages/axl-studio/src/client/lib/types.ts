@@ -93,6 +93,7 @@ export type ExecutionInfo = {
   startedAt: number;
   completedAt?: number;
   duration: number;
+  result?: unknown;
   error?: string;
 };
 

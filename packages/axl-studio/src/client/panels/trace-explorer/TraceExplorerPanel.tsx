@@ -229,6 +229,16 @@ export function TraceExplorerPanel() {
               </div>
             )}
 
+            {/* Result for completed executions */}
+            {selectedExecution?.status === 'completed' && selectedExecution.result != null && (
+              <div className="mb-4">
+                <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
+                  Result
+                </h3>
+                <JsonViewer data={selectedExecution.result as Record<string, unknown>} />
+              </div>
+            )}
+
             {/* Toolbar row */}
             <div className="flex items-center justify-between mb-3">
               <span className="text-xs text-[hsl(var(--muted-foreground))]">

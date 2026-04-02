@@ -22,6 +22,40 @@ export function formatTokens(tokens: number): string {
   return tokens.toLocaleString();
 }
 
+/** Extract a readable label from an eval item's input. */
+export function extractLabel(input: unknown, maxLength = 80): string {
+  const truncate = (s: string): string =>
+    s.length <= maxLength ? s : s.slice(0, maxLength - 3) + '\u2026';
+
+  if (typeof input === 'string') {
+    return truncate(input);
+  }
+  if (typeof input === 'object' && input !== null && !Array.isArray(input)) {
+    const obj = input as Record<string, unknown>;
+    for (const key of [
+      'question',
+      'prompt',
+      'text',
+      'input',
+      'query',
+      'message',
+      'content',
+      'name',
+      'title',
+    ]) {
+      if (typeof obj[key] === 'string' && (obj[key] as string).length > 0) {
+        return truncate(obj[key] as string);
+      }
+    }
+    for (const val of Object.values(obj)) {
+      if (typeof val === 'string' && val.length > 0) {
+        return truncate(val);
+      }
+    }
+  }
+  return truncate(JSON.stringify(input));
+}
+
 /** Get status color class. */
 export function statusColor(status: string): string {
   switch (status) {

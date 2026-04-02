@@ -185,7 +185,8 @@ export function createServer(options: CreateServerOptions) {
       const reqPath = c.req.path;
       const resolved =
         basePath && reqPath.startsWith(basePath) ? reqPath.slice(basePath.length) || '/' : reqPath;
-      if (resolved === '/' || resolved === '/index.html') {
+      // Skip index.html (handled by SPA fallback) and /ws (handled by WebSocket upgrader)
+      if (resolved === '/' || resolved === '/index.html' || resolved === '/ws') {
         return next();
       }
       return staticHandler(c, next);
@@ -193,8 +194,16 @@ export function createServer(options: CreateServerOptions) {
 
     // SPA fallback: serve the (possibly injected) index.html for all
     // non-API, non-static-asset routes so React Router handles routing.
+    // Skip /ws so the WebSocket upgrader (registered after createServer) can handle it.
     if (spaHtml) {
-      app.get('*', (c) => c.html(spaHtml!));
+      app.get('*', async (c, next) => {
+        const resolved =
+          basePath && c.req.path.startsWith(basePath)
+            ? c.req.path.slice(basePath.length) || '/'
+            : c.req.path;
+        if (resolved === '/ws') return next();
+        return c.html(spaHtml!);
+      });
     }
   }
 
@@ -202,6 +211,7 @@ export function createServer(options: CreateServerOptions) {
     app,
     connMgr,
     costAggregator,
+    /** Create WS handlers. Call before registering static/SPA routes are reached. */
     createWsHandlers: () => createWsHandlers(connMgr),
     traceListener,
   };

@@ -199,12 +199,12 @@ export type HealthData = {
 /** Stream event (from WS) */
 export type StreamEvent =
   | { type: 'token'; data: string }
-  | { type: 'tool_call'; name: string; args: unknown }
-  | { type: 'tool_result'; name: string; result: unknown }
+  | { type: 'tool_call'; name: string; args: unknown; callId?: string }
+  | { type: 'tool_result'; name: string; result: unknown; callId?: string }
   | { type: 'tool_approval'; name: string; args: unknown; approved: boolean; reason?: string }
   | { type: 'agent_start'; agent: string; model?: string }
   | { type: 'agent_end'; agent: string; cost?: number; duration?: number }
   | { type: 'handoff'; source: string; target: string; mode?: 'oneway' | 'roundtrip' }
   | { type: 'step'; step: number; data: TraceEvent }
-  | { type: 'done'; result: unknown }
+  | { type: 'done'; data: unknown }
   | { type: 'error'; message: string };

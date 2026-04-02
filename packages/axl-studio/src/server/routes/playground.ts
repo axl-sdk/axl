@@ -5,39 +5,77 @@ import type { ConnectionManager } from '../ws/connection-manager.js';
 export function createPlaygroundRoutes(connMgr: ConnectionManager) {
   const app = new Hono<StudioEnv>();
 
-  // Chat with an agent via session
+  // Chat with an agent directly — no workflow required
   app.post('/playground/chat', async (c) => {
     const runtime = c.get('runtime');
     const body = await c.req.json<{
       sessionId?: string;
       message: string;
-      workflow?: string;
+      agent?: string;
     }>();
 
-    const workflowName = body.workflow ?? runtime.getWorkflowNames()[0];
-    if (!workflowName) {
+    if (!body.message || typeof body.message !== 'string' || !body.message.trim()) {
       return c.json(
-        { ok: false, error: { code: 'NO_WORKFLOW', message: 'No workflows registered' } },
+        {
+          ok: false,
+          error: {
+            code: 'INVALID_INPUT',
+            message: 'message is required and must be a non-empty string',
+          },
+        },
         400,
       );
     }
+
+    const agents = runtime.getAgents();
+    const agent = body.agent ? agents.find((a) => a._name === body.agent) : agents[0];
+    if (!agent) {
+      return c.json(
+        {
+          ok: false,
+          error: { code: 'NO_AGENT', message: `Agent "${body.agent ?? ''}" not found` },
+        },
+        400,
+      );
+    }
+
     const sessionId = body.sessionId ?? `playground-${Date.now()}`;
-    const session = runtime.session(sessionId);
-
-    // Stream the response
-    const stream = await session.stream(workflowName, body.message);
     const executionId = `playground-${sessionId}-${Date.now()}`;
+    const store = runtime.getStateStore();
 
-    // Forward stream events to WS
+    // Load session history for multi-turn conversations
+    const history = await store.getSession(sessionId);
+    history.push({ role: 'user', content: body.message });
+
+    // Create a context wired to stream events to the WS channel
+    const ctx = runtime.createContext({
+      sessionHistory: history,
+      onToken: (token: string) => {
+        connMgr.broadcastWithWildcard(`execution:${executionId}`, {
+          type: 'token',
+          data: token,
+        });
+      },
+    });
+
+    // Run the agent ask asynchronously, stream results via WS
     (async () => {
       try {
-        for await (const event of stream) {
-          connMgr.broadcastWithWildcard(`execution:${executionId}`, event);
-        }
+        const result = await ctx.ask(agent, body.message);
+        const resultText = typeof result === 'string' ? result : JSON.stringify(result);
+
+        // Save assistant response to session history
+        history.push({ role: 'assistant', content: resultText });
+        await store.saveSession(sessionId, history);
+
+        connMgr.broadcastWithWildcard(`execution:${executionId}`, {
+          type: 'done',
+          data: resultText,
+        });
       } catch (err) {
         connMgr.broadcastWithWildcard(`execution:${executionId}`, {
           type: 'error',
-          message: err instanceof Error ? err.message : 'Stream error',
+          message: err instanceof Error ? err.message : String(err),
         });
       }
     })();

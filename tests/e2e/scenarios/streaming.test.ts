@@ -168,6 +168,80 @@ describe('Streaming E2E', () => {
     expect(doneEvents.length).toBe(1);
   });
 
+  it('tool_call and tool_result events include callId for reliable matching', async () => {
+    const lookupTool = tool({
+      name: 'lookup',
+      description: 'Look up a topic',
+      input: z.object({ query: z.string() }),
+      handler: (input) => `Result for: ${input.query}`,
+    });
+
+    const a = agent({
+      name: 'multi-tool-agent',
+      model: 'mock:test',
+      system: 'Use lookup for each topic.',
+      tools: [lookupTool],
+    });
+
+    const provider = MockProvider.sequence([
+      // First response: two tool calls to the SAME tool with different args
+      {
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_aaa',
+            type: 'function' as const,
+            function: { name: 'lookup', arguments: JSON.stringify({ query: 'cats' }) },
+          },
+          {
+            id: 'call_bbb',
+            type: 'function' as const,
+            function: { name: 'lookup', arguments: JSON.stringify({ query: 'dogs' }) },
+          },
+        ],
+      },
+      // Second response: final answer
+      { content: 'Here are the results for cats and dogs.' },
+    ]);
+
+    const { runtime } = createTestRuntime(provider);
+    const wf = workflow({
+      name: 'callid-test-wf',
+      input: z.object({ message: z.string() }),
+      handler: async (ctx) => ctx.ask(a, ctx.input.message),
+    });
+    runtime.register(wf);
+
+    const stream = runtime.stream('callid-test-wf', { message: 'Look up cats and dogs' });
+    const allEvents: StreamEvent[] = [];
+    for await (const event of stream) {
+      allEvents.push(event);
+      if (event.type === 'done') break;
+    }
+
+    // Both tool_call events should have distinct callIds
+    const toolCallEvents = allEvents.filter((e) => e.type === 'tool_call') as Array<
+      Extract<StreamEvent, { type: 'tool_call' }>
+    >;
+    expect(toolCallEvents).toHaveLength(2);
+    expect(toolCallEvents[0].callId).toBe('call_aaa');
+    expect(toolCallEvents[1].callId).toBe('call_bbb');
+    expect(toolCallEvents[0].name).toBe('lookup');
+    expect(toolCallEvents[1].name).toBe('lookup');
+
+    // Both tool_result events should have matching callIds
+    const toolResultEvents = allEvents.filter((e) => e.type === 'tool_result') as Array<
+      Extract<StreamEvent, { type: 'tool_result' }>
+    >;
+    expect(toolResultEvents).toHaveLength(2);
+    expect(toolResultEvents[0].callId).toBe('call_aaa');
+    expect(toolResultEvents[1].callId).toBe('call_bbb');
+
+    // Results should be correctly attributed
+    expect(toolResultEvents[0].result).toBe('Result for: cats');
+    expect(toolResultEvents[1].result).toBe('Result for: dogs');
+  });
+
   it('stream rejects with error when workflow throws', async () => {
     const { runtime } = createTestRuntime();
     const wf = workflow({

@@ -247,7 +247,7 @@ export type StreamEvent =
   | { type: 'handoff'; source: string; target: string; mode?: 'oneway' | 'roundtrip' }
   | { type: 'step'; step: number; data: unknown }
   | { type: 'done'; data: unknown }
-  | { type: 'error'; error: Error };
+  | { type: 'error'; message: string };
 
 /** Record of an agent handoff event (persisted in session metadata). */
 export type HandoffRecord = {

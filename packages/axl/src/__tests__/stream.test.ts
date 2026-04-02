@@ -70,7 +70,7 @@ describe('AxlStream', () => {
     expect(doneEvent.data).toEqual({ result: 'final' });
   });
 
-  it('_error signals error', async () => {
+  it('_error signals error through iterator', async () => {
     const stream = new AxlStream();
     const error = new Error('something broke');
 
@@ -78,10 +78,14 @@ describe('AxlStream', () => {
     stream.promise.catch(() => {});
     stream._error(error);
 
-    // The iterator should complete (done: true) after error
+    // The iterator should yield the error event, then complete
     const iter = stream[Symbol.asyncIterator]();
-    const { done } = await iter.next();
-    expect(done).toBe(true);
+    const first = await iter.next();
+    expect(first.done).toBe(false);
+    expect(first.value).toEqual({ type: 'error', message: 'something broke' });
+
+    const second = await iter.next();
+    expect(second.done).toBe(true);
   });
 
   it('promise resolves on done', async () => {

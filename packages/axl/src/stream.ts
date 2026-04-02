@@ -190,9 +190,16 @@ export class AxlStream extends Readable {
   _error(error: Error): void {
     if (this.finished) return;
     this.finished = true;
-    const errorEvent: StreamEvent = { type: 'error', error };
+    const errorEvent: StreamEvent = { type: 'error', message: error.message };
     this.bus.emit('error', errorEvent);
+    this.push(errorEvent);
     this.push(null);
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter({ value: errorEvent, done: false });
+    } else {
+      this.eventQueue.push(errorEvent);
+    }
     for (const w of this.waiters) {
       w({ value: undefined as unknown as StreamEvent, done: true });
     }

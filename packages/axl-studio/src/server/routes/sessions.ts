@@ -52,17 +52,10 @@ export function createSessionRoutes(connMgr: ConnectionManager) {
     const stream = await session.stream(body.workflow, body.message);
     const executionId = `session-${id}-${Date.now()}`;
 
-    // Forward stream events to WS
+    // Forward stream events to WS (error events flow through the iterator)
     (async () => {
-      try {
-        for await (const event of stream) {
-          connMgr.broadcastWithWildcard(`execution:${executionId}`, event);
-        }
-      } catch (err) {
-        connMgr.broadcastWithWildcard(`execution:${executionId}`, {
-          type: 'error',
-          message: err instanceof Error ? err.message : 'Stream error',
-        });
+      for await (const event of stream) {
+        connMgr.broadcastWithWildcard(`execution:${executionId}`, event);
       }
     })();
 

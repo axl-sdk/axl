@@ -63,17 +63,10 @@ export function createWorkflowRoutes(connMgr: ConnectionManager) {
       const stream = runtime.stream(name, body.input ?? {}, { metadata: body.metadata });
       const executionId = `stream-${Date.now()}`;
 
-      // Forward stream events to WS
+      // Forward stream events to WS (error events flow through the iterator)
       (async () => {
-        try {
-          for await (const event of stream) {
-            connMgr.broadcastWithWildcard(`execution:${executionId}`, event);
-          }
-        } catch (err) {
-          connMgr.broadcastWithWildcard(`execution:${executionId}`, {
-            type: 'error',
-            message: err instanceof Error ? err.message : 'Stream error',
-          });
+        for await (const event of stream) {
+          connMgr.broadcastWithWildcard(`execution:${executionId}`, event);
         }
       })();
 

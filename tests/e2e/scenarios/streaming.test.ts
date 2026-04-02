@@ -257,6 +257,36 @@ describe('Streaming E2E', () => {
     await expect(stream.promise).rejects.toThrow('workflow failed');
   });
 
+  it('stream iterator yields serializable error event when workflow throws', async () => {
+    const { runtime } = createTestRuntime();
+    const wf = workflow({
+      name: 'error-iter-wf',
+      input: z.object({ message: z.string() }),
+      handler: async () => {
+        throw new Error('iterator error test');
+      },
+    });
+    runtime.register(wf);
+
+    const stream = runtime.stream('error-iter-wf', { message: 'hello' });
+    // Prevent unhandled rejection from stream.promise
+    stream.promise.catch(() => {});
+
+    const allEvents: StreamEvent[] = [];
+    for await (const event of stream) {
+      allEvents.push(event);
+    }
+
+    // Should contain an error event with a serializable message
+    const errorEvent = allEvents.find((e) => e.type === 'error');
+    expect(errorEvent).toBeDefined();
+    expect(errorEvent).toEqual({ type: 'error', message: 'iterator error test' });
+
+    // Error event should be JSON-serializable (no Error object)
+    const serialized = JSON.parse(JSON.stringify(errorEvent));
+    expect(serialized.message).toBe('iterator error test');
+  });
+
   it('stream emits workflow_end with status completed on success', async () => {
     const provider = MockProvider.sequence([{ content: 'success' }]);
     const { runtime } = createTestRuntime(provider);

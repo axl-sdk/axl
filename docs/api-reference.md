@@ -810,6 +810,33 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 
 ---
 
+## StreamEvent
+
+Union type for events emitted by `AxlStream` (from `runtime.stream()` and `session.stream()`). Consumed via `for await (const event of stream)`.
+
+```typescript
+for await (const event of stream) {
+  if (event.type === 'token') process.stdout.write(event.data);
+  if (event.type === 'error') console.error('Stream error:', event.message);
+  if (event.type === 'done') console.log('Result:', event.data);
+}
+```
+
+| Variant | Fields | Description |
+|---------|--------|-------------|
+| `token` | `data: string` | Incremental text token from the LLM |
+| `tool_call` | `name: string`, `args: unknown`, `callId?: string` | Agent initiated a tool call. `callId` correlates with the matching `tool_result` |
+| `tool_result` | `name: string`, `result: unknown`, `callId?: string` | Tool execution completed. `callId` matches the originating `tool_call` |
+| `tool_approval` | `name: string`, `args: unknown`, `approved: boolean`, `reason?: string` | Tool approval decision (for tools with `requireApproval`) |
+| `agent_start` | `agent: string`, `model?: string` | Agent began processing |
+| `agent_end` | `agent: string`, `cost?: number`, `duration?: number` | Agent finished processing |
+| `handoff` | `source: string`, `target: string`, `mode?: 'oneway' \| 'roundtrip'` | Agent handed off to another agent |
+| `step` | `step: number`, `data: unknown` | Workflow step event |
+| `done` | `data: unknown` | Stream completed with final result |
+| `error` | `message: string` | Stream error (JSON-serializable — `message` string, not an `Error` object) |
+
+---
+
 ## AxlRuntime
 
 The central orchestrator. Manages workflow registration, provider resolution, state storage, execution lifecycle, and eval history.
@@ -872,6 +899,7 @@ Completed and failed executions are automatically persisted to the state store (
 | `startedAt` | `number` | Start timestamp (ms) |
 | `completedAt` | `number \| undefined` | Completion timestamp (ms) |
 | `duration` | `number` | Duration in ms |
+| `result` | `unknown \| undefined` | Workflow return value (when `status === 'completed'`) |
 | `error` | `string \| undefined` | Error message (when `status === 'failed'`) |
 
 ### Eval History

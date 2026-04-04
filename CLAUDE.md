@@ -156,7 +156,7 @@ packages/axl-studio/src/
       playground.ts  — POST /api/playground/chat
     ws/
       handler.ts     — WebSocket message routing (Hono adapter)
-      connection-manager.ts — Channel subscriptions + broadcast (BroadcastTarget)
+      connection-manager.ts — Channel subscriptions + broadcast (BroadcastTarget) + replay buffer for execution channels
       protocol.ts    — Shared WS protocol: handleWsMessage(), channel validation
   client/
     main.tsx         — React entry point
@@ -166,14 +166,15 @@ packages/axl-studio/src/
       api.ts         — Typed fetch wrappers for all endpoints
       ws.ts          — WebSocket singleton with auto-reconnect
       query-client.ts — TanStack Query client
-      utils.ts       — cn(), formatCost(), formatDuration(), formatTokens()
+      utils.ts       — cn(), formatCost(), formatDuration(), formatTokens(), extractLabel()
+      trace-utils.ts — Trace data extraction helpers for the Trace Explorer panel
       types.ts       — Client-side types mirroring server API
     hooks/
       use-ws.ts      — useWs(channel, callback)
       use-ws-stream.ts — useWsStream(executionId)
     components/
       layout/        — Sidebar, PanelShell
-      shared/        — JsonEditor, JsonViewer, CostBadge, StatusBadge, SchemaForm, StreamingText, etc.
+      shared/        — JsonEditor, JsonViewer, CostBadge, StatusBadge, SchemaForm, StreamingText, StatCard, EmptyState, DurationBadge, TokenBadge
     panels/
       playground/    — Agent Playground (chat, streaming, tool calls)
       workflow-runner/ — Workflow execution with timeline
@@ -182,7 +183,7 @@ packages/axl-studio/src/
       memory-browser/ — Memory CRUD + semantic search
       session-manager/ — Session list, replay, handoff chain
       tool-inspector/ — Tool schemas + direct testing
-      eval-runner/   — Eval execution + comparison (EvalSummaryTable, EvalItemList, EvalItemDetail, ScoreDistribution, EvalCompareView)
+      eval-runner/   — Eval execution + comparison (EvalSummaryTable, EvalItemList, EvalItemSidebar, EvalItemDetail, ScoreDistribution, EvalCompareView). Score colors: 3-tier system (>=0.8 green, >=0.5 amber, <0.5 red)
 ```
 
 ## Testing
@@ -251,13 +252,14 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - Anthropic 4.6 models (Opus 4.6, Sonnet 4.6) use adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`) when `effort` is set. Opus 4.5 supports `output_config.effort` but not adaptive thinking. `thinkingBudget` falls back to manual mode (`thinking: { type: "enabled", budget_tokens }`) for precise control. `effort` + `thinkingBudget: 0` sends standalone `output_config.effort` without thinking block
 - ProviderResponse.usage includes optional `reasoning_tokens` and `cached_tokens`
 - TraceEvent includes optional `tokens: { input?, output?, reasoning? }` — emitted on `agent_call` events from `ProviderResponse.usage`. Used by Studio's CostAggregator for token tracking
-- AxlStream requires `[Symbol.asyncDispose]` on iterator for TS 5.9+ compat
+- AxlStream requires `[Symbol.asyncDispose]` on iterator for TS 5.9+ compat. `promise.catch(() => {})` prevents unhandled rejection warnings when no consumer attaches a handler
 - WorkflowContext.ask() implements tool calling loop with max turns, budget tracking, self-correction retry
 - zodToJsonSchema helper in context.ts wraps Zod v4's built-in `z.toJSONSchema()` for tool definitions
 - Telemetry: `@opentelemetry/api` is optional peer dep; `NoopSpanManager` used when disabled; `runtime.initializeTelemetry()` activates span emission; cost-per-span on all agent/workflow spans
 - State: `StateConfig.store` accepts `'memory'` | `'sqlite'` | `StateStore` instance. `'redis'` is NOT a valid string — pass `await RedisStore.create(url)` as the instance. RedisStore requires the `redis` peer dep (node-redis v5, not ioredis). Private constructor enforces async factory usage
 - StateStore optional methods: `saveExecution`/`getExecution`/`listExecutions` for execution history persistence, `saveEvalResult`/`listEvalResults` for eval history. All 3 built-in stores implement them. Completed/failed executions and eval results auto-persist; lazy-loaded on first access. With SQLite/Redis, history survives restarts
 - `AxlRuntime.resolveProvider(uri)` resolves a `provider:model` URI to `{ provider: Provider, model: string }` using the runtime's provider registry. The eval runner uses this to auto-resolve LLM scorer providers
+- `ExecutionInfo` includes `result?: unknown` field — captures the workflow return value on completed executions
 - `AxlRuntime.getExecutions()` is async (`Promise<ExecutionInfo[]>`), lazy-loads historical from StateStore, merges with in-memory active executions. `getExecution(id)` falls through to store if not in memory
 - `AxlRuntime.getEvalHistory()` returns eval run history (most recent first); `saveEvalResult(entry)` persists to in-memory cache + StateStore. `runRegisteredEval()` auto-saves results
 - `EvalHistoryEntry` type: `{ id, eval, timestamp, data }` — exported from `@axlsdk/axl`
@@ -270,10 +272,11 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - Session options: `runtime.session(id, { history: { maxMessages, summarize }, persist })` for history management
 - Tool handlers receive `(input, ctx)` where `ctx` is a child `WorkflowContext` for nested agent invocations (agent-as-tool pattern)
 - `WorkflowContext.createChildContext()` creates isolated child contexts (shares budget/abort/traces, isolates session/streaming/steps)
-- Tool middleware: approval gate → hooks.before → handler → hooks.after; approval gate skipped for direct tool.run() calls
+- Tool middleware: approval gate → hooks.before → handler → hooks.after; approval gate skipped for direct tool.run() calls. `onToolCall` callback includes `callId` (`{ name, args, callId? }`)
+- Studio: `POST /api/playground/chat` uses `ctx.ask(agent)` directly (no workflow required) — accepts `{ message, agent?, sessionId? }`, resolves agent from registered agents, streams results via WebSocket channel `execution:{id}`
 - `AgentConfig.handoffs` accepts `HandoffDescriptor[] | ((ctx: { metadata? }) => HandoffDescriptor[])` for dynamic routing based on runtime metadata
 - Handoff modes: 'oneway' (default, exits source loop) and 'roundtrip' (returns result to source); roundtrip handoffs include a 'message' parameter
-- StreamEvent union includes 'tool_approval' and handoff 'mode' field
+- StreamEvent union: `token` (`data`), `tool_call` (`name`, `args`, `callId?`), `tool_result` (`name`, `result`, `callId?`), `tool_approval` (`name`, `args`, `approved`, `reason?`), `agent_start` (`agent`, `model?`), `agent_end` (`agent`, `cost?`, `duration?`), `handoff` (`source`, `target`, `mode?`), `step` (`step`, `data`), `done` (`data`), `error` (`message`)
 - `ctx.delegate()` creates a temporary router agent with handoffs; single-agent case short-circuits to `ctx.ask()`. Router defaults to first candidate's model, `temperature: 0`, `maxTurns: 2`
 - Studio: Hono server wraps AxlRuntime with REST API (`/api/*`) + WebSocket (`/ws`); React SPA served from `dist/client/`. Two modes: standalone CLI (`axl-studio`) and embeddable middleware (`createStudioMiddleware()` from `@axlsdk/studio/middleware`)
 - `AxlRuntime.createContext(options?)` creates a `WorkflowContext` for ad-hoc tool testing, evals, and prototyping. Options: `metadata`, `budget`, `signal`, `sessionHistory`, `onToken`, `awaitHumanHandler`. Auto-wires `onTrace` to the runtime's `EventEmitter` and always creates a `budgetContext` (`limit: Infinity` by default) for cost accumulation. `ctx.totalCost` getter returns accumulated cost
@@ -281,7 +284,7 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - Studio: `POST /api/tools/:name/test` uses `tool.run(ctx, input)` with a context from `runtime.createContext()` so agent-as-tool handlers work
 - Studio: AxlRuntime introspection via `registerTool()`, `registerAgent()`, `registerEval()`, `getWorkflows()`, `getTools()`, `getAgents()`, `getExecutions()`, `getRegisteredEvals()`
 - Studio: `zodToJsonSchema()` exported from core for tool schema rendering in Tool Inspector (wraps `z.toJSONSchema()`)
-- Studio: WebSocket uses channel multiplexing (subscribe/unsubscribe); channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`. Protocol logic in `ws/protocol.ts`, shared between Hono handler and Node.js middleware. Channel names validated against allowlist, 256-char max, 64KB message size limit
+- Studio: WebSocket uses channel multiplexing (subscribe/unsubscribe); channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`. Protocol logic in `ws/protocol.ts`, shared between Hono handler and Node.js middleware. Channel names validated against allowlist, 256-char max, 64KB message size limit. Execution channels (`execution:*`) have replay buffering: events stored per-channel (max 500), late subscribers receive full history, buffers cleaned up 30s after stream completes
 - Studio: Embeddable middleware (`@axlsdk/studio/middleware`): `createStudioMiddleware({ runtime, basePath?, serveClient?, verifyUpgrade?, readOnly?, evals? })` returns `{ handler, handleWebSocket, upgradeWebSocket, app, connectionManager, close }`. Works with Express, Fastify, Koa, NestJS, raw `http.Server`, Hono-in-Hono. `verifyUpgrade` callback for WS auth (WS upgrades bypass framework middleware). `readOnly: true` disables mutating endpoints. CORS not applied (host framework responsibility). `basePath` injected at runtime into index.html via `<base>` tag + `window.__AXL_STUDIO_BASE__`
 - Studio: Lazy eval loading (`evals` option on middleware): `evals: 'path/*.eval.ts'` or `evals: { files: '...', conditions: ['development'] }`. Dynamically imports eval files on first eval route access (not at startup). Eval files are standalone entry points — can import from any module without circular deps. Supports glob patterns, explicit paths, and monorepo import conditions (process-wide via `module.register()`). Eval names are the file's cwd-relative path minus `.eval.*` suffix: `evals/api/accuracy.eval.ts` → `"evals/api/accuracy"`. Completely stable — names never change when other patterns or files change. Nested names with `/` must be URL-encoded in run endpoint. Coexists with `runtime.registerEval()`. Files cached for middleware lifetime (restart to pick up changes)
 - Studio: `StateStore.listSessions()` optional method for session browsing (implemented in MemoryStore, SQLiteStore, RedisStore)

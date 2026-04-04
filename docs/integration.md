@@ -93,7 +93,7 @@ npx @axlsdk/studio --open
 
 | Feature | Description |
 |---------|-------------|
-| **Agent Playground** | Chat with any registered agent. Tool calls rendered inline. Multi-turn sessions. |
+| **Agent Playground** | Chat directly with any registered agent (no workflow required). Tool calls rendered inline. Multi-turn sessions. |
 | **Workflow Runner** | Execute workflows with custom input. Visual execution timeline. |
 | **Trace Explorer** | Waterfall view of spans — nested workflow > agent > tool hierarchy. |
 | **Cost Dashboard** | Per-agent and per-workflow cost tracking. Token usage breakdown. |

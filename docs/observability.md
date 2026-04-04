@@ -66,6 +66,7 @@ exec.steps;       // All steps with inputs, outputs, cost, duration
 exec.totalCost;   // Total LLM cost
 exec.duration;    // Wall-clock time
 exec.status;      // "running" | "completed" | "failed" | "waiting" (awaitHuman)
+exec.result;      // Workflow return value (when completed)
 exec.error;       // Error details if failed
 ```
 

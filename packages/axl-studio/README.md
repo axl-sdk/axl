@@ -148,6 +148,7 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `GET /api/evals/history` | List eval run history |
 | `POST /api/evals/:name/run` | Run a registered eval by name |
 | `POST /api/evals/compare` | Compare two eval results |
+| `POST /api/playground/chat` | Chat with an agent directly (no workflow required). Accepts `{ message, agent?, sessionId? }`. Streams results via WebSocket |
 | `GET /api/decisions` | List pending decisions |
 | `POST /api/decisions/:id/resolve` | Resolve a pending decision |
 
@@ -162,7 +163,7 @@ Single endpoint at `ws://localhost:4400/ws` with channel multiplexing:
 { "type": "event", "channel": "trace:abc-123", "data": { ... } }
 ```
 
-Channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`.
+Channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`. Execution channels have replay buffering — late subscribers receive the full event history (capped at 500 events, cleaned up 30s after stream completes).
 
 ## Embeddable Middleware
 
@@ -394,7 +395,7 @@ src/
     routes/               One file per resource (health, workflows, agents, tools, etc.)
     ws/
       handler.ts          WebSocket message routing (Hono adapter)
-      connection-manager.ts  Channel subscriptions + broadcast (BroadcastTarget)
+      connection-manager.ts  Channel subscriptions + broadcast (BroadcastTarget) + replay buffer for execution channels
       protocol.ts         Shared WS protocol: handleWsMessage(), channel validation
   client/
     App.tsx               React SPA — sidebar + 8 panel routes

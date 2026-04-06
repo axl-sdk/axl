@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-04-06
+
 ### Added
 
 - **Core:** `callId` field on `tool_call` and `tool_result` `StreamEvent` variants — correlates tool invocations with their results across streaming consumers
@@ -476,7 +478,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.13.3...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.13.6...HEAD
+[0.13.6]: https://github.com/axl-sdk/axl/compare/v0.13.5...v0.13.6
 [0.13.3]: https://github.com/axl-sdk/axl/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/axl-sdk/axl/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/axl-sdk/axl/compare/v0.13.0...v0.13.1

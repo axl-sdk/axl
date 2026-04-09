@@ -39,6 +39,7 @@ export type EvalResultData = {
   id: string;
   workflow: string;
   dataset: string;
+  metadata?: Record<string, unknown>;
   timestamp: string;
   totalCost: number;
   duration: number;
@@ -87,6 +88,9 @@ export type ComparisonResult = {
       deltaPercent: number;
       ci?: { lower: number; upper: number };
       significant?: boolean;
+      pRegression?: number;
+      pImprovement?: number;
+      n?: number;
     }
   >;
   timing?: {

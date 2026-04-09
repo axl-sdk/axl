@@ -122,12 +122,25 @@ export const resetCosts = () => request<{ reset: boolean }>('/costs/reset', { me
 // ── Evals ──────────────────────────────────────────────────────────
 export const fetchEvals = () => request<RegisteredEval[]>('/evals');
 export const fetchEvalHistory = () => request<EvalHistoryEntry[]>('/evals/history');
-export const runRegisteredEval = (name: string) =>
-  request<unknown>(`/evals/${encodeURIComponent(name)}/run`, { method: 'POST' });
-export const compareEvals = (baseline: unknown, candidate: unknown) =>
+export const runRegisteredEval = (name: string, options?: { runs?: number }) =>
+  request<unknown>(`/evals/${encodeURIComponent(name)}/run`, {
+    method: 'POST',
+    body: options?.runs && options.runs > 1 ? JSON.stringify({ runs: options.runs }) : undefined,
+  });
+export const rescoreEval = (name: string, resultId: string) =>
+  request<unknown>(`/evals/${encodeURIComponent(name)}/rescore`, {
+    method: 'POST',
+    body: JSON.stringify({ resultId }),
+  });
+
+export const compareEvals = (
+  baseline: unknown,
+  candidate: unknown,
+  options?: { thresholds?: Record<string, number> | number },
+) =>
   request<unknown>('/evals/compare', {
     method: 'POST',
-    body: JSON.stringify({ baseline, candidate }),
+    body: JSON.stringify({ baseline, candidate, options }),
   });
 
 // ── Playground ─────────────────────────────────────────────────────

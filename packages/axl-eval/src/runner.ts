@@ -2,28 +2,8 @@ import type { AxlRuntime } from '@axlsdk/axl';
 import type { EvalConfig, EvalResult, EvalItem, EvalSummary } from './types.js';
 import type { ScorerContext } from './scorer.js';
 import { normalizeScorerResult } from './scorer.js';
+import { computeStats, round } from './utils.js';
 import { randomUUID } from 'node:crypto';
-
-function computeStats(scores: number[]): {
-  mean: number;
-  min: number;
-  max: number;
-  p50: number;
-  p95: number;
-} {
-  if (scores.length === 0) return { mean: 0, min: 0, max: 0, p50: 0, p95: 0 };
-  const sorted = [...scores].sort((a, b) => a - b);
-  const mean = sorted.reduce((a, b) => a + b, 0) / sorted.length;
-  const min = sorted[0];
-  const max = sorted[sorted.length - 1];
-  const p50 = sorted[Math.floor(sorted.length * 0.5)];
-  const p95 = sorted[Math.floor(sorted.length * 0.95)];
-  return { mean: round(mean), min: round(min), max: round(max), p50: round(p50), p95: round(p95) };
-}
-
-function round(n: number): number {
-  return Math.round(n * 1000) / 1000;
-}
 
 function parseCost(cost: string): number {
   const match = cost.match(/^\$?([\d.]+)$/);
@@ -193,11 +173,16 @@ export async function runEval(
   const durations = evalItems.filter((i) => !i.error && i.duration != null).map((i) => i.duration!);
   const timing = durations.length > 0 ? computeStats(durations) : undefined;
 
+  const scorerTypes: Record<string, string> = {};
+  for (const s of config.scorers) {
+    scorerTypes[s.name] = s.isLlm ? 'llm' : 'deterministic';
+  }
+
   return {
     id,
     workflow: config.workflow,
     dataset: config.dataset.name,
-    metadata: config.metadata ?? {},
+    metadata: { ...config.metadata, scorerTypes },
     timestamp: new Date().toISOString(),
     totalCost,
     duration: Date.now() - startTime,

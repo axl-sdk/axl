@@ -45,6 +45,12 @@ function DeltaCell({
   );
 }
 
+function formatCI(ci: { lower: number; upper: number }): string {
+  const lo = (ci.lower >= 0 ? '+' : '') + ci.lower.toFixed(4);
+  const hi = (ci.upper >= 0 ? '+' : '') + ci.upper.toFixed(4);
+  return `[${lo}, ${hi}]`;
+}
+
 type ExpandedItem = { type: 'regression' | 'improvement'; index: number };
 
 export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
@@ -58,6 +64,9 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
     }
   };
 
+  const scorerEntries = compareResult.scorers ? Object.entries(compareResult.scorers) : [];
+  const hasCI = scorerEntries.some(([, s]) => s.ci != null);
+
   return (
     <div className="space-y-6">
       {compareResult.summary && (
@@ -65,7 +74,7 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
       )}
 
       {/* ── Scorer comparison table ──────────────────────── */}
-      {compareResult.scorers && Object.keys(compareResult.scorers).length > 0 && (
+      {scorerEntries.length > 0 && (
         <div className="border border-[hsl(var(--border))] rounded-xl overflow-hidden">
           <div className="px-4 py-2.5 bg-[hsl(var(--muted))] border-b border-[hsl(var(--border))]">
             <h3 className="text-xs font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
@@ -81,10 +90,16 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
                   <th className="text-right px-3 py-2 font-medium">Candidate</th>
                   <th className="text-right px-3 py-2 font-medium">Delta</th>
                   <th className="text-right px-3 py-2 font-medium">%</th>
+                  {hasCI && (
+                    <>
+                      <th className="text-right px-3 py-2 font-medium">CI 95%</th>
+                      <th className="text-center px-2 py-2 font-medium">Sig</th>
+                    </>
+                  )}
                 </tr>
               </thead>
               <tbody>
-                {Object.entries(compareResult.scorers).map(([scorer, stats]) => (
+                {scorerEntries.map(([scorer, stats]) => (
                   <tr key={scorer} className="border-b border-[hsl(var(--border))] last:border-b-0">
                     <td className="px-4 py-2.5 font-mono">{scorer}</td>
                     <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">
@@ -93,12 +108,36 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
                     <td
                       className={cn(
                         'px-3 py-2.5 text-right font-mono',
-                        scoreTextColor(stats.candidateMean),
+                        stats.significant === false
+                          ? 'text-[hsl(var(--muted-foreground))]'
+                          : scoreTextColor(stats.candidateMean),
                       )}
                     >
                       {stats.candidateMean.toFixed(3)}
                     </td>
                     <DeltaCell value={stats.delta} percent={stats.deltaPercent} />
+                    {hasCI && (
+                      <>
+                        <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))] text-[10px]">
+                          {stats.ci ? formatCI(stats.ci) : '\u2014'}
+                        </td>
+                        <td className="px-2 py-2.5 text-center font-mono">
+                          {stats.significant === true ? (
+                            <span
+                              className={
+                                stats.delta >= 0
+                                  ? 'text-emerald-600 dark:text-emerald-400'
+                                  : 'text-red-600 dark:text-red-400'
+                              }
+                            >
+                              *
+                            </span>
+                          ) : stats.significant === false ? (
+                            <span className="text-[hsl(var(--muted-foreground))]">\u2014</span>
+                          ) : null}
+                        </td>
+                      </>
+                    )}
                   </tr>
                 ))}
 
@@ -120,6 +159,7 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
                       invert
                       format={formatDuration}
                     />
+                    {hasCI && <td colSpan={2} />}
                   </tr>
                 )}
 
@@ -141,6 +181,7 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
                       invert
                       format={formatCost}
                     />
+                    {hasCI && <td colSpan={2} />}
                   </tr>
                 )}
               </tbody>

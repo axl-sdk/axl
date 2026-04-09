@@ -47,8 +47,8 @@ import type { Effort, ToolChoice, ChatOptions, DelegateOptions, CreateContextOpt
 import { AxlTestRuntime, MockProvider, MockTool } from '@axlsdk/testing';
 
 // Evaluation
-import { dataset, scorer, llmScorer, defineEval, normalizeScorerResult } from '@axlsdk/eval';
-import type { ScorerResult, ScorerDetail } from '@axlsdk/eval';
+import { dataset, scorer, llmScorer, defineEval, normalizeScorerResult, runEval, evalCompare, pairedBootstrapCI, rescore, aggregateRuns } from '@axlsdk/eval';
+import type { ScorerResult, ScorerDetail, EvalCompareOptions, RescoreOptions, MultiRunSummary, BootstrapCIResult } from '@axlsdk/eval';
 
 // Studio (server API)
 import { createServer, ConnectionManager, CostAggregator } from '@axlsdk/studio';
@@ -127,8 +127,12 @@ packages/axl-eval/src/
   llm-scorer.ts      — llmScorer() factory (LLM-as-judge)
   define-eval.ts     — defineEval() (identity, for CLI discovery)
   runner.ts          — runEval() with concurrent execution
-  compare.ts         — evalCompare() regression/improvement detection
-  cli.ts             — CLI entry: --config, --conditions, --output flags
+  compare.ts         — evalCompare() regression/improvement detection with bootstrap CI
+  bootstrap.ts       — pairedBootstrapCI() with seeded PRNG for deterministic tests
+  rescore.ts         — rescore() re-runs scorers on saved outputs
+  multi-run.ts       — aggregateRuns() computes mean ± std across multiple runs
+  utils.ts           — Shared computeStats(), round() helpers
+  cli.ts             — CLI entry: --config, --conditions, --output, --runs, --threshold flags
   cli-utils.ts       — Config detection, tsx loader, ESM forcing, conditions, resolveRuntime
 
 packages/axl-studio/src/
@@ -152,7 +156,7 @@ packages/axl-studio/src/
       memory.ts      — GET/PUT/DELETE /api/memory
       decisions.ts   — GET/POST /api/decisions
       costs.ts       — GET/POST /api/costs
-      evals.ts       — GET /api/evals, POST /api/evals/:name/run, POST /api/evals/compare
+      evals.ts       — GET /api/evals, GET /api/evals/history, POST /api/evals/:name/run, POST /api/evals/:name/rescore, POST /api/evals/compare
       playground.ts  — POST /api/playground/chat
     ws/
       handler.ts     — WebSocket message routing (Hono adapter)
@@ -263,8 +267,13 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - `AxlRuntime.getExecutions()` is async (`Promise<ExecutionInfo[]>`), lazy-loads historical from StateStore, merges with in-memory active executions. `getExecution(id)` falls through to store if not in memory
 - `AxlRuntime.getEvalHistory()` returns eval run history (most recent first); `saveEvalResult(entry)` persists to in-memory cache + StateStore. `runRegisteredEval()` auto-saves results
 - `EvalHistoryEntry` type: `{ id, eval, timestamp, data }` — exported from `@axlsdk/axl`
-- Eval enriched results: `EvalItem` has `duration`, `cost`, `scorerCost`, `scoreDetails` (per-scorer `ScorerDetail` with metadata/timing/cost). `EvalSummary` has `timing` stats. `EvalComparison` has `timing`/`cost` deltas. `EvalRegression`/`EvalImprovement` include `itemIndex`. Runner pre-allocates `evalItems` array for deterministic item ordering under concurrency
+- Eval enriched results: `EvalItem` has `duration`, `cost`, `scorerCost`, `scoreDetails` (per-scorer `ScorerDetail` with metadata/timing/cost). `EvalSummary` has `timing` stats. `EvalComparison` has `timing`/`cost` deltas, `ci?`/`significant?` per scorer. `EvalRegression`/`EvalImprovement` include `itemIndex`. Runner pre-allocates `evalItems` array for deterministic item ordering under concurrency
 - Scorer return type: `Scorer.score()` returns `number | ScorerResult | Promise<number | ScorerResult>`. `ScorerResult` is `{ score, metadata?, cost? }`. `llmScorer()` returns `ScorerResult` with schema metadata (e.g., reasoning) and LLM cost. `normalizeScorerResult()` converts `number | ScorerResult` to `ScorerResult`. LLM scorer attaches `cost` to thrown errors so the runner captures cost even on parse/validation failure
+- `evalCompare()` accepts `EvalResult | EvalResult[]` for baseline/candidate, optional `EvalCompareOptions` with `thresholds`. Computes paired bootstrap CI (95%) on per-item score differences. Auto-calibrates threshold from `scorerTypes` metadata (0 for deterministic, 0.05 for LLM, 0.1 legacy fallback). `significant` = CI excludes zero AND |delta| >= threshold
+- `pairedBootstrapCI(differences, { nResamples?, alpha?, seed? })` — pure-math bootstrap CI, 1000 resamples default. Seeded xorshift32 PRNG for deterministic tests
+- `rescore(result, scorers, runtime, { concurrency? })` — re-runs scorers on saved outputs without re-executing the workflow. Returns new `EvalResult` with `rescored: true`, `originalId` in metadata. Only tracks scorer cost
+- `aggregateRuns(runs)` — computes mean, std, min, max of per-scorer means across multiple `EvalResult[]`. Returns `MultiRunSummary` with `runGroupId`, `runCount`, aggregate `scorers`, `timing?`
+- `runEval()` stores `scorerTypes: Record<string, 'llm' | 'deterministic'>` in `EvalResult.metadata`
 - Memory: `ctx.remember()`/`ctx.recall()`/`ctx.forget()` backed by StateStore; semantic recall via VectorStore + embedder; `MemoryManager` coordinates both
 - Guardrails: `agent({ guardrails: { input, output, onBlock, maxRetries } })`; `GuardrailError` thrown on block; self-correcting retry on `'retry'` policy
 - Validate: `ctx.ask(agent, prompt, { schema, validate, validateRetries })` — per-call post-schema business rule validation on typed object; requires schema (skipped without); `ValidationError` thrown after retries; output pipeline: guardrail → schema → validate, all with accumulating context and independent retry counters. Also supported on `ctx.delegate()` (forwarded to final ask), `ctx.race()` (invalid results discarded), and `ctx.verify()` (runs after schema parse)
@@ -288,5 +297,6 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - Studio: Embeddable middleware (`@axlsdk/studio/middleware`): `createStudioMiddleware({ runtime, basePath?, serveClient?, verifyUpgrade?, readOnly?, evals? })` returns `{ handler, handleWebSocket, upgradeWebSocket, app, connectionManager, close }`. Works with Express, Fastify, Koa, NestJS, raw `http.Server`, Hono-in-Hono. `verifyUpgrade` callback for WS auth (WS upgrades bypass framework middleware). `readOnly: true` disables mutating endpoints. CORS not applied (host framework responsibility). `basePath` injected at runtime into index.html via `<base>` tag + `window.__AXL_STUDIO_BASE__`
 - Studio: Lazy eval loading (`evals` option on middleware): `evals: 'path/*.eval.ts'` or `evals: { files: '...', conditions: ['development'] }`. Dynamically imports eval files on first eval route access (not at startup). Eval files are standalone entry points — can import from any module without circular deps. Supports glob patterns, explicit paths, and monorepo import conditions (process-wide via `module.register()`). Eval names are the file's cwd-relative path minus `.eval.*` suffix: `evals/api/accuracy.eval.ts` → `"evals/api/accuracy"`. Completely stable — names never change when other patterns or files change. Nested names with `/` must be URL-encoded in run endpoint. Coexists with `runtime.registerEval()`. Files cached for middleware lifetime (restart to pick up changes)
 - Studio: `StateStore.listSessions()` optional method for session browsing (implemented in MemoryStore, SQLiteStore, RedisStore)
-- Eval CLI: `axl-eval` binary resolves runtime via three-tier: `--config <path>` → auto-detect `axl.config.*` → bare `new AxlRuntime()`. Supports `--conditions` for monorepo imports. Wraps `executeWorkflow` with `runtime.trackCost()`. Calls `runtime.shutdown()` on completion. Config resolution utilities (tsx `tsImport`, conditions) are copied from studio (can't import from studio due to dependency direction)
+- Studio: `POST /api/evals/:name/run` accepts `{ runs: N }` body for multi-run execution. When `runs > 1`, the response includes `_multiRun: { aggregate: MultiRunSummary, allRuns: EvalResult[] }` enrichment on the result object
+- Eval CLI: `axl-eval` binary resolves runtime via three-tier: `--config <path>` → auto-detect `axl.config.*` → bare `new AxlRuntime()`. Supports `--conditions` for monorepo imports. Wraps `executeWorkflow` with `runtime.trackCost()`. Calls `runtime.shutdown()` on completion. Subcommands: `compare` (with `--threshold`, `--fail-on-regression`), `rescore`. Flags: `--runs N` for multi-run, `--output`, `--config`, `--conditions`. Config resolution utilities (tsx `tsImport`, conditions) are copied from studio (can't import from studio due to dependency direction)
 - Studio: CLI (`axl-studio`) auto-detects config (`axl.config.mts` → `.ts` → `.mjs` → `.js`), expects `export default runtime`. TypeScript files loaded via tsx's `tsImport()` API — handles ESM/CJS correctly without process-wide side effects (no `register()` hooks or ESM-forcing workarounds). `--conditions` flag adds custom import conditions via resolve hook (e.g., `--conditions development` for monorepo source exports)

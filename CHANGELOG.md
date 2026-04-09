@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Eval:** Configurable regression thresholds — `evalCompare()` accepts `EvalCompareOptions` with `thresholds` (global number or per-scorer map). Auto-calibrates from `scorerTypes` metadata: `0` for deterministic scorers, `0.05` for LLM scorers. CLI: `--threshold` flag on `compare` subcommand. Replaces hardcoded `0.1`. New exported type: `EvalCompareOptions`
+- **Eval:** Per-item paired bootstrap confidence intervals — `evalCompare()` computes 95% CIs on per-item score differences. New `ci` and `significant` fields on `EvalComparison.scorers`. `--fail-on-regression` now only exits 1 for statistically significant regressions when CI data is available
+- **Eval:** `pairedBootstrapCI()` and `BootstrapCIResult` type — pure-math bootstrap CI function with optional seeded PRNG for deterministic tests. Exported from `@axlsdk/eval`
+- **Eval:** Rescore mode — `rescore()` function and `RescoreOptions` type. Re-runs scorers on saved `EvalItem.output` without re-executing the workflow. CLI: `axl-eval rescore <results.json> <eval-file>`. Tracks only scorer cost
+- **Eval:** Multi-run — `--runs N` CLI flag runs evals N times, reports mean +/- std per scorer via `aggregateRuns()` (`MultiRunSummary` type). Results include `runGroupId`/`runIndex` in metadata
+- **Eval:** Multi-run comparison — `evalCompare()` accepts `EvalResult[]` arrays, pools per-item paired differences across runs for tighter bootstrap CIs
+- **Eval:** `runEval()` now stores `scorerTypes` (map of scorer name to `'llm'` | `'deterministic'`) in result metadata
+- **Eval:** Shared `utils.ts` module — `computeStats()` and `round()` extracted from runner for reuse in rescore
+- **Studio:** CI and significance columns in `EvalCompareView` scorer comparison table
+- **Studio:** `POST /evals/:name/rescore` endpoint — re-scores a history entry with registered eval's scorers
+- **Studio:** Rescore button on history table rows
+- **Studio:** `POST /evals/:name/run` accepts `{ runs: N }` body for multi-run execution
+- **Studio:** `compareEvals()` API accepts optional `options` parameter for threshold forwarding
+
 ## [0.13.6] - 2026-04-06
 
 ### Added

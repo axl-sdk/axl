@@ -74,6 +74,8 @@ export type EvalComparison = {
       candidateMean: number;
       delta: number;
       deltaPercent: number;
+      ci?: { lower: number; upper: number };
+      significant?: boolean;
     }
   >;
   timing?: {
@@ -103,3 +105,8 @@ export type EvalRegression = {
 };
 
 export type EvalImprovement = EvalRegression;
+
+export type EvalCompareOptions = {
+  /** Global threshold or per-scorer map. Default: auto-calibrate from scorerTypes metadata. */
+  thresholds?: Record<string, number> | number;
+};

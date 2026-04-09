@@ -1020,8 +1020,8 @@ export class AxlRuntime extends EventEmitter {
    *
    * @see Spec Section 13.6
    */
-  async evalCompare(baseline: unknown, candidate: unknown): Promise<unknown> {
-    let evalCompareFn: (baseline: unknown, candidate: unknown) => Promise<unknown>;
+  async evalCompare(baseline: unknown, candidate: unknown, options?: unknown): Promise<unknown> {
+    let evalCompareFn: (baseline: unknown, candidate: unknown, options?: unknown) => unknown;
     try {
       // @ts-expect-error — @axlsdk/eval is an optional peer dependency
       ({ evalCompare: evalCompareFn } = await import('@axlsdk/eval'));
@@ -1031,7 +1031,7 @@ export class AxlRuntime extends EventEmitter {
       );
     }
 
-    return evalCompareFn(baseline, candidate);
+    return evalCompareFn(baseline, candidate, options);
   }
 
   /**

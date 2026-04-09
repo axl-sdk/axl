@@ -195,7 +195,7 @@ describe('evalCompare()', () => {
 
     const comparison = evalCompare(baseline, candidate);
 
-    expect(comparison.summary).toContain('no significant changes');
+    expect(comparison.summary).toContain('no meaningful changes');
   });
 
   it('summary includes direction and percentage for changed scores', () => {
@@ -501,5 +501,468 @@ describe('evalCompare()', () => {
     const comparison = evalCompare(baseline, candidate);
 
     expect(comparison.summary).toContain('cheaper');
+  });
+
+  // ── Configurable threshold tests ────────────────────────────────
+
+  it('uses global threshold from options', () => {
+    const baseline = makeEvalResult({
+      items: [
+        { input: { q: '1' }, output: 'a', scores: { accuracy: 0.8 } },
+        { input: { q: '2' }, output: 'b', scores: { accuracy: 0.7 } },
+      ],
+      summary: {
+        count: 2,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.75, min: 0.7, max: 0.8, p50: 0.75, p95: 0.8 } },
+      },
+    });
+    const candidate = makeEvalResult({
+      items: [
+        { input: { q: '1' }, output: 'a', scores: { accuracy: 0.77 } },
+        { input: { q: '2' }, output: 'b', scores: { accuracy: 0.68 } },
+      ],
+      summary: {
+        count: 2,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.725, min: 0.68, max: 0.77, p50: 0.725, p95: 0.77 } },
+      },
+    });
+
+    // With threshold 0, the 0.03 delta on item 1 should be flagged as regression
+    const withZero = evalCompare(baseline, candidate, { thresholds: 0 });
+    expect(withZero.regressions.length).toBeGreaterThan(0);
+
+    // With threshold 0.1 (legacy), 0.03 should NOT be flagged
+    const withLegacy = evalCompare(baseline, candidate, { thresholds: 0.1 });
+    expect(withLegacy.regressions).toHaveLength(0);
+    expect(withLegacy.improvements).toHaveLength(0);
+  });
+
+  it('uses per-scorer thresholds from options', () => {
+    const baseline = makeEvalResult({
+      items: [{ input: { q: '1' }, output: 'a', scores: { accuracy: 0.8, tone: 0.9 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: {
+          accuracy: { mean: 0.8, min: 0.8, max: 0.8, p50: 0.8, p95: 0.8 },
+          tone: { mean: 0.9, min: 0.9, max: 0.9, p50: 0.9, p95: 0.9 },
+        },
+      },
+    });
+    const candidate = makeEvalResult({
+      items: [{ input: { q: '1' }, output: 'a', scores: { accuracy: 0.75, tone: 0.85 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: {
+          accuracy: { mean: 0.75, min: 0.75, max: 0.75, p50: 0.75, p95: 0.75 },
+          tone: { mean: 0.85, min: 0.85, max: 0.85, p50: 0.85, p95: 0.85 },
+        },
+      },
+    });
+
+    // accuracy threshold=0 → flags -0.05, tone threshold=0.1 → does NOT flag -0.05
+    const comparison = evalCompare(baseline, candidate, {
+      thresholds: { accuracy: 0, tone: 0.1 },
+    });
+    expect(comparison.regressions).toHaveLength(1);
+    expect(comparison.regressions[0].scorer).toBe('accuracy');
+  });
+
+  it('auto-calibrates threshold from scorerTypes metadata', () => {
+    const baseline = makeEvalResult({
+      metadata: { scorerTypes: { accuracy: 'deterministic', quality: 'llm' } },
+      items: [{ input: { q: '1' }, output: 'a', scores: { accuracy: 0.8, quality: 0.8 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: {
+          accuracy: { mean: 0.8, min: 0.8, max: 0.8, p50: 0.8, p95: 0.8 },
+          quality: { mean: 0.8, min: 0.8, max: 0.8, p50: 0.8, p95: 0.8 },
+        },
+      },
+    });
+    const candidate = makeEvalResult({
+      metadata: { scorerTypes: { accuracy: 'deterministic', quality: 'llm' } },
+      items: [{ input: { q: '1' }, output: 'a', scores: { accuracy: 0.78, quality: 0.78 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: {
+          accuracy: { mean: 0.78, min: 0.78, max: 0.78, p50: 0.78, p95: 0.78 },
+          quality: { mean: 0.78, min: 0.78, max: 0.78, p50: 0.78, p95: 0.78 },
+        },
+      },
+    });
+
+    // No explicit thresholds → auto-calibrate
+    // accuracy (deterministic): threshold=0, delta=-0.02 → regression
+    // quality (llm): threshold=0.05, delta=-0.02 → NOT flagged
+    const comparison = evalCompare(baseline, candidate);
+    expect(comparison.regressions).toHaveLength(1);
+    expect(comparison.regressions[0].scorer).toBe('accuracy');
+  });
+
+  it('falls back to 0.1 threshold when no scorerTypes metadata and no explicit threshold', () => {
+    // Default makeEvalResult has no scorerTypes in metadata
+    const baseline = makeEvalResult({
+      items: [{ input: { q: '1' }, output: 'a', scores: { accuracy: 0.8 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.8, min: 0.8, max: 0.8, p50: 0.8, p95: 0.8 } },
+      },
+    });
+    const candidate = makeEvalResult({
+      items: [{ input: { q: '1' }, output: 'a', scores: { accuracy: 0.72 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.72, min: 0.72, max: 0.72, p50: 0.72, p95: 0.72 } },
+      },
+    });
+
+    // delta = -0.08, legacy threshold = 0.1 → NOT flagged
+    const comparison = evalCompare(baseline, candidate);
+    expect(comparison.regressions).toHaveLength(0);
+  });
+
+  it('threshold=0 with identical scores produces no regressions', () => {
+    const baseline = makeEvalResult();
+    const candidate = makeEvalResult();
+
+    const comparison = evalCompare(baseline, candidate, { thresholds: 0 });
+    expect(comparison.regressions).toHaveLength(0);
+    expect(comparison.improvements).toHaveLength(0);
+  });
+
+  // ── Bootstrap CI tests ──────────────────────────────────────
+
+  it('attaches CI data to scorers when sufficient items exist', () => {
+    const items = Array.from({ length: 10 }, (_, i) => ({
+      input: { q: String(i) },
+      output: 'a',
+      scores: { accuracy: 0.7 + i * 0.02 },
+    }));
+    const baseline = makeEvalResult({
+      items,
+      summary: {
+        count: 10,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.79, min: 0.7, max: 0.88, p50: 0.79, p95: 0.88 } },
+      },
+    });
+    const candidateItems = items.map((item) => ({
+      ...item,
+      scores: { accuracy: (item.scores.accuracy as number) + 0.05 },
+    }));
+    const candidate = makeEvalResult({
+      id: 'cand',
+      items: candidateItems,
+      summary: {
+        count: 10,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.84, min: 0.75, max: 0.93, p50: 0.84, p95: 0.93 } },
+      },
+    });
+
+    const comparison = evalCompare(baseline, candidate);
+    expect(comparison.scorers.accuracy.ci).toBeDefined();
+    expect(comparison.scorers.accuracy.ci!.lower).toBeDefined();
+    expect(comparison.scorers.accuracy.ci!.upper).toBeDefined();
+  });
+
+  it('marks scorer as significant when CI does not cross zero', () => {
+    // All items improve by +0.2 — CI should be entirely above zero
+    const items = Array.from({ length: 10 }, (_, i) => ({
+      input: { q: String(i) },
+      output: 'a',
+      scores: { accuracy: 0.5 },
+    }));
+    const candidateItems = items.map((item) => ({
+      ...item,
+      scores: { accuracy: 0.7 },
+    }));
+    const baseline = makeEvalResult({
+      items,
+      summary: {
+        count: 10,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.5, min: 0.5, max: 0.5, p50: 0.5, p95: 0.5 } },
+      },
+    });
+    const candidate = makeEvalResult({
+      id: 'cand',
+      items: candidateItems,
+      summary: {
+        count: 10,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.7, min: 0.7, max: 0.7, p50: 0.7, p95: 0.7 } },
+      },
+    });
+
+    const comparison = evalCompare(baseline, candidate, { thresholds: 0 });
+    expect(comparison.scorers.accuracy.significant).toBe(true);
+  });
+
+  it('marks scorer as not significant when CI spans zero', () => {
+    // Items alternate between small positive and negative changes
+    const items = Array.from({ length: 10 }, (_, i) => ({
+      input: { q: String(i) },
+      output: 'a',
+      scores: { accuracy: 0.5 },
+    }));
+    const candidateItems = items.map((item, i) => ({
+      ...item,
+      scores: { accuracy: i % 2 === 0 ? 0.52 : 0.48 },
+    }));
+    const baseline = makeEvalResult({
+      items,
+      summary: {
+        count: 10,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.5, min: 0.5, max: 0.5, p50: 0.5, p95: 0.5 } },
+      },
+    });
+    const candidate = makeEvalResult({
+      id: 'cand',
+      items: candidateItems,
+      summary: {
+        count: 10,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.5, min: 0.48, max: 0.52, p50: 0.5, p95: 0.52 } },
+      },
+    });
+
+    const comparison = evalCompare(baseline, candidate, { thresholds: 0 });
+    expect(comparison.scorers.accuracy.significant).toBe(false);
+  });
+
+  it('omits CI when fewer than 2 paired items', () => {
+    const baseline = makeEvalResult({
+      items: [{ input: { q: '1' }, output: 'a', scores: { accuracy: 0.8 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.8, min: 0.8, max: 0.8, p50: 0.8, p95: 0.8 } },
+      },
+    });
+    const candidate = makeEvalResult({
+      items: [{ input: { q: '1' }, output: 'a', scores: { accuracy: 0.9 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.9, min: 0.9, max: 0.9, p50: 0.9, p95: 0.9 } },
+      },
+    });
+
+    const comparison = evalCompare(baseline, candidate);
+    expect(comparison.scorers.accuracy.ci).toBeUndefined();
+    expect(comparison.scorers.accuracy.significant).toBeUndefined();
+  });
+
+  it('includes significance indicator in summary string', () => {
+    const items = Array.from({ length: 10 }, (_, i) => ({
+      input: { q: String(i) },
+      output: 'a',
+      scores: { accuracy: 0.5 },
+    }));
+    const candidateItems = items.map((item) => ({
+      ...item,
+      scores: { accuracy: 0.7 },
+    }));
+    const baseline = makeEvalResult({
+      metadata: { scorerTypes: { accuracy: 'deterministic' } },
+      items,
+      summary: {
+        count: 10,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.5, min: 0.5, max: 0.5, p50: 0.5, p95: 0.5 } },
+      },
+    });
+    const candidate = makeEvalResult({
+      id: 'cand',
+      metadata: { scorerTypes: { accuracy: 'deterministic' } },
+      items: candidateItems,
+      summary: {
+        count: 10,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.7, min: 0.7, max: 0.7, p50: 0.7, p95: 0.7 } },
+      },
+    });
+
+    const comparison = evalCompare(baseline, candidate);
+    expect(comparison.summary).toContain('significant');
+  });
+
+  // ── Multi-run array comparison tests ────────────────────────
+
+  it('accepts arrays of EvalResult and pools items across runs', () => {
+    const makeRun = (scoreMean: number) =>
+      makeEvalResult({
+        items: Array.from({ length: 5 }, (_, i) => ({
+          input: { q: String(i) },
+          output: 'a',
+          scores: { accuracy: scoreMean },
+        })),
+        summary: {
+          count: 5,
+          failures: 0,
+          scorers: {
+            accuracy: {
+              mean: scoreMean,
+              min: scoreMean,
+              max: scoreMean,
+              p50: scoreMean,
+              p95: scoreMean,
+            },
+          },
+        },
+      });
+
+    const baselineRuns = [makeRun(0.5), makeRun(0.55), makeRun(0.52)];
+    const candidateRuns = [makeRun(0.7), makeRun(0.75), makeRun(0.72)];
+
+    const comparison = evalCompare(baselineRuns, candidateRuns, { thresholds: 0 });
+
+    // Should have aggregated means across runs
+    expect(comparison.scorers.accuracy.baselineMean).toBeCloseTo(0.523, 1);
+    expect(comparison.scorers.accuracy.candidateMean).toBeCloseTo(0.723, 1);
+    // CI should be computed from pooled 15 items (5 items × 3 runs)
+    expect(comparison.scorers.accuracy.ci).toBeDefined();
+  });
+
+  it('normalizes single EvalResult to array internally', () => {
+    const baseline = makeEvalResult();
+    const candidate = makeEvalResult();
+
+    // Should work the same whether passed as single or array
+    const single = evalCompare(baseline, candidate);
+    const asArray = evalCompare([baseline], [candidate]);
+
+    expect(single.scorers).toEqual(asArray.scorers);
+    expect(single.regressions.length).toBe(asArray.regressions.length);
+  });
+
+  it('handles mismatched run counts by using minimum', () => {
+    const makeRun = (score: number) =>
+      makeEvalResult({
+        items: [{ input: { q: '1' }, output: 'a', scores: { accuracy: score } }],
+        summary: {
+          count: 1,
+          failures: 0,
+          scorers: {
+            accuracy: { mean: score, min: score, max: score, p50: score, p95: score },
+          },
+        },
+      });
+
+    const baselineRuns = [makeRun(0.5), makeRun(0.55)];
+    const candidateRuns = [makeRun(0.7), makeRun(0.75), makeRun(0.72)];
+
+    // Should not throw — uses min(2, 3) = 2 runs for paired diffs
+    const comparison = evalCompare(baselineRuns, candidateRuns, { thresholds: 0 });
+    expect(comparison.scorers.accuracy).toBeDefined();
+    expect(comparison.scorers.accuracy.ci).toBeDefined();
+  });
+
+  it('multi-run provides tighter CI with more data points', () => {
+    const makeRun = (baseScore: number, candScore: number) => ({
+      baseline: makeEvalResult({
+        items: Array.from({ length: 5 }, (_, i) => ({
+          input: { q: String(i) },
+          output: 'a',
+          scores: { accuracy: baseScore + (i % 2 === 0 ? 0.01 : -0.01) },
+        })),
+        summary: {
+          count: 5,
+          failures: 0,
+          scorers: {
+            accuracy: {
+              mean: baseScore,
+              min: baseScore - 0.01,
+              max: baseScore + 0.01,
+              p50: baseScore,
+              p95: baseScore + 0.01,
+            },
+          },
+        },
+      }),
+      candidate: makeEvalResult({
+        id: 'cand',
+        items: Array.from({ length: 5 }, (_, i) => ({
+          input: { q: String(i) },
+          output: 'a',
+          scores: { accuracy: candScore + (i % 2 === 0 ? 0.01 : -0.01) },
+        })),
+        summary: {
+          count: 5,
+          failures: 0,
+          scorers: {
+            accuracy: {
+              mean: candScore,
+              min: candScore - 0.01,
+              max: candScore + 0.01,
+              p50: candScore,
+              p95: candScore + 0.01,
+            },
+          },
+        },
+      }),
+    });
+
+    const run1 = makeRun(0.5, 0.6);
+    const run2 = makeRun(0.5, 0.6);
+    const run3 = makeRun(0.5, 0.6);
+
+    // Single run: 5 paired diffs
+    const singleCI = evalCompare(run1.baseline, run1.candidate, { thresholds: 0 });
+    // Multi run: 15 paired diffs
+    const multiCI = evalCompare(
+      [run1.baseline, run2.baseline, run3.baseline],
+      [run1.candidate, run2.candidate, run3.candidate],
+      { thresholds: 0 },
+    );
+
+    expect(singleCI.scorers.accuracy.ci).toBeDefined();
+    expect(multiCI.scorers.accuracy.ci).toBeDefined();
+    // Both CIs should indicate the same direction
+    expect(multiCI.scorers.accuracy.ci!.lower).toBeGreaterThan(0);
+    expect(singleCI.scorers.accuracy.ci!.lower).toBeGreaterThan(0);
+  });
+
+  it('handles comparison where all items have errors', () => {
+    const baseline = makeEvalResult({
+      items: [
+        { input: { q: '1' }, output: null, error: 'failed', scores: { accuracy: null } },
+        { input: { q: '2' }, output: null, error: 'failed', scores: { accuracy: null } },
+      ],
+      summary: {
+        count: 2,
+        failures: 2,
+        scorers: { accuracy: { mean: 0, min: 0, max: 0, p50: 0, p95: 0 } },
+      },
+    });
+    const candidate = makeEvalResult({
+      items: [
+        { input: { q: '1' }, output: null, error: 'failed', scores: { accuracy: null } },
+        { input: { q: '2' }, output: null, error: 'failed', scores: { accuracy: null } },
+      ],
+      summary: {
+        count: 2,
+        failures: 2,
+        scorers: { accuracy: { mean: 0, min: 0, max: 0, p50: 0, p95: 0 } },
+      },
+    });
+
+    const comparison = evalCompare(baseline, candidate);
+
+    // No paired diffs possible — CI should be undefined
+    expect(comparison.scorers.accuracy.ci).toBeUndefined();
+    expect(comparison.scorers.accuracy.significant).toBeUndefined();
+    expect(comparison.regressions).toHaveLength(0);
+    expect(comparison.improvements).toHaveLength(0);
   });
 });

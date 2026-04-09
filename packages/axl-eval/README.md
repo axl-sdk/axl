@@ -310,16 +310,16 @@ Compare two runs to detect regressions and improvements. Runs must use the same 
 
 ```bash
 npx axl-eval compare ./results/v1.json ./results/v2.json
-npx axl-eval compare v1.json v2.json --fail-on-regression  # exit 1 if worse
+npx axl-eval compare v1.json v2.json --fail-on-regression  # exit 1 if significant regressions
 ```
 
 ```
 Compare: baseline (3f8a2b1c) -> candidate (9d4e7f6a)
 
-  Scorer     Baseline  Candidate  Delta     Change
-  ──────────────────────────────────────────────────
-  quality       0.750      0.850    +0.100   +13.3%
-  safety        0.900      0.900    +0.000    +0.0%
+  Scorer     Baseline  Candidate  Delta     Change  CI 95%            Sig
+  ────────────────────────────────────────────────────────────────────────
+  quality       0.750      0.850    +0.100   +13.3%  [+0.0312, +0.1688]  *
+  safety        0.900      0.900    +0.000    +0.0%  [-0.0250, +0.0250]
 
   Timing: baseline 2.10s -> candidate 4.30s (+104.8%)
   Cost: baseline $0.45 -> candidate $0.31 (-31.1%)
@@ -338,16 +338,67 @@ const comparison = evalCompare(v1Results, v2Results);
 console.log(comparison.scorers.quality.delta);      // +0.1
 console.log(comparison.scorers.quality.deltaPercent); // +13.3
 
+// Statistical significance
+console.log(comparison.scorers.quality.ci);         // { lower: 0.0312, upper: 0.1688 }
+console.log(comparison.scorers.quality.significant); // true
+
 // Timing and cost tradeoffs
 console.log(comparison.timing?.deltaPercent);  // +104.8 (slower)
 console.log(comparison.cost?.deltaPercent);    // -31.1 (cheaper)
 
-// Per-item regressions/improvements (delta > 0.1 threshold)
+// Per-item regressions/improvements
 for (const r of comparison.regressions) {
   console.log(`Item ${r.itemIndex}: ${r.scorer} dropped ${r.baselineScore} → ${r.candidateScore}`);
 }
 
 console.log(comparison.summary);  // human-readable one-liner
+```
+
+`evalCompare()` also accepts arrays for multi-run comparison — see [Multi-Run](#multi-run).
+
+### Configurable Thresholds
+
+By default, thresholds auto-calibrate from scorer type metadata embedded in eval results: **0** for deterministic scorers, **0.05** for LLM scorers (which have natural variance). Results without `scorerTypes` metadata fall back to **0.1**.
+
+Override with `--threshold` on the CLI:
+
+```bash
+# Global threshold for all scorers
+npx axl-eval compare v1.json v2.json --threshold 0.05
+
+# Per-scorer thresholds
+npx axl-eval compare v1.json v2.json --threshold accuracy=0,tone=0.1
+```
+
+Programmatically via `EvalCompareOptions`:
+
+```typescript
+import { evalCompare } from '@axlsdk/eval';
+import type { EvalCompareOptions } from '@axlsdk/eval';
+
+// Global threshold
+evalCompare(baseline, candidate, { thresholds: 0.05 });
+
+// Per-scorer map
+evalCompare(baseline, candidate, { thresholds: { accuracy: 0, tone: 0.1 } });
+```
+
+### Statistical Significance
+
+`evalCompare()` computes a 95% bootstrap confidence interval on paired per-item score differences. A scorer change is marked `significant` when:
+
+1. The CI excludes zero (the effect is unlikely due to chance), **and**
+2. The absolute delta exceeds the threshold (the effect is practically meaningful).
+
+`--fail-on-regression` uses significance when available — it only exits with code 1 if at least one scorer has a significant negative delta. Without enough paired data for CI (fewer than 2 items), it falls back to threshold-only comparison.
+
+The underlying `pairedBootstrapCI()` function is exported for direct use:
+
+```typescript
+import { pairedBootstrapCI } from '@axlsdk/eval';
+
+const ci = pairedBootstrapCI(differences, { nResamples: 1000, alpha: 0.05, seed: 42 });
+console.log(ci); // { lower: -0.02, upper: 0.15, mean: 0.065 }
 ```
 
 ## Eval Files in Detail
@@ -435,6 +486,109 @@ const ctx = runtime.createContext({
   ],
 });
 ```
+
+## Rescore Mode
+
+Re-run scorers on saved outputs without re-executing the workflow. Useful when iterating on scorer logic — avoids burning LLM cost on generation.
+
+```bash
+npx axl-eval rescore ./results/v1.json ./evals/qa.eval.ts
+npx axl-eval rescore ./results/v1.json ./evals/qa.eval.ts --output ./results/v1-rescored.json
+```
+
+The rescored result gets a new `id` and has `metadata.rescored: true` and `metadata.originalId` pointing to the source run. Only scorer cost is tracked (workflow cost is zero).
+
+Programmatically:
+
+```typescript
+import { rescore } from '@axlsdk/eval';
+
+const rescored = await rescore(originalResult, [updatedScorer, newScorer], runtime, {
+  concurrency: 10,
+});
+
+console.log(rescored.metadata.rescored);    // true
+console.log(rescored.metadata.originalId);  // original result ID
+console.log(rescored.totalCost);            // scorer cost only
+```
+
+## Multi-Run
+
+Run the same eval multiple times to measure variance across runs. The CLI aggregates per-scorer means into mean ± std:
+
+```bash
+npx axl-eval ./evals/qa.eval.ts --runs 5
+npx axl-eval ./evals/qa.eval.ts --runs 5 --output ./results/qa-5runs.json
+```
+
+```
+Eval: qa-eval x qa-basics — 5 runs
+  Scorer         Mean ± Std       Min       Max
+  ──────────────────────────────────────────────
+  not-empty     1.000 ± 0.000     1.000     1.000
+  relevance     0.870 ± 0.024     0.840     0.900
+
+  Total Cost: $0.05 | Total Duration: 16.2s
+```
+
+The output JSON contains all individual run results (as an array). Each run has `metadata.runGroupId` and `metadata.runIndex`.
+
+Programmatically, use `aggregateRuns()`:
+
+```typescript
+import { aggregateRuns } from '@axlsdk/eval';
+import type { MultiRunSummary } from '@axlsdk/eval';
+
+const summary: MultiRunSummary = aggregateRuns(runs);
+console.log(summary.scorers.relevance.mean);  // 0.87
+console.log(summary.scorers.relevance.std);   // 0.024
+console.log(summary.runCount);                // 5
+```
+
+### Multi-run comparison
+
+`evalCompare()` accepts arrays of `EvalResult` for both baseline and candidate, pooling paired differences across runs for more robust CI estimates:
+
+```typescript
+import { evalCompare } from '@axlsdk/eval';
+
+const comparison = evalCompare(baselineRuns, candidateRuns);
+// CI is computed from all paired (baseline[r].items[i], candidate[r].items[i]) differences
+```
+
+## API Reference
+
+### Functions
+
+| Function | Description |
+|----------|-------------|
+| `dataset(config)` | Create a dataset from inline items or a JSON file |
+| `scorer(config)` | Create a deterministic scorer |
+| `llmScorer(config)` | Create an LLM-as-judge scorer |
+| `defineEval(config)` | Wrap an eval config for CLI discovery |
+| `runEval(config, executeFn, runtime)` | Run an eval programmatically |
+| `evalCompare(baseline, candidate, options?)` | Compare eval results with bootstrap CI |
+| `rescore(result, scorers, runtime, options?)` | Re-run scorers on saved outputs |
+| `aggregateRuns(runs)` | Aggregate multiple runs into mean ± std |
+| `pairedBootstrapCI(differences, options?)` | Compute bootstrap confidence interval |
+| `normalizeScorerResult(value)` | Convert `number \| ScorerResult` to `ScorerResult` |
+
+### Types
+
+| Type | Description |
+|------|-------------|
+| `EvalConfig` | Eval definition (workflow, dataset, scorers, concurrency, budget) |
+| `EvalResult` | Full eval output (items, summary, cost, duration) |
+| `EvalItem` | Per-item result (input, output, scores, scoreDetails) |
+| `EvalSummary` | Aggregate statistics (count, failures, scorer stats, timing) |
+| `EvalComparison` | Comparison output (scorer deltas, CI, regressions, improvements) |
+| `EvalCompareOptions` | Options for `evalCompare()` (`thresholds`) |
+| `EvalRegression` / `EvalImprovement` | Per-item change record (itemIndex, scorer, scores, delta) |
+| `ScorerDetail` | Per-scorer detail (score, metadata, duration, cost) |
+| `ScorerResult` | Scorer return type (`{ score, metadata?, cost? }`) |
+| `RescoreOptions` | Options for `rescore()` (`concurrency`) |
+| `MultiRunSummary` | Aggregated multi-run output (per-scorer mean/std/min/max) |
+| `BootstrapCIResult` | CI result (`{ lower, upper, mean }`) |
 
 ## License
 

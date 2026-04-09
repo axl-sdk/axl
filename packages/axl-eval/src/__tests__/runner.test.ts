@@ -65,7 +65,7 @@ describe('runEval()', () => {
     expect(result.timestamp).toBeDefined();
     expect(result.totalCost).toBeGreaterThanOrEqual(0);
     expect(result.duration).toBeGreaterThanOrEqual(0);
-    expect(result.metadata).toEqual({});
+    expect(result.metadata).toEqual({ scorerTypes: { exact: 'deterministic' } });
     expect(result.items).toBeInstanceOf(Array);
     expect(result.summary).toBeDefined();
     expect(result.summary.count).toBe(3);
@@ -187,7 +187,11 @@ describe('runEval()', () => {
       mockRuntime,
     );
 
-    expect(result.metadata).toEqual({ version: '1.0', model: 'gpt-4' });
+    expect(result.metadata).toEqual({
+      version: '1.0',
+      model: 'gpt-4',
+      scorerTypes: { exact: 'deterministic' },
+    });
   });
 
   it('handles empty dataset', async () => {
@@ -1085,5 +1089,37 @@ describe('runEval()', () => {
 
     expect(result.items[0].scores['rich']).toBe(0.8);
     expect(result.items[0].scoreDetails!['rich'].metadata).toEqual({ reasoning: 'good' });
+  });
+
+  // ── scorerTypes metadata tests ────────────────────────────────
+
+  it('stores scorerTypes in result metadata', async () => {
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      executeWorkflow,
+      mockRuntime,
+    );
+
+    expect(result.metadata.scorerTypes).toEqual({ exact: 'deterministic' });
+  });
+
+  it('stores mixed LLM and deterministic scorerTypes', async () => {
+    const llmScorerDef: Scorer = {
+      name: 'quality',
+      description: 'LLM-based quality',
+      isLlm: true,
+      score: () => 0.9,
+    };
+
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer, llmScorerDef] },
+      executeWorkflow,
+      mockRuntime,
+    );
+
+    expect(result.metadata.scorerTypes).toEqual({
+      exact: 'deterministic',
+      quality: 'llm',
+    });
   });
 });

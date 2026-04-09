@@ -28,6 +28,13 @@ export type ScorerStats = {
   p95: number;
 };
 
+export type MultiRunAggregate = {
+  runGroupId: string;
+  runCount: number;
+  scorers: Record<string, { mean: number; std: number; min: number; max: number }>;
+  timing?: { mean: number; std: number };
+};
+
 export type EvalResultData = {
   id: string;
   workflow: string;
@@ -47,6 +54,10 @@ export type EvalResultData = {
       p50: number;
       p95: number;
     };
+  };
+  _multiRun?: {
+    aggregate: MultiRunAggregate;
+    allRuns: EvalResultData[];
   };
 };
 
@@ -69,7 +80,14 @@ export type ComparisonResult = {
   }>;
   scorers?: Record<
     string,
-    { baselineMean: number; candidateMean: number; delta: number; deltaPercent: number }
+    {
+      baselineMean: number;
+      candidateMean: number;
+      delta: number;
+      deltaPercent: number;
+      ci?: { lower: number; upper: number };
+      significant?: boolean;
+    }
   >;
   timing?: {
     baselineMean: number;

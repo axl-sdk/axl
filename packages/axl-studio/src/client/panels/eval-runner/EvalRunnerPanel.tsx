@@ -2,7 +2,13 @@ import { useState, useCallback } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { FlaskConical, Play } from 'lucide-react';
 import { EmptyState } from '../../components/shared/EmptyState';
-import { fetchEvals, fetchEvalHistory, runRegisteredEval, compareEvals } from '../../lib/api';
+import {
+  fetchEvals,
+  fetchEvalHistory,
+  runRegisteredEval,
+  compareEvals,
+  rescoreEval,
+} from '../../lib/api';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
 import type { RegisteredEval, EvalHistoryEntry } from '../../lib/types';
 import type { EvalResultData, ComparisonResult } from './types';
@@ -23,6 +29,7 @@ export function EvalRunnerPanel() {
   const [currentResult, setCurrentResult] = useState<EvalResultData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedItem, setSelectedItem] = useState<number | null>(null);
+  const [runCount, setRunCount] = useState(1);
 
   // EvalItemList filter/sort state (lifted so it survives navigate-back from detail view)
   const [errorFilter, setErrorFilter] = useState<'all' | 'errors' | 'no-errors'>('all');
@@ -60,7 +67,10 @@ export function EvalRunnerPanel() {
     setSelectedItem(null);
 
     try {
-      const result = (await runRegisteredEval(selectedEval)) as EvalResultData;
+      const result = (await runRegisteredEval(
+        selectedEval,
+        runCount > 1 ? { runs: runCount } : undefined,
+      )) as EvalResultData;
       setCurrentResult(result);
       queryClient.invalidateQueries({ queryKey: ['evalHistory'] });
     } catch (err) {
@@ -68,7 +78,7 @@ export function EvalRunnerPanel() {
     } finally {
       setRunning(false);
     }
-  }, [selectedEval, queryClient]);
+  }, [selectedEval, runCount, queryClient]);
 
   const handleCompare = useCallback(async () => {
     if (history.length < 2) return;
@@ -89,6 +99,22 @@ export function EvalRunnerPanel() {
       setComparing(false);
     }
   }, [history]);
+
+  const handleRescore = useCallback(
+    async (evalName: string, resultId: string) => {
+      setError(null);
+      try {
+        const result = (await rescoreEval(evalName, resultId)) as EvalResultData;
+        setCurrentResult(result);
+        setSelectedItem(null);
+        setTab('run');
+        queryClient.invalidateQueries({ queryKey: ['evalHistory'] });
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [queryClient],
+  );
 
   const scorerNames = currentResult?.summary?.scorers
     ? Object.keys(currentResult.summary.scorers)
@@ -136,6 +162,17 @@ export function EvalRunnerPanel() {
               <Play size={12} className={running ? 'animate-spin' : ''} />
               {running ? 'Running\u2026' : 'Run'}
             </button>
+            <input
+              type="number"
+              min={1}
+              max={25}
+              value={runCount}
+              onChange={(e) =>
+                setRunCount(Math.max(1, Math.min(25, parseInt(e.target.value) || 1)))
+              }
+              className="w-14 px-2 py-1.5 text-sm text-center rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
+              title="Number of runs"
+            />
           </div>
         )}
       </header>
@@ -246,6 +283,20 @@ export function EvalRunnerPanel() {
                 </div>
               </div>
 
+              {/* Multi-run aggregate banner */}
+              {currentResult._multiRun && (
+                <div className="shrink-0 px-6">
+                  <div className="px-4 py-2 rounded-lg bg-[hsl(var(--muted))] text-xs text-[hsl(var(--muted-foreground))]">
+                    Showing run 1 of {currentResult._multiRun.allRuns.length} — Mean scores:{' '}
+                    {Object.entries(currentResult._multiRun.aggregate.scorers)
+                      .map(
+                        ([name, s]) => `${name}: ${s.mean.toFixed(3)} \u00b1 ${s.std.toFixed(3)}`,
+                      )
+                      .join(', ')}
+                  </div>
+                </div>
+              )}
+
               {/* Master-detail split */}
               <div className="flex flex-1 min-h-0 border-t border-[hsl(var(--border))]">
                 {/* Left panel: compact item list */}
@@ -345,6 +396,7 @@ export function EvalRunnerPanel() {
                 setSelectedItem(null);
                 setTab('run');
               }}
+              onRescore={handleRescore}
             />
           )}
         </div>
@@ -396,11 +448,13 @@ function HistoryTable({
   evalFilter,
   onEvalFilterChange,
   onSelect,
+  onRescore,
 }: {
   history: EvalHistoryEntry[];
   evalFilter: string;
   onEvalFilterChange: (value: string) => void;
   onSelect: (data: EvalResultData) => void;
+  onRescore?: (evalName: string, resultId: string) => void;
 }) {
   const evalNames = [...new Set(history.map((h) => h.eval))].sort();
   const filtered = evalFilter ? history.filter((h) => h.eval === evalFilter) : history;
@@ -460,6 +514,7 @@ function HistoryTable({
                     {name}
                   </th>
                 ))}
+                {onRescore && <th className="px-3 py-2.5 font-medium" />}
               </tr>
             </thead>
             <tbody>
@@ -508,6 +563,19 @@ function HistoryTable({
                         </td>
                       );
                     })}
+                    {onRescore && (
+                      <td className="px-3 py-2.5 text-right">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onRescore(r.eval, r.id);
+                          }}
+                          className="px-2 py-1 text-[10px] font-medium rounded border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))] transition-colors"
+                        >
+                          Rescore
+                        </button>
+                      </td>
+                    )}
                   </tr>
                 );
               })}

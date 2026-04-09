@@ -97,4 +97,191 @@ describe('Studio API: Evals', () => {
     expect(typeof body.data[0].timestamp).toBe('number');
     expect(body.data[0].data).toHaveProperty('summary');
   });
+
+  // --- Rescore endpoint ---
+
+  it('POST /api/evals/:name/rescore rescores a previous result', async () => {
+    const provider = MockProvider.sequence([{ content: 'eval output' }]);
+    const { app } = createTestServer(provider);
+
+    // Run an eval first to get a result in history
+    const runRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
+    expect(runRes.status).toBe(200);
+    const runBody = await runRes.json();
+    const resultId = runBody.data.id;
+
+    // Rescore that result
+    const rescoreRes = await app.request('/api/evals/test-eval/rescore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resultId }),
+    });
+    expect(rescoreRes.status).toBe(200);
+
+    const body = await rescoreRes.json();
+    expect(body.ok).toBe(true);
+    expect(body.data).toHaveProperty('id');
+    expect(body.data.id).not.toBe(resultId); // New result ID
+    expect(body.data.metadata.rescored).toBe(true);
+    expect(body.data.metadata.originalId).toBe(resultId);
+    expect(body.data.items.length).toBe(1);
+    expect(body.data.items[0].scores['always-pass']).toBe(1);
+    expect(body.data.summary.scorers['always-pass']).toBeDefined();
+  });
+
+  it('POST /api/evals/:name/rescore returns 400 when resultId is missing', async () => {
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/test-eval/rescore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resultId: '' }),
+    });
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('BAD_REQUEST');
+  });
+
+  it('POST /api/evals/:name/rescore returns 404 for unknown eval', async () => {
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/nonexistent/rescore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resultId: 'some-id' }),
+    });
+    expect(res.status).toBe(404);
+
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('NOT_FOUND');
+  });
+
+  it('POST /api/evals/:name/rescore returns 404 for unknown resultId', async () => {
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/test-eval/rescore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resultId: 'nonexistent-result-id' }),
+    });
+    expect(res.status).toBe(404);
+
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('NOT_FOUND');
+    expect(body.error.message).toContain('nonexistent-result-id');
+  });
+
+  // --- Multi-run endpoint ---
+
+  it('POST /api/evals/:name/run with runs > 1 returns _multiRun data', async () => {
+    const provider = MockProvider.sequence([
+      { content: 'run1 output' },
+      { content: 'run2 output' },
+      { content: 'run3 output' },
+    ]);
+    const { app } = createTestServer(provider);
+
+    const res = await app.request('/api/evals/test-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 3 }),
+    });
+    expect(res.status).toBe(200);
+
+    const body = (await res.json()) as any;
+    expect(body.ok).toBe(true);
+
+    // Multi-run response wraps first result with _multiRun
+    const data = body.data;
+    expect(data).toHaveProperty('_multiRun');
+    expect(data._multiRun.allRuns.length).toBe(3);
+
+    // Aggregate summary
+    const agg = data._multiRun.aggregate;
+    expect(agg.runCount).toBe(3);
+    expect(agg.workflow).toBe('test-wf');
+    expect(agg.dataset).toBe('test-dataset');
+    expect(agg.scorers['always-pass']).toBeDefined();
+    expect(typeof agg.scorers['always-pass'].mean).toBe('number');
+    expect(typeof agg.scorers['always-pass'].std).toBe('number');
+
+    // Each run has metadata with runGroupId and runIndex
+    for (let i = 0; i < 3; i++) {
+      expect(data._multiRun.allRuns[i].metadata.runGroupId).toBeDefined();
+      expect(data._multiRun.allRuns[i].metadata.runIndex).toBe(i);
+    }
+  });
+
+  // --- Compare endpoint ---
+
+  it('POST /api/evals/compare compares two eval results', async () => {
+    // Run two evals to get results for comparison
+    const provider = MockProvider.sequence([
+      { content: 'baseline output' },
+      { content: 'candidate output' },
+    ]);
+    const { app } = createTestServer(provider);
+
+    const baselineRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
+    expect(baselineRes.status).toBe(200);
+    const baseline = (await baselineRes.json()).data;
+
+    const candidateRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
+    expect(candidateRes.status).toBe(200);
+    const candidate = (await candidateRes.json()).data;
+
+    const compareRes = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseline, candidate }),
+    });
+    expect(compareRes.status).toBe(200);
+
+    const body = await compareRes.json();
+    expect(body.ok).toBe(true);
+
+    const data = body.data;
+    expect(data).toHaveProperty('scorers');
+    expect(data.scorers['always-pass']).toBeDefined();
+    expect(typeof data.scorers['always-pass'].baselineMean).toBe('number');
+    expect(typeof data.scorers['always-pass'].candidateMean).toBe('number');
+    expect(typeof data.scorers['always-pass'].delta).toBe('number');
+  });
+
+  it('POST /api/evals/compare accepts thresholds option', async () => {
+    const provider = MockProvider.sequence([
+      { content: 'baseline output' },
+      { content: 'candidate output' },
+    ]);
+    const { app } = createTestServer(provider);
+
+    const baselineRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
+    const baseline = (await baselineRes.json()).data;
+
+    const candidateRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
+    const candidate = (await candidateRes.json()).data;
+
+    const compareRes = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        baseline,
+        candidate,
+        options: { thresholds: { 'always-pass': 0.1 } },
+      }),
+    });
+    expect(compareRes.status).toBe(200);
+
+    const body = await compareRes.json();
+    expect(body.ok).toBe(true);
+    expect(body.data.scorers['always-pass']).toBeDefined();
+    // With 1-item dataset, not enough paired data for bootstrap CI,
+    // so significant is undefined. Verify the core comparison fields exist.
+    expect(typeof body.data.scorers['always-pass'].baselineMean).toBe('number');
+    expect(typeof body.data.scorers['always-pass'].delta).toBe('number');
+  });
 });

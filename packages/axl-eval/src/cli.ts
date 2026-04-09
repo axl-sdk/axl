@@ -6,6 +6,9 @@ import * as path from 'node:path';
 import type { AxlRuntime } from '@axlsdk/axl';
 import { evalCompare } from './compare.js';
 import { runEval } from './runner.js';
+import { rescore } from './rescore.js';
+import { aggregateRuns } from './multi-run.js';
+import type { MultiRunSummary } from './multi-run.js';
 import type { EvalConfig, EvalResult } from './types.js';
 import {
   findConfig,
@@ -15,7 +18,14 @@ import {
   CONFIG_CANDIDATES,
 } from './cli-utils.js';
 
-const KNOWN_FLAGS = new Set(['--output', '--config', '--conditions', '--fail-on-regression']);
+const KNOWN_FLAGS = new Set([
+  '--output',
+  '--config',
+  '--conditions',
+  '--fail-on-regression',
+  '--threshold',
+  '--runs',
+]);
 
 async function main() {
   const args = process.argv.slice(2);
@@ -24,10 +34,13 @@ async function main() {
     console.log(`
 Usage:
   axl-eval <path>                         Run eval file(s)
+  axl-eval <path> --runs <n>              Run eval N times (multi-run)
   axl-eval <path> --output <file>         Save results to JSON
   axl-eval <path> --config <file>         Use config file for runtime
   axl-eval <path> --conditions <list>     Node.js import conditions (comma-separated)
+  axl-eval rescore <results> <eval-file>  Re-run scorers on saved outputs
   axl-eval compare <a> <b>                Compare two eval result files
+  axl-eval compare <a> <b> --threshold <v>  Set regression threshold (global or per-scorer)
   axl-eval compare <a> <b> --fail-on-regression  Exit 1 if regressions
 
 Config auto-detection (when --config is not specified):
@@ -45,21 +58,49 @@ When no config is found, a bare AxlRuntime is created (providers from env vars).
     return;
   }
 
+  if (args[0] === 'rescore') {
+    await runRescore(args.slice(1));
+    return;
+  }
+
   await runEvalCommand(args);
+}
+
+function parseThresholdArg(args: string[]): Record<string, number> | number | undefined {
+  const idx = args.indexOf('--threshold');
+  if (idx === -1 || idx + 1 >= args.length) return undefined;
+  const value = args[idx + 1];
+
+  // Global numeric threshold: --threshold 0.05
+  if (/^[\d.]+$/.test(value)) return parseFloat(value);
+
+  // Per-scorer map: --threshold accuracy=0,tone=0.1
+  const map: Record<string, number> = {};
+  for (const pair of value.split(',')) {
+    const [key, val] = pair.split('=');
+    if (key && val != null) map[key.trim()] = parseFloat(val.trim());
+  }
+  return Object.keys(map).length > 0 ? map : undefined;
 }
 
 async function runCompare(args: string[]) {
   const failOnRegression = args.includes('--fail-on-regression');
-  const files = args.filter((a) => !a.startsWith('--'));
+  const thresholds = parseThresholdArg(args);
+  const files = args.filter(
+    (a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1] === '--threshold'),
+  );
 
   if (files.length !== 2) {
-    console.error('Usage: axl-eval compare <baseline.json> <candidate.json>');
+    console.error('Usage: axl-eval compare <baseline.json> <candidate.json> [--threshold <value>]');
     process.exit(1);
   }
 
-  const baseline: EvalResult = JSON.parse(await readFileAsync(files[0], 'utf-8'));
-  const candidate: EvalResult = JSON.parse(await readFileAsync(files[1], 'utf-8'));
-  const comparison = evalCompare(baseline, candidate);
+  const baselineRaw = JSON.parse(await readFileAsync(files[0], 'utf-8'));
+  const candidateRaw = JSON.parse(await readFileAsync(files[1], 'utf-8'));
+  const baseline: EvalResult | EvalResult[] = baselineRaw;
+  const candidate: EvalResult | EvalResult[] = candidateRaw;
+  const compareOptions = thresholds != null ? { thresholds } : undefined;
+  const comparison = evalCompare(baseline, candidate, compareOptions);
 
   console.log(
     `\nCompare: baseline (${comparison.baseline.id.slice(0, 8)}) -> candidate (${comparison.candidate.id.slice(0, 8)})\n`,
@@ -67,16 +108,28 @@ async function runCompare(args: string[]) {
 
   const scorerNames = Object.keys(comparison.scorers);
   const maxNameLen = Math.max(...scorerNames.map((n) => n.length), 6);
+  const hasCI = scorerNames.some((n) => comparison.scorers[n].ci != null);
 
-  console.log(`  ${'Scorer'.padEnd(maxNameLen)}  Baseline  Candidate  Delta     Change`);
-  console.log(`  ${''.padEnd(maxNameLen, '-')}  --------  ---------  --------  ------`);
+  const ciHeader = hasCI ? '  CI 95%            Sig' : '';
+  const ciRule = hasCI ? '  ----------------  ---' : '';
+  console.log(`  ${'Scorer'.padEnd(maxNameLen)}  Baseline  Candidate  Delta     Change${ciHeader}`);
+  console.log(`  ${''.padEnd(maxNameLen, '-')}  --------  ---------  --------  ------${ciRule}`);
 
   for (const name of scorerNames) {
     const s = comparison.scorers[name];
     const sign = s.delta > 0 ? '+' : '';
-    console.log(
-      `  ${name.padEnd(maxNameLen)}  ${s.baselineMean.toFixed(3).padStart(8)}  ${s.candidateMean.toFixed(3).padStart(9)}  ${(sign + s.delta.toFixed(3)).padStart(8)}  ${(sign + s.deltaPercent.toFixed(1) + '%').padStart(6)}`,
-    );
+    let line = `  ${name.padEnd(maxNameLen)}  ${s.baselineMean.toFixed(3).padStart(8)}  ${s.candidateMean.toFixed(3).padStart(9)}  ${(sign + s.delta.toFixed(3)).padStart(8)}  ${(sign + s.deltaPercent.toFixed(1) + '%').padStart(6)}`;
+    if (hasCI) {
+      if (s.ci) {
+        const lo = (s.ci.lower >= 0 ? '+' : '') + s.ci.lower.toFixed(4);
+        const hi = (s.ci.upper >= 0 ? '+' : '') + s.ci.upper.toFixed(4);
+        const sig = s.significant ? '  *' : '   ';
+        line += `  [${lo}, ${hi}]${sig}`;
+      } else {
+        line += '  —'.padEnd(22);
+      }
+    }
+    console.log(line);
   }
 
   if (comparison.timing) {
@@ -94,16 +147,69 @@ async function runCompare(args: string[]) {
     );
   }
 
+  const baselineRef = Array.isArray(baseline) ? baseline[0] : baseline;
   const stable = Math.max(
     0,
-    baseline.items.length - comparison.regressions.length - comparison.improvements.length,
+    baselineRef.items.length - comparison.regressions.length - comparison.improvements.length,
   );
   console.log(
     `\n  Regressions: ${comparison.regressions.length} | Improvements: ${comparison.improvements.length} | Stable: ${stable}\n`,
   );
 
   if (failOnRegression && comparison.regressions.length > 0) {
+    // When CI is available, only fail on significant regressions
+    const hasSignificance = scorerNames.some((n) => comparison.scorers[n].significant != null);
+    if (hasSignificance) {
+      const hasSignificantRegression = scorerNames.some(
+        (n) => comparison.scorers[n].significant === true && comparison.scorers[n].delta < 0,
+      );
+      if (hasSignificantRegression) process.exit(1);
+    } else {
+      process.exit(1);
+    }
+  }
+}
+
+async function runRescore(args: string[]) {
+  const { outputPath, configArg, conditions, paths } = parseEvalArgs(args);
+
+  if (paths.length < 2) {
+    console.error('Usage: axl-eval rescore <results.json> <eval-file> [--output <file>]');
     process.exit(1);
+  }
+
+  const [resultsPath, evalFilePath] = paths;
+  const raw = JSON.parse(await readFileAsync(resultsPath, 'utf-8'));
+  const results: EvalResult[] = Array.isArray(raw) ? raw : [raw];
+
+  const runtime = await getRuntime(configArg, conditions);
+  try {
+    const mod = await importModule(path.resolve(evalFilePath), import.meta.url);
+    const evalConfig: EvalConfig = mod.default?.default ?? mod.default ?? mod.config ?? mod;
+
+    if (!evalConfig.scorers || evalConfig.scorers.length === 0) {
+      console.error(`Error: ${evalFilePath} does not export scorers`);
+      process.exit(1);
+    }
+
+    const rescored: EvalResult[] = [];
+    for (const resultData of results) {
+      rescored.push(await rescore(resultData, evalConfig.scorers, runtime));
+    }
+
+    for (const r of rescored) {
+      console.log('\n' + formatTable(r) + '\n');
+    }
+
+    if (outputPath) {
+      const output = Array.isArray(raw) ? rescored : rescored[0];
+      const outputDir = path.dirname(path.resolve(outputPath));
+      await mkdir(outputDir, { recursive: true });
+      await writeFileAsync(outputPath, JSON.stringify(output, null, 2), 'utf-8');
+      console.log(`Rescored results saved to ${outputPath}`);
+    }
+  } finally {
+    await runtime.shutdown().catch(() => {});
   }
 }
 
@@ -180,6 +286,41 @@ function formatTable(result: EvalResult): string {
       lines.push(`    ... and ${uniqueErrors.length - 5} more`);
     }
   }
+
+  return lines.join('\n');
+}
+
+function formatMultiRunTable(summary: MultiRunSummary): string {
+  const lines: string[] = [];
+  const scorerNames = Object.keys(summary.scorers);
+  const maxNameLen = Math.max(...scorerNames.map((n) => n.length), 'Scorer'.length);
+  const colWidth = 16;
+
+  lines.push(`Eval: ${summary.workflow} x ${summary.dataset} \u2014 ${summary.runCount} runs`);
+  lines.push(
+    `  ${'Scorer'.padEnd(maxNameLen)}  ${'Mean \u00b1 Std'.padStart(colWidth)}  ${'Min'.padStart(8)}  ${'Max'.padStart(8)}`,
+  );
+  const ruleLen = maxNameLen + 2 + colWidth + 2 + 8 + 2 + 8;
+  lines.push('  ' + '\u2500'.repeat(ruleLen));
+
+  for (const name of scorerNames) {
+    const s = summary.scorers[name];
+    const meanStd = `${s.mean.toFixed(3)} \u00b1 ${s.std.toFixed(3)}`;
+    lines.push(
+      `  ${name.padEnd(maxNameLen)}  ${meanStd.padStart(colWidth)}  ${s.min.toFixed(3).padStart(8)}  ${s.max.toFixed(3).padStart(8)}`,
+    );
+  }
+
+  if (summary.timing) {
+    lines.push(
+      `  ${'Timing'.padEnd(maxNameLen)}  ${((summary.timing.mean / 1000).toFixed(2) + ' \u00b1 ' + (summary.timing.std / 1000).toFixed(2) + 's').padStart(colWidth)}`,
+    );
+  }
+
+  const costStr = summary.totalCost > 0 ? `$${summary.totalCost.toFixed(2)}` : '$0.00';
+  const durationStr = (summary.totalDuration / 1000).toFixed(1);
+  lines.push('');
+  lines.push(`  Total Cost: ${costStr} | Total Duration: ${durationStr}s`);
 
   return lines.join('\n');
 }
@@ -265,16 +406,18 @@ function parseEvalArgs(args: string[]): {
   outputPath?: string;
   configArg?: string;
   conditions: string[];
+  runs: number;
   paths: string[];
 } {
   let outputPath: string | undefined;
   let configArg: string | undefined;
   let conditions: string[] = [];
+  let runs = 1;
   const paths: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === '--output' || arg === '--config' || arg === '--conditions') {
+    if (arg === '--output' || arg === '--config' || arg === '--conditions' || arg === '--runs') {
       if (i + 1 >= args.length) {
         console.error(`Error: ${arg} requires a value`);
         process.exit(1);
@@ -282,6 +425,7 @@ function parseEvalArgs(args: string[]): {
       const value = args[++i];
       if (arg === '--output') outputPath = value;
       else if (arg === '--config') configArg = value;
+      else if (arg === '--runs') runs = Math.max(1, parseInt(value, 10) || 1);
       else
         conditions = value
           .split(',')
@@ -297,13 +441,13 @@ function parseEvalArgs(args: string[]): {
     }
   }
 
-  return { outputPath, configArg, conditions, paths };
+  return { outputPath, configArg, conditions, runs, paths };
 }
 
 // ── Main eval command ──────────────────────────────────────────────
 
 async function runEvalCommand(args: string[]) {
-  const { outputPath, configArg, conditions, paths } = parseEvalArgs(args);
+  const { outputPath, configArg, conditions, runs, paths } = parseEvalArgs(args);
 
   if (paths.length === 0) {
     console.error('Error: No eval file path provided');
@@ -365,10 +509,29 @@ async function runEvalCommand(args: string[]) {
           executeWorkflow = async (input) => ({ output: input });
         }
 
-        const result = await runEval(evalConfig, executeWorkflow, runtime);
-        results.push(result);
+        if (runs > 1) {
+          // Multi-run mode
+          const { randomUUID } = await import('node:crypto');
+          const runGroupId = randomUUID();
+          const runResults: EvalResult[] = [];
 
-        console.log('\n' + formatTable(result) + '\n');
+          for (let r = 0; r < runs; r++) {
+            console.error(`[axl-eval] Run ${r + 1}/${runs}...`);
+            const result = await runEval(evalConfig, executeWorkflow, runtime);
+            result.metadata.runGroupId = runGroupId;
+            result.metadata.runIndex = r;
+            runResults.push(result);
+            results.push(result);
+          }
+
+          const summary = aggregateRuns(runResults);
+          console.log('\n' + formatMultiRunTable(summary) + '\n');
+        } else {
+          const result = await runEval(evalConfig, executeWorkflow, runtime);
+          results.push(result);
+
+          console.log('\n' + formatTable(result) + '\n');
+        }
       } catch (err) {
         console.error(
           `Error running eval ${filePath}: ${err instanceof Error ? err.message : String(err)}`,

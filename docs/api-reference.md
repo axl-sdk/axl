@@ -1237,7 +1237,7 @@ Result from `evalCompare()` comparing a baseline and candidate eval run.
 |-------|------|-------------|
 | `baseline` | `{ id, metadata }` | Baseline run identity |
 | `candidate` | `{ id, metadata }` | Candidate run identity |
-| `scorers` | `Record<string, { baselineMean, candidateMean, delta, deltaPercent }>` | Per-scorer mean comparison |
+| `scorers` | `Record<string, { baselineMean, candidateMean, delta, deltaPercent, ci?, significant? }>` | Per-scorer mean comparison. `ci` is `{ lower: number; upper: number }` (95% bootstrap CI on paired differences). `significant` is `true` when the CI excludes zero and \|delta\| exceeds the threshold |
 | `timing` | `{ baselineMean, candidateMean, delta, deltaPercent }?` | Per-item duration comparison |
 | `cost` | `{ baselineTotal, candidateTotal, delta, deltaPercent }?` | Total cost comparison |
 | `regressions` | `EvalRegression[]` | Items that got worse |
@@ -1260,6 +1260,79 @@ Individual item that regressed or improved between runs.
 ### `normalizeScorerResult(result)`
 
 Converts a scorer return value (`number | ScorerResult`) to a `ScorerResult`. Returns the input as-is if already a `ScorerResult`, or wraps a plain number as `{ score: result }`.
+
+### `EvalCompareOptions`
+
+Options for `evalCompare()`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `thresholds` | `Record<string, number> \| number` | auto-calibrate | Minimum absolute delta to consider meaningful. A single number applies to all scorers. A per-scorer map allows different thresholds per scorer (scorers not in the map fall through to auto-calibration). Default: auto-calibrates from `scorerTypes` metadata — `0` for deterministic scorers, `0.05` for LLM scorers, `0.1` legacy fallback for results without metadata |
+
+### `evalCompare(baseline, candidate, options?)`
+
+Compare baseline and candidate eval results to detect regressions and improvements. Both arguments accept `EvalResult | EvalResult[]` — passing arrays enables multi-run comparison, which pools per-item paired differences across runs for tighter bootstrap CIs.
+
+Throws if the datasets or scorer names don't match between baseline and candidate.
+
+### `runtime.evalCompare(baseline, candidate, options?)`
+
+Convenience wrapper that dynamically imports `@axlsdk/eval` and calls `evalCompare()`. Accepts an optional `EvalCompareOptions` third parameter.
+
+### `BootstrapCIResult`
+
+Result from `pairedBootstrapCI()`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `lower` | `number` | Lower bound of the confidence interval |
+| `upper` | `number` | Upper bound of the confidence interval |
+| `mean` | `number` | Mean of the original differences |
+
+### `pairedBootstrapCI(differences, options?)`
+
+Compute a percentile-based bootstrap confidence interval on paired differences. Resamples with replacement and returns the CI bounds plus the sample mean.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `nResamples` | `number` | `1000` | Number of bootstrap resamples |
+| `alpha` | `number` | `0.05` | Significance level (0.05 = 95% CI) |
+| `seed` | `number` | — | Seed for xorshift32 PRNG. When provided, results are deterministic |
+
+### `RescoreOptions`
+
+Options for `rescore()`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `concurrency` | `number` | `5` | Maximum parallel scorer executions |
+
+### `rescore(result, scorers, runtime, options?)`
+
+Re-run scorers on the saved outputs of an existing `EvalResult` without re-executing the workflow. Returns a new `EvalResult` with `rescored: true` and `originalId` set in metadata. Only tracks scorer cost (no workflow cost).
+
+### `MultiRunSummary`
+
+Result from `aggregateRuns()`. Computes mean +/- std of per-scorer means across multiple runs.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `runGroupId` | `string` | Shared group ID across runs |
+| `runCount` | `number` | Number of runs aggregated |
+| `workflow` | `string` | Workflow name |
+| `dataset` | `string` | Dataset name |
+| `totalCost` | `number` | Sum of all runs' costs |
+| `totalDuration` | `number` | Sum of all runs' durations (ms) |
+| `scorers` | `Record<string, { mean, std, min, max }>` | Per-scorer aggregate: mean of means, std across runs, min/max of means |
+| `timing` | `{ mean, std }?` | Timing aggregate across runs (present when all runs have timing data) |
+
+### `aggregateRuns(runs)`
+
+Aggregate multiple `EvalResult[]` into a `MultiRunSummary` with mean +/- std per scorer. Throws if the array is empty.
+
+### `scorerTypes` metadata convention
+
+`runEval()` automatically stores `scorerTypes: Record<string, 'llm' | 'deterministic'>` in `EvalResult.metadata`. This metadata is used by `evalCompare()` to auto-calibrate regression thresholds: `0` for deterministic scorers (any change is meaningful) and `0.05` for LLM scorers (accounts for natural variance). Results without `scorerTypes` fall back to a `0.1` legacy threshold.
 
 ### `runEval(config, executeWorkflow, runtime)`
 

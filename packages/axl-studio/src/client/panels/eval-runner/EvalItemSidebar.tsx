@@ -47,7 +47,7 @@ export function EvalItemSidebar({
           <button
             onClick={onDeselectItem}
             className={cn(
-              'text-xs font-medium transition-colors',
+              'text-xs font-medium transition-colors cursor-pointer',
               selectedIndex == null
                 ? 'text-[hsl(var(--foreground))]'
                 : 'text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]',
@@ -76,7 +76,7 @@ export function EvalItemSidebar({
               key={index}
               onClick={() => onSelectItem(index)}
               className={cn(
-                'w-full text-left px-4 py-2.5 flex items-center gap-3 border-b border-[hsl(var(--border))]/50 transition-colors group',
+                'w-full text-left px-4 py-2.5 flex items-center gap-3 border-b border-[hsl(var(--border))]/50 transition-colors group cursor-pointer',
                 isSelected
                   ? 'bg-[hsl(var(--accent))] border-l-2 border-l-[hsl(var(--foreground))]'
                   : 'hover:bg-[hsl(var(--accent))]/50 border-l-2 border-l-transparent',

@@ -6,9 +6,10 @@ type Props = {
   summary: EvalResultData['summary'];
   items: EvalItem[];
   totalCost: number;
+  scorerTypes?: Record<string, string>;
 };
 
-export function EvalSummaryTable({ summary, items, totalCost }: Props) {
+export function EvalSummaryTable({ summary, items, totalCost, scorerTypes }: Props) {
   const scorerEntries = summary.scorers ? Object.entries(summary.scorers) : [];
 
   if (scorerEntries.length === 0 && !summary.timing && totalCost <= 0) {
@@ -40,7 +41,17 @@ export function EvalSummaryTable({ summary, items, totalCost }: Props) {
               const hasValidScores = items.some((i) => !i.error && i.scores[scorer] != null);
               return (
                 <tr key={scorer} className="border-b border-[hsl(var(--border))] last:border-b-0">
-                  <td className="px-4 py-2.5 font-mono text-[hsl(var(--foreground))]">{scorer}</td>
+                  <td className="px-4 py-2.5 font-mono text-[hsl(var(--foreground))]">
+                    {scorer}
+                    {scorerTypes?.[scorer] === 'llm' && (
+                      <span
+                        className="ml-1.5 px-1 py-0.5 text-[9px] font-medium rounded bg-purple-100 text-purple-600 dark:bg-purple-900/30 dark:text-purple-400 align-middle"
+                        title="LLM scorer — scores may vary between runs"
+                      >
+                        LLM
+                      </span>
+                    )}
+                  </td>
                   {hasValidScores ? (
                     <>
                       <td className="px-4 py-2.5">

@@ -120,7 +120,7 @@ export function EvalItemList({
                 onScorerFilterChange('');
                 onThresholdChange('');
               }}
-              className="text-xs text-[hsl(var(--primary))] hover:underline"
+              className="text-xs text-[hsl(var(--primary))] hover:underline cursor-pointer"
             >
               Reset
             </button>
@@ -182,7 +182,7 @@ export function EvalItemList({
           </select>
           <button
             onClick={() => onSortDirChange(sortDir === 'asc' ? 'desc' : 'asc')}
-            className="px-2 py-1 text-xs rounded-lg border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))] transition-colors"
+            className="px-2 py-1 text-xs rounded-lg border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))] transition-colors cursor-pointer"
             title={sortDir === 'asc' ? 'Ascending' : 'Descending'}
           >
             {sortDir === 'asc' ? '\u2191' : '\u2193'}

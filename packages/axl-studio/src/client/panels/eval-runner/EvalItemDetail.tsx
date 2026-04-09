@@ -25,7 +25,7 @@ function ReasoningBlock({ text }: { text: string }) {
       {needsTruncation && (
         <button
           onClick={() => setExpanded(!expanded)}
-          className="text-xs text-[hsl(var(--primary))] hover:underline mt-1.5"
+          className="text-xs text-[hsl(var(--primary))] hover:underline mt-1.5 cursor-pointer"
         >
           {expanded ? 'Show less' : 'Show more'}
         </button>
@@ -64,7 +64,7 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
         <nav className="flex items-center gap-1.5 text-sm">
           <button
             onClick={onBack}
-            className="text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] transition-colors"
+            className="text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] transition-colors cursor-pointer"
           >
             Overview
           </button>

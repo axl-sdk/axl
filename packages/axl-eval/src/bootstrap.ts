@@ -5,6 +5,10 @@ export type BootstrapCIResult = {
   upper: number;
   /** Mean of the original differences. */
   mean: number;
+  /** Proportion of resamples where the mean difference is negative (probability of regression). */
+  pRegression: number;
+  /** Proportion of resamples where the mean difference is positive (probability of improvement). */
+  pImprovement: number;
 };
 
 /**
@@ -18,16 +22,30 @@ export function pairedBootstrapCI(
   options?: { nResamples?: number; alpha?: number; seed?: number },
 ): BootstrapCIResult {
   const n = differences.length;
-  if (n === 0) return { lower: 0, upper: 0, mean: 0 };
+  if (n === 0) return { lower: 0, upper: 0, mean: 0, pRegression: 0, pImprovement: 0 };
 
   const nResamples = options?.nResamples ?? 1000;
   const alpha = options?.alpha ?? 0.05;
 
   const mean = differences.reduce((a, b) => a + b, 0) / n;
 
-  if (n === 1) return { lower: differences[0], upper: differences[0], mean };
+  if (n === 1)
+    return {
+      lower: differences[0],
+      upper: differences[0],
+      mean,
+      pRegression: mean < 0 ? 1 : 0,
+      pImprovement: mean > 0 ? 1 : 0,
+    };
 
-  if (nResamples <= 0) return { lower: round(mean), upper: round(mean), mean: round(mean) };
+  if (nResamples <= 0)
+    return {
+      lower: round(mean),
+      upper: round(mean),
+      mean: round(mean),
+      pRegression: mean < 0 ? 1 : 0,
+      pImprovement: mean > 0 ? 1 : 0,
+    };
 
   // Seeded or random number generator
   const rng = options?.seed != null ? xorshift32(options.seed) : () => Math.random();
@@ -46,10 +64,25 @@ export function pairedBootstrapCI(
   const lowerIdx = Math.floor((alpha / 2) * nResamples);
   const upperIdx = Math.floor((1 - alpha / 2) * nResamples) - 1;
 
+  // Count resamples below/above zero for directional probabilities
+  // resampleMeans is already sorted, so binary search for zero
+  let belowZero = 0;
+  for (let i = 0; i < nResamples; i++) {
+    if (resampleMeans[i] < 0) belowZero++;
+    else break;
+  }
+  let aboveZero = 0;
+  for (let i = nResamples - 1; i >= 0; i--) {
+    if (resampleMeans[i] > 0) aboveZero++;
+    else break;
+  }
+
   return {
     lower: round(resampleMeans[Math.max(0, lowerIdx)]),
     upper: round(resampleMeans[Math.min(nResamples - 1, upperIdx)]),
     mean: round(mean),
+    pRegression: round(belowZero / nResamples),
+    pImprovement: round(aboveZero / nResamples),
   };
 }
 

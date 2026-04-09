@@ -8,7 +8,7 @@ import type {
 import { pairedBootstrapCI } from './bootstrap.js';
 
 function round(n: number): number {
-  return Math.round(n * 100) / 100;
+  return Math.round(n * 1000) / 1000;
 }
 
 const DEFAULT_LLM_THRESHOLD = 0.05;
@@ -130,6 +130,9 @@ export function evalCompare(
     if (diffs.length >= 2) {
       const ci = pairedBootstrapCI(diffs);
       entry.ci = { lower: ci.lower, upper: ci.upper };
+      entry.pRegression = ci.pRegression;
+      entry.pImprovement = ci.pImprovement;
+      entry.n = diffs.length;
       // Significant when CI excludes zero AND delta exceeds practical threshold
       const ciExcludesZero = ci.lower > 0 || ci.upper < 0;
       entry.significant = ciExcludesZero && Math.abs(ci.mean) >= threshold;
@@ -138,37 +141,52 @@ export function evalCompare(
     scorers[name] = entry;
   }
 
-  // Per-item regressions/improvements — computed from the first run of each side
+  // Per-item regressions/improvements.
+  // For multi-run: average each item's score across runs to get a stable per-item comparison.
   const regressions: EvalRegression[] = [];
   const improvements: EvalImprovement[] = [];
 
-  const refMinLength = Math.min(baselineRef.items.length, candidateRef.items.length);
-  for (let i = 0; i < refMinLength; i++) {
-    const bItem = baselineRef.items[i];
-    const cItem = candidateRef.items[i];
-    if (bItem.error || cItem.error) continue;
+  const itemCount = Math.min(
+    ...baselineRuns.map((r) => r.items.length),
+    ...candidateRuns.map((r) => r.items.length),
+  );
+
+  for (let i = 0; i < itemCount; i++) {
+    // Check if any run has an error for this item
+    const hasBaselineError = baselineRuns.some((r) => r.items[i]?.error);
+    const hasCandidateError = candidateRuns.some((r) => r.items[i]?.error);
+    if (hasBaselineError || hasCandidateError) continue;
+
     for (const name of baselineScorerNames) {
-      const bScore = bItem.scores[name];
-      const cScore = cItem.scores[name];
-      if (bScore == null || cScore == null) continue;
-      const delta = round(cScore - bScore);
+      // Average this item's score across all runs on each side
+      const bScores = baselineRuns
+        .map((r) => r.items[i]?.scores[name])
+        .filter((s): s is number => s != null);
+      const cScores = candidateRuns
+        .map((r) => r.items[i]?.scores[name])
+        .filter((s): s is number => s != null);
+      if (bScores.length === 0 || cScores.length === 0) continue;
+
+      const bAvg = bScores.reduce((a, b) => a + b, 0) / bScores.length;
+      const cAvg = cScores.reduce((a, b) => a + b, 0) / cScores.length;
+      const delta = round(cAvg - bAvg);
       const threshold = resolveThreshold(name, options, baselineRef.metadata);
       if (delta < -threshold)
         regressions.push({
           itemIndex: i,
-          input: bItem.input,
+          input: baselineRef.items[i]?.input,
           scorer: name,
-          baselineScore: bScore,
-          candidateScore: cScore,
+          baselineScore: round(bAvg),
+          candidateScore: round(cAvg),
           delta,
         });
       else if (delta > threshold)
         improvements.push({
           itemIndex: i,
-          input: bItem.input,
+          input: baselineRef.items[i]?.input,
           scorer: name,
-          baselineScore: bScore,
-          candidateScore: cScore,
+          baselineScore: round(bAvg),
+          candidateScore: round(cAvg),
           delta,
         });
     }

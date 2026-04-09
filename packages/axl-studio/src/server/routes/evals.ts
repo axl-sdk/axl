@@ -50,8 +50,9 @@ export function createEvalRoutes(evalLoader?: () => Promise<void>) {
         const runGroupId = randomUUID();
         const results = [];
         for (let r = 0; r < runs; r++) {
-          const result = await runtime.runRegisteredEval(name);
-          (result as any).metadata = { ...(result as any).metadata, runGroupId, runIndex: r };
+          const result = await runtime.runRegisteredEval(name, {
+            metadata: { runGroupId, runIndex: r },
+          });
           results.push(result);
         }
         const aggregate = aggregateRuns(results as any);

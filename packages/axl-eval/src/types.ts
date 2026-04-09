@@ -76,6 +76,10 @@ export type EvalComparison = {
       deltaPercent: number;
       ci?: { lower: number; upper: number };
       significant?: boolean;
+      pRegression?: number;
+      pImprovement?: number;
+      /** Number of paired item differences used for CI computation. */
+      n?: number;
     }
   >;
   timing?: {

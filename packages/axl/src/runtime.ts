@@ -284,7 +284,10 @@ export class AxlRuntime extends EventEmitter {
   }
 
   /** Run a registered eval by name. */
-  async runRegisteredEval(name: string): Promise<unknown> {
+  async runRegisteredEval(
+    name: string,
+    options?: { metadata?: Record<string, unknown> },
+  ): Promise<unknown> {
     const entry = this.registeredEvals.get(name);
     if (!entry) throw new Error(`Eval "${name}" is not registered`);
 
@@ -340,8 +343,16 @@ export class AxlRuntime extends EventEmitter {
       );
     }
 
-    // Persist eval result to history (best-effort — don't lose the result on store errors)
+    // Merge extra metadata if provided (e.g., runGroupId for multi-run)
     const resultObj = result as Record<string, unknown>;
+    if (options?.metadata) {
+      resultObj.metadata = {
+        ...(resultObj.metadata as Record<string, unknown>),
+        ...options.metadata,
+      };
+    }
+
+    // Persist eval result to history (best-effort — don't lose the result on store errors)
     try {
       await this.saveEvalResult({
         id: (resultObj.id as string) ?? randomUUID(),

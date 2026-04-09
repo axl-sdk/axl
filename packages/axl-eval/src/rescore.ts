@@ -152,12 +152,12 @@ export async function rescore(
     id: randomUUID(),
     workflow: result.workflow,
     dataset: result.dataset,
-    metadata: {
-      ...result.metadata,
-      rescored: true,
-      originalId: result.id,
-      scorerTypes,
-    },
+    metadata: (() => {
+      // Strip run group membership — rescored results are independent evaluations
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { runGroupId: _, runIndex: __, ...rest } = result.metadata;
+      return { ...rest, rescored: true, originalId: result.id, scorerTypes };
+    })(),
     timestamp: new Date().toISOString(),
     totalCost,
     duration: Date.now() - startTime,

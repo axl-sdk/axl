@@ -55,7 +55,9 @@ describe('pairedBootstrapCI()', () => {
 
   it('returns mean as both bounds when nResamples is 0', () => {
     const result = pairedBootstrapCI([0.1, 0.2], { nResamples: 0, seed: 42 });
-    expect(result).toEqual({ lower: 0.15, upper: 0.15, mean: 0.15 });
+    expect(result.lower).toBe(0.15);
+    expect(result.upper).toBe(0.15);
+    expect(result.mean).toBe(0.15);
   });
 
   it('handles seed of 0 without error', () => {
@@ -66,6 +68,25 @@ describe('pairedBootstrapCI()', () => {
 
   it('handles empty array', () => {
     const result = pairedBootstrapCI([]);
-    expect(result).toEqual({ lower: 0, upper: 0, mean: 0 });
+    expect(result.lower).toBe(0);
+    expect(result.upper).toBe(0);
+    expect(result.mean).toBe(0);
+    expect(result.pRegression).toBe(0);
+    expect(result.pImprovement).toBe(0);
+  });
+
+  it('returns pRegression close to 1 for consistently negative differences', () => {
+    const diffs = [-0.1, -0.2, -0.15, -0.12, -0.18, -0.22, -0.08, -0.14, -0.19, -0.16];
+    const result = pairedBootstrapCI(diffs, { seed: 42 });
+    expect(result.pRegression).toBeGreaterThan(0.95);
+    expect(result.pImprovement).toBeLessThan(0.05);
+  });
+
+  it('returns balanced probabilities for mixed differences', () => {
+    const diffs = [0.1, -0.1, 0.05, -0.05, 0.02, -0.02, 0.08, -0.08, 0.03, -0.03];
+    const result = pairedBootstrapCI(diffs, { seed: 42 });
+    // Neither direction should dominate
+    expect(result.pRegression).toBeGreaterThan(0.1);
+    expect(result.pImprovement).toBeGreaterThan(0.1);
   });
 });

@@ -1,13 +1,29 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
+import { ChevronDown, ChevronUp } from 'lucide-react';
 import { JsonViewer } from '../../components/shared/JsonViewer';
-import { cn, formatCost, formatDuration } from '../../lib/utils';
+import { cn, formatCost, formatDuration, extractLabel } from '../../lib/utils';
+import { EvalCompareItemTable } from './EvalCompareItemTable';
 import type { ComparisonResult, EvalResultData } from './types';
 import { scoreColorClass, scoreTextColor } from './types';
+
+function Tooltip({ text, children }: { text: string; children: React.ReactNode }) {
+  return (
+    <span className="relative group/tip cursor-help">
+      {children}
+      <span className="invisible group-hover/tip:visible absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 px-2.5 py-1.5 text-[10px] leading-snug rounded-md bg-[hsl(var(--foreground))] text-[hsl(var(--background))] whitespace-normal w-56 z-50 shadow-md pointer-events-none">
+        {text}
+      </span>
+    </span>
+  );
+}
 
 type Props = {
   compareResult: ComparisonResult;
   baseline: EvalResultData | null;
   candidate: EvalResultData | null;
+  isGroupComparison?: boolean;
+  baselineRuns?: EvalResultData[] | null;
+  candidateRuns?: EvalResultData[] | null;
 };
 
 function DeltaCell({
@@ -34,27 +50,37 @@ function DeltaCell({
     ? `${value > 0 ? '+' : value < 0 ? '-' : ''}${format(Math.abs(value))}`
     : `${value > 0 ? '+' : ''}${Math.abs(value) < 100 ? value.toFixed(3) : value.toFixed(0)}`;
 
+  const percentStr = `${percent > 0 ? '+' : ''}${percent.toFixed(1)}%`;
+
   return (
-    <>
-      <td className={cn('py-2.5 text-right font-mono', colorClass)}>{formatted}</td>
-      <td className={cn('py-2.5 text-right font-mono', colorClass)}>
-        {percent > 0 ? '+' : ''}
-        {percent.toFixed(1)}%
-      </td>
-    </>
+    <td className={cn('px-3 py-2.5 text-right', colorClass)}>
+      <div className="font-mono">
+        {formatted} ({percentStr})
+      </div>
+    </td>
   );
 }
 
-function formatCI(ci: { lower: number; upper: number }): string {
-  const lo = (ci.lower >= 0 ? '+' : '') + ci.lower.toFixed(4);
-  const hi = (ci.upper >= 0 ? '+' : '') + ci.upper.toFixed(4);
-  return `[${lo}, ${hi}]`;
+function formatSigned(n: number): string {
+  return (n >= 0 ? '+' : '') + n.toFixed(4);
 }
 
 type ExpandedItem = { type: 'regression' | 'improvement'; index: number };
 
-export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
+type ScorerSortField = 'metric' | 'baseline' | 'candidate' | 'delta';
+
+export function EvalCompareView({
+  compareResult,
+  baseline,
+  candidate,
+  isGroupComparison,
+  baselineRuns,
+  candidateRuns,
+}: Props) {
   const [expanded, setExpanded] = useState<ExpandedItem | null>(null);
+  const [scorerSort, setScorerSort] = useState<ScorerSortField>('delta');
+  const [scorerSortDir, setScorerSortDir] = useState<'asc' | 'desc'>('desc');
+  const [showNoise, setShowNoise] = useState<Record<string, boolean>>({});
 
   const toggleExpand = (type: 'regression' | 'improvement', index: number) => {
     if (expanded?.type === type && expanded?.index === index) {
@@ -65,13 +91,229 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
   };
 
   const scorerEntries = compareResult.scorers ? Object.entries(compareResult.scorers) : [];
+  const scorerTypes = (baseline?.metadata?.scorerTypes ?? candidate?.metadata?.scorerTypes) as
+    | Record<string, string>
+    | undefined;
   const hasCI = scorerEntries.some(([, s]) => s.ci != null);
+  const baselineRunCount = baselineRuns?.length ?? 1;
+  const candidateRunCount = candidateRuns?.length ?? 1;
+  const pooledLabel = isGroupComparison
+    ? `averaged across ${baselineRunCount === candidateRunCount ? `${baselineRunCount} runs` : `${baselineRunCount} / ${candidateRunCount} runs`}`
+    : null;
+
+  // Sort scorer entries
+  const sortedScorerEntries = useMemo(() => {
+    const sorted = [...scorerEntries];
+    sorted.sort((a, b) => {
+      let aVal: number, bVal: number;
+      switch (scorerSort) {
+        case 'metric':
+          return scorerSortDir === 'asc' ? a[0].localeCompare(b[0]) : b[0].localeCompare(a[0]);
+        case 'baseline':
+          aVal = a[1].baselineMean;
+          bVal = b[1].baselineMean;
+          break;
+        case 'candidate':
+          aVal = a[1].candidateMean;
+          bVal = b[1].candidateMean;
+          break;
+        case 'delta':
+        default:
+          aVal = Math.abs(a[1].delta);
+          bVal = Math.abs(b[1].delta);
+          break;
+      }
+      return scorerSortDir === 'desc' ? bVal - aVal : aVal - bVal;
+    });
+    // Default: significant entries first, then by sort field
+    if (scorerSort === 'delta') {
+      sorted.sort((a, b) => {
+        const aSig = a[1].significant === true ? 1 : 0;
+        const bSig = b[1].significant === true ? 1 : 0;
+        return bSig - aSig;
+      });
+    }
+    return sorted;
+  }, [scorerEntries, scorerSort, scorerSortDir]);
+
+  const toggleScorerSort = (field: ScorerSortField) => {
+    if (scorerSort === field) {
+      setScorerSortDir((d) => (d === 'desc' ? 'asc' : 'desc'));
+    } else {
+      setScorerSort(field);
+      setScorerSortDir('desc');
+    }
+  };
+
+  const sortIndicator = (field: ScorerSortField) =>
+    scorerSort === field ? (scorerSortDir === 'desc' ? ' \u25BC' : ' \u25B2') : '';
+
+  // Compute stat card values
+  const significantCount = scorerEntries.filter(([, s]) => s.significant === true).length;
+  const regressionCount = compareResult.regressions?.length ?? 0;
+  const improvementCount = compareResult.improvements?.length ?? 0;
 
   return (
     <div className="space-y-6">
-      {compareResult.summary && (
-        <p className="text-sm text-[hsl(var(--muted-foreground))]">{compareResult.summary}</p>
-      )}
+      {/* Verdict banner */}
+      {scorerEntries.length > 0 &&
+        (() => {
+          const hasSignificantRegression = scorerEntries.some(
+            ([, s]) => s.significant === true && s.delta < 0,
+          );
+          const hasSignificantImprovement = scorerEntries.some(
+            ([, s]) => s.significant === true && s.delta > 0,
+          );
+          const hasRegressions = (compareResult.regressions?.length ?? 0) > 0;
+          const allNotSignificant = scorerEntries.every(([, s]) => s.significant === false);
+
+          const formatScorerDetail = (name: string, s: (typeof scorerEntries)[0][1]) => {
+            const pct =
+              s.delta < 0
+                ? s.pRegression != null
+                  ? `${Math.round(s.pRegression * 100)}%`
+                  : null
+                : s.pImprovement != null
+                  ? `${Math.round(s.pImprovement * 100)}%`
+                  : null;
+            const delta = `${s.delta > 0 ? '+' : ''}${s.delta.toFixed(3)}`;
+            return `${name} ${delta}${pct ? ` (${pct} probability)` : ''}`;
+          };
+
+          if (hasSignificantRegression) {
+            const regressed = scorerEntries.filter(
+              ([, s]) => s.significant === true && s.delta < 0,
+            );
+            return (
+              <div className="flex items-start gap-2.5 px-4 py-3 rounded-xl border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950/30">
+                <div className="h-6 w-6 rounded-full bg-red-100 dark:bg-red-900/50 flex items-center justify-center shrink-0 mt-0.5">
+                  <span className="text-red-600 dark:text-red-400 text-xs font-bold">
+                    {'\u2715'}
+                  </span>
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-red-800 dark:text-red-200">
+                    Significant regression detected
+                  </p>
+                  <p className="text-xs text-red-600 dark:text-red-400 mt-0.5">
+                    {regressed.map(([n, s]) => formatScorerDetail(n, s)).join('; ')}
+                  </p>
+                </div>
+              </div>
+            );
+          }
+          if (hasSignificantImprovement) {
+            const improved = scorerEntries.filter(([, s]) => s.significant === true && s.delta > 0);
+            return (
+              <div className="flex items-start gap-2.5 px-4 py-3 rounded-xl border border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-950/30">
+                <div className="h-6 w-6 rounded-full bg-emerald-100 dark:bg-emerald-900/50 flex items-center justify-center shrink-0 mt-0.5">
+                  <span className="text-emerald-600 dark:text-emerald-400 text-xs font-bold">
+                    {'\u2713'}
+                  </span>
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-emerald-800 dark:text-emerald-200">
+                    Significant improvement detected
+                  </p>
+                  <p className="text-xs text-emerald-600 dark:text-emerald-400 mt-0.5">
+                    {improved.map(([n, s]) => formatScorerDetail(n, s)).join('; ')}
+                  </p>
+                </div>
+              </div>
+            );
+          }
+          if (hasRegressions && allNotSignificant) {
+            return (
+              <div className="flex items-center gap-2.5 px-4 py-3 rounded-xl border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/30">
+                <div className="h-6 w-6 rounded-full bg-amber-100 dark:bg-amber-900/50 flex items-center justify-center shrink-0">
+                  <span className="text-amber-600 dark:text-amber-400 text-xs font-bold">~</span>
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-amber-800 dark:text-amber-200">
+                    {compareResult.regressions!.length} item regressions, but not statistically
+                    significant
+                  </p>
+                  <p className="text-xs text-amber-600 dark:text-amber-400">
+                    {isGroupComparison
+                      ? 'Even with pooled multi-run data, the score differences are within normal variation.'
+                      : 'Score differences are within normal LLM variation. Consider multi-run for stronger confidence.'}
+                  </p>
+                </div>
+              </div>
+            );
+          }
+          return (
+            <div className="flex items-center gap-2.5 px-4 py-3 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--muted))]">
+              <div className="h-6 w-6 rounded-full bg-emerald-100 dark:bg-emerald-900/50 flex items-center justify-center shrink-0">
+                <span className="text-emerald-600 dark:text-emerald-400 text-xs font-bold">
+                  {'\u2713'}
+                </span>
+              </div>
+              <div>
+                <p className="text-sm font-medium">No significant changes</p>
+                <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Scores are stable between baseline and candidate
+                </p>
+              </div>
+            </div>
+          );
+        })()}
+
+      {/* Quick stat cards */}
+      <div className="grid grid-cols-4 gap-3">
+        <div className="px-3 py-2 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--card))]">
+          <div className="text-[10px] uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+            Significant
+          </div>
+          <div className="text-lg font-semibold mt-0.5">{significantCount}</div>
+        </div>
+        <div className="px-3 py-2 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--card))]">
+          <div className="text-[10px] uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+            Regressions
+          </div>
+          <div
+            className={cn(
+              'text-lg font-semibold mt-0.5',
+              regressionCount > 0 ? 'text-red-600 dark:text-red-400' : '',
+            )}
+          >
+            {regressionCount}
+          </div>
+        </div>
+        <div className="px-3 py-2 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--card))]">
+          <div className="text-[10px] uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+            Improvements
+          </div>
+          <div
+            className={cn(
+              'text-lg font-semibold mt-0.5',
+              improvementCount > 0 ? 'text-emerald-600 dark:text-emerald-400' : '',
+            )}
+          >
+            {improvementCount}
+          </div>
+        </div>
+        {compareResult.cost && (
+          <div className="px-3 py-2 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--card))]">
+            <div className="text-[10px] uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+              Cost Delta
+            </div>
+            <div
+              className={cn(
+                'text-lg font-semibold mt-0.5',
+                compareResult.cost.delta > 0
+                  ? 'text-red-600 dark:text-red-400'
+                  : compareResult.cost.delta < 0
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : '',
+              )}
+            >
+              {compareResult.cost.delta > 0 ? '+' : ''}
+              {formatCost(Math.abs(compareResult.cost.delta))}
+            </div>
+          </div>
+        )}
+      </div>
 
       {/* ── Scorer comparison table ──────────────────────── */}
       {scorerEntries.length > 0 && (
@@ -79,67 +321,160 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
           <div className="px-4 py-2.5 bg-[hsl(var(--muted))] border-b border-[hsl(var(--border))]">
             <h3 className="text-xs font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
               Scorer Comparison
+              {pooledLabel && (
+                <span className="normal-case tracking-normal font-normal ml-1.5 opacity-70">
+                  {'\u2014'} {pooledLabel}
+                </span>
+              )}
             </h3>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-[hsl(var(--border))]">
-                  <th className="text-left px-4 py-2 font-medium">Metric</th>
-                  <th className="text-right px-3 py-2 font-medium">Baseline</th>
-                  <th className="text-right px-3 py-2 font-medium">Candidate</th>
-                  <th className="text-right px-3 py-2 font-medium">Delta</th>
-                  <th className="text-right px-3 py-2 font-medium">%</th>
-                  {hasCI && (
-                    <>
-                      <th className="text-right px-3 py-2 font-medium">CI 95%</th>
-                      <th className="text-center px-2 py-2 font-medium">Sig</th>
-                    </>
-                  )}
+                  <th
+                    className="text-left px-4 py-2 font-medium cursor-pointer select-none hover:text-[hsl(var(--foreground))]"
+                    onClick={() => toggleScorerSort('metric')}
+                  >
+                    Metric{sortIndicator('metric')}
+                  </th>
+                  <th
+                    className="text-right px-3 py-2 font-medium cursor-pointer select-none hover:text-[hsl(var(--foreground))]"
+                    onClick={() => toggleScorerSort('baseline')}
+                  >
+                    Baseline
+                    {isGroupComparison && baselineRunCount > 1 && (
+                      <span className="font-normal opacity-60 ml-0.5">({baselineRunCount})</span>
+                    )}
+                    {sortIndicator('baseline')}
+                  </th>
+                  <th
+                    className="text-right px-3 py-2 font-medium cursor-pointer select-none hover:text-[hsl(var(--foreground))]"
+                    onClick={() => toggleScorerSort('candidate')}
+                  >
+                    Candidate
+                    {isGroupComparison && candidateRunCount > 1 && (
+                      <span className="font-normal opacity-60 ml-0.5">({candidateRunCount})</span>
+                    )}
+                    {sortIndicator('candidate')}
+                  </th>
+                  <th
+                    className="text-right px-3 py-2 font-medium cursor-pointer select-none hover:text-[hsl(var(--foreground))]"
+                    onClick={() => toggleScorerSort('delta')}
+                  >
+                    {hasCI ? (
+                      <Tooltip text="Score delta with 95% confidence interval via paired bootstrap. If the CI excludes zero and the effect exceeds the practical threshold, the difference is significant (shown with a colored left border).">
+                        Delta{sortIndicator('delta')}
+                      </Tooltip>
+                    ) : (
+                      <>Delta{sortIndicator('delta')}</>
+                    )}
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {scorerEntries.map(([scorer, stats]) => (
-                  <tr key={scorer} className="border-b border-[hsl(var(--border))] last:border-b-0">
-                    <td className="px-4 py-2.5 font-mono">{scorer}</td>
-                    <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">
-                      {stats.baselineMean.toFixed(3)}
-                    </td>
-                    <td
+                {sortedScorerEntries.map(([scorer, stats]) => {
+                  const sign = stats.delta > 0 ? '+' : stats.delta < 0 ? '' : '';
+                  const deltaColor =
+                    stats.delta > 0
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : stats.delta < 0
+                        ? 'text-red-600 dark:text-red-400'
+                        : 'text-[hsl(var(--muted-foreground))]';
+
+                  return (
+                    <tr
+                      key={scorer}
                       className={cn(
-                        'px-3 py-2.5 text-right font-mono',
-                        stats.significant === false
-                          ? 'text-[hsl(var(--muted-foreground))]'
-                          : scoreTextColor(stats.candidateMean),
+                        'border-b border-[hsl(var(--border))] last:border-b-0',
+                        stats.significant === true &&
+                          stats.delta < 0 &&
+                          'border-l-[3px] border-l-red-500',
+                        stats.significant === true &&
+                          stats.delta > 0 &&
+                          'border-l-[3px] border-l-emerald-500',
                       )}
                     >
-                      {stats.candidateMean.toFixed(3)}
-                    </td>
-                    <DeltaCell value={stats.delta} percent={stats.deltaPercent} />
-                    {hasCI && (
-                      <>
-                        <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))] text-[10px]">
-                          {stats.ci ? formatCI(stats.ci) : '\u2014'}
-                        </td>
-                        <td className="px-2 py-2.5 text-center font-mono">
-                          {stats.significant === true ? (
-                            <span
-                              className={
-                                stats.delta >= 0
+                      <td className="px-4 py-2.5 font-mono">
+                        {scorer}
+                        {scorerTypes?.[scorer] === 'llm' && (
+                          <span
+                            className="ml-1.5 px-1 py-0.5 text-[9px] font-medium rounded bg-purple-100 text-purple-600 dark:bg-purple-900/30 dark:text-purple-400 align-middle"
+                            title="LLM scorer — scores may vary between runs"
+                          >
+                            LLM
+                          </span>
+                        )}
+                      </td>
+                      <td
+                        className={cn(
+                          'px-3 py-2.5 text-right font-mono',
+                          scoreTextColor(stats.baselineMean),
+                        )}
+                      >
+                        {stats.baselineMean.toFixed(3)}
+                      </td>
+                      <td
+                        className={cn(
+                          'px-3 py-2.5 text-right font-mono',
+                          scoreTextColor(stats.candidateMean),
+                        )}
+                      >
+                        {stats.candidateMean.toFixed(3)}
+                      </td>
+                      <td className="px-3 py-2.5 text-right">
+                        <div className={cn('font-mono', deltaColor)}>
+                          {sign}
+                          {Math.abs(stats.delta).toFixed(3)} ({sign}
+                          {Math.abs(stats.deltaPercent).toFixed(1)}%)
+                        </div>
+                        {stats.ci && (
+                          <div className="font-mono text-[10px] text-[hsl(var(--muted-foreground))] mt-0.5">
+                            CI [{formatSigned(stats.ci.lower)}, {formatSigned(stats.ci.upper)}]
+                          </div>
+                        )}
+                        {stats.pRegression != null &&
+                          stats.pImprovement != null &&
+                          (() => {
+                            // Show the dominant direction's probability, or "no change" if both are near zero
+                            const pReg = stats.pRegression ?? 0;
+                            const pImp = stats.pImprovement ?? 0;
+                            if (pReg === 0 && pImp === 0) return null;
+
+                            let label: string;
+                            let p: number;
+                            let color: string;
+                            if (pReg > pImp) {
+                              p = pReg;
+                              label = 'regression';
+                              color =
+                                Math.round(p * 100) >= 95
+                                  ? 'text-red-600 dark:text-red-400'
+                                  : 'text-[hsl(var(--muted-foreground))]';
+                            } else if (pImp > pReg) {
+                              p = pImp;
+                              label = 'improvement';
+                              color =
+                                Math.round(p * 100) >= 95
                                   ? 'text-emerald-600 dark:text-emerald-400'
-                                  : 'text-red-600 dark:text-red-400'
-                              }
-                            >
-                              *
-                            </span>
-                          ) : stats.significant === false ? (
-                            <span className="text-[hsl(var(--muted-foreground))]">\u2014</span>
-                          ) : null}
-                        </td>
-                      </>
-                    )}
-                  </tr>
-                ))}
+                                  : 'text-[hsl(var(--muted-foreground))]';
+                            } else {
+                              return null; // exactly 50/50
+                            }
+                            const pct = Math.round(p * 100);
+                            return (
+                              <div className={cn('text-[10px] mt-0.5', color)}>
+                                {pct}% probability of {label}
+                                {stats.n != null && (
+                                  <span className="opacity-60 ml-1">(n={stats.n})</span>
+                                )}
+                              </div>
+                            );
+                          })()}
+                      </td>
+                    </tr>
+                  );
+                })}
 
                 {/* Timing comparison */}
                 {compareResult.timing && (
@@ -159,7 +494,6 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
                       invert
                       format={formatDuration}
                     />
-                    {hasCI && <td colSpan={2} />}
                   </tr>
                 )}
 
@@ -181,7 +515,6 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
                       invert
                       format={formatCost}
                     />
-                    {hasCI && <td colSpan={2} />}
                   </tr>
                 )}
               </tbody>
@@ -190,94 +523,258 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
         </div>
       )}
 
-      {/* ── Regressions ──────────────────────────────────── */}
-      {compareResult.regressions && compareResult.regressions.length > 0 && (
-        <div className="border border-red-200 dark:border-red-900 rounded-lg overflow-hidden">
-          <div className="px-4 py-2.5 bg-red-50 dark:bg-red-950/30 border-b border-red-200 dark:border-red-900">
-            <h3 className="text-xs font-medium text-red-700 dark:text-red-300">
-              Regressions ({compareResult.regressions.length})
-            </h3>
-          </div>
-          <div className="divide-y divide-[hsl(var(--border))]">
-            {compareResult.regressions.map((r, i) => {
-              const isExpanded = expanded?.type === 'regression' && expanded.index === i;
-              const baselineItem = baseline?.items[r.itemIndex];
-              const candidateItem = candidate?.items[r.itemIndex];
+      {/* ── Regressions & Improvements ──────────────────── */}
+      {[
+        {
+          type: 'regression' as const,
+          items: compareResult.regressions ?? [],
+          borderColor: 'border-red-200 dark:border-red-900',
+          bgColor: 'bg-red-50 dark:bg-red-950/30',
+          textColor: 'text-red-700 dark:text-red-300',
+          deltaColor: 'text-red-600 dark:text-red-400',
+          label: 'Regressions',
+          direction: -1,
+        },
+        {
+          type: 'improvement' as const,
+          items: compareResult.improvements ?? [],
+          borderColor: 'border-emerald-200 dark:border-emerald-900',
+          bgColor: 'bg-emerald-50 dark:bg-emerald-950/30',
+          textColor: 'text-emerald-700 dark:text-emerald-300',
+          deltaColor: 'text-emerald-600 dark:text-emerald-400',
+          label: 'Improvements',
+          direction: 1,
+        },
+      ]
+        .filter((section) => section.items.length > 0)
+        .map((section) => {
+          const isPooled = baselineRuns && candidateRuns && baselineRuns.length > 1;
+          const totalRuns = isPooled ? Math.min(baselineRuns!.length, candidateRuns!.length) : 0;
 
-              return (
-                <div key={i}>
-                  <button
-                    onClick={() => toggleExpand('regression', i)}
-                    className="w-full text-left flex items-center justify-between px-4 py-2.5 text-xs hover:bg-[hsl(var(--accent))] transition-colors"
-                  >
-                    <span className="font-mono">
-                      Item #{r.itemIndex + 1}{' '}
-                      <span className="text-[hsl(var(--muted-foreground))]">{r.scorer}</span>
+          // Compute consistency for each item and sort: highest consistency first, then by |delta|
+          const enriched = section.items.map((r, originalIndex) => {
+            let consistentCount = 0;
+            if (isPooled) {
+              for (let ri = 0; ri < totalRuns; ri++) {
+                const bs = baselineRuns![ri]?.items[r.itemIndex]?.scores[r.scorer];
+                const cs = candidateRuns![ri]?.items[r.itemIndex]?.scores[r.scorer];
+                if (bs != null && cs != null && (section.direction < 0 ? cs < bs : cs > bs))
+                  consistentCount++;
+              }
+            }
+            return { ...r, originalIndex, consistentCount, totalRuns };
+          });
+
+          // Sort: consistency desc, then |delta| desc
+          if (isPooled) {
+            enriched.sort(
+              (a, b) =>
+                b.consistentCount - a.consistentCount || Math.abs(b.delta) - Math.abs(a.delta),
+            );
+          } else {
+            enriched.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+          }
+
+          // Check if all items share the same scorer
+          const scorerNames = [...new Set(section.items.map((r) => r.scorer))];
+          const singleScorer = scorerNames.length === 1 ? scorerNames[0] : null;
+
+          // Group items by scorer for multi-scorer display
+          const scorerGroups = new Map<string, typeof enriched>();
+          for (const r of enriched) {
+            if (!scorerGroups.has(r.scorer)) scorerGroups.set(r.scorer, []);
+            scorerGroups.get(r.scorer)!.push(r);
+          }
+
+          const renderItem = (r: (typeof enriched)[0]) => {
+            const isExpanded =
+              expanded?.type === section.type && expanded.index === r.originalIndex;
+            const baselineItem = baseline?.items[r.itemIndex];
+            const candidateItem = candidate?.items[r.itemIndex];
+            const inputLabel = r.input ? extractLabel(r.input, 40) : `Item #${r.itemIndex + 1}`;
+
+            const opacity = isPooled
+              ? r.consistentCount === totalRuns
+                ? ''
+                : r.consistentCount === 0
+                  ? 'opacity-40'
+                  : 'opacity-65'
+              : '';
+
+            return (
+              <div key={r.originalIndex} className={opacity}>
+                <button
+                  onClick={() => toggleExpand(section.type, r.originalIndex)}
+                  className="w-full text-left flex items-center gap-3 px-4 py-2.5 text-xs hover:bg-[hsl(var(--accent))] transition-colors cursor-pointer"
+                >
+                  {isPooled && (
+                    <span
+                      className={cn(
+                        'shrink-0 text-[10px] font-mono font-medium px-1.5 py-0.5 rounded',
+                        r.consistentCount === totalRuns
+                          ? section.type === 'regression'
+                            ? 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300'
+                            : 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300'
+                          : 'bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))]',
+                      )}
+                    >
+                      {r.consistentCount}/{totalRuns}
                     </span>
-                    <span className="font-mono text-red-600 dark:text-red-400">
-                      {r.baselineScore.toFixed(2)} {'\u2192'} {r.candidateScore.toFixed(2)}{' '}
-                      <span className="text-[hsl(var(--muted-foreground))]">
-                        ({r.delta.toFixed(2)})
-                      </span>
-                    </span>
-                  </button>
-                  {isExpanded && baselineItem && candidateItem && (
-                    <ItemComparison
-                      baselineItem={baselineItem}
-                      candidateItem={candidateItem}
-                      scorer={r.scorer}
-                    />
                   )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
+                  <span className="min-w-0 truncate flex-1">
+                    <span className="font-mono text-[hsl(var(--muted-foreground))]">
+                      #{r.itemIndex + 1}
+                    </span>{' '}
+                    <span>{inputLabel}</span>
+                  </span>
+                  <span className={cn('font-mono shrink-0', section.deltaColor)}>
+                    {r.baselineScore.toFixed(2)} {'\u2192'} {r.candidateScore.toFixed(2)}{' '}
+                    <span className="text-[hsl(var(--muted-foreground))]">
+                      ({r.delta > 0 ? '+' : ''}
+                      {r.delta.toFixed(2)})
+                    </span>
+                  </span>
+                </button>
+                {isExpanded && baselineItem && candidateItem && (
+                  <ItemComparison
+                    baselineItem={baselineItem}
+                    candidateItem={candidateItem}
+                    scorer={r.scorer}
+                    baselineRunItems={baselineRuns
+                      ?.map((run) => run.items[r.itemIndex])
+                      .filter(Boolean)}
+                    candidateRunItems={candidateRuns
+                      ?.map((run) => run.items[r.itemIndex])
+                      .filter(Boolean)}
+                  />
+                )}
+              </div>
+            );
+          };
 
-      {/* ── Improvements ─────────────────────────────────── */}
-      {compareResult.improvements && compareResult.improvements.length > 0 && (
-        <div className="border border-emerald-200 dark:border-emerald-900 rounded-lg overflow-hidden">
-          <div className="px-4 py-2.5 bg-emerald-50 dark:bg-emerald-950/30 border-b border-emerald-200 dark:border-emerald-900">
-            <h3 className="text-xs font-medium text-emerald-700 dark:text-emerald-300">
-              Improvements ({compareResult.improvements.length})
-            </h3>
-          </div>
-          <div className="divide-y divide-[hsl(var(--border))]">
-            {compareResult.improvements.map((r, i) => {
-              const isExpanded = expanded?.type === 'improvement' && expanded.index === i;
-              const baselineItem = baseline?.items[r.itemIndex];
-              const candidateItem = candidate?.items[r.itemIndex];
+          // Split into reliable (majority of runs agree) vs noise
+          // In pooled mode: reliable = consistency > totalRuns/2, noise = rest
+          // In single-run mode: show top 5 by default, rest behind toggle
+          const SINGLE_RUN_LIMIT = 5;
+          let reliableItems: typeof enriched;
+          let noiseItems: typeof enriched;
 
+          if (isPooled) {
+            const majorityThreshold = Math.ceil(totalRuns / 2);
+            reliableItems = enriched.filter((r) => r.consistentCount >= majorityThreshold);
+            noiseItems = enriched.filter((r) => r.consistentCount < majorityThreshold);
+          } else {
+            reliableItems = enriched.slice(0, SINGLE_RUN_LIMIT);
+            noiseItems = enriched.slice(SINGLE_RUN_LIMIT);
+          }
+
+          const isShowingNoise = showNoise[section.type] ?? false;
+          const noiseLabel = isPooled
+            ? `${noiseItems.length} likely noise (minority of runs)`
+            : `${noiseItems.length} more`;
+
+          // For multi-scorer, group both reliable and noise by scorer
+          const groupByScorer = (items: typeof enriched) => {
+            const groups = new Map<string, typeof enriched>();
+            for (const r of items) {
+              if (!groups.has(r.scorer)) groups.set(r.scorer, []);
+              groups.get(r.scorer)!.push(r);
+            }
+            return groups;
+          };
+
+          const renderItemList = (items: typeof enriched) => {
+            if (singleScorer) {
               return (
-                <div key={i}>
-                  <button
-                    onClick={() => toggleExpand('improvement', i)}
-                    className="w-full text-left flex items-center justify-between px-4 py-2.5 text-xs hover:bg-[hsl(var(--accent))] transition-colors"
-                  >
-                    <span className="font-mono">
-                      Item #{r.itemIndex + 1}{' '}
-                      <span className="text-[hsl(var(--muted-foreground))]">{r.scorer}</span>
-                    </span>
-                    <span className="font-mono text-emerald-600 dark:text-emerald-400">
-                      {r.baselineScore.toFixed(2)} {'\u2192'} {r.candidateScore.toFixed(2)}{' '}
-                      <span className="text-[hsl(var(--muted-foreground))]">
-                        (+{r.delta.toFixed(2)})
-                      </span>
-                    </span>
-                  </button>
-                  {isExpanded && baselineItem && candidateItem && (
-                    <ItemComparison
-                      baselineItem={baselineItem}
-                      candidateItem={candidateItem}
-                      scorer={r.scorer}
-                    />
-                  )}
-                </div>
+                <div className="divide-y divide-[hsl(var(--border))]">{items.map(renderItem)}</div>
               );
-            })}
-          </div>
-        </div>
+            }
+            const groups = groupByScorer(items);
+            return (
+              <div>
+                {[...groups.entries()].map(([scorerName, groupItems]) => (
+                  <div key={scorerName}>
+                    <div
+                      className={cn(
+                        'px-4 py-2 border-b border-t border-[hsl(var(--border))]',
+                        section.type === 'regression'
+                          ? 'bg-red-50/30 dark:bg-red-950/5'
+                          : 'bg-emerald-50/30 dark:bg-emerald-950/5',
+                      )}
+                    >
+                      <span className="text-[10px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+                        {scorerName}
+                      </span>
+                      <span className="text-[10px] text-[hsl(var(--muted-foreground))] ml-1.5">
+                        ({groupItems.length})
+                      </span>
+                    </div>
+                    <div className="divide-y divide-[hsl(var(--border))]">
+                      {groupItems.map(renderItem)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          };
+
+          return (
+            <div
+              key={section.type}
+              className={cn('border rounded-lg overflow-hidden', section.borderColor)}
+            >
+              <div className={cn('px-4 py-2.5 border-b', section.bgColor, section.borderColor)}>
+                <h3 className={cn('text-xs font-medium', section.textColor)}>
+                  {section.label} ({reliableItems.length}
+                  {noiseItems.length > 0 ? ` + ${noiseItems.length} noise` : ''})
+                  {pooledLabel && (
+                    <span className="font-normal opacity-70 ml-1">
+                      {' \u2014 '}scores {pooledLabel}
+                    </span>
+                  )}
+                </h3>
+              </div>
+
+              {reliableItems.length > 0 ? (
+                renderItemList(reliableItems)
+              ) : (
+                <div className="px-4 py-3 text-xs text-[hsl(var(--muted-foreground))]">
+                  No reliable {section.label.toLowerCase()} detected (all within noise).
+                </div>
+              )}
+
+              {noiseItems.length > 0 && (
+                <>
+                  <button
+                    onClick={() =>
+                      setShowNoise((prev) => ({ ...prev, [section.type]: !isShowingNoise }))
+                    }
+                    className="w-full flex items-center justify-center gap-1.5 px-4 py-2 text-[11px] font-medium text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] transition-colors border-t border-dashed border-[hsl(var(--border))] cursor-pointer"
+                  >
+                    {isShowingNoise ? (
+                      <ChevronUp className="h-3 w-3" />
+                    ) : (
+                      <ChevronDown className="h-3 w-3" />
+                    )}
+                    {isShowingNoise ? 'Hide' : 'Show'} {noiseLabel}
+                  </button>
+                  {isShowingNoise && renderItemList(noiseItems)}
+                </>
+              )}
+            </div>
+          );
+        })}
+
+      {/* ── Item-level comparison ────────────────────────── */}
+      {baseline && candidate && (
+        <EvalCompareItemTable
+          baseline={baseline}
+          candidate={candidate}
+          scorerNames={scorerEntries.map(([name]) => name)}
+          baselineRuns={baselineRuns ?? undefined}
+          candidateRuns={candidateRuns ?? undefined}
+          scorerTypes={scorerTypes}
+        />
       )}
     </div>
   );
@@ -285,94 +782,156 @@ export function EvalCompareView({ compareResult, baseline, candidate }: Props) {
 
 // ── Side-by-side item comparison ───────────────────────────────
 
-function ItemComparison({
+type ItemLike = {
+  output: unknown;
+  scoreDetails?: Record<string, { score: number | null; metadata?: Record<string, unknown> }>;
+};
+
+function ItemSide({ label, item, scorer }: { label: string; item: ItemLike; scorer: string }) {
+  const detail = item.scoreDetails?.[scorer];
+  const reasoning =
+    typeof detail?.metadata?.reasoning === 'string' ? detail.metadata.reasoning : null;
+
+  return (
+    <div className="p-4 space-y-3">
+      <h5 className="font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wider text-[10px]">
+        {label}
+      </h5>
+      <JsonViewer data={item.output} collapsed />
+      {detail?.score != null && (
+        <div className="flex items-center gap-1.5">
+          <span className="text-[hsl(var(--muted-foreground))]">Score:</span>
+          <span
+            className={cn(
+              'px-2 py-0.5 rounded-full font-mono font-medium',
+              scoreColorClass(detail.score),
+            )}
+          >
+            {detail.score.toFixed(3)}
+          </span>
+        </div>
+      )}
+      {reasoning && (
+        <div>
+          <span className="font-medium text-[hsl(var(--muted-foreground))] text-[10px] uppercase tracking-wider block mb-1">
+            Reasoning
+          </span>
+          <pre className="text-xs font-mono p-2 rounded-md bg-[hsl(var(--secondary))] overflow-auto max-h-48 whitespace-pre-wrap leading-relaxed">
+            {reasoning}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function ItemComparison({
   baselineItem,
   candidateItem,
   scorer,
+  baselineRunItems,
+  candidateRunItems,
 }: {
-  baselineItem: {
-    output: unknown;
-    scoreDetails?: Record<string, { score: number | null; metadata?: Record<string, unknown> }>;
-  };
-  candidateItem: {
-    output: unknown;
-    scoreDetails?: Record<string, { score: number | null; metadata?: Record<string, unknown> }>;
-  };
+  baselineItem: ItemLike;
+  candidateItem: ItemLike;
   scorer: string;
+  baselineRunItems?: ItemLike[];
+  candidateRunItems?: ItemLike[];
 }) {
-  const baselineDetail = baselineItem.scoreDetails?.[scorer];
-  const candidateDetail = candidateItem.scoreDetails?.[scorer];
-  const baselineReasoning =
-    typeof baselineDetail?.metadata?.reasoning === 'string'
-      ? baselineDetail.metadata.reasoning
-      : null;
-  const candidateReasoning =
-    typeof candidateDetail?.metadata?.reasoning === 'string'
-      ? candidateDetail.metadata.reasoning
-      : null;
+  const [runIndex, setRunIndex] = useState(0);
+  const isPooled =
+    (baselineRunItems && baselineRunItems.length > 1) ||
+    (candidateRunItems && candidateRunItems.length > 1);
+  const runCount = Math.max(baselineRunItems?.length ?? 1, candidateRunItems?.length ?? 1);
+
+  // In pooled mode, show per-run items; in single mode, show the passed items
+  const bItem =
+    isPooled && baselineRunItems ? (baselineRunItems[runIndex] ?? baselineItem) : baselineItem;
+  const cItem =
+    isPooled && candidateRunItems ? (candidateRunItems[runIndex] ?? candidateItem) : candidateItem;
+
+  // Averaged scores from the representative items (baselineItem/candidateItem have averaged scoreDetails)
+  const bAvgScore = baselineItem.scoreDetails?.[scorer]?.score;
+  const cAvgScore = candidateItem.scoreDetails?.[scorer]?.score;
 
   return (
-    <div className="border-t border-[hsl(var(--border))] bg-[hsl(var(--card))] grid grid-cols-2 gap-0 text-xs">
-      {/* Baseline side */}
-      <div className="p-4 space-y-3 border-r border-[hsl(var(--border))]">
-        <h5 className="font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wider text-[10px]">
-          Baseline
-        </h5>
-        <JsonViewer data={baselineItem.output} collapsed />
-        {baselineDetail?.score != null && (
-          <div className="flex items-center gap-1.5">
-            <span className="text-[hsl(var(--muted-foreground))]">Score:</span>
-            <span
-              className={cn(
-                'px-2 py-0.5 rounded-full font-mono font-medium',
-                scoreColorClass(baselineDetail.score),
-              )}
-            >
-              {baselineDetail.score.toFixed(3)}
-            </span>
+    <div className="border-t border-[hsl(var(--border))] bg-[hsl(var(--card))] text-xs">
+      {/* Averaged score summary for pooled mode */}
+      {isPooled && (bAvgScore != null || cAvgScore != null) && (
+        <div className="flex items-center gap-4 px-4 py-2 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]">
+          <span className="text-[10px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+            Mean across {runCount} runs
+          </span>
+          <div className="flex items-center gap-3">
+            {bAvgScore != null && (
+              <span className="flex items-center gap-1">
+                <span className="text-[hsl(var(--muted-foreground))]">Baseline:</span>
+                <span className={cn('font-mono font-medium', scoreTextColor(bAvgScore))}>
+                  {bAvgScore.toFixed(3)}
+                </span>
+              </span>
+            )}
+            {cAvgScore != null && (
+              <span className="flex items-center gap-1">
+                <span className="text-[hsl(var(--muted-foreground))]">Candidate:</span>
+                <span className={cn('font-mono font-medium', scoreTextColor(cAvgScore))}>
+                  {cAvgScore.toFixed(3)}
+                </span>
+              </span>
+            )}
+            {bAvgScore != null && cAvgScore != null && (
+              <span
+                className={cn(
+                  'font-mono',
+                  cAvgScore - bAvgScore > 0
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : cAvgScore - bAvgScore < 0
+                      ? 'text-red-600 dark:text-red-400'
+                      : 'text-[hsl(var(--muted-foreground))]',
+                )}
+              >
+                ({cAvgScore - bAvgScore > 0 ? '+' : ''}
+                {(cAvgScore - bAvgScore).toFixed(3)})
+              </span>
+            )}
           </div>
-        )}
-        {baselineReasoning && (
-          <div>
-            <span className="font-medium text-[hsl(var(--muted-foreground))] text-[10px] uppercase tracking-wider block mb-1">
-              Reasoning
-            </span>
-            <pre className="text-xs font-mono p-2 rounded-md bg-[hsl(var(--secondary))] overflow-auto max-h-48 whitespace-pre-wrap leading-relaxed">
-              {baselineReasoning}
-            </pre>
-          </div>
-        )}
-      </div>
+        </div>
+      )}
 
-      {/* Candidate side */}
-      <div className="p-4 space-y-3">
-        <h5 className="font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wider text-[10px]">
-          Candidate
-        </h5>
-        <JsonViewer data={candidateItem.output} collapsed />
-        {candidateDetail?.score != null && (
-          <div className="flex items-center gap-1.5">
-            <span className="text-[hsl(var(--muted-foreground))]">Score:</span>
-            <span
-              className={cn(
-                'px-2 py-0.5 rounded-full font-mono font-medium',
-                scoreColorClass(candidateDetail.score),
-              )}
-            >
-              {candidateDetail.score.toFixed(3)}
-            </span>
+      {/* Run switcher for pooled mode */}
+      {isPooled && (
+        <div className="flex items-center gap-2 px-4 py-2 border-b border-[hsl(var(--border))] bg-[hsl(var(--muted))]">
+          <span className="text-[10px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+            Run
+          </span>
+          <div className="flex items-center gap-0.5">
+            {Array.from({ length: runCount }, (_, i) => (
+              <button
+                key={i}
+                onClick={() => setRunIndex(i)}
+                className={cn(
+                  'px-2 py-0.5 rounded text-[10px] font-mono transition-colors cursor-pointer',
+                  i === runIndex
+                    ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]'
+                    : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]',
+                )}
+              >
+                {i + 1}
+              </button>
+            ))}
           </div>
-        )}
-        {candidateReasoning && (
-          <div>
-            <span className="font-medium text-[hsl(var(--muted-foreground))] text-[10px] uppercase tracking-wider block mb-1">
-              Reasoning
-            </span>
-            <pre className="text-xs font-mono p-2 rounded-md bg-[hsl(var(--secondary))] overflow-auto max-h-48 whitespace-pre-wrap leading-relaxed">
-              {candidateReasoning}
-            </pre>
-          </div>
-        )}
+          <span className="text-[10px] text-[hsl(var(--muted-foreground))] ml-auto">
+            Showing output and reasoning from run {runIndex + 1} of {runCount}
+          </span>
+        </div>
+      )}
+
+      {/* Side-by-side comparison */}
+      <div className="grid grid-cols-2 gap-0">
+        <div className="border-r border-[hsl(var(--border))]">
+          <ItemSide label="Baseline" item={bItem} scorer={scorer} />
+        </div>
+        <ItemSide label="Candidate" item={cItem} scorer={scorer} />
       </div>
     </div>
   );

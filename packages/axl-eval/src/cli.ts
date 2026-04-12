@@ -484,23 +484,31 @@ async function runEvalCommand(args: string[]) {
         let executeWorkflow: (
           input: unknown,
           rt?: unknown,
-        ) => Promise<{ output: unknown; cost?: number }>;
+        ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>;
 
         if (mod.executeWorkflow) {
-          // Wrap custom executeWorkflow with trackCost for automatic cost attribution
+          // Wrap custom executeWorkflow with trackExecution for cost + metadata attribution
           executeWorkflow = async (input, rt) => {
-            const { result, cost: trackedCost } = await runtime.trackCost(async () => {
+            const {
+              result,
+              cost: trackedCost,
+              metadata,
+            } = await runtime.trackExecution(async () => {
               return mod.executeWorkflow(input, rt);
             });
-            return { output: result.output, cost: result.cost ?? trackedCost };
+            return {
+              output: result.output,
+              cost: result.cost ?? trackedCost,
+              metadata: result.metadata ?? metadata,
+            };
           };
         } else if (runtime.getWorkflow(evalConfig.workflow)) {
           // No executeWorkflow exported but workflow is registered — use runtime.execute()
           executeWorkflow = async (input) => {
-            const { result, cost } = await runtime.trackCost(async () => {
+            const { result, cost, metadata } = await runtime.trackExecution(async () => {
               return runtime.execute(evalConfig.workflow, input);
             });
-            return { output: result, cost };
+            return { output: result, cost, metadata };
           };
         } else {
           console.warn(

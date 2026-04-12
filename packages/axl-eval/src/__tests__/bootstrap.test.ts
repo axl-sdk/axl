@@ -43,6 +43,14 @@ describe('pairedBootstrapCI()', () => {
     expect(result.lower).toBe(0.5);
     expect(result.upper).toBe(0.5);
     expect(result.mean).toBe(0.5);
+    expect(result.pImprovement).toBe(1);
+    expect(result.pRegression).toBe(0);
+  });
+
+  it('returns pRegression=1, pImprovement=0 for single negative value', () => {
+    const result = pairedBootstrapCI([-0.3], { seed: 42 });
+    expect(result.pRegression).toBe(1);
+    expect(result.pImprovement).toBe(0);
   });
 
   it('respects custom alpha for narrower/wider CI', () => {
@@ -58,6 +66,8 @@ describe('pairedBootstrapCI()', () => {
     expect(result.lower).toBe(0.15);
     expect(result.upper).toBe(0.15);
     expect(result.mean).toBe(0.15);
+    expect(result.pImprovement).toBe(1);
+    expect(result.pRegression).toBe(0);
   });
 
   it('handles seed of 0 without error', () => {

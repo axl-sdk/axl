@@ -54,6 +54,7 @@ export async function rescore(
       input: original.input,
       annotations: original.annotations,
       output: original.output,
+      metadata: original.metadata,
       scores: {},
       scoreDetails: {},
     };

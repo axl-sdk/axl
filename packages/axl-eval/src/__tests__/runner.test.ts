@@ -1122,4 +1122,144 @@ describe('runEval()', () => {
       quality: 'llm',
     });
   });
+
+  // ── per-item metadata tests ────────────────────────────────
+
+  it('stores per-item metadata from executeWorkflow', async () => {
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'a' } }, { input: { q: 'b' } }],
+    });
+
+    const simpleScorer = scorer({ name: 'pass', description: 'Always passes', score: () => 1 });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [simpleScorer] },
+      async () => ({
+        output: 'out',
+        cost: 0.001,
+        metadata: {
+          models: ['openai:gpt-4o'],
+          tokens: { input: 100, output: 50, reasoning: 0 },
+          agentCalls: 1,
+        },
+      }),
+      mockRuntime,
+    );
+
+    for (const item of result.items) {
+      expect(item.metadata).toBeDefined();
+      expect(item.metadata!.models).toEqual(['openai:gpt-4o']);
+      expect(item.metadata!.tokens).toEqual({ input: 100, output: 50, reasoning: 0 });
+      expect(item.metadata!.agentCalls).toBe(1);
+    }
+  });
+
+  it('aggregates per-model call counts from modelCallCounts metadata', async () => {
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'a' } }, { input: { q: 'b' } }, { input: { q: 'c' } }],
+    });
+
+    const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [simpleScorer], concurrency: 1 },
+      async () => ({
+        output: 'out',
+        // Each item calls both models (like a classify-then-answer workflow)
+        metadata: {
+          models: ['openai:gpt-4o-mini', 'openai:gpt-4o'],
+          modelCallCounts: { 'openai:gpt-4o-mini': 1, 'openai:gpt-4o': 1 },
+          agentCalls: 2,
+        },
+      }),
+      mockRuntime,
+    );
+
+    const models = result.metadata.models as string[];
+    expect(models).toHaveLength(2);
+
+    // modelCounts = total LLM calls per model across all items (3 items × 1 call each)
+    const counts = result.metadata.modelCounts as Record<string, number>;
+    expect(counts).toBeDefined();
+    expect(counts['openai:gpt-4o-mini']).toBe(3);
+    expect(counts['openai:gpt-4o']).toBe(3);
+  });
+
+  it('aggregates models sorted by total calls descending', async () => {
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'a' } }, { input: { q: 'b' } }, { input: { q: 'c' } }],
+    });
+
+    const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
+    let callIdx = 0;
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [simpleScorer], concurrency: 1 },
+      async () => {
+        // 2 items use gpt-4o, 1 uses claude — falls back to models array (no modelCallCounts)
+        const models = callIdx++ < 2 ? ['openai:gpt-4o'] : ['anthropic:claude-sonnet-4-6'];
+        return { output: 'out', metadata: { models } };
+      },
+      mockRuntime,
+    );
+
+    const models = result.metadata.models as string[];
+    expect(models).toHaveLength(2);
+    expect(models[0]).toBe('openai:gpt-4o');
+    expect(models[1]).toBe('anthropic:claude-sonnet-4-6');
+
+    const counts = result.metadata.modelCounts as Record<string, number>;
+    expect(counts).toBeDefined();
+    expect(counts['openai:gpt-4o']).toBe(2);
+    expect(counts['anthropic:claude-sonnet-4-6']).toBe(1);
+  });
+
+  it('includes modelCounts even for single-model runs', async () => {
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'a' } }, { input: { q: 'b' } }],
+    });
+
+    const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: ds, scorers: [simpleScorer] },
+      async () => ({ output: 'out', metadata: { models: ['openai:gpt-4o'] } }),
+      mockRuntime,
+    );
+
+    expect(result.metadata.models).toEqual(['openai:gpt-4o']);
+    const counts = result.metadata.modelCounts as Record<string, number>;
+    expect(counts).toBeDefined();
+    expect(counts['openai:gpt-4o']).toBe(2);
+  });
+
+  it('omits models from result metadata when no items have model info', async () => {
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      executeWorkflow,
+      mockRuntime,
+    );
+
+    expect(result.metadata.models).toBeUndefined();
+  });
+
+  it('does not store metadata on items when executeWorkflow returns none', async () => {
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      executeWorkflow,
+      mockRuntime,
+    );
+
+    for (const item of result.items) {
+      expect(item.metadata).toBeUndefined();
+    }
+  });
 });

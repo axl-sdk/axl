@@ -40,6 +40,8 @@ export type EvalItem = {
   cost?: number;
   scorerCost?: number;
   scoreDetails?: Record<string, ScorerDetail>;
+  /** Execution metadata forwarded from the runtime (models, tokens, agentCalls, etc). */
+  metadata?: Record<string, unknown>;
 };
 
 export type EvalSummary = {

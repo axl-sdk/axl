@@ -234,6 +234,19 @@ describe('rescore()', () => {
     }
   });
 
+  it('strips runGroupId and runIndex from metadata while preserving other fields', async () => {
+    const result = makeResult({
+      metadata: { runGroupId: 'group-1', runIndex: 2, customField: 'keep' },
+    });
+    const rescored = await rescore(result, [alwaysOneScorer], mockRuntime);
+
+    expect(rescored.metadata.runGroupId).toBeUndefined();
+    expect(rescored.metadata.runIndex).toBeUndefined();
+    expect(rescored.metadata.customField).toBe('keep');
+    expect(rescored.metadata.rescored).toBe(true);
+    expect(rescored.metadata.originalId).toBe('original-id');
+  });
+
   it('handles multiple scorers correctly', async () => {
     const result = makeResult();
     const rescored = await rescore(result, [alwaysOneScorer, halfScorer], mockRuntime);
@@ -250,5 +263,23 @@ describe('rescore()', () => {
     });
     expect(rescored.summary.scorers['always-one'].mean).toBe(1);
     expect(rescored.summary.scorers['half'].mean).toBe(0.5);
+  });
+
+  it('preserves per-item metadata from original result', async () => {
+    const result = makeResult();
+    // Add metadata to each item (simulating what the runner would do)
+    for (const item of result.items) {
+      item.metadata = { models: ['openai:gpt-4o'], agentCalls: 1 };
+    }
+
+    const rescored = await rescore(result, [alwaysOneScorer], mockRuntime);
+
+    for (const item of rescored.items) {
+      if (!item.error) {
+        expect(item.metadata).toBeDefined();
+        expect(item.metadata!.models).toEqual(['openai:gpt-4o']);
+        expect(item.metadata!.agentCalls).toBe(1);
+      }
+    }
   });
 });

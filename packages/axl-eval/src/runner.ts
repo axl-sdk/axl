@@ -16,7 +16,7 @@ export async function runEval(
   executeWorkflow: (
     input: unknown,
     runtime: AxlRuntime,
-  ) => Promise<{ output: unknown; cost?: number }>,
+  ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>,
   runtime: AxlRuntime,
 ): Promise<EvalResult> {
   const startTime = Date.now();
@@ -66,6 +66,7 @@ export async function runEval(
       evalItem.duration = Date.now() - itemStart;
       evalItem.output = result.output;
       evalItem.cost = result.cost;
+      if (result.metadata) evalItem.metadata = result.metadata;
       if (result.cost != null) {
         totalCost += result.cost;
       }
@@ -178,11 +179,44 @@ export async function runEval(
     scorerTypes[s.name] = s.isLlm ? 'llm' : 'deterministic';
   }
 
+  // Aggregate per-model LLM call counts across all items
+  const totalModelCalls = new Map<string, number>();
+  for (const item of evalItems) {
+    const itemCounts = item.metadata?.modelCallCounts;
+    if (itemCounts && typeof itemCounts === 'object') {
+      for (const [m, count] of Object.entries(itemCounts as Record<string, unknown>)) {
+        if (typeof count === 'number')
+          totalModelCalls.set(m, (totalModelCalls.get(m) ?? 0) + count);
+      }
+    } else {
+      // Fallback: count unique models per item (for executeWorkflow that doesn't provide call counts)
+      const itemModels = item.metadata?.models;
+      if (Array.isArray(itemModels)) {
+        for (const m of itemModels) {
+          if (typeof m === 'string') totalModelCalls.set(m, (totalModelCalls.get(m) ?? 0) + 1);
+        }
+      }
+    }
+  }
+
+  // models: unique list sorted by total calls (most-called first)
+  // modelCounts: total LLM calls per model (e.g., { "openai:gpt-4o": 12, "openai:gpt-4o-mini": 12 })
+  const modelsMeta: Record<string, unknown> = {};
+  if (totalModelCalls.size > 0) {
+    const sorted = [...totalModelCalls.entries()].sort((a, b) => b[1] - a[1]);
+    modelsMeta.models = sorted.map(([m]) => m);
+    modelsMeta.modelCounts = Object.fromEntries(sorted);
+  }
+
   return {
     id,
     workflow: config.workflow,
     dataset: config.dataset.name,
-    metadata: { ...config.metadata, scorerTypes },
+    metadata: {
+      ...config.metadata,
+      scorerTypes,
+      ...modelsMeta,
+    },
     timestamp: new Date().toISOString(),
     totalCost,
     duration: Date.now() - startTime,

@@ -933,6 +933,111 @@ describe('evalCompare()', () => {
     expect(singleCI.scorers.accuracy.ci!.lower).toBeGreaterThan(0);
   });
 
+  it('propagates pRegression, pImprovement, and n from bootstrap CI', () => {
+    // Candidate is clearly better than baseline for all items
+    const items = Array.from({ length: 10 }, (_, i) => ({
+      input: { q: String(i) },
+      output: 'a',
+      scores: { accuracy: 0.4 },
+    }));
+    const candidateItems = items.map((item) => ({
+      ...item,
+      scores: { accuracy: 0.8 },
+    }));
+    const baseline = makeEvalResult({
+      items,
+      summary: {
+        count: 10,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.4, min: 0.4, max: 0.4, p50: 0.4, p95: 0.4 } },
+      },
+    });
+    const candidate = makeEvalResult({
+      id: 'cand',
+      items: candidateItems,
+      summary: {
+        count: 10,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.8, min: 0.8, max: 0.8, p50: 0.8, p95: 0.8 } },
+      },
+    });
+
+    const comparison = evalCompare(baseline, candidate);
+
+    // pRegression and pImprovement are numbers propagated from pairedBootstrapCI
+    expect(typeof comparison.scorers.accuracy.pRegression).toBe('number');
+    expect(typeof comparison.scorers.accuracy.pImprovement).toBe('number');
+    // n equals the number of paired item differences
+    expect(comparison.scorers.accuracy.n).toBe(10);
+    // Clear improvement: pImprovement should be very high
+    expect(comparison.scorers.accuracy.pImprovement).toBeGreaterThan(0.9);
+  });
+
+  it('multi-run averages per-item scores for regression/improvement detection', () => {
+    // Item 0: baseline avg 0.5, candidate avg 0.9 -> improvement
+    // Item 1: baseline avg 0.8, candidate avg 0.3 -> regression
+    const baselineRun1 = makeEvalResult({
+      id: 'b1',
+      items: [
+        { input: { q: '0' }, output: 'a', scores: { accuracy: 0.4 } },
+        { input: { q: '1' }, output: 'b', scores: { accuracy: 0.7 } },
+      ],
+      summary: {
+        count: 2,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.55, min: 0.4, max: 0.7, p50: 0.55, p95: 0.7 } },
+      },
+    });
+    const baselineRun2 = makeEvalResult({
+      id: 'b2',
+      items: [
+        { input: { q: '0' }, output: 'a', scores: { accuracy: 0.6 } },
+        { input: { q: '1' }, output: 'b', scores: { accuracy: 0.9 } },
+      ],
+      summary: {
+        count: 2,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.75, min: 0.6, max: 0.9, p50: 0.75, p95: 0.9 } },
+      },
+    });
+    const candidateRun1 = makeEvalResult({
+      id: 'c1',
+      items: [
+        { input: { q: '0' }, output: 'a', scores: { accuracy: 0.85 } },
+        { input: { q: '1' }, output: 'b', scores: { accuracy: 0.35 } },
+      ],
+      summary: {
+        count: 2,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.6, min: 0.35, max: 0.85, p50: 0.6, p95: 0.85 } },
+      },
+    });
+    const candidateRun2 = makeEvalResult({
+      id: 'c2',
+      items: [
+        { input: { q: '0' }, output: 'a', scores: { accuracy: 0.95 } },
+        { input: { q: '1' }, output: 'b', scores: { accuracy: 0.25 } },
+      ],
+      summary: {
+        count: 2,
+        failures: 0,
+        scorers: { accuracy: { mean: 0.6, min: 0.25, max: 0.95, p50: 0.6, p95: 0.95 } },
+      },
+    });
+
+    const comparison = evalCompare([baselineRun1, baselineRun2], [candidateRun1, candidateRun2], {
+      thresholds: 0,
+    });
+
+    // Item 0: baseline avg (0.4+0.6)/2=0.5, candidate avg (0.85+0.95)/2=0.9 -> improvement
+    expect(comparison.improvements).toHaveLength(1);
+    expect(comparison.improvements[0].itemIndex).toBe(0);
+
+    // Item 1: baseline avg (0.7+0.9)/2=0.8, candidate avg (0.35+0.25)/2=0.3 -> regression
+    expect(comparison.regressions).toHaveLength(1);
+    expect(comparison.regressions[0].itemIndex).toBe(1);
+  });
+
   it('handles comparison where all items have errors', () => {
     const baseline = makeEvalResult({
       items: [

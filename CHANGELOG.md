@@ -7,8 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.7] - 2026-04-11
+
 ### Added
 
+- **Core:** `AxlRuntime.trackExecution()` method — extends `trackCost()` to also capture models, tokens, and agent call counts from trace events during execution. `trackCost()` now delegates to `trackExecution()`. Used by eval runner and CLI for per-item metadata
+- **Core:** `runtime.runRegisteredEval()` accepts optional `options` parameter with `metadata` for injecting custom metadata into eval results
 - **Eval:** Configurable regression thresholds — `evalCompare()` accepts `EvalCompareOptions` with `thresholds` (global number or per-scorer map). Auto-calibrates from `scorerTypes` metadata: `0` for deterministic scorers, `0.05` for LLM scorers. CLI: `--threshold` flag on `compare` subcommand. Replaces hardcoded `0.1`. New exported type: `EvalCompareOptions`
 - **Eval:** Per-item paired bootstrap confidence intervals — `evalCompare()` computes 95% CIs on per-item score differences. New `ci` and `significant` fields on `EvalComparison.scorers`. `--fail-on-regression` now only exits 1 for statistically significant regressions when CI data is available
 - **Eval:** `pairedBootstrapCI()` and `BootstrapCIResult` type — pure-math bootstrap CI function with optional seeded PRNG for deterministic tests. Exported from `@axlsdk/eval`
@@ -16,25 +20,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Eval:** Multi-run — `--runs N` CLI flag runs evals N times, reports mean +/- std per scorer via `aggregateRuns()` (`MultiRunSummary` type). Results include `runGroupId`/`runIndex` in metadata
 - **Eval:** Multi-run comparison — `evalCompare()` accepts `EvalResult[]` arrays, pools per-item paired differences across runs for tighter bootstrap CIs
 - **Eval:** `runEval()` now stores `scorerTypes` (map of scorer name to `'llm'` | `'deterministic'`) in result metadata
-- **Eval:** Shared `utils.ts` module — `computeStats()` and `round()` extracted from runner for reuse in rescore
-- **Studio:** CI and significance columns in `EvalCompareView` scorer comparison table
-- **Studio:** `POST /evals/:name/rescore` endpoint — re-scores a history entry with registered eval's scorers
-- **Studio:** Rescore button on history table rows
-- **Studio:** `POST /evals/:name/run` accepts `{ runs: N }` body for multi-run execution
-- **Studio:** `compareEvals()` API accepts optional `options` parameter for threshold forwarding
 - **Eval:** `pRegression`, `pImprovement`, and `n` fields on `BootstrapCIResult` and `EvalComparison` scorer entries — bootstrap probability estimates for regression/improvement direction and sample size used for CI computation
-- **Core:** `runtime.runRegisteredEval()` accepts optional `options` parameter with `metadata` for injecting custom metadata into eval results
-- **Studio:** 4 new eval components: `EvalHistoryTable` (grouped multi-run history), `EvalCompareItemTable` (full item-level comparison), `EvalCompareRunPicker` (baseline/candidate selection), `EvalMultiRunSwitcher` (run navigation)
-- **Studio:** LLM scorer badges across all eval tabs (History, Compare, Run)
-- **Studio:** Significance tooltips in Compare view explaining bootstrap CI methodology
-- **Studio:** `POST /api/evals/:name/run` caps `runs` at 25
-- **Eval:** `EvalItem.metadata` field — optional `Record<string, unknown>` for per-item execution metadata (models, tokens, agentCalls) forwarded from the runtime
-- **Eval:** `runEval()` `executeWorkflow` callback now accepts optional `metadata` in return type — enables runtimes to forward execution context (model URIs, token counts, agent call counts) per item
-- **Eval:** Result-level model aggregation — `runEval()` auto-populates `models` in `EvalResult.metadata` with unique model URIs across all items
-- **Core:** `AxlRuntime.trackExecution()` method — extends `trackCost()` to also capture models, tokens, and agent call counts from trace events during execution. `trackCost()` now delegates to `trackExecution()`. Used by eval runner and CLI for per-item metadata
-- **Studio:** Model badges in eval UI — Run tab stat cards, History table expanded rows, Compare view header (baseline vs candidate with change detection), and Item detail breadcrumb all display which model(s) produced the results
-- **Studio:** Token counts in eval UI — Run tab stat card shows total tokens with input/output/reasoning breakdown, Item detail shows per-item token count and agent call count, Compare view shows token totals with delta percentage
+- **Eval:** `EvalItem.metadata` field — per-item execution metadata (models, tokens, agentCalls) forwarded from the runtime
+- **Eval:** `runEval()` `executeWorkflow` callback now accepts optional `metadata` in return type — enables runtimes to forward execution context per item
+- **Eval:** Result-level model aggregation — `runEval()` auto-populates `models` and `modelCounts` in `EvalResult.metadata` with unique model URIs across all items
 - **Eval:** `rescore()` preserves per-item `metadata` from original result (execution context survives re-scoring)
+- **Eval:** Shared `utils.ts` module — `computeStats()` and `round()` extracted from runner for reuse in rescore
+- **Studio:** 4 new eval components: `EvalHistoryTable` (grouped multi-run history), `EvalCompareItemTable` (full item-level comparison), `EvalCompareRunPicker` (baseline/candidate selection), `EvalMultiRunSwitcher` (run navigation)
+- **Studio:** CI and significance columns in `EvalCompareView` scorer comparison table
+- **Studio:** Significance tooltips explaining bootstrap CI methodology
+- **Studio:** Model badges across all eval tabs (Run stat cards, History expanded rows, Compare header, Item detail)
+- **Studio:** Token counts in eval UI with input/output/reasoning breakdown
+- **Studio:** LLM scorer badges across all eval tabs
+- **Studio:** `POST /evals/:name/rescore` endpoint — re-scores a history entry with registered eval's scorers
+- **Studio:** `POST /evals/:name/run` accepts `{ runs: N }` body for multi-run execution (capped at 25)
+- **Studio:** `compareEvals()` API accepts optional `options` parameter for threshold forwarding
+- **DX:** Root-level `dev:studio` script (pre-builds core SDK, starts Vite + Hono dev servers) and `dev:studio:kill` for process cleanup
 
 ### Changed
 
@@ -43,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Build:** Work around tsup TS5055 error by redirecting DTS `compilerOptions.outDir` to a temp directory across all 4 packages
 - **Testing:** `MockProvider.fn()` and `MockProvider.sequence()` now respect handler-provided `usage` and `cost` fields instead of silently overwriting them with defaults. Existing code that omits these fields is unaffected (defaults still apply)
 
 ## [0.13.6] - 2026-04-06

@@ -152,9 +152,9 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
     );
   }
 
-  // Convert Hono app → Node.js (req, res) handler.
-  // overrideGlobalObjects: false prevents replacing global.Request and
-  // global.Response, which could break the host application.
+  // Convert Hono app → Node.js (req, res) handler via @hono/node-server.
+  // overrideGlobalObjects: false prevents replacing global.Request/Response,
+  // which could break the host application.
   const listener = getRequestListener(app.fetch, {
     overrideGlobalObjects: false,
   });
@@ -172,8 +172,26 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
       );
       return;
     }
-    // listener returns Promise<void>. Catch async errors to prevent
-    // unhandled rejections from crashing the host process.
+
+    // Express/NestJS/Koa body parsers consume the raw IncomingMessage stream
+    // and store the parsed result on req.body. When that happens,
+    // @hono/node-server's getRequestListener reads an empty stream and Hono
+    // sees no body. To fix this, we re-serialize req.body as req.rawBody —
+    // a Buffer that getRequestListener checks before falling back to the
+    // stream (see newRequestFromIncoming in @hono/node-server/dist/listener.js).
+    //
+    // Verified against @hono/node-server@1.19.9. If this breaks after an
+    // upgrade, check whether the rawBody instanceof Buffer check still exists
+    // in newRequestFromIncoming.
+    const reqAny = req as unknown as Record<string, unknown>;
+    if (reqAny.body != null && !reqAny.rawBody) {
+      try {
+        reqAny.rawBody = Buffer.from(JSON.stringify(reqAny.body));
+      } catch {
+        // Non-serializable body — Hono will see an empty body
+      }
+    }
+
     listener(req, res).catch((err) => {
       console.error('[axl-studio] Unhandled error in request handler:', err);
       if (!res.headersSent) {

@@ -1,8 +1,14 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { createServer as createHttpServer, type Server } from 'node:http';
+import {
+  createServer as createHttpServer,
+  type Server,
+  type IncomingMessage,
+  type ServerResponse,
+} from 'node:http';
 import { z } from 'zod';
 import { AxlRuntime, tool, agent, workflow } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
+import { dataset, scorer } from '@axlsdk/eval';
 import { createStudioMiddleware } from '@axlsdk/studio/middleware';
 import { WebSocket } from 'ws';
 
@@ -35,6 +41,63 @@ function createTestRuntime() {
   runtime.register(wf);
 
   return runtime;
+}
+
+/** Creates a runtime with eval support for multi-run tests. */
+function createEvalRuntime(provider?: MockProvider) {
+  const runtime = new AxlRuntime();
+  const p = provider ?? MockProvider.echo();
+  runtime.registerProvider('mock', p);
+
+  const testAgent = agent({ name: 'eval-agent', model: 'mock:test', system: 'test' });
+  runtime.registerAgent(testAgent);
+
+  const wf = workflow({
+    name: 'eval-wf',
+    input: z.object({ q: z.string() }),
+    handler: async (ctx) => ctx.ask(testAgent, ctx.input.q),
+  });
+  runtime.register(wf);
+
+  const ds = dataset({
+    name: 'test-ds',
+    schema: z.object({ q: z.string() }),
+    items: [{ input: { q: 'hello' } }],
+  });
+  const s = scorer({ name: 'pass', description: 'always 1', score: () => 1 });
+  runtime.registerEval('test-eval', { workflow: 'eval-wf', dataset: ds, scorers: [s] });
+
+  return runtime;
+}
+
+/**
+ * Creates an http.Server that simulates Express/NestJS body-parser behavior:
+ * reads and parses the request body, stores it on req.body, then forwards
+ * to the given handler — leaving the raw stream consumed.
+ */
+function createBodyParserServer(
+  studioHandler: (req: IncomingMessage, res: ServerResponse) => void,
+): Server {
+  return createHttpServer((req, res) => {
+    if (req.method === 'GET' || req.method === 'HEAD') {
+      studioHandler(req, res);
+      return;
+    }
+    let data = '';
+    req.on('data', (chunk: Buffer) => {
+      data += chunk;
+    });
+    req.on('end', () => {
+      if (data) {
+        try {
+          (req as any).body = JSON.parse(data);
+        } catch {
+          /* not JSON */
+        }
+      }
+      studioHandler(req, res);
+    });
+  });
 }
 
 function waitForOpen(ws: WebSocket): Promise<void> {
@@ -301,6 +364,97 @@ describe('Studio Middleware Integration', () => {
 
     studio1.close();
     studio2.close();
+  });
+
+  it('handler reads pre-parsed body from Express/NestJS body parser', async () => {
+    const runtime = createTestRuntime();
+    studio = createStudioMiddleware({ runtime, serveClient: false });
+
+    server = createBodyParserServer(studio.handler);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+
+    const res = await fetch(`http://localhost:${port}/api/tools/greet/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: { name: 'World' } }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.ok).toBe(true);
+    expect(body.data.result).toBe('Hello, World!');
+  });
+
+  it('multi-run eval works through body-parser middleware', async () => {
+    const provider = MockProvider.sequence([
+      { content: 'r1' },
+      { content: 'r2' },
+      { content: 'r3' },
+    ]);
+    const runtime = createEvalRuntime(provider);
+    studio = createStudioMiddleware({ runtime, serveClient: false });
+
+    server = createBodyParserServer(studio.handler);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+
+    const res = await fetch(`http://localhost:${port}/api/evals/test-eval/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 3 }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.ok).toBe(true);
+    expect(body.data._multiRun).toBeDefined();
+    expect(body.data._multiRun.allRuns).toHaveLength(3);
+    expect(body.data._multiRun.aggregate.runCount).toBe(3);
+
+    // Verify grouping metadata exists on each run
+    const groupId = body.data._multiRun.allRuns[0].metadata.runGroupId;
+    expect(groupId).toBeDefined();
+    for (let i = 0; i < 3; i++) {
+      expect(body.data._multiRun.allRuns[i].metadata.runGroupId).toBe(groupId);
+      expect(body.data._multiRun.allRuns[i].metadata.runIndex).toBe(i);
+    }
+  });
+
+  it('POST without body parser still works (raw stream)', async () => {
+    const runtime = createTestRuntime();
+    studio = createStudioMiddleware({ runtime, serveClient: false });
+
+    // Direct handler — no body parser consuming the stream
+    server = createHttpServer(studio.handler);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+
+    const res = await fetch(`http://localhost:${port}/api/tools/greet/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: { name: 'Direct' } }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.ok).toBe(true);
+    expect(body.data.result).toBe('Hello, Direct!');
+  });
+
+  it('GET requests work through body-parser middleware', async () => {
+    const runtime = createTestRuntime();
+    studio = createStudioMiddleware({ runtime, serveClient: false });
+
+    server = createBodyParserServer(studio.handler);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+
+    const res = await fetch(`http://localhost:${port}/api/health`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.ok).toBe(true);
+    expect(body.data.status).toBe('healthy');
   });
 
   it('deeply nested basePath works', async () => {

@@ -47,7 +47,8 @@ function SortTh({
   return (
     <th
       className={cn(
-        `text-${align} px-3 py-2 font-medium cursor-pointer select-none hover:text-[hsl(var(--foreground))]`,
+        align === 'right' ? 'text-right' : 'text-left',
+        'px-3 py-2 font-medium cursor-pointer select-none hover:text-[hsl(var(--foreground))]',
         className,
         align === 'left' && 'px-4',
       )}

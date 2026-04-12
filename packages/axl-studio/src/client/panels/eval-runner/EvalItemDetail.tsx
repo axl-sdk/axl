@@ -2,7 +2,15 @@ import { useState } from 'react';
 import { JsonViewer } from '../../components/shared/JsonViewer';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
 import type { EvalItem } from './types';
-import { scoreColorClass, scoreTextColor, scoreBarColor } from './types';
+import {
+  scoreColorClass,
+  scoreTextColor,
+  scoreBarColor,
+  getItemModels,
+  formatModelName,
+  getItemTokens,
+  getItemAgentCalls,
+} from './types';
 
 type Props = {
   item: EvalItem;
@@ -51,6 +59,9 @@ function DataCard({ label, data }: { label: string; data: unknown }) {
 
 export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) {
   const scorerErrors = item.scorerErrors ?? [];
+  const models = getItemModels(item);
+  const tokens = getItemTokens(item);
+  const agentCalls = getItemAgentCalls(item);
 
   // Compute total cost line
   const workflowCost = item.cost ?? 0;
@@ -77,6 +88,26 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
           )}
         </nav>
         <div className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))] font-mono">
+          {models.length > 0 &&
+            models.map((m) => (
+              <span
+                key={m}
+                className="px-1.5 py-0.5 rounded bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] text-[10px] font-medium"
+                title={m}
+              >
+                {formatModelName(m)}
+              </span>
+            ))}
+          {tokens && (
+            <span
+              title={`Input: ${tokens.input.toLocaleString()}  Output: ${tokens.output.toLocaleString()}${tokens.reasoning ? `  Reasoning: ${tokens.reasoning.toLocaleString()}` : ''}`}
+            >
+              {(tokens.input + tokens.output + tokens.reasoning).toLocaleString()} tok
+            </span>
+          )}
+          {agentCalls > 1 && (
+            <span title={`${agentCalls} agent calls for this item`}>{agentCalls} calls</span>
+          )}
           {item.duration != null && <span>{formatDuration(item.duration)}</span>}
           {totalItemCost > 0 && <span>{formatCost(totalItemCost)}</span>}
         </div>

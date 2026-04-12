@@ -4,7 +4,14 @@ import { JsonViewer } from '../../components/shared/JsonViewer';
 import { cn, formatCost, formatDuration, extractLabel } from '../../lib/utils';
 import { EvalCompareItemTable } from './EvalCompareItemTable';
 import type { ComparisonResult, EvalResultData } from './types';
-import { scoreColorClass, scoreTextColor } from './types';
+import {
+  scoreColorClass,
+  scoreTextColor,
+  getResultModels,
+  formatModelName,
+  aggregateGroupTokens,
+  aggregateGroupCost,
+} from './types';
 
 function Tooltip({ text, children }: { text: string; children: React.ReactNode }) {
   return (
@@ -90,21 +97,26 @@ export function EvalCompareView({
     }
   };
 
-  const scorerEntries = compareResult.scorers ? Object.entries(compareResult.scorers) : [];
   const scorerTypes = (baseline?.metadata?.scorerTypes ?? candidate?.metadata?.scorerTypes) as
     | Record<string, string>
     | undefined;
-  const hasCI = scorerEntries.some(([, s]) => s.ci != null);
   const baselineRunCount = baselineRuns?.length ?? 1;
   const candidateRunCount = candidateRuns?.length ?? 1;
   const pooledLabel = isGroupComparison
     ? `averaged across ${baselineRunCount === candidateRunCount ? `${baselineRunCount} runs` : `${baselineRunCount} / ${candidateRunCount} runs`}`
     : null;
 
-  // Sort scorer entries
+  // Sort scorer entries — derive from compareResult.scorers directly to keep stable deps
   const sortedScorerEntries = useMemo(() => {
-    const sorted = [...scorerEntries];
-    sorted.sort((a, b) => {
+    const entries = Object.entries(compareResult.scorers);
+    entries.sort((a, b) => {
+      // When sorting by delta, significant entries float to the top
+      if (scorerSort === 'delta') {
+        const aSig = a[1].significant === true ? 1 : 0;
+        const bSig = b[1].significant === true ? 1 : 0;
+        if (aSig !== bSig) return bSig - aSig;
+      }
+
       let aVal: number, bVal: number;
       switch (scorerSort) {
         case 'metric':
@@ -125,16 +137,10 @@ export function EvalCompareView({
       }
       return scorerSortDir === 'desc' ? bVal - aVal : aVal - bVal;
     });
-    // Default: significant entries first, then by sort field
-    if (scorerSort === 'delta') {
-      sorted.sort((a, b) => {
-        const aSig = a[1].significant === true ? 1 : 0;
-        const bSig = b[1].significant === true ? 1 : 0;
-        return bSig - aSig;
-      });
-    }
-    return sorted;
-  }, [scorerEntries, scorerSort, scorerSortDir]);
+    return entries;
+  }, [compareResult.scorers, scorerSort, scorerSortDir]);
+
+  const hasCI = sortedScorerEntries.some(([, s]) => s.ci != null);
 
   const toggleScorerSort = (field: ScorerSortField) => {
     if (scorerSort === field) {
@@ -149,25 +155,25 @@ export function EvalCompareView({
     scorerSort === field ? (scorerSortDir === 'desc' ? ' \u25BC' : ' \u25B2') : '';
 
   // Compute stat card values
-  const significantCount = scorerEntries.filter(([, s]) => s.significant === true).length;
-  const regressionCount = compareResult.regressions?.length ?? 0;
-  const improvementCount = compareResult.improvements?.length ?? 0;
+  const significantCount = sortedScorerEntries.filter(([, s]) => s.significant === true).length;
+  const regressionCount = compareResult.regressions.length;
+  const improvementCount = compareResult.improvements.length;
 
   return (
     <div className="space-y-6">
       {/* Verdict banner */}
-      {scorerEntries.length > 0 &&
+      {sortedScorerEntries.length > 0 &&
         (() => {
-          const hasSignificantRegression = scorerEntries.some(
+          const hasSignificantRegression = sortedScorerEntries.some(
             ([, s]) => s.significant === true && s.delta < 0,
           );
-          const hasSignificantImprovement = scorerEntries.some(
+          const hasSignificantImprovement = sortedScorerEntries.some(
             ([, s]) => s.significant === true && s.delta > 0,
           );
-          const hasRegressions = (compareResult.regressions?.length ?? 0) > 0;
-          const allNotSignificant = scorerEntries.every(([, s]) => s.significant === false);
+          const hasRegressions = compareResult.regressions.length > 0;
+          const allNotSignificant = sortedScorerEntries.every(([, s]) => s.significant === false);
 
-          const formatScorerDetail = (name: string, s: (typeof scorerEntries)[0][1]) => {
+          const formatScorerDetail = (name: string, s: (typeof sortedScorerEntries)[0][1]) => {
             const pct =
               s.delta < 0
                 ? s.pRegression != null
@@ -181,7 +187,7 @@ export function EvalCompareView({
           };
 
           if (hasSignificantRegression) {
-            const regressed = scorerEntries.filter(
+            const regressed = sortedScorerEntries.filter(
               ([, s]) => s.significant === true && s.delta < 0,
             );
             return (
@@ -203,7 +209,9 @@ export function EvalCompareView({
             );
           }
           if (hasSignificantImprovement) {
-            const improved = scorerEntries.filter(([, s]) => s.significant === true && s.delta > 0);
+            const improved = sortedScorerEntries.filter(
+              ([, s]) => s.significant === true && s.delta > 0,
+            );
             return (
               <div className="flex items-start gap-2.5 px-4 py-3 rounded-xl border border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-950/30">
                 <div className="h-6 w-6 rounded-full bg-emerald-100 dark:bg-emerald-900/50 flex items-center justify-center shrink-0 mt-0.5">
@@ -230,7 +238,7 @@ export function EvalCompareView({
                 </div>
                 <div>
                   <p className="text-sm font-medium text-amber-800 dark:text-amber-200">
-                    {compareResult.regressions!.length} item regressions, but not statistically
+                    {compareResult.regressions.length} item regressions, but not statistically
                     significant
                   </p>
                   <p className="text-xs text-amber-600 dark:text-amber-400">
@@ -258,6 +266,147 @@ export function EvalCompareView({
             </div>
           );
         })()}
+
+      {/* Model + token + cost comparison */}
+      {(() => {
+        // Aggregate across all runs in a group (falls back to single result)
+        const collectModels = (
+          single: EvalResultData | null,
+          runs?: EvalResultData[] | null,
+        ): string[] => {
+          const sources = runs && runs.length > 0 ? runs : single ? [single] : [];
+          const set = new Set<string>();
+          for (const r of sources) for (const m of getResultModels(r)) set.add(m);
+          return [...set];
+        };
+        const bSources =
+          baselineRuns && baselineRuns.length > 0 ? baselineRuns : baseline ? [baseline] : [];
+        const cSources =
+          candidateRuns && candidateRuns.length > 0 ? candidateRuns : candidate ? [candidate] : [];
+        const baselineModels = collectModels(baseline, baselineRuns);
+        const candidateModels = collectModels(candidate, candidateRuns);
+        const baselineTokens = aggregateGroupTokens(bSources);
+        const candidateTokens = aggregateGroupTokens(cSources);
+        const bTotal = baselineTokens.input + baselineTokens.output + baselineTokens.reasoning;
+        const cTotal = candidateTokens.input + candidateTokens.output + candidateTokens.reasoning;
+        const bCost = aggregateGroupCost(bSources);
+        const cCost = aggregateGroupCost(cSources);
+        const hasModels = baselineModels.length > 0 || candidateModels.length > 0;
+        const hasTokens = bTotal > 0 && cTotal > 0;
+        const hasCost = bCost > 0 || cCost > 0;
+        if (!hasModels && !hasTokens && !hasCost) return null;
+        const baselineSet = new Set(baselineModels);
+        const candidateSet = new Set(candidateModels);
+        const modelsChanged =
+          baselineSet.size !== candidateSet.size ||
+          baselineModels.some((m) => !candidateSet.has(m));
+        const tokenDeltaPct = bTotal > 0 ? ((cTotal - bTotal) / bTotal) * 100 : 0;
+        return (
+          <div className="flex items-center gap-3 px-4 py-2.5 rounded-lg bg-[hsl(var(--muted))]/50 text-xs flex-wrap">
+            {hasModels && (
+              <>
+                <span className="text-[hsl(var(--muted-foreground))] uppercase tracking-wider text-[10px] font-medium shrink-0">
+                  Models
+                </span>
+                <div className="flex items-center gap-1.5">
+                  {baselineModels.length > 0 ? (
+                    baselineModels.map((m) => (
+                      <span
+                        key={m}
+                        className="px-1.5 py-0.5 rounded border border-[hsl(var(--border))] bg-[hsl(var(--background))] font-mono"
+                        title={m}
+                      >
+                        {formatModelName(m)}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="text-[hsl(var(--muted-foreground))] italic">unknown</span>
+                  )}
+                </div>
+                <span className="text-[hsl(var(--muted-foreground))]">{'\u2192'}</span>
+                <div className="flex items-center gap-1.5">
+                  {candidateModels.length > 0 ? (
+                    candidateModels.map((m) => (
+                      <span
+                        key={m}
+                        className={cn(
+                          'px-1.5 py-0.5 rounded font-mono',
+                          modelsChanged
+                            ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300'
+                            : 'border border-[hsl(var(--border))] bg-[hsl(var(--background))]',
+                        )}
+                        title={m}
+                      >
+                        {formatModelName(m)}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="text-[hsl(var(--muted-foreground))] italic">unknown</span>
+                  )}
+                </div>
+                {modelsChanged && (
+                  <span className="text-[10px] font-medium text-blue-600 dark:text-blue-400">
+                    changed
+                  </span>
+                )}
+              </>
+            )}
+            {hasTokens && (
+              <>
+                {hasModels && <span className="text-[hsl(var(--border))]">|</span>}
+                <span className="text-[hsl(var(--muted-foreground))] uppercase tracking-wider text-[10px] font-medium shrink-0">
+                  Tokens
+                </span>
+                <span className="font-mono">{bTotal.toLocaleString()}</span>
+                <span className="text-[hsl(var(--muted-foreground))]">{'\u2192'}</span>
+                <span className="font-mono">{cTotal.toLocaleString()}</span>
+                {Math.abs(tokenDeltaPct) >= 1 && (
+                  <span
+                    className={cn(
+                      'text-[10px] font-medium',
+                      tokenDeltaPct > 0
+                        ? 'text-red-600 dark:text-red-400'
+                        : 'text-emerald-600 dark:text-emerald-400',
+                    )}
+                  >
+                    {tokenDeltaPct > 0 ? '+' : ''}
+                    {tokenDeltaPct.toFixed(0)}%
+                  </span>
+                )}
+              </>
+            )}
+            {hasCost && (
+              <>
+                {(hasModels || hasTokens) && <span className="text-[hsl(var(--border))]">|</span>}
+                <span className="text-[hsl(var(--muted-foreground))] uppercase tracking-wider text-[10px] font-medium shrink-0">
+                  Cost
+                </span>
+                <span className="font-mono">{formatCost(bCost)}</span>
+                <span className="text-[hsl(var(--muted-foreground))]">{'\u2192'}</span>
+                <span className="font-mono">{formatCost(cCost)}</span>
+                {bCost > 0 &&
+                  cCost > 0 &&
+                  (() => {
+                    const costDeltaPct = ((cCost - bCost) / bCost) * 100;
+                    return Math.abs(costDeltaPct) >= 1 ? (
+                      <span
+                        className={cn(
+                          'text-[10px] font-medium',
+                          costDeltaPct > 0
+                            ? 'text-red-600 dark:text-red-400'
+                            : 'text-emerald-600 dark:text-emerald-400',
+                        )}
+                      >
+                        {costDeltaPct > 0 ? '+' : ''}
+                        {costDeltaPct.toFixed(0)}%
+                      </span>
+                    ) : null;
+                  })()}
+              </>
+            )}
+          </div>
+        );
+      })()}
 
       {/* Quick stat cards */}
       <div className="grid grid-cols-4 gap-3">
@@ -316,7 +465,7 @@ export function EvalCompareView({
       </div>
 
       {/* ── Scorer comparison table ──────────────────────── */}
-      {scorerEntries.length > 0 && (
+      {sortedScorerEntries.length > 0 && (
         <div className="border border-[hsl(var(--border))] rounded-xl overflow-hidden">
           <div className="px-4 py-2.5 bg-[hsl(var(--muted))] border-b border-[hsl(var(--border))]">
             <h3 className="text-xs font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
@@ -527,7 +676,7 @@ export function EvalCompareView({
       {[
         {
           type: 'regression' as const,
-          items: compareResult.regressions ?? [],
+          items: compareResult.regressions,
           borderColor: 'border-red-200 dark:border-red-900',
           bgColor: 'bg-red-50 dark:bg-red-950/30',
           textColor: 'text-red-700 dark:text-red-300',
@@ -537,7 +686,7 @@ export function EvalCompareView({
         },
         {
           type: 'improvement' as const,
-          items: compareResult.improvements ?? [],
+          items: compareResult.improvements,
           borderColor: 'border-emerald-200 dark:border-emerald-900',
           bgColor: 'bg-emerald-50 dark:bg-emerald-950/30',
           textColor: 'text-emerald-700 dark:text-emerald-300',
@@ -770,7 +919,7 @@ export function EvalCompareView({
         <EvalCompareItemTable
           baseline={baseline}
           candidate={candidate}
-          scorerNames={scorerEntries.map(([name]) => name)}
+          scorerNames={sortedScorerEntries.map(([name]) => name)}
           baselineRuns={baselineRuns ?? undefined}
           candidateRuns={candidateRuns ?? undefined}
           scorerTypes={scorerTypes}

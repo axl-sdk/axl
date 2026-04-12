@@ -9,10 +9,18 @@ import {
   compareEvals,
   rescoreEval,
 } from '../../lib/api';
-import { cn, formatCost, formatDuration, extractLabel } from '../../lib/utils';
+import { cn, formatCost, formatDuration, formatTokens, extractLabel } from '../../lib/utils';
 import type { RegisteredEval } from '../../lib/types';
 import type { EvalResultData, ComparisonResult } from './types';
-import { scoreTextColor, scoreBgTint, scoreColorClass } from './types';
+import {
+  scoreTextColor,
+  scoreBgTint,
+  scoreColorClass,
+  getResultModels,
+  getResultModelCounts,
+  formatModelName,
+  getResultTokens,
+} from './types';
 import { EvalSummaryTable } from './EvalSummaryTable';
 import { EvalItemList } from './EvalItemList';
 import { EvalItemDetail } from './EvalItemDetail';
@@ -151,9 +159,13 @@ export function EvalRunnerPanel() {
       // Resolve data arrays from selections
       const resolveData = (sel: RunSelection) => {
         if (sel.groupIds && sel.groupIds.length > 1) {
-          return sel.groupIds.map((id) => history.find((h) => h.id === id)!.data);
+          const entries = sel.groupIds.map((id) => history.find((h) => h.id === id));
+          if (entries.some((e) => !e)) throw new Error('Selected run no longer exists in history');
+          return entries.map((e) => e!.data);
         }
-        return history.find((h) => h.id === sel.id)!.data;
+        const entry = history.find((h) => h.id === sel.id);
+        if (!entry) throw new Error('Selected run no longer exists in history');
+        return entry.data;
       };
 
       const baselineData = resolveData(baselineSelection);
@@ -260,23 +272,39 @@ export function EvalRunnerPanel() {
       : 0;
 
   // Aggregate stats for multi-run
+  // Compute overall mean as average of per-scorer means.
+  // Compute overall std as std of per-run overall means (not average of per-scorer stds).
   const aggScorerEntries = multiRun ? Object.entries(multiRun.aggregate.scorers) : [];
   const aggMean =
     aggScorerEntries.length > 0
       ? aggScorerEntries.reduce((sum, [, s]) => sum + s.mean, 0) / aggScorerEntries.length
       : 0;
-  const aggStd =
-    aggScorerEntries.length > 0
-      ? aggScorerEntries.reduce((sum, [, s]) => sum + s.std, 0) / aggScorerEntries.length
-      : 0;
+  const aggStd = useMemo(() => {
+    if (!multiRun) return 0;
+    const allRuns = multiRun.allRuns;
+    const scorerNames = Object.keys(multiRun.aggregate.scorers);
+    if (scorerNames.length === 0 || allRuns.length <= 1) return 0;
+    // Per-run overall mean (average of all scorer means in that run)
+    const perRunMeans = allRuns.map((run) => {
+      const means = scorerNames
+        .map((name) => run.summary?.scorers?.[name]?.mean)
+        .filter((m): m is number => m != null);
+      return means.length > 0 ? means.reduce((a, b) => a + b, 0) / means.length : 0;
+    });
+    const mean = perRunMeans.reduce((a, b) => a + b, 0) / perRunMeans.length;
+    return Math.sqrt(
+      perRunMeans.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (perRunMeans.length - 1),
+    );
+  }, [multiRun]);
   const aggTotalDuration = multiRun ? multiRun.allRuns.reduce((sum, r) => sum + r.duration, 0) : 0;
   const aggTotalCost = multiRun ? multiRun.allRuns.reduce((sum, r) => sum + r.totalCost, 0) : 0;
 
-  // Sorted aggregate scorer entries
+  // Sorted aggregate scorer entries — derive from multiRun directly for stable deps
   const sortedAggScorerEntries = useMemo(() => {
-    const sorted = [...aggScorerEntries];
-    sorted.sort((a, b) => {
-      let aVal: number | string, bVal: number | string;
+    if (!multiRun) return [];
+    const entries = Object.entries(multiRun.aggregate.scorers);
+    entries.sort((a, b) => {
+      let aVal: number, bVal: number;
       switch (aggSortField) {
         case 'scorer':
           return aggSortDir === 'asc' ? a[0].localeCompare(b[0]) : b[0].localeCompare(a[0]);
@@ -298,12 +326,10 @@ export function EvalRunnerPanel() {
           bVal = b[1].max;
           break;
       }
-      return aggSortDir === 'desc'
-        ? (bVal as number) - (aVal as number)
-        : (aVal as number) - (bVal as number);
+      return aggSortDir === 'desc' ? bVal - aVal : aVal - bVal;
     });
-    return sorted;
-  }, [aggScorerEntries, aggSortField, aggSortDir]);
+    return entries;
+  }, [multiRun, aggSortField, aggSortDir]);
 
   const toggleAggSort = (field: typeof aggSortField) => {
     if (aggSortField === field) {
@@ -326,6 +352,8 @@ export function EvalRunnerPanel() {
     return 'text-red-600 dark:text-red-400';
   };
 
+  const WORST_ITEMS_LIMIT = 5;
+
   // Worst items by average score across all scorers (from the representative currentResult)
   const worstItems = useMemo(() => {
     if (!isAggregateView || !currentResult) return [];
@@ -343,7 +371,7 @@ export function EvalRunnerPanel() {
     });
 
     scored.sort((a, b) => a.avgScore - b.avgScore);
-    return scored.slice(0, 5);
+    return scored.slice(0, WORST_ITEMS_LIMIT);
   }, [isAggregateView, currentResult]);
 
   const tabs = ['run', 'history', 'compare'] as const;
@@ -486,7 +514,34 @@ export function EvalRunnerPanel() {
                   {/* Aggregate stat cards + compare button */}
                   <div className="shrink-0 px-6 py-4">
                     <div className="flex items-start justify-between mb-3">
-                      <div className="flex-1" />
+                      <div className="flex-1">
+                        {(() => {
+                          const models = currentResult ? getResultModels(currentResult) : [];
+                          if (models.length === 0) return null;
+                          const counts = currentResult ? getResultModelCounts(currentResult) : null;
+                          return (
+                            <div className="flex items-center gap-2">
+                              <span className="text-[10px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+                                {models.length > 1 ? 'Models' : 'Model'}
+                              </span>
+                              {models.map((m) => (
+                                <span
+                                  key={m}
+                                  className="px-1.5 py-0.5 rounded bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] text-[10px] font-mono font-medium"
+                                  title={counts ? `${m} — ${counts[m]} calls` : m}
+                                >
+                                  {formatModelName(m)}
+                                  {counts && counts[m] != null && (
+                                    <span className="ml-1 text-[hsl(var(--muted-foreground))] font-normal">
+                                      ({counts[m]})
+                                    </span>
+                                  )}
+                                </span>
+                              ))}
+                            </div>
+                          );
+                        })()}
+                      </div>
                       <button
                         onClick={() => {
                           const runGroupId = currentResult?.metadata?.runGroupId as
@@ -515,7 +570,7 @@ export function EvalRunnerPanel() {
                         Compare with previous...
                       </button>
                     </div>
-                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
                       <StatCard
                         label="Runs"
                         value={String(multiRun!.aggregate.runCount)}
@@ -542,6 +597,24 @@ export function EvalRunnerPanel() {
                         value={aggTotalCost > 0 ? formatCost(aggTotalCost) : '\u2014'}
                         subtitle="all runs combined"
                       />
+                      {(() => {
+                        const allRuns = multiRun!.allRuns;
+                        const totals = { input: 0, output: 0, reasoning: 0 };
+                        for (const run of allRuns) {
+                          const t = getResultTokens(run);
+                          totals.input += t.input;
+                          totals.output += t.output;
+                          totals.reasoning += t.reasoning;
+                        }
+                        const totalTokens = totals.input + totals.output + totals.reasoning;
+                        return totalTokens > 0 ? (
+                          <StatCard
+                            label="Total Tokens"
+                            value={formatTokens(totalTokens)}
+                            subtitle={`${formatTokens(totals.input)} in / ${formatTokens(totals.output)} out`}
+                          />
+                        ) : null;
+                      })()}
                     </div>
                   </div>
 
@@ -657,7 +730,7 @@ export function EvalRunnerPanel() {
                           {worstItems.map(({ item, index, avgScore, scores }) => {
                             const isExpanded = expandedWorstItem === index;
                             const allRuns = multiRun?.allRuns;
-                            const runCount = allRuns?.length ?? 0;
+                            const totalRunCount = allRuns?.length ?? 0;
                             const runItem =
                               isExpanded && allRuns ? allRuns[worstItemRunIdx]?.items[index] : null;
 
@@ -711,13 +784,13 @@ export function EvalRunnerPanel() {
                                 {isExpanded && (
                                   <div className="border-t border-[hsl(var(--border))] bg-[hsl(var(--card))] text-xs">
                                     {/* Run switcher */}
-                                    {runCount > 1 && (
+                                    {totalRunCount > 1 && (
                                       <div className="flex items-center gap-2 px-4 py-2 border-b border-[hsl(var(--border))] bg-[hsl(var(--muted))]">
                                         <span className="text-[10px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
                                           Run
                                         </span>
                                         <div className="flex items-center gap-0.5">
-                                          {Array.from({ length: runCount }, (_, ri) => (
+                                          {Array.from({ length: totalRunCount }, (_, ri) => (
                                             <button
                                               key={ri}
                                               onClick={() => setWorstItemRunIdx(ri)}
@@ -803,7 +876,34 @@ export function EvalRunnerPanel() {
                 <>
                   {/* Stat cards */}
                   <div className="shrink-0 px-6 py-4">
-                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                    {/* Model badges */}
+                    {(() => {
+                      const models = getResultModels(displayResult);
+                      if (models.length === 0) return null;
+                      const counts = getResultModelCounts(displayResult);
+                      return (
+                        <div className="flex items-center gap-2 mb-3">
+                          <span className="text-[10px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+                            {models.length > 1 ? 'Models' : 'Model'}
+                          </span>
+                          {models.map((m) => (
+                            <span
+                              key={m}
+                              className="px-1.5 py-0.5 rounded bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] text-[10px] font-mono font-medium"
+                              title={counts ? `${m} — ${counts[m]} calls` : m}
+                            >
+                              {formatModelName(m)}
+                              {counts && counts[m] != null && (
+                                <span className="ml-1 text-[hsl(var(--muted-foreground))] font-normal">
+                                  ({counts[m]})
+                                </span>
+                              )}
+                            </span>
+                          ))}
+                        </div>
+                      );
+                    })()}
+                    <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
                       <StatCard
                         label="Items"
                         value={String(displayResult.summary.count)}
@@ -847,6 +947,17 @@ export function EvalRunnerPanel() {
                         }
                         subtitle="total"
                       />
+                      {(() => {
+                        const tokens = getResultTokens(displayResult);
+                        const totalTokens = tokens.input + tokens.output + tokens.reasoning;
+                        return totalTokens > 0 ? (
+                          <StatCard
+                            label="Tokens"
+                            value={formatTokens(totalTokens)}
+                            subtitle={`${formatTokens(tokens.input)} in / ${formatTokens(tokens.output)} out`}
+                          />
+                        ) : null;
+                      })()}
                     </div>
                   </div>
 

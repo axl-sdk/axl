@@ -3,7 +3,13 @@ import { ArrowLeftRight, ChevronDown, ChevronRight, Layers, Clock } from 'lucide
 import { cn } from '../../lib/utils';
 import type { EvalHistoryEntry } from '../../lib/types';
 import type { EvalResultData } from './types';
-import { scoreBarColor } from './types';
+import {
+  scoreBarColor,
+  getResultModels,
+  getResultModelCounts,
+  formatModelName,
+  aggregateGroupModelCounts,
+} from './types';
 
 /** Selection is either a group (all runs pooled) or a single run. */
 export type RunSelection = {
@@ -128,7 +134,7 @@ function MiniScoreBars({ scorers }: { scorers: Record<string, { mean: number }> 
         >
           <div
             className={cn('absolute bottom-0 left-0 right-0 rounded-sm', scoreBarColor(s.mean))}
-            style={{ height: `${s.mean * 100}%` }}
+            style={{ height: `${Math.max(0, Math.min(100, s.mean * 100))}%` }}
           />
         </div>
       ))}
@@ -167,6 +173,7 @@ function SelectedDisplay({
       (item) => item.type === 'group' && item.entries.some((e) => e.id === selection.id),
     );
     if (group && group.type === 'group') {
+      const sortedGroupCounts = aggregateGroupModelCounts(group.entries);
       return (
         <div className="flex items-center gap-2.5 min-w-0">
           <MiniScoreBars scorers={group.aggregateScorers} />
@@ -177,6 +184,16 @@ function SelectedDisplay({
                 <Layers className="h-2.5 w-2.5" />
                 {group.runCount} runs
               </span>
+              {sortedGroupCounts.map(([m, n]) => (
+                <span
+                  key={m}
+                  className="px-1 py-0.5 rounded bg-[hsl(var(--secondary))] font-mono text-[9px]"
+                  title={`${m} — ${n} calls`}
+                >
+                  {formatModelName(m)}{' '}
+                  <span className="text-[hsl(var(--muted-foreground))]">({n})</span>
+                </span>
+              ))}
             </div>
             <div className="flex items-center gap-1.5 text-[10px] text-[hsl(var(--muted-foreground))]">
               <Clock className="h-2.5 w-2.5" />
@@ -193,12 +210,26 @@ function SelectedDisplay({
   if (!entry)
     return <span className="text-sm text-[hsl(var(--muted-foreground))]">{placeholder}</span>;
   const data = entry.data as EvalResultData;
+  const models = getResultModels(data);
+  const counts = getResultModelCounts(data);
   return (
     <div className="flex items-center gap-2.5 min-w-0">
       <MiniScoreBarsFromData data={data} />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5">
           <span className="text-sm font-medium truncate">{entry.eval}</span>
+          {models.map((m) => (
+            <span
+              key={m}
+              className="px-1 py-0.5 rounded bg-[hsl(var(--secondary))] font-mono text-[9px]"
+              title={counts ? `${m} — ${counts[m]} calls` : m}
+            >
+              {formatModelName(m)}
+              {counts && (
+                <span className="text-[hsl(var(--muted-foreground))]"> ({counts[m]})</span>
+              )}
+            </span>
+          ))}
         </div>
         <div className="flex items-center gap-1.5 text-[10px] text-[hsl(var(--muted-foreground))]">
           <Clock className="h-2.5 w-2.5" />
@@ -333,6 +364,16 @@ function RunPicker({
                               <Layers className="h-2 w-2" />
                               {item.runCount} runs
                             </span>
+                            {aggregateGroupModelCounts(item.entries).map(([m, n]) => (
+                              <span
+                                key={m}
+                                className="px-1 py-0.5 rounded bg-[hsl(var(--secondary))] font-mono text-[9px]"
+                                title={`${m} — ${n} calls`}
+                              >
+                                {formatModelName(m)}{' '}
+                                <span className="text-[hsl(var(--muted-foreground))]">({n})</span>
+                              </span>
+                            ))}
                           </div>
                           <div className="text-[10px] text-[hsl(var(--muted-foreground))]">
                             {formatRelativeTime(item.timestamp)}
@@ -386,12 +427,28 @@ function RunPicker({
                           >
                             <MiniScoreBarsFromData data={data} />
                             <div className="min-w-0 flex-1">
-                              <div className="text-[10px] text-[hsl(var(--muted-foreground))]">
-                                Run {((data.metadata?.runIndex as number) ?? 0) + 1}
-                                <span className="opacity-50"> {'\u00b7'} </span>
+                              <div className="flex items-center gap-1 text-[10px] text-[hsl(var(--muted-foreground))]">
+                                <span>Run {((data.metadata?.runIndex as number) ?? 0) + 1}</span>
+                                <span className="opacity-50">{'\u00b7'}</span>
                                 <span className="font-mono">{entry.id.slice(0, 8)}</span>
-                                <span className="opacity-50"> {'\u00b7'} </span>
-                                {data.summary.count} items
+                                {(() => {
+                                  const counts = getResultModelCounts(data);
+                                  return getResultModels(data).map((m) => (
+                                    <span
+                                      key={m}
+                                      className="px-1 py-0.5 rounded bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] font-mono text-[9px]"
+                                      title={counts ? `${m} — ${counts[m]} calls` : m}
+                                    >
+                                      {formatModelName(m)}
+                                      {counts && (
+                                        <span className="text-[hsl(var(--muted-foreground))]">
+                                          {' '}
+                                          ({counts[m]})
+                                        </span>
+                                      )}
+                                    </span>
+                                  ));
+                                })()}
                               </div>
                             </div>
                             {isSingleSelected && (
@@ -428,6 +485,24 @@ function RunPicker({
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1.5">
                       <span className="text-xs font-medium truncate">{entry.eval}</span>
+                      {(() => {
+                        const counts = getResultModelCounts(data);
+                        return getResultModels(data).map((m) => (
+                          <span
+                            key={m}
+                            className="px-1 py-0.5 rounded bg-[hsl(var(--secondary))] font-mono text-[9px]"
+                            title={counts ? `${m} — ${counts[m]} calls` : m}
+                          >
+                            {formatModelName(m)}
+                            {counts && (
+                              <span className="text-[hsl(var(--muted-foreground))]">
+                                {' '}
+                                ({counts[m]})
+                              </span>
+                            )}
+                          </span>
+                        ));
+                      })()}
                     </div>
                     <div className="text-[10px] text-[hsl(var(--muted-foreground))]">
                       {formatRelativeTime(entry.timestamp)}

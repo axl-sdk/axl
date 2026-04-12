@@ -1,7 +1,13 @@
 import { Fragment, useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Layers, ArrowRight } from 'lucide-react';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
-import { scoreTextColor } from './types';
+import {
+  scoreTextColor,
+  getResultModels,
+  getResultModelCounts,
+  formatModelName,
+  aggregateGroupModelCounts,
+} from './types';
 import type { EvalResultData } from './types';
 import type { EvalHistoryEntry } from '../../lib/types';
 
@@ -159,7 +165,7 @@ export function EvalHistoryTable({
     return types;
   }, [filtered]);
 
-  const totalCols = 7 + scorerCols.length + (onRescore ? 1 : 0);
+  const totalCols = 8 + scorerCols.length + (onRescore ? 1 : 0);
 
   const renderEntryRow = (entry: EvalHistoryEntry, isChild: boolean, isFirst: boolean) => {
     const data = entry.data as EvalResultData;
@@ -167,6 +173,7 @@ export function EvalHistoryTable({
     return (
       <Fragment key={entry.id}>
         <tr
+          data-entry-id={entry.id}
           className={cn(
             'border-t border-[hsl(var(--border))] cursor-pointer hover:bg-[hsl(var(--accent))] transition-colors',
             isFirst && !isChild && 'bg-[hsl(var(--accent))]/30',
@@ -181,6 +188,32 @@ export function EvalHistoryTable({
               )}
               {entry.eval}
             </span>
+          </td>
+          <td className="px-3 py-2.5">
+            {(() => {
+              const models = getResultModels(data);
+              if (models.length === 0)
+                return <span className="text-[hsl(var(--muted-foreground))]">-</span>;
+              const counts = getResultModelCounts(data);
+              return (
+                <span className="inline-flex items-center gap-1 flex-wrap">
+                  {models.map((m) => (
+                    <span
+                      key={m}
+                      className="px-1.5 py-0.5 rounded bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] font-mono text-[10px]"
+                      title={counts ? `${m} — ${counts[m]} calls` : m}
+                    >
+                      {formatModelName(m)}
+                      {counts && counts[m] != null && (
+                        <span className="ml-0.5 text-[hsl(var(--muted-foreground))]">
+                          ({counts[m]})
+                        </span>
+                      )}
+                    </span>
+                  ))}
+                </span>
+              );
+            })()}
           </td>
           <td className="px-3 py-2.5 text-[hsl(var(--muted-foreground))]">
             {new Date(entry.timestamp).toLocaleString()}
@@ -260,6 +293,29 @@ export function EvalHistoryTable({
                           {data.workflow}
                         </span>
                       </span>
+                      {(() => {
+                        const models = getResultModels(data);
+                        if (models.length === 0) return null;
+                        const counts = getResultModelCounts(data);
+                        return (
+                          <span className="inline-flex items-center gap-1">
+                            {models.map((m) => (
+                              <span
+                                key={m}
+                                className="px-1.5 py-0.5 rounded bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] font-mono"
+                                title={counts ? `${m} — ${counts[m]} calls` : m}
+                              >
+                                {formatModelName(m)}
+                                {counts && counts[m] != null && (
+                                  <span className="ml-0.5 text-[hsl(var(--muted-foreground))]">
+                                    ({counts[m]})
+                                  </span>
+                                )}
+                              </span>
+                            ))}
+                          </span>
+                        );
+                      })()}
                       {!!data.metadata?.rescored && (
                         <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
                           Rescored
@@ -272,6 +328,12 @@ export function EvalHistoryTable({
                             onClick={(e) => {
                               e.stopPropagation();
                               setExpandedEntryId(originalId);
+                              // Scroll to the target row after expansion
+                              requestAnimationFrame(() => {
+                                document
+                                  .querySelector(`[data-entry-id="${CSS.escape(originalId)}"]`)
+                                  ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                              });
                             }}
                             className="font-mono underline hover:text-[hsl(var(--foreground))] transition-colors cursor-pointer"
                           >
@@ -369,6 +431,7 @@ export function EvalHistoryTable({
             <thead>
               <tr className="bg-[hsl(var(--muted))]">
                 <th className="text-left px-3 py-2.5 font-medium">Eval</th>
+                <th className="text-left px-3 py-2.5 font-medium">Model</th>
                 <th className="text-left px-3 py-2.5 font-medium">Timestamp</th>
                 <th className="text-right px-3 py-2.5 font-medium">Items</th>
                 <th className="text-right px-3 py-2.5 font-medium">Failures</th>
@@ -432,6 +495,29 @@ export function EvalHistoryTable({
                             </span>
                             {row.evalName}
                           </span>
+                        </td>
+                        <td className="px-3 py-2.5">
+                          {(() => {
+                            const sorted = aggregateGroupModelCounts(row.entries);
+                            if (sorted.length === 0)
+                              return <span className="text-[hsl(var(--muted-foreground))]">-</span>;
+                            return (
+                              <span className="inline-flex items-center gap-1 flex-wrap">
+                                {sorted.map(([m, n]) => (
+                                  <span
+                                    key={m}
+                                    className="px-1.5 py-0.5 rounded bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] font-mono text-[10px]"
+                                    title={`${m} — ${n} calls`}
+                                  >
+                                    {formatModelName(m)}
+                                    <span className="ml-0.5 text-[hsl(var(--muted-foreground))]">
+                                      ({n})
+                                    </span>
+                                  </span>
+                                ))}
+                              </span>
+                            );
+                          })()}
                         </td>
                         <td className="px-3 py-2.5 text-[hsl(var(--muted-foreground))]">
                           {new Date(row.newestTimestamp).toLocaleString()}

@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
+import type { EvalResult, Scorer } from '@axlsdk/eval';
 
 export function createEvalRoutes(evalLoader?: () => Promise<void>) {
   const app = new Hono<StudioEnv>();
@@ -55,8 +56,10 @@ export function createEvalRoutes(evalLoader?: () => Promise<void>) {
           });
           results.push(result);
         }
-        const aggregate = aggregateRuns(results as any);
-        const result = { ...(results[0] as any), _multiRun: { aggregate, allRuns: results } };
+        const typedResults = results as EvalResult[];
+        const aggregate = aggregateRuns(typedResults);
+        const first = typedResults[0]!;
+        const result = { ...first, _multiRun: { aggregate, allRuns: typedResults } };
         return c.json({ ok: true, data: result });
       } else {
         // Runtime persists eval result to history automatically
@@ -103,7 +106,11 @@ export function createEvalRoutes(evalLoader?: () => Promise<void>) {
     try {
       const { rescore } = await import('@axlsdk/eval');
       const config = entry.config as { scorers?: unknown[] };
-      const result = await rescore(historyEntry.data as any, config.scorers as any, runtime);
+      const result = await rescore(
+        historyEntry.data as EvalResult,
+        config.scorers as Scorer[],
+        runtime,
+      );
       await runtime.saveEvalResult({
         id: result.id,
         eval: name,

@@ -216,6 +216,67 @@ describe('Studio API: Evals', () => {
     }
   });
 
+  it('POST /api/evals/:name/run caps runs at 25', async () => {
+    // Create 25 mock responses (1 per run, dataset has 1 item each)
+    const responses = Array.from({ length: 25 }, (_, i) => ({ content: `run${i} output` }));
+    const provider = MockProvider.sequence(responses);
+    const { app } = createTestServer(provider);
+
+    const res = await app.request('/api/evals/test-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 100 }), // Request 100, should be capped to 25
+    });
+    expect(res.status).toBe(200);
+
+    const body = (await res.json()) as any;
+    expect(body.ok).toBe(true);
+    expect(body.data._multiRun.allRuns.length).toBe(25);
+    expect(body.data._multiRun.aggregate.runCount).toBe(25);
+  });
+
+  it('POST /api/evals/:name/run captures per-item model metadata', async () => {
+    const provider = MockProvider.sequence([{ content: 'output' }]);
+    const { app } = createTestServer(provider);
+
+    const res = await app.request('/api/evals/test-eval/run', { method: 'POST' });
+    expect(res.status).toBe(200);
+
+    const body = (await res.json()) as any;
+    const item = body.data.items[0];
+
+    // The test setup uses MockProvider registered as 'test' provider with model 'default'
+    // trackExecution captures model from agent_call trace events
+    expect(item.metadata).toBeDefined();
+    expect(item.metadata.models).toBeInstanceOf(Array);
+    expect(item.metadata.models.length).toBeGreaterThan(0);
+    expect(item.metadata.agentCalls).toBeGreaterThanOrEqual(1);
+    expect(item.metadata.tokens).toBeDefined();
+
+    // Result-level aggregation
+    expect(body.data.metadata.models).toBeInstanceOf(Array);
+    expect(body.data.metadata.models.length).toBeGreaterThan(0);
+  });
+
+  it('POST /api/evals/:name/run multi-run preserves metadata on each run', async () => {
+    const provider = MockProvider.sequence([{ content: 'run1' }, { content: 'run2' }]);
+    const { app } = createTestServer(provider);
+
+    const res = await app.request('/api/evals/test-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 2 }),
+    });
+    expect(res.status).toBe(200);
+
+    const body = (await res.json()) as any;
+    for (const run of body.data._multiRun.allRuns) {
+      expect(run.items[0].metadata).toBeDefined();
+      expect(run.items[0].metadata.models).toBeInstanceOf(Array);
+      expect(run.metadata.models).toBeInstanceOf(Array);
+    }
+  });
+
   // --- Compare endpoint ---
 
   it('POST /api/evals/compare compares two eval results', async () => {

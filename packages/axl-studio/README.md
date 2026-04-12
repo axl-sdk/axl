@@ -107,7 +107,7 @@ Browse active sessions with conversation history. Replay sessions step by step. 
 Browse all registered tools with their schemas rendered as forms. Test any tool directly with custom input and see the result.
 
 ### Eval Runner
-Run evaluations from the UI. View per-item results with scores, timing, and cost. Drill into individual items to see LLM scorer reasoning, per-scorer timing/cost, and annotations. Filter items by error state or score threshold, sort by score/duration/cost. Score distribution chart shows how scores are spread across bins. Compare two runs with timing/cost tradeoff analysis and expandable regression detail showing side-by-side outputs and reasoning. History tab tracks mean scores across runs with an eval name filter. Requires `@axlsdk/eval` as an optional peer dependency.
+Run evaluations from the UI. View per-item results with scores, timing, and cost. Drill into individual items to see LLM scorer reasoning, per-scorer timing/cost, and annotations. Filter items by error state or score threshold, sort by score/duration/cost. Score distribution chart shows how scores are spread across bins. Compare two runs with the run picker (baseline/candidate selection from history), timing/cost tradeoff analysis, item-level comparison table, and expandable regression detail showing side-by-side outputs and reasoning. History tab groups multi-run results and tracks mean scores across runs with an eval name filter. Multi-run switcher navigates between individual runs. LLM scorer badges distinguish LLM-judged from deterministic scorers. Significance tooltips explain bootstrap CI methodology. Requires `@axlsdk/eval` as an optional peer dependency.
 
 ## What gets registered
 
@@ -146,7 +146,8 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `DELETE /api/memory/:scope/:key` | Delete memory entry |
 | `GET /api/evals` | List registered eval configs |
 | `GET /api/evals/history` | List eval run history |
-| `POST /api/evals/:name/run` | Run a registered eval by name |
+| `POST /api/evals/:name/run` | Run a registered eval by name. Accepts `{ runs: N }` (capped at 25) |
+| `POST /api/evals/:name/rescore` | Re-score a history entry with the eval's current scorers |
 | `POST /api/evals/compare` | Compare two eval results |
 | `POST /api/playground/chat` | Chat with an agent directly (no workflow required). Accepts `{ message, agent?, sessionId? }`. Streams results via WebSocket |
 | `GET /api/decisions` | List pending decisions |

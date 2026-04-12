@@ -25,6 +25,12 @@ const provider = MockProvider.sequence([
   { content: 'World!' },
 ]);
 
+// With custom usage/cost per response (defaults: 10/10 tokens, $0)
+const provider = MockProvider.sequence([
+  { content: 'Hello!', usage: { prompt_tokens: 50, completion_tokens: 100, total_tokens: 150 }, cost: 0.003 },
+  { content: 'World!' }, // uses defaults
+]);
+
 // Echo mode — return the user's prompt back
 const provider = MockProvider.echo();
 
@@ -39,6 +45,13 @@ const provider = MockProvider.fn((messages, callIndex) => {
   const lastMessage = messages[messages.length - 1];
   return { content: `You said: ${lastMessage.content}` };
 });
+
+// Function mode with custom usage/cost
+const provider = MockProvider.fn(() => ({
+  content: 'response',
+  usage: { prompt_tokens: 120, completion_tokens: 200, total_tokens: 320 },
+  cost: 0.005,
+}));
 ```
 
 MockProvider also supports tool call simulation:

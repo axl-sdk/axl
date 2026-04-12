@@ -22,6 +22,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Studio:** Rescore button on history table rows
 - **Studio:** `POST /evals/:name/run` accepts `{ runs: N }` body for multi-run execution
 - **Studio:** `compareEvals()` API accepts optional `options` parameter for threshold forwarding
+- **Eval:** `pRegression`, `pImprovement`, and `n` fields on `BootstrapCIResult` and `EvalComparison` scorer entries — bootstrap probability estimates for regression/improvement direction and sample size used for CI computation
+- **Core:** `runtime.runRegisteredEval()` accepts optional `options` parameter with `metadata` for injecting custom metadata into eval results
+- **Studio:** 4 new eval components: `EvalHistoryTable` (grouped multi-run history), `EvalCompareItemTable` (full item-level comparison), `EvalCompareRunPicker` (baseline/candidate selection), `EvalMultiRunSwitcher` (run navigation)
+- **Studio:** LLM scorer badges across all eval tabs (History, Compare, Run)
+- **Studio:** Significance tooltips in Compare view explaining bootstrap CI methodology
+- **Studio:** `POST /api/evals/:name/run` caps `runs` at 25
+- **Eval:** `EvalItem.metadata` field — optional `Record<string, unknown>` for per-item execution metadata (models, tokens, agentCalls) forwarded from the runtime
+- **Eval:** `runEval()` `executeWorkflow` callback now accepts optional `metadata` in return type — enables runtimes to forward execution context (model URIs, token counts, agent call counts) per item
+- **Eval:** Result-level model aggregation — `runEval()` auto-populates `models` in `EvalResult.metadata` with unique model URIs across all items
+- **Core:** `AxlRuntime.trackExecution()` method — extends `trackCost()` to also capture models, tokens, and agent call counts from trace events during execution. `trackCost()` now delegates to `trackExecution()`. Used by eval runner and CLI for per-item metadata
+- **Studio:** Model badges in eval UI — Run tab stat cards, History table expanded rows, Compare view header (baseline vs candidate with change detection), and Item detail breadcrumb all display which model(s) produced the results
+- **Studio:** Token counts in eval UI — Run tab stat card shows total tokens with input/output/reasoning breakdown, Item detail shows per-item token count and agent call count, Compare view shows token totals with delta percentage
+- **Eval:** `rescore()` preserves per-item `metadata` from original result (execution context survives re-scoring)
+
+### Changed
+
+- **Eval:** `evalCompare()` rounding precision increased from 2 to 3 decimal places
+- **Eval:** `rescore()` strips `runGroupId` and `runIndex` from inherited metadata (rescored results are independent evaluations)
+
+### Fixed
+
+- **Testing:** `MockProvider.fn()` and `MockProvider.sequence()` now respect handler-provided `usage` and `cost` fields instead of silently overwriting them with defaults. Existing code that omits these fields is unaffected (defaults still apply)
 
 ## [0.13.6] - 2026-04-06
 

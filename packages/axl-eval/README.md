@@ -275,6 +275,8 @@ console.log(results.summary.count);                     // 50 items
 console.log(results.summary.failures);                  // 2 workflow errors
 console.log(results.summary.timing);                    // { mean, min, max, p50, p95 } in ms
 console.log(results.totalCost);                          // 0.42 (workflow + scorer LLM costs)
+console.log(results.metadata.models);                    // ["openai:gpt-4o"] (sorted by usage)
+console.log(results.metadata.modelCounts);               // { "openai:gpt-4o": 48, "openai:gpt-4o-mini": 2 } (total LLM calls per model)
 
 // ── Per-item inspection ──────────────────────────────
 for (const item of results.items) {
@@ -284,6 +286,11 @@ for (const item of results.items) {
   console.log(item.duration);                            // workflow execution ms
   console.log(item.cost);                                // workflow LLM cost
   console.log(item.scorerCost);                          // total scorer cost for this item
+
+  // Execution metadata (models, tokens, agent calls — captured by AxlRuntime)
+  console.log(item.metadata?.models);                    // ["openai:gpt-4o"]
+  console.log(item.metadata?.tokens);                    // { input: 150, output: 320, reasoning: 0 }
+  console.log(item.metadata?.agentCalls);                // 1
 
   // Quick score access
   console.log(item.scores['quality']);                    // 0.85 or null
@@ -341,6 +348,9 @@ console.log(comparison.scorers.quality.deltaPercent); // +13.3
 // Statistical significance
 console.log(comparison.scorers.quality.ci);         // { lower: 0.0312, upper: 0.1688 }
 console.log(comparison.scorers.quality.significant); // true
+console.log(comparison.scorers.quality.pRegression); // 0.02 (2% chance of regression)
+console.log(comparison.scorers.quality.pImprovement); // 0.98 (98% chance of improvement)
+console.log(comparison.scorers.quality.n);            // 50 (paired sample count)
 
 // Timing and cost tradeoffs
 console.log(comparison.timing?.deltaPercent);  // +104.8 (slower)
@@ -398,7 +408,7 @@ The underlying `pairedBootstrapCI()` function is exported for direct use:
 import { pairedBootstrapCI } from '@axlsdk/eval';
 
 const ci = pairedBootstrapCI(differences, { nResamples: 1000, alpha: 0.05, seed: 42 });
-console.log(ci); // { lower: -0.02, upper: 0.15, mean: 0.065 }
+console.log(ci); // { lower: -0.02, upper: 0.15, mean: 0.065, pRegression: 0.12, pImprovement: 0.88 }
 ```
 
 ## Eval Files in Detail
@@ -496,7 +506,7 @@ npx axl-eval rescore ./results/v1.json ./evals/qa.eval.ts
 npx axl-eval rescore ./results/v1.json ./evals/qa.eval.ts --output ./results/v1-rescored.json
 ```
 
-The rescored result gets a new `id` and has `metadata.rescored: true` and `metadata.originalId` pointing to the source run. Only scorer cost is tracked (workflow cost is zero).
+The rescored result gets a new `id` and has `metadata.rescored: true` and `metadata.originalId` pointing to the source run. `runGroupId` and `runIndex` are stripped from inherited metadata (rescored results are independent evaluations). Only scorer cost is tracked (workflow cost is zero).
 
 Programmatically:
 
@@ -579,16 +589,16 @@ const comparison = evalCompare(baselineRuns, candidateRuns);
 |------|-------------|
 | `EvalConfig` | Eval definition (workflow, dataset, scorers, concurrency, budget) |
 | `EvalResult` | Full eval output (items, summary, cost, duration) |
-| `EvalItem` | Per-item result (input, output, scores, scoreDetails) |
+| `EvalItem` | Per-item result (input, output, scores, scoreDetails, metadata) |
 | `EvalSummary` | Aggregate statistics (count, failures, scorer stats, timing) |
-| `EvalComparison` | Comparison output (scorer deltas, CI, regressions, improvements) |
+| `EvalComparison` | Comparison output (scorer deltas, CI, pRegression/pImprovement, n, regressions, improvements) |
 | `EvalCompareOptions` | Options for `evalCompare()` (`thresholds`) |
 | `EvalRegression` / `EvalImprovement` | Per-item change record (itemIndex, scorer, scores, delta) |
 | `ScorerDetail` | Per-scorer detail (score, metadata, duration, cost) |
 | `ScorerResult` | Scorer return type (`{ score, metadata?, cost? }`) |
 | `RescoreOptions` | Options for `rescore()` (`concurrency`) |
 | `MultiRunSummary` | Aggregated multi-run output (per-scorer mean/std/min/max) |
-| `BootstrapCIResult` | CI result (`{ lower, upper, mean }`) |
+| `BootstrapCIResult` | CI result (`{ lower, upper, mean, pRegression, pImprovement }`) |
 
 ## License
 

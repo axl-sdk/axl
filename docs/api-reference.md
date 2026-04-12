@@ -212,19 +212,29 @@ const ctx = runtime.createContext({
 });
 ```
 
-### `runtime.trackCost(fn)`
+### `runtime.trackExecution(fn)`
 
-Track cost across any runtime operations within `fn`. Returns `{ result, cost }`. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
+Track cost and execution metadata across any runtime operations within `fn`. Returns `{ result, cost, metadata }` where `metadata` includes `models` (unique model URIs), `tokens` (input/output/reasoning sums), and `agentCalls` count. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
 
 ```typescript
-const { result, cost } = await runtime.trackCost(async () => {
+const { result, cost, metadata } = await runtime.trackExecution(async () => {
   const ctx = runtime.createContext();
   return ctx.ask(myAgent, 'hello');
 });
-console.log(`Cost: $${cost}`);
+console.log(`Cost: $${cost}, Models: ${metadata.models.join(', ')}`);
 ```
 
-The eval runner uses `trackCost` internally to capture cost automatically for each eval item, including evals that use custom `executeWorkflow` functions.
+### `runtime.trackCost(fn)`
+
+Convenience wrapper around `trackExecution()` that returns only `{ result, cost }`. Use when you don't need metadata.
+
+```typescript
+const { result, cost } = await runtime.trackCost(async () => {
+  return runtime.execute('my-workflow', input);
+});
+```
+
+The eval runner and CLI use `trackExecution` internally to capture cost and model metadata for each eval item.
 
 ---
 
@@ -908,7 +918,7 @@ Eval results are automatically persisted when using `runRegisteredEval()`. Histo
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `runRegisteredEval(name)` | `Promise<unknown>` | Run a registered eval by name. Automatically persists the result to eval history |
+| `runRegisteredEval(name, options?)` | `Promise<unknown>` | Run a registered eval by name. Automatically persists the result to eval history. `options` accepts `{ metadata?: Record<string, unknown> }` to inject custom metadata into the eval result |
 | `getEvalHistory()` | `Promise<EvalHistoryEntry[]>` | All eval results, most recent first. Merges in-memory results with historical data from the state store |
 | `saveEvalResult(entry)` | `Promise<void>` | Manually save an eval result to history |
 | `eval(config)` | `Promise<unknown>` | Run an ad-hoc eval (not registered). Does **not** auto-persist to history |
@@ -1169,6 +1179,7 @@ Per-item result from an eval run. `scores` provides quick numeric access; `score
 | `cost` | `number?` | Workflow LLM cost |
 | `scorerCost` | `number?` | Total scorer cost for this item (sum of all `scoreDetails[*].cost`) |
 | `scoreDetails` | `Record<string, ScorerDetail>?` | Rich per-scorer data — includes `metadata` (e.g., LLM reasoning), per-scorer `duration`, and `cost` |
+| `metadata` | `Record<string, unknown>?` | Execution metadata forwarded from the runtime (e.g., `models`, `tokens`, `agentCalls`) |
 
 ### `EvalResult`
 
@@ -1237,7 +1248,7 @@ Result from `evalCompare()` comparing a baseline and candidate eval run.
 |-------|------|-------------|
 | `baseline` | `{ id, metadata }` | Baseline run identity |
 | `candidate` | `{ id, metadata }` | Candidate run identity |
-| `scorers` | `Record<string, { baselineMean, candidateMean, delta, deltaPercent, ci?, significant? }>` | Per-scorer mean comparison. `ci` is `{ lower: number; upper: number }` (95% bootstrap CI on paired differences). `significant` is `true` when the CI excludes zero and \|delta\| exceeds the threshold |
+| `scorers` | `Record<string, { baselineMean, candidateMean, delta, deltaPercent, ci?, significant?, pRegression?, pImprovement?, n? }>` | Per-scorer mean comparison. `ci` is `{ lower: number; upper: number }` (95% bootstrap CI on paired differences). `significant` is `true` when the CI excludes zero and \|delta\| exceeds the threshold. `pRegression`/`pImprovement` are bootstrap probability estimates. `n` is the number of paired differences used for CI |
 | `timing` | `{ baselineMean, candidateMean, delta, deltaPercent }?` | Per-item duration comparison |
 | `cost` | `{ baselineTotal, candidateTotal, delta, deltaPercent }?` | Total cost comparison |
 | `regressions` | `EvalRegression[]` | Items that got worse |
@@ -1288,10 +1299,12 @@ Result from `pairedBootstrapCI()`.
 | `lower` | `number` | Lower bound of the confidence interval |
 | `upper` | `number` | Upper bound of the confidence interval |
 | `mean` | `number` | Mean of the original differences |
+| `pRegression` | `number` | Proportion of bootstrap resamples where mean difference < 0 (probability of regression) |
+| `pImprovement` | `number` | Proportion of bootstrap resamples where mean difference > 0 (probability of improvement) |
 
 ### `pairedBootstrapCI(differences, options?)`
 
-Compute a percentile-based bootstrap confidence interval on paired differences. Resamples with replacement and returns the CI bounds plus the sample mean.
+Compute a percentile-based bootstrap confidence interval on paired differences. Resamples with replacement and returns the CI bounds, sample mean, and probability estimates (`pRegression`/`pImprovement`).
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -1309,7 +1322,7 @@ Options for `rescore()`.
 
 ### `rescore(result, scorers, runtime, options?)`
 
-Re-run scorers on the saved outputs of an existing `EvalResult` without re-executing the workflow. Returns a new `EvalResult` with `rescored: true` and `originalId` set in metadata. Only tracks scorer cost (no workflow cost).
+Re-run scorers on the saved outputs of an existing `EvalResult` without re-executing the workflow. Returns a new `EvalResult` with `rescored: true` and `originalId` set in metadata. Strips `runGroupId` and `runIndex` from inherited metadata (rescored results are independent evaluations). Only tracks scorer cost (no workflow cost).
 
 ### `MultiRunSummary`
 

@@ -93,6 +93,8 @@ export class MockProvider implements Provider {
       content: string;
       tool_calls?: ToolCallMessage[];
       providerMetadata?: Record<string, unknown>;
+      usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+      cost?: number;
     }>,
   ): MockProvider {
     return new MockProvider((_messages, callIndex) => {
@@ -101,12 +103,13 @@ export class MockProvider implements Provider {
           `MockProvider.sequence: no response for call index ${callIndex}. Only ${responses.length} responses defined.`,
         );
       }
+      const resp = responses[callIndex];
       return {
-        content: responses[callIndex].content,
-        tool_calls: responses[callIndex].tool_calls,
-        providerMetadata: responses[callIndex].providerMetadata,
-        usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
-        cost: 0,
+        content: resp.content,
+        tool_calls: resp.tool_calls,
+        providerMetadata: resp.providerMetadata,
+        usage: resp.usage ?? { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+        cost: resp.cost ?? 0,
       };
     });
   }
@@ -151,12 +154,17 @@ export class MockProvider implements Provider {
       content: string;
       tool_calls?: ToolCallMessage[];
       providerMetadata?: Record<string, unknown>;
+      usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+      cost?: number;
     },
   ): MockProvider {
-    return new MockProvider((messages, callIndex) => ({
-      ...handler(messages, callIndex),
-      usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
-      cost: 0,
-    }));
+    return new MockProvider((messages, callIndex) => {
+      const result = handler(messages, callIndex);
+      return {
+        ...result,
+        usage: result.usage ?? { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+        cost: result.cost ?? 0,
+      };
+    });
   }
 }

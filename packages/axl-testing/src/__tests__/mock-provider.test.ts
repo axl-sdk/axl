@@ -452,6 +452,51 @@ describe('MockProvider .stream()', () => {
   });
 });
 
+// ── Custom usage/cost passthrough ────────────────────────────────────────────
+
+describe('MockProvider.fn() custom usage/cost', () => {
+  it('uses handler-provided usage and cost when present', async () => {
+    const provider = MockProvider.fn(() => ({
+      content: 'custom',
+      usage: { prompt_tokens: 100, completion_tokens: 200, total_tokens: 300 },
+      cost: 0.005,
+    }));
+
+    const r = await provider.chat([{ role: 'user', content: 'x' }], {});
+    expect(r.usage).toEqual({ prompt_tokens: 100, completion_tokens: 200, total_tokens: 300 });
+    expect(r.cost).toBe(0.005);
+  });
+
+  it('falls back to defaults when handler omits usage and cost', async () => {
+    const provider = MockProvider.fn(() => ({ content: 'default' }));
+
+    const r = await provider.chat([{ role: 'user', content: 'x' }], {});
+    expect(r.usage).toEqual({ prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 });
+    expect(r.cost).toBe(0);
+  });
+});
+
+describe('MockProvider.sequence() custom usage/cost', () => {
+  it('uses per-response usage and cost when present', async () => {
+    const provider = MockProvider.sequence([
+      {
+        content: 'a',
+        usage: { prompt_tokens: 50, completion_tokens: 100, total_tokens: 150 },
+        cost: 0.003,
+      },
+      { content: 'b' }, // no usage/cost — should get defaults
+    ]);
+
+    const r1 = await provider.chat([{ role: 'user', content: 'x' }], {});
+    const r2 = await provider.chat([{ role: 'user', content: 'y' }], {});
+
+    expect(r1.usage).toEqual({ prompt_tokens: 50, completion_tokens: 100, total_tokens: 150 });
+    expect(r1.cost).toBe(0.003);
+    expect(r2.usage).toEqual({ prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 });
+    expect(r2.cost).toBe(0);
+  });
+});
+
 // ── MockProvider.name ────────────────────────────────────────────────────────
 
 describe('MockProvider .name', () => {

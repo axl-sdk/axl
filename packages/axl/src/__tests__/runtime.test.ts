@@ -1519,3 +1519,128 @@ describe('trackCost()', () => {
     expect(runtime.listenerCount('trace')).toBe(listenersBefore);
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════
+// trackExecution()
+// ═════════════════════════════════════════════════════════════════════════
+
+describe('trackExecution()', () => {
+  it('captures model, tokens, and agentCalls from agent_call trace events', async () => {
+    const provider = new TestProvider([{ content: 'answer', cost: 0.05 }]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const { result, cost, metadata } = await runtime.trackExecution(async () => {
+      const ctx = runtime.createContext();
+      return ctx.ask(testAgent, 'hello');
+    });
+
+    expect(result).toBe('answer');
+    expect(cost).toBeCloseTo(0.05);
+    expect(metadata.models).toEqual(['test:default']);
+    expect(metadata.agentCalls).toBe(1);
+    expect(metadata.tokens.input).toBeGreaterThan(0);
+    expect(metadata.tokens.output).toBeGreaterThan(0);
+  });
+
+  it('isolates metadata between concurrent trackExecution calls', async () => {
+    const provider = new TestProvider([
+      { content: 'a', cost: 0.01 },
+      { content: 'b', cost: 0.02 },
+    ]);
+    const { runtime } = createRuntime(provider);
+    const agentA = agent({ name: 'agent-a', model: 'test:model-a', system: 'A' });
+    const agentB = agent({ name: 'agent-b', model: 'test:model-b', system: 'B' });
+
+    // Register both providers under different model names
+    runtime.registerProvider('test', provider as any);
+
+    const [r1, r2] = await Promise.all([
+      runtime.trackExecution(async () => {
+        const ctx = runtime.createContext();
+        return ctx.ask(agentA, 'first');
+      }),
+      runtime.trackExecution(async () => {
+        const ctx = runtime.createContext();
+        return ctx.ask(agentB, 'second');
+      }),
+    ]);
+
+    // Each scope should see exactly one agent call
+    expect(r1.metadata.agentCalls).toBe(1);
+    expect(r2.metadata.agentCalls).toBe(1);
+
+    // Models should be isolated (each scope sees its own model)
+    expect(r1.metadata.models).toEqual(['test:model-a']);
+    expect(r2.metadata.models).toEqual(['test:model-b']);
+
+    // Cost should be isolated
+    expect(r1.cost + r2.cost).toBeCloseTo(0.03);
+  });
+
+  it('captures multiple models in multi-agent workflows', async () => {
+    const provider = new TestProvider([
+      { content: 'step1', cost: 0.01 },
+      { content: 'step2', cost: 0.02 },
+    ]);
+    const { runtime } = createRuntime(provider);
+    const agent1 = agent({ name: 'router', model: 'test:gpt-4o', system: 'Router' });
+    const agent2 = agent({ name: 'worker', model: 'test:claude', system: 'Worker' });
+
+    const { metadata } = await runtime.trackExecution(async () => {
+      const ctx = runtime.createContext();
+      await ctx.ask(agent1, 'route');
+      return ctx.ask(agent2, 'work');
+    });
+
+    expect(metadata.models).toContain('test:gpt-4o');
+    expect(metadata.models).toContain('test:claude');
+    expect(metadata.models).toHaveLength(2);
+    expect(metadata.agentCalls).toBe(2);
+    expect(metadata.modelCallCounts).toEqual({ 'test:gpt-4o': 1, 'test:claude': 1 });
+    expect(metadata.tokens.input).toBeGreaterThan(0);
+  });
+
+  it('returns empty metadata when no agent calls occur', async () => {
+    const { runtime } = createRuntime();
+
+    const { metadata } = await runtime.trackExecution(async () => {
+      return 'no-agent-work';
+    });
+
+    expect(metadata.models).toEqual([]);
+    expect(metadata.agentCalls).toBe(0);
+    expect(metadata.tokens).toEqual({ input: 0, output: 0, reasoning: 0 });
+  });
+
+  it('cleans up listener when fn throws', async () => {
+    const provider = new TestProvider([{ content: 'partial', cost: 0.05 }]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const listenersBefore = runtime.listenerCount('trace');
+
+    await expect(
+      runtime.trackExecution(async () => {
+        const ctx = runtime.createContext();
+        await ctx.ask(testAgent, 'hello');
+        throw new Error('mid-execution failure');
+      }),
+    ).rejects.toThrow('mid-execution failure');
+
+    expect(runtime.listenerCount('trace')).toBe(listenersBefore);
+  });
+
+  it('trackCost delegates to trackExecution (returns same cost)', async () => {
+    const provider = new TestProvider([{ content: 'answer', cost: 0.07 }]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const { cost } = await runtime.trackCost(async () => {
+      const ctx = runtime.createContext();
+      return ctx.ask(testAgent, 'hello');
+    });
+
+    expect(cost).toBeCloseTo(0.07);
+  });
+});

@@ -90,7 +90,7 @@ export class AxlRuntime extends EventEmitter {
       executeWorkflow?: (
         input: unknown,
         runtime?: AxlRuntime,
-      ) => Promise<{ output: unknown; cost?: number }>;
+      ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>;
     }
   >();
   private mcpManager?: McpManager;
@@ -277,7 +277,7 @@ export class AxlRuntime extends EventEmitter {
         executeWorkflow?: (
           input: unknown,
           runtime?: AxlRuntime,
-        ) => Promise<{ output: unknown; cost?: number }>;
+        ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>;
       }
     | undefined {
     return this.registeredEvals.get(name);
@@ -300,7 +300,7 @@ export class AxlRuntime extends EventEmitter {
         executeFn: (
           input: unknown,
           runtime: unknown,
-        ) => Promise<{ output: unknown; cost?: number }>,
+        ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>,
         runtime: unknown,
       ) => Promise<unknown>;
       try {
@@ -311,21 +311,26 @@ export class AxlRuntime extends EventEmitter {
           'axl-eval is required for AxlRuntime.runRegisteredEval(). Install it with: npm install @axlsdk/eval',
         );
       }
-      const originalExecuteFn = entry.executeWorkflow as (
-        input: unknown,
-        runtime: unknown,
-      ) => Promise<{ output: unknown; cost?: number }>;
+      const originalExecuteFn = entry.executeWorkflow!;
 
-      // Wrap with trackCost for transparent cost capture
+      // Wrap with trackExecution for transparent cost + metadata capture
       const wrappedExecuteFn = async (
         input: unknown,
         runtime: unknown,
-      ): Promise<{ output: unknown; cost?: number }> => {
-        const { result, cost: trackedCost } = await this.trackCost(async () => {
-          return originalExecuteFn(input, runtime);
+      ): Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }> => {
+        const {
+          result,
+          cost: trackedCost,
+          metadata,
+        } = await this.trackExecution(async () => {
+          return originalExecuteFn(input, runtime as AxlRuntime);
         });
         // Prefer user-supplied cost if present, fall back to tracked cost
-        return { output: result.output, cost: result.cost ?? trackedCost };
+        return {
+          output: result.output,
+          cost: result.cost ?? trackedCost,
+          metadata: result.metadata ?? metadata,
+        };
       };
 
       result = await runEvalFn(entry.config, wrappedExecuteFn, this);
@@ -1003,7 +1008,10 @@ export class AxlRuntime extends EventEmitter {
   }): Promise<unknown> {
     let runEvalFn: (
       config: unknown,
-      executeFn: (input: unknown, runtime: unknown) => Promise<{ output: unknown; cost?: number }>,
+      executeFn: (
+        input: unknown,
+        runtime: unknown,
+      ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>,
       runtime: unknown,
     ) => Promise<unknown>;
     try {
@@ -1015,11 +1023,13 @@ export class AxlRuntime extends EventEmitter {
       );
     }
 
-    const executeWorkflow = async (input: unknown): Promise<{ output: unknown; cost?: number }> => {
-      const { result, cost } = await this.trackCost(async () => {
+    const executeWorkflow = async (
+      input: unknown,
+    ): Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }> => {
+      const { result, cost, metadata } = await this.trackExecution(async () => {
         return this.execute(config.workflow, input);
       });
-      return { output: result, cost };
+      return { output: result, cost, metadata };
     };
 
     return runEvalFn(config, executeWorkflow, this);
@@ -1053,6 +1063,30 @@ export class AxlRuntime extends EventEmitter {
    * Works with both `createContext()` and `execute()` calls inside `fn`.
    */
   async trackCost<T>(fn: () => Promise<T>): Promise<{ result: T; cost: number }> {
+    const { result, cost } = await this.trackExecution(fn);
+    return { result, cost };
+  }
+
+  /**
+   * Track cost and execution metadata across any runtime operations within the given function.
+   * Uses AsyncLocalStorage to scope attribution to specific execution IDs,
+   * making it correct with concurrent calls.
+   *
+   * Returns cost (same as `trackCost`) plus metadata extracted from trace events:
+   * models (unique URIs), tokens (input/output/reasoning sums), and agent call count.
+   *
+   * Works with both `createContext()` and `execute()` calls inside `fn`.
+   */
+  async trackExecution<T>(fn: () => Promise<T>): Promise<{
+    result: T;
+    cost: number;
+    metadata: {
+      models: string[];
+      modelCallCounts?: Record<string, number>;
+      tokens: { input: number; output: number; reasoning: number };
+      agentCalls: number;
+    };
+  }> {
     const parentScope = costScopeStorage.getStore();
     const scope: CostScope = {
       totalCost: 0,
@@ -1060,20 +1094,41 @@ export class AxlRuntime extends EventEmitter {
       parent: parentScope,
     };
 
-    const costListener = (event: TraceEvent) => {
-      if (event.cost && scope.trackedIds.has(event.executionId)) {
-        scope.totalCost += event.cost;
+    const modelCalls = new Map<string, number>();
+    const tokens = { input: 0, output: 0, reasoning: 0 };
+    let agentCalls = 0;
+
+    const listener = (event: TraceEvent) => {
+      if (!scope.trackedIds.has(event.executionId)) return;
+      if (event.cost) scope.totalCost += event.cost;
+      if (event.type === 'agent_call') {
+        if (event.model) modelCalls.set(event.model, (modelCalls.get(event.model) ?? 0) + 1);
+        agentCalls++;
+        if (event.tokens) {
+          tokens.input += event.tokens.input ?? 0;
+          tokens.output += event.tokens.output ?? 0;
+          tokens.reasoning += event.tokens.reasoning ?? 0;
+        }
       }
     };
 
     // Temporarily increase maxListeners to avoid warnings at high concurrency
     this.setMaxListeners(this.getMaxListeners() + 1);
-    this.on('trace', costListener);
+    this.on('trace', listener);
     try {
       const result = await costScopeStorage.run(scope, fn);
-      return { result, cost: scope.totalCost };
+      return {
+        result,
+        cost: scope.totalCost,
+        metadata: {
+          models: [...modelCalls.keys()],
+          modelCallCounts: modelCalls.size > 0 ? Object.fromEntries(modelCalls) : undefined,
+          tokens,
+          agentCalls,
+        },
+      };
     } finally {
-      this.off('trace', costListener);
+      this.off('trace', listener);
       this.setMaxListeners(this.getMaxListeners() - 1);
     }
   }

@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { FlaskConical, Play, ArrowLeft, Upload } from 'lucide-react';
+import { FlaskConical, ArrowLeft, Upload } from 'lucide-react';
+import { PanelHeader } from '../../components/layout/PanelHeader';
 import { EmptyState } from '../../components/shared/EmptyState';
 import {
   fetchEvals,
@@ -37,6 +38,7 @@ import { EvalCompareRunPicker } from './EvalCompareRunPicker';
 import type { RunSelection } from './EvalCompareRunPicker';
 import { EvalMultiRunSwitcher } from './EvalMultiRunSwitcher';
 import { EvalHistoryTable } from './EvalHistoryTable';
+import { EvalCommandBar } from './EvalCommandBar';
 import { StatCard } from '../../components/shared/StatCard';
 import { JsonViewer } from '../../components/shared/JsonViewer';
 
@@ -521,94 +523,93 @@ export function EvalRunnerPanel() {
 
   return (
     <div className="flex flex-col h-screen">
-      {/* ── Header ─────────────────────────────────────── */}
-      <header className="shrink-0 flex items-center justify-between px-6 py-4 border-b border-[hsl(var(--border))]">
-        <h2 className="text-xl font-semibold">Evals</h2>
-        <div className="flex items-center gap-2">
-          {canShowWriteUi && (
+      <PanelHeader
+        title="Eval Runner"
+        description={
+          selectedMeta ? (
             <>
-              <input
-                ref={importFileInputRef}
-                type="file"
-                accept="application/json,.json"
-                className="hidden"
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) handleImportFile(file);
-                  // Reset so the same filename can be re-imported.
-                  e.target.value = '';
-                }}
-              />
-              <button
-                onClick={() => importFileInputRef.current?.click()}
-                disabled={importing}
-                className={cn(
-                  'inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg transition-all cursor-pointer',
-                  'border border-[hsl(var(--input))] bg-[hsl(var(--background))]',
-                  'hover:bg-[hsl(var(--muted))] disabled:opacity-40',
-                )}
-                title="Import an eval result JSON file (e.g. from `axl-eval --output`). Imported entries persist as long as the runtime's state store does."
-              >
-                <Upload size={12} />
-                {importing ? 'Importing\u2026' : 'Import result'}
-              </button>
+              <span>{selectedMeta.workflow}</span>
+              <span className="opacity-40 mx-1.5">·</span>
+              <span>{selectedMeta.dataset}</span>
+              <span className="opacity-40 mx-1.5">·</span>
+              <span>
+                {selectedMeta.scorers.length} scorer
+                {selectedMeta.scorers.length !== 1 ? 's' : ''}
+              </span>
             </>
-          )}
-          {/* Run controls are hidden in readOnly — the POST /api/evals/:name/run
-              endpoint is blocked, so showing a button that always errors is
-              worse than hiding it. Users can still browse history and compare.
-              `canShowWriteUi` also waits for the health query so we don't
-              briefly flash the button on initial load in a readOnly runtime. */}
-          {evals.length > 0 && canShowWriteUi && (
-            <>
-              <select
-                value={selectedEval}
-                onChange={(e) => setSelectedEval(e.target.value)}
-                className="px-3 py-1.5 text-sm rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))] min-w-[180px]"
-              >
-                <option value="">Select eval…</option>
-                {evals.map((e: RegisteredEval) => (
-                  <option key={e.name} value={e.name}>
-                    {e.name}
-                  </option>
-                ))}
-              </select>
-              <button
-                onClick={handleRun}
-                disabled={!selectedEval || running}
-                className={cn(
-                  'inline-flex items-center gap-1.5 px-4 py-1.5 text-sm font-medium rounded-lg transition-all cursor-pointer',
-                  'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]',
-                  'hover:opacity-90 disabled:opacity-40',
-                )}
-              >
-                <Play size={12} className={running ? 'animate-spin' : ''} />
-                {running ? 'Running\u2026' : 'Run'}
-              </button>
-              <input
-                type="number"
-                min={1}
-                max={25}
-                value={runCount}
-                onChange={(e) =>
-                  setRunCount(Math.max(1, Math.min(25, parseInt(e.target.value) || 1)))
-                }
-                className="w-14 px-2 py-1.5 text-sm text-center rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
-                title="Number of runs"
+          ) : evals.length > 0 ? (
+            `${evals.length} registered eval${evals.length !== 1 ? 's' : ''} · select one to run`
+          ) : (
+            'No evals registered'
+          )
+        }
+        actions={
+          <>
+            {canShowWriteUi && (
+              <>
+                <input
+                  ref={importFileInputRef}
+                  type="file"
+                  accept="application/json,.json"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) handleImportFile(file);
+                    // Reset so the same filename can be re-imported.
+                    e.target.value = '';
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => importFileInputRef.current?.click()}
+                  disabled={importing}
+                  className={cn(
+                    'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-full cursor-pointer',
+                    'ring-1 ring-[hsl(var(--input))] bg-[hsl(var(--background))] shadow-sm',
+                    'hover:bg-[hsl(var(--muted))] hover:ring-[hsl(var(--ring))]',
+                    'focus:outline-none focus-visible:ring-[hsl(var(--ring))] transition-all',
+                    'disabled:opacity-40 disabled:cursor-not-allowed',
+                  )}
+                  title="Import an eval result JSON file (e.g. from `axl-eval --output`). Imported entries persist as long as the runtime's state store does."
+                >
+                  <Upload size={12} />
+                  {importing ? 'Importing\u2026' : 'Import result'}
+                </button>
+              </>
+            )}
+            {/* Run controls are hidden in readOnly — the POST /api/evals/:name/run
+                endpoint is blocked, so showing a button that always errors is
+                worse than hiding it. Users can still browse history and compare.
+                `canShowWriteUi` also waits for the health query so we don't
+                briefly flash the button on initial load in a readOnly runtime. */}
+            {evals.length > 0 && canShowWriteUi && (
+              <EvalCommandBar
+                evals={evals}
+                selectedEval={selectedEval}
+                onSelectEval={setSelectedEval}
+                runCount={runCount}
+                onRunCountChange={setRunCount}
+                running={running}
+                onRun={handleRun}
               />
-            </>
-          )}
-        </div>
-      </header>
+            )}
+          </>
+        }
+      />
 
-      {/* ── Tabs ───────────────────────────────────────── */}
+      {/* ── Tabs ─────────────────────────────────────────
+          Eval metadata moved out of this row and into the header subhead so
+          it lives next to the picker that owns it, instead of being orphaned
+          on the right side of the tab strip. */}
       <div
         role="tablist"
+        aria-label="Eval views"
         className="shrink-0 flex items-center gap-1 px-6 border-b border-[hsl(var(--border))]"
       >
         {tabs.map((t) => (
           <button
             key={t}
+            type="button"
             role="tab"
             aria-selected={tab === t}
             onClick={() => setTab(t)}
@@ -622,23 +623,6 @@ export function EvalRunnerPanel() {
             {t.charAt(0).toUpperCase() + t.slice(1)}
           </button>
         ))}
-
-        {/* Eval metadata chips — visible when an eval is selected */}
-        {selectedMeta && tab === 'run' && (
-          <div className="ml-auto flex items-center gap-2 py-2">
-            <span className="text-[10px] text-[hsl(var(--muted-foreground))] uppercase tracking-wider">
-              {selectedMeta.workflow}
-            </span>
-            <span className="text-[hsl(var(--border))]">/</span>
-            <span className="text-[10px] text-[hsl(var(--muted-foreground))] uppercase tracking-wider">
-              {selectedMeta.dataset}
-            </span>
-            <span className="text-[hsl(var(--border))]">/</span>
-            <span className="text-[10px] text-[hsl(var(--muted-foreground))]">
-              {selectedMeta.scorers.length} scorer{selectedMeta.scorers.length !== 1 ? 's' : ''}
-            </span>
-          </div>
-        )}
       </div>
 
       {/* ── Global error banner ─────────────────────────────

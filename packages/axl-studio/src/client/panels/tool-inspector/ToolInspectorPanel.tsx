@@ -47,8 +47,35 @@ export function ToolInspectorPanel() {
     [selectedToolName],
   );
 
+  const selectedTool = tools.find((t: ToolSummary) => t.name === selectedToolName);
+
   return (
-    <PanelShell title="Tool Inspector" description="View tool schemas and test tools directly">
+    <PanelShell
+      title="Tool Inspector"
+      description={
+        selectedTool ? (
+          <>
+            <span className="font-mono">{selectedTool.name}</span>
+            {selectedTool.description && (
+              <>
+                <span className="opacity-40 mx-1.5">·</span>
+                <span>{selectedTool.description}</span>
+              </>
+            )}
+          </>
+        ) : tools.length > 0 ? (
+          <>
+            <span className="whitespace-nowrap">
+              {tools.length} registered tool{tools.length !== 1 ? 's' : ''}
+            </span>
+            <span className="opacity-40 mx-1.5">·</span>
+            <span>select one to inspect</span>
+          </>
+        ) : (
+          'Registered tools with schemas and direct testing'
+        )
+      }
+    >
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Tool list */}
         <div className="space-y-2">

@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { DollarSign } from 'lucide-react';
+import { DollarSign, RotateCcw } from 'lucide-react';
 import { PanelShell } from '../../components/layout/PanelShell';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { CostBadge } from '../../components/shared/CostBadge';
@@ -39,7 +39,7 @@ export function CostDashboardPanel() {
     return (
       <PanelShell
         title="Cost Dashboard"
-        description="Track spending across agents, models, and workflows"
+        description="Spending across agents, models, and workflows"
       >
         <EmptyState
           icon={<DollarSign size={32} />}
@@ -51,16 +51,41 @@ export function CostDashboardPanel() {
   }
 
   const showReasoning = costs.totalTokens.reasoning > 0;
+  const agentCount = Object.keys(costs.byAgent).length;
+  const modelCount = Object.keys(costs.byModel).length;
 
   return (
     <PanelShell
       title="Cost Dashboard"
-      description="Track spending across agents, models, and workflows"
+      description={
+        costs.totalCost > 0 ? (
+          <>
+            <span>{formatCost(costs.totalCost)} total</span>
+            <span className="opacity-40 mx-1.5">·</span>
+            <span>
+              {agentCount} agent{agentCount !== 1 ? 's' : ''}
+            </span>
+            <span className="opacity-40 mx-1.5">·</span>
+            <span>
+              {modelCount} model{modelCount !== 1 ? 's' : ''}
+            </span>
+          </>
+        ) : (
+          'Spending across agents, models, and workflows'
+        )
+      }
       actions={
         <button
+          type="button"
           onClick={handleReset}
-          className="px-3 py-1.5 text-sm rounded-md border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))]"
+          className={cn(
+            'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-full cursor-pointer',
+            'ring-1 ring-[hsl(var(--input))] bg-[hsl(var(--background))] shadow-sm',
+            'hover:bg-[hsl(var(--muted))] hover:ring-[hsl(var(--ring))]',
+            'focus:outline-none focus-visible:ring-[hsl(var(--ring))] transition-all',
+          )}
         >
+          <RotateCcw size={12} />
           Reset
         </button>
       }

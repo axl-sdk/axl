@@ -66,7 +66,30 @@ export function SessionManagerPanel() {
   return (
     <PanelShell
       title="Session Manager"
-      description="Browse active sessions, replay conversations, and view handoff chains"
+      description={
+        sessions.length > 0 ? (
+          selectedSessionId && sessionDetail ? (
+            <>
+              <span className="font-mono">{sessionDetail.id.slice(0, 16)}</span>
+              <span className="opacity-40 mx-1.5">·</span>
+              <span>
+                {sessionDetail.history.length} message
+                {sessionDetail.history.length !== 1 ? 's' : ''}
+              </span>
+            </>
+          ) : (
+            <>
+              <span>
+                {sessions.length} active session{sessions.length !== 1 ? 's' : ''}
+              </span>
+              <span className="opacity-40 mx-1.5">·</span>
+              <span>select one to replay</span>
+            </>
+          )
+        ) : (
+          'Multi-turn conversations tracked via runtime.session()'
+        )
+      }
     >
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Session list */}

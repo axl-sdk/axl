@@ -1,15 +1,17 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Play, FlaskConical } from 'lucide-react';
+import { PanelHeader } from '../../components/layout/PanelHeader';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { JsonEditor } from '../../components/shared/JsonEditor';
 import { JsonViewer } from '../../components/shared/JsonViewer';
 import { SchemaForm } from '../../components/shared/SchemaForm';
 import { StatusBadge } from '../../components/shared/StatusBadge';
+import { CommandPicker } from '../../components/shared/CommandPicker';
 import { fetchWorkflows, fetchWorkflow, executeWorkflow } from '../../lib/api';
 import { useWsStream } from '../../hooks/use-ws-stream';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
-import type { WorkflowSummary, TraceEvent } from '../../lib/types';
+import type { TraceEvent } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
 import { getBarColor, getDepth } from '../../lib/trace-utils';
 
@@ -68,6 +70,18 @@ export function WorkflowRunnerPanel() {
     }
   }, [inputJson, doExecute]);
 
+  // Reset run state when the user picks a different workflow so leftover
+  // results/errors from the previous run don't leak into the new view.
+  const handleSelectWorkflow = useCallback((name: string) => {
+    setSelectedWorkflow(name);
+    setInputJson('{}');
+    setResult(undefined);
+    setError(null);
+    setStatus('idle');
+  }, []);
+
+  const selectedWorkflowMeta = workflows.find((w) => w.name === selectedWorkflow);
+
   const handleSchemaSubmit = useCallback(
     (values: Record<string, unknown>) => {
       doExecute(values);
@@ -95,44 +109,80 @@ export function WorkflowRunnerPanel() {
 
   return (
     <div className="flex flex-col h-screen">
-      {/* ── Header ─────────────────────────────────────── */}
-      <header className="shrink-0 flex items-center justify-between px-6 py-4 border-b border-[hsl(var(--border))]">
-        <h2 className="text-xl font-semibold">Workflows</h2>
-        {workflows.length > 0 && (
-          <div className="flex items-center gap-2">
-            <select
-              value={selectedWorkflow}
-              onChange={(e) => {
-                setSelectedWorkflow(e.target.value);
-                setInputJson('{}');
-                setResult(undefined);
-                setError(null);
-                setStatus('idle');
-              }}
-              className="px-3 py-1.5 text-sm rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))] min-w-[180px]"
-            >
-              <option value="">Select workflow…</option>
-              {workflows.map((w: WorkflowSummary) => (
-                <option key={w.name} value={w.name}>
-                  {w.name}
-                </option>
-              ))}
-            </select>
-            <button
-              onClick={handleExecuteJson}
-              disabled={!selectedWorkflow || status === 'running'}
+      <PanelHeader
+        title="Workflow Runner"
+        description={
+          selectedWorkflowMeta ? (
+            <>
+              <span>{selectedWorkflowMeta.name}</span>
+              {(selectedWorkflowMeta.hasInputSchema || selectedWorkflowMeta.hasOutputSchema) && (
+                <>
+                  <span className="opacity-40 mx-1.5">·</span>
+                  <span>
+                    {selectedWorkflowMeta.hasInputSchema && 'input schema'}
+                    {selectedWorkflowMeta.hasInputSchema &&
+                      selectedWorkflowMeta.hasOutputSchema &&
+                      ' · '}
+                    {selectedWorkflowMeta.hasOutputSchema && 'output schema'}
+                  </span>
+                </>
+              )}
+            </>
+          ) : workflows.length > 0 ? (
+            `${workflows.length} registered workflow${workflows.length !== 1 ? 's' : ''} · select one to run`
+          ) : (
+            'No workflows registered'
+          )
+        }
+        actions={
+          workflows.length > 0 && (
+            <div
               className={cn(
-                'inline-flex items-center gap-1.5 px-4 py-1.5 text-sm font-medium rounded-lg transition-all',
-                'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]',
-                'hover:opacity-90 disabled:opacity-40',
+                'inline-flex items-stretch rounded-full bg-[hsl(var(--background))] shrink-0',
+                'ring-1 ring-[hsl(var(--input))] shadow-sm',
+                'hover:ring-[hsl(var(--ring))] focus-within:ring-[hsl(var(--ring))]',
+                'transition-shadow',
               )}
             >
-              <Play size={12} className={status === 'running' ? 'animate-spin' : ''} />
-              {status === 'running' ? 'Running…' : 'Run'}
-            </button>
-          </div>
-        )}
-      </header>
+              <CommandPicker
+                items={workflows}
+                value={selectedWorkflow}
+                onSelect={handleSelectWorkflow}
+                getKey={(w) => w.name}
+                getLabel={(w) => w.name}
+                getDescription={(w) => {
+                  const parts = [];
+                  if (w.hasInputSchema) parts.push('input schema');
+                  if (w.hasOutputSchema) parts.push('output schema');
+                  return parts.length > 0 ? parts.join(' · ') : 'no schema';
+                }}
+                placeholder="Select workflow"
+                searchPlaceholder="Search workflows…"
+                emptyLabel="No workflows registered"
+                shortcut
+                triggerClassName="rounded-l-full"
+                ariaLabel="Select a workflow"
+              />
+              <button
+                onClick={handleExecuteJson}
+                disabled={!selectedWorkflow || status === 'running'}
+                className={cn(
+                  'inline-flex items-center gap-1.5 pl-3.5 pr-4 py-2 text-sm font-medium cursor-pointer',
+                  'bg-[hsl(var(--foreground))] text-[hsl(var(--background))] rounded-r-full',
+                  'hover:opacity-90 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-1 focus-visible:ring-[hsl(var(--foreground))]',
+                  'disabled:opacity-40 disabled:cursor-not-allowed transition-opacity',
+                )}
+              >
+                <Play
+                  size={12}
+                  className={cn('fill-current', status === 'running' && 'animate-spin fill-none')}
+                />
+                {status === 'running' ? 'Running\u2026' : 'Run'}
+              </button>
+            </div>
+          )
+        }
+      />
 
       {/* ── Body ───────────────────────────────────────── */}
       <div className="flex-1 min-h-0 flex border-t border-[hsl(var(--border))]">

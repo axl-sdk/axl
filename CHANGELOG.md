@@ -20,10 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Studio:** Unified panel header typography, padding, and row height across all 8 panels. Headers no longer shift vertical position when switching tabs. Fixes a latent `truncate` bug where header descriptions with nested `<span className="truncate">` children silently broke the outer block's inline flow (inner `truncate` forces `display: block`, which `white-space: nowrap` cannot traverse); inner truncates removed — the outer wrapper's `overflow: hidden` + inherited `white-space: nowrap` handles clipping with a single trailing ellipsis
+- **Studio:** `CommandPicker` popover now flips above the trigger when there isn't enough room below, so it no longer clips offscreen on short viewports
+- **Studio:** `CommandPicker` keyboard arrow navigation no longer snaps back to the selected row after every keystroke — a user-moved flag stops the reset-to-selection effect once the cursor has been manually moved
+- **Studio:** `CommandPicker` Tab now closes the popover instead of leaving a ghost listbox behind focus; ⌘K shortcut also guards `contentEditable` surfaces (Monaco, CodeMirror) and lets users toggle from inside the picker's own search input
+- **Studio:** `CommandPicker` accessibility: correct `aria-activedescendant` on the listbox, `aria-selected` now reflects highlight (not the persisted value), `aria-controls` ties the trigger to the popover id, and the search input has an explicit `aria-label`
+- **Studio:** Run-count stepper fixes a double-commit race between Enter keydown and blur (Enter could fire `onChange` twice) and keeps the draft in sync with external `value` changes while not editing
 - **Studio:** `POST /api/evals/compare` no longer hits host body-parser limits when Studio is mounted as middleware. Compare now accepts `{ baselineId, candidateId, options? }` (each ID is `string` for a single run or `string[]` for a pooled multi-run group), resolving full results from runtime history server-side. Drops the wire payload from ~150KB to ~100B and fixes `PayloadTooLargeError: request entity too large` reported when comparing eval results behind NestJS/Express. Compare is also now allowed in `readOnly` mode (it's pure computation)
 
 ### Added
 
+- **Studio:** `PanelHeader` — canonical header component for every panel, owning title typography, description slot, and action row styling. Widens the description prop to `ReactNode` so panels can pass metadata chips (counts, selected-item summary) as a live subhead. Locks a minimum row height and always reserves the description line (non-breaking space fallback) so headers no longer jitter between tall/short variants across tabs
+- **Studio:** `CommandPicker` — reusable command-palette-style picker with search, keyboard nav, and ⌘K shortcut. Two variants: `picker` (primary action with search icon and optional kbd hint) and `filter` (compact dropdown for table/view filters). Used across Agent Playground, Workflow Runner, Eval Runner, and Trace Explorer
+- **Studio:** Inline run-count stepper in the Eval Runner header (`[− N +]` with Shift+click ±5, click-to-type edit mode, Enter/Space keyboard path, ArrowUp/Down to step). Replaces the previous preset dropdown so users can pick any N between 1–25 — each run costs money, so precise selection matters. Announces native `role="spinbutton"` semantics with `aria-valuenow/min/max/valuetext`
+- **Studio:** Contextual subheads in Playground, Cost Dashboard, Memory Browser, Session Manager, and Tool Inspector — replaces static marketing copy with live counts and selected-item summaries (e.g. "14 entries · session scope", "3 registered tools · select one to inspect")
 - **Studio:** `POST /api/evals/import` — ingest a CLI eval artifact (e.g. from `axl-eval --output result.json`) into runtime history. Generates a fresh UUID so repeated imports of the same file create distinct entries. Imported entries are first-class history records and work with the run detail view, comparison, and rescore (rescore requires a matching registered eval name). Blocked in `readOnly` mode. **Only Studio endpoint with potentially large request bodies — host frameworks must raise their JSON body limit on the Studio mount if importing sizeable files**
 - **Studio:** "Import result" button in the Eval Runner panel header — lets users compare or inspect CLI eval artifacts inside Studio without re-running them
 - **Studio:** `GET /api/health` now reports `readOnly: boolean`, used by the client to gate mutating UI affordances
@@ -37,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Studio:** Panel titles normalized to the `{Noun} {Verb}` pattern — "Workflows" → "Workflow Runner" and "Evals" → "Eval Runner". Matches the existing "Agent Playground", "Trace Explorer", "Cost Dashboard", "Memory Browser", "Session Manager", and "Tool Inspector" titles. Sidebar labels remain short (scannability) while panel titles stay descriptive
 - **Studio:** `readOnly` mode block list now uses precise regex patterns instead of `startsWith` matching. `POST /api/evals/compare` is allowed; `POST /api/evals/import`, `POST /api/evals/:name/run`, and `POST /api/evals/:name/rescore` remain blocked
 
 ## [0.13.8] - 2026-04-12

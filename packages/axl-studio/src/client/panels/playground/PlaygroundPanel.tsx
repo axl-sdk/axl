@@ -1,14 +1,14 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Send, ArrowRight, ShieldCheck } from 'lucide-react';
+import { Send, ArrowRight, ShieldCheck, MessageSquarePlus } from 'lucide-react';
 import { PanelShell } from '../../components/layout/PanelShell';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { StreamingText } from '../../components/shared/StreamingText';
 import { JsonViewer } from '../../components/shared/JsonViewer';
+import { CommandPicker } from '../../components/shared/CommandPicker';
 import { fetchAgents, playgroundChat } from '../../lib/api';
 import { useWsStream } from '../../hooks/use-ws-stream';
-import { formatCost, formatTokens } from '../../lib/utils';
-import type { AgentSummary } from '../../lib/types';
+import { cn, formatCost, formatTokens } from '../../lib/utils';
 
 type ToolCall = { name: string; args: unknown; result?: unknown; callId?: string };
 type Handoff = { source: string; target: string; mode: string };
@@ -181,13 +181,38 @@ export function PlaygroundPanel() {
   };
 
   const hasCostData = totalCost > 0 || totalTokens.input > 0;
+  const messageCount = messages.length;
 
   return (
     <PanelShell
       title="Agent Playground"
-      description="Chat with registered agents in real-time"
+      description={
+        messageCount > 0 ? (
+          <>
+            <span>
+              {messageCount} message{messageCount !== 1 ? 's' : ''}
+            </span>
+            {sessionId && (
+              <>
+                <span className="opacity-40 mx-1.5">·</span>
+                <span className="font-mono">session {sessionId.slice(0, 8)}</span>
+              </>
+            )}
+          </>
+        ) : agents.length > 0 ? (
+          <>
+            <span>
+              {agents.length} registered agent{agents.length !== 1 ? 's' : ''}
+            </span>
+            <span className="opacity-40 mx-1.5">·</span>
+            <span>pick one or use the default</span>
+          </>
+        ) : (
+          'Interactive chat with registered agents'
+        )
+      }
       actions={
-        <div className="flex items-center gap-2">
+        <>
           {hasCostData && (
             <div className="flex items-center gap-1.5">
               {totalCost > 0 && (
@@ -202,33 +227,73 @@ export function PlaygroundPanel() {
               )}
             </div>
           )}
-          {agents.length > 0 && (
-            <select
-              value={selectedAgent}
-              onChange={(e) => setSelectedAgent(e.target.value)}
-              className="px-2 py-1.5 text-sm rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
-            >
-              <option value="">Default agent</option>
-              {agents.map((a: AgentSummary) => (
-                <option key={a.name} value={a.name}>
-                  {a.name}
-                </option>
-              ))}
-            </select>
-          )}
-          <button
-            onClick={() => {
-              setMessages([]);
-              setSessionId(null);
-              setExecutionId(null);
-              setTotalCost(0);
-              setTotalTokens({ input: 0, output: 0 });
-            }}
-            className="px-3 py-1.5 text-sm rounded-md border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))]"
+          <div
+            className={cn(
+              'inline-flex items-stretch rounded-full bg-[hsl(var(--background))]',
+              'ring-1 ring-[hsl(var(--input))] shadow-sm',
+              'hover:ring-[hsl(var(--ring))] focus-within:ring-[hsl(var(--ring))]',
+              'transition-shadow',
+            )}
           >
-            New Chat
-          </button>
-        </div>
+            <CommandPicker
+              items={agents}
+              value={selectedAgent}
+              onSelect={setSelectedAgent}
+              getKey={(a) => a.name}
+              getLabel={(a) => a.name}
+              getDescription={(a) => (
+                <>
+                  <span>{a.model}</span>
+                  {a.tools.length > 0 && (
+                    <>
+                      <span className="opacity-40 mx-1">·</span>
+                      <span>
+                        {a.tools.length} tool{a.tools.length !== 1 ? 's' : ''}
+                      </span>
+                    </>
+                  )}
+                  {a.handoffs.length > 0 && (
+                    <>
+                      <span className="opacity-40 mx-1">·</span>
+                      <span>
+                        {a.handoffs.length} handoff{a.handoffs.length !== 1 ? 's' : ''}
+                      </span>
+                    </>
+                  )}
+                </>
+              )}
+              searchMatch={(a, q) =>
+                a.name.toLowerCase().includes(q) ||
+                a.model.toLowerCase().includes(q) ||
+                a.tools.some((t) => t.toLowerCase().includes(q))
+              }
+              placeholder="Default agent"
+              searchPlaceholder="Search agents…"
+              emptyLabel="No agents registered"
+              shortcut
+              triggerClassName="rounded-l-full"
+              ariaLabel="Select an agent"
+            />
+            <button
+              onClick={() => {
+                setMessages([]);
+                setSessionId(null);
+                setExecutionId(null);
+                setTotalCost(0);
+                setTotalTokens({ input: 0, output: 0 });
+              }}
+              className={cn(
+                'inline-flex items-center gap-1.5 pl-3.5 pr-4 py-2 text-sm font-medium cursor-pointer',
+                'border-l border-[hsl(var(--input))] rounded-r-full',
+                'hover:bg-[hsl(var(--muted))] transition-colors',
+                'focus:outline-none focus-visible:bg-[hsl(var(--muted))]',
+              )}
+            >
+              <MessageSquarePlus size={12} />
+              New chat
+            </button>
+          </div>
+        </>
       }
     >
       <div className="flex flex-col h-full max-w-3xl mx-auto">

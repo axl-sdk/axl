@@ -1,17 +1,28 @@
 import { useState, useCallback, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Activity, ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown } from 'lucide-react';
+import {
+  Activity,
+  ChevronDown,
+  ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  RefreshCw,
+} from 'lucide-react';
+import { PanelHeader } from '../../components/layout/PanelHeader';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { StatusBadge } from '../../components/shared/StatusBadge';
 import { CostBadge } from '../../components/shared/CostBadge';
 import { DurationBadge } from '../../components/shared/DurationBadge';
 import { JsonViewer } from '../../components/shared/JsonViewer';
+import { CommandPicker } from '../../components/shared/CommandPicker';
 import { fetchExecutions } from '../../lib/api';
 import { useWs } from '../../hooks/use-ws';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
 import type { ExecutionInfo, TraceEvent } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
 import { getBarColor, getDepth } from '../../lib/trace-utils';
+
+type FilterOption = { value: string; label: string };
 
 const STATUS_TINT: Record<string, string> = {
   running: 'border-l-blue-500',
@@ -68,8 +79,26 @@ export function TraceExplorerPanel() {
   if (typeFilter) filteredEvents = filteredEvents.filter((e) => e.type === typeFilter);
   if (agentFilter) filteredEvents = filteredEvents.filter((e) => e.agent === agentFilter);
 
-  const eventTypes = [...new Set(allEvents.map((e) => e.type))];
-  const agents = [...new Set(allEvents.map((e) => e.agent).filter(Boolean))];
+  // Distinct type/agent sets for the filter dropdowns. Derive + sort so a
+  // stable identity falls out of useMemo — downstream option arrays can then
+  // depend on these directly without a hand-rolled serialization key.
+  const eventTypes = useMemo(() => [...new Set(allEvents.map((e) => e.type))].sort(), [allEvents]);
+  const agents = useMemo(
+    () => [...new Set(allEvents.map((e) => e.agent).filter((a): a is string => !!a))].sort(),
+    [allEvents],
+  );
+
+  // Prepend an "All …" pseudo-entry so users can clear the filter from the
+  // picker popover itself (no separate clear button needed). The empty-string
+  // value resets the filter state.
+  const typeOptions: FilterOption[] = useMemo(
+    () => [{ value: '', label: 'All types' }, ...eventTypes.map((t) => ({ value: t, label: t }))],
+    [eventTypes],
+  );
+  const agentOptions: FilterOption[] = useMemo(
+    () => [{ value: '', label: 'All agents' }, ...agents.map((a) => ({ value: a, label: a }))],
+    [agents],
+  );
 
   // Waterfall visualization: compute relative widths
   const maxDuration = Math.max(...filteredEvents.map((e) => e.duration ?? 0), 1);
@@ -107,48 +136,84 @@ export function TraceExplorerPanel() {
 
   return (
     <div className="flex flex-col h-screen">
-      {/* ── Header ─────────────────────────────────────── */}
-      <header className="shrink-0 flex items-center justify-between px-6 py-4 border-b border-[hsl(var(--border))]">
-        <h2 className="text-xl font-semibold">Trace Explorer</h2>
-        <div className="flex items-center gap-2">
-          {/* Filters */}
-          <select
-            value={typeFilter}
-            onChange={(e) => setTypeFilter(e.target.value)}
-            className="px-2 py-1.5 text-xs rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
-          >
-            <option value="">All types</option>
-            {eventTypes.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
-          {agents.length > 0 && (
-            <select
-              value={agentFilter}
-              onChange={(e) => setAgentFilter(e.target.value)}
-              className="px-2 py-1.5 text-xs rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
+      <PanelHeader
+        title="Trace Explorer"
+        description={
+          selectedExecution ? (
+            <>
+              <span>{selectedExecution.workflow}</span>
+              <span className="opacity-40 mx-1.5">·</span>
+              <span className="font-mono">{selectedExecution.executionId.slice(0, 8)}</span>
+              <span className="opacity-40 mx-1.5">·</span>
+              <span>
+                {selectedExecution.steps.length} event
+                {selectedExecution.steps.length !== 1 ? 's' : ''}
+              </span>
+            </>
+          ) : (
+            <>
+              {executions.length} execution{executions.length !== 1 ? 's' : ''}
+              <span className="opacity-40 mx-1.5">·</span>
+              {liveEvents.length} live event{liveEvents.length !== 1 ? 's' : ''}
+            </>
+          )
+        }
+        actions={
+          <>
+            <CommandPicker
+              items={typeOptions}
+              value={typeFilter}
+              onSelect={setTypeFilter}
+              getKey={(o) => o.value}
+              getLabel={(o) => o.label}
+              placeholder="All types"
+              searchPlaceholder="Filter types…"
+              variant="filter"
+              triggerClassName={cn(
+                'rounded-full shadow-sm ring-1 transition-shadow',
+                typeFilter
+                  ? 'ring-[hsl(var(--foreground))] text-[hsl(var(--foreground))] font-medium'
+                  : 'ring-[hsl(var(--input))]',
+              )}
+              ariaLabel="Filter by event type"
+            />
+            {agents.length > 0 && (
+              <CommandPicker
+                items={agentOptions}
+                value={agentFilter}
+                onSelect={setAgentFilter}
+                getKey={(o) => o.value}
+                getLabel={(o) => o.label}
+                placeholder="All agents"
+                searchPlaceholder="Filter agents…"
+                variant="filter"
+                triggerClassName={cn(
+                  'rounded-full shadow-sm ring-1 transition-shadow',
+                  agentFilter
+                    ? 'ring-[hsl(var(--foreground))] text-[hsl(var(--foreground))] font-medium'
+                    : 'ring-[hsl(var(--input))]',
+                )}
+                ariaLabel="Filter by agent"
+              />
+            )}
+            <button
+              onClick={() => {
+                refetch();
+                setLiveEvents([]);
+              }}
+              className={cn(
+                'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-full cursor-pointer',
+                'ring-1 ring-[hsl(var(--input))] bg-[hsl(var(--background))] shadow-sm',
+                'hover:bg-[hsl(var(--muted))] hover:ring-[hsl(var(--ring))]',
+                'focus:outline-none focus-visible:ring-[hsl(var(--ring))] transition-all',
+              )}
             >
-              <option value="">All agents</option>
-              {agents.map((a) => (
-                <option key={a} value={a!}>
-                  {a}
-                </option>
-              ))}
-            </select>
-          )}
-          <button
-            onClick={() => {
-              refetch();
-              setLiveEvents([]);
-            }}
-            className="px-3 py-1.5 text-sm rounded-lg border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))]"
-          >
-            Refresh
-          </button>
-        </div>
-      </header>
+              <RefreshCw size={12} />
+              Refresh
+            </button>
+          </>
+        }
+      />
 
       {/* ── Body ─────────────────────────────────────── */}
       <div className="flex-1 min-h-0 overflow-auto p-6">

@@ -74,22 +74,47 @@ export function MemoryBrowserPanel() {
   return (
     <PanelShell
       title="Memory Browser"
-      description="View and manage agent memory entries"
+      description={
+        entries.length > 0 ? (
+          <>
+            <span>
+              {entries.length} entr{entries.length !== 1 ? 'ies' : 'y'}
+            </span>
+            <span className="opacity-40 mx-1.5">·</span>
+            <span>{scope} scope</span>
+          </>
+        ) : (
+          'Key-value entries stored via ctx.remember()'
+        )
+      }
       actions={
         <button
+          type="button"
           onClick={() => setShowAddForm(!showAddForm)}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] hover:opacity-90"
+          className={cn(
+            'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-full cursor-pointer',
+            'bg-[hsl(var(--foreground))] text-[hsl(var(--background))] shadow-sm',
+            'hover:opacity-90 focus:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))]',
+            'transition-opacity',
+          )}
         >
-          <Plus size={14} />
-          Add Entry
+          <Plus size={12} />
+          Add entry
         </button>
       }
     >
       {/* Scope tabs */}
-      <div className="flex items-center gap-0 mb-4 border-b border-[hsl(var(--border))]">
+      <div
+        role="tablist"
+        aria-label="Memory scope"
+        className="flex items-center gap-0 mb-4 border-b border-[hsl(var(--border))]"
+      >
         {['session', 'global'].map((s) => (
           <button
             key={s}
+            type="button"
+            role="tab"
+            aria-selected={scope === s}
             onClick={() => {
               setScope(s);
               setSearchResults(null);

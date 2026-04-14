@@ -32,15 +32,35 @@ export type ScorerStats = {
 export type MultiRunAggregate = {
   runGroupId: string;
   runCount: number;
+  /**
+   * Unique workflow names observed across all runs in the group, ordered by
+   * first appearance. Mirrors the server's `MultiRunSummary.workflows`.
+   * Most groups are homogeneous (one workflow); custom callbacks can produce
+   * heterogeneous groups with multiple.
+   */
+  workflows?: string[];
   scorers: Record<string, { mean: number; std: number; min: number; max: number }>;
   timing?: { mean: number; std: number };
 };
 
 export type EvalResultData = {
   id: string;
-  workflow: string;
   dataset: string;
+  /**
+   * Execution metadata. Workflow names live here as `metadata.workflows: string[]`
+   * and `metadata.workflowCounts: Record<string, number>`. The legacy top-level
+   * `workflow: string` field was removed in 0.14.x — readers that need a single
+   * primary workflow call `getResultWorkflows(result)[0]`, which also handles
+   * pre-0.14 imported CLI artifacts via a fallback.
+   */
   metadata?: Record<string, unknown>;
+  /**
+   * Legacy top-level workflow field from pre-0.14 CLI artifacts. Optional and
+   * readers should prefer `getResultWorkflows()` — this is only kept on the
+   * client type so that old JSON files imported via "Import result..." still
+   * deserialize without type errors.
+   */
+  workflow?: string;
   timestamp: string;
   totalCost: number;
   duration: number;
@@ -154,6 +174,48 @@ export function getResultModelCounts(result: EvalResultData): Record<string, num
   if (!mc || typeof mc !== 'object') return null;
   const counts: Record<string, number> = {};
   for (const [k, v] of Object.entries(mc as Record<string, unknown>)) {
+    if (typeof v === 'number') counts[k] = v;
+  }
+  return Object.keys(counts).length > 0 ? counts : null;
+}
+
+/**
+ * Extract workflow names from an EvalResultData's aggregate metadata.
+ *
+ * Resolution order (most authoritative first):
+ *   1. `_multiRun.aggregate.workflows` — server-side union across every run
+ *      in the group. This is the only source that's correct for heterogeneous
+ *      multi-run groups; the spread `currentResult` in aggregate view only
+ *      carries the *first* run's metadata.
+ *   2. `metadata.workflows` — trace-derived, parallel to `metadata.models`.
+ *   3. Legacy top-level `result.workflow` for pre-0.14 imported CLI artifacts.
+ *
+ * Returns `[]` when nothing is available.
+ */
+export function getResultWorkflows(result: EvalResultData): string[] {
+  // Multi-run aggregate union wins — handles heterogeneous groups correctly.
+  const fromAggregate = result._multiRun?.aggregate.workflows;
+  if (Array.isArray(fromAggregate) && fromAggregate.length > 0) {
+    const list = fromAggregate.filter((w): w is string => typeof w === 'string');
+    if (list.length > 0) return list;
+  }
+  const fromMeta = result.metadata?.workflows;
+  if (Array.isArray(fromMeta)) {
+    const list = (fromMeta as unknown[]).filter((w): w is string => typeof w === 'string');
+    if (list.length > 0) return list;
+  }
+  // Legacy fallback: single-string workflow field on the result.
+  const legacy = (result as { workflow?: unknown }).workflow;
+  if (typeof legacy === 'string' && legacy) return [legacy];
+  return [];
+}
+
+/** Extract per-workflow call counts from result metadata. */
+export function getResultWorkflowCounts(result: EvalResultData): Record<string, number> | null {
+  const wc = result.metadata?.workflowCounts;
+  if (!wc || typeof wc !== 'object') return null;
+  const counts: Record<string, number> = {};
+  for (const [k, v] of Object.entries(wc as Record<string, unknown>)) {
     if (typeof v === 'number') counts[k] = v;
   }
   return Object.keys(counts).length > 0 ? counts : null;

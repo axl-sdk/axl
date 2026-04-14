@@ -82,6 +82,15 @@ function buildPickerItems(entries: EvalHistoryEntry[]): PickerItem[] {
   const items: PickerItem[] = [];
 
   for (const [groupId, groupEntries] of groupMap) {
+    // A "group" with one surviving run (e.g., after the user deleted the
+    // others) is no longer a meaningful pool — render it as a plain single
+    // entry instead. Mirrors EvalHistoryTable's grouping logic so the picker
+    // and the History table stay visually consistent.
+    if (groupEntries.length === 1) {
+      singles.push(groupEntries[0]);
+      continue;
+    }
+
     // Compute aggregate scorer means
     const firstData = groupEntries[0].data as EvalResultData;
     const scorerNames = Object.keys(firstData.summary?.scorers ?? {});

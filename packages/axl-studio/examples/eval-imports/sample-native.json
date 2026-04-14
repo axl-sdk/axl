@@ -1,0 +1,92 @@
+{
+  "id": "sample-native-will-be-overwritten",
+  "dataset": "qa-basics",
+  "metadata": {
+    "scorerTypes": {
+      "not-empty": "deterministic",
+      "topic-relevant": "deterministic",
+      "quality": "deterministic",
+      "safety": "deterministic",
+      "fluency": "llm"
+    },
+    "models": ["mock:gpt-4o"],
+    "modelCounts": { "mock:gpt-4o": 3 },
+    "workflows": ["qa-workflow"],
+    "workflowCounts": { "qa-workflow": 3 },
+    "note": "Synthetic 0.14+ CLI artifact for manual testing. Workflow lives in metadata.workflows (the modern shape). See sample-external.json for the legacy top-level shape."
+  },
+  "timestamp": "2026-04-10T14:23:17.842Z",
+  "totalCost": 0.0321,
+  "duration": 2453,
+  "items": [
+    {
+      "input": { "question": "What is TypeScript?" },
+      "annotations": { "expectedTopic": "typescript" },
+      "output": "TypeScript is a strongly typed programming language that builds on JavaScript.",
+      "scores": {
+        "not-empty": 1,
+        "topic-relevant": 1,
+        "quality": 0.89,
+        "safety": 1,
+        "fluency": 0.87
+      },
+      "duration": 412,
+      "cost": 0.0053,
+      "metadata": {
+        "models": ["mock:gpt-4o"],
+        "tokens": { "input": 142, "output": 298, "reasoning": 0 },
+        "agentCalls": 1
+      }
+    },
+    {
+      "input": { "question": "Explain closures in JavaScript" },
+      "annotations": { "expectedTopic": "closures" },
+      "output": "A closure is a function that has access to variables from its outer lexical scope.",
+      "scores": {
+        "not-empty": 1,
+        "topic-relevant": 1,
+        "quality": 0.84,
+        "safety": 1,
+        "fluency": 0.82
+      },
+      "duration": 387,
+      "cost": 0.0048,
+      "metadata": {
+        "models": ["mock:gpt-4o"],
+        "tokens": { "input": 138, "output": 276, "reasoning": 0 },
+        "agentCalls": 1
+      }
+    },
+    {
+      "input": { "question": "What are React hooks?" },
+      "annotations": { "expectedTopic": "react" },
+      "output": "React hooks let you use state and other React features without writing a class.",
+      "scores": {
+        "not-empty": 1,
+        "topic-relevant": 1,
+        "quality": 0.91,
+        "safety": 1,
+        "fluency": 0.9
+      },
+      "duration": 402,
+      "cost": 0.0051,
+      "metadata": {
+        "models": ["mock:gpt-4o"],
+        "tokens": { "input": 145, "output": 289, "reasoning": 0 },
+        "agentCalls": 1
+      }
+    }
+  ],
+  "summary": {
+    "count": 3,
+    "failures": 0,
+    "scorers": {
+      "not-empty": { "mean": 1, "min": 1, "max": 1, "p50": 1, "p95": 1 },
+      "topic-relevant": { "mean": 1, "min": 1, "max": 1, "p50": 1, "p95": 1 },
+      "quality": { "mean": 0.88, "min": 0.84, "max": 0.91, "p50": 0.89, "p95": 0.91 },
+      "safety": { "mean": 1, "min": 1, "max": 1, "p50": 1, "p95": 1 },
+      "fluency": { "mean": 0.863, "min": 0.82, "max": 0.9, "p50": 0.87, "p95": 0.9 }
+    },
+    "timing": { "mean": 400, "min": 387, "max": 412, "p50": 402, "p95": 412 }
+  }
+}

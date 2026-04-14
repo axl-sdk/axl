@@ -1,0 +1,23 @@
+{
+  "id": "sample-mismatch-will-be-overwritten",
+  "workflow": "external-system",
+  "dataset": "different-dataset",
+  "metadata": {},
+  "timestamp": "2026-04-11T10:00:00.000Z",
+  "totalCost": 0.01,
+  "duration": 500,
+  "items": [
+    {
+      "input": { "question": "Unrelated question" },
+      "output": "Unrelated answer",
+      "scores": { "not-empty": 1 }
+    }
+  ],
+  "summary": {
+    "count": 1,
+    "failures": 0,
+    "scorers": {
+      "not-empty": { "mean": 1, "min": 1, "max": 1, "p50": 1, "p95": 1 }
+    }
+  }
+}

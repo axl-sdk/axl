@@ -5,7 +5,13 @@ import { round } from './utils.js';
 export type MultiRunSummary = {
   runGroupId: string;
   runCount: number;
-  workflow: string;
+  /**
+   * Workflow names observed across all runs in the group, deduped and ordered
+   * by first appearance. Parallel to `EvalResult.metadata.workflows`. A homogeneous
+   * multi-run group produced by `axl-eval --runs N` typically has one entry;
+   * heterogeneous groups (custom callbacks) can have multiple.
+   */
+  workflows: string[];
   dataset: string;
   totalCost: number;
   totalDuration: number;
@@ -26,7 +32,23 @@ export function aggregateRuns(runs: EvalResult[]): MultiRunSummary {
   if (runs.length === 0) throw new Error('Cannot aggregate zero runs');
 
   const runGroupId = (runs[0].metadata.runGroupId as string) ?? randomUUID();
-  const { workflow, dataset } = runs[0];
+  const { dataset } = runs[0];
+
+  // Union workflow names across all runs in the group, first-seen first.
+  // Most groups have one, but custom callbacks can produce heterogeneous ones.
+  const seenWorkflows = new Set<string>();
+  const workflows: string[] = [];
+  for (const run of runs) {
+    const list = run.metadata.workflows;
+    if (Array.isArray(list)) {
+      for (const w of list) {
+        if (typeof w === 'string' && !seenWorkflows.has(w)) {
+          seenWorkflows.add(w);
+          workflows.push(w);
+        }
+      }
+    }
+  }
 
   const totalCost = runs.reduce((sum, r) => sum + r.totalCost, 0);
   const totalDuration = runs.reduce((sum, r) => sum + r.duration, 0);
@@ -63,7 +85,7 @@ export function aggregateRuns(runs: EvalResult[]): MultiRunSummary {
   return {
     runGroupId,
     runCount: runs.length,
-    workflow,
+    workflows,
     dataset,
     totalCost: round(totalCost),
     totalDuration: round(totalDuration),

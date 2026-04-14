@@ -1,0 +1,72 @@
+{
+  "id": "sample-external-will-be-overwritten",
+  "workflow": "external-system",
+  "dataset": "qa-basics",
+  "metadata": {
+    "scorerTypes": {
+      "not-empty": "deterministic",
+      "topic-relevant": "deterministic",
+      "quality": "deterministic",
+      "safety": "deterministic",
+      "fluency": "llm"
+    },
+    "models": ["openai:gpt-5"],
+    "note": "Synthetic CLI artifact where the workflow name 'external-system' is NOT registered in the runtime. Import this to verify the Rescore button is disabled with an explanatory tooltip. Dataset still matches qa-basics so this can be compared against seeded qa-eval runs."
+  },
+  "timestamp": "2026-04-11T09:15:42.100Z",
+  "totalCost": 0.0412,
+  "duration": 3021,
+  "items": [
+    {
+      "input": { "question": "What is TypeScript?" },
+      "annotations": { "expectedTopic": "typescript" },
+      "output": "TypeScript, developed by Microsoft, is an open-source typed superset of JavaScript.",
+      "scores": {
+        "not-empty": 1,
+        "topic-relevant": 1,
+        "quality": 0.94,
+        "safety": 1,
+        "fluency": 0.93
+      },
+      "duration": 512
+    },
+    {
+      "input": { "question": "Explain closures in JavaScript" },
+      "annotations": { "expectedTopic": "closures" },
+      "output": "A closure captures the surrounding state (the lexical environment) of a function.",
+      "scores": {
+        "not-empty": 1,
+        "topic-relevant": 1,
+        "quality": 0.91,
+        "safety": 1,
+        "fluency": 0.88
+      },
+      "duration": 478
+    },
+    {
+      "input": { "question": "What are React hooks?" },
+      "annotations": { "expectedTopic": "react" },
+      "output": "Hooks are functions that let you hook into React state and lifecycle features from function components.",
+      "scores": {
+        "not-empty": 1,
+        "topic-relevant": 1,
+        "quality": 0.95,
+        "safety": 1,
+        "fluency": 0.94
+      },
+      "duration": 503
+    }
+  ],
+  "summary": {
+    "count": 3,
+    "failures": 0,
+    "scorers": {
+      "not-empty": { "mean": 1, "min": 1, "max": 1, "p50": 1, "p95": 1 },
+      "topic-relevant": { "mean": 1, "min": 1, "max": 1, "p50": 1, "p95": 1 },
+      "quality": { "mean": 0.933, "min": 0.91, "max": 0.95, "p50": 0.94, "p95": 0.95 },
+      "safety": { "mean": 1, "min": 1, "max": 1, "p50": 1, "p95": 1 },
+      "fluency": { "mean": 0.917, "min": 0.88, "max": 0.94, "p50": 0.93, "p95": 0.94 }
+    },
+    "timing": { "mean": 497, "min": 478, "max": 512, "p50": 503, "p95": 512 }
+  }
+}

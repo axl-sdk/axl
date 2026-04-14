@@ -151,13 +151,31 @@ export async function rescore(
 
   return {
     id: randomUUID(),
-    workflow: result.workflow,
     dataset: result.dataset,
     metadata: (() => {
-      // Strip run group membership — rescored results are independent evaluations
+      // Strip run group membership — rescored results are independent evaluations.
+      // metadata.workflows is preserved via ...rest so the rescored result keeps
+      // the same workflow attribution as the original.
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const { runGroupId: _, runIndex: __, ...rest } = result.metadata;
-      return { ...rest, rescored: true, originalId: result.id, scorerTypes };
+      const merged: Record<string, unknown> = {
+        ...rest,
+        rescored: true,
+        originalId: result.id,
+        scorerTypes,
+      };
+      // Backward compatibility: pre-0.14 EvalResult artifacts had `workflow`
+      // as a top-level string field with no `metadata.workflows`. Migrate it
+      // forward so rescored results from old artifacts retain their workflow
+      // attribution under the modern shape.
+      if (!Array.isArray(merged.workflows)) {
+        const legacyWorkflow = (result as { workflow?: unknown }).workflow;
+        if (typeof legacyWorkflow === 'string' && legacyWorkflow) {
+          merged.workflows = [legacyWorkflow];
+          merged.workflowCounts = { [legacyWorkflow]: result.items.length };
+        }
+      }
+      return merged;
     })(),
     timestamp: new Date().toISOString(),
     totalCost,

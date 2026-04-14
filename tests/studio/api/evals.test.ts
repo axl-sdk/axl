@@ -32,7 +32,8 @@ describe('Studio API: Evals', () => {
     // Validate the full EvalResult shape that the Eval Runner panel depends on
     const data = body.data;
     expect(data).toHaveProperty('id');
-    expect(data).toHaveProperty('workflow');
+    // Workflow name lives in metadata.workflows (trace-derived).
+    expect(data.metadata.workflows).toEqual(['test-wf']);
     expect(data).toHaveProperty('timestamp');
     expect(typeof data.totalCost).toBe('number');
     expect(typeof data.duration).toBe('number');
@@ -203,7 +204,7 @@ describe('Studio API: Evals', () => {
     // Aggregate summary
     const agg = data._multiRun.aggregate;
     expect(agg.runCount).toBe(3);
-    expect(agg.workflow).toBe('test-wf');
+    expect(agg.workflows).toEqual(['test-wf']);
     expect(agg.dataset).toBe('test-dataset');
     expect(agg.scorers['always-pass']).toBeDefined();
     expect(typeof agg.scorers['always-pass'].mean).toBe('number');
@@ -233,6 +234,33 @@ describe('Studio API: Evals', () => {
     expect(body.ok).toBe(true);
     expect(body.data._multiRun.allRuns.length).toBe(25);
     expect(body.data._multiRun.aggregate.runCount).toBe(25);
+  });
+
+  it('POST /api/evals/:name/run captures per-item and per-result workflow metadata', async () => {
+    // End-to-end verification that trace-derived workflows flow through the
+    // real runtime → trackExecution → runner → EvalResult. The dev seed's
+    // test-eval runs test-wf, so we expect 'test-wf' to appear automatically
+    // with no callback-level wiring.
+    const provider = MockProvider.sequence([{ content: 'output' }]);
+    const { app } = createTestServer(provider);
+
+    const res = await app.request('/api/evals/test-eval/run', { method: 'POST' });
+    expect(res.status).toBe(200);
+
+    const body = (await res.json()) as any;
+    const data = body.data;
+
+    // Per-item: workflows array captured from trace events
+    expect(data.items[0].metadata.workflows).toEqual(['test-wf']);
+    expect(data.items[0].metadata.workflowCallCounts).toEqual({ 'test-wf': 1 });
+
+    // Per-result: aggregated workflows
+    expect(data.metadata.workflows).toEqual(['test-wf']);
+    expect(data.metadata.workflowCounts).toEqual({ 'test-wf': 1 });
+
+    // There is no top-level workflow field anymore — consumers read
+    // metadata.workflows. Verify the legacy field is absent on fresh runs.
+    expect((data as { workflow?: unknown }).workflow).toBeUndefined();
   });
 
   it('POST /api/evals/:name/run captures per-item model metadata', async () => {
@@ -277,10 +305,14 @@ describe('Studio API: Evals', () => {
     }
   });
 
-  // --- Compare endpoint ---
+  // --- Compare endpoint (ID-based) ---
+  //
+  // Compare resolves baseline/candidate from runtime history by ID rather
+  // than accepting full EvalResult payloads in the request body. Keeps the
+  // wire payload tiny so host body-parser limits don't fire when Studio is
+  // mounted as middleware behind Express/NestJS/Fastify.
 
-  it('POST /api/evals/compare compares two eval results', async () => {
-    // Run two evals to get results for comparison
+  it('POST /api/evals/compare compares two eval results by ID', async () => {
     const provider = MockProvider.sequence([
       { content: 'baseline output' },
       { content: 'candidate output' },
@@ -289,16 +321,16 @@ describe('Studio API: Evals', () => {
 
     const baselineRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
     expect(baselineRes.status).toBe(200);
-    const baseline = (await baselineRes.json()).data;
+    const baselineId = (await baselineRes.json()).data.id;
 
     const candidateRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
     expect(candidateRes.status).toBe(200);
-    const candidate = (await candidateRes.json()).data;
+    const candidateId = (await candidateRes.json()).data.id;
 
     const compareRes = await app.request('/api/evals/compare', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ baseline, candidate }),
+      body: JSON.stringify({ baselineId, candidateId }),
     });
     expect(compareRes.status).toBe(200);
 
@@ -320,18 +352,19 @@ describe('Studio API: Evals', () => {
     ]);
     const { app } = createTestServer(provider);
 
-    const baselineRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
-    const baseline = (await baselineRes.json()).data;
-
-    const candidateRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
-    const candidate = (await candidateRes.json()).data;
+    const baselineId = (
+      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+    ).data.id;
+    const candidateId = (
+      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+    ).data.id;
 
     const compareRes = await app.request('/api/evals/compare', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        baseline,
-        candidate,
+        baselineId,
+        candidateId,
         options: { thresholds: { 'always-pass': 0.1 } },
       }),
     });
@@ -340,9 +373,718 @@ describe('Studio API: Evals', () => {
     const body = await compareRes.json();
     expect(body.ok).toBe(true);
     expect(body.data.scorers['always-pass']).toBeDefined();
-    // With 1-item dataset, not enough paired data for bootstrap CI,
-    // so significant is undefined. Verify the core comparison fields exist.
     expect(typeof body.data.scorers['always-pass'].baselineMean).toBe('number');
     expect(typeof body.data.scorers['always-pass'].delta).toBe('number');
+  });
+
+  it('POST /api/evals/compare accepts grouped (string[]) IDs for pooled comparison', async () => {
+    const provider = MockProvider.sequence([
+      { content: 'b1' },
+      { content: 'b2' },
+      { content: 'c1' },
+      { content: 'c2' },
+    ]);
+    const { app } = createTestServer(provider);
+
+    // Two baseline runs and two candidate runs.
+    const b1 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+      .data.id;
+    const b2 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+      .data.id;
+    const c1 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+      .data.id;
+    const c2 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+      .data.id;
+
+    const compareRes = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baselineId: [b1, b2], candidateId: [c1, c2] }),
+    });
+    expect(compareRes.status).toBe(200);
+
+    const body = await compareRes.json();
+    expect(body.ok).toBe(true);
+    expect(body.data.scorers['always-pass']).toBeDefined();
+  });
+
+  it('POST /api/evals/compare returns 404 with the missing ID listed', async () => {
+    const provider = MockProvider.sequence([{ content: 'baseline output' }]);
+    const { app } = createTestServer(provider);
+
+    const baselineId = (
+      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+    ).data.id;
+
+    const res = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baselineId, candidateId: 'does-not-exist' }),
+    });
+    expect(res.status).toBe(404);
+
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('NOT_FOUND');
+    expect(body.error.message).toContain('does-not-exist');
+  });
+
+  it('POST /api/evals/compare returns 400 when IDs are missing', async () => {
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('BAD_REQUEST');
+  });
+
+  // --- Import endpoint ---
+
+  it('POST /api/evals/import stores a CLI artifact in history', async () => {
+    const { app } = createTestServer();
+
+    const fakeResult = {
+      id: 'original-cli-id',
+      workflow: 'imported-wf',
+      dataset: 'imported-ds',
+      metadata: {},
+      timestamp: new Date().toISOString(),
+      totalCost: 0.01,
+      duration: 1234,
+      items: [
+        {
+          input: 'in',
+          output: 'out',
+          scores: { 'always-pass': 1 },
+        },
+      ],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: {
+          'always-pass': { mean: 1, min: 1, max: 1, p50: 1, p95: 1 },
+        },
+      },
+    };
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ result: fakeResult }),
+    });
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(typeof body.data.id).toBe('string');
+    expect(body.data.id).not.toBe('original-cli-id'); // Fresh UUID
+    expect(body.data.eval).toBe('imported-wf'); // Falls back to workflow name
+    expect(typeof body.data.timestamp).toBe('number');
+
+    // History contains the imported entry under the new ID
+    const histRes = await app.request('/api/evals/history');
+    const histBody = await histRes.json();
+    const entry = histBody.data.find((e: { id: string }) => e.id === body.data.id);
+    expect(entry).toBeDefined();
+    expect(entry.eval).toBe('imported-wf');
+    expect(entry.data.id).toBe(body.data.id); // result.id was rewritten too
+    expect(entry.data.items.length).toBe(1);
+  });
+
+  it('POST /api/evals/import derives eval name from metadata.workflows first', async () => {
+    // Modern CLI artifacts (post-0.14) carry workflow names in metadata.workflows
+    // rather than at the top level. Import should pick up the first workflow
+    // in that array as the derived eval name.
+    const { app } = createTestServer();
+
+    const modernArtifact = {
+      id: 'cli-original',
+      dataset: 'ds',
+      metadata: {
+        workflows: ['modern-wf', 'nested-wf'],
+        workflowCounts: { 'modern-wf': 3, 'nested-wf': 1 },
+      },
+      timestamp: new Date().toISOString(),
+      totalCost: 0,
+      duration: 100,
+      items: [{ input: 'in', output: 'out', scores: { 'always-pass': 1 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: { 'always-pass': { mean: 1, min: 1, max: 1, p50: 1, p95: 1 } },
+      },
+    };
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ result: modernArtifact }),
+    });
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    // Primary path wins: first entry from metadata.workflows becomes the eval name.
+    expect(body.data.eval).toBe('modern-wf');
+  });
+
+  it('POST /api/evals/import accepts an explicit eval name override', async () => {
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        eval: 'my-custom-name',
+        result: {
+          workflow: 'wf',
+          dataset: 'ds',
+          metadata: {},
+          timestamp: new Date().toISOString(),
+          totalCost: 0,
+          duration: 0,
+          items: [],
+          summary: { count: 0, failures: 0, scorers: {} },
+        },
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).data.eval).toBe('my-custom-name');
+  });
+
+  it('POST /api/evals/import then compare round-trip works end-to-end', async () => {
+    const provider = MockProvider.sequence([{ content: 'native run' }]);
+    const { app } = createTestServer(provider);
+
+    // Run a native eval to use as the baseline.
+    const nativeId = (
+      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+    ).data.id;
+
+    // Import a CLI artifact to use as the candidate. Dataset and scorer names
+    // must match the native eval — evalCompare rejects mismatched datasets.
+    const importRes = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        result: {
+          workflow: 'test-wf',
+          dataset: 'test-dataset',
+          metadata: {},
+          timestamp: new Date().toISOString(),
+          totalCost: 0,
+          duration: 100,
+          items: [{ input: 'in', output: 'out', scores: { 'always-pass': 1 } }],
+          summary: {
+            count: 1,
+            failures: 0,
+            scorers: { 'always-pass': { mean: 1, min: 1, max: 1, p50: 1, p95: 1 } },
+          },
+        },
+      }),
+    });
+    const importedId = (await importRes.json()).data.id;
+
+    const compareRes = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baselineId: nativeId, candidateId: importedId }),
+    });
+    expect(compareRes.status).toBe(200);
+
+    const body = await compareRes.json();
+    expect(body.ok).toBe(true);
+    expect(body.data.scorers['always-pass']).toBeDefined();
+  });
+
+  it('POST /api/evals/import returns 400 for invalid shape', async () => {
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ result: { not: 'an eval result' } }),
+    });
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('BAD_REQUEST');
+  });
+
+  it('POST /api/evals/import is blocked in readOnly mode', async () => {
+    const { app } = createTestServer(undefined, { readOnly: true });
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        result: {
+          workflow: 'wf',
+          dataset: 'ds',
+          metadata: {},
+          timestamp: new Date().toISOString(),
+          totalCost: 0,
+          duration: 0,
+          items: [],
+          summary: { count: 0, failures: 0, scorers: {} },
+        },
+      }),
+    });
+    expect(res.status).toBe(405);
+
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('READ_ONLY');
+  });
+
+  it('POST /api/evals/compare is allowed in readOnly mode (pure computation)', async () => {
+    // readOnly should not block compare — only run/rescore/import which mutate state.
+    const { app } = createTestServer(undefined, { readOnly: true });
+
+    const res = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    // Reaches the route handler (returns 400 for missing IDs, not 405 for readOnly).
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe('BAD_REQUEST');
+  });
+
+  it('POST /api/evals/import returns 400 when result is missing', async () => {
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('BAD_REQUEST');
+  });
+
+  // --- Additional edge-case coverage (hardening pass) ---
+
+  it('POST /api/evals/compare returns 400 for empty-array IDs', async () => {
+    // Empty arrays are truthy, so a naive `!body.baselineId` check would pass
+    // them through — verify the explicit empty-array guard.
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baselineId: [], candidateId: [] }),
+    });
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.error.code).toBe('BAD_REQUEST');
+    expect(body.error.message).toContain('non-empty');
+  });
+
+  it('POST /api/evals/compare accepts mixed single + array IDs', async () => {
+    const provider = MockProvider.sequence([
+      { content: 'b1' },
+      { content: 'c1' },
+      { content: 'c2' },
+    ]);
+    const { app } = createTestServer(provider);
+
+    const b1 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+      .data.id;
+    const c1 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+      .data.id;
+    const c2 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+      .data.id;
+
+    const res = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baselineId: b1, candidateId: [c1, c2] }),
+    });
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.data.scorers['always-pass']).toBeDefined();
+  });
+
+  it('POST /api/evals/compare dedupes duplicate IDs in a pooled group', async () => {
+    // Duplicates in a group would artificially shrink the paired-bootstrap
+    // variance — the server dedupes via Set before resolving.
+    const provider = MockProvider.sequence([{ content: 'b1' }, { content: 'c1' }]);
+    const { app } = createTestServer(provider);
+
+    const b1 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+      .data.id;
+    const c1 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+      .data.id;
+
+    const res = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baselineId: [b1, b1, b1], candidateId: [c1, c1] }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+  });
+
+  it('POST /api/evals/compare uses COMPARE_FAILED code when evalCompare throws', async () => {
+    // Baseline and candidate from different datasets — evalCompare throws,
+    // the route should surface it as a structured error (not EVAL_ERROR).
+    const provider = MockProvider.sequence([{ content: 'out' }]);
+    const { app } = createTestServer(provider);
+
+    const baselineId = (
+      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+    ).data.id;
+
+    // Import a candidate with a different dataset name.
+    const importRes = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        result: {
+          workflow: 'wf',
+          dataset: 'different-dataset',
+          metadata: {},
+          timestamp: new Date().toISOString(),
+          totalCost: 0,
+          duration: 0,
+          items: [{ input: 'x', output: 'y', scores: { 'always-pass': 1 } }],
+          summary: {
+            count: 1,
+            failures: 0,
+            scorers: { 'always-pass': { mean: 1, min: 1, max: 1, p50: 1, p95: 1 } },
+          },
+        },
+      }),
+    });
+    const candidateId = (await importRes.json()).data.id;
+
+    const res = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baselineId, candidateId }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe('COMPARE_FAILED');
+    expect(body.error.message).toContain('dataset');
+  });
+
+  it('POST /api/evals/import returns 400 when dataset is missing', async () => {
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        result: {
+          workflow: 'wf',
+          // dataset: missing
+          metadata: {},
+          timestamp: new Date().toISOString(),
+          totalCost: 0,
+          duration: 0,
+          items: [],
+          summary: { count: 0, failures: 0, scorers: {} },
+        },
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe('BAD_REQUEST');
+    expect(body.error.message).toContain('dataset');
+  });
+
+  it('POST /api/evals/import detects scorer-coverage mismatch in items beyond the first', async () => {
+    // Heterogeneous artifact: item[0] is well-formed but item[1] references a
+    // scorer that's not in summary.scorers. Validation must scan every item,
+    // not just the first.
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        result: {
+          workflow: 'wf',
+          dataset: 'ds',
+          metadata: {},
+          timestamp: new Date().toISOString(),
+          totalCost: 0,
+          duration: 0,
+          items: [
+            // item[0] OK
+            {
+              input: 'in1',
+              output: 'out1',
+              scores: { 'always-pass': 1 },
+            },
+            // item[1] references a phantom scorer
+            {
+              input: 'in2',
+              output: 'out2',
+              scores: { 'always-pass': 1, 'phantom-scorer': 0.5 },
+            },
+          ],
+          summary: {
+            count: 2,
+            failures: 0,
+            scorers: { 'always-pass': { mean: 1, min: 1, max: 1, p50: 1, p95: 1 } },
+          },
+        },
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe('BAD_REQUEST');
+    expect(body.error.message).toContain('phantom-scorer');
+  });
+
+  it('POST /api/evals/compare rejects array IDs containing non-strings', async () => {
+    // A confused caller passing [null] or [123] should get a structured
+    // BAD_REQUEST instead of a confusing "not found: null" downstream.
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baselineId: [null], candidateId: 'some-id' }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe('BAD_REQUEST');
+    expect(body.error.message).toContain('baselineId');
+  });
+
+  it('POST /api/evals/import returns 400 when item scores reference unknown scorers', async () => {
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        result: {
+          workflow: 'wf',
+          dataset: 'ds',
+          metadata: {},
+          timestamp: new Date().toISOString(),
+          totalCost: 0,
+          duration: 0,
+          items: [
+            {
+              input: 'in',
+              output: 'out',
+              // References a scorer not in summary.scorers
+              scores: { 'rogue-scorer': 0.5, 'always-pass': 1 },
+            },
+          ],
+          summary: {
+            count: 1,
+            failures: 0,
+            scorers: { 'always-pass': { mean: 1, min: 1, max: 1, p50: 1, p95: 1 } },
+          },
+        },
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error.code).toBe('BAD_REQUEST');
+    expect(body.error.message).toContain('rogue-scorer');
+  });
+
+  it('POST /api/evals/import normalizes whitespace-only eval name', async () => {
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        eval: '   ', // whitespace-only — should fall through to workflow name
+        result: {
+          workflow: 'fallback-wf',
+          dataset: 'ds',
+          metadata: {},
+          timestamp: new Date().toISOString(),
+          totalCost: 0,
+          duration: 0,
+          items: [],
+          summary: { count: 0, failures: 0, scorers: {} },
+        },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.eval).toBe('fallback-wf');
+  });
+
+  it('POST /api/evals/import defaults missing result.metadata to empty object', async () => {
+    // Downstream code (evalCompare, runner) assumes result.metadata exists.
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        result: {
+          workflow: 'wf',
+          dataset: 'ds',
+          // metadata: missing entirely
+          timestamp: new Date().toISOString(),
+          totalCost: 0,
+          duration: 0,
+          items: [],
+          summary: { count: 0, failures: 0, scorers: {} },
+        },
+      }),
+    });
+    expect(res.status).toBe(200);
+
+    const histRes = await app.request('/api/evals/history');
+    const histBody = await histRes.json();
+    const id = (await res.json()).data.id;
+    const entry = histBody.data.find((e: { id: string }) => e.id === id);
+    expect(entry.data.metadata).toEqual({});
+  });
+
+  // --- Delete endpoint ---
+
+  it('DELETE /api/evals/history/:id removes an entry from history', async () => {
+    const provider = MockProvider.sequence([{ content: 'eval output' }]);
+    const { app } = createTestServer(provider);
+
+    // Run an eval to populate history.
+    const runRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
+    const id = (await runRes.json()).data.id;
+
+    // Confirm it's in history first.
+    const histBefore = await (await app.request('/api/evals/history')).json();
+    expect(histBefore.data.find((e: { id: string }) => e.id === id)).toBeDefined();
+
+    // Delete.
+    const delRes = await app.request(`/api/evals/history/${id}`, { method: 'DELETE' });
+    expect(delRes.status).toBe(200);
+    const delBody = await delRes.json();
+    expect(delBody.ok).toBe(true);
+    expect(delBody.data).toEqual({ id, deleted: true });
+
+    // Confirm it's gone.
+    const histAfter = await (await app.request('/api/evals/history')).json();
+    expect(histAfter.data.find((e: { id: string }) => e.id === id)).toBeUndefined();
+  });
+
+  it('DELETE /api/evals/history/:id returns 404 for unknown id', async () => {
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/history/does-not-exist', { method: 'DELETE' });
+    expect(res.status).toBe(404);
+
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('NOT_FOUND');
+    expect(body.error.message).toContain('does-not-exist');
+  });
+
+  it('DELETE /api/evals/history/:id is blocked in readOnly mode', async () => {
+    const provider = MockProvider.sequence([{ content: 'eval output' }]);
+    // Need a regular (non-readOnly) server first to seed an entry, then a
+    // readOnly one. Simpler: seed via the same readOnly server's runtime
+    // before mounting, but createTestServer doesn't expose that. Instead,
+    // hit the readOnly server directly with a fake id — readOnly gating
+    // happens at the route layer before the handler runs, so 405 fires
+    // regardless of whether the id exists.
+    const { app } = createTestServer(provider, { readOnly: true });
+
+    const res = await app.request('/api/evals/history/any-id', { method: 'DELETE' });
+    expect(res.status).toBe(405);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('READ_ONLY');
+  });
+
+  it('DELETE /api/evals/history/:id then compare with that ID returns 404', async () => {
+    // End-to-end: deleted entries should disappear from compare's resolution path.
+    const provider = MockProvider.sequence([{ content: 'a' }, { content: 'b' }]);
+    const { app } = createTestServer(provider);
+
+    const baselineId = (
+      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+    ).data.id;
+    const candidateId = (
+      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+    ).data.id;
+
+    // Delete the baseline.
+    await app.request(`/api/evals/history/${baselineId}`, { method: 'DELETE' });
+
+    // Compare should now 404 listing the missing baseline.
+    const res = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baselineId, candidateId }),
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error.message).toContain(baselineId);
+  });
+
+  it('POST /api/evals/import round-trip preserves multi-run artifact shape', async () => {
+    // CLI --runs N writes a single file enriched with _multiRun. Importing
+    // such a file should round-trip the _multiRun field and still render
+    // correctly as a history entry.
+    const { app } = createTestServer();
+
+    const singleRun = {
+      workflow: 'wf',
+      dataset: 'ds',
+      metadata: {},
+      timestamp: new Date().toISOString(),
+      totalCost: 0,
+      duration: 0,
+      items: [{ input: 'in', output: 'out', scores: { 'always-pass': 1 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: { 'always-pass': { mean: 1, min: 1, max: 1, p50: 1, p95: 1 } },
+      },
+    };
+    const withMultiRun = {
+      ...singleRun,
+      _multiRun: {
+        aggregate: {
+          runGroupId: 'group-123',
+          runCount: 3,
+          scorers: { 'always-pass': { mean: 1, std: 0, min: 1, max: 1 } },
+        },
+        allRuns: [singleRun, singleRun, singleRun],
+      },
+    };
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ result: withMultiRun }),
+    });
+    expect(res.status).toBe(200);
+
+    const histRes = await app.request('/api/evals/history');
+    const histBody = await histRes.json();
+    const id = (await res.json()).data.id;
+    const entry = histBody.data.find((e: { id: string }) => e.id === id);
+    expect(entry.data._multiRun).toBeDefined();
+    expect(entry.data._multiRun.allRuns.length).toBe(3);
   });
 });

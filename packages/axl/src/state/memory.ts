@@ -196,6 +196,10 @@ export class MemoryStore implements StateStore {
     return result.map((e) => structuredClone(e));
   }
 
+  async deleteEvalResult(id: string): Promise<boolean> {
+    return this.evalHistory.delete(id);
+  }
+
   // ── Sessions (Studio introspection) ─────────────────────────────────
 
   async listSessions(): Promise<string[]> {

@@ -1,14 +1,18 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { FlaskConical, Play, ArrowLeft } from 'lucide-react';
+import { FlaskConical, Play, ArrowLeft, Upload } from 'lucide-react';
 import { EmptyState } from '../../components/shared/EmptyState';
 import {
   fetchEvals,
   fetchEvalHistory,
+  fetchHealth,
   runRegisteredEval,
   compareEvals,
+  importEvalResult,
   rescoreEval,
+  deleteEvalHistoryEntry,
 } from '../../lib/api';
+import type { EvalHistoryEntry } from '../../lib/types';
 import { cn, formatCost, formatDuration, formatTokens, extractLabel } from '../../lib/utils';
 import type { RegisteredEval } from '../../lib/types';
 import type { EvalResultData, ComparisonResult } from './types';
@@ -18,6 +22,8 @@ import {
   scoreColorClass,
   getResultModels,
   getResultModelCounts,
+  getResultWorkflows,
+  getResultWorkflowCounts,
   formatModelName,
   getResultTokens,
 } from './types';
@@ -85,6 +91,81 @@ export function EvalRunnerPanel() {
     queryFn: fetchEvalHistory,
   });
 
+  // readOnly is a boot-time flag on the runtime — safe to cache forever;
+  // the client never needs to refetch it after the initial health call.
+  const {
+    data: health,
+    isLoading: healthLoading,
+    isError: healthError,
+  } = useQuery({
+    queryKey: ['health'],
+    queryFn: fetchHealth,
+    staleTime: Infinity,
+  });
+  const readOnly = !!health?.readOnly;
+  // While the health query is in flight, we can't safely show mutating
+  // affordances — defaulting to "writable" would briefly leak the Run/Import
+  // buttons in a true readOnly runtime, and defaulting to "hidden" forever
+  // would lock users out if the health endpoint ever fails. Instead, hide
+  // mutating controls only during the loading window; on health failure,
+  // assume writable (the route handlers will return 405 if we're wrong).
+  const writeUiReady = !healthLoading || healthError;
+  const canShowWriteUi = writeUiReady && !readOnly;
+
+  const importFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importStatus, setImportStatus] = useState<string | null>(null);
+
+  // Auto-clear the import status after a few seconds so stale success messages
+  // don't linger across unrelated user actions.
+  useEffect(() => {
+    if (!importStatus) return;
+    const timer = setTimeout(() => setImportStatus(null), 6000);
+    return () => clearTimeout(timer);
+  }, [importStatus]);
+
+  const handleImportFile = useCallback(
+    async (file: File) => {
+      setError(null);
+      setImportStatus(null);
+      setImporting(true);
+      try {
+        const text = await file.text();
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          throw new Error(`${file.name} is not valid JSON`);
+        }
+        const { id } = await importEvalResult(parsed);
+        // Refetch history so the imported entry appears before we auto-select it.
+        await queryClient.invalidateQueries({ queryKey: ['evalHistory'] });
+
+        // Auto-select the imported run into whichever slot is open. When both
+        // slots are full we don't stomp on an existing selection — instead we
+        // show a status message so the user knows the import succeeded.
+        //
+        // baselineSelection/candidateSelection come from the callback closure,
+        // which is refreshed by the deps array on every state change, so they
+        // reflect the latest values at click time.
+        if (!baselineSelection) {
+          setBaselineSelection({ id });
+          setImportStatus(`Imported ${file.name} — selected as baseline`);
+        } else if (!candidateSelection) {
+          setCandidateSelection({ id });
+          setImportStatus(`Imported ${file.name} — selected as candidate`);
+        } else {
+          setImportStatus(`Imported ${file.name} — added to history (both compare slots full)`);
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setImporting(false);
+      }
+    },
+    [queryClient, baselineSelection, candidateSelection],
+  );
+
   // Auto-default: select the two most recent groups/entries of the same eval
   useEffect(() => {
     if (baselineSelection || candidateSelection || history.length < 2) return;
@@ -92,7 +173,10 @@ export function EvalRunnerPanel() {
     const sameEval = history.filter((h) => h.eval === firstEval);
     if (sameEval.length < 2) return;
 
-    // Find distinct groups/singles in order
+    // Find distinct groups/singles in order. A "group" with only one
+    // surviving member (e.g., after the user deleted other runs) is treated
+    // as a single — mirrors the picker's display logic so auto-select and
+    // the picker stay consistent.
     const seen = new Set<string>();
     const distinct: RunSelection[] = [];
     for (const entry of sameEval) {
@@ -104,7 +188,11 @@ export function EvalRunnerPanel() {
         const groupIds = sameEval
           .filter((h) => (h.data as EvalResultData).metadata?.runGroupId === gid)
           .map((h) => h.id);
-        distinct.push({ id: groupIds[0], groupIds });
+        if (groupIds.length > 1) {
+          distinct.push({ id: groupIds[0], groupIds });
+        } else {
+          distinct.push({ id: groupIds[0] });
+        }
       } else {
         distinct.push({ id: entry.id });
       }
@@ -117,6 +205,14 @@ export function EvalRunnerPanel() {
   }, [history, baselineSelection, candidateSelection]);
 
   const selectedMeta = evals.find((e: RegisteredEval) => e.name === selectedEval);
+
+  // Set of registered eval names — history entries whose `eval` field isn't
+  // in this set (imported CLI artifacts with unknown eval names) can't be
+  // rescored because the server needs a matching registered eval config.
+  const registeredEvalNames = useMemo(
+    () => new Set(evals.map((e: RegisteredEval) => e.name)),
+    [evals],
+  );
 
   // Multi-run derived state
   const multiRun = currentResult?._multiRun;
@@ -156,20 +252,16 @@ export function EvalRunnerPanel() {
     setComparing(true);
     setCompareResult(null);
     try {
-      // Resolve data arrays from selections
-      const resolveData = (sel: RunSelection) => {
-        if (sel.groupIds && sel.groupIds.length > 1) {
-          const entries = sel.groupIds.map((id) => history.find((h) => h.id === id));
-          if (entries.some((e) => !e)) throw new Error('Selected run no longer exists in history');
-          return entries.map((e) => e!.data);
-        }
-        const entry = history.find((h) => h.id === sel.id);
-        if (!entry) throw new Error('Selected run no longer exists in history');
-        return entry.data;
+      // Send only IDs to the server — it resolves them from runtime history.
+      // This keeps the wire payload tiny and avoids host body-parser limits
+      // (Express/NestJS default 100KB) when Studio is mounted as middleware.
+      const toIdParam = (sel: RunSelection): string | string[] => {
+        if (sel.groupIds && sel.groupIds.length > 1) return sel.groupIds;
+        return sel.id;
       };
 
-      const baselineData = resolveData(baselineSelection);
-      const candidateData = resolveData(candidateSelection);
+      const baselineIdParam = toIdParam(baselineSelection);
+      const candidateIdParam = toIdParam(candidateSelection);
 
       // For item-level views: average per-item scores across runs when pooled
       const buildRepresentative = (sel: RunSelection): EvalResultData | null => {
@@ -221,7 +313,7 @@ export function EvalRunnerPanel() {
       setCompareBaselineRuns(resolveRuns(baselineSelection));
       setCompareCandidateRuns(resolveRuns(candidateSelection));
 
-      const res = (await compareEvals(baselineData, candidateData)) as ComparisonResult;
+      const res = (await compareEvals(baselineIdParam, candidateIdParam)) as ComparisonResult;
       setCompareResult(res);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -245,6 +337,57 @@ export function EvalRunnerPanel() {
       }
     },
     [queryClient],
+  );
+
+  const handleDeleteEntry = useCallback(
+    async (entry: EvalHistoryEntry) => {
+      setError(null);
+      // Native confirm — keeps the v1 surface area small. We surface the eval
+      // name + short id so the user knows exactly what they're deleting.
+      const shortId = entry.id.slice(0, 8);
+      const ok = window.confirm(
+        `Delete this eval history entry?\n\n${entry.eval} (${shortId})\n\nThis cannot be undone.`,
+      );
+      if (!ok) return;
+
+      try {
+        await deleteEvalHistoryEntry(entry.id);
+
+        // Clear any compare selections that referenced the deleted entry, so
+        // a stale ID doesn't 404 the next compare. Handles both single and
+        // grouped selections.
+        const referencedBy = (sel: RunSelection | null): boolean => {
+          if (!sel) return false;
+          if (sel.id === entry.id) return true;
+          return !!sel.groupIds?.includes(entry.id);
+        };
+        if (referencedBy(baselineSelection)) setBaselineSelection(null);
+        if (referencedBy(candidateSelection)) setCandidateSelection(null);
+
+        // Clear the currentResult drilldown if it referenced the deleted entry.
+        // Two cases: the user is viewing the deleted entry directly, OR the user
+        // is viewing a multi-run aggregate whose allRuns contains the deleted id.
+        // In the second case we can't safely re-render an aggregate that's missing
+        // a run (the cached stats and run picker would be wrong), so clear it.
+        if (currentResult) {
+          const directHit = (currentResult as { id?: string }).id === entry.id;
+          const groupHit = !!currentResult._multiRun?.allRuns.some(
+            (r) => (r as { id?: string }).id === entry.id,
+          );
+          if (directHit || groupHit) {
+            setCurrentResult(null);
+            setSelectedItem(null);
+            setMultiRunIndex(-1);
+            setExpandedWorstItem(null);
+          }
+        }
+
+        queryClient.invalidateQueries({ queryKey: ['evalHistory'] });
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    [queryClient, baselineSelection, candidateSelection, currentResult],
   );
 
   const handleToggleGroup = useCallback((groupId: string) => {
@@ -381,45 +524,81 @@ export function EvalRunnerPanel() {
       {/* ── Header ─────────────────────────────────────── */}
       <header className="shrink-0 flex items-center justify-between px-6 py-4 border-b border-[hsl(var(--border))]">
         <h2 className="text-xl font-semibold">Evals</h2>
-        {evals.length > 0 && (
-          <div className="flex items-center gap-2">
-            <select
-              value={selectedEval}
-              onChange={(e) => setSelectedEval(e.target.value)}
-              className="px-3 py-1.5 text-sm rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))] min-w-[180px]"
-            >
-              <option value="">Select eval…</option>
-              {evals.map((e: RegisteredEval) => (
-                <option key={e.name} value={e.name}>
-                  {e.name}
-                </option>
-              ))}
-            </select>
-            <button
-              onClick={handleRun}
-              disabled={!selectedEval || running}
-              className={cn(
-                'inline-flex items-center gap-1.5 px-4 py-1.5 text-sm font-medium rounded-lg transition-all cursor-pointer',
-                'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]',
-                'hover:opacity-90 disabled:opacity-40',
-              )}
-            >
-              <Play size={12} className={running ? 'animate-spin' : ''} />
-              {running ? 'Running\u2026' : 'Run'}
-            </button>
-            <input
-              type="number"
-              min={1}
-              max={25}
-              value={runCount}
-              onChange={(e) =>
-                setRunCount(Math.max(1, Math.min(25, parseInt(e.target.value) || 1)))
-              }
-              className="w-14 px-2 py-1.5 text-sm text-center rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
-              title="Number of runs"
-            />
-          </div>
-        )}
+        <div className="flex items-center gap-2">
+          {canShowWriteUi && (
+            <>
+              <input
+                ref={importFileInputRef}
+                type="file"
+                accept="application/json,.json"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) handleImportFile(file);
+                  // Reset so the same filename can be re-imported.
+                  e.target.value = '';
+                }}
+              />
+              <button
+                onClick={() => importFileInputRef.current?.click()}
+                disabled={importing}
+                className={cn(
+                  'inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-lg transition-all cursor-pointer',
+                  'border border-[hsl(var(--input))] bg-[hsl(var(--background))]',
+                  'hover:bg-[hsl(var(--muted))] disabled:opacity-40',
+                )}
+                title="Import an eval result JSON file (e.g. from `axl-eval --output`). Imported entries persist as long as the runtime's state store does."
+              >
+                <Upload size={12} />
+                {importing ? 'Importing\u2026' : 'Import result'}
+              </button>
+            </>
+          )}
+          {/* Run controls are hidden in readOnly — the POST /api/evals/:name/run
+              endpoint is blocked, so showing a button that always errors is
+              worse than hiding it. Users can still browse history and compare.
+              `canShowWriteUi` also waits for the health query so we don't
+              briefly flash the button on initial load in a readOnly runtime. */}
+          {evals.length > 0 && canShowWriteUi && (
+            <>
+              <select
+                value={selectedEval}
+                onChange={(e) => setSelectedEval(e.target.value)}
+                className="px-3 py-1.5 text-sm rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))] min-w-[180px]"
+              >
+                <option value="">Select eval…</option>
+                {evals.map((e: RegisteredEval) => (
+                  <option key={e.name} value={e.name}>
+                    {e.name}
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={handleRun}
+                disabled={!selectedEval || running}
+                className={cn(
+                  'inline-flex items-center gap-1.5 px-4 py-1.5 text-sm font-medium rounded-lg transition-all cursor-pointer',
+                  'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]',
+                  'hover:opacity-90 disabled:opacity-40',
+                )}
+              >
+                <Play size={12} className={running ? 'animate-spin' : ''} />
+                {running ? 'Running\u2026' : 'Run'}
+              </button>
+              <input
+                type="number"
+                min={1}
+                max={25}
+                value={runCount}
+                onChange={(e) =>
+                  setRunCount(Math.max(1, Math.min(25, parseInt(e.target.value) || 1)))
+                }
+                className="w-14 px-2 py-1.5 text-sm text-center rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--background))]"
+                title="Number of runs"
+              />
+            </>
+          )}
+        </div>
       </header>
 
       {/* ── Tabs ───────────────────────────────────────── */}
@@ -462,6 +641,49 @@ export function EvalRunnerPanel() {
         )}
       </div>
 
+      {/* ── Global error banner ─────────────────────────────
+          Errors from any action (run, compare, import, rescore) surface here
+          regardless of which tab is active, so users never lose feedback
+          by switching tabs. Dismissible. */}
+      {error && (
+        <div className="shrink-0 px-6 py-3 border-b border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/30">
+          <div className="flex items-start justify-between gap-4">
+            <div className="text-sm text-red-700 dark:text-red-300 whitespace-pre-wrap break-words">
+              {error}
+            </div>
+            <button
+              onClick={() => setError(null)}
+              className="shrink-0 text-xs text-red-600 dark:text-red-400 hover:text-red-900 dark:hover:text-red-200 cursor-pointer"
+              aria-label="Dismiss error"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Import status banner ────────────────────────────
+          Shows a transient success message after an import. Full-width so
+          long messages don't truncate. Auto-clears after 6s via useEffect;
+          also dismissible. Lives in a separate slot from the error banner
+          so both can be shown simultaneously if needed. */}
+      {importStatus && (
+        <div className="shrink-0 px-6 py-2 border-b border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-950/30">
+          <div className="flex items-start justify-between gap-4">
+            <div className="text-xs text-emerald-700 dark:text-emerald-300 whitespace-pre-wrap break-words">
+              {importStatus}
+            </div>
+            <button
+              onClick={() => setImportStatus(null)}
+              className="shrink-0 text-xs text-emerald-600 dark:text-emerald-400 hover:text-emerald-900 dark:hover:text-emerald-200 cursor-pointer"
+              aria-label="Dismiss import status"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ── Run Tab ─────────────────────────────────────── */}
       {tab === 'run' && (
         <div className="flex-1 min-h-0 flex flex-col">
@@ -472,12 +694,6 @@ export function EvalRunnerPanel() {
                 title="No evals registered"
                 description="Define evals with defineEval() and load them via the evals middleware option or runtime.registerEval()."
               />
-            </div>
-          ) : error ? (
-            <div className="p-6">
-              <div className="p-4 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm">
-                {error}
-              </div>
             </div>
           ) : currentResult ? (
             <>
@@ -514,7 +730,35 @@ export function EvalRunnerPanel() {
                   {/* Aggregate stat cards + compare button */}
                   <div className="shrink-0 px-6 py-4">
                     <div className="flex items-start justify-between mb-3">
-                      <div className="flex-1">
+                      <div className="flex-1 flex flex-wrap items-center gap-x-4 gap-y-1.5">
+                        {(() => {
+                          const workflows = currentResult ? getResultWorkflows(currentResult) : [];
+                          if (workflows.length === 0) return null;
+                          const counts = currentResult
+                            ? getResultWorkflowCounts(currentResult)
+                            : null;
+                          return (
+                            <div className="flex items-center gap-2">
+                              <span className="text-[10px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+                                {workflows.length > 1 ? 'Workflows' : 'Workflow'}
+                              </span>
+                              {workflows.map((w) => (
+                                <span
+                                  key={w}
+                                  className="px-1.5 py-0.5 rounded bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] text-[10px] font-mono font-medium"
+                                  title={counts ? `${w} — ${counts[w]} calls` : w}
+                                >
+                                  {w}
+                                  {counts && counts[w] != null && (
+                                    <span className="ml-1 text-[hsl(var(--muted-foreground))] font-normal">
+                                      ({counts[w]})
+                                    </span>
+                                  )}
+                                </span>
+                              ))}
+                            </div>
+                          );
+                        })()}
                         {(() => {
                           const models = currentResult ? getResultModels(currentResult) : [];
                           if (models.length === 0) return null;
@@ -876,30 +1120,57 @@ export function EvalRunnerPanel() {
                 <>
                   {/* Stat cards */}
                   <div className="shrink-0 px-6 py-4">
-                    {/* Model badges */}
+                    {/* Workflow + Model badges */}
                     {(() => {
+                      const workflows = getResultWorkflows(displayResult);
+                      const workflowCounts = getResultWorkflowCounts(displayResult);
                       const models = getResultModels(displayResult);
-                      if (models.length === 0) return null;
-                      const counts = getResultModelCounts(displayResult);
+                      const modelCounts = getResultModelCounts(displayResult);
+                      if (workflows.length === 0 && models.length === 0) return null;
                       return (
-                        <div className="flex items-center gap-2 mb-3">
-                          <span className="text-[10px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
-                            {models.length > 1 ? 'Models' : 'Model'}
-                          </span>
-                          {models.map((m) => (
-                            <span
-                              key={m}
-                              className="px-1.5 py-0.5 rounded bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] text-[10px] font-mono font-medium"
-                              title={counts ? `${m} — ${counts[m]} calls` : m}
-                            >
-                              {formatModelName(m)}
-                              {counts && counts[m] != null && (
-                                <span className="ml-1 text-[hsl(var(--muted-foreground))] font-normal">
-                                  ({counts[m]})
+                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 mb-3">
+                          {workflows.length > 0 && (
+                            <div className="flex items-center gap-2">
+                              <span className="text-[10px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+                                {workflows.length > 1 ? 'Workflows' : 'Workflow'}
+                              </span>
+                              {workflows.map((w) => (
+                                <span
+                                  key={w}
+                                  className="px-1.5 py-0.5 rounded bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] text-[10px] font-mono font-medium"
+                                  title={workflowCounts ? `${w} — ${workflowCounts[w]} calls` : w}
+                                >
+                                  {w}
+                                  {workflowCounts && workflowCounts[w] != null && (
+                                    <span className="ml-1 text-[hsl(var(--muted-foreground))] font-normal">
+                                      ({workflowCounts[w]})
+                                    </span>
+                                  )}
                                 </span>
-                              )}
-                            </span>
-                          ))}
+                              ))}
+                            </div>
+                          )}
+                          {models.length > 0 && (
+                            <div className="flex items-center gap-2">
+                              <span className="text-[10px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+                                {models.length > 1 ? 'Models' : 'Model'}
+                              </span>
+                              {models.map((m) => (
+                                <span
+                                  key={m}
+                                  className="px-1.5 py-0.5 rounded bg-[hsl(var(--secondary))] text-[hsl(var(--foreground))] text-[10px] font-mono font-medium"
+                                  title={modelCounts ? `${m} — ${modelCounts[m]} calls` : m}
+                                >
+                                  {formatModelName(m)}
+                                  {modelCounts && modelCounts[m] != null && (
+                                    <span className="ml-1 text-[hsl(var(--muted-foreground))] font-normal">
+                                      ({modelCounts[m]})
+                                    </span>
+                                  )}
+                                </span>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       );
                     })()}
@@ -1093,9 +1364,29 @@ export function EvalRunnerPanel() {
                     max: Math.round(Math.max(...means) * 1000) / 1000,
                   };
                 }
+                // Union workflows across all runs in the group, first-seen
+                // first. Heterogeneous groups (custom callbacks across
+                // different workflows) end up with multiple entries; the
+                // common --runs N case has one. Mirrors the server-side
+                // aggregateRuns() logic exactly so client-rebuilt aggregates
+                // and server-built aggregates render identically.
+                const seenWorkflows = new Set<string>();
+                const aggWorkflows: string[] = [];
+                for (const run of allRuns) {
+                  const list = run.metadata?.workflows;
+                  if (Array.isArray(list)) {
+                    for (const w of list) {
+                      if (typeof w === 'string' && !seenWorkflows.has(w)) {
+                        seenWorkflows.add(w);
+                        aggWorkflows.push(w);
+                      }
+                    }
+                  }
+                }
                 const aggregate = {
                   runGroupId: (first.metadata?.runGroupId as string) ?? '',
                   runCount: allRuns.length,
+                  workflows: aggWorkflows.length > 0 ? aggWorkflows : undefined,
                   scorers: aggScorers,
                 };
                 const enriched = { ...first, _multiRun: { aggregate, allRuns } } as EvalResultData;
@@ -1106,6 +1397,9 @@ export function EvalRunnerPanel() {
                 setTab('run');
               }}
               onRescore={handleRescore}
+              onDelete={handleDeleteEntry}
+              registeredEvalNames={registeredEvalNames}
+              readOnly={readOnly}
               expandedGroups={expandedGroups}
               onToggleGroup={handleToggleGroup}
             />

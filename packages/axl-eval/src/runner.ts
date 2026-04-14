@@ -208,14 +208,51 @@ export async function runEval(
     modelsMeta.modelCounts = Object.fromEntries(sorted);
   }
 
+  // Aggregate per-workflow call counts across all items (parallel to models).
+  // Workflows come from trackExecution's trace-event collection — callers
+  // don't specify workflow names anywhere, they just appear because the
+  // runtime emits workflow_start events for every execute() call.
+  const totalWorkflowCalls = new Map<string, number>();
+  for (const item of evalItems) {
+    const itemCounts = item.metadata?.workflowCallCounts;
+    if (itemCounts && typeof itemCounts === 'object') {
+      for (const [w, count] of Object.entries(itemCounts as Record<string, unknown>)) {
+        if (typeof count === 'number')
+          totalWorkflowCalls.set(w, (totalWorkflowCalls.get(w) ?? 0) + count);
+      }
+    } else {
+      // Fallback: count unique workflows per item
+      const itemWorkflows = item.metadata?.workflows;
+      if (Array.isArray(itemWorkflows)) {
+        for (const w of itemWorkflows) {
+          if (typeof w === 'string')
+            totalWorkflowCalls.set(w, (totalWorkflowCalls.get(w) ?? 0) + 1);
+        }
+      }
+    }
+  }
+
+  // Fall back to config.workflow when the callback bypassed the runtime's
+  // execute() path entirely (e.g. AxlTestRuntime-based tests). This keeps the
+  // metadata.workflows array non-empty for the common test-harness case.
+  const workflowsMeta: Record<string, unknown> = {};
+  if (totalWorkflowCalls.size > 0) {
+    const sorted = [...totalWorkflowCalls.entries()].sort((a, b) => b[1] - a[1]);
+    workflowsMeta.workflows = sorted.map(([w]) => w);
+    workflowsMeta.workflowCounts = Object.fromEntries(sorted);
+  } else if (config.workflow) {
+    workflowsMeta.workflows = [config.workflow];
+    workflowsMeta.workflowCounts = { [config.workflow]: items.length };
+  }
+
   return {
     id,
-    workflow: config.workflow,
     dataset: config.dataset.name,
     metadata: {
       ...config.metadata,
       scorerTypes,
       ...modelsMeta,
+      ...workflowsMeta,
     },
     timestamp: new Date().toISOString(),
     totalCost,

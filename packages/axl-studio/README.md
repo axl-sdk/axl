@@ -148,7 +148,9 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `GET /api/evals/history` | List eval run history |
 | `POST /api/evals/:name/run` | Run a registered eval by name. Accepts `{ runs: N }` (capped at 25) |
 | `POST /api/evals/:name/rescore` | Re-score a history entry with the eval's current scorers |
-| `POST /api/evals/compare` | Compare two eval results |
+| `POST /api/evals/import` | Import a CLI eval artifact (parsed `EvalResult` JSON) into runtime history |
+| `DELETE /api/evals/history/:id` | Delete a single history entry. Blocked in readOnly |
+| `POST /api/evals/compare` | Compare two eval results by history ID. Body: `{ baselineId, candidateId, options? }` where each ID is `string` (single run) or `string[]` (pooled multi-run). Resolves IDs server-side from `runtime.getEvalHistory()` so the wire payload stays small |
 | `POST /api/playground/chat` | Chat with an agent directly (no workflow required). Accepts `{ message, agent?, sessionId? }`. Streams results via WebSocket |
 | `GET /api/decisions` | List pending decisions |
 | `POST /api/decisions/:id/resolve` | Resolve a pending decision |
@@ -219,6 +221,57 @@ studio.upgradeWebSocket(server);
 | `close()` | Shut down middleware (removes listeners, closes connections) |
 
 **Note:** `upgradeWebSocket(server)` is required for real-time features (trace streaming, cost updates, execution events, decision resolution). Without it, the Studio SPA loads but panels relying on live data will show no updates. If your framework manages WebSocket connections itself (NestJS gateway, Fastify plugin), use `handleWebSocket()` instead.
+
+### Host body limits
+
+Studio's API uses small request bodies — the eval comparison flow sends history IDs (~100 bytes), not full result payloads — so the default body limits in Express, NestJS, Fastify, and Koa (typically 100KB) are sufficient for normal use.
+
+The one exception is `POST /api/evals/import`, which accepts a full `EvalResult` JSON (typically a CLI artifact from `axl-eval --output result.json`). If you import sizeable eval files through Studio, raise your host framework's JSON body limit *on the Studio sub-mount only*.
+
+**Express:**
+
+```typescript
+import express from 'express';
+const app = express();
+// Larger limit just for Studio; the rest of the app keeps its defaults.
+app.use('/studio', express.json({ limit: '10mb' }), studio.handler);
+```
+
+**NestJS:** NestJS registers its own body-parser at bootstrap, so `app.use(express.json(...))` added after `NestFactory.create()` does *not* override it — the built-in parser runs first and still rejects with `PayloadTooLargeError`. Disable the built-in parser and register a conditional one:
+
+```typescript
+// main.ts
+import { NestFactory, HttpAdapterHost } from '@nestjs/core';
+import { json } from 'express';
+import { AppModule } from './app.module';
+import { createStudioMiddleware } from '@axlsdk/studio/middleware';
+
+async function bootstrap() {
+  // Disable Nest's built-in body parser so we control limits ourselves.
+  const app = await NestFactory.create(AppModule, { bodyParser: false });
+
+  // Apply 10 MB limit to the Studio sub-mount only; rest of the app keeps
+  // the 100 KB default. This is the maintainer-endorsed pattern for
+  // per-route body limits in NestJS (see nestjs/nest#14734).
+  const studioJson = json({ limit: '10mb' });
+  const defaultJson = json();
+  app.use((req, res, next) =>
+    req.url.startsWith('/studio') ? studioJson(req, res, next) : defaultJson(req, res, next),
+  );
+
+  const studio = createStudioMiddleware({ runtime });
+  const expressApp = app.get(HttpAdapterHost).httpAdapter.getInstance();
+  expressApp.use('/studio', studio.handler);
+  studio.upgradeWebSocket(app.getHttpServer());
+
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+> `app.useBodyParser('json', { limit })` raises the limit **globally**, not per-route — avoid it if you want the larger limit scoped to Studio.
+
+**Fastify:** set `bodyLimit` on the Fastify instance or pass it via `fastify({ bodyLimit: 10 * 1024 * 1024 })`. There's no per-route equivalent as clean as Express's; if Studio is the only route that needs a larger limit, either raise the global limit or mount Studio on a separate Fastify instance.
 
 ### Framework examples
 

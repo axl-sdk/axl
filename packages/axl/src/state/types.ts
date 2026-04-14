@@ -72,6 +72,8 @@ export interface StateStore {
   saveEvalResult?(entry: EvalHistoryEntry): Promise<void>;
   /** List eval history entries (most recent first). */
   listEvalResults?(limit?: number): Promise<EvalHistoryEntry[]>;
+  /** Delete an eval history entry by id. Returns true if an entry was deleted. */
+  deleteEvalResult?(id: string): Promise<boolean>;
 
   // Sessions (Studio introspection)
   /** List all session IDs (used by Studio session browser). */

@@ -350,6 +350,11 @@ export class SQLiteStore implements StateStore {
     }));
   }
 
+  async deleteEvalResult(id: string): Promise<boolean> {
+    const result = this.db.prepare('DELETE FROM eval_history WHERE id = ?').run(id);
+    return result.changes > 0;
+  }
+
   // ── Sessions (Studio introspection) ────────────────────────────────────
 
   async listSessions(): Promise<string[]> {

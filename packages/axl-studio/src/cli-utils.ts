@@ -26,6 +26,7 @@ export interface CliArgs {
   config?: string;
   open: boolean;
   conditions: string[];
+  readOnly: boolean;
   help: boolean;
   portError?: string;
 }
@@ -36,6 +37,7 @@ export function parseArgs(argv: string[]): CliArgs {
   let open = false;
   let help = false;
   let conditions: string[] = [];
+  let readOnly = false;
 
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
@@ -53,12 +55,14 @@ export function parseArgs(argv: string[]): CliArgs {
       i++;
     } else if (arg === '--open') {
       open = true;
+    } else if (arg === '--read-only' || arg === '--readonly') {
+      readOnly = true;
     } else if (arg === '--help' || arg === '-h') {
       help = true;
     }
   }
 
-  const result: CliArgs = { port, config, open, help, conditions };
+  const result: CliArgs = { port, config, open, help, conditions, readOnly };
 
   if (isNaN(port) || port < 1 || port > 65535) {
     result.portError = `Invalid port: ${port}. Must be between 1 and 65535.`;

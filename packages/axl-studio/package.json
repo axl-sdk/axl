@@ -39,6 +39,7 @@
     "build:server": "tsup",
     "build:client": "vite build",
     "dev": "concurrently --names vite,server --prefix-colors blue,green --kill-others-on-fail \"vite\" \"tsx watch src/cli.ts -- --port 4400\"",
+    "dev:read-only": "concurrently --names vite,server --prefix-colors blue,green --kill-others-on-fail \"vite\" \"tsx watch src/cli.ts -- --port 4400 --read-only\"",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest watch",

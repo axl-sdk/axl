@@ -235,6 +235,16 @@ export class RedisStore implements StateStore {
     return limit ? entries.slice(0, limit) : entries;
   }
 
+  async deleteEvalResult(id: string): Promise<boolean> {
+    // Remove from both the index set and the data key. del() returns the
+    // number of keys actually deleted, which we use as the "existed" signal
+    // so callers can distinguish "not found" from "deleted" without a
+    // separate EXISTS round-trip.
+    await this.client.sRem(this.evalHistorySetKey(), id);
+    const deleted = await this.client.del(this.evalHistoryKey(id));
+    return deleted > 0;
+  }
+
   // ── Sessions (Studio introspection) ────────────────────────────────────
 
   async listSessions(): Promise<string[]> {

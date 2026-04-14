@@ -229,13 +229,21 @@ function collectEvalFiles(p: string): string[] {
   }
 }
 
+/** Render observed workflows for a terse header line. Multiple → comma-separated. */
+function formatWorkflows(workflows: unknown): string {
+  if (!Array.isArray(workflows) || workflows.length === 0) return '(unknown)';
+  return (workflows as unknown[]).filter((w): w is string => typeof w === 'string').join(', ');
+}
+
 function formatTable(result: EvalResult): string {
   const lines: string[] = [];
   const scorerNames = Object.keys(result.summary.scorers);
   const maxNameLen = Math.max(...scorerNames.map((n) => n.length), 'Scorer'.length);
   const colWidth = 8;
 
-  lines.push(`Eval: ${result.workflow} x ${result.dataset} (${result.summary.count} items)`);
+  lines.push(
+    `Eval: ${formatWorkflows(result.metadata.workflows)} x ${result.dataset} (${result.summary.count} items)`,
+  );
   lines.push(
     `  ${'Scorer'.padEnd(maxNameLen)}  ${'Mean'.padStart(colWidth)}  ${'Min'.padStart(colWidth)}  ${'Max'.padStart(colWidth)}  ${'p50'.padStart(colWidth)}  ${'p95'.padStart(colWidth)}`,
   );
@@ -296,7 +304,9 @@ function formatMultiRunTable(summary: MultiRunSummary): string {
   const maxNameLen = Math.max(...scorerNames.map((n) => n.length), 'Scorer'.length);
   const colWidth = 16;
 
-  lines.push(`Eval: ${summary.workflow} x ${summary.dataset} \u2014 ${summary.runCount} runs`);
+  lines.push(
+    `Eval: ${formatWorkflows(summary.workflows)} x ${summary.dataset} \u2014 ${summary.runCount} runs`,
+  );
   lines.push(
     `  ${'Scorer'.padEnd(maxNameLen)}  ${'Mean \u00b1 Std'.padStart(colWidth)}  ${'Min'.padStart(8)}  ${'Max'.padStart(8)}`,
   );

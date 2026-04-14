@@ -18,6 +18,7 @@ describe('parseArgs', () => {
       open: false,
       help: false,
       conditions: [],
+      readOnly: false,
     });
   });
 
@@ -31,6 +32,14 @@ describe('parseArgs', () => {
 
   it('parses --open', () => {
     expect(parseArgs(argv('--open')).open).toBe(true);
+  });
+
+  it('parses --read-only', () => {
+    expect(parseArgs(argv('--read-only')).readOnly).toBe(true);
+  });
+
+  it('parses --readonly as alias', () => {
+    expect(parseArgs(argv('--readonly')).readOnly).toBe(true);
   });
 
   it('parses --conditions with single value', () => {
@@ -62,6 +71,7 @@ describe('parseArgs', () => {
       open: true,
       help: false,
       conditions: ['development'],
+      readOnly: false,
     });
   });
 

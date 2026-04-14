@@ -12,8 +12,23 @@ export type EvalConfig = {
 
 export type EvalResult = {
   id: string;
-  workflow: string;
+  /**
+   * Definitional dataset name. An eval is tied to exactly one dataset —
+   * `evalCompare` enforces this. Execution details (models, workflows,
+   * tokens) live in `metadata`.
+   */
   dataset: string;
+  /**
+   * Aggregate execution metadata. Populated by the runner from trace events
+   * and per-item metadata. Common keys:
+   * - `models: string[]` + `modelCounts: Record<string, number>`
+   * - `workflows: string[]` + `workflowCounts: Record<string, number>` —
+   *   workflow names observed during execution (trace-derived). Parallel
+   *   to `models`. Replaces the legacy top-level `workflow` field; readers
+   *   that need a single "primary" workflow should use `workflows[0]`.
+   * - `scorerTypes: Record<string, 'llm' | 'deterministic'>`
+   * - `runGroupId?: string`, `runIndex?: number` for multi-run groups
+   */
   metadata: Record<string, unknown>;
   timestamp: string;
   totalCost: number;

@@ -23,6 +23,7 @@ Options:
   --port <number>          Server port (default: 4400)
   --config <path>          Path to config file (default: auto-detect)
   --conditions <list>      Comma-separated Node.js import conditions (e.g., development)
+  --read-only              Disable all mutating endpoints (runs, imports, rescore, etc)
   --open                   Auto-open browser
   -h, --help               Show this help message
 
@@ -132,7 +133,12 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
   const { app, createWsHandlers } = createServer({
     runtime,
     staticRoot: hasStaticAssets ? staticRoot : undefined,
+    readOnly: args.readOnly,
   });
+
+  if (args.readOnly) {
+    console.log('[axl-studio] Read-only mode enabled — mutating endpoints are disabled.');
+  }
 
   // Set up WebSocket
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });

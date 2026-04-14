@@ -18,7 +18,10 @@ export const testAgent = agent({
   tools: [greetTool],
 });
 
-export function createTestServer(providerOverride?: MockProvider) {
+export function createTestServer(
+  providerOverride?: MockProvider,
+  serverOptions?: { readOnly?: boolean },
+) {
   const runtime = new AxlRuntime();
   const provider = providerOverride ?? MockProvider.echo();
   runtime.registerProvider('mock', provider);
@@ -59,7 +62,10 @@ export function createTestServer(providerOverride?: MockProvider) {
     scorers: [testScorer],
   });
 
-  const { app, connMgr, costAggregator } = createServer({ runtime });
+  const { app, connMgr, costAggregator } = createServer({
+    runtime,
+    readOnly: serverOptions?.readOnly,
+  });
 
   return { app, runtime, connMgr, costAggregator, provider };
 }

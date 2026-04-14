@@ -23,7 +23,43 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { 'Content-Type': 'application/json', ...init?.headers },
     ...init,
   });
-  const body = (await res.json()) as ApiResponse<T>;
+
+  // 413 is the canonical body-too-large status. Host framework body parsers
+  // (Express, NestJS, Koa) reject oversize requests before they reach Studio's
+  // handler, typically with text/html or text/plain. Some hosts use a JSON
+  // error envelope, so check status first regardless of content-type and
+  // surface a specific, actionable message pointing at the README.
+  if (res.status === 413) {
+    throw new Error(
+      `Request body too large (HTTP 413). If you're importing a large eval file ` +
+        `through an embedded Studio middleware, raise your host framework's JSON ` +
+        `body limit on the Studio mount. See the Studio README "Host body limits" section.`,
+    );
+  }
+
+  // Detect non-JSON responses (HTML error pages from host framework body
+  // parsers, reverse proxies, auth layers, etc.) before attempting to parse.
+  // Without this, `res.json()` throws "Unexpected token < in JSON at position 0"
+  // which gives the user zero signal about what actually went wrong.
+  const contentType = res.headers.get('content-type') ?? '';
+  if (!contentType.includes('application/json')) {
+    const text = await res.text().catch(() => '');
+    const snippet = text.slice(0, 200).trim();
+    throw new Error(
+      `Server returned HTTP ${res.status} with non-JSON response` + (snippet ? `: ${snippet}` : ''),
+    );
+  }
+
+  let body: ApiResponse<T>;
+  try {
+    body = (await res.json()) as ApiResponse<T>;
+  } catch (err) {
+    throw new Error(
+      `Failed to parse server response as JSON (HTTP ${res.status}): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
   if (!body.ok) {
     throw new Error(body.error.message);
   }
@@ -134,13 +170,24 @@ export const rescoreEval = (name: string, resultId: string) =>
   });
 
 export const compareEvals = (
-  baseline: unknown,
-  candidate: unknown,
+  baselineId: string | string[],
+  candidateId: string | string[],
   options?: { thresholds?: Record<string, number> | number },
 ) =>
   request<unknown>('/evals/compare', {
     method: 'POST',
-    body: JSON.stringify({ baseline, candidate, options }),
+    body: JSON.stringify({ baselineId, candidateId, options }),
+  });
+
+export const importEvalResult = (result: unknown, evalName?: string) =>
+  request<{ id: string; eval: string; timestamp: number }>('/evals/import', {
+    method: 'POST',
+    body: JSON.stringify({ result, eval: evalName }),
+  });
+
+export const deleteEvalHistoryEntry = (id: string) =>
+  request<{ id: string; deleted: boolean }>(`/evals/history/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
   });
 
 // ── Playground ─────────────────────────────────────────────────────

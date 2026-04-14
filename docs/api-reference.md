@@ -1188,14 +1188,27 @@ Full result from an eval run.
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | `string` | Unique eval run ID |
-| `workflow` | `string` | Workflow name |
-| `dataset` | `string` | Dataset name |
-| `metadata` | `Record<string, unknown>` | User-provided metadata (from `EvalConfig.metadata`) |
+| `dataset` | `string` | Dataset name. Definitional — `evalCompare` enforces matching datasets. |
+| `metadata` | `Record<string, unknown>` | User-provided metadata merged with runner-populated fields (see below) |
 | `timestamp` | `string` | ISO 8601 timestamp |
 | `totalCost` | `number` | Total LLM cost (workflow + LLM scorers) |
 | `duration` | `number` | Wall-clock time in ms |
 | `items` | `EvalItem[]` | Per-item results |
 | `summary` | `EvalSummary` | Aggregate statistics |
+
+**Runner-populated metadata** (on top of user-provided `EvalConfig.metadata`):
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `models` | `string[]` | Unique model URIs observed during execution, sorted by call count desc |
+| `modelCounts` | `Record<string, number>` | Per-model call counts |
+| `workflows` | `string[]` | Unique workflow names observed (trace-derived), sorted by call count desc. Parallel to `models`. Readers that want a single "primary" workflow use `workflows[0]`. When no traces are captured, falls back to `config.workflow` |
+| `workflowCounts` | `Record<string, number>` | Per-workflow call counts |
+| `scorerTypes` | `Record<string, 'llm' \| 'deterministic'>` | Scorer kind for threshold calibration |
+| `runGroupId` | `string?` | Shared ID across multi-run groups (`--runs N`) |
+| `runIndex` | `number?` | Position within a multi-run group |
+
+> `EvalResult` used to have a top-level `workflow: string` field. It was removed in 0.14.x because it could not honestly represent multi-workflow runs (nested execution, heterogeneous callbacks). Use `metadata.workflows` instead. `EvalConfig.workflow` (the scheduling input) is unchanged.
 
 ### `EvalSummary`
 

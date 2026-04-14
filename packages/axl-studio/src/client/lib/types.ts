@@ -192,6 +192,7 @@ export type EvalHistoryEntry = {
 /** Health check response */
 export type HealthData = {
   status: string;
+  readOnly: boolean;
   workflows: number;
   agents: number;
   tools: number;

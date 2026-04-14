@@ -8,6 +8,7 @@ import {
   scoreColorClass,
   scoreTextColor,
   getResultModels,
+  getResultWorkflows,
   formatModelName,
   aggregateGroupTokens,
   aggregateGroupCost,
@@ -283,18 +284,51 @@ export function EvalCompareView({
           baselineRuns && baselineRuns.length > 0 ? baselineRuns : baseline ? [baseline] : [];
         const cSources =
           candidateRuns && candidateRuns.length > 0 ? candidateRuns : candidate ? [candidate] : [];
+        // Aggregate workflows across all runs in a group (parallel to models).
+        // A group from `--runs N` usually has one workflow per side, but custom
+        // callbacks could produce heterogeneous groups so we union.
+        const collectWorkflows = (
+          single: EvalResultData | null,
+          runs?: EvalResultData[] | null,
+        ): string[] => {
+          const sources = runs && runs.length > 0 ? runs : single ? [single] : [];
+          const seen = new Set<string>();
+          const ordered: string[] = [];
+          for (const r of sources) {
+            for (const w of getResultWorkflows(r)) {
+              if (!seen.has(w)) {
+                seen.add(w);
+                ordered.push(w);
+              }
+            }
+          }
+          return ordered;
+        };
+
         const baselineModels = collectModels(baseline, baselineRuns);
         const candidateModels = collectModels(candidate, candidateRuns);
+        const baselineWorkflows = collectWorkflows(baseline, baselineRuns);
+        const candidateWorkflows = collectWorkflows(candidate, candidateRuns);
         const baselineTokens = aggregateGroupTokens(bSources);
         const candidateTokens = aggregateGroupTokens(cSources);
         const bTotal = baselineTokens.input + baselineTokens.output + baselineTokens.reasoning;
         const cTotal = candidateTokens.input + candidateTokens.output + candidateTokens.reasoning;
         const bCost = aggregateGroupCost(bSources);
         const cCost = aggregateGroupCost(cSources);
+
+        const hasWorkflow = baselineWorkflows.length > 0 || candidateWorkflows.length > 0;
+        // "changed" = the two sets of workflow names differ. Any diff — added,
+        // removed, or replaced — counts as changed.
+        const baselineWorkflowSet = new Set(baselineWorkflows);
+        const candidateWorkflowSet = new Set(candidateWorkflows);
+        const workflowChanged =
+          baselineWorkflowSet.size !== candidateWorkflowSet.size ||
+          baselineWorkflows.some((w) => !candidateWorkflowSet.has(w));
+
         const hasModels = baselineModels.length > 0 || candidateModels.length > 0;
         const hasTokens = bTotal > 0 && cTotal > 0;
         const hasCost = bCost > 0 || cCost > 0;
-        if (!hasModels && !hasTokens && !hasCost) return null;
+        if (!hasWorkflow && !hasModels && !hasTokens && !hasCost) return null;
         const baselineSet = new Set(baselineModels);
         const candidateSet = new Set(candidateModels);
         const modelsChanged =
@@ -303,8 +337,59 @@ export function EvalCompareView({
         const tokenDeltaPct = bTotal > 0 ? ((cTotal - bTotal) / bTotal) * 100 : 0;
         return (
           <div className="flex items-center gap-3 px-4 py-2.5 rounded-lg bg-[hsl(var(--muted))]/50 text-xs flex-wrap">
+            {hasWorkflow && (
+              <>
+                <span className="text-[hsl(var(--muted-foreground))] uppercase tracking-wider text-[10px] font-medium shrink-0">
+                  {baselineWorkflows.length > 1 || candidateWorkflows.length > 1
+                    ? 'Workflows'
+                    : 'Workflow'}
+                </span>
+                <div className="flex items-center gap-1.5">
+                  {baselineWorkflows.length > 0 ? (
+                    baselineWorkflows.map((w) => (
+                      <span
+                        key={w}
+                        className="px-1.5 py-0.5 rounded border border-[hsl(var(--border))] bg-[hsl(var(--background))] font-mono"
+                        title={w}
+                      >
+                        {w}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="text-[hsl(var(--muted-foreground))] italic">unknown</span>
+                  )}
+                </div>
+                <span className="text-[hsl(var(--muted-foreground))]">{'\u2192'}</span>
+                <div className="flex items-center gap-1.5">
+                  {candidateWorkflows.length > 0 ? (
+                    candidateWorkflows.map((w) => (
+                      <span
+                        key={w}
+                        className={cn(
+                          'px-1.5 py-0.5 rounded font-mono',
+                          workflowChanged
+                            ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300'
+                            : 'border border-[hsl(var(--border))] bg-[hsl(var(--background))]',
+                        )}
+                        title={w}
+                      >
+                        {w}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="text-[hsl(var(--muted-foreground))] italic">unknown</span>
+                  )}
+                </div>
+                {workflowChanged && (
+                  <span className="text-[10px] font-medium text-blue-600 dark:text-blue-400">
+                    changed
+                  </span>
+                )}
+              </>
+            )}
             {hasModels && (
               <>
+                {hasWorkflow && <span className="text-[hsl(var(--border))]">|</span>}
                 <span className="text-[hsl(var(--muted-foreground))] uppercase tracking-wider text-[10px] font-medium shrink-0">
                   Models
                 </span>

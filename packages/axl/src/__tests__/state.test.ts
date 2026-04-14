@@ -356,6 +356,25 @@ describe('MemoryStore', () => {
       expect(list).toHaveLength(1);
       expect(list[0].id).toBe('ev2');
     });
+
+    it('deleteEvalResult removes the entry and returns true', async () => {
+      const store = new MemoryStore();
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: {} });
+      await store.saveEvalResult({ id: 'ev2', eval: 'test', timestamp: 2000, data: {} });
+
+      const deleted = await store.deleteEvalResult('ev1');
+      expect(deleted).toBe(true);
+
+      const list = await store.listEvalResults();
+      expect(list).toHaveLength(1);
+      expect(list[0].id).toBe('ev2');
+    });
+
+    it('deleteEvalResult returns false for unknown id', async () => {
+      const store = new MemoryStore();
+      const deleted = await store.deleteEvalResult('does-not-exist');
+      expect(deleted).toBe(false);
+    });
   });
 });
 
@@ -712,6 +731,23 @@ describe('SQLiteStore', () => {
       expect(list[0].id).toBe('ev2');
       store.close();
     });
+
+    it('deleteEvalResult removes the row and returns true', async () => {
+      const store = createStore();
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: {} });
+      await store.saveEvalResult({ id: 'ev2', eval: 'test', timestamp: 2000, data: {} });
+
+      expect(await store.deleteEvalResult('ev1')).toBe(true);
+      const list = await store.listEvalResults();
+      expect(list.map((e) => e.id)).toEqual(['ev2']);
+      store.close();
+    });
+
+    it('deleteEvalResult returns false for unknown id', async () => {
+      const store = createStore();
+      expect(await store.deleteEvalResult('does-not-exist')).toBe(false);
+      store.close();
+    });
   });
 });
 
@@ -1061,6 +1097,39 @@ describe('RedisStore', () => {
       expect(pending).toContain('exec-1');
       expect(pending).not.toContain('exec-2');
       expect(pending).toContain('exec-3');
+    });
+  });
+
+  describe('eval history', () => {
+    it('saveEvalResult + listEvalResults round-trip', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: { score: 1 } });
+      await store.saveEvalResult({
+        id: 'ev2',
+        eval: 'test',
+        timestamp: 2000,
+        data: { score: 0.5 },
+      });
+
+      const list = await store.listEvalResults();
+      expect(list).toHaveLength(2);
+      expect(list[0].id).toBe('ev2'); // newest first
+      expect(list[1].data).toEqual({ score: 1 });
+    });
+
+    it('deleteEvalResult removes the entry and returns true', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1000, data: {} });
+      await store.saveEvalResult({ id: 'ev2', eval: 'test', timestamp: 2000, data: {} });
+
+      expect(await store.deleteEvalResult('ev1')).toBe(true);
+      const list = await store.listEvalResults();
+      expect(list.map((e) => e.id)).toEqual(['ev2']);
+    });
+
+    it('deleteEvalResult returns false for unknown id', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      expect(await store.deleteEvalResult('does-not-exist')).toBe(false);
     });
   });
 });

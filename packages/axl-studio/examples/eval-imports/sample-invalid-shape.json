@@ -1,0 +1,4 @@
+{
+  "note": "This file is intentionally NOT an EvalResult — it's missing the required items/summary/dataset fields. Importing it should produce a clear server-side validation error (400 BAD_REQUEST), rendered in the global error banner.",
+  "some_other_data": "hello world"
+}

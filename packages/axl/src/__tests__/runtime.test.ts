@@ -1643,4 +1643,66 @@ describe('trackExecution()', () => {
 
     expect(cost).toBeCloseTo(0.07);
   });
+
+  it('captures workflow names from workflow_start trace events', async () => {
+    const provider = new TestProvider([{ content: 'done', cost: 0.01 }]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+    const wf = workflow({
+      name: 'my-workflow',
+      input: z.object({ prompt: z.string() }),
+      handler: async (ctx) => ctx.ask(testAgent, ctx.input.prompt),
+    });
+    runtime.register(wf);
+
+    const { metadata } = await runtime.trackExecution(async () => {
+      return runtime.execute('my-workflow', { prompt: 'hello' });
+    });
+
+    expect(metadata.workflows).toEqual(['my-workflow']);
+    expect(metadata.workflowCallCounts).toEqual({ 'my-workflow': 1 });
+  });
+
+  it('captures multiple workflow names from repeated execute() calls', async () => {
+    const provider = new TestProvider([
+      { content: 'a', cost: 0.01 },
+      { content: 'b', cost: 0.02 },
+    ]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+    runtime.register(
+      workflow({
+        name: 'wf-a',
+        input: z.string(),
+        handler: async (ctx) => ctx.ask(testAgent, ctx.input),
+      }),
+    );
+    runtime.register(
+      workflow({
+        name: 'wf-b',
+        input: z.string(),
+        handler: async (ctx) => ctx.ask(testAgent, ctx.input),
+      }),
+    );
+
+    const { metadata } = await runtime.trackExecution(async () => {
+      await runtime.execute('wf-a', 'first');
+      return runtime.execute('wf-b', 'second');
+    });
+
+    // Insertion order: wf-a first, wf-b second.
+    expect(metadata.workflows).toEqual(['wf-a', 'wf-b']);
+    expect(metadata.workflowCallCounts).toEqual({ 'wf-a': 1, 'wf-b': 1 });
+  });
+
+  it('returns empty workflows array when no workflow_start events occur', async () => {
+    const { runtime } = createRuntime();
+
+    const { metadata } = await runtime.trackExecution(async () => {
+      return 'pure-computation';
+    });
+
+    expect(metadata.workflows).toEqual([]);
+    expect(metadata.workflowCallCounts).toBeUndefined();
+  });
 });

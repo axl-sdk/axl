@@ -9,7 +9,7 @@ import { errorHandler } from './middleware/error-handler.js';
 import { ConnectionManager } from './ws/connection-manager.js';
 import { createWsHandlers } from './ws/handler.js';
 import { CostAggregator } from './cost-aggregator.js';
-import healthRoutes from './routes/health.js';
+import { createHealthRoutes } from './routes/health.js';
 import { createWorkflowRoutes } from './routes/workflows.js';
 import executionRoutes from './routes/executions.js';
 import { createSessionRoutes } from './routes/sessions.js';
@@ -58,18 +58,23 @@ export function createServer(options: CreateServerOptions) {
 
   // ── Read-only mode ──────────────────────────────────────────────────
   if (readOnly) {
-    const blocked = [
-      'POST /api/workflows',
-      'POST /api/executions',
-      'POST /api/sessions',
-      'DELETE /api/sessions',
-      'PUT /api/memory',
-      'DELETE /api/memory',
-      'POST /api/decisions',
-      'POST /api/costs',
-      'POST /api/tools',
-      'POST /api/evals',
-      'POST /api/playground',
+    // Patterns must be precise: POST /api/evals/compare is pure computation
+    // and must remain allowed, but POST /api/evals/:name/run mutates history.
+    const blocked: RegExp[] = [
+      /^POST \/api\/workflows(\/|$)/,
+      /^POST \/api\/executions(\/|$)/,
+      /^POST \/api\/sessions(\/|$)/,
+      /^DELETE \/api\/sessions(\/|$)/,
+      /^PUT \/api\/memory(\/|$)/,
+      /^DELETE \/api\/memory(\/|$)/,
+      /^POST \/api\/decisions(\/|$)/,
+      /^POST \/api\/costs(\/|$)/,
+      /^POST \/api\/tools(\/|$)/,
+      /^POST \/api\/evals\/import$/,
+      /^POST \/api\/evals\/[^/]+\/run$/,
+      /^POST \/api\/evals\/[^/]+\/rescore$/,
+      /^DELETE \/api\/evals\/history\/[^/]+$/,
+      /^POST \/api\/playground(\/|$)/,
     ];
     app.use('/api/*', async (c, next) => {
       // c.req.path returns the full path including any parent route prefix
@@ -78,7 +83,7 @@ export function createServer(options: CreateServerOptions) {
       const apiIdx = c.req.path.indexOf('/api/');
       const apiPath = apiIdx >= 0 ? c.req.path.slice(apiIdx) : c.req.path;
       const key = `${c.req.method} ${apiPath}`;
-      if (blocked.some((b) => key.startsWith(b))) {
+      if (blocked.some((re) => re.test(key))) {
         return c.json(
           {
             ok: false,
@@ -93,7 +98,7 @@ export function createServer(options: CreateServerOptions) {
 
   // ── API Routes ─────────────────────────────────────────────────────
   const api = new Hono<StudioEnv>();
-  api.route('/', healthRoutes);
+  api.route('/', createHealthRoutes(readOnly));
   api.route('/', createWorkflowRoutes(connMgr));
   api.route('/', executionRoutes);
   api.route('/', createSessionRoutes(connMgr));

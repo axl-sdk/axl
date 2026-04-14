@@ -136,9 +136,16 @@ describe('Eval E2E', () => {
     )) as EvalResult;
 
     expect(result.id).toBeTruthy();
-    expect(result.workflow).toBe('struct-test');
+    // Workflow now lives in metadata.workflows (trace-derived, with fallback
+    // to config.workflow when no traces were captured).
+    expect(result.metadata.workflows).toEqual(['struct-test']);
     expect(result.dataset).toBe('struct-dataset');
-    expect(result.metadata).toEqual({ version: '1.0', scorerTypes: { simple: 'deterministic' } });
+    expect(result.metadata).toEqual({
+      version: '1.0',
+      scorerTypes: { simple: 'deterministic' },
+      workflows: ['struct-test'],
+      workflowCounts: { 'struct-test': 1 },
+    });
     expect(result.timestamp).toBeTruthy();
     expect(typeof result.duration).toBe('number');
     expect(typeof result.totalCost).toBe('number');
@@ -512,7 +519,6 @@ export async function executeWorkflow(input) {
       // so legacy threshold (0.1) is used by default
       const makeResult = (id: string, scores: number[]): EvalResult => ({
         id,
-        workflow: 'threshold-test',
         dataset: 'threshold-ds',
         metadata: {},
         timestamp: new Date().toISOString(),

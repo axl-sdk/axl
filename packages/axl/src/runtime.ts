@@ -862,6 +862,30 @@ export class AxlRuntime extends EventEmitter {
     }
   }
 
+  /**
+   * Delete an eval history entry by id. Removes from in-memory cache and
+   * the configured StateStore. Returns true if an entry was actually removed.
+   *
+   * Ensures lazy-loaded history is loaded first so the in-memory cache and
+   * the store can't drift apart on the deletion path.
+   */
+  async deleteEvalResult(id: string): Promise<boolean> {
+    // Force a lazy-load so the in-memory cache reflects everything in the
+    // store before we mutate it.
+    await this.getEvalHistory();
+
+    const beforeLength = this.evalHistory.length;
+    this.evalHistory = this.evalHistory.filter((e) => e.id !== id);
+    const removedFromMemory = this.evalHistory.length < beforeLength;
+
+    let removedFromStore = false;
+    if (this.stateStore.deleteEvalResult) {
+      removedFromStore = await this.stateStore.deleteEvalResult(id);
+    }
+
+    return removedFromMemory || removedFromStore;
+  }
+
   /** Get eval result history (most recent first). */
   async getEvalHistory(): Promise<EvalHistoryEntry[]> {
     // Lazy-load from store on first access (once-guard)
@@ -1085,6 +1109,15 @@ export class AxlRuntime extends EventEmitter {
       modelCallCounts?: Record<string, number>;
       tokens: { input: number; output: number; reasoning: number };
       agentCalls: number;
+      /**
+       * Unique workflow names observed during execution, ordered by first
+       * appearance (outermost first for nested calls). Captured automatically
+       * from `workflow_start` trace events — callers don't need to declare
+       * anything. Parallel mechanism to `models`.
+       */
+      workflows: string[];
+      /** Call counts per workflow, if workflows.length > 0. */
+      workflowCallCounts?: Record<string, number>;
     };
   }> {
     const parentScope = costScopeStorage.getStore();
@@ -1095,6 +1128,10 @@ export class AxlRuntime extends EventEmitter {
     };
 
     const modelCalls = new Map<string, number>();
+    // Insertion-ordered Map: first time we see a workflow it gets added at
+    // the end, so iteration order is "first-seen first" — which for nested
+    // workflow calls puts the outermost workflow first.
+    const workflowCalls = new Map<string, number>();
     const tokens = { input: 0, output: 0, reasoning: 0 };
     let agentCalls = 0;
 
@@ -1109,6 +1146,23 @@ export class AxlRuntime extends EventEmitter {
           tokens.output += event.tokens.output ?? 0;
           tokens.reasoning += event.tokens.reasoning ?? 0;
         }
+      }
+      // The production runtime emits workflow_start via ctx.log('workflow_start', ...),
+      // which produces a TraceEvent with type: 'log' and the event name + workflow
+      // nested in data. We also defensively handle the directly-typed shape
+      // (type: 'workflow_start') in case the runtime ever switches to direct
+      // emission — the TraceEvent type union already permits it.
+      let workflowName: string | undefined;
+      if (event.type === 'workflow_start' && event.workflow) {
+        workflowName = event.workflow;
+      } else if (event.type === 'log' && event.data && typeof event.data === 'object') {
+        const d = event.data as { event?: unknown; workflow?: unknown };
+        if (d.event === 'workflow_start' && typeof d.workflow === 'string') {
+          workflowName = d.workflow;
+        }
+      }
+      if (workflowName) {
+        workflowCalls.set(workflowName, (workflowCalls.get(workflowName) ?? 0) + 1);
       }
     };
 
@@ -1125,6 +1179,9 @@ export class AxlRuntime extends EventEmitter {
           modelCallCounts: modelCalls.size > 0 ? Object.fromEntries(modelCalls) : undefined,
           tokens,
           agentCalls,
+          workflows: [...workflowCalls.keys()],
+          workflowCallCounts:
+            workflowCalls.size > 0 ? Object.fromEntries(workflowCalls) : undefined,
         },
       };
     } finally {

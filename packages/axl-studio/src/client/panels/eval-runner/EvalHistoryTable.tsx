@@ -1,10 +1,12 @@
 import { Fragment, useMemo, useState } from 'react';
-import { ChevronDown, ChevronRight, Layers, ArrowRight } from 'lucide-react';
+import { ChevronDown, ChevronRight, Layers, ArrowRight, Download, Trash2 } from 'lucide-react';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
 import {
   scoreTextColor,
   getResultModels,
   getResultModelCounts,
+  getResultWorkflows,
+  getResultWorkflowCounts,
   formatModelName,
   aggregateGroupModelCounts,
 } from './types';
@@ -18,6 +20,20 @@ type Props = {
   onSelect: (data: EvalResultData) => void;
   onSelectGroup?: (entries: EvalHistoryEntry[]) => void;
   onRescore?: (evalName: string, resultId: string) => void;
+  onDelete?: (entry: EvalHistoryEntry) => void;
+  /**
+   * Set of eval names registered with the runtime. Entries whose `eval` field
+   * isn't in this set (imported CLI artifacts with unknown eval names) have
+   * their Rescore button disabled — rescore requires a matching registered
+   * eval config server-side.
+   */
+  registeredEvalNames?: Set<string>;
+  /**
+   * Disable all mutating actions (Rescore, Delete) with an explanatory tooltip.
+   * Server-side the endpoints are also blocked, but hiding/disabling in the UI
+   * avoids the user clicking and getting a confusing 405 error.
+   */
+  readOnly?: boolean;
   expandedGroups: Set<string>;
   onToggleGroup: (groupId: string) => void;
 };
@@ -85,6 +101,35 @@ function computeGroupStats(entries: EvalHistoryEntry[]): GroupStats {
   return { scorers, overall };
 }
 
+function exportEntry(entry: EvalHistoryEntry) {
+  // Build a stable, useful filename: <eval-name>-<short-id>-<YYYYMMDDTHHMMSS>.json.
+  // The eval name and short id make the artifact identifiable; the timestamp
+  // includes hours/minutes/seconds so two same-day exports of the same eval
+  // don't collide on disk and so files sort chronologically in a Downloads
+  // folder. We strip the ISO punctuation (`-`, `:`, `.`, milliseconds) for a
+  // filesystem-friendly form.
+  const safeEval = entry.eval.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'eval';
+  const shortId = entry.id.slice(0, 8);
+  const stamp = new Date(entry.timestamp)
+    .toISOString()
+    .replace(/[-:]/g, '')
+    .replace(/\.\d{3}Z$/, 'Z');
+  const filename = `${safeEval}-${shortId}-${stamp}.json`;
+
+  const json = JSON.stringify(entry.data, null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Defer revoke until after the click handler completes so the browser
+  // has a chance to start the download.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 export function EvalHistoryTable({
   history,
   evalFilter,
@@ -92,6 +137,9 @@ export function EvalHistoryTable({
   onSelect,
   onSelectGroup,
   onRescore,
+  onDelete,
+  registeredEvalNames,
+  readOnly,
   expandedGroups,
   onToggleGroup,
 }: Props) {
@@ -182,12 +230,36 @@ export function EvalHistoryTable({
           onClick={() => setExpandedEntryId(isExpanded ? null : entry.id)}
         >
           <td className={cn('px-3 py-2.5 font-mono', isChild && 'pl-9')}>
-            <span className="inline-flex items-center gap-1.5">
-              {isChild && (
-                <span className="inline-block w-1 h-3 mr-0.5 rounded-sm bg-[hsl(var(--border))]" />
-              )}
-              {entry.eval}
-            </span>
+            <div className="flex flex-col gap-0.5">
+              <span className="inline-flex items-center gap-1.5">
+                {isChild && (
+                  <span className="inline-block w-1 h-3 mr-0.5 rounded-sm bg-[hsl(var(--border))]" />
+                )}
+                {entry.eval}
+              </span>
+              {/* Workflow subtitle. Shows every workflow observed during the run
+                  (trace-derived from metadata.workflows), joined with " · ".
+                  Hidden if the only workflow matches the eval name — that's
+                  the imported-CLI case where we derived the eval name from the
+                  workflow and rendering it twice would be noise. */}
+              {(() => {
+                const workflows = getResultWorkflows(data);
+                if (workflows.length === 0) return null;
+                if (workflows.length === 1 && workflows[0] === entry.eval) return null;
+                const counts = getResultWorkflowCounts(data);
+                const title = counts
+                  ? `Workflows: ${workflows.map((w) => `${w} (${counts[w] ?? '?'} calls)`).join(', ')}`
+                  : `Workflows: ${workflows.join(', ')}`;
+                return (
+                  <span
+                    className="text-[10px] font-normal text-[hsl(var(--muted-foreground))] truncate max-w-[240px]"
+                    title={title}
+                  >
+                    {workflows.join(' \u00b7 ')}
+                  </span>
+                );
+              })()}
+            </div>
           </td>
           <td className="px-3 py-2.5">
             {(() => {
@@ -287,12 +359,18 @@ export function EvalHistoryTable({
                           {data.dataset}
                         </span>
                       </span>
-                      <span>
-                        Workflow:{' '}
-                        <span className="font-medium text-[hsl(var(--foreground))]">
-                          {data.workflow}
-                        </span>
-                      </span>
+                      {(() => {
+                        const workflows = getResultWorkflows(data);
+                        if (workflows.length === 0) return null;
+                        return (
+                          <span>
+                            {workflows.length > 1 ? 'Workflows' : 'Workflow'}:{' '}
+                            <span className="font-medium text-[hsl(var(--foreground))]">
+                              {workflows.join(', ')}
+                            </span>
+                          </span>
+                        );
+                      })()}
                       {(() => {
                         const models = getResultModels(data);
                         if (models.length === 0) return null;
@@ -368,16 +446,69 @@ export function EvalHistoryTable({
                       )}
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
-                      {onRescore && (
+                      {onRescore &&
+                        (() => {
+                          const evalRegistered =
+                            !registeredEvalNames || registeredEvalNames.has(entry.eval);
+                          const canRescore = evalRegistered && !readOnly;
+                          const reason = readOnly
+                            ? 'Rescore unavailable — Studio is mounted in read-only mode.'
+                            : !evalRegistered
+                              ? `Rescore unavailable — no registered eval named "${entry.eval}". ` +
+                                'Imported CLI artifacts can only be rescored when the runtime has a matching registered eval config.'
+                              : 'Re-run scorers on saved outputs without re-executing the workflow';
+                          return (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (canRescore) onRescore(entry.eval, entry.id);
+                              }}
+                              disabled={!canRescore}
+                              className={cn(
+                                'px-2.5 py-1 text-[10px] font-medium rounded border border-[hsl(var(--input))] transition-colors',
+                                canRescore
+                                  ? 'hover:bg-[hsl(var(--accent))] cursor-pointer'
+                                  : 'opacity-40 cursor-not-allowed',
+                              )}
+                              title={reason}
+                            >
+                              Rescore
+                            </button>
+                          );
+                        })()}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          exportEntry(entry);
+                        }}
+                        className="p-1 rounded border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))] cursor-pointer transition-colors"
+                        title={`Export this result as JSON (${entry.eval}-${entry.id.slice(0, 8)}-...json)`}
+                        aria-label="Export result as JSON"
+                      >
+                        <Download size={12} />
+                      </button>
+                      {onDelete && (
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            onRescore(entry.eval, entry.id);
+                            if (readOnly) return;
+                            onDelete(entry);
                           }}
-                          className="px-2.5 py-1 text-[10px] font-medium rounded border border-[hsl(var(--input))] hover:bg-[hsl(var(--accent))] transition-colors cursor-pointer"
-                          title="Re-run scorers on saved outputs without re-executing the workflow"
+                          disabled={readOnly}
+                          className={cn(
+                            'p-1 rounded border border-[hsl(var(--input))] transition-colors',
+                            readOnly
+                              ? 'opacity-40 cursor-not-allowed'
+                              : 'hover:bg-red-50 hover:border-red-200 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:border-red-900 dark:hover:text-red-400 cursor-pointer',
+                          )}
+                          title={
+                            readOnly
+                              ? 'Delete unavailable — Studio is mounted in read-only mode.'
+                              : 'Delete this history entry'
+                          }
+                          aria-label="Delete history entry"
                         >
-                          Rescore
+                          <Trash2 size={12} />
                         </button>
                       )}
                       <button
@@ -489,12 +620,40 @@ export function EvalHistoryTable({
                         onClick={() => onToggleGroup(row.groupId)}
                       >
                         <td className="px-3 py-2.5 font-mono">
-                          <span className="inline-flex items-center gap-1.5">
-                            <span className="shrink-0 p-0.5 -m-0.5">
-                              {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                          <div className="flex flex-col gap-0.5">
+                            <span className="inline-flex items-center gap-1.5">
+                              <span className="shrink-0 p-0.5 -m-0.5">
+                                {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                              </span>
+                              {row.evalName}
                             </span>
-                            {row.evalName}
-                          </span>
+                            {/* Aggregate workflows across every run in the group.
+                                Normally all runs in a --runs N group share a workflow,
+                                but custom callbacks could produce heterogeneous groups
+                                so we union them. */}
+                            {(() => {
+                              const seen = new Set<string>();
+                              const ordered: string[] = [];
+                              for (const e of row.entries) {
+                                for (const w of getResultWorkflows(e.data as EvalResultData)) {
+                                  if (!seen.has(w)) {
+                                    seen.add(w);
+                                    ordered.push(w);
+                                  }
+                                }
+                              }
+                              if (ordered.length === 0) return null;
+                              if (ordered.length === 1 && ordered[0] === row.evalName) return null;
+                              return (
+                                <span
+                                  className="text-[10px] font-normal text-[hsl(var(--muted-foreground))] truncate max-w-[240px] pl-[22px]"
+                                  title={`Workflows: ${ordered.join(', ')}`}
+                                >
+                                  {ordered.join(' \u00b7 ')}
+                                </span>
+                              );
+                            })()}
+                          </div>
                         </td>
                         <td className="px-3 py-2.5">
                           {(() => {

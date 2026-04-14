@@ -60,12 +60,17 @@ describe('runEval()', () => {
 
     expect(result.id).toBeDefined();
     expect(typeof result.id).toBe('string');
-    expect(result.workflow).toBe('math-solver');
+    // Workflow name now lives in metadata.workflows (list) — no top-level field.
+    expect(result.metadata.workflows).toEqual(['math-solver']);
     expect(result.dataset).toBe('test-ds');
     expect(result.timestamp).toBeDefined();
     expect(result.totalCost).toBeGreaterThanOrEqual(0);
     expect(result.duration).toBeGreaterThanOrEqual(0);
-    expect(result.metadata).toEqual({ scorerTypes: { exact: 'deterministic' } });
+    expect(result.metadata).toEqual({
+      scorerTypes: { exact: 'deterministic' },
+      workflows: ['math-solver'],
+      workflowCounts: { 'math-solver': 3 },
+    });
     expect(result.items).toBeInstanceOf(Array);
     expect(result.summary).toBeDefined();
     expect(result.summary.count).toBe(3);
@@ -191,6 +196,9 @@ describe('runEval()', () => {
       version: '1.0',
       model: 'gpt-4',
       scorerTypes: { exact: 'deterministic' },
+      // Config-supplied workflow surfaces via metadata.workflows fallback.
+      workflows: ['test'],
+      workflowCounts: { test: 3 },
     });
   });
 
@@ -1261,5 +1269,177 @@ describe('runEval()', () => {
     for (const item of result.items) {
       expect(item.metadata).toBeUndefined();
     }
+  });
+
+  // --- Workflow derivation from metadata ---
+
+  it('uses trace-derived workflows from item metadata over config.workflow', async () => {
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'a' } }, { input: { q: 'b' } }],
+    });
+    const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
+
+    // config.workflow says 'configured-name' but the callback's trace metadata
+    // reports an entirely different workflow actually ran.
+    const result = await runEval(
+      { workflow: 'configured-name', dataset: ds, scorers: [simpleScorer] },
+      async () => ({
+        output: 'out',
+        metadata: { workflows: ['actual-workflow'], workflowCallCounts: { 'actual-workflow': 1 } },
+      }),
+      mockRuntime,
+    );
+
+    // Observed workflow wins over config.workflow. There is no top-level
+    // workflow field anymore — consumers read metadata.workflows directly.
+    expect(result.metadata.workflows).toEqual(['actual-workflow']);
+    const counts = result.metadata.workflowCounts as Record<string, number>;
+    expect(counts['actual-workflow']).toBe(2);
+  });
+
+  it('surfaces multiple workflows when items use different ones', async () => {
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'a' } }, { input: { q: 'b' } }, { input: { q: 'c' } }],
+    });
+    const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
+
+    let callCount = 0;
+    const result = await runEval(
+      { workflow: 'fallback', dataset: ds, scorers: [simpleScorer] },
+      async () => {
+        callCount++;
+        // Item 1 + 2 run wf-a, item 3 runs wf-b
+        const wf = callCount <= 2 ? 'wf-a' : 'wf-b';
+        return {
+          output: 'out',
+          metadata: { workflows: [wf], workflowCallCounts: { [wf]: 1 } },
+        };
+      },
+      mockRuntime,
+    );
+
+    // Both observed workflows appear in metadata.workflows, sorted by call
+    // count descending (most-called first).
+    expect(result.metadata.workflows).toEqual(['wf-a', 'wf-b']);
+    const counts = result.metadata.workflowCounts as Record<string, number>;
+    expect(counts).toEqual({ 'wf-a': 2, 'wf-b': 1 });
+  });
+
+  it('surfaces nested workflows from a single callback call', async () => {
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'a' } }],
+    });
+    const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
+
+    // One item, one callback call, but nested execution touched two workflows.
+    const result = await runEval(
+      { workflow: 'fallback', dataset: ds, scorers: [simpleScorer] },
+      async () => ({
+        output: 'out',
+        metadata: {
+          workflows: ['outer', 'inner'],
+          workflowCallCounts: { outer: 1, inner: 1 },
+        },
+      }),
+      mockRuntime,
+    );
+
+    // Both nested workflows surface. Insertion order from the callback's
+    // metadata is preserved when call counts are equal.
+    expect(result.metadata.workflows).toEqual(['outer', 'inner']);
+  });
+
+  it('falls back to config.workflow when no trace metadata is provided', async () => {
+    const ds = dataset({
+      name: 'ds',
+      schema: z.object({ q: z.string() }),
+      items: [{ input: { q: 'a' } }],
+    });
+    const simpleScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
+
+    // Callback returns no workflow metadata at all — simulates an old caller
+    // that doesn't use trackExecution.
+    const result = await runEval(
+      { workflow: 'config-only', dataset: ds, scorers: [simpleScorer] },
+      async () => ({ output: 'out' }),
+      mockRuntime,
+    );
+
+    // Fallback: with no trace metadata, config.workflow still populates
+    // metadata.workflows so the field is always present when config has one.
+    expect(result.metadata.workflows).toEqual(['config-only']);
+    expect(result.metadata.workflowCounts).toEqual({ 'config-only': 1 });
+  });
+});
+
+describe('rescore() backward compatibility', () => {
+  it('migrates legacy top-level workflow into metadata.workflows', async () => {
+    // Pre-0.14 EvalResult artifact: top-level `workflow` field, no metadata.workflows.
+    // Importing such an artifact and rescoring it should preserve workflow attribution
+    // by migrating the legacy field into the modern shape on the rescored result.
+    const { rescore } = await import('../rescore.js');
+    const legacyResult = {
+      id: 'legacy-id',
+      workflow: 'legacy-wf', // pre-0.14 field
+      dataset: 'ds',
+      metadata: {} as Record<string, unknown>,
+      timestamp: new Date().toISOString(),
+      totalCost: 0.01,
+      duration: 100,
+      items: [
+        { input: { q: 'a' }, output: 'out-a', scores: { pass: 1 } },
+        { input: { q: 'b' }, output: 'out-b', scores: { pass: 1 } },
+      ],
+      summary: {
+        count: 2,
+        failures: 0,
+        scorers: { pass: { mean: 1, min: 1, max: 1, p50: 1, p95: 1 } },
+      },
+    } as unknown as Parameters<typeof rescore>[0];
+
+    const passScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
+    const rescored = await rescore(legacyResult, [passScorer], mockRuntime);
+
+    // Legacy workflow migrated forward into the modern shape.
+    expect(rescored.metadata.workflows).toEqual(['legacy-wf']);
+    expect(rescored.metadata.workflowCounts).toEqual({ 'legacy-wf': 2 });
+    // Other rescore semantics still hold.
+    expect(rescored.metadata.rescored).toBe(true);
+    expect(rescored.metadata.originalId).toBe('legacy-id');
+  });
+
+  it('preserves modern metadata.workflows through rescore', async () => {
+    // Modern artifact: workflow lives in metadata.workflows. Rescore should
+    // pass it through via the existing ...rest spread without touching it.
+    const { rescore } = await import('../rescore.js');
+    const modernResult = {
+      id: 'modern-id',
+      dataset: 'ds',
+      metadata: {
+        workflows: ['wf-a', 'wf-b'],
+        workflowCounts: { 'wf-a': 3, 'wf-b': 1 },
+      } as Record<string, unknown>,
+      timestamp: new Date().toISOString(),
+      totalCost: 0.01,
+      duration: 100,
+      items: [{ input: { q: 'a' }, output: 'o', scores: { pass: 1 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: { pass: { mean: 1, min: 1, max: 1, p50: 1, p95: 1 } },
+      },
+    } as unknown as Parameters<typeof rescore>[0];
+
+    const passScorer = scorer({ name: 'pass', description: 'pass', score: () => 1 });
+    const rescored = await rescore(modernResult, [passScorer], mockRuntime);
+
+    expect(rescored.metadata.workflows).toEqual(['wf-a', 'wf-b']);
+    expect(rescored.metadata.workflowCounts).toEqual({ 'wf-a': 3, 'wf-b': 1 });
   });
 });

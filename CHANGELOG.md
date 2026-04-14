@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-04-14
+
 ### Breaking changes
 
 - **Eval:** `EvalResult.workflow` (top-level single-string field) has been **removed**. Workflow names now live exclusively in `EvalResult.metadata.workflows: string[]` alongside `metadata.workflowCounts: Record<string, number>`, parallel to how `metadata.models` / `metadata.modelCounts` already work. This is a deliberate consolidation: workflow is execution metadata (what ran), not a definitional property of the eval (what the eval *is*), and the previous single-string field couldn't honestly represent multi-workflow runs.

@@ -1,16 +1,27 @@
 import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
+import type { ConnectionManager } from '../ws/connection-manager.js';
 import type { EvalResult, Scorer } from '@axlsdk/eval';
+import { redactEvalHistoryList, redactEvalResult } from '../redact.js';
 
-export function createEvalRoutes(evalLoader?: () => Promise<void>) {
+export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => Promise<void>) {
   const app = new Hono<StudioEnv>();
+
+  // Active streaming eval runs, keyed by evalRunId. Scoped per-middleware
+  // instance so multiple `createStudioMiddleware()` mounts in the same process
+  // (multi-tenant deployments, concurrent unit tests) don't collide on run IDs
+  // or leak AbortControllers across middleware lifecycles.
+  const activeRuns = new Map<string, AbortController>();
 
   // List registered eval configs
   app.get('/evals', async (c) => {
     if (evalLoader) await evalLoader();
     const runtime = c.get('runtime');
     const evals = runtime.getRegisteredEvals();
+    // Registered eval configs contain dataset definitions — the dataset
+    // `.getItems()` contents aren't serialized in this response (we just
+    // return names + scorer list), so there's no raw content to scrub.
     return c.json({ ok: true, data: evals });
   });
 
@@ -18,7 +29,10 @@ export function createEvalRoutes(evalLoader?: () => Promise<void>) {
   app.get('/evals/history', async (c) => {
     const runtime = c.get('runtime');
     const history = await runtime.getEvalHistory();
-    return c.json({ ok: true, data: history });
+    return c.json({
+      ok: true,
+      data: redactEvalHistoryList(history, runtime.isRedactEnabled()),
+    });
   });
 
   // Delete a single eval history entry by id.
@@ -38,7 +52,14 @@ export function createEvalRoutes(evalLoader?: () => Promise<void>) {
     return c.json({ ok: true, data: { id, deleted: true } });
   });
 
-  // Run a registered eval by name (supports optional multi-run via { runs: N })
+  // Run a registered eval by name.
+  //
+  // Body options:
+  //   runs?: number  — multi-run count (capped at 25)
+  //   stream?: true  — return evalRunId immediately, broadcast progress via WS
+  //
+  // When stream is false/absent, the endpoint blocks until the eval completes
+  // and returns the full result (backward compatible).
   app.post('/evals/:name/run', async (c) => {
     if (evalLoader) await evalLoader();
     const runtime = c.get('runtime');
@@ -53,15 +74,105 @@ export function createEvalRoutes(evalLoader?: () => Promise<void>) {
     }
 
     let runs = 1;
+    let stream = false;
     try {
       const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
       if (typeof body.runs === 'number' && Number.isFinite(body.runs) && body.runs > 1) {
         runs = Math.min(Math.floor(body.runs), 25);
       }
+      if (body.stream === true) {
+        stream = true;
+      }
     } catch {
-      // No body or invalid body — single run
+      // No body or invalid body — single run, synchronous
     }
 
+    // ── Streaming mode ─────────────────────────────────────────────
+    if (stream) {
+      const evalRunId = `eval-${randomUUID()}`;
+      const ac = new AbortController();
+      activeRuns.set(evalRunId, ac);
+
+      // Fire-and-forget async execution with WS progress broadcasting.
+      //
+      // NOTE on the done event shape: we deliberately broadcast only a
+      // pointer (`evalResultId`, optional `runGroupId`) instead of the
+      // full `EvalResult`. A real eval result with ~12 items, per-item
+      // score details, and metadata easily exceeds 64KB, which is our
+      // WS frame budget. When we previously embedded the whole result,
+      // `truncateIfOversized` replaced it with a `{__truncated}` stub
+      // and the client rendered a blank screen.
+      //
+      // Architecturally: WS events are for small notifications,
+      // `runRegisteredEval` already persists results to history via the
+      // StateStore, and the client can fetch the full payload from
+      // `GET /api/evals/history` once notified. This matches the hint
+      // text that the truncation placeholder already used to emit.
+      (async () => {
+        try {
+          if (runs > 1) {
+            const runGroupId = randomUUID();
+            const results: EvalResult[] = [];
+
+            for (let r = 0; r < runs; r++) {
+              if (ac.signal.aborted) break;
+              const result = (await runtime.runRegisteredEval(name, {
+                metadata: { runGroupId, runIndex: r },
+                signal: ac.signal,
+                onProgress: (event) => {
+                  connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
+                    ...event,
+                    run: r + 1,
+                    totalRuns: runs,
+                  });
+                },
+              })) as EvalResult;
+              results.push(result);
+              connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
+                type: 'run_done',
+                run: r + 1,
+                totalRuns: runs,
+              });
+            }
+
+            if (results.length > 0) {
+              connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
+                type: 'done',
+                evalResultId: results[0].id,
+                runGroupId,
+              });
+            } else {
+              connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
+                type: 'error',
+                message: 'All runs were cancelled',
+              });
+            }
+          } else {
+            const result = (await runtime.runRegisteredEval(name, {
+              signal: ac.signal,
+              onProgress: (event) => {
+                connMgr.broadcastWithWildcard(`eval:${evalRunId}`, event);
+              },
+            })) as EvalResult;
+            connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
+              type: 'done',
+              evalResultId: result.id,
+            });
+          }
+        } catch (err) {
+          connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
+            type: 'error',
+            message: err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          activeRuns.delete(evalRunId);
+        }
+      })();
+
+      return c.json({ ok: true, data: { evalRunId } });
+    }
+
+    // ── Synchronous mode (backward compatible) ─────────────────────
     try {
       if (runs > 1) {
         const { aggregateRuns } = await import('@axlsdk/eval');
@@ -76,17 +187,41 @@ export function createEvalRoutes(evalLoader?: () => Promise<void>) {
         const typedResults = results as EvalResult[];
         const aggregate = aggregateRuns(typedResults);
         const first = typedResults[0]!;
-        const result = { ...first, _multiRun: { aggregate, allRuns: typedResults } };
-        return c.json({ ok: true, data: result });
+        const result = {
+          ...first,
+          _multiRun: { aggregate, allRuns: typedResults },
+        } as EvalResult;
+        return c.json({
+          ok: true,
+          data: redactEvalResult(result, runtime.isRedactEnabled()),
+        });
       } else {
         // Runtime persists eval result to history automatically
-        const result = await runtime.runRegisteredEval(name);
-        return c.json({ ok: true, data: result });
+        const result = (await runtime.runRegisteredEval(name)) as EvalResult;
+        return c.json({
+          ok: true,
+          data: redactEvalResult(result, runtime.isRedactEnabled()),
+        });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return c.json({ ok: false, error: { code: 'EVAL_ERROR', message } }, 400);
     }
+  });
+
+  // Cancel an active streaming eval run.
+  app.post('/evals/runs/:evalRunId/cancel', (c) => {
+    const evalRunId = c.req.param('evalRunId');
+    const ac = activeRuns.get(evalRunId);
+    if (!ac) {
+      return c.json(
+        { ok: false, error: { code: 'NOT_FOUND', message: 'No active eval run found' } },
+        404,
+      );
+    }
+    ac.abort();
+    activeRuns.delete(evalRunId);
+    return c.json({ ok: true, data: { cancelled: true } });
   });
 
   // Rescore: re-run scorers on saved outputs
@@ -134,7 +269,10 @@ export function createEvalRoutes(evalLoader?: () => Promise<void>) {
         timestamp: Date.now(),
         data: result,
       });
-      return c.json({ ok: true, data: result });
+      return c.json({
+        ok: true,
+        data: redactEvalResult(result, runtime.isRedactEnabled()),
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return c.json({ ok: false, error: { code: 'EVAL_ERROR', message } }, 400);

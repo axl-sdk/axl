@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
+import { redactExecutionInfo, redactExecutionList } from '../redact.js';
 
 const app = new Hono<StudioEnv>();
 
@@ -7,7 +8,10 @@ const app = new Hono<StudioEnv>();
 app.get('/executions', async (c) => {
   const runtime = c.get('runtime');
   const executions = await runtime.getExecutions();
-  return c.json({ ok: true, data: executions });
+  return c.json({
+    ok: true,
+    data: redactExecutionList(executions, runtime.isRedactEnabled()),
+  });
 });
 
 // Get execution by ID
@@ -21,7 +25,10 @@ app.get('/executions/:id', async (c) => {
       404,
     );
   }
-  return c.json({ ok: true, data: execution });
+  return c.json({
+    ok: true,
+    data: redactExecutionInfo(execution, runtime.isRedactEnabled()),
+  });
 });
 
 // Abort a running execution

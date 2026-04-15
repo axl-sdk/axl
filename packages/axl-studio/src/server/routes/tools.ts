@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { zodToJsonSchema } from '@axlsdk/axl';
 import type { StudioEnv, ToolSummary } from '../types.js';
+import { redactValue } from '../redact.js';
 
 const app = new Hono<StudioEnv>();
 
@@ -64,7 +65,10 @@ app.post('/tools/:name/test', async (c) => {
   const body = await c.req.json<{ input: unknown }>();
   const ctx = runtime.createContext();
   const result = await tool.run(ctx, body.input);
-  return c.json({ ok: true, data: { result } });
+  return c.json({
+    ok: true,
+    data: { result: redactValue(result, runtime.isRedactEnabled()) },
+  });
 });
 
 export default app;

@@ -73,6 +73,7 @@ export function createServer(options: CreateServerOptions) {
       /^POST \/api\/evals\/import$/,
       /^POST \/api\/evals\/[^/]+\/run$/,
       /^POST \/api\/evals\/[^/]+\/rescore$/,
+      /^POST \/api\/evals\/runs\/[^/]+\/cancel$/,
       /^DELETE \/api\/evals\/history\/[^/]+$/,
       /^POST \/api\/playground(\/|$)/,
     ];
@@ -107,7 +108,7 @@ export function createServer(options: CreateServerOptions) {
   api.route('/', memoryRoutes);
   api.route('/', decisionRoutes);
   api.route('/', createCostRoutes(costAggregator));
-  api.route('/', createEvalRoutes(options.evalLoader));
+  api.route('/', createEvalRoutes(connMgr, options.evalLoader));
   api.route('/', createPlaygroundRoutes(connMgr));
 
   app.route('/api', api);

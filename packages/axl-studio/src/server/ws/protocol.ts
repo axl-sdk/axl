@@ -1,8 +1,8 @@
 import type { BroadcastTarget } from './connection-manager.js';
-import type { ConnectionManager } from './connection-manager.js';
+import { MAX_WS_FRAME_BYTES, type ConnectionManager } from './connection-manager.js';
 
 /** Channel prefixes that accept suffixes (e.g., execution:abc, trace:*). */
-const VALID_CHANNEL_PREFIXES = ['execution:', 'trace:'];
+const VALID_CHANNEL_PREFIXES = ['execution:', 'trace:', 'eval:'];
 /** Channels that must match exactly (no suffix allowed). */
 const VALID_EXACT_CHANNELS = ['costs', 'decisions'];
 const MAX_CHANNEL_LENGTH = 256;
@@ -19,8 +19,9 @@ export function handleWsMessage(
   socket: BroadcastTarget,
   connMgr: ConnectionManager,
 ): string | null {
-  // Reject oversized messages (64KB limit)
-  if (raw.length > 65536) {
+  // Reject oversized messages. Shared cap with the outbound broadcast path
+  // in connection-manager.ts — see `MAX_WS_FRAME_BYTES` for rationale.
+  if (raw.length > MAX_WS_FRAME_BYTES) {
     return JSON.stringify({ type: 'error', message: 'Message too large' });
   }
 

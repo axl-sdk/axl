@@ -131,6 +131,116 @@ describe('ConnectionManager', () => {
     expect(closed.length).toBe(2);
   });
 
+  describe('per-connection trace filtering (multi-tenant)', () => {
+    it('scopes broadcasts to connections whose metadata matches the filter', () => {
+      const { ws: tenantA, messages: msgsA } = createMockWs();
+      const { ws: tenantB, messages: msgsB } = createMockWs();
+      connMgr.add(tenantA);
+      connMgr.add(tenantB);
+      connMgr.setMetadata(tenantA, { tenantId: 'A' });
+      connMgr.setMetadata(tenantB, { tenantId: 'B' });
+      connMgr.subscribe(tenantA, 'trace:*');
+      connMgr.subscribe(tenantB, 'trace:*');
+
+      // Filter: deliver only when event.tenantId matches the connection's.
+      connMgr.setFilter((event, metadata) => {
+        const e = event as { tenantId?: string };
+        const m = metadata as { tenantId?: string } | undefined;
+        return !!e.tenantId && e.tenantId === m?.tenantId;
+      });
+
+      connMgr.broadcastWithWildcard('trace:exec-1', { tenantId: 'A', data: 'secret-A' });
+      connMgr.broadcastWithWildcard('trace:exec-2', { tenantId: 'B', data: 'secret-B' });
+
+      // Each tenant sees only its own event
+      expect(msgsA).toHaveLength(1);
+      expect(msgsB).toHaveLength(1);
+      const parsedA = JSON.parse(msgsA[0]);
+      const parsedB = JSON.parse(msgsB[0]);
+      expect(parsedA.data.tenantId).toBe('A');
+      expect(parsedB.data.tenantId).toBe('B');
+    });
+
+    it('treats filter exceptions as drop (fail-closed)', () => {
+      const { ws, messages } = createMockWs();
+      connMgr.add(ws);
+      connMgr.subscribe(ws, 'trace:abc');
+
+      connMgr.setFilter(() => {
+        throw new Error('predicate blew up');
+      });
+      connMgr.broadcast('trace:abc', { hello: 'world' });
+
+      expect(messages).toHaveLength(0);
+    });
+
+    it('re-applies filter on buffered replay when late subscriber joins', () => {
+      // Broadcast with no subscribers yet — events go into the replay buffer
+      connMgr.broadcast('execution:run-1', { tenantId: 'A', step: 1 });
+      connMgr.broadcast('execution:run-1', { tenantId: 'A', step: 2 });
+
+      // Install a filter, then a tenant-B subscriber joins late. They should
+      // NOT see tenant A's buffered events.
+      connMgr.setFilter((event, metadata) => {
+        const e = event as { tenantId?: string };
+        const m = metadata as { tenantId?: string } | undefined;
+        return e.tenantId === m?.tenantId;
+      });
+      const { ws: tenantB, messages: msgsB } = createMockWs();
+      connMgr.add(tenantB);
+      connMgr.setMetadata(tenantB, { tenantId: 'B' });
+      connMgr.subscribe(tenantB, 'execution:run-1');
+
+      expect(msgsB).toHaveLength(0);
+    });
+  });
+
+  it('truncates oversized broadcast payloads to a placeholder event', () => {
+    // Build a payload well above the 64KB WS frame budget. Verbose-mode
+    // agent_call events with a long conversation history can easily reach
+    // this size on real workloads; consumers should receive an explicit
+    // truncation marker rather than have the underlying socket silently drop.
+    const { ws, messages } = createMockWs();
+    connMgr.add(ws);
+    connMgr.subscribe(ws, 'execution:big');
+
+    const hugeMessages = new Array(200).fill(null).map((_, i) => ({
+      role: 'user',
+      content: 'x'.repeat(500) + ` (msg ${i})`,
+    }));
+    connMgr.broadcast('execution:big', {
+      type: 'agent_call',
+      step: 5,
+      agent: 'helper',
+      data: { messages: hugeMessages, response: 'y'.repeat(500) },
+    });
+
+    expect(messages.length).toBe(1);
+    const parsed = JSON.parse(messages[0]);
+    expect(parsed.type).toBe('event');
+    expect(parsed.channel).toBe('execution:big');
+    // Original shape fields preserved (type, step, agent) so consumers still
+    // see the event in the stream
+    expect(parsed.data.type).toBe('agent_call');
+    expect(parsed.data.step).toBe(5);
+    expect(parsed.data.agent).toBe('helper');
+    // Data replaced with a truncation marker
+    expect(parsed.data.data.__truncated).toBe(true);
+    expect(parsed.data.data.originalBytes).toBeGreaterThan(65536);
+  });
+
+  it('lets small broadcasts pass through unchanged', () => {
+    const { ws, messages } = createMockWs();
+    connMgr.add(ws);
+    connMgr.subscribe(ws, 'trace:small');
+    connMgr.broadcast('trace:small', { type: 'log', data: { event: 'ping' } });
+    expect(messages.length).toBe(1);
+    const parsed = JSON.parse(messages[0]);
+    // No __truncated marker
+    expect(parsed.data.__truncated).toBeUndefined();
+    expect(parsed.data.data).toEqual({ event: 'ping' });
+  });
+
   it('maxConnections rejects connections beyond the limit', () => {
     const closed: boolean[] = [];
     // Fill to capacity (maxConnections = 100)

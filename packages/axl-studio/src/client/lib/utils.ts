@@ -3,10 +3,32 @@ export function cn(...classes: (string | undefined | false | null)[]): string {
   return classes.filter(Boolean).join(' ');
 }
 
-/** Format a cost value as a dollar string. */
+/**
+ * Format a cost value as a dollar string, with sub-cent precision when needed.
+ *
+ * Embedder costs (typical range: $0.00000001 to $0.001 per call) and cached
+ * LLM responses can fall well below the one-cent precision of `toFixed(2)`.
+ * A naive `$${cost.toFixed(4)}` still bottoms out at $0.0000 for very small
+ * values, which lies — the user's cost tracker then diverges from their
+ * provider bill with no visible signal.
+ *
+ * Tiers:
+ * - exactly `0`                  → `$0.00` (distinct from "unknown / unrendered")
+ * - `< $0.000001` (micro-cents)  → `< $0.000001` (rounding-noise sentinel)
+ * - `< $0.0001`                  → `$X.XXeN` scientific (e.g. `$1.50e-5`)
+ * - `< $0.01`                    → 6 decimal places (e.g. `$0.000095`)
+ * - `>= $0.01`                   → 2 decimal places (e.g. `$1.23`)
+ */
 export function formatCost(cost: number): string {
-  if (cost === 0) return '$0.00';
-  if (cost < 0.01) return `$${cost.toFixed(4)}`;
+  if (!Number.isFinite(cost) || cost === 0) return '$0.00';
+  const abs = Math.abs(cost);
+  if (abs < 0.000001) return '< $0.000001';
+  if (abs < 0.0001) {
+    // Scientific notation: 2 significant digits after the mantissa.
+    const [mantissa, exponent] = cost.toExponential(2).split('e');
+    return `$${mantissa}e${parseInt(exponent, 10)}`;
+  }
+  if (abs < 0.01) return `$${cost.toFixed(6)}`;
   return `$${cost.toFixed(2)}`;
 }
 

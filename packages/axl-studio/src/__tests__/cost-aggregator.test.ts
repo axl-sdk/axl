@@ -62,6 +62,29 @@ describe('CostAggregator', () => {
     expect(data.byWorkflow['wf-2']).toBeDefined();
   });
 
+  it('increments byWorkflow.executions on workflow_start events (no cost/tokens)', () => {
+    // Regression: workflow_start events have neither cost nor tokens, so
+    // the onTrace early-return previously short-circuited them and the
+    // per-workflow executions counter stayed at 0 in production. The
+    // test fixtures masked this by passing explicit `workflow:` on
+    // agent_call events, but `entry.executions` was never incremented.
+    aggregator.onTrace({ type: 'workflow_start', workflow: 'wf-exec' });
+    aggregator.onTrace({ type: 'workflow_start', workflow: 'wf-exec' });
+    aggregator.onTrace({ type: 'workflow_start', workflow: 'wf-exec' });
+    // Cost-bearing events between executions still aggregate correctly.
+    aggregator.onTrace({
+      type: 'agent_call',
+      agent: 'a',
+      model: 'm',
+      workflow: 'wf-exec',
+      cost: 0.05,
+      tokens: { input: 10, output: 5 },
+    });
+
+    const data = aggregator.getData();
+    expect(data.byWorkflow['wf-exec']).toEqual({ cost: 0.05, executions: 3 });
+  });
+
   it('reset zeroes all counters', () => {
     aggregator.onTrace({
       type: 'agent_call',
@@ -79,6 +102,7 @@ describe('CostAggregator', () => {
     expect(Object.keys(data.byAgent)).toHaveLength(0);
     expect(Object.keys(data.byModel)).toHaveLength(0);
     expect(Object.keys(data.byWorkflow)).toHaveLength(0);
+    expect(Object.keys(data.byEmbedder)).toHaveLength(0);
   });
 
   it('processes events with cost: 0 and does not skip them', () => {
@@ -96,5 +120,288 @@ describe('CostAggregator', () => {
     expect(data.byAgent['test']).toBeDefined();
     expect(data.byAgent['test'].calls).toBe(1);
     expect(data.byAgent['test'].cost).toBe(0);
+  });
+
+  describe('retry cost decomposition', () => {
+    it('buckets primary vs retry-triggered agent_call cost by retryReason', () => {
+      // Turn 1: primary call
+      aggregator.onTrace({
+        type: 'agent_call',
+        agent: 'a',
+        cost: 0.05,
+        data: {},
+      });
+      // Turn 2: schema retry
+      aggregator.onTrace({
+        type: 'agent_call',
+        agent: 'a',
+        cost: 0.05,
+        data: { retryReason: 'schema' },
+      });
+      // Turn 3: validate retry
+      aggregator.onTrace({
+        type: 'agent_call',
+        agent: 'a',
+        cost: 0.05,
+        data: { retryReason: 'validate' },
+      });
+      // Turn 4: guardrail retry
+      aggregator.onTrace({
+        type: 'agent_call',
+        agent: 'a',
+        cost: 0.05,
+        data: { retryReason: 'guardrail' },
+      });
+
+      const data = aggregator.getData();
+      expect(data.retry.primary).toBeCloseTo(0.05);
+      expect(data.retry.schema).toBeCloseTo(0.05);
+      expect(data.retry.validate).toBeCloseTo(0.05);
+      expect(data.retry.guardrail).toBeCloseTo(0.05);
+      expect(data.retry.retryCalls).toBe(3);
+      // Primary + retries should sum to total
+      const retrySum =
+        data.retry.primary + data.retry.schema + data.retry.validate + data.retry.guardrail;
+      expect(retrySum).toBeCloseTo(data.totalCost);
+    });
+
+    it('retry bucket is untouched by non-agent_call events', () => {
+      aggregator.onTrace({
+        type: 'tool_call',
+        agent: 'a',
+        cost: 0.03,
+      });
+      aggregator.onTrace({
+        type: 'workflow_end',
+        workflow: 'w',
+        cost: 0,
+      });
+
+      const data = aggregator.getData();
+      expect(data.retry.primary).toBe(0);
+      expect(data.retry.schema).toBe(0);
+      expect(data.retry.retryCalls).toBe(0);
+    });
+
+    it('reset clears the retry bucket', () => {
+      aggregator.onTrace({
+        type: 'agent_call',
+        agent: 'a',
+        cost: 0.1,
+        data: { retryReason: 'schema' },
+      });
+      aggregator.reset();
+      const data = aggregator.getData();
+      expect(data.retry).toEqual({
+        primary: 0,
+        primaryCalls: 0,
+        schema: 0,
+        schemaCalls: 0,
+        validate: 0,
+        validateCalls: 0,
+        guardrail: 0,
+        guardrailCalls: 0,
+        retryCalls: 0,
+      });
+    });
+
+    it('tracks per-reason call counts alongside cost', () => {
+      // 2 primary calls
+      aggregator.onTrace({ type: 'agent_call', agent: 'a', cost: 0.01, data: {} });
+      aggregator.onTrace({ type: 'agent_call', agent: 'a', cost: 0.02, data: {} });
+      // 3 schema retries
+      aggregator.onTrace({
+        type: 'agent_call',
+        agent: 'a',
+        cost: 0.01,
+        data: { retryReason: 'schema' },
+      });
+      aggregator.onTrace({
+        type: 'agent_call',
+        agent: 'a',
+        cost: 0.01,
+        data: { retryReason: 'schema' },
+      });
+      aggregator.onTrace({
+        type: 'agent_call',
+        agent: 'a',
+        cost: 0.01,
+        data: { retryReason: 'schema' },
+      });
+      // 1 validate retry
+      aggregator.onTrace({
+        type: 'agent_call',
+        agent: 'a',
+        cost: 0.02,
+        data: { retryReason: 'validate' },
+      });
+      // 1 guardrail retry
+      aggregator.onTrace({
+        type: 'agent_call',
+        agent: 'a',
+        cost: 0.02,
+        data: { retryReason: 'guardrail' },
+      });
+
+      const data = aggregator.getData();
+      expect(data.retry.primaryCalls).toBe(2);
+      expect(data.retry.schemaCalls).toBe(3);
+      expect(data.retry.validateCalls).toBe(1);
+      expect(data.retry.guardrailCalls).toBe(1);
+      expect(data.retry.retryCalls).toBe(5); // schema+validate+guardrail
+    });
+  });
+
+  describe('embedder cost bucketing', () => {
+    it('buckets memory_remember/memory_recall cost by embedder model', () => {
+      aggregator.onTrace({
+        type: 'log',
+        cost: 0.000005,
+        tokens: { input: 10 },
+        data: {
+          event: 'memory_remember',
+          key: 'pet',
+          usage: { cost: 0.000005, tokens: 10, model: 'text-embedding-3-small' },
+        },
+      });
+      aggregator.onTrace({
+        type: 'log',
+        cost: 0.000003,
+        tokens: { input: 6 },
+        data: {
+          event: 'memory_recall',
+          key: 'pet',
+          usage: { cost: 0.000003, tokens: 6, model: 'text-embedding-3-small' },
+        },
+      });
+      aggregator.onTrace({
+        type: 'log',
+        cost: 0.0001,
+        tokens: { input: 100 },
+        data: {
+          event: 'memory_remember',
+          key: 'doc',
+          usage: { cost: 0.0001, tokens: 100, model: 'text-embedding-3-large' },
+        },
+      });
+
+      const data = aggregator.getData();
+      // Small model: 2 calls, sum of costs + tokens
+      expect(data.byEmbedder['text-embedding-3-small']).toEqual({
+        cost: 0.000005 + 0.000003,
+        calls: 2,
+        tokens: 16,
+      });
+      // Large model: 1 call
+      expect(data.byEmbedder['text-embedding-3-large']).toEqual({
+        cost: 0.0001,
+        calls: 1,
+        tokens: 100,
+      });
+      // Total cost still includes embedder cost (rides the same rail)
+      expect(data.totalCost).toBeCloseTo(0.000108, 9);
+      // Embedder tokens must NOT be counted in totalTokens — those are
+      // scoped to agent prompt/completion/reasoning by design.
+      expect(data.totalTokens.input).toBe(0);
+      // Retry buckets must not be touched by log events
+      expect(data.retry.primary).toBe(0);
+      expect(data.retry.retryCalls).toBe(0);
+    });
+
+    it('buckets calls that report tokens but no cost (unknown pricing)', () => {
+      // Local embedders, Azure proxies, and any model not in the OpenAI
+      // pricing table report tokens but no cost. Previously the aggregator's
+      // early-return gate (`cost == null && !tokens`) would silently drop
+      // these events — a data loss bug for anyone using a non-OpenAI
+      // embedder. Context.ts now mirrors `usage.tokens` to top-level
+      // `event.tokens.input` so the gate allows the event through.
+      aggregator.onTrace({
+        type: 'log',
+        // NB: no top-level cost
+        tokens: { input: 50 },
+        data: {
+          event: 'memory_remember',
+          key: 'pet',
+          // no cost in usage either — local embedder
+          usage: { tokens: 50, model: 'local-embedder' },
+        },
+      });
+
+      const data = aggregator.getData();
+      expect(data.byEmbedder['local-embedder']).toEqual({
+        cost: 0,
+        calls: 1,
+        tokens: 50,
+      });
+      // CRITICAL: memory tokens must NOT conflate with agent prompt tokens
+      // in the totalTokens summary — that's a separate semantic.
+      expect(data.totalTokens.input).toBe(0);
+      expect(data.totalCost).toBe(0);
+    });
+
+    it('uses "unknown" key when embedder does not report a model', () => {
+      aggregator.onTrace({
+        type: 'log',
+        cost: 0.000002,
+        data: {
+          event: 'memory_remember',
+          key: 'x',
+          // no usage.model field
+          usage: { cost: 0.000002, tokens: 4 },
+        },
+      });
+
+      const data = aggregator.getData();
+      expect(data.byEmbedder['unknown']).toEqual({
+        cost: 0.000002,
+        calls: 1,
+        tokens: 4,
+      });
+    });
+
+    it('ignores non-memory log events', () => {
+      aggregator.onTrace({
+        type: 'log',
+        cost: 0.01,
+        data: { event: 'workflow_start' },
+      });
+      aggregator.onTrace({
+        type: 'log',
+        cost: 0.02,
+        data: { event: 'budget_exceeded' },
+      });
+
+      const data = aggregator.getData();
+      expect(Object.keys(data.byEmbedder)).toHaveLength(0);
+      // But the cost is still counted in totalCost via the main path
+      expect(data.totalCost).toBeCloseTo(0.03);
+    });
+
+    it('memory events without top-level cost still skip byEmbedder bucketing', () => {
+      // Key-value (non-semantic) recall has no embedder call, so no cost.
+      // The early-return in onTrace should prevent us from ever reaching
+      // the embedder bucket path for this event.
+      aggregator.onTrace({
+        type: 'log',
+        data: { event: 'memory_recall', key: 'name', semantic: false, hit: true },
+      });
+
+      const data = aggregator.getData();
+      expect(Object.keys(data.byEmbedder)).toHaveLength(0);
+    });
+
+    it('reset clears byEmbedder', () => {
+      aggregator.onTrace({
+        type: 'log',
+        cost: 0.000005,
+        data: {
+          event: 'memory_remember',
+          usage: { cost: 0.000005, tokens: 10, model: 'text-embedding-3-small' },
+        },
+      });
+      aggregator.reset();
+      const data = aggregator.getData();
+      expect(data.byEmbedder).toEqual({});
+    });
   });
 });

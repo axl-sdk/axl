@@ -97,7 +97,7 @@ export type ExecutionInfo = {
   error?: string;
 };
 
-/** Trace event */
+/** Trace event. Loose on the client — server types are the source of truth. */
 export type TraceEvent = {
   executionId: string;
   workflow?: string;
@@ -112,6 +112,9 @@ export type TraceEvent = {
   cost?: number;
   tokens?: { input: number; output: number; reasoning?: number };
   data?: unknown;
+  /** When set, this event was emitted from a nested child context (agent-as-tool).
+   *  Value is the `callId` of the outer `tool_call` that spawned it. */
+  parentToolCallId?: string;
 };
 
 /** Cost data */
@@ -124,6 +127,27 @@ export type CostData = {
     { cost: number; calls: number; tokens: { input: number; output: number } }
   >;
   byWorkflow: Record<string, { cost: number; executions: number }>;
+  /** Cost decomposition by retry reason. `primary` is first-attempt calls;
+   *  `schema`/`validate`/`guardrail` are retry-attempt costs bucketed by
+   *  which gate triggered the retry. Optional because a client may be talking
+   *  to an older server that doesn't emit this field — consumers should
+   *  tolerate absence via a `?? emptyRetry()` fallback. */
+  retry?: {
+    primary: number;
+    primaryCalls: number;
+    schema: number;
+    schemaCalls: number;
+    validate: number;
+    validateCalls: number;
+    guardrail: number;
+    guardrailCalls: number;
+    retryCalls: number;
+  };
+  /** Embedder cost from semantic memory ops (`ctx.remember({embed:true})`,
+   *  `ctx.recall({query})`). Keyed by embedder model; `tokens` is a flat
+   *  count (embeddings APIs don't split input/output). Optional for the
+   *  same back-compat reason as `retry` — older servers won't emit it. */
+  byEmbedder?: Record<string, { cost: number; calls: number; tokens: number }>;
 };
 
 /** Session summary */

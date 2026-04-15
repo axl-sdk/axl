@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
+import { redactMemoryList, redactMemoryValue } from '../redact.js';
 
 const app = new Hono<StudioEnv>();
 
@@ -14,7 +15,7 @@ app.get('/memory/:scope', async (c) => {
   }
 
   const entries = await store.getAllMemory(scope);
-  return c.json({ ok: true, data: entries });
+  return c.json({ ok: true, data: redactMemoryList(entries, runtime.isRedactEnabled()) });
 });
 
 // Get a specific memory entry
@@ -39,7 +40,10 @@ app.get('/memory/:scope/:key', async (c) => {
     );
   }
 
-  return c.json({ ok: true, data: { key, value } });
+  return c.json({
+    ok: true,
+    data: { key, value: redactMemoryValue(value, runtime.isRedactEnabled()) },
+  });
 });
 
 // Save a memory entry

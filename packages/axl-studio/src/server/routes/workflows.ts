@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { zodToJsonSchema } from '@axlsdk/axl';
 import type { StudioEnv, WorkflowSummary } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
+import { redactStreamEvent, redactValue } from '../redact.js';
 
 export function createWorkflowRoutes(connMgr: ConnectionManager) {
   const app = new Hono<StudioEnv>();
@@ -59,14 +60,21 @@ export function createWorkflowRoutes(connMgr: ConnectionManager) {
     }>();
 
     if (body.stream) {
-      // Streaming execution — pipe events to WS channel
+      // Streaming execution — pipe events to WS channel. Under
+      // `trace.redact`, scrub each StreamEvent before broadcast so
+      // token deltas, tool args/results, and the final `done.data`
+      // don't leak raw LLM/user content to WS subscribers.
       const stream = runtime.stream(name, body.input ?? {}, { metadata: body.metadata });
       const executionId = `stream-${Date.now()}`;
+      const redactOn = runtime.isRedactEnabled();
 
       // Forward stream events to WS (error events flow through the iterator)
       (async () => {
         for await (const event of stream) {
-          connMgr.broadcastWithWildcard(`execution:${executionId}`, event);
+          connMgr.broadcastWithWildcard(
+            `execution:${executionId}`,
+            redactStreamEvent(event, redactOn),
+          );
         }
       })();
 
@@ -74,7 +82,10 @@ export function createWorkflowRoutes(connMgr: ConnectionManager) {
     }
 
     const result = await runtime.execute(name, body.input ?? {}, { metadata: body.metadata });
-    return c.json({ ok: true, data: { result } });
+    return c.json({
+      ok: true,
+      data: { result: redactValue(result, runtime.isRedactEnabled()) },
+    });
   });
 
   return app;

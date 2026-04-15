@@ -4,12 +4,21 @@ export const EVENT_COLORS: Record<string, string> = {
   agent_call: 'bg-blue-500',
   tool_call: 'bg-purple-500',
   tool_call_complete: 'bg-purple-400',
+  tool_approval: 'bg-purple-300',
+  tool_denied: 'bg-red-400',
   workflow_start: 'bg-green-500',
+  workflow_end: 'bg-green-400',
   workflow_complete: 'bg-green-400',
   handoff: 'bg-amber-500',
+  delegate: 'bg-amber-400',
   await_human: 'bg-red-500',
   vote_start: 'bg-cyan-500',
   spawn: 'bg-indigo-500',
+  guardrail: 'bg-rose-400',
+  schema_check: 'bg-teal-500',
+  validate: 'bg-teal-400',
+  verify: 'bg-teal-300',
+  log: 'bg-slate-400',
 };
 
 export function getBarColor(type: string): string {
@@ -18,8 +27,70 @@ export function getBarColor(type: string): string {
 
 export function getDepth(event: TraceEvent): number {
   const type = event.type;
-  if (type === 'workflow_start' || type === 'workflow_complete') return 0;
-  if (type === 'agent_call' || type === 'spawn' || type === 'vote_start') return 1;
-  if (type === 'tool_call' || type === 'tool_call_complete' || type === 'handoff') return 2;
-  return 1;
+  // Nested events (emitted from a child context inside a tool handler) get an
+  // extra indent so the visual hierarchy matches the actual call graph. The
+  // extra depth is additive on top of the type-based depth below.
+  const nestedBoost = event.parentToolCallId ? 2 : 0;
+  if (type === 'workflow_start' || type === 'workflow_end' || type === 'workflow_complete')
+    return 0 + nestedBoost;
+  if (type === 'agent_call' || type === 'spawn' || type === 'vote_start' || type === 'delegate')
+    return 1 + nestedBoost;
+  if (
+    type === 'tool_call' ||
+    type === 'tool_call_complete' ||
+    type === 'tool_approval' ||
+    type === 'tool_denied' ||
+    type === 'handoff' ||
+    type === 'guardrail' ||
+    type === 'schema_check' ||
+    type === 'validate' ||
+    type === 'verify'
+  )
+    return 2 + nestedBoost;
+  return 1 + nestedBoost;
+}
+
+/** Trace data narrowers — mirrors packages/axl/src/types.ts. Loose on client. */
+export type AgentCallData = {
+  prompt?: string;
+  response?: string;
+  system?: string;
+  thinking?: string;
+  params?: Record<string, unknown>;
+  turn?: number;
+  retryReason?: 'schema' | 'validate' | 'guardrail';
+  messages?: Array<{ role: string; content: string }>;
+};
+
+export type GateCheckData = {
+  valid?: boolean;
+  blocked?: boolean;
+  guardrailType?: 'input' | 'output';
+  reason?: string;
+  attempt?: number;
+  maxAttempts?: number;
+  feedbackMessage?: string;
+};
+
+export type ToolApprovalData = {
+  approved: boolean;
+  args: unknown;
+  reason?: string;
+};
+
+export function getAgentCallData(event: TraceEvent): AgentCallData | null {
+  if (event.type !== 'agent_call' || !event.data) return null;
+  return event.data as AgentCallData;
+}
+
+export function getGateData(event: TraceEvent): GateCheckData | null {
+  if (event.type !== 'guardrail' && event.type !== 'schema_check' && event.type !== 'validate')
+    return null;
+  return (event.data ?? null) as GateCheckData | null;
+}
+
+/** Returns true if this agent_call is a retry triggered by a failed gate. */
+export function isRetryCall(event: TraceEvent): boolean {
+  const d = getAgentCallData(event);
+  return !!d?.retryReason;
 }

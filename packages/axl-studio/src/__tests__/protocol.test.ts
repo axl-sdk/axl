@@ -167,11 +167,11 @@ describe('handleWsMessage', () => {
     expect(JSON.parse(reply2!).type).toBe('error');
   });
 
-  it('allows valid channel prefixes: execution:, trace:, costs, decisions', () => {
+  it('allows valid channel prefixes: execution:, trace:, eval:, costs, decisions', () => {
     const { socket } = createMockSocket();
     connMgr.add(socket);
 
-    for (const channel of ['execution:123', 'trace:abc', 'costs', 'decisions']) {
+    for (const channel of ['execution:123', 'trace:abc', 'eval:run-1', 'costs', 'decisions']) {
       const reply = handleWsMessage(
         JSON.stringify({ type: 'subscribe', channel }),
         socket,

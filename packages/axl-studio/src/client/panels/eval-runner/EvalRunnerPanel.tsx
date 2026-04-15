@@ -1,13 +1,13 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { FlaskConical, ArrowLeft, Upload } from 'lucide-react';
+import { FlaskConical, ArrowLeft, Upload, X } from 'lucide-react';
+import { useEvalExecution, startEvalRun, cancelEvalRun, clearEvalRun } from './eval-store';
 import { PanelHeader } from '../../components/layout/PanelHeader';
 import { EmptyState } from '../../components/shared/EmptyState';
 import {
   fetchEvals,
   fetchEvalHistory,
   fetchHealth,
-  runRegisteredEval,
   compareEvals,
   importEvalResult,
   rescoreEval,
@@ -27,6 +27,7 @@ import {
   getResultWorkflowCounts,
   formatModelName,
   getResultTokens,
+  buildMultiRunResult,
 } from './types';
 import { EvalSummaryTable } from './EvalSummaryTable';
 import { EvalItemList } from './EvalItemList';
@@ -46,7 +47,8 @@ export function EvalRunnerPanel() {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<'run' | 'history' | 'compare'>('run');
   const [selectedEval, setSelectedEval] = useState('');
-  const [running, setRunning] = useState(false);
+  const evalExec = useEvalExecution();
+  const running = evalExec.status === 'running';
   const [currentResult, setCurrentResult] = useState<EvalResultData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedItem, setSelectedItem] = useState<number | null>(null);
@@ -227,27 +229,69 @@ export function EvalRunnerPanel() {
     setSelectedItem(null);
   }, [multiRunIndex]);
 
+  // Adopt result/error from the global eval execution store into local state.
+  // The store survives route changes; local state drives the result display.
+  //
+  // On done, the server broadcasts only a pointer (`evalResultId` + optional
+  // `runGroupId`) rather than the full result, because the full payload
+  // easily exceeds the 64KB WS frame budget and used to be silently
+  // truncated — which left the client rendering an empty scaffold (the
+  // "blank screen" bug). We refetch history and resolve the pointer here.
+  const prevExecStatus = useRef(evalExec.status);
+  useEffect(() => {
+    if (prevExecStatus.current === evalExec.status) return;
+    prevExecStatus.current = evalExec.status;
+
+    if (evalExec.status === 'done' && evalExec.done) {
+      const { evalResultId, runGroupId } = evalExec.done;
+      // Refetch history, then look up the completed entry (and sibling
+      // entries if this was a multi-run group) and adopt into local state.
+      (async () => {
+        try {
+          await queryClient.refetchQueries({ queryKey: ['evalHistory'] });
+          const fresh = queryClient.getQueryData<EvalHistoryEntry[]>(['evalHistory']) ?? [];
+          const entry = fresh.find((e) => e.id === evalResultId);
+          if (!entry) {
+            setError(`Eval completed but result ${evalResultId} was not found in history.`);
+            return;
+          }
+          if (runGroupId) {
+            const groupEntries = fresh.filter(
+              (e) => (e.data as EvalResultData).metadata?.runGroupId === runGroupId,
+            );
+            const allRuns = groupEntries.map((g) => g.data as EvalResultData);
+            const multiRun = buildMultiRunResult(allRuns);
+            setCurrentResult(multiRun ?? (entry.data as EvalResultData));
+          } else {
+            setCurrentResult(entry.data as EvalResultData);
+          }
+          setSelectedItem(null);
+          setMultiRunIndex(-1);
+        } catch (err) {
+          setError(err instanceof Error ? err.message : String(err));
+        } finally {
+          clearEvalRun();
+        }
+      })();
+    } else if (evalExec.status === 'error' && evalExec.error) {
+      setError(evalExec.error);
+      clearEvalRun();
+    }
+  }, [evalExec.status, evalExec.done, evalExec.error, queryClient]);
+
   const handleRun = useCallback(async () => {
     if (!selectedEval) return;
-    setRunning(true);
     setError(null);
     setCurrentResult(null);
     setSelectedItem(null);
     setMultiRunIndex(-1);
 
     try {
-      const result = (await runRegisteredEval(
-        selectedEval,
-        runCount > 1 ? { runs: runCount } : undefined,
-      )) as EvalResultData;
-      setCurrentResult(result);
-      queryClient.invalidateQueries({ queryKey: ['evalHistory'] });
+      await startEvalRun(selectedEval, runCount);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setRunning(false);
     }
-  }, [selectedEval, runCount, queryClient]);
+  }, [selectedEval, runCount]);
 
   const handleCompare = useCallback(async () => {
     if (!baselineSelection || !candidateSelection) return;
@@ -1279,21 +1323,7 @@ export function EvalRunnerPanel() {
               ) : null}
             </>
           ) : running ? (
-            <div className="flex-1 flex flex-col items-center justify-center gap-4">
-              <div className="relative">
-                <FlaskConical size={28} className="text-[hsl(var(--muted-foreground))]" />
-                <div className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping" />
-                <div className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-500" />
-              </div>
-              <div className="text-center">
-                <p className="text-sm font-medium">Running evaluation…</p>
-                <p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
-                  {selectedMeta
-                    ? `${selectedMeta.dataset} \u00b7 ${selectedMeta.scorers.length} scorers`
-                    : selectedEval}
-                </p>
-              </div>
-            </div>
+            <EvalRunningView exec={evalExec} onCancel={cancelEvalRun} />
           ) : (
             <div className="flex-1 flex items-center justify-center">
               <EmptyState
@@ -1325,55 +1355,8 @@ export function EvalRunnerPanel() {
               }}
               onSelectGroup={(entries) => {
                 const allRuns = entries.map((e) => e.data as EvalResultData);
-                const first = allRuns[0];
-                const scorerNames = Object.keys(first.summary?.scorers ?? {});
-                // Compute aggregate: mean/std/min/max of per-scorer means across runs
-                const aggScorers: Record<
-                  string,
-                  { mean: number; std: number; min: number; max: number }
-                > = {};
-                for (const name of scorerNames) {
-                  const means = allRuns.map((r) => r.summary?.scorers?.[name]?.mean ?? 0);
-                  const mean = means.reduce((a, b) => a + b, 0) / means.length;
-                  const std =
-                    means.length > 1
-                      ? Math.sqrt(
-                          means.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (means.length - 1),
-                        )
-                      : 0;
-                  aggScorers[name] = {
-                    mean: Math.round(mean * 1000) / 1000,
-                    std: Math.round(std * 1000) / 1000,
-                    min: Math.round(Math.min(...means) * 1000) / 1000,
-                    max: Math.round(Math.max(...means) * 1000) / 1000,
-                  };
-                }
-                // Union workflows across all runs in the group, first-seen
-                // first. Heterogeneous groups (custom callbacks across
-                // different workflows) end up with multiple entries; the
-                // common --runs N case has one. Mirrors the server-side
-                // aggregateRuns() logic exactly so client-rebuilt aggregates
-                // and server-built aggregates render identically.
-                const seenWorkflows = new Set<string>();
-                const aggWorkflows: string[] = [];
-                for (const run of allRuns) {
-                  const list = run.metadata?.workflows;
-                  if (Array.isArray(list)) {
-                    for (const w of list) {
-                      if (typeof w === 'string' && !seenWorkflows.has(w)) {
-                        seenWorkflows.add(w);
-                        aggWorkflows.push(w);
-                      }
-                    }
-                  }
-                }
-                const aggregate = {
-                  runGroupId: (first.metadata?.runGroupId as string) ?? '',
-                  runCount: allRuns.length,
-                  workflows: aggWorkflows.length > 0 ? aggWorkflows : undefined,
-                  scorers: aggScorers,
-                };
-                const enriched = { ...first, _multiRun: { aggregate, allRuns } } as EvalResultData;
+                const enriched = buildMultiRunResult(allRuns);
+                if (!enriched) return;
                 setCurrentResult(enriched);
                 setSelectedItem(null);
                 setMultiRunIndex(-1);
@@ -1429,6 +1412,93 @@ export function EvalRunnerPanel() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Running progress view ────────────────────────────────────────
+
+function EvalRunningView({
+  exec,
+  onCancel,
+}: {
+  exec: import('./eval-store').EvalExecState;
+  onCancel: () => void;
+}) {
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    if (!exec.startedAt) return;
+    setElapsed(Math.floor((Date.now() - exec.startedAt) / 1000));
+    const timer = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - exec.startedAt!) / 1000));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [exec.startedAt]);
+
+  const minutes = Math.floor(elapsed / 60);
+  const seconds = elapsed % 60;
+  const elapsedStr = minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+
+  const p = exec.progress;
+  const isMultiRun = (exec.runCount ?? 1) > 1;
+  const totalItems = p?.totalItems ?? 0;
+  const completedItems = p?.completedItems ?? 0;
+  const completedRuns = p?.completedRuns ?? 0;
+  const totalRuns = p?.totalRuns ?? exec.runCount ?? 1;
+  const pct = totalItems > 0 ? Math.round((completedItems / totalItems) * 100) : 0;
+
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center gap-5">
+      {/* Icon + pulse */}
+      <div className="relative">
+        <FlaskConical size={28} className="text-[hsl(var(--muted-foreground))]" />
+        <div className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping" />
+        <div className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-500" />
+      </div>
+
+      {/* Status text */}
+      <div className="text-center space-y-1">
+        <p className="text-sm font-medium">
+          {isMultiRun ? `Run ${completedRuns + 1} of ${totalRuns}` : 'Running evaluation\u2026'}
+        </p>
+        {exec.evalName && (
+          <p className="text-xs text-[hsl(var(--muted-foreground))]">
+            {exec.evalName}
+            {isMultiRun ? ` \u00b7 ${totalRuns} runs` : ''}
+          </p>
+        )}
+      </div>
+
+      {/* Progress bar */}
+      {totalItems > 0 && (
+        <div className="w-56 space-y-1.5">
+          <div className="h-1.5 rounded-full bg-[hsl(var(--muted))] overflow-hidden">
+            <div
+              className="h-full rounded-full bg-emerald-500 transition-all duration-300 ease-out"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <p className="text-[11px] text-[hsl(var(--muted-foreground))] text-center tabular-nums">
+            {completedItems} / {totalItems} items
+          </p>
+        </div>
+      )}
+
+      {/* Elapsed time */}
+      <p className="text-[11px] text-[hsl(var(--muted-foreground))] tabular-nums">{elapsedStr}</p>
+
+      {/* Cancel */}
+      <button
+        onClick={onCancel}
+        className="inline-flex items-center gap-1.5 px-3 py-1 text-xs rounded-md
+          border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))]
+          hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--foreground))]
+          transition-colors cursor-pointer"
+      >
+        <X size={12} />
+        Cancel
+      </button>
     </div>
   );
 }

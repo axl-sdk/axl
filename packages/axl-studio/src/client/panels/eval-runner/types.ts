@@ -19,6 +19,8 @@ export type EvalItem = {
   scorerCost?: number;
   scoreDetails?: Record<string, ScorerDetail>;
   metadata?: Record<string, unknown>;
+  /** Per-item trace events (populated when runEval was called with `captureTraces: true`). */
+  traces?: unknown[];
 };
 
 export type ScorerStats = {
@@ -122,6 +124,63 @@ export type ComparisonResult = {
   };
   summary: string;
 };
+
+// ── Multi-run aggregate builders ──────────────────────────────────
+
+/**
+ * Build an `EvalResultData` enriched with `_multiRun` from a set of per-run
+ * entries that share a `runGroupId`. Mirrors the server-side `aggregateRuns()`
+ * logic exactly so a locally-rebuilt aggregate renders identically to one
+ * built by the server.
+ *
+ * Used by:
+ *   - The History tab's `onSelectGroup` callback (adopt a historical group)
+ *   - The Run tab's done-event handler (adopt a freshly-completed run group)
+ *
+ * Returns `null` if `allRuns` is empty (nothing to aggregate).
+ */
+export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData | null {
+  if (allRuns.length === 0) return null;
+  const first = allRuns[0];
+  const scorerNames = Object.keys(first.summary?.scorers ?? {});
+  const aggScorers: Record<string, { mean: number; std: number; min: number; max: number }> = {};
+  for (const name of scorerNames) {
+    const means = allRuns.map((r) => r.summary?.scorers?.[name]?.mean ?? 0);
+    const mean = means.reduce((a, b) => a + b, 0) / means.length;
+    const std =
+      means.length > 1
+        ? Math.sqrt(means.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (means.length - 1))
+        : 0;
+    aggScorers[name] = {
+      mean: Math.round(mean * 1000) / 1000,
+      std: Math.round(std * 1000) / 1000,
+      min: Math.round(Math.min(...means) * 1000) / 1000,
+      max: Math.round(Math.max(...means) * 1000) / 1000,
+    };
+  }
+  // Union workflows across all runs, first-seen first. Heterogeneous groups
+  // (custom callbacks mixing workflows) preserve insertion order.
+  const seenWorkflows = new Set<string>();
+  const aggWorkflows: string[] = [];
+  for (const run of allRuns) {
+    const list = run.metadata?.workflows;
+    if (Array.isArray(list)) {
+      for (const w of list) {
+        if (typeof w === 'string' && !seenWorkflows.has(w)) {
+          seenWorkflows.add(w);
+          aggWorkflows.push(w);
+        }
+      }
+    }
+  }
+  const aggregate: MultiRunAggregate = {
+    runGroupId: (first.metadata?.runGroupId as string) ?? '',
+    runCount: allRuns.length,
+    workflows: aggWorkflows.length > 0 ? aggWorkflows : undefined,
+    scorers: aggScorers,
+  };
+  return { ...first, _multiRun: { aggregate, allRuns } };
+}
 
 // ── Score color utilities ─────────────────────────────────────────
 

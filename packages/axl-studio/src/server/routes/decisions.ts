@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
+import { redactPendingDecisionList } from '../redact.js';
 
 const app = new Hono<StudioEnv>();
 
@@ -7,7 +8,10 @@ const app = new Hono<StudioEnv>();
 app.get('/decisions', async (c) => {
   const runtime = c.get('runtime');
   const decisions = await runtime.getPendingDecisions();
-  return c.json({ ok: true, data: decisions });
+  return c.json({
+    ok: true,
+    data: redactPendingDecisionList(decisions, runtime.isRedactEnabled()),
+  });
 });
 
 // Resolve a pending decision

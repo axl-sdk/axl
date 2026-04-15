@@ -1,6 +1,8 @@
 import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
+import { redactStreamEvent } from '../redact.js';
+import type { StreamEvent } from '@axlsdk/axl';
 
 export function createPlaygroundRoutes(connMgr: ConnectionManager) {
   const app = new Hono<StudioEnv>();
@@ -47,14 +49,20 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
     const history = await store.getSession(sessionId);
     history.push({ role: 'user', content: body.message });
 
+    // Shared scrubber — playground broadcasts token/done/error events
+    // over WS. Under trace.redact we scrub content before broadcast so
+    // WS subscribers (Studio UI, any filterTraceEvent consumer) never
+    // see raw LLM output.
+    const redactOn = runtime.isRedactEnabled();
+    const broadcast = (event: StreamEvent) => {
+      connMgr.broadcastWithWildcard(`execution:${executionId}`, redactStreamEvent(event, redactOn));
+    };
+
     // Create a context wired to stream events to the WS channel
     const ctx = runtime.createContext({
       sessionHistory: history,
       onToken: (token: string) => {
-        connMgr.broadcastWithWildcard(`execution:${executionId}`, {
-          type: 'token',
-          data: token,
-        });
+        broadcast({ type: 'token', data: token });
       },
     });
 
@@ -64,16 +72,15 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
         const result = await ctx.ask(agent, body.message);
         const resultText = typeof result === 'string' ? result : JSON.stringify(result);
 
-        // Save assistant response to session history
+        // Save assistant response to session history — raw, because
+        // redaction is an observability-boundary filter, not a data-at-
+        // rest transform. The next playground turn needs the real text.
         history.push({ role: 'assistant', content: resultText });
         await store.saveSession(sessionId, history);
 
-        connMgr.broadcastWithWildcard(`execution:${executionId}`, {
-          type: 'done',
-          data: resultText,
-        });
+        broadcast({ type: 'done', data: resultText });
       } catch (err) {
-        connMgr.broadcastWithWildcard(`execution:${executionId}`, {
+        broadcast({
           type: 'error',
           message: err instanceof Error ? err.message : String(err),
         });

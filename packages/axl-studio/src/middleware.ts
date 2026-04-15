@@ -43,14 +43,61 @@ export type StudioMiddlewareOptions = {
 
   /**
    * Verify a WebSocket upgrade request before completing the handshake.
-   * Return true to allow, false to reject. Throw to reject with an error.
+   *
+   * Return either a boolean (`true` allow, `false` reject) or an object
+   * `{ allowed: boolean, metadata?: unknown }` to ALSO attach per-connection
+   * metadata that `filterTraceEvent` can later read — typically the auth
+   * subject (userId, tenantId, role). Throw to reject with an error.
    *
    * IMPORTANT: WebSocket upgrades bypass Express/Fastify/Koa middleware.
    * If your HTTP routes are behind auth middleware, WS connections are NOT
    * automatically protected. Use this callback to enforce authentication
    * on WebSocket connections.
+   *
+   * @example Multi-tenant: extract tenant from JWT, attach as metadata
+   * verifyUpgrade: async (req) => {
+   *   const token = req.headers.authorization?.slice(7);
+   *   const claims = await verifyJwt(token);
+   *   if (!claims) return false;
+   *   return { allowed: true, metadata: { userId: claims.sub, tenantId: claims.tid } };
+   * }
    */
-  verifyUpgrade?: (req: IncomingMessage) => boolean | Promise<boolean>;
+  verifyUpgrade?: (
+    req: IncomingMessage,
+  ) =>
+    | boolean
+    | { allowed: boolean; metadata?: unknown }
+    | Promise<boolean | { allowed: boolean; metadata?: unknown }>;
+
+  /**
+   * Optional per-event filter used by multi-tenant deployments to scope the
+   * trace firehose. Called on every outbound WebSocket broadcast; return
+   * `true` to deliver to this connection, `false` to drop.
+   *
+   * `event` is the parsed event payload — for the `trace:*` channel this is
+   * a `TraceEvent` from `@axlsdk/axl` (narrow via the discriminated union);
+   * for `costs` it's a `CostData`; for `execution:*` / `eval:*` it's a
+   * `StreamEvent`. Typed `unknown` because the filter runs for every channel.
+   * `metadata` is the per-connection metadata attached by `verifyUpgrade`,
+   * or `undefined` if `verifyUpgrade` returned a bare boolean.
+   *
+   * Filter errors are treated as `drop` (fail-closed) so a buggy predicate
+   * cannot accidentally leak events cross-tenant.
+   *
+   * @example Scope trace events by tenant id stored on agent metadata
+   * import type { TraceEvent } from '@axlsdk/axl';
+   *
+   * filterTraceEvent: (event, meta) => {
+   *   const m = meta as { tenantId?: string } | undefined;
+   *   if (!m?.tenantId) return false;
+   *   const e = event as TraceEvent;
+   *   // Only narrow event.type === 'agent_call' events; pass structural
+   *   // events (workflow_start/end, cost updates) through unconditionally.
+   *   if (e.type !== 'agent_call') return true;
+   *   return e.workflow?.startsWith(`${m.tenantId}:`) ?? false;
+   * }
+   */
+  filterTraceEvent?: (event: unknown, metadata: unknown) => boolean;
 
   /**
    * Disable all mutating endpoints (execute, test, send, delete, resolve).
@@ -112,7 +159,13 @@ export { handleWsMessage } from './server/ws/protocol.js';
 export type StudioMiddleware = ReturnType<typeof createStudioMiddleware>;
 
 export function createStudioMiddleware(options: StudioMiddlewareOptions) {
-  const { runtime, serveClient = true, verifyUpgrade, readOnly = false } = options;
+  const {
+    runtime,
+    serveClient = true,
+    verifyUpgrade,
+    readOnly = false,
+    filterTraceEvent,
+  } = options;
 
   // Normalize basePath: strip trailing slashes, validate format
   const basePath = normalizeBasePath(options.basePath);
@@ -142,6 +195,13 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
     cors: false, // Host framework owns CORS policy
     evalLoader,
   });
+
+  // Install the broadcast filter once at construction time. The connMgr
+  // applies it on every outbound event; `metadata` is attached to each
+  // connection after a successful `verifyUpgrade`.
+  if (filterTraceEvent) {
+    connMgr.setFilter(filterTraceEvent);
+  }
 
   // Log production safety warning
   if (process.env.NODE_ENV === 'production' && !verifyUpgrade) {
@@ -208,7 +268,9 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
 
   // Handle an individual WebSocket using the Studio protocol.
   // Adapts any StudioWebSocket to ConnectionManager's internal BroadcastTarget.
-  function handleWebSocket(ws: StudioWebSocket) {
+  // `metadata` is whatever `verifyUpgrade` attached — passed through so the
+  // `filterTraceEvent` callback can read it on every outbound event.
+  function handleWebSocket(ws: StudioWebSocket, metadata?: unknown) {
     if (closed) {
       ws.close();
       return;
@@ -218,6 +280,9 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
       close: () => ws.close(),
     };
     connMgr.add(socket);
+    if (metadata !== undefined) {
+      connMgr.setMetadata(socket, metadata);
+    }
 
     ws.on('message', (raw) => {
       const reply = handleWsMessage(String(raw), socket, connMgr);
@@ -253,14 +318,21 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
       const pathname = new URL(req.url!, `http://${req.headers.host}`).pathname;
       if (pathname !== wsPath) return; // Let other upgrade handlers run
 
-      // Apply auth verification
+      // Apply auth verification and capture optional per-connection metadata
+      // (e.g. { userId, tenantId }) that filterTraceEvent can later read.
+      let connectionMetadata: unknown;
       if (verifyUpgrade) {
         try {
-          const allowed = await verifyUpgrade(req);
+          const result = await verifyUpgrade(req);
+          // Normalize both return shapes: plain boolean or { allowed, metadata }
+          const allowed = typeof result === 'boolean' ? result : result.allowed;
           if (!allowed) {
             socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
             socket.destroy();
             return;
+          }
+          if (typeof result === 'object' && result !== null) {
+            connectionMetadata = result.metadata;
           }
         } catch {
           socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
@@ -276,7 +348,7 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
       }
 
       wss.handleUpgrade(req, socket, head, (ws) => {
-        handleWebSocket(ws);
+        handleWebSocket(ws, connectionMetadata);
       });
     };
 

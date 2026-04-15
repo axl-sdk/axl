@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { StudioEnv, SessionSummary } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
+import { redactSessionHistory } from '../redact.js';
 
 export function createSessionRoutes(connMgr: ConnectionManager) {
   const app = new Hono<StudioEnv>();
@@ -18,6 +19,8 @@ export function createSessionRoutes(connMgr: ConnectionManager) {
       const history = await store.getSession(id);
       sessions.push({ id, messageCount: history.length });
     }
+    // List endpoint carries no message content — just id + count.
+    // Nothing to redact.
     return c.json({ ok: true, data: sessions });
   });
 
@@ -28,7 +31,16 @@ export function createSessionRoutes(connMgr: ConnectionManager) {
     const id = c.req.param('id');
     const history = await store.getSession(id);
     const handoffHistory = await store.getSessionMeta(id, 'handoffHistory');
-    return c.json({ ok: true, data: { id, history, handoffHistory: handoffHistory ?? [] } });
+    return c.json({
+      ok: true,
+      data: {
+        id,
+        history: redactSessionHistory(history, runtime.isRedactEnabled()),
+        // HandoffRecord has no content fields (source/target/mode/
+        // timestamp/duration) — nothing to scrub.
+        handoffHistory: handoffHistory ?? [],
+      },
+    });
   });
 
   // Send message to session (non-streaming)

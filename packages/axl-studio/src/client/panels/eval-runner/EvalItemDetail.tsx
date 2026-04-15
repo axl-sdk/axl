@@ -1,6 +1,9 @@
 import { useState } from 'react';
+import { ChevronDown, ChevronRight } from 'lucide-react';
 import { JsonViewer } from '../../components/shared/JsonViewer';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
+import { getBarColor } from '../../lib/trace-utils';
+import type { TraceEvent } from '../../lib/types';
 import type { EvalItem } from './types';
 import {
   scoreColorClass,
@@ -53,6 +56,80 @@ function DataCard({ label, data }: { label: string; data: unknown }) {
       <div className="p-4">
         <JsonViewer data={data} collapsed />
       </div>
+    </div>
+  );
+}
+
+/** Collapsible per-item trace viewer. Shows each captured event as a row with
+ *  type + agent/tool + cost/duration, and expands to a JsonViewer on click. */
+function ItemTraces({ traces }: { traces: TraceEvent[] }) {
+  const [collapsed, setCollapsed] = useState(false);
+  const [expanded, setExpanded] = useState<Set<number>>(new Set());
+  const toggle = (i: number) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+  };
+  return (
+    <div className="rounded-xl border border-[hsl(var(--border))] overflow-hidden">
+      <button
+        onClick={() => setCollapsed((v) => !v)}
+        className="w-full flex items-center gap-2 px-4 py-2.5 bg-[hsl(var(--muted))]/50 border-b border-[hsl(var(--border))] hover:bg-[hsl(var(--muted))] text-left cursor-pointer"
+      >
+        {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+        <span className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+          Trace
+        </span>
+        <span className="text-[11px] text-[hsl(var(--muted-foreground))] ml-1">
+          {traces.length} event{traces.length !== 1 ? 's' : ''}
+        </span>
+      </button>
+      {!collapsed && (
+        <div className="divide-y divide-[hsl(var(--border))]">
+          {traces.map((event, i) => {
+            const isExpanded = expanded.has(i);
+            return (
+              <div key={i}>
+                <button
+                  onClick={() => toggle(i)}
+                  className="w-full flex items-center gap-2 px-4 py-1.5 text-xs hover:bg-[hsl(var(--accent))] text-left cursor-pointer"
+                >
+                  {isExpanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                  <span className="font-mono text-[hsl(var(--muted-foreground))] w-6">{i + 1}</span>
+                  <span
+                    className={cn('w-1.5 h-1.5 rounded-full shrink-0', getBarColor(event.type))}
+                  />
+                  <span className="font-medium w-28 truncate">{event.type}</span>
+                  {event.agent && (
+                    <span className="text-blue-600 dark:text-blue-400 w-24 truncate">
+                      {event.agent}
+                    </span>
+                  )}
+                  {event.tool && (
+                    <span className="text-purple-600 dark:text-purple-400 w-24 truncate">
+                      {event.tool}
+                    </span>
+                  )}
+                  <div className="ml-auto flex items-center gap-2 font-mono text-[10px] text-[hsl(var(--muted-foreground))]">
+                    {event.duration != null && event.duration > 0 && (
+                      <span>{formatDuration(event.duration)}</span>
+                    )}
+                    {event.cost != null && event.cost > 0 && <span>{formatCost(event.cost)}</span>}
+                  </div>
+                </button>
+                {isExpanded && (
+                  <div className="px-4 py-3 bg-[hsl(var(--card))]">
+                    <JsonViewer data={event as unknown as Record<string, unknown>} collapsed />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -175,6 +252,11 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
             {formatCost(totalItemCost)}
           </span>
         </div>
+      )}
+
+      {/* ── Per-item traces (captureTraces mode only) ─── */}
+      {item.traces && item.traces.length > 0 && (
+        <ItemTraces traces={item.traces as unknown as TraceEvent[]} />
       )}
 
       {/* ── Scorer details ────────────────────────────── */}

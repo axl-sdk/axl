@@ -922,7 +922,7 @@ Eval results are automatically persisted when using `runRegisteredEval()`. Histo
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `runRegisteredEval(name, options?)` | `Promise<unknown>` | Run a registered eval by name. Automatically persists the result to eval history. `options` accepts `{ metadata?: Record<string, unknown> }` to inject custom metadata into the eval result |
+| `runRegisteredEval(name, options?)` | `Promise<unknown>` | Run a registered eval by name. Automatically persists the result to eval history. `options` accepts `{ metadata?, onProgress?, signal? }` — `metadata: Record<string, unknown>` injects custom metadata, `onProgress: (event) => void` fires after each dataset item completes (`EvalProgressEvent`), `signal: AbortSignal` cancels remaining items |
 | `getEvalHistory()` | `Promise<EvalHistoryEntry[]>` | All eval results, most recent first. Merges in-memory results with historical data from the state store |
 | `saveEvalResult(entry)` | `Promise<void>` | Manually save an eval result to history |
 | `eval(config)` | `Promise<unknown>` | Run an ad-hoc eval (not registered). Does **not** auto-persist to history |

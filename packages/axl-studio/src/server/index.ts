@@ -108,7 +108,8 @@ export function createServer(options: CreateServerOptions) {
   api.route('/', memoryRoutes);
   api.route('/', decisionRoutes);
   api.route('/', createCostRoutes(costAggregator));
-  api.route('/', createEvalRoutes(connMgr, options.evalLoader));
+  const { app: evalApp, closeActiveRuns } = createEvalRoutes(connMgr, options.evalLoader);
+  api.route('/', evalApp);
   api.route('/', createPlaygroundRoutes(connMgr));
 
   app.route('/api', api);
@@ -220,5 +221,7 @@ export function createServer(options: CreateServerOptions) {
     /** Create WS handlers. Call before registering static/SPA routes are reached. */
     createWsHandlers: () => createWsHandlers(connMgr),
     traceListener,
+    /** Abort all active streaming eval runs. */
+    closeActiveRuns,
   };
 }

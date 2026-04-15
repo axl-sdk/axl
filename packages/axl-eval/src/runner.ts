@@ -196,6 +196,7 @@ export async function runEval(
     let itemScorerCost = 0;
 
     for (const scorer of config.scorers) {
+      if (options?.signal?.aborted) break;
       const scorerStart = Date.now();
       try {
         const raw = await scorer.score(

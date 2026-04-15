@@ -1839,4 +1839,34 @@ describe('runEval: signal cancellation', () => {
     // At least one item should have executed before abort
     expect(callCount).toBeGreaterThanOrEqual(1);
   });
+
+  it('fires onProgress for cancelled items', async () => {
+    const ac = new AbortController();
+    const events: Array<{ type: string; itemIndex: number; totalItems: number }> = [];
+    let callCount = 0;
+
+    await runEval(
+      {
+        workflow: 'test',
+        dataset: testDataset,
+        scorers: [exactScorer],
+        concurrency: 1,
+      },
+      async () => {
+        callCount++;
+        if (callCount === 1) ac.abort();
+        return { output: '2' };
+      },
+      mockRuntime,
+      {
+        signal: ac.signal,
+        onProgress: (event) => events.push(event),
+      },
+    );
+
+    // All 3 items should emit progress (1 executed + 2 cancelled)
+    expect(events).toHaveLength(3);
+    expect(events.every((e) => e.type === 'item_done')).toBe(true);
+    expect(events.every((e) => e.totalItems === 3)).toBe(true);
+  });
 });

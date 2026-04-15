@@ -278,4 +278,24 @@ describe('ConnectionManager', () => {
     expect(connMgr.hasSubscribers('ch-3')).toBe(false);
     expect(connMgr.connectionCount).toBe(0);
   });
+
+  it('buffers and replays eval: channel events to late subscribers', () => {
+    // Broadcast before any subscriber connects
+    connMgr.broadcast('eval:run-1', { type: 'item_done', itemIndex: 0, totalItems: 3 });
+    connMgr.broadcast('eval:run-1', { type: 'item_done', itemIndex: 1, totalItems: 3 });
+    connMgr.broadcast('eval:run-1', { type: 'done', evalResultId: 'abc-123' });
+
+    // Late subscriber should receive all buffered events
+    const { ws, messages } = createMockWs();
+    connMgr.add(ws);
+    connMgr.subscribe(ws, 'eval:run-1');
+
+    expect(messages).toHaveLength(3);
+    const first = JSON.parse(messages[0]);
+    expect(first.data.type).toBe('item_done');
+    expect(first.data.itemIndex).toBe(0);
+    const last = JSON.parse(messages[2]);
+    expect(last.data.type).toBe('done');
+    expect(last.data.evalResultId).toBe('abc-123');
+  });
 });

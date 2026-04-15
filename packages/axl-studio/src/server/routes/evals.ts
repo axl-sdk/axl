@@ -502,5 +502,10 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     return c.json({ ok: true, data: { id, eval: evalName, timestamp } });
   });
 
-  return app;
+  function closeActiveRuns() {
+    for (const ac of activeRuns.values()) ac.abort();
+    activeRuns.clear();
+  }
+
+  return { app, closeActiveRuns };
 }

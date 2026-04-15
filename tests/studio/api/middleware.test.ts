@@ -421,6 +421,36 @@ describe('Studio Middleware Integration', () => {
     }
   });
 
+  it('streaming eval (stream: true) works through body-parser middleware', async () => {
+    const provider = MockProvider.sequence([{ content: 'streamed' }]);
+    const runtime = createEvalRuntime(provider);
+    studio = createStudioMiddleware({ runtime, serveClient: false });
+
+    server = createBodyParserServer(studio.handler);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+
+    const res = await fetch(`http://localhost:${port}/api/evals/test-eval/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stream: true }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.ok).toBe(true);
+    // stream: true should return evalRunId, not the full result
+    expect(body.data.evalRunId).toBeDefined();
+    expect(typeof body.data.evalRunId).toBe('string');
+    expect(body.data.evalRunId.startsWith('eval-')).toBe(true);
+
+    // Wait for async completion then verify result is in history
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const histRes = await fetch(`http://localhost:${port}/api/evals/history`);
+    const histBody = (await histRes.json()) as any;
+    expect(histBody.data.length).toBeGreaterThan(0);
+  });
+
   it('POST without body parser still works (raw stream)', async () => {
     const runtime = createTestRuntime();
     studio = createStudioMiddleware({ runtime, serveClient: false });

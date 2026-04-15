@@ -53,9 +53,21 @@ const IDLE: EvalExecState = {
   error: null,
 };
 
+/**
+ * How long to wait without any WS event before assuming the server is gone.
+ * Resets on every incoming event (item_done, run_done, etc.). If the timer
+ * fires, the store transitions to error so the UI isn't stuck forever.
+ *
+ * 5 minutes is generous — even a large eval with LLM scorers should produce
+ * at least one item_done within this window. The user can always cancel
+ * manually before the timeout fires.
+ */
+const STALE_TIMEOUT_MS = 5 * 60 * 1000;
+
 let state: EvalExecState = IDLE;
 const listeners = new Set<() => void>();
 let unsubscribeWs: (() => void) | null = null;
+let staleTimer: ReturnType<typeof setTimeout> | null = null;
 
 function setState(next: EvalExecState) {
   state = next;
@@ -76,6 +88,26 @@ function cleanup() {
     unsubscribeWs();
     unsubscribeWs = null;
   }
+  if (staleTimer) {
+    clearTimeout(staleTimer);
+    staleTimer = null;
+  }
+}
+
+/** Reset the stale-run watchdog. Called on every incoming WS event. */
+function resetStaleTimer() {
+  if (staleTimer) clearTimeout(staleTimer);
+  staleTimer = setTimeout(() => {
+    if (state.status === 'running') {
+      setState({
+        ...state,
+        status: 'error',
+        error:
+          'Lost contact with the server — no progress received. The eval may still be running; check the History tab.',
+      });
+      cleanup();
+    }
+  }, STALE_TIMEOUT_MS);
 }
 
 // ── React hook ─────────────────────────────────────────────────────
@@ -89,6 +121,16 @@ export function useEvalExecution(): EvalExecState {
 
 /** Start a streaming eval run. Returns when the server acknowledges (not when eval completes). */
 export async function startEvalRun(evalName: string, runCount: number): Promise<void> {
+  // Guard: if an eval is already running, cancel it first so we don't
+  // orphan a server-side run with no client-side listener.
+  if (state.status === 'running' && state.evalRunId) {
+    try {
+      await apiCancelEvalRun(state.evalRunId);
+    } catch {
+      // Best effort — server may have already completed
+    }
+  }
+
   cleanup();
 
   setState({
@@ -116,9 +158,16 @@ export async function startEvalRun(evalName: string, runCount: number): Promise<
   }
   setState({ ...state, evalRunId });
 
+  // Start the watchdog — if no WS event arrives within STALE_TIMEOUT_MS,
+  // assume the server is unreachable and transition to error.
+  resetStaleTimer();
+
   // Subscribe to progress events from the server
   unsubscribeWs = wsClient.subscribe(`eval:${evalRunId}`, (data: unknown) => {
     const event = data as Record<string, unknown>;
+
+    // Every event resets the stale-run watchdog
+    resetStaleTimer();
 
     switch (event.type) {
       case 'item_done': {

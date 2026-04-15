@@ -58,7 +58,10 @@ export class MockProvider implements Provider {
   private _calls: { messages: ChatMessage[]; options: ChatOptions }[] = [];
 
   private constructor(
-    private responseFn: (messages: ChatMessage[], callIndex: number) => ProviderResponse,
+    private responseFn: (
+      messages: ChatMessage[],
+      callIndex: number,
+    ) => ProviderResponse | Promise<ProviderResponse>,
   ) {}
 
   get calls() {
@@ -67,7 +70,7 @@ export class MockProvider implements Provider {
 
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
     this._calls.push({ messages, options });
-    return this.responseFn(messages, this._calls.length - 1);
+    return await this.responseFn(messages, this._calls.length - 1);
   }
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
@@ -150,16 +153,24 @@ export class MockProvider implements Provider {
     handler: (
       messages: ChatMessage[],
       callIndex: number,
-    ) => {
-      content: string;
-      tool_calls?: ToolCallMessage[];
-      providerMetadata?: Record<string, unknown>;
-      usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
-      cost?: number;
-    },
+    ) =>
+      | {
+          content: string;
+          tool_calls?: ToolCallMessage[];
+          providerMetadata?: Record<string, unknown>;
+          usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+          cost?: number;
+        }
+      | Promise<{
+          content: string;
+          tool_calls?: ToolCallMessage[];
+          providerMetadata?: Record<string, unknown>;
+          usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+          cost?: number;
+        }>,
   ): MockProvider {
-    return new MockProvider((messages, callIndex) => {
-      const result = handler(messages, callIndex);
+    return new MockProvider(async (messages, callIndex) => {
+      const result = await handler(messages, callIndex);
       return {
         ...result,
         usage: result.usage ?? { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },

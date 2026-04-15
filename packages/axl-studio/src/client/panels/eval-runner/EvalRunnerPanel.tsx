@@ -128,6 +128,15 @@ export function EvalRunnerPanel() {
     return () => clearTimeout(timer);
   }, [importStatus]);
 
+  // Auto-dismiss the "Cancelled" banner after a few seconds — it's a
+  // user-initiated action, not a real error. Server errors persist until
+  // manually dismissed so the user doesn't miss them.
+  useEffect(() => {
+    if (error !== 'Cancelled') return;
+    const timer = setTimeout(() => setError(null), 4000);
+    return () => clearTimeout(timer);
+  }, [error]);
+
   const handleImportFile = useCallback(
     async (file: File) => {
       setError(null);
@@ -274,7 +283,16 @@ export function EvalRunnerPanel() {
         }
       })();
     } else if (evalExec.status === 'error' && evalExec.error) {
-      setError(evalExec.error);
+      // If the previous state was 'done', an adoption is already in flight.
+      // A late cancel response (race) should not overwrite with "Cancelled".
+      if (prevExecStatus.current !== 'done') {
+        setError(evalExec.error);
+      }
+      // Invalidate history cache — partial runs from a cancelled multi-run
+      // or completed runs from a failed eval may have been persisted by the
+      // server before the error arrived. Without this, the History tab shows
+      // stale data until the 5s staleTime expires.
+      queryClient.invalidateQueries({ queryKey: ['evalHistory'] });
       clearEvalRun();
     }
   }, [evalExec.status, evalExec.done, evalExec.error, queryClient]);

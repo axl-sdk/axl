@@ -115,7 +115,7 @@ packages/axl/src/
 
 packages/axl-testing/src/
   index.ts           — Exports
-  mock-provider.ts   — MockProvider with sequence/echo/json/replay/fn modes
+  mock-provider.ts   — MockProvider with sequence/echo/json/replay/fn modes (fn accepts sync or async handlers)
   mock-tool.ts       — MockTool wrapper
   test-runtime.ts    — AxlTestRuntime (mirrors WorkflowContext for testing)
 

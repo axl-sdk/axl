@@ -187,7 +187,7 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
   // Create lazy eval loader if eval files are configured
   const evalLoader = options.evals ? createEvalLoader(options.evals, runtime) : undefined;
 
-  const { app, connMgr, traceListener } = createServer({
+  const { app, connMgr, traceListener, closeActiveRuns } = createServer({
     runtime,
     staticRoot,
     basePath,
@@ -358,6 +358,9 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
   // Cleanup function for lifecycle management.
   function close() {
     closed = true;
+
+    // Abort active streaming eval runs before closing connections
+    closeActiveRuns();
 
     // Close all WebSocket connections
     connMgr.closeAll();

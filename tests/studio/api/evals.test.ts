@@ -1149,6 +1149,55 @@ describe('Studio API: Evals', () => {
     expect(body.error.code).toBe('NOT_FOUND');
   });
 
+  it('POST /api/evals/runs/:evalRunId/cancel is blocked in readOnly mode', async () => {
+    const { app } = createTestServer(undefined, { readOnly: true });
+
+    const res = await app.request('/api/evals/runs/any-id/cancel', { method: 'POST' });
+    expect(res.status).toBe(405);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('READ_ONLY');
+  });
+
+  it('POST /api/evals/runs/:evalRunId/cancel stops an active streaming run', async () => {
+    // Use a slow provider so we can cancel mid-flight
+    let resolveCall: (() => void) | null = null;
+    const provider = MockProvider.fn(async () => {
+      await new Promise<void>((resolve) => {
+        resolveCall = resolve;
+      });
+      return { content: 'should not reach' };
+    });
+    const { app } = createTestServer(provider);
+
+    // Start streaming eval
+    const res = await app.request('/api/evals/test-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stream: true }),
+    });
+    expect(res.status).toBe(200);
+    const evalRunId = ((await res.json()) as any).data.evalRunId;
+
+    // Cancel while the eval is still running (provider is blocked)
+    const cancelRes = await app.request(`/api/evals/runs/${evalRunId}/cancel`, {
+      method: 'POST',
+    });
+    expect(cancelRes.status).toBe(200);
+    const cancelBody = await cancelRes.json();
+    expect(cancelBody.ok).toBe(true);
+    expect((cancelBody as any).data.cancelled).toBe(true);
+
+    // Unblock the provider so the async IIFE can complete
+    resolveCall?.();
+
+    // Second cancel should 404 — the run was already cleaned up
+    const cancelRes2 = await app.request(`/api/evals/runs/${evalRunId}/cancel`, {
+      method: 'POST',
+    });
+    expect(cancelRes2.status).toBe(404);
+  });
+
   it('POST /api/evals/:name/run without stream remains synchronous', async () => {
     const provider = MockProvider.sequence([{ content: 'sync output' }]);
     const { app } = createTestServer(provider);

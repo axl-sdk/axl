@@ -380,6 +380,10 @@ export class AxlRuntime extends EventEmitter {
           budget?: string;
           metadata?: Record<string, unknown>;
         },
+        {
+          onProgress: options?.onProgress,
+          signal: options?.signal,
+        },
       );
     }
 
@@ -1083,14 +1087,20 @@ export class AxlRuntime extends EventEmitter {
    *
    * @see Spec Section 13.5
    */
-  async eval(config: {
-    workflow: string;
-    dataset: unknown;
-    scorers: unknown[];
-    concurrency?: number;
-    budget?: string;
-    metadata?: Record<string, unknown>;
-  }): Promise<unknown> {
+  async eval(
+    config: {
+      workflow: string;
+      dataset: unknown;
+      scorers: unknown[];
+      concurrency?: number;
+      budget?: string;
+      metadata?: Record<string, unknown>;
+    },
+    options?: {
+      onProgress?: (event: { type: string; itemIndex: number; totalItems: number }) => void;
+      signal?: AbortSignal;
+    },
+  ): Promise<unknown> {
     let runEvalFn: (
       config: unknown,
       executeFn: (
@@ -1098,6 +1108,10 @@ export class AxlRuntime extends EventEmitter {
         runtime: unknown,
       ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>,
       runtime: unknown,
+      evalOptions?: {
+        onProgress?: (event: { type: string; itemIndex: number; totalItems: number }) => void;
+        signal?: AbortSignal;
+      },
     ) => Promise<unknown>;
     try {
       // @ts-expect-error — @axlsdk/eval is an optional peer dependency
@@ -1117,7 +1131,7 @@ export class AxlRuntime extends EventEmitter {
       return { output: result, cost, metadata };
     };
 
-    return runEvalFn(config, executeWorkflow, this);
+    return runEvalFn(config, executeWorkflow, this, options);
   }
 
   /**

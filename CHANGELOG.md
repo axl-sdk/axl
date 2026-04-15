@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed (final review round)
 
+- **Core:** `runtime.eval()` fallback path (used when no custom `executeWorkflow` is provided) now forwards `onProgress` and `signal` options to `runEval()`. Previously these were silently dropped, making progress tracking and cancellation no-ops for evals using the default execution path
+- **Studio:** `close()` now aborts all active streaming eval runs via `closeActiveRuns()` before tearing down WebSocket connections. Previously, in-flight eval runs continued executing after shutdown, wasting LLM calls
+- **Eval:** Signal check now also runs between scorers within an item (not just between items), reducing cancellation latency for items with multiple expensive LLM scorers
+- **Studio:** Cancel/done race guard in `EvalRunnerPanel` — if a `done` event is being adopted when a late cancel response arrives, the error is suppressed to prevent a confusing flash of "Cancelled" before the result appears
+- **Studio:** Eval history cache is now invalidated on cancel/error (not just on success). Previously, partial runs from a cancelled multi-run eval didn't appear in the History tab until the 5s stale-time expired
+- **Studio:** "Cancelled" error banner auto-dismisses after 4 seconds since it's a user-initiated action, not a real error. Server errors still persist until manually dismissed
+- **Studio:** Stale-run watchdog in eval execution store — if no WS event arrives within 5 minutes, the store transitions to error instead of staying stuck in "running" forever (e.g., after a server crash)
+- **Testing:** `MockProvider.fn()` now accepts async handlers (return type `Promise<...>`) for simulating latency in dev/test scenarios
 - **Core:** `formatBudgetCost` (in `BudgetExceededError.message`) rendered negative values as `$-1.50` instead of `-$1.50` and silently collapsed `NaN` / `Infinity` to `$0.00`, hiding cost-accounting bug signals behind the error message. Now places the sign before `$` and emits `$NaN` / `$Infinity` / `-$Infinity` literally so budget bugs surface loudly
 - **Core:** `runtime.getConfig(): Readonly<AxlConfig>` replaced with narrow `runtime.isRedactEnabled(): boolean`. `Readonly<T>` is shallow — consumers could mutate `trace.redact` at runtime via sub-object access. The narrow boolean getter is the right surface for observability consumers and removes DRY violations (the three copy-pasted `isRedactOn` helpers in Studio route files are gone)
 - **Studio:** `redactChatMessage` now uses `satisfies ChatMessage` with an explicit allow-list — if `ChatMessage` gains a new required field, typecheck fails and forces a review on whether to scrub or preserve

@@ -61,4 +61,32 @@ describe('Studio API: Sessions', () => {
     expect(body.ok).toBe(true);
     expect(body.data.deleted).toBe(true);
   });
+
+  it('GET /api/sessions/:id scrubs message content when trace.redact is on', async () => {
+    // Closes the same inconsistency as the executions Result fix:
+    // agent_call.data.prompt/response are already scrubbed in trace events,
+    // so scrubbing session history content here makes the two views
+    // consistent for compliance users.
+    const provider = MockProvider.sequence([{ content: 'sensitive response' }]);
+    const { app } = createTestServer(provider, { redact: true });
+
+    await app.request('/api/sessions/redact-test/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'secret user question', workflow: 'chat-wf' }),
+    });
+
+    const res = await app.request('/api/sessions/redact-test');
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.data.id).toBe('redact-test');
+    expect(body.data.history.length).toBeGreaterThanOrEqual(2);
+    // Every message content is scrubbed; roles remain visible so users
+    // can still understand the session shape.
+    for (const msg of body.data.history) {
+      expect(msg.content).toBe('[redacted]');
+      expect(typeof msg.role).toBe('string');
+      expect(msg.role).not.toBe('[redacted]');
+    }
+  });
 });

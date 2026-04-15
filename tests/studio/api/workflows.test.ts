@@ -51,4 +51,20 @@ describe('Studio API: Workflows', () => {
     expect(body.ok).toBe(true);
     expect(body.data.result).toBe('executed result');
   });
+
+  it('POST /api/workflows/:name/execute scrubs result when trace.redact is on', async () => {
+    const provider = MockProvider.sequence([{ content: 'sensitive workflow result' }]);
+    const { app } = createTestServer(provider, { redact: true });
+
+    const res = await app.request('/api/workflows/test-wf/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: { message: 'hello' } }),
+    });
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    // Synchronous execute result is scrubbed at the REST boundary
+    // regardless of whether the workflow's trace events were redacted.
+    expect(body.data.result).toBe('[redacted]');
+  });
 });

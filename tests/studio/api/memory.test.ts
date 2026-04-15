@@ -64,4 +64,41 @@ describe('Studio API: Memory', () => {
     expect(getBody.ok).toBe(false);
     expect(getBody.error.code).toBe('NOT_FOUND');
   });
+
+  it('GET /api/memory scrubs values when trace.redact is on (keys preserved)', async () => {
+    const { app } = createTestServer(undefined, { redact: true });
+
+    // Write raw values via PUT — redact is an observability-boundary filter,
+    // write endpoints accept raw data so the user can still populate memory
+    // under compliance mode.
+    await app.request('/api/memory/global/user_profile', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: { ssn: '123-45-6789' } }),
+    });
+    await app.request('/api/memory/global/preferences', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: { theme: 'dark' } }),
+    });
+
+    // Detail: value scrubbed, key preserved.
+    const detailRes = await app.request('/api/memory/global/user_profile');
+    const detailBody = await detailRes.json();
+    expect(detailBody.ok).toBe(true);
+    expect(detailBody.data.key).toBe('user_profile');
+    expect(detailBody.data.value).toBe('[redacted]');
+
+    // List: every value scrubbed, keys preserved for navigation.
+    const listRes = await app.request('/api/memory/global');
+    const listBody = await listRes.json();
+    expect(listBody.ok).toBe(true);
+    const entries = listBody.data as Array<{ key: string; value: unknown }>;
+    expect(entries.length).toBeGreaterThanOrEqual(2);
+    for (const entry of entries) {
+      expect(entry.value).toBe('[redacted]');
+      expect(typeof entry.key).toBe('string');
+      expect(entry.key).not.toBe('[redacted]');
+    }
+  });
 });

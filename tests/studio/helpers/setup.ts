@@ -20,9 +20,13 @@ export const testAgent = agent({
 
 export function createTestServer(
   providerOverride?: MockProvider,
-  serverOptions?: { readOnly?: boolean },
+  serverOptions?: { readOnly?: boolean; redact?: boolean },
 ) {
-  const runtime = new AxlRuntime();
+  // Only set `redact: true` — leave `trace.enabled` at the config default
+  // so redact-on tests don't unexpectedly activate console trace output
+  // and spam test logs. `runtime.isRedactEnabled()` reads the flag
+  // directly and doesn't require `enabled: true`.
+  const runtime = new AxlRuntime(serverOptions?.redact ? { trace: { redact: true } } : undefined);
   const provider = providerOverride ?? MockProvider.echo();
   runtime.registerProvider('mock', provider);
 

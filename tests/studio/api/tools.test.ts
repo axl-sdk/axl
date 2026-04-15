@@ -44,4 +44,20 @@ describe('Studio API: Tools', () => {
     const body = await res.json();
     expect(body.ok).toBe(false);
   });
+
+  it('POST /api/tools/:name/test scrubs result when trace.redact is on', async () => {
+    const { app } = createTestServer(undefined, { redact: true });
+
+    const res = await app.request('/api/tools/greet/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: { name: 'World' } }),
+    });
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    // Tool output is scrubbed — tool results can be arbitrary user/LLM
+    // content (the tool's return value) and are covered by the same
+    // observability-boundary contract as workflow results.
+    expect(body.data.result).toBe('[redacted]');
+  });
 });

@@ -78,6 +78,53 @@ describe('Studio API: Evals', () => {
     expect(body.data).toEqual([]);
   });
 
+  it('POST /api/evals/:name/run scrubs per-item content when trace.redact is on', async () => {
+    // Closes the gap where eval results with raw prompts/responses would
+    // render in the Studio Eval Runner under compliance mode.
+    const provider = MockProvider.sequence([{ content: 'sensitive eval response' }]);
+    const { app } = createTestServer(provider, { redact: true });
+
+    const res = await app.request('/api/evals/test-eval/run', {
+      method: 'POST',
+    });
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+
+    // Per-item content scrubbed
+    expect(body.data.items.length).toBe(1);
+    expect(body.data.items[0].input).toBe('[redacted]');
+    expect(body.data.items[0].output).toBe('[redacted]');
+
+    // Scores preserved (structural metric)
+    expect(body.data.items[0].scores['always-pass']).toBe(1);
+
+    // Summary preserved — Eval Runner needs this to render stats under redact
+    expect(typeof body.data.summary.count).toBe('number');
+    expect(typeof body.data.summary.scorers['always-pass'].mean).toBe('number');
+
+    // Metadata (execution context) preserved
+    expect(body.data.metadata.workflows).toEqual(['test-wf']);
+  });
+
+  it('GET /api/evals/history scrubs per-item content when trace.redact is on', async () => {
+    const provider = MockProvider.sequence([{ content: 'history content' }]);
+    const { app } = createTestServer(provider, { redact: true });
+
+    // Run an eval to populate history
+    await app.request('/api/evals/test-eval/run', { method: 'POST' });
+
+    const res = await app.request('/api/evals/history');
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.data.length).toBe(1);
+    const result = body.data[0].data;
+    expect(result.items[0].input).toBe('[redacted]');
+    expect(result.items[0].output).toBe('[redacted]');
+    // History-entry-level metadata preserved
+    expect(body.data[0].eval).toBe('test-eval');
+    expect(typeof body.data[0].timestamp).toBe('number');
+  });
+
   it('GET /api/evals/history returns runs after execution', async () => {
     const provider = MockProvider.sequence([{ content: 'eval output' }]);
     const { app } = createTestServer(provider);
@@ -1039,6 +1086,84 @@ describe('Studio API: Evals', () => {
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.error.message).toContain(baselineId);
+  });
+
+  // --- Streaming eval run endpoint ---
+
+  it('POST /api/evals/:name/run with stream: true returns evalRunId immediately', async () => {
+    const provider = MockProvider.sequence([{ content: 'output' }]);
+    const { app } = createTestServer(provider);
+
+    const res = await app.request('/api/evals/test-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stream: true }),
+    });
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.data.evalRunId).toBeDefined();
+    expect(typeof body.data.evalRunId).toBe('string');
+    expect(body.data.evalRunId.startsWith('eval-')).toBe(true);
+
+    // Give the async eval a moment to complete so history gets populated
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const histRes = await app.request('/api/evals/history');
+    const histBody = await histRes.json();
+    expect(histBody.data.length).toBeGreaterThan(0);
+  });
+
+  it('POST /api/evals/:name/run with stream: true + runs: 3 completes all runs', async () => {
+    const provider = MockProvider.sequence([
+      { content: 'r1' },
+      { content: 'r2' },
+      { content: 'r3' },
+    ]);
+    const { app } = createTestServer(provider);
+
+    const res = await app.request('/api/evals/test-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 3, stream: true }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).data.evalRunId).toBeDefined();
+
+    // Wait for async completion
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const histRes = await app.request('/api/evals/history');
+    const histBody = await histRes.json();
+    // Multi-run produces N individual entries (each run saved separately)
+    expect(histBody.data.length).toBe(3);
+  });
+
+  it('POST /api/evals/runs/:evalRunId/cancel returns 404 for unknown run', async () => {
+    const { app } = createTestServer();
+
+    const res = await app.request('/api/evals/runs/nonexistent/cancel', {
+      method: 'POST',
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.error.code).toBe('NOT_FOUND');
+  });
+
+  it('POST /api/evals/:name/run without stream remains synchronous', async () => {
+    const provider = MockProvider.sequence([{ content: 'sync output' }]);
+    const { app } = createTestServer(provider);
+
+    const res = await app.request('/api/evals/test-eval/run', {
+      method: 'POST',
+    });
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    // Synchronous mode returns the full result, not an evalRunId
+    expect(body.data.evalRunId).toBeUndefined();
+    expect(body.data.items).toBeDefined();
+    expect(body.data.summary).toBeDefined();
   });
 
   it('POST /api/evals/import round-trip preserves multi-run artifact shape', async () => {

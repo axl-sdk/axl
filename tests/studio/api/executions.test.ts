@@ -42,4 +42,51 @@ describe('Studio API: Executions', () => {
     expect(body.ok).toBe(true);
     expect(body.data.aborted).toBe(true);
   });
+
+  it('GET /api/executions scrubs result when trace.redact is on', async () => {
+    const provider = MockProvider.sequence([{ content: 'sensitive response' }]);
+    const { app } = createTestServer(provider, { redact: true });
+
+    await app.request('/api/workflows/test-wf/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: { message: 'test' } }),
+    });
+
+    // List endpoint: result should be `[redacted]`.
+    const res = await app.request('/api/executions');
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.data.length).toBe(1);
+    expect(body.data[0].result).toBe('[redacted]');
+    // Metadata must remain visible for the Trace Explorer to render context.
+    expect(body.data[0].workflow).toBe('test-wf');
+    expect(body.data[0].status).toBe('completed');
+
+    // Detail endpoint: same scrubbing.
+    const id = body.data[0].executionId;
+    const detailRes = await app.request(`/api/executions/${id}`);
+    const detailBody = await detailRes.json();
+    expect(detailBody.ok).toBe(true);
+    expect(detailBody.data.result).toBe('[redacted]');
+    expect(detailBody.data.workflow).toBe('test-wf');
+  });
+
+  it('GET /api/executions returns raw result when trace.redact is off', async () => {
+    const provider = MockProvider.sequence([{ content: 'public answer' }]);
+    const { app } = createTestServer(provider, { redact: false });
+
+    await app.request('/api/workflows/test-wf/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: { message: 'test' } }),
+    });
+
+    const res = await app.request('/api/executions');
+    const body = await res.json();
+    // Assert the exact raw content — a weaker `.not.toBe('[redacted]')`
+    // assertion would miss regressions like `'[redacted]-suffix'` or
+    // null-coerced-to-'empty' that still bypass the scrub.
+    expect(body.data[0].result).toBe('public answer');
+  });
 });

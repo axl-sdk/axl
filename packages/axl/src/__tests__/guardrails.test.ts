@@ -252,10 +252,14 @@ describe('guardrails', () => {
       expect(guardrailEvents[0].attributes).toEqual({
         'axl.guardrail.type': 'input',
         'axl.guardrail.blocked': false,
+        'axl.guardrail.attempt': 1,
+        'axl.guardrail.maxAttempts': 1,
       });
       expect(guardrailEvents[1].attributes).toEqual({
         'axl.guardrail.type': 'output',
         'axl.guardrail.blocked': false,
+        'axl.guardrail.attempt': 1,
+        'axl.guardrail.maxAttempts': 3,
       });
     });
 
@@ -302,15 +306,21 @@ describe('guardrails', () => {
       expect(guardrailEvents[0].attributes).toEqual({
         'axl.guardrail.type': 'input',
         'axl.guardrail.blocked': false,
+        'axl.guardrail.attempt': 1,
+        'axl.guardrail.maxAttempts': 1,
       });
       expect(guardrailEvents[1].attributes).toEqual({
         'axl.guardrail.type': 'output',
         'axl.guardrail.blocked': true,
         'axl.guardrail.reason': 'Bad word',
+        'axl.guardrail.attempt': 1,
+        'axl.guardrail.maxAttempts': 3,
       });
       expect(guardrailEvents[2].attributes).toEqual({
         'axl.guardrail.type': 'output',
         'axl.guardrail.blocked': false,
+        'axl.guardrail.attempt': 2,
+        'axl.guardrail.maxAttempts': 3,
       });
     });
 
@@ -348,6 +358,8 @@ describe('guardrails', () => {
       expect(guardrailEvents[0].attributes).toEqual({
         'axl.guardrail.type': 'input',
         'axl.guardrail.blocked': true,
+        'axl.guardrail.attempt': 1,
+        'axl.guardrail.maxAttempts': 1,
         'axl.guardrail.reason': 'Bad content',
       });
     });

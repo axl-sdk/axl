@@ -305,10 +305,11 @@ describe('Streaming E2E', () => {
       if (event.type === 'done') break;
     }
 
+    // workflow_end is now a first-class trace type, not a nested log event.
     const stepEvents = allEvents.filter((e) => e.type === 'step');
     const workflowEndStep = stepEvents.find((e) => {
       const data = (e as { data: TraceEvent }).data;
-      return data.type === 'log' && (data.data as { event?: string })?.event === 'workflow_end';
+      return data.type === 'workflow_end';
     });
     expect(workflowEndStep).toBeDefined();
 
@@ -330,11 +331,8 @@ describe('Streaming E2E', () => {
     const stream = runtime.stream('wf-fail-stream-wf', { message: 'hello' });
     await expect(stream.promise).rejects.toThrow('intentional failure');
 
-    // Verify workflow_end trace was emitted via the runtime trace listener
-    const logTraces = traces.filter((t: TraceEvent) => t.type === 'log');
-    const workflowEndTrace = logTraces.find(
-      (t: TraceEvent) => (t.data as { event?: string })?.event === 'workflow_end',
-    );
+    // Verify workflow_end trace fired with status: failed + error message
+    const workflowEndTrace = traces.find((t: TraceEvent) => t.type === 'workflow_end');
     expect(workflowEndTrace).toBeDefined();
     expect((workflowEndTrace!.data as { status?: string })?.status).toBe('failed');
     expect((workflowEndTrace!.data as { error?: string })?.error).toBe('intentional failure');

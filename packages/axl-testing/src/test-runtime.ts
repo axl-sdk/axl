@@ -6,6 +6,7 @@ import type {
   HumanDecision,
   ProviderResponse,
   AgentCallInfo,
+  AxlConfig,
 } from '@axlsdk/axl';
 import { WorkflowContext, MemoryStore, ProviderRegistry } from '@axlsdk/axl';
 import type { WorkflowContextInit } from '@axlsdk/axl';
@@ -29,6 +30,10 @@ function generateExecutionId(): string {
 export type AxlTestRuntimeOptions = {
   record?: string;
   humanDecisions?: (options: AwaitHumanOptions) => HumanDecision;
+  /** AxlConfig for the test runtime. Controls trace level/redact, context management, etc.
+   *  Defaults to `{}`. Set `{ trace: { level: 'full' } }` to verify verbose-mode snapshots
+   *  in tests, or `{ trace: { redact: true } }` to verify redaction policy in tests. */
+  config?: AxlConfig;
 };
 
 export class AxlTestRuntime {
@@ -45,10 +50,12 @@ export class AxlTestRuntime {
   private recorded: ProviderResponse[] = [];
   private _executionId: string = generateExecutionId();
   private _humanDecisionHandler?: (options: AwaitHumanOptions) => HumanDecision;
+  private _config: AxlConfig;
 
   constructor(options?: AxlTestRuntimeOptions) {
     this.recordPath = options?.record;
     this._humanDecisionHandler = options?.humanDecisions;
+    this._config = options?.config ?? {};
   }
 
   register(workflow: WorkflowLike): void {
@@ -118,7 +125,9 @@ export class AxlTestRuntime {
       input: validated,
       executionId: this._executionId,
       metadata: options?.metadata,
-      config: {},
+      // Thread the constructor-provided config so tests can exercise
+      // trace.level === 'full' and trace.redact behavior end-to-end.
+      config: this._config,
       providerRegistry: registry,
       stateStore: new MemoryStore(),
       toolOverrides: toolOverrides.size > 0 ? toolOverrides : undefined,
@@ -196,13 +205,27 @@ export class AxlTestRuntime {
     this._steps.push({ step: this._stepCounter, type, data });
   }
 
-  private _pushTrace(partial: Omit<TraceEvent, 'executionId' | 'step' | 'timestamp'>): void {
+  private _pushTrace(partial: {
+    type: TraceEvent['type'];
+    workflow?: string;
+    agent?: string;
+    tool?: string;
+    promptVersion?: string;
+    model?: string;
+    cost?: number;
+    tokens?: { input?: number; output?: number; reasoning?: number };
+    duration?: number;
+    data?: unknown;
+  }): void {
+    // See `WorkflowContext.emitTrace` for the rationale — the loose internal
+    // partial type can't be narrowed to a single union member, so we cast
+    // through `unknown`. Runtime invariant is maintained by call sites.
     this._traceLog.push({
       executionId: this._executionId,
       step: this._stepCounter,
       timestamp: Date.now(),
       ...partial,
-    });
+    } as unknown as TraceEvent);
   }
 
   private async _writeRecording(): Promise<void> {

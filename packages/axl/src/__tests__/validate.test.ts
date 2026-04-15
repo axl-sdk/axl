@@ -532,9 +532,13 @@ describe('validate (post-schema business rule validation)', () => {
       expect(validateEvents[0].attributes).toEqual({
         'axl.validate.valid': false,
         'axl.validate.reason': 'Too low',
+        'axl.validate.attempt': 1,
+        'axl.validate.maxAttempts': 3,
       });
       expect(validateEvents[1].attributes).toEqual({
         'axl.validate.valid': true,
+        'axl.validate.attempt': 2,
+        'axl.validate.maxAttempts': 3,
       });
     });
   });

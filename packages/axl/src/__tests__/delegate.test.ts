@@ -41,9 +41,15 @@ describe('ctx.delegate()', () => {
     const systemMsg = messages.find((m) => m.role === 'system' || m.role === 'developer');
     expect(systemMsg?.content).toBe('You are the solo agent.');
 
-    // No delegate trace event should be emitted for single-agent case
+    // Single-agent path still emits a delegate trace so consumers can see the
+    // routing decision (trivial though it is) — with reason: 'single_candidate'.
     const delegateTraces = traces.filter((t) => t.type === 'delegate');
-    expect(delegateTraces).toHaveLength(0);
+    expect(delegateTraces).toHaveLength(1);
+    expect(delegateTraces[0].data).toMatchObject({
+      candidates: ['solo_agent'],
+      selected: 'solo_agent',
+      reason: 'single_candidate',
+    });
   });
 
   it('multiple agents creates router with handoffs', async () => {

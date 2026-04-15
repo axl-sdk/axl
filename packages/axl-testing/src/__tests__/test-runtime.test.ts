@@ -654,4 +654,52 @@ describe('AxlTestRuntime', () => {
       expect(runtime.toolCalls()[1].args).toEqual({ orderId: 'B' });
     });
   });
+
+  describe('config threading (parity with production runtime)', () => {
+    it('honors trace.redact on agent_call events', async () => {
+      const runtime = new AxlTestRuntime({
+        config: { trace: { redact: true } },
+      });
+
+      const provider = MockProvider.sequence([{ content: 'secret response' }]);
+      runtime.register(SimpleAskWorkflow);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('SimpleAsk', { q: 'secret prompt' });
+
+      const agentCalls = runtime.traceLog().filter((t) => t.type === 'agent_call');
+      expect(agentCalls.length).toBeGreaterThan(0);
+      const data = agentCalls[0].data as Record<string, unknown>;
+      expect(data.prompt).toBe('[redacted]');
+      expect(data.response).toBe('[redacted]');
+    });
+
+    it('honors trace.level: full on agent_call events', async () => {
+      const runtime = new AxlTestRuntime({
+        config: { trace: { level: 'full' } },
+      });
+
+      const provider = MockProvider.sequence([{ content: 'hello' }]);
+      runtime.register(SimpleAskWorkflow);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('SimpleAsk', { q: 'hi' });
+
+      const agentCall = runtime.traceLog().find((t) => t.type === 'agent_call');
+      expect(agentCall).toBeDefined();
+      const data = agentCall!.data as Record<string, unknown>;
+      expect(Array.isArray(data.messages)).toBe(true);
+    });
+  });
+});
+
+// Small fixture used by the config-threading tests above.
+const SimpleAsker = agent({
+  model: 'openai:gpt-4o-mini',
+  system: 'Helpful.',
+});
+const SimpleAskWorkflow = workflow({
+  name: 'SimpleAsk',
+  input: z.object({ q: z.string() }),
+  handler: async (ctx) => ctx.ask(SimpleAsker, (ctx.input as { q: string }).q),
 });

@@ -136,33 +136,193 @@ export type RaceOptions<T = unknown> = {
 /** Execution status */
 export type ExecutionStatus = 'running' | 'completed' | 'failed' | 'waiting';
 
-/** Trace event */
-export type TraceEvent = {
+/** Trace event type. See `TraceEvent` for per-type data shapes. */
+export type TraceEventType =
+  | 'agent_call'
+  | 'tool_call'
+  | 'verify'
+  | 'handoff'
+  | 'delegate'
+  | 'tool_denied'
+  | 'tool_approval'
+  | 'log'
+  | 'workflow_start'
+  | 'workflow_end'
+  | 'guardrail'
+  | 'schema_check'
+  | 'validate';
+
+/** Data shape for `agent_call` trace events. Populated on every LLM call (pass or fail). */
+export type AgentCallTraceData = {
+  /** Original user prompt passed to `ctx.ask()`. Does not include retry feedback or tool results. */
+  prompt: string;
+  /** Final LLM response content for this turn. */
+  response: string;
+  /** Resolved system prompt (after evaluating dynamic system selectors). */
+  system?: string;
+  /** Reasoning/thinking content returned by the provider, when available. */
+  thinking?: string;
+  /** Resolved model parameters sent to the provider for this call. */
+  params?: {
+    temperature?: number;
+    maxTokens?: number;
+    effort?: Effort;
+    thinkingBudget?: number;
+    includeThoughts?: boolean;
+    toolChoice?: ToolChoice;
+    stop?: string[];
+  };
+  /** 1-indexed iteration of the tool-calling loop for this `ctx.ask()` call. */
+  turn?: number;
+  /** When set, this call is a retry triggered by a failed gate check on the previous turn. */
+  retryReason?: 'schema' | 'validate' | 'guardrail';
+  /** Full ChatMessage[] sent to the provider this turn. Only populated when `trace.level === 'full'`. */
+  messages?: ChatMessage[];
+};
+
+/** Data shape for `guardrail` trace events. */
+export type GuardrailTraceData = {
+  guardrailType: 'input' | 'output';
+  blocked: boolean;
+  reason?: string;
+  /** 1-indexed attempt count (output guardrails only). */
+  attempt?: number;
+  /** Maximum attempts allowed before the guardrail throws. */
+  maxAttempts?: number;
+  /** The exact corrective message about to be injected into the conversation — only set when
+   *  this check failed and a retry is happening. Gives users visibility into what the LLM sees
+   *  between retry attempts. */
+  feedbackMessage?: string;
+};
+
+/** Data shape for `schema_check` trace events. Emitted on every schema parse (pass or fail). */
+export type SchemaCheckTraceData = {
+  valid: boolean;
+  reason?: string;
+  attempt: number;
+  maxAttempts: number;
+  feedbackMessage?: string;
+};
+
+/** Data shape for `validate` trace events (post-schema business rule validation). */
+export type ValidateTraceData = {
+  valid: boolean;
+  reason?: string;
+  attempt: number;
+  maxAttempts: number;
+  feedbackMessage?: string;
+};
+
+/** Data shape for `tool_approval` trace events. Emitted by the approval gate on both outcomes. */
+export type ToolApprovalTraceData = {
+  approved: boolean;
+  args: unknown;
+  reason?: string;
+};
+
+/** Data shape for `tool_call` trace events. */
+export type ToolCallTraceData = {
+  args: unknown;
+  result: unknown;
+  callId?: string;
+};
+
+/** Data shape for `handoff` trace events. */
+export type HandoffTraceData = {
+  target: string;
+  mode: 'oneway' | 'roundtrip';
+  /** Wall-clock ms from handoff_to_X tool call to target agent completion.
+   *  Always emitted — the event only fires at the terminal point of the
+   *  handoff, so we always have a measurement. */
+  duration: number;
+  /** Source agent that initiated the handoff (mirrors the event's `agent` field
+   *  for convenience — lets consumers query the handoff chain without
+   *  stitching together event.agent and data.target). */
+  source?: string;
+  /** The `message` arg the source agent passed when invoking `handoff_to_X`
+   *  (roundtrip mode only). Gives observability into *why* the source chose
+   *  to delegate. Subject to `config.trace.redact`. */
+  message?: string;
+};
+
+/** Data shape for `delegate` trace events. */
+export type DelegateTraceData = {
+  candidates: string[];
+  /** Set when the decision is known at emission time (single-agent short-circuit). */
+  selected?: string;
+  /** Router model used for multi-agent routing. */
+  routerModel?: string;
+  /** Why this delegate was emitted: 'routed' (multi-agent) or 'single_candidate'. */
+  reason: 'routed' | 'single_candidate';
+};
+
+/** Data shape for `verify` trace events. */
+export type VerifyTraceData = {
+  attempts: number;
+  passed: boolean;
+  lastError?: string;
+};
+
+/** Data shape for `workflow_start` trace events. Emitted once per workflow execution. */
+export type WorkflowStartTraceData = {
+  /** The validated input passed to the workflow handler. */
+  input: unknown;
+};
+
+/** Data shape for `workflow_end` trace events. Emitted once per workflow execution
+ *  on completion, failure, or cancellation. Distinguish cancellation via `aborted`. */
+export type WorkflowEndTraceData = {
+  status: 'completed' | 'failed';
+  duration: number;
+  /** Workflow return value. Present on `status: 'completed'`. */
+  result?: unknown;
+  /** Error message. Present on `status: 'failed'`. */
+  error?: string;
+  /** True when the failure was an `AbortError` (user cancellation, budget hard_stop,
+   *  or consumer disconnect on streaming workflows). */
+  aborted?: boolean;
+};
+
+/** Common fields carried by every `TraceEvent` regardless of `type`. */
+type TraceEventBase = {
   executionId: string;
   step: number;
-  type:
-    | 'agent_call'
-    | 'tool_call'
-    | 'verify'
-    | 'handoff'
-    | 'delegate'
-    | 'tool_denied'
-    | 'log'
-    | 'workflow_start'
-    | 'workflow_end'
-    | 'guardrail'
-    | 'validate';
+  timestamp: number;
   workflow?: string;
   agent?: string;
-  tool?: string;
   promptVersion?: string;
   model?: string;
   cost?: number;
   tokens?: { input?: number; output?: number; reasoning?: number };
   duration?: number;
-  data?: unknown;
-  timestamp: number;
+  /** When set, this event was emitted from a child context spawned by a tool
+   *  handler. The value is the `callId` of the outer `tool_call` that invoked
+   *  the tool. Lets consumers reconstruct agent-as-tool call graphs by
+   *  joining nested events to their parent `tool_call`. Undefined on top-level
+   *  events. */
+  parentToolCallId?: string;
 };
+
+/**
+ * Trace event. A discriminated union over `type` — consumers that narrow via
+ * `type` get statically-typed access to `data` and event-specific fields.
+ * When adding a new event type, extend this union AND the emitter in
+ * `WorkflowContext.emitTrace()` together so the compiler catches drift.
+ */
+export type TraceEvent =
+  | (TraceEventBase & { type: 'agent_call'; data?: AgentCallTraceData })
+  | (TraceEventBase & { type: 'tool_call'; tool: string; data?: ToolCallTraceData })
+  | (TraceEventBase & { type: 'tool_approval'; tool: string; data?: ToolApprovalTraceData })
+  | (TraceEventBase & { type: 'tool_denied'; tool: string; data?: unknown })
+  | (TraceEventBase & { type: 'guardrail'; data?: GuardrailTraceData })
+  | (TraceEventBase & { type: 'schema_check'; data?: SchemaCheckTraceData })
+  | (TraceEventBase & { type: 'validate'; data?: ValidateTraceData })
+  | (TraceEventBase & { type: 'delegate'; data?: DelegateTraceData })
+  | (TraceEventBase & { type: 'handoff'; data?: HandoffTraceData })
+  | (TraceEventBase & { type: 'verify'; data?: VerifyTraceData })
+  | (TraceEventBase & { type: 'log'; data?: unknown })
+  | (TraceEventBase & { type: 'workflow_start'; data?: WorkflowStartTraceData })
+  | (TraceEventBase & { type: 'workflow_end'; data?: WorkflowEndTraceData });
 
 /** Result of a guardrail check. */
 export type GuardrailResult = {

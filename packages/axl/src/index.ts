@@ -10,7 +10,7 @@ export type { Workflow, WorkflowConfig } from './workflow.js';
 
 // Runtime
 export { AxlRuntime } from './runtime.js';
-export type { CreateContextOptions } from './runtime.js';
+export type { CreateContextOptions, ExecuteOptions } from './runtime.js';
 export { defineConfig } from './config.js';
 export type { AxlConfig } from './config.js';
 
@@ -29,6 +29,21 @@ export type {
   BudgetResult,
   HumanDecision,
   TraceEvent,
+  TraceEventType,
+  // Per-type trace data shapes — consumers narrowing via `event.type` get
+  // statically-typed access to `data`. Kept in the same export block as
+  // `TraceEvent` so the discriminated union and its parts move together.
+  AgentCallTraceData,
+  GuardrailTraceData,
+  SchemaCheckTraceData,
+  ValidateTraceData,
+  ToolCallTraceData,
+  ToolApprovalTraceData,
+  HandoffTraceData,
+  DelegateTraceData,
+  VerifyTraceData,
+  WorkflowStartTraceData,
+  WorkflowEndTraceData,
   StreamEvent,
   AskOptions,
   DelegateOptions,
@@ -102,6 +117,7 @@ export { RedisStore } from './state/redis.js';
 
 // Memory
 export { MemoryManager } from './memory/manager.js';
+export type { RememberResult, RecallResult } from './memory/manager.js';
 export { OpenAIEmbedder } from './memory/embedder-openai.js';
 export { InMemoryVectorStore } from './memory/vector-memory.js';
 export { SqliteVectorStore } from './memory/vector-sqlite.js';
@@ -110,6 +126,8 @@ export type {
   VectorResult,
   VectorStore,
   Embedder,
+  EmbedResult,
+  EmbedUsage,
   RememberOptions,
   RecallOptions,
   MemoryConfig,

@@ -5,23 +5,36 @@ import { SqliteVectorStore } from '../memory/vector-sqlite.js';
 import { MemoryStore } from '../state/memory.js';
 import { WorkflowContext } from '../context.js';
 import { ProviderRegistry } from '../providers/registry.js';
+import { AxlRuntime } from '../runtime.js';
 import { randomUUID } from 'node:crypto';
-import type { Embedder } from '../memory/types.js';
+import type { Embedder, EmbedResult } from '../memory/types.js';
+import type { TraceEvent } from '../types.js';
 
-/** Mock embedder that returns predictable vectors. */
+/**
+ * Mock embedder that returns predictable vectors plus optional usage
+ * reporting so we can exercise the cost-attribution path without a
+ * real pricing table or network call.
+ */
 class MockEmbedder implements Embedder {
   readonly dimensions = 3;
-  private callCount = 0;
+  /** Number of times `embed()` has been called (counts calls, not texts). */
+  callCount = 0;
+  /** When set, each embed() call reports this usage. */
+  reportUsage?: { cost?: number; tokens?: number; model?: string };
+  /** When set, `embed()` throws with this error on every call. */
+  throwError?: Error;
 
-  async embed(texts: string[]): Promise<number[][]> {
-    return texts.map((text) => {
-      this.callCount++;
+  async embed(texts: string[]): Promise<EmbedResult> {
+    this.callCount++;
+    if (this.throwError) throw this.throwError;
+    const vectors = texts.map((text) => {
       // Simple deterministic embedding based on text content
       if (text.includes('cat')) return [1, 0, 0];
       if (text.includes('dog')) return [0.9, 0.1, 0];
       if (text.includes('fish')) return [0, 0, 1];
       return [0.5, 0.5, 0];
     });
+    return this.reportUsage ? { vectors, usage: this.reportUsage } : { vectors };
   }
 }
 
@@ -112,8 +125,8 @@ describe('memory', () => {
       const mgr = new MemoryManager();
 
       await mgr.remember('name', 'Alice', stateStore, 'sess-1');
-      const result = await mgr.recall('name', stateStore, 'sess-1');
-      expect(result).toBe('Alice');
+      const { data } = await mgr.recall('name', stateStore, 'sess-1');
+      expect(data).toBe('Alice');
     });
 
     it('remember and recall key-value (global scope)', async () => {
@@ -122,8 +135,8 @@ describe('memory', () => {
 
       await mgr.remember('setting', 'dark', stateStore, 'sess-1', { scope: 'global' });
       // Can recall from different session
-      const result = await mgr.recall('setting', stateStore, 'sess-2', { scope: 'global' });
-      expect(result).toBe('dark');
+      const { data } = await mgr.recall('setting', stateStore, 'sess-2', { scope: 'global' });
+      expect(data).toBe('dark');
     });
 
     it('semantic recall with vector store', async () => {
@@ -137,9 +150,9 @@ describe('memory', () => {
       await mgr.remember('pet3', 'The fish swims', stateStore, 'sess-1', { embed: true });
 
       // Search for cat-like things
-      const results = await mgr.recall('', stateStore, 'sess-1', { query: 'cat', topK: 2 });
-      expect(Array.isArray(results)).toBe(true);
-      const arr = results as any[];
+      const { data } = await mgr.recall('', stateStore, 'sess-1', { query: 'cat', topK: 2 });
+      expect(Array.isArray(data)).toBe(true);
+      const arr = data as any[];
       expect(arr).toHaveLength(2);
       expect(arr[0].content).toContain('cat');
     });
@@ -155,11 +168,11 @@ describe('memory', () => {
 
       await mgr.remember('name', 'Alice', stateStore, 'sess-1');
       const before = await mgr.recall('name', stateStore, 'sess-1');
-      expect(before).toBe('Alice');
+      expect(before.data).toBe('Alice');
 
       await mgr.forget('name', stateStore, 'sess-1');
       const after = await mgr.recall('name', stateStore, 'sess-1');
-      expect(after).toBeNull();
+      expect(after.data).toBeNull();
     });
 
     it('forget removes a global-scoped memory entry', async () => {
@@ -168,11 +181,11 @@ describe('memory', () => {
 
       await mgr.remember('setting', 'dark', stateStore, undefined, { scope: 'global' });
       const before = await mgr.recall('setting', stateStore, undefined, { scope: 'global' });
-      expect(before).toBe('dark');
+      expect(before.data).toBe('dark');
 
       await mgr.forget('setting', stateStore, undefined, { scope: 'global' });
       const after = await mgr.recall('setting', stateStore, undefined, { scope: 'global' });
-      expect(after).toBeNull();
+      expect(after.data).toBeNull();
     });
 
     it('forget also removes vector embedding', async () => {
@@ -217,6 +230,53 @@ describe('memory', () => {
       await expect(mgr.forget('key', stateStore, undefined)).rejects.toThrow(
         'sessionId is required for session-scoped memory',
       );
+    });
+
+    it('remember propagates embedder usage when embedding happens', async () => {
+      const stateStore = new MemoryStore();
+      const vectorStore = new InMemoryVectorStore();
+      const embedder = new MockEmbedder();
+      embedder.reportUsage = { cost: 0.000002, tokens: 5, model: 'mock-embed' };
+      const mgr = new MemoryManager({ vectorStore, embedder });
+
+      const result = await mgr.remember('pet', 'I love my cat', stateStore, 'sess-1', {
+        embed: true,
+      });
+      expect(result.usage).toEqual({ cost: 0.000002, tokens: 5, model: 'mock-embed' });
+    });
+
+    it('remember without embed does not report usage', async () => {
+      const stateStore = new MemoryStore();
+      const vectorStore = new InMemoryVectorStore();
+      const embedder = new MockEmbedder();
+      embedder.reportUsage = { cost: 0.000002, tokens: 5 };
+      const mgr = new MemoryManager({ vectorStore, embedder });
+
+      // Not embedding — no embedder call, so no usage.
+      const result = await mgr.remember('pet', 'I love my cat', stateStore, 'sess-1');
+      expect(result.usage).toBeUndefined();
+    });
+
+    it('semantic recall propagates embedder usage', async () => {
+      const stateStore = new MemoryStore();
+      const vectorStore = new InMemoryVectorStore();
+      const embedder = new MockEmbedder();
+      embedder.reportUsage = { cost: 0.0000015, tokens: 3, model: 'mock-embed' };
+      const mgr = new MemoryManager({ vectorStore, embedder });
+
+      await mgr.remember('pet', 'I love my cat', stateStore, 'sess-1', { embed: true });
+      embedder.reportUsage = { cost: 0.0000008, tokens: 2, model: 'mock-embed' };
+      const result = await mgr.recall('', stateStore, 'sess-1', { query: 'cat' });
+      expect(result.usage).toEqual({ cost: 0.0000008, tokens: 2, model: 'mock-embed' });
+    });
+
+    it('key-value recall does not report usage (no embedder call)', async () => {
+      const stateStore = new MemoryStore();
+      const mgr = new MemoryManager();
+
+      await mgr.remember('name', 'Alice', stateStore, 'sess-1');
+      const result = await mgr.recall('name', stateStore, 'sess-1');
+      expect(result.usage).toBeUndefined();
     });
   });
 
@@ -352,6 +412,272 @@ describe('memory', () => {
       await expect(ctx.forget('key')).rejects.toThrow('Memory is not configured');
     });
 
+    it('emits memory_remember / memory_recall / memory_forget trace events with operation metadata only', async () => {
+      const stateStore = new MemoryStore();
+      const mgr = new MemoryManager();
+      const traces: TraceEvent[] = [];
+      const ctx = new WorkflowContext({
+        input: 'test',
+        executionId: randomUUID(),
+        config: {},
+        providerRegistry: new ProviderRegistry(),
+        stateStore,
+        memoryManager: mgr,
+        metadata: { sessionId: 'audit' },
+        onTrace: (e) => traces.push(e),
+      });
+
+      await ctx.remember('audit_key', { ssn: '123-45-6789' });
+      await ctx.recall('audit_key');
+      await ctx.recall('missing_key');
+      await ctx.forget('audit_key');
+
+      const memoryEvents = traces.filter(
+        (t) =>
+          t.type === 'log' &&
+          typeof (t.data as Record<string, unknown>)?.event === 'string' &&
+          ((t.data as Record<string, unknown>).event as string).startsWith('memory_'),
+      );
+      expect(memoryEvents).toHaveLength(4);
+
+      const remember = memoryEvents.find(
+        (e) => (e.data as Record<string, unknown>).event === 'memory_remember',
+      );
+      expect(remember).toBeDefined();
+      const rememberData = remember!.data as Record<string, unknown>;
+      expect(rememberData.key).toBe('audit_key');
+      expect(rememberData.scope).toBe('session');
+      // Critically: the value (which contains PII) is NOT in the trace
+      expect('value' in rememberData).toBe(false);
+
+      const recallHit = memoryEvents.find(
+        (e) =>
+          (e.data as Record<string, unknown>).event === 'memory_recall' &&
+          (e.data as Record<string, unknown>).key === 'audit_key',
+      );
+      expect(recallHit).toBeDefined();
+      expect((recallHit!.data as Record<string, unknown>).hit).toBe(true);
+
+      const recallMiss = memoryEvents.find(
+        (e) =>
+          (e.data as Record<string, unknown>).event === 'memory_recall' &&
+          (e.data as Record<string, unknown>).key === 'missing_key',
+      );
+      expect(recallMiss).toBeDefined();
+      expect((recallMiss!.data as Record<string, unknown>).hit).toBe(false);
+
+      const forget = memoryEvents.find(
+        (e) => (e.data as Record<string, unknown>).event === 'memory_forget',
+      );
+      expect(forget).toBeDefined();
+      expect((forget!.data as Record<string, unknown>).key).toBe('audit_key');
+    });
+
+    it('emits memory_remember audit event with error field on failure (compliance)', async () => {
+      // Mock store that rejects writes — simulates a Redis outage or permission denial.
+      const failingStore: MemoryStore = new MemoryStore();
+      const origSaveMemory = failingStore.saveMemory;
+      failingStore.saveMemory = async () => {
+        throw new Error('store unavailable');
+      };
+      const mgr = new MemoryManager();
+      const traces: TraceEvent[] = [];
+      const ctx = new WorkflowContext({
+        input: 'test',
+        executionId: randomUUID(),
+        config: {},
+        providerRegistry: new ProviderRegistry(),
+        stateStore: failingStore,
+        memoryManager: mgr,
+        metadata: { sessionId: 'audit' },
+        onTrace: (e) => traces.push(e),
+      });
+
+      await expect(ctx.remember('audit_key', { foo: 'bar' })).rejects.toThrow('store unavailable');
+
+      // The audit trail MUST record the attempted write even though it failed
+      // — that's the whole point of a compliance audit log. Before the fix
+      // this event was only emitted on success, leaving failed writes invisible.
+      const rememberEvent = traces.find(
+        (t) => t.type === 'log' && (t.data as Record<string, unknown>)?.event === 'memory_remember',
+      );
+      expect(rememberEvent).toBeDefined();
+      const data = rememberEvent!.data as Record<string, unknown>;
+      expect(data.key).toBe('audit_key');
+      expect(data.error).toBe('store unavailable');
+
+      // Restore for other tests in the suite
+      failingStore.saveMemory = origSaveMemory;
+    });
+
+    it('preserves numeric usage fields under redaction (one-level walk)', async () => {
+      // Under `trace.redact`, the log event should keep `usage.tokens` and
+      // `usage.cost` visible (numeric observability, non-PII) while
+      // scrubbing `usage.model` (could carry tenant info). Top-level
+      // `event.cost` is also preserved — it's load-bearing for the
+      // trackExecution cost rail.
+      const stateStore = new MemoryStore();
+      const vectorStore = new InMemoryVectorStore();
+      const embedder = new MockEmbedder();
+      embedder.reportUsage = {
+        cost: 0.000007,
+        tokens: 12,
+        model: 'text-embedding-3-small',
+      };
+      const mgr = new MemoryManager({ vectorStore, embedder });
+      const traces: TraceEvent[] = [];
+      const ctx = new WorkflowContext({
+        input: 'test',
+        executionId: randomUUID(),
+        config: { trace: { redact: true } },
+        providerRegistry: new ProviderRegistry(),
+        stateStore,
+        memoryManager: mgr,
+        metadata: { sessionId: 'compliance' },
+        onTrace: (e) => traces.push(e),
+      });
+
+      await ctx.remember('pet', 'I love my cat', { embed: true });
+
+      const remember = traces.find(
+        (t) => t.type === 'log' && (t.data as Record<string, unknown>)?.event === 'memory_remember',
+      );
+      expect(remember).toBeDefined();
+      // Top-level cost preserved (non-PII, load-bearing for trackExecution)
+      expect(remember!.cost).toBe(0.000007);
+      // data.usage is an object now; numeric fields inside preserved
+      const data = remember!.data as Record<string, unknown>;
+      const usage = data.usage as Record<string, unknown>;
+      expect(usage.tokens).toBe(12);
+      expect(usage.cost).toBe(0.000007);
+      // Model name scrubbed (could carry tenant ID)
+      expect(usage.model).toBe('[redacted]');
+      // Top-level key still redacted (conservative policy for strings)
+      expect(data.key).toBe('[redacted]');
+    });
+
+    it('preserves embedder cost when vectorStore.upsert fails after successful embed', async () => {
+      // The user has been billed for the API call even though the memory
+      // write ultimately failed — we must NOT lose cost attribution, or
+      // their reported spend diverges from their real provider bill.
+      const stateStore = new MemoryStore();
+      // Custom vector store that succeeds on the first couple of ops but
+      // fails on upsert so we can exercise the partial-failure path.
+      const failingVectorStore: InMemoryVectorStore = new InMemoryVectorStore();
+      let allowUpsert = true;
+      const origUpsert = failingVectorStore.upsert.bind(failingVectorStore);
+      failingVectorStore.upsert = async (entries) => {
+        if (!allowUpsert) throw new Error('vectorStore write failed');
+        return origUpsert(entries);
+      };
+      const embedder = new MockEmbedder();
+      embedder.reportUsage = { cost: 0.000009, tokens: 18, model: 'mock-embed' };
+      const mgr = new MemoryManager({ vectorStore: failingVectorStore, embedder });
+      const traces: TraceEvent[] = [];
+      const ctx = new WorkflowContext({
+        input: 'test',
+        executionId: randomUUID(),
+        config: {},
+        providerRegistry: new ProviderRegistry(),
+        stateStore,
+        memoryManager: mgr,
+        metadata: { sessionId: 'partial-session' },
+        onTrace: (e) => traces.push(e),
+      });
+
+      allowUpsert = false;
+      await expect(ctx.remember('pet', 'cat', { embed: true })).rejects.toThrow(
+        'vectorStore write failed',
+      );
+
+      const errorEvent = traces.find(
+        (t) =>
+          t.type === 'log' &&
+          (t.data as Record<string, unknown>)?.event === 'memory_remember' &&
+          (t.data as Record<string, unknown>)?.error !== undefined,
+      );
+      expect(errorEvent).toBeDefined();
+      // CRITICAL: cost attribution must survive the partial failure.
+      expect(errorEvent!.cost).toBe(0.000009);
+      const data = errorEvent!.data as Record<string, unknown>;
+      expect(data.usage).toEqual({
+        cost: 0.000009,
+        tokens: 18,
+        model: 'mock-embed',
+      });
+      expect(data.error).toBe('vectorStore write failed');
+    });
+
+    it('emits memory_remember audit event without cost on embedder failure', async () => {
+      // When the embedder throws mid-operation, the error-path trace must
+      // NOT carry a stale usage/cost from a prior call or fabricated data.
+      const stateStore = new MemoryStore();
+      const vectorStore = new InMemoryVectorStore();
+      const embedder = new MockEmbedder();
+      embedder.reportUsage = { cost: 0.0001, tokens: 20, model: 'mock' };
+      embedder.throwError = new Error('embedder network failure');
+      const mgr = new MemoryManager({ vectorStore, embedder });
+      const traces: TraceEvent[] = [];
+      const ctx = new WorkflowContext({
+        input: 'test',
+        executionId: randomUUID(),
+        config: {},
+        providerRegistry: new ProviderRegistry(),
+        stateStore,
+        memoryManager: mgr,
+        metadata: { sessionId: 'err-session' },
+        onTrace: (e) => traces.push(e),
+      });
+
+      await expect(ctx.remember('pet', 'cat', { embed: true })).rejects.toThrow(
+        'embedder network failure',
+      );
+
+      const errorEvent = traces.find(
+        (t) =>
+          t.type === 'log' &&
+          (t.data as Record<string, unknown>)?.event === 'memory_remember' &&
+          (t.data as Record<string, unknown>)?.error !== undefined,
+      );
+      expect(errorEvent).toBeDefined();
+      // Critically: cost must NOT be attributed for a failed embed call.
+      // The embedder threw — no tokens consumed, no money spent.
+      expect(errorEvent!.cost).toBeUndefined();
+      // Error message is recorded for audit purposes.
+      expect((errorEvent!.data as Record<string, unknown>).error).toBe('embedder network failure');
+    });
+
+    it('redacts memory key when config.trace.redact is on', async () => {
+      const stateStore = new MemoryStore();
+      const mgr = new MemoryManager();
+      const traces: TraceEvent[] = [];
+      const ctx = new WorkflowContext({
+        input: 'test',
+        executionId: randomUUID(),
+        config: { trace: { redact: true } },
+        providerRegistry: new ProviderRegistry(),
+        stateStore,
+        memoryManager: mgr,
+        metadata: { sessionId: 'compliance' },
+        onTrace: (e) => traces.push(e),
+      });
+
+      await ctx.remember('user:john@acme.com', { foo: 'bar' });
+
+      const remember = traces.find(
+        (t) => t.type === 'log' && (t.data as Record<string, unknown>)?.event === 'memory_remember',
+      );
+      const data = remember!.data as Record<string, unknown>;
+      // Event discriminator preserved
+      expect(data.event).toBe('memory_remember');
+      // Key (potentially PII) scrubbed
+      expect(data.key).toBe('[redacted]');
+      // Scope is a string too, so it's redacted under the conservative policy
+      expect(data.scope).toBe('[redacted]');
+      // Booleans still visible
+      expect(data.embed).toBe(false);
+    });
+
     it('ctx.forget throws without stateStore', async () => {
       const mgr = new MemoryManager();
       const ctx = new WorkflowContext({
@@ -387,6 +713,169 @@ describe('memory', () => {
       await expect(ctx.forget('key')).rejects.toThrow(
         'sessionId is required for session-scoped memory',
       );
+    });
+
+    it('surfaces embedder cost as top-level cost on memory_remember/recall log events', async () => {
+      const stateStore = new MemoryStore();
+      const vectorStore = new InMemoryVectorStore();
+      const embedder = new MockEmbedder();
+      embedder.reportUsage = { cost: 0.000005, tokens: 10, model: 'mock-embed' };
+      const mgr = new MemoryManager({ vectorStore, embedder });
+
+      const traces: TraceEvent[] = [];
+      const ctx = new WorkflowContext({
+        input: 'test',
+        executionId: randomUUID(),
+        config: {},
+        providerRegistry: new ProviderRegistry(),
+        stateStore,
+        memoryManager: mgr,
+        metadata: { sessionId: 'cost-session' },
+        onTrace: (e) => traces.push(e),
+      });
+
+      await ctx.remember('pet1', 'I love my cat', { embed: true });
+      await ctx.recall('any-key', { query: 'cat' });
+
+      const rememberEvent = traces.find(
+        (t) => t.type === 'log' && (t.data as Record<string, unknown>)?.event === 'memory_remember',
+      );
+      expect(rememberEvent).toBeDefined();
+      // Top-level cost is what trackExecution's listener aggregates.
+      expect(rememberEvent!.cost).toBe(0.000005);
+      // usage is also nested into data for trace-explorer visibility.
+      expect((rememberEvent!.data as Record<string, unknown>).usage).toEqual({
+        cost: 0.000005,
+        tokens: 10,
+        model: 'mock-embed',
+      });
+
+      const recallEvent = traces.find(
+        (t) => t.type === 'log' && (t.data as Record<string, unknown>)?.event === 'memory_recall',
+      );
+      expect(recallEvent).toBeDefined();
+      expect(recallEvent!.cost).toBe(0.000005);
+    });
+
+    it('embedder cost accumulates into ctx.budget() totalCost', async () => {
+      // Memory ops must feed into the same budgetContext as agent_call —
+      // otherwise heavy semantic recall workloads silently breach a
+      // hard_stop budget. Regression for Gap C.
+      const stateStore = new MemoryStore();
+      const vectorStore = new InMemoryVectorStore();
+      const embedder = new MockEmbedder();
+      embedder.reportUsage = { cost: 0.3, tokens: 10, model: 'mock-embed' };
+      const mgr = new MemoryManager({ vectorStore, embedder });
+      const ctx = new WorkflowContext({
+        input: 'test',
+        executionId: randomUUID(),
+        config: {},
+        providerRegistry: new ProviderRegistry(),
+        stateStore,
+        memoryManager: mgr,
+        metadata: { sessionId: 'budget-session' },
+      });
+
+      // Spin up a budget of $0.5 with hard_stop policy.
+      await ctx.budget({ cost: '$0.5', onExceed: 'hard_stop' }, async () => {
+        // First remember spends $0.3, under the limit
+        await ctx.remember('a', 'I love cats', { embed: true });
+        // Second remember would push totalCost to $0.6, over the limit.
+        // After this call, budgetContext.exceeded = true.
+        await ctx.remember('b', 'I love dogs', { embed: true });
+        // Third op should be rejected because budget was exceeded on the
+        // previous call.
+        await expect(ctx.remember('c', 'I love fish', { embed: true })).rejects.toThrow(
+          /Budget exceeded/,
+        );
+      });
+    });
+
+    it('memory ops throw BudgetExceededError when budget already exceeded', async () => {
+      // Covers the top-of-function gate: if budget was exceeded by a
+      // prior operation (e.g. ctx.ask), subsequent memory ops must not
+      // start. Regression for Gap D.
+      const stateStore = new MemoryStore();
+      const vectorStore = new InMemoryVectorStore();
+      const embedder = new MockEmbedder();
+      embedder.reportUsage = { cost: 0.0001, tokens: 2 };
+      const mgr = new MemoryManager({ vectorStore, embedder });
+      const ctx = new WorkflowContext({
+        input: 'test',
+        executionId: randomUUID(),
+        config: {},
+        providerRegistry: new ProviderRegistry(),
+        stateStore,
+        memoryManager: mgr,
+        metadata: { sessionId: 'gate-session' },
+      });
+
+      await ctx.budget({ cost: '$0.01', onExceed: 'finish_and_stop' }, async () => {
+        // Directly flip the budget to exceeded (simulating a prior ctx.ask
+        // that already breached it). This is the pre-check path.
+        (ctx as unknown as { budgetContext: { exceeded: boolean } }).budgetContext.exceeded = true;
+        await expect(ctx.remember('x', 'y', { embed: true })).rejects.toThrow(/Budget exceeded/);
+        await expect(ctx.recall('x', { query: 'anything' })).rejects.toThrow(/Budget exceeded/);
+      });
+    });
+
+    it('embedder cost flows through runtime.trackExecution to totalCost', async () => {
+      // End-to-end validation of the architectural choice: embedder
+      // cost lands at `event.cost` (top-level), which the trackExecution
+      // listener aggregates into `scope.totalCost`. No special-case
+      // plumbing — it rides the existing cost-aggregation rail.
+      const embedder = new MockEmbedder();
+      embedder.reportUsage = { cost: 0.000007, tokens: 14, model: 'mock-embed' };
+      const runtime = new AxlRuntime({
+        memory: {
+          vectorStore: new InMemoryVectorStore(),
+          embedder,
+        },
+      });
+
+      const { cost } = await runtime.trackExecution(async () => {
+        const ctx = runtime.createContext({ metadata: { sessionId: 'track-session' } });
+        await ctx.remember('pet', 'I love my cat', { embed: true });
+        await ctx.recall('any', { query: 'cat' });
+      });
+
+      // Two embedder calls: 0.000007 * 2 = 0.000014
+      expect(cost).toBeCloseTo(0.000014, 9);
+    });
+
+    it('non-semantic recall emits no cost (no embedder call)', async () => {
+      const stateStore = new MemoryStore();
+      const vectorStore = new InMemoryVectorStore();
+      const embedder = new MockEmbedder();
+      embedder.reportUsage = { cost: 0.000005, tokens: 10 };
+      const mgr = new MemoryManager({ vectorStore, embedder });
+
+      const traces: TraceEvent[] = [];
+      const ctx = new WorkflowContext({
+        input: 'test',
+        executionId: randomUUID(),
+        config: {},
+        providerRegistry: new ProviderRegistry(),
+        stateStore,
+        memoryManager: mgr,
+        metadata: { sessionId: 'cost-session' },
+        onTrace: (e) => traces.push(e),
+      });
+
+      // Non-embedding remember + key-value recall — neither should invoke the embedder.
+      await ctx.remember('name', 'Alice');
+      await ctx.recall('name');
+
+      const memEvents = traces.filter(
+        (t) =>
+          t.type === 'log' &&
+          typeof (t.data as Record<string, unknown>)?.event === 'string' &&
+          String((t.data as Record<string, unknown>).event).startsWith('memory_'),
+      );
+      // Neither operation hit the embedder, so no cost should be attached.
+      for (const ev of memEvents) {
+        expect(ev.cost).toBeUndefined();
+      }
     });
   });
 });

@@ -114,13 +114,13 @@ describe('tool middleware & approval gates', () => {
       expect(awaitHumanHandler).toHaveBeenCalledOnce();
       expect(awaitHumanHandler.mock.calls[0][0].channel).toBe('tool_approval');
 
-      // Approval-succeeded trace emitted (tool_denied with denied: false)
-      const approvalTraces = traces.filter((t) => t.type === 'tool_denied');
+      // Approval-succeeded trace: proper tool_approval event with approved: true
+      const approvalTraces = traces.filter((t) => t.type === 'tool_approval');
       expect(approvalTraces).toHaveLength(1);
-      expect((approvalTraces[0].data as any).denied).toBe(false);
+      expect((approvalTraces[0].data as any).approved).toBe(true);
     });
 
-    it('denied → LLM gets denial message, tool_denied trace emitted', async () => {
+    it('denied → LLM gets denial message, tool_approval trace emitted', async () => {
       const myTool = tool({
         name: 'risky_action',
         description: 'A risky action',
@@ -156,9 +156,10 @@ describe('tool middleware & approval gates', () => {
       const result = await ctx.ask(a, 'Do the risky thing');
       expect(result).toBe('OK, I will not do that');
 
-      // Verify tool_denied trace was emitted
-      const deniedTraces = traces.filter((t) => t.type === 'tool_denied');
+      // Verify tool_approval trace was emitted with approved: false + reason
+      const deniedTraces = traces.filter((t) => t.type === 'tool_approval');
       expect(deniedTraces).toHaveLength(1);
+      expect((deniedTraces[0].data as any).approved).toBe(false);
       expect((deniedTraces[0].data as any).reason).toBe('Too dangerous');
     });
   });

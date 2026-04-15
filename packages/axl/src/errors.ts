@@ -54,6 +54,48 @@ export class TimeoutError extends AxlError {
   }
 }
 
+/**
+ * Format a cost for human-readable error messages. Uses tiered precision
+ * so sub-cent costs (semantic memory embedder calls, cached responses,
+ * free-tier models) don't collapse to `$0.0000`. Mirrors the Studio
+ * client's `formatCost` utility so users see consistent numbers.
+ *
+ * Sign: negative values prefix `-` before the `$`, so `-1.50` renders
+ * as `-$1.50` (not `$-1.50`). Negative costs aren't physically
+ * meaningful but a budget accounting bug could produce them, and we
+ * want those to be visibly wrong instead of hidden behind formatting.
+ *
+ * Non-finite: `NaN` and `±Infinity` are fail-loud signals that
+ * something is broken in cost accounting — we preserve them literally
+ * (`$NaN`, `$Infinity`, `-$Infinity`) so users see the bug in the
+ * error message rather than a misleading `$0.00`.
+ *
+ * Tiers (for finite, non-zero values):
+ *   `|cost| < $0.000001` (noise)  → `< $0.000001` (or `-< $0.000001`)
+ *   `|cost| < $0.0001`            → scientific, e.g. `$1.5e-7`
+ *   `|cost| < $0.01`              → 6 decimals, e.g. `$0.000095`
+ *   `|cost| >= $0.01`             → 2 decimals, e.g. `$1.23`
+ */
+function formatBudgetCost(cost: number): string {
+  // Fail-loud on non-finite: `NaN` / `Infinity` reaching this function
+  // almost certainly means a cost-accounting bug, and collapsing them
+  // to `$0.00` would hide the signal in the error message.
+  if (Number.isNaN(cost)) return '$NaN';
+  if (cost === Infinity) return '$Infinity';
+  if (cost === -Infinity) return '-$Infinity';
+  if (cost === 0) return '$0.00';
+
+  const sign = cost < 0 ? '-' : '';
+  const abs = Math.abs(cost);
+  if (abs < 0.000001) return `${sign}< $0.000001`;
+  if (abs < 0.0001) {
+    const [mantissa, exponent] = abs.toExponential(2).split('e');
+    return `${sign}$${mantissa}e${parseInt(exponent, 10)}`;
+  }
+  if (abs < 0.01) return `${sign}$${abs.toFixed(6)}`;
+  return `${sign}$${abs.toFixed(2)}`;
+}
+
 /** Thrown when a budget limit is exceeded */
 export class BudgetExceededError extends AxlError {
   readonly limit: number;
@@ -63,7 +105,9 @@ export class BudgetExceededError extends AxlError {
   constructor(limit: number, spent: number, policy: string) {
     super(
       'BUDGET_EXCEEDED',
-      `Budget exceeded: spent $${spent.toFixed(4)} of $${limit.toFixed(4)} limit (policy: ${policy})`,
+      `Budget exceeded: spent ${formatBudgetCost(spent)} of ${formatBudgetCost(
+        limit,
+      )} limit (policy: ${policy})`,
     );
     this.name = 'BudgetExceededError';
     this.limit = limit;

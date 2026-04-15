@@ -42,9 +42,51 @@ export interface VectorStore {
   close?(): Promise<void>;
 }
 
+/**
+ * Usage info reported by an embedder for a single `embed()` call.
+ *
+ * Mirrors the provider `usage` namespace — nested rather than flat so
+ * future additions (latency, cache-hit info, rate-limit headers) extend
+ * this type without breaking the `Embedder` return shape.
+ *
+ * All fields are optional so embedders without cost/pricing knowledge
+ * (e.g. local models, self-hosted) can still conform to the interface.
+ */
+export type EmbedUsage = {
+  /** Total input tokens consumed. */
+  tokens?: number;
+  /** Cost in USD, computed from tokens × per-model pricing. */
+  cost?: number;
+  /** The underlying model identifier (e.g. "text-embedding-3-small"). */
+  model?: string;
+};
+
+/**
+ * Result of an `Embedder.embed()` call.
+ *
+ * Always contains `vectors`. `usage` is optional so embedders can omit
+ * it entirely (non-OpenAI, local, test fakes).
+ */
+export type EmbedResult = {
+  vectors: number[][];
+  usage?: EmbedUsage;
+};
+
 /** Embedder interface for converting text to vectors. */
 export interface Embedder {
-  embed(texts: string[]): Promise<number[][]>;
+  /**
+   * Embed one or more texts into vectors.
+   *
+   * @param texts   Input strings to embed.
+   * @param signal  Optional `AbortSignal` — when triggered, the underlying
+   *                network call should abort. Passed through from
+   *                `ctx.remember` / `ctx.recall` so user cancellation and
+   *                hard_stop budget aborts propagate to the embedder fetch.
+   *                Impls are free to ignore it (the call just runs to
+   *                completion like before), but OpenAIEmbedder honors it
+   *                via `fetchWithRetry`.
+   */
+  embed(texts: string[], signal?: AbortSignal): Promise<EmbedResult>;
   readonly dimensions: number;
 }
 

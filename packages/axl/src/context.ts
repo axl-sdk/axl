@@ -138,6 +138,27 @@ function extractBalanced(
 }
 
 /** Estimate tokens for a message array. */
+/**
+ * Append the assistant's failed attempt and the corrective feedback message to
+ * the conversation so the next LLM turn sees both. Shared across guardrail,
+ * schema_check, and validate retry paths — keeps the exact message shape in
+ * one place so fixes (e.g. preserving providerMetadata for Gemini) apply to
+ * all three gates at once.
+ */
+function appendRetryMessages(
+  messages: ChatMessage[],
+  content: string,
+  feedbackMessage: string,
+  providerMetadata?: Record<string, unknown>,
+): void {
+  messages.push({
+    role: 'assistant',
+    content,
+    ...(providerMetadata ? { providerMetadata } : {}),
+  });
+  messages.push({ role: 'system', content: feedbackMessage });
+}
+
 function estimateMessagesTokens(messages: ChatMessage[]): number {
   let total = 0;
   for (const msg of messages) {
@@ -188,6 +209,10 @@ export type WorkflowContextInit = {
   onAgentStart?: (info: { agent: string; model: string }) => void;
   /** Callback fired after each ctx.ask() completes (once per ask invocation). */
   onAgentCallComplete?: (call: AgentCallInfo) => void;
+  /** Set by `createChildContext(parentToolCallId)` — stamped on every trace event
+   *  emitted from this child so consumers can join nested agent calls back to
+   *  the outer tool call that spawned them. */
+  parentToolCallId?: string;
 };
 
 /**
@@ -238,6 +263,7 @@ export class WorkflowContext<TInput = unknown> {
   ) => HumanDecision | Promise<HumanDecision>;
   private onAgentStart?: (info: { agent: string; model: string }) => void;
   private onAgentCallComplete?: (call: AgentCallInfo) => void;
+  private parentToolCallId?: string;
   constructor(init: WorkflowContextInit) {
     this.input = init.input as TInput;
     this.executionId = init.executionId;
@@ -261,6 +287,7 @@ export class WorkflowContext<TInput = unknown> {
     this.awaitHumanHandler = init.awaitHumanHandler;
     this.onAgentStart = init.onAgentStart;
     this.onAgentCallComplete = init.onAgentCallComplete;
+    this.parentToolCallId = init.parentToolCallId;
     // Restore cached summary from session metadata (survives across requests)
     if (init.metadata?.summaryCache) {
       this.summaryCache = init.metadata.summaryCache as string;
@@ -273,8 +300,13 @@ export class WorkflowContext<TInput = unknown> {
    *         state store, span manager, memory manager, MCP manager, config,
    *         awaitHuman handler, pending decisions, tool overrides.
    * Isolates: session history, step counter, streaming callbacks (onToken, onAgentStart, onToolCall).
+   *
+   * @param parentToolCallId - The `callId` of the outer `tool_call` that
+   *   spawned this child. When set, every trace event emitted by the child
+   *   will carry this id as `parentToolCallId`, so consumers can join nested
+   *   agent calls back to the outer tool call that invoked them.
    */
-  createChildContext(): WorkflowContext {
+  createChildContext(parentToolCallId?: string): WorkflowContext {
     return new WorkflowContext({
       input: this.input,
       executionId: this.executionId,
@@ -294,6 +326,10 @@ export class WorkflowContext<TInput = unknown> {
       toolOverrides: this.toolOverrides,
       signal: this.signal,
       workflowName: this.workflowName,
+      // Join key for nested event correlation. Inherit the parent's
+      // `parentToolCallId` when this child is itself nested inside another
+      // child — so grand-children still point to the outermost tool call.
+      parentToolCallId: parentToolCallId ?? this.parentToolCallId,
       // Isolated: sessionHistory (empty), stepCounter (0),
       // onToken (null), onAgentStart (null), onToolCall (null)
     });
@@ -529,11 +565,22 @@ export class WorkflowContext<TInput = unknown> {
       this.emitTrace({
         type: 'guardrail',
         agent: agent._name,
-        data: { guardrailType: 'input', blocked: inputResult.block, reason: inputResult.reason },
+        data: {
+          guardrailType: 'input',
+          blocked: inputResult.block,
+          ...(inputResult.reason ? { reason: inputResult.reason } : {}),
+          // Input guardrails can't retry (prompt is user-supplied), so attempt
+          // and maxAttempts are always 1 — emit them for shape consistency with
+          // output guardrails so consumers don't need two narrowers.
+          attempt: 1,
+          maxAttempts: 1,
+        },
       });
       this.spanManager?.addEventToActiveSpan('axl.guardrail.check', {
         'axl.guardrail.type': 'input',
         'axl.guardrail.blocked': inputResult.block,
+        'axl.guardrail.attempt': 1,
+        'axl.guardrail.maxAttempts': 1,
         ...(inputResult.reason ? { 'axl.guardrail.reason': inputResult.reason } : {}),
       });
       if (inputResult.block) {
@@ -567,6 +614,14 @@ export class WorkflowContext<TInput = unknown> {
     let guardrailOutputRetries = 0;
     let schemaRetries = 0;
     let validateRetries = 0;
+    const maxGuardrailRetries = guardrails?.maxRetries ?? 2;
+    // Set before `continue`ing to a retry turn; read when emitting the next
+    // agent_call so consumers can see *why* a given LLM call is a retry.
+    let pendingRetryReason: 'schema' | 'validate' | 'guardrail' | undefined;
+    // `trace.level === 'full'` opts into verbose traces: we include the full ChatMessage[]
+    // snapshot on each agent_call so the trace explorer can reconstruct exactly what the
+    // model saw (growing with tool results + retry feedback across turns).
+    const verboseTrace = this.config.trace?.level === 'full';
 
     while (turns < maxTurns) {
       // Timeout check
@@ -575,6 +630,10 @@ export class WorkflowContext<TInput = unknown> {
       }
 
       turns++;
+      // Per-turn start time for accurate `duration` on each agent_call event.
+      // `startTime` above is the start of the entire ask() call; without this,
+      // turn N's duration would include all prior turns' latency and gates.
+      const turnStart = Date.now();
 
       const chatOptions: ChatOptions = {
         model,
@@ -672,17 +731,33 @@ export class WorkflowContext<TInput = unknown> {
 
       // Track cost
       if (response.cost) {
-        if (this.budgetContext) {
-          this.budgetContext.totalCost += response.cost;
-          if (this.budgetContext.totalCost >= this.budgetContext.limit) {
-            this.budgetContext.exceeded = true;
-            // hard_stop: abort current in-flight operations immediately
-            if (this.budgetContext.policy === 'hard_stop' && this.budgetContext.abortController) {
-              this.budgetContext.abortController.abort();
-            }
-          }
+        this._accumulateBudgetCost(response.cost);
+      }
+
+      // Snapshot of what we actually sent the provider this turn (excluding the
+      // new assistant message that's about to be appended). Consumers can use
+      // this to reconstruct the model's exact view on any given turn.
+      // structuredClone avoids sharing references with `currentMessages` — later
+      // turns mutate pushed-into arrays (e.g. tool_calls), and async consumers
+      // would otherwise see post-mutation state. Wrapped in try/catch because
+      // exotic `providerMetadata` (e.g. a future provider attaching a Function
+      // or Buffer) would throw — we'd rather log the issue and keep the
+      // workflow running than crash on an observability snapshot.
+      let messagesSnapshot: ChatMessage[] | undefined;
+      if (verboseTrace) {
+        try {
+          messagesSnapshot = structuredClone(currentMessages);
+        } catch (err) {
+          console.warn(
+            '[axl] verbose trace messages snapshot failed to clone; emitting shallow copy:',
+            err instanceof Error ? err.message : String(err),
+          );
+          messagesSnapshot = [...currentMessages];
         }
       }
+
+      const retryReason = pendingRetryReason;
+      pendingRetryReason = undefined;
 
       this.emitTrace({
         type: 'agent_call',
@@ -697,8 +772,31 @@ export class WorkflowContext<TInput = unknown> {
               reasoning: response.usage.reasoning_tokens,
             }
           : undefined,
-        duration: Date.now() - startTime,
-        data: { prompt, response: response.content },
+        duration: Date.now() - turnStart,
+        data: {
+          prompt,
+          response: response.content,
+          ...(systemPrompt ? { system: systemPrompt } : {}),
+          ...(response.thinking_content ? { thinking: response.thinking_content } : {}),
+          params: {
+            ...(chatOptions.temperature !== undefined
+              ? { temperature: chatOptions.temperature }
+              : {}),
+            maxTokens: chatOptions.maxTokens,
+            ...(chatOptions.effort !== undefined ? { effort: chatOptions.effort } : {}),
+            ...(chatOptions.thinkingBudget !== undefined
+              ? { thinkingBudget: chatOptions.thinkingBudget }
+              : {}),
+            ...(chatOptions.includeThoughts !== undefined
+              ? { includeThoughts: chatOptions.includeThoughts }
+              : {}),
+            ...(chatOptions.toolChoice !== undefined ? { toolChoice: chatOptions.toolChoice } : {}),
+            ...(chatOptions.stop !== undefined ? { stop: chatOptions.stop } : {}),
+          },
+          turn: turns,
+          ...(retryReason ? { retryReason } : {}),
+          ...(messagesSnapshot ? { messages: messagesSnapshot } : {}),
+        },
       });
 
       // Handle tool calls
@@ -781,7 +879,13 @@ export class WorkflowContext<TInput = unknown> {
                       this.emitTrace({
                         type: 'handoff',
                         agent: agent._name,
-                        data: { target: targetName, mode, duration },
+                        data: {
+                          target: targetName,
+                          mode,
+                          duration,
+                          source: agent._name,
+                          ...(handoffPrompt !== prompt ? { message: handoffPrompt } : {}),
+                        },
                       });
                       return result;
                     },
@@ -791,7 +895,13 @@ export class WorkflowContext<TInput = unknown> {
                   this.emitTrace({
                     type: 'handoff',
                     agent: agent._name,
-                    data: { target: targetName, mode, duration: Date.now() - handoffStart },
+                    data: {
+                      target: targetName,
+                      mode,
+                      duration: Date.now() - handoffStart,
+                      source: agent._name,
+                      ...(handoffPrompt !== prompt ? { message: handoffPrompt } : {}),
+                    },
                   });
                 }
                 continue; // Source agent loop continues
@@ -813,7 +923,7 @@ export class WorkflowContext<TInput = unknown> {
                     this.emitTrace({
                       type: 'handoff',
                       agent: agent._name,
-                      data: { target: targetName, mode, duration },
+                      data: { target: targetName, mode, duration, source: agent._name },
                     });
                     return result;
                   },
@@ -823,7 +933,12 @@ export class WorkflowContext<TInput = unknown> {
               this.emitTrace({
                 type: 'handoff',
                 agent: agent._name,
-                data: { target: targetName, mode, duration: Date.now() - handoffStart },
+                data: {
+                  target: targetName,
+                  mode,
+                  duration: Date.now() - handoffStart,
+                  source: agent._name,
+                },
               });
               return onewayResult;
             }
@@ -929,7 +1044,7 @@ export class WorkflowContext<TInput = unknown> {
           // so they bypass the approval gate entirely. This is intentional — MCP tools
           // are externally managed and don't carry requireApproval config.
           if (tool && tool.requireApproval) {
-            const approvalFn = async (): Promise<boolean> => {
+            const approvalFn = async (): Promise<{ approved: boolean; reason?: string }> => {
               const decision = await this.awaitHuman({
                 channel: 'tool_approval',
                 prompt: `Tool "${toolName}" wants to execute with args: ${JSON.stringify(toolArgs)}`,
@@ -937,25 +1052,19 @@ export class WorkflowContext<TInput = unknown> {
               });
               if (!decision.approved) {
                 const reason = decision.reason ?? 'Denied by human';
-                this.emitTrace({
-                  type: 'tool_denied',
-                  agent: agent._name,
-                  tool: toolName,
-                  data: { denied: true, reason, args: toolArgs },
-                });
                 currentMessages.push({
                   role: 'tool',
                   content: JSON.stringify({ error: `Tool denied by human: ${reason}` }),
                   tool_call_id: toolCall.id,
                 });
-                return false;
+                return { approved: false, reason };
               }
-              return true;
+              return { approved: true };
             };
 
-            let approved: boolean;
+            let approvalOutcome: { approved: boolean; reason?: string };
             if (this.spanManager) {
-              approved = await this.spanManager.withSpanAsync(
+              approvalOutcome = await this.spanManager.withSpanAsync(
                 'axl.tool.approval',
                 {
                   'axl.tool.name': toolName,
@@ -963,23 +1072,26 @@ export class WorkflowContext<TInput = unknown> {
                 },
                 async (span) => {
                   const result = await approvalFn();
-                  span.setAttribute('axl.tool.approval.approved', result);
+                  span.setAttribute('axl.tool.approval.approved', result.approved);
                   return result;
                 },
               );
             } else {
-              approved = await approvalFn();
+              approvalOutcome = await approvalFn();
             }
 
-            if (!approved) continue;
-
-            // Emit approval-succeeded trace so the stream handler can emit a tool_approval event
             this.emitTrace({
-              type: 'tool_denied',
+              type: 'tool_approval',
               agent: agent._name,
               tool: toolName,
-              data: { denied: false, args: toolArgs },
+              data: {
+                approved: approvalOutcome.approved,
+                args: toolArgs,
+                ...(approvalOutcome.reason ? { reason: approvalOutcome.reason } : {}),
+              },
             });
+
+            if (!approvalOutcome.approved) continue;
           }
 
           // Before hook: transform input before execution
@@ -1020,8 +1132,10 @@ export class WorkflowContext<TInput = unknown> {
                 resultContent = JSON.stringify(toolResult);
               }
             } else if (tool) {
-              // Execute local tool with a child context for nested agent invocations
-              const childCtx = this.createChildContext();
+              // Execute local tool with a child context for nested agent invocations.
+              // Pass toolCall.id so any nested trace events can be joined back
+              // to this outer tool_call via `parentToolCallId`.
+              const childCtx = this.createChildContext(toolCall.id);
               try {
                 toolResult = await tool._execute(toolArgs, childCtx);
               } catch (err) {
@@ -1113,40 +1227,52 @@ export class WorkflowContext<TInput = unknown> {
       // -- Gate 1: Output guardrail (raw text — content safety) --
       if (guardrails?.output) {
         const outputResult = await guardrails.output(content, { metadata: this.metadata });
+
+        // Compute retry intent *before* emitting the trace so the feedback message
+        // the LLM will see on its next attempt is visible in the same event.
+        const attempt = guardrailOutputRetries + 1;
+        const maxAttempts = maxGuardrailRetries + 1;
+        const onBlock = guardrails.onBlock ?? 'throw';
+        let feedbackMessage: string | undefined;
+        if (
+          outputResult.block &&
+          onBlock === 'retry' &&
+          guardrailOutputRetries < maxGuardrailRetries
+        ) {
+          feedbackMessage = `Your previous response was blocked by a safety guardrail: ${outputResult.reason ?? 'Output blocked'}. Please provide a different response that complies with the guidelines.`;
+        }
+
         this.emitTrace({
           type: 'guardrail',
           agent: agent._name,
           data: {
             guardrailType: 'output',
             blocked: outputResult.block,
-            reason: outputResult.reason,
+            ...(outputResult.reason ? { reason: outputResult.reason } : {}),
+            attempt,
+            maxAttempts,
+            ...(feedbackMessage ? { feedbackMessage } : {}),
           },
         });
         this.spanManager?.addEventToActiveSpan('axl.guardrail.check', {
           'axl.guardrail.type': 'output',
           'axl.guardrail.blocked': outputResult.block,
+          'axl.guardrail.attempt': attempt,
+          'axl.guardrail.maxAttempts': maxAttempts,
           ...(outputResult.reason ? { 'axl.guardrail.reason': outputResult.reason } : {}),
         });
+
         if (outputResult.block) {
-          const onBlock = guardrails.onBlock ?? 'throw';
-          if (onBlock === 'retry') {
-            const maxGuardrailRetries = guardrails.maxRetries ?? 2;
-            if (guardrailOutputRetries < maxGuardrailRetries) {
-              guardrailOutputRetries++;
-              currentMessages.push({
-                role: 'assistant',
-                content,
-                ...(response.providerMetadata
-                  ? { providerMetadata: response.providerMetadata }
-                  : {}),
-              });
-              currentMessages.push({
-                role: 'system',
-                content: `Your previous response was blocked by a safety guardrail: ${outputResult.reason ?? 'Output blocked'}. Please provide a different response that complies with the guidelines.`,
-              });
-              continue; // Re-enter the while loop for another LLM turn
-            }
-            // Max retries exhausted — fall through to throw
+          if (feedbackMessage) {
+            guardrailOutputRetries++;
+            appendRetryMessages(
+              currentMessages,
+              content,
+              feedbackMessage,
+              response.providerMetadata,
+            );
+            pendingRetryReason = 'guardrail';
+            continue; // Re-enter the while loop for another LLM turn
           }
           if (typeof onBlock === 'function') {
             return onBlock(outputResult.reason ?? 'Output blocked by guardrail', {
@@ -1160,33 +1286,63 @@ export class WorkflowContext<TInput = unknown> {
       // -- Gate 2: Schema validation (parse + Zod) --
       let validated: unknown = undefined;
       if (options?.schema) {
+        const maxSchemaRetries = options.retries ?? 3;
+        const schemaAttempt = schemaRetries + 1;
+        const schemaMaxAttempts = maxSchemaRetries + 1;
+        let schemaValid = false;
+        let schemaReason: string | undefined;
+        let schemaFeedback: string | undefined;
+        let schemaErr: unknown;
         try {
           const parsed = JSON.parse(extractJson(content));
           validated = (options.schema as z.ZodType).parse(parsed);
+          schemaValid = true;
         } catch (err) {
-          const maxSchemaRetries = options.retries ?? 3;
+          schemaErr = err;
+          schemaReason = err instanceof Error ? err.message : String(err);
           if (schemaRetries < maxSchemaRetries) {
+            schemaFeedback = `Your response was not valid JSON or did not match the required schema: ${schemaReason}. Please fix and try again.`;
+          }
+        }
+
+        this.emitTrace({
+          type: 'schema_check',
+          agent: agent._name,
+          data: {
+            valid: schemaValid,
+            ...(schemaReason ? { reason: schemaReason } : {}),
+            attempt: schemaAttempt,
+            maxAttempts: schemaMaxAttempts,
+            ...(schemaFeedback ? { feedbackMessage: schemaFeedback } : {}),
+          },
+        });
+        this.spanManager?.addEventToActiveSpan('axl.schema.check', {
+          'axl.schema.valid': schemaValid,
+          'axl.schema.attempt': schemaAttempt,
+          'axl.schema.maxAttempts': schemaMaxAttempts,
+          ...(schemaReason ? { 'axl.schema.reason': schemaReason } : {}),
+        });
+
+        if (!schemaValid) {
+          if (schemaFeedback) {
             schemaRetries++;
-            const errorMsg = err instanceof Error ? err.message : String(err);
-            currentMessages.push({
-              role: 'assistant',
+            appendRetryMessages(
+              currentMessages,
               content,
-              ...(response.providerMetadata ? { providerMetadata: response.providerMetadata } : {}),
-            });
-            currentMessages.push({
-              role: 'system',
-              content: `Your response was not valid JSON or did not match the required schema: ${errorMsg}. Please fix and try again.`,
-            });
+              schemaFeedback,
+              response.providerMetadata,
+            );
+            pendingRetryReason = 'schema';
             continue; // Re-enter the while loop for another LLM turn
           }
           const zodErr =
-            err instanceof ZodError
-              ? err
+            schemaErr instanceof ZodError
+              ? schemaErr
               : new ZodError([
                   {
                     code: 'custom',
                     path: [],
-                    message: err instanceof Error ? err.message : String(err),
+                    message: schemaReason ?? 'Schema parse failed',
                   },
                 ]);
           throw new VerifyError(content, zodErr, maxSchemaRetries);
@@ -1209,32 +1365,42 @@ export class WorkflowContext<TInput = unknown> {
           validateResult = { valid: false, reason: `Validator error: ${reason}` };
         }
 
+        const maxValidateRetries = options.validateRetries ?? 2;
+        const validateAttempt = validateRetries + 1;
+        const validateMaxAttempts = maxValidateRetries + 1;
+        let validateFeedback: string | undefined;
+        if (!validateResult.valid && validateRetries < maxValidateRetries) {
+          validateFeedback = `Your response parsed correctly but failed validation: ${validateResult.reason ?? 'Validation failed'}. Previous attempts are visible above. Please fix and try again.`;
+        }
+
         this.emitTrace({
           type: 'validate',
           agent: agent._name,
           data: {
             valid: validateResult.valid,
             ...(validateResult.reason ? { reason: validateResult.reason } : {}),
+            attempt: validateAttempt,
+            maxAttempts: validateMaxAttempts,
+            ...(validateFeedback ? { feedbackMessage: validateFeedback } : {}),
           },
         });
         this.spanManager?.addEventToActiveSpan('axl.validate.check', {
           'axl.validate.valid': validateResult.valid,
+          'axl.validate.attempt': validateAttempt,
+          'axl.validate.maxAttempts': validateMaxAttempts,
           ...(validateResult.reason ? { 'axl.validate.reason': validateResult.reason } : {}),
         });
 
         if (!validateResult.valid) {
-          const maxValidateRetries = options.validateRetries ?? 2;
-          if (validateRetries < maxValidateRetries) {
+          if (validateFeedback) {
             validateRetries++;
-            currentMessages.push({
-              role: 'assistant',
+            appendRetryMessages(
+              currentMessages,
               content,
-              ...(response.providerMetadata ? { providerMetadata: response.providerMetadata } : {}),
-            });
-            currentMessages.push({
-              role: 'system',
-              content: `Your response parsed correctly but failed validation: ${validateResult.reason ?? 'Validation failed'}. Previous attempts are visible above. Please fix and try again.`,
-            });
+              validateFeedback,
+              response.providerMetadata,
+            );
+            pendingRetryReason = 'validate';
             continue; // Re-enter the while loop — goes through all gates again
           }
           throw new ValidationError(
@@ -1713,6 +1879,21 @@ export class WorkflowContext<TInput = unknown> {
     const maxRetries = options?.retries ?? 3;
     let lastRetry: VerifyRetry<T> | undefined = undefined;
 
+    // Emits exactly one `verify` trace event at each terminal point so consumers
+    // can see the outcome (pass/fail) and the number of attempts used. Called
+    // just before every return/throw below; no-op on `continue`.
+    const emitVerifyOutcome = (passed: boolean, attempts: number, lastError?: string) => {
+      this.emitTrace({
+        type: 'verify',
+        agent: undefined,
+        data: {
+          passed,
+          attempts,
+          ...(lastError ? { lastError } : {}),
+        },
+      });
+    };
+
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       let rawOutput: unknown;
       try {
@@ -1733,6 +1914,7 @@ export class WorkflowContext<TInput = unknown> {
             const errorMsg = validateResult.reason ?? 'Validation failed';
             lastRetry = { error: errorMsg, output: rawOutput, parsed };
             if (attempt === maxRetries) {
+              emitVerifyOutcome(false, attempt + 1, errorMsg);
               if (options?.fallback !== undefined) return options.fallback;
               throw new ValidationError(parsed, errorMsg, maxRetries);
             }
@@ -1740,6 +1922,7 @@ export class WorkflowContext<TInput = unknown> {
           }
         }
 
+        emitVerifyOutcome(true, attempt + 1);
         return parsed;
       } catch (err) {
         if (err instanceof ValidationError) {
@@ -1752,6 +1935,7 @@ export class WorkflowContext<TInput = unknown> {
             parsed: err.lastOutput as T,
           };
           if (attempt === maxRetries) {
+            emitVerifyOutcome(false, attempt + 1, err.reason);
             if (options?.fallback !== undefined) return options.fallback;
             throw err;
           }
@@ -1764,6 +1948,7 @@ export class WorkflowContext<TInput = unknown> {
         if (err instanceof VerifyError) {
           lastRetry = { error: err.message, output: rawOutput ?? err.lastOutput };
           if (attempt === maxRetries) {
+            emitVerifyOutcome(false, attempt + 1, err.message);
             if (options?.fallback !== undefined) return options.fallback;
             throw err;
           }
@@ -1775,6 +1960,7 @@ export class WorkflowContext<TInput = unknown> {
         lastRetry = { error: errorMsg, output: rawOutput };
 
         if (attempt === maxRetries) {
+          emitVerifyOutcome(false, attempt + 1, errorMsg);
           if (options?.fallback !== undefined) return options.fallback;
           const zodErr =
             err instanceof ZodError
@@ -1785,6 +1971,7 @@ export class WorkflowContext<TInput = unknown> {
       }
     }
 
+    emitVerifyOutcome(false, maxRetries + 1, lastRetry?.error ?? 'Verify failed');
     if (options?.fallback !== undefined) return options.fallback;
     throw new VerifyError(
       lastRetry?.output,
@@ -2166,6 +2353,88 @@ export class WorkflowContext<TInput = unknown> {
     return decision;
   }
 
+  /**
+   * Compose an `AbortSignal` for a memory operation's underlying embedder
+   * fetch. Combines the parent context signal (user cancellation,
+   * `runtime.execute({ signal })`) with the budget hard_stop abort so
+   * that either cause correctly aborts an in-flight embed call.
+   *
+   * Returns `undefined` if there's nothing to cancel on — the embedder
+   * runs without a signal in that case, matching its prior behavior.
+   *
+   * @internal
+   */
+  private _composeMemorySignal(): AbortSignal | undefined {
+    const budgetSignal = this.budgetContext?.abortController?.signal;
+    if (this.signal && budgetSignal) return AbortSignal.any([this.signal, budgetSignal]);
+    return this.signal ?? budgetSignal;
+  }
+
+  /**
+   * Accumulate a cost amount into the active `budgetContext` and trip the
+   * `exceeded` flag if we've crossed the limit. On `hard_stop` policy,
+   * also fires the abort controller so in-flight operations cancel.
+   *
+   * Called from every code path that spends money: the `agent_call` loop,
+   * semantic memory operations (`ctx.remember({embed:true})`, `ctx.recall({query})`),
+   * and any future cost-emitting primitive. Centralizing the logic here
+   * means `ctx.budget({ limit, policy })` accurately enforces the limit
+   * across ALL cost sources — not just agent calls.
+   *
+   * @internal
+   */
+  private _accumulateBudgetCost(amount: number): void {
+    if (!this.budgetContext) return;
+    if (!Number.isFinite(amount) || amount <= 0) return;
+    this.budgetContext.totalCost += amount;
+    if (this.budgetContext.totalCost >= this.budgetContext.limit) {
+      this.budgetContext.exceeded = true;
+      // hard_stop: abort current in-flight operations immediately
+      if (this.budgetContext.policy === 'hard_stop' && this.budgetContext.abortController) {
+        this.budgetContext.abortController.abort();
+      }
+    }
+  }
+
+  // ── workflow lifecycle trace emission ──────────────────────────────────
+  //
+  // These are called by the runtime at execution boundaries. They emit
+  // first-class `workflow_start` / `workflow_end` trace events instead of
+  // the previous `ctx.log('workflow_start', ...)` indirection — so consumers
+  // that narrow via `event.type === 'workflow_start'` actually see them.
+  // Internal: the runtime is the only caller, user workflows never call these.
+
+  /** @internal */
+  _emitWorkflowStart(input: unknown): void {
+    this.emitTrace({
+      type: 'workflow_start',
+      workflow: this.workflowName,
+      data: { input },
+    });
+  }
+
+  /** @internal */
+  _emitWorkflowEnd(info: {
+    status: 'completed' | 'failed';
+    duration: number;
+    result?: unknown;
+    error?: string;
+    aborted?: boolean;
+  }): void {
+    this.emitTrace({
+      type: 'workflow_end',
+      workflow: this.workflowName,
+      duration: info.duration,
+      data: {
+        status: info.status,
+        duration: info.duration,
+        ...(info.result !== undefined ? { result: info.result } : {}),
+        ...(info.error !== undefined ? { error: info.error } : {}),
+        ...(info.aborted ? { aborted: true } : {}),
+      },
+    });
+  }
+
   // ── ctx.log() ─────────────────────────────────────────────────────────
 
   log(event: string, data?: unknown): void {
@@ -2210,8 +2479,92 @@ export class WorkflowContext<TInput = unknown> {
     if (!this.stateStore) {
       throw new Error('A state store is required for memory operations.');
     }
+    // Budget gate: refuse to start a new memory op if the budget has
+    // already been breached. Semantic remember hits a paid embedding API
+    // and without this check a hard_stop budget only stopped the next
+    // `ctx.ask()` call — memory writes could keep spending after the
+    // limit. Mirrors the gate at the top of `ctx.ask()`.
+    if (this.budgetContext?.exceeded) {
+      const { limit, totalCost: spent, policy } = this.budgetContext;
+      if (policy !== 'warn') {
+        throw new BudgetExceededError(limit, spent, policy);
+      }
+    }
     const sessionId = this.metadata?.sessionId as string | undefined;
-    await this.memoryManager.remember(key, value, this.stateStore, sessionId, options);
+    const scope: 'session' | 'global' = options?.scope ?? (sessionId ? 'session' : 'global');
+    // Operation-only audit trail — values are deliberately NOT traced because
+    // they can be arbitrary user data. Emit on both success and failure so
+    // compliance consumers can reconstruct the full audit history even when
+    // the underlying store rejects the write.
+    try {
+      const memorySignal = this._composeMemorySignal();
+      const { usage } = await this.memoryManager.remember(
+        key,
+        value,
+        this.stateStore,
+        sessionId,
+        options,
+        memorySignal,
+      );
+      // Budget attribution: embedder spend counts against `ctx.budget()`
+      // the same way agent_call cost does. Without this, a RAG workload
+      // with heavy semantic memory can silently breach a hard_stop
+      // budget (memory cost was previously only flowing through the
+      // trace-event rail for trackExecution, bypassing budgetContext).
+      if (usage?.cost != null) {
+        this._accumulateBudgetCost(usage.cost);
+      }
+      // Surface embedder cost at the TraceEvent top level so the
+      // `trackExecution` listener picks it up automatically (it sums
+      // `event.cost` across every event in scope, regardless of type).
+      // Also mirror `usage.tokens` to top-level `tokens.input` so the
+      // CostAggregator's early-return gate (`cost == null && !tokens`)
+      // doesn't silently drop zero-cost-but-nonzero-token events from a
+      // local embedder or an unknown-pricing model. Tokens live in
+      // `tokens.input` because embedding APIs bill on input only.
+      // `usage` is also nested into the event `data` for trace-explorer
+      // visibility (debuggers see the full model/cost/tokens breakdown).
+      this.emitTrace({
+        type: 'log',
+        ...(usage?.cost != null ? { cost: usage.cost } : {}),
+        ...(usage?.tokens != null ? { tokens: { input: usage.tokens } } : {}),
+        data: {
+          event: 'memory_remember',
+          key,
+          scope,
+          embed: options?.embed === true,
+          ...(usage ? { usage } : {}),
+        },
+      });
+    } catch (err) {
+      // Recover cost attribution on the partial-failure path: if the
+      // embedder call succeeded but a downstream step (vectorStore.upsert)
+      // failed, `MemoryManager.remember` attaches the usage to the error
+      // as a non-enumerable `axlEmbedUsage` property. The user has already
+      // been billed for the embed — we owe them accurate cost tracking
+      // even though the memory write ultimately failed (including budget
+      // accounting, so a partial-failure RAG burst still counts against
+      // a hard_stop budget).
+      const partialUsage = (err as { axlEmbedUsage?: import('./memory/types.js').EmbedUsage })
+        .axlEmbedUsage;
+      if (partialUsage?.cost != null) {
+        this._accumulateBudgetCost(partialUsage.cost);
+      }
+      this.emitTrace({
+        type: 'log',
+        ...(partialUsage?.cost != null ? { cost: partialUsage.cost } : {}),
+        ...(partialUsage?.tokens != null ? { tokens: { input: partialUsage.tokens } } : {}),
+        data: {
+          event: 'memory_remember',
+          key,
+          scope,
+          embed: options?.embed === true,
+          ...(partialUsage ? { usage: partialUsage } : {}),
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+      throw err;
+    }
   }
 
   /**
@@ -2226,8 +2579,76 @@ export class WorkflowContext<TInput = unknown> {
     if (!this.stateStore) {
       throw new Error('A state store is required for memory operations.');
     }
+    // Budget gate: refuse to start a new semantic recall if the budget
+    // has already been breached. See ctx.remember for rationale.
+    if (this.budgetContext?.exceeded) {
+      const { limit, totalCost: spent, policy } = this.budgetContext;
+      if (policy !== 'warn') {
+        throw new BudgetExceededError(limit, spent, policy);
+      }
+    }
     const sessionId = this.metadata?.sessionId as string | undefined;
-    return this.memoryManager.recall(key, this.stateStore, sessionId, options);
+    const scope: 'session' | 'global' = options?.scope ?? (sessionId ? 'session' : 'global');
+    const semantic = options?.query !== undefined;
+    // Operation-only audit trail. Emit on both success and failure.
+    try {
+      const memorySignal = this._composeMemorySignal();
+      const { data, usage } = await this.memoryManager.recall(
+        key,
+        this.stateStore,
+        sessionId,
+        options,
+        memorySignal,
+      );
+      let hit: boolean;
+      let resultCount: number | undefined;
+      if (semantic) {
+        resultCount = Array.isArray(data) ? data.length : 0;
+        hit = resultCount > 0;
+      } else {
+        hit = data !== null && data !== undefined;
+      }
+      // Budget attribution: semantic recall embedder cost counts against
+      // `ctx.budget()`. Heavy RAG read workloads could previously breach
+      // a hard_stop budget silently — memory cost flowed through the trace
+      // rail for trackExecution but bypassed budgetContext.
+      if (usage?.cost != null) {
+        this._accumulateBudgetCost(usage.cost);
+      }
+      // Surface embedder cost + tokens at the TraceEvent top level so
+      // the `trackExecution` listener picks cost up and the CostAggregator's
+      // early-return gate (`cost == null && !tokens`) doesn't silently
+      // drop zero-cost-but-nonzero-token events. `usage` is also nested
+      // into `data.usage` for trace inspection.
+      this.emitTrace({
+        type: 'log',
+        ...(usage?.cost != null ? { cost: usage.cost } : {}),
+        ...(usage?.tokens != null ? { tokens: { input: usage.tokens } } : {}),
+        data: {
+          event: 'memory_recall',
+          key,
+          scope,
+          semantic,
+          hit,
+          ...(resultCount !== undefined ? { resultCount } : {}),
+          ...(usage ? { usage } : {}),
+        },
+      });
+      return data;
+    } catch (err) {
+      this.emitTrace({
+        type: 'log',
+        data: {
+          event: 'memory_recall',
+          key,
+          scope,
+          semantic,
+          hit: false,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+      throw err;
+    }
   }
 
   /** Delete a memory entry by key. */
@@ -2241,7 +2662,25 @@ export class WorkflowContext<TInput = unknown> {
       throw new Error('A state store is required for memory operations.');
     }
     const sessionId = this.metadata?.sessionId as string | undefined;
-    await this.memoryManager.forget(key, this.stateStore, sessionId, options);
+    const scope: 'session' | 'global' = options?.scope ?? (sessionId ? 'session' : 'global');
+    try {
+      await this.memoryManager.forget(key, this.stateStore, sessionId, options);
+      this.emitTrace({
+        type: 'log',
+        data: { event: 'memory_forget', key, scope },
+      });
+    } catch (err) {
+      this.emitTrace({
+        type: 'log',
+        data: {
+          event: 'memory_forget',
+          key,
+          scope,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
+      throw err;
+    }
   }
 
   // ── ctx.delegate() ──────────────────────────────────────────────────
@@ -2279,6 +2718,15 @@ export class WorkflowContext<TInput = unknown> {
     }
 
     if (agents.length === 1) {
+      this.emitTrace({
+        type: 'delegate',
+        agent: agents[0]._name,
+        data: {
+          candidates: [agents[0]._name],
+          selected: agents[0]._name,
+          reason: 'single_candidate',
+        },
+      });
       return this.ask(agents[0], prompt, {
         schema: options?.schema,
         retries: options?.retries,
@@ -2335,6 +2783,7 @@ export class WorkflowContext<TInput = unknown> {
       data: {
         candidates: agents.map((a) => a._name),
         routerModel: routerModelUri,
+        reason: 'routed',
       },
     });
 
@@ -2349,18 +2798,201 @@ export class WorkflowContext<TInput = unknown> {
 
   // ── Private ───────────────────────────────────────────────────────────
 
-  private emitTrace(partial: Omit<TraceEvent, 'executionId' | 'step' | 'timestamp'>): void {
-    let data = partial.data;
-    if (this.config.trace?.redact && partial.type === 'agent_call' && data) {
-      data = { ...(data as Record<string, unknown>), prompt: '[redacted]', response: '[redacted]' };
+  /**
+   * Internal emitter input — intentionally loose so call sites don't need to
+   * build a perfectly-narrowed discriminated-union member. The resulting
+   * `TraceEvent` (exported type) remains strict, and TypeScript narrows it at
+   * consumer sites via the `type` discriminator.
+   */
+  private emitTrace(partial: {
+    type: TraceEvent['type'];
+    workflow?: string;
+    agent?: string;
+    tool?: string;
+    promptVersion?: string;
+    model?: string;
+    cost?: number;
+    tokens?: { input?: number; output?: number; reasoning?: number };
+    duration?: number;
+    data?: unknown;
+  }): void {
+    let data: unknown = partial.data;
+    if (this.config.trace?.redact && data) {
+      // Redact any field that can carry prompt/response/PII content. Structural
+      // fields (attempt, maxAttempts, params, turn, valid, blocked, etc.) are
+      // left visible so traces remain useful for debugging and observability.
+      // Redaction preserves the original field shape — strings become
+      // '[redacted]' strings, `messages` stays a `ChatMessage[]` (single stub
+      // entry preserving the count) — so downstream consumers can narrow
+      // types without special-casing redacted vs non-redacted events.
+      if (partial.type === 'agent_call') {
+        const d = data as Record<string, unknown>;
+        const redacted: Record<string, unknown> = {
+          ...d,
+          prompt: '[redacted]',
+          response: '[redacted]',
+        };
+        if (d.system !== undefined) redacted.system = '[redacted]';
+        if (d.thinking !== undefined) redacted.thinking = '[redacted]';
+        if (Array.isArray(d.messages)) {
+          redacted.messages = [
+            { role: 'system', content: `[${d.messages.length} messages redacted]` },
+          ];
+        }
+        data = redacted;
+      } else if (
+        partial.type === 'guardrail' ||
+        partial.type === 'schema_check' ||
+        partial.type === 'validate'
+      ) {
+        const d = data as Record<string, unknown>;
+        // `reason` can trivially echo user input (e.g. "Value 'john@acme.com'
+        // is not a valid email") — redact it alongside `feedbackMessage`.
+        const needsRedact = d.feedbackMessage !== undefined || d.reason !== undefined;
+        if (needsRedact) {
+          data = {
+            ...d,
+            ...(d.reason !== undefined ? { reason: '[redacted]' } : {}),
+            ...(d.feedbackMessage !== undefined ? { feedbackMessage: '[redacted]' } : {}),
+          };
+        }
+      } else if (partial.type === 'tool_call') {
+        // Tool args can carry user PII ("lookup SSN: 123-45-6789"), tool
+        // results can carry full records from internal systems. Redact both
+        // when the global trace.redact policy is on; callId stays visible so
+        // consumers can still correlate with other events in the stream.
+        const d = data as Record<string, unknown>;
+        data = {
+          ...d,
+          args: '[redacted]',
+          result: '[redacted]',
+        };
+      } else if (partial.type === 'tool_approval') {
+        const d = data as Record<string, unknown>;
+        data = {
+          ...d,
+          args: '[redacted]',
+          ...(d.reason !== undefined ? { reason: '[redacted]' } : {}),
+        };
+      } else if (partial.type === 'handoff') {
+        // `message` on roundtrip handoffs is user-supplied content. `target`,
+        // `source`, `mode`, `duration` are structural — keep visible.
+        const d = data as Record<string, unknown>;
+        if (d.message !== undefined) {
+          data = { ...d, message: '[redacted]' };
+        }
+      } else if (partial.type === 'workflow_start') {
+        // `input` is the user-supplied workflow input. Scrub it; keep shape so
+        // consumers can still detect the event. Structural fields (executionId
+        // on the parent event, workflow name) remain visible.
+        const d = data as Record<string, unknown>;
+        if (d.input !== undefined) {
+          data = { ...d, input: '[redacted]' };
+        }
+      } else if (partial.type === 'workflow_end') {
+        // `result` is the workflow return value, `error` is the thrown error
+        // message — both can echo user data (e.g., Zod error messages from
+        // outputSchema.parse failures quote the offending user value). Status,
+        // duration, and `aborted` are structural — keep visible.
+        const d = data as Record<string, unknown>;
+        const redacted: Record<string, unknown> = { ...d };
+        if (d.result !== undefined) redacted.result = '[redacted]';
+        if (d.error !== undefined) redacted.error = '[redacted]';
+        data = redacted;
+      } else if (partial.type === 'log') {
+        // `log` events can carry arbitrary user-emitted data (ctx.log) or
+        // system events like await_human that include user-supplied prompts.
+        // Conservative redaction: scrub string fields, preserve structural
+        // ones (event name, channel, step counts, numeric observability
+        // data). For nested objects, walk ONE level deep and apply the
+        // same rules — this preserves `usage.tokens` / `usage.cost` on
+        // memory events (numeric, non-PII, load-bearing for the Cost
+        // Dashboard's byEmbedder bucket) while still scrubbing string
+        // fields like `usage.model` that could carry tenant info.
+        //
+        // We deliberately don't recurse beyond one level. `ctx.log({ foo:
+        // { bar: { baz: 'secret' } } })` will have `foo.bar` replaced
+        // with an opaque sentinel — if a caller needs deeper structure
+        // preserved they should flatten before emitting. One level is
+        // exactly enough for the `usage` namespace shape we control.
+        const d = data as Record<string, unknown>;
+        const redacted: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(d)) {
+          // Keep the `event` discriminator and purely-numeric/boolean
+          // fields visible at the top level.
+          if (k === 'event' || typeof v === 'number' || typeof v === 'boolean') {
+            redacted[k] = v;
+          } else if (typeof v === 'string') {
+            redacted[k] = '[redacted]';
+          } else if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+            // One-level walk: preserve numeric/boolean fields, scrub strings.
+            // Arrays skipped — they're more commonly user data than structured
+            // numeric buckets, and deep-scrubbing them loses shape.
+            const inner = v as Record<string, unknown>;
+            const innerRedacted: Record<string, unknown> = {};
+            for (const [ik, iv] of Object.entries(inner)) {
+              if (typeof iv === 'number' || typeof iv === 'boolean') {
+                innerRedacted[ik] = iv;
+              } else if (typeof iv === 'string') {
+                innerRedacted[ik] = '[redacted]';
+              } else {
+                innerRedacted[ik] = '[redacted]';
+              }
+            }
+            redacted[k] = innerRedacted;
+          } else {
+            // Arrays, null, or deeper nesting — opaque sentinel.
+            redacted[k] = '[redacted]';
+          }
+        }
+        data = redacted;
+      }
     }
-    const event: TraceEvent = {
+    // `as unknown as TraceEvent`: the loose internal `partial` type can't be
+    // narrowed to a single discriminated union member at compile time, but the
+    // runtime invariant is maintained by the gate/emission call sites that
+    // always pair `type` with matching `data`/`tool`/etc.
+    //
+    // NOTE on redaction: we deliberately do NOT scrub top-level `cost`,
+    // `tokens`, or `duration` under `config.trace.redact`. They are numeric
+    // observability metrics (non-PII) and are load-bearing — `trackExecution`'s
+    // cost-aggregation listener and Studio's CostAggregator both read
+    // `event.cost` / `event.tokens` directly, so zeroing them would silently
+    // break cost totals when redaction is enabled. In strict compliance
+    // environments where even aggregate spend is sensitive, callers should
+    // filter these events out entirely via `onTrace` rather than mutate them.
+    //
+    // NOTE on `workflow`: every trace event gets stamped with the owning
+    // workflow name automatically (if set on the context). Previously each
+    // caller had to explicitly pass `workflow` in the partial, and only
+    // `_emitWorkflowStart` / `_emitWorkflowEnd` did so — which meant
+    // `event.workflow` was undefined on every other event type in production.
+    // Studio's `CostData.byWorkflow.cost` was effectively always $0 as a
+    // result (workflows appeared with execution counts but zero spend).
+    // Auto-stamping here is the single-source-of-truth fix: callers can
+    // still override via `partial.workflow` if needed (e.g. a child context
+    // emitting on behalf of its parent), but the common case "just works".
+    const event = {
       executionId: this.executionId,
       step: this.stepCounter++,
       timestamp: Date.now(),
+      ...(this.workflowName ? { workflow: this.workflowName } : {}),
+      ...(this.parentToolCallId ? { parentToolCallId: this.parentToolCallId } : {}),
       ...partial,
       data,
-    };
-    this.onTrace?.(event);
+    } as unknown as TraceEvent;
+    // Isolate consumer bugs: a buggy onTrace handler must not crash the
+    // workflow. Swallow and forward to console.error so the caller sees
+    // the failure in ops but the workflow keeps running.
+    if (this.onTrace) {
+      try {
+        this.onTrace(event);
+      } catch (err) {
+        console.error(
+          '[axl] onTrace handler threw; trace event dropped:',
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+    }
   }
 }

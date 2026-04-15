@@ -42,6 +42,11 @@ function hashInput(input: unknown): string {
 
 export type ExecuteOptions = {
   metadata?: Record<string, unknown>;
+  /** Handler for tool approval requests. When provided, tools with `requireApproval` resolve
+   *  via this handler instead of suspending the execution and registering a pending decision.
+   *  Useful for in-process testing and ad-hoc invocations where you don't want to poll
+   *  `runtime.getPendingDecisions()` and call `runtime.resolveDecision()`. */
+  awaitHumanHandler?: (options: AwaitHumanOptions) => Promise<HumanDecision>;
 };
 
 export type CreateContextOptions = {
@@ -112,6 +117,23 @@ export class AxlRuntime extends EventEmitter {
         embedder: this.config.memory.embedder,
       });
     }
+  }
+
+  /**
+   * Whether `config.trace.redact` is enabled on this runtime. A narrow
+   * boolean getter is preferred over exposing the full config because:
+   * (a) `Readonly<AxlConfig>` is shallow so the config would be mutable
+   * at runtime through sub-objects, subverting any compliance guarantee;
+   * (b) observability consumers like Studio only need the boolean, not
+   * the whole config tree; (c) if future observability config needs to
+   * expand, each new flag gets its own narrow getter.
+   *
+   * Studio's server-side redaction helpers (executions, memory, sessions,
+   * evals, decisions, tools, playground, workflows) all route through
+   * this accessor to decide whether to scrub response payloads.
+   */
+  isRedactEnabled(): boolean {
+    return this.config.trace?.redact === true;
   }
 
   /**
@@ -286,7 +308,13 @@ export class AxlRuntime extends EventEmitter {
   /** Run a registered eval by name. */
   async runRegisteredEval(
     name: string,
-    options?: { metadata?: Record<string, unknown> },
+    options?: {
+      metadata?: Record<string, unknown>;
+      /** Called after each dataset item completes (execution + scoring). */
+      onProgress?: (event: { type: string; itemIndex: number; totalItems: number }) => void;
+      /** Abort signal — checked before starting each item. */
+      signal?: AbortSignal;
+    },
   ): Promise<unknown> {
     const entry = this.registeredEvals.get(name);
     if (!entry) throw new Error(`Eval "${name}" is not registered`);
@@ -302,6 +330,10 @@ export class AxlRuntime extends EventEmitter {
           runtime: unknown,
         ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>,
         runtime: unknown,
+        evalOptions?: {
+          onProgress?: (event: { type: string; itemIndex: number; totalItems: number }) => void;
+          signal?: AbortSignal;
+        },
       ) => Promise<unknown>;
       try {
         // @ts-expect-error — @axlsdk/eval is an optional peer dependency
@@ -333,7 +365,10 @@ export class AxlRuntime extends EventEmitter {
         };
       };
 
-      result = await runEvalFn(entry.config, wrappedExecuteFn, this);
+      result = await runEvalFn(entry.config, wrappedExecuteFn, this, {
+        onProgress: options?.onProgress,
+        signal: options?.signal,
+      });
     } else {
       // Default: use runtime.eval() which creates its own executeWorkflow
       result = await this.eval(
@@ -517,6 +552,7 @@ export class AxlRuntime extends EventEmitter {
         }
       },
       pendingDecisions: this.pendingDecisionResolvers,
+      awaitHumanHandler: options?.awaitHumanHandler,
       stateStore: this.stateStore,
       workflowName: name,
       mcpManager: this.mcpManager,
@@ -531,9 +567,6 @@ export class AxlRuntime extends EventEmitter {
       },
     });
 
-    // Emit workflow start trace
-    ctx.log('workflow_start', { workflow: name, executionId });
-
     return this.spanManager.withSpanAsync(
       'axl.workflow.execute',
       {
@@ -543,6 +576,11 @@ export class AxlRuntime extends EventEmitter {
       },
       async (span) => {
         try {
+          // Emit workflow_start inside the span context so OTel exporters
+          // that correlate trace events to spans via active-context see it.
+          // BREAKING CHANGE from v0.14.x — previously emitted as
+          // `type: 'log'` with `data.event: 'workflow_start'`.
+          ctx._emitWorkflowStart(validated);
           const result = await workflow.handler(ctx);
 
           // Validate (and coerce) output if schema exists
@@ -552,11 +590,10 @@ export class AxlRuntime extends EventEmitter {
           execInfo.completedAt = Date.now();
           execInfo.duration = execInfo.completedAt - execInfo.startedAt;
           execInfo.result = output;
-          ctx.log('workflow_end', {
-            workflow: name,
+          ctx._emitWorkflowEnd({
             status: 'completed',
             duration: execInfo.duration,
-            cost: execInfo.totalCost,
+            result: output,
           });
 
           // Clean up checkpoints for completed execution
@@ -570,11 +607,24 @@ export class AxlRuntime extends EventEmitter {
           this.persistExecution(execInfo);
           return output;
         } catch (err) {
+          // Detect AbortError from both `DOMException` (browser / Node fetch path)
+          // and a plain `Error` with `name === 'AbortError'` (signal.throwIfAborted,
+          // user-thrown abort). A strict instanceof check misses cancellations
+          // thrown by other code paths.
+          const aborted =
+            typeof err === 'object' &&
+            err !== null &&
+            (err as { name?: unknown }).name === 'AbortError';
           execInfo.status = 'failed';
           execInfo.completedAt = Date.now();
           execInfo.duration = execInfo.completedAt - execInfo.startedAt;
           execInfo.error = err instanceof Error ? err.message : String(err);
-          ctx.log('workflow_end', { workflow: name, status: 'failed', error: execInfo.error });
+          ctx._emitWorkflowEnd({
+            status: 'failed',
+            duration: execInfo.duration,
+            error: execInfo.error,
+            ...(aborted ? { aborted: true } : {}),
+          });
           this.persistExecution(execInfo);
           throw err;
         } finally {
@@ -654,26 +704,24 @@ export class AxlRuntime extends EventEmitter {
                 duration: (data?.duration as number) ?? undefined,
               });
             }
+          } else if (event.type === 'tool_approval') {
+            // Approval gate decision — emit a `tool_approval` stream event that
+            // mirrors the trace event. Fires on both approve and deny so UI
+            // consumers can show the decision inline with the tool call.
+            const data = event.data as
+              | { approved?: boolean; args?: unknown; reason?: string }
+              | undefined;
+            axlStream._push({
+              type: 'tool_approval',
+              name: event.tool ?? '',
+              args: data?.args,
+              approved: data?.approved === true,
+              ...(data?.reason ? { reason: data.reason } : {}),
+            });
           } else if (event.type === 'tool_denied') {
-            const data = event.data as Record<string, unknown> | undefined;
-            if (data?.denied === false) {
-              // Approval succeeded
-              axlStream._push({
-                type: 'tool_approval',
-                name: event.tool ?? '',
-                args: data?.args,
-                approved: true,
-              });
-            } else {
-              // Approval denied
-              axlStream._push({
-                type: 'tool_approval',
-                name: event.tool ?? '',
-                args: data?.args,
-                approved: false,
-                reason: (data?.reason as string) ?? undefined,
-              });
-            }
+            // Agent tried to call a tool that doesn't exist (not an approval denial).
+            // No equivalent stream event today — the step event below still fires
+            // so consumers subscribing to all steps can react if needed.
           } else if (event.type === 'agent_call') {
             axlStream._push({
               type: 'agent_end',
@@ -707,6 +755,7 @@ export class AxlRuntime extends EventEmitter {
           axlStream._push({ type: 'agent_start', agent: info.agent, model: info.model });
         },
         pendingDecisions: this.pendingDecisionResolvers,
+        awaitHumanHandler: options?.awaitHumanHandler,
         stateStore: this.stateStore,
         workflowName: name,
         mcpManager: this.mcpManager,
@@ -731,6 +780,10 @@ export class AxlRuntime extends EventEmitter {
         },
         async (span) => {
           try {
+            // Parity fix: stream() used to never emit workflow_start
+            // (execute() did). Now both code paths emit it inside the span
+            // context as a first-class trace event.
+            wfCtx._emitWorkflowStart(validated);
             const rawResult = await workflow.handler(wfCtx);
             const result = workflow.outputSchema
               ? workflow.outputSchema.parse(rawResult)
@@ -740,11 +793,10 @@ export class AxlRuntime extends EventEmitter {
             execInfo!.completedAt = Date.now();
             execInfo!.duration = execInfo!.completedAt - execInfo!.startedAt;
             execInfo!.result = result;
-            wfCtx.log('workflow_end', {
-              workflow: name,
+            wfCtx._emitWorkflowEnd({
               status: 'completed',
               duration: execInfo!.duration,
-              cost: execInfo!.totalCost,
+              result,
             });
 
             // Clean up checkpoints for completed execution
@@ -769,14 +821,23 @@ export class AxlRuntime extends EventEmitter {
       .catch((err) => {
         // Update execution status on error
         if (execInfo) {
+          // Detect AbortError from both `DOMException` (browser / Node fetch path)
+          // and a plain `Error` with `name === 'AbortError'` (signal.throwIfAborted,
+          // user-thrown abort). A strict instanceof check misses cancellations
+          // thrown by other code paths.
+          const aborted =
+            typeof err === 'object' &&
+            err !== null &&
+            (err as { name?: unknown }).name === 'AbortError';
           execInfo.status = 'failed';
           execInfo.completedAt = Date.now();
           execInfo.duration = execInfo.completedAt - execInfo.startedAt;
           execInfo.error = err instanceof Error ? err.message : String(err);
-          ctx?.log('workflow_end', {
-            workflow: name,
+          ctx?._emitWorkflowEnd({
             status: 'failed',
+            duration: execInfo.duration,
             error: execInfo.error,
+            ...(aborted ? { aborted: true } : {}),
           });
           this.persistExecution(execInfo);
         }
@@ -1099,14 +1160,44 @@ export class AxlRuntime extends EventEmitter {
    * Returns cost (same as `trackCost`) plus metadata extracted from trace events:
    * models (unique URIs), tokens (input/output/reasoning sums), and agent call count.
    *
+   * ## Cost vs tokens semantics
+   *
+   * - `cost` is the full aggregate across EVERY event with a top-level
+   *   `event.cost` set: agent calls, tool calls, semantic memory ops, etc.
+   *   This is the number to reconcile against your provider bill.
+   *
+   * - `metadata.tokens` is narrowly scoped to **agent** prompt/completion/
+   *   reasoning tokens. Embedder tokens from semantic `ctx.remember({embed:true})`
+   *   / `ctx.recall({query})` are deliberately NOT summed here — they're a
+   *   different category (input-only, different pricing, different model).
+   *   Conflating them would make "prompt tokens" misleading in the UI. If you
+   *   need embedder token counts, subscribe to `runtime.on('trace', ...)` and
+   *   read `data.usage.tokens` on `memory_remember` / `memory_recall` events.
+   *
+   * Pass `{ captureTraces: true }` to also collect the raw `TraceEvent[]` observed
+   * during `fn()`. This is opt-in because it keeps every event in memory for the
+   * duration of the call — useful for eval per-item capture, debugging, and test
+   * assertions, but overhead grows with trace volume. When enabled, verbose-mode
+   * `agent_call.data.messages` snapshots are omitted from captured events (still
+   * broadcast via onTrace) to keep memory bounded — callers who need the full
+   * verbose snapshot should subscribe to `runtime.on('trace', ...)` directly.
+   *
    * Works with both `createContext()` and `execute()` calls inside `fn`.
    */
-  async trackExecution<T>(fn: () => Promise<T>): Promise<{
+  async trackExecution<T>(
+    fn: () => Promise<T>,
+    options?: { captureTraces?: boolean },
+  ): Promise<{
     result: T;
     cost: number;
+    traces?: TraceEvent[];
     metadata: {
       models: string[];
       modelCallCounts?: Record<string, number>;
+      /**
+       * Agent token totals only — does not include embedder tokens from
+       * semantic memory operations. See the method-level JSDoc above.
+       */
       tokens: { input: number; output: number; reasoning: number };
       agentCalls: number;
       /**
@@ -1134,6 +1225,7 @@ export class AxlRuntime extends EventEmitter {
     const workflowCalls = new Map<string, number>();
     const tokens = { input: 0, output: 0, reasoning: 0 };
     let agentCalls = 0;
+    const capturedTraces: TraceEvent[] | undefined = options?.captureTraces ? [] : undefined;
 
     const listener = (event: TraceEvent) => {
       if (!scope.trackedIds.has(event.executionId)) return;
@@ -1147,22 +1239,31 @@ export class AxlRuntime extends EventEmitter {
           tokens.reasoning += event.tokens.reasoning ?? 0;
         }
       }
-      // The production runtime emits workflow_start via ctx.log('workflow_start', ...),
-      // which produces a TraceEvent with type: 'log' and the event name + workflow
-      // nested in data. We also defensively handle the directly-typed shape
-      // (type: 'workflow_start') in case the runtime ever switches to direct
-      // emission — the TraceEvent type union already permits it.
-      let workflowName: string | undefined;
+      // Both `runtime.execute()` and `runtime.stream()` now emit workflow_start
+      // as a first-class `type: 'workflow_start'` event. AxlTestRuntime does
+      // the same. The prior log-form fallback is no longer needed.
       if (event.type === 'workflow_start' && event.workflow) {
-        workflowName = event.workflow;
-      } else if (event.type === 'log' && event.data && typeof event.data === 'object') {
-        const d = event.data as { event?: unknown; workflow?: unknown };
-        if (d.event === 'workflow_start' && typeof d.workflow === 'string') {
-          workflowName = d.workflow;
-        }
+        workflowCalls.set(event.workflow, (workflowCalls.get(event.workflow) ?? 0) + 1);
       }
-      if (workflowName) {
-        workflowCalls.set(workflowName, (workflowCalls.get(workflowName) ?? 0) + 1);
+
+      // Capture a compact copy of the event when requested. We strip the
+      // verbose `messages` field (can be tens of KB per turn) to keep memory
+      // predictable — callers who need the full verbose snapshot should
+      // subscribe to `runtime.on('trace', ...)` directly.
+      if (capturedTraces) {
+        if (event.type === 'agent_call' && event.data) {
+          const d = event.data as Record<string, unknown>;
+          if ('messages' in d) {
+            // Strip the verbose messages array by rebuilding without it.
+            const rest: Record<string, unknown> = {};
+            for (const k of Object.keys(d)) {
+              if (k !== 'messages') rest[k] = d[k];
+            }
+            capturedTraces.push({ ...event, data: rest } as TraceEvent);
+            return;
+          }
+        }
+        capturedTraces.push(event);
       }
     };
 
@@ -1174,6 +1275,7 @@ export class AxlRuntime extends EventEmitter {
       return {
         result,
         cost: scope.totalCost,
+        ...(capturedTraces ? { traces: capturedTraces } : {}),
         metadata: {
           models: [...modelCalls.keys()],
           modelCallCounts: modelCalls.size > 0 ? Object.fromEntries(modelCalls) : undefined,
@@ -1184,6 +1286,20 @@ export class AxlRuntime extends EventEmitter {
             workflowCalls.size > 0 ? Object.fromEntries(workflowCalls) : undefined,
         },
       };
+    } catch (err) {
+      // Attach captured traces to the thrown error so callers using
+      // `captureTraces: true` can recover the diagnostic trail on failure
+      // (e.g., eval runner per-item traces for failed items). Non-enumerable
+      // so the property doesn't pollute JSON serialization or stack traces.
+      if (capturedTraces && typeof err === 'object' && err !== null) {
+        Object.defineProperty(err, 'axlCapturedTraces', {
+          value: capturedTraces,
+          enumerable: false,
+          writable: true,
+          configurable: true,
+        });
+      }
+      throw err;
     } finally {
       this.off('trace', listener);
       this.setMaxListeners(this.getMaxListeners() - 1);
@@ -1248,12 +1364,16 @@ export class AxlRuntime extends EventEmitter {
     const workflowPrefix = event.workflow ? `workflow:${event.workflow} | ` : '';
     const parts = [`[axl] execution:${event.executionId}`];
 
-    const data = event.data as { workflow?: string } | undefined;
-
     if (event.type === 'workflow_start') {
-      parts.push(`${workflowPrefix}workflow:${data?.workflow ?? 'unknown'} | started`);
+      // workflow name now lives on the event top-level, not in data.
+      parts.push(`${workflowPrefix}started`);
     } else if (event.type === 'workflow_end') {
-      parts.push(`${workflowPrefix}workflow:${data?.workflow ?? 'unknown'} | completed`);
+      // Honour the actual outcome — previously this always said "completed"
+      // even for failed/aborted runs.
+      const d = event.data as { status?: string; aborted?: boolean } | undefined;
+      const status = d?.aborted ? 'aborted' : (d?.status ?? 'completed');
+      parts.push(`${workflowPrefix}${status}`);
+      if (event.duration != null) parts.push(`${(event.duration / 1000).toFixed(1)}s`);
     } else if (event.type === 'agent_call') {
       parts.push(`${workflowPrefix}step:${event.step} agent_call`);
       if (event.agent) parts.push(`agent:${event.agent}`);

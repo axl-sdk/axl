@@ -108,7 +108,7 @@ describe('Basic Workflow E2E', () => {
     expect(typeof result).toBe('number');
   });
 
-  it('emits trace events: log(workflow_start), agent_call, log(workflow_end)', async () => {
+  it('emits trace events: workflow_start, agent_call, workflow_end', async () => {
     const provider = MockProvider.sequence([{ content: 'done' }]);
     const { runtime, traces } = createTestRuntime(provider);
     const wf = testWorkflow();
@@ -117,14 +117,16 @@ describe('Basic Workflow E2E', () => {
     await runtime.execute('test-wf', { message: 'hello' });
 
     const types = traces.map((t) => t.type);
-    expect(types).toContain('log'); // workflow_start and workflow_end are emitted as 'log' type
+    // workflow_start and workflow_end are now first-class trace types.
+    expect(types).toContain('workflow_start');
+    expect(types).toContain('workflow_end');
     expect(types).toContain('agent_call');
 
-    // Verify workflow_start and workflow_end exist as log events
-    const logEvents = traces.filter((t) => t.type === 'log');
-    const logData = logEvents.map((t) => (t.data as { event?: string })?.event);
-    expect(logData).toContain('workflow_start');
-    expect(logData).toContain('workflow_end');
+    const startEvent = traces.find((t) => t.type === 'workflow_start');
+    const endEvent = traces.find((t) => t.type === 'workflow_end');
+    expect(startEvent?.workflow).toBe('test-wf');
+    expect(endEvent?.workflow).toBe('test-wf');
+    expect((endEvent!.data as { status?: string }).status).toBe('completed');
   });
 
   it('passes metadata through to context', async () => {

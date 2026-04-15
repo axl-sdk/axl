@@ -7,6 +7,7 @@ import {
   NoConsensus,
   TimeoutError,
   ToolDenied,
+  BudgetExceededError,
 } from '../errors.js';
 
 describe('AxlError', () => {
@@ -189,5 +190,64 @@ describe('ToolDenied', () => {
   it('extends Error', () => {
     const err = new ToolDenied('test', 'agent');
     expect(err).toBeInstanceOf(Error);
+  });
+});
+
+describe('BudgetExceededError', () => {
+  it('formats 2-decimal values normally', () => {
+    const err = new BudgetExceededError(10, 12.5, 'hard_stop');
+    expect(err.message).toBe('Budget exceeded: spent $12.50 of $10.00 limit (policy: hard_stop)');
+  });
+
+  it('formats sub-cent values in [0.0001, 0.01) with 6 decimals', () => {
+    const err = new BudgetExceededError(0.005, 0.008, 'finish_and_stop');
+    expect(err.message).toContain('$0.008000');
+    expect(err.message).toContain('$0.005000');
+  });
+
+  it('formats values in [1e-6, 1e-4) with scientific notation', () => {
+    const err = new BudgetExceededError(5e-5, 8e-5, 'hard_stop');
+    // Inside the scientific tier: `$8.00e-5` and `$5.00e-5`
+    expect(err.message).toContain('e-5');
+    expect(err.message).toContain('$8.00e-5');
+  });
+
+  it('formats noise-level values (< 1e-6) with the < sentinel', () => {
+    const err = new BudgetExceededError(1e-7, 5e-8, 'warn');
+    expect(err.message).toContain('< $0.000001');
+  });
+
+  it('preserves cost numbers on the error instance', () => {
+    const err = new BudgetExceededError(0.5, 0.75, 'hard_stop');
+    expect(err.limit).toBe(0.5);
+    expect(err.spent).toBe(0.75);
+    expect(err.policy).toBe('hard_stop');
+  });
+
+  it('places the minus sign outside the dollar sign for negative values', () => {
+    // Shouldn't happen in practice — cost is always non-negative — but a
+    // cost-accounting bug could produce a negative value, and we want
+    // the error message to render it cleanly as `-$X` instead of `$-X`.
+    const err = new BudgetExceededError(1, -2.5, 'hard_stop');
+    expect(err.message).toContain('-$2.50');
+    expect(err.message).not.toContain('$-2.50');
+  });
+
+  it('renders NaN/Infinity literally to preserve the bug signal', () => {
+    // Collapsing NaN/Infinity to $0.00 would hide a cost-accounting bug
+    // behind the error message. Fail-loud.
+    const nanErr = new BudgetExceededError(10, NaN, 'hard_stop');
+    expect(nanErr.message).toContain('$NaN');
+    const infErr = new BudgetExceededError(10, Infinity, 'hard_stop');
+    expect(infErr.message).toContain('$Infinity');
+    const negInfErr = new BudgetExceededError(10, -Infinity, 'hard_stop');
+    expect(negInfErr.message).toContain('-$Infinity');
+  });
+
+  it('extends AxlError with code BUDGET_EXCEEDED', () => {
+    const err = new BudgetExceededError(1, 2, 'hard_stop');
+    expect(err).toBeInstanceOf(AxlError);
+    expect(err.code).toBe('BUDGET_EXCEEDED');
+    expect(err.name).toBe('BudgetExceededError');
   });
 });

@@ -257,6 +257,133 @@ describe('stream()', () => {
     expect(events.some((e) => e.type === 'done')).toBe(true);
   });
 
+  it('routes trace tool_approval events to stream on approve and deny', async () => {
+    // Regression: the stream handler used to read a `tool_denied`-with-
+    // `denied: false` hack. After switching context.ts to emit a dedicated
+    // `tool_approval` trace event, the stream handler must pick it up.
+    // Exercises the full trace → stream pipeline end-to-end via runtime.stream().
+    const makeProvider = () => {
+      let call = 0;
+      return {
+        name: 'test',
+        chat: async () => {
+          call++;
+          if (call === 1) {
+            return {
+              content: '',
+              tool_calls: [
+                {
+                  id: 'tc1',
+                  type: 'function' as const,
+                  function: { name: 'risky', arguments: '{"x":1}' },
+                },
+              ],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+              cost: 0,
+            };
+          }
+          return {
+            content: 'done',
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            cost: 0,
+          };
+        },
+        stream: async function* () {
+          const resp = await (this as any).chat();
+          if (resp.tool_calls) {
+            for (const tc of resp.tool_calls) {
+              yield {
+                type: 'tool_call_delta' as const,
+                id: tc.id,
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+              };
+            }
+          } else if (resp.content) {
+            yield { type: 'text_delta' as const, content: resp.content };
+          }
+          yield {
+            type: 'done' as const,
+            usage: resp.usage,
+            cost: resp.cost,
+          };
+        },
+      };
+    };
+
+    const riskyTool = tool({
+      name: 'risky',
+      description: 'risky',
+      input: z.object({ x: z.number() }),
+      handler: (input) => `got ${input.x}`,
+      requireApproval: true,
+    });
+
+    const runApproved = async () => {
+      const runtime = new AxlRuntime({ defaultProvider: 'test' });
+      runtime.registerProvider('test', makeProvider() as any);
+      const a = agent({ name: 'a', model: 'test:m', system: 'sys', tools: [riskyTool] });
+      runtime.register(
+        workflow({
+          name: 'appr',
+          input: z.any(),
+          handler: async (ctx) => ctx.ask(a, 'go'),
+        }),
+      );
+      const stream = runtime.stream('appr', 'go', {
+        awaitHumanHandler: async () => ({ approved: true }),
+      });
+      const events: any[] = [];
+      for await (const event of stream) {
+        events.push(event);
+        if (event.type === 'done') break;
+      }
+      return events;
+    };
+
+    const runDenied = async () => {
+      const runtime = new AxlRuntime({ defaultProvider: 'test' });
+      runtime.registerProvider('test', makeProvider() as any);
+      const a = agent({ name: 'a', model: 'test:m', system: 'sys', tools: [riskyTool] });
+      runtime.register(
+        workflow({
+          name: 'den',
+          input: z.any(),
+          handler: async (ctx) => ctx.ask(a, 'go'),
+        }),
+      );
+      const stream = runtime.stream('den', 'go', {
+        awaitHumanHandler: async () => ({ approved: false, reason: 'nope' }),
+      });
+      const events: any[] = [];
+      for await (const event of stream) {
+        events.push(event);
+        if (event.type === 'done') break;
+      }
+      return events;
+    };
+
+    const approvedEvents = await runApproved();
+    const approvedStreamEvents = approvedEvents.filter((e) => e.type === 'tool_approval');
+    expect(approvedStreamEvents).toHaveLength(1);
+    expect(approvedStreamEvents[0]).toMatchObject({
+      type: 'tool_approval',
+      name: 'risky',
+      approved: true,
+    });
+    expect(approvedStreamEvents[0].args).toEqual({ x: 1 });
+
+    const deniedEvents = await runDenied();
+    const deniedStreamEvents = deniedEvents.filter((e) => e.type === 'tool_approval');
+    expect(deniedStreamEvents).toHaveLength(1);
+    expect(deniedStreamEvents[0]).toMatchObject({
+      type: 'tool_approval',
+      name: 'risky',
+      approved: false,
+      reason: 'nope',
+    });
+  });
+
   it('signals an error via the stream when workflow fails', async () => {
     const { runtime } = createRuntime();
 
@@ -525,15 +652,16 @@ describe('trace events', () => {
 
     expect(traces.length).toBeGreaterThan(0);
 
-    // Should include workflow_start and workflow_end log events
-    const logEvents = traces.filter((t) => t.type === 'log');
-    const startEvent = logEvents.find((t) => (t.data as any)?.event === 'workflow_start');
-    const endEvent = logEvents.find((t) => (t.data as any)?.event === 'workflow_end');
+    // workflow_start and workflow_end are now first-class trace types,
+    // not log events with a nested event name.
+    const startEvent = traces.find((t) => t.type === 'workflow_start');
+    const endEvent = traces.find((t) => t.type === 'workflow_end');
     expect(startEvent).toBeDefined();
     expect(endEvent).toBeDefined();
     expect((endEvent!.data as any).status).toBe('completed');
 
-    // Should include the custom log event
+    // ctx.log() still emits type: 'log' for user-emitted events.
+    const logEvents = traces.filter((t) => t.type === 'log');
     const customEvent = logEvents.find((t) => (t.data as any)?.event === 'custom_event');
     expect(customEvent).toBeDefined();
     expect((customEvent!.data as any).key).toBe('value');
@@ -570,7 +698,7 @@ describe('trace events', () => {
     }
   });
 
-  it('trace events for workflow_start and workflow_end include workflow name in data', async () => {
+  it('workflow_start and workflow_end carry the workflow name on the event itself', async () => {
     const { runtime } = createRuntime();
     const traces: TraceEvent[] = [];
 
@@ -590,15 +718,17 @@ describe('trace events', () => {
 
     await runtime.execute('named-workflow', {});
 
-    const logEvents = traces.filter((t) => t.type === 'log');
-    const startEvent = logEvents.find((t) => (t.data as any)?.event === 'workflow_start');
-    const endEvent = logEvents.find((t) => (t.data as any)?.event === 'workflow_end');
+    const startEvent = traces.find((t) => t.type === 'workflow_start');
+    const endEvent = traces.find((t) => t.type === 'workflow_end');
 
     expect(startEvent).toBeDefined();
-    expect((startEvent!.data as any).workflow).toBe('named-workflow');
+    expect(startEvent!.workflow).toBe('named-workflow');
 
     expect(endEvent).toBeDefined();
-    expect((endEvent!.data as any).workflow).toBe('named-workflow');
+    expect(endEvent!.workflow).toBe('named-workflow');
+    expect((endEvent!.data as any).status).toBe('completed');
+    // result is captured on completed end events
+    expect((endEvent!.data as any).result).toBe('ok');
   });
 });
 
@@ -794,11 +924,12 @@ describe('error handling', () => {
 
     await expect(runtime.execute('fail-trace', {})).rejects.toThrow('traced error');
 
-    const logEvents = traces.filter((t) => t.type === 'log');
-    const endEvent = logEvents.find((t) => (t.data as any)?.event === 'workflow_end');
+    const endEvent = traces.find((t) => t.type === 'workflow_end');
     expect(endEvent).toBeDefined();
     expect((endEvent!.data as any).status).toBe('failed');
     expect((endEvent!.data as any).error).toBe('traced error');
+    // Failed non-abort workflows should NOT carry an aborted flag
+    expect((endEvent!.data as any).aborted).toBeUndefined();
   });
 
   it('re-throws the original error from execute()', async () => {
@@ -1082,6 +1213,46 @@ describe('abort()', () => {
     const { runtime } = createRuntime();
     // Should not throw
     runtime.abort('nonexistent-id');
+  });
+
+  it('marks workflow_end as aborted when a workflow is cancelled mid-flight', async () => {
+    const { runtime } = createRuntime();
+    const traces: TraceEvent[] = [];
+    runtime.on('trace', (event: TraceEvent) => traces.push(event));
+
+    let resolveWait: () => void;
+    const waitPromise = new Promise<void>((r) => {
+      resolveWait = r;
+    });
+    let executionId: string | undefined;
+
+    const wf = workflow({
+      name: 'cancellable',
+      input: z.any(),
+      handler: async (ctx) => {
+        executionId = ctx.executionId;
+        // Wait until the test aborts us
+        await waitPromise;
+        // Throw an AbortError so the catch path fires
+        throw new DOMException('aborted', 'AbortError');
+      },
+    });
+    runtime.register(wf);
+
+    const execPromise = runtime.execute('cancellable', {});
+    await new Promise((r) => setTimeout(r, 20));
+    runtime.abort(executionId!);
+    resolveWait!();
+
+    await expect(execPromise).rejects.toThrow();
+
+    // workflow_end now carries the abort signal directly; consumers don't
+    // need to listen for a second event to detect cancellation.
+    const endEvent = traces.find((t) => t.type === 'workflow_end');
+    expect(endEvent).toBeDefined();
+    const data = endEvent!.data as Record<string, unknown>;
+    expect(data.status).toBe('failed');
+    expect(data.aborted).toBe(true);
   });
 
   it('sets the abort signal for an in-flight execution', async () => {

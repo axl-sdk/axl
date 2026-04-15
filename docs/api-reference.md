@@ -1095,6 +1095,9 @@ Every agent call, tool invocation, handoff, and system event emits a `TraceEvent
 | `duration` | `number?` | Duration in ms |
 | `data` | `unknown?` | Event-specific payload — narrow via `type`. See per-type shapes below |
 | `timestamp` | `number` | Event timestamp (ms) |
+| `parentToolCallId` | `string?` | Set on events emitted from a nested agent-as-tool child context. Joins back to the outer `tool_call.id` so consumers can reconstruct the call graph |
+
+`TraceEvent` is a **discriminated union** over `type` — consumers that narrow via `event.type === 'agent_call'` / `'tool_call'` / etc. get statically-typed access to per-variant `data` shapes and type-specific required fields. Per-type data shapes are exported from `@axlsdk/axl`: `AgentCallTraceData`, `GuardrailTraceData`, `SchemaCheckTraceData`, `ValidateTraceData`, `ToolCallTraceData`, `ToolApprovalTraceData`, `HandoffTraceData`, `DelegateTraceData`, `VerifyTraceData`, `WorkflowStartTraceData`, `WorkflowEndTraceData`.
 
 ### `AgentCallTraceData` (data on `agent_call` events)
 
@@ -1128,10 +1131,61 @@ Every agent call, tool invocation, handoff, and system event emits a `TraceEvent
 | `args` | `unknown` | Tool arguments that were pending approval |
 | `reason` | `string?` | Denial reason (set only when `approved: false`) |
 
+### `ToolCallTraceData` (data on `tool_call` events)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `args` | `unknown` | Tool arguments received from the LLM |
+| `result` | `unknown?` | Tool return value |
+| `callId` | `string?` | Correlation id from the provider's tool call |
+
+### `HandoffTraceData` (data on `handoff` events)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | `string` | Agent name that initiated the handoff. Mirrors `event.agent` for join-convenience |
+| `target` | `string` | Agent name receiving the handoff |
+| `mode` | `'oneway' \| 'roundtrip'` | Handoff mode |
+| `duration` | `number` | Wall-clock duration of the handoff in ms |
+| `message` | `string?` | The `message` argument the source agent passed when invoking `handoff_to_X` in roundtrip mode. Subject to `config.trace.redact` |
+
+### `DelegateTraceData` (data on `delegate` events)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `candidates` | `string[]` | Agent names the delegation router considered |
+| `selected` | `string?` | Chosen agent, if the router completed a routing decision |
+| `routerModel` | `string?` | Model URI used by the routing ask |
+| `reason` | `'single_candidate' \| 'routed'` | `'single_candidate'` on the short-circuit path (only one agent available), `'routed'` when a router was actually invoked |
+
+### `VerifyTraceData` (data on `verify` events)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `passed` | `boolean` | Whether the verification ultimately succeeded |
+| `attempts` | `number` | Number of attempts before the terminal outcome |
+| `lastError` | `string?` | Error message from the final failing attempt, when applicable |
+
+### `WorkflowStartTraceData` (data on `workflow_start` events)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `input` | `unknown` | Workflow input, after Zod schema validation. Subject to `config.trace.redact` |
+
+### `WorkflowEndTraceData` (data on `workflow_end` events)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | `'completed' \| 'failed'` | Terminal status |
+| `duration` | `number` | Total wall-clock duration in ms |
+| `result` | `unknown?` | Workflow return value (when `status === 'completed'`). Subject to `config.trace.redact` |
+| `error` | `string?` | Error message (when `status === 'failed'`). Subject to `config.trace.redact` |
+| `aborted` | `boolean?` | `true` when the execution ended via `AbortSignal` (user cancel, budget `hard_stop`, parent-scope abort). Lets consumers distinguish cancellation from genuine error |
+
 ### Verbose trace mode and redaction
 
 - **`config.trace.level === 'full'`** opts into verbose mode: `agent_call.data.messages` is populated with the full `ChatMessage[]` sent to the provider on each turn. This grows with tool results and retry feedback across turns, so it's off by default
-- **`config.trace.redact === true`** redacts `prompt`, `response`, `system`, `thinking`, `messages` on `agent_call` events and `feedbackMessage` on gate events. Structural fields (`turn`, `attempt`, `maxAttempts`, `params`, `valid`, `blocked`) remain visible so traces stay useful for debugging when redacted
+- **`config.trace.redact === true`** is an **observability-boundary filter** — scrubs user/LLM content everywhere it would otherwise flow to observability consumers (trace events, Studio REST route responses, Studio WebSocket broadcasts). Structural metadata (workflow names, agent names, tool names, cost/token metrics, durations, roles, IDs, attempt counters, scorer scores) stays visible so the Trace Explorer, Memory Browser, Session Manager, Cost Dashboard, and Eval Runner all remain usable under compliance mode. See [`observability.md`](./observability.md#pii-and-redaction) for the complete per-route scrubbed/preserved table. Programmatic callers of `runtime.execute()` and direct `StateStore` access still receive raw values — redaction is an observability filter, not a data-at-rest transform. Access the flag from Studio consumers via `runtime.isRedactEnabled(): boolean`
 
 ---
 

@@ -600,6 +600,8 @@ await ctx.remember('user_preference', { theme: 'dark' }, { scope: 'global', embe
 | `metadata` | `Record<string, unknown>` | — | Arbitrary metadata stored alongside the value |
 | `embed` | `boolean` | `false` | When `true`, also generates an embedding for semantic search. Requires a vector store and embedder in the runtime config |
 
+**Cost tracking.** When `embed: true`, the embedder call cost is automatically attributed to the current execution scope — `runtime.trackExecution()` picks it up via the trace-event cost rail, and Studio's Cost Dashboard displays it under "Memory (Embedder)" bucketed by embedder model. See [observability.md](./observability.md#trace-event-types) for details.
+
 ---
 
 ### `ctx.recall(key, options?)`
@@ -625,6 +627,8 @@ const related = await ctx.recall('preferences', {
 | `topK` | `number` | `5` | Number of results to return from semantic search |
 
 **Returns:** `unknown | null` for exact lookup, `VectorResult[]` for semantic search.
+
+**Cost tracking.** When `query` is provided, the embedder cost for the query embedding is attributed to the current execution scope (same rail as `ctx.remember({embed: true})`).
 
 ---
 
@@ -1080,7 +1084,7 @@ Every agent call, tool invocation, handoff, and system event emits a `TraceEvent
 |-------|------|-------------|
 | `executionId` | `string` | Execution this event belongs to |
 | `step` | `number` | Auto-incrementing step counter |
-| `type` | `string` | Event type: `'agent_call'`, `'tool_call'`, `'tool_denied'`, `'handoff'`, `'delegate'`, `'verify'`, `'guardrail'`, `'validate'`, `'log'`, `'workflow_start'`, `'workflow_end'` |
+| `type` | `TraceEventType` | `'agent_call'`, `'tool_call'`, `'tool_approval'`, `'tool_denied'`, `'handoff'`, `'delegate'`, `'verify'`, `'guardrail'`, `'schema_check'`, `'validate'`, `'log'`, `'workflow_start'`, `'workflow_end'` |
 | `workflow` | `string?` | Workflow name (on workflow events) |
 | `agent` | `string?` | Agent name |
 | `tool` | `string?` | Tool name (on tool events) |
@@ -1089,8 +1093,45 @@ Every agent call, tool invocation, handoff, and system event emits a `TraceEvent
 | `cost` | `number?` | Cost in USD for this step |
 | `tokens` | `{ input?, output?, reasoning? }?` | Token usage from the provider (on `agent_call` events). Maps from `ProviderResponse.usage` |
 | `duration` | `number?` | Duration in ms |
-| `data` | `unknown?` | Event-specific payload (prompt/response for agent_call, args/result for tool_call, etc.) |
+| `data` | `unknown?` | Event-specific payload — narrow via `type`. See per-type shapes below |
 | `timestamp` | `number` | Event timestamp (ms) |
+
+### `AgentCallTraceData` (data on `agent_call` events)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `prompt` | `string` | Original user prompt passed to `ctx.ask()` |
+| `response` | `string` | Final LLM response content for this turn |
+| `system` | `string?` | Resolved system prompt (dynamic selectors evaluated at call time) |
+| `thinking` | `string?` | Reasoning/thinking content returned by the provider, when available |
+| `params` | `object?` | Resolved model parameters sent to the provider: `{ temperature?, maxTokens?, effort?, thinkingBudget?, includeThoughts?, toolChoice?, stop? }` |
+| `turn` | `number?` | 1-indexed iteration of the tool-calling loop for this `ctx.ask()` call |
+| `retryReason` | `'schema' \| 'validate' \| 'guardrail'?` | Set when this call was triggered by a failed gate on the previous turn |
+| `messages` | `ChatMessage[]?` | Full conversation sent to the provider this turn. **Only populated when `config.trace.level === 'full'`** |
+
+### `GuardrailTraceData` / `SchemaCheckTraceData` / `ValidateTraceData` (symmetric shape)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `valid` / `blocked` | `boolean` | Check outcome. Guardrails use `blocked`; schema_check and validate use `valid` |
+| `guardrailType` | `'input' \| 'output'?` | Guardrail events only |
+| `reason` | `string?` | Human-readable failure reason |
+| `attempt` | `number?` | 1-indexed attempt. Omitted for input guardrails (they don't retry) |
+| `maxAttempts` | `number?` | Maximum attempts allowed before throwing. Equals `retries + 1` |
+| `feedbackMessage` | `string?` | The exact corrective message about to be injected into the conversation. **Only set when the check failed and a retry is happening** — gives observability into what the LLM sees between retry attempts |
+
+### `ToolApprovalTraceData` (data on `tool_approval` events)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `approved` | `boolean` | Whether the human approved the tool call |
+| `args` | `unknown` | Tool arguments that were pending approval |
+| `reason` | `string?` | Denial reason (set only when `approved: false`) |
+
+### Verbose trace mode and redaction
+
+- **`config.trace.level === 'full'`** opts into verbose mode: `agent_call.data.messages` is populated with the full `ChatMessage[]` sent to the provider on each turn. This grows with tool results and retry feedback across turns, so it's off by default
+- **`config.trace.redact === true`** redacts `prompt`, `response`, `system`, `thinking`, `messages` on `agent_call` events and `feedbackMessage` on gate events. Structural fields (`turn`, `attempt`, `maxAttempts`, `params`, `valid`, `blocked`) remain visible so traces stay useful for debugging when redacted
 
 ---
 

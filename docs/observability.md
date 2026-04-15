@@ -30,8 +30,8 @@ AXL_TRACE_ENABLED=true AXL_TRACE_LEVEL=full node server.js
 | Level | What's logged |
 |-------|--------------|
 | `off` | Nothing. |
-| `steps` | One line per workflow step: agent calls, tool calls, verify results, budget usage. Includes cost and duration. |
-| `full` | Everything in `steps`, plus: full LLM prompts, full LLM responses, tool arguments, tool return values, token counts. |
+| `steps` | One line per workflow step: agent calls, tool calls, verify results, budget usage. Includes cost and duration. **Default.** `agent_call` events already carry the resolved system prompt, resolved model params, reasoning/thinking content, turn counter, and retry reason — none of those depend on `full` mode |
+| `full` | Everything in `steps`, plus: a complete `ChatMessage[]` snapshot on every `agent_call` event (under `data.messages`) so you can reconstruct exactly what the model saw on any given turn, including tool results and retry feedback accumulated across loop iterations. This grows with conversation depth, so it's off by default — enable when debugging |
 
 ### Example Output (`steps` level)
 
@@ -53,6 +53,90 @@ runtime.on('trace', (event) => {
   // event: { executionId, step, type, agent?, tool?, promptVersion?, cost?, duration?, ... }
   myLogger.info(event);
   datadogClient.send(event);
+});
+```
+
+### Trace event types
+
+All events share the base `TraceEvent` shape; `data` is narrowed by `type`. See [api-reference.md](./api-reference.md#traceevent) for the full per-type schemas. The full set of types:
+
+| Type | When emitted | Key `data` fields |
+|------|-------------|-------------------|
+| `workflow_start` / `workflow_end` | Workflow lifecycle | `input` / `result` |
+| `agent_call` | Every LLM call (every loop turn of `ctx.ask()`) | `prompt`, `response`, `system`, `thinking?`, `params`, `turn`, `retryReason?`, `messages?` (verbose only) |
+| `tool_call` | Tool execution completes | `args`, `result`, `callId` |
+| `tool_approval` | `requireApproval` gate fires — **both** approve and deny | `approved`, `args`, `reason?` |
+| `tool_denied` | Agent tried to call a tool that doesn't exist | `reason`, `args` |
+| `guardrail` | Input or output guardrail runs — pass or fail | `guardrailType`, `blocked`, `reason?`, `attempt?`, `maxAttempts?`, `feedbackMessage?` (output only, on retry) |
+| `schema_check` | Every schema parse on a structured-output call — pass or fail | `valid`, `reason?`, `attempt`, `maxAttempts`, `feedbackMessage?` (on retry) |
+| `validate` | Post-schema business rule validator runs — pass or fail | `valid`, `reason?`, `attempt`, `maxAttempts`, `feedbackMessage?` (on retry) |
+| `delegate` | `ctx.delegate()` routes to a candidate (including the single-agent short-circuit) | `candidates`, `selected?`, `routerModel?`, `reason?` |
+| `handoff` | One agent hands off to another via a `handoff_to_*` tool | `target`, `mode`, `duration` |
+| `verify` | `ctx.verify()` completes (pass or fail) | `attempts`, `passed`, `lastError?` |
+| `log` | `ctx.log()` user-emitted event OR system audit events like `memory_remember` / `memory_recall` / `memory_forget` / `workflow_start` | caller-provided or `{ event, key, scope, hit?, resultCount?, embed?, usage? }` for memory ops |
+
+**Semantic memory cost attribution.** `ctx.remember({embed: true})` and `ctx.recall({query})` call a paid embedding API. The operation emits a `log` event with `event: 'memory_remember'` or `'memory_recall'`, and when the embedder reported usage it sets:
+
+- **Top-level `cost`** — USD amount, picked up automatically by `runtime.trackExecution()` and Studio's `CostAggregator` (flows into `totalCost` like any provider call).
+- **Top-level `tokens.input`** — input tokens consumed by the embedder (kept separate from agent prompt tokens in the `totalTokens` summary).
+- **`data.usage`** — full `{ tokens?, cost?, model? }` breakdown for trace inspection.
+
+The Studio Cost Dashboard renders a "Memory (Embedder)" section when there's at least one embedder call, bucketing cost by embedder model via `CostData.byEmbedder`.
+
+### Debugging retries
+
+Three common symptoms and what to look for in traces:
+
+**"My agent cost 3× what I expected."** Filter for `agent_call` events and check the `turn` field — if you see `turn: 2`, `turn: 3`, etc., the tool-calling loop ran multiple iterations. Check `retryReason` on those calls to see whether it was a schema, validate, or guardrail retry. Check the preceding `schema_check` / `validate` / `guardrail` event for the exact failure reason and `feedbackMessage` that was sent back to the LLM.
+
+**"My structured output keeps failing."** Filter for `schema_check` events with `valid: false`. The `reason` field has the Zod parse error; the `feedbackMessage` is the exact message the model saw on its next attempt. If the feedback isn't clear enough to help the model correct itself, that's a prompt/schema design problem, not a retry-count problem.
+
+**"Why did my agent respond that way?"** Enable `trace.level: 'full'` and check the `messages` array on the relevant `agent_call` — it has the exact conversation (system prompt, history, tool results, retry feedback) as the model saw it. `system`, `params`, `thinking`, and `retryReason` are visible in default mode without needing verbose.
+
+### PII and redaction
+
+`config.trace.redact` is an **observability-boundary filter** that scrubs user/LLM content everywhere it would otherwise flow to observability consumers. The mental model: "what can the observability layer see?". Under `redact: true`, structural metadata (workflow names, agent names, tool names, cost/token metrics, durations, status, roles, keys, IDs) stays visible — but any field that carries prompt/response/user/LLM content is replaced with `'[redacted]'`.
+
+The filter applies at three layers:
+
+**1. Trace events** — at `emitTrace()` emission time. Scrubs:
+
+- `agent_call.data`: `prompt`, `response`, `system`, `thinking`, `messages`
+- `guardrail` / `schema_check` / `validate`: `reason`, `feedbackMessage`
+- `tool_call.data`: `args`, `result`
+- `tool_approval.data`: `args`, `reason`
+- `handoff.data.message` (roundtrip handoffs)
+- `workflow_start.data.input`, `workflow_end.data.result`/`error`
+- `log` events: string fields, with a one-level walk so nested numeric fields like `memory_remember.data.usage.tokens` / `.cost` survive while string fields like `.usage.model` are scrubbed
+
+**2. Studio REST routes** — at response serialization time, via `runtime.isRedactEnabled()`. Scrubs:
+
+| Route | Scrubbed fields | Preserved |
+|---|---|---|
+| `GET /api/executions` / `:id` | `result`, `error` | `executionId`, `workflow`, `status`, `duration`, `totalCost`, `startedAt` |
+| `GET /api/memory/:scope` / `:key` | `value` | `key` (programmer-chosen identifier, needed for navigation) |
+| `GET /api/sessions/:id` | `message.content`, `message.tool_calls[*].function.arguments`, `message.providerMetadata` | `role`, `name`, `tool_call_id`, `tool_calls[*].id`, `tool_calls[*].function.name`, handoff records |
+| `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore` | per-item `input`, `output`, `error`, `annotations`, `scorerErrors`, `scoreDetails[*].metadata` | per-item `scores`, `duration`, `cost`, `scorerCost`; result-level `summary`, `metadata`, `totalCost`, `duration`, `timestamp` |
+| `GET /api/decisions` | `prompt`, `metadata` (replaced with `{ redacted: true }`) | `executionId`, `channel`, `createdAt` |
+| `POST /api/tools/:name/test` | `result` | tool name, input schema |
+| `POST /api/workflows/:name/execute` (sync) | `result` | — |
+
+**3. Studio WebSocket broadcasts** — for streaming endpoints (playground, workflow execute with `stream: true`). Scrubs `StreamEvent` fields before they hit the WS channel:
+
+- `token.data` — streaming LLM output
+- `tool_call.args`, `tool_result.result` — tool invocations
+- `tool_approval.args`, `.reason`
+- `done.data` — final workflow result
+- `error.message`
+- `step.data` passes through because the underlying `TraceEvent` was already scrubbed at emit time
+
+**Top-level numeric fields (`cost`, `tokens`, `duration`) are never scrubbed**, even under `redact: true`. They're load-bearing — `trackExecution`'s cost-aggregation listener and Studio's `CostAggregator` both read `event.cost` directly, so zeroing them would silently break total cost tracking when redaction is enabled. If your compliance environment treats aggregate spend as sensitive, filter events out entirely in your `onTrace` / `filterTraceEvent` handler rather than relying on redaction to scrub them.
+
+**Redaction is an observability-boundary filter, not a data-at-rest transform.** Programmatic callers of `runtime.execute()`, `runtime.getExecution()`, and direct `StateStore` access still receive raw values. Write endpoints (`PUT /api/memory`, `POST /api/sessions/:id/send`) still accept raw data. If you need scrubbed state-at-rest, configure your own `StateStore` wrapper that stores scrubbed values.
+
+```typescript
+const runtime = new AxlRuntime({
+  trace: { enabled: true, level: 'full', redact: true },
 });
 ```
 

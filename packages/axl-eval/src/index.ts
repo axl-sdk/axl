@@ -27,4 +27,6 @@ export type {
   EvalRegression,
   EvalImprovement,
   ScorerDetail,
+  EvalProgressEvent,
+  RunEvalOptions,
 } from './types.js';

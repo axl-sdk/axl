@@ -1,5 +1,6 @@
 import type { Dataset } from './dataset.js';
 import type { Scorer } from './scorer.js';
+import type { TraceEvent } from '@axlsdk/axl';
 
 export type EvalConfig = {
   workflow: string;
@@ -57,6 +58,11 @@ export type EvalItem = {
   scoreDetails?: Record<string, ScorerDetail>;
   /** Execution metadata forwarded from the runtime (models, tokens, agentCalls, etc). */
   metadata?: Record<string, unknown>;
+  /** Trace events captured during this item's execution. Only populated when
+   *  `runEval` was called with `{ captureTraces: true }`. Verbose-mode
+   *  `agent_call.data.messages` snapshots are stripped to keep memory bounded;
+   *  subscribe to `runtime.on('trace', ...)` directly if you need those. */
+  traces?: TraceEvent[];
 };
 
 export type EvalSummary = {
@@ -130,4 +136,34 @@ export type EvalImprovement = EvalRegression;
 export type EvalCompareOptions = {
   /** Global threshold or per-scorer map. Default: auto-calibrate from scorerTypes metadata. */
   thresholds?: Record<string, number> | number;
+};
+
+// ── Progress & cancellation ──────────────────────────────────────
+
+/** Emitted after each dataset item is fully processed (executed + scored). */
+export type EvalProgressEvent = {
+  type: 'item_done';
+  itemIndex: number;
+  totalItems: number;
+};
+
+/** Optional runtime behavior for `runEval()`. */
+export type RunEvalOptions = {
+  /** Called after each dataset item completes (execution + scoring). */
+  onProgress?: (event: EvalProgressEvent) => void;
+  /** Abort signal — checked before starting each item. */
+  signal?: AbortSignal;
+  /**
+   * Capture per-item `TraceEvent[]` from the runtime and store them on
+   * `EvalItem.traces`. Off by default because traces multiply memory with
+   * dataset size × turns × agents. When on, the runner wraps the user-provided
+   * `executeWorkflow` with `runtime.trackExecution({ captureTraces: true })`,
+   * so any `runtime.execute()` / `ctx.ask()` activity inside the callback is
+   * captured and scoped to the current item.
+   *
+   * Note: verbose-mode `agent_call.data.messages` snapshots are stripped from
+   * captured traces to keep memory bounded — if you need the full verbose
+   * payload, subscribe to `runtime.on('trace', ...)` directly.
+   */
+  captureTraces?: boolean;
 };

@@ -133,6 +133,151 @@ describe('runEval()', () => {
     }
   });
 
+  it('rejects non-numeric user-returned cost and keeps totalCost numeric', async () => {
+    // TS type says `cost?: number` but JS can violate it. The runner must
+    // guard so a string/object cost doesn't NaN-poison the running total.
+    const badCostWorkflow = async (_input: any) => ({
+      output: 'x',
+      cost: 'free' as unknown as number,
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      badCostWorkflow,
+      mockRuntime,
+    );
+
+    expect(Number.isFinite(result.totalCost)).toBe(true);
+    expect(result.totalCost).toBe(0);
+    for (const item of result.items) {
+      expect(item.cost === undefined || typeof item.cost === 'number').toBe(true);
+    }
+  });
+
+  it('rejects negative cost from user workflow (budget bypass guard)', async () => {
+    // A negative cost would shrink totalCost below the budget limit
+    // check, letting a buggy/malicious workflow run unbounded.
+    // Rejecting it is defense-in-depth at the trust boundary.
+    const negativeCostWorkflow = async (_input: any) => ({
+      output: 'x',
+      cost: -0.05,
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      negativeCostWorkflow,
+      mockRuntime,
+    );
+
+    expect(result.totalCost).toBe(0);
+    for (const item of result.items) {
+      expect(item.cost === undefined || item.cost >= 0).toBe(true);
+    }
+  });
+
+  it('rejects NaN and Infinity cost from user workflow', async () => {
+    const nanWorkflow = async (_input: any) => ({
+      output: 'x',
+      cost: NaN,
+    });
+    const infWorkflow = async (_input: any) => ({
+      output: 'x',
+      cost: Infinity,
+    });
+
+    const nanResult = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      nanWorkflow,
+      mockRuntime,
+    );
+    const infResult = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      infWorkflow,
+      mockRuntime,
+    );
+
+    expect(Number.isFinite(nanResult.totalCost)).toBe(true);
+    expect(nanResult.totalCost).toBe(0);
+    expect(Number.isFinite(infResult.totalCost)).toBe(true);
+    expect(infResult.totalCost).toBe(0);
+  });
+
+  it('preserves zero cost from user workflow (valid free op)', async () => {
+    // `0` is a legitimate cost for free operations (cached response,
+    // free-tier model). The type guard must NOT fall through for 0.
+    const freeWorkflow = async (_input: any) => ({
+      output: 'x',
+      cost: 0,
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      freeWorkflow,
+      mockRuntime,
+    );
+
+    expect(result.totalCost).toBe(0);
+    for (const item of result.items) {
+      expect(item.cost).toBe(0);
+    }
+  });
+
+  it('rejects exotic metadata types (Date, Map, Set, class instances)', async () => {
+    // typeof === 'object' is true for these, but they're not
+    // Record<string, unknown> — spreading/entries returns empty or crashes.
+    class CustomClass {
+      constructor(public x: number) {}
+    }
+    const exoticMetadataWorkflow = async (input: any) => ({
+      output: 'x',
+      cost: 0.001,
+      metadata:
+        input.question === 'What is 1+1?'
+          ? (new Map([['a', 1]]) as unknown as Record<string, unknown>)
+          : input.question === 'What is 2+2?'
+            ? (new Date() as unknown as Record<string, unknown>)
+            : (new CustomClass(42) as unknown as Record<string, unknown>),
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      exoticMetadataWorkflow,
+      mockRuntime,
+    );
+
+    for (const item of result.items) {
+      // All three exotic types should be rejected, leaving metadata
+      // either undefined or coming from the tracked metadata fallback.
+      if (item.metadata !== undefined) {
+        const proto = Object.getPrototypeOf(item.metadata);
+        expect(proto === Object.prototype || proto === null).toBe(true);
+      }
+    }
+  });
+
+  it('rejects non-object user-returned metadata', async () => {
+    // Arrays satisfy `typeof === "object"` but are not valid `Record<string, unknown>`;
+    // a scalar metadata would break every downstream consumer that spreads it.
+    const badMetadataWorkflow = async (_input: any) => ({
+      output: 'x',
+      cost: 0.001,
+      metadata: ['not', 'a', 'record'] as unknown as Record<string, unknown>,
+    });
+
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      badMetadataWorkflow,
+      mockRuntime,
+    );
+
+    for (const item of result.items) {
+      if (item.metadata !== undefined) {
+        expect(typeof item.metadata).toBe('object');
+        expect(Array.isArray(item.metadata)).toBe(false);
+      }
+    }
+  });
+
   it('computes summary stats (mean, min, max, p50, p95)', async () => {
     const variableScorer = scorer({
       name: 'variable',
@@ -1441,5 +1586,257 @@ describe('rescore() backward compatibility', () => {
 
     expect(rescored.metadata.workflows).toEqual(['wf-a', 'wf-b']);
     expect(rescored.metadata.workflowCounts).toEqual({ 'wf-a': 3, 'wf-b': 1 });
+  });
+});
+
+describe('runEval: onProgress callback', () => {
+  it('calls onProgress after each item completes', async () => {
+    const events: Array<{ type: string; itemIndex: number; totalItems: number }> = [];
+
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      async (_input) => ({ output: '2' }),
+      mockRuntime,
+      {
+        onProgress: (event) => events.push(event),
+      },
+    );
+
+    expect(events).toHaveLength(3);
+    for (let i = 0; i < 3; i++) {
+      expect(events[i].type).toBe('item_done');
+      expect(events[i].totalItems).toBe(3);
+    }
+    // All three items should be reported (order may vary due to concurrency)
+    const indices = events.map((e) => e.itemIndex).sort();
+    expect(indices).toEqual([0, 1, 2]);
+    expect(result.items).toHaveLength(3);
+  });
+
+  it('calls onProgress for error items', async () => {
+    const events: Array<{ type: string; itemIndex: number }> = [];
+
+    const result = await runEval(
+      { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
+      async () => {
+        throw new Error('boom');
+      },
+      mockRuntime,
+      {
+        onProgress: (event) => events.push(event),
+      },
+    );
+
+    expect(events).toHaveLength(3);
+    expect(result.items.every((i) => i.error === 'boom')).toBe(true);
+  });
+});
+
+describe('runEval: captureTraces', () => {
+  // A tiny in-process workflow that triggers a real agent_call trace event
+  // so we can assert the per-item trace capture end-to-end.
+  async function buildTracingRuntime() {
+    const { AxlRuntime, agent, workflow } = await import('@axlsdk/axl');
+    const runtime = new AxlRuntime({ defaultProvider: 'mock' });
+    const provider = {
+      name: 'mock',
+      chat: async () => ({
+        content: 'answer',
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        cost: 0.002,
+      }),
+      stream: async function* () {
+        yield { type: 'text_delta' as const, content: 'answer' };
+        yield {
+          type: 'done' as const,
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          cost: 0.002,
+        };
+      },
+    };
+    runtime.registerProvider('mock', provider as any);
+    const answerer = agent({
+      name: 'answerer',
+      model: 'mock:test',
+      system: 'Answer the question.',
+    });
+    const wf = workflow({
+      name: 'ask',
+      input: z.object({ question: z.string() }),
+      handler: async (ctx) => ctx.ask(answerer, ctx.input.question),
+    });
+    runtime.register(wf);
+    return { runtime, wf };
+  }
+
+  it('captures per-item trace events when captureTraces is true', async () => {
+    const { runtime } = await buildTracingRuntime();
+    const result = await runEval(
+      { workflow: 'ask', dataset: testDataset, scorers: [] },
+      async (input, rt) => {
+        const output = await rt.execute('ask', input);
+        return { output };
+      },
+      runtime,
+      { captureTraces: true },
+    );
+
+    expect(result.items).toHaveLength(3);
+    for (const item of result.items) {
+      expect(item.error).toBeUndefined();
+      expect(Array.isArray(item.traces)).toBe(true);
+      // Each item should have at least workflow_start + agent_call + workflow_end
+      expect(item.traces!.length).toBeGreaterThanOrEqual(3);
+      // Agent call should carry the resolved model
+      const agentCall = item.traces!.find((t) => t.type === 'agent_call');
+      expect(agentCall).toBeDefined();
+      expect(agentCall!.agent).toBe('answerer');
+    }
+
+    // Trace cost should match item cost
+    for (const item of result.items) {
+      expect(item.cost).toBeGreaterThan(0);
+    }
+  });
+
+  it('does not capture traces by default (backward compat)', async () => {
+    const { runtime } = await buildTracingRuntime();
+    const result = await runEval(
+      { workflow: 'ask', dataset: testDataset, scorers: [] },
+      async (input, rt) => {
+        const output = await rt.execute('ask', input);
+        return { output };
+      },
+      runtime,
+    );
+
+    for (const item of result.items) {
+      expect(item.traces).toBeUndefined();
+    }
+  });
+
+  it('strips verbose messages snapshot from captured traces', async () => {
+    const { AxlRuntime, agent, workflow } = await import('@axlsdk/axl');
+    const runtime = new AxlRuntime({
+      defaultProvider: 'mock',
+      trace: { level: 'full' }, // Verbose mode ON — snapshots would be emitted
+    });
+    const provider = {
+      name: 'mock',
+      chat: async () => ({
+        content: 'answer',
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        cost: 0.001,
+      }),
+      stream: async function* () {
+        yield { type: 'text_delta' as const, content: 'answer' };
+        yield {
+          type: 'done' as const,
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          cost: 0.001,
+        };
+      },
+    };
+    runtime.registerProvider('mock', provider as any);
+    const a = agent({ name: 'a', model: 'mock:test', system: 'sys' });
+    runtime.register(
+      workflow({
+        name: 'ask',
+        input: z.object({ question: z.string() }),
+        handler: async (ctx) => ctx.ask(a, ctx.input.question),
+      }),
+    );
+
+    const result = await runEval(
+      { workflow: 'ask', dataset: testDataset, scorers: [] },
+      async (input, rt) => {
+        const output = await rt.execute('ask', input);
+        return { output };
+      },
+      runtime,
+      { captureTraces: true },
+    );
+
+    // Verbose messages are intentionally omitted from captured traces to keep
+    // memory bounded. The runtime still broadcasts them via onTrace for
+    // consumers who subscribe directly.
+    for (const item of result.items) {
+      const agentCall = item.traces?.find((t) => t.type === 'agent_call');
+      expect(agentCall).toBeDefined();
+      expect((agentCall!.data as Record<string, unknown>).messages).toBeUndefined();
+      // Non-verbose agent_call data (system, params, turn) is still present
+      expect((agentCall!.data as Record<string, unknown>).system).toBe('sys');
+    }
+  });
+
+  it('captures traces on failed items — the exact case where they matter most', async () => {
+    // Build a runtime that records a workflow_start, then throws.
+    const { AxlRuntime, workflow: wf } = await import('@axlsdk/axl');
+    const runtime = new AxlRuntime();
+    runtime.register(
+      wf({
+        name: 'boom',
+        input: z.object({ question: z.string() }),
+        handler: async () => {
+          throw new Error('intentional failure for trace capture test');
+        },
+      }),
+    );
+
+    const result = await runEval(
+      { workflow: 'boom', dataset: testDataset, scorers: [] },
+      async (input, rt) => {
+        const output = await rt.execute('boom', input);
+        return { output };
+      },
+      runtime,
+      { captureTraces: true },
+    );
+
+    // Every item should be marked failed
+    for (const item of result.items) {
+      expect(item.error).toContain('intentional failure');
+      // But traces should STILL be attached — this is the whole point of the
+      // fix. A failed item without traces leaves the user with no diagnostic
+      // trail, which is exactly when they need one most.
+      expect(Array.isArray(item.traces)).toBe(true);
+      expect(item.traces!.length).toBeGreaterThan(0);
+      // workflow_start fired inside the withSpanAsync span before the throw
+      const start = item.traces!.find((t) => t.type === 'workflow_start');
+      expect(start).toBeDefined();
+      // workflow_end with failed status also fired (catch path)
+      const end = item.traces!.find((t) => t.type === 'workflow_end');
+      expect(end).toBeDefined();
+      expect((end!.data as Record<string, unknown>).status).toBe('failed');
+    }
+  });
+});
+
+describe('runEval: signal cancellation', () => {
+  it('marks remaining items as cancelled when signal is aborted', async () => {
+    const ac = new AbortController();
+    let callCount = 0;
+
+    const result = await runEval(
+      {
+        workflow: 'test',
+        dataset: testDataset,
+        scorers: [exactScorer],
+        concurrency: 1, // Sequential so we can abort after first
+      },
+      async () => {
+        callCount++;
+        if (callCount === 1) ac.abort();
+        return { output: '2' };
+      },
+      mockRuntime,
+      { signal: ac.signal },
+    );
+
+    // First item executes, remaining should be cancelled
+    const cancelled = result.items.filter((i) => i.error === 'Cancelled');
+    expect(cancelled.length).toBeGreaterThan(0);
+    // At least one item should have executed before abort
+    expect(callCount).toBeGreaterThanOrEqual(1);
   });
 });

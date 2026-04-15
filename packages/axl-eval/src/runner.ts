@@ -1,5 +1,5 @@
 import type { AxlRuntime } from '@axlsdk/axl';
-import type { EvalConfig, EvalResult, EvalItem, EvalSummary } from './types.js';
+import type { EvalConfig, EvalResult, EvalItem, EvalSummary, RunEvalOptions } from './types.js';
 import type { ScorerContext } from './scorer.js';
 import { normalizeScorerResult } from './scorer.js';
 import { computeStats, round } from './utils.js';
@@ -11,6 +11,67 @@ function parseCost(cost: string): number {
   return parseFloat(match[1]);
 }
 
+/**
+ * Extract a user-returned cost only if it's a non-negative finite number.
+ * Guards against workflows that return `{ cost: 'free' }`, `{ cost: NaN }`,
+ * `{ cost: -1 }`, `{ cost: Infinity }`, etc. — the TS type says `cost?: number`
+ * but at runtime we can't trust that.
+ *
+ * Negative costs are rejected because (a) cost is a USD amount and negative
+ * values are nonsensical, and (b) a negative cost would silently shrink
+ * `totalCost` below the budget limit check at the processItem level,
+ * letting a buggy/malicious workflow run unbounded. `0` is preserved
+ * because free operations on paid models are valid.
+ *
+ * When a user-supplied value is rejected (present but invalid), we log
+ * once per item via `console.warn` so the type violation is visible
+ * rather than silently swallowed.
+ */
+function extractUserCost(result: unknown, label = 'executeWorkflow'): number | undefined {
+  if (result === null || typeof result !== 'object') return undefined;
+  const raw = (result as { cost?: unknown }).cost;
+  if (raw === undefined) return undefined;
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) return raw;
+
+  console.warn(
+    `[axl-eval] Ignoring invalid \`cost\` from ${label} return: expected non-negative finite number, got ${typeof raw === 'number' ? String(raw) : typeof raw}. Falling back to tracked cost (or undefined).`,
+  );
+  return undefined;
+}
+
+/**
+ * Extract a user-returned metadata record only if it's a plain object.
+ * Rejects arrays, null, scalars, and exotic object types (Date, Map, Set,
+ * Error, class instances) that would satisfy a loose `typeof === 'object'`
+ * check but break `Record<string, unknown>` assumptions in downstream
+ * consumers (spread, Object.entries, property access).
+ */
+function extractUserMetadata(
+  result: unknown,
+  label = 'executeWorkflow',
+): Record<string, unknown> | undefined {
+  if (result === null || typeof result !== 'object') return undefined;
+  const meta = (result as { metadata?: unknown }).metadata;
+  if (meta === undefined) return undefined;
+  if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) {
+    console.warn(
+      `[axl-eval] Ignoring invalid \`metadata\` from ${label} return: expected plain object, got ${meta === null ? 'null' : Array.isArray(meta) ? 'array' : typeof meta}.`,
+    );
+    return undefined;
+  }
+  // Reject exotic objects (Date, Map, Set, Error, class instances) whose
+  // prototype chain differs from Object.prototype. Those pass `typeof ===
+  // 'object'` but don't behave like `Record<string, unknown>`.
+  const proto = Object.getPrototypeOf(meta);
+  if (proto !== Object.prototype && proto !== null) {
+    console.warn(
+      `[axl-eval] Ignoring invalid \`metadata\` from ${label} return: expected plain object, got ${(proto?.constructor?.name as string | undefined) ?? 'exotic object'}.`,
+    );
+    return undefined;
+  }
+  return meta as Record<string, unknown>;
+}
+
 export async function runEval(
   config: EvalConfig,
   executeWorkflow: (
@@ -18,6 +79,7 @@ export async function runEval(
     runtime: AxlRuntime,
   ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>,
   runtime: AxlRuntime,
+  options?: RunEvalOptions,
 ): Promise<EvalResult> {
   const startTime = Date.now();
   const id = randomUUID();
@@ -43,6 +105,18 @@ export async function runEval(
   let budgetExceeded = false;
 
   async function processItem(item: (typeof items)[0], itemIndex: number): Promise<void> {
+    if (options?.signal?.aborted) {
+      evalItems[itemIndex] = {
+        input: item.input,
+        annotations: item.annotations,
+        output: null,
+        error: 'Cancelled',
+        scores: {},
+      };
+      options?.onProgress?.({ type: 'item_done', itemIndex, totalItems: items.length });
+      return;
+    }
+
     if (budgetExceeded) {
       evalItems[itemIndex] = {
         input: item.input,
@@ -51,6 +125,7 @@ export async function runEval(
         error: 'Budget exceeded',
         scores: {},
       };
+      options?.onProgress?.({ type: 'item_done', itemIndex, totalItems: items.length });
       return;
     }
 
@@ -62,18 +137,54 @@ export async function runEval(
     };
     const itemStart = Date.now();
     try {
-      const result = await executeWorkflow(item.input, runtime);
-      evalItem.duration = Date.now() - itemStart;
-      evalItem.output = result.output;
-      evalItem.cost = result.cost;
-      if (result.metadata) evalItem.metadata = result.metadata;
-      if (result.cost != null) {
-        totalCost += result.cost;
+      // When captureTraces is on, wrap the user's executeWorkflow in
+      // trackExecution so we get a per-item TraceEvent[] scoped via
+      // AsyncLocalStorage. trackExecution's scope walks the parent chain, so
+      // any nested trackExecution (e.g. from the CLI) continues to work.
+      if (options?.captureTraces) {
+        const tracked = await runtime.trackExecution(
+          async () => executeWorkflow(item.input, runtime),
+          { captureTraces: true },
+        );
+        evalItem.duration = Date.now() - itemStart;
+        evalItem.output = tracked.result.output;
+        // Prefer user-returned cost/metadata; fall back to tracked values.
+        // Type-guarded so a non-number cost (e.g. `{ cost: 'free' }`) or a
+        // non-object metadata (e.g. an array or scalar) doesn't silently
+        // corrupt downstream math or shape expectations.
+        evalItem.cost = extractUserCost(tracked.result) ?? tracked.cost;
+        evalItem.metadata = extractUserMetadata(tracked.result) ?? tracked.metadata;
+        if (tracked.traces && tracked.traces.length > 0) {
+          evalItem.traces = tracked.traces;
+        }
+        if (evalItem.cost != null) {
+          totalCost += evalItem.cost;
+        }
+      } else {
+        const result = await executeWorkflow(item.input, runtime);
+        evalItem.duration = Date.now() - itemStart;
+        evalItem.output = result.output;
+        evalItem.cost = extractUserCost(result);
+        const meta = extractUserMetadata(result);
+        if (meta) evalItem.metadata = meta;
+        if (evalItem.cost != null) {
+          totalCost += evalItem.cost;
+        }
       }
     } catch (err) {
       evalItem.duration = Date.now() - itemStart;
       evalItem.error = err instanceof Error ? err.message : String(err);
+      // Failed items are exactly when per-item traces are most valuable —
+      // recover them from the captured-traces side-channel `trackExecution`
+      // attaches to the error on the failure path.
+      if (options?.captureTraces) {
+        const captured = (err as { axlCapturedTraces?: unknown }).axlCapturedTraces;
+        if (Array.isArray(captured) && captured.length > 0) {
+          evalItem.traces = captured as EvalItem['traces'];
+        }
+      }
       evalItems[itemIndex] = evalItem;
+      options?.onProgress?.({ type: 'item_done', itemIndex, totalItems: items.length });
       return;
     }
 
@@ -148,6 +259,7 @@ export async function runEval(
     }
     evalItem.scorerCost = itemScorerCost > 0 ? itemScorerCost : undefined;
     evalItems[itemIndex] = evalItem;
+    options?.onProgress?.({ type: 'item_done', itemIndex, totalItems: items.length });
   }
 
   let index = 0;

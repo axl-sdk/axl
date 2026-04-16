@@ -187,7 +187,7 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
   // Create lazy eval loader if eval files are configured
   const evalLoader = options.evals ? createEvalLoader(options.evals, runtime) : undefined;
 
-  const { app, connMgr, traceListener, closeActiveRuns } = createServer({
+  const { app, connMgr, traceListener, closeActiveRuns, closeAggregators } = createServer({
     runtime,
     staticRoot,
     basePath,
@@ -382,6 +382,9 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
     if (traceListener) {
       runtime.removeListener('trace', traceListener);
     }
+
+    // Close all aggregators (clear intervals and unsubscribe listeners)
+    closeAggregators();
   }
 
   return {

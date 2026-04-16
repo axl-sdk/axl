@@ -66,10 +66,20 @@ export function createTestServer(
     scorers: [testScorer],
   });
 
-  const { app, connMgr, costAggregator } = createServer({
+  const server = createServer({
     runtime,
     readOnly: serverOptions?.readOnly,
   });
 
-  return { app, runtime, connMgr, costAggregator, provider };
+  return {
+    app: server.app,
+    runtime,
+    connMgr: server.connMgr,
+    costAggregator: server.costAggregator,
+    workflowStatsAggregator: server.workflowStatsAggregator,
+    traceStatsAggregator: server.traceStatsAggregator,
+    evalTrendsAggregator: server.evalTrendsAggregator,
+    aggregatorStartPromise: server.aggregatorStartPromise,
+    provider,
+  };
 }

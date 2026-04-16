@@ -16,6 +16,16 @@ export type ExecutionAggregatorOptions<State> = {
   executionCap?: number;
 };
 
+/** Detect workflow_end across both production (type: 'log', data.event: 'workflow_end')
+ *  and test runtime (type: 'workflow_end') shapes. */
+function isWorkflowEnd(event: TraceEvent): boolean {
+  if (event.type === 'workflow_end') return true;
+  if (event.type === 'log' && event.data && typeof event.data === 'object') {
+    return (event.data as { event?: unknown }).event === 'workflow_end';
+  }
+  return false;
+}
+
 /**
  * Consumes ExecutionInfo at the execution granularity (not individual trace events).
  * Live updates arrive via workflow_end trace events — the aggregator fetches the
@@ -26,6 +36,8 @@ export class ExecutionAggregator<State> {
   private interval?: ReturnType<typeof setInterval>;
   private listener?: (event: TraceEvent) => void;
   private options: ExecutionAggregatorOptions<State>;
+  /** Generation counter to prevent stale async fold after rebuild. */
+  private generation = 0;
 
   constructor(options: ExecutionAggregatorOptions<State>) {
     this.options = options;
@@ -40,11 +52,14 @@ export class ExecutionAggregator<State> {
   async start(): Promise<void> {
     await this.rebuild();
     this.listener = (event: TraceEvent) => {
-      if (event.type !== 'workflow_end') return;
-      // Fetch the finalized ExecutionInfo and fold it
+      if (!isWorkflowEnd(event)) return;
+      // Capture generation before the async gap
+      const gen = this.generation;
       this.options.runtime
         .getExecution(event.executionId)
         .then((exec) => {
+          // Skip if a rebuild happened between event and resolution
+          if (this.generation !== gen) return;
           if (exec) {
             this.snaps.fold(exec.startedAt, (prev) => this.options.reducer(prev, exec));
           }
@@ -59,6 +74,7 @@ export class ExecutionAggregator<State> {
   }
 
   async rebuild(): Promise<void> {
+    this.generation++;
     const executions: ExecutionInfo[] = await this.options.runtime.getExecutions();
     const cap = this.options.executionCap ?? 2000;
     const capped = executions.slice(0, cap);

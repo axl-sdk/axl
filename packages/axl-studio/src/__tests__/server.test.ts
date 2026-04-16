@@ -14,13 +14,17 @@ function createTestApp() {
 }
 
 describe('Studio Server', () => {
-  it('createServer returns app, connMgr, costAggregator, createWsHandlers, traceListener', () => {
+  it('createServer returns app, connMgr, aggregators, createWsHandlers, traceListener', () => {
     const result = createTestApp();
     expect(result.app).toBeDefined();
     expect(result.connMgr).toBeDefined();
     expect(result.costAggregator).toBeDefined();
+    expect(result.workflowStatsAggregator).toBeDefined();
+    expect(result.traceStatsAggregator).toBeDefined();
+    expect(result.evalTrendsAggregator).toBeDefined();
     expect(result.createWsHandlers).toBeTypeOf('function');
     expect(result.traceListener).toBeTypeOf('function');
+    expect(result.closeAggregators).toBeTypeOf('function');
   });
 
   it('GET /api/health returns 200 with healthy status', async () => {

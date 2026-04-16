@@ -1,28 +1,19 @@
 import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
 import type { TraceAggregator } from '../aggregates/trace-aggregator.js';
-import type { CostData } from '../types.js';
+import type { TraceStatsData } from '../aggregates/reducers.js';
 import type { WindowId } from '../aggregates/aggregate-snapshots.js';
 
 const VALID_WINDOWS = new Set<string>(['24h', '7d', '30d', 'all']);
 
-export function createCostRoutes(costAggregator: TraceAggregator<CostData>) {
+export function createTraceStatsRoutes(aggregator: TraceAggregator<TraceStatsData>) {
   const app = new Hono<StudioEnv>();
 
-  app.get('/costs', (c) => {
+  app.get('/trace-stats', (c) => {
     const windowParam = c.req.query('window');
-    const windowsParam = c.req.query('windows');
-
-    // Multi-window debug mode
-    if (windowsParam === 'all') {
-      return c.json({ ok: true, data: costAggregator.getAllSnapshots() });
-    }
-
-    // Single window mode (default: 7d)
     const window: WindowId =
       windowParam && VALID_WINDOWS.has(windowParam) ? (windowParam as WindowId) : '7d';
-
-    return c.json({ ok: true, data: costAggregator.getSnapshot(window) });
+    return c.json({ ok: true, data: aggregator.getSnapshot(window) });
   });
 
   return app;

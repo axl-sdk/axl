@@ -5,7 +5,35 @@
 import type { TraceEvent, ExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
 import type { CostData } from '../types.js';
 
+// ── Shared helpers ────────────────────────────────────────────────────
+
+/** Clamp a possibly-NaN/Infinity number to 0. */
+const finite = (v: number | undefined): number => (Number.isFinite(v) ? v! : 0);
+
+/** Detect log-form events from the production runtime (type: 'log' + data.event). */
+export function isLogEvent(event: TraceEvent, eventName: string): boolean {
+  if (event.type === eventName) return true;
+  if (event.type === 'log' && event.data != null && typeof event.data === 'object') {
+    return (event.data as { event?: unknown }).event === eventName;
+  }
+  return false;
+}
+
 // ── Cost reducer (TraceEvent → CostData) ──────────────────────────────
+
+function emptyRetry(): CostData['retry'] {
+  return {
+    primary: 0,
+    primaryCalls: 0,
+    schema: 0,
+    schemaCalls: 0,
+    validate: 0,
+    validateCalls: 0,
+    guardrail: 0,
+    guardrailCalls: 0,
+    retryCalls: 0,
+  };
+}
 
 export function emptyCostData(): CostData {
   return {
@@ -14,24 +42,45 @@ export function emptyCostData(): CostData {
     byAgent: {},
     byModel: {},
     byWorkflow: {},
+    retry: emptyRetry(),
+    byEmbedder: {},
   };
 }
 
 /**
- * Pure reducer extracted from CostAggregator.onTrace.
- * Every mutation becomes a fresh-object return.
+ * Pure reducer for CostData with full parity to CostAggregator.onTrace.
+ * Handles retry decomposition, embedder cost bucketing, workflow_start
+ * detection (both production log-form and test runtime shapes), and
+ * NaN/Infinity guards on all numeric accumulations.
  */
 export function reduceCost(acc: CostData, event: TraceEvent): CostData {
-  if (event.cost == null && !event.tokens) return acc;
+  const isWorkflowStart = isLogEvent(event, 'workflow_start');
 
-  const cost = Number.isFinite(event.cost) ? event.cost! : 0;
+  // Early return for events with no cost data. workflow_start events carry
+  // no cost/tokens but need to increment the per-workflow executions counter.
+  if (event.cost == null && !event.tokens) {
+    if (isWorkflowStart && event.workflow) {
+      const byWorkflow = { ...acc.byWorkflow };
+      const prev = byWorkflow[event.workflow] ?? { cost: 0, executions: 0 };
+      byWorkflow[event.workflow] = { ...prev, executions: prev.executions + 1 };
+      return { ...acc, byWorkflow };
+    }
+    return acc;
+  }
+
+  const cost = finite(event.cost);
   const tokens = event.tokens ?? {};
 
-  const totalTokens = {
-    input: acc.totalTokens.input + (tokens.input ?? 0),
-    output: acc.totalTokens.output + (tokens.output ?? 0),
-    reasoning: acc.totalTokens.reasoning + (tokens.reasoning ?? 0),
-  };
+  // Only count tokens from agent_call events — embedder tokens are
+  // bucketed separately into byEmbedder.tokens.
+  const totalTokens =
+    event.type === 'agent_call'
+      ? {
+          input: acc.totalTokens.input + finite(tokens.input),
+          output: acc.totalTokens.output + finite(tokens.output),
+          reasoning: acc.totalTokens.reasoning + finite(tokens.reasoning),
+        }
+      : acc.totalTokens;
 
   const byAgent = { ...acc.byAgent };
   if (event.agent) {
@@ -46,8 +95,8 @@ export function reduceCost(acc: CostData, event: TraceEvent): CostData {
       cost: prev.cost + cost,
       calls: prev.calls + 1,
       tokens: {
-        input: prev.tokens.input + (tokens.input ?? 0),
-        output: prev.tokens.output + (tokens.output ?? 0),
+        input: prev.tokens.input + finite(tokens.input),
+        output: prev.tokens.output + finite(tokens.output),
       },
     };
   }
@@ -57,8 +106,52 @@ export function reduceCost(acc: CostData, event: TraceEvent): CostData {
     const prev = byWorkflow[event.workflow] ?? { cost: 0, executions: 0 };
     byWorkflow[event.workflow] = {
       cost: prev.cost + cost,
-      executions: prev.executions + (event.type === 'workflow_start' ? 1 : 0),
+      executions: prev.executions + (isWorkflowStart ? 1 : 0),
     };
+  }
+
+  // Retry-cost decomposition: split agent_call cost by retryReason.
+  let retry = acc.retry;
+  if (event.type === 'agent_call') {
+    const d = (event.data ?? {}) as { retryReason?: 'schema' | 'validate' | 'guardrail' };
+    const reason = d.retryReason;
+    retry = { ...acc.retry };
+    if (reason === 'schema') {
+      retry.schema += cost;
+      retry.schemaCalls += 1;
+      retry.retryCalls += 1;
+    } else if (reason === 'validate') {
+      retry.validate += cost;
+      retry.validateCalls += 1;
+      retry.retryCalls += 1;
+    } else if (reason === 'guardrail') {
+      retry.guardrail += cost;
+      retry.guardrailCalls += 1;
+      retry.retryCalls += 1;
+    } else {
+      retry.primary += cost;
+      retry.primaryCalls += 1;
+    }
+  }
+
+  // Embedder cost: memory_remember and memory_recall log events.
+  let byEmbedder = acc.byEmbedder;
+  if (event.type === 'log') {
+    const d = (event.data ?? {}) as {
+      event?: string;
+      usage?: { model?: string; tokens?: number };
+    };
+    if (d.event === 'memory_remember' || d.event === 'memory_recall') {
+      byEmbedder = { ...acc.byEmbedder };
+      const modelKey = d.usage?.model ?? 'unknown';
+      const embedTokens = typeof d.usage?.tokens === 'number' ? finite(d.usage.tokens) : 0;
+      const prev = byEmbedder[modelKey] ?? { cost: 0, calls: 0, tokens: 0 };
+      byEmbedder[modelKey] = {
+        cost: prev.cost + cost,
+        calls: prev.calls + 1,
+        tokens: prev.tokens + embedTokens,
+      };
+    }
   }
 
   return {
@@ -67,6 +160,8 @@ export function reduceCost(acc: CostData, event: TraceEvent): CostData {
     byAgent,
     byModel,
     byWorkflow,
+    retry,
+    byEmbedder,
   };
 }
 
@@ -154,9 +249,17 @@ export function reduceEvalTrends(acc: EvalTrendData, entry: EvalHistoryEntry): E
   const runs = prev ? [...prev.runs, run] : [run];
   const { mean, std } = computeScoreStats(runs);
 
+  // latestScores is the most recent run's scores by timestamp.
+  // During rebuild, entries arrive newest-first, so only overwrite if
+  // there's no existing entry or this run is newer.
+  const latestScores =
+    prev && prev.runs.length > 0 && prev.runs[prev.runs.length - 1].timestamp > run.timestamp
+      ? prev.latestScores
+      : scores;
+
   byEval[entry.eval] = {
     runs,
-    latestScores: scores,
+    latestScores,
     scoreMean: mean,
     scoreStd: std,
     costTotal: (prev?.costTotal ?? 0) + cost,
@@ -172,6 +275,9 @@ export function reduceEvalTrends(acc: EvalTrendData, entry: EvalHistoryEntry): E
 
 // ── Workflow stats reducer (ExecutionInfo → WorkflowStatsData) ────────
 
+/** Max recent durations to keep per workflow for percentile computation. */
+const MAX_DURATIONS = 200;
+
 export type WorkflowStatsData = {
   byWorkflow: Record<
     string,
@@ -179,7 +285,9 @@ export type WorkflowStatsData = {
       total: number;
       completed: number;
       failed: number;
-      durations: number[]; // kept for p50/p95 computation
+      /** Bounded sorted array of recent durations for p50/p95. Max MAX_DURATIONS entries. */
+      durations: number[];
+      durationSum: number;
       avgDuration: number;
     }
   >;
@@ -210,20 +318,30 @@ export function reduceWorkflowStats(
     completed: 0,
     failed: 0,
     durations: [],
+    durationSum: 0,
     avgDuration: 0,
   };
 
-  const durations = [...prev.durations, execution.duration];
+  // Maintain a bounded sorted array for percentile computation.
+  // Insert in sorted position, evict the oldest (first) if over cap.
+  const durations = [...prev.durations];
+  const insertIdx = durations.findIndex((d) => d > execution.duration);
+  if (insertIdx === -1) durations.push(execution.duration);
+  else durations.splice(insertIdx, 0, execution.duration);
+  if (durations.length > MAX_DURATIONS) durations.shift();
+
   const total = prev.total + 1;
   const completed = prev.completed + (execution.status === 'completed' ? 1 : 0);
   const failed = prev.failed + (execution.status === 'failed' ? 1 : 0);
-  const avgDuration = durations.reduce((a, b) => a + b, 0) / durations.length;
+  const durationSum = prev.durationSum + execution.duration;
+  const avgDuration = durationSum / total;
 
   byWorkflow[execution.workflow] = {
     total,
     completed,
     failed,
     durations,
+    durationSum,
     avgDuration,
   };
 
@@ -234,15 +352,15 @@ export function reduceWorkflowStats(
   return { byWorkflow, totalExecutions, failureRate };
 }
 
-/** Get p50/p95 from a WorkflowStatsData entry (computed on read). */
+/** Get p50/p95 from a WorkflowStatsData entry. Durations are pre-sorted. */
 export function getWorkflowPercentiles(entry: WorkflowStatsData['byWorkflow'][string]): {
   durationP50: number;
   durationP95: number;
 } {
-  const sorted = [...entry.durations].sort((a, b) => a - b);
+  // Durations are maintained in sorted order by the reducer
   return {
-    durationP50: percentile(sorted, 50),
-    durationP95: percentile(sorted, 95),
+    durationP50: percentile(entry.durations, 50),
+    durationP95: percentile(entry.durations, 95),
   };
 }
 
@@ -271,12 +389,15 @@ export function reduceTraceStats(acc: TraceStatsData, event: TraceEvent): TraceS
   const byTool = { ...acc.byTool };
   if (event.tool) {
     const prev = byTool[event.tool] ?? { calls: 0, denied: 0, approved: 0 };
+    // tool_approval events include both approved and denied outcomes.
+    // Only count as 'approved' when data.approved === true.
+    const isApproved =
+      (event.type as string) === 'tool_approval' &&
+      (event.data as { approved?: boolean } | undefined)?.approved === true;
     byTool[event.tool] = {
       calls: prev.calls + (event.type === 'tool_call' ? 1 : 0),
       denied: prev.denied + (event.type === 'tool_denied' ? 1 : 0),
-      approved:
-        prev.approved +
-        (event.type === 'tool_call' || (event.type as string) === 'tool_approval' ? 1 : 0),
+      approved: prev.approved + (isApproved ? 1 : 0),
     };
   }
 

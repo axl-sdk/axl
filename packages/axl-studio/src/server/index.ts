@@ -8,7 +8,20 @@ import type { StudioEnv } from './types.js';
 import { errorHandler } from './middleware/error-handler.js';
 import { ConnectionManager } from './ws/connection-manager.js';
 import { createWsHandlers } from './ws/handler.js';
-import { CostAggregator } from './cost-aggregator.js';
+import { TraceAggregator } from './aggregates/trace-aggregator.js';
+import { ExecutionAggregator } from './aggregates/execution-aggregator.js';
+import { EvalAggregator } from './aggregates/eval-aggregator.js';
+import {
+  reduceCost,
+  emptyCostData,
+  reduceWorkflowStats,
+  emptyWorkflowStatsData,
+  reduceTraceStats,
+  emptyTraceStatsData,
+  reduceEvalTrends,
+  emptyEvalTrendData,
+} from './aggregates/reducers.js';
+import type { WindowId } from './aggregates/aggregate-snapshots.js';
 import { createHealthRoutes } from './routes/health.js';
 import { createWorkflowRoutes } from './routes/workflows.js';
 import executionRoutes from './routes/executions.js';
@@ -20,11 +33,17 @@ import decisionRoutes from './routes/decisions.js';
 import { createCostRoutes } from './routes/costs.js';
 import { createEvalRoutes } from './routes/evals.js';
 import { createPlaygroundRoutes } from './routes/playground.js';
+import { createEvalTrendsRoutes } from './routes/eval-trends.js';
+import { createWorkflowStatsRoutes } from './routes/workflow-stats.js';
+import { createTraceStatsRoutes } from './routes/trace-stats.js';
 
 export type { StudioEnv } from './types.js';
 export { ConnectionManager } from './ws/connection-manager.js';
 export type { BroadcastTarget } from './ws/connection-manager.js';
-export { CostAggregator } from './cost-aggregator.js';
+export { TraceAggregator } from './aggregates/trace-aggregator.js';
+export { ExecutionAggregator } from './aggregates/execution-aggregator.js';
+export { EvalAggregator } from './aggregates/eval-aggregator.js';
+export type { WindowId, AggregateBroadcast } from './aggregates/aggregate-snapshots.js';
 
 export type CreateServerOptions = {
   runtime: AxlRuntime;
@@ -44,7 +63,43 @@ export function createServer(options: CreateServerOptions) {
   const { runtime, staticRoot, basePath = '', readOnly = false } = options;
   const app = new Hono<StudioEnv>();
   const connMgr = new ConnectionManager();
-  const costAggregator = new CostAggregator(connMgr);
+  const windows: WindowId[] = ['24h', '7d', '30d', 'all'];
+
+  const costAggregator = new TraceAggregator({
+    runtime,
+    connMgr,
+    channel: 'costs',
+    reducer: reduceCost,
+    emptyState: emptyCostData,
+    windows,
+  });
+
+  const workflowStatsAggregator = new ExecutionAggregator({
+    runtime,
+    connMgr,
+    channel: 'workflow-stats',
+    reducer: reduceWorkflowStats,
+    emptyState: emptyWorkflowStatsData,
+    windows,
+  });
+
+  const traceStatsAggregator = new TraceAggregator({
+    runtime,
+    connMgr,
+    channel: 'trace-stats',
+    reducer: reduceTraceStats,
+    emptyState: emptyTraceStatsData,
+    windows,
+  });
+
+  const evalTrendsAggregator = new EvalAggregator({
+    runtime,
+    connMgr,
+    channel: 'eval-trends',
+    reducer: reduceEvalTrends,
+    emptyState: emptyEvalTrendData,
+    windows,
+  });
 
   // ── Middleware ──────────────────────────────────────────────────────
   if (options.cors !== false) {
@@ -68,7 +123,6 @@ export function createServer(options: CreateServerOptions) {
       /^PUT \/api\/memory(\/|$)/,
       /^DELETE \/api\/memory(\/|$)/,
       /^POST \/api\/decisions(\/|$)/,
-      /^POST \/api\/costs(\/|$)/,
       /^POST \/api\/tools(\/|$)/,
       /^POST \/api\/evals\/import$/,
       /^POST \/api\/evals\/[^/]+\/run$/,
@@ -108,6 +162,9 @@ export function createServer(options: CreateServerOptions) {
   api.route('/', memoryRoutes);
   api.route('/', decisionRoutes);
   api.route('/', createCostRoutes(costAggregator));
+  api.route('/', createEvalTrendsRoutes(evalTrendsAggregator));
+  api.route('/', createWorkflowStatsRoutes(workflowStatsAggregator));
+  api.route('/', createTraceStatsRoutes(traceStatsAggregator));
   const { app: evalApp, closeActiveRuns } = createEvalRoutes(connMgr, options.evalLoader);
   api.route('/', evalApp);
   api.route('/', createPlaygroundRoutes(connMgr));
@@ -115,15 +172,12 @@ export function createServer(options: CreateServerOptions) {
   app.route('/api', api);
 
   // ── Trace event bridging ───────────────────────────────────────────
+  // Aggregators subscribe to runtime events directly via their start() method.
+  // This listener handles trace channel broadcasting and decision events only.
   const traceListener = (event: unknown) => {
     const traceEvent = event as {
       executionId?: string;
       type?: string;
-      agent?: string;
-      model?: string;
-      workflow?: string;
-      cost?: number;
-      tokens?: { input?: number; output?: number; reasoning?: number };
     };
 
     // Broadcast to trace channels
@@ -131,15 +185,20 @@ export function createServer(options: CreateServerOptions) {
       connMgr.broadcastWithWildcard(`trace:${traceEvent.executionId}`, traceEvent);
     }
 
-    // Feed cost aggregator
-    costAggregator.onTrace(traceEvent);
-
     // Broadcast pending decisions
     if (traceEvent.type === 'await_human') {
       connMgr.broadcast('decisions', traceEvent);
     }
   };
   runtime.on('trace', traceListener);
+
+  // ── Start aggregators (rebuild from history + subscribe to live events) ──
+  const aggregatorStartPromise = Promise.all([
+    costAggregator.start(),
+    workflowStatsAggregator.start(),
+    traceStatsAggregator.start(),
+    evalTrendsAggregator.start(),
+  ]).catch((err) => console.error('[axl-studio] aggregator start failed:', err));
 
   // ── Static SPA serving (production) ────────────────────────────────
   if (staticRoot) {
@@ -218,10 +277,21 @@ export function createServer(options: CreateServerOptions) {
     app,
     connMgr,
     costAggregator,
+    workflowStatsAggregator,
+    traceStatsAggregator,
+    evalTrendsAggregator,
+    aggregatorStartPromise,
     /** Create WS handlers. Call before registering static/SPA routes are reached. */
     createWsHandlers: () => createWsHandlers(connMgr),
     traceListener,
     /** Abort all active streaming eval runs. */
     closeActiveRuns,
+    /** Close all aggregators (clear intervals and unsubscribe listeners). */
+    closeAggregators: () => {
+      costAggregator.close();
+      workflowStatsAggregator.close();
+      traceStatsAggregator.close();
+      evalTrendsAggregator.close();
+    },
   };
 }

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { createTestServer } from '../helpers/setup.js';
 
 describe('Studio API: Costs', () => {
-  it('GET /api/costs returns initial cost data with zero totals', async () => {
+  it('GET /api/costs returns cost data with zero totals (default window: 7d)', async () => {
     const { app } = createTestServer();
     const res = await app.request('/api/costs');
     expect(res.status).toBe(200);
@@ -15,33 +15,43 @@ describe('Studio API: Costs', () => {
     expect(body.data.totalTokens.output).toBe(0);
   });
 
-  it('POST /api/costs/reset resets the cost aggregator', async () => {
-    const { app, costAggregator } = createTestServer();
-
-    // Manually feed a trace to accumulate some cost
-    costAggregator.onTrace({
-      type: 'agent_call',
-      agent: 'test-agent',
-      model: 'mock:test',
-      cost: 0.05,
-      tokens: { input: 100, output: 50 },
-    });
-
-    // Verify cost was accumulated
-    const before = await app.request('/api/costs');
-    const beforeBody = await before.json();
-    expect(beforeBody.data.totalCost).toBeCloseTo(0.05);
-
-    // Reset
-    const res = await app.request('/api/costs/reset', { method: 'POST' });
+  it('GET /api/costs?window=all returns the all-time snapshot', async () => {
+    const { app } = createTestServer();
+    const res = await app.request('/api/costs?window=all');
     expect(res.status).toBe(200);
+
     const body = await res.json();
     expect(body.ok).toBe(true);
-    expect(body.data.reset).toBe(true);
+    expect(body.data.totalCost).toBe(0);
+  });
 
-    // Verify cost is zeroed
-    const after = await app.request('/api/costs');
-    const afterBody = await after.json();
-    expect(afterBody.data.totalCost).toBe(0);
+  it('GET /api/costs?windows=all returns all window snapshots', async () => {
+    const { app } = createTestServer();
+    const res = await app.request('/api/costs?windows=all');
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    // Should have all four windows
+    expect(body.data['24h']).toBeDefined();
+    expect(body.data['7d']).toBeDefined();
+    expect(body.data['30d']).toBeDefined();
+    expect(body.data['all']).toBeDefined();
+  });
+
+  it('GET /api/costs?window=invalid falls back to 7d', async () => {
+    const { app } = createTestServer();
+    const res = await app.request('/api/costs?window=invalid');
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.data.totalCost).toBe(0);
+  });
+
+  it('POST /api/costs/reset returns 404 (removed)', async () => {
+    const { app } = createTestServer();
+    const res = await app.request('/api/costs/reset', { method: 'POST' });
+    expect(res.status).toBe(404);
   });
 });

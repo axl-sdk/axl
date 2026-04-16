@@ -14,6 +14,10 @@ import type {
   HealthData,
   RegisteredEval,
   EvalHistoryEntry,
+  WindowId,
+  EvalTrendData,
+  WorkflowStatsResponse,
+  TraceStatsData,
 } from './types';
 
 const BASE = (window.__AXL_STUDIO_BASE__ ?? '') + '/api';
@@ -152,8 +156,15 @@ export const resolveDecision = (executionId: string, approved: boolean, reason?:
   });
 
 // ── Costs ──────────────────────────────────────────────────────────
-export const fetchCosts = () => request<CostData>('/costs');
-export const resetCosts = () => request<{ reset: boolean }>('/costs/reset', { method: 'POST' });
+export const fetchCosts = (window: WindowId = '7d') => request<CostData>(`/costs?window=${window}`);
+
+// ── Aggregate endpoints ───────────────────────────────────────────
+export const fetchEvalTrends = (window: WindowId = '7d') =>
+  request<EvalTrendData>(`/eval-trends?window=${window}`);
+export const fetchWorkflowStats = (window: WindowId = '7d') =>
+  request<WorkflowStatsResponse>(`/workflow-stats?window=${window}`);
+export const fetchTraceStats = (window: WindowId = '7d') =>
+  request<TraceStatsData>(`/trace-stats?window=${window}`);
 
 // ── Evals ──────────────────────────────────────────────────────────
 export const fetchEvals = () => request<RegisteredEval[]>('/evals');

@@ -925,6 +925,9 @@ export class AxlRuntime extends EventEmitter {
     if (this.stateStore.saveEvalResult) {
       await this.stateStore.saveEvalResult(entry);
     }
+
+    // Emit for live aggregation (e.g., Studio eval trends)
+    this.emit('eval_result', entry);
   }
 
   /**

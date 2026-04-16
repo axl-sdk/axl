@@ -1,45 +1,55 @@
 import { useState, useCallback, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { DollarSign, RotateCcw } from 'lucide-react';
+import { DollarSign } from 'lucide-react';
 import { PanelShell } from '../../components/layout/PanelShell';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { CostBadge } from '../../components/shared/CostBadge';
 import { TokenBadge } from '../../components/shared/TokenBadge';
-import { fetchCosts, resetCosts } from '../../lib/api';
+import {
+  WindowSelector,
+  getStoredWindow,
+  setStoredWindow,
+} from '../../components/shared/WindowSelector';
+import { fetchCosts } from '../../lib/api';
 import { useWs } from '../../hooks/use-ws';
 import { cn, formatCost, formatTokens } from '../../lib/utils';
-import type { CostData } from '../../lib/types';
+import type { CostData, WindowId, AggregateBroadcast } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
 
 export function CostDashboardPanel() {
-  const [liveCosts, setLiveCosts] = useState<CostData | null>(null);
+  const [window, setWindow] = useState<WindowId>(getStoredWindow);
+  const [liveSnapshots, setLiveSnapshots] = useState<Record<WindowId, CostData> | null>(null);
 
-  const { data: fetchedCosts, refetch } = useQuery({
-    queryKey: ['costs'],
-    queryFn: fetchCosts,
+  const { data: fetchedCosts } = useQuery({
+    queryKey: ['costs', window],
+    queryFn: () => fetchCosts(window),
   });
 
-  // Live updates via WS
+  // Live updates via WS — new payload shape: { snapshots, updatedAt }
   useWs(
     'costs',
     useCallback((data: unknown) => {
-      setLiveCosts(data as CostData);
+      const broadcast = data as AggregateBroadcast<CostData>;
+      if (broadcast.snapshots) {
+        setLiveSnapshots(broadcast.snapshots);
+      }
     }, []),
   );
 
-  const costs = liveCosts ?? fetchedCosts;
-
-  const handleReset = async () => {
-    await resetCosts();
-    setLiveCosts(null);
-    refetch();
+  const handleWindowChange = (w: WindowId) => {
+    setWindow(w);
+    setStoredWindow(w);
   };
+
+  // Prefer live data for the currently selected window, fall back to fetched
+  const costs = liveSnapshots?.[window] ?? fetchedCosts;
 
   if (!costs) {
     return (
       <PanelShell
         title="Cost Dashboard"
         description="Spending across agents, models, and workflows"
+        actions={<WindowSelector value={window} onChange={handleWindowChange} />}
       >
         <EmptyState
           icon={<DollarSign size={32} />}
@@ -99,21 +109,7 @@ export function CostDashboardPanel() {
           'Spending across agents, models, and workflows'
         )
       }
-      actions={
-        <button
-          type="button"
-          onClick={handleReset}
-          className={cn(
-            'inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-full cursor-pointer',
-            'ring-1 ring-[hsl(var(--input))] bg-[hsl(var(--background))] shadow-sm',
-            'hover:bg-[hsl(var(--muted))] hover:ring-[hsl(var(--ring))]',
-            'focus:outline-none focus-visible:ring-[hsl(var(--ring))] transition-all',
-          )}
-        >
-          <RotateCcw size={12} />
-          Reset
-        </button>
-      }
+      actions={<WindowSelector value={window} onChange={handleWindowChange} />}
     >
       {/* Summary Cards */}
       <div
@@ -122,7 +118,7 @@ export function CostDashboardPanel() {
           showReasoning ? 'lg:grid-cols-4' : 'lg:grid-cols-3',
         )}
       >
-        <StatCard label="Total Cost" value={formatCost(costs.totalCost)} subtitle="all time" />
+        <StatCard label="Total Cost" value={formatCost(costs.totalCost)} subtitle={window} />
         <StatCard
           label="Input Tokens"
           value={formatTokens(costs.totalTokens.input)}

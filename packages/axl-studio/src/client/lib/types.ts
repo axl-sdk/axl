@@ -213,6 +213,62 @@ export type EvalHistoryEntry = {
   data: unknown;
 };
 
+/** Time window for aggregate views */
+export type WindowId = '24h' | '7d' | '30d' | 'all';
+
+/** Aggregate broadcast payload from WS */
+export type AggregateBroadcast<T> = {
+  snapshots: Record<WindowId, T>;
+  updatedAt: number;
+};
+
+/** Eval trend data from GET /api/eval-trends */
+export type EvalTrendData = {
+  byEval: Record<
+    string,
+    {
+      runs: Array<{
+        timestamp: number;
+        id: string;
+        scores: Record<string, number>;
+        cost: number;
+      }>;
+      latestScores: Record<string, number>;
+      scoreMean: Record<string, number>;
+      scoreStd: Record<string, number>;
+      costTotal: number;
+      runCount: number;
+    }
+  >;
+  totalRuns: number;
+  totalCost: number;
+};
+
+/** Workflow stats from GET /api/workflow-stats */
+export type WorkflowStatsResponse = {
+  byWorkflow: Record<
+    string,
+    {
+      total: number;
+      completed: number;
+      failed: number;
+      durationP50: number;
+      durationP95: number;
+      avgDuration: number;
+    }
+  >;
+  totalExecutions: number;
+  failureRate: number;
+};
+
+/** Trace stats from GET /api/trace-stats */
+export type TraceStatsData = {
+  eventTypeCounts: Record<string, number>;
+  byTool: Record<string, { calls: number; denied: number; approved: number }>;
+  retryByAgent: Record<string, { schema: number; validate: number; guardrail: number }>;
+  totalEvents: number;
+};
+
 /** Health check response */
 export type HealthData = {
   status: string;

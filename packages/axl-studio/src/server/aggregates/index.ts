@@ -20,6 +20,7 @@ export {
   getWorkflowPercentiles,
   reduceTraceStats,
   emptyTraceStatsData,
+  isLogEvent,
 } from './reducers.js';
 export type {
   EvalTrendData,

@@ -2,6 +2,7 @@ import type { AxlRuntime, TraceEvent, ExecutionInfo } from '@axlsdk/axl';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import { AggregateSnapshots, REBUILD_INTERVAL_MS, withinWindow } from './aggregate-snapshots.js';
 import type { WindowId } from './aggregate-snapshots.js';
+import { isLogEvent } from './reducers.js';
 
 export type ExecutionReducer<State> = (acc: State, execution: ExecutionInfo) => State;
 
@@ -15,16 +16,6 @@ export type ExecutionAggregatorOptions<State> = {
   /** Max executions to replay on rebuild. Default 2000. */
   executionCap?: number;
 };
-
-/** Detect workflow_end across both production (type: 'log', data.event: 'workflow_end')
- *  and test runtime (type: 'workflow_end') shapes. */
-function isWorkflowEnd(event: TraceEvent): boolean {
-  if (event.type === 'workflow_end') return true;
-  if (event.type === 'log' && event.data && typeof event.data === 'object') {
-    return (event.data as { event?: unknown }).event === 'workflow_end';
-  }
-  return false;
-}
 
 /**
  * Consumes ExecutionInfo at the execution granularity (not individual trace events).
@@ -52,7 +43,7 @@ export class ExecutionAggregator<State> {
   async start(): Promise<void> {
     await this.rebuild();
     this.listener = (event: TraceEvent) => {
-      if (!isWorkflowEnd(event)) return;
+      if (!isLogEvent(event, 'workflow_end')) return;
       // Capture generation before the async gap
       const gen = this.generation;
       this.options.runtime

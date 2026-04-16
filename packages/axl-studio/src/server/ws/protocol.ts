@@ -4,7 +4,7 @@ import { MAX_WS_FRAME_BYTES, type ConnectionManager } from './connection-manager
 /** Channel prefixes that accept suffixes (e.g., execution:abc, trace:*). */
 const VALID_CHANNEL_PREFIXES = ['execution:', 'trace:', 'eval:'];
 /** Channels that must match exactly (no suffix allowed). */
-const VALID_EXACT_CHANNELS = ['costs', 'decisions'];
+const VALID_EXACT_CHANNELS = ['costs', 'decisions', 'eval-trends', 'workflow-stats', 'trace-stats'];
 const MAX_CHANNEL_LENGTH = 256;
 
 /**

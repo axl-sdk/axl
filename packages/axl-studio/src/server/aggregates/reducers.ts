@@ -208,7 +208,7 @@ function extractCost(data: unknown): number {
   if (!data || typeof data !== 'object') return 0;
   const result = data as Record<string, unknown>;
   const summary = result.summary as Record<string, unknown> | undefined;
-  return typeof summary?.totalCost === 'number' ? summary.totalCost : 0;
+  return Number.isFinite(summary?.totalCost) ? (summary!.totalCost as number) : 0;
 }
 
 /** Compute mean and std for score arrays. */
@@ -325,16 +325,17 @@ export function reduceWorkflowStats(
   // Maintain a bounded sorted array for percentile computation.
   // Insert in sorted position, evict the smallest (front) if over cap.
   // This biases toward recent larger values — acceptable for dashboard use.
+  const dur = finite(execution.duration);
   const durations = [...prev.durations];
-  const insertIdx = durations.findIndex((d) => d > execution.duration);
-  if (insertIdx === -1) durations.push(execution.duration);
-  else durations.splice(insertIdx, 0, execution.duration);
+  const insertIdx = durations.findIndex((d) => d > dur);
+  if (insertIdx === -1) durations.push(dur);
+  else durations.splice(insertIdx, 0, dur);
   if (durations.length > MAX_DURATIONS) durations.shift();
 
   const total = prev.total + 1;
   const completed = prev.completed + (execution.status === 'completed' ? 1 : 0);
   const failed = prev.failed + (execution.status === 'failed' ? 1 : 0);
-  const durationSum = prev.durationSum + execution.duration;
+  const durationSum = prev.durationSum + dur;
   const avgDuration = durationSum / total;
 
   byWorkflow[execution.workflow] = {
@@ -390,14 +391,17 @@ export function reduceTraceStats(acc: TraceStatsData, event: TraceEvent): TraceS
   const byTool = { ...acc.byTool };
   if (event.tool) {
     const prev = byTool[event.tool] ?? { calls: 0, denied: 0, approved: 0 };
-    // tool_approval events include both approved and denied outcomes.
-    // Only count as 'approved' when data.approved === true.
-    const isApproved =
-      (event.type as string) === 'tool_approval' &&
-      (event.data as { approved?: boolean } | undefined)?.approved === true;
+    // The trace system emits both tool approvals and denials as type: 'tool_denied'.
+    // data.approved distinguishes them: true = approved, absent/false = denied.
+    const isDeniedEvent = event.type === 'tool_denied';
+    const deniedData = isDeniedEvent
+      ? (event.data as { approved?: boolean } | undefined)
+      : undefined;
+    const isApproved = isDeniedEvent && deniedData?.approved === true;
+    const isDenied = isDeniedEvent && !deniedData?.approved;
     byTool[event.tool] = {
       calls: prev.calls + (event.type === 'tool_call' ? 1 : 0),
-      denied: prev.denied + (event.type === 'tool_denied' ? 1 : 0),
+      denied: prev.denied + (isDenied ? 1 : 0),
       approved: prev.approved + (isApproved ? 1 : 0),
     };
   }

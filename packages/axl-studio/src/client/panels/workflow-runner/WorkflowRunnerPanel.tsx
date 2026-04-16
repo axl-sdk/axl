@@ -8,11 +8,13 @@ import { JsonViewer } from '../../components/shared/JsonViewer';
 import { SchemaForm } from '../../components/shared/SchemaForm';
 import { StatusBadge } from '../../components/shared/StatusBadge';
 import { CommandPicker } from '../../components/shared/CommandPicker';
-import { TraceEventList } from '../../components/shared/TraceEventList';
 import { fetchWorkflows, fetchWorkflow, executeWorkflow } from '../../lib/api';
 import { useWsStream } from '../../hooks/use-ws-stream';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
+import type { TraceEvent } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
+import { WorkflowStatsBar } from './WorkflowStatsBar';
+import { getBarColor, getDepth } from '../../lib/trace-utils';
 
 export function WorkflowRunnerPanel() {
   const [selectedWorkflow, setSelectedWorkflow] = useState('');
@@ -244,6 +246,7 @@ export function WorkflowRunnerPanel() {
 
         {/* Right: Results */}
         <div className="flex-1 overflow-y-auto p-5">
+          <WorkflowStatsBar />
           {status === 'idle' ? (
             <div className="flex items-center justify-center h-full">
               <EmptyState
@@ -282,16 +285,81 @@ export function WorkflowRunnerPanel() {
                 </div>
               )}
 
-              {/* Timeline — shares the trace explorer's row/body renderer
-                  via `TraceEventList`. Same look, same expand/collapse
-                  semantics (recursive into inner sections), same system
-                  prompt / prompt / response collapsible blocks. */}
+              {/* Timeline */}
               {timelineEvents.length > 0 && (
                 <div>
                   <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
                     Timeline
                   </h3>
-                  <TraceEventList events={timelineEvents} maxDuration={maxDuration} />
+                  <div className="space-y-1">
+                    {timelineEvents.map((event: TraceEvent, i: number) => {
+                      const depth = getDepth(event);
+                      return (
+                        <details key={i} className="group">
+                          <summary
+                            className="flex items-center gap-2 px-3 py-1.5 text-xs rounded-xl bg-[hsl(var(--secondary))] cursor-pointer hover:bg-[hsl(var(--accent))]"
+                            style={{ marginLeft: `${depth * 16}px` }}
+                          >
+                            <span className="font-mono text-[hsl(var(--muted-foreground))] w-8">
+                              #{event.step}
+                            </span>
+                            <span
+                              className={`w-1.5 h-1.5 rounded-full shrink-0 ${getBarColor(event.type)}`}
+                            />
+                            <span className="font-medium w-24 truncate">{event.type}</span>
+                            {event.agent && (
+                              <span className="text-blue-600 dark:text-blue-400 w-24 truncate">
+                                {event.agent}
+                              </span>
+                            )}
+                            {event.tool && (
+                              <span className="text-purple-600 dark:text-purple-400 w-24 truncate">
+                                {event.tool}
+                              </span>
+                            )}
+                            <div className="flex-1 h-3 bg-[hsl(var(--background))] rounded overflow-hidden">
+                              {event.duration != null && event.duration > 0 && (
+                                <div
+                                  className={`h-full rounded ${getBarColor(event.type)}`}
+                                  style={{
+                                    width: `${Math.max((event.duration / maxDuration) * 100, 2)}%`,
+                                    opacity: 0.7,
+                                  }}
+                                />
+                              )}
+                            </div>
+                            {event.duration != null && (
+                              <span className="text-[10px] font-mono text-[hsl(var(--muted-foreground))]">
+                                {formatDuration(event.duration)}
+                              </span>
+                            )}
+                          </summary>
+                          <div
+                            className="mt-1 mb-2 p-3 rounded-xl bg-[hsl(var(--card))] border border-[hsl(var(--border))]"
+                            style={{ marginLeft: `${depth * 16 + 32}px` }}
+                          >
+                            {event.model && (
+                              <p className="text-xs mb-1">
+                                <strong>Model:</strong> {event.model}
+                              </p>
+                            )}
+                            {event.tokens && (
+                              <p className="text-xs mb-1">
+                                <strong>Tokens:</strong> in={event.tokens.input} out=
+                                {event.tokens.output}
+                                {event.tokens.reasoning
+                                  ? ` reasoning=${event.tokens.reasoning}`
+                                  : ''}
+                              </p>
+                            )}
+                            {event.data != null && (
+                              <JsonViewer data={event.data as Record<string, unknown>} collapsed />
+                            )}
+                          </div>
+                        </details>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
 

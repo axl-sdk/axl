@@ -4,6 +4,7 @@ import { FlaskConical, ArrowLeft, Upload, X } from 'lucide-react';
 import { useEvalExecution, startEvalRun, cancelEvalRun, clearEvalRun } from './eval-store';
 import { PanelHeader } from '../../components/layout/PanelHeader';
 import { EmptyState } from '../../components/shared/EmptyState';
+import { EvalTrendsView } from './EvalTrendsView';
 import {
   fetchEvals,
   fetchEvalHistory,
@@ -45,7 +46,7 @@ import { JsonViewer } from '../../components/shared/JsonViewer';
 
 export function EvalRunnerPanel() {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<'run' | 'history' | 'compare'>('run');
+  const [tab, setTab] = useState<'run' | 'history' | 'compare' | 'trends'>('run');
   const [selectedEval, setSelectedEval] = useState('');
   const evalExec = useEvalExecution();
   const running = evalExec.status === 'running';
@@ -581,7 +582,7 @@ export function EvalRunnerPanel() {
     return scored.slice(0, WORST_ITEMS_LIMIT);
   }, [isAggregateView, currentResult]);
 
-  const tabs = ['run', 'history', 'compare'] as const;
+  const tabs = ['run', 'history', 'compare', 'trends'] as const;
 
   return (
     <div className="flex flex-col h-screen">
@@ -1391,6 +1392,9 @@ export function EvalRunnerPanel() {
           )}
         </div>
       )}
+
+      {/* ── Trends Tab ──────────────────────────────────── */}
+      {tab === 'trends' && <EvalTrendsView />}
 
       {/* ── Compare Tab ──────────────────────────────────── */}
       {tab === 'compare' && (

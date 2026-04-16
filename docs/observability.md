@@ -259,3 +259,36 @@ const PlanGenerator = agent({
 ```
 
 This lets you correlate trace output to specific prompt versions, which is especially useful when comparing eval results.
+
+## Windowed Aggregates (Studio)
+
+Studio's aggregate views (Cost Dashboard, Eval Runner, Workflow Runner, Trace Explorer) compute time-windowed statistics from persisted execution and eval history. When backed by SQLiteStore or RedisStore, aggregates survive server restarts.
+
+### Window selection
+
+All four panels share a window selector: `24h | 7d | 30d | All`. Default is `7d`. The selection is persisted to `localStorage['axl.studio.window']` and shared across panels.
+
+### How it works
+
+Each aggregate panel is backed by a typed aggregator that:
+
+1. **Rebuilds from history** on server start — replays persisted executions (up to 2000) or eval entries (up to 500) through a pure reducer function
+2. **Folds live events** as they arrive via the runtime's event emitter
+3. **Periodically rebuilds** every 5 minutes to evict events that fall outside time windows
+
+Aggregate state is compute-on-read from the existing `ExecutionInfo.steps` and `EvalHistoryEntry` data — no new persisted schema or materialized tables.
+
+### REST endpoints
+
+| Endpoint | Source | Description |
+|---|---|---|
+| `GET /api/costs?window=7d` | `TraceEvent` | Cost by agent, model, workflow + token totals |
+| `GET /api/eval-trends?window=7d` | `EvalHistoryEntry` | Per-eval score trends, mean/std, cost |
+| `GET /api/workflow-stats?window=7d` | `ExecutionInfo` | Per-workflow totals, failure rate, p50/p95 duration |
+| `GET /api/trace-stats?window=7d` | `TraceEvent` | Event distribution, tool calls, retry breakdown |
+
+All endpoints accept `?window=24h|7d|30d|all` (default `7d`). All are pure computation and allowed in `readOnly` mode.
+
+### WebSocket channels
+
+Each aggregator broadcasts to its own WS channel (`costs`, `eval-trends`, `workflow-stats`, `trace-stats`) with the payload `{ snapshots: Record<WindowId, State>, updatedAt: number }`.

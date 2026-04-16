@@ -85,9 +85,11 @@ Real-world examples that showcase Axl's strengths as standalone, runnable TypeSc
 | RAG-augmented Q&A | Semantic recall, vector stores, sessions |
 | Eval-driven prompt iteration | `dataset()`, `scorer()`, `llmScorer()`, `evalCompare()` |
 
-#### Reference Tool Package (`@axlsdk/tools`)
+#### Reference Tool Package (`@axlsdk/tools`) — Q2 2026 target
 
 A companion package shipping battle-tested tool implementations for common agentic patterns. Users building coding agents, research agents, or browsing agents need these on day one — "bring your own tools" is the right default, but the gap is visible when competing SDKs ship them built-in.
+
+Timing is pressing: OpenAI's April 2026 Agents SDK update ships sandbox-native shell and apply-patch tools in Python, with TypeScript to follow. Axl's provider-agnostic equivalents are the right response — same primitives, usable with any model.
 
 | Tool | Description | Priority |
 |------|-------------|----------|
@@ -102,6 +104,49 @@ Design constraints:
 - Backends are pluggable (e.g., `webSearchTool({ provider: 'tavily', apiKey })`) so users aren't locked to one service
 - Zero required dependencies in the package — backends are optional peer deps
 - All tools work with `AxlTestRuntime` via `MockTool` for testing
+
+#### `agent.asTool()` Helper
+
+Axl already supports the agent-as-tool pattern — wrap `ctx.ask(subAgent, input)` in a `tool()` and give it to an outer agent. This is distinct from `handoffs: 'roundtrip'` (which carries source conversation) and provides **session isolation**: the sub-agent sees a fresh context. The pattern works today, but requires boilerplate:
+
+```typescript
+const specialistTool = tool({
+  name: 'consult_specialist',
+  description: 'Ask the specialist agent a question',
+  input: z.object({ question: z.string() }),
+  handler: async (input, ctx) => ctx.ask(specialist, input.question),
+});
+```
+
+Planned ergonomic sugar:
+
+```typescript
+const specialistTool = specialist.asTool({
+  name: 'consult_specialist',  // optional, defaults to agent name
+  description: '...',           // optional, defaults to agent system prompt
+});
+```
+
+Implementation is a thin helper on the `Agent` prototype — wraps `ctx.ask(this, ...)` with a default input schema (`{ question: string }`) or accepts a custom one. Does not collapse the other three multi-agent patterns (`handoffs: oneway`, `handoffs: roundtrip`, `ctx.delegate`/`ctx.spawn`); each has distinct semantics and should remain explicit.
+
+Naming aligns with OpenAI Agents JS's `agent.asTool()`, making mental-model portability easier for developers evaluating both SDKs.
+
+#### AGENTS.md Convention Support
+
+`AGENTS.md` is emerging as a cross-ecosystem convention for project-level agent instructions (used by Claude Code, OpenAI's April 2026 harness, and similar tools). Axl agents currently take `system` prompts in code; this adds an optional loader that merges project-level guidance from `AGENTS.md`.
+
+```typescript
+const dev = agent({
+  name: 'dev',
+  model: 'openai:gpt-4o',
+  system: 'You are a coding assistant.',
+  projectContext: 'AGENTS.md',  // auto-prepended to system prompt
+});
+```
+
+Resolution: path relative to the file that defined the agent, or `process.cwd()` for absolute paths. Files are read once at agent creation, not per-call. Studio's Playground panel can optionally surface which agents loaded AGENTS.md context.
+
+Low priority — convention alignment rather than core capability. Implement if developer demand materializes.
 
 #### Dynamic Tool Loading
 

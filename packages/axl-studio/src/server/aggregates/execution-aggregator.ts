@@ -15,6 +15,8 @@ export type ExecutionAggregatorOptions<State> = {
   windows: WindowId[];
   /** Max executions to replay on rebuild. Default 2000. */
   executionCap?: number;
+  /** Optional transform applied to each window's state before WS broadcast. */
+  broadcastTransform?: (state: State) => unknown;
 };
 
 /**
@@ -37,6 +39,7 @@ export class ExecutionAggregator<State> {
       options.emptyState,
       options.connMgr,
       options.channel,
+      options.broadcastTransform,
     );
   }
 

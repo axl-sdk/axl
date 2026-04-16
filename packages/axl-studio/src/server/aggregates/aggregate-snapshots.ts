@@ -40,6 +40,10 @@ export class AggregateSnapshots<State> {
     private emptyState: () => State,
     private connMgr: ConnectionManager,
     private channel: string,
+    /** Optional transform applied to each window's state before WS broadcast.
+     *  Useful when the broadcast payload differs from the internal state
+     *  (e.g., stripping internal arrays and adding computed fields). */
+    private broadcastTransform?: (state: State) => unknown,
   ) {
     this.snapshots = new Map(windows.map((w) => [w, emptyState()]));
   }
@@ -73,9 +77,14 @@ export class AggregateSnapshots<State> {
   }
 
   private broadcast(): void {
+    const snapshots = this.broadcastTransform
+      ? (Object.fromEntries(
+          this.windows.map((w) => [w, this.broadcastTransform!(this.snapshots.get(w)!)]),
+        ) as Record<WindowId, unknown>)
+      : this.getAll();
     this.connMgr.broadcast(this.channel, {
-      snapshots: this.getAll(),
+      snapshots,
       updatedAt: Date.now(),
-    } satisfies AggregateBroadcast<State>);
+    });
   }
 }

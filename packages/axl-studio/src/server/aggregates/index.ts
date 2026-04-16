@@ -23,6 +23,7 @@ export {
   reduceWorkflowStats,
   emptyWorkflowStatsData,
   getWorkflowPercentiles,
+  enrichWorkflowStats,
   reduceTraceStats,
   emptyTraceStatsData,
   isLogEvent,

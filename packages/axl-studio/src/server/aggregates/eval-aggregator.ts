@@ -14,6 +14,8 @@ export type EvalAggregatorOptions<State> = {
   windows: WindowId[];
   /** Max eval entries to replay on rebuild. Default 500. */
   entryCap?: number;
+  /** Optional transform applied to each window's state before WS broadcast. */
+  broadcastTransform?: (state: State) => unknown;
 };
 
 /**
@@ -33,6 +35,7 @@ export class EvalAggregator<State> {
       options.emptyState,
       options.connMgr,
       options.channel,
+      options.broadcastTransform,
     );
   }
 

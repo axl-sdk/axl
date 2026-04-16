@@ -16,6 +16,7 @@ import {
   emptyCostData,
   reduceWorkflowStats,
   emptyWorkflowStatsData,
+  enrichWorkflowStats,
   reduceTraceStats,
   emptyTraceStatsData,
   reduceEvalTrends,
@@ -81,6 +82,7 @@ export function createServer(options: CreateServerOptions) {
     reducer: reduceWorkflowStats,
     emptyState: emptyWorkflowStatsData,
     windows,
+    broadcastTransform: enrichWorkflowStats,
   });
 
   const traceStatsAggregator = new TraceAggregator({

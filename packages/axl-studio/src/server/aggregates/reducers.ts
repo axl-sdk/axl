@@ -267,7 +267,7 @@ export function reduceEvalTrends(acc: EvalTrendData, entry: EvalHistoryEntry): E
     scoreMean: mean,
     scoreStd: std,
     costTotal: (prev?.costTotal ?? 0) + cost,
-    runCount: runs.length,
+    runCount: (prev?.runCount ?? 0) + 1,
   };
 
   return {
@@ -370,6 +370,38 @@ export function getWorkflowPercentiles(entry: WorkflowStatsData['byWorkflow'][st
   };
 }
 
+/** Enrich raw WorkflowStatsData with computed percentiles for API/WS consumers.
+ *  Strips the internal `durations` and `durationSum` fields to keep payloads lean. */
+export function enrichWorkflowStats(data: WorkflowStatsData) {
+  const byWorkflow: Record<
+    string,
+    {
+      total: number;
+      completed: number;
+      failed: number;
+      durationP50: number;
+      durationP95: number;
+      avgDuration: number;
+    }
+  > = {};
+  for (const [name, entry] of Object.entries(data.byWorkflow)) {
+    const { durationP50, durationP95 } = getWorkflowPercentiles(entry);
+    byWorkflow[name] = {
+      total: entry.total,
+      completed: entry.completed,
+      failed: entry.failed,
+      durationP50,
+      durationP95,
+      avgDuration: entry.avgDuration,
+    };
+  }
+  return {
+    byWorkflow,
+    totalExecutions: data.totalExecutions,
+    failureRate: data.failureRate,
+  };
+}
+
 // ── Trace stats reducer (TraceEvent → TraceStatsData) ────────────────
 
 export type TraceStatsData = {
@@ -400,14 +432,20 @@ export function reduceTraceStats(acc: TraceStatsData, event: TraceEvent): TraceS
   ) {
     const toolName = event.tool;
     const prev = byTool[toolName] ?? { calls: 0, denied: 0, approved: 0 };
-    // The trace system emits both tool approvals and denials as type: 'tool_denied'.
-    // data.approved distinguishes them: true = approved, absent/false = denied.
+    // tool_denied: legacy event for "tool not available" path. data.approved
+    // distinguishes approvals (true) from denials (absent/false).
+    // tool_approval: distinct event from the approval gate with data.approved.
     const isDeniedEvent = event.type === 'tool_denied';
-    const deniedData = isDeniedEvent
-      ? (event.data as { approved?: boolean } | undefined)
-      : undefined;
-    const isApproved = isDeniedEvent && deniedData?.approved === true;
-    const isDenied = isDeniedEvent && !deniedData?.approved;
+    const isApprovalEvent = event.type === 'tool_approval';
+    const eventData =
+      isDeniedEvent || isApprovalEvent
+        ? (event.data as { approved?: boolean } | undefined)
+        : undefined;
+    const isApproved =
+      (isDeniedEvent && eventData?.approved === true) ||
+      (isApprovalEvent && eventData?.approved === true);
+    const isDenied =
+      (isDeniedEvent && !eventData?.approved) || (isApprovalEvent && eventData?.approved === false);
     byTool[toolName] = {
       calls: prev.calls + (event.type === 'tool_call' ? 1 : 0),
       denied: prev.denied + (isDenied ? 1 : 0),

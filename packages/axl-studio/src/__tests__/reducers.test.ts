@@ -176,6 +176,51 @@ describe('reduceCost', () => {
     });
   });
 
+  describe('workflow_start log-form detection', () => {
+    it('counts executions from log-form workflow_start (production runtime)', () => {
+      const events: TraceEvent[] = [
+        // Production runtime emits type: 'log' with data.event: 'workflow_start'
+        makeEvent({
+          type: 'log',
+          workflow: 'wf-1',
+          data: { event: 'workflow_start', input: {} },
+        }),
+        makeEvent({
+          type: 'agent_call',
+          workflow: 'wf-1',
+          cost: 0.01,
+          tokens: { input: 10, output: 5 },
+        }),
+        makeEvent({
+          type: 'log',
+          workflow: 'wf-1',
+          data: { event: 'workflow_start', input: {} },
+        }),
+      ];
+
+      let data = emptyCostData();
+      for (const e of events) data = reduceCost(data, e);
+
+      expect(data.byWorkflow['wf-1'].executions).toBe(2);
+      expect(data.byWorkflow['wf-1'].cost).toBeCloseTo(0.01);
+    });
+
+    it('counts executions from both log-form and direct workflow_start', () => {
+      const events: TraceEvent[] = [
+        makeEvent({ type: 'workflow_start', workflow: 'wf-1', cost: 0 }),
+        makeEvent({
+          type: 'log',
+          workflow: 'wf-1',
+          data: { event: 'workflow_start', input: {} },
+        }),
+      ];
+
+      let data = emptyCostData();
+      for (const e of events) data = reduceCost(data, e);
+      expect(data.byWorkflow['wf-1'].executions).toBe(2);
+    });
+  });
+
   describe('pure function properties', () => {
     it('does not mutate the accumulator', () => {
       const acc = emptyCostData();

@@ -323,7 +323,8 @@ export function reduceWorkflowStats(
   };
 
   // Maintain a bounded sorted array for percentile computation.
-  // Insert in sorted position, evict the oldest (first) if over cap.
+  // Insert in sorted position, evict the smallest (front) if over cap.
+  // This biases toward recent larger values — acceptable for dashboard use.
   const durations = [...prev.durations];
   const insertIdx = durations.findIndex((d) => d > execution.duration);
   if (insertIdx === -1) durations.push(execution.duration);

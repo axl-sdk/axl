@@ -56,17 +56,17 @@ export function emptyCostData(): CostData {
 export function reduceCost(acc: CostData, event: TraceEvent): CostData {
   const isWorkflowStart = isLogEvent(event, 'workflow_start');
 
-  // Early return for events with no cost data. workflow_start events carry
-  // no cost/tokens but need to increment the per-workflow executions counter.
-  if (event.cost == null && !event.tokens) {
-    if (isWorkflowStart && event.workflow) {
-      const byWorkflow = { ...acc.byWorkflow };
-      const prev = byWorkflow[event.workflow] ?? { cost: 0, executions: 0 };
-      byWorkflow[event.workflow] = { ...prev, executions: prev.executions + 1 };
-      return { ...acc, byWorkflow };
-    }
-    return acc;
+  // workflow_start events increment per-workflow executions and return early.
+  // They carry no meaningful cost — any cost/token fields are incidental.
+  if (isWorkflowStart && event.workflow) {
+    const byWorkflow = { ...acc.byWorkflow };
+    const prev = byWorkflow[event.workflow] ?? { cost: 0, executions: 0 };
+    byWorkflow[event.workflow] = { ...prev, executions: prev.executions + 1 };
+    return { ...acc, byWorkflow };
   }
+
+  // Early return for events with no cost data.
+  if (event.cost == null && !event.tokens) return acc;
 
   const cost = finite(event.cost);
   const tokens = event.tokens ?? {};
@@ -246,7 +246,11 @@ export function reduceEvalTrends(acc: EvalTrendData, entry: EvalHistoryEntry): E
 
   const byEval = { ...acc.byEval };
   const prev = byEval[entry.eval];
-  const runs = prev ? [...prev.runs, run] : [run];
+  // Cap runs array to limit WS broadcast payload size. Client only shows
+  // the 10 most recent; keep 50 for future chart use.
+  const MAX_EVAL_RUNS = 50;
+  const allRuns = prev ? [...prev.runs, run] : [run];
+  const runs = allRuns.length > MAX_EVAL_RUNS ? allRuns.slice(-MAX_EVAL_RUNS) : allRuns;
   const { mean, std } = computeScoreStats(runs);
 
   // latestScores is the most recent run's scores by timestamp.
@@ -389,8 +393,13 @@ export function reduceTraceStats(acc: TraceStatsData, event: TraceEvent): TraceS
   eventTypeCounts[event.type] = (eventTypeCounts[event.type] ?? 0) + 1;
 
   const byTool = { ...acc.byTool };
-  if (event.tool) {
-    const prev = byTool[event.tool] ?? { calls: 0, denied: 0, approved: 0 };
+  if (
+    event.type === 'tool_call' ||
+    event.type === 'tool_denied' ||
+    event.type === 'tool_approval'
+  ) {
+    const toolName = event.tool;
+    const prev = byTool[toolName] ?? { calls: 0, denied: 0, approved: 0 };
     // The trace system emits both tool approvals and denials as type: 'tool_denied'.
     // data.approved distinguishes them: true = approved, absent/false = denied.
     const isDeniedEvent = event.type === 'tool_denied';
@@ -399,7 +408,7 @@ export function reduceTraceStats(acc: TraceStatsData, event: TraceEvent): TraceS
       : undefined;
     const isApproved = isDeniedEvent && deniedData?.approved === true;
     const isDenied = isDeniedEvent && !deniedData?.approved;
-    byTool[event.tool] = {
+    byTool[toolName] = {
       calls: prev.calls + (event.type === 'tool_call' ? 1 : 0),
       denied: prev.denied + (isDenied ? 1 : 0),
       approved: prev.approved + (isApproved ? 1 : 0),

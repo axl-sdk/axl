@@ -1,41 +1,13 @@
-import { useState, useCallback } from 'react';
-import { useQuery } from '@tanstack/react-query';
 import { BarChart3 } from 'lucide-react';
 import { StatCard } from '../../components/shared/StatCard';
 import { EmptyState } from '../../components/shared/EmptyState';
-import {
-  WindowSelector,
-  getStoredWindow,
-  setStoredWindow,
-} from '../../components/shared/WindowSelector';
+import { WindowSelector } from '../../components/shared/WindowSelector';
 import { fetchTraceStats } from '../../lib/api';
-import { useWs } from '../../hooks/use-ws';
+import { useAggregate } from '../../hooks/use-aggregate';
 import { cn } from '../../lib/utils';
-import type { WindowId, TraceStatsData, AggregateBroadcast } from '../../lib/types';
 
 export function TraceStatsView() {
-  const [window, setWindow] = useState<WindowId>(getStoredWindow);
-  const [liveSnapshots, setLiveSnapshots] = useState<Record<WindowId, TraceStatsData> | null>(null);
-
-  const { data: fetchedData } = useQuery({
-    queryKey: ['trace-stats', window],
-    queryFn: () => fetchTraceStats(window),
-  });
-
-  useWs(
-    'trace-stats',
-    useCallback((data: unknown) => {
-      const broadcast = data as AggregateBroadcast<TraceStatsData>;
-      if (broadcast.snapshots) setLiveSnapshots(broadcast.snapshots);
-    }, []),
-  );
-
-  const handleWindowChange = (w: WindowId) => {
-    setWindow(w);
-    setStoredWindow(w);
-  };
-
-  const stats = liveSnapshots?.[window] ?? fetchedData;
+  const { window, handleWindowChange, data: stats } = useAggregate('trace-stats', fetchTraceStats);
 
   if (!stats || stats.totalEvents === 0) {
     return (

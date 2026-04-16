@@ -1,45 +1,15 @@
-import { useState, useCallback } from 'react';
-import { useQuery } from '@tanstack/react-query';
 import { StatCard } from '../../components/shared/StatCard';
-import {
-  WindowSelector,
-  getStoredWindow,
-  setStoredWindow,
-} from '../../components/shared/WindowSelector';
+import { WindowSelector } from '../../components/shared/WindowSelector';
 import { fetchWorkflowStats } from '../../lib/api';
-import { useWs } from '../../hooks/use-ws';
+import { useAggregate } from '../../hooks/use-aggregate';
 import { formatDuration } from '../../lib/utils';
-import type { WindowId, WorkflowStatsResponse, AggregateBroadcast } from '../../lib/types';
 
 export function WorkflowStatsBar() {
-  const [window, setWindow] = useState<WindowId>(getStoredWindow);
-  const [liveSnapshots, setLiveSnapshots] = useState<Record<
-    WindowId,
-    WorkflowStatsResponse
-  > | null>(null);
-
-  const { data: fetchedData } = useQuery({
-    queryKey: ['workflow-stats', window],
-    queryFn: () => fetchWorkflowStats(window),
-  });
-
-  useWs(
-    'workflow-stats',
-    useCallback((data: unknown) => {
-      // WS broadcasts the internal WorkflowStatsData (with durations array),
-      // not the enriched API response. We only use totalExecutions/failureRate
-      // and per-workflow counts here, so both shapes work.
-      const broadcast = data as AggregateBroadcast<WorkflowStatsResponse>;
-      if (broadcast.snapshots) setLiveSnapshots(broadcast.snapshots);
-    }, []),
-  );
-
-  const handleWindowChange = (w: WindowId) => {
-    setWindow(w);
-    setStoredWindow(w);
-  };
-
-  const stats = liveSnapshots?.[window] ?? fetchedData;
+  const {
+    window,
+    handleWindowChange,
+    data: stats,
+  } = useAggregate('workflow-stats', fetchWorkflowStats);
   if (!stats || stats.totalExecutions === 0) return null;
 
   const workflows = Object.entries(stats.byWorkflow).sort(([, a], [, b]) => b.total - a.total);

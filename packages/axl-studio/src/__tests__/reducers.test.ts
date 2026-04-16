@@ -240,6 +240,38 @@ describe('reduceCost', () => {
       expect(result).toBe(acc); // same reference — identity return
     });
   });
+
+  describe('finite clamping', () => {
+    it('clamps NaN cost to 0', () => {
+      const acc = emptyCostData();
+      const event = makeEvent({
+        cost: NaN,
+        agent: 'a',
+        model: 'gpt-4',
+        tokens: { input: 10, output: 5 },
+      });
+      const result = reduceCost(acc, event);
+
+      expect(result.totalCost).toBe(0);
+      expect(result.byAgent['a'].cost).toBe(0);
+      expect(result.byModel['gpt-4'].cost).toBe(0);
+    });
+
+    it('clamps Infinity cost to 0', () => {
+      const acc = emptyCostData();
+      const event = makeEvent({
+        cost: Infinity,
+        agent: 'a',
+        model: 'gpt-4',
+        tokens: { input: 10, output: 5 },
+      });
+      const result = reduceCost(acc, event);
+
+      expect(result.totalCost).toBe(0);
+      expect(result.byAgent['a'].cost).toBe(0);
+      expect(result.byModel['gpt-4'].cost).toBe(0);
+    });
+  });
 });
 
 // ── reduceEvalTrends ──────────────────────────────────────────────────
@@ -311,6 +343,35 @@ describe('reduceEvalTrends', () => {
     expect(acc.totalRuns).toBe(0);
     expect(result.totalRuns).toBe(1);
   });
+
+  it('latestScores reflects newest run when entries arrive newest-first', () => {
+    const now = Date.now();
+    let state = emptyEvalTrendData();
+
+    // During rebuild, entries arrive newest-first (most recent first)
+    state = reduceEvalTrends(
+      state,
+      makeEvalEntry({
+        id: 'newest',
+        eval: 'accuracy',
+        timestamp: now,
+        data: { summary: { scores: { acc: 0.95 }, totalCost: 0 } },
+      }),
+    );
+    state = reduceEvalTrends(
+      state,
+      makeEvalEntry({
+        id: 'older',
+        eval: 'accuracy',
+        timestamp: now - 60_000,
+        data: { summary: { scores: { acc: 0.7 }, totalCost: 0 } },
+      }),
+    );
+
+    // latestScores should reflect the newest run (timestamp: now), not the
+    // last-processed entry (timestamp: now - 60000)
+    expect(state.byEval['accuracy'].latestScores).toEqual({ acc: 0.95 });
+  });
 });
 
 // ── reduceWorkflowStats ───────────────────────────────────────────────
@@ -380,6 +441,33 @@ describe('reduceWorkflowStats', () => {
     expect(state.byWorkflow['wf'].total).toBe(2);
     expect(state.byWorkflow['wf'].completed).toBe(0);
     expect(state.byWorkflow['wf'].failed).toBe(0);
+  });
+
+  it('evicts the smallest duration when MAX_DURATIONS (200) exceeded', () => {
+    let state = emptyWorkflowStatsData();
+    // Insert 200 executions with duration 100..299
+    for (let i = 0; i < 200; i++) {
+      state = reduceWorkflowStats(state, makeExecution({ duration: 100 + i, workflow: 'wf' }));
+    }
+    expect(state.byWorkflow['wf'].durations).toHaveLength(200);
+    expect(state.byWorkflow['wf'].durations[0]).toBe(100);
+
+    // Insert a value smaller than all existing — it gets inserted at front
+    // then immediately evicted by shift(), so the array is unchanged
+    state = reduceWorkflowStats(state, makeExecution({ duration: 50, workflow: 'wf' }));
+    expect(state.byWorkflow['wf'].durations).toHaveLength(200);
+    expect(state.byWorkflow['wf'].durations[0]).toBe(100);
+
+    // Insert a large value — goes to the end, smallest (100) evicted
+    state = reduceWorkflowStats(state, makeExecution({ duration: 10000, workflow: 'wf' }));
+    expect(state.byWorkflow['wf'].durations).toHaveLength(200);
+    expect(state.byWorkflow['wf'].durations[0]).toBe(101);
+    expect(state.byWorkflow['wf'].durations[199]).toBe(10000);
+
+    // Insert a mid-range value — goes in sorted position, smallest (101) evicted
+    state = reduceWorkflowStats(state, makeExecution({ duration: 200, workflow: 'wf' }));
+    expect(state.byWorkflow['wf'].durations).toHaveLength(200);
+    expect(state.byWorkflow['wf'].durations[0]).toBe(102);
   });
 });
 
@@ -480,5 +568,21 @@ describe('reduceTraceStats', () => {
     );
     // Should not create an entry since 'unknown_reason' is not in the schema
     expect(state.retryByAgent['agent-a']).toBeUndefined();
+  });
+
+  it('counts tool_denied with data.approved=true as approved, not denied', () => {
+    let state = emptyTraceStatsData();
+    state = reduceTraceStats(
+      state,
+      makeEvent({
+        type: 'tool_denied',
+        tool: 'dangerous-tool',
+        data: { approved: true },
+      }),
+    );
+
+    expect(state.byTool['dangerous-tool'].approved).toBe(1);
+    expect(state.byTool['dangerous-tool'].denied).toBe(0);
+    expect(state.byTool['dangerous-tool'].calls).toBe(0);
   });
 });

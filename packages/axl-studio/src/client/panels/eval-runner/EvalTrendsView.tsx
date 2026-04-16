@@ -1,18 +1,11 @@
-import { useState, useCallback } from 'react';
-import { useQuery } from '@tanstack/react-query';
 import { TrendingUp } from 'lucide-react';
 import { StatCard } from '../../components/shared/StatCard';
 import { EmptyState } from '../../components/shared/EmptyState';
-import {
-  WindowSelector,
-  getStoredWindow,
-  setStoredWindow,
-} from '../../components/shared/WindowSelector';
+import { WindowSelector } from '../../components/shared/WindowSelector';
 import { CostBadge } from '../../components/shared/CostBadge';
 import { fetchEvalTrends } from '../../lib/api';
-import { useWs } from '../../hooks/use-ws';
+import { useAggregate } from '../../hooks/use-aggregate';
 import { cn, formatCost } from '../../lib/utils';
-import type { WindowId, EvalTrendData, AggregateBroadcast } from '../../lib/types';
 
 /** 3-tier score color: >=0.8 green, >=0.5 amber, <0.5 red */
 function scoreColor(score: number): string {
@@ -26,28 +19,7 @@ function formatScore(score: number): string {
 }
 
 export function EvalTrendsView() {
-  const [window, setWindow] = useState<WindowId>(getStoredWindow);
-  const [liveSnapshots, setLiveSnapshots] = useState<Record<WindowId, EvalTrendData> | null>(null);
-
-  const { data: fetchedData } = useQuery({
-    queryKey: ['eval-trends', window],
-    queryFn: () => fetchEvalTrends(window),
-  });
-
-  useWs(
-    'eval-trends',
-    useCallback((data: unknown) => {
-      const broadcast = data as AggregateBroadcast<EvalTrendData>;
-      if (broadcast.snapshots) setLiveSnapshots(broadcast.snapshots);
-    }, []),
-  );
-
-  const handleWindowChange = (w: WindowId) => {
-    setWindow(w);
-    setStoredWindow(w);
-  };
-
-  const trends = liveSnapshots?.[window] ?? fetchedData;
+  const { window, handleWindowChange, data: trends } = useAggregate('eval-trends', fetchEvalTrends);
 
   if (!trends || trends.totalRuns === 0) {
     return (

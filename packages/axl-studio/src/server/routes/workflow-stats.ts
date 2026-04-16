@@ -3,9 +3,7 @@ import type { StudioEnv } from '../types.js';
 import type { ExecutionAggregator } from '../aggregates/execution-aggregator.js';
 import type { WorkflowStatsData } from '../aggregates/reducers.js';
 import { getWorkflowPercentiles } from '../aggregates/reducers.js';
-import type { WindowId } from '../aggregates/aggregate-snapshots.js';
-
-const VALID_WINDOWS = new Set<string>(['24h', '7d', '30d', 'all']);
+import { parseWindowParam } from '../aggregates/aggregate-snapshots.js';
 
 /** Enrich the raw WorkflowStatsData with computed percentiles for the API response.
  *  Strips the internal `durations` and `durationSum` arrays to keep the payload lean. */
@@ -43,9 +41,7 @@ export function createWorkflowStatsRoutes(aggregator: ExecutionAggregator<Workfl
   const app = new Hono<StudioEnv>();
 
   app.get('/workflow-stats', (c) => {
-    const windowParam = c.req.query('window');
-    const window: WindowId =
-      windowParam && VALID_WINDOWS.has(windowParam) ? (windowParam as WindowId) : '7d';
+    const window = parseWindowParam(c.req.query('window'));
     return c.json({ ok: true, data: enrichWorkflowStats(aggregator.getSnapshot(window)) });
   });
 

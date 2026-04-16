@@ -1,4 +1,9 @@
-export { AggregateSnapshots, withinWindow, REBUILD_INTERVAL_MS } from './aggregate-snapshots.js';
+export {
+  AggregateSnapshots,
+  withinWindow,
+  REBUILD_INTERVAL_MS,
+  parseWindowParam,
+} from './aggregate-snapshots.js';
 export type { WindowId, AggregateBroadcast } from './aggregate-snapshots.js';
 
 export { TraceAggregator } from './trace-aggregator.js';

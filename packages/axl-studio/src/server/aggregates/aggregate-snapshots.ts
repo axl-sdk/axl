@@ -21,6 +21,13 @@ export function withinWindow(ts: number, window: WindowId, now: number): boolean
 /** Hardcoded rebuild interval — no env var or config surface in v1. */
 export const REBUILD_INTERVAL_MS = 5 * 60_000;
 
+const ALL_WINDOWS = new Set<string>(Object.keys(WINDOW_MS));
+
+/** Parse a `?window=` query param into a validated WindowId, defaulting to `7d`. */
+export function parseWindowParam(raw?: string | null, fallback: WindowId = '7d'): WindowId {
+  return raw && ALL_WINDOWS.has(raw) ? (raw as WindowId) : fallback;
+}
+
 /**
  * Holds per-window snapshots of an aggregate state and handles
  * window-filter logic and WebSocket broadcast.

@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Studio:** Trace Explorer "Stats" tab with event distribution, tool usage, and retry analysis
 - **Runtime:** `AxlRuntime.saveEvalResult()` now emits `eval_result` event for live eval aggregation
 
+### Fixed
+
+- **Studio:** `reduceEvalTrends` `runCount` tracked capped array length (max 50) instead of actual total — now uses independent counter
+- **Studio:** `reduceTraceStats` silently dropped `tool_approval` events — `approved` and `denied` counters now increment for both `tool_approval` and `tool_denied` event types
+- **Studio:** Workflow Runner WS live updates showed "—" for p50/p95 because `AggregateSnapshots` broadcast sent raw `WorkflowStatsData` (with `durations` array) while client expected enriched format — added `broadcastTransform` option that applies `enrichWorkflowStats` before WS broadcast
+
 ## [0.14.0] - 2026-04-14
 
 ### Breaking changes

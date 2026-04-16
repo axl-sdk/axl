@@ -84,8 +84,22 @@ export function EvalTrendsView() {
                   <tr className="border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]">
                     <th className="py-2 px-4 text-left font-medium">Scorer</th>
                     <th className="py-2 px-4 text-right font-medium">Latest</th>
-                    <th className="py-2 px-4 text-right font-medium">Mean</th>
-                    <th className="py-2 px-4 text-right font-medium">Std</th>
+                    <th
+                      className="py-2 px-4 text-right font-medium"
+                      title={
+                        entry.runCount > 50 ? 'Computed over the 50 most recent runs' : undefined
+                      }
+                    >
+                      Mean{entry.runCount > 50 ? '*' : ''}
+                    </th>
+                    <th
+                      className="py-2 px-4 text-right font-medium"
+                      title={
+                        entry.runCount > 50 ? 'Computed over the 50 most recent runs' : undefined
+                      }
+                    >
+                      Std{entry.runCount > 50 ? '*' : ''}
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -120,6 +134,12 @@ export function EvalTrendsView() {
                   ))}
                 </tbody>
               </table>
+            )}
+
+            {entry.runCount > 50 && (
+              <p className="px-4 pt-2 text-[10px] text-[hsl(var(--muted-foreground))]">
+                * Mean and Std computed over the 50 most recent runs
+              </p>
             )}
 
             {/* Recent runs timeline */}

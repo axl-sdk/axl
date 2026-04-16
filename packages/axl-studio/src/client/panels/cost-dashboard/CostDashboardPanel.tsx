@@ -1,48 +1,18 @@
-import { useState, useCallback, useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useState, useMemo } from 'react';
 import { DollarSign } from 'lucide-react';
 import { PanelShell } from '../../components/layout/PanelShell';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { CostBadge } from '../../components/shared/CostBadge';
 import { TokenBadge } from '../../components/shared/TokenBadge';
-import {
-  WindowSelector,
-  getStoredWindow,
-  setStoredWindow,
-} from '../../components/shared/WindowSelector';
+import { WindowSelector } from '../../components/shared/WindowSelector';
 import { fetchCosts } from '../../lib/api';
-import { useWs } from '../../hooks/use-ws';
+import { useAggregate } from '../../hooks/use-aggregate';
 import { cn, formatCost, formatTokens } from '../../lib/utils';
-import type { CostData, WindowId, AggregateBroadcast } from '../../lib/types';
+import type { CostData } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
 
 export function CostDashboardPanel() {
-  const [window, setWindow] = useState<WindowId>(getStoredWindow);
-  const [liveSnapshots, setLiveSnapshots] = useState<Record<WindowId, CostData> | null>(null);
-
-  const { data: fetchedCosts } = useQuery({
-    queryKey: ['costs', window],
-    queryFn: () => fetchCosts(window),
-  });
-
-  // Live updates via WS — new payload shape: { snapshots, updatedAt }
-  useWs(
-    'costs',
-    useCallback((data: unknown) => {
-      const broadcast = data as AggregateBroadcast<CostData>;
-      if (broadcast.snapshots) {
-        setLiveSnapshots(broadcast.snapshots);
-      }
-    }, []),
-  );
-
-  const handleWindowChange = (w: WindowId) => {
-    setWindow(w);
-    setStoredWindow(w);
-  };
-
-  // Prefer live data for the currently selected window, fall back to fetched
-  const costs = liveSnapshots?.[window] ?? fetchedCosts;
+  const { window, handleWindowChange, data: costs } = useAggregate<CostData>('costs', fetchCosts);
 
   if (!costs) {
     return (

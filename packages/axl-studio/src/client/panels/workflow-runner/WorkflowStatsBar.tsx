@@ -45,8 +45,18 @@ export function WorkflowStatsBar() {
                 <th className="py-2 px-3 text-left font-medium">Workflow</th>
                 <th className="py-2 px-3 text-right font-medium">Total</th>
                 <th className="py-2 px-3 text-right font-medium">Failed</th>
-                <th className="py-2 px-3 text-right font-medium">p50</th>
-                <th className="py-2 px-3 text-right font-medium">p95</th>
+                <th
+                  className="py-2 px-3 text-right font-medium"
+                  title="50th percentile duration (approximate for workflows with 200+ executions)"
+                >
+                  p50
+                </th>
+                <th
+                  className="py-2 px-3 text-right font-medium"
+                  title="95th percentile duration (approximate for workflows with 200+ executions)"
+                >
+                  p95
+                </th>
                 <th className="py-2 px-3 text-right font-medium">Avg</th>
               </tr>
             </thead>

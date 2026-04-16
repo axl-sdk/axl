@@ -9,3 +9,22 @@ export type { ExecutionReducer, ExecutionAggregatorOptions } from './execution-a
 
 export { EvalAggregator } from './eval-aggregator.js';
 export type { EvalReducer, EvalAggregatorOptions } from './eval-aggregator.js';
+
+export {
+  reduceCost,
+  emptyCostData,
+  reduceEvalTrends,
+  emptyEvalTrendData,
+  reduceWorkflowStats,
+  emptyWorkflowStatsData,
+  getWorkflowPercentiles,
+  reduceTraceStats,
+  emptyTraceStatsData,
+} from './reducers.js';
+export type {
+  EvalTrendData,
+  EvalTrendRun,
+  EvalTrendEntry,
+  WorkflowStatsData,
+  TraceStatsData,
+} from './reducers.js';

@@ -49,9 +49,13 @@ describe('Studio API: Costs', () => {
     expect(body.data.totalCost).toBe(0);
   });
 
-  it('POST /api/costs/reset returns 404 (removed)', async () => {
+  it('POST /api/costs/reset returns 410 Gone with migration hint (removed)', async () => {
     const { app } = createTestServer();
     const res = await app.request('/api/costs/reset', { method: 'POST' });
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(410);
+    const body = (await res.json()) as { ok: boolean; error: { code: string; message: string } };
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('GONE');
+    expect(body.error.message).toMatch(/window=/);
   });
 });

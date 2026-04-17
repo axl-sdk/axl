@@ -53,10 +53,10 @@ describe('Studio API: Aggregate Endpoints', () => {
       expect(body.data['all']).toBeDefined();
     });
 
-    it('POST /api/costs/reset returns 404', async () => {
+    it('POST /api/costs/reset returns 410 Gone (removed in 0.15.0)', async () => {
       const { app } = createTestServer();
       const res = await app.request('/api/costs/reset', { method: 'POST' });
-      expect(res.status).toBe(404);
+      expect(res.status).toBe(410);
     });
   });
 

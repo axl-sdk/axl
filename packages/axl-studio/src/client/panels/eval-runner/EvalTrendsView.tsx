@@ -257,7 +257,12 @@ export function EvalTrendsView({
                     title="Cost over time"
                   >
                     <span>cost</span>
-                    <SparkLine values={costValues} color="hsl(var(--primary))" width={80} height={22} />
+                    <SparkLine
+                      values={costValues}
+                      color="hsl(var(--primary))"
+                      width={80}
+                      height={22}
+                    />
                   </div>
                 )}
                 <CostBadge cost={entry.costTotal} />
@@ -303,7 +308,11 @@ export function EvalTrendsView({
                     xMin={xMin}
                     xMax={xMax}
                     yClamp={yClamp}
-                    yDomain={{ strategy: 'data', minSpan: viewMode === 'duration' ? 100 : 0.1, padPct: 0.1 }}
+                    yDomain={{
+                      strategy: 'data',
+                      minSpan: viewMode === 'duration' ? 100 : 0.1,
+                      padPct: 0.1,
+                    }}
                     height={180}
                     formatX={formatTimestamp}
                     formatY={formatYValue}

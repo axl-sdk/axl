@@ -110,10 +110,15 @@ export function TraceStatsView() {
         {/* Top tools */}
         <div className="rounded-xl border border-[hsl(var(--border))] p-4">
           <h4 className="text-sm font-medium mb-3">
-            Tool Calls {tools.length > 10 && <span className="text-[10px] text-[hsl(var(--muted-foreground))]">(top 10)</span>}
+            Tool Calls{' '}
+            {tools.length > 10 && (
+              <span className="text-[10px] text-[hsl(var(--muted-foreground))]">(top 10)</span>
+            )}
           </h4>
           {tools.length === 0 ? (
-            <p className="text-xs text-[hsl(var(--muted-foreground))]">No tool activity in window</p>
+            <p className="text-xs text-[hsl(var(--muted-foreground))]">
+              No tool activity in window
+            </p>
           ) : (
             <BarChart data={toolBars} maxBars={10} />
           )}

@@ -43,13 +43,18 @@ export function SparkLine({
     return [x, y];
   });
 
-  const linePath = points.map(([x, y], i) => `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`).join(' ');
-  const areaPath = fill
-    ? `${linePath} L ${width} ${height} L 0 ${height} Z`
-    : null;
+  const linePath = points
+    .map(([x, y], i) => `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`)
+    .join(' ');
+  const areaPath = fill ? `${linePath} L ${width} ${height} L 0 ${height} Z` : null;
 
   return (
-    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className={cn('inline-block', className)}>
+    <svg
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      className={cn('inline-block', className)}
+    >
       {areaPath && <path d={areaPath} fill={color} fillOpacity={0.12} />}
       <path d={linePath} stroke={color} strokeWidth={1.25} fill="none" />
     </svg>

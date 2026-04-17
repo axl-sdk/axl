@@ -21,10 +21,12 @@ function formatRelative(ts: number, now: number): string {
 }
 
 export function CostDashboardPanel() {
-  const { window, handleWindowChange, data: costs, updatedAt } = useAggregate<CostData>(
-    'costs',
-    fetchCosts,
-  );
+  const {
+    window,
+    handleWindowChange,
+    data: costs,
+    updatedAt,
+  } = useAggregate<CostData>('costs', fetchCosts);
 
   // Re-render every second so "Last updated: Xs ago" stays fresh.
   const [nowTick, setNowTick] = useState(() => Date.now());
@@ -409,8 +411,7 @@ export function CostDashboardPanel() {
         </span>
         <span className="opacity-40">·</span>
         <span>
-          Last updated:{' '}
-          {updatedAt != null ? formatRelative(updatedAt, nowTick) : 'pending'}
+          Last updated: {updatedAt != null ? formatRelative(updatedAt, nowTick) : 'pending'}
         </span>
         <span className="opacity-40">·</span>
         <span>

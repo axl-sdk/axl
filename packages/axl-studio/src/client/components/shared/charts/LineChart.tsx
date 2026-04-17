@@ -51,7 +51,10 @@ export function LineChart({
   ariaLabel?: string;
   className?: string;
 }) {
-  const [hover, setHover] = useState<{ x: number; points: Array<{ series: LineSeries; point: LinePoint }> } | null>(null);
+  const [hover, setHover] = useState<{
+    x: number;
+    points: Array<{ series: LineSeries; point: LinePoint }>;
+  } | null>(null);
   const [size, setSize] = useState<{ width: number; height: number }>({ width: 480, height });
 
   // ── Compute y-axis domain ───────────────────────────────────────────

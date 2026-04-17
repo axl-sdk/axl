@@ -58,7 +58,10 @@ function makeExecution(overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
 /** Build a data blob matching the real EvalResult shape:
  *  top-level `totalCost`, `summary.scorers[name] = { mean, ... }`. */
 function makeEvalData(scores: Record<string, number>, totalCost: number) {
-  const scorers: Record<string, { mean: number; min: number; max: number; p50: number; p95: number }> = {};
+  const scorers: Record<
+    string,
+    { mean: number; min: number; max: number; p50: number; p95: number }
+  > = {};
   for (const [name, score] of Object.entries(scores)) {
     scorers[name] = { mean: score, min: score, max: score, p50: score, p95: score };
   }

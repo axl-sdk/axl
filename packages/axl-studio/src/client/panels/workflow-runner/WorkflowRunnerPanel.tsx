@@ -229,130 +229,130 @@ export function WorkflowRunnerPanel() {
 
       {/* ── Run Tab ───────────────────────────────────── */}
       {wfTab === 'run' && (
-      <div className="flex-1 min-h-0 flex">
-        {/* Left: Input configuration — narrower than before so Result +
+        <div className="flex-1 min-h-0 flex">
+          {/* Left: Input configuration — narrower than before so Result +
             Timeline get more horizontal room. */}
-        <div className="w-[320px] xl:w-[360px] shrink-0 border-r border-[hsl(var(--border))] overflow-y-auto p-5 space-y-4">
-          {/* Input mode toggle */}
-          {hasSchema && (
-            <div className="flex items-center gap-1">
-              <button
-                onClick={() => setUseSchemaForm(true)}
-                className={cn(
-                  'px-3 py-1 text-xs rounded-lg transition-colors',
-                  useSchemaForm
-                    ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]'
-                    : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]',
-                )}
-              >
-                Form
-              </button>
-              <button
-                onClick={() => setUseSchemaForm(false)}
-                className={cn(
-                  'px-3 py-1 text-xs rounded-lg transition-colors',
-                  !useSchemaForm
-                    ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]'
-                    : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]',
-                )}
-              >
-                JSON
-              </button>
-            </div>
-          )}
-
-          {/* Input form or editor */}
-          {hasSchema && useSchemaForm ? (
-            <SchemaForm
-              schema={workflowDetail.inputSchema as Record<string, unknown>}
-              onSubmit={handleSchemaSubmit}
-              submitLabel={status === 'running' ? 'Running…' : 'Execute'}
-            />
-          ) : (
-            <div>
-              <label className="block text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
-                Input (JSON)
-              </label>
-              <JsonEditor value={inputJson} onChange={setInputJson} />
-            </div>
-          )}
-
-          {/* Output schema (collapsed) */}
-          {workflowDetail?.outputSchema != null && (
-            <div>
-              <label className="block text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
-                Output Schema
-              </label>
-              <JsonViewer data={workflowDetail.outputSchema} collapsed />
-            </div>
-          )}
-        </div>
-
-        {/* Right: Results */}
-        <div className="flex-1 overflow-y-auto p-5">
-          {status === 'idle' ? (
-            <div className="flex items-center justify-center h-full">
-              <EmptyState
-                icon={<FlaskConical size={32} />}
-                title="No execution"
-                description="Select a workflow and click Run to see results."
-              />
-            </div>
-          ) : (
-            <div className="space-y-5">
-              {/* Stat cards */}
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-                <StatCard label="Status" badge={<StatusBadge status={status} />} />
-                <StatCard label="Steps" value={String(timelineEvents.length)} />
-                <StatCard
-                  label="Duration"
-                  value={totalDuration > 0 ? formatDuration(totalDuration) : '\u2014'}
-                />
-                <StatCard label="Cost" value={totalCost > 0 ? formatCost(totalCost) : '\u2014'} />
+          <div className="w-[320px] xl:w-[360px] shrink-0 border-r border-[hsl(var(--border))] overflow-y-auto p-5 space-y-4">
+            {/* Input mode toggle */}
+            {hasSchema && (
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => setUseSchemaForm(true)}
+                  className={cn(
+                    'px-3 py-1 text-xs rounded-lg transition-colors',
+                    useSchemaForm
+                      ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]'
+                      : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]',
+                  )}
+                >
+                  Form
+                </button>
+                <button
+                  onClick={() => setUseSchemaForm(false)}
+                  className={cn(
+                    'px-3 py-1 text-xs rounded-lg transition-colors',
+                    !useSchemaForm
+                      ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]'
+                      : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]',
+                  )}
+                >
+                  JSON
+                </button>
               </div>
+            )}
 
-              {/* Error */}
-              {error && (
-                <div className="p-4 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm">
-                  {error}
+            {/* Input form or editor */}
+            {hasSchema && useSchemaForm ? (
+              <SchemaForm
+                schema={workflowDetail.inputSchema as Record<string, unknown>}
+                onSubmit={handleSchemaSubmit}
+                submitLabel={status === 'running' ? 'Running…' : 'Execute'}
+              />
+            ) : (
+              <div>
+                <label className="block text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
+                  Input (JSON)
+                </label>
+                <JsonEditor value={inputJson} onChange={setInputJson} />
+              </div>
+            )}
+
+            {/* Output schema (collapsed) */}
+            {workflowDetail?.outputSchema != null && (
+              <div>
+                <label className="block text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
+                  Output Schema
+                </label>
+                <JsonViewer data={workflowDetail.outputSchema} collapsed />
+              </div>
+            )}
+          </div>
+
+          {/* Right: Results */}
+          <div className="flex-1 overflow-y-auto p-5">
+            {status === 'idle' ? (
+              <div className="flex items-center justify-center h-full">
+                <EmptyState
+                  icon={<FlaskConical size={32} />}
+                  title="No execution"
+                  description="Select a workflow and click Run to see results."
+                />
+              </div>
+            ) : (
+              <div className="space-y-5">
+                {/* Stat cards */}
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                  <StatCard label="Status" badge={<StatusBadge status={status} />} />
+                  <StatCard label="Steps" value={String(timelineEvents.length)} />
+                  <StatCard
+                    label="Duration"
+                    value={totalDuration > 0 ? formatDuration(totalDuration) : '\u2014'}
+                  />
+                  <StatCard label="Cost" value={totalCost > 0 ? formatCost(totalCost) : '\u2014'} />
                 </div>
-              )}
 
-              {/* Result */}
-              {result !== undefined && (
-                <div>
-                  <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
-                    Result
-                  </h3>
-                  <JsonViewer data={result} />
-                </div>
-              )}
+                {/* Error */}
+                {error && (
+                  <div className="p-4 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm">
+                    {error}
+                  </div>
+                )}
 
-              {/* Timeline — shares the trace explorer's row/body renderer
+                {/* Result */}
+                {result !== undefined && (
+                  <div>
+                    <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
+                      Result
+                    </h3>
+                    <JsonViewer data={result} />
+                  </div>
+                )}
+
+                {/* Timeline — shares the trace explorer's row/body renderer
                   via `TraceEventList`. Same look, same expand/collapse
                   semantics (recursive into inner sections via
                   TraceExpandContext), same system prompt / prompt /
                   response collapsible blocks. */}
-              {timelineEvents.length > 0 && (
-                <div>
-                  <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
-                    Timeline
-                  </h3>
-                  <TraceEventList events={timelineEvents} maxDuration={maxDuration} />
-                </div>
-              )}
+                {timelineEvents.length > 0 && (
+                  <div>
+                    <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
+                      Timeline
+                    </h3>
+                    <TraceEventList events={timelineEvents} maxDuration={maxDuration} />
+                  </div>
+                )}
 
-              {/* Loading indicator */}
-              {status === 'running' && timelineEvents.length === 0 && (
-                <div className="flex items-center justify-center py-12 text-sm text-[hsl(var(--muted-foreground))]">
-                  <FlaskConical size={16} className="animate-pulse mr-2" />
-                  Executing workflow…
-                </div>
-              )}
-            </div>
-          )}
+                {/* Loading indicator */}
+                {status === 'running' && timelineEvents.length === 0 && (
+                  <div className="flex items-center justify-center py-12 text-sm text-[hsl(var(--muted-foreground))]">
+                    <FlaskConical size={16} className="animate-pulse mr-2" />
+                    Executing workflow…
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
-      </div>
       )}
     </div>
   );

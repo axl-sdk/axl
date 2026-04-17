@@ -25,9 +25,7 @@ export function BarChart({
   const max = rows.length > 0 ? Math.max(...rows.map((r) => r.value)) : 1;
 
   if (rows.length === 0) {
-    return (
-      <p className={cn('text-xs text-[hsl(var(--muted-foreground))]', className)}>No data</p>
-    );
+    return <p className={cn('text-xs text-[hsl(var(--muted-foreground))]', className)}>No data</p>;
   }
 
   return (
@@ -36,7 +34,10 @@ export function BarChart({
         const pct = max > 0 ? (row.value / max) * 100 : 0;
         return (
           <div key={row.label} className="flex items-center gap-2 text-xs">
-            <div className="w-24 truncate font-mono text-[hsl(var(--muted-foreground))]" title={row.label}>
+            <div
+              className="w-24 truncate font-mono text-[hsl(var(--muted-foreground))]"
+              title={row.label}
+            >
               {row.label}
             </div>
             <div className="relative flex-1 h-5 rounded bg-[hsl(var(--muted))]">
@@ -89,9 +90,7 @@ export function StackedBarChart({
   const max = rows.length > 0 ? Math.max(...rows.map((r) => r.total)) : 1;
 
   if (rows.length === 0) {
-    return (
-      <p className={cn('text-xs text-[hsl(var(--muted-foreground))]', className)}>No data</p>
-    );
+    return <p className={cn('text-xs text-[hsl(var(--muted-foreground))]', className)}>No data</p>;
   }
 
   // Collect all segment names for the legend
@@ -108,7 +107,10 @@ export function StackedBarChart({
         <div className="flex flex-wrap gap-3 text-[10px] text-[hsl(var(--muted-foreground))]">
           {Array.from(legend.entries()).map(([name, color]) => (
             <div key={name} className="flex items-center gap-1">
-              <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: color }} />
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ backgroundColor: color }}
+              />
               <span>{name}</span>
             </div>
           ))}
@@ -119,7 +121,10 @@ export function StackedBarChart({
           const widthPct = max > 0 ? (row.total / max) * 100 : 0;
           return (
             <div key={row.label} className="flex items-center gap-2 text-xs">
-              <div className="w-24 truncate font-mono text-[hsl(var(--muted-foreground))]" title={row.label}>
+              <div
+                className="w-24 truncate font-mono text-[hsl(var(--muted-foreground))]"
+                title={row.label}
+              >
                 {row.label}
               </div>
               <div className="relative flex-1 h-5 rounded bg-[hsl(var(--muted))] overflow-hidden">

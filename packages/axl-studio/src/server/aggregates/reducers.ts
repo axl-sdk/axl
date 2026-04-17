@@ -206,9 +206,7 @@ function extractScores(data: unknown): Record<string, number> {
   if (!data || typeof data !== 'object') return {};
   const result = data as Record<string, unknown>;
   const summary = result.summary as Record<string, unknown> | undefined;
-  const scorers = summary?.scorers as
-    | Record<string, { mean?: number } | number>
-    | undefined;
+  const scorers = summary?.scorers as Record<string, { mean?: number } | number> | undefined;
   if (!scorers) return {};
   const out: Record<string, number> = {};
   for (const [name, entry] of Object.entries(scorers)) {
@@ -240,9 +238,7 @@ function extractCost(data: unknown): number {
 function extractModel(data: unknown): string | undefined {
   if (!data || typeof data !== 'object') return undefined;
   const result = data as Record<string, unknown>;
-  const metadata = result.metadata as
-    | { models?: unknown; modelCounts?: unknown }
-    | undefined;
+  const metadata = result.metadata as { models?: unknown; modelCounts?: unknown } | undefined;
   const counts = metadata?.modelCounts;
   if (counts && typeof counts === 'object' && !Array.isArray(counts)) {
     const entries = Object.entries(counts as Record<string, unknown>).filter(

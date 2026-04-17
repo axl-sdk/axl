@@ -215,7 +215,7 @@ Test infrastructure lives in `tests/` workspace:
 - `tests/e2e/` — Cross-package E2E scenarios (basic workflow, streaming, sessions, handoffs, structured output, error handling, eval)
 - `tests/studio/` — Studio REST API + middleware integration tests (health, workflows, executions, sessions, agents, tools, memory, costs, decisions, evals, playground, middleware)
 - `tests/smoke/` — Tarball content validation via `pnpm pack`
-- `packages/axl-studio/src/__tests__/` — Inline studio unit tests (server, cost-aggregator, connection-manager, ws-handler, protocol, middleware)
+- `packages/axl-studio/src/__tests__/` — Inline studio unit tests (server, cost-aggregator, connection-manager, ws-handler, protocol, middleware, aggregates, reducers, redact) plus React Testing Library component tests in `.test.tsx` files (opt-in to jsdom via a per-file `// @vitest-environment jsdom` directive; `setup-dom.ts` loads jest-dom matchers + RTL `cleanup` only when a DOM is present)
 
 All tests use `MockProvider` — no API keys needed.
 

@@ -19,8 +19,56 @@ export const EVENT_COLORS: Record<string, string> = {
   log: 'bg-slate-400',
 };
 
+/**
+ * Returns `true` when the event represents a failure signal in its payload —
+ * a blocked guardrail, invalid schema/validate check, failed verify, denied
+ * tool, aborted workflow, or `log` event carrying an `error` field (the
+ * memory-audit events emit `error` on the failure path).
+ */
+export function isFailureEvent(event: TraceEvent): boolean {
+  const type = event.type;
+  if (type === 'tool_denied') return true;
+  if (type === 'guardrail' || type === 'schema_check' || type === 'validate') {
+    const d = event.data as { valid?: boolean; blocked?: boolean } | undefined;
+    // Output-gate events use `valid: false`; input/output guardrails use `blocked: true`.
+    return d?.valid === false || d?.blocked === true;
+  }
+  if (type === 'verify') {
+    const d = event.data as { passed?: boolean } | undefined;
+    return d?.passed === false;
+  }
+  if (type === 'tool_approval') {
+    const d = event.data as { approved?: boolean } | undefined;
+    return d?.approved === false;
+  }
+  if (type === 'workflow_end') {
+    const d = event.data as { status?: string; aborted?: boolean } | undefined;
+    return d?.status === 'failed' || d?.aborted === true;
+  }
+  if (type === 'log') {
+    const d = event.data as { error?: unknown } | undefined;
+    return d?.error !== undefined && d?.error !== null;
+  }
+  return false;
+}
+
+/**
+ * Type-only color lookup (back-compat for call sites that don't have the
+ * whole event). Prefer `getEventColor(event)` when possible — it reflects
+ * failure state in the payload.
+ */
 export function getBarColor(type: string): string {
   return EVENT_COLORS[type] ?? 'bg-slate-500';
+}
+
+/**
+ * Payload-aware color lookup. Gate/verify/tool-approval/workflow_end/log
+ * events render red when their payload indicates failure so the user can
+ * spot failure clusters in the trace waterfall without expanding every row.
+ */
+export function getEventColor(event: TraceEvent): string {
+  if (isFailureEvent(event)) return 'bg-red-500';
+  return getBarColor(event.type);
 }
 
 export function getDepth(event: TraceEvent): number {

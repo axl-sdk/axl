@@ -95,7 +95,12 @@ Execute workflows with custom JSON input. View execution timelines showing each 
 Waterfall visualization of execution traces. Filter by type, agent, or tool. View token counts, cost per step, and duration.
 
 ### Cost Dashboard
-Track spending across agents, models, and workflows. Live cost updates via WebSocket. Per-agent and per-model breakdowns.
+Track spending across agents, models, workflows, and embedders with time-window filtering (24h/7d/30d/all). Live cost updates via WebSocket; all breakdown tables are user-sortable by any column. Two sections appear conditionally:
+
+- **Retry Overhead** — when retries have happened, decomposes `agent_call` cost by `retryReason` (`primary` / `schema` / `validate` / `guardrail`) with per-reason call counts. Surfaces how much spend was wasted on gate failures.
+- **Memory (Embedder)** — when semantic memory ops have run, shows `CostData.byEmbedder: Record<string, { cost, calls, tokens }>` bucketed by embedder model (e.g., `text-embedding-3-small`).
+
+Sub-cent cost values use tiered precision (`< $0.000001` sentinel, `< $0.0001` scientific, `< $0.01` six decimals, `>= $0.01` two decimals) so embedder costs don't collapse to `$0.0000`.
 
 ### Memory Browser
 View and manage agent memory (session and global scope). Create, edit, and delete entries. Test semantic recall queries.
@@ -107,7 +112,7 @@ Browse active sessions with conversation history. Replay sessions step by step. 
 Browse all registered tools with their schemas rendered as forms. Test any tool directly with custom input and see the result.
 
 ### Eval Runner
-Run evaluations from the UI. View per-item results with scores, timing, and cost. Drill into individual items to see LLM scorer reasoning, per-scorer timing/cost, and annotations. Filter items by error state or score threshold, sort by score/duration/cost. Score distribution chart shows how scores are spread across bins. Compare two runs with the run picker (baseline/candidate selection from history), timing/cost tradeoff analysis, item-level comparison table, and expandable regression detail showing side-by-side outputs and reasoning. History tab groups multi-run results and tracks mean scores across runs with an eval name filter. Multi-run switcher navigates between individual runs. LLM scorer badges distinguish LLM-judged from deterministic scorers. Significance tooltips explain bootstrap CI methodology. Requires `@axlsdk/eval` as an optional peer dependency.
+Run evaluations from the UI. Toggle **Capture traces** in the command bar to populate per-item `EvalItem.traces` — the item detail panel renders each captured event inline with type, agent/tool, duration, and cost (success and failure paths both). View per-item results with scores, timing, and cost. Drill into individual items to see LLM scorer reasoning, per-scorer timing/cost, and annotations. Filter items by error state or score threshold, sort by score/duration/cost. Score distribution chart shows how scores are spread across bins. Compare two runs with the run picker (baseline/candidate selection from history), timing/cost tradeoff analysis, item-level comparison table, and expandable regression detail showing side-by-side outputs and reasoning. History tab groups multi-run results and tracks mean scores across runs with an eval name filter. Multi-run switcher navigates between individual runs. LLM scorer badges distinguish LLM-judged from deterministic scorers. Significance tooltips explain bootstrap CI methodology. Requires `@axlsdk/eval` as an optional peer dependency.
 
 ## What gets registered
 
@@ -148,7 +153,8 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `DELETE /api/memory/:scope/:key` | Delete memory entry |
 | `GET /api/evals` | List registered eval configs |
 | `GET /api/evals/history` | List eval run history |
-| `POST /api/evals/:name/run` | Run a registered eval by name. Accepts `{ runs: N }` (capped at 25) |
+| `POST /api/evals/:name/run` | Run a registered eval by name. Body: `{ runs?: N, stream?: true, captureTraces?: true }` (`runs` capped at 25). When `stream: true`, returns `{ evalRunId }` immediately and broadcasts progress over the `eval:{evalRunId}` WS channel (`item_done` / `run_done` / `done` / `error`). The `done` event carries only `{ evalResultId, runGroupId? }` — a pointer, not the full result — so multi-item evals don't hit the 64KB WS frame cap. Clients refetch the full result from history. `captureTraces: true` populates per-item `EvalItem.traces` on every item (success + failure); the Eval Runner panel renders these inline on item detail. Synchronous mode (default) is unchanged |
+| `POST /api/evals/runs/:evalRunId/cancel` | Abort an active streaming eval run. The cancelled run appears in history with remaining items marked as cancelled |
 | `POST /api/evals/:name/rescore` | Re-score a history entry with the eval's current scorers |
 | `POST /api/evals/import` | Import a CLI eval artifact (parsed `EvalResult` JSON) into runtime history |
 | `DELETE /api/evals/history/:id` | Delete a single history entry. Blocked in readOnly |
@@ -168,7 +174,15 @@ Single endpoint at `ws://localhost:4400/ws` with channel multiplexing:
 { "type": "event", "channel": "trace:abc-123", "data": { ... } }
 ```
 
-Channels: `execution:{id}`, `trace:{id}`, `trace:*`, `eval:{id}`, `eval:*`, `costs`, `eval-trends`, `workflow-stats`, `trace-stats`, `decisions`. Execution and eval channels have replay buffering — late subscribers receive the full event history (capped at 500 events, cleaned up 30s after stream completes). Aggregate channels (`costs`, `eval-trends`, `workflow-stats`, `trace-stats`) broadcast `{ snapshots: Record<WindowId, State>, updatedAt }` on every fold or rebuild.
+Channels: `execution:{id}`, `trace:{id}`, `trace:*`, `eval:{id}`, `eval:{evalRunId}`, `eval:*`, `costs`, `eval-trends`, `workflow-stats`, `trace-stats`, `decisions`. Execution and eval channels have replay buffering — late subscribers receive the full event history (capped at 500 events, cleaned up 30s after stream completes). Aggregate channels (`costs`, `eval-trends`, `workflow-stats`, `trace-stats`) broadcast `{ snapshots: Record<WindowId, State>, updatedAt }` on every fold or rebuild.
+
+**Outbound frame budget.** The WS broadcast layer enforces a 64KB soft cap via `truncateIfOversized`. Oversized verbose-mode `agent_call.data.messages` snapshots are replaced with a `{ __truncated: true, originalBytes, maxBytes, hint }` placeholder that preserves the event's `type`/`step`/`agent`/`tool` so the Trace Explorer still renders the row. The 64KB threshold matches the inbound message reject limit in the WS protocol (shared constant).
+
+### Migrating from 0.14
+
+- **`POST /api/costs/reset` has been removed.** Any script hitting the old endpoint gets `404`. Use window selection (`?window=`) instead — snapshots evict automatically as their window slides.
+- **`CostAggregator` class is no longer exported** from `@axlsdk/studio`. Replaced by `TraceAggregator<CostData>` configured with a pure `reduceCost` reducer. Behavior is preserved.
+- **`costs` WS channel payload shape changed** from `CostData` to `{ snapshots: Record<WindowId, CostData>, updatedAt: number }`. Clients that read the old shape must select a window (typically `snapshots['7d']`).
 
 ## Embeddable Middleware
 
@@ -207,8 +221,9 @@ studio.upgradeWebSocket(server);
 | `runtime` | `AxlRuntime` | required | The runtime instance to observe and control |
 | `basePath` | `string` | `''` | URL path prefix (e.g., `'/studio'`) |
 | `serveClient` | `boolean` | `true` | Serve the pre-built SPA |
-| `verifyUpgrade` | `(req) => boolean \| Promise<boolean>` | — | Auth callback for WebSocket upgrades |
-| `readOnly` | `boolean` | `false` | Disable all mutating endpoints |
+| `verifyUpgrade` | `(req) => boolean \| { allowed: boolean, metadata?: unknown } \| Promise<...>` | — | Auth callback for WebSocket upgrades. The object form attaches `metadata` (tenant/user id / role) to the connection, available to `filterTraceEvent` on every outbound broadcast. Bare boolean still works (back-compat) |
+| `filterTraceEvent` | `(event, metadata) => boolean` | — | Per-connection broadcast filter for multi-tenant deployments. Called on every outbound trace event (and on replay buffer events for late subscribers, so historical cross-tenant events can't leak on reconnect). Predicate errors are fail-closed — event is dropped |
+| `readOnly` | `boolean` | `false` | Disable all mutating endpoints. `POST /api/evals/compare` is allowed (pure computation); `POST /api/evals/import`, `POST /api/evals/:name/run`, `POST /api/evals/:name/rescore`, `POST /api/evals/runs/:evalRunId/cancel`, and `DELETE /api/evals/history/:id` are blocked |
 | `evals` | `string \| string[] \| { files, conditions? }` | — | Lazy-load eval files for the Eval Runner panel |
 
 ### Return value
@@ -422,6 +437,42 @@ Lazy-loaded evals coexist with evals registered directly via `runtime.registerEv
 - Consider `readOnly: true` for production monitoring — view traces, costs, and schemas without execution capability
 - CORS is not applied in embedded mode — the host framework owns CORS policy
 - `basePath` is validated against unsafe characters and path traversal
+
+### Observability-boundary redaction
+
+When the runtime is constructed with `config.trace.redact: true`, Studio scrubs user/LLM content at three layers — trace events at emission, REST route responses at serialization, and WebSocket broadcasts at send time — while preserving structural metadata (IDs, keys, agent/tool/workflow names, roles, cost/token/duration metrics, timestamps).
+
+```typescript
+const runtime = new AxlRuntime({ config: { trace: { redact: true } } });
+const studio = createStudioMiddleware({ runtime });
+```
+
+Under `redact: true`, the following Studio endpoints scrub user content server-side before responding: `GET /api/executions{,/:id}`, `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser stays navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync); streaming WS broadcasts on `/workflows/:name/execute` with `stream: true` and `/api/playground/chat` also scrub `StreamEvent` content before send.
+
+Studio checks the flag via `runtime.isRedactEnabled(): boolean` — it does **not** reach into the config object directly, because `Readonly<AxlConfig>` is shallow and consumers could mutate the nested `trace.redact` field via sub-object access. `GET /api/health` also reports `readOnly: boolean` so clients can gate mutating UI affordances.
+
+See [`docs/observability.md`](../../docs/observability.md#pii-and-redaction) for the complete scrubbed/preserved field table.
+
+### Multi-tenant deployments
+
+Combine `verifyUpgrade` returning `{ allowed, metadata }` with `filterTraceEvent` to scope each WebSocket connection to a tenant/user:
+
+```typescript
+const studio = createStudioMiddleware({
+  runtime,
+  verifyUpgrade: (req) => {
+    const userId = authenticate(req);
+    if (!userId) return { allowed: false };
+    return { allowed: true, metadata: { userId, tenantId: lookupTenant(userId) } };
+  },
+  filterTraceEvent: (event, metadata) => {
+    // Scope the trace firehose: only let a connection see its own tenant's events.
+    return event.metadata?.tenantId === metadata?.tenantId;
+  },
+});
+```
+
+The filter runs on live broadcasts **and** on replay buffer events delivered to late subscribers, so historical cross-tenant events can't leak on reconnect. Predicate errors are fail-closed (event dropped).
 
 ### Migrating from the standalone CLI
 

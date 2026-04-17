@@ -25,6 +25,7 @@ const KNOWN_FLAGS = new Set([
   '--fail-on-regression',
   '--threshold',
   '--runs',
+  '--capture-traces',
 ]);
 
 async function main() {
@@ -38,6 +39,10 @@ Usage:
   axl-eval <path> --output <file>         Save results to JSON
   axl-eval <path> --config <file>         Use config file for runtime
   axl-eval <path> --conditions <list>     Node.js import conditions (comma-separated)
+  axl-eval <path> --capture-traces        Populate EvalItem.traces on every item
+                                          (success + failure). Adds memory
+                                          overhead proportional to dataset size
+                                          x turns x agents; off by default.
   axl-eval rescore <results> <eval-file>  Re-run scorers on saved outputs
   axl-eval compare <a> <b>                Compare two eval result files
   axl-eval compare <a> <b> --threshold <v>  Set regression threshold (global or per-scorer)
@@ -417,12 +422,14 @@ function parseEvalArgs(args: string[]): {
   configArg?: string;
   conditions: string[];
   runs: number;
+  captureTraces: boolean;
   paths: string[];
 } {
   let outputPath: string | undefined;
   let configArg: string | undefined;
   let conditions: string[] = [];
   let runs = 1;
+  let captureTraces = false;
   const paths: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -441,6 +448,9 @@ function parseEvalArgs(args: string[]): {
           .split(',')
           .map((c) => c.trim())
           .filter(Boolean);
+    } else if (arg === '--capture-traces') {
+      // Boolean flag — no value consumed.
+      captureTraces = true;
     } else if (arg.startsWith('--')) {
       if (!KNOWN_FLAGS.has(arg)) {
         console.error(`Unknown flag: ${arg}`);
@@ -451,13 +461,13 @@ function parseEvalArgs(args: string[]): {
     }
   }
 
-  return { outputPath, configArg, conditions, runs, paths };
+  return { outputPath, configArg, conditions, runs, captureTraces, paths };
 }
 
 // ── Main eval command ──────────────────────────────────────────────
 
 async function runEvalCommand(args: string[]) {
-  const { outputPath, configArg, conditions, runs, paths } = parseEvalArgs(args);
+  const { outputPath, configArg, conditions, runs, captureTraces, paths } = parseEvalArgs(args);
 
   if (paths.length === 0) {
     console.error('Error: No eval file path provided');
@@ -527,6 +537,15 @@ async function runEvalCommand(args: string[]) {
           executeWorkflow = async (input) => ({ output: input });
         }
 
+        // When --capture-traces is set, forward it to runEval so the runner
+        // wraps each item's execution in a nested trackExecution({ captureTraces: true }).
+        // This populates EvalItem.traces on both success (via tracked.traces)
+        // and failure (via the axlCapturedTraces side-channel on the thrown
+        // error). Nested trackExecution scopes walk the AsyncLocalStorage
+        // parent chain, so the outer trackExecution above still observes
+        // cost/metadata correctly.
+        const runOptions = captureTraces ? { captureTraces: true } : undefined;
+
         if (runs > 1) {
           // Multi-run mode
           const { randomUUID } = await import('node:crypto');
@@ -535,7 +554,7 @@ async function runEvalCommand(args: string[]) {
 
           for (let r = 0; r < runs; r++) {
             console.error(`[axl-eval] Run ${r + 1}/${runs}...`);
-            const result = await runEval(evalConfig, executeWorkflow, runtime);
+            const result = await runEval(evalConfig, executeWorkflow, runtime, runOptions);
             result.metadata.runGroupId = runGroupId;
             result.metadata.runIndex = r;
             runResults.push(result);
@@ -545,7 +564,7 @@ async function runEvalCommand(args: string[]) {
           const summary = aggregateRuns(runResults);
           console.log('\n' + formatMultiRunTable(summary) + '\n');
         } else {
-          const result = await runEval(evalConfig, executeWorkflow, runtime);
+          const result = await runEval(evalConfig, executeWorkflow, runtime, runOptions);
           results.push(result);
 
           console.log('\n' + formatTable(result) + '\n');

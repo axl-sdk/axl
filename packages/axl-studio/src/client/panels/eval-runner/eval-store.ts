@@ -120,7 +120,11 @@ export function useEvalExecution(): EvalExecState {
 // ── Actions ────────────────────────────────────────────────────────
 
 /** Start a streaming eval run. Returns when the server acknowledges (not when eval completes). */
-export async function startEvalRun(evalName: string, runCount: number): Promise<void> {
+export async function startEvalRun(
+  evalName: string,
+  runCount: number,
+  captureTraces = false,
+): Promise<void> {
   // Guard: if an eval is already running, cancel it first so we don't
   // orphan a server-side run with no client-side listener.
   if (state.status === 'running' && state.evalRunId) {
@@ -146,7 +150,7 @@ export async function startEvalRun(evalName: string, runCount: number): Promise<
   // that by catching and transitioning to an error state so the UI can recover.
   let evalRunId: string;
   try {
-    const ack = await apiStartEvalRun(evalName, { runs: runCount });
+    const ack = await apiStartEvalRun(evalName, { runs: runCount, captureTraces });
     evalRunId = ack.evalRunId;
   } catch (err) {
     setState({

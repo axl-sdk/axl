@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import type { EvalResult, Scorer } from '@axlsdk/eval';
-import { redactEvalHistoryList, redactEvalResult } from '../redact.js';
+import { redactEvalHistoryList, redactEvalResult, redactErrorMessage } from '../redact.js';
 
 export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => Promise<void>) {
   const app = new Hono<StudioEnv>();
@@ -64,6 +64,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     if (evalLoader) await evalLoader();
     const runtime = c.get('runtime');
     const name = c.req.param('name');
+    const redactOn = runtime.isRedactEnabled();
 
     const entry = runtime.getRegisteredEval(name);
     if (!entry) {
@@ -75,6 +76,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
 
     let runs = 1;
     let stream = false;
+    let captureTraces = false;
     try {
       const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
       if (typeof body.runs === 'number' && Number.isFinite(body.runs) && body.runs > 1) {
@@ -82,6 +84,9 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       }
       if (body.stream === true) {
         stream = true;
+      }
+      if (body.captureTraces === true) {
+        captureTraces = true;
       }
     } catch {
       // No body or invalid body — single run, synchronous
@@ -119,7 +124,13 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
               const result = (await runtime.runRegisteredEval(name, {
                 metadata: { runGroupId, runIndex: r },
                 signal: ac.signal,
+                captureTraces,
                 onProgress: (event) => {
+                  // Library-level `run_done` fires after every iteration with
+                  // `{ totalItems, failures }`; Studio emits its own wire-level
+                  // `run_done` below with `{ run, totalRuns }` semantics, so we
+                  // drop the library variant to avoid collision on the client.
+                  if (event.type === 'run_done') return;
                   connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
                     ...event,
                     run: r + 1,
@@ -150,7 +161,12 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
           } else {
             const result = (await runtime.runRegisteredEval(name, {
               signal: ac.signal,
+              captureTraces,
               onProgress: (event) => {
+                // Drop library-level `run_done` — Studio's terminal signal for
+                // single-run streams is the `done` event below, which carries
+                // the `evalResultId` pointer the client uses to refetch.
+                if (event.type === 'run_done') return;
                 connMgr.broadcastWithWildcard(`eval:${evalRunId}`, event);
               },
             })) as EvalResult;
@@ -160,9 +176,13 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
             });
           }
         } catch (err) {
+          // Eval-channel error event shape is NOT a `StreamEvent`, so it
+          // doesn't pass through `redactStreamEvent`. Scrub the message
+          // inline so ValidationError/GuardrailError/provider errors don't
+          // leak user input on the eval:* channel under redact mode.
           connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
             type: 'error',
-            message: err instanceof Error ? err.message : String(err),
+            message: redactErrorMessage(err, redactOn),
           });
         } finally {
           activeRuns.delete(evalRunId);
@@ -181,6 +201,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
         for (let r = 0; r < runs; r++) {
           const result = await runtime.runRegisteredEval(name, {
             metadata: { runGroupId, runIndex: r },
+            captureTraces,
           });
           results.push(result);
         }
@@ -193,19 +214,23 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
         } as EvalResult;
         return c.json({
           ok: true,
-          data: redactEvalResult(result, runtime.isRedactEnabled()),
+          data: redactEvalResult(result, redactOn),
         });
       } else {
         // Runtime persists eval result to history automatically
-        const result = (await runtime.runRegisteredEval(name)) as EvalResult;
+        const result = (await runtime.runRegisteredEval(name, { captureTraces })) as EvalResult;
         return c.json({
           ok: true,
-          data: redactEvalResult(result, runtime.isRedactEnabled()),
+          data: redactEvalResult(result, redactOn),
         });
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return c.json({ ok: false, error: { code: 'EVAL_ERROR', message } }, 400);
+      // Inline error envelope — scrub to keep redaction semantics
+      // consistent with the global `errorHandler` middleware.
+      return c.json(
+        { ok: false, error: { code: 'EVAL_ERROR', message: redactErrorMessage(err, redactOn) } },
+        400,
+      );
     }
   });
 
@@ -228,6 +253,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
   app.post('/evals/:name/rescore', async (c) => {
     if (evalLoader) await evalLoader();
     const runtime = c.get('runtime');
+    const redactOn = runtime.isRedactEnabled();
     const name = c.req.param('name');
     const body = await c.req.json<{ resultId: string }>();
 
@@ -271,11 +297,13 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       });
       return c.json({
         ok: true,
-        data: redactEvalResult(result, runtime.isRedactEnabled()),
+        data: redactEvalResult(result, redactOn),
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return c.json({ ok: false, error: { code: 'EVAL_ERROR', message } }, 400);
+      return c.json(
+        { ok: false, error: { code: 'EVAL_ERROR', message: redactErrorMessage(err, redactOn) } },
+        400,
+      );
     }
   });
 
@@ -287,6 +315,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
   // Studio is mounted as middleware behind Express/NestJS/Fastify.
   app.post('/evals/compare', async (c) => {
     const runtime = c.get('runtime');
+    const redactOn = runtime.isRedactEnabled();
     const body = await c.req.json<{
       baselineId: string | string[];
       candidateId: string | string[];
@@ -377,8 +406,13 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       const result = await runtime.evalCompare(baseline!, candidate!, body.options);
       return c.json({ ok: true, data: result });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return c.json({ ok: false, error: { code: 'COMPARE_FAILED', message } }, 400);
+      return c.json(
+        {
+          ok: false,
+          error: { code: 'COMPARE_FAILED', message: redactErrorMessage(err, redactOn) },
+        },
+        400,
+      );
     }
   });
 

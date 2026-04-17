@@ -174,10 +174,14 @@ export const runRegisteredEval = (name: string, options?: { runs?: number }) =>
     method: 'POST',
     body: options?.runs && options.runs > 1 ? JSON.stringify({ runs: options.runs }) : undefined,
   });
-export const startEvalRun = (name: string, options?: { runs?: number }) =>
+export const startEvalRun = (name: string, options?: { runs?: number; captureTraces?: boolean }) =>
   request<{ evalRunId: string }>(`/evals/${encodeURIComponent(name)}/run`, {
     method: 'POST',
-    body: JSON.stringify({ runs: options?.runs, stream: true }),
+    body: JSON.stringify({
+      runs: options?.runs,
+      stream: true,
+      captureTraces: options?.captureTraces,
+    }),
   });
 export const cancelEvalRun = (evalRunId: string) =>
   request<{ cancelled: boolean }>(`/evals/runs/${encodeURIComponent(evalRunId)}/cancel`, {

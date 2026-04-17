@@ -49,6 +49,15 @@ export type ExecuteOptions = {
   awaitHumanHandler?: (options: AwaitHumanOptions) => Promise<HumanDecision>;
 };
 
+/**
+ * Shape of events forwarded to an eval `onProgress` callback. Mirrors
+ * `@axlsdk/eval`'s `EvalProgressEvent` so runtime consumers can type their
+ * callbacks without importing the optional peer dep.
+ */
+export type EvalProgressEventShape =
+  | { type: 'item_done'; itemIndex: number; totalItems: number }
+  | { type: 'run_done'; totalItems: number; failures: number };
+
 export type CreateContextOptions = {
   metadata?: Record<string, unknown>;
   /** Cost budget for the context (e.g., '$0.50'). Enforced via finish_and_stop policy. */
@@ -311,9 +320,17 @@ export class AxlRuntime extends EventEmitter {
     options?: {
       metadata?: Record<string, unknown>;
       /** Called after each dataset item completes (execution + scoring). */
-      onProgress?: (event: { type: string; itemIndex: number; totalItems: number }) => void;
+      onProgress?: (event: EvalProgressEventShape) => void;
       /** Abort signal — checked before starting each item. */
       signal?: AbortSignal;
+      /**
+       * When `true`, populate `EvalItem.traces` on every item (success + failure
+       * paths). Forwards to `runEval({ captureTraces: true })`, which wraps each
+       * item's execution in `runtime.trackExecution({ captureTraces: true })`.
+       * Verbose-mode `agent_call.data.messages` snapshots are stripped from
+       * captured traces to keep memory bounded.
+       */
+      captureTraces?: boolean;
     },
   ): Promise<unknown> {
     const entry = this.registeredEvals.get(name);
@@ -331,8 +348,9 @@ export class AxlRuntime extends EventEmitter {
         ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>,
         runtime: unknown,
         evalOptions?: {
-          onProgress?: (event: { type: string; itemIndex: number; totalItems: number }) => void;
+          onProgress?: (event: EvalProgressEventShape) => void;
           signal?: AbortSignal;
+          captureTraces?: boolean;
         },
       ) => Promise<unknown>;
       try {
@@ -345,7 +363,10 @@ export class AxlRuntime extends EventEmitter {
       }
       const originalExecuteFn = entry.executeWorkflow!;
 
-      // Wrap with trackExecution for transparent cost + metadata capture
+      // Wrap with trackExecution for transparent cost + metadata capture.
+      // When captureTraces is on, runEval wraps this again in a second
+      // trackExecution({ captureTraces: true }) — nested trackExecution walks
+      // the AsyncLocalStorage parent chain so both scopes observe events.
       const wrappedExecuteFn = async (
         input: unknown,
         runtime: unknown,
@@ -368,6 +389,7 @@ export class AxlRuntime extends EventEmitter {
       result = await runEvalFn(entry.config, wrappedExecuteFn, this, {
         onProgress: options?.onProgress,
         signal: options?.signal,
+        captureTraces: options?.captureTraces,
       });
     } else {
       // Default: use runtime.eval() which creates its own executeWorkflow
@@ -383,6 +405,7 @@ export class AxlRuntime extends EventEmitter {
         {
           onProgress: options?.onProgress,
           signal: options?.signal,
+          captureTraces: options?.captureTraces,
         },
       );
     }
@@ -1100,8 +1123,9 @@ export class AxlRuntime extends EventEmitter {
       metadata?: Record<string, unknown>;
     },
     options?: {
-      onProgress?: (event: { type: string; itemIndex: number; totalItems: number }) => void;
+      onProgress?: (event: EvalProgressEventShape) => void;
       signal?: AbortSignal;
+      captureTraces?: boolean;
     },
   ): Promise<unknown> {
     let runEvalFn: (
@@ -1112,8 +1136,9 @@ export class AxlRuntime extends EventEmitter {
       ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>,
       runtime: unknown,
       evalOptions?: {
-        onProgress?: (event: { type: string; itemIndex: number; totalItems: number }) => void;
+        onProgress?: (event: EvalProgressEventShape) => void;
         signal?: AbortSignal;
+        captureTraces?: boolean;
       },
     ) => Promise<unknown>;
     try {

@@ -453,6 +453,25 @@ const relevant = await ctx.recall('knowledge-base', {
 
 Vector store implementations: `InMemoryVectorStore` (testing), `SqliteVectorStore` (production, requires `better-sqlite3`).
 
+**Embedder cost attribution.** `OpenAIEmbedder` reports `{ tokens, cost, model }` on every embed call — computed from the response's `prompt_tokens` and a pricing table (`text-embedding-3-small` $0.02/1M, `-large` $0.13/1M, `ada-002` $0.10/1M). The cost flows through `runtime.trackExecution()` the same way agent-call cost does, counts against `ctx.budget()`, and shows up in Studio's Cost Dashboard under "Memory (Embedder)". See [observability.md](../../docs/observability.md#trace-event-types) for the trace-event shape.
+
+**Custom `Embedder` implementations** (breaking change in 0.15.0 — `embed()` previously returned `Promise<number[][]>`):
+
+```typescript
+import type { Embedder, EmbedResult } from '@axlsdk/axl';
+
+class MyEmbedder implements Embedder {
+  readonly dimensions = 1536;
+
+  // `signal` is optional but recommended — lets budget hard-stops and user
+  // aborts cancel in-flight embedder fetches mid-retry.
+  async embed(texts: string[], signal?: AbortSignal): Promise<EmbedResult> {
+    const vectors = await myProvider.embed(texts, { signal });
+    return { vectors }; // `usage` optional — omit if you don't compute cost
+  }
+}
+```
+
 ### Agent Guardrails
 
 Input and output validation at the agent boundary. You define your own validation logic — Axl calls it before and after each LLM turn:

@@ -112,3 +112,62 @@ const safe = agent({
 When `onBlock` is `'retry'`, the LLM's blocked output is appended to the conversation as an assistant message, followed by a system message containing the block reason. These messages **accumulate** across retries — if the guardrail blocks multiple times, the LLM sees all prior failed attempts and corrections, giving it increasing context about what to avoid. These retry messages are ephemeral — they only exist within the `ctx.ask()` call and are **not** persisted to session history, so subsequent turns never see the blocked attempts. Input guardrails always throw (the prompt is user-supplied and can't be retried by the LLM). Throws `GuardrailError` if retries are exhausted.
 
 For **business rule validation** on the parsed typed object (not raw text), use `validate` (per-call, co-located with the `schema` it validates). This runs after schema parsing and receives the fully typed object, letting you enforce domain constraints (cross-field relationships, referential integrity, etc.). Supported on `ctx.ask()`, `ctx.delegate()`, `ctx.race()`, and `ctx.verify()`. Requires a `schema` — without one, use output guardrails for raw text validation instead. See the [API Reference](api-reference.md#validate) for details.
+
+## Observability-Boundary Redaction
+
+`config.trace.redact: true` enables a three-layer filter that scrubs user/LLM content everywhere it would otherwise flow to observability consumers, while preserving structural metadata (IDs, keys, agent/tool/workflow names, roles, cost/token metrics, durations, timestamps) so observability stays useful under compliance mode.
+
+```typescript
+const runtime = new AxlRuntime({
+  config: {
+    trace: { redact: true, level: 'steps' },
+  },
+});
+```
+
+**The three layers:**
+
+1. **Trace events** at emission — `agent_call.data.prompt`/`.response`/`.system`/`.thinking`/`.messages`, gate-event `reason`/`feedbackMessage`, `tool_call.data.args`/`.result`, `tool_approval.data.args`/`.reason`, `handoff.data.message` (roundtrip), `workflow_start.data.input`, `workflow_end.data.result`/`.error`, string fields on `log` events (one-level walk — nested numeric/boolean fields like `usage.tokens` / `usage.cost` survive so the Cost Dashboard's byEmbedder bucket still works).
+2. **Studio REST route responses** at serialization — `GET /api/executions{,/:id}`, `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser remains navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync).
+3. **Studio WebSocket broadcasts** — `StreamEvent` content scrubbed on `POST /api/workflows/:name/execute` with `stream: true` and `POST /api/playground/chat` (`token.data`, `tool_call.args`, `tool_result.result`, `tool_approval.args/.reason`, `done.data`, `error.message`). `step` events pass through unchanged — the underlying `TraceEvent` was already scrubbed at emit time.
+
+**What's NOT scrubbed:** Programmatic callers of `runtime.execute()` and direct `StateStore` access still receive raw data — redaction is an observability-boundary filter, **not** a data-at-rest transform. Write endpoints (`PUT /api/memory`, `POST /api/sessions/:id/send`) still accept raw data. Top-level numeric fields (`cost`, `tokens`, `duration`) on every trace event are never scrubbed — they're load-bearing for `trackExecution` and the cost aggregator.
+
+Studio consumers should check the flag via `runtime.isRedactEnabled(): boolean` rather than reaching into the config (the full config was intentionally not exposed because `Readonly<T>` is shallow — consumers could mutate `trace.redact` via sub-object access). Separately, `GET /api/health` reports `readOnly: boolean` so a client can gate mutating UI affordances (e.g., the Eval Runner hides its Import / Run buttons in readOnly mode); the redact flag is not surfaced on the health endpoint because it's only consumed server-side at response serialization time.
+
+See [observability.md](./observability.md#pii-and-redaction) for the complete per-route scrubbed/preserved field table.
+
+## Multi-Tenant Deployments (Studio Middleware)
+
+When `@axlsdk/studio/middleware` is mounted inside a multi-tenant application, two hooks scope what each connection can see:
+
+**Per-connection metadata via `verifyUpgrade`:**
+
+```typescript
+const studio = createStudioMiddleware({
+  runtime,
+  verifyUpgrade: (req) => {
+    const userId = authenticate(req);
+    if (!userId) return { allowed: false };
+    return { allowed: true, metadata: { userId, tenantId: lookupTenant(userId) } };
+  },
+});
+```
+
+The `verifyUpgrade` callback can return a bare `boolean` (back-compat) OR `{ allowed, metadata }`. The `metadata` is attached to the connection and passed to every `filterTraceEvent` call. `verifyUpgrade` may be sync or async (return a `Promise`). If omitted in production (`NODE_ENV === 'production'`) the middleware logs a warning — WebSocket upgrades bypass Express/Fastify/Koa HTTP middleware, so relying on host auth middleware alone leaves WS connections unauthenticated.
+
+**Broadcast filter via `filterTraceEvent`:**
+
+```typescript
+const studio = createStudioMiddleware({
+  runtime,
+  filterTraceEvent: (event, metadata) => {
+    // Only let a connection see events from its own tenant
+    return event.metadata?.tenantId === metadata?.tenantId;
+  },
+});
+```
+
+The filter runs on every outbound broadcast — including historical replay buffers for late subscribers — so cross-tenant events can't leak even on reconnect. Predicate errors are **fail-closed** (event dropped) so a buggy filter can't accidentally widen visibility. `event` is typed `unknown` because the filter runs across every channel (`trace:*` carries `TraceEvent`, `costs` carries `CostData`, `execution:*` / `eval:*` carry `StreamEvent`); narrow via the channel-specific union at the call site.
+
+Studio's WebSocket broadcast layer also enforces a 64KB soft frame cap via `truncateIfOversized`. Oversized `agent_call.data.messages` snapshots (verbose mode) are replaced with a `{ __truncated: true, originalBytes, maxBytes, hint }` placeholder that preserves `type`/`step`/`agent`/`tool` so the Trace Explorer still renders the row.

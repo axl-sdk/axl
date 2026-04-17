@@ -140,12 +140,21 @@ export type EvalCompareOptions = {
 
 // ── Progress & cancellation ──────────────────────────────────────
 
-/** Emitted after each dataset item is fully processed (executed + scored). */
-export type EvalProgressEvent = {
-  type: 'item_done';
-  itemIndex: number;
-  totalItems: number;
-};
+/**
+ * Emitted by `runEval` at two points:
+ *
+ * - `'item_done'` — after each dataset item is fully processed (executed +
+ *   scored). Emitted for every item regardless of outcome: success, workflow
+ *   error, scorer error, cancelled (via `signal`), or budget exhaustion.
+ * - `'run_done'` — once after all items have finished and the final summary
+ *   has been computed. Includes total item count and failure count so
+ *   consumers can show a completion toast without waiting for the full result.
+ *
+ * Consumers should narrow on `type` — the shape is a discriminated union.
+ */
+export type EvalProgressEvent =
+  | { type: 'item_done'; itemIndex: number; totalItems: number }
+  | { type: 'run_done'; totalItems: number; failures: number };
 
 /** Optional runtime behavior for `runEval()`. */
 export type RunEvalOptions = {

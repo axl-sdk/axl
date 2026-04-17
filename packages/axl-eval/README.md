@@ -130,6 +130,8 @@ const lengthScore = scorer({
 });
 ```
 
+Scorers that return a non-finite value (`NaN` / `Infinity`) or a score outside `[0, 1]` are recorded as `null` with an entry in `item.scorerErrors` — they don't abort the run.
+
 ### LLM scorers
 
 Use an LLM as a judge. The scorer constructs a prompt from the input, output, and annotations, calls the LLM, and validates the response:
@@ -240,6 +242,36 @@ const results = await runEval(
 );
 ```
 
+**Optional `RunEvalOptions` 4th arg** (`onProgress` / `signal` / `captureTraces`):
+
+```typescript
+import type { RunEvalOptions, EvalProgressEvent } from '@axlsdk/eval';
+
+const controller = new AbortController();
+
+const results = await runEval(
+  { workflow: 'my-eval', dataset: ds, scorers: [...] },
+  executeWorkflow,
+  runtime,
+  {
+    onProgress: (event: EvalProgressEvent) => {
+      // `item_done` fires after each dataset item finishes (execution + scoring,
+      // or aborted/budget-exceeded). `run_done` fires once after all items.
+      // Narrow on `type` — `itemIndex` only exists on `item_done`.
+      if (event.type === 'item_done') {
+        console.log(`Item ${event.itemIndex + 1}/${event.totalItems} done`);
+      } else {
+        console.log(`All done: ${event.failures}/${event.totalItems} failed`);
+      }
+    },
+    signal: controller.signal,   // cancels between items (and between scorers within an item)
+    captureTraces: true,          // populates EvalItem.traces (success + failure paths)
+  },
+);
+```
+
+**Trust-boundary validation on workflow returns.** When your `executeWorkflow` callback returns `{ output, cost, metadata }`, the runner validates the untrusted fields before trusting them: `cost` must be a non-negative finite number, `metadata` must be a plain object (`Date`, `Map`, `Set`, class instances are rejected). Invalid values trigger a `console.warn` and fall back to trace-derived values from `runtime.trackExecution()`. A buggy workflow returning `{ cost: 'free' }` no longer silently NaN-poisons `totalCost`.
+
 ### Studio
 
 Eval files can be lazy-loaded by the Studio middleware for the Eval Runner panel:
@@ -307,6 +339,16 @@ for (const item of results.items) {
   // Error handling
   if (item.scores['quality'] === null) {
     console.log('Scorer failed:', item.scorerErrors);    // ["Scorer "quality" threw: ..."]
+  }
+
+  // Per-item trace events (when run with { captureTraces: true })
+  if (item.traces) {
+    console.log(`${item.traces.length} trace events captured`);
+    const agentCalls = item.traces.filter(e => e.type === 'agent_call');
+    console.log(`${agentCalls.length} LLM turns`);
+    // Failure-path traces are also populated (recovered from axlCapturedTraces
+    // on the thrown error) — captureTraces is especially useful for debugging
+    // items that error
   }
 }
 ```
@@ -576,7 +618,7 @@ const comparison = evalCompare(baselineRuns, candidateRuns);
 | `scorer(config)` | Create a deterministic scorer |
 | `llmScorer(config)` | Create an LLM-as-judge scorer |
 | `defineEval(config)` | Wrap an eval config for CLI discovery |
-| `runEval(config, executeFn, runtime)` | Run an eval programmatically |
+| `runEval(config, executeFn, runtime, options?)` | Run an eval programmatically. `options: RunEvalOptions` accepts `onProgress` / `signal` / `captureTraces` |
 | `evalCompare(baseline, candidate, options?)` | Compare eval results with bootstrap CI |
 | `rescore(result, scorers, runtime, options?)` | Re-run scorers on saved outputs |
 | `aggregateRuns(runs)` | Aggregate multiple runs into mean ± std |
@@ -589,7 +631,7 @@ const comparison = evalCompare(baselineRuns, candidateRuns);
 |------|-------------|
 | `EvalConfig` | Eval definition (workflow, dataset, scorers, concurrency, budget) |
 | `EvalResult` | Full eval output (items, summary, cost, duration) |
-| `EvalItem` | Per-item result (input, output, scores, scoreDetails, metadata) |
+| `EvalItem` | Per-item result (input, output, scores, scoreDetails, metadata, traces?) |
 | `EvalSummary` | Aggregate statistics (count, failures, scorer stats, timing) |
 | `EvalComparison` | Comparison output (scorer deltas, CI, pRegression/pImprovement, n, regressions, improvements) |
 | `EvalCompareOptions` | Options for `evalCompare()` (`thresholds`) |
@@ -599,6 +641,8 @@ const comparison = evalCompare(baselineRuns, candidateRuns);
 | `RescoreOptions` | Options for `rescore()` (`concurrency`) |
 | `MultiRunSummary` | Aggregated multi-run output (per-scorer mean/std/min/max) |
 | `BootstrapCIResult` | CI result (`{ lower, upper, mean, pRegression, pImprovement }`) |
+| `RunEvalOptions` | Options for `runEval()` (`onProgress`, `signal`, `captureTraces`) |
+| `EvalProgressEvent` | Event passed to `onProgress`: `{ type: 'item_done', itemIndex, totalItems }` (emitted after each item finishes — success, failure, cancellation, or budget-exceeded) \| `{ type: 'run_done', totalItems, failures }` (emitted once after all items finish and stats are computed) |
 
 ## License
 

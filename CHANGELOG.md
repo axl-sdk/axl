@@ -7,43 +7,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-04-17
+
 ### Breaking changes
 
-- **Studio:** `POST /api/costs/reset` removed. The reset button is replaced by time-window selection. Any script hitting the old endpoint will get 404. `CostAggregator` class removed as a named export from `@axlsdk/studio` — replaced by `TraceAggregator`
+- **Core:** `Embedder.embed()` return type changed from `Promise<number[][]>` to `Promise<EmbedResult>` where `EmbedResult = { vectors: number[][]; usage?: EmbedUsage }` and `EmbedUsage = { tokens?: number; cost?: number; model?: string }`. Lets embedders report cost so it flows through the cost aggregator. Custom `Embedder` implementations must wrap their return value:
+
+  ```ts
+  import type { Embedder, EmbedResult } from '@axlsdk/axl';
+
+  // Before:
+  async embed(texts: string[]): Promise<number[][]> { return await myEmbed(texts); }
+
+  // After:
+  async embed(texts: string[]): Promise<EmbedResult> {
+    const vectors = await myEmbed(texts);
+    return { vectors }; // usage optional
+  }
+  ```
+
+  `MemoryManager.remember()` / `.recall()` return types also changed (`RememberResult` / `RecallResult` wrapping optional `usage`). `ctx.remember()` / `ctx.recall()` public surface is unchanged. A custom embedder still returning the legacy bare `number[][]` shape now throws a precise migration hint from `assertEmbedResult` instead of a cryptic `TypeError: Cannot read properties of undefined (reading 'vectors')` deep inside upsert/search
+- **Core:** `workflow_start` and `workflow_end` are now first-class `TraceEvent` types — previously emitted as `type: 'log'` with `data.event === 'workflow_start'` / `'workflow_end'`. Consumers filtering via the old log-form shape must switch to `event.type === 'workflow_start'` / `'workflow_end'`. `event.workflow` is now a top-level field; `data` carries `WorkflowStartTraceData { input }` / `WorkflowEndTraceData { status, duration, result?, error?, aborted? }`. `runtime.stream()` now also emits `workflow_start` (previously silently omitted). `AxlTestRuntime` already emits the first-class shape; no compatibility shim is provided — the filter change is a source-level edit
+- **Eval:** `EvalProgressEvent` expanded from single-variant `{ type: 'item_done', ... }` to a discriminated union: `{ type: 'item_done'; itemIndex; totalItems } | { type: 'run_done'; totalItems; failures }`. Consumers must narrow on `type` before accessing variant-specific fields. `run_done` fires once after stats are computed, letting UIs transition from "processing items" → "computing" → "done"
+- **Studio:** `POST /api/costs/reset` removed. The reset button is replaced by time-window selection; scripts hitting the old endpoint now receive a structured `410 Gone` envelope pointing at `GET /api/costs?window=24h|7d|30d|all`. `CostAggregator` class removed as a named export from `@axlsdk/studio` — replaced by `TraceAggregator`
 - **Studio:** `costs` WS channel payload shape changed from `CostData` to `{ snapshots: Record<WindowId, CostData>, updatedAt: number }`. Client ships in the same bundle, so no internal break; document as a breaking change for anyone who subscribed via custom WS client
 
 ### Added
 
-- **Studio:** Time-windowed history aggregates — Cost Dashboard, Eval Runner, Workflow Runner, and Trace Explorer now survive server restarts by rebuilding from StateStore history. All four panels share a window selector (24h / 7d / 30d / All, default 7d, persisted to localStorage)
-- **Studio:** `GET /api/costs?window=24h|7d|30d|all` — replaces the all-time-only cost endpoint with per-window snapshots. `?windows=all` returns all four windows for debugging
-- **Studio:** `GET /api/eval-trends?window=` — per-eval score trends (latest, mean, std), cost breakdown, run timeline
-- **Studio:** `GET /api/workflow-stats?window=` — per-workflow total/completed/failed counts, p50/p95/avg duration, failure rate
-- **Studio:** `GET /api/trace-stats?window=` — event type distribution, tool call counts (calls/approved/denied), retry breakdown by agent
-- **Studio:** Eval Runner "Trends" tab with per-eval line chart (one line per scorer), cost-over-time sparkline, per-scorer Latest/Mean/Std table, and a segmented "By Scorer | By Model | Duration" view toggle. The By Model view groups runs by the most-called model from `metadata.modelCounts` to answer "did upgrading models improve scores?". Duration view plots run duration per model, showing the speed/quality tradeoff. Clicking a point navigates to the run detail.
-- **Studio:** Workflow Runner stats bar with execution counts, failure rate, and duration percentiles. Clicking a workflow row in the stats table selects it for the next run.
-- **Studio:** Trace Explorer "Stats" tab — event type distribution, top-N tool-calls bar chart, retry-by-agent stacked bar (segments per schema/validate/guardrail), tool-approval/denial stacked bar
-- **Studio:** Cost Dashboard footer ("Window · Last updated · N executions") showing how fresh the aggregate is and how many executions fall in the window
-- **Studio:** Workflow Runner split into `Run | Stats` tabs (mirrors Trace Explorer's `Events | Stats` pattern). Run tab: form|results split (form column narrowed from 400/480 to 320/360px so result JSON + timeline get more horizontal room). Stats tab: `WorkflowStatsBar` as the sole panel body — no longer competes with the form for vertical space, and row-click still selects the workflow (then switches back to Run)
-- **Studio:** Shared chart primitives in `components/shared/charts/`: `LineChart` (multi-series, auto-scaled y-axis with optional clamp, hover tooltip with overflow-aware positioning, point-click navigation, non-hovered line dimming, ARIA role/label), `SparkLine` (inline trend with optional fill), `BarChart` + `StackedBarChart` (horizontal bars with proportion scaling)
-- **Studio:** `useAggregate<T>(channel, fetchFn)` shared client hook wiring window state, REST fetch, WS subscription, and `updatedAt` freshness to any aggregate panel
-- **Studio:** React Testing Library scaffolding — vitest picks up `.test.tsx` files, jsdom is opt-in per-file via `// @vitest-environment jsdom`, and `setup-dom.ts` loads jest-dom matchers + RTL `cleanup` only when a DOM is present so node-environment tests stay unaffected. Regression suites seeded: `StatCard`, `WindowSelector` (aria-checked + localStorage round-trip), `CostBadge`/`formatCost` (all five format tiers including the sub-cent scientific-notation branch that used to bottom out at `$0.0000`), `TraceEventList` (retry pill, `N/M` attempt counter, `#0` step guard against `#undefined`, CostBadge + DurationBadge row placement, Expand-all toolbar, independent row toggle), `WorkflowStatsBar` (empty-state keeps the WindowSelector visible so the user can widen the window, row click fires `onWorkflowClick`, sort-by-total descending)
-- **Studio:** `EvalTrendRun` now carries `model` and `duration` (server + client types) so trend charts can segment and compare without refetching raw history entries
-- **Studio:** `AggregateSnapshots` constructor accepts a `broadcastTransform` option to enrich/strip state before WS broadcast — the `workflow-stats` aggregator uses this to ship `durationP50`/`durationP95` to clients instead of the internal `durations` array
-- **Runtime:** `AxlRuntime.saveEvalResult()` now emits `eval_result` event for live eval aggregation
+#### Core — trace observability
+
+- `TraceEvent` is now a discriminated union over `type` — narrowing gives statically-typed `data`. New per-type exports: `TraceEventType`, `AgentCallTraceData`, `GuardrailTraceData`, `SchemaCheckTraceData`, `ValidateTraceData`, `ToolCallTraceData`, `ToolApprovalTraceData`, `HandoffTraceData`, `DelegateTraceData`, `VerifyTraceData`, `WorkflowStartTraceData`, `WorkflowEndTraceData`. `ExecuteOptions` also exported
+- `agent_call.data` now carries resolved system prompt, resolved model params (`temperature`/`maxTokens`/`effort`/`thinkingBudget`/`includeThoughts`/`toolChoice`/`stop`), provider `thinking_content`, 1-indexed `turn`, and `retryReason` (`'schema'|'validate'|'guardrail'`) when the call was triggered by a prior gate failure
+- New `schema_check` event closes the schema-retry observability gap. `schema_check`/`validate`/`guardrail` all include `attempt`/`maxAttempts`/`feedbackMessage` (the exact corrective message about to be injected on retry)
+- New `tool_approval` event replaces the overloaded `tool_denied`-with-`denied:false` on the approve path
+- `ctx.verify()` now emits a `verify` event (the type existed but nothing was emitting)
+- `ctx.delegate()` single-agent short-circuit emits `delegate { reason: 'single_candidate' }`; multi-agent router emits `{ reason: 'routed' }`
+- `parentToolCallId` stamped on every event from a child context (agent-as-tool) — enables joining nested call graphs back to the outer `tool_call`
+- Verbose trace mode (`config.trace.level === 'full'`) adds a deep-cloned `ChatMessage[]` snapshot to each `agent_call.data.messages`
+- `HandoffTraceData` gains `source` (mirrors `event.agent` for join-convenience) and `message` (the roundtrip arg the source agent passed)
+- `config.trace.redact` extended to scrub `agent_call.data.system`/`thinking`/`messages`, gate-event `feedbackMessage`/`reason`, `tool_call.data.args`/`.result`, `tool_approval.data.args`, `handoff.data.message`, log-event string fields (one-level walk preserves nested numeric/boolean fields like `usage.tokens`/`.cost`)
+- `ExecuteOptions.awaitHumanHandler` — `runtime.execute()` and `.stream()` accept an in-process approval handler (parity with `CreateContextOptions`)
+
+#### Core — memory cost attribution
+
+- Semantic memory cost flows through the trace rail — `OpenAIEmbedder` computes cost from a pricing table (`text-embedding-3-small` $0.02/1M, `-large` $0.13/1M, `ada-002` $0.10/1M); `MemoryManager` propagates `usage`; `ctx.remember({embed:true})` / `ctx.recall({query})` emit `memory_*` events with top-level `cost` and `data.usage`. Memory spend automatically flows through `runtime.trackExecution` aggregates
+- Memory cost feeds `budgetContext` via `_accumulateBudgetCost` — `ctx.budget({ cost, onExceed })` now enforces across agent calls AND semantic memory. `ctx.remember` / `ctx.recall` check `budgetContext.exceeded` at call top and throw `BudgetExceededError` before hitting the embedder
+- `Embedder.embed(texts, signal?)` accepts an optional `AbortSignal`; `WorkflowContext` composes user-abort + budget-hard_stop via `AbortSignal.any` on every memory op
+- `ctx.remember`/`ctx.recall`/`ctx.forget` emit operation-only audit-trail events (values never in the trace; `key` scrubbed under `redact`); fire on both success and failure paths (failure carries `error` field)
+- Partial-failure cost preservation: if `embedder.embed` succeeded but `vectorStore.upsert` fails, `MemoryManager.remember` attaches the usage to the thrown error via a non-enumerable `axlEmbedUsage` property and `context.ts` extracts it, so budget and cost aggregator still see the paid-for API call
+- New exports: `EmbedResult`, `EmbedUsage`, `RememberResult`, `RecallResult`
+
+#### Core — misc
+
+- `runtime.isRedactEnabled(): boolean` — narrow public getter (replaces `runtime.getConfig()`, which returned a shallow-readonly config that consumers could mutate)
+- `runtime.trackExecution(fn, { captureTraces: true })` captures per-invocation `TraceEvent[]`. On failure, traces are attached to the thrown error via a non-enumerable `axlCapturedTraces` property — exactly when they're most valuable
+- `runtime.getConfig(): Readonly<AxlConfig>` replaced with `runtime.isRedactEnabled(): boolean`. The full-config accessor was shallow-readonly (consumers could mutate `trace.redact` via sub-object access) and encouraged tight coupling; the narrow boolean is the right surface for observability consumers
+
+#### Eval
+
+- `runEval()` accepts `RunEvalOptions` 4th arg: `onProgress` callback, `signal` (AbortSignal), `captureTraces`. Per-item `EvalItem.traces` populated when capture is on, including on the failure path via the `axlCapturedTraces` side-channel
+- `runtime.runRegisteredEval(name, { captureTraces })` and `runtime.eval(config, { captureTraces })` forward to `runEval` — per-item trace capture is reachable from the runtime surface (previously only via direct `runEval` calls). The matching `EvalProgressEventShape` union is exported from `@axlsdk/axl` so callers can type `onProgress` without importing the optional `@axlsdk/eval` peer dep
+- `rescore()` preserves `original.traces` — the workflow didn't re-run, so execution traces remain accurate and useful for diagnosing score changes
+- Type-guarded cost/metadata extraction from user `executeWorkflow` returns — rejects `NaN`/`Infinity`/negative `cost` and exotic `metadata` (`Date`/`Map`/`Set`/class instances) with a console warn at the trust boundary
+- Scorer `NaN`/`Infinity` returns recorded as `null` in `scores` with a `scorerErrors` entry — don't abort the run and don't poison `totalCost`
+- New exports: `EvalProgressEvent`, `RunEvalOptions`
+
+#### Eval CLI
+
+- `axl-eval --capture-traces` flag — populates `EvalItem.traces` on every item (success + failure). Documented caveat: memory proportional to dataset × turns × agents, off by default
+
+#### Studio — trace/streaming/redaction
+
+- Trace Explorer: native rendering of enriched `agent_call` events — collapsible system/prompt/response/thinking/messages blocks, chip-style param display, `attempt/maxAttempts` badges on gate events, retry badge + amber tint on retry-triggered `agent_call` rows, failed gate events also tint amber. Top-level Expand cascades into every event body via `TraceJsonViewer` (context-aware wrapper that force-remounts on toggle)
+- Failure-red event dots — gate events with `valid: false`/`blocked: true`, `verify` with `passed: false`, `tool_approval` with `approved: false`, `tool_denied`, aborted `workflow_end`, and `log` events with an `error` field now render with a red dot + red waterfall bar so failure clusters pop visually
+- Shared `TraceEventList` component used by Trace Explorer, Workflow Runner timeline, AND Eval Runner's per-item trace viewer — single renderer, consistent UX across all three views (retry pills, attempt counters, body collapsibles, cost/duration badges, Expand-all toolbar)
+- Eval Runner streaming multi-run — `POST /api/evals/:name/run` with `{ stream: true }` returns `{ evalRunId }` immediately and broadcasts progress over a new `eval:{evalRunId}` WS channel (`item_done` / `run_done` / `done` / `error`). The `done` event carries only `{ evalResultId, runGroupId? }` — the client refetches from history and rebuilds `_multiRun` locally via shared `buildMultiRunResult()` (avoids the 64KB WS frame limit on large `EvalResult` payloads). `POST /api/evals/runs/:evalRunId/cancel` aborts an active run
+- Eval Runner `captureTraces` body flag on `POST /api/evals/:name/run` — UI toggle defaults ON (Studio's value prop is observability); toggle off for very large datasets. Library default (`runEval`) remains OFF so CLI batch jobs don't pay memory silently
+- Eval execution state survives route navigation (module-level external store via `useSyncExternalStore`); running view shows progress bar, run counter, elapsed timer, cancel button. Stale-run watchdog transitions store to `error` after 5 minutes of WS silence (server-crash recovery)
+- `config.trace.redact` is now a three-layer observability-boundary filter — trace events at emission, REST responses at serialization, WS broadcasts. Under `redact: true`: `GET /api/executions{,/:id}`, `GET /api/memory/:scope{,/:key}`, `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync), plus two streaming WS paths (`/workflows/:name/execute` with `stream:true`, `/api/playground/chat`) scrub user/LLM content while preserving IDs, keys, names, metrics, roles, and timestamps
+- `redactErrorMessage` — scrubs error envelopes in redact mode so `ValidationError`, `GuardrailError`, `VerifyError`, and provider errors don't leak user content through REST `error.message` fields and the `eval:*` WS channel. Allow-lists structural error names (`BudgetExceededError`, `TimeoutError`, `MaxTurnsError`, `QuorumNotMet`, `NoConsensus`, `ToolDenied`) which don't carry user input; everything else surfaces as a generic structural message
+- Redaction helpers in `src/server/redact.ts`: `redactExecutionInfo`/`List`, `redactMemoryValue`/`List`, `redactSessionHistory`/`ChatMessage` (uses `satisfies ChatMessage` to fail-compile on new fields), `redactEvalResult`/`HistoryEntry`/`HistoryList`, `redactPendingDecision`/`List`, `redactStreamEvent`, `redactErrorMessage`, generic `redactValue` — none mutate, all return the original reference when `redact: false`
+- `filterTraceEvent?: (event, metadata) => boolean` on `createStudioMiddleware` — per-connection broadcast filter for multi-tenant deployments, fail-closed on predicate error, also applied to replay buffers (late subscribers can't see historical cross-tenant events)
+- `verifyUpgrade` may return `{ allowed, metadata }` — metadata is attached to the connection and passed to `filterTraceEvent` on every outbound event (backward compatible with bare boolean return). Close-race guard tightened: connections are rejected even if `close()` runs partway through an in-flight async upgrade
+- WS broadcast enforces a 64KB soft cap via `truncateIfOversized` with a structural placeholder preserving `type`/`step`/`agent`/`tool`
+- Cost Dashboard: "Retry Overhead" section decomposes `agent_call` cost by `retryReason` (primary/schema/validate/guardrail) with per-reason call counts; "Memory (Embedder)" section surfaces `CostData.byEmbedder` bucketing cost by embedder model. All breakdown tables user-sortable via a row-based generic `CostTable`
+- `formatCost` tiered precision — `< $0.000001` sentinel, `< $0.0001` scientific, `< $0.01` 6 decimals, `>= $0.01` 2 decimals (embedder costs no longer collapse to `$0.0000`)
+
+#### Studio — aggregates
+
+- Time-windowed history aggregates — Cost Dashboard, Eval Runner, Workflow Runner, and Trace Explorer now survive server restarts by rebuilding from StateStore history. All four panels share a window selector (24h / 7d / 30d / All, default 7d, persisted to localStorage)
+- `GET /api/costs?window=24h|7d|30d|all` — replaces the all-time-only cost endpoint with per-window snapshots. `?windows=all` returns all four windows for debugging
+- `GET /api/eval-trends?window=` — per-eval score trends (latest, mean, std), cost breakdown, run timeline
+- `GET /api/workflow-stats?window=` — per-workflow total/completed/failed counts, p50/p95/avg duration, failure rate
+- `GET /api/trace-stats?window=` — event type distribution, tool call counts (calls/approved/denied), retry breakdown by agent
+- Eval Runner "Trends" tab with per-eval line chart (one line per scorer), cost-over-time sparkline, per-scorer Latest/Mean/Std table, and a segmented "By Scorer | By Model | Duration" view toggle. By Model groups runs by most-called model from `metadata.modelCounts`; Duration plots per-run time by model. Clicking a point navigates to run detail
+- Workflow Runner stats bar with execution counts, failure rate, and duration percentiles. Clicking a workflow row in the stats table selects it for the next run
+- Trace Explorer "Stats" tab — event type distribution, top-N tool-calls bar chart, retry-by-agent stacked bar (segments per schema/validate/guardrail), tool-approval/denial stacked bar
+- Cost Dashboard footer (`Window · Last updated · N executions`) showing how fresh the aggregate is
+- Workflow Runner split into `Run | Stats` tabs (mirrors Trace Explorer's `Events | Stats` pattern)
+- Shared chart primitives in `components/shared/charts/`: `LineChart`, `SparkLine`, `BarChart`, `StackedBarChart`
+- `useAggregate<T>(channel, fetchFn)` shared client hook wiring window state, REST fetch, WS subscription, and `updatedAt` freshness
+- `EvalTrendRun` now carries `model` and `duration` so trend charts can segment and compare without refetching raw history entries
+- `AggregateSnapshots` constructor accepts a `broadcastTransform` option to enrich/strip state before WS broadcast
+- Stats-accuracy disclosures — Eval Trends marks mean/std columns with an asterisk + footnote when runCount > 50; Workflow Stats p50/p95 headers note percentiles are approximate at 200+ executions
+
+#### Studio — item labels under redact
+
+- Eval Runner item list falls back to a stable `Item N` label when `item.input` is scrubbed under redact. Row index column was already visible, but the input-preview column would otherwise read `[redacted]` on every row, making items indistinguishable; this keeps the panel navigable in compliance mode
+
+#### Studio — testing
+
+- React Testing Library scaffolding — vitest picks up `.test.tsx` files, jsdom is opt-in per-file via `// @vitest-environment jsdom`, and `setup-dom.ts` loads jest-dom matchers + RTL `cleanup` only when a DOM is present. Regression suites seeded for `StatCard`, `WindowSelector`, `CostBadge`/`formatCost`, `TraceEventList`, `WorkflowStatsBar`
+
+#### Runtime
+
+- `AxlRuntime.saveEvalResult()` emits `eval_result` event for live eval aggregation
 
 ### Fixed
 
-- **Studio:** `reduceEvalTrends.extractScores` / `extractCost` read wrong paths in `EvalResult` (`summary.scores[name]` and `summary.totalCost` instead of `summary.scorers[name].mean` and top-level `totalCost`), which silently returned empty scores and zero cost for every saved eval. Now reads the correct paths with a back-compat fallback for legacy `summary.totalCost` fixtures
-- **Studio:** `reduceEvalTrends` `runCount` tracked capped array length (max 50) instead of actual total — now uses independent counter
-- **Studio:** `reduceTraceStats` silently dropped `tool_approval` events — `approved` and `denied` counters now increment for both `tool_approval` and `tool_denied` event types
-- **Studio:** Workflow Runner WS live updates showed "—" for p50/p95 because `AggregateSnapshots` broadcast sent raw `WorkflowStatsData` (with `durations` array) while client expected enriched format — added `broadcastTransform` option that applies `enrichWorkflowStats` before WS broadcast
-- **Studio:** `extractModel` tie-breaking (when two models have identical call counts) was non-deterministic (dependent on `Object.entries` insertion order). Now breaks ties alphabetically.
-- **Studio:** `LineChart` silently produced invalid SVG paths when a series had NaN y-values — filters non-finite points before rendering
-- **Studio:** Workflow Runner and Trace Explorer regressed the shared `TraceEventList` renderer in a prior refactor, silently dropping the Expand-all toolbar, retry pills, gate-failure amber tint, attempt counter pills, `AgentCallBody`/`GateCheckBody`/`ToolApprovalBody` collapsibles (system prompt / prompt / response / feedback), `TraceJsonViewer` context-aware JSON expansion, `CostBadge` on rows, and `DurationBadge`. Both panels now route through `TraceEventList` again. A tripwire test in `panel-trace-list-tripwire.test.ts` catches future re-regressions at the source level
-- **Studio:** `trace-utils.ts` `EVENT_COLORS` / `getDepth` referenced `workflow_complete` and `tool_call_complete` as event types — these names don't exist in the `TraceEvent` union. Removed the dead branches
-- **Studio:** Chart tooltip overflowed the right edge of the chart container — now flips to the left of the cursor when the point is in the right half, with a `max-width: 240px` cap
-- **Studio:** Chart point cursor didn't change to `pointer` when a click handler was wired (hover indicator circle overlapped the small clickable dots). Chart-level click + cursor now fire whenever hover is active
-- **Studio:** `LineChart` hover logic picked the nearest point per series and then filtered to the first series' `snapX`, causing the hover indicator to miss points in views where series don't share x-values (e.g., By Model). Now picks the globally nearest point and snaps to its x
+- **Core:** `CostData.byWorkflow.executions` was always `0` in production — the cost aggregator's `cost == null && !tokens` early-return short-circuited `workflow_start` events (which carry neither) before reaching the execution counter
+- **Core:** `CostData.byWorkflow.cost` was always `$0` — `emitTrace` only stamped `workflow` on `workflow_start`/`workflow_end`; every other event type had `event.workflow` undefined, so the `byWorkflow` bucket never received cost. `emitTrace` now auto-stamps `workflow` on every event from a workflow context
+- **Core:** `OpenAIEmbedder` didn't use `fetchWithRetry` — a transient 429/503/529 on the embeddings endpoint was fatal. Now gets exponential-backoff retry with `Retry-After` support, matching the other provider adapters
+- **Core:** `config.trace.redact` didn't scrub `tool_call.data.args`/`.result`, `handoff.data.message` (roundtrip), string fields on `log` events, or `reason` on `guardrail`/`validate` events — compliance deployments could leak PII via tool args, handoff context, system logs, and validator reasons that echo user input
+- **Core:** Log event redaction collapsed nested objects to `'[redacted]'`, including numeric fields inside objects like `data.usage`. Redaction now walks one level, preserving numeric/boolean fields while scrubbing strings
+- **Core:** `agent_call.duration` was cumulative from the start of `ctx.ask()` instead of per-turn. Each `agent_call` event now reports wall-clock time of that specific turn's provider call
+- **Core:** `onTrace` consumer exceptions could silently abort an in-flight workflow. `emitTrace` now catches throws, logs via `console.error`, and continues
+- **Core:** `AbortError` detection in `runtime.execute()`/`.stream()` was `err instanceof DOMException && err.name === 'AbortError'` — too strict, missed plain `Error` instances with `name === 'AbortError'` thrown by `signal.throwIfAborted()` or non-fetch code paths
+- **Core:** `formatBudgetCost` (in `BudgetExceededError.message`) rendered negative values as `$-1.50` instead of `-$1.50` and silently collapsed `NaN` / `Infinity` to `$0.00`, hiding cost-accounting bug signals. Now places the sign before `$` and emits `$NaN` / `$Infinity` / `-$Infinity` literally so bugs surface loudly
+- **Studio:** `POST /api/costs/reset` (removed in this release) now returns a structured `410 Gone` envelope with a migration hint pointing at `GET /api/costs?window=…`, instead of the bare Hono default 404. Helps scripts and CI dashboards upgrading from 0.14.x surface the correct fix
+- **Studio:** Workflow Runner and Trace Explorer had regressed the shared `TraceEventList` renderer in a prior refactor — silently dropping the Expand-all toolbar, retry pills, gate-failure amber tint, attempt counter pills, `AgentCallBody`/`GateCheckBody`/`ToolApprovalBody` collapsibles, `TraceJsonViewer` context-aware JSON expansion, `CostBadge` on rows, and `DurationBadge`. Both panels now route through `TraceEventList` again. A tripwire test in `panel-trace-list-tripwire.test.ts` catches future re-regressions
+- **Studio:** `trace-utils.ts` `EVENT_COLORS` / `getDepth` referenced `workflow_complete` and `tool_call_complete` as event types — these names don't exist in the `TraceEvent` union. Dead branches removed
+- **Studio:** Embedded middleware (`createStudioMiddleware`) lost `POST` request bodies when the host framework (Express, NestJS, Koa) had body-parsing middleware. Most visibly, multi-run evals (`{ runs: N }`) fell back to a single run. Handler now re-serializes `req.body` to `req.rawBody` (Buffer) before calling `getRequestListener`, so Hono's `rawBody instanceof Buffer` check picks it up
 
 ## [0.14.0] - 2026-04-14
 
@@ -607,8 +701,14 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.13.6...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/axl-sdk/axl/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/axl-sdk/axl/compare/v0.13.8...v0.14.0
+[0.13.8]: https://github.com/axl-sdk/axl/compare/v0.13.7...v0.13.8
+[0.13.7]: https://github.com/axl-sdk/axl/compare/v0.13.6...v0.13.7
 [0.13.6]: https://github.com/axl-sdk/axl/compare/v0.13.5...v0.13.6
+[0.13.5]: https://github.com/axl-sdk/axl/compare/v0.13.4...v0.13.5
+[0.13.4]: https://github.com/axl-sdk/axl/compare/v0.13.3...v0.13.4
 [0.13.3]: https://github.com/axl-sdk/axl/compare/v0.13.2...v0.13.3
 [0.13.2]: https://github.com/axl-sdk/axl/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/axl-sdk/axl/compare/v0.13.0...v0.13.1

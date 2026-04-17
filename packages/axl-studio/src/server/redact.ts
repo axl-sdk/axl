@@ -35,6 +35,44 @@ import type { EvalHistoryEntry } from '@axlsdk/axl';
 const REDACTED = '[redacted]';
 
 /**
+ * Error `name` values whose `message` is purely structural (codes, counts,
+ * identifiers) and safe to surface verbatim under redact mode. Every other
+ * error — `ValidationError`, `GuardrailError`, `VerifyError`, arbitrary
+ * provider errors, `Error` from user code — is treated as potentially
+ * echoing user/LLM content and has its message scrubbed.
+ *
+ * Kept in sync with the allow-list in
+ * `server/middleware/error-handler.ts`; both sites must match so a route
+ * that surfaces errors inline has identical redaction semantics to one
+ * that throws through the global handler.
+ */
+const SAFE_ERROR_NAMES = new Set([
+  'QuorumNotMet',
+  'NoConsensus',
+  'TimeoutError',
+  'MaxTurnsError',
+  'BudgetExceededError',
+  'ToolDenied',
+]);
+
+/**
+ * Scrub an error's `.message` for inclusion in a REST error envelope or WS
+ * error event. Under redact mode, only messages from the structural
+ * allow-list above pass through; everything else becomes `[redacted]`. The
+ * `code`/`name` stay untouched so clients can still branch programmatically.
+ *
+ * Call sites that catch an error and build a `{ code, message }` envelope
+ * locally (instead of re-throwing through `errorHandler`) should use this
+ * helper so their redaction behavior stays consistent with the global path.
+ */
+export function redactErrorMessage(err: unknown, redact: boolean): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  if (!redact) return raw;
+  const name = err instanceof Error ? err.name : '';
+  return SAFE_ERROR_NAMES.has(name) ? raw : REDACTED;
+}
+
+/**
  * Generic "scrub any value to the redacted sentinel" helper. Used by
  * routes that return a single opaque payload (workflow execute result,
  * tool test result, playground done data) where the value could be

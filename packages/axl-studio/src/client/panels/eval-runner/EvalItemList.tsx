@@ -242,7 +242,14 @@ export function EvalItemList({
                     </td>
                     <td className="px-3 py-2 max-w-xs">
                       <span className="text-[11px] leading-tight text-[hsl(var(--muted-foreground))] truncate block group-hover:text-[hsl(var(--foreground))] transition-colors">
-                        {extractLabel(item.input)}
+                        {/* Redact mode scrubs `item.input` to the sentinel string
+                            so the preview would otherwise read "[redacted]" on
+                            every row, making items indistinguishable. Fall back
+                            to a stable "Item N" label so users can still
+                            navigate and compare scores across items. */}
+                        {extractLabel(item.input) === '[redacted]'
+                          ? `Item ${index + 1}`
+                          : extractLabel(item.input)}
                       </span>
                     </td>
                     {scorerNames.map((name) => {

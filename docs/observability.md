@@ -62,7 +62,7 @@ All events share the base `TraceEvent` shape; `data` is narrowed by `type`. See 
 
 | Type | When emitted | Key `data` fields |
 |------|-------------|-------------------|
-| `workflow_start` / `workflow_end` | Workflow lifecycle | `input` / `result` |
+| `workflow_start` / `workflow_end` | Workflow lifecycle | `input` / `status`, `duration`, `result?`, `error?`, `aborted?` |
 | `agent_call` | Every LLM call (every loop turn of `ctx.ask()`) | `prompt`, `response`, `system`, `thinking?`, `params`, `turn`, `retryReason?`, `messages?` (verbose only) |
 | `tool_call` | Tool execution completes | `args`, `result`, `callId` |
 | `tool_approval` | `requireApproval` gate fires — **both** approve and deny | `approved`, `args`, `reason?` |
@@ -70,18 +70,34 @@ All events share the base `TraceEvent` shape; `data` is narrowed by `type`. See 
 | `guardrail` | Input or output guardrail runs — pass or fail | `guardrailType`, `blocked`, `reason?`, `attempt?`, `maxAttempts?`, `feedbackMessage?` (output only, on retry) |
 | `schema_check` | Every schema parse on a structured-output call — pass or fail | `valid`, `reason?`, `attempt`, `maxAttempts`, `feedbackMessage?` (on retry) |
 | `validate` | Post-schema business rule validator runs — pass or fail | `valid`, `reason?`, `attempt`, `maxAttempts`, `feedbackMessage?` (on retry) |
-| `delegate` | `ctx.delegate()` routes to a candidate (including the single-agent short-circuit) | `candidates`, `selected?`, `routerModel?`, `reason?` |
-| `handoff` | One agent hands off to another via a `handoff_to_*` tool | `target`, `mode`, `duration` |
+| `delegate` | `ctx.delegate()` routes to a candidate (including the single-agent short-circuit) | `candidates`, `selected?`, `routerModel?`, `reason` (`'routed'` \| `'single_candidate'`) |
+| `handoff` | One agent hands off to another via a `handoff_to_*` tool | `target`, `mode`, `duration`, `source?`, `message?` (roundtrip only) |
 | `verify` | `ctx.verify()` completes (pass or fail) | `attempts`, `passed`, `lastError?` |
-| `log` | `ctx.log()` user-emitted event OR system audit events like `memory_remember` / `memory_recall` / `memory_forget` / `workflow_start` | caller-provided or `{ event, key, scope, hit?, resultCount?, embed?, usage? }` for memory ops |
+| `log` | `ctx.log()` user-emitted event OR system audit events like `memory_remember` / `memory_recall` / `memory_forget` | caller-provided or `{ event, key, scope, hit?, resultCount?, embed?, usage?, error? }` for memory ops |
 
-**Semantic memory cost attribution.** `ctx.remember({embed: true})` and `ctx.recall({query})` call a paid embedding API. The operation emits a `log` event with `event: 'memory_remember'` or `'memory_recall'`, and when the embedder reported usage it sets:
+**`workflow_start` / `workflow_end` are first-class `TraceEvent` types as of 0.15.0** — previously emitted as `log` events with `data.event === 'workflow_start'` / `'workflow_end'`. Consumers filtering on the old log-form shape must switch to `event.type === 'workflow_start'` / `'workflow_end'`; `event.workflow` is now top-level, `data` carries `WorkflowStartTraceData { input }` / `WorkflowEndTraceData { status, duration, result?, error?, aborted? }`. `runtime.stream()` now also emits `workflow_start` (was silently omitted). Aborted workflows emit `workflow_end` with `data.aborted: true` so consumers can distinguish cancellation / budget hard-stop from genuine errors without a separate event subscription.
 
-- **Top-level `cost`** — USD amount, picked up automatically by `runtime.trackExecution()` and Studio's `CostAggregator` (flows into `totalCost` like any provider call).
+**`parentToolCallId` on nested events.** When an agent-as-tool handler spawns a child `WorkflowContext` (via `ctx.createChildContext()` inside a tool), every trace event emitted from the child stamps `parentToolCallId: string` — the `callId` of the outer `tool_call`. Consumers can join `event.parentToolCallId === toolCall.id` to reconstruct call graphs. The Trace Explorer visualizes nesting via `getDepth()`.
+
+**Semantic memory cost attribution.** `ctx.remember({embed: true})` and `ctx.recall({query})` call a paid embedding API. The operation emits a `log` event with `event: 'memory_remember'` or `'memory_recall'` on BOTH success and failure paths (failure variant includes an `error` field), and when the embedder reported usage it sets:
+
+- **Top-level `cost`** — USD amount, picked up automatically by `runtime.trackExecution()` and Studio's cost aggregator (flows into `totalCost` like any provider call).
 - **Top-level `tokens.input`** — input tokens consumed by the embedder (kept separate from agent prompt tokens in the `totalTokens` summary).
 - **`data.usage`** — full `{ tokens?, cost?, model? }` breakdown for trace inspection.
 
-The Studio Cost Dashboard renders a "Memory (Embedder)" section when there's at least one embedder call, bucketing cost by embedder model via `CostData.byEmbedder`.
+`ctx.remember` additionally recovers cost attribution on the partial-failure path: if the embedder succeeded but a downstream `vectorStore.upsert` threw, `MemoryManager.remember` attaches the usage to the error via a non-enumerable `axlEmbedUsage` property so the trace event still reports real spend and budget still sees the charge. (Plain key-value `remember` with `embed: false` never embeds, so there's no cost on the failure path.)
+
+`OpenAIEmbedder` computes cost from a pricing table:
+
+| Model | Cost |
+|---|---|
+| `text-embedding-3-small` | $0.02 / 1M tokens |
+| `text-embedding-3-large` | $0.13 / 1M tokens |
+| `text-embedding-ada-002` | $0.10 / 1M tokens |
+
+Unknown models report `tokens` but no `cost`. The Studio Cost Dashboard renders a "Memory (Embedder)" section when there's at least one embedder call, bucketing cost by embedder model via `CostData.byEmbedder: Record<string, { cost, calls, tokens }>`.
+
+**Memory cost + budget.** Embedder cost feeds the same `budgetContext` as agent calls via `_accumulateBudgetCost` — `ctx.budget({ cost, onExceed: 'hard_stop' })` enforces across both. `ctx.remember` / `ctx.recall` also check `budgetContext.exceeded` at call top and throw `BudgetExceededError` before hitting the embedder if a prior call already breached the limit. The composed `AbortSignal` (user-abort + budget hard-stop) is forwarded to the embedder fetch so in-flight calls cancel.
 
 ### Debugging retries
 
@@ -101,22 +117,22 @@ The filter applies at three layers:
 
 **1. Trace events** — at `emitTrace()` emission time. Scrubs:
 
-- `agent_call.data`: `prompt`, `response`, `system`, `thinking`, `messages`
+- `agent_call.data`: `prompt`, `response`, `system`, `thinking`, `messages` (replaced with a single placeholder message preserving the count)
 - `guardrail` / `schema_check` / `validate`: `reason`, `feedbackMessage`
 - `tool_call.data`: `args`, `result`
 - `tool_approval.data`: `args`, `reason`
 - `handoff.data.message` (roundtrip handoffs)
 - `workflow_start.data.input`, `workflow_end.data.result`/`error`
-- `log` events: string fields, with a one-level walk so nested numeric fields like `memory_remember.data.usage.tokens` / `.cost` survive while string fields like `.usage.model` are scrubbed
+- `log` events: string fields, with a one-level walk so nested numeric fields like `memory_remember.data.usage.tokens` / `.cost` survive while string fields like `.usage.model` are scrubbed. Arrays and deeper nesting collapse to the `'[redacted]'` sentinel
 
 **2. Studio REST routes** — at response serialization time, via `runtime.isRedactEnabled()`. Scrubs:
 
 | Route | Scrubbed fields | Preserved |
 |---|---|---|
-| `GET /api/executions` / `:id` | `result`, `error` | `executionId`, `workflow`, `status`, `duration`, `totalCost`, `startedAt` |
+| `GET /api/executions` / `:id` | `result`, `error` | `executionId`, `workflow`, `status`, `duration`, `totalCost`, `startedAt`, `completedAt`, `steps` (trace events already scrubbed at emit time) |
 | `GET /api/memory/:scope` / `:key` | `value` | `key` (programmer-chosen identifier, needed for navigation) |
-| `GET /api/sessions/:id` | `message.content`, `message.tool_calls[*].function.arguments`, `message.providerMetadata` | `role`, `name`, `tool_call_id`, `tool_calls[*].id`, `tool_calls[*].function.name`, handoff records |
-| `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore` | per-item `input`, `output`, `error`, `annotations`, `scorerErrors`, `scoreDetails[*].metadata` | per-item `scores`, `duration`, `cost`, `scorerCost`; result-level `summary`, `metadata`, `totalCost`, `duration`, `timestamp` |
+| `GET /api/sessions/:id` | `message.content`, `message.tool_calls[*].function.arguments`; `message.providerMetadata` is dropped entirely (opaque bag that may carry encoded reasoning / cache keys) | `role`, `name`, `tool_call_id`, `tool_calls[*].id`, `tool_calls[*].type`, `tool_calls[*].function.name`, `handoffHistory` (no content fields to scrub) |
+| `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore` | per-item `input`, `output`, `error`, `annotations`, `scorerErrors`, `scoreDetails[*].metadata` | per-item `scores`, `duration`, `cost`, `scorerCost`, `metadata` (models / tokens / workflows), `traces` (already scrubbed at emit time); result-level `summary`, `metadata`, `totalCost`, `duration`, `timestamp` |
 | `GET /api/decisions` | `prompt`, `metadata` (replaced with `{ redacted: true }`) | `executionId`, `channel`, `createdAt` |
 | `POST /api/tools/:name/test` | `result` | tool name, input schema |
 | `POST /api/workflows/:name/execute` (sync) | `result` | — |
@@ -129,6 +145,7 @@ The filter applies at three layers:
 - `done.data` — final workflow result
 - `error.message`
 - `step.data` passes through because the underlying `TraceEvent` was already scrubbed at emit time
+- `agent_start` / `agent_end` / `handoff` pass through — structural only, no content fields
 
 **Top-level numeric fields (`cost`, `tokens`, `duration`) are never scrubbed**, even under `redact: true`. They're load-bearing — `trackExecution`'s cost-aggregation listener and Studio's `CostAggregator` both read `event.cost` directly, so zeroing them would silently break total cost tracking when redaction is enabled. If your compliance environment treats aggregate spend as sensitive, filter events out entirely in your `onTrace` / `filterTraceEvent` handler rather than relying on redaction to scrub them.
 
@@ -287,8 +304,14 @@ Aggregate state is compute-on-read from the existing `ExecutionInfo.steps` and `
 | `GET /api/workflow-stats?window=7d` | `ExecutionInfo` | Per-workflow totals, failure rate, p50/p95 duration |
 | `GET /api/trace-stats?window=7d` | `TraceEvent` | Event distribution, tool calls, retry breakdown |
 
-All endpoints accept `?window=24h|7d|30d|all` (default `7d`). All are pure computation and allowed in `readOnly` mode.
+All endpoints accept `?window=24h|7d|30d|all` (default `7d`). `GET /api/costs` also accepts `?windows=all` (plural) which returns the full per-window snapshot map in a single response — intended for debugging. All four endpoints are pure computation and allowed in `readOnly` mode.
 
 ### WebSocket channels
 
 Each aggregator broadcasts to its own WS channel (`costs`, `eval-trends`, `workflow-stats`, `trace-stats`) with the payload `{ snapshots: Record<WindowId, State>, updatedAt: number }`.
+
+### Migration from 0.14
+
+- `POST /api/costs/reset` was **removed** in 0.15.0 — any client that was hitting it for a manual reset gets `404`. Use window selection instead; snapshots evict automatically as their window slides.
+- The `CostAggregator` class was replaced by a generic `TraceAggregator<CostData>` configured with a pure `reduceCost` reducer. Behavior is preserved; any external consumer importing `CostAggregator` from `@axlsdk/studio` must switch to `TraceAggregator`.
+- The `costs` WS channel payload changed from `CostData` to `{ snapshots: Record<WindowId, CostData>, updatedAt: number }`. Existing clients that read the old shape must select a window from `snapshots` (typically `snapshots['7d']`).

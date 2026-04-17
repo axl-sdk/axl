@@ -2,6 +2,7 @@ import type {
   VectorStore,
   Embedder,
   EmbedUsage,
+  EmbedResult,
   VectorResult,
   RememberOptions,
   RecallOptions,
@@ -31,6 +32,41 @@ export type RecallResult = {
   data: unknown | VectorResult[] | null;
   usage?: EmbedUsage;
 };
+
+/**
+ * Validate the shape returned by a user-supplied `Embedder.embed()` call.
+ *
+ * In 0.15 the `Embedder` contract changed from `Promise<number[][]>` to
+ * `Promise<{ vectors: number[][]; usage?: EmbedUsage }>` so semantic
+ * memory can carry cost attribution out to `ctx.budget()` and the cost
+ * aggregator. A custom embedder that still returns the legacy bare
+ * `number[][]` shape would otherwise destructure to `vectors === undefined`
+ * and throw a cryptic `TypeError: Cannot read properties of undefined
+ * (reading '0')` deep inside upsert/search — giving no hint to the user
+ * that the fix is a return-shape migration, not a bug in axl.
+ *
+ * Fail loudly with a clear migration hint at the interface boundary.
+ */
+function assertEmbedResult(result: unknown): asserts result is EmbedResult {
+  if (Array.isArray(result)) {
+    throw new Error(
+      'Embedder.embed() returned a bare number[][] (legacy shape). ' +
+        'As of @axlsdk/axl 0.15, Embedder.embed() must return ' +
+        '{ vectors: number[][]; usage?: { tokens?, cost?, model? } }. ' +
+        'Wrap your existing return value: `return { vectors: await old() }`.',
+    );
+  }
+  if (
+    !result ||
+    typeof result !== 'object' ||
+    !Array.isArray((result as { vectors?: unknown }).vectors)
+  ) {
+    throw new Error(
+      'Embedder.embed() must return { vectors: number[][]; usage?: EmbedUsage }. ' +
+        `Got ${result === null ? 'null' : typeof result}.`,
+    );
+  }
+}
 
 /**
  * Coordinates key-value memory and vector store for semantic search.
@@ -90,7 +126,9 @@ export class MemoryManager {
     // Optionally embed for semantic search (opt-in: embed must be explicitly true)
     if (options?.embed === true && this.vectorStore && this.embedder) {
       const text = typeof value === 'string' ? value : JSON.stringify(value);
-      const { vectors, usage } = await this.embedder.embed([text], signal);
+      const raw = await this.embedder.embed([text], signal);
+      assertEmbedResult(raw);
+      const { vectors, usage } = raw;
       // The embed API call already happened — the user has been billed.
       // If the downstream vectorStore.upsert fails, we must preserve the
       // usage attribution so the caller's error handler can still record
@@ -141,7 +179,9 @@ export class MemoryManager {
   ): Promise<RecallResult> {
     // Semantic search mode
     if (options?.query && this.vectorStore && this.embedder) {
-      const { vectors, usage } = await this.embedder.embed([options.query], signal);
+      const raw = await this.embedder.embed([options.query], signal);
+      assertEmbedResult(raw);
+      const { vectors, usage } = raw;
       const topK = options?.topK ?? 5;
 
       // Determine the target scope for filtering

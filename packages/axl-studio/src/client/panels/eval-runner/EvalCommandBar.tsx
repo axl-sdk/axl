@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
-import { Play, Minus, Plus } from 'lucide-react';
+import { Play, Minus, Plus, Activity } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { CommandPicker } from '../../components/shared/CommandPicker';
 import type { RegisteredEval } from '../../lib/types';
@@ -11,6 +11,8 @@ interface EvalCommandBarProps {
   onSelectEval: (name: string) => void;
   runCount: number;
   onRunCountChange: (value: number) => void;
+  captureTraces: boolean;
+  onCaptureTracesChange: (value: boolean) => void;
   running: boolean;
   onRun: () => void;
 }
@@ -30,6 +32,8 @@ export function EvalCommandBar({
   onSelectEval,
   runCount,
   onRunCountChange,
+  captureTraces,
+  onCaptureTracesChange,
   running,
   onRun,
 }: EvalCommandBarProps) {
@@ -73,6 +77,30 @@ export function EvalCommandBar({
       />
 
       <RunCountStepper value={runCount} onChange={onRunCountChange} disabled={running} />
+
+      <button
+        type="button"
+        role="switch"
+        aria-checked={captureTraces}
+        aria-label="Capture per-item trace events"
+        onClick={() => onCaptureTracesChange(!captureTraces)}
+        disabled={running}
+        title={
+          captureTraces
+            ? 'Capturing per-item traces (click to disable) — traces appear inline on each item'
+            : 'Capture per-item traces — extra memory, but lets you inspect every event per item'
+        }
+        className={cn(
+          'flex items-center px-2 border-l border-[hsl(var(--input))] transition-colors cursor-pointer',
+          'focus:outline-none focus-visible:bg-[hsl(var(--muted))]',
+          'disabled:opacity-40 disabled:cursor-not-allowed',
+          captureTraces
+            ? 'text-[hsl(var(--foreground))] bg-[hsl(var(--muted))]'
+            : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--foreground))]',
+        )}
+      >
+        <Activity size={12} strokeWidth={2.5} />
+      </button>
 
       <button
         type="button"

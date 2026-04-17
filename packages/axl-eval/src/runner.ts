@@ -358,6 +358,8 @@ export async function runEval(
     workflowsMeta.workflowCounts = { [config.workflow]: items.length };
   }
 
+  options?.onProgress?.({ type: 'run_done', totalItems: items.length, failures });
+
   return {
     id,
     dataset: config.dataset.name,

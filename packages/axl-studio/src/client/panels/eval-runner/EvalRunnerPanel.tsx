@@ -54,6 +54,12 @@ export function EvalRunnerPanel() {
   const [error, setError] = useState<string | null>(null);
   const [selectedItem, setSelectedItem] = useState<number | null>(null);
   const [runCount, setRunCount] = useState(1);
+  // Default ON: Studio's core value prop is observability, so per-item traces
+  // should be visible by default. Users running very large datasets can
+  // toggle off to avoid persisting the trace array per item. The library
+  // default (runEval({ captureTraces })) remains OFF so CLI batch jobs
+  // don't pay the memory cost without explicit opt-in.
+  const [captureTraces, setCaptureTraces] = useState(true);
   const [multiRunIndex, setMultiRunIndex] = useState(-1);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [expandedWorstItem, setExpandedWorstItem] = useState<number | null>(null);
@@ -306,11 +312,11 @@ export function EvalRunnerPanel() {
     setMultiRunIndex(-1);
 
     try {
-      await startEvalRun(selectedEval, runCount);
+      await startEvalRun(selectedEval, runCount, captureTraces);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [selectedEval, runCount]);
+  }, [selectedEval, runCount, captureTraces]);
 
   const handleCompare = useCallback(async () => {
     if (!baselineSelection || !candidateSelection) return;
@@ -652,6 +658,8 @@ export function EvalRunnerPanel() {
                 onSelectEval={setSelectedEval}
                 runCount={runCount}
                 onRunCountChange={setRunCount}
+                captureTraces={captureTraces}
+                onCaptureTracesChange={setCaptureTraces}
                 running={running}
                 onRun={handleRun}
               />

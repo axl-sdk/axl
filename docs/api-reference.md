@@ -212,9 +212,15 @@ const ctx = runtime.createContext({
 });
 ```
 
-### `runtime.trackExecution(fn)`
+### `runtime.trackExecution(fn, options?)`
 
-Track cost and execution metadata across any runtime operations within `fn`. Returns `{ result, cost, metadata }` where `metadata` includes `models` (unique model URIs), `tokens` (input/output/reasoning sums), and `agentCalls` count. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
+Track cost and execution metadata across any runtime operations within `fn`. Returns `{ result, cost, metadata, traces? }` where `metadata` includes `models` (unique model URIs), `modelCallCounts`, `tokens` (input/output/reasoning sums — agent calls only, not embedder tokens), `agentCalls` count, `workflows` (insertion-ordered unique names), and `workflowCallCounts`. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
+
+**Note on `metadata.tokens`:** narrowly scoped to agent prompt/completion/reasoning tokens. Embedder tokens from semantic memory ops are deliberately not summed in (different pricing, different model). Consumers who want embedder token counts should subscribe to `runtime.on('trace', ...)` and read `data.usage.tokens` on `memory_remember` / `memory_recall` events.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `captureTraces` | `boolean` | `false` | When `true`, collects every `TraceEvent` observed during `fn` and returns it on `result.traces`. On failure, the captured traces are attached to the thrown error as a non-enumerable `axlCapturedTraces` property (eval runners read this side-channel to populate `EvalItem.traces` on failed items). Verbose-mode `agent_call.data.messages` snapshots are stripped from captured traces to keep memory bounded |
 
 ```typescript
 const { result, cost, metadata } = await runtime.trackExecution(async () => {
@@ -222,6 +228,13 @@ const { result, cost, metadata } = await runtime.trackExecution(async () => {
   return ctx.ask(myAgent, 'hello');
 });
 console.log(`Cost: $${cost}, Models: ${metadata.models.join(', ')}`);
+
+// With per-invocation trace capture:
+const { result, traces } = await runtime.trackExecution(
+  async () => runtime.execute('my-workflow', input),
+  { captureTraces: true }
+);
+console.log(`${traces.length} trace events captured`);
 ```
 
 ### `runtime.trackCost(fn)`
@@ -602,6 +615,10 @@ await ctx.remember('user_preference', { theme: 'dark' }, { scope: 'global', embe
 
 **Cost tracking.** When `embed: true`, the embedder call cost is automatically attributed to the current execution scope — `runtime.trackExecution()` picks it up via the trace-event cost rail, and Studio's Cost Dashboard displays it under "Memory (Embedder)" bucketed by embedder model. See [observability.md](./observability.md#trace-event-types) for details.
 
+**Budget enforcement.** Semantic memory calls (`embed: true` / `query`) count against `ctx.budget({ cost, onExceed: 'hard_stop' })` the same way agent calls do. `ctx.remember` and `ctx.recall` check `budgetContext.exceeded` at call top and throw `BudgetExceededError` before hitting the embedder if a prior call already breached the limit. The composed `AbortSignal` (user-abort + budget-hard_stop) is also forwarded to the embedder fetch so in-flight calls cancel promptly.
+
+**Audit events.** `ctx.remember`, `ctx.recall`, and `ctx.forget` emit a `log` trace event on both success and failure (`event: 'memory_remember' | 'memory_recall' | 'memory_forget'` with `{ key, scope, hit?, resultCount?, embed?, usage?, error? }`). Values are never in the trace — only operation shape. Under `config.trace.redact`, `key` is scrubbed.
+
 ---
 
 ### `ctx.recall(key, options?)`
@@ -643,6 +660,51 @@ await ctx.forget('user_preference', { scope: 'global' });
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `scope` | `'session' \| 'global'` | `'session'` | Memory scope |
+
+---
+
+### Memory cost: `Embedder`, `EmbedResult`, `EmbedUsage`
+
+Embedders report cost through a structured return type so it flows through `runtime.trackExecution()` and Studio's cost aggregator the same way agent-call cost does.
+
+```typescript
+interface Embedder {
+  readonly dimensions: number;
+  embed(texts: string[], signal?: AbortSignal): Promise<EmbedResult>;
+}
+
+type EmbedResult = { vectors: number[][]; usage?: EmbedUsage };
+type EmbedUsage = { tokens?: number; cost?: number; model?: string };
+```
+
+**Breaking change in 0.15.0:** `embed()` previously returned `Promise<number[][]>`. Custom `Embedder` implementations must wrap their vectors:
+
+```typescript
+class MyEmbedder implements Embedder {
+  readonly dimensions = 1536;
+  async embed(texts: string[], signal?: AbortSignal): Promise<EmbedResult> {
+    const vectors = await myEmbedCall(texts, { signal });
+    return { vectors }; // `usage` optional — omit if you don't compute cost
+  }
+}
+```
+
+**`OpenAIEmbedder` pricing table:**
+
+| Model | Cost |
+|---|---|
+| `text-embedding-3-small` | $0.02 / 1M tokens |
+| `text-embedding-3-large` | $0.13 / 1M tokens |
+| `text-embedding-ada-002` | $0.10 / 1M tokens |
+
+Unknown models report `tokens` but no `cost`. The `signal` parameter is propagated through `fetchWithRetry` so budget hard-stops and user aborts cancel in-flight embedder calls mid-retry.
+
+**`MemoryManager` wrappers** (only relevant if you call `MemoryManager` directly — `ctx.remember`/`ctx.recall` hide these):
+
+```typescript
+type RememberResult = { usage?: EmbedUsage };
+type RecallResult = { data: unknown | VectorResult[] | null; usage?: EmbedUsage };
+```
 
 ---
 
@@ -886,11 +948,12 @@ const runtime = new AxlRuntime({
 | `getPendingDecisions()` | `Promise<PendingDecision[]>` | List all pending human decisions |
 | `resolveDecision(executionId, decision)` | `Promise<void>` | Resolve a pending human decision. The suspended workflow resumes automatically |
 
-`ExecuteOptions`:
+`ExecuteOptions` (accepted by both `execute()` and `stream()`; exported from `@axlsdk/axl`):
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `metadata` | `Record<string, unknown>` | `{}` | Metadata passed to the workflow context. Reserved keys: `sessionId`, `sessionHistory`, `resumeMode` |
+| `awaitHumanHandler` | `(options) => Promise<HumanDecision>` | — | In-process approval handler for tool calls with `requireApproval`. Parity with `CreateContextOptions.awaitHumanHandler` — lets tests and embedded use cases resolve approvals inline instead of suspending execution and polling `getPendingDecisions()` |
 
 ### Execution History
 
@@ -922,10 +985,11 @@ Eval results are automatically persisted when using `runRegisteredEval()`. Histo
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `runRegisteredEval(name, options?)` | `Promise<unknown>` | Run a registered eval by name. Automatically persists the result to eval history. `options` accepts `{ metadata?, onProgress?, signal? }` — `metadata: Record<string, unknown>` injects custom metadata, `onProgress: (event) => void` fires after each dataset item completes (`EvalProgressEvent`), `signal: AbortSignal` cancels remaining items |
+| `runRegisteredEval(name, options?)` | `Promise<unknown>` | Run a registered eval by name. Automatically persists the result to eval history. `options` accepts `{ metadata?, onProgress?, signal?, captureTraces? }` — `metadata: Record<string, unknown>` injects custom metadata, `onProgress: (event: EvalProgressEventShape) => void` fires on `item_done` and `run_done` progress events, `signal: AbortSignal` cancels remaining items, `captureTraces: boolean` populates per-item `EvalItem.traces` on success and failure paths (forwarded to `runEval`) |
 | `getEvalHistory()` | `Promise<EvalHistoryEntry[]>` | All eval results, most recent first. Merges in-memory results with historical data from the state store |
-| `saveEvalResult(entry)` | `Promise<void>` | Manually save an eval result to history |
-| `eval(config)` | `Promise<unknown>` | Run an ad-hoc eval (not registered). Does **not** auto-persist to history |
+| `saveEvalResult(entry)` | `Promise<void>` | Manually save an eval result to history. Persists to the in-memory cache + `StateStore` and emits an `eval_result` event on the runtime's `EventEmitter` (load-bearing for Studio's live eval-trends aggregation — any custom consumer wanting live eval updates can subscribe via `runtime.on('eval_result', ...)`) |
+| `deleteEvalResult(id)` | `Promise<boolean>` | Remove a single eval history entry. Mutates the in-memory cache and delegates to `StateStore.deleteEvalResult?`. Returns `true` if the id existed |
+| `eval(config, options?)` | `Promise<unknown>` | Run an ad-hoc eval (not registered). Does **not** auto-persist to history. `options` accepts the same `{ onProgress?, signal?, captureTraces? }` as `runRegisteredEval` |
 | `evalCompare(baseline, candidate)` | `Promise<unknown>` | Compare two eval results for regressions/improvements |
 
 `EvalHistoryEntry`:
@@ -953,6 +1017,7 @@ Eval results are automatically persisted when using `runRegisteredEval()`. Histo
 | `resolveProvider(uri)` | `{ provider, model }` | Resolve a `provider:model` URI to a Provider instance and model name |
 | `getStateStore()` | `StateStore` | The runtime's state store instance |
 | `getMcpManager()` | `McpManager \| undefined` | The runtime's MCP manager (if initialized) |
+| `isRedactEnabled()` | `boolean` | Narrow public getter for `config.trace.redact`. Use this instead of reaching into the config object — the full config was intentionally not exposed because `Readonly<AxlConfig>` is shallow and consumers could mutate nested fields. Used by Studio's REST routes and WS broadcast paths to decide whether to scrub user/LLM content at the observability boundary |
 
 ### Lifecycle
 
@@ -1275,6 +1340,7 @@ Per-item result from an eval run. `scores` provides quick numeric access; `score
 | `scorerCost` | `number?` | Total scorer cost for this item (sum of all `scoreDetails[*].cost`) |
 | `scoreDetails` | `Record<string, ScorerDetail>?` | Rich per-scorer data — includes `metadata` (e.g., LLM reasoning), per-scorer `duration`, and `cost` |
 | `metadata` | `Record<string, unknown>?` | Execution metadata forwarded from the runtime (e.g., `models`, `tokens`, `agentCalls`) |
+| `traces` | `TraceEvent[]?` | Per-item trace events. Populated only when the eval was run with `{ captureTraces: true }`. Includes events on the failure path (recovered from the `axlCapturedTraces` side-channel on thrown errors) |
 
 ### `EvalResult`
 
@@ -1440,7 +1506,7 @@ Result from `aggregateRuns()`. Computes mean +/- std of per-scorer means across 
 |-------|------|-------------|
 | `runGroupId` | `string` | Shared group ID across runs |
 | `runCount` | `number` | Number of runs aggregated |
-| `workflow` | `string` | Workflow name |
+| `workflows` | `string[]` | Union of workflow names observed across runs (deduped, first-seen order). Parallel to `EvalResult.metadata.workflows`. Homogeneous groups (`axl-eval --runs N`) typically have one entry; heterogeneous groups (custom callbacks) can have multiple |
 | `dataset` | `string` | Dataset name |
 | `totalCost` | `number` | Sum of all runs' costs |
 | `totalDuration` | `number` | Sum of all runs' durations (ms) |
@@ -1455,9 +1521,29 @@ Aggregate multiple `EvalResult[]` into a `MultiRunSummary` with mean +/- std per
 
 `runEval()` automatically stores `scorerTypes: Record<string, 'llm' | 'deterministic'>` in `EvalResult.metadata`. This metadata is used by `evalCompare()` to auto-calibrate regression thresholds: `0` for deterministic scorers (any change is meaningful) and `0.05` for LLM scorers (accounts for natural variance). Results without `scorerTypes` fall back to a `0.1` legacy threshold.
 
-### `runEval(config, executeWorkflow, runtime)`
+### `runEval(config, executeWorkflow, runtime, options?)`
 
 Run an evaluation. LLM scorer providers are auto-resolved from the runtime's provider registry using each scorer's `model` URI. No explicit provider export is needed from eval files -- ensure the relevant API key environment variable is set or register providers via `runtime.registerProvider()`.
+
+`RunEvalOptions`:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `onProgress` | `(event: EvalProgressEvent) => void` | — | Called synchronously on two events: `item_done` (after each dataset item finishes — success, failure, cancellation, or budget-exceeded) and `run_done` (once after all items finish and stats are computed). Useful for progress bars, live log streams, or WS broadcasts |
+| `signal` | `AbortSignal` | — | Checked before each item AND between scorers within an item. Remaining items are marked as cancelled in the result |
+| `captureTraces` | `boolean` | `false` | Wrap `executeWorkflow` in `runtime.trackExecution(..., { captureTraces: true })`. Per-item `EvalItem.traces` is populated on both success and failure (failure path reads the `axlCapturedTraces` side-channel on the thrown error) |
+
+`EvalProgressEvent`:
+
+```typescript
+type EvalProgressEvent =
+  | { type: 'item_done'; itemIndex: number; totalItems: number }
+  | { type: 'run_done'; totalItems: number; failures: number };
+```
+
+`run_done` fires once after the final `item_done` — use it to transition a progress UI from "processing items" to "computing stats" before the full `EvalResult` returns. The runtime surface (`runtime.runRegisteredEval` / `runtime.eval`) re-exports the same shape as `EvalProgressEventShape` from `@axlsdk/axl` so you can type callbacks without importing the optional `@axlsdk/eval` peer dep.
+
+**Type-guarded cost/metadata extraction.** When a custom `executeWorkflow` returns `{ output, cost, metadata }`, the runner validates the untrusted fields before accepting them: `cost` must be a non-negative finite number, `metadata` must be a plain object (rejects `Date`/`Map`/`Set`/`Error`/class instances). Invalid values trigger a `console.warn` and fall back to trace-derived values from `trackExecution`. Previously a buggy workflow returning `{ cost: 'free' }` could silently NaN-poison `totalCost`.
 
 ---
 

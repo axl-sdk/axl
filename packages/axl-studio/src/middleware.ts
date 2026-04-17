@@ -318,6 +318,14 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
       const pathname = new URL(req.url!, `http://${req.headers.host}`).pathname;
       if (pathname !== wsPath) return; // Let other upgrade handlers run
 
+      // Early-reject if close() already started. This is a cheap pre-check —
+      // we repeat it AFTER the async verifyUpgrade resolves to close the race
+      // where close() runs while verifyUpgrade is still in flight.
+      if (closed) {
+        socket.destroy();
+        return;
+      }
+
       // Apply auth verification and capture optional per-connection metadata
       // (e.g. { userId, tenantId }) that filterTraceEvent can later read.
       let connectionMetadata: unknown;
@@ -341,8 +349,14 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
         }
       }
 
-      // Guard against close() being called during async verifyUpgrade
-      if (!wss) {
+      // Guard against close() having run during async verifyUpgrade. We check
+      // BOTH `closed` (set at the top of `close()`) and `!wss` (set at the
+      // end). `closed` is the authoritative signal — checking `!wss` alone
+      // wouldn't catch the window where `close()` has marked the middleware
+      // as shut down but hasn't yet torn down the WebSocketServer. Failing
+      // open here would leak a connection past the middleware's lifetime
+      // and leave it holding references the host expected to be released.
+      if (closed || !wss) {
         socket.destroy();
         return;
       }

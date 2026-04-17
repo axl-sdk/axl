@@ -6,6 +6,7 @@ import { scorer } from '../scorer.js';
 import type { Scorer } from '../scorer.js';
 import { llmScorer } from '../llm-scorer.js';
 import { runEval } from '../runner.js';
+import type { EvalProgressEvent } from '../types.js';
 
 const mockRuntime = {} as AxlRuntime;
 
@@ -1591,7 +1592,7 @@ describe('rescore() backward compatibility', () => {
 
 describe('runEval: onProgress callback', () => {
   it('calls onProgress after each item completes', async () => {
-    const events: Array<{ type: string; itemIndex: number; totalItems: number }> = [];
+    const events: EvalProgressEvent[] = [];
 
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
@@ -1602,19 +1603,22 @@ describe('runEval: onProgress callback', () => {
       },
     );
 
-    expect(events).toHaveLength(3);
-    for (let i = 0; i < 3; i++) {
-      expect(events[i].type).toBe('item_done');
-      expect(events[i].totalItems).toBe(3);
+    const itemEvents = events.filter((e) => e.type === 'item_done');
+    const runEvents = events.filter((e) => e.type === 'run_done');
+    expect(itemEvents).toHaveLength(3);
+    expect(runEvents).toHaveLength(1);
+    for (const e of itemEvents) {
+      expect(e.totalItems).toBe(3);
     }
     // All three items should be reported (order may vary due to concurrency)
-    const indices = events.map((e) => e.itemIndex).sort();
+    const indices = itemEvents.map((e) => (e as { itemIndex: number }).itemIndex).sort();
     expect(indices).toEqual([0, 1, 2]);
+    expect((runEvents[0] as { totalItems: number; failures: number }).failures).toBe(0);
     expect(result.items).toHaveLength(3);
   });
 
   it('calls onProgress for error items', async () => {
-    const events: Array<{ type: string; itemIndex: number }> = [];
+    const events: Array<{ type: string; itemIndex?: number; failures?: number }> = [];
 
     const result = await runEval(
       { workflow: 'test', dataset: testDataset, scorers: [exactScorer] },
@@ -1627,7 +1631,11 @@ describe('runEval: onProgress callback', () => {
       },
     );
 
-    expect(events).toHaveLength(3);
+    const itemEvents = events.filter((e) => e.type === 'item_done');
+    const runEvents = events.filter((e) => e.type === 'run_done');
+    expect(itemEvents).toHaveLength(3);
+    expect(runEvents).toHaveLength(1);
+    expect((runEvents[0] as { failures: number }).failures).toBe(3);
     expect(result.items.every((i) => i.error === 'boom')).toBe(true);
   });
 });
@@ -1842,7 +1850,7 @@ describe('runEval: signal cancellation', () => {
 
   it('fires onProgress for cancelled items', async () => {
     const ac = new AbortController();
-    const events: Array<{ type: string; itemIndex: number; totalItems: number }> = [];
+    const events: EvalProgressEvent[] = [];
     let callCount = 0;
 
     await runEval(
@@ -1864,9 +1872,11 @@ describe('runEval: signal cancellation', () => {
       },
     );
 
-    // All 3 items should emit progress (1 executed + 2 cancelled)
-    expect(events).toHaveLength(3);
-    expect(events.every((e) => e.type === 'item_done')).toBe(true);
-    expect(events.every((e) => e.totalItems === 3)).toBe(true);
+    // 3 item_done events (1 executed + 2 cancelled) + 1 run_done
+    const itemEvents = events.filter((e) => e.type === 'item_done');
+    const runEvents = events.filter((e) => e.type === 'run_done');
+    expect(itemEvents).toHaveLength(3);
+    expect(runEvents).toHaveLength(1);
+    expect(itemEvents.every((e) => e.totalItems === 3)).toBe(true);
   });
 });

@@ -21,7 +21,7 @@ import { DurationBadge } from './DurationBadge';
 import { JsonViewer } from './JsonViewer';
 import type { TraceEvent } from '../../lib/types';
 import {
-  getBarColor,
+  getEventColor,
   getDepth,
   getAgentCallData,
   getGateData,
@@ -341,7 +341,7 @@ function TraceEventRow({
         <span className="font-mono text-[hsl(var(--muted-foreground))] w-8">
           #{event.step != null ? event.step : index}
         </span>
-        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${getBarColor(event.type)}`} />
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${getEventColor(event)}`} />
         <span className="font-medium w-28 truncate">{event.type}</span>
         {isRetry && (
           <span
@@ -369,7 +369,7 @@ function TraceEventRow({
         <div className="flex-1 h-3 bg-[hsl(var(--background))] rounded overflow-hidden">
           {event.duration != null && event.duration > 0 && (
             <div
-              className={`h-full rounded ${getBarColor(event.type)}`}
+              className={`h-full rounded ${getEventColor(event)}`}
               style={{
                 width: `${Math.max((event.duration / maxDuration) * 100, 2)}%`,
                 opacity: 0.7,

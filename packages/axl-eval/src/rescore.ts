@@ -50,11 +50,15 @@ export async function rescore(
       return;
     }
 
+    // Preserve per-item traces from the original run: rescore re-runs scorers
+    // but leaves the workflow untouched, so the original execution traces
+    // remain accurate and useful for diagnosing score changes.
     const item: EvalItem = {
       input: original.input,
       annotations: original.annotations,
       output: original.output,
       metadata: original.metadata,
+      traces: original.traces,
       scores: {},
       scoreDetails: {},
     };

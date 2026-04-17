@@ -744,18 +744,18 @@ export function EvalRunnerPanel() {
             </div>
           ) : currentResult ? (
             <>
-              {/* Back to History link */}
-              {previousTab === 'history' && (
+              {/* Back link — returns to wherever you came from (history or trends) */}
+              {(previousTab === 'history' || previousTab === 'trends') && (
                 <div className="shrink-0 px-6 pt-4">
                   <button
                     onClick={() => {
-                      setTab('history');
+                      setTab(previousTab as 'history' | 'trends');
                       setPreviousTab(null);
                     }}
                     className="inline-flex items-center gap-1.5 text-xs text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] transition-colors cursor-pointer"
                   >
                     <ArrowLeft size={14} />
-                    Back to History
+                    Back to {previousTab === 'history' ? 'History' : 'Trends'}
                   </button>
                 </div>
               )}
@@ -1394,7 +1394,20 @@ export function EvalRunnerPanel() {
       )}
 
       {/* ── Trends Tab ──────────────────────────────────── */}
-      {tab === 'trends' && <EvalTrendsView />}
+      {tab === 'trends' && (
+        <EvalTrendsView
+          onViewRun={(runId) => {
+            const entry = history.find((e) => e.id === runId);
+            if (entry) {
+              setCurrentResult(entry.data as EvalResultData);
+              setSelectedItem(null);
+              setMultiRunIndex(-1);
+              setPreviousTab('trends');
+              setTab('run');
+            }
+          }}
+        />
+      )}
 
       {/* ── Compare Tab ──────────────────────────────────── */}
       {tab === 'compare' && (

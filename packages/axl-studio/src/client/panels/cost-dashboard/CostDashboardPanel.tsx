@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import { DollarSign } from 'lucide-react';
 import { PanelShell } from '../../components/layout/PanelShell';
 import { EmptyState } from '../../components/shared/EmptyState';
@@ -11,8 +11,27 @@ import { cn, formatCost, formatTokens } from '../../lib/utils';
 import type { CostData } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
 
+/** Format "N seconds ago" / "N minutes ago" / "N hours ago" relative to now. */
+function formatRelative(ts: number, now: number): string {
+  const diff = Math.max(0, now - ts);
+  if (diff < 1000) return 'just now';
+  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  return `${Math.floor(diff / 3_600_000)}h ago`;
+}
+
 export function CostDashboardPanel() {
-  const { window, handleWindowChange, data: costs } = useAggregate<CostData>('costs', fetchCosts);
+  const { window, handleWindowChange, data: costs, updatedAt } = useAggregate<CostData>(
+    'costs',
+    fetchCosts,
+  );
+
+  // Re-render every second so "Last updated: Xs ago" stays fresh.
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   if (!costs) {
     return (
@@ -33,6 +52,10 @@ export function CostDashboardPanel() {
   const showReasoning = costs.totalTokens.reasoning > 0;
   const agentCount = Object.keys(costs.byAgent).length;
   const modelCount = Object.keys(costs.byModel).length;
+  const executionsInWindow = Object.values(costs.byWorkflow).reduce(
+    (sum, wf) => sum + wf.executions,
+    0,
+  );
   // Retry overhead: cost spent re-asking the LLM because a gate failed.
   // Back-compat: the `retry` bucket was added after 0.14.x — degrade gracefully
   // if a client is connected to an older server that doesn't emit it.
@@ -377,6 +400,22 @@ export function CostDashboardPanel() {
             />
           </div>
         )}
+      </div>
+
+      {/* Footer: window · last updated · N executions in window */}
+      <div className="mt-6 pt-3 border-t border-[hsl(var(--border))] text-[11px] text-[hsl(var(--muted-foreground))] flex items-center gap-2 flex-wrap">
+        <span>
+          Window: <span className="font-mono">{window}</span>
+        </span>
+        <span className="opacity-40">·</span>
+        <span>
+          Last updated:{' '}
+          {updatedAt != null ? formatRelative(updatedAt, nowTick) : 'pending'}
+        </span>
+        <span className="opacity-40">·</span>
+        <span>
+          {executionsInWindow} execution{executionsInWindow !== 1 ? 's' : ''} in window
+        </span>
       </div>
     </PanelShell>
   );

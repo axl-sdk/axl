@@ -36,11 +36,18 @@ export function WindowSelector({
   onChange: (window: WindowId) => void;
 }) {
   return (
-    <div className="inline-flex items-center gap-0.5 p-0.5 rounded-lg bg-[hsl(var(--muted))]">
+    <div
+      className="inline-flex items-center gap-0.5 p-0.5 rounded-lg bg-[hsl(var(--muted))]"
+      role="radiogroup"
+      aria-label="Time window"
+    >
       {WINDOWS.map((w) => (
         <button
           key={w.id}
           type="button"
+          role="radio"
+          aria-checked={value === w.id}
+          aria-label={`Window: ${w.label}`}
           onClick={() => onChange(w.id)}
           className={cn(
             'px-2.5 py-1 text-xs font-medium rounded-md transition-all cursor-pointer',

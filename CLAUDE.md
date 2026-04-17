@@ -185,18 +185,20 @@ packages/axl-studio/src/
     hooks/
       use-ws.ts      — useWs(channel, callback)
       use-ws-stream.ts — useWsStream(executionId)
+      use-aggregate.ts — useAggregate<T>(channel, fetchFn): window state, REST fetch, WS subscription, updatedAt — used by all four aggregate panels
     components/
-      layout/        — Sidebar, PanelShell
-      shared/        — JsonEditor, JsonViewer, CostBadge, StatusBadge, SchemaForm, StreamingText, StatCard, EmptyState, DurationBadge, TokenBadge, WindowSelector
+      layout/        — Sidebar, PanelShell, PanelHeader
+      shared/        — JsonEditor, JsonViewer, CostBadge, StatusBadge, SchemaForm, StreamingText, StatCard, EmptyState, DurationBadge, TokenBadge, WindowSelector, CommandPicker, TraceEventList
+      shared/charts/ — LineChart (auto y-scale, clamp, hover, point-click), SparkLine (inline fill line), BarChart + StackedBarChart (horizontal bars, stacked segments)
     panels/
       playground/    — Agent Playground (chat, streaming, tool calls)
-      workflow-runner/ — Workflow execution with timeline
-      trace-explorer/ — Waterfall visualization of traces
-      cost-dashboard/ — Cost tracking by agent/model/workflow
+      workflow-runner/ — Workflow execution with timeline, split into Run | Stats tabs (mirrors Trace Explorer). Run tab has the form|results split (form narrowed to 320/360px); Stats tab shows the `WorkflowStatsBar` (clickable rows, p50/p95; clicking a row selects the workflow and switches back to Run)
+      trace-explorer/ — Waterfall visualization of traces; TraceStatsView (event distribution, top-N tools, retry stacks)
+      cost-dashboard/ — Cost tracking by agent/model/workflow; footer with window/updated/count
       memory-browser/ — Memory CRUD + semantic search
       session-manager/ — Session list, replay, handoff chain
       tool-inspector/ — Tool schemas + direct testing
-      eval-runner/   — Eval execution + comparison (EvalSummaryTable, EvalItemList, EvalItemSidebar, EvalItemDetail, ScoreDistribution, EvalCompareView, EvalHistoryTable, EvalCompareItemTable, EvalCompareRunPicker, EvalMultiRunSwitcher). Score colors: 3-tier system (>=0.8 green, >=0.5 amber, <0.5 red)
+      eval-runner/   — Eval execution + comparison (EvalSummaryTable, EvalItemList, EvalItemSidebar, EvalItemDetail, ScoreDistribution, EvalCompareView, EvalHistoryTable, EvalCompareItemTable, EvalCompareRunPicker, EvalMultiRunSwitcher, EvalTrendsView — By Scorer/By Model/Duration views with click-to-run-detail). Score colors: 3-tier system (>=0.8 green, >=0.5 amber, <0.5 red)
 ```
 
 ## Testing

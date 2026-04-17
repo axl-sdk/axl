@@ -11,6 +11,7 @@ import type { WindowId, AggregateBroadcast } from '../lib/types';
 export function useAggregate<T>(channel: string, fetchFn: (w: WindowId) => Promise<T>) {
   const [window, setWindow] = useState<WindowId>(getStoredWindow);
   const [liveSnapshots, setLiveSnapshots] = useState<Record<WindowId, T> | null>(null);
+  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
 
   const { data: fetchedData } = useQuery({
     queryKey: [channel, window],
@@ -21,7 +22,10 @@ export function useAggregate<T>(channel: string, fetchFn: (w: WindowId) => Promi
     channel,
     useCallback((data: unknown) => {
       const broadcast = data as AggregateBroadcast<T>;
-      if (broadcast.snapshots) setLiveSnapshots(broadcast.snapshots);
+      if (broadcast.snapshots) {
+        setLiveSnapshots(broadcast.snapshots);
+        if (typeof broadcast.updatedAt === 'number') setUpdatedAt(broadcast.updatedAt);
+      }
     }, []),
   );
 
@@ -34,5 +38,7 @@ export function useAggregate<T>(channel: string, fetchFn: (w: WindowId) => Promi
     window,
     handleWindowChange,
     data: liveSnapshots?.[window] ?? fetchedData ?? null,
+    /** Epoch ms of the most recent WS broadcast. Null until the first broadcast arrives. */
+    updatedAt,
   };
 }

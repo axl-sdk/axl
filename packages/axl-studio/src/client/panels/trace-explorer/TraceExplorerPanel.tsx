@@ -1,27 +1,19 @@
 import { useState, useCallback, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import {
-  Activity,
-  ChevronDown,
-  ChevronRight,
-  ChevronsDownUp,
-  ChevronsUpDown,
-  RefreshCw,
-} from 'lucide-react';
+import { Activity, RefreshCw } from 'lucide-react';
 import { PanelHeader } from '../../components/layout/PanelHeader';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { TraceStatsView } from './TraceStatsView';
 import { StatusBadge } from '../../components/shared/StatusBadge';
 import { CostBadge } from '../../components/shared/CostBadge';
-import { DurationBadge } from '../../components/shared/DurationBadge';
 import { JsonViewer } from '../../components/shared/JsonViewer';
 import { CommandPicker } from '../../components/shared/CommandPicker';
+import { TraceEventList } from '../../components/shared/TraceEventList';
 import { fetchExecutions } from '../../lib/api';
 import { useWs } from '../../hooks/use-ws';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
 import type { ExecutionInfo, TraceEvent } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
-import { getBarColor, getDepth } from '../../lib/trace-utils';
 
 type FilterOption = { value: string; label: string };
 
@@ -59,7 +51,6 @@ export function TraceExplorerPanel() {
   const [liveEvents, setLiveEvents] = useState<TraceEvent[]>([]);
   const [typeFilter, setTypeFilter] = useState('');
   const [agentFilter, setAgentFilter] = useState('');
-  const [expandedEvents, setExpandedEvents] = useState<Set<string | number>>(new Set());
 
   const { data: executions = [], refetch } = useQuery({
     queryKey: ['executions'],
@@ -104,25 +95,6 @@ export function TraceExplorerPanel() {
 
   // Waterfall visualization: compute relative widths
   const maxDuration = Math.max(...filteredEvents.map((e) => e.duration ?? 0), 1);
-
-  // Expand/collapse helpers
-  const toggleEvent = (key: string | number) => {
-    setExpandedEvents((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  };
-
-  const expandAll = () => {
-    const keys = filteredEvents.map((e, i) => e.step ?? i);
-    setExpandedEvents(new Set(keys));
-  };
-
-  const collapseAll = () => {
-    setExpandedEvents(new Set());
-  };
 
   // Stat cards for selected execution
   const stats = useMemo(() => {
@@ -259,7 +231,6 @@ export function TraceExplorerPanel() {
               <button
                 onClick={() => {
                   setSelectedExecution(null);
-                  setExpandedEvents(new Set());
                 }}
                 className={cn(
                   'w-full text-left px-3 py-2 text-xs rounded-xl border',
@@ -275,7 +246,6 @@ export function TraceExplorerPanel() {
                   key={exec.executionId}
                   onClick={() => {
                     setSelectedExecution(exec);
-                    setExpandedEvents(new Set());
                   }}
                   className={cn(
                     'w-full text-left px-3 py-2.5 text-xs rounded-xl border border-l-[3px] transition-colors',
@@ -342,33 +312,6 @@ export function TraceExplorerPanel() {
                 </div>
               )}
 
-              {/* Toolbar row */}
-              <div className="flex items-center justify-between mb-3">
-                <span className="text-xs text-[hsl(var(--muted-foreground))]">
-                  {filteredEvents.length} events
-                </span>
-                {filteredEvents.length > 0 && (
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={expandAll}
-                      className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md hover:bg-[hsl(var(--accent))] text-[hsl(var(--muted-foreground))]"
-                      title="Expand all"
-                    >
-                      <ChevronsUpDown size={12} />
-                      Expand
-                    </button>
-                    <button
-                      onClick={collapseAll}
-                      className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded-md hover:bg-[hsl(var(--accent))] text-[hsl(var(--muted-foreground))]"
-                      title="Collapse all"
-                    >
-                      <ChevronsDownUp size={12} />
-                      Collapse
-                    </button>
-                  </div>
-                )}
-              </div>
-
               {filteredEvents.length === 0 ? (
                 <EmptyState
                   icon={<Activity size={32} />}
@@ -376,94 +319,11 @@ export function TraceExplorerPanel() {
                   description="Execute a workflow to see trace events here."
                 />
               ) : (
-                <div className="space-y-1">
-                  {filteredEvents.map((event, i) => {
-                    const depth = getDepth(event);
-                    const eventKey = event.step ?? i;
-                    const isExpanded = expandedEvents.has(eventKey);
-                    return (
-                      <div key={eventKey}>
-                        <button
-                          onClick={() => toggleEvent(eventKey)}
-                          className="w-full flex items-center gap-2 px-3 py-1.5 text-xs rounded-xl bg-[hsl(var(--secondary))] cursor-pointer hover:bg-[hsl(var(--accent))] text-left"
-                          style={{ marginLeft: `${depth * 16}px` }}
-                        >
-                          {isExpanded ? (
-                            <ChevronDown
-                              size={12}
-                              className="shrink-0 text-[hsl(var(--muted-foreground))]"
-                            />
-                          ) : (
-                            <ChevronRight
-                              size={12}
-                              className="shrink-0 text-[hsl(var(--muted-foreground))]"
-                            />
-                          )}
-                          <span className="font-mono text-[hsl(var(--muted-foreground))] w-8">
-                            #{event.step != null ? event.step : i}
-                          </span>
-                          <span
-                            className={`w-1.5 h-1.5 rounded-full shrink-0 ${getBarColor(event.type)}`}
-                          />
-                          <span className="font-medium w-28 truncate">{event.type}</span>
-                          {event.agent && (
-                            <span className="text-blue-600 dark:text-blue-400 w-28 truncate">
-                              {event.agent}
-                            </span>
-                          )}
-                          {event.tool && (
-                            <span className="text-purple-600 dark:text-purple-400 w-28 truncate">
-                              {event.tool}
-                            </span>
-                          )}
-                          {/* Waterfall bar */}
-                          <div className="flex-1 h-3 bg-[hsl(var(--background))] rounded overflow-hidden">
-                            {event.duration != null && event.duration > 0 && (
-                              <div
-                                className={`h-full rounded ${getBarColor(event.type)}`}
-                                style={{
-                                  width: `${Math.max((event.duration / maxDuration) * 100, 2)}%`,
-                                  opacity: 0.7,
-                                }}
-                              />
-                            )}
-                          </div>
-                          {event.duration != null && <DurationBadge ms={event.duration} />}
-                          {event.cost != null && event.cost > 0 && <CostBadge cost={event.cost} />}
-                        </button>
-                        {isExpanded && (
-                          <div
-                            className="mt-1 mb-2 p-3 rounded-xl bg-[hsl(var(--card))] border border-[hsl(var(--border))]"
-                            style={{ marginLeft: `${depth * 16 + 32}px` }}
-                          >
-                            {event.model && (
-                              <p className="text-xs mb-1">
-                                <strong>Model:</strong> {event.model}
-                              </p>
-                            )}
-                            {event.promptVersion && (
-                              <p className="text-xs mb-1">
-                                <strong>Version:</strong> {event.promptVersion}
-                              </p>
-                            )}
-                            {event.tokens && (
-                              <p className="text-xs mb-1">
-                                <strong>Tokens:</strong> in={event.tokens.input} out=
-                                {event.tokens.output}
-                                {event.tokens.reasoning
-                                  ? ` reasoning=${event.tokens.reasoning}`
-                                  : ''}
-                              </p>
-                            )}
-                            {event.data != null && (
-                              <JsonViewer data={event.data as Record<string, unknown>} collapsed />
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
+                /* Shared trace-event renderer — owns its own Expand/Collapse
+                   toolbar, expand/collapse state, and TraceExpandContext so
+                   "Expand" cascades into nested TextBlocks (system prompt,
+                   prompt, response) and embedded JSON dumps. */
+                <TraceEventList events={filteredEvents} maxDuration={maxDuration} />
               )}
             </div>
           </div>

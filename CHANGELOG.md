@@ -19,16 +19,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Studio:** `GET /api/eval-trends?window=` — per-eval score trends (latest, mean, std), cost breakdown, run timeline
 - **Studio:** `GET /api/workflow-stats?window=` — per-workflow total/completed/failed counts, p50/p95/avg duration, failure rate
 - **Studio:** `GET /api/trace-stats?window=` — event type distribution, tool call counts (calls/approved/denied), retry breakdown by agent
-- **Studio:** Eval Runner "Trends" tab with per-eval scorer history, cost tracking, and recent runs
-- **Studio:** Workflow Runner stats bar with execution counts, failure rate, and duration percentiles
-- **Studio:** Trace Explorer "Stats" tab with event distribution, tool usage, and retry analysis
+- **Studio:** Eval Runner "Trends" tab with per-eval line chart (one line per scorer), cost-over-time sparkline, per-scorer Latest/Mean/Std table, and a segmented "By Scorer | By Model | Duration" view toggle. The By Model view groups runs by the most-called model from `metadata.modelCounts` to answer "did upgrading models improve scores?". Duration view plots run duration per model, showing the speed/quality tradeoff. Clicking a point navigates to the run detail.
+- **Studio:** Workflow Runner stats bar with execution counts, failure rate, and duration percentiles. Clicking a workflow row in the stats table selects it for the next run.
+- **Studio:** Trace Explorer "Stats" tab — event type distribution, top-N tool-calls bar chart, retry-by-agent stacked bar (segments per schema/validate/guardrail), tool-approval/denial stacked bar
+- **Studio:** Cost Dashboard footer ("Window · Last updated · N executions") showing how fresh the aggregate is and how many executions fall in the window
+- **Studio:** Workflow Runner split into `Run | Stats` tabs (mirrors Trace Explorer's `Events | Stats` pattern). Run tab: form|results split (form column narrowed from 400/480 to 320/360px so result JSON + timeline get more horizontal room). Stats tab: `WorkflowStatsBar` as the sole panel body — no longer competes with the form for vertical space, and row-click still selects the workflow (then switches back to Run)
+- **Studio:** Shared chart primitives in `components/shared/charts/`: `LineChart` (multi-series, auto-scaled y-axis with optional clamp, hover tooltip with overflow-aware positioning, point-click navigation, non-hovered line dimming, ARIA role/label), `SparkLine` (inline trend with optional fill), `BarChart` + `StackedBarChart` (horizontal bars with proportion scaling)
+- **Studio:** `useAggregate<T>(channel, fetchFn)` shared client hook wiring window state, REST fetch, WS subscription, and `updatedAt` freshness to any aggregate panel
+- **Studio:** `EvalTrendRun` now carries `model` and `duration` (server + client types) so trend charts can segment and compare without refetching raw history entries
+- **Studio:** `AggregateSnapshots` constructor accepts a `broadcastTransform` option to enrich/strip state before WS broadcast — the `workflow-stats` aggregator uses this to ship `durationP50`/`durationP95` to clients instead of the internal `durations` array
 - **Runtime:** `AxlRuntime.saveEvalResult()` now emits `eval_result` event for live eval aggregation
 
 ### Fixed
 
+- **Studio:** `reduceEvalTrends.extractScores` / `extractCost` read wrong paths in `EvalResult` (`summary.scores[name]` and `summary.totalCost` instead of `summary.scorers[name].mean` and top-level `totalCost`), which silently returned empty scores and zero cost for every saved eval. Now reads the correct paths with a back-compat fallback for legacy `summary.totalCost` fixtures
 - **Studio:** `reduceEvalTrends` `runCount` tracked capped array length (max 50) instead of actual total — now uses independent counter
 - **Studio:** `reduceTraceStats` silently dropped `tool_approval` events — `approved` and `denied` counters now increment for both `tool_approval` and `tool_denied` event types
 - **Studio:** Workflow Runner WS live updates showed "—" for p50/p95 because `AggregateSnapshots` broadcast sent raw `WorkflowStatsData` (with `durations` array) while client expected enriched format — added `broadcastTransform` option that applies `enrichWorkflowStats` before WS broadcast
+- **Studio:** `extractModel` tie-breaking (when two models have identical call counts) was non-deterministic (dependent on `Object.entries` insertion order). Now breaks ties alphabetically.
+- **Studio:** `LineChart` silently produced invalid SVG paths when a series had NaN y-values — filters non-finite points before rendering
+- **Studio:** Workflow Runner and Trace Explorer regressed the shared `TraceEventList` renderer in a prior refactor, silently dropping the Expand-all toolbar, retry pills, gate-failure amber tint, attempt counter pills, `AgentCallBody`/`GateCheckBody`/`ToolApprovalBody` collapsibles (system prompt / prompt / response / feedback), `TraceJsonViewer` context-aware JSON expansion, `CostBadge` on rows, and `DurationBadge`. Both panels now route through `TraceEventList` again. A tripwire test in `panel-trace-list-tripwire.test.ts` catches future re-regressions at the source level
+- **Studio:** `trace-utils.ts` `EVENT_COLORS` / `getDepth` referenced `workflow_complete` and `tool_call_complete` as event types — these names don't exist in the `TraceEvent` union. Removed the dead branches
+- **Studio:** Chart tooltip overflowed the right edge of the chart container — now flips to the left of the cursor when the point is in the right half, with a `max-width: 240px` cap
+- **Studio:** Chart point cursor didn't change to `pointer` when a click handler was wired (hover indicator circle overlapped the small clickable dots). Chart-level click + cursor now fire whenever hover is active
+- **Studio:** `LineChart` hover logic picked the nearest point per series and then filtered to the first series' `snapX`, causing the hover indicator to miss points in views where series don't share x-values (e.g., By Model). Now picks the globally nearest point and snaps to its x
 
 ## [0.14.0] - 2026-04-14
 

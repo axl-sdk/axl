@@ -3,12 +3,10 @@ import type { TraceEvent } from './types';
 export const EVENT_COLORS: Record<string, string> = {
   agent_call: 'bg-blue-500',
   tool_call: 'bg-purple-500',
-  tool_call_complete: 'bg-purple-400',
   tool_approval: 'bg-purple-300',
   tool_denied: 'bg-red-400',
   workflow_start: 'bg-green-500',
   workflow_end: 'bg-green-400',
-  workflow_complete: 'bg-green-400',
   handoff: 'bg-amber-500',
   delegate: 'bg-amber-400',
   await_human: 'bg-red-500',
@@ -31,13 +29,11 @@ export function getDepth(event: TraceEvent): number {
   // extra indent so the visual hierarchy matches the actual call graph. The
   // extra depth is additive on top of the type-based depth below.
   const nestedBoost = event.parentToolCallId ? 2 : 0;
-  if (type === 'workflow_start' || type === 'workflow_end' || type === 'workflow_complete')
-    return 0 + nestedBoost;
+  if (type === 'workflow_start' || type === 'workflow_end') return 0 + nestedBoost;
   if (type === 'agent_call' || type === 'spawn' || type === 'vote_start' || type === 'delegate')
     return 1 + nestedBoost;
   if (
     type === 'tool_call' ||
-    type === 'tool_call_complete' ||
     type === 'tool_approval' ||
     type === 'tool_denied' ||
     type === 'handoff' ||

@@ -55,17 +55,22 @@ function makeExecution(overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
   };
 }
 
+/** Build a data blob matching the real EvalResult shape:
+ *  top-level `totalCost`, `summary.scorers[name] = { mean, ... }`. */
+function makeEvalData(scores: Record<string, number>, totalCost: number) {
+  const scorers: Record<string, { mean: number; min: number; max: number; p50: number; p95: number }> = {};
+  for (const [name, score] of Object.entries(scores)) {
+    scorers[name] = { mean: score, min: score, max: score, p50: score, p95: score };
+  }
+  return { totalCost, summary: { scorers } };
+}
+
 function makeEvalEntry(overrides: Partial<EvalHistoryEntry> = {}): EvalHistoryEntry {
   return {
     id: 'eval-1',
     eval: 'accuracy',
     timestamp: Date.now(),
-    data: {
-      summary: {
-        scores: { exact_match: 0.8 },
-        totalCost: 0.05,
-      },
-    },
+    data: makeEvalData({ exact_match: 0.8 }, 0.05),
     ...overrides,
   };
 }
@@ -244,7 +249,7 @@ describe('reduceEvalTrends runCount cap regression', () => {
           id: `run-${i}`,
           eval: 'accuracy',
           timestamp: Date.now() + i * 1000,
-          data: { summary: { scores: { acc: 0.8 }, totalCost: 0.01 } },
+          data: makeEvalData({ acc: 0.8 }, 0.01),
         }),
       );
     }
@@ -267,7 +272,7 @@ describe('reduceEvalTrends runCount cap regression', () => {
           id: `run-${i}`,
           eval: 'accuracy',
           timestamp: Date.now() + i * 1000,
-          data: { summary: { scores: { acc: 0.8 }, totalCost: 0.01 } },
+          data: makeEvalData({ acc: 0.8 }, 0.01),
         }),
       );
     }
@@ -286,7 +291,7 @@ describe('reduceEvalTrends runCount cap regression', () => {
           id: `run-${i}`,
           eval: 'accuracy',
           timestamp: Date.now() + i * 1000,
-          data: { summary: { scores: {}, totalCost: 0.1 } },
+          data: makeEvalData({}, 0.1),
         }),
       );
     }
@@ -540,7 +545,7 @@ describe('reduceEvalTrends hardening', () => {
         id: 'older',
         eval: 'accuracy',
         timestamp: now - 60_000,
-        data: { summary: { scores: { acc: 0.7 }, totalCost: 0 } },
+        data: makeEvalData({ acc: 0.7 }, 0),
       }),
     );
     state = reduceEvalTrends(
@@ -549,7 +554,7 @@ describe('reduceEvalTrends hardening', () => {
         id: 'newest',
         eval: 'accuracy',
         timestamp: now,
-        data: { summary: { scores: { acc: 0.95 }, totalCost: 0 } },
+        data: makeEvalData({ acc: 0.95 }, 0),
       }),
     );
 
@@ -561,22 +566,25 @@ describe('reduceEvalTrends hardening', () => {
     state = reduceEvalTrends(
       state,
       makeEvalEntry({
-        data: { summary: { scores: { acc: 0.8 }, totalCost: 0 } },
+        data: makeEvalData({ acc: 0.8 }, 0),
       }),
     );
     expect(state.byEval['accuracy'].scoreStd['acc']).toBe(0);
   });
 
-  it('handles NaN scores by including them in stats', () => {
+  it('filters NaN scores out of the per-scorer map', () => {
     let state = emptyEvalTrendData();
     state = reduceEvalTrends(
       state,
       makeEvalEntry({
-        data: { summary: { scores: { acc: NaN }, totalCost: 0 } },
+        data: makeEvalData({ acc: NaN }, 0),
       }),
     );
-    // NaN is not null, so it passes the filter
-    expect(state.byEval['accuracy'].scoreMean['acc']).toBeNaN();
+    // extractScores uses Number.isFinite, so NaN scorers are dropped entirely.
+    // The run still counts (totalRuns=1) but no score column is tracked.
+    expect(state.totalRuns).toBe(1);
+    expect(state.byEval['accuracy'].runs[0].scores).toEqual({});
+    expect(state.byEval['accuracy'].scoreMean['acc']).toBeUndefined();
   });
 
   it('multiple evals with different names are independent', () => {

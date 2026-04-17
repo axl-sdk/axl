@@ -39,17 +39,22 @@ function makeExecution(overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
   };
 }
 
+/** Build a data blob matching the real EvalResult shape:
+ *  top-level `totalCost`, and `summary.scorers[name] = { mean, min, max, p50, p95 }`. */
+function makeEvalData(scores: Record<string, number>, totalCost: number) {
+  const scorers: Record<string, { mean: number; min: number; max: number; p50: number; p95: number }> = {};
+  for (const [name, score] of Object.entries(scores)) {
+    scorers[name] = { mean: score, min: score, max: score, p50: score, p95: score };
+  }
+  return { totalCost, summary: { scorers } };
+}
+
 function makeEvalEntry(overrides: Partial<EvalHistoryEntry> = {}): EvalHistoryEntry {
   return {
     id: 'eval-1',
     eval: 'accuracy',
     timestamp: Date.now(),
-    data: {
-      summary: {
-        scores: { exact_match: 0.8, f1: 0.9 },
-        totalCost: 0.05,
-      },
-    },
+    data: makeEvalData({ exact_match: 0.8, f1: 0.9 }, 0.05),
     ...overrides,
   };
 }
@@ -294,14 +299,14 @@ describe('reduceEvalTrends', () => {
       state,
       makeEvalEntry({
         id: 'r1',
-        data: { summary: { scores: { acc: 0.8 }, totalCost: 0 } },
+        data: makeEvalData({ acc: 0.8 }, 0),
       }),
     );
     state = reduceEvalTrends(
       state,
       makeEvalEntry({
         id: 'r2',
-        data: { summary: { scores: { acc: 0.6 }, totalCost: 0 } },
+        data: makeEvalData({ acc: 0.6 }, 0),
       }),
     );
 
@@ -324,14 +329,14 @@ describe('reduceEvalTrends', () => {
       state,
       makeEvalEntry({
         eval: 'a',
-        data: { summary: { scores: {}, totalCost: 0.1 } },
+        data: makeEvalData({}, 0.1),
       }),
     );
     state = reduceEvalTrends(
       state,
       makeEvalEntry({
         eval: 'b',
-        data: { summary: { scores: {}, totalCost: 0.2 } },
+        data: makeEvalData({}, 0.2),
       }),
     );
     expect(state.totalCost).toBeCloseTo(0.3);
@@ -355,7 +360,7 @@ describe('reduceEvalTrends', () => {
         id: 'newest',
         eval: 'accuracy',
         timestamp: now,
-        data: { summary: { scores: { acc: 0.95 }, totalCost: 0 } },
+        data: makeEvalData({ acc: 0.95 }, 0),
       }),
     );
     state = reduceEvalTrends(
@@ -364,7 +369,7 @@ describe('reduceEvalTrends', () => {
         id: 'older',
         eval: 'accuracy',
         timestamp: now - 60_000,
-        data: { summary: { scores: { acc: 0.7 }, totalCost: 0 } },
+        data: makeEvalData({ acc: 0.7 }, 0),
       }),
     );
 

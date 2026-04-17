@@ -232,6 +232,10 @@ export type EvalTrendData = {
         id: string;
         scores: Record<string, number>;
         cost: number;
+        /** Primary model (first of `metadata.models`). Undefined for legacy runs. */
+        model?: string;
+        /** Total run duration in ms. */
+        duration?: number;
       }>;
       latestScores: Record<string, number>;
       scoreMean: Record<string, number>;

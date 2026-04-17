@@ -172,6 +172,11 @@ export type EvalTrendRun = {
   id: string;
   scores: Record<string, number>;
   cost: number;
+  /** Primary model for this run (first entry of `metadata.models`). Undefined
+   *  when the run has no recorded models (e.g., legacy data or test harnesses). */
+  model?: string;
+  /** Total run duration in ms (from `EvalResult.duration`). */
+  duration?: number;
 };
 
 export type EvalTrendEntry = {
@@ -193,22 +198,74 @@ export function emptyEvalTrendData(): EvalTrendData {
   return { byEval: {}, totalRuns: 0, totalCost: 0 };
 }
 
-/** Extract scores from an EvalHistoryEntry's data blob. */
+/** Extract per-scorer aggregate score from an EvalHistoryEntry's data blob.
+ *  The EvalResult shape is `{ summary: { scorers: Record<string, { mean, min,
+ *  max, p50, p95 }> }, ... }`. We take `mean` as the representative score for
+ *  each scorer in this run — what gets plotted on the trend line. */
 function extractScores(data: unknown): Record<string, number> {
   if (!data || typeof data !== 'object') return {};
   const result = data as Record<string, unknown>;
-  // EvalResult.summary?.scores is the standard location
   const summary = result.summary as Record<string, unknown> | undefined;
-  const scores = summary?.scores as Record<string, number> | undefined;
-  return scores ?? {};
+  const scorers = summary?.scorers as
+    | Record<string, { mean?: number } | number>
+    | undefined;
+  if (!scorers) return {};
+  const out: Record<string, number> = {};
+  for (const [name, entry] of Object.entries(scorers)) {
+    if (typeof entry === 'number' && Number.isFinite(entry)) {
+      out[name] = entry;
+    } else if (entry && typeof entry === 'object' && Number.isFinite(entry.mean)) {
+      out[name] = entry.mean as number;
+    }
+  }
+  return out;
 }
 
-/** Extract cost from an EvalHistoryEntry's data blob. */
+/** Extract total cost from an EvalHistoryEntry's data blob.
+ *  `EvalResult.totalCost` is at the top level (not under summary). */
 function extractCost(data: unknown): number {
   if (!data || typeof data !== 'object') return 0;
   const result = data as Record<string, unknown>;
+  if (Number.isFinite(result.totalCost)) return result.totalCost as number;
+  // Back-compat: some early tests/fixtures put it under summary.totalCost
   const summary = result.summary as Record<string, unknown> | undefined;
   return Number.isFinite(summary?.totalCost) ? (summary!.totalCost as number) : 0;
+}
+
+/** Extract the primary model for this run.
+ *  Prefers the most-called model from `metadata.modelCounts`, falling back to
+ *  `metadata.models[0]`. Returns undefined if no model is recorded — UI groups
+ *  those runs under "unknown". For a mixed-model run (e.g., classify-then-answer),
+ *  the most-called model is the honest "primary" choice. */
+function extractModel(data: unknown): string | undefined {
+  if (!data || typeof data !== 'object') return undefined;
+  const result = data as Record<string, unknown>;
+  const metadata = result.metadata as
+    | { models?: unknown; modelCounts?: unknown }
+    | undefined;
+  const counts = metadata?.modelCounts;
+  if (counts && typeof counts === 'object' && !Array.isArray(counts)) {
+    const entries = Object.entries(counts as Record<string, unknown>).filter(
+      ([, v]) => typeof v === 'number',
+    ) as Array<[string, number]>;
+    if (entries.length > 0) {
+      // Secondary alphabetical sort breaks ties deterministically so two
+      // runs with the same modelCounts (e.g., { a: 3, b: 3 } vs { b: 3, a: 3 })
+      // always resolve to the same "primary model" regardless of insertion order.
+      entries.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+      return entries[0][0];
+    }
+  }
+  const models = metadata?.models;
+  if (Array.isArray(models) && typeof models[0] === 'string') return models[0];
+  return undefined;
+}
+
+/** Extract run duration in ms from `EvalResult.duration`. */
+function extractDuration(data: unknown): number | undefined {
+  if (!data || typeof data !== 'object') return undefined;
+  const result = data as Record<string, unknown>;
+  return Number.isFinite(result.duration) ? (result.duration as number) : undefined;
 }
 
 /** Compute mean and std for score arrays. */
@@ -237,11 +294,15 @@ function computeScoreStats(runs: EvalTrendRun[]): {
 export function reduceEvalTrends(acc: EvalTrendData, entry: EvalHistoryEntry): EvalTrendData {
   const scores = extractScores(entry.data);
   const cost = extractCost(entry.data);
+  const model = extractModel(entry.data);
+  const duration = extractDuration(entry.data);
   const run: EvalTrendRun = {
     timestamp: entry.timestamp,
     id: entry.id,
     scores,
     cost,
+    ...(model !== undefined ? { model } : {}),
+    ...(duration !== undefined ? { duration } : {}),
   };
 
   const byEval = { ...acc.byEval };

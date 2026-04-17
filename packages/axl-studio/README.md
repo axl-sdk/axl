@@ -139,8 +139,10 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `POST /api/tools/:name/test` | Test a tool with `{ input: {...} }` |
 | `GET /api/sessions` | List sessions |
 | `GET /api/executions` | List executions |
-| `GET /api/costs` | Aggregated cost data |
-| `POST /api/costs/reset` | Reset cost counters |
+| `GET /api/costs?window=24h\|7d\|30d\|all` | Aggregated cost data for a time window (default `7d`). `?windows=all` returns all four windows at once for debugging |
+| `GET /api/eval-trends?window=` | Per-eval score trends (latest, mean, std), cost totals, recent runs with `model`/`duration` |
+| `GET /api/workflow-stats?window=` | Per-workflow totals, completed/failed counts, p50/p95/avg duration, failure rate |
+| `GET /api/trace-stats?window=` | Event-type distribution, tool call counts (calls/approved/denied), retry breakdown by agent |
 | `GET /api/memory/:scope/:key` | Read memory entry |
 | `PUT /api/memory/:scope/:key` | Save memory entry |
 | `DELETE /api/memory/:scope/:key` | Delete memory entry |
@@ -166,7 +168,7 @@ Single endpoint at `ws://localhost:4400/ws` with channel multiplexing:
 { "type": "event", "channel": "trace:abc-123", "data": { ... } }
 ```
 
-Channels: `execution:{id}`, `trace:{id}`, `trace:*`, `costs`, `decisions`. Execution channels have replay buffering — late subscribers receive the full event history (capped at 500 events, cleaned up 30s after stream completes).
+Channels: `execution:{id}`, `trace:{id}`, `trace:*`, `eval:{id}`, `eval:*`, `costs`, `eval-trends`, `workflow-stats`, `trace-stats`, `decisions`. Execution and eval channels have replay buffering — late subscribers receive the full event history (capped at 500 events, cleaned up 30s after stream completes). Aggregate channels (`costs`, `eval-trends`, `workflow-stats`, `trace-stats`) broadcast `{ snapshots: Record<WindowId, State>, updatedAt }` on every fold or rebuild.
 
 ## Embeddable Middleware
 
@@ -443,10 +445,15 @@ src/
   server/
     index.ts              createServer() — Hono app composition (basePath, readOnly, cors)
     types.ts              API types, WebSocket message types
-    cost-aggregator.ts    Accumulates cost from trace events
+    aggregates/
+      aggregate-snapshots.ts  AggregateSnapshots<State> helper (per-window state, fold, replace, broadcastTransform)
+      trace-aggregator.ts     TraceAggregator<State> — TraceEvent consumer (costs, trace-stats)
+      execution-aggregator.ts ExecutionAggregator<State> — ExecutionInfo consumer (workflow-stats)
+      eval-aggregator.ts      EvalAggregator<State> — EvalHistoryEntry consumer (eval-trends)
+      reducers.ts             Pure reducers: reduceCost, reduceWorkflowStats, reduceTraceStats, reduceEvalTrends + enrichWorkflowStats
     middleware/
       error-handler.ts    Axl errors → JSON error envelope
-    routes/               One file per resource (health, workflows, agents, tools, etc.)
+    routes/               One file per resource (health, workflows, agents, tools, costs, eval-trends, workflow-stats, trace-stats, evals, etc.)
     ws/
       handler.ts          WebSocket message routing (Hono adapter)
       connection-manager.ts  Channel subscriptions + broadcast (BroadcastTarget) + replay buffer for execution channels

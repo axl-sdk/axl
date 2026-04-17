@@ -11,10 +11,9 @@ import { CommandPicker } from '../../components/shared/CommandPicker';
 import { fetchWorkflows, fetchWorkflow, executeWorkflow } from '../../lib/api';
 import { useWsStream } from '../../hooks/use-ws-stream';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
-import type { TraceEvent } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
+import { TraceEventList } from '../../components/shared/TraceEventList';
 import { WorkflowStatsBar } from './WorkflowStatsBar';
-import { getBarColor, getDepth } from '../../lib/trace-utils';
 
 export function WorkflowRunnerPanel() {
   const [selectedWorkflow, setSelectedWorkflow] = useState('');
@@ -24,6 +23,11 @@ export function WorkflowRunnerPanel() {
   const [result, setResult] = useState<unknown>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string>('idle');
+  // "run" holds the form + live/last execution result; "stats" shows the
+  // aggregate WorkflowStatsBar. Split into tabs (following Trace Explorer's
+  // Events|Stats pattern) because cohabiting form + results + stats in one
+  // body made the form cramped and turned the stats into a "dead top strip".
+  const [wfTab, setWfTab] = useState<'run' | 'stats'>('run');
 
   const { data: workflows = [] } = useQuery({
     queryKey: ['workflows'],
@@ -185,10 +189,50 @@ export function WorkflowRunnerPanel() {
         }
       />
 
-      {/* ── Body ───────────────────────────────────────── */}
-      <div className="flex-1 min-h-0 flex border-t border-[hsl(var(--border))]">
-        {/* Left: Input configuration */}
-        <div className="w-[400px] xl:w-[480px] shrink-0 border-r border-[hsl(var(--border))] overflow-y-auto p-5 space-y-4">
+      {/* ── Tabs ─────────────────────────────────────── */}
+      <div
+        role="tablist"
+        aria-label="Workflow Runner views"
+        className="shrink-0 flex items-center gap-1 px-6 border-b border-[hsl(var(--border))]"
+      >
+        {(['run', 'stats'] as const).map((t) => (
+          <button
+            key={t}
+            type="button"
+            role="tab"
+            aria-selected={wfTab === t}
+            onClick={() => setWfTab(t)}
+            className={cn(
+              'px-3 py-2.5 text-sm -mb-px border-b-2 transition-colors cursor-pointer',
+              wfTab === t
+                ? 'border-[hsl(var(--foreground))] text-[hsl(var(--foreground))] font-medium'
+                : 'border-transparent text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]',
+            )}
+          >
+            {t.charAt(0).toUpperCase() + t.slice(1)}
+          </button>
+        ))}
+      </div>
+
+      {/* ── Stats Tab ─────────────────────────────────── */}
+      {wfTab === 'stats' && (
+        <div className="flex-1 min-h-0 overflow-auto p-5">
+          <WorkflowStatsBar
+            onWorkflowClick={(name) => {
+              handleSelectWorkflow(name);
+              setWfTab('run');
+            }}
+            selectedWorkflow={selectedWorkflow}
+          />
+        </div>
+      )}
+
+      {/* ── Run Tab ───────────────────────────────────── */}
+      {wfTab === 'run' && (
+      <div className="flex-1 min-h-0 flex">
+        {/* Left: Input configuration — narrower than before so Result +
+            Timeline get more horizontal room. */}
+        <div className="w-[320px] xl:w-[360px] shrink-0 border-r border-[hsl(var(--border))] overflow-y-auto p-5 space-y-4">
           {/* Input mode toggle */}
           {hasSchema && (
             <div className="flex items-center gap-1">
@@ -246,7 +290,6 @@ export function WorkflowRunnerPanel() {
 
         {/* Right: Results */}
         <div className="flex-1 overflow-y-auto p-5">
-          <WorkflowStatsBar />
           {status === 'idle' ? (
             <div className="flex items-center justify-center h-full">
               <EmptyState
@@ -285,81 +328,17 @@ export function WorkflowRunnerPanel() {
                 </div>
               )}
 
-              {/* Timeline */}
+              {/* Timeline — shares the trace explorer's row/body renderer
+                  via `TraceEventList`. Same look, same expand/collapse
+                  semantics (recursive into inner sections via
+                  TraceExpandContext), same system prompt / prompt /
+                  response collapsible blocks. */}
               {timelineEvents.length > 0 && (
                 <div>
                   <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
                     Timeline
                   </h3>
-                  <div className="space-y-1">
-                    {timelineEvents.map((event: TraceEvent, i: number) => {
-                      const depth = getDepth(event);
-                      return (
-                        <details key={i} className="group">
-                          <summary
-                            className="flex items-center gap-2 px-3 py-1.5 text-xs rounded-xl bg-[hsl(var(--secondary))] cursor-pointer hover:bg-[hsl(var(--accent))]"
-                            style={{ marginLeft: `${depth * 16}px` }}
-                          >
-                            <span className="font-mono text-[hsl(var(--muted-foreground))] w-8">
-                              #{event.step}
-                            </span>
-                            <span
-                              className={`w-1.5 h-1.5 rounded-full shrink-0 ${getBarColor(event.type)}`}
-                            />
-                            <span className="font-medium w-24 truncate">{event.type}</span>
-                            {event.agent && (
-                              <span className="text-blue-600 dark:text-blue-400 w-24 truncate">
-                                {event.agent}
-                              </span>
-                            )}
-                            {event.tool && (
-                              <span className="text-purple-600 dark:text-purple-400 w-24 truncate">
-                                {event.tool}
-                              </span>
-                            )}
-                            <div className="flex-1 h-3 bg-[hsl(var(--background))] rounded overflow-hidden">
-                              {event.duration != null && event.duration > 0 && (
-                                <div
-                                  className={`h-full rounded ${getBarColor(event.type)}`}
-                                  style={{
-                                    width: `${Math.max((event.duration / maxDuration) * 100, 2)}%`,
-                                    opacity: 0.7,
-                                  }}
-                                />
-                              )}
-                            </div>
-                            {event.duration != null && (
-                              <span className="text-[10px] font-mono text-[hsl(var(--muted-foreground))]">
-                                {formatDuration(event.duration)}
-                              </span>
-                            )}
-                          </summary>
-                          <div
-                            className="mt-1 mb-2 p-3 rounded-xl bg-[hsl(var(--card))] border border-[hsl(var(--border))]"
-                            style={{ marginLeft: `${depth * 16 + 32}px` }}
-                          >
-                            {event.model && (
-                              <p className="text-xs mb-1">
-                                <strong>Model:</strong> {event.model}
-                              </p>
-                            )}
-                            {event.tokens && (
-                              <p className="text-xs mb-1">
-                                <strong>Tokens:</strong> in={event.tokens.input} out=
-                                {event.tokens.output}
-                                {event.tokens.reasoning
-                                  ? ` reasoning=${event.tokens.reasoning}`
-                                  : ''}
-                              </p>
-                            )}
-                            {event.data != null && (
-                              <JsonViewer data={event.data as Record<string, unknown>} collapsed />
-                            )}
-                          </div>
-                        </details>
-                      );
-                    })}
-                  </div>
+                  <TraceEventList events={timelineEvents} maxDuration={maxDuration} />
                 </div>
               )}
 
@@ -374,6 +353,7 @@ export function WorkflowRunnerPanel() {
           )}
         </div>
       </div>
+      )}
     </div>
   );
 }

@@ -11,11 +11,19 @@ import type {
 import { WorkflowContext, MemoryStore, ProviderRegistry, eventCostContribution } from '@axlsdk/axl';
 import type { WorkflowContextInit } from '@axlsdk/axl';
 
+// `WorkflowContext<any>` here (rather than `<unknown>`) is load-bearing:
+// function parameters are contravariant under strict types, so a
+// `Workflow<TInput=MsgType>` whose handler takes `WorkflowContext<MsgType>`
+// would otherwise fail to satisfy `WorkflowLike` at `register()` call sites.
+// The test runtime never touches the input-shape narrowly; `any` here is
+// the standard bivariant-parameter workaround.
+
 interface WorkflowLike {
   readonly name: string;
   readonly inputSchema: { parse: (input: unknown) => unknown };
   readonly outputSchema: { parse: (input: unknown) => unknown } | undefined;
-  readonly handler: (ctx: WorkflowContext) => Promise<unknown>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  readonly handler: (ctx: WorkflowContext<any>) => Promise<unknown>;
 }
 
 export type RecordedToolCall = { name: string; args: unknown; result: unknown };
@@ -113,13 +121,13 @@ export class AxlTestRuntime {
       });
     }
 
-    // Record steps and traces via callbacks
+    // `workflow_start` is recorded here for the flat `_steps` log (legacy
+    // shape predating ctx), but the AxlEvent is emitted below *through*
+    // `ctx._emitWorkflowStart` so it runs through the same `emitEvent`
+    // pipeline production uses — including `config.trace.redact`. That's
+    // the parity claim in the README / CLAUDE.md: test-runtime sees the
+    // same AxlEvents production does.
     this._recordStep('workflow_start', { workflow: workflowName, input: validated });
-    this._pushTrace({
-      type: 'workflow_start',
-      workflow: workflowName,
-      data: { input: validated },
-    });
 
     const init: WorkflowContextInit = {
       input: validated,
@@ -128,6 +136,12 @@ export class AxlTestRuntime {
       // Thread the constructor-provided config so tests can exercise
       // trace.level === 'full' and trace.redact behavior end-to-end.
       config: this._config,
+      // Production runtime threads this (see `runtime.ts:594` in
+      // `execute()` and `:765` in `stream()`). `emitEvent` auto-stamps
+      // `event.workflow` from it, so consumers grouping by workflow
+      // (Cost Dashboard `byWorkflow`, `trackExecution.metadata.workflows`,
+      // any eval runner) see the same attribution in tests and prod.
+      workflowName,
       providerRegistry: registry,
       stateStore: new MemoryStore(),
       toolOverrides: toolOverrides.size > 0 ? toolOverrides : undefined,
@@ -170,20 +184,51 @@ export class AxlTestRuntime {
     };
 
     const ctx = new WorkflowContext(init);
-    const result = await workflow.handler(ctx);
 
-    // Validate output schema if defined
-    if (workflow.outputSchema) workflow.outputSchema.parse(result);
+    // Emit workflow_start through the same pipeline production uses,
+    // AFTER ctx exists so `emitEvent`'s redact/step/timestamp handling
+    // applies. Previously emitted via `_pushTrace` which bypassed
+    // redaction — `config: { trace: { redact: true } }` on the test
+    // runtime would scrub intermediate events but leak `input`/`result`
+    // through the synthesized workflow_start/end.
+    const startedAt = Date.now();
+    ctx._emitWorkflowStart(validated);
+    try {
+      const result = await workflow.handler(ctx);
 
-    this._recordStep('workflow_end', { workflow: workflowName, result });
-    this._pushTrace({
-      type: 'workflow_end',
-      workflow: workflowName,
-      data: { result },
-    });
+      // Validate output schema if defined
+      if (workflow.outputSchema) workflow.outputSchema.parse(result);
 
-    if (this.recordPath) await this._writeRecording();
-    return result;
+      ctx._emitWorkflowEnd({
+        status: 'completed',
+        duration: Date.now() - startedAt,
+        result,
+      });
+      this._recordStep('workflow_end', { workflow: workflowName, result });
+
+      if (this.recordPath) await this._writeRecording();
+      return result;
+    } catch (err) {
+      // Parity with production: failed workflows get a terminal
+      // `workflow_end(status: 'failed')` event so consumers counting
+      // workflow_start ↔ workflow_end pairs never see an unclosed one.
+      // `aborted` flag mirrors the runtime.ts AbortError detection.
+      const aborted =
+        typeof err === 'object' &&
+        err !== null &&
+        (err as { name?: unknown }).name === 'AbortError';
+      ctx._emitWorkflowEnd({
+        status: 'failed',
+        duration: Date.now() - startedAt,
+        error: err instanceof Error ? err.message : String(err),
+        ...(aborted ? { aborted: true } : {}),
+      });
+      this._recordStep('workflow_end', {
+        workflow: workflowName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
   }
 
   toolCalls(name?: string): RecordedToolCall[] {
@@ -207,29 +252,6 @@ export class AxlTestRuntime {
   private _recordStep(type: string, data: unknown): void {
     this._stepCounter++;
     this._steps.push({ step: this._stepCounter, type, data });
-  }
-
-  private _pushTrace(partial: {
-    type: AxlEvent['type'];
-    workflow?: string;
-    agent?: string;
-    tool?: string;
-    promptVersion?: string;
-    model?: string;
-    cost?: number;
-    tokens?: { input?: number; output?: number; reasoning?: number };
-    duration?: number;
-    data?: unknown;
-  }): void {
-    // See `WorkflowContext.emitTrace` for the rationale — the loose internal
-    // partial type can't be narrowed to a single union member, so we cast
-    // through `unknown`. Runtime invariant is maintained by call sites.
-    this._traceLog.push({
-      executionId: this._executionId,
-      step: this._stepCounter,
-      timestamp: Date.now(),
-      ...partial,
-    } as unknown as AxlEvent);
   }
 
   private async _writeRecording(): Promise<void> {

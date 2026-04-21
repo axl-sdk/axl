@@ -690,7 +690,121 @@ describe('AxlTestRuntime', () => {
       const data = agentCall!.data as Record<string, unknown>;
       expect(Array.isArray(data.messages)).toBe(true);
     });
+
+    it('applies trace.redact to workflow_start and workflow_end events', async () => {
+      const runtime = new AxlTestRuntime({
+        config: { trace: { redact: true } },
+      });
+
+      runtime.register(RedactFixtureWorkflow);
+
+      await runtime.execute('RedactFixture', { secret: 'abc' });
+
+      const startEvent = runtime.traceLog().find((t) => t.type === 'workflow_start');
+      const endEvent = runtime.traceLog().find((t) => t.type === 'workflow_end');
+
+      expect(startEvent).toBeDefined();
+      expect(endEvent).toBeDefined();
+
+      // Redaction should scrub input/result but preserve structural fields.
+      const startData = startEvent!.data as Record<string, unknown>;
+      expect(startData.input).toBe('[redacted]');
+      expect(startEvent!.workflow).toBe('RedactFixture');
+      expect(typeof startEvent!.step).toBe('number');
+      expect(typeof startEvent!.timestamp).toBe('number');
+      expect(startEvent!.executionId).toMatch(/^test-/);
+
+      const endData = endEvent!.data as Record<string, unknown>;
+      expect(endData.result).toBe('[redacted]');
+      expect(endData.status).toBe('completed');
+      expect(endEvent!.workflow).toBe('RedactFixture');
+      expect(typeof endEvent!.step).toBe('number');
+      expect(typeof endEvent!.timestamp).toBe('number');
+      expect(endEvent!.executionId).toMatch(/^test-/);
+    });
+
+    it('preserves raw input/result on workflow_start/end when redact is off', async () => {
+      const runtime = new AxlTestRuntime();
+      runtime.register(RedactFixtureWorkflow);
+
+      await runtime.execute('RedactFixture', { secret: 'abc' });
+
+      const startEvent = runtime.traceLog().find((t) => t.type === 'workflow_start');
+      const endEvent = runtime.traceLog().find((t) => t.type === 'workflow_end');
+
+      expect(startEvent).toBeDefined();
+      expect(endEvent).toBeDefined();
+
+      expect((startEvent!.data as Record<string, unknown>).input).toEqual({ secret: 'abc' });
+      expect((endEvent!.data as Record<string, unknown>).result).toEqual({ answer: 'ok:abc' });
+    });
   });
+
+  describe('failure path emits workflow_end (parity with production runtime)', () => {
+    it('emits workflow_end(status: failed) when handler throws', async () => {
+      const runtime = new AxlTestRuntime();
+      runtime.register(ThrowingWorkflow);
+
+      await expect(runtime.execute('Throwing', { x: 1 })).rejects.toThrow('boom');
+
+      const endEvents = runtime.traceLog().filter((t) => t.type === 'workflow_end');
+      expect(endEvents).toHaveLength(1);
+
+      const endData = endEvents[0].data as Record<string, unknown>;
+      expect(endData.status).toBe('failed');
+      expect(endData.error).toBe('boom');
+      expect(endData.aborted).toBeUndefined();
+
+      // workflow_start should still fire before the failure.
+      const startEvents = runtime.traceLog().filter((t) => t.type === 'workflow_start');
+      expect(startEvents).toHaveLength(1);
+
+      // Start must precede end.
+      expect(startEvents[0].step).toBeLessThan(endEvents[0].step);
+    });
+
+    it('marks workflow_end.aborted=true when handler throws an AbortError', async () => {
+      const runtime = new AxlTestRuntime();
+      runtime.register(AbortingWorkflow);
+
+      await expect(runtime.execute('Aborting', { x: 1 })).rejects.toThrow('cancelled');
+
+      const endEvents = runtime.traceLog().filter((t) => t.type === 'workflow_end');
+      expect(endEvents).toHaveLength(1);
+
+      const endData = endEvents[0].data as Record<string, unknown>;
+      expect(endData.status).toBe('failed');
+      expect(endData.error).toBe('cancelled');
+      expect(endData.aborted).toBe(true);
+    });
+  });
+});
+
+// Fixtures for the redaction + failure-path tests above.
+const RedactFixtureWorkflow = workflow({
+  name: 'RedactFixture',
+  input: z.object({ secret: z.string() }),
+  handler: async (ctx) => {
+    return { answer: `ok:${(ctx.input as { secret: string }).secret}` };
+  },
+});
+
+const ThrowingWorkflow = workflow({
+  name: 'Throwing',
+  input: z.object({ x: z.number() }),
+  handler: async () => {
+    throw new Error('boom');
+  },
+});
+
+const AbortingWorkflow = workflow({
+  name: 'Aborting',
+  input: z.object({ x: z.number() }),
+  handler: async () => {
+    const err = new Error('cancelled');
+    err.name = 'AbortError';
+    throw err;
+  },
 });
 
 // Small fixture used by the config-threading tests above.

@@ -774,7 +774,6 @@ export class AxlRuntime extends EventEmitter {
           policy: 'finish_and_stop',
         },
       });
-      ctx = wfCtx;
 
       return this.spanManager.withSpanAsync(
         'axl.workflow.execute',
@@ -788,7 +787,14 @@ export class AxlRuntime extends EventEmitter {
             // Parity fix: stream() used to never emit workflow_start
             // (execute() did). Now both code paths emit it inside the span
             // context as a first-class trace event.
+            //
+            // Invariant: `ctx` is captured by the outer `.catch(err => …)`
+            // to fire `workflow_end(failed)` on failures. We assign it
+            // ONLY after `_emitWorkflowStart` succeeds so the catch
+            // handler never emits `workflow_end` without a preceding
+            // `workflow_start` — pairing is unconditional.
             wfCtx._emitWorkflowStart(validated);
+            ctx = wfCtx;
             const rawResult = await workflow.handler(wfCtx);
             const result = workflow.outputSchema
               ? workflow.outputSchema.parse(rawResult)

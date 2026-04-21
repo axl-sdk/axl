@@ -652,8 +652,10 @@ describe('memory', () => {
       expect(remember!.type).toBe('memory_remember');
       // Key (potentially PII) scrubbed
       expect(remember!.data.key).toBe('[redacted]');
-      // Scope is a string too, so it's redacted under the conservative policy
-      expect(remember!.data.scope).toBe('[redacted]');
+      // Scope is a structural discriminator ('session' | 'global') —
+      // preserved here so consumers match the WS-layer redact policy
+      // (which also preserves it). Aligns both redaction boundaries.
+      expect(remember!.data.scope).toBe('session');
       // Booleans still visible
       expect(remember!.data.embed).toBe(false);
     });

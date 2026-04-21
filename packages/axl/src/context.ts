@@ -3313,17 +3313,20 @@ export class WorkflowContext<TInput = unknown> {
         partial.type === 'memory_forget'
       ) {
         // Memory-event data fields can carry PII (`key` may echo user
-        // input like "user:john@x.com"; `scope` may encode tenant ids;
-        // `usage.model` may expose the embedder URI). Conservative
-        // redaction: scrub all string fields; preserve numeric/boolean
-        // fields (load-bearing for the Cost Dashboard's byEmbedder
-        // bucket + trace-explorer row metadata). One-level object walk
-        // mirrors the legacy `log`-branch policy so `usage.tokens` and
-        // `usage.cost` stay visible while `usage.model` is scrubbed.
+        // input like "user:john@x.com"; `usage.model` may expose the
+        // embedder URI). Conservative redaction: scrub string fields;
+        // preserve numeric/boolean fields (load-bearing for the Cost
+        // Dashboard's byEmbedder bucket + trace-explorer row metadata).
+        // `scope` is a structural discriminator (`'session' | 'global'`
+        // in practice) — preserved, matching the WS-layer policy in
+        // `redactStreamEvent` so consumers see consistent values across
+        // both redaction boundaries. One-level object walk on nested
+        // containers keeps `usage.tokens` / `usage.cost` visible while
+        // scrubbing string fields like `usage.model`.
         const d = data as Record<string, unknown>;
         const redacted: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(d)) {
-          if (typeof v === 'number' || typeof v === 'boolean') {
+          if (k === 'scope' || typeof v === 'number' || typeof v === 'boolean') {
             redacted[k] = v;
           } else if (typeof v === 'string') {
             redacted[k] = '[redacted]';

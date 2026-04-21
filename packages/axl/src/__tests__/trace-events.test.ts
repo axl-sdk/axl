@@ -849,6 +849,81 @@ describe('trace events — workflow_start/end redaction', () => {
   });
 });
 
+describe('trace events — token redaction', () => {
+  it('redacts token.data under trace.redact (closes three-layer contract gap)', async () => {
+    // Reviewer bug: the core emit-time redactor had no `token` case.
+    // Direct `runtime.on('trace', ...)` consumers bypassed the
+    // Studio WS-layer `redactStreamEvent` scrub and received raw
+    // LLM output. The CLAUDE.md three-layer contract (a) AxlEvents
+    // at emitEvent emission (b) Studio REST serialization (c) Studio
+    // WS — (a) must cover the highest-volume variant too.
+    const { workflow, AxlRuntime, agent } = await import('../index.js');
+    const { MockProvider } = await import('../../../axl-testing/src/mock-provider.js');
+    const provider = MockProvider.sequence([
+      { content: 'secret-response', chunks: ['secret-', 'response'] },
+    ]);
+    const runtime = new AxlRuntime({ defaultProvider: 'mock', trace: { redact: true } });
+    runtime.registerProvider('mock', provider);
+    const a = agent({ name: 'token-redact-test', model: 'mock:m', system: 'test' });
+    runtime.register(
+      workflow({
+        name: 'token-redact-wf',
+        input: z.object({}),
+        handler: async (ctx) => ctx.ask(a, 'q'),
+      }),
+    );
+
+    const tokens: Array<{ data: unknown }> = [];
+    runtime.on('trace', (e: unknown) => {
+      const ev = e as { type: string; data: unknown };
+      if (ev.type === 'token') tokens.push(ev as { data: unknown });
+    });
+
+    // Streaming surfaces tokens
+    const stream = runtime.stream('token-redact-wf', {});
+    for await (const event of stream) {
+      if (event.type === 'done') break;
+    }
+
+    expect(tokens.length).toBeGreaterThan(0);
+    for (const t of tokens) {
+      expect(t.data).toBe('[redacted]');
+      expect(t.data).not.toContain('secret');
+    }
+  });
+
+  it('leaves token.data raw when trace.redact is off', async () => {
+    const { workflow, AxlRuntime, agent } = await import('../index.js');
+    const { MockProvider } = await import('../../../axl-testing/src/mock-provider.js');
+    const provider = MockProvider.sequence([
+      { content: 'visible-token', chunks: ['visible-', 'token'] },
+    ]);
+    const runtime = new AxlRuntime({ defaultProvider: 'mock' });
+    runtime.registerProvider('mock', provider);
+    const a = agent({ name: 'token-visible', model: 'mock:m', system: 'test' });
+    runtime.register(
+      workflow({
+        name: 'token-visible-wf',
+        input: z.object({}),
+        handler: async (ctx) => ctx.ask(a, 'q'),
+      }),
+    );
+
+    const tokenData: string[] = [];
+    runtime.on('trace', (e: unknown) => {
+      const ev = e as { type: string; data: unknown };
+      if (ev.type === 'token' && typeof ev.data === 'string') tokenData.push(ev.data);
+    });
+
+    const stream = runtime.stream('token-visible-wf', {});
+    for await (const event of stream) {
+      if (event.type === 'done') break;
+    }
+
+    expect(tokenData.join('')).toBe('visible-token');
+  });
+});
+
 describe('trace events — ask_start / ask_end redaction (spec/16 §3.8)', () => {
   it('redacts ask_start.prompt under trace.redact', async () => {
     const { agent, workflow, AxlRuntime } = await import('../index.js');

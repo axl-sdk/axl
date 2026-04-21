@@ -491,6 +491,27 @@ describe('Studio API: Evals', () => {
     expect(body.error.code).toBe('BAD_REQUEST');
   });
 
+  it('POST /api/evals/compare rejects pooled ID arrays larger than the cap (DoS guard)', async () => {
+    // Reviewer security finding (H1): `evalCompare` runs paired bootstrap
+    // CI (1000 resamples) across every pooled run × item. Without a cap,
+    // a readOnly attacker submitting 500 IDs per side could trigger ~50B
+    // operations per request. Cap is 25 to match the multi-run ceiling on
+    // `POST /api/evals/:name/run`.
+    const { app } = createTestServer();
+
+    const tooManyIds = Array.from({ length: 26 }, (_, i) => `run-${i}`);
+    const res = await app.request('/api/evals/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baselineId: tooManyIds, candidateId: 'other' }),
+    });
+    expect(res.status).toBe(400);
+
+    const body = await res.json();
+    expect(body.error.code).toBe('BAD_REQUEST');
+    expect(body.error.message).toMatch(/baselineId.*25.*ids.*pooled/i);
+  });
+
   // --- Import endpoint ---
 
   it('POST /api/evals/import stores a CLI artifact in history', async () => {

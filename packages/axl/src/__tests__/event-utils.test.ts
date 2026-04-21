@@ -53,6 +53,25 @@ describe('eventCostContribution', () => {
     expect(eventCostContribution(e)).toBe(0);
   });
 
+  it('returns 0 when event.cost is negative (likely pricing-table typo)', () => {
+    // Providers always charge, never refund per-call. A negative `cost`
+    // is almost certainly a buggy provider or pricing-table typo —
+    // silently ignore to avoid corrupting downstream budgets / cost
+    // dashboards, matching the NaN/Infinity guard philosophy.
+    const e = ev({ type: 'agent_call_end', cost: -0.01 });
+    expect(eventCostContribution(e)).toBe(0);
+  });
+
+  it('returns 0 for ask_end with NaN cost (ask_end check short-circuits before finite guard)', () => {
+    // Ordering invariant: ask_end type check fires first, so a malformed
+    // ask_end.cost (NaN/negative/Infinity) never reaches the finite+sign
+    // guard. A refactor that reversed the order would still return 0
+    // because the guard catches NaN, but this test pins the explicit
+    // "type === ask_end ⇒ 0" rule regardless of cost value.
+    const e = ev({ type: 'ask_end', cost: Number.NaN, outcome: { ok: true, result: null } });
+    expect(eventCostContribution(e)).toBe(0);
+  });
+
   it('returns event.cost for agent_call_end', () => {
     const e = ev({ type: 'agent_call_end', cost: 0.05 });
     expect(eventCostContribution(e)).toBe(0.05);

@@ -67,6 +67,53 @@ describe('AxlStream.fullText — commit-on-pipeline-committed', () => {
     expect(stream.fullText).toBe('Hello world');
   });
 
+  it('does not leak tokens across asks when an ask throws terminally (ask_end(ok:false) resets buffer)', async () => {
+    // Reviewer bug B2: ctx.ask() terminal-throw paths (max-turns,
+    // guardrail exhaustion, verify-throw, validate-throw) do NOT emit
+    // `pipeline(failed)`. Without the ask_end(ok:false) reset trigger,
+    // the failed ask's `currentAttemptTokens` would leak into the NEXT
+    // ask's `pipeline(committed)` and corrupt `fullText`.
+    //
+    // Build a workflow that attempts an ask whose schema never parses
+    // (exhausts retries → throws `VerifyError`), catches the error, and
+    // runs a second successful ask. `fullText` must reflect only the
+    // second ask's content.
+    const provider = MockProvider.sequence([
+      // First ask: 3 attempts of invalid JSON (exhausts retries=2 → terminal throw)
+      { content: 'fail-one', chunks: ['fail-', 'one'] },
+      { content: 'fail-two', chunks: ['fail-', 'two'] },
+      { content: 'fail-three', chunks: ['fail-', 'three'] },
+      // Second ask: succeeds
+      { content: 'winner', chunks: ['win', 'ner'] },
+    ]);
+    const runtime = new AxlRuntime({ defaultProvider: 'mock' });
+    runtime.registerProvider('mock', provider);
+    const a = agent({ name: 'leak-test', model: 'mock:test', system: 'test' });
+    const wf = workflow({
+      name: 'cross-ask-leak-wf',
+      input: z.object({}),
+      handler: async (ctx) => {
+        try {
+          await ctx.ask(a, 'q1', { schema: z.object({ x: z.number() }), retries: 2 });
+        } catch {
+          // Swallow the terminal VerifyError; the second ask should
+          // start with a clean `currentAttemptTokens` buffer.
+        }
+        return ctx.ask(a, 'q2');
+      },
+    });
+    runtime.register(wf);
+
+    const stream = runtime.stream('cross-ask-leak-wf', {});
+    for await (const event of stream) {
+      if (event.type === 'done') break;
+    }
+
+    // The failed ask's tokens MUST NOT appear in fullText.
+    expect(stream.fullText).not.toContain('fail-');
+    expect(stream.fullText).toBe('winner');
+  });
+
   it('mid-attempt fullText reflects in-progress tokens until pipeline(committed) commits them', async () => {
     const provider = MockProvider.sequence([
       { content: 'one two three', chunks: ['one ', 'two ', 'three'] },

@@ -1937,6 +1937,31 @@ describe('trackExecution()', () => {
     expect(cost).toBeCloseTo(0.07);
   });
 
+  it('captureTraces strips high-volume token and partial_object events', async () => {
+    // Reviewer bug B3: `execInfo.events` (runtime.ts:570, :735) strips
+    // `token` and `partial_object` to bound memory, but the
+    // `captureTraces` path did not — so `runEval({captureTraces: true})`
+    // on a streaming eval item blew the captured-traces array.
+    const provider = new TestProvider([{ content: 'hello world', cost: 0.01 }]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    const { traces } = await runtime.trackExecution(
+      async () => {
+        const ctx = runtime.createContext({ onToken: () => {} });
+        return ctx.ask(testAgent, 'hi');
+      },
+      { captureTraces: true },
+    );
+
+    expect(traces).toBeDefined();
+    // High-volume stream-only events must NOT be captured.
+    expect(traces!.some((t) => t.type === 'token')).toBe(false);
+    expect(traces!.some((t) => t.type === 'partial_object')).toBe(false);
+    // But structural events (agent_call_end) still are.
+    expect(traces!.some((t) => t.type === 'agent_call_end')).toBe(true);
+  });
+
   it('captures workflow names from workflow_start trace events', async () => {
     const provider = new TestProvider([{ content: 'done', cost: 0.01 }]);
     const { runtime } = createRuntime(provider);
@@ -1997,5 +2022,50 @@ describe('trackExecution()', () => {
 
     expect(metadata.workflows).toEqual([]);
     expect(metadata.workflowCallCounts).toBeUndefined();
+  });
+});
+
+describe('workflow_end idempotency', () => {
+  it('does not fire workflow_end twice when post-emit side-effects throw', async () => {
+    // Reviewer bug B1: `_emitWorkflowEnd(completed)` fires BEFORE
+    // `deleteCheckpoints` / `persistExecution`. If either throws, the
+    // outer catch would fire a second `_emitWorkflowEnd(failed)` with
+    // conflicting status. The idempotency guard on WorkflowContext
+    // makes the second call a no-op — first-wins semantics.
+    const provider = new TestProvider([{ content: 'ok', cost: 0.01 }]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    // Patch `deleteCheckpoints` on the existing store to throw — simulates
+    // a transient SQLite I/O error on post-completion cleanup. Using a
+    // method patch rather than a full replacement so the rest of the
+    // `StateStore` surface (sessions, checkpoints, eval history) stays
+    // intact.
+    const store = (runtime as unknown as { stateStore: Record<string, unknown> }).stateStore;
+    store.deleteCheckpoints = async () => {
+      throw new Error('checkpoint delete failed');
+    };
+
+    runtime.register(
+      workflow({
+        name: 'wfend-idempotency',
+        input: z.object({}),
+        handler: async (ctx) => ctx.ask(testAgent, 'q'),
+      }),
+    );
+
+    const ends: Array<{ data: { status: string } }> = [];
+    runtime.on('trace', (e: unknown) => {
+      const ev = e as { type: string; data: { status: string } };
+      if (ev.type === 'workflow_end') ends.push(ev);
+    });
+
+    await expect(runtime.execute('wfend-idempotency', {})).rejects.toThrow(
+      'checkpoint delete failed',
+    );
+    expect(ends).toHaveLength(1);
+    // First (completed) event stands — the cleanup failure didn't
+    // transform a succeeded workflow into a failed one.
+    expect(ends[0].data.status).toBe('completed');
   });
 });

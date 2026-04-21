@@ -237,6 +237,18 @@ export class AxlStream extends Readable {
         this.currentAttemptTokens = [];
       }
     }
+    // Terminal-throw safety net: `ctx.ask()` exit paths that throw
+    // (max-turns, guardrail exhaustion, verify-throw, validate-throw) do
+    // NOT emit `pipeline(failed)` — they emit `ask_end({ok:false})` and
+    // propagate the error. Without this reset, `currentAttemptTokens`
+    // from the failed ask would stay buffered and flush into the NEXT
+    // ask's `pipeline(committed)`, corrupting `fullText`. Reviewer bug
+    // B2. Only applies to root asks; nested asks don't touch
+    // `currentAttemptTokens` (they're filtered out by `isRootLevel` on
+    // the token-accumulation path above).
+    if (event.type === 'ask_end' && isRootLevel(event) && !event.outcome.ok) {
+      this.currentAttemptTokens = [];
+    }
     this.bus.emit(event.type, event);
     this.push(event);
     const waiter = this.waiters.shift();

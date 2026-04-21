@@ -35,6 +35,7 @@ import {
 } from './errors.js';
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
+import { COST_BEARING_LEAF_TYPES } from './event-utils.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import type { AxlConfig } from './config.js';
@@ -299,6 +300,16 @@ export class WorkflowContext<TInput = unknown> {
    *  separate executions don't cross-talk. */
   private stepRefRoot: { value: number } = { value: 0 };
   private checkpointCounter = 0;
+  /** Idempotency guards for `workflow_start` / `workflow_end` emission.
+   *  Both `runtime.execute()` and `runtime.stream()` have paths where a
+   *  post-emit side-effect (checkpoint deletion, state-store persistence)
+   *  can throw AFTER `_emitWorkflowEnd({status: 'completed'})` has already
+   *  fired — the outer catch would then fire `_emitWorkflowEnd({status:
+   *  'failed'})` for a second time. These flags make both emitters
+   *  single-fire so consumers never see paired-then-conflicting terminal
+   *  events for one execution. */
+  private _workflowStartEmitted = false;
+  private _workflowEndEmitted = false;
   private signal?: AbortSignal;
   private summaryCache?: string;
   private workflowName?: string;
@@ -2753,8 +2764,10 @@ export class WorkflowContext<TInput = unknown> {
   // that narrow via `event.type === 'workflow_start'` actually see them.
   // Internal: the runtime is the only caller, user workflows never call these.
 
-  /** @internal */
+  /** @internal — idempotent; no-ops on second+ call within one ctx. */
   _emitWorkflowStart(input: unknown): void {
+    if (this._workflowStartEmitted) return;
+    this._workflowStartEmitted = true;
     this.emitEvent({
       type: 'workflow_start',
       workflow: this.workflowName,
@@ -2762,7 +2775,14 @@ export class WorkflowContext<TInput = unknown> {
     });
   }
 
-  /** @internal */
+  /** @internal — idempotent; no-ops on second+ call within one ctx.
+   *  Protects against the post-emit-side-effect double-fire (reviewer
+   *  bug B1): `runtime.execute()` / `runtime.stream()` emit
+   *  `workflow_end(completed)`, then call `deleteCheckpoints` /
+   *  `persistExecution`. If either throws, the outer catch would
+   *  otherwise fire a second `workflow_end(failed)` with conflicting
+   *  status. First-wins semantics: the completed event stands, the
+   *  inner side-effect failure propagates as a normal thrown error. */
   _emitWorkflowEnd(info: {
     status: 'completed' | 'failed';
     duration: number;
@@ -2770,6 +2790,8 @@ export class WorkflowContext<TInput = unknown> {
     error?: string;
     aborted?: boolean;
   }): void {
+    if (this._workflowEndEmitted) return;
+    this._workflowEndEmitted = true;
     this.emitEvent({
       type: 'workflow_end',
       workflow: this.workflowName,
@@ -3194,7 +3216,14 @@ export class WorkflowContext<TInput = unknown> {
       // '[redacted]' strings, `messages` stays a `ChatMessage[]` (single stub
       // entry preserving the count) — so downstream consumers can narrow
       // types without special-casing redacted vs non-redacted events.
-      if (partial.type === 'agent_call_end') {
+      if (partial.type === 'token') {
+        // `token.data` is the raw LLM chunk — the highest-volume PII surface.
+        // Closes the CLAUDE.md three-layer contract: Studio's WS
+        // `redactStreamEvent` already scrubs `token.data`, but direct
+        // `runtime.on('trace', ...)` consumers bypassed that layer. Now the
+        // emit-time scrub catches them too.
+        data = '[redacted]';
+      } else if (partial.type === 'agent_call_end') {
         const d = data as Record<string, unknown>;
         const redacted: Record<string, unknown> = {
           ...d,
@@ -3438,15 +3467,22 @@ export class WorkflowContext<TInput = unknown> {
     const frame = askStorage.getStore();
     const step = (frame?.stepRef ?? this.stepRefRoot).value++;
     // Per-frame ask cost rollup. Only count cost-bearing leaf events
-    // (`agent_call_end` / `tool_call_end`) emitted directly within this
-    // frame — nested asks have their own frame and their own counter, and
-    // their own `ask_end` event will surface their rollup. This keeps
-    // `ask_end.cost` honest per spec decision 10.
+    // emitted directly within this frame — nested asks have their own
+    // frame and their own counter, and their own `ask_end` event will
+    // surface their rollup. This keeps `ask_end.cost` honest per spec
+    // decision 10. Uses `COST_BEARING_LEAF_TYPES` so the rollup stays
+    // in lockstep with `eventCostContribution` / `isCostBearingLeaf` —
+    // previously this was hardcoded to `agent_call_end | tool_call_end`
+    // which silently dropped embedder cost (`memory_remember` /
+    // `memory_recall`) from the per-ask rollup when `ctx.recall()` ran
+    // inside an ask.
     const cost = (partial as { cost?: number }).cost;
     if (
       frame &&
       typeof cost === 'number' &&
-      (partial.type === 'agent_call_end' || partial.type === 'tool_call_end')
+      Number.isFinite(cost) &&
+      cost >= 0 &&
+      (COST_BEARING_LEAF_TYPES as readonly string[]).includes(partial.type as string)
     ) {
       frame.askCost.value += cost;
     }

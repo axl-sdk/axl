@@ -239,17 +239,13 @@ describe('AxlTestRuntime', () => {
       const steps = runtime.steps();
       expect(steps.length).toBeGreaterThanOrEqual(2);
       expect(steps[0].type).toBe('workflow_start');
-      expect(steps[0].data).toMatchObject({
-        workflow: 'HandleSupport',
-        input: { msg: 'check steps' },
-      });
+      // `data` shape comes from `WorkflowStartData` — `{ input }` only;
+      // the workflow name is a top-level event field, not inside `data`.
+      expect(steps[0].data).toMatchObject({ input: { msg: 'check steps' } });
 
       const last = steps[steps.length - 1];
       expect(last.type).toBe('workflow_end');
-      expect(last.data).toMatchObject({
-        workflow: 'HandleSupport',
-        result: 'done',
-      });
+      expect(last.data).toMatchObject({ status: 'completed', result: 'done' });
     });
 
     it('includes agent_call steps', async () => {

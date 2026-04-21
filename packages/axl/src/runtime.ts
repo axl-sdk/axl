@@ -72,6 +72,12 @@ export type CreateContextOptions = {
    *  so consumers can route or filter by ask correlation (e.g.,
    *  `meta.depth === 0` for root-only chat UIs). */
   onToken?: (token: string, meta: CallbackMeta) => void;
+  /** Fires when an agent invokes a tool. `meta` carries the same ask
+   *  correlation shape as `onToken`. */
+  onToolCall?: (call: { name: string; args: unknown; callId?: string }, meta: CallbackMeta) => void;
+  /** Fires when an agent begins processing a turn. `meta` carries the
+   *  same ask correlation shape as `onToken`. */
+  onAgentStart?: (info: { agent: string; model?: string }, meta: CallbackMeta) => void;
   /** Handler for tool approval requests. Called when an agent invokes a tool with requireApproval. */
   awaitHumanHandler?: (options: AwaitHumanOptions) => Promise<HumanDecision>;
 };
@@ -496,6 +502,8 @@ export class AxlRuntime extends EventEmitter {
       sessionHistory: options?.sessionHistory,
       signal: options?.signal,
       onToken: options?.onToken,
+      onToolCall: options?.onToolCall,
+      onAgentStart: options?.onAgentStart,
       awaitHumanHandler: options?.awaitHumanHandler,
       onTrace: (event: AxlEvent) => {
         this.emit('trace', event);
@@ -1283,6 +1291,12 @@ export class AxlRuntime extends EventEmitter {
       // predictable — callers who need the full verbose snapshot should
       // subscribe to `runtime.on('trace', ...)` directly.
       if (capturedTraces) {
+        // Skip high-volume stream-only events for the same reason
+        // `runtime.execute()` / `runtime.stream()` drop them from
+        // `ExecutionInfo.events`: a streaming eval item with thousands of
+        // tokens / progressive `partial_object` snapshots would blow memory
+        // when `captureTraces: true` is set on `runEval`. Reviewer bug B3.
+        if (event.type === 'token' || event.type === 'partial_object') return;
         if (event.type === 'agent_call_end' && event.data) {
           const d = event.data as Record<string, unknown>;
           if ('messages' in d) {

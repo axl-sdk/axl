@@ -55,12 +55,16 @@ export function eventCostContribution(event: AxlEvent): number {
   // regression than a small over-count on a hypothetical new variant.
   //
   // `Number.isFinite` guards against NaN / +-Infinity from malformed
-  // pricing tables (spec/16 bug-review §B-2). Polluting the running
-  // total with NaN is permanent — it flows into every downstream
-  // consumer and can't be recovered. Silently ignore instead.
+  // pricing tables (spec/16 bug-review §B-2). `c >= 0` guards against
+  // negative values — providers always charge, never refund per-call,
+  // so a negative `cost` is almost certainly a pricing-table typo or a
+  // buggy third-party provider. Silently ignore either anomaly:
+  // polluting the running total is permanent — it flows into every
+  // downstream consumer (budget checks, cost dashboard, eval metadata)
+  // and can't be recovered.
   if (event.type === 'ask_end') return 0;
   const c = event.cost;
-  return typeof c === 'number' && Number.isFinite(c) ? c : 0;
+  return typeof c === 'number' && Number.isFinite(c) && c >= 0 ? c : 0;
 }
 
 /**

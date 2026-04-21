@@ -433,9 +433,12 @@ describe('reduceCost hardening', () => {
   it('handles negative cost gracefully', () => {
     const event = makeEvent({ cost: -0.01, agent: 'a', tokens: { input: 10, output: 5 } });
     const result = reduceCost(emptyCostData(), event);
-    // Negative cost is finite, so it's accepted (not clamped)
-    // This is consistent with the old CostAggregator behavior
-    expect(result.totalCost).toBe(-0.01);
+    // Negative cost is treated as a likely pricing-table typo and
+    // silently dropped by `eventCostContribution` — providers always
+    // charge, never refund per-call. A buggy emitter that sends
+    // -0.01 doesn't corrupt every downstream budget check / cost
+    // dashboard. Matches the NaN/Infinity guard philosophy.
+    expect(result.totalCost).toBe(0);
   });
 
   it('handles undefined agent/model/workflow without crashing', () => {

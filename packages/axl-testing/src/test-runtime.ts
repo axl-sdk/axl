@@ -121,13 +121,14 @@ export class AxlTestRuntime {
       });
     }
 
-    // `workflow_start` is recorded here for the flat `_steps` log (legacy
-    // shape predating ctx), but the AxlEvent is emitted below *through*
-    // `ctx._emitWorkflowStart` so it runs through the same `emitEvent`
-    // pipeline production uses — including `config.trace.redact`. That's
-    // the parity claim in the README / CLAUDE.md: test-runtime sees the
-    // same AxlEvents production does.
-    this._recordStep('workflow_start', { workflow: workflowName, input: validated });
+    // Previously `_recordStep('workflow_start', ...)` was called here with
+    // raw `{ workflow, input }` data, AND `ctx._emitWorkflowStart` below
+    // pushed through the onTrace handler (which also bumps `_stepCounter`
+    // and appends to `_steps`). Result: two entries in `steps()` per
+    // workflow_start, with the first bypassing `config.trace.redact`.
+    // The `_recordStep` call is removed — onTrace is the single source
+    // of truth for `_steps`, matching the behavior of every other event
+    // type in the test runtime. Reviewer architecture §5.
 
     const init: WorkflowContextInit = {
       input: validated,
@@ -204,7 +205,9 @@ export class AxlTestRuntime {
         duration: Date.now() - startedAt,
         result,
       });
-      this._recordStep('workflow_end', { workflow: workflowName, result });
+      // `_steps` is populated by onTrace for every event (including
+      // workflow_end); no separate `_recordStep` call needed — that
+      // would double-count.
 
       if (this.recordPath) await this._writeRecording();
       return result;
@@ -223,10 +226,7 @@ export class AxlTestRuntime {
         error: err instanceof Error ? err.message : String(err),
         ...(aborted ? { aborted: true } : {}),
       });
-      this._recordStep('workflow_end', {
-        workflow: workflowName,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      // `_steps` populated by onTrace (see comment on the success path).
       throw err;
     }
   }
@@ -247,11 +247,6 @@ export class AxlTestRuntime {
   }
   traceLog(): AxlEvent[] {
     return this._traceLog;
-  }
-
-  private _recordStep(type: string, data: unknown): void {
-    this._stepCounter++;
-    this._steps.push({ step: this._stepCounter, type, data });
   }
 
   private async _writeRecording(): Promise<void> {

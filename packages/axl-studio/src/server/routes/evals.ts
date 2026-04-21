@@ -328,10 +328,20 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     // `[]` as truthy, so check explicitly. We also reject arrays that contain
     // any non-string element (e.g. `[null]`), which would otherwise produce a
     // confusing "Eval result(s) not found in history: null" error downstream.
+    //
+    // DoS cap (reviewer HIGH H1): `evalCompare` pools items across all runs
+    // for paired bootstrap CI (1000 resamples). An unbounded array lets a
+    // readOnly attacker run 500-run × 100-item × 1000-resample comparisons
+    // on each request. Cap at 25 to match the multi-run ceiling on
+    // `POST /api/evals/:name/run`.
+    const MAX_POOLED_RUNS = 25;
     const validateIdParam = (v: unknown, name: string): string | null => {
       if (typeof v === 'string') return v === '' ? `${name} must be non-empty` : null;
       if (Array.isArray(v)) {
         if (v.length === 0) return `${name} must be a non-empty array`;
+        if (v.length > MAX_POOLED_RUNS) {
+          return `${name} may contain at most ${MAX_POOLED_RUNS} ids (pooled comparison)`;
+        }
         for (const elem of v) {
           if (typeof elem !== 'string' || elem === '') {
             return `${name} array must contain only non-empty strings`;

@@ -247,8 +247,15 @@ export class AxlStream extends Readable {
     }
   }
 
-  /** Signal successful completion. */
-  _done(result: unknown, executionId = ''): void {
+  /**
+   * Signal successful completion.
+   *
+   * `executionId` is required — the runtime must allocate it before
+   * calling `stream()` so terminal events always carry a real id.
+   * Previously the default-empty parameter surfaced blank executionIds
+   * on error paths that threw before `execInfo` was assigned (review S4).
+   */
+  _done(result: unknown, executionId: string): void {
     if (this.finished) return;
     this.finished = true;
     this.result = result;
@@ -279,8 +286,10 @@ export class AxlStream extends Readable {
     this.bus.emit('__resolve', result);
   }
 
-  /** Signal an error. */
-  _error(error: Error, executionId = ''): void {
+  /** Signal an error. `executionId` is required for the same reason as
+   *  `_done`: terminal events must carry a real id even when the
+   *  failure happens before any real trace event fires (review S4). */
+  _error(error: Error, executionId: string): void {
     if (this.finished) return;
     this.finished = true;
     const errorEvent: AxlEvent = {

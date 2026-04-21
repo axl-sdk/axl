@@ -679,8 +679,18 @@ export class AxlRuntime extends EventEmitter {
     // Cancel workflow when consumer disconnects (stops reading the stream)
     axlStream.on('close', () => controller.abort());
 
-    // Execute asynchronously, piping events to the stream.
-    // execInfo and ctx are captured by the closure so the catch handler can update them on error.
+    // Generate executionId BEFORE the async closure so it's available on
+    // terminal `done` / `error` events even when `run()` throws early
+    // (e.g., unregistered workflow, input validation failure). Review S4:
+    // previously `_done(result, execInfo?.executionId ?? '')` sent an
+    // empty-string sentinel in that path, which broke consumers
+    // correlating the terminal event with the execution.
+    const executionId = randomUUID();
+    this.abortControllers.set(executionId, controller);
+    // ctx is captured by the closure so the catch handler can call
+    // `_emitWorkflowEnd` on it. `execInfo` is also closure-captured but
+    // allocated inside `run()` — the catch path is defensive about
+    // running before `execInfo` is assigned.
     let execInfo: ExecutionInfo | undefined;
     let ctx: WorkflowContext | undefined;
 
@@ -689,8 +699,6 @@ export class AxlRuntime extends EventEmitter {
       if (!workflow) throw new Error(`Workflow "${name}" not registered`);
 
       const validated = workflow.inputSchema.parse(input);
-      const executionId = randomUUID();
-      this.abortControllers.set(executionId, controller);
       const sessionHistory = (options?.metadata?.sessionHistory as ChatMessage[]) ?? undefined;
 
       // Register with active cost scope for trackCost() attribution
@@ -814,7 +822,7 @@ export class AxlRuntime extends EventEmitter {
     };
 
     run()
-      .then((result) => axlStream._done(result, execInfo?.executionId ?? ''))
+      .then((result) => axlStream._done(result, executionId))
       .catch((err) => {
         // Update execution status on error
         if (execInfo) {
@@ -838,10 +846,11 @@ export class AxlRuntime extends EventEmitter {
           });
           this.persistExecution(execInfo);
         }
-        axlStream._error(
-          err instanceof Error ? err : new Error(String(err)),
-          execInfo?.executionId ?? '',
-        );
+        // Clean up the abort controller even on pre-execInfo throws
+        // (e.g., "workflow not registered") — the successful path clears
+        // it in the `finally` inside `run`, but early-throw never gets there.
+        this.abortControllers.delete(executionId);
+        axlStream._error(err instanceof Error ? err : new Error(String(err)), executionId);
       });
 
     return axlStream;

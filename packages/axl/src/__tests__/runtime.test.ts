@@ -1341,6 +1341,130 @@ describe('abort()', () => {
     const result = await stream.promise;
     expect(result).toBe('done');
   });
+
+  it('stream.promise rejects with AbortError when aborted mid-flight, paired with workflow_end.aborted=true', async () => {
+    // Verifies two invariants at once:
+    //   1. Aborting an in-flight stream rejects `.promise` (consumers
+    //      awaiting the stream see the abort).
+    //   2. `workflow_end.aborted === true` accompanies the failure, so
+    //      subscribers can distinguish cancellation from a real crash
+    //      without needing a second event channel.
+    const { runtime } = createRuntime();
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (event: AxlEvent) => traces.push(event));
+
+    let resolveWait: () => void;
+    const waitPromise = new Promise<void>((r) => {
+      resolveWait = r;
+    });
+    let executionId: string | undefined;
+
+    const wf = workflow({
+      name: 'stream-abort-rejects',
+      input: z.any(),
+      handler: async (ctx) => {
+        executionId = ctx.executionId;
+        await waitPromise;
+        // Handler re-throws as AbortError when unblocked — mirrors the
+        // real cancellation path (fetch aborts, ctx.signal.throwIfAborted).
+        throw new DOMException('aborted', 'AbortError');
+      },
+    });
+    runtime.register(wf);
+
+    const stream = runtime.stream('stream-abort-rejects', {});
+    // Attach the rejection handler before we abort so the test framework
+    // doesn't surface the rejection as unhandled.
+    const promiseRejection = expect(stream.promise).rejects.toThrow();
+
+    // Wait for the handler to start, capture executionId, then abort.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(executionId).toBeDefined();
+    runtime.abort(executionId!);
+    resolveWait!();
+
+    await promiseRejection;
+
+    const endEvent = traces.find((t) => t.type === 'workflow_end');
+    expect(endEvent).toBeDefined();
+    const data = endEvent!.data as Record<string, unknown>;
+    expect(data.status).toBe('failed');
+    expect(data.aborted).toBe(true);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// AbortController map cleanup
+// ═════════════════════════════════════════════════════════════════════════
+
+describe('abortControllers map cleanup', () => {
+  // All four lifecycle paths (execute-success, execute-failure,
+  // stream-success, stream-early-throw) must leave the runtime's
+  // `abortControllers` map empty — a slow leak here would accumulate
+  // one AbortController per execution across the lifetime of a long-
+  // running process. Access the private map via a narrow escape hatch
+  // since this is an internal invariant check.
+  type RuntimeInternals = { abortControllers: Map<string, AbortController> };
+  const internals = (r: AxlRuntime) => r as unknown as RuntimeInternals;
+
+  it('execute() success path leaves the map empty', async () => {
+    const { runtime } = createRuntime();
+    const wf = workflow({
+      name: 'ok-wf',
+      input: z.any(),
+      handler: async () => 'ok',
+    });
+    runtime.register(wf);
+
+    expect(internals(runtime).abortControllers.size).toBe(0);
+    await runtime.execute('ok-wf', {});
+    expect(internals(runtime).abortControllers.size).toBe(0);
+  });
+
+  it('execute() failure path leaves the map empty', async () => {
+    const { runtime } = createRuntime();
+    const failWf = workflow({
+      name: 'fail-wf',
+      input: z.any(),
+      handler: async () => {
+        throw new Error('boom');
+      },
+    });
+    runtime.register(failWf);
+
+    expect(internals(runtime).abortControllers.size).toBe(0);
+    await expect(runtime.execute('fail-wf', {})).rejects.toThrow('boom');
+    expect(internals(runtime).abortControllers.size).toBe(0);
+  });
+
+  it('stream() success path (consumed to completion) leaves the map empty', async () => {
+    const { runtime } = createRuntime();
+    const wf = workflow({
+      name: 'stream-ok',
+      input: z.any(),
+      handler: async () => 'streamed',
+    });
+    runtime.register(wf);
+
+    expect(internals(runtime).abortControllers.size).toBe(0);
+    const stream = runtime.stream('stream-ok', {});
+    const result = await stream.promise;
+    expect(result).toBe('streamed');
+    expect(internals(runtime).abortControllers.size).toBe(0);
+  });
+
+  it('stream() early-throw path (unregistered workflow) leaves the map empty', async () => {
+    // The early throw happens inside the async `run()` closure before
+    // `execInfo` is assigned. The catch handler at the end of the
+    // `.catch(err => …)` block must still delete the controller — the
+    // `finally` inside `run()` never fires on this path.
+    const { runtime } = createRuntime();
+
+    expect(internals(runtime).abortControllers.size).toBe(0);
+    const stream = runtime.stream('nonexistent-wf', {});
+    await expect(stream.promise).rejects.toThrow(/not registered/);
+    expect(internals(runtime).abortControllers.size).toBe(0);
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════

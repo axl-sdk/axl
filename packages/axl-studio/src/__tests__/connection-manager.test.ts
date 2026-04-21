@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { ConnectionManager } from '../server/ws/connection-manager.js';
 
 /** Minimal WSContext mock for testing. */
@@ -375,6 +375,57 @@ describe('ConnectionManager', () => {
       expect(messages.length).toBeLessThan(101);
       const last = JSON.parse(messages[messages.length - 1]);
       expect(last.data.type).toBe('done');
+    });
+  });
+
+  describe('buffer TTL cleanup', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    // BUFFER_TTL_MS = 30_000 — the replay buffer must be evicted 30s after a
+    // terminal event so late subscribers that join *after* that window get an
+    // empty replay instead of replaying a completed stream indefinitely.
+    // A regression removing the setTimeout cleanup would otherwise pass all
+    // other tests in this file.
+    it('drops the replay buffer 30s after a terminal `done` event', () => {
+      connMgr.broadcast('execution:ttl-done', { type: 'agent_call_start', agent: 'a' });
+      connMgr.broadcast('execution:ttl-done', { type: 'done', data: { result: 'ok' } });
+
+      // Just BEFORE the TTL fires: buffer is still present, late subscriber
+      // replays both events.
+      vi.advanceTimersByTime(30_000 - 1);
+      const { ws: early, messages: earlyMsgs } = createMockWs();
+      connMgr.add(early);
+      connMgr.subscribe(early, 'execution:ttl-done');
+      expect(earlyMsgs).toHaveLength(2);
+
+      // Advance past the TTL (relative to the ORIGINAL terminal event).
+      // Total elapsed = 30_001 ms.
+      vi.advanceTimersByTime(2);
+
+      // A fresh late subscriber should see no replay — buffer has been
+      // evicted by the TTL timer.
+      const { ws: late, messages: lateMsgs } = createMockWs();
+      connMgr.add(late);
+      connMgr.subscribe(late, 'execution:ttl-done');
+      expect(lateMsgs).toHaveLength(0);
+      expect(connMgr.hasSubscribers('execution:ttl-done')).toBe(true); // subscribed, just no replay
+    });
+
+    it('drops the replay buffer 30s after a terminal `error` event', () => {
+      connMgr.broadcast('execution:ttl-err', { type: 'agent_call_start', agent: 'a' });
+      connMgr.broadcast('execution:ttl-err', { type: 'error', message: 'boom' });
+
+      vi.advanceTimersByTime(30_001);
+
+      const { ws, messages } = createMockWs();
+      connMgr.add(ws);
+      connMgr.subscribe(ws, 'execution:ttl-err');
+      expect(messages).toHaveLength(0);
     });
   });
 });

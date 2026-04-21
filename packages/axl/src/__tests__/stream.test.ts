@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { AxlStream } from '../stream.js';
-import type { AxlEvent } from '../types.js';
+import { AXL_EVENT_TYPES, type AxlEvent, type AxlEventType } from '../types.js';
 
 /** Build a synthetic AxlEvent with the required base fields (executionId,
  *  step, timestamp). Test fixtures pass variant-specific fields via the
@@ -468,5 +468,286 @@ describe('AxlStream', () => {
     expect(events).toHaveLength(2);
     expect((events[0] as { data: string }).data).toBe('delayed');
     expect((events[1] as { data: { result: unknown } }).data).toEqual({ result: 'fin' });
+  });
+
+  // ── Block A: .textByAsk ─────────────────────────────────────────────────
+  //
+  // `.text` filters to root tokens only (the "chat bubble" view). `.textByAsk`
+  // is the sibling iterator that covers every ask lane (root + nested) and
+  // tags each chunk with the ask frame that produced it. Before this block
+  // the getter had zero direct coverage — asserted only transitively via
+  // `fullText` tests, which is not the same contract.
+
+  describe('.textByAsk', () => {
+    it('yields { askId, agent, text } for every token across root and nested asks', async () => {
+      const stream = new AxlStream();
+
+      stream._push(ev({ type: 'token', data: 'r1', askId: 'root', agent: 'outer', depth: 0 }));
+      stream._push(ev({ type: 'token', data: 'n1', askId: 'child', agent: 'inner', depth: 1 }));
+      stream._push(ev({ type: 'token', data: 'r2', askId: 'root', agent: 'outer', depth: 0 }));
+      stream._done('result', 'test-exec');
+
+      const chunks: Array<{ askId: string; agent?: string; text: string }> = [];
+      for await (const chunk of stream.textByAsk) chunks.push(chunk);
+
+      expect(chunks).toEqual([
+        { askId: 'root', agent: 'outer', text: 'r1' },
+        { askId: 'child', agent: 'inner', text: 'n1' },
+        { askId: 'root', agent: 'outer', text: 'r2' },
+      ]);
+    });
+
+    it('carries `agent` through when set on the emitting event', async () => {
+      const stream = new AxlStream();
+
+      stream._push(ev({ type: 'token', data: 'hi', askId: 'a', agent: 'claude-3', depth: 0 }));
+      stream._done('r', 'test-exec');
+
+      const chunks: Array<{ askId: string; agent?: string; text: string }> = [];
+      for await (const chunk of stream.textByAsk) chunks.push(chunk);
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0].agent).toBe('claude-3');
+    });
+
+    it('omits `agent` when the event was emitted outside any ask (rare — synthesized fixtures)', async () => {
+      // Per the getter's doc: the `agent` field is undefined when the token
+      // was produced without an emitting-agent context. Pin that tri-state
+      // so consumers don't assume a string.
+      const stream = new AxlStream();
+
+      stream._push(ev({ type: 'token', data: 'orphan', askId: 'a', depth: 0 }));
+      stream._done('r', 'test-exec');
+
+      const chunks: Array<{ askId: string; agent?: string; text: string }> = [];
+      for await (const chunk of stream.textByAsk) chunks.push(chunk);
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0].askId).toBe('a');
+      expect(chunks[0].text).toBe('orphan');
+      expect(chunks[0].agent).toBeUndefined();
+    });
+
+    it('filters out non-token events', async () => {
+      const stream = new AxlStream();
+
+      stream._push(ev({ type: 'token', data: 'hi', askId: 'a', agent: 'o', depth: 0 }));
+      stream._push(ev({ type: 'log', data: { event: 'noise' } }));
+      stream._push(
+        ev({ type: 'agent_call_start', agent: 'o', model: 'm', turn: 1, askId: 'a', depth: 0 }),
+      );
+      stream._push(ev({ type: 'token', data: ' there', askId: 'a', agent: 'o', depth: 0 }));
+      stream._push(
+        ev({
+          type: 'agent_call_end',
+          agent: 'o',
+          model: 'm',
+          cost: 0,
+          duration: 1,
+          data: { prompt: 'p', response: 'r' },
+          askId: 'a',
+          depth: 0,
+        }),
+      );
+      stream._done('r', 'test-exec');
+
+      const chunks: Array<{ askId: string; agent?: string; text: string }> = [];
+      for await (const chunk of stream.textByAsk) chunks.push(chunk);
+
+      expect(chunks.map((c) => c.text)).toEqual(['hi', ' there']);
+    });
+  });
+
+  // ── Block B: Lifecycle exhaustiveness guard ─────────────────────────────
+  //
+  // `stream.ts` hard-codes the set of types that `.lifecycle` yields. If a
+  // future PR adds a new variant to `AXL_EVENT_TYPES` (the canonical tuple),
+  // the lifecycle set can silently drift out of sync — a consumer relying on
+  // `.lifecycle` would never see the new event, with no compile error.
+  //
+  // This block pins the partition: every `AxlEventType` must be either
+  // "lifecycle" (yielded by `.lifecycle`) or explicitly "excluded" (in the
+  // allowlist below). Adding a new variant forces a conscious choice.
+
+  describe('lifecycle iterator exhaustiveness (AXL_EVENT_TYPES partition)', () => {
+    /**
+     * Compile-time exhaustiveness: this record must list every `AxlEventType`.
+     * If a new discriminator is added, TS will complain that the record is
+     * missing a key, forcing the author to categorize it.
+     *
+     * 'lifecycle' → surfaces via `stream.lifecycle` (structural, "what
+     *   happened" timeline event).
+     * 'excluded'  → deliberately skipped by `.lifecycle`. Rationales:
+     *     - token / partial_object: high-volume content chunks; consumers
+     *       who want them iterate the raw stream.
+     *     - log: caller-emitted observability events (ctx.log), not
+     *       part of the structural timeline.
+     *     - memory_*: observability/audit rows with a dedicated subscription
+     *       pattern; not structural.
+     *     - guardrail / schema_check / validate: legacy gate events
+     *       collapsed into `pipeline` in PR 2; kept for back-compat but
+     *       not part of the canonical lifecycle.
+     *     - done / error: terminal markers synthesized by AxlStream itself,
+     *       already surface via `.on('done' | 'error', ...)` and the stream's
+     *       `.promise`; re-delivering them through `.lifecycle` would
+     *       duplicate the terminal signal.
+     */
+    const categorization: Record<AxlEventType, 'lifecycle' | 'excluded'> = {
+      workflow_start: 'lifecycle',
+      workflow_end: 'lifecycle',
+      ask_start: 'lifecycle',
+      ask_end: 'lifecycle',
+      agent_call_start: 'lifecycle',
+      agent_call_end: 'lifecycle',
+      tool_call_start: 'lifecycle',
+      tool_call_end: 'lifecycle',
+      tool_approval: 'lifecycle',
+      tool_denied: 'lifecycle',
+      delegate: 'lifecycle',
+      handoff: 'lifecycle',
+      pipeline: 'lifecycle',
+      verify: 'lifecycle',
+      token: 'excluded',
+      partial_object: 'excluded',
+      log: 'excluded',
+      memory_remember: 'excluded',
+      memory_recall: 'excluded',
+      memory_forget: 'excluded',
+      guardrail: 'excluded',
+      schema_check: 'excluded',
+      validate: 'excluded',
+      done: 'excluded',
+      error: 'excluded',
+    };
+
+    it('every AXL_EVENT_TYPES entry is categorized as lifecycle or excluded (compile-time)', () => {
+      // The type of `categorization` requires every key from `AxlEventType`.
+      // This runtime assertion catches a mismatch between the tuple and the
+      // keys — e.g., someone adds to the record but forgets the tuple.
+      const keys = new Set(Object.keys(categorization));
+      for (const t of AXL_EVENT_TYPES) {
+        expect(keys.has(t)).toBe(true);
+      }
+      expect(keys.size).toBe(AXL_EVENT_TYPES.length);
+    });
+
+    it('.lifecycle yields exactly the types marked lifecycle and none marked excluded', async () => {
+      const stream = new AxlStream();
+      const ASK_ = { askId: 'a', depth: 0 } as const;
+
+      // Push a minimal synthetic event for every type in AXL_EVENT_TYPES.
+      // The per-variant shapes only need to satisfy `_push` (which doesn't
+      // validate); the test's concern is purely which `type` values make
+      // it through the `.lifecycle` filter.
+      const minimalByType: Record<AxlEventType, Record<string, unknown>> = {
+        workflow_start: { type: 'workflow_start', workflow: 'w', data: { input: {} } },
+        workflow_end: {
+          type: 'workflow_end',
+          workflow: 'w',
+          data: { status: 'completed', duration: 1 },
+        },
+        ask_start: { type: 'ask_start', prompt: 'p', ...ASK_ },
+        ask_end: {
+          type: 'ask_end',
+          outcome: { ok: true, result: 'x' },
+          cost: 0,
+          duration: 1,
+          ...ASK_,
+        },
+        agent_call_start: { type: 'agent_call_start', agent: 'a', model: 'm', turn: 1, ...ASK_ },
+        agent_call_end: {
+          type: 'agent_call_end',
+          agent: 'a',
+          model: 'm',
+          cost: 0,
+          duration: 1,
+          data: { prompt: 'p', response: 'r' },
+          ...ASK_,
+        },
+        token: { type: 'token', data: 'tok', ...ASK_ },
+        tool_call_start: {
+          type: 'tool_call_start',
+          tool: 't',
+          callId: 'c1',
+          data: { args: {} },
+          ...ASK_,
+        },
+        tool_call_end: {
+          type: 'tool_call_end',
+          tool: 't',
+          callId: 'c1',
+          duration: 1,
+          data: { args: {}, result: 'r' },
+          ...ASK_,
+        },
+        tool_approval: {
+          type: 'tool_approval',
+          tool: 't',
+          data: { approved: true, args: {} },
+          ...ASK_,
+        },
+        tool_denied: { type: 'tool_denied', tool: 't', ...ASK_ },
+        delegate: {
+          type: 'delegate',
+          data: { candidates: ['a'], reason: 'single_candidate' },
+          ...ASK_,
+        },
+        handoff: {
+          type: 'handoff',
+          fromAskId: 'a1',
+          toAskId: 'a2',
+          sourceDepth: 0,
+          targetDepth: 0,
+          data: { source: 'a', target: 'b', mode: 'oneway', duration: 1 },
+        },
+        pipeline: {
+          type: 'pipeline',
+          status: 'start',
+          stage: 'initial',
+          attempt: 1,
+          maxAttempts: 1,
+          ...ASK_,
+        },
+        partial_object: { type: 'partial_object', attempt: 1, data: { object: {} }, ...ASK_ },
+        verify: { type: 'verify', data: { attempts: 1, passed: true }, ...ASK_ },
+        log: { type: 'log', data: { event: 'x' } },
+        memory_remember: { type: 'memory_remember', data: { scope: 'global' } },
+        memory_recall: { type: 'memory_recall', data: { scope: 'global' } },
+        memory_forget: { type: 'memory_forget', data: { scope: 'global' } },
+        guardrail: { type: 'guardrail', data: { guardrailType: 'input', blocked: false } },
+        schema_check: {
+          type: 'schema_check',
+          data: { valid: true, attempt: 1, maxAttempts: 1 },
+        },
+        validate: { type: 'validate', data: { valid: true, attempt: 1, maxAttempts: 1 } },
+        // `done` and `error` are synthesized by AxlStream's `_done` / `_error`
+        // methods, so we don't push them directly — `_done` below emits the
+        // canonical `done` event for us. Including placeholder entries here
+        // keeps the record exhaustive over `AxlEventType`.
+        done: { type: 'done', data: { result: null } },
+        error: { type: 'error', data: { message: 'x' } },
+      };
+
+      for (const t of AXL_EVENT_TYPES) {
+        if (t === 'done' || t === 'error') continue; // synthesized by the stream
+        stream._push(ev(minimalByType[t]));
+      }
+      stream._done('fin', 'test-exec');
+
+      const lifecycleTypes: AxlEventType[] = [];
+      for await (const event of stream.lifecycle) {
+        lifecycleTypes.push(event.type);
+      }
+
+      const expectedLifecycle = AXL_EVENT_TYPES.filter((t) => categorization[t] === 'lifecycle');
+      // Sort both sides: AXL_EVENT_TYPES order is not the push order for
+      // synthesized terminals (done), but the set equality is the contract.
+      expect([...lifecycleTypes].sort()).toEqual([...expectedLifecycle].sort());
+
+      // And no excluded type must have leaked through.
+      for (const t of lifecycleTypes) {
+        expect(categorization[t]).toBe('lifecycle');
+      }
+    });
   });
 });

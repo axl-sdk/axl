@@ -319,4 +319,77 @@ describe('<AskTree />', () => {
     render(<AskTree events={events} />);
     expect(screen.getByText(/handoff → specialist/)).toBeInTheDocument();
   });
+
+  // Orphan handoff: a `handoff` event names a `toAskId` for which no
+  // `ask_start` ever arrives (target aborted / crashed / never reported back).
+  // AskTree synthesizes a placeholder node so the target isn't invisible —
+  // users can see the handoff happened and that the target never completed.
+  // Without this placeholder the orphan would silently disappear from the UI
+  // and the "target never responded" failure mode would be invisible.
+  it('synthesizes a placeholder node for orphan handoff targets (no matching ask_start)', () => {
+    const events: AxlEvent[] = [
+      ev({ type: 'ask_start', askId: 'src', depth: 0, agent: 's' }),
+      ev({
+        type: 'handoff',
+        fromAskId: 'src',
+        toAskId: 'orphan-never-started',
+        sourceDepth: 0,
+        targetDepth: 1,
+        data: { source: 's', target: 'lost-specialist', mode: 'oneway', duration: 1 },
+      }),
+      // NOTE: no ask_start for 'orphan-never-started' — the target frame never
+      // reported back.
+    ];
+    render(<AskTree events={events} />);
+
+    // Two nodes should render: the source (completed view is `running` here
+    // since there's no ask_end either, which is fine) AND the synthetic orphan.
+    const nodes = screen.getAllByTestId('ask-node');
+    expect(nodes).toHaveLength(2);
+
+    // Find the orphan by its data-ask-id attribute on the outer wrapper.
+    const orphan = document.querySelector('[data-ask-id="orphan-never-started"]');
+    expect(orphan).not.toBeNull();
+    // Placeholder status stays `running` — deliberate signal that the handoff
+    // target never reported back.
+    expect(orphan!.getAttribute('data-status')).toBe('running');
+    // Agent label falls back to the `target` field from the handoff data.
+    expect(within(orphan as HTMLElement).getByText('lost-specialist')).toBeInTheDocument();
+  });
+
+  it('does NOT synthesize a placeholder when the target has a real ask_start', () => {
+    // Comparison case: both source and target report in normally. We should
+    // see exactly two nodes (one per real ask_start), and the target should
+    // NOT be a synthetic placeholder — its status tracks the real ask_end.
+    const events: AxlEvent[] = [
+      ev({ type: 'ask_start', askId: 'src', depth: 0, agent: 's' }),
+      ev({
+        type: 'handoff',
+        fromAskId: 'src',
+        toAskId: 'dst',
+        sourceDepth: 0,
+        targetDepth: 1,
+        data: { source: 's', target: 'specialist', mode: 'oneway', duration: 1 },
+      }),
+      ev({ type: 'ask_start', askId: 'dst', depth: 1, parentAskId: 'src', agent: 'specialist' }),
+      ev({
+        type: 'ask_end',
+        askId: 'dst',
+        depth: 1,
+        parentAskId: 'src',
+        agent: 'specialist',
+        cost: 0.01,
+        duration: 10,
+        outcome: { ok: true, result: 'ok' },
+      }),
+    ];
+    render(<AskTree events={events} />);
+    const nodes = screen.getAllByTestId('ask-node');
+    expect(nodes).toHaveLength(2);
+    const dst = document.querySelector('[data-ask-id="dst"]');
+    expect(dst).not.toBeNull();
+    // The real ask_end fired → status resolves to `completed`, not the
+    // placeholder's stuck `running`.
+    expect(dst!.getAttribute('data-status')).toBe('completed');
+  });
 });

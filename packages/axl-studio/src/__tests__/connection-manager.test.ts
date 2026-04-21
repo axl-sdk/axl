@@ -298,4 +298,83 @@ describe('ConnectionManager', () => {
     expect(last.data.type).toBe('done');
     expect(last.data.evalResultId).toBe('abc-123');
   });
+
+  describe('replay buffer resource caps (SEC-H5, B-4)', () => {
+    it('enforces a global cap on concurrent replay buffers', () => {
+      // Allocate MAX_ACTIVE_BUFFERS + 10 distinct execution channels.
+      // The eldest 10 should be evicted, but the newest remain live.
+      // We use `execution:*` to trigger buffering; each broadcast creates
+      // a fresh ChannelBuffer for a new channel name.
+      const OVERFLOW = 10;
+      const CAP = 256; // matches MAX_ACTIVE_BUFFERS
+      for (let i = 0; i < CAP + OVERFLOW; i++) {
+        connMgr.broadcast(`execution:run-${i}`, { type: 'agent_call_start', agent: 'a' });
+      }
+      // Subscribe to the 5th channel (well within the evicted range):
+      // buffer should have been evicted, so no replay events land.
+      const { ws: wsEarly, messages: earlyMsgs } = createMockWs();
+      connMgr.add(wsEarly);
+      connMgr.subscribe(wsEarly, `execution:run-0`);
+      expect(earlyMsgs).toHaveLength(0);
+
+      // Subscribe to a channel created near the end: buffer should be
+      // live and replay its event.
+      const { ws: wsLate, messages: lateMsgs } = createMockWs();
+      connMgr.add(wsLate);
+      connMgr.subscribe(wsLate, `execution:run-${CAP + OVERFLOW - 1}`);
+      expect(lateMsgs).toHaveLength(1);
+    });
+
+    it('prefers evicting completed buffers over live ones when at cap', () => {
+      // Fill to the cap with live (no terminal) buffers, then complete
+      // buffer #1. Adding a (CAP+1)th buffer should evict #1, NOT #0.
+      const CAP = 256;
+      for (let i = 0; i < CAP; i++) {
+        connMgr.broadcast(`execution:live-${i}`, { type: 'agent_call_start' });
+      }
+      // Complete buffer #1 by emitting a terminal event.
+      connMgr.broadcast(`execution:live-1`, { type: 'done', data: { result: 'ok' } });
+      // Adding one more buffer should evict the completed one (live-1),
+      // not the oldest live (live-0).
+      connMgr.broadcast(`execution:new-one`, { type: 'agent_call_start' });
+
+      // live-0 (oldest, but live) still has its buffer.
+      const { ws: ws0, messages: m0 } = createMockWs();
+      connMgr.add(ws0);
+      connMgr.subscribe(ws0, 'execution:live-0');
+      expect(m0).toHaveLength(1);
+
+      // live-1 (completed → evicted) has no replay.
+      const { ws: ws1, messages: m1 } = createMockWs();
+      connMgr.add(ws1);
+      connMgr.subscribe(ws1, 'execution:live-1');
+      expect(m1).toHaveLength(0);
+    });
+
+    it('drops non-terminal events once per-buffer byte budget is exceeded but keeps the terminal', () => {
+      // Each broadcast is a ~50KB payload — just below the 64KB WS
+      // frame truncation threshold so it lands in the buffer at full
+      // size rather than being replaced with a ~500B placeholder.
+      // 100 × 50KB = 5MB total, exceeding the 4MB byte cap. Roughly
+      // the last ~20 non-terminal events should be dropped; the
+      // terminal `done` is buffered regardless.
+      const chunk = 'x'.repeat(50_000);
+      for (let i = 0; i < 100; i++) {
+        connMgr.broadcast('execution:big', { type: 'agent_call_start', data: { payload: chunk } });
+      }
+      connMgr.broadcast('execution:big', { type: 'done', data: { result: 'ok' } });
+
+      // Late subscriber: sees as many non-terminals as fit in the 4MB
+      // budget plus the terminal `done`. The exact count depends on
+      // per-event byte overhead, but it must be strictly less than
+      // 101 (i.e., at least one non-terminal was dropped).
+      const { ws, messages } = createMockWs();
+      connMgr.add(ws);
+      connMgr.subscribe(ws, 'execution:big');
+      expect(messages.length).toBeGreaterThan(0);
+      expect(messages.length).toBeLessThan(101);
+      const last = JSON.parse(messages[messages.length - 1]);
+      expect(last.data.type).toBe('done');
+    });
+  });
 });

@@ -25,6 +25,10 @@ interface ChannelBuffer {
   events: BufferedEvent[];
   complete: boolean; // True after done/error event
   timer?: ReturnType<typeof setTimeout>;
+  /** Sum of `msg.length` over buffered events. Byte-accurate; used to
+   *  enforce the per-buffer memory cap below. Maintained incrementally
+   *  so we don't have to re-scan on every push. */
+  bytes: number;
 }
 
 const BUFFER_TTL_MS = 30_000; // Clean up buffers 30s after stream completes
@@ -32,6 +36,23 @@ const MAX_BUFFER_EVENTS = 1000; // Cap replay buffer size (raised from 500 in
 // spec/16 §5.2 to absorb nested-ask volume —
 // ~10 nested asks × ~20 structural events
 // each, with headroom).
+
+/** Per-buffer byte budget. 1000 events × 64KB max each would peak at
+ *  ~64MB per stream; the real-world distribution is bimodal (hundreds of
+ *  small structural events + a few verbose `agent_call_end` snapshots),
+ *  so 4MB per buffer is generous. When exceeded, new non-terminal events
+ *  are dropped (terminal `done`/`error` always buffered). Review B-4. */
+const MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+
+/** Cap on the number of concurrently-live replay buffers. Each buffer
+ *  is an open execution/eval stream; without a cap, a server that sees
+ *  sustained churn (say, 10k short-lived executions / minute) holds
+ *  10k × MAX_BUFFER_BYTES = 40GB of event-log memory across the
+ *  TTL window. When we hit the cap, the oldest complete buffer is
+ *  evicted immediately; if all live buffers are still incomplete, the
+ *  oldest one is dropped anyway (its late subscribers will miss the
+ *  replay, which is degraded UX but NOT a crash). Review SEC-H5. */
+const MAX_ACTIVE_BUFFERS = 256;
 
 /**
  * Stream-only event types excluded from the replay buffer entirely.
@@ -229,18 +250,48 @@ export class ConnectionManager {
     if (isBufferedChannel(channel)) {
       let buffer = this.buffers.get(channel);
       if (!buffer) {
-        buffer = { events: [], complete: false };
+        // Enforce the global-buffer cap before allocating. Evict the
+        // oldest-inserted buffer (Map preserves insertion order, so
+        // `.keys().next().value` is the eldest). Prefer evicting a
+        // completed buffer if any exist — its late-subscriber window
+        // is already effectively closed. Falls back to evicting the
+        // eldest live buffer under sustained pressure.
+        if (this.buffers.size >= MAX_ACTIVE_BUFFERS) {
+          let victim: string | undefined;
+          for (const [ch, buf] of this.buffers) {
+            if (buf.complete) {
+              victim = ch;
+              break;
+            }
+          }
+          if (victim === undefined) {
+            victim = this.buffers.keys().next().value as string | undefined;
+          }
+          if (victim !== undefined) {
+            const old = this.buffers.get(victim);
+            if (old?.timer) clearTimeout(old.timer);
+            this.buffers.delete(victim);
+          }
+        }
+        buffer = { events: [], complete: false, bytes: 0 };
         this.buffers.set(channel, buffer);
       }
-      // Always buffer terminal events; skip non-terminal if at capacity;
-      // never buffer high-volume types (token, partial_object) per
-      // spec/16 §5.2 — late subscribers reconstruct the same info from
-      // structural events.
+      // Always buffer terminal events; skip non-terminal if at capacity
+      // on EITHER the event-count OR byte budget; never buffer
+      // high-volume types (token, partial_object) per spec/16 §5.2 —
+      // late subscribers reconstruct the same info from structural
+      // events.
       const event = data as { type?: string };
       const isTerminal = event.type === 'done' || event.type === 'error';
       const isUnbuffered = event.type !== undefined && UNBUFFERED_EVENT_TYPES.has(event.type);
-      if (!isUnbuffered && (buffer.events.length < MAX_BUFFER_EVENTS || isTerminal)) {
-        buffer.events.push({ msg, data });
+      if (!isUnbuffered) {
+        const msgBytes = Buffer.byteLength(msg, 'utf8');
+        const atCountCap = buffer.events.length >= MAX_BUFFER_EVENTS;
+        const atByteCap = buffer.bytes + msgBytes > MAX_BUFFER_BYTES;
+        if (isTerminal || (!atCountCap && !atByteCap)) {
+          buffer.events.push({ msg, data });
+          buffer.bytes += msgBytes;
+        }
       }
 
       // Schedule buffer cleanup after terminal events

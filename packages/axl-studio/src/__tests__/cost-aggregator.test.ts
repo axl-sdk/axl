@@ -255,32 +255,32 @@ describe('CostAggregator', () => {
   describe('embedder cost bucketing', () => {
     it('buckets memory_remember/memory_recall cost by embedder model', () => {
       aggregator.onTrace({
-        type: 'log',
+        type: 'memory_remember',
         cost: 0.000005,
         tokens: { input: 10 },
         data: {
-          event: 'memory_remember',
           key: 'pet',
+          scope: 'session',
           usage: { cost: 0.000005, tokens: 10, model: 'text-embedding-3-small' },
         },
       });
       aggregator.onTrace({
-        type: 'log',
+        type: 'memory_recall',
         cost: 0.000003,
         tokens: { input: 6 },
         data: {
-          event: 'memory_recall',
           key: 'pet',
+          scope: 'session',
           usage: { cost: 0.000003, tokens: 6, model: 'text-embedding-3-small' },
         },
       });
       aggregator.onTrace({
-        type: 'log',
+        type: 'memory_remember',
         cost: 0.0001,
         tokens: { input: 100 },
         data: {
-          event: 'memory_remember',
           key: 'doc',
+          scope: 'session',
           usage: { cost: 0.0001, tokens: 100, model: 'text-embedding-3-large' },
         },
       });
@@ -316,12 +316,12 @@ describe('CostAggregator', () => {
       // embedder. Context.ts now mirrors `usage.tokens` to top-level
       // `event.tokens.input` so the gate allows the event through.
       aggregator.onTrace({
-        type: 'log',
+        type: 'memory_remember',
         // NB: no top-level cost
         tokens: { input: 50 },
         data: {
-          event: 'memory_remember',
           key: 'pet',
+          scope: 'session',
           // no cost in usage either — local embedder
           usage: { tokens: 50, model: 'local-embedder' },
         },
@@ -341,11 +341,11 @@ describe('CostAggregator', () => {
 
     it('uses "unknown" key when embedder does not report a model', () => {
       aggregator.onTrace({
-        type: 'log',
+        type: 'memory_remember',
         cost: 0.000002,
         data: {
-          event: 'memory_remember',
           key: 'x',
+          scope: 'session',
           // no usage.model field
           usage: { cost: 0.000002, tokens: 4 },
         },
@@ -359,7 +359,10 @@ describe('CostAggregator', () => {
       });
     });
 
-    it('ignores non-memory log events', () => {
+    it('ignores non-memory events (no byEmbedder bucket touched)', () => {
+      // `log` events don't carry memory shape anymore — they're free-form
+      // `ctx.log()` calls. A `log` with a top-level cost should still land
+      // in totalCost but must NOT touch `byEmbedder`.
       aggregator.onTrace({
         type: 'log',
         cost: 0.01,
@@ -382,8 +385,8 @@ describe('CostAggregator', () => {
       // The early-return in onTrace should prevent us from ever reaching
       // the embedder bucket path for this event.
       aggregator.onTrace({
-        type: 'log',
-        data: { event: 'memory_recall', key: 'name', semantic: false, hit: true },
+        type: 'memory_recall',
+        data: { key: 'name', scope: 'session', semantic: false, hit: true },
       });
 
       const data = aggregator.getData();
@@ -392,10 +395,11 @@ describe('CostAggregator', () => {
 
     it('reset clears byEmbedder', () => {
       aggregator.onTrace({
-        type: 'log',
+        type: 'memory_remember',
         cost: 0.000005,
         data: {
-          event: 'memory_remember',
+          key: 'x',
+          scope: 'session',
           usage: { cost: 0.000005, tokens: 10, model: 'text-embedding-3-small' },
         },
       });

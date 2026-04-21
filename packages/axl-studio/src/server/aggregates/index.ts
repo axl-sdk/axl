@@ -26,7 +26,6 @@ export {
   enrichWorkflowStats,
   reduceTraceStats,
   emptyTraceStatsData,
-  isLogEvent,
 } from './reducers.js';
 export type {
   EvalTrendData,

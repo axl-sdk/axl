@@ -2,7 +2,6 @@ import type { AxlRuntime, AxlEvent, ExecutionInfo } from '@axlsdk/axl';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import { AggregateSnapshots, REBUILD_INTERVAL_MS, withinWindow } from './aggregate-snapshots.js';
 import type { WindowId } from './aggregate-snapshots.js';
-import { isLogEvent } from './reducers.js';
 
 export type ExecutionReducer<State> = (acc: State, execution: ExecutionInfo) => State;
 
@@ -46,7 +45,7 @@ export class ExecutionAggregator<State> {
   async start(): Promise<void> {
     await this.rebuild();
     this.listener = (event: AxlEvent) => {
-      if (!isLogEvent(event, 'workflow_end')) return;
+      if (event.type !== 'workflow_end') return;
       // Capture generation before the async gap
       const gen = this.generation;
       this.options.runtime

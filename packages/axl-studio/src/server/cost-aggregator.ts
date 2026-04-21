@@ -131,23 +131,19 @@ export class CostAggregator {
     }
 
     // Embedder cost decomposition: `ctx.remember({embed:true})` and
-    // semantic `ctx.recall({query})` emit `log` events with top-level
-    // `cost` and `data.usage`. Bucket them by embedder model so the UI
-    // can render a breakdown that mirrors byModel for agent calls.
-    if (event.type === 'log') {
-      const d = (event.data ?? {}) as {
-        event?: string;
-        usage?: { model?: string; tokens?: number };
-      };
-      if (d.event === 'memory_remember' || d.event === 'memory_recall') {
-        const modelKey = d.usage?.model ?? 'unknown';
-        const embedTokens = typeof d.usage?.tokens === 'number' ? d.usage.tokens : 0;
-        const entry = this.data.byEmbedder[modelKey] ?? { cost: 0, calls: 0, tokens: 0 };
-        entry.cost += cost;
-        entry.calls += 1;
-        entry.tokens += embedTokens;
-        this.data.byEmbedder[modelKey] = entry;
-      }
+    // semantic `ctx.recall({query})` emit `memory_remember` /
+    // `memory_recall` variants with top-level `cost` and `data.usage`.
+    // Bucket them by embedder model so the UI can render a breakdown
+    // that mirrors byModel for agent calls.
+    if (event.type === 'memory_remember' || event.type === 'memory_recall') {
+      const d = (event.data ?? {}) as { usage?: { model?: string; tokens?: number } };
+      const modelKey = d.usage?.model ?? 'unknown';
+      const embedTokens = typeof d.usage?.tokens === 'number' ? d.usage.tokens : 0;
+      const entry = this.data.byEmbedder[modelKey] ?? { cost: 0, calls: 0, tokens: 0 };
+      entry.cost += cost;
+      entry.calls += 1;
+      entry.tokens += embedTokens;
+      this.data.byEmbedder[modelKey] = entry;
     }
 
     // Broadcast to WS subscribers

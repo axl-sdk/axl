@@ -186,50 +186,12 @@ describe('reduceCost', () => {
     });
   });
 
-  describe('workflow_start log-form detection', () => {
-    it('counts executions from log-form workflow_start (production runtime)', () => {
-      const events: AxlEvent[] = [
-        // Production runtime emits type: 'log' with data.event: 'workflow_start'
-        makeEvent({
-          type: 'log',
-          workflow: 'wf-1',
-          data: { event: 'workflow_start', input: {} },
-        }),
-        makeEvent({
-          type: 'agent_call_end',
-          workflow: 'wf-1',
-          cost: 0.01,
-          tokens: { input: 10, output: 5 },
-        }),
-        makeEvent({
-          type: 'log',
-          workflow: 'wf-1',
-          data: { event: 'workflow_start', input: {} },
-        }),
-      ];
-
-      let data = emptyCostData();
-      for (const e of events) data = reduceCost(data, e);
-
-      expect(data.byWorkflow['wf-1'].executions).toBe(2);
-      expect(data.byWorkflow['wf-1'].cost).toBeCloseTo(0.01);
-    });
-
-    it('counts executions from both log-form and direct workflow_start', () => {
-      const events: AxlEvent[] = [
-        makeEvent({ type: 'workflow_start', workflow: 'wf-1', cost: 0 }),
-        makeEvent({
-          type: 'log',
-          workflow: 'wf-1',
-          data: { event: 'workflow_start', input: {} },
-        }),
-      ];
-
-      let data = emptyCostData();
-      for (const e of events) data = reduceCost(data, e);
-      expect(data.byWorkflow['wf-1'].executions).toBe(2);
-    });
-  });
+  // The `type: 'log'` + `data.event: 'workflow_start'` shape was the
+  // production runtime's emission form in 0.14.x and earlier. Both
+  // `runtime.execute()`/`stream()` and `AxlTestRuntime` were updated in
+  // 0.15.0 to emit `workflow_start` as a first-class typed variant, and
+  // the log-form fallback has been deleted. Tests covering the old
+  // shape were removed alongside the dead `isLogEvent` helper.
 
   describe('pure function properties', () => {
     it('does not mutate the accumulator', () => {

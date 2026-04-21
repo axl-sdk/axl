@@ -463,9 +463,9 @@ describe('reduceCost hardening', () => {
 
   it('embedder cost with missing usage data does not crash', () => {
     const event = makeEvent({
-      type: 'log',
+      type: 'memory_remember',
       cost: 0.001,
-      data: { event: 'memory_remember' }, // no usage field
+      data: { key: 'x', scope: 'session' }, // no usage field
     });
     const result = reduceCost(emptyCostData(), event);
     expect(result.byEmbedder['unknown'].cost).toBe(0.001);
@@ -474,9 +474,9 @@ describe('reduceCost hardening', () => {
 
   it('embedder cost with NaN tokens clamps to 0', () => {
     const event = makeEvent({
-      type: 'log',
+      type: 'memory_recall',
       cost: 0.001,
-      data: { event: 'memory_recall', usage: { model: 'ada', tokens: NaN } },
+      data: { key: 'x', scope: 'session', usage: { model: 'ada', tokens: NaN } },
     });
     const result = reduceCost(emptyCostData(), event);
     expect(result.byEmbedder['ada'].tokens).toBe(0);

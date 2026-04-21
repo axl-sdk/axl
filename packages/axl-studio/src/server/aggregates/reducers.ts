@@ -11,15 +11,6 @@ import type { CostData } from '../types.js';
 /** Clamp a possibly-NaN/Infinity number to 0. */
 const finite = (v: number | undefined): number => (Number.isFinite(v) ? v! : 0);
 
-/** Detect log-form events from the production runtime (type: 'log' + data.event). */
-export function isLogEvent(event: AxlEvent, eventName: string): boolean {
-  if (event.type === eventName) return true;
-  if (event.type === 'log' && event.data != null && typeof event.data === 'object') {
-    return (event.data as { event?: unknown }).event === eventName;
-  }
-  return false;
-}
-
 // ── Cost reducer (AxlEvent → CostData) ──────────────────────────────
 
 function emptyRetry(): CostData['retry'] {
@@ -55,7 +46,7 @@ export function emptyCostData(): CostData {
  * NaN/Infinity guards on all numeric accumulations.
  */
 export function reduceCost(acc: CostData, event: AxlEvent): CostData {
-  const isWorkflowStart = isLogEvent(event, 'workflow_start');
+  const isWorkflowStart = event.type === 'workflow_start';
 
   // workflow_start events increment per-workflow executions and return early.
   // They carry no meaningful cost — any cost/token fields are incidental.
@@ -142,24 +133,22 @@ export function reduceCost(acc: CostData, event: AxlEvent): CostData {
     }
   }
 
-  // Embedder cost: memory_remember and memory_recall log events.
+  // Embedder cost: `memory_remember` / `memory_recall` variants carry
+  // `usage.{tokens,model}` and a top-level `cost` (mirrored by the
+  // emitter). Bucket by embedder model so the Cost Dashboard's
+  // "Memory (Embedder)" section can break down spend.
   let byEmbedder = acc.byEmbedder;
-  if (event.type === 'log') {
-    const d = (event.data ?? {}) as {
-      event?: string;
-      usage?: { model?: string; tokens?: number };
+  if (event.type === 'memory_remember' || event.type === 'memory_recall') {
+    const usage = event.data.usage;
+    byEmbedder = { ...acc.byEmbedder };
+    const modelKey = usage?.model ?? 'unknown';
+    const embedTokens = typeof usage?.tokens === 'number' ? finite(usage.tokens) : 0;
+    const prev = byEmbedder[modelKey] ?? { cost: 0, calls: 0, tokens: 0 };
+    byEmbedder[modelKey] = {
+      cost: prev.cost + cost,
+      calls: prev.calls + 1,
+      tokens: prev.tokens + embedTokens,
     };
-    if (d.event === 'memory_remember' || d.event === 'memory_recall') {
-      byEmbedder = { ...acc.byEmbedder };
-      const modelKey = d.usage?.model ?? 'unknown';
-      const embedTokens = typeof d.usage?.tokens === 'number' ? finite(d.usage.tokens) : 0;
-      const prev = byEmbedder[modelKey] ?? { cost: 0, calls: 0, tokens: 0 };
-      byEmbedder[modelKey] = {
-        cost: prev.cost + cost,
-        calls: prev.calls + 1,
-        tokens: prev.tokens + embedTokens,
-      };
-    }
   }
 
   return {

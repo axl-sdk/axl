@@ -144,42 +144,9 @@ describe('ExecutionAggregator', () => {
     agg.close();
   });
 
-  it('detects log-form workflow_end from production runtime', async () => {
-    const now = Date.now();
-    const exec = makeExecution({
-      executionId: 'e-log',
-      startedAt: now,
-      totalCost: 0.1,
-    });
-    const runtime = createMockRuntime([]);
-    runtime.getExecution.mockResolvedValue(exec);
-
-    const agg = new ExecutionAggregator({
-      runtime: runtime as any,
-      connMgr,
-      channel: 'test',
-      reducer: executionReducer,
-      emptyState,
-      windows,
-    });
-
-    await agg.start();
-
-    // Production runtime emits type: 'log' with data.event: 'workflow_end'
-    const event: AxlEvent = {
-      executionId: 'e-log',
-      step: 1,
-      type: 'log',
-      timestamp: now,
-      data: { event: 'workflow_end', status: 'completed', duration: 100 },
-    };
-    runtime.emit('trace', event);
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(agg.getSnapshot('all').count).toBe(1);
-    expect(agg.getSnapshot('all').totalCost).toBeCloseTo(0.1);
-    agg.close();
-  });
+  // The `type: 'log'` + `data.event: 'workflow_end'` shape was the
+  // runtime's emission form in 0.14.x — removed in 0.15.0 alongside
+  // the log-form `workflow_start` fallback.
 
   it('ignores non-workflow_end events', async () => {
     const runtime = createMockRuntime([]);

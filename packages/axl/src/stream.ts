@@ -123,6 +123,45 @@ export class AxlStream extends Readable {
   }
 
   /**
+   * Iterator over `{ askId, text }` pairs — one emission per token chunk,
+   * tagged with the ask frame that produced it. Complements `.text`
+   * (root-only stream): consumers building a split-pane UI that shows
+   * each sub-agent's output in its own lane can group by `askId`
+   * without iterating the raw stream and hand-filtering on `event.type`.
+   *
+   * Nested and root tokens both flow through. The `agent` field names
+   * the producing agent for UI labelling; it's undefined when the token
+   * was emitted outside any ask (rare — synthesized test fixtures).
+   */
+  get textByAsk(): AsyncIterable<{ askId: string; agent?: string; text: string }> {
+    const self = this;
+    return {
+      [Symbol.asyncIterator](): AsyncIterator<{ askId: string; agent?: string; text: string }> {
+        const iter = self[Symbol.asyncIterator]();
+        return {
+          async next(): Promise<IteratorResult<{ askId: string; agent?: string; text: string }>> {
+            while (true) {
+              const { value, done } = await iter.next();
+              if (done) {
+                return {
+                  value: undefined as unknown as { askId: string; agent?: string; text: string },
+                  done: true,
+                };
+              }
+              if (value.type === 'token') {
+                return {
+                  value: { askId: value.askId, agent: value.agent, text: value.data },
+                  done: false,
+                };
+              }
+            }
+          },
+        };
+      },
+    };
+  }
+
+  /**
    * Iterator over structural lifecycle events only — skips per-token chatter
    * and progressive partial_object emissions. Useful for waterfall UIs and
    * any consumer that wants the "what happened" timeline without per-chunk

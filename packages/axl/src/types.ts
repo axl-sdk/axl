@@ -364,12 +364,39 @@ export type AxlEventBase = {
   model?: string;
   /** Optional prompt version stamped from `agent._config.version`. */
   promptVersion?: string;
-  /** Agent turn cost. Variants like `agent_call_end` and `ask_end` require it
-   *  (intersection narrows to required); other emit sites may stamp it
-   *  optionally to flow into cost rails. */
+  /**
+   * Cost (USD) contributed by this event.
+   *
+   * Two DIFFERENT semantics ship on this field and consumers must know
+   * which they're reading:
+   *
+   *   - **Leaf cost** (`agent_call_end`, `tool_call_end`, `memory_remember`,
+   *     `memory_recall`): the authoritative charge for this single
+   *     provider call / tool invocation / embedder call. Summing these
+   *     across an execution gives the true spend.
+   *
+   *   - **Per-ask rollup** (`ask_end`): the SUM of leaf costs emitted
+   *     within this ask's frame, EXCLUDING nested asks (which roll up
+   *     into their own `ask_end`). Spec/16 decision 10.
+   *
+   * **If you write your own accumulator, DO NOT do `total += event.cost`
+   * across all event types — you'll double-count every ask** because the
+   * leaves AND the rollup both carry `cost`. Use the exported
+   * `eventCostContribution(event)` helper from `@axlsdk/axl` instead:
+   * it encapsulates the "skip ask_end, finite-check, leaf-only" rule in
+   * one place so your accumulator stays in lockstep with the built-in
+   * `runtime.trackExecution`, `ExecutionInfo.totalCost`, and Studio's
+   * cost aggregator.
+   *
+   * Other variants may stamp `cost` optionally to flow into cost rails
+   * (e.g., memory ops mirror `usage.cost` here). Review UX-8.
+   */
   cost?: number;
   /** Token counts. Required-by-narrowing on `agent_call_end`; optional on
-   *  any event that wishes to mirror an aggregate. */
+   *  any event that wishes to mirror an aggregate. Scope is agent prompt /
+   *  completion / reasoning tokens ONLY — embedder tokens live in
+   *  `memory_*.data.usage.tokens` and are deliberately NOT summed into
+   *  this field (different pricing, different model, different category). */
   tokens?: { input?: number; output?: number; reasoning?: number };
   /** Duration in ms (set on `_end` variants and a few single-point events). */
   duration?: number;

@@ -75,12 +75,35 @@ function buildAskTree(events: AxlEvent[]): AskNode[] {
       }
     }
 
-    // `handoff` spans two asks — attribute the handoff to `fromAskId`.
+    // `handoff` spans two asks — attribute the handoff to `fromAskId`,
+    // and stub a target node so the tree still renders a row for the
+    // target even if it aborts before emitting any of its own events.
+    // Review UX-9: an orphan handoff (target produced nothing) used to
+    // disappear entirely from the tree; now we show it with a placeholder
+    // node that later events overwrite naturally if they arrive.
     if (ev.type === 'handoff' && ev.fromAskId) {
       const node = nodes.get(ev.fromAskId);
       const target = (ev.data as { target?: string } | undefined)?.target ?? ev.toAskId ?? '';
       if (node && ev.toAskId) {
         node.handoffsOut.push({ toAskId: ev.toAskId, target });
+        if (!nodes.has(ev.toAskId)) {
+          nodes.set(ev.toAskId, {
+            askId: ev.toAskId,
+            parentAskId: ev.fromAskId,
+            depth:
+              typeof ev.targetDepth === 'number' ? ev.targetDepth : (ev.depth ?? node.depth) + 1,
+            agent: target || undefined,
+            cost: 0,
+            // Status stays 'running' until a real ask_start/end for
+            // this frame arrives; if none ever does (true orphan), the
+            // UI renders it indefinitely — a deliberate hint that the
+            // handoff target never reported back.
+            status: 'running',
+            events: [],
+            children: [],
+            handoffsOut: [],
+          });
+        }
       }
       continue;
     }

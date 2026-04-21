@@ -34,6 +34,7 @@ import {
   ValidationError,
 } from './errors.js';
 import type { Agent } from './agent.js';
+import { parsePartialJson } from './partial-json.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import type { AxlConfig } from './config.js';
@@ -760,6 +761,11 @@ export class WorkflowContext<TInput = unknown> {
     // model saw (growing with tool results + retry feedback across turns).
     const verboseTrace = this.config.trace?.level === 'full';
 
+    // Track the most recent pipeline `start` so the terminal `committed`
+    // event can carry the matching attempt/maxAttempts. Spec §4.2.
+    let lastStartAttempt = 1;
+    let lastStartMaxAttempts = 1;
+
     while (turns < maxTurns) {
       // Timeout check
       if (Date.now() - startTime > timeoutMs) {
@@ -767,6 +773,38 @@ export class WorkflowContext<TInput = unknown> {
       }
 
       turns++;
+      // Emit pipeline `start` only on the FIRST turn of the ask OR when
+      // entering a gate-rejection retry. Tool-calling continuations
+      // within the same ask do NOT produce additional starts — they're
+      // agent-loop iterations, not retry attempts. Spec §4.2 invariant.
+      const isFirstTurn = turns === 1;
+      const isRetryTurn = pendingRetryReason !== undefined;
+      if (isFirstTurn || isRetryTurn) {
+        const stage: 'initial' | 'schema' | 'validate' | 'guardrail' =
+          pendingRetryReason ?? 'initial';
+        let pipelineAttempt = 1;
+        let pipelineMaxAttempts = 1;
+        if (stage === 'guardrail') {
+          pipelineAttempt = guardrailOutputRetries + 1;
+          pipelineMaxAttempts = maxGuardrailRetries + 1;
+        } else if (stage === 'schema') {
+          pipelineAttempt = schemaRetries + 1;
+          pipelineMaxAttempts = (options?.retries ?? 3) + 1;
+        } else if (stage === 'validate') {
+          pipelineAttempt = validateRetries + 1;
+          pipelineMaxAttempts = (options?.validateRetries ?? 2) + 1;
+        }
+        lastStartAttempt = pipelineAttempt;
+        lastStartMaxAttempts = pipelineMaxAttempts;
+        this.emitEvent({
+          type: 'pipeline',
+          agent: agent._name,
+          status: 'start',
+          stage,
+          attempt: pipelineAttempt,
+          maxAttempts: pipelineMaxAttempts,
+        });
+      }
       // Per-turn start time for accurate `duration` on each agent_call event.
       // `startTime` above is the start of the entire ask() call; without this,
       // turn N's duration would include all prior turns' latency and gates.
@@ -811,6 +849,17 @@ export class WorkflowContext<TInput = unknown> {
 
         let thinkingContent = '';
 
+        // partial_object emission gating (spec §4.2):
+        //   - schema is set
+        //   - no tools (JSON-mode response, not tool-calling)
+        //   - schema root is a ZodObject (only object roots get partials)
+        // Structural-boundary throttle: parse only when the delta's last
+        // non-whitespace char is `,`, `}`, or `]`. Bounds event volume
+        // and avoids parsing on every single character.
+        const partialObjectEnabled =
+          !!options?.schema && toolDefs.length === 0 && options.schema instanceof z.ZodObject;
+        const currentAttempt = schemaRetries + 1;
+
         for await (const chunk of provider.stream(currentMessages, chatOptions)) {
           if (chunk.type === 'text_delta') {
             content += chunk.content;
@@ -819,6 +868,32 @@ export class WorkflowContext<TInput = unknown> {
             // onTrace skips persisting tokens to ExecutionInfo.events.
             this.emitEvent({ type: 'token', data: chunk.content });
             this.onToken(chunk.content, callbackMeta);
+            if (partialObjectEnabled) {
+              // Throttle on structural boundaries — last non-whitespace
+              // char of the delta is one of `,`, `}`, `]`. Tolerant
+              // parser handles any trailing truncation in `content`.
+              const trimmed = chunk.content.replace(/\s+$/, '');
+              const lastCh = trimmed[trimmed.length - 1];
+              if (lastCh === ',' || lastCh === '}' || lastCh === ']') {
+                let parsed: unknown;
+                try {
+                  parsed = parsePartialJson(extractJson(content));
+                } catch {
+                  // Mid-document malformed (not just truncation) — skip
+                  // this delta. The next structural-boundary delta will
+                  // get another shot once the model writes valid syntax.
+                  parsed = undefined;
+                }
+                if (parsed !== undefined) {
+                  this.emitEvent({
+                    type: 'partial_object',
+                    agent: agent._name,
+                    attempt: currentAttempt,
+                    data: { object: parsed },
+                  });
+                }
+              }
+            }
           } else if (chunk.type === 'thinking_delta') {
             thinkingContent += chunk.content;
           } else if (chunk.type === 'tool_call_delta') {
@@ -1454,6 +1529,15 @@ export class WorkflowContext<TInput = unknown> {
 
         if (outputResult.block) {
           if (feedbackMessage) {
+            this.emitEvent({
+              type: 'pipeline',
+              agent: agent._name,
+              status: 'failed',
+              stage: 'guardrail',
+              attempt: guardrailOutputRetries + 1,
+              maxAttempts: maxGuardrailRetries + 1,
+              reason: feedbackMessage,
+            });
             guardrailOutputRetries++;
             appendRetryMessages(
               currentMessages,
@@ -1515,6 +1599,15 @@ export class WorkflowContext<TInput = unknown> {
 
         if (!schemaValid) {
           if (schemaFeedback) {
+            this.emitEvent({
+              type: 'pipeline',
+              agent: agent._name,
+              status: 'failed',
+              stage: 'schema',
+              attempt: schemaRetries + 1,
+              maxAttempts: (options.retries ?? 3) + 1,
+              reason: schemaFeedback,
+            });
             schemaRetries++;
             appendRetryMessages(
               currentMessages,
@@ -1583,6 +1676,15 @@ export class WorkflowContext<TInput = unknown> {
 
         if (!validateResult.valid) {
           if (validateFeedback) {
+            this.emitEvent({
+              type: 'pipeline',
+              agent: agent._name,
+              status: 'failed',
+              stage: 'validate',
+              attempt: validateRetries + 1,
+              maxAttempts: (options.validateRetries ?? 2) + 1,
+              reason: validateFeedback,
+            });
             validateRetries++;
             appendRetryMessages(
               currentMessages,
@@ -1601,7 +1703,16 @@ export class WorkflowContext<TInput = unknown> {
         }
       }
 
-      // All gates passed — push to session history and return
+      // All gates passed — emit pipeline `committed`, push to session
+      // history, and return. Spec §4.2: terminal pipeline event for this
+      // ask, fires before `done`.
+      this.emitEvent({
+        type: 'pipeline',
+        agent: agent._name,
+        status: 'committed',
+        attempt: lastStartAttempt,
+        maxAttempts: lastStartMaxAttempts,
+      });
       this.pushAssistantToSessionHistory(content, response.providerMetadata);
       return validated ?? content;
     }

@@ -15,7 +15,16 @@ import { AXL_EVENT_TYPES, type AxlEvent, type AxlEventType } from './types.js';
  */
 export class AxlStream extends Readable {
   private bus = new EventEmitter();
-  private tokens: string[] = [];
+  /**
+   * Token buffer split into "in-progress" and "committed" halves so
+   * `fullText` only includes tokens from attempts that actually won.
+   * On `pipeline(status: 'committed')`, the in-progress buffer flushes
+   * to `committedText`. On `pipeline(status: 'failed')`, the in-progress
+   * buffer is discarded — retried attempts no longer leak garbled
+   * output into `fullText`. Spec/16 §4.3.
+   */
+  private currentAttemptTokens: string[] = [];
+  private committedText = '';
   private result: unknown = undefined;
   private finished = false;
   readonly promise: Promise<unknown>;
@@ -174,7 +183,19 @@ export class AxlStream extends Readable {
     // canonical "render this in a chat bubble" use case; nested-ask tokens
     // still flow through the iterator so consumers that want them can filter.
     if (event.type === 'token' && (event.depth ?? 0) === 0) {
-      this.tokens.push(event.data);
+      this.currentAttemptTokens.push(event.data);
+    }
+    // Pipeline lifecycle: commit on success, discard on failure. Spec §4.3.
+    // Reading `fullText` between `committed` and `done` sees the correct
+    // text — that's why we commit on `committed` (which fires before
+    // `done`) rather than on `done`.
+    if (event.type === 'pipeline' && (event.depth ?? 0) === 0) {
+      if (event.status === 'committed') {
+        this.committedText += this.currentAttemptTokens.join('');
+        this.currentAttemptTokens = [];
+      } else if (event.status === 'failed') {
+        this.currentAttemptTokens = [];
+      }
     }
     this.bus.emit(event.type, event);
     this.push(event);
@@ -245,8 +266,12 @@ export class AxlStream extends Readable {
     this.bus.emit('__reject', error);
   }
 
-  /** Concatenated root-only text — what most chat UIs render. */
+  /** Concatenated root-only text from committed attempts plus the current
+   *  in-flight attempt. Retried (gate-rejected) attempts are excluded — see
+   *  spec/16 §4.3. Reading mid-attempt returns the in-progress text;
+   *  reading after `pipeline(committed)` (which fires before `done`)
+   *  returns the canonical winning text. */
   get fullText(): string {
-    return this.tokens.join('');
+    return this.committedText + this.currentAttemptTokens.join('');
   }
 }

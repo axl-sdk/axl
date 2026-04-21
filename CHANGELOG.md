@@ -73,9 +73,23 @@ for a step-by-step consumer migration guide.
   - `tool_call_start` (carries `tool`, `callId`, `data: { args }`) —
     pre-call marker; pairs with `tool_call_end` (which carries args
     AND result).
-  - Reserved (PR 2): `pipeline` (start/failed/committed retry
-    lifecycle) and `partial_object` (progressive structured-output
-    streaming).
+  - `pipeline` events (three statuses: `start`, `failed`, `committed`).
+    `start` fires once per LLM turn that contributes to the final
+    result (initial entry + each gate-rejection retry). Tool-calling
+    continuations within the same ask do NOT fire additional starts.
+    `failed` fires before each retry `continue` with the gate stage
+    (`schema` / `validate` / `guardrail`) and the feedback message
+    that's about to be injected. `committed` fires once on success
+    before `done`. Spec §4.2.
+  - `partial_object` events for progressive structured-output
+    streaming. Gated on `options?.schema && toolDefs.length === 0
+    && schema instanceof z.ZodObject`. Structural-boundary throttle:
+    emits only when a delta's last non-whitespace char is `,`, `}`,
+    or `]`. Backed by a hand-rolled tolerant JSON parser
+    (`packages/axl/src/partial-json.ts`, zero deps, ~250 LOC) that
+    handles trailing-truncation gracefully. Monotonicity guarantee:
+    each emission is a superset of the prior (no fields disappear
+    within an attempt).
 - `AskScoped` mixin adds `askId`, `parentAskId?`, `depth`, `agent?`
   to every event originating within `ctx.ask()`. Tree reconstruction
   via group-by(askId) + parent-link(parentAskId).
@@ -103,6 +117,12 @@ for a step-by-step consumer migration guide.
   propagate to outer-context callbacks. Spec §3.2.
 - Fixed: PII leak where the trace WS channel bypassed `redact`
   scrubbing has been closed.
+- Fixed: `AxlStream.fullText` no longer concatenates retried-attempt
+  tokens. The buffer is split into in-progress and committed halves;
+  `pipeline(committed)` flushes in-progress to committed (before
+  `done`); `pipeline(failed)` discards in-progress. Mid-attempt reads
+  see the growing buffer; post-`pipeline(committed)` reads see the
+  canonical winning text. Spec §4.3.
 
 ### Deprecated
 

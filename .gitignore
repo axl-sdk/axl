@@ -3,6 +3,7 @@ dist/
 *.tsbuildinfo
 .env
 .env.local
+.markdownlint.json
 coverage/
 .DS_Store
 .internal/

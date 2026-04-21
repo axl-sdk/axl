@@ -1216,7 +1216,14 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped, CallbackMeta } from
 
 Per-variant data shape exports from `@axlsdk/axl`: `AgentCallData`, `ToolCallData`, `ToolCallStartData`, `ToolApprovalData`, `ToolDeniedData`, `HandoffData`, `DelegateData`, `VerifyData`, `WorkflowStartData`, `WorkflowEndData`, `MemoryEventData`, `GuardrailData`, `SchemaCheckData`, `ValidateData`. The constant tuple `AXL_EVENT_TYPES` is the single source of truth for the discriminator.
 
-**Cost double-counting guard:** `ask_end.cost` is the per-ask rollup of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). Custom accumulators must skip `ask_end`: `if (event.cost && event.type !== 'ask_end') total += event.cost`. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, and Studio's cost aggregator already apply this guard.
+**Cost double-counting guard:** `ask_end.cost` is the per-ask rollup of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). Use the exported helper `eventCostContribution(event)` — returns `0` on `ask_end` and on non-finite values, `event.cost` otherwise. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, Studio's cost aggregator, and `AxlTestRuntime.totalCost()` all use this helper internally:
+
+```typescript
+import { eventCostContribution } from '@axlsdk/axl';
+const total = info.events.reduce((sum, e) => sum + eventCostContribution(e), 0);
+```
+
+Also exported: `isCostBearingLeaf(type)` (boolean test for cost-bearing leaf types) and `COST_BEARING_LEAF_TYPES` (the canonical tuple: `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall`), and `isRootLevel(event)` (true when `depth === 0` or undefined — used for root-only token filtering).
 
 ### `AgentCallData` (data on `agent_call_end` events)
 

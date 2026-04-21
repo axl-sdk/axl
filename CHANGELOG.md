@@ -295,6 +295,92 @@ in this release; no separate minor cycle.
   `ExecutionAggregator.start`. All three read typed discriminators
   directly now. `isLogEvent` helper deleted.
 
+#### Unified event model — user-scenario verification pass
+
+Follow-up after mapping user-facing scenarios (chat UX, ask-graph
+reconstruction, cost aggregation, retry observability, multi-tenancy,
+abort handling, session accumulation, test-runtime parity) to the
+implementation and closing gaps. No user-visible API changes — only
+correctness, parity, and test-coverage fixes.
+
+- **`memory_*.scope` is preserved under `trace.redact: true`** at the
+  core emit-time scrub. Previously it was overwritten with `'[redacted]'`
+  along with other string fields, diverging from the WS-layer
+  `redactStreamEvent` policy which correctly treats `scope` as a
+  structural discriminator (`'session' | 'global'`). Both layers now
+  preserve `scope` consistently.
+- **`AxlTestRuntime` emits `workflow_start` / `workflow_end` through
+  `ctx._emit*`** instead of a manual `_pushTrace` bypass. The previous
+  path skipped the `emitEvent` redaction pipeline, leaking raw
+  `input` / `result` through the test trace log even when
+  `config: { trace: { redact: true } }` was set. Parity with
+  production runtime is now unbroken.
+- **`AxlTestRuntime` emits `workflow_end(status: 'failed')` on handler
+  throw** with `aborted: true` when the error is an `AbortError`. The
+  previous implementation only emitted `workflow_end` on the success
+  path, so test assertions counting start↔end pairs saw unclosed
+  workflows on the failure path.
+- **`AxlTestRuntime` threads `workflowName` into `WorkflowContextInit`.**
+  The production runtime has always done this (`emitEvent` auto-stamps
+  `event.workflow` from it); the test runtime omitted it, so every
+  event emitted under test had `workflow: undefined`. Any consumer
+  grouping by workflow (Cost Dashboard `byWorkflow`,
+  `trackExecution.metadata.workflows`, eval runners) now sees correct
+  attribution in tests and production.
+- **`runtime.stream()` tightens the "workflow_start iff workflow_end"
+  invariant.** `ctx = wfCtx` is now assigned only AFTER
+  `_emitWorkflowStart` succeeds, so the outer `.catch` handler's
+  `ctx?._emitWorkflowEnd(...)` can never fire workflow_end without a
+  matching preceding workflow_start (e.g. if span setup throws
+  synchronously).
+- **`WorkflowLike` handler type uses bivariant parameter.** Switched
+  from `WorkflowContext` (defaults to `<unknown>`) to
+  `WorkflowContext<any>` so generic `Workflow<TInput>` instances
+  assign to `WorkflowLike` under strict function-parameter variance.
+  Unblocks `pnpm --filter @axlsdk/testing typecheck`; runtime behavior
+  is unchanged. (Pre-existing type error uncovered while adding tests.)
+
+**Test coverage added** to pin all the invariants above plus the ones
+that were correct but unpinned:
+
+- `event-utils.test.ts` (new file, 28 tests) — `eventCostContribution`
+  NaN/Infinity guards, ask_end exclusion, leaf-type table;
+  `isCostBearingLeaf`, `isRootLevel` depth handling,
+  `COST_BEARING_LEAF_TYPES` contents.
+- `stream.test.ts` — `.textByAsk` iterator (root + nested + `agent`
+  passthrough + non-token filtering); compile-time lifecycle
+  exhaustiveness via `Record<AxlEventType, 'lifecycle' | 'excluded'>`
+  + runtime check so a new `AxlEventType` can't silently fall out
+  of the `.lifecycle` iterator.
+- `ask-lifecycle.test.ts` — spec §9 `ask_end(ok:false)` invariant
+  expanded from "schema exhaustion only" to cover guardrail
+  exhaustion, validate exhaustion, and mid-ask
+  `BudgetExceededError`. Each pins: `ask_end.outcome.ok === false`
+  AND the failure does NOT emit a workflow-level `error`.
+- `runtime.test.ts` — stream abort rejects `.promise` with
+  `workflow_end.aborted === true`; `abortControllers` map cleanup
+  for all four paths (execute-success/failure,
+  stream-success/early-throw).
+- `connection-manager.test.ts` — 30-second TTL buffer cleanup
+  pinned via `vi.useFakeTimers()` with boundary coverage at
+  `TTL_MS - 1` (still present) and `TTL_MS + 1` (evicted).
+- `ask-tree.test.tsx` — orphan handoff placeholder renders when
+  `toAskId` has no matching `ask_start`; non-orphan comparison
+  confirms real `ask_start` replaces the placeholder.
+- `test-runtime.test.ts` — redaction applied to
+  `workflow_start`/`workflow_end`; raw values preserved when
+  redact is off; `workflow_end(failed)` on throw; `aborted: true`
+  on AbortError.
+
+**Docs:**
+
+- `docs/observability.md` + `docs/api-reference.md` now teach the
+  exported `eventCostContribution(event)` helper as the canonical
+  cost-aggregation API instead of the hand-rolled
+  `event.cost && event.type !== 'ask_end'` guard. Also documents
+  `isCostBearingLeaf`, `COST_BEARING_LEAF_TYPES`, and `isRootLevel`
+  as first-class exports.
+
 ### Deprecated
 
 - `AxlEventBase.parentToolCallId` is `@deprecated` (one-cycle window).

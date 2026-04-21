@@ -115,16 +115,20 @@ for (const event of info.events) {
 
 ### Cost: avoid double-counting in custom accumulators
 
-`ask_end.cost` is the **per-ask rollup** of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). If you sum `event.cost` across every event you observe, you'll double-count. Skip `ask_end` in your accumulator, or sum only the leaf events:
+`ask_end.cost` is the **per-ask rollup** of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). If you sum `event.cost` across every event you observe, you'll double-count.
+
+Use the exported helper `eventCostContribution(event)` — it returns `0` for `ask_end` rollups and for non-finite values, and the event's cost otherwise. This is the single source of truth Axl's internals use; third-party accumulators should match:
 
 ```typescript
+import { eventCostContribution } from '@axlsdk/axl';
+
 let total = 0;
 for (const event of info.events) {
-  if (event.cost && event.type !== 'ask_end') total += event.cost;
+  total += eventCostContribution(event);
 }
 ```
 
-The whole-execution total is `ExecutionInfo.totalCost`. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, and Studio's cost aggregator already apply this guard internally.
+The whole-execution total is `ExecutionInfo.totalCost`. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, Studio's cost aggregator, and `AxlTestRuntime.totalCost()` all apply this guard via `eventCostContribution` internally.
 
 ### Failure surfacing — `ask_end` vs. `error`
 

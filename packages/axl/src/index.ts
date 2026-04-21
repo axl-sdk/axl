@@ -18,6 +18,17 @@ export type { AxlConfig } from './config.js';
 // narrow on `event.type` from the `AxlEvent` union (spec/16 decision 8).
 export { AxlStream } from './stream.js';
 
+// Event helpers — consumer-facing utilities for accumulators / reducers
+// that need to honor spec invariants (cost-rollup skip, root-level
+// filter, leaf-cost detection). Use these instead of hand-rolling the
+// `event.type !== 'ask_end'` guard at every call site.
+export {
+  eventCostContribution,
+  isCostBearingLeaf,
+  isRootLevel,
+  COST_BEARING_LEAF_TYPES,
+} from './event-utils.js';
+
 // Session
 export { Session } from './session.js';
 export type { SessionOptions } from './session.js';

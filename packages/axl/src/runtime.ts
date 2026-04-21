@@ -27,6 +27,7 @@ import type {
   ChatMessage,
   HandoffRecord,
 } from './types.js';
+import { eventCostContribution } from './event-utils.js';
 import { NoopSpanManager } from './telemetry/noop.js';
 import { createSpanManager } from './telemetry/index.js';
 import type { SpanManager } from './telemetry/types.js';
@@ -562,12 +563,14 @@ export class AxlRuntime extends EventEmitter {
       sessionHistory,
       signal: controller.signal,
       onTrace: (event: AxlEvent) => {
-        execInfo.events.push(event);
-        // `ask_end` carries the per-ask rollup cost; the underlying
-        // `agent_call_end` / `tool_call_end` events that compose it have
-        // already incremented totalCost. Skip the rollup to avoid double
-        // counting (spec decision 10).
-        if (event.cost && event.type !== 'ask_end') execInfo.totalCost += event.cost;
+        // High-volume stream-only events (`token`, `partial_object`) are
+        // never persisted to `ExecutionInfo.events` — spec §2 and §5.2.
+        // They'd blow up the array on long streams AND leak per-chunk
+        // PII through REST reads that trust emit-time redaction.
+        if (event.type !== 'token' && event.type !== 'partial_object') {
+          execInfo.events.push(event);
+        }
+        execInfo.totalCost += eventCostContribution(event);
         this.emit('trace', event);
         this.outputAxlEvent(event);
         // Persist handoff records to session metadata
@@ -719,13 +722,12 @@ export class AxlRuntime extends EventEmitter {
         // the wire through `onTrace` — this callback is just the gate.
         onToken: () => {},
         onTrace: (event: AxlEvent) => {
-          // Persist non-token events to ExecutionInfo.events (per-token events
-          // would blow up the timeline at >10k events per long stream).
-          if (event.type !== 'token') execInfo!.events.push(event);
-          // Skip ask_end's per-ask rollup cost — its constituent
-          // agent_call_end / tool_call_end events already accumulated.
-          // Spec decision 10.
-          if (event.cost && event.type !== 'ask_end') execInfo!.totalCost += event.cost;
+          // High-volume stream-only events never persist to
+          // `ExecutionInfo.events` — spec §2, §5.2.
+          if (event.type !== 'token' && event.type !== 'partial_object') {
+            execInfo!.events.push(event);
+          }
+          execInfo!.totalCost += eventCostContribution(event);
           this.emit('trace', event);
           this.outputAxlEvent(event);
           // Single fan-out: every event flows verbatim to the wire. The
@@ -1242,10 +1244,9 @@ export class AxlRuntime extends EventEmitter {
 
     const listener = (event: AxlEvent) => {
       if (!scope.trackedIds.has(event.executionId)) return;
-      // Skip `ask_end` for cost — it's the per-ask rollup of agent_call_end
-      // and tool_call_end costs that already pass through this listener
-      // (spec decision 10). Counting it would double-charge every ask.
-      if (event.cost && event.type !== 'ask_end') scope.totalCost += event.cost;
+      // Cost rollup via shared helper — one source of truth for the
+      // "skip ask_end, finite-check, leaf-only" invariant (spec §10).
+      scope.totalCost += eventCostContribution(event);
       if (event.type === 'agent_call_end') {
         if (event.model) modelCalls.set(event.model, (modelCalls.get(event.model) ?? 0) + 1);
         agentCalls++;

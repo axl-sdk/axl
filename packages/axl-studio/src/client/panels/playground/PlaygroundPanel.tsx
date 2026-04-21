@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Send, ArrowRight, ShieldCheck, MessageSquarePlus, Network } from 'lucide-react';
+import { eventCostContribution } from '@axlsdk/axl';
 import { PanelShell } from '../../components/layout/PanelShell';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { StreamingText } from '../../components/shared/StreamingText';
@@ -143,15 +144,12 @@ export function PlaygroundPanel() {
     let addedCost = 0;
     let addedInput = 0;
     let addedOutput = 0;
-    // Post-spec/16 wire: the legacy `agent_end` / `step` wrappers are
-    // gone. Costs flow on `agent_call_end` and tokens are inlined on
-    // the same event. `ask_end` is a rollup — skip to avoid
-    // double-counting against leaf `agent_call_end` events.
+    // Cost rollup via shared helper (spec §10). Token counts are
+    // explicitly scoped to `agent_call_end` because embedder events
+    // (`memory_recall` / `memory_remember`) carry embedder-token
+    // counts in a different category and shouldn't be conflated.
     for (const event of newEvents) {
-      if (event.type === 'ask_end') continue;
-      if (event.type === 'agent_call_end' && event.cost) {
-        addedCost += event.cost;
-      }
+      addedCost += eventCostContribution(event as unknown as import('@axlsdk/axl').AxlEvent);
       if (event.type === 'agent_call_end' && event.tokens) {
         addedInput += event.tokens.input ?? 0;
         addedOutput += event.tokens.output ?? 0;

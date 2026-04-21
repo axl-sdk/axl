@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Play, FlaskConical } from 'lucide-react';
+import { eventCostContribution } from '@axlsdk/axl';
 import { PanelHeader } from '../../components/layout/PanelHeader';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { JsonEditor } from '../../components/shared/JsonEditor';
@@ -118,11 +119,10 @@ export function WorkflowRunnerPanel() {
 
   const hasSchema = !!workflowDetail?.inputSchema;
   const maxDuration = Math.max(...timelineEvents.map((e) => e.duration ?? 0), 1);
-  // ask_end carries a per-ask cost rollup; skip it here to avoid
-  // double-counting against the agent_call_end leaf events (spec §10).
   const totalDuration = timelineEvents.reduce((sum, e) => sum + (e.duration ?? 0), 0);
+  // Cost rollup via shared helper (spec §10) — single source of truth.
   const totalCost = timelineEvents.reduce(
-    (sum, e) => (e.type === 'ask_end' ? sum : sum + (e.cost ?? 0)),
+    (sum, e) => sum + eventCostContribution(e as unknown as import('@axlsdk/axl').AxlEvent),
     0,
   );
 

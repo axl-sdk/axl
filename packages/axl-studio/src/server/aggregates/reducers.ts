@@ -3,6 +3,7 @@
  * Each reducer is a pure (state, source) => state function — no I/O, no mutation.
  */
 import type { AxlEvent, ExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
+import { eventCostContribution } from '@axlsdk/axl';
 import type { CostData } from '../types.js';
 
 // ── Shared helpers ────────────────────────────────────────────────────
@@ -68,14 +69,14 @@ export function reduceCost(acc: CostData, event: AxlEvent): CostData {
   // Early return for events with no cost data.
   if (event.cost == null && !event.tokens) return acc;
 
-  // ask_end carries a per-ask rollup of agent_call_end + tool_call_end
-  // costs that already passed through this reducer. Counting it would
-  // double-charge every ask. Spec/16 decision 10. The same guard lives
-  // in core (`runtime.ts` and `AxlTestRuntime._totalCost`) — Studio
-  // mirrors it because the reducer runs against the same event stream.
+  // Rollup guard: `eventCostContribution` encapsulates the spec §10
+  // "skip ask_end, finite-check, leaf-only" invariant. The rest of
+  // this reducer buckets the charge across per-agent / per-model /
+  // per-workflow views; calling the helper once here keeps the
+  // semantics in one place. If the contribution is 0 (ask_end or
+  // NaN), short-circuit so we don't increment call counts either.
+  const cost = eventCostContribution(event);
   if (event.type === 'ask_end') return acc;
-
-  const cost = finite(event.cost);
   const tokens = event.tokens ?? {};
 
   // Only count tokens from agent_call_end events — embedder tokens are

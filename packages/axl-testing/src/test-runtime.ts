@@ -8,7 +8,7 @@ import type {
   AgentCallInfo,
   AxlConfig,
 } from '@axlsdk/axl';
-import { WorkflowContext, MemoryStore, ProviderRegistry } from '@axlsdk/axl';
+import { WorkflowContext, MemoryStore, ProviderRegistry, eventCostContribution } from '@axlsdk/axl';
 import type { WorkflowContextInit } from '@axlsdk/axl';
 
 interface WorkflowLike {
@@ -148,12 +148,9 @@ export class AxlTestRuntime {
           this._toolCalls.push({ name: event.tool!, args, result });
         }
 
-        // Skip ask_end (per-ask rollup) so we don't double-count the
-        // agent_call_end / tool_call_end events that already accumulated.
-        // Spec decision 10.
-        if (event.cost && event.type !== 'ask_end') {
-          this._totalCost += event.cost;
-        }
+        // Single-source-of-truth cost accumulator. Skips ask_end
+        // rollups (decision 10) and guards NaN/Infinity.
+        this._totalCost += eventCostContribution(event);
 
         // Track provider responses for recording
         if (event.type === 'agent_call_end' && event.data) {

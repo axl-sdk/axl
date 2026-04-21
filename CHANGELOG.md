@@ -381,6 +381,97 @@ that were correct but unpinned:
   `isCostBearingLeaf`, `COST_BEARING_LEAF_TYPES`, and `isRootLevel`
   as first-class exports.
 
+#### Unified event model — final multi-perspective review pass
+
+Five reviewer perspectives (architecture, bug-hunt, UX/DX,
+security/operational, test quality) on the entire spec/16 migration
+after the scenario-verification pass. Real correctness bugs and DX
+gaps fixed; resource caps tightened; docs corrected. All at the
+observability boundary — no breaking API changes.
+
+**Correctness bugs:**
+
+- **Double `workflow_end` emission** when a post-emit side-effect
+  (`stateStore.deleteCheckpoints`, `persistExecution`) throws after
+  `_emitWorkflowEnd(completed)`. The outer catch would fire a
+  second `_emitWorkflowEnd(failed)` with conflicting status, so
+  consumers saw two terminal events per execution. Now
+  `WorkflowContext._emitWorkflowStart` / `_emitWorkflowEnd` are
+  idempotent (first-wins) via `_workflowStartEmitted` /
+  `_workflowEndEmitted` flags. Regression test in `runtime.test.ts`.
+- **`AxlStream.fullText` cross-ask token leak** when `ctx.ask()`
+  throws terminally (max-turns exhaustion, guardrail exhaustion,
+  `VerifyError`, `ValidationError`). These paths emit
+  `ask_end({ok:false})` but NOT `pipeline(failed)`, so the failed
+  ask's in-progress tokens stayed buffered and flushed into the
+  NEXT ask's `pipeline(committed)`. `stream.ts._push` now treats
+  `ask_end({ok:false})` as a buffer-reset trigger for root asks.
+  Regression test in `fulltext-commit.test.ts`.
+- **`token.data` bypassed emit-time redaction**, contradicting
+  CLAUDE.md's three-layer contract claim. Direct
+  `runtime.on('trace', ...)` consumers received raw LLM output
+  under `config.trace.redact: true`; only Studio's WS layer was
+  scrubbing. Added a `token` branch to the emit-time redactor.
+  Regression test in `trace-events.test.ts`.
+- **`trackExecution({captureTraces: true})` memory blowout on
+  streaming workloads.** `execInfo.events` strips `token` and
+  `partial_object` to bound memory, but `capturedTraces.push` did
+  not — so `runEval({captureTraces: true})` on a streaming eval
+  item blew the captured-traces array. Filter added in
+  `runtime.ts`. Regression test in `runtime.test.ts`.
+- **`frame.askCost` hardcoded `agent_call_end | tool_call_end`**,
+  silently dropping embedder cost (`memory_remember` /
+  `memory_recall`) from the per-ask rollup when `ctx.recall()`
+  ran inside an ask. Now uses `COST_BEARING_LEAF_TYPES` so the
+  rollup stays in lockstep with `isCostBearingLeaf` /
+  `eventCostContribution`.
+- **`eventCostContribution` accepted negative `cost` values**,
+  silently crediting budgets on buggy providers or pricing-table
+  typos. Now matches the NaN/Infinity guard philosophy: negative
+  costs are silently dropped. Regression test in
+  `event-utils.test.ts`.
+- **`AxlTestRuntime._recordStep` duplicated workflow_start/end**
+  entries in `steps()` (one from the raw-data `_recordStep` call,
+  one from the onTrace handler) and bypassed redaction on the
+  `_recordStep` path. Removed the redundant `_recordStep` calls
+  so onTrace is the single source of truth for `_steps` — parity
+  with every other event type in the test runtime.
+
+**Security:**
+
+- **`POST /api/evals/compare` pooled-ID count cap** (reviewer HIGH
+  H1). `evalCompare` runs paired bootstrap CI (1000 resamples)
+  across all pooled run × item pairs. Without a cap, a readOnly
+  attacker could trigger ~50B operations per request. Capped at
+  25 ids per side to match the multi-run ceiling on
+  `POST /api/evals/:name/run`. Regression test in
+  `tests/studio/api/evals.test.ts`.
+
+**DX / docs:**
+
+- **`CreateContextOptions` gains `onToolCall` / `onAgentStart`**
+  to match what the docs already advertised. Previously only
+  `onToken` was wired through from `createContext` — the other
+  two were documented but not exposed on the public API.
+  Non-breaking additive change.
+- **Docs: stale "PR 2 / Reserved / emitted in a follow-up release"**
+  labels for `pipeline`, `partial_object`, and the gate-event
+  collapse removed from `docs/api-reference.md` and
+  `docs/observability.md`. These features shipped in 0.16.0.
+- **Docs: `isCostBearingLeaf` signature corrected** from
+  `(type)` to `(event: AxlEvent)` in `docs/api-reference.md`.
+- **Docs: `AxlStream.textByAsk` now in the accessor table** with
+  a description of the split-pane-UI use case and its
+  relationship to `.text` (root-only).
+- **Docs: `AxlStream.promise` unhandled-rejection suppression**
+  documented — errors are ALSO delivered via the iterator and
+  `.on('error', ...)`, and the promise has an internal no-op
+  catch so iterator-only consumers never see unhandled-rejection
+  warnings.
+- **Docs: `.text` JSDoc cross-references `.textByAsk`** so users
+  hitting "missing tokens from my nested asks" find the right
+  iterator on first read.
+
 ### Deprecated
 
 - `AxlEventBase.parentToolCallId` is `@deprecated` (one-cycle window).

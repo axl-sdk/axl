@@ -82,7 +82,7 @@ All events share the `AxlEventBase` shape; `data` and other variant-specific fie
 | `memory_remember` / `memory_recall` / `memory_forget` | Memory ops audit | `{ key, scope, hit?, count?, embed?, usage? }` |
 | `done` / `error` | Terminal workflow markers (wrap their payload under `data` — `done.data = { result }`, `error.data = { message, name?, code? }`) | see signatures |
 
-**Reserved (emitted in a follow-up release):** `pipeline` (retry/validation lifecycle, three statuses) and `partial_object` (progressive structured output). They're already in the `AxlEvent` union so consumers can write the narrow today.
+**`pipeline`** (retry/validation lifecycle, three statuses: `start` / `committed` / `failed`) and **`partial_object`** (progressive structured output, emitted at string-safe boundaries when `ctx.ask()` has a `schema` and no tools) are emitted. `AxlStream.fullText` commits on `pipeline(committed)` and discards the in-progress buffer on `pipeline(failed)` or `ask_end({ok: false})`, so retried attempts' tokens never leak into the committed text.
 
 **`workflow_start` / `workflow_end` are first-class event types as of 0.15.0** — previously emitted as `log` events with `data.event === 'workflow_start'` / `'workflow_end'`. Consumers filtering on the old log-form shape must switch to `event.type === 'workflow_start'` / `'workflow_end'`; `event.workflow` is now top-level, `data` carries `WorkflowStartData { input }` / `WorkflowEndData { status, duration, result?, error?, aborted? }`. `runtime.stream()` now also emits `workflow_start` (was silently omitted). Aborted workflows emit `workflow_end` with `data.aborted: true` so consumers can distinguish cancellation / budget hard-stop from genuine errors without a separate event subscription.
 

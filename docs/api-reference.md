@@ -910,8 +910,10 @@ for await (const event of stream) {
 |---|---|---|
 | `for await ... of stream` | `AsyncIterable<AxlEvent>` | Every `AxlEvent`, in the order emitted |
 | `stream.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only (`ask_*`, `agent_call_*`, `tool_call_*`, `tool_approval`, `tool_denied`, `handoff`, `delegate`, `pipeline`, `verify`, `workflow_*`). Skips token chatter |
-| `stream.text` | `AsyncIterable<string>` | Root-only token stream (depth=0) |
-| `stream.fullText` | `string` | Accumulated text from root-only tokens |
+| `stream.text` | `AsyncIterable<string>` | Root-only token stream (`depth === 0`). Nested-ask tokens (agent-as-tool handlers, `delegate`, `race` branches) are omitted — use `stream.textByAsk` or filter the raw stream on `event.depth >= 1` to see them |
+| `stream.textByAsk` | `AsyncIterable<{ askId, agent?, text }>` | **Every** token tagged with the producing ask frame. Complements `.text` — use for split-pane UIs that render each sub-agent's output in its own lane, grouped by `askId` |
+| `stream.fullText` | `string` | Accumulated text from root-only tokens, committed on `pipeline(committed)`. Retried-attempt tokens are discarded on `pipeline(failed)` or `ask_end({ok:false})` so only the winning attempt's text appears |
+| `stream.promise` | `Promise<unknown>` | Resolves with the workflow result; rejects with the thrown error. Errors are ALSO delivered via the iterator and `.on('error', ...)` (as a synthesized `AxlEvent{type:'error'}`). The promise has an internal no-op `.catch(() => {})` so consumers who only read the iterator never see unhandled-rejection warnings |
 | `stream.on('done', ...)` / `.on('error', ...)` | `EventEmitter` | Terminal events. `done.data = { result }`, `error.data = { message, name?, code? }` |
 
 **Renamed in 0.16.0:** `stream.steps` → `stream.lifecycle`. The old `StreamEvent` union (`tool_result`, `agent_start`, `agent_end`, `step`) is gone — use the unified `AxlEvent` variants (`tool_call_end`, `agent_call_start`, `agent_call_end`, etc.) directly.
@@ -1205,10 +1207,10 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped, CallbackMeta } from
 | `tool_denied` | `AskScoped` | `tool: string`, `callId?`, `data?: ToolDeniedData` | LLM names a tool the agent doesn't expose |
 | `delegate` | `AskScoped` | `data: DelegateData` | `ctx.delegate()` routes (including single-agent short-circuit) |
 | `handoff` | — (spans two asks) | `fromAskId`, `toAskId`, `sourceDepth`, `targetDepth`, `data: HandoffData` | One agent hands off to another |
-| `pipeline` | `AskScoped` | `status: 'start'\|'failed'\|'committed'`, `stage`, `attempt`, `maxAttempts`, `reason?` | Retry/validation lifecycle. **Reserved — emitted in PR 2** |
-| `partial_object` | `AskScoped` | `attempt: number`, `data: { object: unknown }` | Progressive structured output. **Reserved — emitted in PR 2** |
+| `pipeline` | `AskScoped` | `status: 'start'\|'failed'\|'committed'`, `stage`, `attempt`, `maxAttempts`, `reason?` | Retry/validation lifecycle; `AxlStream.fullText` commits on `pipeline(committed)` and discards in-progress tokens on `pipeline(failed)` |
+| `partial_object` | `AskScoped` | `attempt: number`, `data: { object: unknown }` | Progressive structured output — emitted at string-safe boundaries when a `schema` is set on `ctx.ask()` and no tools are registered |
 | `verify` | `AskScoped` | `data: VerifyData` | `ctx.verify()` completes (pass or fail) |
-| `guardrail` / `schema_check` / `validate` | `Partial<AskScoped>` | `data: GuardrailData/SchemaCheckData/ValidateData` | Legacy gate events — collapsed into `pipeline` in PR 2 |
+| `guardrail` / `schema_check` / `validate` | `Partial<AskScoped>` | `data: GuardrailData/SchemaCheckData/ValidateData` | Per-gate retry events emitted alongside `pipeline` |
 | `log` | `Partial<AskScoped>` | `data: unknown` | `ctx.log()` user event |
 | `memory_remember` / `memory_recall` / `memory_forget` | `Partial<AskScoped>` | `data: MemoryEventData` | Memory ops audit |
 | `done` | — | `data: { result: unknown }` | Terminal — workflow completed |
@@ -1223,7 +1225,7 @@ import { eventCostContribution } from '@axlsdk/axl';
 const total = info.events.reduce((sum, e) => sum + eventCostContribution(e), 0);
 ```
 
-Also exported: `isCostBearingLeaf(type)` (boolean test for cost-bearing leaf types) and `COST_BEARING_LEAF_TYPES` (the canonical tuple: `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall`), and `isRootLevel(event)` (true when `depth === 0` or undefined — used for root-only token filtering).
+Also exported: `isCostBearingLeaf(event: AxlEvent): boolean` (takes an event, checks its `type` against the leaf set — pass the event, not the type string), `COST_BEARING_LEAF_TYPES` (the canonical `as const` tuple: `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall`), and `isRootLevel(event: AxlEvent): boolean` (true when `depth === 0` or undefined — used for root-only token filtering).
 
 ### `AgentCallData` (data on `agent_call_end` events)
 

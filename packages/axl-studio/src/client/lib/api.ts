@@ -87,8 +87,18 @@ export const executeWorkflow = (name: string, input: unknown, stream = false) =>
 
 // ── Executions ─────────────────────────────────────────────────────
 export const fetchExecutions = () => request<ExecutionInfo[]>('/executions');
-export const fetchExecution = (id: string) =>
-  request<ExecutionInfo>(`/executions/${encodeURIComponent(id)}`);
+/**
+ * Fetch an execution. When `since` is set, the server filters `events`
+ * to those with `step > since` (spec/16 §5.4) — useful for panels that
+ * poll and only want the tail. Omit for the full event array.
+ */
+export const fetchExecution = (id: string, since?: number) => {
+  const qs =
+    since !== undefined && Number.isFinite(since) && Number.isInteger(since) && since >= 0
+      ? `?since=${since}`
+      : '';
+  return request<ExecutionInfo>(`/executions/${encodeURIComponent(id)}${qs}`);
+};
 export const abortExecution = (id: string) =>
   request<{ aborted: boolean }>(`/executions/${encodeURIComponent(id)}/abort`, { method: 'POST' });
 

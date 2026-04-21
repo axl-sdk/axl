@@ -89,4 +89,58 @@ describe('Studio API: Executions', () => {
     // null-coerced-to-'empty' that still bypass the scrub.
     expect(body.data[0].result).toBe('public answer');
   });
+
+  it('GET /api/executions/:id?since={step} filters events to the tail', async () => {
+    // Spec/16 §5.4. Polling clients can request only events with
+    // `step > since` so the wire payload stays bounded on long runs.
+    type Envelope = {
+      ok: boolean;
+      data: { executionId: string; events: Array<{ step: number }> };
+    };
+    type ListEnvelope = { ok: boolean; data: Array<{ executionId: string }> };
+
+    const provider = MockProvider.sequence([{ content: 'done' }]);
+    const { app } = createTestServer(provider);
+
+    await app.request('/api/workflows/test-wf/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: { message: 'test' } }),
+    });
+
+    const list = (await (await app.request('/api/executions')).json()) as ListEnvelope;
+    const id = list.data[0].executionId;
+
+    // Full fetch — note the total event count so we have a baseline.
+    const full = (await (await app.request(`/api/executions/${id}`)).json()) as Envelope;
+    const total = full.data.events.length;
+    expect(total).toBeGreaterThan(1);
+
+    // `?since=0` drops only events with step === 0 (workflow_start).
+    const sinceZero = (await (
+      await app.request(`/api/executions/${id}?since=0`)
+    ).json()) as Envelope;
+    expect(sinceZero.data.events.length).toBe(total - 1);
+    expect(sinceZero.data.events.every((e) => e.step > 0)).toBe(true);
+
+    // `?since={lastStep}` returns an empty array (no events beyond the last).
+    const lastStep = full.data.events[full.data.events.length - 1].step;
+    const tail = (await (
+      await app.request(`/api/executions/${id}?since=${lastStep}`)
+    ).json()) as Envelope;
+    expect(tail.data.events).toEqual([]);
+
+    // Malformed `since` param: server returns the full events array
+    // (no error) — stale clients shouldn't crash the panel.
+    const malformed = (await (
+      await app.request(`/api/executions/${id}?since=notanumber`)
+    ).json()) as Envelope;
+    expect(malformed.data.events.length).toBe(total);
+
+    // Negative `since` also falls through to full array.
+    const negative = (await (
+      await app.request(`/api/executions/${id}?since=-1`)
+    ).json()) as Envelope;
+    expect(negative.data.events.length).toBe(total);
+  });
 });

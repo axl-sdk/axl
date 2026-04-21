@@ -1,15 +1,17 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useWs } from './use-ws';
-// TODO(PR-3-spec-16): the wire format still emits the legacy `StreamEvent`
-// shape (token / tool_call / tool_result / agent_start / agent_end / step /
-// done / error) via the runtime's translation layer in `runtime.ts`. PR 3
-// collapses the wire to `AxlEvent` and this hook switches to consuming
-// `AxlEvent` directly.
-import type { StreamEvent } from '../lib/types';
+// Post-spec/16: the wire carries `AxlEvent` directly. The legacy
+// `StreamEvent` shape and the runtime translation layer that synthesized
+// `agent_end` / `tool_result` / `step` from rich trace events are gone.
+import type { AxlEvent } from '../lib/types';
 
 type StreamState = {
+  /** Concatenated root-only tokens (spec/16 §3.2): consumer filters on
+   *  `event.depth === 0` so nested-ask tokens don't pollute the
+   *  chat-bubble view. Callers that want nested tokens should iterate
+   *  `events` directly. */
   tokens: string;
-  events: StreamEvent[];
+  events: AxlEvent[];
   done: boolean;
   error: string | null;
   result: unknown;
@@ -66,15 +68,37 @@ export function useWsStream(executionId: string | null): StreamState {
   }, [executionId]);
 
   const handleEvent = useCallback((data: unknown) => {
-    const event = data as StreamEvent;
+    const event = data as AxlEvent;
     setState((prev) => {
       switch (event.type) {
-        case 'token':
-          return { ...prev, tokens: prev.tokens + event.data, events: [...prev.events, event] };
-        case 'done':
-          return { ...prev, done: true, result: event.data, events: [...prev.events, event] };
-        case 'error':
-          return { ...prev, done: true, error: event.message, events: [...prev.events, event] };
+        case 'token': {
+          // Root-only token accumulation so nested-ask tokens don't leak
+          // into chat UIs. Consumers wanting nested tokens iterate the
+          // `events` array and filter on `event.depth` themselves.
+          const depth = event.depth ?? 0;
+          const nextTokens = depth === 0 ? prev.tokens + (event.data ?? '') : prev.tokens;
+          return { ...prev, tokens: nextTokens, events: [...prev.events, event] };
+        }
+        case 'done': {
+          // AxlEvent `done` wraps the result as `data: { result }`.
+          const doneData = event.data as { result?: unknown } | undefined;
+          return {
+            ...prev,
+            done: true,
+            result: doneData?.result ?? null,
+            events: [...prev.events, event],
+          };
+        }
+        case 'error': {
+          // AxlEvent `error` wraps the message as `data: { message, ... }`.
+          const errData = event.data as { message?: string } | undefined;
+          return {
+            ...prev,
+            done: true,
+            error: errData?.message ?? 'Unknown error',
+            events: [...prev.events, event],
+          };
+        }
         default:
           return { ...prev, events: [...prev.events, event] };
       }

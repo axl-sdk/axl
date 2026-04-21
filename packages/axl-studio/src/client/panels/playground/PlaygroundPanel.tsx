@@ -1,11 +1,12 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Send, ArrowRight, ShieldCheck, MessageSquarePlus } from 'lucide-react';
+import { Send, ArrowRight, ShieldCheck, MessageSquarePlus, Network } from 'lucide-react';
 import { PanelShell } from '../../components/layout/PanelShell';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { StreamingText } from '../../components/shared/StreamingText';
 import { JsonViewer } from '../../components/shared/JsonViewer';
 import { CommandPicker } from '../../components/shared/CommandPicker';
+import { AskTree } from '../../components/shared/AskTree';
 import { fetchAgents, playgroundChat } from '../../lib/api';
 import { useWsStream } from '../../hooks/use-ws-stream';
 import { cn, formatCost, formatTokens } from '../../lib/utils';
@@ -30,6 +31,10 @@ export function PlaygroundPanel() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [totalCost, setTotalCost] = useState(0);
   const [totalTokens, setTotalTokens] = useState({ input: 0, output: 0 });
+  // Spec/16 §5.10.1: subagent visibility drawer. Off by default so the
+  // default chat experience is unchanged; users opt in when they want
+  // to observe nested-ask activity (agent-as-tool, delegate, race).
+  const [showSubagents, setShowSubagents] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const processedEventsCount = useRef(0);
 
@@ -74,23 +79,39 @@ export function PlaygroundPanel() {
     const handoffs: Handoff[] = [];
     const approvals: Array<{ tool: string; approved: boolean }> = [];
 
+    // Post-spec/16 wire (no translation layer): tool activity flows as
+    // `tool_call_start` (args at dispatch) and `tool_call_end` (args +
+    // result at completion); handoff's `source/target/mode` live under
+    // `data`; tool_approval carries `tool` + `data.approved`.
     for (const event of stream.events) {
-      if (event.type === 'tool_call') {
-        toolCalls.push({ name: event.name, args: event.args, callId: event.callId });
+      if (event.type === 'tool_call_start') {
+        const data = event.data as { args?: unknown } | undefined;
+        toolCalls.push({
+          name: event.tool ?? '',
+          args: data?.args,
+          callId: event.callId,
+        });
       }
-      if (event.type === 'tool_result') {
-        // Match by callId when available (reliable), fall back to name (legacy)
+      if (event.type === 'tool_call_end') {
+        // Prefer callId match; the top-level `tool` is the fallback
+        // for legacy events that didn't stamp callId.
+        const data = event.data as { result?: unknown } | undefined;
         const existing = event.callId
           ? toolCalls.find((tc) => tc.callId === event.callId)
-          : toolCalls.find((tc) => tc.name === event.name && !tc.result);
-        if (existing) existing.result = event.result;
+          : toolCalls.find((tc) => tc.name === event.tool && !tc.result);
+        if (existing) existing.result = data?.result;
       }
-      // Handle handoff and approval events
       if (event.type === 'handoff') {
-        handoffs.push({ source: event.source, target: event.target, mode: event.mode ?? 'oneway' });
+        const data = event.data as { source?: string; target?: string; mode?: string } | undefined;
+        handoffs.push({
+          source: data?.source ?? '',
+          target: data?.target ?? '',
+          mode: (data?.mode as 'oneway' | 'roundtrip') ?? 'oneway',
+        });
       }
       if (event.type === 'tool_approval') {
-        approvals.push({ tool: event.name, approved: event.approved });
+        const data = event.data as { approved?: boolean } | undefined;
+        approvals.push({ tool: event.tool ?? '', approved: data?.approved === true });
       }
     }
 
@@ -122,13 +143,18 @@ export function PlaygroundPanel() {
     let addedCost = 0;
     let addedInput = 0;
     let addedOutput = 0;
+    // Post-spec/16 wire: the legacy `agent_end` / `step` wrappers are
+    // gone. Costs flow on `agent_call_end` and tokens are inlined on
+    // the same event. `ask_end` is a rollup — skip to avoid
+    // double-counting against leaf `agent_call_end` events.
     for (const event of newEvents) {
-      if (event.type === 'agent_end' && event.cost) {
+      if (event.type === 'ask_end') continue;
+      if (event.type === 'agent_call_end' && event.cost) {
         addedCost += event.cost;
       }
-      if (event.type === 'step' && event.data.tokens) {
-        addedInput += event.data.tokens.input ?? 0;
-        addedOutput += event.data.tokens.output ?? 0;
+      if (event.type === 'agent_call_end' && event.tokens) {
+        addedInput += event.tokens.input ?? 0;
+        addedOutput += event.tokens.output ?? 0;
       }
     }
     if (addedCost > 0) setTotalCost((prev) => prev + addedCost);
@@ -227,6 +253,24 @@ export function PlaygroundPanel() {
               )}
             </div>
           )}
+          {/* Subagent activity toggle (spec/16 §5.10.1). Renders an
+              AskTree drawer under the chat when on; off by default. */}
+          <button
+            type="button"
+            onClick={() => setShowSubagents((v) => !v)}
+            aria-pressed={showSubagents}
+            title="Show nested-ask activity (agent-as-tool, delegate, race branches)"
+            className={cn(
+              'inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs',
+              'ring-1 ring-[hsl(var(--input))] hover:ring-[hsl(var(--ring))]',
+              showSubagents
+                ? 'bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]'
+                : 'bg-[hsl(var(--background))] text-[hsl(var(--muted-foreground))]',
+            )}
+          >
+            <Network size={12} />
+            Subagents
+          </button>
           <div
             className={cn(
               'inline-flex items-stretch rounded-full bg-[hsl(var(--background))]',
@@ -381,6 +425,20 @@ export function PlaygroundPanel() {
           ))}
           <div ref={messagesEndRef} />
         </div>
+
+        {/* Subagent activity drawer (spec/16 §5.10.1). Renders a live
+            AskTree of nested ask frames so the user can see the agent
+            hierarchy work — agent-as-tool, delegate, race, parallel
+            branches. Off by default; toggled via the header Subagents
+            button. */}
+        {showSubagents && (
+          <div className="border-t border-[hsl(var(--border))] pt-4">
+            <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
+              Subagent activity
+            </h3>
+            <AskTree events={stream.events} />
+          </div>
+        )}
 
         {/* Input */}
         <div className="border-t border-[hsl(var(--border))] pt-4">

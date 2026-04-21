@@ -13,6 +13,8 @@ import { useWsStream } from '../../hooks/use-ws-stream';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
 import { StatCard } from '../../components/shared/StatCard';
 import { TraceEventList } from '../../components/shared/TraceEventList';
+import { AskTree } from '../../components/shared/AskTree';
+import { AskDetails } from '../../components/shared/AskDetails';
 import { WorkflowStatsBar } from './WorkflowStatsBar';
 
 export function WorkflowRunnerPanel() {
@@ -28,6 +30,13 @@ export function WorkflowRunnerPanel() {
   // Events|Stats pattern) because cohabiting form + results + stats in one
   // body made the form cramped and turned the stats into a "dead top strip".
   const [wfTab, setWfTab] = useState<'run' | 'stats'>('run');
+  // Spec/16 §5.10.2: workflows now produce ask trees, not flat event
+  // lists. AskTree is the default timeline view; the flat TraceEventList
+  // stays available via a toggle for users who prefer the chronological
+  // list or need to scan for specific event types.
+  const [timelineView, setTimelineView] = useState<'tree' | 'flat'>('tree');
+  // Selected ask surfaces as an AskDetails drawer alongside the tree.
+  const [selectedAskId, setSelectedAskId] = useState<string | undefined>(undefined);
 
   const { data: workflows = [] } = useQuery({
     queryKey: ['workflows'],
@@ -103,14 +112,19 @@ export function WorkflowRunnerPanel() {
     }
   }, [stream.done, stream.error, stream.result, status]);
 
-  const timelineEvents = stream.events
-    .filter((e): e is Extract<typeof e, { type: 'step' }> => e.type === 'step')
-    .map((e) => e.data);
+  // Post-spec/16: the wire carries AxlEvent directly. No more `step`
+  // wrapper to unwrap — events flow verbatim from the runtime.
+  const timelineEvents = stream.events;
 
   const hasSchema = !!workflowDetail?.inputSchema;
   const maxDuration = Math.max(...timelineEvents.map((e) => e.duration ?? 0), 1);
+  // ask_end carries a per-ask cost rollup; skip it here to avoid
+  // double-counting against the agent_call_end leaf events (spec §10).
   const totalDuration = timelineEvents.reduce((sum, e) => sum + (e.duration ?? 0), 0);
-  const totalCost = timelineEvents.reduce((sum, e) => sum + (e.cost ?? 0), 0);
+  const totalCost = timelineEvents.reduce(
+    (sum, e) => (e.type === 'ask_end' ? sum : sum + (e.cost ?? 0)),
+    0,
+  );
 
   return (
     <div className="flex flex-col h-screen">
@@ -328,17 +342,63 @@ export function WorkflowRunnerPanel() {
                   </div>
                 )}
 
-                {/* Timeline — shares the trace explorer's row/body renderer
-                  via `TraceEventList`. Same look, same expand/collapse
-                  semantics (recursive into inner sections via
-                  TraceExpandContext), same system prompt / prompt /
-                  response collapsible blocks. */}
+                {/* Timeline — the new default is the AskTree (spec/16
+                  §5.10.2) so users see the ask graph first; a toggle
+                  falls back to the flat TraceEventList that historical
+                  screenshots showed. Clicking an ask opens AskDetails
+                  alongside (when tree view is active). */}
                 {timelineEvents.length > 0 && (
                   <div>
-                    <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
-                      Timeline
-                    </h3>
-                    <TraceEventList events={timelineEvents} maxDuration={maxDuration} />
+                    <div className="flex items-center justify-between mb-2">
+                      <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+                        Timeline
+                      </h3>
+                      <div className="flex gap-1 text-xs">
+                        <button
+                          type="button"
+                          onClick={() => setTimelineView('tree')}
+                          className={cn(
+                            'px-2 py-0.5 rounded',
+                            timelineView === 'tree'
+                              ? 'bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]'
+                              : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--secondary))]/50',
+                          )}
+                        >
+                          Tree
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setTimelineView('flat')}
+                          className={cn(
+                            'px-2 py-0.5 rounded',
+                            timelineView === 'flat'
+                              ? 'bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]'
+                              : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--secondary))]/50',
+                          )}
+                        >
+                          Flat
+                        </button>
+                      </div>
+                    </div>
+                    {timelineView === 'tree' ? (
+                      <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-3">
+                        <AskTree
+                          events={timelineEvents}
+                          selectedAskId={selectedAskId}
+                          onSelectAsk={setSelectedAskId}
+                        />
+                        {selectedAskId && (
+                          <AskDetails
+                            events={timelineEvents}
+                            askId={selectedAskId}
+                            onClose={() => setSelectedAskId(undefined)}
+                            className="max-h-[600px] rounded border border-slate-200 dark:border-slate-700"
+                          />
+                        )}
+                      </div>
+                    ) : (
+                      <TraceEventList events={timelineEvents} maxDuration={maxDuration} />
+                    )}
                   </div>
                 )}
 

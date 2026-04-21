@@ -160,12 +160,47 @@ for a step-by-step consumer migration guide.
   `sourceDepth`, `targetDepth`. Loose on the client per the existing
   pattern; strict server-side via `@axlsdk/axl#AxlEvent`.
 
-Studio panel migration (Playground / Workflow Runner / Trace Explorer
-UI upgrades to render `AskTree` / `PartialObjectRenderer` /
-`RetryIndicator` / `AskDetails` components per spec §5.9, §5.10.x) is
-deferred to a follow-up — the current panels work correctly with the
-new wire format via `TraceEventList`. The follow-up is pure UX, not
-correctness.
+#### Studio — panel integration + REST pagination (spec §5.9, §5.10, §5.4)
+
+- **New shared components** (`packages/axl-studio/src/client/components/shared/`):
+  `AskTree` (hierarchical live ask graph by `askId`, parent-linked via
+  `parentAskId`, with status badges, inline `RetryIndicator`, cost rollup,
+  handoff arrows), `AskDetails` (side-panel event timeline for a selected
+  ask), `RetryIndicator` (inline pipeline-state badge), `PartialObjectRenderer`
+  (progressive JSON view that resets on `pipeline(failed)`). All four are
+  pure — take events, return JSX — so panels can plug them in against
+  either in-flight streams or historical execution events. 35 component
+  tests cover the `buildAskTree` reducer invariants (parent-link, temporal
+  sort, discarded overlay, handoff attribution, retry state, running-cost
+  accumulation + `ask_end.cost` override) plus rendering and interaction.
+- **Playground panel**: subagent activity drawer. Opt-in via a header
+  "Subagents" toggle so the default chat experience is unchanged; users
+  who want nested-ask visibility enable it and see an `AskTree` of the
+  agent-as-tool / delegate / race branches live. Tool activity reconstruction
+  migrated to the AxlEvent shape (`tool_call_start` / `tool_call_end`,
+  `handoff.data.source/target/mode`, `tool_approval.data.approved`).
+- **Workflow Runner panel**: `AskTree` is the new default timeline view
+  (replacing the flat `TraceEventList`). A Tree / Flat toggle preserves
+  the chronological list for users who prefer it. Clicking an ask opens
+  an `AskDetails` drawer alongside. Timeline cost calculation skips
+  `ask_end` to avoid double-counting against `agent_call_end` leaves
+  (spec decision 10).
+- **Trace Explorer panel**: no code changes needed — `TraceEventList`'s
+  `getDepth(event)` now reads the native `event.depth` field (PR 3
+  commit), so nested-ask rows indent correctly automatically.
+- **`useWsStream` hook**: switched from the legacy `StreamEvent` type to
+  `AxlEvent`. Token accumulation now filters root-only
+  (`event.depth === 0`) so nested-ask tokens don't leak into chat UIs;
+  consumers wanting nested tokens iterate `events` directly. `done` /
+  `error` event handlers updated for the wrapped `data.{result, message}`
+  shape.
+- **REST pagination** (`GET /api/executions/:id?since={step}`, spec §5.4):
+  filters `events` to those with `step > since`. Monotonic per-execution
+  and shared across nested asks (spec §3.7), so polling clients can
+  request only the tail since their last known step without missing
+  concurrent-branch events. Malformed `since` (non-integer, negative)
+  falls through to the full events array — stale clients can't crash
+  the panel. Client `fetchExecution(id, since?)` helper added.
 
 ### Deprecated
 

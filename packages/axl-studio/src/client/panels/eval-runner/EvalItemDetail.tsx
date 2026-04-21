@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { JsonViewer } from '../../components/shared/JsonViewer';
 import { TraceEventList } from '../../components/shared/TraceEventList';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
-import type { TraceEvent } from '../../lib/types';
+import type { AxlEvent } from '../../lib/types';
 import type { EvalItem } from './types';
 import {
   scoreColorClass,
@@ -64,7 +64,7 @@ function DataCard({ label, data }: { label: string; data: unknown }) {
  *  an outer collapse toggle, so users get retry pills, attempt counters,
  *  agent_call body renderers, failure-red dots, and the full set of
  *  affordances consistent with the rest of the app. */
-function ItemTraces({ traces }: { traces: TraceEvent[] }) {
+function ItemTraces({ traces }: { traces: AxlEvent[] }) {
   const [collapsed, setCollapsed] = useState(false);
   return (
     <div className="rounded-xl border border-[hsl(var(--border))] overflow-hidden">
@@ -211,7 +211,7 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
 
       {/* ── Per-item traces (captureTraces mode only) ─── */}
       {item.traces && item.traces.length > 0 && (
-        <ItemTraces traces={item.traces as unknown as TraceEvent[]} />
+        <ItemTraces traces={item.traces as unknown as AxlEvent[]} />
       )}
 
       {/* ── Scorer details ────────────────────────────── */}

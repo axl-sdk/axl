@@ -197,7 +197,7 @@ describe('ConnectionManager', () => {
 
   it('truncates oversized broadcast payloads to a placeholder event', () => {
     // Build a payload well above the 64KB WS frame budget. Verbose-mode
-    // agent_call events with a long conversation history can easily reach
+    // agent_call_end events with a long conversation history can easily reach
     // this size on real workloads; consumers should receive an explicit
     // truncation marker rather than have the underlying socket silently drop.
     const { ws, messages } = createMockWs();
@@ -209,7 +209,7 @@ describe('ConnectionManager', () => {
       content: 'x'.repeat(500) + ` (msg ${i})`,
     }));
     connMgr.broadcast('execution:big', {
-      type: 'agent_call',
+      type: 'agent_call_end',
       step: 5,
       agent: 'helper',
       data: { messages: hugeMessages, response: 'y'.repeat(500) },
@@ -221,7 +221,7 @@ describe('ConnectionManager', () => {
     expect(parsed.channel).toBe('execution:big');
     // Original shape fields preserved (type, step, agent) so consumers still
     // see the event in the stream
-    expect(parsed.data.type).toBe('agent_call');
+    expect(parsed.data.type).toBe('agent_call_end');
     expect(parsed.data.step).toBe(5);
     expect(parsed.data.agent).toBe('helper');
     // Data replaced with a truncation marker

@@ -1,9 +1,9 @@
-import type { AxlRuntime, TraceEvent, ExecutionInfo } from '@axlsdk/axl';
+import type { AxlRuntime, AxlEvent, ExecutionInfo } from '@axlsdk/axl';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import { AggregateSnapshots, REBUILD_INTERVAL_MS, withinWindow } from './aggregate-snapshots.js';
 import type { WindowId } from './aggregate-snapshots.js';
 
-export type TraceReducer<State> = (acc: State, event: TraceEvent) => State;
+export type TraceReducer<State> = (acc: State, event: AxlEvent) => State;
 
 export type TraceAggregatorOptions<State> = {
   runtime: AxlRuntime;
@@ -19,13 +19,13 @@ export type TraceAggregatorOptions<State> = {
 };
 
 /**
- * Consumes TraceEvents from execution history and the live trace stream.
+ * Consumes AxlEvents from execution history and the live trace stream.
  * Maintains per-window aggregate snapshots via a pure reducer.
  */
 export class TraceAggregator<State> {
   private snaps: AggregateSnapshots<State>;
   private interval?: ReturnType<typeof setInterval>;
-  private listener?: (event: TraceEvent) => void;
+  private listener?: (event: AxlEvent) => void;
   private options: TraceAggregatorOptions<State>;
 
   constructor(options: TraceAggregatorOptions<State>) {
@@ -41,7 +41,7 @@ export class TraceAggregator<State> {
 
   async start(): Promise<void> {
     await this.rebuild();
-    this.listener = (event: TraceEvent) => {
+    this.listener = (event: AxlEvent) => {
       this.snaps.fold(event.timestamp, (prev) => this.options.reducer(prev, event));
     };
     this.options.runtime.on('trace', this.listener);
@@ -60,7 +60,7 @@ export class TraceAggregator<State> {
       this.options.windows.map((w) => [w, this.options.emptyState()]),
     );
     for (const exec of capped) {
-      for (const event of exec.steps) {
+      for (const event of exec.events) {
         for (const window of this.options.windows) {
           if (withinWindow(event.timestamp, window, now)) {
             fresh.set(window, this.options.reducer(fresh.get(window)!, event));

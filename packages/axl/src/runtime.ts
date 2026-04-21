@@ -19,7 +19,7 @@ import { AxlStream } from './stream.js';
 import { McpManager } from './mcp/manager.js';
 import { MemoryManager } from './memory/manager.js';
 import type {
-  TraceEvent,
+  AxlEvent,
   ExecutionInfo,
   HumanDecision,
   AwaitHumanOptions,
@@ -493,9 +493,9 @@ export class AxlRuntime extends EventEmitter {
       signal: options?.signal,
       onToken: options?.onToken,
       awaitHumanHandler: options?.awaitHumanHandler,
-      onTrace: (event: TraceEvent) => {
+      onTrace: (event: AxlEvent) => {
         this.emit('trace', event);
-        this.outputTraceEvent(event);
+        this.outputAxlEvent(event);
       },
       budgetContext: {
         totalCost: 0,
@@ -539,7 +539,7 @@ export class AxlRuntime extends EventEmitter {
       executionId,
       workflow: name,
       status: 'running',
-      steps: [],
+      events: [],
       totalCost: 0,
       startedAt: Date.now(),
       duration: 0,
@@ -558,11 +558,11 @@ export class AxlRuntime extends EventEmitter {
       providerRegistry: this.providerRegistry,
       sessionHistory,
       signal: controller.signal,
-      onTrace: (event: TraceEvent) => {
-        execInfo.steps.push(event);
+      onTrace: (event: AxlEvent) => {
+        execInfo.events.push(event);
         if (event.cost) execInfo.totalCost += event.cost;
         this.emit('trace', event);
-        this.outputTraceEvent(event);
+        this.outputAxlEvent(event);
         // Persist handoff records to session metadata
         if (event.type === 'handoff') {
           const sessionId = options?.metadata?.sessionId as string | undefined;
@@ -691,7 +691,7 @@ export class AxlRuntime extends EventEmitter {
         executionId,
         workflow: name,
         status: 'running',
-        steps: [],
+        events: [],
         totalCost: 0,
         startedAt: Date.now(),
         duration: 0,
@@ -706,11 +706,11 @@ export class AxlRuntime extends EventEmitter {
         providerRegistry: this.providerRegistry,
         sessionHistory,
         signal: controller.signal,
-        onTrace: (event: TraceEvent) => {
-          execInfo!.steps.push(event);
+        onTrace: (event: AxlEvent) => {
+          execInfo!.events.push(event);
           if (event.cost) execInfo!.totalCost += event.cost;
           this.emit('trace', event);
-          this.outputTraceEvent(event);
+          this.outputAxlEvent(event);
           // Emit typed stream events for specific trace types
           if (event.type === 'handoff') {
             const data = event.data as Record<string, unknown> | undefined;
@@ -749,14 +749,14 @@ export class AxlRuntime extends EventEmitter {
             // Agent tried to call a tool that doesn't exist (not an approval denial).
             // No equivalent stream event today — the step event below still fires
             // so consumers subscribing to all steps can react if needed.
-          } else if (event.type === 'agent_call') {
+          } else if (event.type === 'agent_call_end') {
             axlStream._push({
               type: 'agent_end',
               agent: event.agent ?? '',
               cost: event.cost,
               duration: event.duration,
             });
-          } else if (event.type === 'tool_call') {
+          } else if (event.type === 'tool_call_end') {
             axlStream._push({
               type: 'tool_result',
               name: event.tool ?? '',
@@ -1216,7 +1216,7 @@ export class AxlRuntime extends EventEmitter {
    *   need embedder token counts, subscribe to `runtime.on('trace', ...)` and
    *   read `data.usage.tokens` on `memory_remember` / `memory_recall` events.
    *
-   * Pass `{ captureTraces: true }` to also collect the raw `TraceEvent[]` observed
+   * Pass `{ captureTraces: true }` to also collect the raw `AxlEvent[]` observed
    * during `fn()`. This is opt-in because it keeps every event in memory for the
    * duration of the call — useful for eval per-item capture, debugging, and test
    * assertions, but overhead grows with trace volume. When enabled, verbose-mode
@@ -1232,7 +1232,7 @@ export class AxlRuntime extends EventEmitter {
   ): Promise<{
     result: T;
     cost: number;
-    traces?: TraceEvent[];
+    traces?: AxlEvent[];
     metadata: {
       models: string[];
       modelCallCounts?: Record<string, number>;
@@ -1267,12 +1267,12 @@ export class AxlRuntime extends EventEmitter {
     const workflowCalls = new Map<string, number>();
     const tokens = { input: 0, output: 0, reasoning: 0 };
     let agentCalls = 0;
-    const capturedTraces: TraceEvent[] | undefined = options?.captureTraces ? [] : undefined;
+    const capturedTraces: AxlEvent[] | undefined = options?.captureTraces ? [] : undefined;
 
-    const listener = (event: TraceEvent) => {
+    const listener = (event: AxlEvent) => {
       if (!scope.trackedIds.has(event.executionId)) return;
       if (event.cost) scope.totalCost += event.cost;
-      if (event.type === 'agent_call') {
+      if (event.type === 'agent_call_end') {
         if (event.model) modelCalls.set(event.model, (modelCalls.get(event.model) ?? 0) + 1);
         agentCalls++;
         if (event.tokens) {
@@ -1293,7 +1293,7 @@ export class AxlRuntime extends EventEmitter {
       // predictable — callers who need the full verbose snapshot should
       // subscribe to `runtime.on('trace', ...)` directly.
       if (capturedTraces) {
-        if (event.type === 'agent_call' && event.data) {
+        if (event.type === 'agent_call_end' && event.data) {
           const d = event.data as Record<string, unknown>;
           if ('messages' in d) {
             // Strip the verbose messages array by rebuilding without it.
@@ -1301,7 +1301,7 @@ export class AxlRuntime extends EventEmitter {
             for (const k of Object.keys(d)) {
               if (k !== 'messages') rest[k] = d[k];
             }
-            capturedTraces.push({ ...event, data: rest } as TraceEvent);
+            capturedTraces.push({ ...event, data: rest } as AxlEvent);
             return;
           }
         }
@@ -1368,7 +1368,7 @@ export class AxlRuntime extends EventEmitter {
    * The emit('trace', event) call happens before this method is called, so
    * programmatic subscribers always receive events regardless of trace config.
    */
-  private outputTraceEvent(event: TraceEvent): void {
+  private outputAxlEvent(event: AxlEvent): void {
     const traceConfig = this.config.trace;
     if (!traceConfig?.enabled) return;
 
@@ -1398,10 +1398,10 @@ export class AxlRuntime extends EventEmitter {
     }
 
     // Console output (default)
-    this.logTraceEvent(event);
+    this.logAxlEvent(event);
   }
 
-  private logTraceEvent(event: TraceEvent): void {
+  private logAxlEvent(event: AxlEvent): void {
     const level = this.config.trace?.level ?? 'steps';
     const workflowPrefix = event.workflow ? `workflow:${event.workflow} | ` : '';
     const parts = [`[axl] execution:${event.executionId}`];
@@ -1416,7 +1416,7 @@ export class AxlRuntime extends EventEmitter {
       const status = d?.aborted ? 'aborted' : (d?.status ?? 'completed');
       parts.push(`${workflowPrefix}${status}`);
       if (event.duration != null) parts.push(`${(event.duration / 1000).toFixed(1)}s`);
-    } else if (event.type === 'agent_call') {
+    } else if (event.type === 'agent_call_end') {
       parts.push(`${workflowPrefix}step:${event.step} agent_call`);
       if (event.agent) parts.push(`agent:${event.agent}`);
       if (event.promptVersion) parts.push(`version:${event.promptVersion}`);
@@ -1426,7 +1426,7 @@ export class AxlRuntime extends EventEmitter {
       if (level === 'full' && event.data) {
         parts.push(`data:${JSON.stringify(event.data)}`);
       }
-    } else if (event.type === 'tool_call') {
+    } else if (event.type === 'tool_call_end') {
       parts.push(`${workflowPrefix}step:${event.step} tool_call`);
       if (event.tool) parts.push(`tool:${event.tool}`);
       if (event.duration) parts.push(`${event.duration}ms`);
@@ -1445,8 +1445,12 @@ export class AxlRuntime extends EventEmitter {
       parts.push(`${workflowPrefix}log: ${JSON.stringify(event.data)}`);
     } else {
       parts.push(`${workflowPrefix}${event.type}`);
-      if (level === 'full' && event.data) {
-        parts.push(`data:${JSON.stringify(event.data)}`);
+      // Some variants don't carry `data` (e.g., `ask_start`, `agent_call_start`).
+      // Inspect dynamically so the logger remains a catch-all without
+      // enumerating every variant.
+      const data = (event as { data?: unknown }).data;
+      if (level === 'full' && data !== undefined) {
+        parts.push(`data:${JSON.stringify(data)}`);
       }
     }
 

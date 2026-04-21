@@ -2,7 +2,11 @@ import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import { redactStreamEvent } from '../redact.js';
-import type { StreamEvent } from '@axlsdk/axl';
+// TODO(PR-3-spec-16): the playground broadcasts events through
+// `runtime.stream()`'s legacy translation layer (`runtime.ts` adapter), which
+// emits the old `StreamEvent` shape. PR 3 collapses the wire to `AxlEvent`
+// and this local import disappears (along with `redactStreamEvent` itself).
+import type { StreamEvent } from '../redact.js';
 
 export function createPlaygroundRoutes(connMgr: ConnectionManager) {
   const app = new Hono<StudioEnv>();

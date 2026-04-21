@@ -1,4 +1,4 @@
-import type { AxlRuntime, TraceEvent, ExecutionInfo } from '@axlsdk/axl';
+import type { AxlRuntime, AxlEvent, ExecutionInfo } from '@axlsdk/axl';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import { AggregateSnapshots, REBUILD_INTERVAL_MS, withinWindow } from './aggregate-snapshots.js';
 import type { WindowId } from './aggregate-snapshots.js';
@@ -27,7 +27,7 @@ export type ExecutionAggregatorOptions<State> = {
 export class ExecutionAggregator<State> {
   private snaps: AggregateSnapshots<State>;
   private interval?: ReturnType<typeof setInterval>;
-  private listener?: (event: TraceEvent) => void;
+  private listener?: (event: AxlEvent) => void;
   private options: ExecutionAggregatorOptions<State>;
   /** Generation counter to prevent stale async fold after rebuild. */
   private generation = 0;
@@ -45,7 +45,7 @@ export class ExecutionAggregator<State> {
 
   async start(): Promise<void> {
     await this.rebuild();
-    this.listener = (event: TraceEvent) => {
+    this.listener = (event: AxlEvent) => {
       if (!isLogEvent(event, 'workflow_end')) return;
       // Capture generation before the async gap
       const gen = this.generation;

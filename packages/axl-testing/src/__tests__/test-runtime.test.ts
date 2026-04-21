@@ -261,7 +261,7 @@ describe('AxlTestRuntime', () => {
 
       await runtime.execute('HandleSupport', { msg: 'test' });
 
-      const agentSteps = runtime.steps().filter((s) => s.type === 'agent_call');
+      const agentSteps = runtime.steps().filter((s) => s.type === 'agent_call_end');
       expect(agentSteps).toHaveLength(1);
     });
 
@@ -286,7 +286,7 @@ describe('AxlTestRuntime', () => {
 
       await runtime.execute('HandleSupport', { msg: 'find order' });
 
-      const toolSteps = runtime.steps().filter((s) => s.type === 'tool_call');
+      const toolSteps = runtime.steps().filter((s) => s.type === 'tool_call_end');
       expect(toolSteps).toHaveLength(1);
       expect(toolSteps[0].data).toMatchObject({
         args: { orderId: 'x1' },
@@ -667,7 +667,7 @@ describe('AxlTestRuntime', () => {
 
       await runtime.execute('SimpleAsk', { q: 'secret prompt' });
 
-      const agentCalls = runtime.traceLog().filter((t) => t.type === 'agent_call');
+      const agentCalls = runtime.traceLog().filter((t) => t.type === 'agent_call_end');
       expect(agentCalls.length).toBeGreaterThan(0);
       const data = agentCalls[0].data as Record<string, unknown>;
       expect(data.prompt).toBe('[redacted]');
@@ -685,7 +685,7 @@ describe('AxlTestRuntime', () => {
 
       await runtime.execute('SimpleAsk', { q: 'hi' });
 
-      const agentCall = runtime.traceLog().find((t) => t.type === 'agent_call');
+      const agentCall = runtime.traceLog().find((t) => t.type === 'agent_call_end');
       expect(agentCall).toBeDefined();
       const data = agentCall!.data as Record<string, unknown>;
       expect(Array.isArray(data.messages)).toBe(true);

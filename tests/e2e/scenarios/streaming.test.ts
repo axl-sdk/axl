@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { agent, tool, workflow } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
-import type { StreamEvent, TraceEvent } from '@axlsdk/axl';
+import type { StreamEvent, AxlEvent } from '@axlsdk/axl';
 import { createTestRuntime } from '../helpers/setup.js';
 
 describe('Streaming E2E', () => {
@@ -74,7 +74,7 @@ describe('Streaming E2E', () => {
     // Verify the step event contains an agent_call trace
     const stepEvents = allEvents.filter((e) => e.type === 'step');
     const agentCallStep = stepEvents.find(
-      (e) => (e as { data: { type?: string } }).data?.type === 'agent_call',
+      (e) => (e as { data: { type?: string } }).data?.type === 'agent_call_end',
     );
     expect(agentCallStep).toBeDefined();
   });
@@ -308,13 +308,13 @@ describe('Streaming E2E', () => {
     // workflow_end is now a first-class trace type, not a nested log event.
     const stepEvents = allEvents.filter((e) => e.type === 'step');
     const workflowEndStep = stepEvents.find((e) => {
-      const data = (e as { data: TraceEvent }).data;
+      const data = (e as { data: AxlEvent }).data;
       return data.type === 'workflow_end';
     });
     expect(workflowEndStep).toBeDefined();
 
-    const endData = (workflowEndStep as { data: TraceEvent }).data;
-    expect((endData.data as { status?: string })?.status).toBe('completed');
+    const endData = (workflowEndStep as { data: AxlEvent }).data;
+    expect(((endData as { data?: unknown }).data as { status?: string })?.status).toBe('completed');
   });
 
   it('stream emits workflow_end with status failed on error', async () => {
@@ -332,7 +332,7 @@ describe('Streaming E2E', () => {
     await expect(stream.promise).rejects.toThrow('intentional failure');
 
     // Verify workflow_end trace fired with status: failed + error message
-    const workflowEndTrace = traces.find((t: TraceEvent) => t.type === 'workflow_end');
+    const workflowEndTrace = traces.find((t: AxlEvent) => t.type === 'workflow_end');
     expect(workflowEndTrace).toBeDefined();
     expect((workflowEndTrace!.data as { status?: string })?.status).toBe('failed');
     expect((workflowEndTrace!.data as { error?: string })?.error).toBe('intentional failure');

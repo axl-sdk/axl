@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { agent, workflow } from '@axlsdk/axl';
-import type { TraceEvent } from '@axlsdk/axl';
+import type { AxlEvent } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
 import { createTestRuntime, testWorkflow, greetTool } from '../helpers/setup.js';
 
@@ -120,7 +120,7 @@ describe('Basic Workflow E2E', () => {
     // workflow_start and workflow_end are now first-class trace types.
     expect(types).toContain('workflow_start');
     expect(types).toContain('workflow_end');
-    expect(types).toContain('agent_call');
+    expect(types).toContain('agent_call_end');
 
     const startEvent = traces.find((t) => t.type === 'workflow_start');
     const endEvent = traces.find((t) => t.type === 'workflow_end');
@@ -174,7 +174,7 @@ describe('Basic Workflow E2E', () => {
 
     await runtime.execute('token-wf', { message: 'hello' });
 
-    const agentCall = traces.find((t: TraceEvent) => t.type === 'agent_call');
+    const agentCall = traces.find((t: AxlEvent) => t.type === 'agent_call_end');
     expect(agentCall).toBeDefined();
     expect(agentCall!.tokens).toEqual({ input: 100, output: 50, reasoning: 10 });
   });
@@ -196,7 +196,7 @@ describe('Basic Workflow E2E', () => {
 
     await runtime.execute('no-usage-wf', { message: 'hello' });
 
-    const agentCall = traces.find((t: TraceEvent) => t.type === 'agent_call');
+    const agentCall = traces.find((t: AxlEvent) => t.type === 'agent_call_end');
     expect(agentCall).toBeDefined();
     expect(agentCall!.tokens).toBeUndefined();
   });

@@ -6,7 +6,7 @@ import { AxlRuntime } from '../runtime.js';
 import { workflow } from '../workflow.js';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import type { TraceEvent } from '../types.js';
+import type { AxlEvent } from '../types.js';
 import type { Provider, ProviderResponse, ToolCallMessage } from '../providers/types.js';
 
 /**
@@ -49,7 +49,7 @@ function createCtx(overrides: Record<string, unknown> = {}) {
   const registry = new ProviderRegistry();
   const provider = (overrides.provider as Provider) ?? createSequenceProvider(['Done']);
   registry.registerInstance('mock', provider);
-  const traces: TraceEvent[] = [];
+  const traces: AxlEvent[] = [];
   return {
     ctx: new WorkflowContext({
       input: 'test',

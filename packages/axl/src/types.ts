@@ -136,24 +136,59 @@ export type RaceOptions<T = unknown> = {
 /** Execution status */
 export type ExecutionStatus = 'running' | 'completed' | 'failed' | 'waiting';
 
-/** Trace event type. See `TraceEvent` for per-type data shapes. */
-export type TraceEventType =
-  | 'agent_call'
-  | 'tool_call'
-  | 'verify'
-  | 'handoff'
-  | 'delegate'
-  | 'tool_denied'
-  | 'tool_approval'
-  | 'log'
-  | 'workflow_start'
-  | 'workflow_end'
-  | 'guardrail'
-  | 'schema_check'
-  | 'validate';
+/**
+ * Canonical list of `AxlEvent.type` discriminators. Single source of truth —
+ * derive `AxlEventType` from this tuple and use it to validate stream filters,
+ * redaction tables, and exhaustiveness assertions.
+ */
+export const AXL_EVENT_TYPES = [
+  // Workflow lifecycle
+  'workflow_start',
+  'workflow_end',
+  // Ask boundary
+  'ask_start',
+  'ask_end',
+  // Agent turn lifecycle
+  'agent_call_start',
+  'agent_call_end',
+  // Content delivery (stream-only)
+  'token',
+  // Tool invocation lifecycle
+  'tool_call_start',
+  'tool_call_end',
+  // Single-point tool events
+  'tool_approval',
+  'tool_denied',
+  // Delegation
+  'delegate',
+  // Handoff (spans two asks; not AskScoped)
+  'handoff',
+  // Pipeline (retry/validation lifecycle) — added in PR 2; reserved here.
+  'pipeline',
+  // Progressive structured output — added in PR 2; reserved here.
+  'partial_object',
+  // Verification
+  'verify',
+  // Observability
+  'log',
+  'memory_remember',
+  'memory_recall',
+  'memory_forget',
+  // Legacy gate events — emitted by current code; collapsed into `pipeline`
+  // in PR 2 (spec/16-streaming-wire-reliability §4.2).
+  'guardrail',
+  'schema_check',
+  'validate',
+  // Terminal workflow markers
+  'done',
+  'error',
+] as const;
 
-/** Data shape for `agent_call` trace events. Populated on every LLM call (pass or fail). */
-export type AgentCallTraceData = {
+/** Discriminator union derived from `AXL_EVENT_TYPES`. */
+export type AxlEventType = (typeof AXL_EVENT_TYPES)[number];
+
+/** Data shape for `agent_call_end` events. Populated on every LLM call (pass or fail). */
+export type AgentCallData = {
   /** Original user prompt passed to `ctx.ask()`. Does not include retry feedback or tool results. */
   prompt: string;
   /** Final LLM response content for this turn. */
@@ -180,73 +215,48 @@ export type AgentCallTraceData = {
   messages?: ChatMessage[];
 };
 
-/** Data shape for `guardrail` trace events. */
-export type GuardrailTraceData = {
-  guardrailType: 'input' | 'output';
-  blocked: boolean;
-  reason?: string;
-  /** 1-indexed attempt count (output guardrails only). */
-  attempt?: number;
-  /** Maximum attempts allowed before the guardrail throws. */
-  maxAttempts?: number;
-  /** The exact corrective message about to be injected into the conversation — only set when
-   *  this check failed and a retry is happening. Gives users visibility into what the LLM sees
-   *  between retry attempts. */
-  feedbackMessage?: string;
-};
-
-/** Data shape for `schema_check` trace events. Emitted on every schema parse (pass or fail). */
-export type SchemaCheckTraceData = {
-  valid: boolean;
-  reason?: string;
-  attempt: number;
-  maxAttempts: number;
-  feedbackMessage?: string;
-};
-
-/** Data shape for `validate` trace events (post-schema business rule validation). */
-export type ValidateTraceData = {
-  valid: boolean;
-  reason?: string;
-  attempt: number;
-  maxAttempts: number;
-  feedbackMessage?: string;
-};
-
-/** Data shape for `tool_approval` trace events. Emitted by the approval gate on both outcomes. */
-export type ToolApprovalTraceData = {
-  approved: boolean;
-  args: unknown;
-  reason?: string;
-};
-
-/** Data shape for `tool_call` trace events. */
-export type ToolCallTraceData = {
+/** Data shape for `tool_call_end` events. */
+export type ToolCallData = {
   args: unknown;
   result: unknown;
   callId?: string;
 };
 
-/** Data shape for `handoff` trace events. */
-export type HandoffTraceData = {
+/** Data shape for `tool_call_start` events. */
+export type ToolCallStartData = {
+  args: unknown;
+};
+
+/** Data shape for `tool_approval` events. Emitted by the approval gate on both outcomes. */
+export type ToolApprovalData = {
+  approved: boolean;
+  args: unknown;
+  reason?: string;
+};
+
+/** Data shape for `tool_denied` events. Emitted when the LLM names a tool the agent doesn't expose. */
+export type ToolDeniedData = {
+  args?: unknown;
+  reason?: string;
+  callId?: string;
+};
+
+/** Data shape for `handoff` events. */
+export type HandoffData = {
+  source: string;
   target: string;
   mode: 'oneway' | 'roundtrip';
   /** Wall-clock ms from handoff_to_X tool call to target agent completion.
    *  Always emitted — the event only fires at the terminal point of the
    *  handoff, so we always have a measurement. */
   duration: number;
-  /** Source agent that initiated the handoff (mirrors the event's `agent` field
-   *  for convenience — lets consumers query the handoff chain without
-   *  stitching together event.agent and data.target). */
-  source?: string;
   /** The `message` arg the source agent passed when invoking `handoff_to_X`
-   *  (roundtrip mode only). Gives observability into *why* the source chose
-   *  to delegate. Subject to `config.trace.redact`. */
+   *  (roundtrip mode only). Subject to `config.trace.redact`. */
   message?: string;
 };
 
-/** Data shape for `delegate` trace events. */
-export type DelegateTraceData = {
+/** Data shape for `delegate` events. */
+export type DelegateData = {
   candidates: string[];
   /** Set when the decision is known at emission time (single-agent short-circuit). */
   selected?: string;
@@ -256,22 +266,50 @@ export type DelegateTraceData = {
   reason: 'routed' | 'single_candidate';
 };
 
-/** Data shape for `verify` trace events. */
-export type VerifyTraceData = {
+/** Data shape for `verify` events. */
+export type VerifyData = {
   attempts: number;
   passed: boolean;
   lastError?: string;
 };
 
-/** Data shape for `workflow_start` trace events. Emitted once per workflow execution. */
-export type WorkflowStartTraceData = {
+/** Data shape for legacy `guardrail` events. Replaced by `pipeline` in PR 2. */
+export type GuardrailData = {
+  guardrailType: 'input' | 'output';
+  blocked: boolean;
+  reason?: string;
+  attempt?: number;
+  maxAttempts?: number;
+  feedbackMessage?: string;
+};
+
+/** Data shape for legacy `schema_check` events. Replaced by `pipeline` in PR 2. */
+export type SchemaCheckData = {
+  valid: boolean;
+  reason?: string;
+  attempt: number;
+  maxAttempts: number;
+  feedbackMessage?: string;
+};
+
+/** Data shape for legacy `validate` events. Replaced by `pipeline` in PR 2. */
+export type ValidateData = {
+  valid: boolean;
+  reason?: string;
+  attempt: number;
+  maxAttempts: number;
+  feedbackMessage?: string;
+};
+
+/** Data shape for `workflow_start` events. Emitted once per workflow execution. */
+export type WorkflowStartData = {
   /** The validated input passed to the workflow handler. */
   input: unknown;
 };
 
-/** Data shape for `workflow_end` trace events. Emitted once per workflow execution
+/** Data shape for `workflow_end` events. Emitted once per workflow execution
  *  on completion, failure, or cancellation. Distinguish cancellation via `aborted`. */
-export type WorkflowEndTraceData = {
+export type WorkflowEndData = {
   status: 'completed' | 'failed';
   duration: number;
   /** Workflow return value. Present on `status: 'completed'`. */
@@ -283,46 +321,256 @@ export type WorkflowEndTraceData = {
   aborted?: boolean;
 };
 
-/** Common fields carried by every `TraceEvent` regardless of `type`. */
-type TraceEventBase = {
-  executionId: string;
-  step: number;
-  timestamp: number;
-  workflow?: string;
-  agent?: string;
-  promptVersion?: string;
-  model?: string;
+/** Data shape for `memory_remember` / `memory_recall` / `memory_forget` events. */
+export type MemoryEventData = {
+  scope: string;
+  key?: string;
+  /** Result count for `recall` (number of vectors returned). */
+  count?: number;
+  /** Embedder cost for semantic recall/remember. Mirrored at the top-level
+   *  `cost` on the event so cost rails (`trackExecution`) pick it up. */
   cost?: number;
+  /** Embedder usage detail (tokens / model). */
+  usage?: { tokens?: number; cost?: number; model?: string };
+  /** True when this memory op called the semantic recall path (vs. key-only). */
+  embed?: boolean;
+  /** True when a key-only recall returned a value. */
+  hit?: boolean;
+  /** Result count for `recall` (alias for `count` retained for back-compat). */
+  resultCount?: number;
+};
+
+/** Common fields carried by every `AxlEvent` regardless of `type`. */
+export type AxlEventBase = {
+  executionId: string;
+  /** Monotonic per-execution step counter, shared across nested asks via ALS. */
+  step: number;
+  /** Wall-clock ms. */
+  timestamp: number;
+  /** Workflow this event belongs to. Auto-stamped by `emitEvent` from
+   *  `this.workflowName` when defined; callers may override. */
+  workflow?: string;
+  /** Optional emitting-agent name. Variants that always have an agent
+   *  (e.g., `agent_call_start/end`) redeclare it as required so consumers
+   *  narrowing on those variants get a non-optional `agent`. Single-point
+   *  events that may or may not have an agent (`handoff`, gate events,
+   *  `log`) keep the optional. */
+  agent?: string;
+  /** Optional model URI — set on agent-related events; ignored on others. */
+  model?: string;
+  /** Optional prompt version stamped from `agent._config.version`. */
+  promptVersion?: string;
+  /** Agent turn cost. Variants like `agent_call_end` and `ask_end` require it
+   *  (intersection narrows to required); other emit sites may stamp it
+   *  optionally to flow into cost rails. */
+  cost?: number;
+  /** Token counts. Required-by-narrowing on `agent_call_end`; optional on
+   *  any event that wishes to mirror an aggregate. */
   tokens?: { input?: number; output?: number; reasoning?: number };
+  /** Duration in ms (set on `_end` variants and a few single-point events). */
   duration?: number;
-  /** When set, this event was emitted from a child context spawned by a tool
-   *  handler. The value is the `callId` of the outer `tool_call` that invoked
-   *  the tool. Lets consumers reconstruct agent-as-tool call graphs by
-   *  joining nested events to their parent `tool_call`. Undefined on top-level
-   *  events. */
+  /**
+   * @deprecated Use `parentAskId` (on `AskScoped`) for ask-graph correlation
+   *  going forward. Retained for one minor cycle so existing telemetry
+   *  consumers that grep agent-as-tool call graphs by tool callId keep
+   *  working — `WorkflowContext.createChildContext()` still populates this
+   *  during PR 1, so reading it is safe through this transition window.
+   *  Removal is tracked in the follow-up to spec/16-streaming-wire-reliability.
+   */
   parentToolCallId?: string;
 };
 
+/** Fields on every event that originates within a specific `ctx.ask()` call. */
+export type AskScoped = {
+  askId: string;
+  /** Absent on root ask. */
+  parentAskId?: string;
+  /** 0 = root ask; +1 per nested ask. */
+  depth: number;
+  /** Emitting agent's name. Absent on `ask_start` (pre-resolution) and on
+   *  events that predate agent resolution. */
+  agent?: string;
+};
+
+/** Meta carried alongside callback invocations so consumers can group/route by ask. */
+export type CallbackMeta = {
+  askId: string;
+  parentAskId?: string;
+  depth: number;
+  agent: string;
+};
+
 /**
- * Trace event. A discriminated union over `type` — consumers that narrow via
- * `type` get statically-typed access to `data` and event-specific fields.
- * When adding a new event type, extend this union AND the emitter in
- * `WorkflowContext.emitTrace()` together so the compiler catches drift.
+ * Unified event union. Replaces the old `TraceEvent` (rich, persisted) and
+ * `StreamEvent` (lean, wire) by emitting a single rich event from one site
+ * and consuming the same shape on both rails.
+ *
+ * - Streaming consumers iterate `AxlStream` (an `AsyncIterable<AxlEvent>`).
+ * - Non-streaming consumers read `ExecutionInfo.events: AxlEvent[]`.
+ *
+ * Tree reconstruction: group ask-scoped events by `askId`, parent-link via
+ * `parentAskId`, sort by `step`, render by `depth`. Tokens (high-volume) and
+ * `partial_object` events are stream-only — never persisted to
+ * `ExecutionInfo.events`.
+ *
+ * When adding a new variant, extend `AXL_EVENT_TYPES` AND the emitter in
+ * `WorkflowContext.emitEvent()` together so the compiler catches drift; the
+ * exhaustiveness fixture in `__tests__/axl-event-exhaustive.test-d.ts` will
+ * also fail until the new case is handled.
  */
-export type TraceEvent =
-  | (TraceEventBase & { type: 'agent_call'; data?: AgentCallTraceData })
-  | (TraceEventBase & { type: 'tool_call'; tool: string; data?: ToolCallTraceData })
-  | (TraceEventBase & { type: 'tool_approval'; tool: string; data?: ToolApprovalTraceData })
-  | (TraceEventBase & { type: 'tool_denied'; tool: string; data?: unknown })
-  | (TraceEventBase & { type: 'guardrail'; data?: GuardrailTraceData })
-  | (TraceEventBase & { type: 'schema_check'; data?: SchemaCheckTraceData })
-  | (TraceEventBase & { type: 'validate'; data?: ValidateTraceData })
-  | (TraceEventBase & { type: 'delegate'; data?: DelegateTraceData })
-  | (TraceEventBase & { type: 'handoff'; data?: HandoffTraceData })
-  | (TraceEventBase & { type: 'verify'; data?: VerifyTraceData })
-  | (TraceEventBase & { type: 'log'; data?: unknown })
-  | (TraceEventBase & { type: 'workflow_start'; data?: WorkflowStartTraceData })
-  | (TraceEventBase & { type: 'workflow_end'; data?: WorkflowEndTraceData });
+export type AxlEvent =
+  // ── Execution lifecycle ─────────────────────────────────────────────────
+  | (AxlEventBase & { type: 'workflow_start'; workflow: string; data: WorkflowStartData })
+  | (AxlEventBase & { type: 'workflow_end'; workflow: string; data: WorkflowEndData })
+
+  // ── Ask boundary (user-level ctx.ask() call) ────────────────────────────
+  | (AxlEventBase & AskScoped & { type: 'ask_start'; prompt: string })
+  | (AxlEventBase &
+      AskScoped & {
+        type: 'ask_end';
+        /** Discriminated outcome — narrow on `outcome.ok`. Ask-internal throws
+         *  surface here, NOT via the workflow-level `error` event. */
+        outcome: { ok: true; result: unknown } | { ok: false; error: string };
+        /** Sum of `agent_call_end.cost` + `tool_call_end.cost` WITHIN THIS ASK,
+         *  excluding nested asks. Nested asks contribute to their own ask_end. */
+        cost: number;
+        duration: number;
+      })
+
+  // ── Agent turn lifecycle (one LLM call within an ask) ───────────────────
+  | (AxlEventBase &
+      AskScoped & {
+        type: 'agent_call_start';
+        agent: string;
+        model: string;
+        /** 1-indexed tool-calling loop iteration within the ask. */
+        turn: number;
+      })
+  | (AxlEventBase &
+      AskScoped & {
+        type: 'agent_call_end';
+        agent: string;
+        model: string;
+        /** Authoritative turn-level cost. */
+        cost: number;
+        duration: number;
+        tokens?: { input?: number; output?: number; reasoning?: number };
+        data: AgentCallData;
+      })
+
+  // ── Content delivery (stream-only; never in ExecutionInfo.events) ───────
+  | (AxlEventBase & AskScoped & { type: 'token'; data: string })
+
+  // ── Tool invocation lifecycle ───────────────────────────────────────────
+  | (AxlEventBase &
+      AskScoped & {
+        type: 'tool_call_start';
+        tool: string;
+        callId: string;
+        data: ToolCallStartData;
+      })
+  | (AxlEventBase &
+      AskScoped & {
+        type: 'tool_call_end';
+        tool: string;
+        callId: string;
+        duration: number;
+        cost?: number;
+        data: ToolCallData;
+      })
+
+  // ── Single-point tool events ────────────────────────────────────────────
+  | (AxlEventBase &
+      AskScoped & {
+        type: 'tool_approval';
+        tool: string;
+        callId?: string;
+        data: ToolApprovalData;
+      })
+  | (AxlEventBase &
+      AskScoped & {
+        type: 'tool_denied';
+        tool: string;
+        callId?: string;
+        data?: ToolDeniedData;
+      })
+
+  // ── Delegation ──────────────────────────────────────────────────────────
+  | (AxlEventBase & AskScoped & { type: 'delegate'; data: DelegateData })
+
+  // ── Handoff (atomic; spans two asks — NOT AskScoped) ────────────────────
+  | (AxlEventBase & {
+      type: 'handoff';
+      fromAskId: string;
+      toAskId: string;
+      sourceDepth: number;
+      targetDepth: number;
+      data: HandoffData;
+    })
+
+  // ── Pipeline (retry/validation lifecycle; multi-state via `status`) ─────
+  | (AxlEventBase &
+      AskScoped & {
+        type: 'pipeline';
+        status: 'start';
+        stage: 'initial' | 'schema' | 'validate' | 'guardrail';
+        attempt: number;
+        maxAttempts: number;
+      })
+  | (AxlEventBase &
+      AskScoped & {
+        type: 'pipeline';
+        status: 'failed';
+        stage: 'schema' | 'validate' | 'guardrail';
+        attempt: number;
+        maxAttempts: number;
+        /** Feedback message about to be injected into the conversation. */
+        reason: string;
+      })
+  | (AxlEventBase &
+      AskScoped & {
+        type: 'pipeline';
+        status: 'committed';
+        /** The final successful attempt. */
+        attempt: number;
+        maxAttempts: number;
+      })
+
+  // ── Progressive structured output ───────────────────────────────────────
+  | (AxlEventBase &
+      AskScoped & {
+        type: 'partial_object';
+        attempt: number;
+        /** DeepPartial<T>; consumers cast at the render site. */
+        data: { object: unknown };
+      })
+
+  // ── Verification ────────────────────────────────────────────────────────
+  | (AxlEventBase & AskScoped & { type: 'verify'; data: VerifyData })
+
+  // ── Legacy gate events (collapsed into `pipeline` in PR 2) ──────────────
+  | (AxlEventBase & Partial<AskScoped> & { type: 'guardrail'; data?: GuardrailData })
+  | (AxlEventBase & Partial<AskScoped> & { type: 'schema_check'; data?: SchemaCheckData })
+  | (AxlEventBase & Partial<AskScoped> & { type: 'validate'; data?: ValidateData })
+
+  // ── Observability ───────────────────────────────────────────────────────
+  | (AxlEventBase & Partial<AskScoped> & { type: 'log'; data: unknown })
+  | (AxlEventBase &
+      Partial<AskScoped> & {
+        type: 'memory_remember' | 'memory_recall' | 'memory_forget';
+        data: MemoryEventData;
+      })
+
+  // ── Terminal workflow markers (idiomatic names; see decision 9) ─────────
+  | (AxlEventBase & { type: 'done'; data: { result: unknown } })
+  | (AxlEventBase &
+      Partial<AskScoped> & {
+        type: 'error';
+        data: { message: string; name?: string; code?: string };
+      });
+
+/** Convenience: extract the union member matching a given `type` discriminator. */
+export type AxlEventOf<T extends AxlEventType> = Extract<AxlEvent, { type: T }>;
 
 /** Result of a guardrail check. */
 export type GuardrailResult = {
@@ -376,7 +624,10 @@ export type ExecutionInfo = {
   executionId: string;
   workflow: string;
   status: ExecutionStatus;
-  steps: TraceEvent[];
+  /** Full event timeline. Tokens and `partial_object` events are NOT persisted
+   *  here (stream-only); aggregate `tokens: { input, output, reasoning? }`
+   *  on `agent_call_end` is the persisted token representation. */
+  events: AxlEvent[];
   totalCost: number;
   startedAt: number;
   completedAt?: number;
@@ -384,31 +635,6 @@ export type ExecutionInfo = {
   result?: unknown;
   error?: string;
 };
-
-/** Stream event types */
-export type StreamEventType =
-  | 'token'
-  | 'tool_call'
-  | 'tool_result'
-  | 'tool_approval'
-  | 'agent_start'
-  | 'agent_end'
-  | 'handoff'
-  | 'step'
-  | 'done'
-  | 'error';
-
-export type StreamEvent =
-  | { type: 'token'; data: string }
-  | { type: 'tool_call'; name: string; args: unknown; callId?: string }
-  | { type: 'tool_result'; name: string; result: unknown; callId?: string }
-  | { type: 'tool_approval'; name: string; args: unknown; approved: boolean; reason?: string }
-  | { type: 'agent_start'; agent: string; model?: string }
-  | { type: 'agent_end'; agent: string; cost?: number; duration?: number }
-  | { type: 'handoff'; source: string; target: string; mode?: 'oneway' | 'roundtrip' }
-  | { type: 'step'; step: number; data: unknown }
-  | { type: 'done'; data: unknown }
-  | { type: 'error'; message: string };
 
 /** Record of an agent handoff event (persisted in session metadata). */
 export type HandoffRecord = {

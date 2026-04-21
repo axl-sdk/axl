@@ -12,7 +12,7 @@ import { TraceEventList } from '../../components/shared/TraceEventList';
 import { fetchExecutions } from '../../lib/api';
 import { useWs } from '../../hooks/use-ws';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
-import type { ExecutionInfo, TraceEvent } from '../../lib/types';
+import type { ExecutionInfo, AxlEvent } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
 
 type FilterOption = { value: string; label: string };
@@ -48,7 +48,7 @@ function formatTimestamp(ts: number): string {
 export function TraceExplorerPanel() {
   const [traceTab, setTraceTab] = useState<'events' | 'stats'>('events');
   const [selectedExecution, setSelectedExecution] = useState<ExecutionInfo | null>(null);
-  const [liveEvents, setLiveEvents] = useState<TraceEvent[]>([]);
+  const [liveEvents, setLiveEvents] = useState<AxlEvent[]>([]);
   const [typeFilter, setTypeFilter] = useState('');
   const [agentFilter, setAgentFilter] = useState('');
 
@@ -62,11 +62,11 @@ export function TraceExplorerPanel() {
   useWs(
     'trace:*',
     useCallback((data: unknown) => {
-      setLiveEvents((prev) => [...prev.slice(-200), data as TraceEvent]);
+      setLiveEvents((prev) => [...prev.slice(-200), data as AxlEvent]);
     }, []),
   );
 
-  const allEvents = selectedExecution ? selectedExecution.steps : liveEvents;
+  const allEvents = selectedExecution ? selectedExecution.events : liveEvents;
 
   let filteredEvents = allEvents;
   if (typeFilter) filteredEvents = filteredEvents.filter((e) => e.type === typeFilter);
@@ -99,10 +99,10 @@ export function TraceExplorerPanel() {
   // Stat cards for selected execution
   const stats = useMemo(() => {
     if (!selectedExecution) return null;
-    const models = [...new Set(selectedExecution.steps.map((s) => s.model).filter(Boolean))];
+    const models = [...new Set(selectedExecution.events.map((s) => s.model).filter(Boolean))];
     return {
       duration: selectedExecution.duration,
-      eventCount: selectedExecution.steps.length,
+      eventCount: selectedExecution.events.length,
       cost: selectedExecution.totalCost,
       models,
     };
@@ -120,8 +120,8 @@ export function TraceExplorerPanel() {
               <span className="font-mono">{selectedExecution.executionId.slice(0, 8)}</span>
               <span className="opacity-40 mx-1.5">·</span>
               <span>
-                {selectedExecution.steps.length} event
-                {selectedExecution.steps.length !== 1 ? 's' : ''}
+                {selectedExecution.events.length} event
+                {selectedExecution.events.length !== 1 ? 's' : ''}
               </span>
             </>
           ) : (
@@ -261,7 +261,7 @@ export function TraceExplorerPanel() {
                   </div>
                   <div className="flex items-center justify-between mt-1">
                     <span className="text-[hsl(var(--muted-foreground))] truncate">
-                      {exec.executionId.slice(0, 8)}… | {exec.steps.length} steps
+                      {exec.executionId.slice(0, 8)}… | {exec.events.length} events
                     </span>
                     {exec.totalCost > 0 && <CostBadge cost={exec.totalCost} />}
                   </div>

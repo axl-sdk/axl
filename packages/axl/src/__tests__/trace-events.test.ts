@@ -5,7 +5,7 @@ import { tool } from '../tool.js';
 import { WorkflowContext } from '../context.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { randomUUID } from 'node:crypto';
-import type { TraceEvent, ToolCallMessage } from '../types.js';
+import type { AxlEvent, ToolCallMessage } from '../types.js';
 import type { HumanDecision } from '../types.js';
 import { createSequenceProvider, createTestCtx } from './helpers.js';
 
@@ -27,7 +27,7 @@ describe('trace events — agent_call enrichment', () => {
     const { ctx, traces } = createTestCtx({ provider: createSequenceProvider(['ok']) });
     await ctx.ask(a, 'hi', { effort: 'low', toolChoice: 'auto' });
 
-    const agentCall = traces.find((t) => t.type === 'agent_call');
+    const agentCall = traces.find((t) => t.type === 'agent_call_end');
     expect(agentCall).toBeDefined();
     const data = agentCall!.data as Record<string, unknown>;
     expect(data.system).toBe('You are a helpful assistant.');
@@ -51,7 +51,7 @@ describe('trace events — agent_call enrichment', () => {
     });
     await ctx.ask(a, 'hi');
 
-    const agentCall = traces.find((t) => t.type === 'agent_call');
+    const agentCall = traces.find((t) => t.type === 'agent_call_end');
     expect((agentCall!.data as Record<string, unknown>).system).toBe('Tenant: acme');
   });
 
@@ -60,7 +60,7 @@ describe('trace events — agent_call enrichment', () => {
     const { ctx, traces } = createTestCtx({ provider: createSequenceProvider(['ok']) });
     await ctx.ask(a, 'hi');
 
-    const agentCall = traces.find((t) => t.type === 'agent_call');
+    const agentCall = traces.find((t) => t.type === 'agent_call_end');
     expect((agentCall!.data as Record<string, unknown>).messages).toBeUndefined();
   });
 
@@ -69,7 +69,7 @@ describe('trace events — agent_call enrichment', () => {
     const provider = createSequenceProvider(['ok']);
     const registry = new ProviderRegistry();
     registry.registerInstance('mock', provider);
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     const ctx = new WorkflowContext({
       input: 'test',
       executionId: randomUUID(),
@@ -79,7 +79,7 @@ describe('trace events — agent_call enrichment', () => {
     });
     await ctx.ask(a, 'hi');
 
-    const agentCall = traces.find((t) => t.type === 'agent_call');
+    const agentCall = traces.find((t) => t.type === 'agent_call_end');
     const data = agentCall!.data as Record<string, unknown>;
     expect(Array.isArray(data.messages)).toBe(true);
     const messages = data.messages as Array<{ role: string; content: string }>;
@@ -100,7 +100,7 @@ describe('trace events — agent_call enrichment', () => {
     const { ctx, traces } = createTestCtx({ provider });
     await ctx.ask(a, 'hi');
 
-    const agentCall = traces.find((t) => t.type === 'agent_call');
+    const agentCall = traces.find((t) => t.type === 'agent_call_end');
     expect((agentCall!.data as Record<string, unknown>).thinking).toBe(
       'Let me think about this...',
     );
@@ -153,7 +153,7 @@ describe('trace events — schema_check', () => {
     });
     await ctx.ask(a, 'hi', { schema: z.object({ answer: z.string() }) });
 
-    const calls = traces.filter((t) => t.type === 'agent_call');
+    const calls = traces.filter((t) => t.type === 'agent_call_end');
     expect(calls).toHaveLength(2);
     const firstData = calls[0].data as Record<string, unknown>;
     const secondData = calls[1].data as Record<string, unknown>;
@@ -169,7 +169,7 @@ describe('trace events — verbose messages snapshot across retries', () => {
     const provider = createSequenceProvider(['not json', '{"answer":"ok"}']);
     const registry = new ProviderRegistry();
     registry.registerInstance('mock', provider);
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     const ctx = new WorkflowContext({
       input: 'test',
       executionId: randomUUID(),
@@ -179,7 +179,7 @@ describe('trace events — verbose messages snapshot across retries', () => {
     });
     await ctx.ask(a, 'hi', { schema: z.object({ answer: z.string() }) });
 
-    const calls = traces.filter((t) => t.type === 'agent_call');
+    const calls = traces.filter((t) => t.type === 'agent_call_end');
     expect(calls).toHaveLength(2);
     const turn1Messages = (calls[0].data as Record<string, unknown>).messages as Array<{
       role: string;
@@ -233,16 +233,20 @@ describe('trace events — nested child contexts (agent-as-tool)', () => {
     // The outer tool_call gets the `callId: 'outer-tc-1'` on its data,
     // and any nested trace events (e.g. child agent_call) carry the same
     // id as `parentToolCallId` at the top level.
-    const outerToolCall = traces.find((t) => t.type === 'tool_call' && t.tool === 'nested_call');
+    const outerToolCall = traces.find(
+      (t) => t.type === 'tool_call_end' && t.tool === 'nested_call',
+    );
     expect(outerToolCall).toBeDefined();
 
     const childEvents = traces.filter((t) => t.parentToolCallId === 'outer-tc-1');
     expect(childEvents.length).toBeGreaterThan(0);
     // The child agent's LLM call should be in that set
-    const childAgentCall = childEvents.find((t) => t.type === 'agent_call' && t.agent === 'child');
+    const childAgentCall = childEvents.find(
+      (t) => t.type === 'agent_call_end' && t.agent === 'child',
+    );
     expect(childAgentCall).toBeDefined();
     // Outer parent agent_call should NOT carry parentToolCallId
-    const parentAgentCall = traces.find((t) => t.type === 'agent_call' && t.agent === 'parent');
+    const parentAgentCall = traces.find((t) => t.type === 'agent_call_end' && t.agent === 'parent');
     expect(parentAgentCall!.parentToolCallId).toBeUndefined();
   });
 
@@ -284,7 +288,7 @@ describe('trace events — nested child contexts (agent-as-tool)', () => {
 
     // Both parent and child agent_calls should appear, but neither should
     // carry retryReason since neither hit a gate failure.
-    const calls = traces.filter((t) => t.type === 'agent_call');
+    const calls = traces.filter((t) => t.type === 'agent_call_end');
     expect(calls.length).toBeGreaterThanOrEqual(2);
     for (const call of calls) {
       expect((call.data as Record<string, unknown>).retryReason).toBeUndefined();
@@ -317,7 +321,7 @@ describe('trace events — streaming path captures thinking', () => {
     };
     const registry = new ProviderRegistry();
     registry.registerInstance('mock', provider);
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     const tokens: string[] = [];
     const ctx = new WorkflowContext({
       input: 'test',
@@ -331,7 +335,7 @@ describe('trace events — streaming path captures thinking', () => {
     await ctx.ask(a, 'hi');
 
     expect(tokens.join('')).toBe('answer');
-    const call = traces.find((t) => t.type === 'agent_call');
+    const call = traces.find((t) => t.type === 'agent_call_end');
     expect(call).toBeDefined();
     expect((call!.data as Record<string, unknown>).thinking).toBe('let me think');
   });
@@ -388,7 +392,7 @@ describe('trace events — guardrail attempt tracking', () => {
     expect(first.feedbackMessage).toContain('blocked by a safety guardrail');
 
     // Second agent_call should be tagged as a guardrail retry
-    const calls = traces.filter((t) => t.type === 'agent_call');
+    const calls = traces.filter((t) => t.type === 'agent_call_end');
     expect((calls[1].data as Record<string, unknown>).retryReason).toBe('guardrail');
   });
 });
@@ -415,7 +419,7 @@ describe('trace events — validate attempt tracking', () => {
     expect(first.maxAttempts).toBe(3);
     expect(first.feedbackMessage).toContain('failed validation');
 
-    const calls = traces.filter((t) => t.type === 'agent_call');
+    const calls = traces.filter((t) => t.type === 'agent_call_end');
     expect((calls[1].data as Record<string, unknown>).retryReason).toBe('validate');
   });
 });
@@ -511,7 +515,7 @@ describe('trace events — handoff clears retryReason', () => {
     const { ctx, traces } = createTestCtx({ provider });
     await ctx.ask(source, 'hi', { schema: z.object({ answer: z.string() }) });
 
-    const calls = traces.filter((t) => t.type === 'agent_call');
+    const calls = traces.filter((t) => t.type === 'agent_call_end');
     expect(calls.length).toBeGreaterThanOrEqual(3);
     const sourceCalls = calls.filter((c) => c.agent === 'source');
     const targetCalls = calls.filter((c) => c.agent === 'target');
@@ -722,7 +726,7 @@ describe('trace events — workflow_start/end redaction', () => {
   it('redacts workflow_start.input under trace.redact', async () => {
     const { workflow, AxlRuntime } = await import('../index.js');
     const runtime = new AxlRuntime({ trace: { redact: true } });
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     runtime.on('trace', (e) => traces.push(e));
 
     runtime.register(
@@ -746,7 +750,7 @@ describe('trace events — workflow_start/end redaction', () => {
   it('redacts workflow_end.result and workflow_end.error under trace.redact', async () => {
     const { workflow, AxlRuntime } = await import('../index.js');
     const runtime = new AxlRuntime({ trace: { redact: true } });
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     runtime.on('trace', (e) => traces.push(e));
 
     runtime.register(
@@ -789,7 +793,7 @@ describe('trace events — workflow_start/end redaction', () => {
   it('leaves workflow_start/end fields visible when trace.redact is off', async () => {
     const { workflow, AxlRuntime } = await import('../index.js');
     const runtime = new AxlRuntime();
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     runtime.on('trace', (e) => traces.push(e));
 
     runtime.register(
@@ -816,7 +820,7 @@ describe('trace events — workflow_start/end redaction', () => {
     // carries the workflow name and cost-aggregation works end-to-end.
     const { workflow: mkWorkflow, AxlRuntime } = await import('../index.js');
     const runtime = new AxlRuntime();
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     runtime.on('trace', (e) => traces.push(e));
 
     runtime.register(
@@ -857,7 +861,7 @@ describe('trace events — redaction', () => {
     });
     const registry = new ProviderRegistry();
     registry.registerInstance('mock', provider);
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     const ctx = new WorkflowContext({
       input: 'test',
       executionId: randomUUID(),
@@ -867,7 +871,7 @@ describe('trace events — redaction', () => {
     });
     await ctx.ask(a, 'secret prompt');
 
-    const agentCall = traces.find((t) => t.type === 'agent_call');
+    const agentCall = traces.find((t) => t.type === 'agent_call_end');
     const data = agentCall!.data as Record<string, unknown>;
     expect(data.prompt).toBe('[redacted]');
     expect(data.response).toBe('[redacted]');
@@ -901,7 +905,7 @@ describe('trace events — redaction', () => {
     const provider = createSequenceProvider([{ tool_calls: toolCalls }, 'done']);
     const registry = new ProviderRegistry();
     registry.registerInstance('mock', provider);
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     const ctx = new WorkflowContext({
       input: 'test',
       executionId: randomUUID(),
@@ -912,7 +916,7 @@ describe('trace events — redaction', () => {
     const a = agent({ model: 'mock:test', system: 'sys', tools: [myTool] });
     await ctx.ask(a, 'lookup');
 
-    const toolCallEvents = traces.filter((t) => t.type === 'tool_call');
+    const toolCallEvents = traces.filter((t) => t.type === 'tool_call_end');
     expect(toolCallEvents).toHaveLength(1);
     const data = toolCallEvents[0].data as Record<string, unknown>;
     expect(data.args).toBe('[redacted]');
@@ -937,7 +941,7 @@ describe('trace events — redaction', () => {
     const provider = createSequenceProvider([{ tool_calls: toolCalls }, 'done']);
     const registry = new ProviderRegistry();
     registry.registerInstance('mock', provider);
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     const ctx = new WorkflowContext({
       input: 'test',
       executionId: randomUUID(),
@@ -973,7 +977,7 @@ describe('trace events — redaction', () => {
     const provider = createSequenceProvider([{ tool_calls: handoffCall }, 'fetched', 'done']);
     const registry = new ProviderRegistry();
     registry.registerInstance('mock', provider);
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     const ctx = new WorkflowContext({
       input: 'test',
       executionId: randomUUID(),
@@ -999,7 +1003,7 @@ describe('trace events — redaction', () => {
     const provider = createSequenceProvider(['ok']);
     const registry = new ProviderRegistry();
     registry.registerInstance('mock', provider);
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     const ctx = new WorkflowContext({
       input: 'test',
       executionId: randomUUID(),
@@ -1028,7 +1032,7 @@ describe('trace events — redaction', () => {
     const a = agent({ model: 'mock:test', system: 'sys' });
     const registry = new ProviderRegistry();
     registry.registerInstance('mock', createSequenceProvider(['not json', '{"answer":"ok"}']));
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
     const ctx = new WorkflowContext({
       input: 'test',
       executionId: randomUUID(),

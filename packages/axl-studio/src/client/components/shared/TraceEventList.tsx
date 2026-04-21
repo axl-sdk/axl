@@ -4,7 +4,7 @@
  * (for the per-run timeline). Centralizes:
  *
  * - Row rendering: chevron, type pill, agent/tool, waterfall bar, duration, cost
- * - Body rendering: per-type bodies (agent_call, tool_approval, gate events)
+ * - Body rendering: per-type bodies (agent_call_end, tool_approval, gate events)
  * - Expand/collapse state: local row state + trace-wide level via context
  * - Retry/gate failure amber tint
  * - Nested-depth indentation via `getDepth(event)`
@@ -19,7 +19,7 @@ import { cn } from '../../lib/utils';
 import { CostBadge } from './CostBadge';
 import { DurationBadge } from './DurationBadge';
 import { JsonViewer } from './JsonViewer';
-import type { TraceEvent } from '../../lib/types';
+import type { AxlEvent } from '../../lib/types';
 import {
   getEventColor,
   getDepth,
@@ -127,7 +127,7 @@ export function TextBlock({
 
 // ── Per-type body renderers ─────────────────────────────────────────
 
-/** Small pill for key/value params on agent_call. */
+/** Small pill for key/value params on agent_call_end. */
 function ParamPill({ label, value }: { label: string; value: unknown }) {
   return (
     <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] rounded-full bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))]">
@@ -139,8 +139,8 @@ function ParamPill({ label, value }: { label: string; value: unknown }) {
   );
 }
 
-/** Rendered body for an expanded agent_call event. */
-export function AgentCallBody({ event }: { event: TraceEvent }) {
+/** Rendered body for an expanded agent_call_end event. */
+export function AgentCallBody({ event }: { event: AxlEvent }) {
   const d = getAgentCallData(event);
   if (!d) return null;
   return (
@@ -188,7 +188,7 @@ export function AgentCallBody({ event }: { event: TraceEvent }) {
 }
 
 /** Rendered body for an expanded tool_approval event. */
-export function ToolApprovalBody({ event }: { event: TraceEvent }) {
+export function ToolApprovalBody({ event }: { event: AxlEvent }) {
   const d = (event.data ?? null) as {
     approved?: boolean;
     args?: unknown;
@@ -227,7 +227,7 @@ export function ToolApprovalBody({ event }: { event: TraceEvent }) {
 }
 
 /** Rendered body for an expanded gate event (guardrail / schema_check / validate). */
-export function GateCheckBody({ event }: { event: TraceEvent }) {
+export function GateCheckBody({ event }: { event: AxlEvent }) {
   const d = getGateData(event);
   if (!d) return null;
   const failed = d.valid === false || d.blocked === true;
@@ -271,7 +271,7 @@ export function GateCheckBody({ event }: { event: TraceEvent }) {
 }
 
 /** Generic fallback body for event types without a dedicated renderer. */
-function GenericBody({ event }: { event: TraceEvent }) {
+function GenericBody({ event }: { event: AxlEvent }) {
   return (
     <>
       {event.model && (
@@ -308,7 +308,7 @@ function TraceEventRow({
   onToggle,
   maxDuration,
 }: {
-  event: TraceEvent;
+  event: AxlEvent;
   index: number;
   isExpanded: boolean;
   onToggle: () => void;
@@ -385,7 +385,7 @@ function TraceEventRow({
           className="mt-1 mb-2 p-3 rounded-xl bg-[hsl(var(--card))] border border-[hsl(var(--border))]"
           style={{ marginLeft: `${depth * 16 + 32}px` }}
         >
-          {event.type === 'agent_call' ? (
+          {event.type === 'agent_call_end' ? (
             <AgentCallBody event={event} />
           ) : isGateEvent ? (
             <GateCheckBody event={event} />
@@ -411,7 +411,7 @@ function TraceEventRow({
  *   - Waterfall scaling (auto-computed from events if `maxDuration` omitted)
  *
  * Props:
- *   events            — the list of TraceEvent to render
+ *   events            — the list of AxlEvent to render
  *   maxDuration?      — for the waterfall bar. Auto-computed from events if omitted.
  *   showToolbar       — default true; render the Expand/Collapse buttons + count row
  *   header?           — optional extra content rendered next to the event count
@@ -422,7 +422,7 @@ export function TraceEventList({
   showToolbar = true,
   header,
 }: {
-  events: TraceEvent[];
+  events: AxlEvent[];
   maxDuration?: number;
   showToolbar?: boolean;
   header?: ReactNode;

@@ -5,7 +5,7 @@ import { WorkflowContext } from '../context.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { ValidationError, VerifyError } from '../errors.js';
 import { randomUUID } from 'node:crypto';
-import type { TraceEvent } from '../types.js';
+import type { AxlEvent } from '../types.js';
 import type { Provider, ProviderResponse } from '../providers/types.js';
 
 /** Create a mock provider that returns fixed responses in sequence. */
@@ -38,7 +38,7 @@ function createCtx(overrides: Record<string, unknown> = {}) {
     'mock',
     createMockProvider((overrides.responses as string[]) ?? ['{"ok":true}']),
   );
-  const traces: TraceEvent[] = [];
+  const traces: AxlEvent[] = [];
   return {
     ctx: new WorkflowContext({
       input: 'test',

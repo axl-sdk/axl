@@ -12,7 +12,10 @@ import {
   redactPendingDecision,
   redactPendingDecisionList,
 } from '../server/redact.js';
-import type { ExecutionInfo, ChatMessage, StreamEvent, PendingDecision } from '@axlsdk/axl';
+import type { ExecutionInfo, ChatMessage, PendingDecision } from '@axlsdk/axl';
+// StreamEvent is the legacy wire shape, defined locally on the redact module
+// (see TODO in redact.ts about PR-3-spec-16).
+import type { StreamEvent } from '../server/redact.js';
 import type { EvalResult } from '@axlsdk/eval';
 
 function makeExecution(overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
@@ -21,7 +24,7 @@ function makeExecution(overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
     workflow: 'qa-workflow',
     status: 'completed',
     startedAt: 1000,
-    steps: [],
+    events: [],
     duration: 500,
     totalCost: 0.05,
     result: { answer: 'sensitive user content' },

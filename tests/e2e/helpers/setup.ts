@@ -1,14 +1,14 @@
 import { z } from 'zod';
-import { tool, agent, workflow, AxlRuntime, type TraceEvent, type Agent } from '@axlsdk/axl';
+import { tool, agent, workflow, AxlRuntime, type AxlEvent, type Agent } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
 
 /** Create a test runtime with a MockProvider registered as 'mock'. */
 export function createTestRuntime(provider?: MockProvider) {
   const runtime = new AxlRuntime();
-  const traces: TraceEvent[] = [];
+  const traces: AxlEvent[] = [];
   const mockProvider = provider ?? MockProvider.echo();
   runtime.registerProvider('mock', mockProvider);
-  runtime.on('trace', (event: TraceEvent) => {
+  runtime.on('trace', (event: AxlEvent) => {
     traces.push(event);
   });
   return { runtime, traces, provider: mockProvider };
@@ -60,9 +60,9 @@ export function testWorkflow(agentDef?: Agent) {
 }
 
 /** Collect trace events from a runtime. */
-export function collectTraces(runtime: AxlRuntime): TraceEvent[] {
-  const traces: TraceEvent[] = [];
-  runtime.on('trace', (event: TraceEvent) => {
+export function collectTraces(runtime: AxlRuntime): AxlEvent[] {
+  const traces: AxlEvent[] = [];
+  runtime.on('trace', (event: AxlEvent) => {
     traces.push(event);
   });
   return traces;

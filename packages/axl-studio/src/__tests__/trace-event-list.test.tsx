@@ -18,13 +18,13 @@ import { describe, it, expect } from 'vitest';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TraceEventList } from '../client/components/shared/TraceEventList';
-import type { TraceEvent } from '../client/lib/types';
+import type { AxlEvent } from '../client/lib/types';
 
-function makeEvent(overrides: Partial<TraceEvent>): TraceEvent {
+function makeEvent(overrides: Partial<AxlEvent>): AxlEvent {
   return {
     executionId: 'exec-1',
     step: 0,
-    type: 'agent_call',
+    type: 'agent_call_end',
     timestamp: Date.now(),
     ...overrides,
   };
@@ -48,14 +48,14 @@ describe('TraceEventList', () => {
     // Guards against a regression where the step-number check turns into a
     // truthy/falsy test (`event.step || index`) that treats `0` as missing,
     // or where the prefix is dropped entirely so we display `#undefined`.
-    render(<TraceEventList events={[makeEvent({ step: 0, type: 'agent_call' })]} />);
+    render(<TraceEventList events={[makeEvent({ step: 0, type: 'agent_call_end' })]} />);
     expect(screen.getByText('#0')).toBeInTheDocument();
     expect(screen.queryByText('#undefined')).not.toBeInTheDocument();
   });
 
   it('shows the retry pill on agent_call events with a retryReason', () => {
     const event = makeEvent({
-      type: 'agent_call',
+      type: 'agent_call_end',
       data: { retryReason: 'schema', prompt: 'hi' },
     });
     render(<TraceEventList events={[event]} />);
@@ -73,7 +73,7 @@ describe('TraceEventList', () => {
 
   it('renders CostBadge and DurationBadge on rows that have them', () => {
     const event = makeEvent({
-      type: 'agent_call',
+      type: 'agent_call_end',
       duration: 1500,
       cost: 0.00042,
     });
@@ -86,8 +86,8 @@ describe('TraceEventList', () => {
 
   it('expand-all opens every row simultaneously', async () => {
     const events = [
-      makeEvent({ step: 0, type: 'agent_call', data: { prompt: 'first prompt' } }),
-      makeEvent({ step: 1, type: 'agent_call', data: { prompt: 'second prompt' } }),
+      makeEvent({ step: 0, type: 'agent_call_end', data: { prompt: 'first prompt' } }),
+      makeEvent({ step: 1, type: 'agent_call_end', data: { prompt: 'second prompt' } }),
     ];
     render(<TraceEventList events={events} />);
     const user = userEvent.setup();
@@ -106,7 +106,7 @@ describe('TraceEventList', () => {
   it('toggles a single row independently via click', async () => {
     const event = makeEvent({
       step: 0,
-      type: 'agent_call',
+      type: 'agent_call_end',
       data: { prompt: 'solo prompt' },
     });
     render(<TraceEventList events={[event]} />);

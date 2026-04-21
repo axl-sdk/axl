@@ -88,7 +88,7 @@ export type ExecutionInfo = {
   executionId: string;
   workflow: string;
   status: 'running' | 'completed' | 'failed';
-  steps: TraceEvent[];
+  events: AxlEvent[];
   totalCost: number;
   startedAt: number;
   completedAt?: number;
@@ -97,8 +97,10 @@ export type ExecutionInfo = {
   error?: string;
 };
 
-/** Trace event. Loose on the client — server types are the source of truth. */
-export type TraceEvent = {
+/** Axl event. Loose on the client — server types are the source of truth.
+ *  Replaces the legacy `TraceEvent` + `StreamEvent` split; see
+ *  `@axlsdk/axl#AxlEvent` for the strict discriminated union. */
+export type AxlEvent = {
   executionId: string;
   workflow?: string;
   step: number;
@@ -282,7 +284,14 @@ export type HealthData = {
   tools: number;
 };
 
-/** Stream event (from WS) */
+/** Stream event (from WS).
+ *
+ *  TODO(PR-3-spec-16): The runtime currently translates `AxlEvent` into this
+ *  legacy wire shape (`runtime.ts` adapter). PR 3 collapses the wire format to
+ *  `AxlEvent` directly, at which point this type — and the `tool_call`/
+ *  `tool_result`/`agent_start`/`agent_end`/`step` variants in particular —
+ *  should be removed in favor of `AxlEvent`.
+ */
 export type StreamEvent =
   | { type: 'token'; data: string }
   | { type: 'tool_call'; name: string; args: unknown; callId?: string }
@@ -291,6 +300,6 @@ export type StreamEvent =
   | { type: 'agent_start'; agent: string; model?: string }
   | { type: 'agent_end'; agent: string; cost?: number; duration?: number }
   | { type: 'handoff'; source: string; target: string; mode?: 'oneway' | 'roundtrip' }
-  | { type: 'step'; step: number; data: TraceEvent }
+  | { type: 'step'; step: number; data: AxlEvent }
   | { type: 'done'; data: unknown }
   | { type: 'error'; message: string };

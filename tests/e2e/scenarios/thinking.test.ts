@@ -350,7 +350,7 @@ describe('Thinking E2E', () => {
 
     await runtime.execute('trace-thinking-wf', { message: 'trace me' });
 
-    const agentCallTraces = traces.filter((t) => t.type === 'agent_call');
+    const agentCallTraces = traces.filter((t) => t.type === 'agent_call_end');
     expect(agentCallTraces.length).toBeGreaterThanOrEqual(1);
   });
 });

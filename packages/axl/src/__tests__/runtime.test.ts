@@ -6,7 +6,7 @@ import { agent } from '../agent.js';
 import { tool } from '../tool.js';
 import { Session } from '../session.js';
 import { AxlStream } from '../stream.js';
-import type { TraceEvent } from '../types.js';
+import type { AxlEvent } from '../types.js';
 
 // ── Mock Provider ────────────────────────────────────────────────────────
 
@@ -487,7 +487,7 @@ describe('getExecution()', () => {
 
     // Capture executionId from trace events
     let executionId: string | undefined;
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       executionId = event.executionId;
     });
 
@@ -499,7 +499,7 @@ describe('getExecution()', () => {
     expect(info!.workflow).toBe('exec-info');
     expect(info!.status).toBe('completed');
     expect(info!.duration).toBeGreaterThanOrEqual(0);
-    expect(info!.steps.length).toBeGreaterThan(0);
+    expect(info!.events.length).toBeGreaterThan(0);
   });
 
   it('returns execution info with failed status after workflow error', async () => {
@@ -515,7 +515,7 @@ describe('getExecution()', () => {
     runtime.register(failWorkflow);
 
     let executionId: string | undefined;
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       executionId = event.executionId;
     });
 
@@ -552,7 +552,7 @@ describe('getExecution()', () => {
     runtime.register(costWorkflow);
 
     let executionId: string | undefined;
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       executionId = event.executionId;
     });
 
@@ -632,9 +632,9 @@ describe('resolveProvider()', () => {
 describe('trace events', () => {
   it('emits trace events during execution', async () => {
     const { runtime } = createRuntime();
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
 
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       traces.push(event);
     });
 
@@ -669,9 +669,9 @@ describe('trace events', () => {
 
   it('trace events include executionId and step numbers', async () => {
     const { runtime } = createRuntime();
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
 
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       traces.push(event);
     });
 
@@ -700,9 +700,9 @@ describe('trace events', () => {
 
   it('workflow_start and workflow_end carry the workflow name on the event itself', async () => {
     const { runtime } = createRuntime();
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
 
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       traces.push(event);
     });
 
@@ -733,10 +733,10 @@ describe('trace events', () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-// outputTraceEvent()
+// outputAxlEvent()
 // ═════════════════════════════════════════════════════════════════════════
 
-describe('outputTraceEvent()', () => {
+describe('outputAxlEvent()', () => {
   it('does not log to console when trace is not enabled', async () => {
     const runtime = new AxlRuntime({ defaultProvider: 'test' });
     const provider = new TestProvider([{ content: 'ok' }]);
@@ -857,8 +857,8 @@ describe('outputTraceEvent()', () => {
     const provider = new TestProvider([{ content: 'ok' }]);
     runtime.registerProvider('test', provider as any);
 
-    const traces: TraceEvent[] = [];
-    runtime.on('trace', (event: TraceEvent) => traces.push(event));
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (event: AxlEvent) => traces.push(event));
 
     const wf = workflow({
       name: 'emitter-trace',
@@ -895,7 +895,7 @@ describe('error handling', () => {
     runtime.register(failWorkflow);
 
     let executionId: string | undefined;
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       executionId = event.executionId;
     });
 
@@ -909,9 +909,9 @@ describe('error handling', () => {
 
   it('emits workflow_end trace with failed status on error', async () => {
     const { runtime } = createRuntime();
-    const traces: TraceEvent[] = [];
+    const traces: AxlEvent[] = [];
 
-    runtime.on('trace', (event: TraceEvent) => traces.push(event));
+    runtime.on('trace', (event: AxlEvent) => traces.push(event));
 
     const failWorkflow = workflow({
       name: 'fail-trace',
@@ -970,7 +970,7 @@ describe('error handling', () => {
     runtime.register(stringThrowWorkflow);
 
     let executionId: string | undefined;
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       executionId = event.executionId;
     });
 
@@ -1043,7 +1043,7 @@ describe('execution isolation', () => {
     const { runtime } = createRuntime();
     const executionIds = new Set<string>();
 
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       executionIds.add(event.executionId);
     });
 
@@ -1071,7 +1071,7 @@ describe('execution isolation', () => {
     const { runtime } = createRuntime();
     const executionIds = new Set<string>();
 
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       executionIds.add(event.executionId);
     });
 
@@ -1188,7 +1188,7 @@ describe('abort()', () => {
   it('aborts the signal for a running execution', async () => {
     const { runtime } = createRuntime();
     let executionId: string | undefined;
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       executionId = event.executionId;
     });
 
@@ -1217,8 +1217,8 @@ describe('abort()', () => {
 
   it('marks workflow_end as aborted when a workflow is cancelled mid-flight', async () => {
     const { runtime } = createRuntime();
-    const traces: TraceEvent[] = [];
-    runtime.on('trace', (event: TraceEvent) => traces.push(event));
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (event: AxlEvent) => traces.push(event));
 
     let resolveWait: () => void;
     const waitPromise = new Promise<void>((r) => {
@@ -1275,7 +1275,7 @@ describe('abort()', () => {
     });
     runtime.register(wf);
 
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       executionId = event.executionId;
     });
 
@@ -1322,7 +1322,7 @@ describe('abort()', () => {
     });
     runtime.register(wf);
 
-    runtime.on('trace', (event: TraceEvent) => {
+    runtime.on('trace', (event: AxlEvent) => {
       if (!executionId) {
         executionId = event.executionId;
         resolveGotId!();
@@ -1413,14 +1413,14 @@ describe('createContext()', () => {
     const { runtime } = createRuntime();
     const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
 
-    const traces: TraceEvent[] = [];
-    runtime.on('trace', (event: TraceEvent) => traces.push(event));
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (event: AxlEvent) => traces.push(event));
 
     const ctx = runtime.createContext();
     await ctx.ask(testAgent, 'hello');
 
     expect(traces.length).toBeGreaterThan(0);
-    expect(traces.some((t) => t.type === 'agent_call')).toBe(true);
+    expect(traces.some((t) => t.type === 'agent_call_end')).toBe(true);
   });
 
   it('tracks cost via totalCost getter', async () => {

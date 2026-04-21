@@ -8,7 +8,7 @@ import { ProviderRegistry } from '../providers/registry.js';
 import { AxlRuntime } from '../runtime.js';
 import { randomUUID } from 'node:crypto';
 import type { Embedder, EmbedResult } from '../memory/types.js';
-import type { TraceEvent } from '../types.js';
+import type { AxlEvent } from '../types.js';
 
 /**
  * Mock embedder that returns predictable vectors plus optional usage
@@ -415,7 +415,7 @@ describe('memory', () => {
     it('emits memory_remember / memory_recall / memory_forget trace events with operation metadata only', async () => {
       const stateStore = new MemoryStore();
       const mgr = new MemoryManager();
-      const traces: TraceEvent[] = [];
+      const traces: AxlEvent[] = [];
       const ctx = new WorkflowContext({
         input: 'test',
         executionId: randomUUID(),
@@ -481,7 +481,7 @@ describe('memory', () => {
         throw new Error('store unavailable');
       };
       const mgr = new MemoryManager();
-      const traces: TraceEvent[] = [];
+      const traces: AxlEvent[] = [];
       const ctx = new WorkflowContext({
         input: 'test',
         executionId: randomUUID(),
@@ -525,7 +525,7 @@ describe('memory', () => {
         model: 'text-embedding-3-small',
       };
       const mgr = new MemoryManager({ vectorStore, embedder });
-      const traces: TraceEvent[] = [];
+      const traces: AxlEvent[] = [];
       const ctx = new WorkflowContext({
         input: 'test',
         executionId: randomUUID(),
@@ -573,7 +573,7 @@ describe('memory', () => {
       const embedder = new MockEmbedder();
       embedder.reportUsage = { cost: 0.000009, tokens: 18, model: 'mock-embed' };
       const mgr = new MemoryManager({ vectorStore: failingVectorStore, embedder });
-      const traces: TraceEvent[] = [];
+      const traces: AxlEvent[] = [];
       const ctx = new WorkflowContext({
         input: 'test',
         executionId: randomUUID(),
@@ -617,7 +617,7 @@ describe('memory', () => {
       embedder.reportUsage = { cost: 0.0001, tokens: 20, model: 'mock' };
       embedder.throwError = new Error('embedder network failure');
       const mgr = new MemoryManager({ vectorStore, embedder });
-      const traces: TraceEvent[] = [];
+      const traces: AxlEvent[] = [];
       const ctx = new WorkflowContext({
         input: 'test',
         executionId: randomUUID(),
@@ -650,7 +650,7 @@ describe('memory', () => {
     it('redacts memory key when config.trace.redact is on', async () => {
       const stateStore = new MemoryStore();
       const mgr = new MemoryManager();
-      const traces: TraceEvent[] = [];
+      const traces: AxlEvent[] = [];
       const ctx = new WorkflowContext({
         input: 'test',
         executionId: randomUUID(),
@@ -722,7 +722,7 @@ describe('memory', () => {
       embedder.reportUsage = { cost: 0.000005, tokens: 10, model: 'mock-embed' };
       const mgr = new MemoryManager({ vectorStore, embedder });
 
-      const traces: TraceEvent[] = [];
+      const traces: AxlEvent[] = [];
       const ctx = new WorkflowContext({
         input: 'test',
         executionId: randomUUID(),
@@ -850,7 +850,7 @@ describe('memory', () => {
       embedder.reportUsage = { cost: 0.000005, tokens: 10 };
       const mgr = new MemoryManager({ vectorStore, embedder });
 
-      const traces: TraceEvent[] = [];
+      const traces: AxlEvent[] = [];
       const ctx = new WorkflowContext({
         input: 'test',
         executionId: randomUUID(),

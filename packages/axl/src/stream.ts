@@ -1,6 +1,23 @@
 import { Readable } from 'node:stream';
 import { EventEmitter } from 'node:events';
-import type { StreamEvent } from './types.js';
+
+/**
+ * Internal stream event shape — TEMPORARY scaffolding for the unified-event
+ * model migration. The translation layer in `runtime.ts` synthesizes these
+ * from `AxlEvent`s. Both this type AND the translation layer get deleted in
+ * the follow-up commit; `AxlStream` will then carry `AxlEvent` directly.
+ */
+export type StreamEvent =
+  | { type: 'token'; data: string }
+  | { type: 'tool_call'; name: string; args: unknown; callId?: string }
+  | { type: 'tool_result'; name: string; result: unknown; callId?: string }
+  | { type: 'tool_approval'; name: string; args: unknown; approved: boolean; reason?: string }
+  | { type: 'agent_start'; agent: string; model?: string }
+  | { type: 'agent_end'; agent: string; cost?: number; duration?: number }
+  | { type: 'handoff'; source: string; target: string; mode?: 'oneway' | 'roundtrip' }
+  | { type: 'step'; step: number; data: unknown }
+  | { type: 'done'; data: unknown }
+  | { type: 'error'; message: string };
 
 /**
  * A streamable workflow execution.

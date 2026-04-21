@@ -2,7 +2,7 @@
  * Pure reducer functions for each aggregate panel.
  * Each reducer is a pure (state, source) => state function — no I/O, no mutation.
  */
-import type { TraceEvent, ExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
+import type { AxlEvent, ExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
 import type { CostData } from '../types.js';
 
 // ── Shared helpers ────────────────────────────────────────────────────
@@ -11,7 +11,7 @@ import type { CostData } from '../types.js';
 const finite = (v: number | undefined): number => (Number.isFinite(v) ? v! : 0);
 
 /** Detect log-form events from the production runtime (type: 'log' + data.event). */
-export function isLogEvent(event: TraceEvent, eventName: string): boolean {
+export function isLogEvent(event: AxlEvent, eventName: string): boolean {
   if (event.type === eventName) return true;
   if (event.type === 'log' && event.data != null && typeof event.data === 'object') {
     return (event.data as { event?: unknown }).event === eventName;
@@ -19,7 +19,7 @@ export function isLogEvent(event: TraceEvent, eventName: string): boolean {
   return false;
 }
 
-// ── Cost reducer (TraceEvent → CostData) ──────────────────────────────
+// ── Cost reducer (AxlEvent → CostData) ──────────────────────────────
 
 function emptyRetry(): CostData['retry'] {
   return {
@@ -53,7 +53,7 @@ export function emptyCostData(): CostData {
  * detection (both production log-form and test runtime shapes), and
  * NaN/Infinity guards on all numeric accumulations.
  */
-export function reduceCost(acc: CostData, event: TraceEvent): CostData {
+export function reduceCost(acc: CostData, event: AxlEvent): CostData {
   const isWorkflowStart = isLogEvent(event, 'workflow_start');
 
   // workflow_start events increment per-workflow executions and return early.
@@ -71,10 +71,10 @@ export function reduceCost(acc: CostData, event: TraceEvent): CostData {
   const cost = finite(event.cost);
   const tokens = event.tokens ?? {};
 
-  // Only count tokens from agent_call events — embedder tokens are
+  // Only count tokens from agent_call_end events — embedder tokens are
   // bucketed separately into byEmbedder.tokens.
   const totalTokens =
-    event.type === 'agent_call'
+    event.type === 'agent_call_end'
       ? {
           input: acc.totalTokens.input + finite(tokens.input),
           output: acc.totalTokens.output + finite(tokens.output),
@@ -110,9 +110,9 @@ export function reduceCost(acc: CostData, event: TraceEvent): CostData {
     };
   }
 
-  // Retry-cost decomposition: split agent_call cost by retryReason.
+  // Retry-cost decomposition: split agent_call_end cost by retryReason.
   let retry = acc.retry;
-  if (event.type === 'agent_call') {
+  if (event.type === 'agent_call_end') {
     const d = (event.data ?? {}) as { retryReason?: 'schema' | 'validate' | 'guardrail' };
     const reason = d.retryReason;
     retry = { ...acc.retry };
@@ -459,7 +459,7 @@ export function enrichWorkflowStats(data: WorkflowStatsData) {
   };
 }
 
-// ── Trace stats reducer (TraceEvent → TraceStatsData) ────────────────
+// ── Trace stats reducer (AxlEvent → TraceStatsData) ────────────────
 
 export type TraceStatsData = {
   eventTypeCounts: Record<string, number>;
@@ -477,13 +477,13 @@ export function emptyTraceStatsData(): TraceStatsData {
   };
 }
 
-export function reduceTraceStats(acc: TraceStatsData, event: TraceEvent): TraceStatsData {
+export function reduceTraceStats(acc: TraceStatsData, event: AxlEvent): TraceStatsData {
   const eventTypeCounts = { ...acc.eventTypeCounts };
   eventTypeCounts[event.type] = (eventTypeCounts[event.type] ?? 0) + 1;
 
   const byTool = { ...acc.byTool };
   if (
-    event.type === 'tool_call' ||
+    event.type === 'tool_call_end' ||
     event.type === 'tool_denied' ||
     event.type === 'tool_approval'
   ) {
@@ -504,14 +504,14 @@ export function reduceTraceStats(acc: TraceStatsData, event: TraceEvent): TraceS
     const isDenied =
       (isDeniedEvent && !eventData?.approved) || (isApprovalEvent && eventData?.approved === false);
     byTool[toolName] = {
-      calls: prev.calls + (event.type === 'tool_call' ? 1 : 0),
+      calls: prev.calls + (event.type === 'tool_call_end' ? 1 : 0),
       denied: prev.denied + (isDenied ? 1 : 0),
       approved: prev.approved + (isApproved ? 1 : 0),
     };
   }
 
   const retryByAgent = { ...acc.retryByAgent };
-  if (event.agent && event.type === 'agent_call') {
+  if (event.agent && event.type === 'agent_call_end') {
     const data = event.data as { retryReason?: string } | undefined;
     if (data?.retryReason) {
       const prev = retryByAgent[event.agent] ?? { schema: 0, validate: 0, guardrail: 0 };

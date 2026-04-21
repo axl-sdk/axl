@@ -75,9 +75,10 @@ export type StudioMiddlewareOptions = {
    * `true` to deliver to this connection, `false` to drop.
    *
    * `event` is the parsed event payload — for the `trace:*` channel this is
-   * a `TraceEvent` from `@axlsdk/axl` (narrow via the discriminated union);
-   * for `costs` it's a `CostData`; for `execution:*` / `eval:*` it's a
-   * `StreamEvent`. Typed `unknown` because the filter runs for every channel.
+   * an `AxlEvent` from `@axlsdk/axl` (narrow via the discriminated union);
+   * for `costs` it's a `CostData`; for `execution:*` / `eval:*` it's the
+   * legacy stream-event shape (until PR 3 collapses the wire to `AxlEvent`).
+   * Typed `unknown` because the filter runs for every channel.
    * `metadata` is the per-connection metadata attached by `verifyUpgrade`,
    * or `undefined` if `verifyUpgrade` returned a bare boolean.
    *
@@ -85,15 +86,15 @@ export type StudioMiddlewareOptions = {
    * cannot accidentally leak events cross-tenant.
    *
    * @example Scope trace events by tenant id stored on agent metadata
-   * import type { TraceEvent } from '@axlsdk/axl';
+   * import type { AxlEvent } from '@axlsdk/axl';
    *
    * filterTraceEvent: (event, meta) => {
    *   const m = meta as { tenantId?: string } | undefined;
    *   if (!m?.tenantId) return false;
-   *   const e = event as TraceEvent;
-   *   // Only narrow event.type === 'agent_call' events; pass structural
+   *   const e = event as AxlEvent;
+   *   // Only narrow event.type === 'agent_call_end' events; pass structural
    *   // events (workflow_start/end, cost updates) through unconditionally.
-   *   if (e.type !== 'agent_call') return true;
+   *   if (e.type !== 'agent_call_end') return true;
    *   return e.workflow?.startsWith(`${m.tenantId}:`) ?? false;
    * }
    */

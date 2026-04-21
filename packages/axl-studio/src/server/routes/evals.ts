@@ -180,6 +180,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
           // doesn't pass through `redactStreamEvent`. Scrub the message
           // inline so ValidationError/GuardrailError/provider errors don't
           // leak user input on the eval:* channel under redact mode.
+          // (StreamEvent itself is legacy — see TODO in redact.ts.)
           connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
             type: 'error',
             message: redactErrorMessage(err, redactOn),

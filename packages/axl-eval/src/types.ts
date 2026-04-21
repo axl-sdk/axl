@@ -1,6 +1,6 @@
 import type { Dataset } from './dataset.js';
 import type { Scorer } from './scorer.js';
-import type { TraceEvent } from '@axlsdk/axl';
+import type { AxlEvent } from '@axlsdk/axl';
 
 export type EvalConfig = {
   workflow: string;
@@ -62,7 +62,7 @@ export type EvalItem = {
    *  `runEval` was called with `{ captureTraces: true }`. Verbose-mode
    *  `agent_call.data.messages` snapshots are stripped to keep memory bounded;
    *  subscribe to `runtime.on('trace', ...)` directly if you need those. */
-  traces?: TraceEvent[];
+  traces?: AxlEvent[];
 };
 
 export type EvalSummary = {
@@ -163,7 +163,7 @@ export type RunEvalOptions = {
   /** Abort signal — checked before starting each item. */
   signal?: AbortSignal;
   /**
-   * Capture per-item `TraceEvent[]` from the runtime and store them on
+   * Capture per-item `AxlEvent[]` from the runtime and store them on
    * `EvalItem.traces`. Off by default because traces multiply memory with
    * dataset size × turns × agents. When on, the runner wraps the user-provided
    * `executeWorkflow` with `runtime.trackExecution({ captureTraces: true })`,

@@ -1,7 +1,7 @@
 import { ProviderRegistry } from '../providers/registry.js';
 import { WorkflowContext } from '../context.js';
 import { randomUUID } from 'node:crypto';
-import type { TraceEvent } from '../types.js';
+import type { AxlEvent } from '../types.js';
 import type { Provider, ProviderResponse, ToolCallMessage } from '../providers/types.js';
 
 /** A mock provider that replays a fixed sequence of responses, with optional call tracking. */
@@ -60,7 +60,7 @@ export function createTestCtx(overrides: Record<string, unknown> = {}) {
   if (!overrides.registry) {
     registry.registerInstance('mock', provider);
   }
-  const traces: TraceEvent[] = [];
+  const traces: AxlEvent[] = [];
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { registry: _omit, provider: _omitProvider, ...restOverrides } = overrides;
   return {
@@ -69,7 +69,7 @@ export function createTestCtx(overrides: Record<string, unknown> = {}) {
       executionId: randomUUID(),
       config: {},
       providerRegistry: registry,
-      onTrace: (e: TraceEvent) => traces.push(e),
+      onTrace: (e: AxlEvent) => traces.push(e),
       ...restOverrides,
     }),
     traces,

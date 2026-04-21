@@ -4,7 +4,7 @@ import { tool } from '../tool.js';
 import { agent } from '../agent.js';
 import { workflow } from '../workflow.js';
 import { AxlRuntime } from '../runtime.js';
-import type { TraceEvent } from '../types.js';
+import type { AxlEvent } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // Shared test helpers
@@ -555,8 +555,8 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('End-to-end workflow', () => {
     runtime.register(mathWorkflow);
 
     // Collect trace events
-    const traces: TraceEvent[] = [];
-    runtime.on('trace', (event: TraceEvent) => {
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (event: AxlEvent) => {
       traces.push(event);
     });
 
@@ -583,11 +583,11 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('End-to-end workflow', () => {
     expect(workflowStart).toBeDefined();
 
     // Should have at least one agent_call trace
-    const agentCalls = traces.filter((t) => t.type === 'agent_call');
+    const agentCalls = traces.filter((t) => t.type === 'agent_call_end');
     expect(agentCalls.length).toBeGreaterThan(0);
 
     // Should have at least one tool_call trace (calculator was used)
-    const toolCalls = traces.filter((t) => t.type === 'tool_call');
+    const toolCalls = traces.filter((t) => t.type === 'tool_call_end');
     expect(toolCalls.length).toBeGreaterThan(0);
     expect(toolCalls.some((t) => t.tool === 'calculator')).toBe(true);
 

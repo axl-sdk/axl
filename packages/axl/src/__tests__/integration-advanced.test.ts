@@ -4,7 +4,7 @@ import { tool } from '../tool.js';
 import { agent } from '../agent.js';
 import { workflow } from '../workflow.js';
 import { AxlRuntime } from '../runtime.js';
-import type { TraceEvent, StreamEvent } from '../types.js';
+import type { AxlEvent, StreamEvent } from '../types.js';
 import { TimeoutError, MaxTurnsError, QuorumNotMet, VerifyError } from '../errors.js';
 
 // ---------------------------------------------------------------------------
@@ -85,8 +85,8 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       });
 
       const runtime = new AxlRuntime();
-      const traces: TraceEvent[] = [];
-      runtime.on('trace', (e: TraceEvent) => traces.push(e));
+      const traces: AxlEvent[] = [];
+      runtime.on('trace', (e: AxlEvent) => traces.push(e));
 
       const w = workflow({
         name: 'research-pipeline',
@@ -109,7 +109,7 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       }
 
       // Should have made at least 2 calculator calls
-      const toolCalls = traces.filter((t) => t.type === 'tool_call' && t.tool === 'calculator');
+      const toolCalls = traces.filter((t) => t.type === 'tool_call_end' && t.tool === 'calculator');
       expect(toolCalls.length).toBeGreaterThanOrEqual(2);
     },
   );
@@ -371,8 +371,8 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
     });
 
     const runtime = new AxlRuntime();
-    const traces: TraceEvent[] = [];
-    runtime.on('trace', (e: TraceEvent) => traces.push(e));
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (e: AxlEvent) => traces.push(e));
 
     const w = workflow({
       name: 'support-handoff',
@@ -391,7 +391,7 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
     expect((handoffs[0].data as any)?.target).toBe('math_expert');
 
     // Calculator should have been used by the math expert
-    const toolCalls = traces.filter((t) => t.type === 'tool_call' && t.tool === 'calculator');
+    const toolCalls = traces.filter((t) => t.type === 'tool_call_end' && t.tool === 'calculator');
     expect(toolCalls.length).toBeGreaterThanOrEqual(1);
 
     expect(String(result)).toContain('221');
@@ -416,8 +416,8 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
     });
 
     const runtime = new AxlRuntime();
-    const traces: TraceEvent[] = [];
-    runtime.on('trace', (e: TraceEvent) => traces.push(e));
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (e: AxlEvent) => traces.push(e));
 
     const w = workflow({
       name: 'dynamic-routing',
@@ -439,7 +439,7 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
     expect(String(result)).toContain('100');
 
     // Verify the trace recorded the model URI
-    const agentCalls = traces.filter((t) => t.type === 'agent_call');
+    const agentCalls = traces.filter((t) => t.type === 'agent_call_end');
     expect(agentCalls.length).toBeGreaterThan(0);
     expect(agentCalls[0].model).toBe(model);
   });
@@ -597,7 +597,7 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       const toolCallEvents: StreamEvent[] = [];
       for await (const event of stream) {
         if (event.type === 'token') tokens.push(event.data);
-        if (event.type === 'tool_call') toolCallEvents.push(event);
+        if (event.type === 'tool_call_end') toolCallEvents.push(event);
       }
 
       // Should have received tokens (the final text response)
@@ -680,8 +680,8 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       });
 
       const runtime = new AxlRuntime();
-      const traces: TraceEvent[] = [];
-      runtime.on('trace', (e: TraceEvent) => traces.push(e));
+      const traces: AxlEvent[] = [];
+      runtime.on('trace', (e: AxlEvent) => traces.push(e));
 
       const w = workflow({
         name: 'spawn-tool-vote',
@@ -709,7 +709,7 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       expect(result.result).toBe(50);
 
       // Multiple calculator tool calls should have been made (one per agent)
-      const toolCalls = traces.filter((t) => t.type === 'tool_call' && t.tool === 'calculator');
+      const toolCalls = traces.filter((t) => t.type === 'tool_call_end' && t.tool === 'calculator');
       expect(toolCalls.length).toBeGreaterThanOrEqual(2);
     },
     60_000,
@@ -726,8 +726,8 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
     });
 
     const runtime = new AxlRuntime();
-    const traces: TraceEvent[] = [];
-    runtime.on('trace', (e: TraceEvent) => traces.push(e));
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (e: AxlEvent) => traces.push(e));
 
     const w = workflow({
       name: 'budget-hard-stop',
@@ -757,7 +757,7 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       // and fewer than 10 agent_call traces should exist
       expect(result.value).toBeNull();
       expect(result.totalCost).toBeGreaterThan(0);
-      const agentCalls = traces.filter((t) => t.type === 'agent_call');
+      const agentCalls = traces.filter((t) => t.type === 'agent_call_end');
       expect(agentCalls.length).toBeLessThan(10);
     } else {
       // Provider didn't report cost — all 10 calls completed normally
@@ -801,8 +801,8 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
     });
 
     const runtime = new AxlRuntime();
-    const traces: TraceEvent[] = [];
-    runtime.on('trace', (e: TraceEvent) => traces.push(e));
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (e: AxlEvent) => traces.push(e));
 
     const w = workflow({
       name: 'max-turns-test',
@@ -820,7 +820,7 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       caughtError = err;
     }
 
-    const toolCalls = traces.filter((t) => t.type === 'tool_call');
+    const toolCalls = traces.filter((t) => t.type === 'tool_call_end');
     if (toolCalls.length > 0) {
       // Agent used a tool → with maxTurns:1 the loop exits → MaxTurnsError required
       expect(caughtError).toBeInstanceOf(MaxTurnsError);
@@ -981,8 +981,8 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
     });
 
     const runtime = new AxlRuntime();
-    const traces: TraceEvent[] = [];
-    runtime.on('trace', (e: TraceEvent) => traces.push(e));
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (e: AxlEvent) => traces.push(e));
 
     const w = workflow({
       name: 'tool-recovery',
@@ -996,7 +996,7 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
     });
 
     expect(String(result)).toContain('15');
-    const toolCalls = traces.filter((t) => t.type === 'tool_call');
+    const toolCalls = traces.filter((t) => t.type === 'tool_call_end');
     expect(toolCalls.length).toBeGreaterThanOrEqual(2);
     const toolNames = toolCalls.map((t) => t.tool);
     expect(toolNames).toContain('failing_tool');
@@ -1033,8 +1033,8 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       });
 
       const runtime = new AxlRuntime();
-      const traces: TraceEvent[] = [];
-      runtime.on('trace', (e: TraceEvent) => traces.push(e));
+      const traces: AxlEvent[] = [];
+      runtime.on('trace', (e: AxlEvent) => traces.push(e));
 
       const w = workflow({
         name: 'multi-handoff',

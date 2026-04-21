@@ -12,18 +12,20 @@ import {
   reduceTraceStats,
   emptyTraceStatsData,
 } from '../server/aggregates/reducers.js';
-import type { TraceEvent, ExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
+import type { AxlEvent, ExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-function makeEvent(overrides: Partial<TraceEvent> = {}): TraceEvent {
+// Wider override type so tests can construct partially-shaped events to
+// exercise reducer behavior (intentional malformed fixtures included).
+function makeEvent(overrides: Record<string, unknown> = {}): AxlEvent {
   return {
     executionId: 'exec-1',
     step: 1,
-    type: 'agent_call',
+    type: 'agent_call_end',
     timestamp: Date.now(),
     ...overrides,
-  };
+  } as AxlEvent;
 }
 
 function makeExecution(overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
@@ -31,7 +33,7 @@ function makeExecution(overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
     executionId: 'exec-1',
     workflow: 'test-wf',
     status: 'completed',
-    steps: [],
+    events: [],
     totalCost: 0,
     startedAt: Date.now(),
     duration: 100,
@@ -67,7 +69,7 @@ function makeEvalEntry(overrides: Partial<EvalHistoryEntry> = {}): EvalHistoryEn
 describe('reduceCost', () => {
   describe('parity with CostAggregator', () => {
     it('produces identical output for a sequence of events', () => {
-      const events: TraceEvent[] = [
+      const events: AxlEvent[] = [
         makeEvent({
           type: 'workflow_start',
           agent: 'agent-a',
@@ -76,7 +78,7 @@ describe('reduceCost', () => {
           cost: 0,
         }),
         makeEvent({
-          type: 'agent_call',
+          type: 'agent_call_end',
           agent: 'agent-a',
           model: 'gpt-4',
           workflow: 'wf-1',
@@ -84,7 +86,7 @@ describe('reduceCost', () => {
           tokens: { input: 100, output: 50, reasoning: 10 },
         }),
         makeEvent({
-          type: 'agent_call',
+          type: 'agent_call_end',
           agent: 'agent-b',
           model: 'claude-3-opus',
           workflow: 'wf-1',
@@ -97,7 +99,7 @@ describe('reduceCost', () => {
           cost: 0,
         }),
         makeEvent({
-          type: 'agent_call',
+          type: 'agent_call_end',
           agent: 'agent-a',
           model: 'gpt-4',
           workflow: 'wf-2',
@@ -124,9 +126,9 @@ describe('reduceCost', () => {
     });
 
     it('matches on events with no cost or tokens (skip path)', () => {
-      const events: TraceEvent[] = [
+      const events: AxlEvent[] = [
         makeEvent({ type: 'log' }), // no cost, no tokens → skip
-        makeEvent({ type: 'agent_call', cost: 0.01, tokens: { input: 10, output: 5 } }),
+        makeEvent({ type: 'agent_call_end', cost: 0.01, tokens: { input: 10, output: 5 } }),
       ];
 
       const connMgr = new ConnectionManager();
@@ -161,10 +163,10 @@ describe('reduceCost', () => {
     });
 
     it('matches on workflow_start execution counting', () => {
-      const events: TraceEvent[] = [
+      const events: AxlEvent[] = [
         makeEvent({ type: 'workflow_start', workflow: 'wf-1', cost: 0 }),
         makeEvent({
-          type: 'agent_call',
+          type: 'agent_call_end',
           workflow: 'wf-1',
           cost: 0.01,
           tokens: { input: 10, output: 5 },
@@ -186,7 +188,7 @@ describe('reduceCost', () => {
 
   describe('workflow_start log-form detection', () => {
     it('counts executions from log-form workflow_start (production runtime)', () => {
-      const events: TraceEvent[] = [
+      const events: AxlEvent[] = [
         // Production runtime emits type: 'log' with data.event: 'workflow_start'
         makeEvent({
           type: 'log',
@@ -194,7 +196,7 @@ describe('reduceCost', () => {
           data: { event: 'workflow_start', input: {} },
         }),
         makeEvent({
-          type: 'agent_call',
+          type: 'agent_call_end',
           workflow: 'wf-1',
           cost: 0.01,
           tokens: { input: 10, output: 5 },
@@ -214,7 +216,7 @@ describe('reduceCost', () => {
     });
 
     it('counts executions from both log-form and direct workflow_start', () => {
-      const events: TraceEvent[] = [
+      const events: AxlEvent[] = [
         makeEvent({ type: 'workflow_start', workflow: 'wf-1', cost: 0 }),
         makeEvent({
           type: 'log',
@@ -484,21 +486,21 @@ describe('reduceWorkflowStats', () => {
 describe('reduceTraceStats', () => {
   it('counts events by type', () => {
     let state = emptyTraceStatsData();
-    state = reduceTraceStats(state, makeEvent({ type: 'agent_call' }));
-    state = reduceTraceStats(state, makeEvent({ type: 'agent_call' }));
-    state = reduceTraceStats(state, makeEvent({ type: 'tool_call', tool: 'search' }));
+    state = reduceTraceStats(state, makeEvent({ type: 'agent_call_end' }));
+    state = reduceTraceStats(state, makeEvent({ type: 'agent_call_end' }));
+    state = reduceTraceStats(state, makeEvent({ type: 'tool_call_end', tool: 'search' }));
     state = reduceTraceStats(state, makeEvent({ type: 'log' }));
 
-    expect(state.eventTypeCounts['agent_call']).toBe(2);
-    expect(state.eventTypeCounts['tool_call']).toBe(1);
+    expect(state.eventTypeCounts['agent_call_end']).toBe(2);
+    expect(state.eventTypeCounts['tool_call_end']).toBe(1);
     expect(state.eventTypeCounts['log']).toBe(1);
     expect(state.totalEvents).toBe(4);
   });
 
   it('tracks tool calls, approvals, and denials', () => {
     let state = emptyTraceStatsData();
-    state = reduceTraceStats(state, makeEvent({ type: 'tool_call', tool: 'search' }));
-    state = reduceTraceStats(state, makeEvent({ type: 'tool_call', tool: 'search' }));
+    state = reduceTraceStats(state, makeEvent({ type: 'tool_call_end', tool: 'search' }));
+    state = reduceTraceStats(state, makeEvent({ type: 'tool_call_end', tool: 'search' }));
     state = reduceTraceStats(state, makeEvent({ type: 'tool_denied', tool: 'search' }));
 
     expect(state.byTool['search'].calls).toBe(2);
@@ -510,7 +512,7 @@ describe('reduceTraceStats', () => {
     state = reduceTraceStats(
       state,
       makeEvent({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'agent-a',
         data: { retryReason: 'schema' },
       }),
@@ -518,7 +520,7 @@ describe('reduceTraceStats', () => {
     state = reduceTraceStats(
       state,
       makeEvent({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'agent-a',
         data: { retryReason: 'validate' },
       }),
@@ -526,7 +528,7 @@ describe('reduceTraceStats', () => {
     state = reduceTraceStats(
       state,
       makeEvent({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'agent-a',
         data: { retryReason: 'guardrail' },
       }),
@@ -534,7 +536,7 @@ describe('reduceTraceStats', () => {
     state = reduceTraceStats(
       state,
       makeEvent({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'agent-a',
         // no retryReason — primary call
       }),
@@ -548,7 +550,7 @@ describe('reduceTraceStats', () => {
     state = reduceTraceStats(
       state,
       makeEvent({
-        type: 'tool_call',
+        type: 'tool_call_end',
         tool: 'search',
         agent: 'agent-a',
         data: { retryReason: 'schema' },
@@ -569,7 +571,7 @@ describe('reduceTraceStats', () => {
     state = reduceTraceStats(
       state,
       makeEvent({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'agent-a',
         data: { retryReason: 'unknown_reason' },
       }),

@@ -28,18 +28,18 @@ import {
   emptyTraceStatsData,
 } from '../server/aggregates/reducers.js';
 import type { WindowId } from '../server/aggregates/aggregate-snapshots.js';
-import type { TraceEvent, ExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
+import type { AxlEvent, ExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-function makeEvent(overrides: Record<string, unknown> = {}): TraceEvent {
+function makeEvent(overrides: Record<string, unknown> = {}): AxlEvent {
   return {
     executionId: 'exec-1',
     step: 1,
-    type: 'agent_call',
+    type: 'agent_call_end',
     timestamp: Date.now(),
     ...overrides,
-  } as unknown as TraceEvent;
+  } as unknown as AxlEvent;
 }
 
 function makeExecution(overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
@@ -47,7 +47,7 @@ function makeExecution(overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
     executionId: 'exec-1',
     workflow: 'test-wf',
     status: 'completed',
-    steps: [],
+    events: [],
     totalCost: 0,
     startedAt: Date.now(),
     duration: 100,
@@ -363,7 +363,7 @@ describe('reduceTraceStats tool_approval regression', () => {
 
     // 3 calls
     for (let i = 0; i < 3; i++) {
-      state = reduceTraceStats(state, makeEvent({ type: 'tool_call', tool }));
+      state = reduceTraceStats(state, makeEvent({ type: 'tool_call_end', tool }));
     }
     // 2 approvals
     state = reduceTraceStats(
@@ -499,7 +499,7 @@ describe('reduceCost hardening', () => {
       state = reduceCost(
         state,
         makeEvent({
-          type: 'agent_call',
+          type: 'agent_call_end',
           agent: 'agent-a',
           model: 'gpt-4',
           cost: 0.001,
@@ -727,7 +727,7 @@ describe('ExecutionAggregator rapid-fire events', () => {
         step: 1,
         type: 'workflow_end',
         timestamp: now,
-      } as TraceEvent);
+      } as AxlEvent);
     }
 
     // Flush all microtasks
@@ -774,19 +774,19 @@ describe('ExecutionAggregator rapid-fire events', () => {
       step: 1,
       type: 'workflow_end',
       timestamp: now,
-    } as TraceEvent);
+    } as AxlEvent);
     runtime.emit('trace', {
       executionId: 'bad',
       step: 1,
       type: 'workflow_end',
       timestamp: now,
-    } as TraceEvent);
+    } as AxlEvent);
     runtime.emit('trace', {
       executionId: 'good',
       step: 1,
       type: 'workflow_end',
       timestamp: now,
-    } as TraceEvent);
+    } as AxlEvent);
 
     await vi.advanceTimersByTimeAsync(0);
 
@@ -886,9 +886,19 @@ describe('EvalAggregator window filtering', () => {
 
 describe('reducer purity across independent reduce chains', () => {
   it('two independent reduce chains do not interfere', () => {
-    const events: TraceEvent[] = [
-      makeEvent({ type: 'agent_call', agent: 'a', cost: 0.01, tokens: { input: 10, output: 5 } }),
-      makeEvent({ type: 'agent_call', agent: 'b', cost: 0.02, tokens: { input: 20, output: 10 } }),
+    const events: AxlEvent[] = [
+      makeEvent({
+        type: 'agent_call_end',
+        agent: 'a',
+        cost: 0.01,
+        tokens: { input: 10, output: 5 },
+      }),
+      makeEvent({
+        type: 'agent_call_end',
+        agent: 'b',
+        cost: 0.02,
+        tokens: { input: 20, output: 10 },
+      }),
     ];
 
     // Chain 1: both events

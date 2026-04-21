@@ -1,8 +1,8 @@
-import type { TraceEvent } from './types';
+import type { AxlEvent } from './types';
 
 export const EVENT_COLORS: Record<string, string> = {
-  agent_call: 'bg-blue-500',
-  tool_call: 'bg-purple-500',
+  agent_call_end: 'bg-blue-500',
+  tool_call_end: 'bg-purple-500',
   tool_approval: 'bg-purple-300',
   tool_denied: 'bg-red-400',
   workflow_start: 'bg-green-500',
@@ -25,7 +25,7 @@ export const EVENT_COLORS: Record<string, string> = {
  * tool, aborted workflow, or `log` event carrying an `error` field (the
  * memory-audit events emit `error` on the failure path).
  */
-export function isFailureEvent(event: TraceEvent): boolean {
+export function isFailureEvent(event: AxlEvent): boolean {
   const type = event.type;
   if (type === 'tool_denied') return true;
   if (type === 'guardrail' || type === 'schema_check' || type === 'validate') {
@@ -66,22 +66,22 @@ export function getBarColor(type: string): string {
  * events render red when their payload indicates failure so the user can
  * spot failure clusters in the trace waterfall without expanding every row.
  */
-export function getEventColor(event: TraceEvent): string {
+export function getEventColor(event: AxlEvent): string {
   if (isFailureEvent(event)) return 'bg-red-500';
   return getBarColor(event.type);
 }
 
-export function getDepth(event: TraceEvent): number {
+export function getDepth(event: AxlEvent): number {
   const type = event.type;
   // Nested events (emitted from a child context inside a tool handler) get an
   // extra indent so the visual hierarchy matches the actual call graph. The
   // extra depth is additive on top of the type-based depth below.
   const nestedBoost = event.parentToolCallId ? 2 : 0;
   if (type === 'workflow_start' || type === 'workflow_end') return 0 + nestedBoost;
-  if (type === 'agent_call' || type === 'spawn' || type === 'vote_start' || type === 'delegate')
+  if (type === 'agent_call_end' || type === 'spawn' || type === 'vote_start' || type === 'delegate')
     return 1 + nestedBoost;
   if (
-    type === 'tool_call' ||
+    type === 'tool_call_end' ||
     type === 'tool_approval' ||
     type === 'tool_denied' ||
     type === 'handoff' ||
@@ -94,7 +94,7 @@ export function getDepth(event: TraceEvent): number {
   return 1 + nestedBoost;
 }
 
-/** Trace data narrowers — mirrors packages/axl/src/types.ts. Loose on client. */
+/** Event data narrowers — mirrors packages/axl/src/types.ts. Loose on client. */
 export type AgentCallData = {
   prompt?: string;
   response?: string;
@@ -122,19 +122,19 @@ export type ToolApprovalData = {
   reason?: string;
 };
 
-export function getAgentCallData(event: TraceEvent): AgentCallData | null {
-  if (event.type !== 'agent_call' || !event.data) return null;
+export function getAgentCallData(event: AxlEvent): AgentCallData | null {
+  if (event.type !== 'agent_call_end' || !event.data) return null;
   return event.data as AgentCallData;
 }
 
-export function getGateData(event: TraceEvent): GateCheckData | null {
+export function getGateData(event: AxlEvent): GateCheckData | null {
   if (event.type !== 'guardrail' && event.type !== 'schema_check' && event.type !== 'validate')
     return null;
   return (event.data ?? null) as GateCheckData | null;
 }
 
 /** Returns true if this agent_call is a retry triggered by a failed gate. */
-export function isRetryCall(event: TraceEvent): boolean {
+export function isRetryCall(event: AxlEvent): boolean {
   const d = getAgentCallData(event);
   return !!d?.retryReason;
 }

@@ -1,5 +1,10 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { useWs } from './use-ws';
+// TODO(PR-3-spec-16): the wire format still emits the legacy `StreamEvent`
+// shape (token / tool_call / tool_result / agent_start / agent_end / step /
+// done / error) via the runtime's translation layer in `runtime.ts`. PR 3
+// collapses the wire to `AxlEvent` and this hook switches to consuming
+// `AxlEvent` directly.
 import type { StreamEvent } from '../lib/types';
 
 type StreamState = {

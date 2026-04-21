@@ -36,7 +36,9 @@ function rowToExecutionInfo(row: ExecutionHistoryRow): ExecutionInfo {
     completedAt: row.completed_at ?? undefined,
     duration: row.duration,
     error: row.error ?? undefined,
-    steps: (safeJsonParse(row.steps) as ExecutionInfo['steps']) ?? [],
+    // DB column is still `steps` for back-compat; renamed to `events` in
+    // the SQLite migration commit (spec §3.6a).
+    events: (safeJsonParse(row.steps) as ExecutionInfo['events']) ?? [],
   };
 }
 
@@ -301,7 +303,7 @@ export class SQLiteStore implements StateStore {
         execution.completedAt ?? null,
         execution.duration,
         execution.error ?? null,
-        JSON.stringify(execution.steps),
+        JSON.stringify(execution.events),
       );
   }
 

@@ -862,7 +862,7 @@ describe('trace redaction', () => {
 
     const agentCallTrace = onTrace.mock.calls
       .map((c) => c[0])
-      .find((e: any) => e.type === 'agent_call');
+      .find((e: any) => e.type === 'agent_call_end');
     expect(agentCallTrace).toBeDefined();
     expect((agentCallTrace.data as any).prompt).toBe('[redacted]');
     expect((agentCallTrace.data as any).response).toBe('[redacted]');
@@ -880,7 +880,7 @@ describe('trace redaction', () => {
 
     const agentCallTrace = onTrace.mock.calls
       .map((c) => c[0])
-      .find((e: any) => e.type === 'agent_call');
+      .find((e: any) => e.type === 'agent_call_end');
     expect(agentCallTrace).toBeDefined();
     expect((agentCallTrace.data as any).prompt).toBe('visible prompt');
     expect((agentCallTrace.data as any).response).toBe('visible response');

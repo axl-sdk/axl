@@ -5,7 +5,7 @@ import { agent } from '../agent.js';
 import { WorkflowContext } from '../context.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { randomUUID } from 'node:crypto';
-import type { TraceEvent, AwaitHumanOptions, HumanDecision } from '../types.js';
+import type { AxlEvent, AwaitHumanOptions, HumanDecision } from '../types.js';
 import type { Provider, ProviderResponse, ToolCallMessage } from '../providers/types.js';
 
 /** Create a mock provider that returns tool calls then a final response. */
@@ -61,7 +61,7 @@ function createCtx(overrides: Record<string, unknown> = {}) {
   const registry = new ProviderRegistry();
   const provider = (overrides.provider as Provider) ?? createSimpleProvider('Done');
   registry.registerInstance('mock', provider);
-  const traces: TraceEvent[] = [];
+  const traces: AxlEvent[] = [];
   return {
     ctx: new WorkflowContext({
       input: 'test',

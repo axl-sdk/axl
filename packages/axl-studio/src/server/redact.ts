@@ -28,9 +28,19 @@
  * not a data-at-rest transform. If a user needs scrubbed state-at-rest they
  * configure their own StateStore to store scrubbed values.
  */
-import type { ExecutionInfo, ChatMessage, StreamEvent, PendingDecision } from '@axlsdk/axl';
+import type { ExecutionInfo, ChatMessage, PendingDecision, StreamEvent } from '@axlsdk/axl';
 import type { EvalResult, EvalItem, ScorerDetail } from '@axlsdk/eval';
 import type { EvalHistoryEntry } from '@axlsdk/axl';
+
+// Re-export the legacy stream-event type from core. The core export is itself
+// transitional (`@deprecated` JSDoc on `StreamEvent` in `@axlsdk/axl`) — the
+// runtime translation layer that synthesizes these shapes goes away in the
+// next commit, after which `redactStreamEvent` is rewritten to scrub
+// `AxlEvent` variants and both this re-export and the core `StreamEvent`
+// type are deleted.
+//
+// TODO(PR-3-spec-16): delete this re-export when the translation layer goes.
+export type { StreamEvent };
 
 const REDACTED = '[redacted]';
 
@@ -217,9 +227,9 @@ export function redactSessionHistory(history: ChatMessage[], redact: boolean): C
  * Pass-through (structural / non-PII):
  *   agent_start / agent_end / handoff / step
  *
- * `step` events wrap a `TraceEvent` in `data`. Those trace events are
- * already redacted at emission time by `emitTrace` in the core runtime,
- * so double-redacting here would be wasteful and could mask a missing
+ * `step` events wrap an `AxlEvent` in `data`. Those events are already
+ * redacted at emission time by `emitEvent` in the core runtime, so
+ * double-redacting here would be wasteful and could mask a missing
  * emitter-level scrub — we let them pass through and rely on the core.
  */
 export function redactStreamEvent(event: StreamEvent, redact: boolean): StreamEvent {

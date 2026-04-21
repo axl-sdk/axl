@@ -101,7 +101,7 @@ describe('child context', () => {
     await child.ask(childAgent, 'trace me');
 
     // Traces from the child's agent call should appear in the parent's trace array
-    const agentCallTraces = traces.filter((t) => t.type === 'agent_call');
+    const agentCallTraces = traces.filter((t) => t.type === 'agent_call_end');
     expect(agentCallTraces.length).toBeGreaterThanOrEqual(1);
     expect(agentCallTraces.some((t) => t.agent === 'traced_child')).toBe(true);
   });
@@ -232,7 +232,7 @@ describe('child context', () => {
     await ctx.ask(outerAgent, 'Run analysis');
 
     // Should have agent_call traces for both the outer and inner agents
-    const agentCallTraces = traces.filter((t) => t.type === 'agent_call');
+    const agentCallTraces = traces.filter((t) => t.type === 'agent_call_end');
     const outerTraces = agentCallTraces.filter((t) => t.agent === 'outer_coordinator');
     const innerTraces = agentCallTraces.filter((t) => t.agent === 'inner_specialist');
 
@@ -240,7 +240,7 @@ describe('child context', () => {
     expect(innerTraces.length).toBeGreaterThanOrEqual(1);
 
     // Should also have a tool_call trace for consult_specialist
-    const toolCallTraces = traces.filter((t) => t.type === 'tool_call');
+    const toolCallTraces = traces.filter((t) => t.type === 'tool_call_end');
     expect(toolCallTraces.some((t) => t.tool === 'consult_specialist')).toBe(true);
   });
 });
@@ -712,7 +712,9 @@ describe('edge cases', () => {
     expect(result).toBe('outer done');
 
     // Verify the mock was used (not the real handler)
-    const innerToolTraces = traces.filter((t) => t.type === 'tool_call' && t.tool === 'inner_tool');
+    const innerToolTraces = traces.filter(
+      (t) => t.type === 'tool_call_end' && t.tool === 'inner_tool',
+    );
     expect(innerToolTraces).toHaveLength(1);
     expect((innerToolTraces[0].data as Record<string, unknown>).result).toBe('MOCKED');
   });

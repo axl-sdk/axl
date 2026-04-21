@@ -3,35 +3,35 @@ import { EventEmitter } from 'node:events';
 import { TraceAggregator } from '../server/aggregates/trace-aggregator.js';
 import { ConnectionManager } from '../server/ws/connection-manager.js';
 import type { WindowId } from '../server/aggregates/aggregate-snapshots.js';
-import type { TraceEvent, ExecutionInfo } from '@axlsdk/axl';
+import type { AxlEvent, ExecutionInfo } from '@axlsdk/axl';
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
 type Counter = { count: number; totalCost: number };
 const emptyState = (): Counter => ({ count: 0, totalCost: 0 });
-const reducer = (acc: Counter, event: TraceEvent): Counter => ({
+const reducer = (acc: Counter, event: AxlEvent): Counter => ({
   count: acc.count + 1,
   totalCost: acc.totalCost + (event.cost ?? 0),
 });
 
-function makeEvent(overrides: Partial<TraceEvent> = {}): TraceEvent {
+function makeEvent(overrides: Partial<AxlEvent> = {}): AxlEvent {
   return {
     executionId: 'exec-1',
     step: 1,
-    type: 'agent_call',
+    type: 'agent_call_end',
     timestamp: Date.now(),
     ...overrides,
-  };
+  } as AxlEvent;
 }
 
-function makeExecution(steps: TraceEvent[], overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
+function makeExecution(events: AxlEvent[], overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
   return {
     executionId: overrides.executionId ?? 'exec-1',
     workflow: 'test-wf',
     status: 'completed',
-    steps,
-    totalCost: steps.reduce((sum, s) => sum + (s.cost ?? 0), 0),
-    startedAt: steps[0]?.timestamp ?? Date.now(),
+    events,
+    totalCost: events.reduce((sum, s) => sum + (s.cost ?? 0), 0),
+    startedAt: events[0]?.timestamp ?? Date.now(),
     duration: 100,
     ...overrides,
   };

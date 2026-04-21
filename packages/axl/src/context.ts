@@ -13,7 +13,7 @@ import type {
   AskOptions,
   DelegateOptions,
   RaceOptions,
-  TraceEvent,
+  AxlEvent,
   ChatMessage,
   ToolCallMessage,
   ProviderResponse,
@@ -180,7 +180,7 @@ export type WorkflowContextInit = {
   config: AxlConfig;
   providerRegistry: ProviderRegistry;
   sessionHistory?: ChatMessage[];
-  onTrace?: (event: TraceEvent) => void;
+  onTrace?: (event: AxlEvent) => void;
   onToken?: (token: string) => void;
   onToolCall?: (call: { name: string; args: unknown; callId?: string }) => void;
   pendingDecisions?: Map<string, (d: HumanDecision) => void>;
@@ -236,7 +236,7 @@ export class WorkflowContext<TInput = unknown> {
   private config: AxlConfig;
   private providerRegistry: ProviderRegistry;
   private sessionHistory: ChatMessage[];
-  private onTrace?: (event: TraceEvent) => void;
+  private onTrace?: (event: AxlEvent) => void;
   private onToken?: (token: string) => void;
   private onToolCall?: (call: { name: string; args: unknown; callId?: string }) => void;
   private pendingDecisions?: Map<string, (d: HumanDecision) => void>;
@@ -760,7 +760,7 @@ export class WorkflowContext<TInput = unknown> {
       pendingRetryReason = undefined;
 
       this.emitTrace({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: agent._name,
         model: modelUri,
         promptVersion: agent._config.version,
@@ -993,7 +993,7 @@ export class WorkflowContext<TInput = unknown> {
 
             const resultContent = JSON.stringify(toolResult);
             this.emitTrace({
-              type: 'tool_call',
+              type: 'tool_call_end',
               agent: agent._name,
               tool: toolName,
               duration: Date.now() - toolStart,
@@ -1204,7 +1204,7 @@ export class WorkflowContext<TInput = unknown> {
             : await executeTool();
 
           this.emitTrace({
-            type: 'tool_call',
+            type: 'tool_call_end',
             agent: agent._name,
             tool: traceName,
             duration: Date.now() - toolStart,
@@ -2514,7 +2514,7 @@ export class WorkflowContext<TInput = unknown> {
       if (usage?.cost != null) {
         this._accumulateBudgetCost(usage.cost);
       }
-      // Surface embedder cost at the TraceEvent top level so the
+      // Surface embedder cost at the AxlEvent top level so the
       // `trackExecution` listener picks it up automatically (it sums
       // `event.cost` across every event in scope, regardless of type).
       // Also mirror `usage.tokens` to top-level `tokens.input` so the
@@ -2615,7 +2615,7 @@ export class WorkflowContext<TInput = unknown> {
       if (usage?.cost != null) {
         this._accumulateBudgetCost(usage.cost);
       }
-      // Surface embedder cost + tokens at the TraceEvent top level so
+      // Surface embedder cost + tokens at the AxlEvent top level so
       // the `trackExecution` listener picks cost up and the CostAggregator's
       // early-return gate (`cost == null && !tokens`) doesn't silently
       // drop zero-cost-but-nonzero-token events. `usage` is also nested
@@ -2801,11 +2801,11 @@ export class WorkflowContext<TInput = unknown> {
   /**
    * Internal emitter input — intentionally loose so call sites don't need to
    * build a perfectly-narrowed discriminated-union member. The resulting
-   * `TraceEvent` (exported type) remains strict, and TypeScript narrows it at
+   * `AxlEvent` (exported type) remains strict, and TypeScript narrows it at
    * consumer sites via the `type` discriminator.
    */
   private emitTrace(partial: {
-    type: TraceEvent['type'];
+    type: AxlEvent['type'];
     workflow?: string;
     agent?: string;
     tool?: string;
@@ -2825,7 +2825,7 @@ export class WorkflowContext<TInput = unknown> {
       // '[redacted]' strings, `messages` stays a `ChatMessage[]` (single stub
       // entry preserving the count) — so downstream consumers can narrow
       // types without special-casing redacted vs non-redacted events.
-      if (partial.type === 'agent_call') {
+      if (partial.type === 'agent_call_end') {
         const d = data as Record<string, unknown>;
         const redacted: Record<string, unknown> = {
           ...d,
@@ -2856,7 +2856,7 @@ export class WorkflowContext<TInput = unknown> {
             ...(d.feedbackMessage !== undefined ? { feedbackMessage: '[redacted]' } : {}),
           };
         }
-      } else if (partial.type === 'tool_call') {
+      } else if (partial.type === 'tool_call_end') {
         // Tool args can carry user PII ("lookup SSN: 123-45-6789"), tool
         // results can carry full records from internal systems. Redact both
         // when the global trace.redact policy is on; callId stays visible so
@@ -2948,7 +2948,7 @@ export class WorkflowContext<TInput = unknown> {
         data = redacted;
       }
     }
-    // `as unknown as TraceEvent`: the loose internal `partial` type can't be
+    // `as unknown as AxlEvent`: the loose internal `partial` type can't be
     // narrowed to a single discriminated union member at compile time, but the
     // runtime invariant is maintained by the gate/emission call sites that
     // always pair `type` with matching `data`/`tool`/etc.
@@ -2980,7 +2980,7 @@ export class WorkflowContext<TInput = unknown> {
       ...(this.parentToolCallId ? { parentToolCallId: this.parentToolCallId } : {}),
       ...partial,
       data,
-    } as unknown as TraceEvent;
+    } as unknown as AxlEvent;
     // Isolate consumer bugs: a buggy onTrace handler must not crash the
     // workflow. Swallow and forward to console.error so the caller sees
     // the failure in ops but the workflow keeps running.

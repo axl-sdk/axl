@@ -16,6 +16,14 @@ export type { AxlConfig } from './config.js';
 
 // Stream
 export { AxlStream } from './stream.js';
+/**
+ * @deprecated Temporary re-export bridging the unified-event-model migration.
+ *  The wire stream still synthesizes legacy stream events via a translation
+ *  layer in `runtime.ts`; that layer (and this type) get deleted in the next
+ *  commit, after which `AxlStream` carries `AxlEvent` directly. Migrate
+ *  consumers to narrow on `AxlEvent` instead.
+ */
+export type { StreamEvent } from './stream.js';
 
 // Session
 export { Session } from './session.js';
@@ -28,23 +36,30 @@ export type {
   Result,
   BudgetResult,
   HumanDecision,
-  TraceEvent,
-  TraceEventType,
-  // Per-type trace data shapes — consumers narrowing via `event.type` get
+  // Unified event model — replaces the old TraceEvent + StreamEvent split.
+  AxlEvent,
+  AxlEventType,
+  AxlEventBase,
+  AxlEventOf,
+  AskScoped,
+  CallbackMeta,
+  // Per-type data shapes — consumers narrowing via `event.type` get
   // statically-typed access to `data`. Kept in the same export block as
-  // `TraceEvent` so the discriminated union and its parts move together.
-  AgentCallTraceData,
-  GuardrailTraceData,
-  SchemaCheckTraceData,
-  ValidateTraceData,
-  ToolCallTraceData,
-  ToolApprovalTraceData,
-  HandoffTraceData,
-  DelegateTraceData,
-  VerifyTraceData,
-  WorkflowStartTraceData,
-  WorkflowEndTraceData,
-  StreamEvent,
+  // `AxlEvent` so the discriminated union and its parts move together.
+  AgentCallData,
+  ToolCallData,
+  ToolCallStartData,
+  ToolApprovalData,
+  ToolDeniedData,
+  HandoffData,
+  DelegateData,
+  VerifyData,
+  WorkflowStartData,
+  WorkflowEndData,
+  MemoryEventData,
+  GuardrailData,
+  SchemaCheckData,
+  ValidateData,
   AskOptions,
   DelegateOptions,
   RaceOptions,
@@ -66,6 +81,7 @@ export type {
   HandoffRecord,
   AgentCallInfo,
 } from './types.js';
+export { AXL_EVENT_TYPES } from './types.js';
 
 // Errors
 export {

@@ -1,7 +1,7 @@
 import { MockProvider } from './mock-provider.js';
 import { MockTool } from './mock-tool.js';
 import type {
-  TraceEvent,
+  AxlEvent,
   AwaitHumanOptions,
   HumanDecision,
   ProviderResponse,
@@ -43,7 +43,7 @@ export class AxlTestRuntime {
   private _toolCalls: RecordedToolCall[] = [];
   private _agentCalls: RecordedAgentCall[] = [];
   private _steps: RecordedStep[] = [];
-  private _traceLog: TraceEvent[] = [];
+  private _traceLog: AxlEvent[] = [];
   private _totalCost = 0;
   private _stepCounter = 0;
   private recordPath?: string;
@@ -134,12 +134,16 @@ export class AxlTestRuntime {
       awaitHumanHandler: this._humanDecisionHandler
         ? (opts: AwaitHumanOptions) => this._humanDecisionHandler!(opts)
         : undefined,
-      onTrace: (event: TraceEvent) => {
+      onTrace: (event: AxlEvent) => {
         this._traceLog.push(event);
         this._stepCounter++;
-        this._steps.push({ step: this._stepCounter, type: event.type, data: event.data });
+        this._steps.push({
+          step: this._stepCounter,
+          type: event.type,
+          data: (event as { data?: unknown }).data,
+        });
 
-        if (event.type === 'tool_call' && event.data) {
+        if (event.type === 'tool_call_end' && event.data) {
           const { args, result } = event.data as { args: unknown; result: unknown };
           this._toolCalls.push({ name: event.tool!, args, result });
         }
@@ -149,7 +153,7 @@ export class AxlTestRuntime {
         }
 
         // Track provider responses for recording
-        if (event.type === 'agent_call' && event.data) {
+        if (event.type === 'agent_call_end' && event.data) {
           const { response } = event.data as { prompt?: string; response?: string };
           if (response !== undefined) {
             this.recorded.push({
@@ -196,7 +200,7 @@ export class AxlTestRuntime {
   steps(): RecordedStep[] {
     return this._steps;
   }
-  traceLog(): TraceEvent[] {
+  traceLog(): AxlEvent[] {
     return this._traceLog;
   }
 
@@ -206,7 +210,7 @@ export class AxlTestRuntime {
   }
 
   private _pushTrace(partial: {
-    type: TraceEvent['type'];
+    type: AxlEvent['type'];
     workflow?: string;
     agent?: string;
     tool?: string;
@@ -225,7 +229,7 @@ export class AxlTestRuntime {
       step: this._stepCounter,
       timestamp: Date.now(),
       ...partial,
-    } as unknown as TraceEvent);
+    } as unknown as AxlEvent);
   }
 
   private async _writeRecording(): Promise<void> {

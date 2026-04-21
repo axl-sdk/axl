@@ -69,7 +69,7 @@ export class CostAggregator {
     // don't want them conflated with agent tokens in the UI summary.
     // Embedder tokens are bucketed separately into `byEmbedder.tokens`
     // further below.
-    if (event.type === 'agent_call') {
+    if (event.type === 'agent_call_end') {
       this.data.totalTokens.input += tokens.input ?? 0;
       this.data.totalTokens.output += tokens.output ?? 0;
       this.data.totalTokens.reasoning += tokens.reasoning ?? 0;
@@ -109,7 +109,7 @@ export class CostAggregator {
     // primary (first-attempt) call or a retry triggered by a gate failure.
     // `retryReason` lives on `data.retryReason` and is set by context.ts
     // when the call was triggered by a failed gate on the previous turn.
-    if (event.type === 'agent_call') {
+    if (event.type === 'agent_call_end') {
       const d = (event.data ?? {}) as { retryReason?: 'schema' | 'validate' | 'guardrail' };
       const reason = d.retryReason;
       if (reason === 'schema') {

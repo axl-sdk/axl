@@ -13,7 +13,7 @@ describe('CostAggregator', () => {
 
   it('onTrace with cost accumulates totals', () => {
     aggregator.onTrace({
-      type: 'agent_call',
+      type: 'agent_call_end',
       agent: 'test-agent',
       model: 'gpt-4',
       workflow: 'test-wf',
@@ -21,7 +21,7 @@ describe('CostAggregator', () => {
       tokens: { input: 100, output: 50, reasoning: 10 },
     });
     aggregator.onTrace({
-      type: 'agent_call',
+      type: 'agent_call_end',
       agent: 'test-agent',
       model: 'gpt-4',
       cost: 0.03,
@@ -37,7 +37,7 @@ describe('CostAggregator', () => {
 
   it('getData returns breakdown by agent, model, and workflow', () => {
     aggregator.onTrace({
-      type: 'agent_call',
+      type: 'agent_call_end',
       agent: 'agent-a',
       model: 'model-x',
       workflow: 'wf-1',
@@ -45,7 +45,7 @@ describe('CostAggregator', () => {
       tokens: { input: 10, output: 5 },
     });
     aggregator.onTrace({
-      type: 'agent_call',
+      type: 'agent_call_end',
       agent: 'agent-b',
       model: 'model-y',
       workflow: 'wf-2',
@@ -73,7 +73,7 @@ describe('CostAggregator', () => {
     aggregator.onTrace({ type: 'workflow_start', workflow: 'wf-exec' });
     // Cost-bearing events between executions still aggregate correctly.
     aggregator.onTrace({
-      type: 'agent_call',
+      type: 'agent_call_end',
       agent: 'a',
       model: 'm',
       workflow: 'wf-exec',
@@ -87,7 +87,7 @@ describe('CostAggregator', () => {
 
   it('reset zeroes all counters', () => {
     aggregator.onTrace({
-      type: 'agent_call',
+      type: 'agent_call_end',
       agent: 'test',
       cost: 0.1,
       tokens: { input: 50, output: 25 },
@@ -107,7 +107,7 @@ describe('CostAggregator', () => {
 
   it('processes events with cost: 0 and does not skip them', () => {
     aggregator.onTrace({
-      type: 'agent_call',
+      type: 'agent_call_end',
       agent: 'test',
       cost: 0,
       tokens: { input: 10, output: 5 },
@@ -126,28 +126,28 @@ describe('CostAggregator', () => {
     it('buckets primary vs retry-triggered agent_call cost by retryReason', () => {
       // Turn 1: primary call
       aggregator.onTrace({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'a',
         cost: 0.05,
         data: {},
       });
       // Turn 2: schema retry
       aggregator.onTrace({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'a',
         cost: 0.05,
         data: { retryReason: 'schema' },
       });
       // Turn 3: validate retry
       aggregator.onTrace({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'a',
         cost: 0.05,
         data: { retryReason: 'validate' },
       });
       // Turn 4: guardrail retry
       aggregator.onTrace({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'a',
         cost: 0.05,
         data: { retryReason: 'guardrail' },
@@ -167,7 +167,7 @@ describe('CostAggregator', () => {
 
     it('retry bucket is untouched by non-agent_call events', () => {
       aggregator.onTrace({
-        type: 'tool_call',
+        type: 'tool_call_end',
         agent: 'a',
         cost: 0.03,
       });
@@ -185,7 +185,7 @@ describe('CostAggregator', () => {
 
     it('reset clears the retry bucket', () => {
       aggregator.onTrace({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'a',
         cost: 0.1,
         data: { retryReason: 'schema' },
@@ -207,37 +207,37 @@ describe('CostAggregator', () => {
 
     it('tracks per-reason call counts alongside cost', () => {
       // 2 primary calls
-      aggregator.onTrace({ type: 'agent_call', agent: 'a', cost: 0.01, data: {} });
-      aggregator.onTrace({ type: 'agent_call', agent: 'a', cost: 0.02, data: {} });
+      aggregator.onTrace({ type: 'agent_call_end', agent: 'a', cost: 0.01, data: {} });
+      aggregator.onTrace({ type: 'agent_call_end', agent: 'a', cost: 0.02, data: {} });
       // 3 schema retries
       aggregator.onTrace({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'a',
         cost: 0.01,
         data: { retryReason: 'schema' },
       });
       aggregator.onTrace({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'a',
         cost: 0.01,
         data: { retryReason: 'schema' },
       });
       aggregator.onTrace({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'a',
         cost: 0.01,
         data: { retryReason: 'schema' },
       });
       // 1 validate retry
       aggregator.onTrace({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'a',
         cost: 0.02,
         data: { retryReason: 'validate' },
       });
       // 1 guardrail retry
       aggregator.onTrace({
-        type: 'agent_call',
+        type: 'agent_call_end',
         agent: 'a',
         cost: 0.02,
         data: { retryReason: 'guardrail' },

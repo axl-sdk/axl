@@ -4,7 +4,7 @@ import { ExecutionAggregator } from '../server/aggregates/execution-aggregator.j
 import { EvalAggregator } from '../server/aggregates/eval-aggregator.js';
 import { ConnectionManager } from '../server/ws/connection-manager.js';
 import type { WindowId } from '../server/aggregates/aggregate-snapshots.js';
-import type { TraceEvent, ExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
+import type { AxlEvent, ExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -26,7 +26,7 @@ function makeExecution(overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
     executionId: 'exec-1',
     workflow: 'test-wf',
     status: 'completed',
-    steps: [],
+    events: [],
     totalCost: 0,
     startedAt: Date.now(),
     duration: 100,
@@ -126,11 +126,13 @@ describe('ExecutionAggregator', () => {
     expect(agg.getSnapshot('all').count).toBe(0);
 
     // Emit a workflow_end trace event (direct type form)
-    const event: TraceEvent = {
+    const event: AxlEvent = {
       executionId: 'e-live',
       step: 1,
       type: 'workflow_end',
       timestamp: now,
+      workflow: 'wf-live',
+      data: { status: 'completed', duration: 0 },
     };
     runtime.emit('trace', event);
 
@@ -164,7 +166,7 @@ describe('ExecutionAggregator', () => {
     await agg.start();
 
     // Production runtime emits type: 'log' with data.event: 'workflow_end'
-    const event: TraceEvent = {
+    const event: AxlEvent = {
       executionId: 'e-log',
       step: 1,
       type: 'log',
@@ -196,13 +198,13 @@ describe('ExecutionAggregator', () => {
     runtime.emit('trace', {
       executionId: 'e1',
       step: 1,
-      type: 'agent_call',
+      type: 'agent_call_end',
       timestamp: Date.now(),
     });
     runtime.emit('trace', {
       executionId: 'e1',
       step: 2,
-      type: 'tool_call',
+      type: 'tool_call_end',
       timestamp: Date.now(),
       tool: 'search',
     });
@@ -256,7 +258,7 @@ describe('ExecutionAggregator', () => {
       step: 1,
       type: 'workflow_end',
       timestamp: now,
-    } as TraceEvent);
+    } as AxlEvent);
 
     // Before the getExecution resolves, trigger a rebuild (increments generation)
     await agg.rebuild();
@@ -290,7 +292,7 @@ describe('ExecutionAggregator', () => {
       step: 1,
       type: 'workflow_end',
       timestamp: Date.now(),
-    } as TraceEvent);
+    } as AxlEvent);
 
     await vi.advanceTimersByTimeAsync(0);
 
@@ -327,7 +329,7 @@ describe('ExecutionAggregator', () => {
       step: 1,
       type: 'workflow_end',
       timestamp: now,
-    } as TraceEvent);
+    } as AxlEvent);
 
     await vi.advanceTimersByTimeAsync(0);
 

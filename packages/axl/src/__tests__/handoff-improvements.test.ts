@@ -275,6 +275,63 @@ describe('agent handoff improvements', () => {
       expect((handoffTraces[0].data as any).mode).toBe('oneway');
     });
 
+    it('handoff.toAskId matches the target agent_call_end.askId (review B-7/B-8)', async () => {
+      // The handoff event's `toAskId` used to be a synthesized UUID
+      // that no other event referenced — consumers grouping by askId
+      // saw the handoff as an orphan row. The fix runs the target's
+      // executeAgentCall under a real ask frame whose askId is
+      // `handoffToAskId`, so downstream events from the target
+      // (agent_call_end, tool_call_end) carry askId === handoffToAskId
+      // and parentAskId === handoffFromAskId.
+      const targetAgent = agent({
+        name: 'target-b7',
+        model: 'mock:test',
+        system: 'target',
+      });
+      const sourceAgent = agent({
+        name: 'source-b7',
+        model: 'mock:test',
+        system: 'source',
+        handoffs: [{ agent: targetAgent }], // oneway
+      });
+      const provider = createSequenceProvider([
+        {
+          tool_calls: [
+            {
+              id: 'tc1',
+              type: 'function',
+              function: { name: 'handoff_to_target-b7', arguments: '{}' },
+            },
+          ],
+        },
+        'target answer',
+      ]);
+      const { ctx, traces } = createCtx({ provider });
+      await ctx.ask(sourceAgent, 'start');
+
+      const handoff = traces.find((t) => t.type === 'handoff');
+      expect(handoff).toBeDefined();
+      const toAskId = handoff!.toAskId;
+      const fromAskId = handoff!.fromAskId;
+      expect(toAskId).toBeTypeOf('string');
+      expect(fromAskId).toBeTypeOf('string');
+      expect(toAskId).not.toBe(fromAskId);
+
+      // The target agent's agent_call_end event should be scoped to
+      // the handoffToAskId frame — proving the askId is a real
+      // correlation anchor, not a synthesized sentinel.
+      type AgentCallEnd = Extract<AxlEvent, { type: 'agent_call_end' }>;
+      const targetCalls = traces.filter(
+        (t): t is AgentCallEnd => t.type === 'agent_call_end' && t.agent === 'target-b7',
+      );
+      expect(targetCalls.length).toBeGreaterThan(0);
+      for (const call of targetCalls) {
+        expect(call.askId).toBe(toAskId);
+        expect(call.parentAskId).toBe(fromAskId);
+        expect(call.depth).toBe((handoff!.sourceDepth ?? 0) + 1);
+      }
+    });
+
     it('oneway tool definition has empty parameters', async () => {
       const targetAgent = agent({
         name: 'helper',

@@ -1088,16 +1088,28 @@ export class WorkflowContext<TInput = unknown> {
 
               const handoffStart = Date.now();
               // Capture the source ask's frame for handoff correlation.
-              // `toAskId` is synthesized — handoff targets don't currently
-              // create their own ask frame (target invocation goes through
-              // the internal executeAgentCall path, not ctx.ask). For PR 1
-              // we surface a sentinel UUID so the wire shape matches spec
-              // §2.1; full target-frame integration is a follow-up.
+              // Review B-7 / B-8: we now allocate a REAL ask frame for
+              // the target and run its executeAgentCall under
+              // `askStorage.run(targetFrame, …)` so events emitted from
+              // the target's tool-calling loop carry the proper
+              // `askId: handoffToAskId` + `parentAskId: handoffFromAskId`.
+              // Previously `toAskId` was a synthesized UUID with no
+              // matching frame, so consumers grouping by `askId` saw
+              // the handoff row as an orphan.
               const sourceFrame = askStorage.getStore();
               const handoffFromAskId = sourceFrame?.askId ?? this.executionId;
               const handoffSourceDepth = sourceFrame?.depth ?? 0;
               const handoffToAskId = randomUUID();
               const handoffTargetDepth = handoffSourceDepth + 1;
+              const targetFrame: AskFrame = {
+                askId: handoffToAskId,
+                parentAskId: handoffFromAskId,
+                depth: handoffTargetDepth,
+                agent: descriptor.agent._name,
+                parentToolCallId: sourceFrame?.parentToolCallId,
+                stepRef: sourceFrame?.stepRef ?? this.stepRefRoot,
+                askCost: { value: 0 },
+              };
 
               // Pass accumulated messages so the target agent can see the source agent's work.
               // Forward schema/retries/validate/metadata — the target agent uses its own model params.
@@ -1111,12 +1123,14 @@ export class WorkflowContext<TInput = unknown> {
                   }
                 : undefined;
               const handoffFn = () =>
-                this.executeAgentCall(
-                  descriptor.agent,
-                  handoffPrompt,
-                  handoffOptions,
-                  currentMessages,
-                  usageCapture,
+                askStorage.run(targetFrame, () =>
+                  this.executeAgentCall(
+                    descriptor.agent,
+                    handoffPrompt,
+                    handoffOptions,
+                    currentMessages,
+                    usageCapture,
+                  ),
                 );
 
               if (mode === 'roundtrip') {

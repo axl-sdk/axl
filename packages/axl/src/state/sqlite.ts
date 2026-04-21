@@ -84,6 +84,16 @@ export class SQLiteStore implements StateStore {
    * IF NOT EXISTS` runs against the post-migration column name. Fresh
    * installs just create the table with `events` directly and bump
    * `user_version` to the current version.
+   *
+   * TOCTOU guard (review B-3): the initial `user_version` read is
+   * informational only — a concurrent process can complete the
+   * migration between that read and our `BEGIN IMMEDIATE`. We
+   * re-read `user_version` inside the transaction and short-circuit
+   * if it's already at target, so the non-idempotent half (writes
+   * that went beyond a simple ALTER) never double-applies under a
+   * race. The current v0→v1 step IS idempotent via the column-
+   * presence check, but future migrations may not be, and the
+   * transactional re-read costs nothing.
    */
   private migrate(): void {
     const TARGET_VERSION = 1;
@@ -92,6 +102,14 @@ export class SQLiteStore implements StateStore {
 
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      // Re-read under the write lock — a concurrent constructor may
+      // have completed the migration between our pragma read above
+      // and our lock acquisition. Short-circuit to avoid re-applying.
+      const committed = this.db.pragma('user_version', { simple: true }) as number;
+      if (committed >= TARGET_VERSION) {
+        this.db.exec('COMMIT');
+        return;
+      }
       // v0 → v1: rename `steps` column on `execution_history` if present.
       // `table_info()` is safe even if the table doesn't exist (returns []).
       const cols = this.db.pragma('table_info(execution_history)') as Array<{ name: string }>;

@@ -151,6 +151,52 @@ describe('partial_object events (spec/16 §4.2)', () => {
     expect(partials[0].data.object).toEqual({ name: 'Alice' });
   });
 
+  it('does not over-emit on commas inside string values (review B-9)', async () => {
+    // Split a comma-heavy STRING value across two chunks. The naive
+    // "last char of delta is a comma" throttle used to emit on every
+    // comma inside the string — 4 commas in "A, B, C, D" each fired
+    // a parse. With the in-string state tracker there is ONE emission
+    // per real structural boundary (the closing `}`).
+    const provider = MockProvider.sequence([
+      {
+        content: '{"description":"A, B, C, D, E"}',
+        chunks: ['{"description":"A, B,', ' C, D, E"}'],
+      },
+    ]);
+    const { ctx, traces } = makeCtx(provider);
+    const a = agent({ name: 'str-comma', model: 'mock:test', system: 'test' });
+
+    await ctx.ask(a, 'q', { schema: z.object({ description: z.string() }) });
+
+    const partials = partialObjectEvents(traces);
+    // Exactly one emission — the final `}` — despite four commas in the
+    // string. Under the old throttle this would have emitted 5 times
+    // (4 commas inside the string + 1 closing `}`).
+    expect(partials.length).toBe(1);
+    expect(partials[0].data.object).toEqual({ description: 'A, B, C, D, E' });
+  });
+
+  it('handles escaped quotes inside strings without re-entering/exiting string state', async () => {
+    // The string contains an escaped quote. If we miscounted the
+    // `\"` as a string-exit, a later `,` would look "outside a string"
+    // and trigger an emission on a non-structural position. The
+    // escape-aware walker should see exactly one emission (the `}`).
+    const provider = MockProvider.sequence([
+      {
+        content: '{"quote":"She said \\"hi, friend\\" loudly"}',
+        chunks: ['{"quote":"She said \\"hi,', ' friend\\" loudly"}'],
+      },
+    ]);
+    const { ctx, traces } = makeCtx(provider);
+    const a = agent({ name: 'esc', model: 'mock:test', system: 'test' });
+
+    await ctx.ask(a, 'q', { schema: z.object({ quote: z.string() }) });
+
+    const partials = partialObjectEvents(traces);
+    expect(partials.length).toBe(1);
+    expect(partials[0].data.object).toEqual({ quote: 'She said "hi, friend" loudly' });
+  });
+
   it('attempt field tracks the current schema retry counter', async () => {
     // First attempt: malformed → schema retry. Second attempt: valid.
     const provider = MockProvider.sequence([

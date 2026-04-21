@@ -853,12 +853,22 @@ export class WorkflowContext<TInput = unknown> {
         //   - schema is set
         //   - no tools (JSON-mode response, not tool-calling)
         //   - schema root is a ZodObject (only object roots get partials)
-        // Structural-boundary throttle: parse only when the delta's last
-        // non-whitespace char is `,`, `}`, or `]`. Bounds event volume
-        // and avoids parsing on every single character.
+        // Structural-boundary throttle: emit when we cross a `,`, `}`, or
+        // `]` that is OUTSIDE a string literal. A naive "last char of
+        // delta is a comma" check (review B-9) over-emits on prose-heavy
+        // fields like {"description": "short, comma-heavy text..."} —
+        // every comma inside the string triggered a parse. We track
+        // in-string + escape state across chunks with a small walker so
+        // each boundary fires exactly once at a real structural seam.
         const partialObjectEnabled =
           !!options?.schema && toolDefs.length === 0 && options.schema instanceof z.ZodObject;
         const currentAttempt = schemaRetries + 1;
+        // Running parser state for the delta walker. Reset per ask
+        // invocation (not per retry — schema retry feeds the same
+        // conversation back, so we want a fresh parse of the new attempt).
+        let inString = false;
+        let escaped = false;
+        let boundaryPending = false;
 
         for await (const chunk of provider.stream(currentMessages, chatOptions)) {
           if (chunk.type === 'text_delta') {
@@ -869,19 +879,43 @@ export class WorkflowContext<TInput = unknown> {
             this.emitEvent({ type: 'token', data: chunk.content });
             this.onToken(chunk.content, callbackMeta);
             if (partialObjectEnabled) {
-              // Throttle on structural boundaries — last non-whitespace
-              // char of the delta is one of `,`, `}`, `]`. Tolerant
-              // parser handles any trailing truncation in `content`.
-              const trimmed = chunk.content.replace(/\s+$/, '');
-              const lastCh = trimmed[trimmed.length - 1];
-              if (lastCh === ',' || lastCh === '}' || lastCh === ']') {
+              // Walk `chunk.content` char-by-char, updating the
+              // in-string / escape state and recording whether a
+              // structural boundary landed outside a string. The
+              // running state survives across chunks because
+              // `inString` / `escaped` are closed over by the outer
+              // for-await loop.
+              for (const ch of chunk.content) {
+                if (escaped) {
+                  escaped = false;
+                  continue;
+                }
+                if (ch === '\\') {
+                  // Inside a string, `\\` starts an escape. Outside,
+                  // a bare backslash is invalid JSON — treat the same
+                  // way (swallow the next char) so malformed input
+                  // doesn't derail our state machine.
+                  escaped = true;
+                  continue;
+                }
+                if (ch === '"') {
+                  inString = !inString;
+                  continue;
+                }
+                if (!inString && (ch === ',' || ch === '}' || ch === ']')) {
+                  boundaryPending = true;
+                }
+              }
+              if (boundaryPending) {
+                boundaryPending = false;
                 let parsed: unknown;
                 try {
                   parsed = parsePartialJson(extractJson(content));
                 } catch {
                   // Mid-document malformed (not just truncation) — skip
-                  // this delta. The next structural-boundary delta will
-                  // get another shot once the model writes valid syntax.
+                  // this delta. The next structural boundary outside a
+                  // string will get another shot once the model writes
+                  // valid syntax.
                   parsed = undefined;
                 }
                 if (parsed !== undefined) {

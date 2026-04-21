@@ -23,7 +23,7 @@ type ExecutionHistoryRow = {
   completed_at: number | null;
   duration: number;
   error: string | null;
-  steps: string;
+  events: string;
 };
 
 function rowToExecutionInfo(row: ExecutionHistoryRow): ExecutionInfo {
@@ -36,9 +36,7 @@ function rowToExecutionInfo(row: ExecutionHistoryRow): ExecutionInfo {
     completedAt: row.completed_at ?? undefined,
     duration: row.duration,
     error: row.error ?? undefined,
-    // DB column is still `steps` for back-compat; renamed to `events` in
-    // the SQLite migration commit (spec §3.6a).
-    events: (safeJsonParse(row.steps) as ExecutionInfo['events']) ?? [],
+    events: (safeJsonParse(row.events) as ExecutionInfo['events']) ?? [],
   };
 }
 
@@ -66,7 +64,46 @@ export class SQLiteStore implements StateStore {
 
     this.db = new BetterSqlite3(filePath);
     this.db.pragma('journal_mode = WAL');
+    this.migrate();
     this.initTables();
+  }
+
+  /**
+   * Idempotent schema migration. Tracks version via `PRAGMA user_version`
+   * so reopens skip applied steps. Wrapped in `BEGIN IMMEDIATE` so
+   * concurrent `SQLiteStore` constructors serialize at the file level
+   * and rollback on failure leaves the DB in a clean pre-migration
+   * state.
+   *
+   * Migration history:
+   * - v1 (spec/16): rename `execution_history.steps` → `events`. The
+   *   JS-level `ExecutionInfo.steps` was renamed to `.events` in PR 1
+   *   commit 1; this brings the on-disk schema in line.
+   *
+   * Applied BEFORE `initTables()` so the subsequent `CREATE TABLE
+   * IF NOT EXISTS` runs against the post-migration column name. Fresh
+   * installs just create the table with `events` directly and bump
+   * `user_version` to the current version.
+   */
+  private migrate(): void {
+    const TARGET_VERSION = 1;
+    const current = this.db.pragma('user_version', { simple: true }) as number;
+    if (current >= TARGET_VERSION) return;
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      // v0 → v1: rename `steps` column on `execution_history` if present.
+      // `table_info()` is safe even if the table doesn't exist (returns []).
+      const cols = this.db.pragma('table_info(execution_history)') as Array<{ name: string }>;
+      if (cols.some((c) => c.name === 'steps') && !cols.some((c) => c.name === 'events')) {
+        this.db.exec('ALTER TABLE execution_history RENAME COLUMN steps TO events');
+      }
+      this.db.pragma(`user_version = ${TARGET_VERSION}`);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
   }
 
   private initTables(): void {
@@ -124,7 +161,7 @@ export class SQLiteStore implements StateStore {
         completed_at INTEGER,
         duration INTEGER NOT NULL DEFAULT 0,
         error TEXT,
-        steps TEXT NOT NULL
+        events TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS eval_history (
@@ -292,7 +329,7 @@ export class SQLiteStore implements StateStore {
   async saveExecution(execution: ExecutionInfo): Promise<void> {
     this.db
       .prepare(
-        'INSERT OR REPLACE INTO execution_history (execution_id, workflow, status, total_cost, started_at, completed_at, duration, error, steps) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT OR REPLACE INTO execution_history (execution_id, workflow, status, total_cost, started_at, completed_at, duration, error, events) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         execution.executionId,

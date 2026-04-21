@@ -7,6 +7,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking changes — Unified event model (spec/16-streaming-wire-reliability)
+
+The two parallel event models (rich `TraceEvent` for traces, lean
+`StreamEvent` for the wire) collapse into a single `AxlEvent`
+discriminated union. Tokens, tool calls, ask boundaries, and agent turns
+are observable end-to-end with full fidelity. See
+[`docs/migration/unified-event-model.md`](docs/migration/unified-event-model.md)
+for a step-by-step consumer migration guide.
+
+- **`TraceEvent` and `StreamEvent` are deleted.** Both types collapse
+  into `AxlEvent` (exported from `@axlsdk/axl`). External TS consumers
+  get compile errors on `TraceEvent` / `StreamEvent` imports — switch
+  to `AxlEvent` and narrow on `event.type`. No type alias is kept.
+- **`ExecutionInfo.steps` → `ExecutionInfo.events`.** Read sites
+  rename verbatim. The on-disk SQLite column auto-migrates on first
+  open via `PRAGMA user_version` (transactional, idempotent).
+- **`AxlStream.steps` → `AxlStream.lifecycle`.** Same iterator shape;
+  the rename reflects that these are events, not pipeline steps. The
+  filter set expands to include `ask_*`, `agent_call_*`,
+  `tool_call_*`, `tool_approval`, `tool_denied`, `delegate`,
+  `pipeline`, `verify`, `workflow_*`.
+- **Streaming-callback signatures gain `meta`.** `onToken`,
+  `onToolCall`, `onAgentStart` now take a second
+  `meta: CallbackMeta = { askId, parentAskId?, depth, agent }`
+  parameter. Existing chat UIs that want root-only behavior add a one-
+  line `if (meta.depth === 0)` filter to preserve the prior behavior.
+- **`createChildContext` no longer isolates streaming callbacks.**
+  Nested asks now propagate tokens, tool calls, and agent starts to
+  the same callbacks as the parent — consumers filter via
+  `meta.depth` to recover root-only behavior. Spec §3.2.
+- **Trace event type renames:** `'agent_call'` → `'agent_call_end'`,
+  `'tool_call'` → `'tool_call_end'`. The new `_end` variants pair with
+  newly-emitted `_start` events (see Added).
+- **`error` event scope narrowed.** Ask-internal failures (gate
+  exhaustion, `ctx.verify` failure, handler error) surface via
+  `ask_end({ outcome: { ok: false, error } })` — NOT via the
+  workflow-level `error` event. The workflow `error` event is reserved
+  for failures with no `ask_end` available (top-level workflow throws
+  before any ask runs, infrastructure / abort errors). Consumers must
+  never see both for the same failure. Spec decision 9.
+- **Runtime translation layer at `runtime.ts:709-783` deleted.** The
+  block that synthesized legacy `StreamEvent` shapes (`agent_end`,
+  `tool_result`, `step`) from `AxlEvent` traces is gone. Every event
+  flows verbatim from `emitEvent` to the wire. The wire format IS the
+  trace format.
+- **SQLite `execution_history` column rename:** `steps` → `events`.
+  Auto-migrated on first open of an existing DB; no manual migration
+  needed. Tracked via `PRAGMA user_version`.
+- **Step counter shared via AsyncLocalStorage.** `event.step` is now
+  monotonic across the whole execution tree (root ask + nested asks
+  + branch primitives), not per-context. Consumers ordering by `step`
+  see a single shared counter.
+- **`Embedder.embed()` signature unchanged in this release** (the
+  0.15.0 `EmbedResult` change still applies).
+
+### Added — Unified event model
+
+- New `AxlEvent` union variants:
+  - `ask_start` (carries `prompt`) and `ask_end` (carries
+    `outcome: {ok: true, result} | {ok: false, error}`, `cost`,
+    `duration`) bound every `ctx.ask()` call.
+  - `agent_call_start` (carries `agent`, `model`, `turn`) — pre-call
+    marker; pairs with `agent_call_end`.
+  - `tool_call_start` (carries `tool`, `callId`, `data: { args }`) —
+    pre-call marker; pairs with `tool_call_end` (which carries args
+    AND result).
+  - Reserved (PR 2): `pipeline` (start/failed/committed retry
+    lifecycle) and `partial_object` (progressive structured-output
+    streaming).
+- `AskScoped` mixin adds `askId`, `parentAskId?`, `depth`, `agent?`
+  to every event originating within `ctx.ask()`. Tree reconstruction
+  via group-by(askId) + parent-link(parentAskId).
+- `AXL_EVENT_TYPES` const tuple — single source of truth for the
+  discriminator set; derived `AxlEventType` and `AxlEventOf<T>`
+  Extract helper.
+- `AxlEventBase`, `AskScoped`, `CallbackMeta`, plus per-variant data
+  shapes (`AgentCallData`, `ToolCallData`, `ToolCallStartData`,
+  `ToolApprovalData`, `ToolDeniedData`, `HandoffData`, `DelegateData`,
+  `VerifyData`, `WorkflowStartData`, `WorkflowEndData`,
+  `MemoryEventData`, `GuardrailData`, `SchemaCheckData`,
+  `ValidateData`).
+- `MockProvider.sequence()` accepts an optional `chunks?: string[]`
+  per response; `MockProvider.chunked(contents, chunkSize?)` static
+  helper. `stream()` yields one `text_delta` per chunk — used by
+  partial-JSON, structural-boundary, and cross-attempt token tests.
+- Compile-time exhaustiveness fixture
+  (`packages/axl/src/__tests__/axl-event-exhaustive.test-d.ts`) —
+  switches on every `AxlEvent.type` and ends with
+  `const _exhaustive: never = ev`. New variants without a matching
+  case fail `pnpm -r typecheck`.
+- Fixed: `validate + onToken` no longer throws `INVALID_CONFIG` —
+  validate runs against the buffered streaming response. Spec §4.1.
+- Fixed: nested-ask events (tokens, tool calls, agent starts) now
+  propagate to outer-context callbacks. Spec §3.2.
+- Fixed: PII leak where the trace WS channel bypassed `redact`
+  scrubbing has been closed.
+
+### Deprecated
+
+- `AxlEventBase.parentToolCallId` is `@deprecated` (one-cycle window).
+  Use `parentAskId` (on `AskScoped`) for ask-graph correlation going
+  forward. Removal is tracked for the spec follow-up.
+
 ## [0.15.0] - 2026-04-17
 
 ### Breaking changes

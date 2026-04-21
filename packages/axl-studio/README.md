@@ -447,7 +447,7 @@ const runtime = new AxlRuntime({ config: { trace: { redact: true } } });
 const studio = createStudioMiddleware({ runtime });
 ```
 
-Under `redact: true`, the following Studio endpoints scrub user content server-side before responding: `GET /api/executions{,/:id}`, `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser stays navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync); streaming WS broadcasts on `/workflows/:name/execute` with `stream: true` and `/api/playground/chat` also scrub `StreamEvent` content before send.
+Under `redact: true`, the following Studio endpoints scrub user content server-side before responding: `GET /api/executions{,/:id}`, `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser stays navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync); streaming WS broadcasts on `/workflows/:name/execute` with `stream: true`, `/api/playground/chat`, AND the trace channel firehose (`trace:{executionId}`) all scrub `AxlEvent` content before send.
 
 Studio checks the flag via `runtime.isRedactEnabled(): boolean` — it does **not** reach into the config object directly, because `Readonly<AxlConfig>` is shallow and consumers could mutate the nested `trace.redact` field via sub-object access. `GET /api/health` also reports `readOnly: boolean` so clients can gate mutating UI affordances.
 
@@ -498,7 +498,7 @@ src/
     types.ts              API types, WebSocket message types
     aggregates/
       aggregate-snapshots.ts  AggregateSnapshots<State> helper (per-window state, fold, replace, broadcastTransform)
-      trace-aggregator.ts     TraceAggregator<State> — TraceEvent consumer (costs, trace-stats)
+      trace-aggregator.ts     TraceAggregator<State> — AxlEvent consumer (costs, trace-stats)
       execution-aggregator.ts ExecutionAggregator<State> — ExecutionInfo consumer (workflow-stats)
       eval-aggregator.ts      EvalAggregator<State> — EvalHistoryEntry consumer (eval-trends)
       reducers.ts             Pure reducers: reduceCost, reduceWorkflowStats, reduceTraceStats, reduceEvalTrends + enrichWorkflowStats

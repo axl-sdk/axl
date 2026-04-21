@@ -344,7 +344,7 @@ for (const item of results.items) {
   // Per-item trace events (when run with { captureTraces: true })
   if (item.traces) {
     console.log(`${item.traces.length} trace events captured`);
-    const agentCalls = item.traces.filter(e => e.type === 'agent_call');
+    const agentCalls = item.traces.filter(e => e.type === 'agent_call_end');
     console.log(`${agentCalls.length} LLM turns`);
     // Failure-path traces are also populated (recovered from axlCapturedTraces
     // on the thrown error) — captureTraces is especially useful for debugging

@@ -19,7 +19,7 @@
 - **Session Options** — Configurable history limits, summarization, and persistence
 - **Tool Middleware** — Approval gates (`requireApproval`) and lifecycle hooks (`before`/`after`)
 - **Agent Handoffs** — Oneway and roundtrip modes with descriptions, OTel spans, and session history
-- **Streaming Improvements** — Typed `StreamEvent` variants, `stream.steps` filtered iterable
+- **Unified Event Model** — Single `AxlEvent` discriminated union (replaces the 0.15 `StreamEvent` + `TraceEvent` split). Wire format = trace format. Adds `ask_start`/`ask_end`, `agent_call_start`, `tool_call_start`, ask-graph correlation (`askId`/`parentAskId`/`depth`). `AxlStream.lifecycle` filtered iterable. See [migration guide](docs/migration/unified-event-model.md)
 - **Axl Studio** — Local development UI with 8 panels (Playground, Workflows, Traces, Costs, Memory, Sessions, Tools, Evals)
 - **Evaluation Framework** — `dataset()`, `scorer()`, `llmScorer()`, `evalCompare()`, `rescore()`, `aggregateRuns()`, CLI with `compare`, `rescore` subcommands, `--runs` multi-run support
 - **Configurable Model Parameters** — `temperature`, `maxTokens`, `effort`, `thinkingBudget`, `includeThoughts`, `toolChoice`, `stop` on `AgentConfig` and per-call via `AskOptions`

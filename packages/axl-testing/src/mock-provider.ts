@@ -56,6 +56,10 @@ function generateFromSchema(schema: unknown): unknown {
 export class MockProvider implements Provider {
   readonly name = 'mock';
   private _calls: { messages: ChatMessage[]; options: ChatOptions }[] = [];
+  /** Per-call optional chunk arrays, set by `sequence()` / `chunked()` so
+   *  `stream()` can yield one `text_delta` per chunk. Per-call indexed
+   *  alongside the response sequence. */
+  private chunkSequence?: Array<string[] | undefined>;
 
   private constructor(
     private responseFn: (
@@ -74,8 +78,24 @@ export class MockProvider implements Provider {
   }
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
+    const callIndex = this._calls.length;
     const response = await this.chat(messages, options);
-    if (response.content) {
+    const chunks = this.chunkSequence?.[callIndex];
+    if (chunks && chunks.length > 0) {
+      // Sanity guard — if a caller passes chunks AND content, they MUST
+      // match. Otherwise tests pass while the real prod content silently
+      // diverges from what the streaming path observes.
+      const joined = chunks.join('');
+      if (joined !== response.content) {
+        throw new Error(
+          `MockProvider.stream: chunks.join('') !== content. ` +
+            `chunks="${joined}" content="${response.content}"`,
+        );
+      }
+      for (const chunk of chunks) {
+        yield { type: 'text_delta', content: chunk };
+      }
+    } else if (response.content) {
       yield { type: 'text_delta', content: response.content };
     }
     if (response.tool_calls) {
@@ -98,9 +118,15 @@ export class MockProvider implements Provider {
       providerMetadata?: Record<string, unknown>;
       usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
       cost?: number;
+      /** When set, `stream()` yields one `text_delta` per entry instead
+       *  of one big delta with the full content. Use to exercise
+       *  partial-JSON parsing, structural-boundary throttling, and
+       *  cross-attempt token retention in tests. Must satisfy
+       *  `chunks.join('') === content`. */
+      chunks?: string[];
     }>,
   ): MockProvider {
-    return new MockProvider((_messages, callIndex) => {
+    const provider = new MockProvider((_messages, callIndex) => {
       if (callIndex >= responses.length) {
         throw new Error(
           `MockProvider.sequence: no response for call index ${callIndex}. Only ${responses.length} responses defined.`,
@@ -115,6 +141,24 @@ export class MockProvider implements Provider {
         cost: resp.cost ?? 0,
       };
     });
+    provider.chunkSequence = responses.map((r) => r.chunks);
+    return provider;
+  }
+
+  /**
+   * Convenience: build a `sequence()` from plain content strings, splitting
+   * each one into fixed-size chunks for the streaming path. Default
+   * `chunkSize` is 4 chars (≈1 token).
+   */
+  static chunked(contents: string[], chunkSize = 4): MockProvider {
+    const responses = contents.map((content) => {
+      const chunks: string[] = [];
+      for (let i = 0; i < content.length; i += chunkSize) {
+        chunks.push(content.slice(i, i + chunkSize));
+      }
+      return { content, chunks };
+    });
+    return MockProvider.sequence(responses);
   }
 
   static echo(): MockProvider {

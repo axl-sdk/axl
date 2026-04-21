@@ -2,6 +2,8 @@
 
 Complete reference for all Axl factories, context primitives, and configuration options.
 
+> Migrating from 0.15.x? `TraceEvent` and `StreamEvent` collapsed into a single `AxlEvent` discriminated union. Several event tag names changed (`agent_call` → `agent_call_end`, `tool_call` → `tool_call_end`) and `ExecutionInfo.steps` is now `ExecutionInfo.events`. See the [unified event model migration guide](./migration/unified-event-model.md) for the full diff.
+
 ## Factories
 
 ### `tool(config)`
@@ -67,7 +69,7 @@ const researchTool = tool({
 });
 ```
 
-The child context shares budget tracking, abort signals, and trace emission with the parent, while isolating session history, step counters, and streaming callbacks. Created internally via `WorkflowContext.createChildContext()`.
+The child context shares budget tracking, abort signals, trace emission, and streaming callbacks (`onToken` / `onToolCall` / `onAgentStart`) with the parent — nested-ask events propagate to the same callbacks. Session history is isolated. Created internally via `WorkflowContext.createChildContext()`. Consumers wanting root-only callback behavior filter on `meta.depth === 0` at the callback site.
 
 ---
 
@@ -187,7 +189,9 @@ console.log(ctx.totalCost); // accumulated cost from all agent calls
 | `budget` | `string` | — | Cost budget (e.g., `'$0.50'`). Enforced via `finish_and_stop` policy |
 | `signal` | `AbortSignal` | — | Abort signal for cancellation/timeouts |
 | `sessionHistory` | `ChatMessage[]` | — | Prior conversation history for multi-turn testing |
-| `onToken` | `(token: string) => void` | — | Token streaming callback |
+| `onToken` | `(token: string, meta: CallbackMeta) => void` | — | Token streaming callback. `meta` carries `{ askId, parentAskId?, depth, agent }` so consumers can route per-ask. Filter on `meta.depth === 0` for root-only behavior |
+| `onToolCall` | `(call: { name, args, callId? }, meta: CallbackMeta) => void` | — | Fires when an agent invokes a tool. Same `meta` shape as `onToken` |
+| `onAgentStart` | `(info: { agent, model }, meta: CallbackMeta) => void` | — | Fires when an agent begins processing. Same `meta` shape as `onToken` |
 | `awaitHumanHandler` | `(options) => Promise<HumanDecision>` | — | Handler for tool approval requests. Required when the agent uses tools with `requireApproval` — without it, the call throws a clear error |
 
 **When to use vs. workflows:** Use `createContext()` when you want to call agents without registering a workflow — eval files, one-off scripts, tests, API endpoints. Use `runtime.execute()` when you want execution lifecycle tracking (status, duration, history in Studio's executions panel).
@@ -220,7 +224,7 @@ Track cost and execution metadata across any runtime operations within `fn`. Ret
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `captureTraces` | `boolean` | `false` | When `true`, collects every `TraceEvent` observed during `fn` and returns it on `result.traces`. On failure, the captured traces are attached to the thrown error as a non-enumerable `axlCapturedTraces` property (eval runners read this side-channel to populate `EvalItem.traces` on failed items). Verbose-mode `agent_call.data.messages` snapshots are stripped from captured traces to keep memory bounded |
+| `captureTraces` | `boolean` | `false` | When `true`, collects every `AxlEvent` observed during `fn` and returns it on `result.traces`. On failure, the captured traces are attached to the thrown error as a non-enumerable `axlCapturedTraces` property (eval runners read this side-channel to populate `EvalItem.traces` on failed items). Verbose-mode `agent_call_end.data.messages` snapshots are stripped from captured traces to keep memory bounded |
 
 ```typescript
 const { result, cost, metadata } = await runtime.trackExecution(async () => {
@@ -291,7 +295,7 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 
 **Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a system message explaining the error. On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
 
-**Streaming:** `validate` cannot be used with streaming (`runtime.stream()`). Validate requires `schema`, which means the output is structured JSON — not text that benefits from progressive rendering. Using both throws an error. For structured output with validation, use a non-streaming call and work with the parsed result directly.
+**Streaming + validate:** As of 0.16.0, `validate` and streaming callbacks (`onToken`) coexist — validate runs against the buffered response after streaming completes. (Pre-0.16.0 this combination threw `INVALID_CONFIG`.) For structured output, the typed result is still only available after the full response arrives.
 
 ---
 
@@ -447,7 +451,7 @@ See [Validated Data Extraction](use-cases.md#validated-data-extraction) for more
 - **Other errors**: `retry.output` and `retry.parsed` are both `undefined` (no structured output to extract).
 
 | Option | Type | Default | Description |
-|--------|------|---------|-------------|
+|-------|------|---------|-------------|
 | `retries` | `number` | `3` | Maximum retry attempts |
 | `fallback` | `T` | — | Return this value instead of throwing when retries are exhausted |
 | `validate` | `OutputValidator<T>` | — | Post-schema business rule validation. Runs after schema parse succeeds |
@@ -613,11 +617,11 @@ await ctx.remember('user_preference', { theme: 'dark' }, { scope: 'global', embe
 | `metadata` | `Record<string, unknown>` | — | Arbitrary metadata stored alongside the value |
 | `embed` | `boolean` | `false` | When `true`, also generates an embedding for semantic search. Requires a vector store and embedder in the runtime config |
 
-**Cost tracking.** When `embed: true`, the embedder call cost is automatically attributed to the current execution scope — `runtime.trackExecution()` picks it up via the trace-event cost rail, and Studio's Cost Dashboard displays it under "Memory (Embedder)" bucketed by embedder model. See [observability.md](./observability.md#trace-event-types) for details.
+**Cost tracking.** When `embed: true`, the embedder call cost is automatically attributed to the current execution scope — `runtime.trackExecution()` picks it up via the trace-event cost rail, and Studio's Cost Dashboard displays it under "Memory (Embedder)" bucketed by embedder model. See [observability.md](./observability.md#event-types) for details.
 
 **Budget enforcement.** Semantic memory calls (`embed: true` / `query`) count against `ctx.budget({ cost, onExceed: 'hard_stop' })` the same way agent calls do. `ctx.remember` and `ctx.recall` check `budgetContext.exceeded` at call top and throw `BudgetExceededError` before hitting the embedder if a prior call already breached the limit. The composed `AbortSignal` (user-abort + budget-hard_stop) is also forwarded to the embedder fetch so in-flight calls cancel promptly.
 
-**Audit events.** `ctx.remember`, `ctx.recall`, and `ctx.forget` emit a `log` trace event on both success and failure (`event: 'memory_remember' | 'memory_recall' | 'memory_forget'` with `{ key, scope, hit?, resultCount?, embed?, usage?, error? }`). Values are never in the trace — only operation shape. Under `config.trace.redact`, `key` is scrubbed.
+**Audit events.** `ctx.remember`, `ctx.recall`, and `ctx.forget` emit a `memory_remember` / `memory_recall` / `memory_forget` event on both success and failure, with `{ key, scope, hit?, count?, embed?, usage?, error? }`. Values are never in the trace — only operation shape. Under `config.trace.redact`, `key` is scrubbed.
 
 ---
 
@@ -886,30 +890,31 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 
 ---
 
-## StreamEvent
+## AxlStream
 
-Union type for events emitted by `AxlStream` (from `runtime.stream()` and `session.stream()`). Consumed via `for await (const event of stream)`.
+Returned from `runtime.stream()` and `session.stream()`. An `AsyncIterable<AxlEvent>` (the wire format **is** the trace format — same shape, full fidelity, no translation layer). Also exposes accessors for filtered views.
 
 ```typescript
+import type { AxlEvent } from '@axlsdk/axl';
+
+const stream = runtime.stream('MyWorkflow', input);
 for await (const event of stream) {
   if (event.type === 'token') process.stdout.write(event.data);
-  if (event.type === 'error') console.error('Stream error:', event.message);
-  if (event.type === 'done') console.log('Result:', event.data);
+  if (event.type === 'tool_call_end') console.log('tool result:', event.tool, event.data.result);
+  if (event.type === 'error') console.error('error:', event.data.message);
+  if (event.type === 'done') console.log('result:', event.data.result);
 }
 ```
 
-| Variant | Fields | Description |
-|---------|--------|-------------|
-| `token` | `data: string` | Incremental text token from the LLM |
-| `tool_call` | `name: string`, `args: unknown`, `callId?: string` | Agent initiated a tool call. `callId` correlates with the matching `tool_result` |
-| `tool_result` | `name: string`, `result: unknown`, `callId?: string` | Tool execution completed. `callId` matches the originating `tool_call` |
-| `tool_approval` | `name: string`, `args: unknown`, `approved: boolean`, `reason?: string` | Tool approval decision (for tools with `requireApproval`) |
-| `agent_start` | `agent: string`, `model?: string` | Agent began processing |
-| `agent_end` | `agent: string`, `cost?: number`, `duration?: number` | Agent finished processing |
-| `handoff` | `source: string`, `target: string`, `mode?: 'oneway' \| 'roundtrip'` | Agent handed off to another agent |
-| `step` | `step: number`, `data: unknown` | Workflow step event |
-| `done` | `data: unknown` | Stream completed with final result |
-| `error` | `message: string` | Stream error (JSON-serializable — `message` string, not an `Error` object) |
+| Accessor | Type | Description |
+|---|---|---|
+| `for await ... of stream` | `AsyncIterable<AxlEvent>` | Every `AxlEvent`, in the order emitted |
+| `stream.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only (`ask_*`, `agent_call_*`, `tool_call_*`, `tool_approval`, `tool_denied`, `handoff`, `delegate`, `pipeline`, `verify`, `workflow_*`). Skips token chatter |
+| `stream.text` | `AsyncIterable<string>` | Root-only token stream (depth=0) |
+| `stream.fullText` | `string` | Accumulated text from root-only tokens |
+| `stream.on('done', ...)` / `.on('error', ...)` | `EventEmitter` | Terminal events. `done.data = { result }`, `error.data = { message, name?, code? }` |
+
+**Renamed in 0.16.0:** `stream.steps` → `stream.lifecycle`. The old `StreamEvent` union (`tool_result`, `agent_start`, `agent_end`, `step`) is gone — use the unified `AxlEvent` variants (`tool_call_end`, `agent_call_start`, `agent_call_end`, etc.) directly.
 
 ---
 
@@ -953,6 +958,7 @@ const runtime = new AxlRuntime({
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `metadata` | `Record<string, unknown>` | `{}` | Metadata passed to the workflow context. Reserved keys: `sessionId`, `sessionHistory`, `resumeMode` |
+| `onToken` | `(token: string, meta: CallbackMeta) => void` | — | Token streaming callback. `meta`: `{ askId, parentAskId?, depth, agent }`. Filter on `meta.depth === 0` for root-only |
 | `awaitHumanHandler` | `(options) => Promise<HumanDecision>` | — | In-process approval handler for tool calls with `requireApproval`. Parity with `CreateContextOptions.awaitHumanHandler` — lets tests and embedded use cases resolve approvals inline instead of suspending execution and polling `getPendingDecisions()` |
 
 ### Execution History
@@ -971,7 +977,7 @@ Completed and failed executions are automatically persisted to the state store (
 | `executionId` | `string` | Unique execution ID |
 | `workflow` | `string` | Workflow name |
 | `status` | `'running' \| 'completed' \| 'failed' \| 'waiting'` | Current status |
-| `steps` | `TraceEvent[]` | All trace events for this execution |
+| `events` | `AxlEvent[]` | All events for this execution. Renamed from `steps` in 0.16.0; `SQLiteStore` auto-migrates the `execution_history.steps` column to `events` on first open |
 | `totalCost` | `number` | Accumulated cost in USD |
 | `startedAt` | `number` | Start timestamp (ms) |
 | `completedAt` | `number \| undefined` | Completion timestamp (ms) |
@@ -1014,7 +1020,7 @@ Eval results are automatically persisted when using `runRegisteredEval()`. Histo
 | `getTool(name)` | `Tool \| undefined` | Look up a tool by name |
 | `getRegisteredEvals()` | `Array<{ name, workflow, dataset, scorers }>` | All registered eval configs |
 | `getRegisteredEval(name)` | `{ config, executeWorkflow? } \| undefined` | Look up a specific eval registration |
-| `resolveProvider(uri)` | `{ provider, model }` | Resolve a `provider:model` URI to a Provider instance and model name |
+| `resolveProvider(uri)` | `{ provider, model }` | Resolve a `provider:model` URI to a Provider instance and stripped model name |
 | `getStateStore()` | `StateStore` | The runtime's state store instance |
 | `getMcpManager()` | `McpManager \| undefined` | The runtime's MCP manager (if initialized) |
 | `isRedactEnabled()` | `boolean` | Narrow public getter for `config.trace.redact`. Use this instead of reaching into the config object — the full config was intentionally not exposed because `Readonly<AxlConfig>` is shallow and consumers could mutate nested fields. Used by Studio's REST routes and WS broadcast paths to decide whether to scrub user/LLM content at the observability boundary |
@@ -1141,30 +1147,78 @@ const runtime = new AxlRuntime({ state: { store: new MyStore() } });
 
 ---
 
-## TraceEvent
+## AxlEvent
 
-Every agent call, tool invocation, handoff, and system event emits a `TraceEvent`. These accumulate in `ExecutionInfo.steps` and are broadcast via WebSocket in Studio.
+Every agent call, tool invocation, handoff, and system event emits an `AxlEvent`. These accumulate in `ExecutionInfo.events` and are broadcast via WebSocket in Studio. The wire format (streaming) and trace format (persisted) are the same shape — no translation layer.
+
+```typescript
+import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped, CallbackMeta } from '@axlsdk/axl';
+```
+
+> Renamed from `TraceEvent`/`StreamEvent` in 0.16.0. See the [migration guide](./migration/unified-event-model.md) for the full diff.
+
+### `AxlEventBase` (common fields on every variant)
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `executionId` | `string` | Execution this event belongs to |
-| `step` | `number` | Auto-incrementing step counter |
-| `type` | `TraceEventType` | `'agent_call'`, `'tool_call'`, `'tool_approval'`, `'tool_denied'`, `'handoff'`, `'delegate'`, `'verify'`, `'guardrail'`, `'schema_check'`, `'validate'`, `'log'`, `'workflow_start'`, `'workflow_end'` |
-| `workflow` | `string?` | Workflow name (on workflow events) |
-| `agent` | `string?` | Agent name |
-| `tool` | `string?` | Tool name (on tool events) |
-| `model` | `string?` | Model URI (on agent_call events) |
-| `promptVersion` | `string?` | Agent version (on agent_call events) |
-| `cost` | `number?` | Cost in USD for this step |
-| `tokens` | `{ input?, output?, reasoning? }?` | Token usage from the provider (on `agent_call` events). Maps from `ProviderResponse.usage` |
-| `duration` | `number?` | Duration in ms |
-| `data` | `unknown?` | Event-specific payload — narrow via `type`. See per-type shapes below |
+| `step` | `number` | Monotonic per-execution step counter, shared across nested asks via `AsyncLocalStorage` |
+| `type` | `AxlEventType` | See `AXL_EVENT_TYPES` below |
+| `workflow` | `string?` | Workflow name (auto-stamped from the active context) |
+| `agent` | `string?` | Agent name. Required on variants like `agent_call_start`/`agent_call_end` |
+| `tool` | `string?` | Tool name (on tool-related events) |
+| `model` | `string?` | Model URI (on agent-related events) |
+| `promptVersion` | `string?` | Agent version (on agent-related events) |
+| `cost` | `number?` | Cost in USD for this step. Required on `agent_call_end` and `ask_end` (narrowing). **`ask_end.cost` is a per-ask rollup — see double-counting note below** |
+| `tokens` | `{ input?, output?, reasoning? }?` | Token usage from the provider (on `agent_call_end` events). Maps from `ProviderResponse.usage` |
+| `duration` | `number?` | Duration in ms (set on `_end` variants) |
+| `data` | event-specific | Variant-specific payload — narrow via `type` |
 | `timestamp` | `number` | Event timestamp (ms) |
-| `parentToolCallId` | `string?` | Set on events emitted from a nested agent-as-tool child context. Joins back to the outer `tool_call.id` so consumers can reconstruct the call graph |
+| `parentToolCallId` | `string?` | **@deprecated** — use `parentAskId` (on `AskScoped`) for ask-graph correlation. Retained for one minor cycle for back-compat with telemetry consumers that grep agent-as-tool call graphs |
 
-`TraceEvent` is a **discriminated union** over `type` — consumers that narrow via `event.type === 'agent_call'` / `'tool_call'` / etc. get statically-typed access to per-variant `data` shapes and type-specific required fields. Per-type data shapes are exported from `@axlsdk/axl`: `AgentCallTraceData`, `GuardrailTraceData`, `SchemaCheckTraceData`, `ValidateTraceData`, `ToolCallTraceData`, `ToolApprovalTraceData`, `HandoffTraceData`, `DelegateTraceData`, `VerifyTraceData`, `WorkflowStartTraceData`, `WorkflowEndTraceData`.
+### `AskScoped` (mixin on every event originating within `ctx.ask()`)
 
-### `AgentCallTraceData` (data on `agent_call` events)
+| Field | Type | Description |
+|-------|------|-------------|
+| `askId` | `string` | UUID for this ask invocation. Stable for all events emitted within a single `ctx.ask()` |
+| `parentAskId` | `string?` | The enclosing ask (absent on the root) |
+| `depth` | `number` | `0` for root, `+1` per nested `ctx.ask()` |
+| `agent` | `string?` | Emitting agent's name |
+
+`handoff` is the single exception — it spans two asks atomically and carries `fromAskId` / `toAskId` / `sourceDepth` / `targetDepth` instead.
+
+### `AxlEvent` variants
+
+`AxlEvent` is a **discriminated union** over `type`. Narrow via `event.type === 'agent_call_end'` etc. Use `AxlEventOf<'agent_call_end'>` to extract a specific variant.
+
+| `type` | Mixin | Required variant fields | When emitted |
+|---|---|---|---|
+| `workflow_start` / `workflow_end` | — | `workflow`, `data: WorkflowStartData/WorkflowEndData` | Workflow lifecycle |
+| `ask_start` | `AskScoped` | `prompt: string` | Top of every `ctx.ask()` |
+| `ask_end` | `AskScoped` | `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration` | Every `ctx.ask()` exit. Ask-internal failures surface here, NOT via the workflow-level `error` event |
+| `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number` | Before each LLM call (one per loop turn) |
+| `agent_call_end` | `AskScoped` | `agent: string`, `model: string`, `cost: number`, `duration: number`, `data: AgentCallData` | After each LLM call returns |
+| `token` | `AskScoped` | `data: string` | Streaming text chunk. **Stream-only** — never persisted to `ExecutionInfo.events` |
+| `tool_call_start` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallStartData` | Before tool handler runs |
+| `tool_call_end` | `AskScoped` | `tool: string`, `callId: string`, `duration: number`, `cost?`, `data: ToolCallData` | After tool handler returns |
+| `tool_approval` | `AskScoped` | `tool: string`, `callId?`, `data: ToolApprovalData` | `requireApproval` gate fires (both approve and deny) |
+| `tool_denied` | `AskScoped` | `tool: string`, `callId?`, `data?: ToolDeniedData` | LLM names a tool the agent doesn't expose |
+| `delegate` | `AskScoped` | `data: DelegateData` | `ctx.delegate()` routes (including single-agent short-circuit) |
+| `handoff` | — (spans two asks) | `fromAskId`, `toAskId`, `sourceDepth`, `targetDepth`, `data: HandoffData` | One agent hands off to another |
+| `pipeline` | `AskScoped` | `status: 'start'\|'failed'\|'committed'`, `stage`, `attempt`, `maxAttempts`, `reason?` | Retry/validation lifecycle. **Reserved — emitted in PR 2** |
+| `partial_object` | `AskScoped` | `attempt: number`, `data: { object: unknown }` | Progressive structured output. **Reserved — emitted in PR 2** |
+| `verify` | `AskScoped` | `data: VerifyData` | `ctx.verify()` completes (pass or fail) |
+| `guardrail` / `schema_check` / `validate` | `Partial<AskScoped>` | `data: GuardrailData/SchemaCheckData/ValidateData` | Legacy gate events — collapsed into `pipeline` in PR 2 |
+| `log` | `Partial<AskScoped>` | `data: unknown` | `ctx.log()` user event |
+| `memory_remember` / `memory_recall` / `memory_forget` | `Partial<AskScoped>` | `data: MemoryEventData` | Memory ops audit |
+| `done` | — | `data: { result: unknown }` | Terminal — workflow completed |
+| `error` | `Partial<AskScoped>` | `data: { message: string, name?, code? }` | Terminal — non-ask-internal error (top-level workflow throws, infra/abort errors) |
+
+Per-variant data shape exports from `@axlsdk/axl`: `AgentCallData`, `ToolCallData`, `ToolCallStartData`, `ToolApprovalData`, `ToolDeniedData`, `HandoffData`, `DelegateData`, `VerifyData`, `WorkflowStartData`, `WorkflowEndData`, `MemoryEventData`, `GuardrailData`, `SchemaCheckData`, `ValidateData`. The constant tuple `AXL_EVENT_TYPES` is the single source of truth for the discriminator.
+
+**Cost double-counting guard:** `ask_end.cost` is the per-ask rollup of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). Custom accumulators must skip `ask_end`: `if (event.cost && event.type !== 'ask_end') total += event.cost`. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, and Studio's cost aggregator already apply this guard.
+
+### `AgentCallData` (data on `agent_call_end` events)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1177,7 +1231,7 @@ Every agent call, tool invocation, handoff, and system event emits a `TraceEvent
 | `retryReason` | `'schema' \| 'validate' \| 'guardrail'?` | Set when this call was triggered by a failed gate on the previous turn |
 | `messages` | `ChatMessage[]?` | Full conversation sent to the provider this turn. **Only populated when `config.trace.level === 'full'`** |
 
-### `GuardrailTraceData` / `SchemaCheckTraceData` / `ValidateTraceData` (symmetric shape)
+### `GuardrailData` / `SchemaCheckData` / `ValidateData` (symmetric shape)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1188,7 +1242,7 @@ Every agent call, tool invocation, handoff, and system event emits a `TraceEvent
 | `maxAttempts` | `number?` | Maximum attempts allowed before throwing. Equals `retries + 1` |
 | `feedbackMessage` | `string?` | The exact corrective message about to be injected into the conversation. **Only set when the check failed and a retry is happening** — gives observability into what the LLM sees between retry attempts |
 
-### `ToolApprovalTraceData` (data on `tool_approval` events)
+### `ToolApprovalData` (data on `tool_approval` events)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1196,15 +1250,13 @@ Every agent call, tool invocation, handoff, and system event emits a `TraceEvent
 | `args` | `unknown` | Tool arguments that were pending approval |
 | `reason` | `string?` | Denial reason (set only when `approved: false`) |
 
-### `ToolCallTraceData` (data on `tool_call` events)
+### `ToolCallStartData` / `ToolCallData` (`tool_call_start` / `tool_call_end`)
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `args` | `unknown` | Tool arguments received from the LLM |
-| `result` | `unknown?` | Tool return value |
-| `callId` | `string?` | Correlation id from the provider's tool call |
+`ToolCallStartData`: `{ args: unknown }` — the args the LLM provided.
 
-### `HandoffTraceData` (data on `handoff` events)
+`ToolCallData` (on `tool_call_end`): `{ args, result, callId? }` — args, return value, and provider correlation id.
+
+### `HandoffData` (data on `handoff` events)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1214,7 +1266,7 @@ Every agent call, tool invocation, handoff, and system event emits a `TraceEvent
 | `duration` | `number` | Wall-clock duration of the handoff in ms |
 | `message` | `string?` | The `message` argument the source agent passed when invoking `handoff_to_X` in roundtrip mode. Subject to `config.trace.redact` |
 
-### `DelegateTraceData` (data on `delegate` events)
+### `DelegateData` (data on `delegate` events)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1223,7 +1275,7 @@ Every agent call, tool invocation, handoff, and system event emits a `TraceEvent
 | `routerModel` | `string?` | Model URI used by the routing ask |
 | `reason` | `'single_candidate' \| 'routed'` | `'single_candidate'` on the short-circuit path (only one agent available), `'routed'` when a router was actually invoked |
 
-### `VerifyTraceData` (data on `verify` events)
+### `VerifyData` (data on `verify` events)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1231,13 +1283,13 @@ Every agent call, tool invocation, handoff, and system event emits a `TraceEvent
 | `attempts` | `number` | Number of attempts before the terminal outcome |
 | `lastError` | `string?` | Error message from the final failing attempt, when applicable |
 
-### `WorkflowStartTraceData` (data on `workflow_start` events)
+### `WorkflowStartData` (data on `workflow_start` events)
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `input` | `unknown` | Workflow input, after Zod schema validation. Subject to `config.trace.redact` |
 
-### `WorkflowEndTraceData` (data on `workflow_end` events)
+### `WorkflowEndData` (data on `workflow_end` events)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1247,10 +1299,23 @@ Every agent call, tool invocation, handoff, and system event emits a `TraceEvent
 | `error` | `string?` | Error message (when `status === 'failed'`). Subject to `config.trace.redact` |
 | `aborted` | `boolean?` | `true` when the execution ended via `AbortSignal` (user cancel, budget `hard_stop`, parent-scope abort). Lets consumers distinguish cancellation from genuine error |
 
+### `CallbackMeta` (passed to `onToken` / `onToolCall` / `onAgentStart`)
+
+```typescript
+type CallbackMeta = {
+  askId: string;
+  parentAskId?: string;
+  depth: number;
+  agent: string;
+};
+```
+
+Streaming callbacks now propagate to nested asks (child contexts inherit them). Filter on `meta.depth === 0` for root-only behavior. See [observability.md](./observability.md#streaming-callbacks-meta-parameter) for examples.
+
 ### Verbose trace mode and redaction
 
-- **`config.trace.level === 'full'`** opts into verbose mode: `agent_call.data.messages` is populated with the full `ChatMessage[]` sent to the provider on each turn. This grows with tool results and retry feedback across turns, so it's off by default
-- **`config.trace.redact === true`** is an **observability-boundary filter** — scrubs user/LLM content everywhere it would otherwise flow to observability consumers (trace events, Studio REST route responses, Studio WebSocket broadcasts). Structural metadata (workflow names, agent names, tool names, cost/token metrics, durations, roles, IDs, attempt counters, scorer scores) stays visible so the Trace Explorer, Memory Browser, Session Manager, Cost Dashboard, and Eval Runner all remain usable under compliance mode. See [`observability.md`](./observability.md#pii-and-redaction) for the complete per-route scrubbed/preserved table. Programmatic callers of `runtime.execute()` and direct `StateStore` access still receive raw values — redaction is an observability filter, not a data-at-rest transform. Access the flag from Studio consumers via `runtime.isRedactEnabled(): boolean`
+- **`config.trace.level === 'full'`** opts into verbose mode: `agent_call_end.data.messages` is populated with the full `ChatMessage[]` sent to the provider on each turn. This grows with tool results and retry feedback across turns, so it's off by default
+- **`config.trace.redact === true`** is an **observability-boundary filter** — scrubs user/LLM content everywhere it would otherwise flow to observability consumers (events, Studio REST route responses, Studio WebSocket broadcasts). Structural metadata (workflow names, agent names, tool names, cost/token metrics, durations, roles, IDs, attempt counters, scorer scores, ask-graph fields like `askId`/`parentAskId`/`depth`) stays visible so the Trace Explorer, Memory Browser, Session Manager, Cost Dashboard, and Eval Runner all remain usable under compliance mode. See [`observability.md`](./observability.md#pii-and-redaction) for the complete per-route scrubbed/preserved table. Programmatic callers of `runtime.execute()` and direct `StateStore` access still receive raw values — redaction is an observability filter, not a data-at-rest transform. Access the flag from Studio consumers via `runtime.isRedactEnabled(): boolean`
 
 ---
 
@@ -1340,7 +1405,7 @@ Per-item result from an eval run. `scores` provides quick numeric access; `score
 | `scorerCost` | `number?` | Total scorer cost for this item (sum of all `scoreDetails[*].cost`) |
 | `scoreDetails` | `Record<string, ScorerDetail>?` | Rich per-scorer data — includes `metadata` (e.g., LLM reasoning), per-scorer `duration`, and `cost` |
 | `metadata` | `Record<string, unknown>?` | Execution metadata forwarded from the runtime (e.g., `models`, `tokens`, `agentCalls`) |
-| `traces` | `TraceEvent[]?` | Per-item trace events. Populated only when the eval was run with `{ captureTraces: true }`. Includes events on the failure path (recovered from the `axlCapturedTraces` side-channel on thrown errors) |
+| `traces` | `AxlEvent[]?` | Per-item events. Populated only when the eval was run with `{ captureTraces: true }`. Includes events on the failure path (recovered from the `axlCapturedTraces` side-channel on thrown errors) |
 
 ### `EvalResult`
 

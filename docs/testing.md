@@ -46,7 +46,8 @@ describe('HandleSupport workflow', () => {
 
 | Mode | Usage | Description |
 |------|-------|-------------|
-| `MockProvider.sequence([...])` | Ordered responses | Returns responses in order. Fails if more calls than responses. |
+| `MockProvider.sequence([...])` | Ordered responses | Returns responses in order. Fails if more calls than responses. Each response accepts an optional `chunks?: string[]` to drive the streaming path one delta per chunk (must satisfy `chunks.join('') === content`). |
+| `MockProvider.chunked(contents, chunkSize?)` | Partial-content streaming | Convenience over `sequence()`: takes plain content strings and splits each into fixed-size chunks (default 4 chars ≈ 1 token). Use to exercise partial-JSON parsing, structural-boundary throttling, and cross-attempt token retention. |
 | `MockProvider.echo()` | Parrot mode | Returns the user prompt back as the response. Useful for testing plumbing. |
 | `MockProvider.json(schema)` | Schema-conforming | Generates random valid JSON matching the given Zod schema. Useful for fuzz testing `verify`. |
 | `MockProvider.replay(file)` | Recorded sessions | Replays a recorded session from a JSON file. See snapshot testing below. |
@@ -105,8 +106,15 @@ axl.mockProvider('openai', MockProvider.replay('./snapshots/support.json'));
 | `.toolCalls(name?)` | `ToolCall[]` | All tool calls made, optionally filtered by tool name. |
 | `.agentCalls(name?)` | `AgentCall[]` | All LLM calls made, optionally filtered by agent name. |
 | `.totalCost()` | `number` | Total cost incurred (0 if mocked). |
-| `.steps()` | `Step[]` | All workflow steps in execution order. |
-| `.traceLog()` | `TraceEvent[]` | Full structured trace of the execution. |
+| `.steps()` | `RecordedStep[]` | All workflow steps in execution order (test-runtime-internal recording). |
+| `.traceLog()` | `AxlEvent[]` | Full structured `AxlEvent` trace of the execution. Narrow on `event.type` (e.g., `'agent_call_end'`, `'tool_call_end'`). |
+
+Filter `traceLog()` results with the unified event tag names:
+
+```typescript
+const agentCalls = runtime.traceLog().filter((e) => e.type === 'agent_call_end');
+const toolCalls = runtime.traceLog().filter((e) => e.type === 'tool_call_end');
+```
 
 ## AxlTestRuntime
 

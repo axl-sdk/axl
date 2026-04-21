@@ -177,26 +177,39 @@ export function createServer(options: CreateServerOptions) {
   // ── Trace event bridging ───────────────────────────────────────────
   // Aggregators subscribe to runtime events directly via their start() method.
   // This listener handles trace channel broadcasting and decision events only.
-  const redactOn = runtime.isRedactEnabled();
+  // `isRedactEnabled()` is read per-event so a runtime that flips the flag
+  // at runtime (not the common path, but possible) reflects immediately.
   const traceListener = (event: unknown) => {
-    const traceEvent = event as AxlEvent;
+    // Wrap the whole body in try/catch so a throw in `redactStreamEvent`
+    // (malformed event shape) or `broadcastWithWildcard` (serialization
+    // error) doesn't propagate back through `EventEmitter.emit('trace')`
+    // and starve downstream listeners. Fail-loud to console.error so ops
+    // sees it in logs but the runtime keeps going.
+    try {
+      const traceEvent = event as AxlEvent;
 
-    // Broadcast to trace channels — apply the same scrubbing as the
-    // playground/workflow execution paths so the trace firehose doesn't
-    // leak content the per-route broadcasts are scrubbing.
-    if (traceEvent.executionId) {
-      connMgr.broadcastWithWildcard(
-        `trace:${traceEvent.executionId}`,
-        redactStreamEvent(traceEvent, redactOn),
+      // Broadcast to trace channels — apply the same scrubbing as the
+      // playground/workflow execution paths so the trace firehose doesn't
+      // leak content the per-route broadcasts are scrubbing.
+      if (traceEvent.executionId) {
+        connMgr.broadcastWithWildcard(
+          `trace:${traceEvent.executionId}`,
+          redactStreamEvent(traceEvent, runtime.isRedactEnabled()),
+        );
+      }
+
+      // Broadcast pending decisions
+      if (
+        traceEvent.type === 'log' &&
+        (traceEvent.data as { event?: string })?.event === 'await_human'
+      ) {
+        connMgr.broadcast('decisions', traceEvent);
+      }
+    } catch (err) {
+      console.error(
+        '[axl-studio] trace listener threw; event dropped:',
+        err instanceof Error ? err.message : String(err),
       );
-    }
-
-    // Broadcast pending decisions
-    if (
-      traceEvent.type === 'log' &&
-      (traceEvent.data as { event?: string })?.event === 'await_human'
-    ) {
-      connMgr.broadcast('decisions', traceEvent);
     }
   };
   runtime.on('trace', traceListener);

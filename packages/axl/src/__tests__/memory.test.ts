@@ -10,6 +10,12 @@ import { randomUUID } from 'node:crypto';
 import type { Embedder, EmbedResult } from '../memory/types.js';
 import type { AxlEvent } from '../types.js';
 
+/** Memory-event shape with typed `data`, for use with `.find` narrowing. */
+type MemoryEvent = Extract<
+  AxlEvent,
+  { type: 'memory_remember' | 'memory_recall' | 'memory_forget' }
+>;
+
 /**
  * Mock embedder that returns predictable vectors plus optional usage
  * reporting so we can exercise the cost-attribution path without a
@@ -433,44 +439,33 @@ describe('memory', () => {
       await ctx.forget('audit_key');
 
       const memoryEvents = traces.filter(
-        (t) =>
-          t.type === 'log' &&
-          typeof (t.data as Record<string, unknown>)?.event === 'string' &&
-          ((t.data as Record<string, unknown>).event as string).startsWith('memory_'),
+        (t): t is MemoryEvent =>
+          t.type === 'memory_remember' || t.type === 'memory_recall' || t.type === 'memory_forget',
       );
       expect(memoryEvents).toHaveLength(4);
 
-      const remember = memoryEvents.find(
-        (e) => (e.data as Record<string, unknown>).event === 'memory_remember',
-      );
+      const remember = memoryEvents.find((e) => e.type === 'memory_remember');
       expect(remember).toBeDefined();
-      const rememberData = remember!.data as Record<string, unknown>;
-      expect(rememberData.key).toBe('audit_key');
-      expect(rememberData.scope).toBe('session');
+      expect(remember!.data.key).toBe('audit_key');
+      expect(remember!.data.scope).toBe('session');
       // Critically: the value (which contains PII) is NOT in the trace
-      expect('value' in rememberData).toBe(false);
+      expect('value' in remember!.data).toBe(false);
 
       const recallHit = memoryEvents.find(
-        (e) =>
-          (e.data as Record<string, unknown>).event === 'memory_recall' &&
-          (e.data as Record<string, unknown>).key === 'audit_key',
+        (e) => e.type === 'memory_recall' && e.data.key === 'audit_key',
       );
       expect(recallHit).toBeDefined();
-      expect((recallHit!.data as Record<string, unknown>).hit).toBe(true);
+      expect(recallHit!.data.hit).toBe(true);
 
       const recallMiss = memoryEvents.find(
-        (e) =>
-          (e.data as Record<string, unknown>).event === 'memory_recall' &&
-          (e.data as Record<string, unknown>).key === 'missing_key',
+        (e) => e.type === 'memory_recall' && e.data.key === 'missing_key',
       );
       expect(recallMiss).toBeDefined();
-      expect((recallMiss!.data as Record<string, unknown>).hit).toBe(false);
+      expect(recallMiss!.data.hit).toBe(false);
 
-      const forget = memoryEvents.find(
-        (e) => (e.data as Record<string, unknown>).event === 'memory_forget',
-      );
+      const forget = memoryEvents.find((e) => e.type === 'memory_forget');
       expect(forget).toBeDefined();
-      expect((forget!.data as Record<string, unknown>).key).toBe('audit_key');
+      expect(forget!.data.key).toBe('audit_key');
     });
 
     it('emits memory_remember audit event with error field on failure (compliance)', async () => {
@@ -498,13 +493,10 @@ describe('memory', () => {
       // The audit trail MUST record the attempted write even though it failed
       // — that's the whole point of a compliance audit log. Before the fix
       // this event was only emitted on success, leaving failed writes invisible.
-      const rememberEvent = traces.find(
-        (t) => t.type === 'log' && (t.data as Record<string, unknown>)?.event === 'memory_remember',
-      );
+      const rememberEvent = traces.find((t): t is MemoryEvent => t.type === 'memory_remember');
       expect(rememberEvent).toBeDefined();
-      const data = rememberEvent!.data as Record<string, unknown>;
-      expect(data.key).toBe('audit_key');
-      expect(data.error).toBe('store unavailable');
+      expect(rememberEvent!.data.key).toBe('audit_key');
+      expect(rememberEvent!.data.error).toBe('store unavailable');
 
       // Restore for other tests in the suite
       failingStore.saveMemory = origSaveMemory;
@@ -539,21 +531,18 @@ describe('memory', () => {
 
       await ctx.remember('pet', 'I love my cat', { embed: true });
 
-      const remember = traces.find(
-        (t) => t.type === 'log' && (t.data as Record<string, unknown>)?.event === 'memory_remember',
-      );
+      const remember = traces.find((t): t is MemoryEvent => t.type === 'memory_remember');
       expect(remember).toBeDefined();
       // Top-level cost preserved (non-PII, load-bearing for trackExecution)
       expect(remember!.cost).toBe(0.000007);
       // data.usage is an object now; numeric fields inside preserved
-      const data = remember!.data as Record<string, unknown>;
-      const usage = data.usage as Record<string, unknown>;
+      const usage = remember!.data.usage!;
       expect(usage.tokens).toBe(12);
       expect(usage.cost).toBe(0.000007);
       // Model name scrubbed (could carry tenant ID)
       expect(usage.model).toBe('[redacted]');
       // Top-level key still redacted (conservative policy for strings)
-      expect(data.key).toBe('[redacted]');
+      expect(remember!.data.key).toBe('[redacted]');
     });
 
     it('preserves embedder cost when vectorStore.upsert fails after successful embed', async () => {
@@ -591,21 +580,17 @@ describe('memory', () => {
       );
 
       const errorEvent = traces.find(
-        (t) =>
-          t.type === 'log' &&
-          (t.data as Record<string, unknown>)?.event === 'memory_remember' &&
-          (t.data as Record<string, unknown>)?.error !== undefined,
+        (t): t is MemoryEvent => t.type === 'memory_remember' && t.data.error !== undefined,
       );
       expect(errorEvent).toBeDefined();
       // CRITICAL: cost attribution must survive the partial failure.
       expect(errorEvent!.cost).toBe(0.000009);
-      const data = errorEvent!.data as Record<string, unknown>;
-      expect(data.usage).toEqual({
+      expect(errorEvent!.data.usage).toEqual({
         cost: 0.000009,
         tokens: 18,
         model: 'mock-embed',
       });
-      expect(data.error).toBe('vectorStore write failed');
+      expect(errorEvent!.data.error).toBe('vectorStore write failed');
     });
 
     it('emits memory_remember audit event without cost on embedder failure', async () => {
@@ -634,17 +619,14 @@ describe('memory', () => {
       );
 
       const errorEvent = traces.find(
-        (t) =>
-          t.type === 'log' &&
-          (t.data as Record<string, unknown>)?.event === 'memory_remember' &&
-          (t.data as Record<string, unknown>)?.error !== undefined,
+        (t): t is MemoryEvent => t.type === 'memory_remember' && t.data.error !== undefined,
       );
       expect(errorEvent).toBeDefined();
       // Critically: cost must NOT be attributed for a failed embed call.
       // The embedder threw — no tokens consumed, no money spent.
       expect(errorEvent!.cost).toBeUndefined();
       // Error message is recorded for audit purposes.
-      expect((errorEvent!.data as Record<string, unknown>).error).toBe('embedder network failure');
+      expect(errorEvent!.data.error).toBe('embedder network failure');
     });
 
     it('redacts memory key when config.trace.redact is on', async () => {
@@ -664,18 +646,16 @@ describe('memory', () => {
 
       await ctx.remember('user:john@acme.com', { foo: 'bar' });
 
-      const remember = traces.find(
-        (t) => t.type === 'log' && (t.data as Record<string, unknown>)?.event === 'memory_remember',
-      );
-      const data = remember!.data as Record<string, unknown>;
-      // Event discriminator preserved
-      expect(data.event).toBe('memory_remember');
+      const remember = traces.find((t): t is MemoryEvent => t.type === 'memory_remember');
+      expect(remember).toBeDefined();
+      // Type discriminator preserved at the top level (not scrubbed)
+      expect(remember!.type).toBe('memory_remember');
       // Key (potentially PII) scrubbed
-      expect(data.key).toBe('[redacted]');
+      expect(remember!.data.key).toBe('[redacted]');
       // Scope is a string too, so it's redacted under the conservative policy
-      expect(data.scope).toBe('[redacted]');
+      expect(remember!.data.scope).toBe('[redacted]');
       // Booleans still visible
-      expect(data.embed).toBe(false);
+      expect(remember!.data.embed).toBe(false);
     });
 
     it('ctx.forget throws without stateStore', async () => {
@@ -737,22 +717,18 @@ describe('memory', () => {
       await ctx.remember('pet1', 'I love my cat', { embed: true });
       await ctx.recall('any-key', { query: 'cat' });
 
-      const rememberEvent = traces.find(
-        (t) => t.type === 'log' && (t.data as Record<string, unknown>)?.event === 'memory_remember',
-      );
+      const rememberEvent = traces.find((t): t is MemoryEvent => t.type === 'memory_remember');
       expect(rememberEvent).toBeDefined();
       // Top-level cost is what trackExecution's listener aggregates.
       expect(rememberEvent!.cost).toBe(0.000005);
       // usage is also nested into data for trace-explorer visibility.
-      expect((rememberEvent!.data as Record<string, unknown>).usage).toEqual({
+      expect(rememberEvent!.data.usage).toEqual({
         cost: 0.000005,
         tokens: 10,
         model: 'mock-embed',
       });
 
-      const recallEvent = traces.find(
-        (t) => t.type === 'log' && (t.data as Record<string, unknown>)?.event === 'memory_recall',
-      );
+      const recallEvent = traces.find((t): t is MemoryEvent => t.type === 'memory_recall');
       expect(recallEvent).toBeDefined();
       expect(recallEvent!.cost).toBe(0.000005);
     });
@@ -867,10 +843,8 @@ describe('memory', () => {
       await ctx.recall('name');
 
       const memEvents = traces.filter(
-        (t) =>
-          t.type === 'log' &&
-          typeof (t.data as Record<string, unknown>)?.event === 'string' &&
-          String((t.data as Record<string, unknown>).event).startsWith('memory_'),
+        (t): t is MemoryEvent =>
+          t.type === 'memory_remember' || t.type === 'memory_recall' || t.type === 'memory_forget',
       );
       // Neither operation hit the embedder, so no cost should be attached.
       for (const ev of memEvents) {

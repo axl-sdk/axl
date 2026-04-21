@@ -334,10 +334,14 @@ export type MemoryEventData = {
   usage?: { tokens?: number; cost?: number; model?: string };
   /** True when this memory op called the semantic recall path (vs. key-only). */
   embed?: boolean;
+  /** True when a key-only recall returned a value / semantic call path. */
+  semantic?: boolean;
   /** True when a key-only recall returned a value. */
   hit?: boolean;
   /** Result count for `recall` (alias for `count` retained for back-compat). */
   resultCount?: number;
+  /** Error message when the operation failed on the partial-failure path. */
+  error?: string;
 };
 
 /** Common fields carried by every `AxlEvent` regardless of `type`. */

@@ -314,22 +314,6 @@ export type HealthData = {
   tools: number;
 };
 
-/** Stream event (from WS).
- *
- *  TODO(PR-3-spec-16): The runtime currently translates `AxlEvent` into this
- *  legacy wire shape (`runtime.ts` adapter). PR 3 collapses the wire format to
- *  `AxlEvent` directly, at which point this type — and the `tool_call`/
- *  `tool_result`/`agent_start`/`agent_end`/`step` variants in particular —
- *  should be removed in favor of `AxlEvent`.
- */
-export type StreamEvent =
-  | { type: 'token'; data: string }
-  | { type: 'tool_call'; name: string; args: unknown; callId?: string }
-  | { type: 'tool_result'; name: string; result: unknown; callId?: string }
-  | { type: 'tool_approval'; name: string; args: unknown; approved: boolean; reason?: string }
-  | { type: 'agent_start'; agent: string; model?: string }
-  | { type: 'agent_end'; agent: string; cost?: number; duration?: number }
-  | { type: 'handoff'; source: string; target: string; mode?: 'oneway' | 'roundtrip' }
-  | { type: 'step'; step: number; data: AxlEvent }
-  | { type: 'done'; data: unknown }
-  | { type: 'error'; message: string };
+// Legacy `StreamEvent` removed in spec/16 PR 3 — the wire carries
+// `AxlEvent` directly. Consumers import `AxlEvent` from this module
+// and narrow on `event.type`.

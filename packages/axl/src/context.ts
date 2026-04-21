@@ -2826,11 +2826,10 @@ export class WorkflowContext<TInput = unknown> {
       // `usage` is also nested into the event `data` for trace-explorer
       // visibility (debuggers see the full model/cost/tokens breakdown).
       this.emitEvent({
-        type: 'log',
+        type: 'memory_remember',
         ...(usage?.cost != null ? { cost: usage.cost } : {}),
         ...(usage?.tokens != null ? { tokens: { input: usage.tokens } } : {}),
         data: {
-          event: 'memory_remember',
           key,
           scope,
           embed: options?.embed === true,
@@ -2852,11 +2851,10 @@ export class WorkflowContext<TInput = unknown> {
         this._accumulateBudgetCost(partialUsage.cost);
       }
       this.emitEvent({
-        type: 'log',
+        type: 'memory_remember',
         ...(partialUsage?.cost != null ? { cost: partialUsage.cost } : {}),
         ...(partialUsage?.tokens != null ? { tokens: { input: partialUsage.tokens } } : {}),
         data: {
-          event: 'memory_remember',
           key,
           scope,
           embed: options?.embed === true,
@@ -2922,25 +2920,23 @@ export class WorkflowContext<TInput = unknown> {
       // drop zero-cost-but-nonzero-token events. `usage` is also nested
       // into `data.usage` for trace inspection.
       this.emitEvent({
-        type: 'log',
+        type: 'memory_recall',
         ...(usage?.cost != null ? { cost: usage.cost } : {}),
         ...(usage?.tokens != null ? { tokens: { input: usage.tokens } } : {}),
         data: {
-          event: 'memory_recall',
           key,
           scope,
           semantic,
           hit,
-          ...(resultCount !== undefined ? { resultCount } : {}),
+          ...(resultCount !== undefined ? { resultCount, count: resultCount } : {}),
           ...(usage ? { usage } : {}),
         },
       });
       return data;
     } catch (err) {
       this.emitEvent({
-        type: 'log',
+        type: 'memory_recall',
         data: {
-          event: 'memory_recall',
           key,
           scope,
           semantic,
@@ -2967,14 +2963,13 @@ export class WorkflowContext<TInput = unknown> {
     try {
       await this.memoryManager.forget(key, this.stateStore, sessionId, options);
       this.emitEvent({
-        type: 'log',
-        data: { event: 'memory_forget', key, scope },
+        type: 'memory_forget',
+        data: { key, scope },
       });
     } catch (err) {
       this.emitEvent({
-        type: 'log',
+        type: 'memory_forget',
         data: {
-          event: 'memory_forget',
           key,
           scope,
           error: err instanceof Error ? err.message : String(err),
@@ -3182,6 +3177,12 @@ export class WorkflowContext<TInput = unknown> {
             ...(d.feedbackMessage !== undefined ? { feedbackMessage: '[redacted]' } : {}),
           };
         }
+      } else if (partial.type === 'tool_call_start') {
+        // Pre-execution args carry the same user PII as the post-execution
+        // tool_call_end. Scrub at emit time so direct `runtime.on('trace')`
+        // consumers and `ExecutionInfo.events` reads don't leak them.
+        const d = data as Record<string, unknown>;
+        data = { ...d, args: '[redacted]' };
       } else if (partial.type === 'tool_call_end') {
         // Tool args can carry user PII ("lookup SSN: 123-45-6789"), tool
         // results can carry full records from internal systems. Redact both
@@ -3193,6 +3194,39 @@ export class WorkflowContext<TInput = unknown> {
           args: '[redacted]',
           result: '[redacted]',
         };
+      } else if (partial.type === 'tool_denied') {
+        // The LLM named a tool the agent doesn't expose. `args` and `reason`
+        // can echo user intent verbatim.
+        const d = (data ?? {}) as Record<string, unknown>;
+        data = {
+          ...d,
+          ...(d.args !== undefined ? { args: '[redacted]' } : {}),
+          ...(d.reason !== undefined ? { reason: '[redacted]' } : {}),
+        };
+      } else if (partial.type === 'partial_object') {
+        // Progressive structured-output snapshots carry the same payload
+        // as the final result — same PII surface. Stream-only, but still
+        // flows through `onTrace` to any direct subscriber.
+        const d = data as Record<string, unknown>;
+        if (d.object !== undefined) {
+          data = { ...d, object: '[redacted]' };
+        }
+      } else if (partial.type === 'verify') {
+        // `lastError` echoes the verify predicate's failure message, which
+        // often quotes the LLM's output (the same text that's scrubbed on
+        // agent_call_end).
+        const d = data as Record<string, unknown>;
+        if (d.lastError !== undefined) {
+          data = { ...d, lastError: '[redacted]' };
+        }
+      } else if (partial.type === 'pipeline') {
+        // Only the `failed` status carries `reason` (the feedback message
+        // about to be injected into the conversation — quotes LLM output).
+        // Mutate the top-level field in-place; pipeline events don't use
+        // `data` for the reason.
+        if ((partial as { status?: string }).status === 'failed') {
+          (partial as Record<string, unknown>).reason = '[redacted]';
+        }
       } else if (partial.type === 'tool_approval') {
         const d = data as Record<string, unknown>;
         data = {
@@ -3225,6 +3259,53 @@ export class WorkflowContext<TInput = unknown> {
         if (d.result !== undefined) redacted.result = '[redacted]';
         if (d.error !== undefined) redacted.error = '[redacted]';
         data = redacted;
+      } else if (
+        partial.type === 'memory_remember' ||
+        partial.type === 'memory_recall' ||
+        partial.type === 'memory_forget'
+      ) {
+        // Memory-event data fields can carry PII (`key` may echo user
+        // input like "user:john@x.com"; `scope` may encode tenant ids;
+        // `usage.model` may expose the embedder URI). Conservative
+        // redaction: scrub all string fields; preserve numeric/boolean
+        // fields (load-bearing for the Cost Dashboard's byEmbedder
+        // bucket + trace-explorer row metadata). One-level object walk
+        // mirrors the legacy `log`-branch policy so `usage.tokens` and
+        // `usage.cost` stay visible while `usage.model` is scrubbed.
+        const d = data as Record<string, unknown>;
+        const redacted: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(d)) {
+          if (typeof v === 'number' || typeof v === 'boolean') {
+            redacted[k] = v;
+          } else if (typeof v === 'string') {
+            redacted[k] = '[redacted]';
+          } else if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+            const inner = v as Record<string, unknown>;
+            const innerRedacted: Record<string, unknown> = {};
+            for (const [ik, iv] of Object.entries(inner)) {
+              if (typeof iv === 'number' || typeof iv === 'boolean') {
+                innerRedacted[ik] = iv;
+              } else {
+                innerRedacted[ik] = '[redacted]';
+              }
+            }
+            redacted[k] = innerRedacted;
+          } else {
+            redacted[k] = '[redacted]';
+          }
+        }
+        data = redacted;
+      } else if (partial.type === 'done') {
+        // Terminal marker — `data.result` IS the workflow return value.
+        data = { result: '[redacted]' };
+      } else if (partial.type === 'error') {
+        // Terminal error marker — `data.message` can echo user / LLM
+        // content. `name` / `code` are structural and pass through.
+        const d = data as Record<string, unknown>;
+        data = {
+          ...d,
+          ...(d.message !== undefined ? { message: '[redacted]' } : {}),
+        };
       } else if (partial.type === 'log') {
         // `log` events can carry arbitrary user-emitted data (ctx.log) or
         // system events like await_human that include user-supplied prompts.

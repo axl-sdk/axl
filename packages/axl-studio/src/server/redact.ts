@@ -37,20 +37,9 @@ import type {
 } from '@axlsdk/axl';
 import type { EvalResult, EvalItem, ScorerDetail } from '@axlsdk/eval';
 
-// Stream events on the wire are now `AxlEvent` (translation layer deleted
-// in spec/16 PR 1 commit 4). The legacy `StreamEvent` shapes (token /
-// tool_call / tool_result / agent_start / agent_end / step / done /
-// error) no longer exist — consumers narrow on the AxlEvent union.
-//
-// PR 3 brings the full table-driven `redactAxlEvent` per spec §5.1.
-// What lives here through PR 1 commit 4 is a minimal subset that scrubs
-// the high-volume per-event PII surface (token content, tool args/results,
-// done/error payloads). Per-variant entries that need expansion in PR 3
-// are flagged with TODO(PR-3-spec-16-§5.1).
-//
-// TODO(PR-3-spec-16): delete this `StreamEvent` alias and rename
-// `redactStreamEvent` → `redactAxlEvent` once Studio panels migrate.
-export type StreamEvent = AxlEvent;
+// Stream events on the wire are `AxlEvent` — the translation layer was
+// deleted in PR 1 commit 4. The legacy `StreamEvent` shapes are gone;
+// consumers narrow on the AxlEvent union.
 
 const REDACTED = '[redacted]';
 
@@ -108,16 +97,23 @@ export function redactValue(value: unknown, redact: boolean): unknown {
  * Return a shallow-cloned ExecutionInfo with user-content fields scrubbed
  * when `redact` is true. Never mutates the input. When `redact` is false,
  * returns the input unchanged (reference equality preserved).
+ *
+ * Event scrubbing: every event in `events[]` is piped through
+ * `redactStreamEvent` to catch per-variant payloads that emit-time
+ * redaction may have missed (e.g., `partial_object.data.object`,
+ * `verify.data.lastError`, `pipeline.reason`, terminal `done`/`error`,
+ * `tool_call_start.data.args`, `tool_denied.data.*`). Defense in depth —
+ * core `emitEvent` scrubs most variants at emission, but the REST
+ * serialization boundary is the last line before PII leaves the
+ * observability envelope.
  */
 export function redactExecutionInfo(info: ExecutionInfo, redact: boolean): ExecutionInfo {
   if (!redact) return info;
-  // We only scrub fields that are known to carry workflow input/output.
-  // `steps` (trace events) are already redacted at `emitTrace` time when
-  // the runtime's `trace.redact` flag is set, so we don't touch them here.
   return {
     ...info,
     ...(info.result !== undefined ? { result: REDACTED } : {}),
     ...(info.error !== undefined ? { error: REDACTED } : {}),
+    events: info.events.map((e) => redactStreamEvent(e, true)),
   };
 }
 

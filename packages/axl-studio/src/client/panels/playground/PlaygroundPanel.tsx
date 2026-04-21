@@ -32,9 +32,14 @@ export function PlaygroundPanel() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [totalCost, setTotalCost] = useState(0);
   const [totalTokens, setTotalTokens] = useState({ input: 0, output: 0 });
-  // Spec/16 §5.10.1: subagent visibility drawer. Off by default so the
-  // default chat experience is unchanged; users opt in when they want
-  // to observe nested-ask activity (agent-as-tool, delegate, race).
+  // Spec/16 §5.10.1: subagent visibility drawer. Starts off so single-agent
+  // chats render unchanged, but auto-promotes to on the first time we
+  // observe a nested-ask event (`depth >= 1`) on the current stream —
+  // users with agent-as-tool / delegate / race setups don't have to
+  // toggle the drawer manually to see what their system just did. The
+  // effect below watches `stream.events` and flips the flag exactly once
+  // per session; explicit user-off still wins because the set call is
+  // conditional on the observation, not a hard override.
   const [showSubagents, setShowSubagents] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const processedEventsCount = useRef(0);
@@ -163,6 +168,23 @@ export function PlaygroundPanel() {
       }));
     }
   }, [stream.events]);
+
+  // Auto-enable the subagent drawer the first time we see a nested-ask
+  // event on this session's stream. Nested activity (agent-as-tool /
+  // delegate / race) is invisible without the drawer, so surface it
+  // proactively rather than making the user discover the toggle. We
+  // only flip `false → true`, never the reverse — an explicit user-off
+  // still wins (the effect's condition is a one-way latch).
+  useEffect(() => {
+    if (showSubagents) return;
+    for (const event of stream.events) {
+      const depth = (event as { depth?: number }).depth;
+      if ((depth ?? 0) >= 1) {
+        setShowSubagents(true);
+        return;
+      }
+    }
+  }, [stream.events, showSubagents]);
 
   // Auto-scroll
   useEffect(() => {

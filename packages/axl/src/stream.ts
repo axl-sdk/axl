@@ -1,6 +1,7 @@
 import { Readable } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { AXL_EVENT_TYPES, type AxlEvent, type AxlEventType } from './types.js';
+import { isRootLevel } from './event-utils.js';
 
 /**
  * A streamable workflow execution.
@@ -111,7 +112,7 @@ export class AxlStream extends Readable {
               // Root-only token text by default — consumers wanting nested
               // tokens too should iterate the whole stream and filter on
               // `event.depth >= 1` themselves.
-              if (value.type === 'token' && (value.depth ?? 0) === 0) {
+              if (value.type === 'token' && isRootLevel(value)) {
                 return { value: value.data, done: false };
               }
             }
@@ -182,14 +183,14 @@ export class AxlStream extends Readable {
     // Token accumulation for `fullText`. Root-only by default to preserve the
     // canonical "render this in a chat bubble" use case; nested-ask tokens
     // still flow through the iterator so consumers that want them can filter.
-    if (event.type === 'token' && (event.depth ?? 0) === 0) {
+    if (event.type === 'token' && isRootLevel(event)) {
       this.currentAttemptTokens.push(event.data);
     }
     // Pipeline lifecycle: commit on success, discard on failure. Spec §4.3.
     // Reading `fullText` between `committed` and `done` sees the correct
     // text — that's why we commit on `committed` (which fires before
     // `done`) rather than on `done`.
-    if (event.type === 'pipeline' && (event.depth ?? 0) === 0) {
+    if (event.type === 'pipeline' && isRootLevel(event)) {
       if (event.status === 'committed') {
         this.committedText += this.currentAttemptTokens.join('');
         this.currentAttemptTokens = [];

@@ -29,6 +29,12 @@ export {
   COST_BEARING_LEAF_TYPES,
 } from './event-utils.js';
 
+// Tolerant JSON parser — used internally for `partial_object` streaming.
+// Exported so consumers building their own progressive-render pipelines
+// can reuse the same truncation recovery + stack-overflow guard rails
+// we ship with the SDK.
+export { parsePartialJson } from './partial-json.js';
+
 // Session
 export { Session } from './session.js';
 export type { SessionOptions } from './session.js';

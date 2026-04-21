@@ -11,11 +11,11 @@ Axl had two parallel event models that duplicated each other:
 - `TraceEvent` — rich, persisted to `ExecutionInfo.steps`, the authoritative trace record.
 - `StreamEvent` — lean, emitted on the wire via `AxlStream`, derived from `TraceEvent` by a translation layer in `runtime.ts` that **dropped fields**.
 
-The duplication caused three user-visible bugs:
+The duplication caused three user-visible bugs that this release fixes:
 
-1. **Nested asks were half-visible** on the wire. Token streams and tool-call args from sub-agents were silently dropped.
-2. **Retries silently re-emitted tokens** in `AxlStream.fullText`, garbling output.
-3. **`validate + onToken` threw `INVALID_CONFIG`** rather than working — a defensive workaround for the retry-leak above.
+1. **Nested asks were half-visible** on the wire. Token streams and tool-call args from sub-agents were silently dropped. Now every nested ask flows to the same wire with `askId` / `parentAskId` / `depth` so consumers can group-by and reconstruct the tree.
+2. **Retries silently re-emitted tokens** in `AxlStream.fullText`, garbling output. Now `AxlStream.fullText` commits on `pipeline(status: 'committed')` and discards on `pipeline(status: 'failed')` — retried attempts never leak into the committed buffer.
+3. **`validate + onToken` threw `INVALID_CONFIG`** rather than working — a defensive workaround for the retry-leak above. That configuration is now supported end-to-end because the retry-leak is fixed at the source.
 
 This release collapses both models into one `AxlEvent` discriminated union. The wire format IS the trace format — same shape, full fidelity, zero translation. The translation layer is gone; the runtime is a pure fan-out.
 
@@ -188,17 +188,9 @@ If you use `SQLiteStore`, the `execution_history.steps` column is renamed to `ev
 
 If you query the table directly (outside `SQLiteStore.getExecution()`), update your SQL: `SELECT events FROM execution_history` instead of `SELECT steps`.
 
-## What's NOT in this release
+## Studio panels
 
-The following are reserved in the new `AxlEvent` union but not yet emitted — they land in a follow-up:
-
-- `pipeline` events (retry/validation lifecycle)
-- `partial_object` events (progressive structured output)
-- `AxlStream.fullText` commit-on-success (currently still concatenates retried attempts)
-
-The matching consumer code in this guide already references these — when they ship, your consumer needs no further changes.
-
-Studio panels (Playground, Workflow Runner, Trace Explorer) are migrated separately. If you embed Studio via `@axlsdk/studio/middleware`, your build will work in 0.16.x because the wire format IS the trace format and Studio's reducers handle both — but the panel UIs receive their full upgrade in the Studio PR.
+Studio panels (Playground, Workflow Runner, Trace Explorer) ship migrated in 0.16.x — there's no split-release gap. If you embed Studio via `@axlsdk/studio/middleware`, mount it in 0.16.x exactly as before; the wire format IS the trace format and the bundled React client consumes `AxlEvent` directly.
 
 ## FAQ
 
@@ -206,7 +198,18 @@ Studio panels (Playground, Workflow Runner, Trace Explorer) are migrated separat
 Deleted. The wire stream now carries `AxlEvent` directly. Narrow on `event.type` from the new union.
 
 **Q: I had `event.cost` accumulators. Anything to worry about?**
-Yes — `ask_end.cost` is a per-ask rollup. If you sum every event's `cost`, you'll double-count. The fix is to skip `ask_end` in your accumulator: `if (event.cost && event.type !== 'ask_end') total += event.cost`. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, and Studio's cost aggregator already do this.
+Yes — `ask_end.cost` is a per-ask rollup. If you sum every event's `cost`, you'll double-count. We ship `eventCostContribution(event)` from `@axlsdk/axl` as the single source of truth for the "skip ask_end, finite-check, leaf-only" invariant — use it instead of hand-rolling the guard:
+
+```ts
+import { eventCostContribution } from '@axlsdk/axl';
+
+let total = 0;
+for (const event of info.events) {
+  total += eventCostContribution(event);
+}
+```
+
+Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, and Studio's cost aggregator all call the same helper internally, so upstream behavior is guaranteed to stay in lockstep with yours.
 
 **Q: My tests fixture-built `TraceEvent` objects. How do I migrate?**
 Stamp the new required fields (`executionId`, `step`, `timestamp`) and use the new tag names. For ask-scoped events add `askId` and `depth`. Cast via `as unknown as AxlEvent` if your fixture is partial — the runtime invariants are what matter.

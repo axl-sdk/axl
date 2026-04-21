@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Send, ArrowRight, ShieldCheck, MessageSquarePlus, Network } from 'lucide-react';
-import { eventCostContribution } from '@axlsdk/axl';
+import { eventCostContribution } from '../../lib/event-utils';
 import { PanelShell } from '../../components/layout/PanelShell';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { StreamingText } from '../../components/shared/StreamingText';
@@ -154,7 +154,7 @@ export function PlaygroundPanel() {
     // (`memory_recall` / `memory_remember`) carry embedder-token
     // counts in a different category and shouldn't be conflated.
     for (const event of newEvents) {
-      addedCost += eventCostContribution(event as unknown as import('@axlsdk/axl').AxlEvent);
+      addedCost += eventCostContribution(event);
       if (event.type === 'agent_call_end' && event.tokens) {
         addedInput += event.tokens.input ?? 0;
         addedOutput += event.tokens.output ?? 0;

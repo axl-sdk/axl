@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Play, FlaskConical } from 'lucide-react';
-import { eventCostContribution } from '@axlsdk/axl';
+import { eventCostContribution } from '../../lib/event-utils';
 import { PanelHeader } from '../../components/layout/PanelHeader';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { JsonEditor } from '../../components/shared/JsonEditor';
@@ -121,10 +121,7 @@ export function WorkflowRunnerPanel() {
   const maxDuration = Math.max(...timelineEvents.map((e) => e.duration ?? 0), 1);
   const totalDuration = timelineEvents.reduce((sum, e) => sum + (e.duration ?? 0), 0);
   // Cost rollup via shared helper (spec §10) — single source of truth.
-  const totalCost = timelineEvents.reduce(
-    (sum, e) => sum + eventCostContribution(e as unknown as import('@axlsdk/axl').AxlEvent),
-    0,
-  );
+  const totalCost = timelineEvents.reduce((sum, e) => sum + eventCostContribution(e), 0);
 
   return (
     <div className="flex flex-col h-screen">

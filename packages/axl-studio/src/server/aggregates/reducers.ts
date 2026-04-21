@@ -68,6 +68,13 @@ export function reduceCost(acc: CostData, event: AxlEvent): CostData {
   // Early return for events with no cost data.
   if (event.cost == null && !event.tokens) return acc;
 
+  // ask_end carries a per-ask rollup of agent_call_end + tool_call_end
+  // costs that already passed through this reducer. Counting it would
+  // double-charge every ask. Spec/16 decision 10. The same guard lives
+  // in core (`runtime.ts` and `AxlTestRuntime._totalCost`) — Studio
+  // mirrors it because the reducer runs against the same event stream.
+  if (event.type === 'ask_end') return acc;
+
   const cost = finite(event.cost);
   const tokens = event.tokens ?? {};
 

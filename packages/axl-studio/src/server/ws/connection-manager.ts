@@ -28,7 +28,20 @@ interface ChannelBuffer {
 }
 
 const BUFFER_TTL_MS = 30_000; // Clean up buffers 30s after stream completes
-const MAX_BUFFER_EVENTS = 500; // Cap replay buffer size
+const MAX_BUFFER_EVENTS = 1000; // Cap replay buffer size (raised from 500 in
+// spec/16 §5.2 to absorb nested-ask volume —
+// ~10 nested asks × ~20 structural events
+// each, with headroom).
+
+/**
+ * Stream-only event types excluded from the replay buffer entirely.
+ * Late subscribers to an in-flight stream don't need per-token chatter
+ * or per-delta progressive-render snapshots — they reconstruct the same
+ * info from the final `agent_call_end` (token aggregates) and `done`
+ * (final result). Both types are stream-only ergonomics, not
+ * correctness-critical for replay. Spec/16 §5.2.
+ */
+const UNBUFFERED_EVENT_TYPES = new Set(['token', 'partial_object']);
 
 /** WS frame size soft cap. Used for both the inbound message reject in
  *  `protocol.ts` and the outbound broadcast truncation below — keeping them
@@ -212,10 +225,14 @@ export class ConnectionManager {
         buffer = { events: [], complete: false };
         this.buffers.set(channel, buffer);
       }
-      // Always buffer terminal events; skip non-terminal if at capacity
+      // Always buffer terminal events; skip non-terminal if at capacity;
+      // never buffer high-volume types (token, partial_object) per
+      // spec/16 §5.2 — late subscribers reconstruct the same info from
+      // structural events.
       const event = data as { type?: string };
       const isTerminal = event.type === 'done' || event.type === 'error';
-      if (buffer.events.length < MAX_BUFFER_EVENTS || isTerminal) {
+      const isUnbuffered = event.type !== undefined && UNBUFFERED_EVENT_TYPES.has(event.type);
+      if (!isUnbuffered && (buffer.events.length < MAX_BUFFER_EVENTS || isTerminal)) {
         buffer.events.push({ msg, data });
       }
 

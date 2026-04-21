@@ -124,6 +124,49 @@ for a step-by-step consumer migration guide.
   see the growing buffer; post-`pipeline(committed)` reads see the
   canonical winning text. Spec §4.3.
 
+#### Studio — adoption (spec §5)
+
+- **Fixed: cost double-count in Studio reducers.** `reduceCost` now
+  skips `ask_end` events to match the per-ask rollup contract (decision
+  10) — previously the cost dashboard would double-charge any execution
+  that emitted an `ask_end` (every ctx.ask call). Mirrors the same
+  guard in core `runtime.ts` and `AxlTestRuntime`.
+- **`redactStreamEvent` covers the full per-variant table** (spec §5.1):
+  `tool_denied`, `partial_object`, `verify`, `memory_*`, `pipeline`
+  (failed.reason), in addition to the partial set landed in PR 1.
+  Numeric metrics (`cost`, `tokens`, `duration`) and structural
+  metadata (`askId`, `parentAskId`, `depth`, `agent`, `executionId`,
+  `step`, `timestamp`) are NEVER scrubbed.
+- **WS replay buffer excludes `token` and `partial_object`**
+  (spec §5.2). Late subscribers no longer receive 10k token events on
+  reconnect — they reconstruct the same info from the final
+  `agent_call_end` (token aggregates) and `done` (final result).
+  `MAX_BUFFER_EVENTS` raised from 500 → 1000 to absorb nested-ask
+  structural-event volume.
+- **Client `EVENT_COLORS` covers all new variants** (`ask_start`,
+  `ask_end`, `agent_call_start`, `tool_call_start`, `pipeline`,
+  `partial_object`, `memory_*`). The Trace Explorer now renders these
+  with their own colors instead of falling back to grey.
+- **`isFailureEvent` recognizes `pipeline(failed)` and
+  `ask_end(outcome.ok: false)`** as failure signals so the trace
+  waterfall highlights them in red.
+- **`getDepth(event)` reads the native `event.depth` field** (spec/16
+  §3.1) instead of inferring from the deprecated `parentToolCallId`.
+  Reflects the actual call graph including nested asks via
+  agent-as-tool / delegate / race / parallel paths.
+- Client `AxlEvent` type extended with all new optional fields:
+  `askId`, `parentAskId`, `depth`, `outcome`, `status`, `stage`,
+  `attempt`, `maxAttempts`, `reason`, `prompt`, `fromAskId`, `toAskId`,
+  `sourceDepth`, `targetDepth`. Loose on the client per the existing
+  pattern; strict server-side via `@axlsdk/axl#AxlEvent`.
+
+Studio panel migration (Playground / Workflow Runner / Trace Explorer
+UI upgrades to render `AskTree` / `PartialObjectRenderer` /
+`RetryIndicator` / `AskDetails` components per spec §5.9, §5.10.x) is
+deferred to a follow-up — the current panels work correctly with the
+new wire format via `TraceEventList`. The follow-up is pure UX, not
+correctness.
+
 ### Deprecated
 
 - `AxlEventBase.parentToolCallId` is `@deprecated` (one-cycle window).

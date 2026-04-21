@@ -107,6 +107,7 @@ export type AxlEvent = {
   type: string;
   agent?: string;
   tool?: string;
+  callId?: string;
   model?: string;
   promptVersion?: string;
   timestamp: number;
@@ -114,8 +115,37 @@ export type AxlEvent = {
   cost?: number;
   tokens?: { input: number; output: number; reasoning?: number };
   data?: unknown;
-  /** When set, this event was emitted from a nested child context (agent-as-tool).
-   *  Value is the `callId` of the outer `tool_call` that spawned it. */
+  /** Ask correlation (spec/16 §2.1). Present on every ask-scoped variant
+   *  — group by `askId`, link parents via `parentAskId`, indent by
+   *  `depth` (0 = root ask; +1 per nested ctx.ask()). Absent on
+   *  workflow lifecycle / error / done events and on `handoff` (which
+   *  spans two asks via `fromAskId` / `toAskId` instead). */
+  askId?: string;
+  parentAskId?: string;
+  depth?: number;
+  /** Discriminated outcome on `ask_end` events. */
+  outcome?: { ok: true; result: unknown } | { ok: false; error: string };
+  /** `pipeline` event status (spec/16 §4.2). */
+  status?: 'start' | 'failed' | 'committed';
+  /** `pipeline` event stage. */
+  stage?: 'initial' | 'schema' | 'validate' | 'guardrail';
+  /** `pipeline` / `partial_object` attempt counter. */
+  attempt?: number;
+  maxAttempts?: number;
+  /** `pipeline(failed).reason`: feedback message about to be injected. */
+  reason?: string;
+  /** `ask_start.prompt`. */
+  prompt?: string;
+  /** `handoff` correlation: from/to askIds and their depths. */
+  fromAskId?: string;
+  toAskId?: string;
+  sourceDepth?: number;
+  targetDepth?: number;
+  /**
+   * @deprecated Use `parentAskId` for ask-graph correlation. Kept one
+   * minor cycle for telemetry consumers that still grep agent-as-tool
+   * call graphs by tool callId.
+   */
   parentToolCallId?: string;
 };
 

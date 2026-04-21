@@ -222,18 +222,36 @@ export function redactSessionHistory(history: ChatMessage[], redact: boolean): C
 
 /**
  * Scrub an `AxlEvent` before broadcasting it to Studio WS subscribers.
- * Playground and workflow-execute routes pipe `runtime.stream()` events
- * directly to WS channels; under `trace.redact`, raw token content and
- * tool call results would otherwise leak through untouched.
+ * Playground, workflow-execute, AND the trace-channel firehose all run
+ * events through this function under `trace.redact: true`. The core
+ * `emitEvent` already redacts most fields at emission time (prompts,
+ * responses, system, etc.); this function is the wire-boundary
+ * defense-in-depth pass.
  *
- * The core `emitEvent` already redacts most fields at emission time
- * (prompts, responses, system, etc.). This function applies a second
- * pass for fields that pass through the wire boundary — defense in
- * depth.
+ * Per-variant scrubbing per spec §5.1:
  *
- * TODO(PR-3-spec-16-§5.1): the full per-variant redaction table
- * (delegate, pipeline, partial_object, memory_*, verify) lands in PR 3
- * with table-driven tests.
+ * | Event             | Scrubbed                          | Preserved (structural) |
+ * | ----------------- | --------------------------------- | ---------------------- |
+ * | token             | data (token text)                 | askId/depth/agent      |
+ * | tool_call_start   | data.args                         | tool/callId/askId      |
+ * | tool_call_end     | data.args, data.result            | tool/callId/duration   |
+ * | tool_approval     | data.args, data.reason            | data.approved/tool     |
+ * | tool_denied       | data.args, data.reason            | tool/callId            |
+ * | ask_start         | prompt                            | askId/agent/depth      |
+ * | ask_end           | outcome.{result,error}            | cost/duration/ok       |
+ * | handoff           | data.message (roundtrip arg)      | source/target/mode     |
+ * | partial_object    | data.object                       | attempt/askId          |
+ * | verify            | data.lastError                    | passed/attempts        |
+ * | memory_*          | data.key                          | scope/count/cost       |
+ * | done              | data.result                       | -                      |
+ * | error             | data.message                      | data.name/code         |
+ * | delegate          | (nothing — all structural)        | all                    |
+ * | pipeline          | reason (only on `failed`)         | stage/status/attempt   |
+ *
+ * Top-level `cost`, `tokens`, `duration` are NEVER scrubbed (numeric
+ * observability metrics). `askId`/`parentAskId`/`depth`/`agent`/
+ * `executionId`/`step`/`timestamp` are NEVER scrubbed (random IDs and
+ * structural metadata).
  */
 export function redactStreamEvent(event: AxlEvent, redact: boolean): AxlEvent {
   if (!redact) return event;
@@ -253,6 +271,19 @@ export function redactStreamEvent(event: AxlEvent, redact: boolean): AxlEvent {
           ...(event.data.reason !== undefined ? { reason: REDACTED } : {}),
         },
       };
+    case 'tool_denied':
+      // The variant carries `data?: ToolDeniedData` — may be undefined.
+      // Scrub args/reason if present; preserve callId for correlation.
+      return event.data
+        ? {
+            ...event,
+            data: {
+              ...event.data,
+              ...(event.data.args !== undefined ? { args: REDACTED } : {}),
+              ...(event.data.reason !== undefined ? { reason: REDACTED } : {}),
+            },
+          }
+        : event;
     case 'done':
       return { ...event, data: { result: REDACTED } };
     case 'error':
@@ -267,9 +298,34 @@ export function redactStreamEvent(event: AxlEvent, redact: boolean): AxlEvent {
       return event.data.message !== undefined
         ? { ...event, data: { ...event.data, message: REDACTED } }
         : event;
+    case 'partial_object':
+      // Progressive structured-output snapshots — same risk surface as
+      // the final result on `done`.
+      return { ...event, data: { object: REDACTED } };
+    case 'verify':
+      return event.data.lastError !== undefined
+        ? { ...event, data: { ...event.data, lastError: REDACTED } }
+        : event;
+    case 'memory_remember':
+    case 'memory_recall':
+    case 'memory_forget':
+      // `key` may echo user input on semantic recall. `scope`, `count`,
+      // numeric `cost` and `usage.tokens` are structural — preserve.
+      return event.data.key !== undefined
+        ? { ...event, data: { ...event.data, key: REDACTED } }
+        : event;
+    case 'pipeline':
+      // Only the `failed` status carries `reason` (the feedback message
+      // about to be injected into the conversation — may echo user
+      // input or LLM output).
+      return event.status === 'failed' ? { ...event, reason: REDACTED } : event;
     // Structural / numeric events pass through. `agent_call_end` and
-    // gate events (guardrail/schema_check/validate) are scrubbed at
-    // emission time by core `emitEvent` — second-pass would be wasteful.
+    // legacy gate events (guardrail/schema_check/validate) are scrubbed
+    // at emission time by core `emitEvent` — second-pass would be
+    // wasteful and could mask a missing emitter-level scrub.
+    // `delegate`, `agent_call_start`, `tool_call_start` (data.args
+    // already scrubbed above), `workflow_*`, `log` (already scrubbed at
+    // emission) all fall through.
     default:
       return event;
   }

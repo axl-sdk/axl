@@ -198,9 +198,102 @@ for a step-by-step consumer migration guide.
   filters `events` to those with `step > since`. Monotonic per-execution
   and shared across nested asks (spec §3.7), so polling clients can
   request only the tail since their last known step without missing
-  concurrent-branch events. Malformed `since` (non-integer, negative)
-  falls through to the full events array — stale clients can't crash
-  the panel. Client `fetchExecution(id, since?)` helper added.
+  concurrent-branch events. `since=-1` is now an explicit "everything
+  from step 0" sentinel; malformed `since` (non-integer, NaN, Infinity,
+  fractional) returns a 400 `INVALID_PARAM` envelope instead of silently
+  falling through. Client `fetchExecution(id, since?)` helper added.
+
+#### Unified event model — post-spec multi-perspective review
+
+Follow-up hardening after the full review pass across UX, architecture,
+bugs/edge-cases, and security/operational perspectives. All fixes ship
+in this release; no separate minor cycle.
+
+- **`eventCostContribution(event)` helper** exported from `@axlsdk/axl`
+  as the single source of truth for the spec §10 "skip ask_end rollup,
+  finite-check, leaf-only" cost invariant. The runtime accumulator,
+  `AxlTestRuntime`, `trackExecution`, Studio's `reduceCost`, and the
+  Playground/Workflow Runner UI panels all now call the helper instead
+  of hand-rolling the guard. Also exported: `isRootLevel(event)`,
+  `isCostBearingLeaf(event)`, `COST_BEARING_LEAF_TYPES`.
+- **`parsePartialJson` exported** from `@axlsdk/axl` so consumers
+  building their own progressive-render pipelines can reuse the
+  truncation-recovery parser. 256-depth cap guards against
+  adversarial provider output.
+- **Token and `partial_object` events are NOT persisted** to
+  `ExecutionInfo.events` — they were already excluded from the WS
+  replay buffer; this change brings the REST `events[]` array into line
+  so REST consumers don't get token floods either, and per-route
+  redaction can't be bypassed by trusting emit-time scrub alone.
+- **Memory-op events are typed variants** (`memory_remember`,
+  `memory_recall`, `memory_forget`) instead of sub-discriminating the
+  `log` catch-all bucket. Consumers narrow directly on `event.type`
+  and get typed access to `data.{key,scope,usage,hit,…}` without
+  hand-casting.
+- **Emit-time redaction covers all variants** that carry LLM/user
+  content: `tool_call_start`, `tool_denied`, `partial_object`,
+  `verify`, `pipeline(failed).reason`, terminal `done`/`error`.
+  Previously these passed through unredacted on the trace channel.
+  `redactExecutionInfo` also pipes every event through
+  `redactStreamEvent` so REST serialization is a second-pass defense-
+  in-depth.
+- **`runtime.isRedactEnabled()` is consulted per-event** in the trace
+  listener (not cached at listener construction), so runtime config
+  flips propagate. The trace listener is wrapped in try/catch with a
+  fail-loud `console.error` so a buggy event shape can't starve
+  downstream listeners.
+- **Studio REST `GET /api/executions/:id?since=…` returns 400** with a
+  `{code: 'INVALID_PARAM', param: 'since'}` envelope for malformed
+  inputs (non-integer / NaN / Infinity). `since=-1` is a valid
+  "everything from step 0" sentinel.
+- **WS frame budget measured in bytes** via `Buffer.byteLength(msg,
+  'utf8')` instead of UTF-16 `msg.length`. Emoji / CJK payloads could
+  previously pass the 64KB length check yet serialize to >128KB on the
+  wire, re-introducing silent-drop behavior.
+- **Partial-JSON parser has a 256-level recursion cap.** Adversarial
+  `[[[[[...]]]]]` input used to exhaust V8's default ~10k-frame stack
+  and crash the workflow; now it throws a `SyntaxError` instead.
+- **`partial_object` throttle is string-safe.** A small char-by-char
+  walker tracks `inString` + `escaped` state across chunks so commas
+  inside string values no longer trigger per-comma parse+emit. On a
+  prose-heavy description field with 50 commas, this drops event
+  volume from 50+ emissions to 1.
+- **SQLite migration re-reads `user_version` inside `BEGIN IMMEDIATE`**
+  so a concurrent constructor race can't double-apply a non-idempotent
+  migration (the current v0→v1 ALTER is idempotent, but future steps
+  may not be).
+- **Handoff `toAskId` is a real ask frame.** The target agent's
+  `executeAgentCall` now runs under `askStorage.run(targetFrame, …)`
+  so its events carry `askId === handoffToAskId` and
+  `parentAskId === handoffFromAskId`. Consumers grouping by askId no
+  longer see the handoff as an orphan; UI tree-builders link the
+  target to the source automatically.
+- **WS replay buffer resource caps.** `MAX_ACTIVE_BUFFERS = 256` (global
+  concurrent buffer cap, oldest-complete-first eviction) and
+  `MAX_BUFFER_BYTES = 4 MB` (per-buffer byte budget, terminal `done`/
+  `error` always buffered). Closes DoS vectors on high-churn deployments.
+- **`AxlStream.textByAsk` iterator** yields `{askId, agent?, text}`
+  pairs tagged with the producing ask frame. Complements `.text`
+  (root-only) for split-pane UIs that render each sub-agent's output
+  in its own lane without iterating the raw event stream.
+- **`AxlEventBase.cost` JSDoc** clarifies the dual "leaf cost vs
+  per-ask rollup" semantics and points at `eventCostContribution` so
+  consumers don't write the naive accumulator.
+- **Playground subagent drawer auto-enables** the first time a
+  nested-ask event lands on the current stream — users with
+  agent-as-tool / delegate / race setups don't have to discover the
+  toggle to see what their system just did. Explicit user-off still
+  wins (one-way latch).
+- **`AxlStream._done` / `_error` require `executionId`** explicitly
+  (no default). `runtime.stream()` now allocates the id BEFORE the
+  async closure so terminal events always carry it, even when `run()`
+  throws before `execInfo` is assigned.
+- **Dead code purged from aggregators.** The `type: 'log'` +
+  `data.event: 'workflow_*'` / `'memory_*'` log-form fallback shipped
+  through 0.14.x was already removed from the emitter in 0.15.0 but
+  lingered in `reduceCost`, `CostAggregator`, and
+  `ExecutionAggregator.start`. All three read typed discriminators
+  directly now. `isLogEvent` helper deleted.
 
 ### Deprecated
 

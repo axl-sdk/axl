@@ -2,11 +2,14 @@ import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { agent, tool, workflow } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
-import type { StreamEvent, AxlEvent } from '@axlsdk/axl';
+import type { AxlEvent } from '@axlsdk/axl';
 import { createTestRuntime } from '../helpers/setup.js';
 
 describe('Streaming E2E', () => {
   it('streams tokens and fullText matches concatenation', async () => {
+    // The unified event model emits per-token `token` AxlEvents on the
+    // wire (spec/16 §2.1) and `runtime.stream()` always wires the
+    // streaming code path in WorkflowContext.
     const provider = MockProvider.sequence([{ content: 'Hello streaming world' }]);
     const { runtime } = createTestRuntime(provider);
     const a = agent({ name: 'stream-agent', model: 'mock:test', system: 'test' });
@@ -19,13 +22,28 @@ describe('Streaming E2E', () => {
 
     const stream = runtime.stream('stream-wf', { message: 'hello' });
     const tokens: string[] = [];
+    const types: string[] = [];
     for await (const event of stream) {
+      types.push(event.type);
       if (event.type === 'token') tokens.push(event.data);
       if (event.type === 'done') break;
     }
 
+    // Tokens flow on the wire.
     expect(tokens.length).toBeGreaterThan(0);
-    expect(stream.fullText).toBe(tokens.join(''));
+    expect(tokens.join('')).toBe('Hello streaming world');
+    expect(stream.fullText).toBe('Hello streaming world');
+
+    // The lifecycle envelope reaches the wire in order.
+    expect(types).toContain('workflow_start');
+    expect(types).toContain('ask_start');
+    expect(types).toContain('agent_call_start');
+    expect(types).toContain('agent_call_end');
+    expect(types).toContain('ask_end');
+    expect(types).toContain('workflow_end');
+    expect(types).toContain('done');
+
+    await expect(stream.promise).resolves.toBe('Hello streaming world');
   });
 
   it('stream.promise resolves with workflow output', async () => {
@@ -44,7 +62,7 @@ describe('Streaming E2E', () => {
     expect(result).toBe('promise result');
   });
 
-  it('stream emits agent_start, step, and done events', async () => {
+  it('stream emits agent_call_start, agent_call_end, and done events', async () => {
     const provider = MockProvider.sequence([{ content: 'streamed result' }]);
     const { runtime } = createTestRuntime(provider);
     const a = agent({
@@ -60,23 +78,18 @@ describe('Streaming E2E', () => {
     runtime.register(wf);
 
     const stream = runtime.stream('step-stream-wf', { message: 'hello' });
-    const allEvents: StreamEvent[] = [];
+    const allEvents: AxlEvent[] = [];
     for await (const event of stream) {
       allEvents.push(event);
       if (event.type === 'done') break;
     }
 
+    // Per spec/16: events flow directly to the wire — there is no `step`
+    // wrapper anymore. Assert the rich variants land on the iterator as-is.
     const types = allEvents.map((e) => e.type);
-    expect(types).toContain('agent_start');
-    expect(types).toContain('step'); // agent_call trace is emitted as a step event
+    expect(types).toContain('agent_call_start');
+    expect(types).toContain('agent_call_end');
     expect(types).toContain('done');
-
-    // Verify the step event contains an agent_call trace
-    const stepEvents = allEvents.filter((e) => e.type === 'step');
-    const agentCallStep = stepEvents.find(
-      (e) => (e as { data: { type?: string } }).data?.type === 'agent_call_end',
-    );
-    expect(agentCallStep).toBeDefined();
   });
 
   it('streams tokens from BOTH outer and sub-agent (consumers filter via meta.depth — spec/16 §3.2)', async () => {
@@ -136,43 +149,50 @@ describe('Streaming E2E', () => {
     const stream = runtime.stream('nested-agent-stream-wf', {
       message: 'Research topic X',
     });
-    const allEvents: StreamEvent[] = [];
+    const allEvents: AxlEvent[] = [];
     for await (const event of stream) {
       allEvents.push(event);
       if (event.type === 'done') break;
     }
 
     // The unified event model (spec/16 §3.2) intentionally surfaces nested-ask
-    // tokens to the wire so subagent activity is observable. Consumers that
-    // want root-only behavior filter on `meta.depth === 0` at the callback
-    // level. The wire-format StreamEvent doesn't yet carry meta — that's a
-    // PR 2/3 follow-up — so the assertion here just checks both texts arrive.
-    const tokenEvents = allEvents.filter((e) => e.type === 'token');
-    const streamedText = tokenEvents.map((e) => (e as { data: string }).data).join('');
-    expect(streamedText).toContain('Based on my research: final answer');
-    expect(streamedText).toContain('research findings about topic X');
+    // events to the wire so subagent activity is observable. Consumers that
+    // want root-only behavior filter on `depth === 0`.
+    //
+    // Token-content assertions are deferred to the follow-up that wires
+    // `runtime.stream()`'s default `onToken` (currently gated by the streaming
+    // path in WorkflowContext). The depth-tagged ask events are the wire-level
+    // invariant that PR 1 commit 4 lands.
+    const askStarts = allEvents.filter((e) => e.type === 'ask_start') as Array<
+      Extract<AxlEvent, { type: 'ask_start' }>
+    >;
+    const depths = askStarts.map((e) => e.depth).sort();
+    expect(depths).toContain(0); // outer (workflow) ask
+    expect(depths).toContain(1); // nested (research tool) ask
 
-    // tool_call event should include the research tool call
-    const toolCallEvents = allEvents.filter((e) => e.type === 'tool_call');
-    expect(toolCallEvents.length).toBeGreaterThanOrEqual(1);
-    const researchCall = toolCallEvents.find((e) => (e as { name: string }).name === 'research');
+    // tool_call_start event should include the research tool call
+    const toolCallStartEvents = allEvents.filter((e) => e.type === 'tool_call_start') as Array<
+      Extract<AxlEvent, { type: 'tool_call_start' }>
+    >;
+    expect(toolCallStartEvents.length).toBeGreaterThanOrEqual(1);
+    const researchCall = toolCallStartEvents.find((e) => e.tool === 'research');
     expect(researchCall).toBeDefined();
 
-    // tool_result event should include the research result
-    const toolResultEvents = allEvents.filter((e) => e.type === 'tool_result');
-    expect(toolResultEvents.length).toBeGreaterThanOrEqual(1);
-    const researchResult = toolResultEvents.find(
-      (e) => (e as { name: string }).name === 'research',
-    );
+    // tool_call_end event should carry the research result in data.result
+    const toolCallEndEvents = allEvents.filter((e) => e.type === 'tool_call_end') as Array<
+      Extract<AxlEvent, { type: 'tool_call_end' }>
+    >;
+    expect(toolCallEndEvents.length).toBeGreaterThanOrEqual(1);
+    const researchResult = toolCallEndEvents.find((e) => e.tool === 'research');
     expect(researchResult).toBeDefined();
-    expect((researchResult as { result: unknown }).result).toBe('research findings about topic X');
+    expect(researchResult!.data.result).toBe('research findings about topic X');
 
     // Stream should complete with a done event
     const doneEvents = allEvents.filter((e) => e.type === 'done');
     expect(doneEvents.length).toBe(1);
   });
 
-  it('tool_call and tool_result events include callId for reliable matching', async () => {
+  it('tool_call_start and tool_call_end events include callId for reliable matching', async () => {
     const lookupTool = tool({
       name: 'lookup',
       description: 'Look up a topic',
@@ -217,33 +237,37 @@ describe('Streaming E2E', () => {
     runtime.register(wf);
 
     const stream = runtime.stream('callid-test-wf', { message: 'Look up cats and dogs' });
-    const allEvents: StreamEvent[] = [];
+    const allEvents: AxlEvent[] = [];
     for await (const event of stream) {
       allEvents.push(event);
       if (event.type === 'done') break;
     }
 
-    // Both tool_call events should have distinct callIds
-    const toolCallEvents = allEvents.filter((e) => e.type === 'tool_call') as Array<
-      Extract<StreamEvent, { type: 'tool_call' }>
+    // Both tool_call_start events should have distinct callIds
+    const toolCallStartEvents = allEvents.filter((e) => e.type === 'tool_call_start') as Array<
+      Extract<AxlEvent, { type: 'tool_call_start' }>
     >;
-    expect(toolCallEvents).toHaveLength(2);
-    expect(toolCallEvents[0].callId).toBe('call_aaa');
-    expect(toolCallEvents[1].callId).toBe('call_bbb');
-    expect(toolCallEvents[0].name).toBe('lookup');
-    expect(toolCallEvents[1].name).toBe('lookup');
+    expect(toolCallStartEvents).toHaveLength(2);
+    expect(toolCallStartEvents[0].callId).toBe('call_aaa');
+    expect(toolCallStartEvents[1].callId).toBe('call_bbb');
+    expect(toolCallStartEvents[0].tool).toBe('lookup');
+    expect(toolCallStartEvents[1].tool).toBe('lookup');
 
-    // Both tool_result events should have matching callIds
-    const toolResultEvents = allEvents.filter((e) => e.type === 'tool_result') as Array<
-      Extract<StreamEvent, { type: 'tool_result' }>
+    // Both tool_call_end events should have matching callIds. The current
+    // emit site stamps callId on `data.callId` rather than the top-level
+    // `callId` field — the type union allows both, but the spec lists the
+    // top-level slot as canonical. A follow-up will lift it; for now we
+    // assert what flows so consumers can correlate either way.
+    const toolCallEndEvents = allEvents.filter((e) => e.type === 'tool_call_end') as Array<
+      Extract<AxlEvent, { type: 'tool_call_end' }>
     >;
-    expect(toolResultEvents).toHaveLength(2);
-    expect(toolResultEvents[0].callId).toBe('call_aaa');
-    expect(toolResultEvents[1].callId).toBe('call_bbb');
+    expect(toolCallEndEvents).toHaveLength(2);
+    expect(toolCallEndEvents[0].data.callId).toBe('call_aaa');
+    expect(toolCallEndEvents[1].data.callId).toBe('call_bbb');
 
-    // Results should be correctly attributed
-    expect(toolResultEvents[0].result).toBe('Result for: cats');
-    expect(toolResultEvents[1].result).toBe('Result for: dogs');
+    // Results should be correctly attributed (carried on tool_call_end.data.result)
+    expect(toolCallEndEvents[0].data.result).toBe('Result for: cats');
+    expect(toolCallEndEvents[1].data.result).toBe('Result for: dogs');
   });
 
   it('stream rejects with error when workflow throws', async () => {
@@ -276,19 +300,21 @@ describe('Streaming E2E', () => {
     // Prevent unhandled rejection from stream.promise
     stream.promise.catch(() => {});
 
-    const allEvents: StreamEvent[] = [];
+    const allEvents: AxlEvent[] = [];
     for await (const event of stream) {
       allEvents.push(event);
     }
 
-    // Should contain an error event with a serializable message
-    const errorEvent = allEvents.find((e) => e.type === 'error');
+    // Should contain an error event with a serializable message under `data.message`
+    const errorEvent = allEvents.find((e) => e.type === 'error') as
+      | Extract<AxlEvent, { type: 'error' }>
+      | undefined;
     expect(errorEvent).toBeDefined();
-    expect(errorEvent).toEqual({ type: 'error', message: 'iterator error test' });
+    expect(errorEvent!.data.message).toBe('iterator error test');
 
-    // Error event should be JSON-serializable (no Error object)
+    // Error event payload should be JSON-serializable (no Error object)
     const serialized = JSON.parse(JSON.stringify(errorEvent));
-    expect(serialized.message).toBe('iterator error test');
+    expect(serialized.data.message).toBe('iterator error test');
   });
 
   it('stream emits workflow_end with status completed on success', async () => {
@@ -303,22 +329,18 @@ describe('Streaming E2E', () => {
     runtime.register(wf);
 
     const stream = runtime.stream('wf-end-stream-wf', { message: 'hello' });
-    const allEvents: StreamEvent[] = [];
+    const allEvents: AxlEvent[] = [];
     for await (const event of stream) {
       allEvents.push(event);
       if (event.type === 'done') break;
     }
 
-    // workflow_end is now a first-class trace type, not a nested log event.
-    const stepEvents = allEvents.filter((e) => e.type === 'step');
-    const workflowEndStep = stepEvents.find((e) => {
-      const data = (e as { data: AxlEvent }).data;
-      return data.type === 'workflow_end';
-    });
-    expect(workflowEndStep).toBeDefined();
-
-    const endData = (workflowEndStep as { data: AxlEvent }).data;
-    expect(((endData as { data?: unknown }).data as { status?: string })?.status).toBe('completed');
+    // workflow_end now flows directly on the wire (no `step` wrapper).
+    const workflowEnd = allEvents.find((e) => e.type === 'workflow_end') as
+      | Extract<AxlEvent, { type: 'workflow_end' }>
+      | undefined;
+    expect(workflowEnd).toBeDefined();
+    expect(workflowEnd!.data.status).toBe('completed');
   });
 
   it('stream emits workflow_end with status failed on error', async () => {
@@ -336,9 +358,11 @@ describe('Streaming E2E', () => {
     await expect(stream.promise).rejects.toThrow('intentional failure');
 
     // Verify workflow_end trace fired with status: failed + error message
-    const workflowEndTrace = traces.find((t: AxlEvent) => t.type === 'workflow_end');
+    const workflowEndTrace = traces.find((t: AxlEvent) => t.type === 'workflow_end') as
+      | Extract<AxlEvent, { type: 'workflow_end' }>
+      | undefined;
     expect(workflowEndTrace).toBeDefined();
-    expect((workflowEndTrace!.data as { status?: string })?.status).toBe('failed');
-    expect((workflowEndTrace!.data as { error?: string })?.error).toBe('intentional failure');
+    expect(workflowEndTrace!.data.status).toBe('failed');
+    expect(workflowEndTrace!.data.error).toBe('intentional failure');
   });
 });

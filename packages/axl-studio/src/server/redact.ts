@@ -28,19 +28,29 @@
  * not a data-at-rest transform. If a user needs scrubbed state-at-rest they
  * configure their own StateStore to store scrubbed values.
  */
-import type { ExecutionInfo, ChatMessage, PendingDecision, StreamEvent } from '@axlsdk/axl';
+import type {
+  ExecutionInfo,
+  ChatMessage,
+  PendingDecision,
+  AxlEvent,
+  EvalHistoryEntry,
+} from '@axlsdk/axl';
 import type { EvalResult, EvalItem, ScorerDetail } from '@axlsdk/eval';
-import type { EvalHistoryEntry } from '@axlsdk/axl';
 
-// Re-export the legacy stream-event type from core. The core export is itself
-// transitional (`@deprecated` JSDoc on `StreamEvent` in `@axlsdk/axl`) — the
-// runtime translation layer that synthesizes these shapes goes away in the
-// next commit, after which `redactStreamEvent` is rewritten to scrub
-// `AxlEvent` variants and both this re-export and the core `StreamEvent`
-// type are deleted.
+// Stream events on the wire are now `AxlEvent` (translation layer deleted
+// in spec/16 PR 1 commit 4). The legacy `StreamEvent` shapes (token /
+// tool_call / tool_result / agent_start / agent_end / step / done /
+// error) no longer exist — consumers narrow on the AxlEvent union.
 //
-// TODO(PR-3-spec-16): delete this re-export when the translation layer goes.
-export type { StreamEvent };
+// PR 3 brings the full table-driven `redactAxlEvent` per spec §5.1.
+// What lives here through PR 1 commit 4 is a minimal subset that scrubs
+// the high-volume per-event PII surface (token content, tool args/results,
+// done/error payloads). Per-variant entries that need expansion in PR 3
+// are flagged with TODO(PR-3-spec-16-§5.1).
+//
+// TODO(PR-3-spec-16): delete this `StreamEvent` alias and rename
+// `redactStreamEvent` → `redactAxlEvent` once Studio panels migrate.
+export type StreamEvent = AxlEvent;
 
 const REDACTED = '[redacted]';
 
@@ -211,51 +221,56 @@ export function redactSessionHistory(history: ChatMessage[], redact: boolean): C
 // ── Stream events (WS broadcast) ─────────────────────────────────────
 
 /**
- * Scrub a `StreamEvent` before broadcasting it to Studio WS subscribers.
+ * Scrub an `AxlEvent` before broadcasting it to Studio WS subscribers.
  * Playground and workflow-execute routes pipe `runtime.stream()` events
  * directly to WS channels; under `trace.redact`, raw token content and
  * tool call results would otherwise leak through untouched.
  *
- * Per-type scrubbing:
- *   token           → `data` replaced with `[redacted]`
- *   tool_call       → `args` replaced
- *   tool_result     → `result` replaced
- *   tool_approval   → `args` and `reason` replaced
- *   done            → `data` replaced (often the full workflow result)
- *   error           → `message` replaced (may echo user input)
+ * The core `emitEvent` already redacts most fields at emission time
+ * (prompts, responses, system, etc.). This function applies a second
+ * pass for fields that pass through the wire boundary — defense in
+ * depth.
  *
- * Pass-through (structural / non-PII):
- *   agent_start / agent_end / handoff / step
- *
- * `step` events wrap an `AxlEvent` in `data`. Those events are already
- * redacted at emission time by `emitEvent` in the core runtime, so
- * double-redacting here would be wasteful and could mask a missing
- * emitter-level scrub — we let them pass through and rely on the core.
+ * TODO(PR-3-spec-16-§5.1): the full per-variant redaction table
+ * (delegate, pipeline, partial_object, memory_*, verify) lands in PR 3
+ * with table-driven tests.
  */
-export function redactStreamEvent(event: StreamEvent, redact: boolean): StreamEvent {
+export function redactStreamEvent(event: AxlEvent, redact: boolean): AxlEvent {
   if (!redact) return event;
   switch (event.type) {
     case 'token':
-      return { type: 'token', data: REDACTED };
-    case 'tool_call':
-      return { ...event, args: REDACTED };
-    case 'tool_result':
-      return { ...event, result: REDACTED };
+      return { ...event, data: REDACTED };
+    case 'tool_call_start':
+      return { ...event, data: { args: REDACTED } };
+    case 'tool_call_end':
+      return { ...event, data: { args: REDACTED, result: REDACTED, callId: event.data.callId } };
     case 'tool_approval':
       return {
         ...event,
-        args: REDACTED,
-        ...(event.reason !== undefined ? { reason: REDACTED } : {}),
+        data: {
+          ...event.data,
+          args: REDACTED,
+          ...(event.data.reason !== undefined ? { reason: REDACTED } : {}),
+        },
       };
     case 'done':
-      return { type: 'done', data: REDACTED };
+      return { ...event, data: { result: REDACTED } };
     case 'error':
-      return { type: 'error', message: REDACTED };
-    // Structural events have no user content to scrub.
-    case 'agent_start':
-    case 'agent_end':
+      return { ...event, data: { ...event.data, message: REDACTED } };
+    case 'ask_start':
+      return { ...event, prompt: REDACTED };
+    case 'ask_end':
+      return event.outcome.ok
+        ? { ...event, outcome: { ok: true, result: REDACTED } }
+        : { ...event, outcome: { ok: false, error: REDACTED } };
     case 'handoff':
-    case 'step':
+      return event.data.message !== undefined
+        ? { ...event, data: { ...event.data, message: REDACTED } }
+        : event;
+    // Structural / numeric events pass through. `agent_call_end` and
+    // gate events (guardrail/schema_check/validate) are scrubbed at
+    // emission time by core `emitEvent` — second-pass would be wasteful.
+    default:
       return event;
   }
 }

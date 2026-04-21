@@ -12,11 +12,17 @@ import {
   redactPendingDecision,
   redactPendingDecisionList,
 } from '../server/redact.js';
-import type { ExecutionInfo, ChatMessage, PendingDecision } from '@axlsdk/axl';
-// StreamEvent is the legacy wire shape, defined locally on the redact module
-// (see TODO in redact.ts about PR-3-spec-16).
-import type { StreamEvent } from '../server/redact.js';
+import type { ExecutionInfo, ChatMessage, PendingDecision, AxlEvent } from '@axlsdk/axl';
 import type { EvalResult } from '@axlsdk/eval';
+
+// AxlEvent fixture helper — supplies the base fields every event needs so
+// per-test fixtures stay focused on the variant-specific surface.
+function baseEvent() {
+  return { executionId: 'test', step: 0, timestamp: 0 } as const;
+}
+function askScoped() {
+  return { askId: 'a1', depth: 0 } as const;
+}
 
 function makeExecution(overrides: Partial<ExecutionInfo> = {}): ExecutionInfo {
   return {
@@ -253,80 +259,195 @@ describe('redactValue (generic scalar)', () => {
 
 describe('redactStreamEvent', () => {
   it('returns the original event when redact is false', () => {
-    const event: StreamEvent = { type: 'token', data: 'hello' };
+    const event: AxlEvent = { ...baseEvent(), ...askScoped(), type: 'token', data: 'hello' };
     expect(redactStreamEvent(event, false)).toBe(event);
   });
 
   it('scrubs token.data', () => {
-    const out = redactStreamEvent({ type: 'token', data: 'sensitive' }, true);
-    expect(out).toEqual({ type: 'token', data: '[redacted]' });
+    const event: AxlEvent = { ...baseEvent(), ...askScoped(), type: 'token', data: 'sensitive' };
+    const out = redactStreamEvent(event, true);
+    expect(out.type).toBe('token');
+    expect((out as Extract<AxlEvent, { type: 'token' }>).data).toBe('[redacted]');
   });
 
-  it('scrubs tool_call.args but preserves name/callId', () => {
-    const out = redactStreamEvent(
-      { type: 'tool_call', name: 'send_email', args: { to: 'x@y.z' }, callId: 'call_1' },
-      true,
-    );
-    expect(out).toEqual({
-      type: 'tool_call',
-      name: 'send_email',
-      args: '[redacted]',
+  it('scrubs tool_call_start.data.args but preserves tool/callId', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'tool_call_start',
+      tool: 'send_email',
       callId: 'call_1',
-    });
+      data: { args: { to: 'x@y.z' } },
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'tool_call_start' }>;
+    expect(out.tool).toBe('send_email');
+    expect(out.callId).toBe('call_1');
+    expect(out.data.args).toBe('[redacted]');
   });
 
-  it('scrubs tool_result.result but preserves name/callId', () => {
-    const out = redactStreamEvent(
-      { type: 'tool_result', name: 'fetch', result: { data: 'secret' }, callId: 'call_2' },
-      true,
-    );
-    expect(out).toEqual({
-      type: 'tool_result',
-      name: 'fetch',
-      result: '[redacted]',
+  it('scrubs tool_call_end.data (args + result) but preserves tool/callId', () => {
+    // tool_call_end folds the legacy `tool_result` wire event — args and
+    // result both ride on `data`, callId stays at the top level.
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'tool_call_end',
+      tool: 'fetch',
       callId: 'call_2',
-    });
+      duration: 50,
+      data: { args: { url: 'https://x' }, result: { data: 'secret' } },
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'tool_call_end' }>;
+    expect(out.tool).toBe('fetch');
+    expect(out.callId).toBe('call_2');
+    expect(out.data.args).toBe('[redacted]');
+    expect(out.data.result).toBe('[redacted]');
   });
 
-  it('scrubs tool_approval.args and .reason', () => {
-    const out = redactStreamEvent(
-      {
-        type: 'tool_approval',
-        name: 'delete',
-        args: { id: 1 },
+  it('scrubs tool_approval.data.args and .data.reason', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'tool_approval',
+      tool: 'delete',
+      callId: 'call_3',
+      data: {
         approved: false,
+        args: { id: 1 },
         reason: 'user denied — contains PII',
       },
-      true,
-    );
-    expect(out).toEqual({
-      type: 'tool_approval',
-      name: 'delete',
-      args: '[redacted]',
-      approved: false,
-      reason: '[redacted]',
-    });
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'tool_approval' }>;
+    expect(out.tool).toBe('delete');
+    expect(out.data.approved).toBe(false);
+    expect(out.data.args).toBe('[redacted]');
+    expect(out.data.reason).toBe('[redacted]');
   });
 
-  it('scrubs done.data', () => {
-    const out = redactStreamEvent({ type: 'done', data: { result: 'sensitive' } }, true);
-    expect(out).toEqual({ type: 'done', data: '[redacted]' });
+  it('scrubs done.data.result', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      type: 'done',
+      data: { result: 'sensitive' },
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'done' }>;
+    expect(out.data.result).toBe('[redacted]');
   });
 
-  it('scrubs error.message', () => {
-    const out = redactStreamEvent(
-      { type: 'error', message: 'Failed: user john@acme.com not found' },
-      true,
-    );
-    expect(out).toEqual({ type: 'error', message: '[redacted]' });
+  it('scrubs error.data.message', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      type: 'error',
+      data: { message: 'Failed: user john@acme.com not found' },
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'error' }>;
+    expect(out.data.message).toBe('[redacted]');
   });
 
-  it('passes through structural events (agent_start, agent_end, handoff, step)', () => {
-    const events: StreamEvent[] = [
-      { type: 'agent_start', agent: 'a1', model: 'mock:gpt-4o' },
-      { type: 'agent_end', agent: 'a1', cost: 0.05, duration: 100 },
-      { type: 'handoff', source: 'a1', target: 'a2', mode: 'oneway' },
-      { type: 'step', step: 1, data: { type: 'agent_call', data: '[already redacted]' } },
+  it('scrubs ask_start.prompt', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'ask_start',
+      prompt: 'sensitive user question',
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'ask_start' }>;
+    expect(out.prompt).toBe('[redacted]');
+    expect(out.askId).toBe('a1');
+  });
+
+  it('scrubs ask_end.outcome (success result)', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'ask_end',
+      outcome: { ok: true, result: 'sensitive answer' },
+      cost: 0.01,
+      duration: 100,
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'ask_end' }>;
+    expect(out.outcome.ok).toBe(true);
+    expect(out.outcome.ok && out.outcome.result).toBe('[redacted]');
+    // numeric fields preserved (load-bearing for cost rails)
+    expect(out.cost).toBe(0.01);
+    expect(out.duration).toBe(100);
+  });
+
+  it('scrubs ask_end.outcome (failure error)', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'ask_end',
+      outcome: { ok: false, error: 'leaked input value: secret' },
+      cost: 0.005,
+      duration: 60,
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'ask_end' }>;
+    expect(out.outcome.ok).toBe(false);
+    expect(!out.outcome.ok && out.outcome.error).toBe('[redacted]');
+  });
+
+  it('scrubs handoff.data.message (roundtrip mode) but preserves source/target/mode', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      type: 'handoff',
+      fromAskId: 'a1',
+      toAskId: 'a2',
+      sourceDepth: 0,
+      targetDepth: 1,
+      data: {
+        source: 'a1',
+        target: 'a2',
+        mode: 'roundtrip',
+        duration: 30,
+        message: 'sensitive handoff payload',
+      },
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'handoff' }>;
+    expect(out.data.source).toBe('a1');
+    expect(out.data.target).toBe('a2');
+    expect(out.data.mode).toBe('roundtrip');
+    expect(out.data.duration).toBe(30);
+    expect(out.data.message).toBe('[redacted]');
+  });
+
+  it('passes through handoff with no message (oneway) unchanged', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      type: 'handoff',
+      fromAskId: 'a1',
+      toAskId: 'a2',
+      sourceDepth: 0,
+      targetDepth: 1,
+      data: { source: 'a1', target: 'a2', mode: 'oneway', duration: 30 },
+    };
+    expect(redactStreamEvent(event, true)).toBe(event);
+  });
+
+  it('passes through structural events (agent_call_start, agent_call_end)', () => {
+    // These variants don't have user-content fields the wire-boundary scrubber
+    // needs to touch. agent_call_end's rich `data` (prompt/response/messages)
+    // is scrubbed at emission time by core `emitEvent` — second-pass here
+    // would be wasteful. Default branch returns the event as-is.
+    const events: AxlEvent[] = [
+      {
+        ...baseEvent(),
+        ...askScoped(),
+        type: 'agent_call_start',
+        agent: 'a1',
+        model: 'mock:gpt-4o',
+        turn: 1,
+      },
+      {
+        ...baseEvent(),
+        ...askScoped(),
+        type: 'agent_call_end',
+        agent: 'a1',
+        model: 'mock:gpt-4o',
+        cost: 0.05,
+        duration: 100,
+        data: { prompt: '[already redacted]', response: '[already redacted]' },
+      },
     ];
     for (const event of events) {
       expect(redactStreamEvent(event, true)).toBe(event);

@@ -3,7 +3,8 @@ import { resolve } from 'node:path';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { serveStatic } from '@hono/node-server/serve-static';
-import type { AxlRuntime } from '@axlsdk/axl';
+import type { AxlRuntime, AxlEvent } from '@axlsdk/axl';
+import { redactStreamEvent } from './redact.js';
 import type { StudioEnv } from './types.js';
 import { errorHandler } from './middleware/error-handler.js';
 import { ConnectionManager } from './ws/connection-manager.js';
@@ -176,19 +177,25 @@ export function createServer(options: CreateServerOptions) {
   // ── Trace event bridging ───────────────────────────────────────────
   // Aggregators subscribe to runtime events directly via their start() method.
   // This listener handles trace channel broadcasting and decision events only.
+  const redactOn = runtime.isRedactEnabled();
   const traceListener = (event: unknown) => {
-    const traceEvent = event as {
-      executionId?: string;
-      type?: string;
-    };
+    const traceEvent = event as AxlEvent;
 
-    // Broadcast to trace channels
+    // Broadcast to trace channels — apply the same scrubbing as the
+    // playground/workflow execution paths so the trace firehose doesn't
+    // leak content the per-route broadcasts are scrubbing.
     if (traceEvent.executionId) {
-      connMgr.broadcastWithWildcard(`trace:${traceEvent.executionId}`, traceEvent);
+      connMgr.broadcastWithWildcard(
+        `trace:${traceEvent.executionId}`,
+        redactStreamEvent(traceEvent, redactOn),
+      );
     }
 
     // Broadcast pending decisions
-    if (traceEvent.type === 'await_human') {
+    if (
+      traceEvent.type === 'log' &&
+      (traceEvent.data as { event?: string })?.event === 'await_human'
+    ) {
       connMgr.broadcast('decisions', traceEvent);
     }
   };

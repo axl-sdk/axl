@@ -167,7 +167,11 @@ export class Session {
     };
 
     axlStream.on('done', (event: unknown) => {
-      updateHistory((event as { data: unknown }).data).catch((err) => {
+      // The unified event model wraps the result in `data: { result }` on
+      // `done` events (spec §2.1) — extract and pass the inner result to
+      // the legacy updateHistory path.
+      const data = (event as { data: { result: unknown } }).data;
+      updateHistory(data.result).catch((err) => {
         this.runtime.emit('error', {
           type: 'session_history_save_failed',
           sessionId: this.sessionId,

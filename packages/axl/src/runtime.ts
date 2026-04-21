@@ -713,90 +713,41 @@ export class AxlRuntime extends EventEmitter {
         providerRegistry: this.providerRegistry,
         sessionHistory,
         signal: controller.signal,
+        // Sentinel `onToken` so the streaming code path in WorkflowContext
+        // is entered (it's gated on `this.onToken` being defined). The
+        // actual `token` AxlEvents are emitted via `emitEvent` and reach
+        // the wire through `onTrace` — this callback is just the gate.
+        onToken: () => {},
         onTrace: (event: AxlEvent) => {
-          execInfo!.events.push(event);
-          // Skip ask_end's per-ask rollup cost — the constituent agent_call_end
-          // / tool_call_end events have already accumulated their cost above
-          // (spec decision 10).
+          // Persist non-token events to ExecutionInfo.events (per-token events
+          // would blow up the timeline at >10k events per long stream).
+          if (event.type !== 'token') execInfo!.events.push(event);
+          // Skip ask_end's per-ask rollup cost — its constituent
+          // agent_call_end / tool_call_end events already accumulated.
+          // Spec decision 10.
           if (event.cost && event.type !== 'ask_end') execInfo!.totalCost += event.cost;
           this.emit('trace', event);
           this.outputAxlEvent(event);
-          // Emit typed stream events for specific trace types
+          // Single fan-out: every event flows verbatim to the wire. The
+          // legacy translation layer (which derived StreamEvent shapes
+          // like `agent_end` / `tool_result` / `step` and dropped fields
+          // along the way) is gone — consumers receive the full AxlEvent.
+          axlStream._push(event);
+
+          // Side effect: persist handoff records to session metadata.
+          // This is observability persistence, not stream derivation.
           if (event.type === 'handoff') {
-            const data = event.data as Record<string, unknown> | undefined;
-            axlStream._push({
-              type: 'handoff',
-              source: event.agent ?? '',
-              target: (data?.target as string) ?? '',
-              mode: (data?.mode as 'oneway' | 'roundtrip') ?? undefined,
-            });
-            // Persist handoff records to session metadata
             const sessionId = options?.metadata?.sessionId as string | undefined;
             if (sessionId) {
               this.appendHandoffRecord(sessionId, {
-                source: event.agent ?? '',
-                target: (data?.target as string) ?? '',
-                mode: (data?.mode as 'oneway' | 'roundtrip') ?? 'oneway',
+                source: event.data.source,
+                target: event.data.target,
+                mode: event.data.mode,
                 timestamp: event.timestamp,
-                duration: (data?.duration as number) ?? undefined,
+                duration: event.data.duration,
               });
             }
-          } else if (event.type === 'tool_approval') {
-            // Approval gate decision — emit a `tool_approval` stream event that
-            // mirrors the trace event. Fires on both approve and deny so UI
-            // consumers can show the decision inline with the tool call.
-            const data = event.data as
-              | { approved?: boolean; args?: unknown; reason?: string }
-              | undefined;
-            axlStream._push({
-              type: 'tool_approval',
-              name: event.tool ?? '',
-              args: data?.args,
-              approved: data?.approved === true,
-              ...(data?.reason ? { reason: data.reason } : {}),
-            });
-          } else if (event.type === 'tool_denied') {
-            // Agent tried to call a tool that doesn't exist (not an approval denial).
-            // No equivalent stream event today — the step event below still fires
-            // so consumers subscribing to all steps can react if needed.
-          } else if (event.type === 'agent_call_end') {
-            axlStream._push({
-              type: 'agent_end',
-              agent: event.agent ?? '',
-              cost: event.cost,
-              duration: event.duration,
-            });
-          } else if (event.type === 'tool_call_end') {
-            axlStream._push({
-              type: 'tool_result',
-              name: event.tool ?? '',
-              result: (event.data as Record<string, unknown>)?.result,
-              callId: (event.data as Record<string, unknown>)?.callId as string | undefined,
-            });
           }
-          // Always emit raw step event for backwards compat
-          axlStream._push({ type: 'step', step: event.step, data: event });
-        },
-        onToken: (token: string) => {
-          // The translation layer between AxlEvent (core) and the legacy
-          // wire-format StreamEvent (consumer-facing) lives here through
-          // PR 1. The next commit deletes it; the AxlStream then carries
-          // AxlEvent directly. The `meta` parameter is intentionally
-          // ignored at the wire boundary today — preserving root-only
-          // behavior — and the next commit lets `meta.depth` flow through
-          // into per-event AxlEvent records.
-          axlStream._push({ type: 'token', data: token });
-        },
-        onToolCall: (call: { name: string; args: unknown; callId?: string }) => {
-          axlStream._push({
-            type: 'tool_call',
-            name: call.name,
-            args: call.args,
-            callId: call.callId,
-          });
-        },
-        onAgentStart: (info: { agent: string; model: string }) => {
-          axlStream._push({ type: 'agent_start', agent: info.agent, model: info.model });
         },
         pendingDecisions: this.pendingDecisionResolvers,
         awaitHumanHandler: options?.awaitHumanHandler,
@@ -861,7 +812,7 @@ export class AxlRuntime extends EventEmitter {
     };
 
     run()
-      .then((result) => axlStream._done(result))
+      .then((result) => axlStream._done(result, execInfo?.executionId ?? ''))
       .catch((err) => {
         // Update execution status on error
         if (execInfo) {
@@ -885,7 +836,10 @@ export class AxlRuntime extends EventEmitter {
           });
           this.persistExecution(execInfo);
         }
-        axlStream._error(err instanceof Error ? err : new Error(String(err)));
+        axlStream._error(
+          err instanceof Error ? err : new Error(String(err)),
+          execInfo?.executionId ?? '',
+        );
       });
 
     return axlStream;

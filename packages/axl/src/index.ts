@@ -14,16 +14,9 @@ export type { CreateContextOptions, ExecuteOptions } from './runtime.js';
 export { defineConfig } from './config.js';
 export type { AxlConfig } from './config.js';
 
-// Stream
+// Stream — carries `AxlEvent` directly. No `StreamEvent` shim — consumers
+// narrow on `event.type` from the `AxlEvent` union (spec/16 decision 8).
 export { AxlStream } from './stream.js';
-/**
- * @deprecated Temporary re-export bridging the unified-event-model migration.
- *  The wire stream still synthesizes legacy stream events via a translation
- *  layer in `runtime.ts`; that layer (and this type) get deleted in the next
- *  commit, after which `AxlStream` carries `AxlEvent` directly. Migrate
- *  consumers to narrow on `AxlEvent` instead.
- */
-export type { StreamEvent } from './stream.js';
 
 // Session
 export { Session } from './session.js';

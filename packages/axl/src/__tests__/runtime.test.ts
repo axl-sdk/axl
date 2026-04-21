@@ -231,7 +231,9 @@ describe('stream()', () => {
     expect(result).toBe(42);
   });
 
-  it('emits step events via the stream', async () => {
+  it('emits log events via the stream (unified event model — formerly wrapped as `step`)', async () => {
+    // Spec/16 §2.2: the legacy `step` wrapper event is removed. Logs (and
+    // every other AxlEvent) flow directly to the wire.
     const { runtime } = createRuntime();
 
     const wf = workflow({
@@ -252,8 +254,8 @@ describe('stream()', () => {
       if (event.type === 'done') break;
     }
 
-    const stepEvents = events.filter((e) => e.type === 'step');
-    expect(stepEvents.length).toBeGreaterThanOrEqual(2);
+    const logEvents = events.filter((e) => e.type === 'log');
+    expect(logEvents.length).toBeGreaterThanOrEqual(2);
     expect(events.some((e) => e.type === 'done')).toBe(true);
   });
 
@@ -363,25 +365,21 @@ describe('stream()', () => {
       return events;
     };
 
+    // Wire format is now AxlEvent — `tool_approval` carries `tool` (not
+    // `name`) at the top level and `data: { approved, args, reason? }`.
     const approvedEvents = await runApproved();
     const approvedStreamEvents = approvedEvents.filter((e) => e.type === 'tool_approval');
     expect(approvedStreamEvents).toHaveLength(1);
-    expect(approvedStreamEvents[0]).toMatchObject({
-      type: 'tool_approval',
-      name: 'risky',
-      approved: true,
-    });
-    expect(approvedStreamEvents[0].args).toEqual({ x: 1 });
+    expect(approvedStreamEvents[0].tool).toBe('risky');
+    expect(approvedStreamEvents[0].data.approved).toBe(true);
+    expect(approvedStreamEvents[0].data.args).toEqual({ x: 1 });
 
     const deniedEvents = await runDenied();
     const deniedStreamEvents = deniedEvents.filter((e) => e.type === 'tool_approval');
     expect(deniedStreamEvents).toHaveLength(1);
-    expect(deniedStreamEvents[0]).toMatchObject({
-      type: 'tool_approval',
-      name: 'risky',
-      approved: false,
-      reason: 'nope',
-    });
+    expect(deniedStreamEvents[0].tool).toBe('risky');
+    expect(deniedStreamEvents[0].data.approved).toBe(false);
+    expect(deniedStreamEvents[0].data.reason).toBe('nope');
   });
 
   it('signals an error via the stream when workflow fails', async () => {

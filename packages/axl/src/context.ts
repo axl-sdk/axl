@@ -792,6 +792,12 @@ export class WorkflowContext<TInput = unknown> {
       }
 
       const callbackMeta = this.currentCallbackMeta(agent._name);
+      this.emitEvent({
+        type: 'agent_call_start',
+        agent: agent._name,
+        model: modelUri,
+        turn: turns,
+      });
       this.onAgentStart?.({ agent: agent._name, model: modelUri }, callbackMeta);
 
       let response: ProviderResponse;
@@ -808,6 +814,10 @@ export class WorkflowContext<TInput = unknown> {
         for await (const chunk of provider.stream(currentMessages, chatOptions)) {
           if (chunk.type === 'text_delta') {
             content += chunk.content;
+            // Emit a `token` AxlEvent so wire consumers (AxlStream) and
+            // trace listeners both see it. Stream-only — `runtime.execute`'s
+            // onTrace skips persisting tokens to ExecutionInfo.events.
+            this.emitEvent({ type: 'token', data: chunk.content });
             this.onToken(chunk.content, callbackMeta);
           } else if (chunk.type === 'thinking_delta') {
             thinkingContent += chunk.content;
@@ -968,6 +978,17 @@ export class WorkflowContext<TInput = unknown> {
               }
 
               const handoffStart = Date.now();
+              // Capture the source ask's frame for handoff correlation.
+              // `toAskId` is synthesized — handoff targets don't currently
+              // create their own ask frame (target invocation goes through
+              // the internal executeAgentCall path, not ctx.ask). For PR 1
+              // we surface a sentinel UUID so the wire shape matches spec
+              // §2.1; full target-frame integration is a follow-up.
+              const sourceFrame = askStorage.getStore();
+              const handoffFromAskId = sourceFrame?.askId ?? this.executionId;
+              const handoffSourceDepth = sourceFrame?.depth ?? 0;
+              const handoffToAskId = randomUUID();
+              const handoffTargetDepth = handoffSourceDepth + 1;
 
               // Pass accumulated messages so the target agent can see the source agent's work.
               // Forward schema/retries/validate/metadata — the target agent uses its own model params.
@@ -1017,11 +1038,15 @@ export class WorkflowContext<TInput = unknown> {
                       this.emitEvent({
                         type: 'handoff',
                         agent: agent._name,
+                        fromAskId: handoffFromAskId,
+                        toAskId: handoffToAskId,
+                        sourceDepth: handoffSourceDepth,
+                        targetDepth: handoffTargetDepth,
                         data: {
+                          source: agent._name,
                           target: targetName,
                           mode,
                           duration,
-                          source: agent._name,
                           ...(handoffPrompt !== prompt ? { message: handoffPrompt } : {}),
                         },
                       });
@@ -1033,11 +1058,15 @@ export class WorkflowContext<TInput = unknown> {
                   this.emitEvent({
                     type: 'handoff',
                     agent: agent._name,
+                    fromAskId: handoffFromAskId,
+                    toAskId: handoffToAskId,
+                    sourceDepth: handoffSourceDepth,
+                    targetDepth: handoffTargetDepth,
                     data: {
+                      source: agent._name,
                       target: targetName,
                       mode,
                       duration: Date.now() - handoffStart,
-                      source: agent._name,
                       ...(handoffPrompt !== prompt ? { message: handoffPrompt } : {}),
                     },
                   });
@@ -1061,7 +1090,11 @@ export class WorkflowContext<TInput = unknown> {
                     this.emitEvent({
                       type: 'handoff',
                       agent: agent._name,
-                      data: { target: targetName, mode, duration, source: agent._name },
+                      fromAskId: handoffFromAskId,
+                      toAskId: handoffToAskId,
+                      sourceDepth: handoffSourceDepth,
+                      targetDepth: handoffTargetDepth,
+                      data: { source: agent._name, target: targetName, mode, duration },
                     });
                     return result;
                   },
@@ -1071,11 +1104,15 @@ export class WorkflowContext<TInput = unknown> {
               this.emitEvent({
                 type: 'handoff',
                 agent: agent._name,
+                fromAskId: handoffFromAskId,
+                toAskId: handoffToAskId,
+                sourceDepth: handoffSourceDepth,
+                targetDepth: handoffTargetDepth,
                 data: {
+                  source: agent._name,
                   target: targetName,
                   mode,
                   duration: Date.now() - handoffStart,
-                  source: agent._name,
                 },
               });
               return onewayResult;
@@ -1096,6 +1133,12 @@ export class WorkflowContext<TInput = unknown> {
               });
               continue;
             }
+            this.emitEvent({
+              type: 'tool_call_start',
+              tool: toolName,
+              callId: toolCall.id,
+              data: { args: toolArgs },
+            });
             this.onToolCall?.(
               { name: toolName, args: toolArgs, callId: toolCall.id },
               callbackMeta,
@@ -1176,6 +1219,12 @@ export class WorkflowContext<TInput = unknown> {
             continue;
           }
 
+          this.emitEvent({
+            type: 'tool_call_start',
+            tool: toolName,
+            callId: toolCall.id,
+            data: { args: toolArgs },
+          });
           this.onToolCall?.({ name: toolName, args: toolArgs, callId: toolCall.id }, callbackMeta);
 
           const toolStart = Date.now();

@@ -58,15 +58,33 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
     // WS subscribers (Studio UI, any filterTraceEvent consumer) never
     // see raw LLM output.
     const redactOn = runtime.isRedactEnabled();
+    // The wire now carries `AxlEvent` directly. Build minimal events with
+    // the required base fields so `redactStreamEvent` can typecheck —
+    // `step`/`timestamp` are best-effort approximations because the
+    // playground route synthesizes events outside any AxlRuntime ALS frame.
+    let stepCounter = 0;
     const broadcast = (event: StreamEvent) => {
       connMgr.broadcastWithWildcard(`execution:${executionId}`, redactStreamEvent(event, redactOn));
     };
+    const baseFields = () => ({
+      executionId,
+      step: stepCounter++,
+      timestamp: Date.now(),
+    });
 
     // Create a context wired to stream events to the WS channel
     const ctx = runtime.createContext({
       sessionHistory: history,
-      onToken: (token: string) => {
-        broadcast({ type: 'token', data: token });
+      onToken: (token: string, meta) => {
+        broadcast({
+          ...baseFields(),
+          type: 'token',
+          data: token,
+          askId: meta.askId,
+          ...(meta.parentAskId ? { parentAskId: meta.parentAskId } : {}),
+          depth: meta.depth,
+          agent: meta.agent,
+        });
       },
     });
 
@@ -82,11 +100,12 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
         history.push({ role: 'assistant', content: resultText });
         await store.saveSession(sessionId, history);
 
-        broadcast({ type: 'done', data: resultText });
+        broadcast({ ...baseFields(), type: 'done', data: { result: resultText } });
       } catch (err) {
         broadcast({
+          ...baseFields(),
           type: 'error',
-          message: err instanceof Error ? err.message : String(err),
+          data: { message: err instanceof Error ? err.message : String(err) },
         });
       }
     })();

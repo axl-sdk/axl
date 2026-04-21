@@ -1,29 +1,17 @@
 import { Readable } from 'node:stream';
 import { EventEmitter } from 'node:events';
-
-/**
- * Internal stream event shape — TEMPORARY scaffolding for the unified-event
- * model migration. The translation layer in `runtime.ts` synthesizes these
- * from `AxlEvent`s. Both this type AND the translation layer get deleted in
- * the follow-up commit; `AxlStream` will then carry `AxlEvent` directly.
- */
-export type StreamEvent =
-  | { type: 'token'; data: string }
-  | { type: 'tool_call'; name: string; args: unknown; callId?: string }
-  | { type: 'tool_result'; name: string; result: unknown; callId?: string }
-  | { type: 'tool_approval'; name: string; args: unknown; approved: boolean; reason?: string }
-  | { type: 'agent_start'; agent: string; model?: string }
-  | { type: 'agent_end'; agent: string; cost?: number; duration?: number }
-  | { type: 'handoff'; source: string; target: string; mode?: 'oneway' | 'roundtrip' }
-  | { type: 'step'; step: number; data: unknown }
-  | { type: 'done'; data: unknown }
-  | { type: 'error'; message: string };
+import { AXL_EVENT_TYPES, type AxlEvent, type AxlEventType } from './types.js';
 
 /**
  * A streamable workflow execution.
  *
- * Extends Node's Readable and implements AsyncIterable<StreamEvent>.
- * Supports .on() events, for-await-of, .text iterator, and .pipe().
+ * Extends Node's Readable and implements `AsyncIterable<AxlEvent>`. Supports
+ * `.on()` events, `for-await-of`, the `.text` iterator (root-only tokens),
+ * the `.lifecycle` iterator (structural events only), and `.pipe()`.
+ *
+ * The wire carries `AxlEvent` directly — there is no per-stream synthesized
+ * shape. Consumers narrow on `event.type` and use `AskScoped` fields
+ * (`askId`, `parentAskId`, `depth`) for routing/filtering.
  */
 export class AxlStream extends Readable {
   private bus = new EventEmitter();
@@ -31,8 +19,8 @@ export class AxlStream extends Readable {
   private result: unknown = undefined;
   private finished = false;
   readonly promise: Promise<unknown>;
-  private eventQueue: StreamEvent[] = [];
-  private waiters: Array<(value: IteratorResult<StreamEvent>) => void> = [];
+  private eventQueue: AxlEvent[] = [];
+  private waiters: Array<(value: IteratorResult<AxlEvent>) => void> = [];
 
   constructor() {
     super({ objectMode: true, read() {} });
@@ -54,21 +42,13 @@ export class AxlStream extends Readable {
     this.promise.catch(() => {});
   }
 
-  private static readonly STREAM_EVENTS = new Set([
-    'token',
-    'tool_call',
-    'tool_result',
-    'tool_approval',
-    'agent_start',
-    'agent_end',
-    'handoff',
-    'step',
-    'done',
-    'error',
-  ]);
+  /** Wire-format event names callers can subscribe to via `.on(name, fn)`.
+   *  Derived from the canonical `AXL_EVENT_TYPES` tuple — adding a new
+   *  variant in `types.ts` automatically extends the subscribable set. */
+  private static readonly STREAM_EVENTS = new Set<AxlEventType>(AXL_EVENT_TYPES);
 
   on(event: string, handler: (...args: unknown[]) => void): this {
-    if (AxlStream.STREAM_EVENTS.has(event)) {
+    if (AxlStream.STREAM_EVENTS.has(event as AxlEventType)) {
       this.bus.on(event, handler);
     } else {
       super.on(event, handler);
@@ -77,7 +57,7 @@ export class AxlStream extends Readable {
   }
 
   off(event: string, handler: (...args: unknown[]) => void): this {
-    if (AxlStream.STREAM_EVENTS.has(event)) {
+    if (AxlStream.STREAM_EVENTS.has(event as AxlEventType)) {
       this.bus.off(event, handler);
     } else {
       super.off(event, handler);
@@ -88,12 +68,12 @@ export class AxlStream extends Readable {
   [Symbol.asyncIterator]() {
     const self = this;
     return {
-      next: (): Promise<IteratorResult<StreamEvent>> => {
+      next: (): Promise<IteratorResult<AxlEvent>> => {
         if (self.eventQueue.length > 0) {
           return Promise.resolve({ value: self.eventQueue.shift()!, done: false });
         }
         if (self.finished && self.eventQueue.length === 0) {
-          return Promise.resolve({ value: undefined as unknown as StreamEvent, done: true });
+          return Promise.resolve({ value: undefined as unknown as AxlEvent, done: true });
         }
         return new Promise((resolve) => {
           self.waiters.push(resolve);
@@ -119,7 +99,12 @@ export class AxlStream extends Readable {
             while (true) {
               const { value, done } = await iter.next();
               if (done) return { value: undefined as unknown as string, done: true };
-              if (value.type === 'token') return { value: value.data, done: false };
+              // Root-only token text by default — consumers wanting nested
+              // tokens too should iterate the whole stream and filter on
+              // `event.depth >= 1` themselves.
+              if (value.type === 'token' && (value.depth ?? 0) === 0) {
+                return { value: value.data, done: false };
+              }
             }
           },
         };
@@ -127,25 +112,40 @@ export class AxlStream extends Readable {
     };
   }
 
-  get steps(): AsyncIterable<StreamEvent> {
-    const stepTypes = new Set([
-      'agent_start',
-      'agent_end',
-      'tool_call',
-      'tool_result',
+  /**
+   * Iterator over structural lifecycle events only — skips per-token chatter
+   * and progressive partial_object emissions. Useful for waterfall UIs and
+   * any consumer that wants the "what happened" timeline without per-chunk
+   * noise. Renamed from `.steps` in the unified-event-model migration
+   * because these are events, not pipeline steps.
+   */
+  get lifecycle(): AsyncIterable<AxlEvent> {
+    const lifecycleTypes = new Set<AxlEventType>([
+      'ask_start',
+      'ask_end',
+      'agent_call_start',
+      'agent_call_end',
+      'tool_call_start',
+      'tool_call_end',
       'tool_approval',
+      'tool_denied',
       'handoff',
+      'delegate',
+      'pipeline',
+      'verify',
+      'workflow_start',
+      'workflow_end',
     ]);
     const self = this;
     return {
-      [Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+      [Symbol.asyncIterator](): AsyncIterator<AxlEvent> {
         const iter = self[Symbol.asyncIterator]();
         return {
-          async next(): Promise<IteratorResult<StreamEvent>> {
+          async next(): Promise<IteratorResult<AxlEvent>> {
             while (true) {
               const { value, done } = await iter.next();
-              if (done) return { value: undefined as unknown as StreamEvent, done: true };
-              if (stepTypes.has(value.type)) return { value, done: false };
+              if (done) return { value: undefined as unknown as AxlEvent, done: true };
+              if (lifecycleTypes.has(value.type)) return { value, done: false };
             }
           },
         };
@@ -155,7 +155,7 @@ export class AxlStream extends Readable {
 
   pipe<T extends NodeJS.WritableStream>(destination: T, options?: { end?: boolean }): T {
     const shouldEnd = options?.end !== false;
-    this.bus.on('token', (event: StreamEvent) => {
+    this.bus.on('token', (event: AxlEvent) => {
       if (event.type === 'token') destination.write(event.data);
     });
     this.bus.on('done', () => {
@@ -167,10 +167,15 @@ export class AxlStream extends Readable {
     return destination;
   }
 
-  /** Push a stream event. Called by the runtime. */
-  _push(event: StreamEvent): void {
+  /** Push an event onto the stream. Called by the runtime. */
+  _push(event: AxlEvent): void {
     if (this.finished) return;
-    if (event.type === 'token') this.tokens.push(event.data);
+    // Token accumulation for `fullText`. Root-only by default to preserve the
+    // canonical "render this in a chat bubble" use case; nested-ask tokens
+    // still flow through the iterator so consumers that want them can filter.
+    if (event.type === 'token' && (event.depth ?? 0) === 0) {
+      this.tokens.push(event.data);
+    }
     this.bus.emit(event.type, event);
     this.push(event);
     const waiter = this.waiters.shift();
@@ -182,11 +187,21 @@ export class AxlStream extends Readable {
   }
 
   /** Signal successful completion. */
-  _done(result: unknown): void {
+  _done(result: unknown, executionId = ''): void {
     if (this.finished) return;
     this.finished = true;
     this.result = result;
-    const doneEvent: StreamEvent = { type: 'done', data: result };
+    // Synthesize a terminal `done` AxlEvent. The stream itself is the
+    // emission source (no WorkflowContext frame to read), so `step` is set
+    // to `Number.MAX_SAFE_INTEGER` as a sentinel meaning "after all
+    // numbered events" — consumers ordering by step still see `done` last.
+    const doneEvent: AxlEvent = {
+      type: 'done',
+      executionId,
+      step: Number.MAX_SAFE_INTEGER,
+      timestamp: Date.now(),
+      data: { result },
+    };
     this.bus.emit('done', doneEvent);
     this.push(doneEvent);
     this.push(null);
@@ -197,17 +212,23 @@ export class AxlStream extends Readable {
       this.eventQueue.push(doneEvent);
     }
     for (const w of this.waiters) {
-      w({ value: undefined as unknown as StreamEvent, done: true });
+      w({ value: undefined as unknown as AxlEvent, done: true });
     }
     this.waiters.length = 0;
     this.bus.emit('__resolve', result);
   }
 
   /** Signal an error. */
-  _error(error: Error): void {
+  _error(error: Error, executionId = ''): void {
     if (this.finished) return;
     this.finished = true;
-    const errorEvent: StreamEvent = { type: 'error', message: error.message };
+    const errorEvent: AxlEvent = {
+      type: 'error',
+      executionId,
+      step: Number.MAX_SAFE_INTEGER,
+      timestamp: Date.now(),
+      data: { message: error.message, name: error.name },
+    };
     this.bus.emit('error', errorEvent);
     this.push(errorEvent);
     this.push(null);
@@ -218,12 +239,13 @@ export class AxlStream extends Readable {
       this.eventQueue.push(errorEvent);
     }
     for (const w of this.waiters) {
-      w({ value: undefined as unknown as StreamEvent, done: true });
+      w({ value: undefined as unknown as AxlEvent, done: true });
     }
     this.waiters.length = 0;
     this.bus.emit('__reject', error);
   }
 
+  /** Concatenated root-only text — what most chat UIs render. */
   get fullText(): string {
     return this.tokens.join('');
   }

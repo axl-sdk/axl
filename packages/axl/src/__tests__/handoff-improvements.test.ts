@@ -591,9 +591,14 @@ describe('agent handoff improvements', () => {
 
       const handoffEvents = events.filter((e) => e.type === 'handoff');
       expect(handoffEvents).toHaveLength(1);
-      expect(handoffEvents[0].source).toBe('coordinator');
-      expect(handoffEvents[0].target).toBe('specialist');
-      expect(handoffEvents[0].mode).toBe('oneway');
+      // Wire format is now AxlEvent — handoff fields live under `data`
+      // (spec/16 §2.1). `fromAskId`/`toAskId` are at the top level for
+      // tree reconstruction.
+      expect(handoffEvents[0].data.source).toBe('coordinator');
+      expect(handoffEvents[0].data.target).toBe('specialist');
+      expect(handoffEvents[0].data.mode).toBe('oneway');
+      expect(handoffEvents[0].fromAskId).toBeDefined();
+      expect(handoffEvents[0].toAskId).toBeDefined();
     });
   });
 

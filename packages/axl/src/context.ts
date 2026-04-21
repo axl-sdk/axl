@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
 import { z, ZodError } from 'zod';
 import type {
   Result,
@@ -14,6 +15,7 @@ import type {
   DelegateOptions,
   RaceOptions,
   AxlEvent,
+  CallbackMeta,
   ChatMessage,
   ToolCallMessage,
   ProviderResponse,
@@ -22,7 +24,6 @@ import type {
   VerifyRetry,
 } from './types.js';
 import {
-  AxlError,
   VerifyError,
   QuorumNotMet,
   NoConsensus,
@@ -49,6 +50,41 @@ import type { RememberOptions, RecallOptions, VectorResult } from './memory/type
  * without mutating shared state on the WorkflowContext instance.
  */
 const signalStorage = new AsyncLocalStorage<AbortSignal>();
+
+/**
+ * Per-ask frame propagated via AsyncLocalStorage.
+ *
+ * - `askId` / `depth` / `agent`: identify the ask this event belongs to so
+ *   consumers can group, indent, and link nested asks without consulting
+ *   parent context.
+ * - `parentAskId`: set on every nested frame so the consumer can reconstruct
+ *   the ask tree; absent on the root ask.
+ * - `parentToolCallId`: bridges the legacy correlation field. The tool
+ *   execution path threads the outer tool's `callId` here so child contexts
+ *   keep stamping `parentToolCallId` for telemetry consumers that haven't
+ *   migrated yet (kept for one minor cycle alongside the new field).
+ * - `stepRef`: a single mutable counter shared across the entire execution
+ *   (root ask + every nested ask + every branch primitive). Atomically
+ *   incremented on each event emission so `event.step` is monotonic across
+ *   the whole tree, not per-context.
+ */
+type AskFrame = {
+  askId: string;
+  parentAskId?: string;
+  depth: number;
+  agent?: string;
+  parentToolCallId?: string;
+  stepRef: { value: number };
+  /**
+   * Cost incurred by THIS ask only — agent_call_end + tool_call_end events
+   * emitted within this frame (NOT including nested asks, which have their
+   * own frame and own counter). `emitEvent` increments this on every event
+   * that carries `cost` as long as the event's frame matches `this`. Read
+   * by `ask_end` to populate `cost` per spec decision 10.
+   */
+  askCost: { value: number };
+};
+const askStorage = new AsyncLocalStorage<AskFrame>();
 
 /** Convert a Zod schema to JSON Schema. Exported for Studio tool introspection.
  *  Wraps Zod v4's built-in `z.toJSONSchema()`, stripping the `$schema` key
@@ -181,8 +217,12 @@ export type WorkflowContextInit = {
   providerRegistry: ProviderRegistry;
   sessionHistory?: ChatMessage[];
   onTrace?: (event: AxlEvent) => void;
-  onToken?: (token: string) => void;
-  onToolCall?: (call: { name: string; args: unknown; callId?: string }) => void;
+  /** Per-token streaming callback. `meta` carries `askId`/`parentAskId`/
+   *  `depth`/`agent` so consumers can route or filter (e.g., `meta.depth === 0`
+   *  for root-only chat UIs). */
+  onToken?: (token: string, meta: CallbackMeta) => void;
+  /** Pre-execution tool-call callback. `meta` carries the ask correlation. */
+  onToolCall?: (call: { name: string; args: unknown; callId?: string }, meta: CallbackMeta) => void;
   pendingDecisions?: Map<string, (d: HumanDecision) => void>;
   budgetContext?: {
     totalCost: number;
@@ -206,7 +246,7 @@ export type WorkflowContextInit = {
   /** Handler for awaitHuman — when set, returns immediately instead of waiting for pendingDecisions. */
   awaitHumanHandler?: (options: AwaitHumanOptions) => HumanDecision | Promise<HumanDecision>;
   /** Callback fired when an agent LLM call is about to start. */
-  onAgentStart?: (info: { agent: string; model: string }) => void;
+  onAgentStart?: (info: { agent: string; model: string }, meta: CallbackMeta) => void;
   /** Callback fired after each ctx.ask() completes (once per ask invocation). */
   onAgentCallComplete?: (call: AgentCallInfo) => void;
   /** Set by `createChildContext(parentToolCallId)` — stamped on every trace event
@@ -237,8 +277,11 @@ export class WorkflowContext<TInput = unknown> {
   private providerRegistry: ProviderRegistry;
   private sessionHistory: ChatMessage[];
   private onTrace?: (event: AxlEvent) => void;
-  private onToken?: (token: string) => void;
-  private onToolCall?: (call: { name: string; args: unknown; callId?: string }) => void;
+  private onToken?: (token: string, meta: CallbackMeta) => void;
+  private onToolCall?: (
+    call: { name: string; args: unknown; callId?: string },
+    meta: CallbackMeta,
+  ) => void;
   private pendingDecisions?: Map<string, (d: HumanDecision) => void>;
   private budgetContext?: {
     totalCost: number;
@@ -248,7 +291,12 @@ export class WorkflowContext<TInput = unknown> {
     abortController?: AbortController;
   };
   private stateStore?: StateStore;
-  private stepCounter = 0;
+  /** Root step counter for this execution. Inherited by every ctx.ask()
+   *  frame so all events from this WorkflowContext (root + nested) share
+   *  a single monotonic counter, even when concurrent branch primitives
+   *  fire asks before any single parent ask exists. Per-instance so
+   *  separate executions don't cross-talk. */
+  private stepRefRoot: { value: number } = { value: 0 };
   private checkpointCounter = 0;
   private signal?: AbortSignal;
   private summaryCache?: string;
@@ -261,7 +309,7 @@ export class WorkflowContext<TInput = unknown> {
   private awaitHumanHandler?: (
     options: AwaitHumanOptions,
   ) => HumanDecision | Promise<HumanDecision>;
-  private onAgentStart?: (info: { agent: string; model: string }) => void;
+  private onAgentStart?: (info: { agent: string; model: string }, meta: CallbackMeta) => void;
   private onAgentCallComplete?: (call: AgentCallInfo) => void;
   private parentToolCallId?: string;
   constructor(init: WorkflowContextInit) {
@@ -298,13 +346,22 @@ export class WorkflowContext<TInput = unknown> {
    * Create a child context for nested agent invocations (e.g., agent-as-tool).
    * Shares: budget tracking, abort signals, trace emission, provider registry,
    *         state store, span manager, memory manager, MCP manager, config,
-   *         awaitHuman handler, pending decisions, tool overrides.
-   * Isolates: session history, step counter, streaming callbacks (onToken, onAgentStart, onToolCall).
+   *         awaitHuman handler, pending decisions, tool overrides, AND the
+   *         streaming callbacks (onToken / onAgentStart / onToolCall).
+   * Isolates: session history.
+   *
+   * Streaming callbacks now propagate into nested asks because every callback
+   * invocation carries `meta.askId`/`meta.parentAskId`/`meta.depth` so
+   * consumers that want root-only behavior can filter on `meta.depth === 0`
+   * instead of relying on the runtime to drop nested events. This is the
+   * "nested ask visibility" fix from spec §3.2.
+   *
+   * The shared step counter lives in `askStorage` (ALS), so there is no
+   * per-context counter to pass through anymore.
    *
    * @param parentToolCallId - The `callId` of the outer `tool_call` that
-   *   spawned this child. When set, every trace event emitted by the child
-   *   will carry this id as `parentToolCallId`, so consumers can join nested
-   *   agent calls back to the outer tool call that invoked them.
+   *   spawned this child. Threaded through `askStorage` so nested asks can
+   *   stamp `parentToolCallId` on their events for legacy telemetry consumers.
    */
   createChildContext(parentToolCallId?: string): WorkflowContext {
     return new WorkflowContext({
@@ -320,6 +377,9 @@ export class WorkflowContext<TInput = unknown> {
       spanManager: this.spanManager,
       memoryManager: this.memoryManager,
       onTrace: this.onTrace,
+      onToken: this.onToken,
+      onToolCall: this.onToolCall,
+      onAgentStart: this.onAgentStart,
       onAgentCallComplete: this.onAgentCallComplete,
       awaitHumanHandler: this.awaitHumanHandler,
       pendingDecisions: this.pendingDecisions,
@@ -330,8 +390,7 @@ export class WorkflowContext<TInput = unknown> {
       // `parentToolCallId` when this child is itself nested inside another
       // child — so grand-children still point to the outermost tool call.
       parentToolCallId: parentToolCallId ?? this.parentToolCallId,
-      // Isolated: sessionHistory (empty), stepCounter (0),
-      // onToken (null), onAgentStart (null), onToolCall (null)
+      // Isolated: sessionHistory (empty)
     });
   }
 
@@ -344,83 +403,163 @@ export class WorkflowContext<TInput = unknown> {
     return signalStorage.getStore() ?? this.signal;
   }
 
+  /**
+   * Build a `CallbackMeta` for the current ask frame. Used at every
+   * `onToken`/`onToolCall`/`onAgentStart` call site so consumers can
+   * route or filter by ask correlation (`meta.depth === 0` for root
+   * chat UIs, etc.).
+   *
+   * If the call is somehow outside an ask frame (e.g., a programmatic
+   * `tool.run()` test harness), falls back to a synthetic meta keyed off
+   * `executionId` so the type contract holds — consumers see `depth: 0`
+   * and can ignore those events.
+   */
+  private currentCallbackMeta(agentName: string): CallbackMeta {
+    const frame = askStorage.getStore();
+    if (frame) {
+      return {
+        askId: frame.askId,
+        ...(frame.parentAskId ? { parentAskId: frame.parentAskId } : {}),
+        depth: frame.depth,
+        agent: agentName,
+      };
+    }
+    return { askId: this.executionId, depth: 0, agent: agentName };
+  }
+
   // ── ctx.ask() ─────────────────────────────────────────────────────────
 
   async ask<T = string>(agent: Agent, prompt: string, options?: AskOptions<T>): Promise<T> {
     return this._checkpoint(async () => {
-      const costBefore = this.budgetContext?.totalCost ?? 0;
-      const startTime = Date.now();
-      const resolveCtx = options?.metadata
-        ? { metadata: { ...this.metadata, ...options.metadata } }
-        : { metadata: this.metadata };
-
-      // Use a mutable container to capture usage from executeAgentCall without
-      // relying on an instance property (which is racy under concurrent calls).
-      const usageCapture: {
-        value?: {
-          prompt_tokens: number;
-          completion_tokens: number;
-          total_tokens: number;
-          cached_tokens?: number;
-        };
-      } = {};
-
-      const doCall = async () => {
-        const result = await this.executeAgentCall(
-          agent,
-          prompt,
-          options as AskOptions<unknown>,
-          undefined,
-          usageCapture,
-        );
-        return result as T;
+      // Allocate the ask frame BEFORE entering askStorage.run so the
+      // emitEvent calls inside the run() callback see the new frame in ALS.
+      const parentFrame = askStorage.getStore();
+      const askId = randomUUID();
+      const depth = (parentFrame?.depth ?? -1) + 1;
+      // Nested asks inherit the parent frame's counter; top-level asks
+      // share the WorkflowContext's instance-level `stepRefRoot` so all
+      // top-level asks (including concurrent ones from spawn / parallel /
+      // race) share a single monotonic counter. Spec §3.7.
+      const stepRef = parentFrame?.stepRef ?? this.stepRefRoot;
+      const frame: AskFrame = {
+        askId,
+        parentAskId: parentFrame?.askId,
+        depth,
+        agent: agent._name,
+        // Inherit the parent's tool-call correlation so legacy consumers
+        // see the outermost tool call across nested asks. The instance-level
+        // `parentToolCallId` (set by `createChildContext`) takes priority.
+        parentToolCallId: this.parentToolCallId ?? parentFrame?.parentToolCallId,
+        stepRef,
+        askCost: { value: 0 },
       };
 
-      const result = this.spanManager
-        ? await this.spanManager.withSpanAsync(
-            'axl.agent.ask',
-            {
-              'axl.agent.name': agent._name,
-              'axl.agent.model': agent.resolveModel(resolveCtx),
-            },
-            async (span) => {
-              const r = await doCall();
-              const costAfter = this.budgetContext?.totalCost ?? 0;
-              span.setAttribute('axl.agent.cost', costAfter - costBefore);
-              span.setAttribute('axl.agent.duration', Date.now() - startTime);
-              if (usageCapture.value) {
-                span.setAttribute('axl.agent.prompt_tokens', usageCapture.value.prompt_tokens);
-                span.setAttribute(
-                  'axl.agent.completion_tokens',
-                  usageCapture.value.completion_tokens,
-                );
-                if (usageCapture.value.cached_tokens)
-                  span.setAttribute('axl.agent.cached_tokens', usageCapture.value.cached_tokens);
-              }
-              return r;
-            },
-          )
-        : await doCall();
+      return askStorage.run(frame, async () => {
+        const askStart = Date.now();
+        this.emitEvent({ type: 'ask_start', prompt });
 
-      const costAfter = this.budgetContext?.totalCost ?? 0;
-      this.onAgentCallComplete?.({
-        agent: agent._name,
-        prompt,
-        response: typeof result === 'string' ? result : JSON.stringify(result),
-        model: agent.resolveModel(resolveCtx),
-        cost: costAfter - costBefore,
-        duration: Date.now() - startTime,
-        promptVersion: agent._config.version,
-        temperature: options?.temperature ?? agent._config.temperature,
-        maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
-        effort: options?.effort ?? agent._config.effort,
-        thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
-        includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
-        toolChoice: options?.toolChoice ?? agent._config.toolChoice,
-        stop: options?.stop ?? agent._config.stop,
-        providerOptions: options?.providerOptions ?? agent._config.providerOptions,
+        // `costBefore` snapshots the global budget so we can pass the per-ask
+        // cost delta to onAgentCallComplete (legacy callback that reports the
+        // whole-tree spend). `frame.askCost` is the spec-correct, this-ask-only
+        // figure used on `ask_end` (decision 10).
+        const costBefore = this.budgetContext?.totalCost ?? 0;
+        const resolveCtx = options?.metadata
+          ? { metadata: { ...this.metadata, ...options.metadata } }
+          : { metadata: this.metadata };
+
+        // Use a mutable container to capture usage from executeAgentCall
+        // without relying on an instance property (which is racy under
+        // concurrent calls).
+        const usageCapture: {
+          value?: {
+            prompt_tokens: number;
+            completion_tokens: number;
+            total_tokens: number;
+            cached_tokens?: number;
+          };
+        } = {};
+
+        const doCall = async () => {
+          const result = await this.executeAgentCall(
+            agent,
+            prompt,
+            options as AskOptions<unknown>,
+            undefined,
+            usageCapture,
+          );
+          return result as T;
+        };
+
+        let result: T;
+        try {
+          result = this.spanManager
+            ? await this.spanManager.withSpanAsync(
+                'axl.agent.ask',
+                {
+                  'axl.agent.name': agent._name,
+                  'axl.agent.model': agent.resolveModel(resolveCtx),
+                },
+                async (span) => {
+                  const r = await doCall();
+                  const costAfter = this.budgetContext?.totalCost ?? 0;
+                  span.setAttribute('axl.agent.cost', costAfter - costBefore);
+                  span.setAttribute('axl.agent.duration', Date.now() - askStart);
+                  if (usageCapture.value) {
+                    span.setAttribute('axl.agent.prompt_tokens', usageCapture.value.prompt_tokens);
+                    span.setAttribute(
+                      'axl.agent.completion_tokens',
+                      usageCapture.value.completion_tokens,
+                    );
+                    if (usageCapture.value.cached_tokens)
+                      span.setAttribute(
+                        'axl.agent.cached_tokens',
+                        usageCapture.value.cached_tokens,
+                      );
+                  }
+                  return r;
+                },
+              )
+            : await doCall();
+        } catch (err) {
+          // Ask-internal failure surfaces via ask_end with outcome.ok:false
+          // (spec decision 9). The workflow-level `error` event is reserved
+          // for failures with no ask_end available — consumers must never
+          // see both for the same failure.
+          this.emitEvent({
+            type: 'ask_end',
+            outcome: { ok: false, error: err instanceof Error ? err.message : String(err) },
+            cost: frame.askCost.value,
+            duration: Date.now() - askStart,
+          });
+          throw err;
+        }
+
+        const costAfter = this.budgetContext?.totalCost ?? 0;
+        this.onAgentCallComplete?.({
+          agent: agent._name,
+          prompt,
+          response: typeof result === 'string' ? result : JSON.stringify(result),
+          model: agent.resolveModel(resolveCtx),
+          cost: costAfter - costBefore,
+          duration: Date.now() - askStart,
+          promptVersion: agent._config.version,
+          temperature: options?.temperature ?? agent._config.temperature,
+          maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
+          effort: options?.effort ?? agent._config.effort,
+          thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
+          includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
+          toolChoice: options?.toolChoice ?? agent._config.toolChoice,
+          stop: options?.stop ?? agent._config.stop,
+          providerOptions: options?.providerOptions ?? agent._config.providerOptions,
+        });
+        this.emitEvent({
+          type: 'ask_end',
+          outcome: { ok: true, result },
+          cost: frame.askCost.value,
+          duration: Date.now() - askStart,
+        });
+        return result;
       });
-      return result;
     });
   }
 
@@ -442,7 +581,7 @@ export class WorkflowContext<TInput = unknown> {
     if (this.budgetContext?.exceeded) {
       const { limit, totalCost: spent, policy } = this.budgetContext;
       if (policy === 'warn') {
-        this.emitTrace({
+        this.emitEvent({
           type: 'log',
           data: { warning: 'Budget exceeded', limit, spent, policy },
         });
@@ -562,7 +701,7 @@ export class WorkflowContext<TInput = unknown> {
     const guardrails = agent._config.guardrails;
     if (guardrails?.input) {
       const inputResult = await guardrails.input(prompt, { metadata: this.metadata });
-      this.emitTrace({
+      this.emitEvent({
         type: 'guardrail',
         agent: agent._name,
         data: {
@@ -599,15 +738,13 @@ export class WorkflowContext<TInput = unknown> {
     const timeoutMs = parseDuration(agent._config.timeout ?? '60s');
     const startTime = Date.now();
 
-    // Streaming + validate is not supported: validate requires schema (JSON output),
-    // and on retry the token stream would contain tokens from multiple attempts
-    // concatenated together with no separator, producing garbled output.
-    if (this.onToken && options?.validate) {
-      throw new AxlError(
-        'INVALID_CONFIG',
-        'Cannot use validate with streaming. Validate requires schema (JSON output) which does not benefit from token streaming. Use a non-streaming call instead.',
-      );
-    }
+    // Streaming + validate is supported as of the unified event model
+    // (spec §4.1). With pipeline events landing in PR 2, retry boundaries
+    // are visible to consumers via `pipeline(status: 'failed' | 'committed')`
+    // and `AxlStream.fullText` only commits the winning attempt's tokens.
+    // Until pipeline events ship, retried tokens still concatenate; the
+    // tradeoff is acceptable because the throw was a worse failure mode
+    // (refused to run a valid configuration).
 
     const currentMessages = [...messages];
     let turns = 0;
@@ -654,7 +791,8 @@ export class WorkflowContext<TInput = unknown> {
         chatOptions.responseFormat = { type: 'json_object' };
       }
 
-      this.onAgentStart?.({ agent: agent._name, model: modelUri });
+      const callbackMeta = this.currentCallbackMeta(agent._name);
+      this.onAgentStart?.({ agent: agent._name, model: modelUri }, callbackMeta);
 
       let response: ProviderResponse;
 
@@ -670,7 +808,7 @@ export class WorkflowContext<TInput = unknown> {
         for await (const chunk of provider.stream(currentMessages, chatOptions)) {
           if (chunk.type === 'text_delta') {
             content += chunk.content;
-            this.onToken(chunk.content);
+            this.onToken(chunk.content, callbackMeta);
           } else if (chunk.type === 'thinking_delta') {
             thinkingContent += chunk.content;
           } else if (chunk.type === 'tool_call_delta') {
@@ -759,7 +897,7 @@ export class WorkflowContext<TInput = unknown> {
       const retryReason = pendingRetryReason;
       pendingRetryReason = undefined;
 
-      this.emitTrace({
+      this.emitEvent({
         type: 'agent_call_end',
         agent: agent._name,
         model: modelUri,
@@ -876,7 +1014,7 @@ export class WorkflowContext<TInput = unknown> {
                       const result = await executeRoundtrip();
                       const duration = Date.now() - handoffStart;
                       span.setAttribute('axl.handoff.duration', duration);
-                      this.emitTrace({
+                      this.emitEvent({
                         type: 'handoff',
                         agent: agent._name,
                         data: {
@@ -892,7 +1030,7 @@ export class WorkflowContext<TInput = unknown> {
                   );
                 } else {
                   await executeRoundtrip();
-                  this.emitTrace({
+                  this.emitEvent({
                     type: 'handoff',
                     agent: agent._name,
                     data: {
@@ -920,7 +1058,7 @@ export class WorkflowContext<TInput = unknown> {
                     const result = await handoffFn();
                     const duration = Date.now() - handoffStart;
                     span.setAttribute('axl.handoff.duration', duration);
-                    this.emitTrace({
+                    this.emitEvent({
                       type: 'handoff',
                       agent: agent._name,
                       data: { target: targetName, mode, duration, source: agent._name },
@@ -930,7 +1068,7 @@ export class WorkflowContext<TInput = unknown> {
                 );
               }
               const onewayResult = await handoffFn();
-              this.emitTrace({
+              this.emitEvent({
                 type: 'handoff',
                 agent: agent._name,
                 data: {
@@ -958,7 +1096,10 @@ export class WorkflowContext<TInput = unknown> {
               });
               continue;
             }
-            this.onToolCall?.({ name: toolName, args: toolArgs, callId: toolCall.id });
+            this.onToolCall?.(
+              { name: toolName, args: toolArgs, callId: toolCall.id },
+              callbackMeta,
+            );
             const toolStart = Date.now();
 
             const executeOverride = async () => {
@@ -992,7 +1133,7 @@ export class WorkflowContext<TInput = unknown> {
               : await executeOverride();
 
             const resultContent = JSON.stringify(toolResult);
-            this.emitTrace({
+            this.emitEvent({
               type: 'tool_call_end',
               agent: agent._name,
               tool: toolName,
@@ -1013,7 +1154,7 @@ export class WorkflowContext<TInput = unknown> {
 
           if (!tool && !isMcpTool) {
             // Tool denied
-            this.emitTrace({ type: 'tool_denied', agent: agent._name, tool: toolName });
+            this.emitEvent({ type: 'tool_denied', agent: agent._name, tool: toolName });
             currentMessages.push({
               role: 'tool',
               content: `Tool "${toolName}" is not available. Available tools: ${agent._config.tools?.map((t) => t.name).join(', ') ?? 'none'}`,
@@ -1035,7 +1176,7 @@ export class WorkflowContext<TInput = unknown> {
             continue;
           }
 
-          this.onToolCall?.({ name: toolName, args: toolArgs, callId: toolCall.id });
+          this.onToolCall?.({ name: toolName, args: toolArgs, callId: toolCall.id }, callbackMeta);
 
           const toolStart = Date.now();
 
@@ -1080,7 +1221,7 @@ export class WorkflowContext<TInput = unknown> {
               approvalOutcome = await approvalFn();
             }
 
-            this.emitTrace({
+            this.emitEvent({
               type: 'tool_approval',
               agent: agent._name,
               tool: toolName,
@@ -1203,7 +1344,7 @@ export class WorkflowContext<TInput = unknown> {
               )
             : await executeTool();
 
-          this.emitTrace({
+          this.emitEvent({
             type: 'tool_call_end',
             agent: agent._name,
             tool: traceName,
@@ -1242,7 +1383,7 @@ export class WorkflowContext<TInput = unknown> {
           feedbackMessage = `Your previous response was blocked by a safety guardrail: ${outputResult.reason ?? 'Output blocked'}. Please provide a different response that complies with the guidelines.`;
         }
 
-        this.emitTrace({
+        this.emitEvent({
           type: 'guardrail',
           agent: agent._name,
           data: {
@@ -1305,7 +1446,7 @@ export class WorkflowContext<TInput = unknown> {
           }
         }
 
-        this.emitTrace({
+        this.emitEvent({
           type: 'schema_check',
           agent: agent._name,
           data: {
@@ -1373,7 +1514,7 @@ export class WorkflowContext<TInput = unknown> {
           validateFeedback = `Your response parsed correctly but failed validation: ${validateResult.reason ?? 'Validation failed'}. Previous attempts are visible above. Please fix and try again.`;
         }
 
-        this.emitTrace({
+        this.emitEvent({
           type: 'validate',
           agent: agent._name,
           data: {
@@ -1610,7 +1751,7 @@ export class WorkflowContext<TInput = unknown> {
     // Check for a saved checkpoint from a previous execution
     const saved = await this.stateStore.getCheckpoint(this.executionId, step);
     if (saved !== null) {
-      this.emitTrace({
+      this.emitEvent({
         type: 'log',
         data: { event: 'checkpoint_replay', step },
       });
@@ -1623,7 +1764,7 @@ export class WorkflowContext<TInput = unknown> {
 
     await this.stateStore.saveCheckpoint(this.executionId, step, result);
 
-    this.emitTrace({
+    this.emitEvent({
       type: 'log',
       data: { event: 'checkpoint_save', step },
     });
@@ -1883,7 +2024,7 @@ export class WorkflowContext<TInput = unknown> {
     // can see the outcome (pass/fail) and the number of attempts used. Called
     // just before every return/throw below; no-op on `continue`.
     const emitVerifyOutcome = (passed: boolean, attempts: number, lastError?: string) => {
-      this.emitTrace({
+      this.emitEvent({
         type: 'verify',
         agent: undefined,
         data: {
@@ -2294,7 +2435,7 @@ export class WorkflowContext<TInput = unknown> {
   private async _awaitHumanImpl(options: AwaitHumanOptions): Promise<HumanDecision> {
     if (this.awaitHumanHandler) {
       const decision = await this.awaitHumanHandler(options);
-      this.emitTrace({
+      this.emitEvent({
         type: 'log',
         data: { event: 'await_human_resolved', channel: options.channel, decision },
       });
@@ -2321,7 +2462,7 @@ export class WorkflowContext<TInput = unknown> {
       await this.stateStore.saveExecutionState(this.executionId, {
         workflow: this.workflowName ?? 'unknown',
         input: this.input,
-        step: this.stepCounter,
+        step: this.stepRefRoot.value,
         status: 'waiting',
         metadata: {
           ...this.metadata,
@@ -2331,7 +2472,7 @@ export class WorkflowContext<TInput = unknown> {
       });
     }
 
-    this.emitTrace({
+    this.emitEvent({
       type: 'log',
       data: { event: 'await_human', channel: options.channel, prompt: options.prompt },
     });
@@ -2345,7 +2486,7 @@ export class WorkflowContext<TInput = unknown> {
       await this.stateStore.saveExecutionState(this.executionId, {
         workflow: this.workflowName ?? 'unknown',
         input: this.input,
-        step: this.stepCounter,
+        step: this.stepRefRoot.value,
         status: 'running',
       });
     }
@@ -2406,7 +2547,7 @@ export class WorkflowContext<TInput = unknown> {
 
   /** @internal */
   _emitWorkflowStart(input: unknown): void {
-    this.emitTrace({
+    this.emitEvent({
       type: 'workflow_start',
       workflow: this.workflowName,
       data: { input },
@@ -2421,7 +2562,7 @@ export class WorkflowContext<TInput = unknown> {
     error?: string;
     aborted?: boolean;
   }): void {
-    this.emitTrace({
+    this.emitEvent({
       type: 'workflow_end',
       workflow: this.workflowName,
       duration: info.duration,
@@ -2438,7 +2579,7 @@ export class WorkflowContext<TInput = unknown> {
   // ── ctx.log() ─────────────────────────────────────────────────────────
 
   log(event: string, data?: unknown): void {
-    this.emitTrace({
+    this.emitEvent({
       type: 'log',
       data: {
         event,
@@ -2524,7 +2665,7 @@ export class WorkflowContext<TInput = unknown> {
       // `tokens.input` because embedding APIs bill on input only.
       // `usage` is also nested into the event `data` for trace-explorer
       // visibility (debuggers see the full model/cost/tokens breakdown).
-      this.emitTrace({
+      this.emitEvent({
         type: 'log',
         ...(usage?.cost != null ? { cost: usage.cost } : {}),
         ...(usage?.tokens != null ? { tokens: { input: usage.tokens } } : {}),
@@ -2550,7 +2691,7 @@ export class WorkflowContext<TInput = unknown> {
       if (partialUsage?.cost != null) {
         this._accumulateBudgetCost(partialUsage.cost);
       }
-      this.emitTrace({
+      this.emitEvent({
         type: 'log',
         ...(partialUsage?.cost != null ? { cost: partialUsage.cost } : {}),
         ...(partialUsage?.tokens != null ? { tokens: { input: partialUsage.tokens } } : {}),
@@ -2620,7 +2761,7 @@ export class WorkflowContext<TInput = unknown> {
       // early-return gate (`cost == null && !tokens`) doesn't silently
       // drop zero-cost-but-nonzero-token events. `usage` is also nested
       // into `data.usage` for trace inspection.
-      this.emitTrace({
+      this.emitEvent({
         type: 'log',
         ...(usage?.cost != null ? { cost: usage.cost } : {}),
         ...(usage?.tokens != null ? { tokens: { input: usage.tokens } } : {}),
@@ -2636,7 +2777,7 @@ export class WorkflowContext<TInput = unknown> {
       });
       return data;
     } catch (err) {
-      this.emitTrace({
+      this.emitEvent({
         type: 'log',
         data: {
           event: 'memory_recall',
@@ -2665,12 +2806,12 @@ export class WorkflowContext<TInput = unknown> {
     const scope: 'session' | 'global' = options?.scope ?? (sessionId ? 'session' : 'global');
     try {
       await this.memoryManager.forget(key, this.stateStore, sessionId, options);
-      this.emitTrace({
+      this.emitEvent({
         type: 'log',
         data: { event: 'memory_forget', key, scope },
       });
     } catch (err) {
-      this.emitTrace({
+      this.emitEvent({
         type: 'log',
         data: {
           event: 'memory_forget',
@@ -2718,7 +2859,7 @@ export class WorkflowContext<TInput = unknown> {
     }
 
     if (agents.length === 1) {
-      this.emitTrace({
+      this.emitEvent({
         type: 'delegate',
         agent: agents[0]._name,
         data: {
@@ -2777,7 +2918,7 @@ export class WorkflowContext<TInput = unknown> {
       resolveSystem: () => routerSystem,
     };
 
-    this.emitTrace({
+    this.emitEvent({
       type: 'delegate',
       agent: '_delegate_router',
       data: {
@@ -2804,7 +2945,7 @@ export class WorkflowContext<TInput = unknown> {
    * `AxlEvent` (exported type) remains strict, and TypeScript narrows it at
    * consumer sites via the `type` discriminator.
    */
-  private emitTrace(partial: {
+  private emitEvent(partial: {
     type: AxlEvent['type'];
     workflow?: string;
     agent?: string;
@@ -2815,7 +2956,32 @@ export class WorkflowContext<TInput = unknown> {
     tokens?: { input?: number; output?: number; reasoning?: number };
     duration?: number;
     data?: unknown;
+    // Variant-specific fields are accepted as `unknown`-typed extras so
+    // call sites don't need to build a perfectly-narrowed discriminated
+    // union member. The final `as unknown as AxlEvent` cast at the bottom
+    // of the function is the runtime contract — emit sites are
+    // responsible for pairing `type` with the matching variant fields.
+    [key: string]: unknown;
   }): void {
+    // Top-level redaction for variants whose user/LLM payload sits outside
+    // `data` (e.g. `ask_start.prompt`, `ask_end.outcome.{result,error}`).
+    // Mutates `partial` in place — done before the `data`-branch redactor
+    // below to keep the two paths independent.
+    if (this.config.trace?.redact) {
+      if (partial.type === 'ask_start' && typeof partial.prompt === 'string') {
+        partial.prompt = '[redacted]';
+      } else if (partial.type === 'ask_end') {
+        const outcome = partial.outcome as
+          | { ok: true; result: unknown }
+          | { ok: false; error: string }
+          | undefined;
+        if (outcome?.ok) {
+          partial.outcome = { ok: true, result: '[redacted]' };
+        } else if (outcome) {
+          partial.outcome = { ok: false, error: '[redacted]' };
+        }
+      }
+    }
     let data: unknown = partial.data;
     if (this.config.trace?.redact && data) {
       // Redact any field that can carry prompt/response/PII content. Structural
@@ -2972,12 +3138,49 @@ export class WorkflowContext<TInput = unknown> {
     // Auto-stamping here is the single-source-of-truth fix: callers can
     // still override via `partial.workflow` if needed (e.g. a child context
     // emitting on behalf of its parent), but the common case "just works".
+    // Read the ALS frame for ask correlation. The step counter prefers the
+    // ALS frame's `stepRef` (which is `this.stepRefRoot` for top-level
+    // asks, or the parent's counter for nested asks). Out-of-ask events
+    // (workflow_start, workflow_end, ad-hoc log) also use `stepRefRoot` so
+    // every event from this WorkflowContext shares one monotonic counter.
+    const frame = askStorage.getStore();
+    const step = (frame?.stepRef ?? this.stepRefRoot).value++;
+    // Per-frame ask cost rollup. Only count cost-bearing leaf events
+    // (`agent_call_end` / `tool_call_end`) emitted directly within this
+    // frame — nested asks have their own frame and their own counter, and
+    // their own `ask_end` event will surface their rollup. This keeps
+    // `ask_end.cost` honest per spec decision 10.
+    const cost = (partial as { cost?: number }).cost;
+    if (
+      frame &&
+      typeof cost === 'number' &&
+      (partial.type === 'agent_call_end' || partial.type === 'tool_call_end')
+    ) {
+      frame.askCost.value += cost;
+    }
+    // Inherit `parentToolCallId` from the ALS frame if present; this lets
+    // tool-execution contexts thread the outer tool callId through nested
+    // asks even when the WorkflowContext instance itself wasn't constructed
+    // with `parentToolCallId` set.
+    const parentToolCallId = this.parentToolCallId ?? frame?.parentToolCallId;
     const event = {
       executionId: this.executionId,
-      step: this.stepCounter++,
+      step,
       timestamp: Date.now(),
       ...(this.workflowName ? { workflow: this.workflowName } : {}),
-      ...(this.parentToolCallId ? { parentToolCallId: this.parentToolCallId } : {}),
+      ...(parentToolCallId ? { parentToolCallId } : {}),
+      // Stamp ask correlation from ALS. Variants like `workflow_start` /
+      // `workflow_end` and out-of-ask `log` events may legitimately have
+      // no frame — they get no askId/parentAskId/depth, matching the
+      // `Partial<AskScoped>` shape on those union members.
+      ...(frame
+        ? {
+            askId: frame.askId,
+            ...(frame.parentAskId ? { parentAskId: frame.parentAskId } : {}),
+            depth: frame.depth,
+            ...(frame.agent ? { agent: frame.agent } : {}),
+          }
+        : {}),
       ...partial,
       data,
     } as unknown as AxlEvent;

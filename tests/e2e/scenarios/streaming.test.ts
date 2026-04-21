@@ -79,7 +79,7 @@ describe('Streaming E2E', () => {
     expect(agentCallStep).toBeDefined();
   });
 
-  it('streams tokens only from outer agent, not from sub-agent in tool handler', async () => {
+  it('streams tokens from BOTH outer and sub-agent (consumers filter via meta.depth — spec/16 §3.2)', async () => {
     const researcher = agent({
       name: 'researcher',
       model: 'mock:researcher',
@@ -142,11 +142,15 @@ describe('Streaming E2E', () => {
       if (event.type === 'done') break;
     }
 
-    // Token events should only contain text from the coordinator's final response
+    // The unified event model (spec/16 §3.2) intentionally surfaces nested-ask
+    // tokens to the wire so subagent activity is observable. Consumers that
+    // want root-only behavior filter on `meta.depth === 0` at the callback
+    // level. The wire-format StreamEvent doesn't yet carry meta — that's a
+    // PR 2/3 follow-up — so the assertion here just checks both texts arrive.
     const tokenEvents = allEvents.filter((e) => e.type === 'token');
     const streamedText = tokenEvents.map((e) => (e as { data: string }).data).join('');
-    expect(streamedText).toBe('Based on my research: final answer');
-    expect(streamedText).not.toContain('research findings about topic X');
+    expect(streamedText).toContain('Based on my research: final answer');
+    expect(streamedText).toContain('research findings about topic X');
 
     // tool_call event should include the research tool call
     const toolCallEvents = allEvents.filter((e) => e.type === 'tool_call');

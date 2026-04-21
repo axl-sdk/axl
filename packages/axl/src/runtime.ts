@@ -20,6 +20,7 @@ import { McpManager } from './mcp/manager.js';
 import { MemoryManager } from './memory/manager.js';
 import type {
   AxlEvent,
+  CallbackMeta,
   ExecutionInfo,
   HumanDecision,
   AwaitHumanOptions,
@@ -66,8 +67,10 @@ export type CreateContextOptions = {
   signal?: AbortSignal;
   /** Prior conversation history for multi-turn eval testing. */
   sessionHistory?: ChatMessage[];
-  /** Token streaming callback. */
-  onToken?: (token: string) => void;
+  /** Token streaming callback. `meta` carries `askId`/`parentAskId`/`depth`/`agent`
+   *  so consumers can route or filter by ask correlation (e.g.,
+   *  `meta.depth === 0` for root-only chat UIs). */
+  onToken?: (token: string, meta: CallbackMeta) => void;
   /** Handler for tool approval requests. Called when an agent invokes a tool with requireApproval. */
   awaitHumanHandler?: (options: AwaitHumanOptions) => Promise<HumanDecision>;
 };
@@ -560,7 +563,11 @@ export class AxlRuntime extends EventEmitter {
       signal: controller.signal,
       onTrace: (event: AxlEvent) => {
         execInfo.events.push(event);
-        if (event.cost) execInfo.totalCost += event.cost;
+        // `ask_end` carries the per-ask rollup cost; the underlying
+        // `agent_call_end` / `tool_call_end` events that compose it have
+        // already incremented totalCost. Skip the rollup to avoid double
+        // counting (spec decision 10).
+        if (event.cost && event.type !== 'ask_end') execInfo.totalCost += event.cost;
         this.emit('trace', event);
         this.outputAxlEvent(event);
         // Persist handoff records to session metadata
@@ -708,7 +715,10 @@ export class AxlRuntime extends EventEmitter {
         signal: controller.signal,
         onTrace: (event: AxlEvent) => {
           execInfo!.events.push(event);
-          if (event.cost) execInfo!.totalCost += event.cost;
+          // Skip ask_end's per-ask rollup cost — the constituent agent_call_end
+          // / tool_call_end events have already accumulated their cost above
+          // (spec decision 10).
+          if (event.cost && event.type !== 'ask_end') execInfo!.totalCost += event.cost;
           this.emit('trace', event);
           this.outputAxlEvent(event);
           // Emit typed stream events for specific trace types
@@ -768,6 +778,13 @@ export class AxlRuntime extends EventEmitter {
           axlStream._push({ type: 'step', step: event.step, data: event });
         },
         onToken: (token: string) => {
+          // The translation layer between AxlEvent (core) and the legacy
+          // wire-format StreamEvent (consumer-facing) lives here through
+          // PR 1. The next commit deletes it; the AxlStream then carries
+          // AxlEvent directly. The `meta` parameter is intentionally
+          // ignored at the wire boundary today — preserving root-only
+          // behavior — and the next commit lets `meta.depth` flow through
+          // into per-event AxlEvent records.
           axlStream._push({ type: 'token', data: token });
         },
         onToolCall: (call: { name: string; args: unknown; callId?: string }) => {
@@ -1271,7 +1288,10 @@ export class AxlRuntime extends EventEmitter {
 
     const listener = (event: AxlEvent) => {
       if (!scope.trackedIds.has(event.executionId)) return;
-      if (event.cost) scope.totalCost += event.cost;
+      // Skip `ask_end` for cost — it's the per-ask rollup of agent_call_end
+      // and tool_call_end costs that already pass through this listener
+      // (spec decision 10). Counting it would double-charge every ask.
+      if (event.cost && event.type !== 'ask_end') scope.totalCost += event.cost;
       if (event.type === 'agent_call_end') {
         if (event.model) modelCalls.set(event.model, (modelCalls.get(event.model) ?? 0) + 1);
         agentCalls++;

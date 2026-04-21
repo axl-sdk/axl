@@ -11,6 +11,7 @@ import type { Provider, ProviderResponse } from '../providers/types.js';
 /** Create a mock provider that returns fixed responses in sequence. */
 function createMockProvider(responses: string[]): Provider {
   let callIndex = 0;
+  let streamCallIndex = 0;
   return {
     name: 'mock',
     chat: async () => {
@@ -24,9 +25,16 @@ function createMockProvider(responses: string[]): Provider {
       return resp;
     },
     stream: async function* () {
+      // Mirror the same response sequence on the streaming path so tests
+      // exercising onToken can rely on `responses` being delivered. Without
+      // this, the streaming branch would emit empty content and gates that
+      // expect a JSON payload would always fail.
+      const content = responses[streamCallIndex] ?? responses[responses.length - 1];
+      streamCallIndex++;
+      yield { type: 'text_delta' as const, content };
       yield {
         type: 'done' as const,
-        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
       };
     },
   };
@@ -130,20 +138,30 @@ describe('validate (post-schema business rule validation)', () => {
       expect(validateCalled).toBe(false);
     });
 
-    it('throws when validate is used with streaming', async () => {
+    it('runs validate against the buffered response when streaming is enabled', async () => {
+      // The unified-event-model migration (spec/16, §4.1) drops the old
+      // hard error: validate + onToken now coexist. Tokens stream as they
+      // arrive; the validate callback runs against the fully-buffered,
+      // schema-parsed response. With the pipeline events landing in PR 2,
+      // consumers see retry boundaries and `AxlStream.fullText` only
+      // commits the winning attempt's tokens.
       const a = agent({ model: 'mock:test', system: 'Return JSON.' });
+      const tokens: string[] = [];
+      let validateCalled = false;
       const { ctx } = createCtx({
-        responses: [JSON.stringify({ value: 1 })],
-        onToken: () => {},
+        responses: [JSON.stringify({ value: 7 })],
+        onToken: (t: string) => tokens.push(t),
       });
-      const err = await ctx
-        .ask(a, 'Hello', {
-          schema: ValueSchema,
-          validate: () => ({ valid: true }),
-        })
-        .catch((e) => e);
-      expect(err.code).toBe('INVALID_CONFIG');
-      expect(err.message).toContain('Cannot use validate with streaming');
+      const result = await ctx.ask(a, 'Hello', {
+        schema: ValueSchema,
+        validate: (out) => {
+          validateCalled = true;
+          return { valid: out.value === 7, reason: 'must equal 7' };
+        },
+      });
+      expect(result).toEqual({ value: 7 });
+      expect(validateCalled).toBe(true);
+      expect(tokens.length).toBeGreaterThan(0);
     });
   });
 

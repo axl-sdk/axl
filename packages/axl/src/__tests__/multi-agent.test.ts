@@ -106,16 +106,20 @@ describe('child context', () => {
     expect(agentCallTraces.some((t) => t.agent === 'traced_child')).toBe(true);
   });
 
-  it('createChildContext() isolates streaming callbacks', async () => {
-    let parentTokenCalled = false;
-    let parentAgentStartCalled = false;
+  it('createChildContext() inherits streaming callbacks (callback meta carries depth)', async () => {
+    // Spec/16 §3.2: callbacks now propagate into nested asks because every
+    // invocation carries `meta.askId`/`meta.depth` so consumers can filter
+    // root-only behavior with `meta.depth === 0` instead of relying on
+    // runtime isolation.
+    const tokenInvocations: { token: string; depth: number }[] = [];
+    const agentStartInvocations: { agent: string; depth: number }[] = [];
 
     const { ctx } = createTestCtx({
-      onToken: () => {
-        parentTokenCalled = true;
+      onToken: (token: string, meta: { depth: number }) => {
+        tokenInvocations.push({ token, depth: meta.depth });
       },
-      onAgentStart: () => {
-        parentAgentStartCalled = true;
+      onAgentStart: (info: { agent: string }, meta: { depth: number }) => {
+        agentStartInvocations.push({ agent: info.agent, depth: meta.depth });
       },
     });
 
@@ -129,9 +133,13 @@ describe('child context', () => {
 
     await child.ask(childAgent, 'hello');
 
-    // The parent's streaming callbacks should NOT have been triggered by the child
-    expect(parentTokenCalled).toBe(false);
-    expect(parentAgentStartCalled).toBe(false);
+    // Parent's streaming callbacks DO fire — the new contract is that
+    // consumers filter on `meta.depth` if they want root-only.
+    expect(agentStartInvocations.length).toBeGreaterThan(0);
+    expect(agentStartInvocations[0].agent).toBe('streaming_child');
+    // Depth is 0 because the child ctx is invoked outside any parent ask;
+    // this is the root ask of that child.
+    expect(agentStartInvocations[0].depth).toBe(0);
   });
 
   it('agent-as-tool pattern: tool handler can invoke sub-agent via ctx.ask()', async () => {

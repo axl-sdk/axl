@@ -148,7 +148,10 @@ export class AxlTestRuntime {
           this._toolCalls.push({ name: event.tool!, args, result });
         }
 
-        if (event.cost) {
+        // Skip ask_end (per-ask rollup) so we don't double-count the
+        // agent_call_end / tool_call_end events that already accumulated.
+        // Spec decision 10.
+        if (event.cost && event.type !== 'ask_end') {
           this._totalCost += event.cost;
         }
 

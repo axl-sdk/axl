@@ -849,6 +849,91 @@ describe('trace events — workflow_start/end redaction', () => {
   });
 });
 
+describe('trace events — ask_start / ask_end redaction (spec/16 §3.8)', () => {
+  it('redacts ask_start.prompt under trace.redact', async () => {
+    const { agent, workflow, AxlRuntime } = await import('../index.js');
+    const runtime = new AxlRuntime({ trace: { redact: true } });
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (e) => traces.push(e));
+
+    const a = agent({ name: 'redact-ask', model: 'mock:m', system: 'sys' });
+    runtime.registerProvider('mock', {
+      name: 'mock',
+      chat: async () => ({
+        content: 'ok',
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        cost: 0.001,
+      }),
+      stream: async function* () {
+        yield {
+          type: 'done' as const,
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+      },
+    });
+    runtime.register(
+      workflow({
+        name: 'redact-ask-wf',
+        input: z.object({}),
+        handler: async (ctx) => ctx.ask(a, 'sensitive-prompt-with-ssn-123-45-6789'),
+      }),
+    );
+    await runtime.execute('redact-ask-wf', {});
+
+    const askStart = traces.find((t) => t.type === 'ask_start') as
+      | (AxlEvent & { type: 'ask_start'; prompt: string })
+      | undefined;
+    expect(askStart).toBeDefined();
+    expect(askStart!.prompt).toBe('[redacted]');
+  });
+
+  it('redacts ask_end.outcome.result and outcome.error under trace.redact', async () => {
+    const { agent, workflow, AxlRuntime } = await import('../index.js');
+    const runtime = new AxlRuntime({ trace: { redact: true } });
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (e) => traces.push(e));
+
+    const a = agent({ name: 'redact-end', model: 'mock:m', system: 'sys' });
+    runtime.registerProvider('mock', {
+      name: 'mock',
+      chat: async () => ({
+        content: 'sensitive-response-john@acme.com',
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        cost: 0.001,
+      }),
+      stream: async function* () {
+        yield {
+          type: 'done' as const,
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+      },
+    });
+    runtime.register(
+      workflow({
+        name: 'redact-end-wf',
+        input: z.object({}),
+        handler: async (ctx) => ctx.ask(a, 'q'),
+      }),
+    );
+    await runtime.execute('redact-end-wf', {});
+
+    const askEnd = traces.find((t) => t.type === 'ask_end') as
+      | (AxlEvent & {
+          type: 'ask_end';
+          outcome: { ok: true; result: unknown } | { ok: false; error: string };
+          cost: number;
+        })
+      | undefined;
+    expect(askEnd).toBeDefined();
+    expect(askEnd!.outcome.ok).toBe(true);
+    if (askEnd!.outcome.ok) {
+      expect(askEnd!.outcome.result).toBe('[redacted]');
+    }
+    // Cost is structural metadata — never scrubbed.
+    expect(askEnd!.cost).toBeGreaterThan(0);
+  });
+});
+
 describe('trace events — redaction', () => {
   it('redacts sensitive fields on agent_call when trace.redact is true', async () => {
     const a = agent({ name: 'a', model: 'mock:test', system: 'secret system prompt' });

@@ -28,6 +28,16 @@
  * Zero runtime deps. ~250 LOC.
  */
 
+/**
+ * Maximum nesting depth we'll accept before throwing. LLM responses
+ * don't organically produce 256-deep nested structures — a deeply-
+ * adversarial provider returning `[[[[[...]]]]]` can exhaust V8's
+ * default ~10k-frame stack via the recursive-descent walker (each
+ * `parseValue` → `parseArray/Object` pair consumes ~3 frames). The
+ * cap is an availability guard, not a correctness limit.
+ */
+const MAX_DEPTH = 256;
+
 /** Parse a JSON-shaped string that may be truncated mid-stream. */
 export function parsePartialJson(input: string): unknown {
   const parser = new PartialParser(input);
@@ -42,6 +52,7 @@ type ParseResult = { value: unknown; complete: boolean };
 
 class PartialParser {
   private pos = 0;
+  private depth = 0;
   constructor(private readonly src: string) {}
 
   eof(): boolean {
@@ -71,8 +82,22 @@ class PartialParser {
     this.skipWhitespace();
     if (this.eof()) return { value: undefined, complete: false };
     const c = this.peek();
-    if (c === '{') return this.parseObject();
-    if (c === '[') return this.parseArray();
+    // Gate object/array recursion on the depth counter — scalar parsers
+    // don't recurse so they skip the check. Enter/exit via try/finally
+    // so any throw from below (EOF, malformed input) still restores the
+    // depth counter to its caller-visible state.
+    if (c === '{' || c === '[') {
+      if (++this.depth > MAX_DEPTH) {
+        throw new SyntaxError(
+          `Maximum nesting depth exceeded (${MAX_DEPTH}) at position ${this.pos}`,
+        );
+      }
+      try {
+        return c === '{' ? this.parseObject() : this.parseArray();
+      } finally {
+        this.depth--;
+      }
+    }
     if (c === '"') return this.parseString();
     if (c === 't' || c === 'f') return this.parseBool();
     if (c === 'n') return this.parseNull();

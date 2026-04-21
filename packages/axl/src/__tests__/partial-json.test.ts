@@ -135,6 +135,25 @@ describe('parsePartialJson — empty input', () => {
   });
 });
 
+describe('parsePartialJson — adversarial input', () => {
+  it('throws on deeply nested input (stack overflow guard)', () => {
+    // Build `[[[[[...]]]]]` at a depth well above the 256 cap. A
+    // typical V8 stack tolerates ~10k recursive frames; we cap at 256
+    // so the error surfaces as a SyntaxError rather than a hard crash.
+    const depth = 300;
+    const deep = '['.repeat(depth) + ']'.repeat(depth);
+    expect(() => parsePartialJson(deep)).toThrow(/Maximum nesting depth/);
+  });
+
+  it('accepts input at the legal depth ceiling (256 levels)', () => {
+    const depth = 200;
+    const deep = '['.repeat(depth) + ']'.repeat(depth);
+    // Should parse without throwing — depth is checked with ++, so
+    // exactly 256 is the first rejected value.
+    expect(() => parsePartialJson(deep)).not.toThrow();
+  });
+});
+
 describe('parsePartialJson — monotonicity guard (spec/16 §4.2)', () => {
   it('progressive parses are supersets of earlier parses (object case)', () => {
     const final = '{"name":"Alice","age":30,"tags":["a","b"]}';

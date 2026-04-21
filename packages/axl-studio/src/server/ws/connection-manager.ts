@@ -69,7 +69,14 @@ function isBufferedChannel(channel: string): boolean {
  * explicit truncation marker instead of silently losing data.
  */
 function truncateIfOversized(msg: string, channel: string, data: unknown): string {
-  if (msg.length <= MAX_WS_FRAME_BYTES) return msg;
+  // WS frame budgets are measured in bytes. `string.length` counts UTF-16
+  // code units; a payload with emoji / CJK / other multi-byte UTF-8 chars
+  // can pass `msg.length <= 65536` yet serialize to >128KB when the
+  // browser encodes the frame. Measure bytes directly to avoid
+  // reintroducing the silent-drop / disconnect behavior this function
+  // exists to prevent.
+  const msgBytes = Buffer.byteLength(msg, 'utf8');
+  if (msgBytes <= MAX_WS_FRAME_BYTES) return msg;
   const event = (data ?? {}) as {
     type?: string;
     step?: number;
@@ -84,7 +91,7 @@ function truncateIfOversized(msg: string, channel: string, data: unknown): strin
       ...event,
       data: {
         __truncated: true,
-        originalBytes: msg.length,
+        originalBytes: msgBytes,
         maxBytes: MAX_WS_FRAME_BYTES,
         hint: 'Event exceeded WS frame budget (likely a verbose agent_call with a large messages[] snapshot). Fetch via REST if you need the full payload.',
       },

@@ -130,14 +130,26 @@ describe('Studio API: Executions', () => {
     ).json()) as Envelope;
     expect(tail.data.events).toEqual([]);
 
-    // Malformed `since` param: server returns the full events array
-    // (no error) — stale clients shouldn't crash the panel.
-    const malformed = (await (
-      await app.request(`/api/executions/${id}?since=notanumber`)
-    ).json()) as Envelope;
-    expect(malformed.data.events.length).toBe(total);
+    // Malformed `since` param: server returns 400 with a diagnostic
+    // envelope. Silent fallthrough would let a stringly-typed client bug
+    // balloon the payload; a 400 surfaces the bug instead.
+    const malformedRes = await app.request(`/api/executions/${id}?since=notanumber`);
+    expect(malformedRes.status).toBe(400);
+    const malformed = (await malformedRes.json()) as {
+      ok: false;
+      error: { code: string; param: string };
+    };
+    expect(malformed.ok).toBe(false);
+    expect(malformed.error.code).toBe('INVALID_PARAM');
+    expect(malformed.error.param).toBe('since');
 
-    // Negative `since` also falls through to full array.
+    // Fractional and Infinity also rejected.
+    const fracRes = await app.request(`/api/executions/${id}?since=0.5`);
+    expect(fracRes.status).toBe(400);
+    const infRes = await app.request(`/api/executions/${id}?since=Infinity`);
+    expect(infRes.status).toBe(400);
+
+    // Negative `since=-1` is a valid "everything from step 0" sentinel.
     const negative = (await (
       await app.request(`/api/executions/${id}?since=-1`)
     ).json()) as Envelope;

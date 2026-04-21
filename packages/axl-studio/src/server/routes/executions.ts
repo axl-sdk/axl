@@ -22,9 +22,15 @@ app.get('/executions', async (c) => {
 // polling clients can request only the tail since their last known
 // step without missing events from concurrent branches.
 //
-// When `since` is invalid (non-integer / negative), returns the full
-// events array rather than erroring — the UX mental model is "show me
-// what's current" and stale clients shouldn't crash the panel.
+// Polling pattern: client tracks `lastStep = events[events.length - 1]?.step`
+// and passes `?since=<lastStep>` on the next poll. First poll either
+// omits `since` or passes `-1` for "everything from step 0 onward" —
+// `since=0` explicitly means "I already have step 0, give me step 1+".
+// This preserves correctness when `workflow_start` lands at step 0.
+//
+// Malformed `since` (non-integer / non-finite) returns 400 — stale or
+// buggy clients get a clear diagnostic instead of silently receiving
+// the full events array and blowing their memory budget.
 app.get('/executions/:id', async (c) => {
   const runtime = c.get('runtime');
   const id = c.req.param('id');
@@ -40,12 +46,25 @@ app.get('/executions/:id', async (c) => {
   let paged = execution;
   if (sinceParam !== undefined) {
     const since = Number(sinceParam);
-    if (Number.isFinite(since) && Number.isInteger(since) && since >= 0) {
-      paged = {
-        ...execution,
-        events: execution.events.filter((e) => e.step > since),
-      };
+    // Accept any finite integer, including -1 for "everything". Reject
+    // NaN, Infinity, fractions, and non-numeric strings with a 400.
+    if (!Number.isFinite(since) || !Number.isInteger(since)) {
+      return c.json(
+        {
+          ok: false,
+          error: {
+            code: 'INVALID_PARAM',
+            message: `\`since\` must be a finite integer (got "${sinceParam}")`,
+            param: 'since',
+          },
+        },
+        400,
+      );
     }
+    paged = {
+      ...execution,
+      events: execution.events.filter((e) => e.step > since),
+    };
   }
 
   return c.json({

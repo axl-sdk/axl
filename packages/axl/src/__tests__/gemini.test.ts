@@ -1149,6 +1149,371 @@ describe('GeminiProvider', () => {
     });
   });
 
+  describe('schema sanitization (Gemini API rejects standard JSON Schema fields)', () => {
+    // Gemini's API rejects fields like `additionalProperties`, `$schema`,
+    // `oneOf`, etc. that Zod v4's `z.toJSONSchema()` emits by default.
+    // Without sanitization, every Zod-defined tool would 400 on first call
+    // with "Unknown name 'additionalProperties' at 'tools[0].function_
+    // declarations[0].parameters'". These tests pin the strip behavior at
+    // the wire layer so the failure can't regress.
+
+    it('strips additionalProperties from tool function parameters at every depth', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gemini-2.0-flash',
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'lookup',
+              description: 'Look up a thing',
+              // Mirrors the exact shape Zod v4 emits for nested objects + arrays.
+              parameters: {
+                type: 'object',
+                properties: {
+                  outer: { type: 'string' },
+                  nested: {
+                    type: 'object',
+                    properties: { inner: { type: 'number' } },
+                    required: ['inner'],
+                    additionalProperties: false,
+                  },
+                  list: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: { x: { type: 'boolean' } },
+                      required: ['x'],
+                      additionalProperties: false,
+                    },
+                  },
+                },
+                required: ['outer', 'nested', 'list'],
+                additionalProperties: false,
+              },
+            },
+          },
+        ],
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      const params = body.tools[0].functionDeclarations[0].parameters;
+      // Walk the whole tree and assert NO additionalProperties survived.
+      const stack: unknown[] = [params];
+      while (stack.length > 0) {
+        const node = stack.pop();
+        if (node && typeof node === 'object' && !Array.isArray(node)) {
+          expect(node).not.toHaveProperty('additionalProperties');
+          for (const v of Object.values(node)) stack.push(v);
+        } else if (Array.isArray(node)) {
+          for (const v of node) stack.push(v);
+        }
+      }
+      // Sanity: real fields survive.
+      expect(params.type).toBe('object');
+      expect(params.properties.outer.type).toBe('string');
+      expect(params.properties.nested.properties.inner.type).toBe('number');
+      expect(params.properties.list.items.properties.x.type).toBe('boolean');
+    });
+
+    it('strips $schema, $ref, $defs, allOf, not, patternProperties, unevaluated* from tool parameters', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gemini-2.0-flash',
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 't',
+              description: 'd',
+              parameters: {
+                $schema: 'https://json-schema.org/draft/2020-12/schema',
+                $defs: { Foo: { type: 'object' } },
+                $ref: '#/$defs/Foo',
+                type: 'object',
+                properties: {
+                  field: {
+                    allOf: [{ type: 'string' }],
+                    not: { type: 'null' },
+                    patternProperties: { '^x': { type: 'string' } },
+                    unevaluatedProperties: false,
+                    unevaluatedItems: false,
+                  },
+                },
+              },
+            },
+          },
+        ],
+      });
+
+      const params = JSON.parse(fetchMock.mock.calls[0][1].body).tools[0].functionDeclarations[0]
+        .parameters;
+      for (const banned of [
+        '$schema',
+        '$defs',
+        '$ref',
+        'allOf',
+        'not',
+        'patternProperties',
+        'unevaluatedProperties',
+        'unevaluatedItems',
+      ]) {
+        // Walk the whole tree and assert no occurrence anywhere.
+        const stack: unknown[] = [params];
+        while (stack.length > 0) {
+          const node = stack.pop();
+          if (node && typeof node === 'object' && !Array.isArray(node)) {
+            expect(node, `${banned} should be stripped from every node`).not.toHaveProperty(banned);
+            for (const v of Object.values(node)) stack.push(v);
+          } else if (Array.isArray(node)) {
+            for (const v of node) stack.push(v);
+          }
+        }
+      }
+    });
+
+    it('translates oneOf → anyOf so z.discriminatedUnion still works', async () => {
+      // Regression: stripping oneOf entirely (the naive fix) would erase
+      // the union shape that `z.discriminatedUnion` produces — Gemini
+      // would have no schema for the field. Translate to anyOf instead;
+      // the two are semantically identical for tool-use because the
+      // discriminator field already enforces mutual exclusion.
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gemini-2.0-flash',
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 't',
+              description: 'd',
+              // Mirrors what `z.discriminatedUnion('kind', [...])` emits.
+              parameters: {
+                oneOf: [
+                  {
+                    type: 'object',
+                    properties: { kind: { type: 'string', const: 'a' }, x: { type: 'string' } },
+                    required: ['kind', 'x'],
+                    additionalProperties: false,
+                  },
+                  {
+                    type: 'object',
+                    properties: { kind: { type: 'string', const: 'b' }, y: { type: 'number' } },
+                    required: ['kind', 'y'],
+                    additionalProperties: false,
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      });
+
+      const params = JSON.parse(fetchMock.mock.calls[0][1].body).tools[0].functionDeclarations[0]
+        .parameters;
+      // oneOf gone, anyOf present with both branches
+      expect(params).not.toHaveProperty('oneOf');
+      expect(params.anyOf).toHaveLength(2);
+      // Branches recursed into: additionalProperties stripped, const → enum translated
+      expect(params.anyOf[0]).not.toHaveProperty('additionalProperties');
+      expect(params.anyOf[0].properties.kind).not.toHaveProperty('const');
+      expect(params.anyOf[0].properties.kind.enum).toEqual(['a']);
+      expect(params.anyOf[1].properties.kind.enum).toEqual(['b']);
+      // Real fields survive.
+      expect(params.anyOf[0].properties.x.type).toBe('string');
+      expect(params.anyOf[1].properties.y.type).toBe('number');
+    });
+
+    it('translates const → enum so z.literal still works', async () => {
+      // Regression: stripping const entirely would lose the literal
+      // constraint. Translate to enum with a single value — Gemini's
+      // supported equivalent.
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gemini-2.0-flash',
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 't',
+              description: 'd',
+              parameters: {
+                type: 'object',
+                properties: {
+                  // z.literal('foo') → { type: 'string', const: 'foo' }
+                  literalField: { type: 'string', const: 'foo' },
+                  // z.literal(42)
+                  numLiteral: { type: 'number', const: 42 },
+                },
+              },
+            },
+          },
+        ],
+      });
+
+      const params = JSON.parse(fetchMock.mock.calls[0][1].body).tools[0].functionDeclarations[0]
+        .parameters;
+      expect(params.properties.literalField).not.toHaveProperty('const');
+      expect(params.properties.literalField.enum).toEqual(['foo']);
+      expect(params.properties.numLiteral.enum).toEqual([42]);
+    });
+
+    it('does NOT clobber an explicit enum when const is also present', async () => {
+      // Defensive: if a schema author explicitly wrote `enum`, don't let
+      // the const→enum translation overwrite it.
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gemini-2.0-flash',
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 't',
+              description: 'd',
+              parameters: {
+                type: 'string',
+                enum: ['x', 'y', 'z'],
+                const: 'shouldNotWin', // ← const is dropped silently
+              },
+            },
+          },
+        ],
+      });
+
+      const params = JSON.parse(fetchMock.mock.calls[0][1].body).tools[0].functionDeclarations[0]
+        .parameters;
+      expect(params.enum).toEqual(['x', 'y', 'z']); // explicit wins
+      expect(params).not.toHaveProperty('const');
+    });
+
+    it('preserves anyOf (Gemini supports it) and recurses into its branches', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gemini-2.0-flash',
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 't',
+              description: 'd',
+              parameters: {
+                type: 'object',
+                properties: {
+                  union: {
+                    anyOf: [
+                      { type: 'string' },
+                      {
+                        type: 'object',
+                        properties: { y: { type: 'number' } },
+                        additionalProperties: false, // ← must be stripped from inside anyOf
+                      },
+                    ],
+                  },
+                },
+                additionalProperties: false,
+              },
+            },
+          },
+        ],
+      });
+
+      const params = JSON.parse(fetchMock.mock.calls[0][1].body).tools[0].functionDeclarations[0]
+        .parameters;
+      expect(params.properties.union.anyOf).toHaveLength(2);
+      expect(params.properties.union.anyOf[0]).toEqual({ type: 'string' });
+      expect(params.properties.union.anyOf[1].properties.y.type).toBe('number');
+      expect(params.properties.union.anyOf[1]).not.toHaveProperty('additionalProperties');
+    });
+
+    it('strips disallowed fields from responseSchema (structured output path)', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('{"a":1}')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Give me JSON' }], {
+        model: 'gemini-2.0-flash',
+        responseFormat: {
+          type: 'json_schema',
+          json_schema: {
+            name: 'Out',
+            schema: {
+              $schema: 'https://json-schema.org/draft/2020-12/schema',
+              type: 'object',
+              properties: { a: { type: 'number' } },
+              required: ['a'],
+              additionalProperties: false,
+            },
+          },
+        },
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.responseMimeType).toBe('application/json');
+      const schema = body.generationConfig.responseSchema;
+      expect(schema).not.toHaveProperty('additionalProperties');
+      expect(schema).not.toHaveProperty('$schema');
+      // Real fields survive.
+      expect(schema.type).toBe('object');
+      expect(schema.properties.a.type).toBe('number');
+      expect(schema.required).toEqual(['a']);
+    });
+
+    it('passes through schemas that have no disallowed fields untouched', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const clean = {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'a name' },
+          age: { type: 'integer', minimum: 0 },
+        },
+        required: ['name'],
+      };
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gemini-2.0-flash',
+        tools: [
+          {
+            type: 'function',
+            function: { name: 't', description: 'd', parameters: clean },
+          },
+        ],
+      });
+
+      const params = JSON.parse(fetchMock.mock.calls[0][1].body).tools[0].functionDeclarations[0]
+        .parameters;
+      expect(params).toEqual(clean);
+    });
+  });
+
   describe('stream()', () => {
     it('sends correct URL with alt=sse', async () => {
       const encoder = new TextEncoder();

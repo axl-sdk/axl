@@ -472,6 +472,76 @@ observability boundary — no breaking API changes.
   hitting "missing tokens from my nested asks" find the right
   iterator on first read.
 
+#### Provider fixes — Gemini schema dialect
+
+Gemini's tool/responseSchema endpoint accepts a strict subset of OpenAPI
+3.0 Schema Object — narrower than standard JSON Schema. Zod v4's
+`z.toJSONSchema()` emits Draft 2020-12 fields that Gemini rejects with
+a 400, the most common being `additionalProperties: false` (emitted on
+EVERY object schema and EVERY nested object/array element). Caught by
+the live integration test pass — every Zod-defined tool 400'd on first
+Gemini call with `Unknown name 'additionalProperties' at 'tools[0].
+function_declarations[0].parameters'`.
+
+- **`sanitizeSchemaForGemini` recursively rewrites schemas** for
+  tool function parameters AND `responseSchema` (structured output
+  path) before sending. Strip list: `additionalProperties`,
+  `$schema`, `$ref`, `$defs`, `definitions`, `not`, `allOf`,
+  `patternProperties`, `unevaluatedProperties`, `unevaluatedItems`.
+  Recurses into every value so an inner `additionalProperties: false`
+  on a nested object also gets removed (the 400 fires at any depth).
+- **Two fields get TRANSLATED** rather than stripped because they're
+  load-bearing for common Zod patterns:
+  - `oneOf` → `anyOf` — `z.discriminatedUnion()` produces `oneOf`.
+    Naive stripping would erase the entire union shape and Gemini
+    would have no schema for the field. The two are semantically
+    identical for tool-use because the discriminator field already
+    enforces mutual exclusion at the consumer site.
+  - `const: x` → `enum: [x]` — `z.literal('foo')` produces `const`.
+    Naive stripping would lose the constraint entirely. `enum` with
+    a single value is Gemini's supported equivalent. Skipped if
+    `enum` is also explicitly set (don't clobber the schema author's
+    intent).
+- Loss without `additionalProperties: false`: the LLM has slightly
+  less guidance about strict-mode schemas, so it may occasionally
+  emit extra fields. Default Zod (`z.object`) silently strips them
+  on parse so the user sees clean data; `.strict()` schemas trigger
+  our schema retry loop. Net cost: a handful of extra tokens,
+  occasional retry. Not a correctness issue.
+- Regression coverage: 8 new unit tests in `gemini.test.ts` pinning
+  the strip + translate behavior on tools (nested + array-element +
+  `anyOf` branches), discriminatedUnion (`oneOf` → `anyOf`),
+  `z.literal` (`const` → `enum`), explicit-enum-not-clobbered, the
+  `responseSchema` (structured output), and no-op pass-through for
+  already-clean schemas.
+- Other providers verified clean: OpenAI Chat Completions and
+  Responses API both REQUIRE `additionalProperties: false` for
+  strict mode (Zod already provides it). Anthropic accepts standard
+  JSON Schema. No sanitization needed for either.
+- **Pre-existing bug, surfaced by 0.16.0 integration test pass** —
+  unrelated to the unified event model. The sanitizer would have
+  been correct in any prior release; we simply hadn't run a
+  Gemini-with-tools integration test against the live API.
+
+#### Test reliability — Gemini integration model
+
+- Switched the live Gemini integration test model from
+  `gemini-2.0-flash` to `gemini-2.5-flash-lite`. Both have the same
+  input/output pricing ($0.10 / $0.40 per 1M tokens) but 2.5-flash-lite
+  has a much higher free-tier per-minute quota; running the full Gemini
+  suite back-to-back against 2.0-flash hit 429s mid-suite. After the
+  switch, all 76 Gemini-touching integration tests pass cleanly.
+
+#### Spec/16 migration — straggler
+
+- **Fixed: `integration-advanced.test.ts` streaming test was reading
+  `event.name` on a `tool_call_end` event** — the field renamed to
+  `event.tool` in 0.16.0 but this test was missed in the migration
+  pass. Surfaced when the live Anthropic streaming test ran (since
+  `as any` silenced the would-be typecheck failure). Also dropped a
+  stale `import { StreamEvent } from '../types.js'` (no longer
+  exported).
+
 ### Deprecated
 
 - `AxlEventBase.parentToolCallId` is `@deprecated` (one-cycle window).

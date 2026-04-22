@@ -4,7 +4,7 @@ import { tool } from '../tool.js';
 import { agent } from '../agent.js';
 import { workflow } from '../workflow.js';
 import { AxlRuntime } from '../runtime.js';
-import type { AxlEvent, StreamEvent } from '../types.js';
+import type { AxlEvent } from '../types.js';
 import { TimeoutError, MaxTurnsError, QuorumNotMet, VerifyError } from '../errors.js';
 
 // ---------------------------------------------------------------------------
@@ -594,7 +594,7 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       });
 
       const tokens: string[] = [];
-      const toolCallEvents: StreamEvent[] = [];
+      const toolCallEvents: Array<Extract<AxlEvent, { type: 'tool_call_end' }>> = [];
       for await (const event of stream) {
         if (event.type === 'token') tokens.push(event.data);
         if (event.type === 'tool_call_end') toolCallEvents.push(event);
@@ -603,9 +603,10 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       // Should have received tokens (the final text response)
       expect(tokens.length).toBeGreaterThan(0);
 
-      // Should have received at least one tool_call event for calculator
+      // Should have received at least one tool_call_end event for calculator.
+      // Post-spec/16: tool name lives on `event.tool`, not `event.name`.
       expect(toolCallEvents.length).toBeGreaterThanOrEqual(1);
-      expect((toolCallEvents[0] as any).name).toBe('calculator');
+      expect(toolCallEvents[0].tool).toBe('calculator');
 
       // The final result should contain 42
       const result = await stream.promise;

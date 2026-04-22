@@ -11,6 +11,96 @@ import { resolveThinkingOptions } from './types.js';
 import { fetchWithRetry } from './retry.js';
 
 // ---------------------------------------------------------------------------
+// Schema sanitization for Gemini's tool/responseSchema dialect.
+//
+// Gemini accepts a strict subset of OpenAPI 3.0 Schema Object — narrower
+// than standard JSON Schema. Zod v4's `z.toJSONSchema()` emits Draft
+// 2020-12 fields that Gemini rejects with a 400. Caught in the live
+// integration test pass — every Zod-defined tool 400'd on first call.
+//
+//   Allowed:  type, format, description, nullable, enum, properties,
+//             required, items, minItems, maxItems, minLength, maxLength,
+//             minimum, maximum, pattern, anyOf, propertyOrdering, default,
+//             title, minProperties, maxProperties, example, multipleOf
+//   Rejected: additionalProperties, $schema, $ref, $defs, definitions,
+//             not, allOf, oneOf, patternProperties, const,
+//             unevaluatedProperties, unevaluatedItems
+//
+// Two fields get TRANSLATED rather than stripped because they're load-
+// bearing for common Zod patterns:
+//
+//   `oneOf`  →  `anyOf`   — `z.discriminatedUnion()` produces `oneOf`.
+//                            Naive stripping would erase the entire union
+//                            shape and Gemini would have no schema for
+//                            the field. The two are semantically identical
+//                            for tool-use (the discriminator field already
+//                            enforces mutual exclusion at the consumer
+//                            site).
+//
+//   `const: x`  →  `enum: [x]`  — `z.literal('foo')` produces `const`.
+//                            Naive stripping would lose the constraint
+//                            entirely. `enum` with a single value is
+//                            Gemini's supported equivalent. (If both
+//                            `const` and `enum` are present, the explicit
+//                            `enum` wins — we don't clobber.)
+//
+// `allOf` is stripped (rare in Zod output and merging it correctly is
+// non-trivial — schema intersections that survive `allOf` removal will
+// surface as a schema validation retry on our side, which is acceptable
+// degradation). The function recurses through every value so an inner
+// `additionalProperties: false` on a nested object also gets removed —
+// the 400 fires at any depth.
+//
+// Loss without `additionalProperties: false`: the LLM has slightly less
+// guidance about strict-mode schemas, so it may occasionally emit extra
+// fields. Default Zod (`z.object`) silently strips them on parse, so the
+// user sees clean data; `.strict()` schemas trigger our schema retry
+// loop. Net cost: a handful of extra tokens, occasional retry. Not a
+// correctness issue.
+// ---------------------------------------------------------------------------
+
+const GEMINI_DISALLOWED_SCHEMA_KEYS = new Set([
+  'additionalProperties',
+  '$schema',
+  '$ref',
+  '$defs',
+  'definitions',
+  'not',
+  'allOf',
+  'patternProperties',
+  'unevaluatedProperties',
+  'unevaluatedItems',
+]);
+
+function sanitizeSchemaForGemini(schema: unknown): unknown {
+  if (Array.isArray(schema)) {
+    return schema.map((item) => sanitizeSchemaForGemini(item));
+  }
+  if (schema === null || typeof schema !== 'object') {
+    return schema;
+  }
+  const src = schema as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(src)) {
+    if (GEMINI_DISALLOWED_SCHEMA_KEYS.has(key)) continue;
+    if (key === 'oneOf') {
+      // Translate to anyOf — preserves z.discriminatedUnion's union shape.
+      out.anyOf = sanitizeSchemaForGemini(value);
+      continue;
+    }
+    if (key === 'const') {
+      // Translate to enum with one element — preserves z.literal's
+      // constraint. Skip if `enum` is also set so we don't clobber an
+      // explicit enum the schema author already wrote.
+      if (!('enum' in src)) out.enum = [value];
+      continue;
+    }
+    out[key] = sanitizeSchemaForGemini(value);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Approximate per-token pricing (USD) for common Gemini models.
 // Format: [inputCostPerToken, outputCostPerToken]
 // Uses standard context pricing (<=200k) as default.
@@ -261,7 +351,9 @@ export class GeminiProvider implements Provider {
         options.responseFormat.type === 'json_schema' &&
         options.responseFormat.json_schema?.schema
       ) {
-        generationConfig.responseSchema = options.responseFormat.json_schema.schema;
+        generationConfig.responseSchema = sanitizeSchemaForGemini(
+          options.responseFormat.json_schema.schema,
+        );
       }
     }
 
@@ -476,7 +568,7 @@ export class GeminiProvider implements Provider {
     return {
       name: tool.function.name,
       description: tool.function.description,
-      parameters: tool.function.parameters,
+      parameters: sanitizeSchemaForGemini(tool.function.parameters),
     };
   }
 

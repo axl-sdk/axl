@@ -1,0 +1,8 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["dev-fixtures/**/*.mts"],
+  "exclude": ["node_modules", "dist"]
+}

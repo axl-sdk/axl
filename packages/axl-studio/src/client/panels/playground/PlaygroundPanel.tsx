@@ -62,7 +62,14 @@ export function PlaygroundPanel() {
         return [...prev, { role: 'assistant', content: stream.tokens }];
       });
     }
-    if (stream.done) {
+    // Gate the done/error append on `isStreaming` so it only runs ONCE
+    // per stream. Without this guard, the effect re-fires on the
+    // intermediate render between `setIsStreaming(false)` and useWsStream's
+    // own `id → null` gate-clear effect — during that window stream.done
+    // and stream.error are still set, so the error bubble would be
+    // appended a second time. Reproducible regression: see
+    // playground-panel-integration.test.tsx > "renders an Error: bubble".
+    if (stream.done && isStreaming) {
       setIsStreaming(false);
       setExecutionId(null);
       // Show stream error as an assistant message

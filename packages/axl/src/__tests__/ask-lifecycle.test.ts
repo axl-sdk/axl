@@ -370,3 +370,213 @@ describe('ask_start / ask_end lifecycle (spec/16 §3.8)', () => {
     expect((workflowEnds[0].data as { status: string }).status).toBe('completed');
   });
 });
+
+describe('ask-graph correlation across 3+ levels of nesting (spec/16 §3.1, §3.7)', () => {
+  // Three-level ask graph: outer → middle (via call_middle tool) → inner
+  // (via call_inner tool). Pins three invariants that two-level tests can't
+  // cover:
+  //
+  //   1. parentAskId chains transitively — inner's parent is middle, middle's
+  //      parent is outer. The single-shared `stepRef` in AsyncLocalStorage
+  //      stamps the right ancestor on every event.
+  //   2. ask_end.cost rolls up THIS ask's leaf cost only, excluding ALL
+  //      descendants (not just direct children — middle must NOT include
+  //      inner's cost; outer must NOT include middle's OR inner's).
+  //   3. eventCostContribution() summed across info.events equals the
+  //      sum of every leaf event's cost — independent of how deep the
+  //      ask tree gets.
+  //
+  // Each chat call costs $0.001 (createSequenceProvider default). Setup:
+  //   outer turn 1: call_middle tool       → 1 chat = $0.001
+  //   outer turn 2: final answer           → 1 chat = $0.001
+  //     middle turn 1: call_inner tool     → 1 chat = $0.001
+  //     middle turn 2: final answer        → 1 chat = $0.001
+  //       inner turn 1: final answer       → 1 chat = $0.001
+  // Expected:
+  //   inner.cost  = $0.001
+  //   middle.cost = $0.002 (its own 2 turns; inner is NOT counted)
+  //   outer.cost  = $0.002 (its own 2 turns; middle + inner NOT counted)
+  //   total leaf  = $0.005
+
+  it('parentAskId chains transitively through 3 levels and ask_end.cost excludes all descendants', async () => {
+    const inner = agent({ name: 'inner', model: 'mock:test', system: 'inner' });
+    const callInner = tool({
+      name: 'call_inner',
+      description: 'Call inner',
+      input: z.object({}),
+      handler: async (_input, ctx) => ctx.ask(inner, 'inner-q'),
+    });
+    const middle = agent({
+      name: 'middle',
+      model: 'mock:test',
+      system: 'middle',
+      tools: [callInner],
+    });
+    const callMiddle = tool({
+      name: 'call_middle',
+      description: 'Call middle',
+      input: z.object({}),
+      handler: async (_input, ctx) => ctx.ask(middle, 'middle-q'),
+    });
+    const outer = agent({
+      name: 'outer',
+      model: 'mock:test',
+      system: 'outer',
+      tools: [callMiddle],
+    });
+
+    // Sequence: outer-tool, outer-final, middle-tool, middle-final, inner-final.
+    // The provider runs in call order, which is depth-first: outer makes its
+    // first turn (returns call_middle), then its tool handler runs middle,
+    // which does its first turn (call_inner), inner runs once, middle wraps
+    // up, then outer wraps up.
+    const provider = createSequenceProvider([
+      // outer turn 1 → call_middle
+      {
+        tool_calls: [
+          {
+            id: 'om1',
+            type: 'function' as const,
+            function: { name: 'call_middle', arguments: '{}' },
+          },
+        ],
+      },
+      // middle turn 1 → call_inner
+      {
+        tool_calls: [
+          {
+            id: 'mi1',
+            type: 'function' as const,
+            function: { name: 'call_inner', arguments: '{}' },
+          },
+        ],
+      },
+      // inner turn 1 → final
+      'INNER',
+      // middle turn 2 → final
+      'MIDDLE',
+      // outer turn 2 → final
+      'OUTER',
+    ]);
+    const { ctx, traces } = createTestCtx({ provider });
+
+    await ctx.ask(outer, 'go');
+
+    type AskEnd = AxlEvent &
+      AskScoped & {
+        type: 'ask_end';
+        cost: number;
+        agent?: string;
+        outcome: { ok: true; result: unknown };
+      };
+    const askEnds = traces.filter((t): t is AskEnd => t.type === 'ask_end');
+    expect(askEnds.length).toBe(3);
+
+    const innerEnd = askEnds.find((e) => e.agent === 'inner');
+    const middleEnd = askEnds.find((e) => e.agent === 'middle');
+    const outerEnd = askEnds.find((e) => e.agent === 'outer');
+    expect(innerEnd).toBeDefined();
+    expect(middleEnd).toBeDefined();
+    expect(outerEnd).toBeDefined();
+
+    // (1) Parent-link transitivity: outer is root (no parentAskId);
+    // middle's parent IS outer; inner's parent IS middle. NOT outer in
+    // either case — the chain must be transitive, not flattened.
+    expect(outerEnd!.parentAskId).toBeUndefined();
+    expect(middleEnd!.parentAskId).toBe(outerEnd!.askId);
+    expect(innerEnd!.parentAskId).toBe(middleEnd!.askId);
+    // Negative check: inner.parentAskId is NOT outer (would indicate the
+    // chain got flattened by a parent-walking bug).
+    expect(innerEnd!.parentAskId).not.toBe(outerEnd!.askId);
+
+    // (2) Depth invariant — root is 0, each level +1. Pins the AsyncLocalStorage
+    // depth counter increments correctly through tool→ask transitions.
+    expect(outerEnd!.depth).toBe(0);
+    expect(middleEnd!.depth).toBe(1);
+    expect(innerEnd!.depth).toBe(2);
+
+    // (3) Cost rollup excludes ALL descendants (transitive), not just direct
+    // children. Inner: 1 chat = $0.001. Middle: 2 chats = $0.002 (NOT $0.003
+    // — inner is excluded). Outer: 2 chats = $0.002 (NOT $0.005 — middle and
+    // inner both excluded).
+    expect(innerEnd!.cost).toBeCloseTo(0.001, 5);
+    expect(middleEnd!.cost).toBeCloseTo(0.002, 5);
+    expect(outerEnd!.cost).toBeCloseTo(0.002, 5);
+  });
+
+  it('eventCostContribution sum across all events equals total leaf cost regardless of nesting depth', async () => {
+    // Same 3-level setup. Verifies that the public cost-aggregation helper
+    // gets the right answer when consumers iterate ExecutionInfo.events for
+    // a deeply-nested execution.
+    const { eventCostContribution } = await import('../event-utils.js');
+
+    const inner = agent({ name: 'inner', model: 'mock:test', system: 'inner' });
+    const callInner = tool({
+      name: 'call_inner',
+      description: 'Call inner',
+      input: z.object({}),
+      handler: async (_input, ctx) => ctx.ask(inner, 'inner-q'),
+    });
+    const middle = agent({
+      name: 'middle',
+      model: 'mock:test',
+      system: 'middle',
+      tools: [callInner],
+    });
+    const callMiddle = tool({
+      name: 'call_middle',
+      description: 'Call middle',
+      input: z.object({}),
+      handler: async (_input, ctx) => ctx.ask(middle, 'middle-q'),
+    });
+    const outer = agent({
+      name: 'outer',
+      model: 'mock:test',
+      system: 'outer',
+      tools: [callMiddle],
+    });
+
+    const provider = createSequenceProvider([
+      {
+        tool_calls: [
+          {
+            id: 'om1',
+            type: 'function' as const,
+            function: { name: 'call_middle', arguments: '{}' },
+          },
+        ],
+      },
+      {
+        tool_calls: [
+          {
+            id: 'mi1',
+            type: 'function' as const,
+            function: { name: 'call_inner', arguments: '{}' },
+          },
+        ],
+      },
+      'INNER',
+      'MIDDLE',
+      'OUTER',
+    ]);
+    const { ctx, traces } = createTestCtx({ provider });
+    await ctx.ask(outer, 'go');
+
+    // 5 chat calls × $0.001 each = $0.005 total. The helper must skip
+    // ask_end rollup events (which also carry a cost field) to avoid
+    // double-counting the inner/middle/outer rollups on top of the leaves.
+    const total = traces.reduce((sum, e) => sum + eventCostContribution(e), 0);
+    expect(total).toBeCloseTo(0.005, 5);
+
+    // Sanity: ask_end events carry non-zero `cost` (the rollup field that
+    // the helper must skip). If we naively summed `event.cost`, we'd get
+    // 0.005 (5 leaves) + 0.001 (inner) + 0.002 (middle) + 0.002 (outer)
+    // = 0.010 — twice the truth. Pinning this prevents accidental
+    // simplification of the helper that would lose the ask_end skip.
+    const naiveSum = traces.reduce((sum, e) => {
+      const c = (e as { cost?: unknown }).cost;
+      return sum + (typeof c === 'number' && Number.isFinite(c) ? c : 0);
+    }, 0);
+    expect(naiveSum).toBeCloseTo(0.01, 5);
+  });
+});

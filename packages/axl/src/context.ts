@@ -1133,19 +1133,70 @@ export class WorkflowContext<TInput = unknown> {
                     validateRetries: options.validateRetries,
                   }
                 : undefined;
+              // Execute the target's ask frame. Wraps `executeAgentCall`
+              // in ask_start/ask_end so the target has the same event
+              // shape as a regular `ctx.ask()` call — consumers grouping
+              // by askId can resolve the target agent via its ask_start,
+              // and the tree view's per-ask summary (duration, cost,
+              // outcome) works uniformly for direct and handoff asks.
               const handoffFn = () =>
-                askStorage.run(targetFrame, () =>
-                  this.executeAgentCall(
-                    descriptor.agent,
-                    handoffPrompt,
-                    handoffOptions,
-                    currentMessages,
-                    usageCapture,
-                  ),
-                );
+                askStorage.run(targetFrame, async () => {
+                  this.emitEvent({ type: 'ask_start', prompt: handoffPrompt });
+                  const targetAskStart = Date.now();
+                  try {
+                    const result = await this.executeAgentCall(
+                      descriptor.agent,
+                      handoffPrompt,
+                      handoffOptions,
+                      currentMessages,
+                      usageCapture,
+                    );
+                    this.emitEvent({
+                      type: 'ask_end',
+                      outcome: { ok: true, result },
+                      cost: targetFrame.askCost.value,
+                      duration: Date.now() - targetAskStart,
+                    });
+                    return result;
+                  } catch (err) {
+                    this.emitEvent({
+                      type: 'ask_end',
+                      outcome: {
+                        ok: false,
+                        error: err instanceof Error ? err.message : String(err),
+                      },
+                      cost: targetFrame.askCost.value,
+                      duration: Date.now() - targetAskStart,
+                    });
+                    throw err;
+                  }
+                });
+
+              // Emit handoff_start BEFORE the target ask begins so it
+              // orders correctly in step-sorted timelines (ahead of the
+              // target's ask_start / agent_call_* events). Always fired
+              // regardless of mode — this event represents the transition.
+              this.emitEvent({
+                type: 'handoff_start',
+                agent: agent._name,
+                fromAskId: handoffFromAskId,
+                toAskId: handoffToAskId,
+                sourceDepth: handoffSourceDepth,
+                targetDepth: handoffTargetDepth,
+                data: {
+                  source: agent._name,
+                  target: targetName,
+                  mode,
+                  ...(mode === 'roundtrip' && handoffPrompt !== prompt
+                    ? { message: handoffPrompt }
+                    : {}),
+                },
+              });
 
               if (mode === 'roundtrip') {
-                // Roundtrip: execute target, feed result back to source as tool response
+                // Roundtrip: execute target, feed result back to source as tool response,
+                // then emit `handoff_return` to mark control returning to source.
+                // The target's return value is observable on its `ask_end.outcome`.
                 const executeRoundtrip = async (): Promise<unknown> => {
                   const result = await handoffFn();
                   const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
@@ -1157,6 +1208,11 @@ export class WorkflowContext<TInput = unknown> {
                   return result;
                 };
 
+                // `handoff_return` always emits — success OR failure. If the
+                // target throws, control still returns to source (via the
+                // exception path); without the event the timeline shows a
+                // `handoff_start` with no completion. Try/finally re-throws
+                // any error so the source's loop sees the failure.
                 if (this.spanManager) {
                   await this.spanManager.withSpanAsync(
                     'axl.agent.handoff',
@@ -1166,49 +1222,48 @@ export class WorkflowContext<TInput = unknown> {
                       'axl.handoff.mode': mode,
                     },
                     async (span) => {
-                      const result = await executeRoundtrip();
-                      const duration = Date.now() - handoffStart;
-                      span.setAttribute('axl.handoff.duration', duration);
-                      this.emitEvent({
-                        type: 'handoff',
-                        agent: agent._name,
-                        fromAskId: handoffFromAskId,
-                        toAskId: handoffToAskId,
-                        sourceDepth: handoffSourceDepth,
-                        targetDepth: handoffTargetDepth,
-                        data: {
-                          source: agent._name,
-                          target: targetName,
-                          mode,
-                          duration,
-                          ...(handoffPrompt !== prompt ? { message: handoffPrompt } : {}),
-                        },
-                      });
-                      return result;
+                      try {
+                        return await executeRoundtrip();
+                      } finally {
+                        const duration = Date.now() - handoffStart;
+                        span.setAttribute('axl.handoff.duration', duration);
+                        this.emitEvent({
+                          type: 'handoff_return',
+                          agent: agent._name,
+                          fromAskId: handoffFromAskId,
+                          toAskId: handoffToAskId,
+                          sourceDepth: handoffSourceDepth,
+                          targetDepth: handoffTargetDepth,
+                          data: { source: agent._name, target: targetName, duration },
+                        });
+                      }
                     },
                   );
                 } else {
-                  await executeRoundtrip();
-                  this.emitEvent({
-                    type: 'handoff',
-                    agent: agent._name,
-                    fromAskId: handoffFromAskId,
-                    toAskId: handoffToAskId,
-                    sourceDepth: handoffSourceDepth,
-                    targetDepth: handoffTargetDepth,
-                    data: {
-                      source: agent._name,
-                      target: targetName,
-                      mode,
-                      duration: Date.now() - handoffStart,
-                      ...(handoffPrompt !== prompt ? { message: handoffPrompt } : {}),
-                    },
-                  });
+                  try {
+                    await executeRoundtrip();
+                  } finally {
+                    this.emitEvent({
+                      type: 'handoff_return',
+                      agent: agent._name,
+                      fromAskId: handoffFromAskId,
+                      toAskId: handoffToAskId,
+                      sourceDepth: handoffSourceDepth,
+                      targetDepth: handoffTargetDepth,
+                      data: {
+                        source: agent._name,
+                        target: targetName,
+                        duration: Date.now() - handoffStart,
+                      },
+                    });
+                  }
                 }
                 continue; // Source agent loop continues
               }
 
-              // Oneway (default): return target's result, exiting source's loop
+              // Oneway (default): return target's result, exiting source's loop.
+              // No `handoff_return` event — control doesn't come back to source.
+              // The target's `ask_end` already marks the end of this chain.
               if (this.spanManager) {
                 return this.spanManager.withSpanAsync(
                   'axl.agent.handoff',
@@ -1219,37 +1274,12 @@ export class WorkflowContext<TInput = unknown> {
                   },
                   async (span) => {
                     const result = await handoffFn();
-                    const duration = Date.now() - handoffStart;
-                    span.setAttribute('axl.handoff.duration', duration);
-                    this.emitEvent({
-                      type: 'handoff',
-                      agent: agent._name,
-                      fromAskId: handoffFromAskId,
-                      toAskId: handoffToAskId,
-                      sourceDepth: handoffSourceDepth,
-                      targetDepth: handoffTargetDepth,
-                      data: { source: agent._name, target: targetName, mode, duration },
-                    });
+                    span.setAttribute('axl.handoff.duration', Date.now() - handoffStart);
                     return result;
                   },
                 );
               }
-              const onewayResult = await handoffFn();
-              this.emitEvent({
-                type: 'handoff',
-                agent: agent._name,
-                fromAskId: handoffFromAskId,
-                toAskId: handoffToAskId,
-                sourceDepth: handoffSourceDepth,
-                targetDepth: handoffTargetDepth,
-                data: {
-                  source: agent._name,
-                  target: targetName,
-                  mode,
-                  duration: Date.now() - handoffStart,
-                },
-              });
-              return onewayResult;
+              return await handoffFn();
             }
           }
 
@@ -3311,9 +3341,10 @@ export class WorkflowContext<TInput = unknown> {
           args: '[redacted]',
           ...(d.reason !== undefined ? { reason: '[redacted]' } : {}),
         };
-      } else if (partial.type === 'handoff') {
-        // `message` on roundtrip handoffs is user-supplied content. `target`,
-        // `source`, `mode`, `duration` are structural — keep visible.
+      } else if (partial.type === 'handoff_start') {
+        // `message` on roundtrip handoff_start is the user-supplied prompt
+        // passed to the target. Structural fields (source, target, mode)
+        // stay visible.
         const d = data as Record<string, unknown>;
         if (d.message !== undefined) {
           data = { ...d, message: '[redacted]' };

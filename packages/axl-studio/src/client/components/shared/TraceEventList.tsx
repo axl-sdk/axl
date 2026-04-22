@@ -270,6 +270,121 @@ export function GateCheckBody({ event }: { event: AxlEvent }) {
   );
 }
 
+/** `ask_start` body — renders the user prompt at the top level of the
+ *  event (not inside `event.data`, which is absent on this variant). */
+function AskStartBody({ event }: { event: AxlEvent }) {
+  const prompt = (event as { prompt?: unknown }).prompt;
+  return (
+    <>
+      {typeof prompt === 'string' && prompt.length > 0 ? (
+        <TextBlock label="Prompt" content={prompt} defaultOpen />
+      ) : (
+        <p className="text-xs text-[hsl(var(--muted-foreground))]">(no prompt)</p>
+      )}
+    </>
+  );
+}
+
+/** `ask_end` body — renders outcome (narrowed on outcome.ok), plus the
+ *  per-ask cost and duration from the top level of the event. */
+function AskEndBody({ event }: { event: AxlEvent }) {
+  const outcome = (event as { outcome?: { ok: boolean; result?: unknown; error?: string } })
+    .outcome;
+  const cost = (event as { cost?: number }).cost;
+  const duration = (event as { duration?: number }).duration;
+  return (
+    <>
+      {outcome && (
+        <p className="text-xs mb-1">
+          <strong>Outcome:</strong>{' '}
+          <span
+            className={
+              outcome.ok ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
+            }
+          >
+            {outcome.ok ? 'ok' : 'error'}
+          </span>
+        </p>
+      )}
+      {typeof cost === 'number' && (
+        <p className="text-xs mb-1">
+          <strong>Ask cost:</strong> ${cost.toFixed(5)}
+        </p>
+      )}
+      {typeof duration === 'number' && (
+        <p className="text-xs mb-1">
+          <strong>Duration:</strong> {duration}ms
+        </p>
+      )}
+      {outcome?.ok && outcome.result !== undefined && (
+        <TextBlock
+          label="Result"
+          content={
+            typeof outcome.result === 'string'
+              ? outcome.result
+              : JSON.stringify(outcome.result, null, 2)
+          }
+          defaultOpen
+        />
+      )}
+      {outcome && !outcome.ok && outcome.error && (
+        <TextBlock label="Error" content={outcome.error} tone="warning" defaultOpen />
+      )}
+    </>
+  );
+}
+
+/** `pipeline` body — renders status/stage/attempt progression and the
+ *  failure reason (only populated on `status: 'failed'`). */
+function PipelineBody({ event }: { event: AxlEvent }) {
+  const e = event as {
+    status?: string;
+    stage?: string;
+    attempt?: number;
+    maxAttempts?: number;
+    reason?: string;
+  };
+  return (
+    <>
+      <p className="text-xs mb-1">
+        <strong>Pipeline:</strong> {e.stage ?? '(unknown stage)'} · {e.status ?? '(unknown status)'}
+        {e.attempt != null && e.maxAttempts != null
+          ? ` · attempt ${e.attempt}/${e.maxAttempts}`
+          : ''}
+      </p>
+      {e.reason && (
+        <TextBlock label="Failure reason" content={e.reason} tone="warning" defaultOpen />
+      )}
+    </>
+  );
+}
+
+/** `handoff_start` / `handoff_return` body — shows source→target and
+ *  (for roundtrip start) the message passed to the target. */
+function HandoffBody({ event }: { event: AxlEvent }) {
+  const data = event.data as
+    | { source?: string; target?: string; mode?: string; message?: string; duration?: number }
+    | undefined;
+  const isStart = event.type === 'handoff_start';
+  return (
+    <>
+      <p className="text-xs mb-1">
+        <strong>{isStart ? 'Handoff starts:' : 'Handoff returns:'}</strong> {data?.source ?? '?'} →{' '}
+        {data?.target ?? '?'}
+        {isStart && data?.mode ? ` · ${data.mode}` : ''}
+      </p>
+      {!isStart && typeof data?.duration === 'number' && (
+        <p className="text-xs mb-1">
+          <strong>Round-trip duration:</strong> {data.duration}ms
+        </p>
+      )}
+      {isStart && data?.message && (
+        <TextBlock label="Prompt to target" content={data.message} defaultOpen />
+      )}
+    </>
+  );
+}
+
 /** Generic fallback body for event types without a dedicated renderer. */
 function GenericBody({ event }: { event: AxlEvent }) {
   return (
@@ -307,19 +422,26 @@ function TraceEventRow({
   isExpanded,
   onToggle,
   maxDuration,
+  baseDepth,
 }: {
   event: AxlEvent;
   index: number;
   isExpanded: boolean;
   onToggle: () => void;
   maxDuration: number;
+  baseDepth: number;
 }) {
-  const depth = getDepth(event);
+  const depth = Math.max(0, getDepth(event) - baseDepth);
   const isRetry = isRetryCall(event);
   const gate = getGateData(event);
   const isGateEvent =
     event.type === 'guardrail' || event.type === 'schema_check' || event.type === 'validate';
   const gateFailed = isGateEvent && (gate?.valid === false || gate?.blocked === true);
+  // `done` and `error` synthesize `step: Number.MAX_SAFE_INTEGER` as a
+  // "sort last" sentinel. Rendering the literal value blows past the
+  // step column and collides with the label. Treat it as "no step".
+  const stepDisplay =
+    event.step != null && event.step !== Number.MAX_SAFE_INTEGER ? `#${event.step}` : '';
 
   return (
     <div>
@@ -338,8 +460,8 @@ function TraceEventRow({
         ) : (
           <ChevronRight size={12} className="shrink-0 text-[hsl(var(--muted-foreground))]" />
         )}
-        <span className="font-mono text-[hsl(var(--muted-foreground))] w-8">
-          #{event.step != null ? event.step : index}
+        <span className="font-mono text-[hsl(var(--muted-foreground))] w-8 truncate">
+          {stepDisplay || `#${index}`}
         </span>
         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${getEventColor(event)}`} />
         <span className="font-medium w-28 truncate">{event.type}</span>
@@ -391,6 +513,14 @@ function TraceEventRow({
             <GateCheckBody event={event} />
           ) : event.type === 'tool_approval' ? (
             <ToolApprovalBody event={event} />
+          ) : event.type === 'ask_start' ? (
+            <AskStartBody event={event} />
+          ) : event.type === 'ask_end' ? (
+            <AskEndBody event={event} />
+          ) : event.type === 'pipeline' ? (
+            <PipelineBody event={event} />
+          ) : event.type === 'handoff_start' || event.type === 'handoff_return' ? (
+            <HandoffBody event={event} />
           ) : (
             <GenericBody event={event} />
           )}
@@ -435,6 +565,21 @@ export function TraceEventList({
     if (maxDurationOverride != null) return maxDurationOverride;
     return Math.max(...events.map((e) => e.duration ?? 0), 1);
   }, [events, maxDurationOverride]);
+
+  // Base depth for indent rendering. When drilled into a single ask, all
+  // rows share a depth (e.g. 2 for a grandchild), which would push every
+  // row right by 32px — the drill-down looks misaligned. Subtracting the
+  // min depth re-grounds indentation so the drill-down reads as a normal
+  // tree starting at 0. For the flat full-trace view, minDepth is 0 and
+  // this becomes a no-op.
+  const baseDepth = useMemo(() => {
+    let min = Infinity;
+    for (const e of events) {
+      const d = getDepth(e);
+      if (d < min) min = d;
+    }
+    return Number.isFinite(min) ? min : 0;
+  }, [events]);
 
   const toggleEvent = (key: string | number) => {
     setExpandedEvents((prev) => {
@@ -501,6 +646,7 @@ export function TraceEventList({
                 isExpanded={expandedEvents.has(eventKey)}
                 onToggle={() => toggleEvent(eventKey)}
                 maxDuration={maxDuration}
+                baseDepth={baseDepth}
               />
             );
           })}

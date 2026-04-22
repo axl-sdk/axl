@@ -216,7 +216,7 @@ describe('AxlStream', () => {
     }
   });
 
-  it('carries the new AxlEvent shape (agent_call_start/end, tool_call_start/end, handoff)', async () => {
+  it('carries the new AxlEvent shape (agent_call_start/end, tool_call_start/end, handoff_start)', async () => {
     const stream = new AxlStream();
 
     stream._push(
@@ -243,12 +243,12 @@ describe('AxlStream', () => {
     );
     stream._push(
       ev({
-        type: 'handoff',
+        type: 'handoff_start',
         fromAskId: 'a1',
         toAskId: 'a2',
         sourceDepth: 0,
         targetDepth: 0,
-        data: { source: 'triage', target: 'specialist', mode: 'oneway', duration: 1 },
+        data: { source: 'triage', target: 'specialist', mode: 'oneway' },
       }),
     );
     stream._push(
@@ -274,7 +274,7 @@ describe('AxlStream', () => {
       'agent_call_start',
       'tool_call_start',
       'tool_call_end',
-      'handoff',
+      'handoff_start',
       'agent_call_end',
       'done',
     ]);
@@ -302,12 +302,12 @@ describe('AxlStream', () => {
     );
     stream._push(
       ev({
-        type: 'handoff',
+        type: 'handoff_start',
         fromAskId: 'a1',
         toAskId: 'a2',
         sourceDepth: 0,
         targetDepth: 0,
-        data: { source: 'a', target: 'b', mode: 'oneway', duration: 1 },
+        data: { source: 'a', target: 'b', mode: 'oneway' },
       }),
     );
     stream._push(
@@ -328,13 +328,13 @@ describe('AxlStream', () => {
       lifecycle.push(event);
     }
 
-    // Should include: agent_call_start, tool_call_start, tool_call_end, handoff, agent_call_end
+    // Should include: agent_call_start, tool_call_start, tool_call_end, handoff_start, agent_call_end
     // Should exclude: token, log, done, error
     expect(lifecycle.map((s) => s.type)).toEqual([
       'agent_call_start',
       'tool_call_start',
       'tool_call_end',
-      'handoff',
+      'handoff_start',
       'agent_call_end',
     ]);
   });
@@ -344,26 +344,38 @@ describe('AxlStream', () => {
     const received: AxlEvent[] = [];
 
     stream.on('agent_call_start', (event: unknown) => received.push(event as AxlEvent));
-    stream.on('handoff', (event: unknown) => received.push(event as AxlEvent));
+    stream.on('handoff_start', (event: unknown) => received.push(event as AxlEvent));
+    stream.on('handoff_return', (event: unknown) => received.push(event as AxlEvent));
 
     stream._push(ev({ type: 'agent_call_start', agent: 'a', model: 'm', turn: 1, ...ASK }));
     stream._push(
       ev({
-        type: 'handoff',
+        type: 'handoff_start',
         fromAskId: 'a1',
         toAskId: 'a2',
         sourceDepth: 0,
         targetDepth: 0,
-        data: { source: 'a', target: 'b', mode: 'oneway', duration: 1 },
+        data: { source: 'a', target: 'b', mode: 'roundtrip' },
+      }),
+    );
+    stream._push(
+      ev({
+        type: 'handoff_return',
+        fromAskId: 'a1',
+        toAskId: 'a2',
+        sourceDepth: 0,
+        targetDepth: 0,
+        data: { source: 'a', target: 'b', duration: 1 },
       }),
     );
     stream._done('done', 'test-exec');
 
     await new Promise((r) => setTimeout(r, 10));
 
-    expect(received).toHaveLength(2);
+    expect(received).toHaveLength(3);
     expect(received[0].type).toBe('agent_call_start');
-    expect(received[1].type).toBe('handoff');
+    expect(received[1].type).toBe('handoff_start');
+    expect(received[2].type).toBe('handoff_return');
   });
 
   it('tool_approval event appears in stream.lifecycle but not stream.text', async () => {
@@ -420,17 +432,17 @@ describe('AxlStream', () => {
     expect(e.data.approved).toBe(true);
   });
 
-  it('handoff event with mode field preserved through iterator', async () => {
+  it('handoff_start event with mode field preserved through iterator', async () => {
     const stream = new AxlStream();
 
     stream._push(
       ev({
-        type: 'handoff',
+        type: 'handoff_start',
         fromAskId: 'a1',
         toAskId: 'a2',
         sourceDepth: 0,
         targetDepth: 0,
-        data: { source: 'coordinator', target: 'specialist', mode: 'roundtrip', duration: 1 },
+        data: { source: 'coordinator', target: 'specialist', mode: 'roundtrip' },
       }),
     );
     stream._done('result', 'test-exec');
@@ -440,8 +452,8 @@ describe('AxlStream', () => {
       events.push(event);
     }
 
-    const handoff = events.find((e) => e.type === 'handoff') as
-      | Extract<AxlEvent, { type: 'handoff' }>
+    const handoff = events.find((e) => e.type === 'handoff_start') as
+      | Extract<AxlEvent, { type: 'handoff_start' }>
       | undefined;
     expect(handoff).toBeDefined();
     expect(handoff!.data.source).toBe('coordinator');
@@ -604,7 +616,8 @@ describe('AxlStream', () => {
       tool_approval: 'lifecycle',
       tool_denied: 'lifecycle',
       delegate: 'lifecycle',
-      handoff: 'lifecycle',
+      handoff_start: 'lifecycle',
+      handoff_return: 'lifecycle',
       pipeline: 'lifecycle',
       verify: 'lifecycle',
       token: 'excluded',
@@ -692,13 +705,21 @@ describe('AxlStream', () => {
           data: { candidates: ['a'], reason: 'single_candidate' },
           ...ASK_,
         },
-        handoff: {
-          type: 'handoff',
+        handoff_start: {
+          type: 'handoff_start',
           fromAskId: 'a1',
           toAskId: 'a2',
           sourceDepth: 0,
           targetDepth: 0,
-          data: { source: 'a', target: 'b', mode: 'oneway', duration: 1 },
+          data: { source: 'a', target: 'b', mode: 'oneway' },
+        },
+        handoff_return: {
+          type: 'handoff_return',
+          fromAskId: 'a1',
+          toAskId: 'a2',
+          sourceDepth: 0,
+          targetDepth: 0,
+          data: { source: 'a', target: 'b', duration: 1 },
         },
         pipeline: {
           type: 'pipeline',

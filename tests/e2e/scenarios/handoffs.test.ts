@@ -50,7 +50,10 @@ describe('Handoffs E2E', () => {
     const result = await runtime.execute('handoff-wf', { message: 'start handoff' });
     expect(result).toBe('Target handled it.');
 
-    const handoffTraces = traces.filter((t) => t.type === 'handoff');
+    // `handoff_start` always fires before the target ask begins; oneway
+    // handoffs emit no `handoff_return` because control doesn't return
+    // to the source.
+    const handoffTraces = traces.filter((t) => t.type === 'handoff_start');
     expect(handoffTraces.length).toBeGreaterThanOrEqual(1);
   });
 
@@ -201,7 +204,9 @@ describe('Handoffs E2E', () => {
 
     await runtime.execute('trace-handoff-wf', { message: 'test' });
 
-    const handoffTraces = traces.filter((t) => t.type === 'handoff');
+    // `handoff_start.data.target` names the destination agent; fired
+    // before the target ask begins.
+    const handoffTraces = traces.filter((t) => t.type === 'handoff_start');
     expect(handoffTraces.length).toBeGreaterThanOrEqual(1);
     const handoff = handoffTraces[0];
     const data = handoff.data as Record<string, unknown>;

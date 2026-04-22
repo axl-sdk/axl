@@ -116,12 +116,18 @@ describe('isCostBearingLeaf', () => {
     },
   );
 
-  it.each(['ask_end', 'tool_approval', 'pipeline', 'log', 'workflow_end', 'handoff', 'token'])(
-    'returns false for %s',
-    (type) => {
-      expect(isCostBearingLeaf(ev({ type }))).toBe(false);
-    },
-  );
+  it.each([
+    'ask_end',
+    'tool_approval',
+    'pipeline',
+    'log',
+    'workflow_end',
+    'handoff_start',
+    'handoff_return',
+    'token',
+  ])('returns false for %s', (type) => {
+    expect(isCostBearingLeaf(ev({ type }))).toBe(false);
+  });
 });
 
 describe('isRootLevel', () => {

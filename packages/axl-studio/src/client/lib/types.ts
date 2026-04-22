@@ -205,13 +205,16 @@ export type ChatMessage = {
   }>;
 };
 
-/** Handoff record */
+/** Handoff record. `duration` is target ask duration (oneway) or
+ *  round-trip wall-clock (roundtrip); `toAskId` correlates to the
+ *  target's `ask_end.askId` in the trace stream. */
 export type HandoffRecord = {
   source: string;
   target: string;
   mode: 'oneway' | 'roundtrip';
   timestamp: number;
   duration?: number;
+  toAskId?: string;
 };
 
 /** Memory entry */

@@ -109,11 +109,16 @@ describe('agent handoff improvements', () => {
       // Source should continue after roundtrip and produce the final result
       expect(result).toBe('Final answer: specialist answer was helpful');
 
-      // Verify handoff trace was emitted with mode and duration
-      const handoffTraces = traces.filter((t) => t.type === 'handoff');
-      expect(handoffTraces).toHaveLength(1);
-      expect((handoffTraces[0].data as any).mode).toBe('roundtrip');
-      expect(typeof (handoffTraces[0].data as any).duration).toBe('number');
+      // Verify handoff_start (carries mode) and handoff_return (carries
+      // duration) were both emitted — roundtrip mode emits both legs of
+      // the split event pair.
+      const handoffStarts = traces.filter((t) => t.type === 'handoff_start');
+      expect(handoffStarts).toHaveLength(1);
+      expect((handoffStarts[0].data as any).mode).toBe('roundtrip');
+
+      const handoffReturns = traces.filter((t) => t.type === 'handoff_return');
+      expect(handoffReturns).toHaveLength(1);
+      expect(typeof (handoffReturns[0].data as any).duration).toBe('number');
     });
 
     it('roundtrip message param used as target agent prompt', async () => {
@@ -270,9 +275,12 @@ describe('agent handoff improvements', () => {
       // Oneway: result comes from target directly
       expect(result).toBe('I am the target agent');
 
-      const handoffTraces = traces.filter((t) => t.type === 'handoff');
+      // Oneway handoffs emit only `handoff_start` (no return trip — the
+      // target's `ask_end` IS the end of the chain, so no `handoff_return`).
+      const handoffTraces = traces.filter((t) => t.type === 'handoff_start');
       expect(handoffTraces).toHaveLength(1);
       expect((handoffTraces[0].data as any).mode).toBe('oneway');
+      expect(traces.filter((t) => t.type === 'handoff_return')).toHaveLength(0);
     });
 
     it('handoff.toAskId matches the target agent_call_end.askId (review B-7/B-8)', async () => {
@@ -309,7 +317,9 @@ describe('agent handoff improvements', () => {
       const { ctx, traces } = createCtx({ provider });
       await ctx.ask(sourceAgent, 'start');
 
-      const handoff = traces.find((t) => t.type === 'handoff');
+      // `handoff_start` is always emitted (for both oneway and roundtrip)
+      // and carries the fromAskId/toAskId correlation anchors.
+      const handoff = traces.find((t) => t.type === 'handoff_start');
       expect(handoff).toBeDefined();
       const toAskId = handoff!.toAskId;
       const fromAskId = handoff!.fromAskId;
@@ -646,16 +656,20 @@ describe('agent handoff improvements', () => {
         events.push(event);
       }
 
-      const handoffEvents = events.filter((e) => e.type === 'handoff');
-      expect(handoffEvents).toHaveLength(1);
-      // Wire format is now AxlEvent — handoff fields live under `data`
+      // Oneway handoffs emit only `handoff_start` (no return trip).
+      // Wire format is AxlEvent — handoff fields live under `data`
       // (spec/16 §2.1). `fromAskId`/`toAskId` are at the top level for
-      // tree reconstruction.
+      // tree reconstruction. `mode` is on `handoff_start` (no return trip
+      // means no `handoff_return` for oneway).
+      const handoffEvents = events.filter((e) => e.type === 'handoff_start');
+      expect(handoffEvents).toHaveLength(1);
       expect(handoffEvents[0].data.source).toBe('coordinator');
       expect(handoffEvents[0].data.target).toBe('specialist');
       expect(handoffEvents[0].data.mode).toBe('oneway');
       expect(handoffEvents[0].fromAskId).toBeDefined();
       expect(handoffEvents[0].toAskId).toBeDefined();
+      // Oneway: no handoff_return emitted.
+      expect(events.filter((e) => e.type === 'handoff_return')).toHaveLength(0);
     });
   });
 
@@ -723,13 +737,140 @@ describe('agent handoff improvements', () => {
 
       expect(result).toBe('Final: incorporated deep answer');
 
-      // Should have two handoff traces (inner completes first since traces are emitted post-execution)
-      const handoffTraces = traces.filter((t) => t.type === 'handoff');
-      expect(handoffTraces).toHaveLength(2);
-      expect((handoffTraces[0].data as any).target).toBe('sub_specialist');
-      expect((handoffTraces[0].data as any).mode).toBe('oneway');
-      expect((handoffTraces[1].data as any).target).toBe('specialist');
-      expect((handoffTraces[1].data as any).mode).toBe('roundtrip');
+      // Both handoffs emit `handoff_start` (always fired, pre-transition).
+      // `handoff_start` orders correctly in step-sorted timelines — the
+      // outer source → specialist transition fires first, then the
+      // inner specialist → sub_specialist transition.
+      const handoffStarts = traces.filter((t) => t.type === 'handoff_start');
+      expect(handoffStarts).toHaveLength(2);
+      expect((handoffStarts[0].data as any).target).toBe('specialist');
+      expect((handoffStarts[0].data as any).mode).toBe('roundtrip');
+      expect((handoffStarts[1].data as any).target).toBe('sub_specialist');
+      expect((handoffStarts[1].data as any).mode).toBe('oneway');
+
+      // Only the roundtrip leg produces a `handoff_return` event.
+      const handoffReturns = traces.filter((t) => t.type === 'handoff_return');
+      expect(handoffReturns).toHaveLength(1);
+      expect((handoffReturns[0].data as any).target).toBe('specialist');
+    });
+  });
+
+  describe('handoff_return on target failure (gap 1)', () => {
+    it('roundtrip target throws → handoff_return still emits with measurable duration', async () => {
+      // Failing target makes handoffFn throw. Without try/finally on the
+      // emission site, the source's loop sees the error but consumers
+      // never see a handoff_return — the timeline shows handoff_start
+      // with no completion. The fix wraps the emission in try/finally
+      // so the event always fires.
+      const targetAgent = agent({
+        name: 'failing_specialist',
+        model: 'mock:test',
+        system: 'You always fail.',
+      });
+      const sourceAgent = agent({
+        name: 'coordinator',
+        model: 'mock:test',
+        system: 'You coordinate via roundtrip handoff.',
+        handoffs: [{ agent: targetAgent, mode: 'roundtrip' }],
+      });
+
+      const provider: Provider = {
+        name: 'mock',
+        chat: async (messages) => {
+          // First call (coordinator): emit handoff tool call.
+          // Second call (specialist): throw.
+          const sysContent = messages.find((m) => m.role === 'system')?.content ?? '';
+          if (typeof sysContent === 'string' && sysContent.includes('always fail')) {
+            throw new Error('specialist exploded');
+          }
+          return {
+            content: '',
+            tool_calls: [
+              {
+                id: 'tc1',
+                type: 'function',
+                function: {
+                  name: 'handoff_to_failing_specialist',
+                  arguments: '{"message":"do the thing"}',
+                },
+              },
+            ],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          };
+        },
+        stream: async function* () {
+          yield {
+            type: 'done',
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          };
+        },
+      };
+
+      const { ctx, traces } = createCtx({ provider });
+      await expect(ctx.ask(sourceAgent, 'go')).rejects.toThrow('specialist exploded');
+
+      const starts = traces.filter((t) => t.type === 'handoff_start');
+      const returns = traces.filter((t) => t.type === 'handoff_return');
+      expect(starts).toHaveLength(1);
+      // The fix: handoff_return emits even when the target throws.
+      expect(returns).toHaveLength(1);
+      expect(typeof (returns[0].data as { duration: number }).duration).toBe('number');
+      expect((returns[0].data as { duration: number }).duration).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  describe('HandoffRecord.duration backfill from target ask_end (gap 2)', () => {
+    it('oneway handoff populates session HandoffRecord.duration from target ask_end', async () => {
+      // Old behavior: oneway handoffs left `duration: undefined` because
+      // there was no `handoff_return` event to fire the update. Fix: the
+      // runtime listens for the target's `ask_end` and patches the
+      // record (matched by `toAskId`) with the target's measured duration.
+      const targetAgent = agent({
+        name: 'oneway_specialist',
+        model: 'mock:test',
+        system: 'You answer.',
+      });
+      const sourceAgent = agent({
+        name: 'oneway_coordinator',
+        model: 'mock:test',
+        system: 'You delegate via oneway handoff.',
+        handoffs: [{ agent: targetAgent, mode: 'oneway' }],
+      });
+
+      const runtime = new AxlRuntime({});
+      const provider = createSequenceProvider([
+        {
+          tool_calls: [
+            {
+              id: 'tc1',
+              type: 'function',
+              function: { name: 'handoff_to_oneway_specialist', arguments: '{}' },
+            },
+          ],
+        },
+        'specialist answer',
+      ]);
+      runtime.registerProvider('mock', provider);
+
+      const wf = workflow({
+        name: 'oneway-test',
+        input: z.string(),
+        handler: async (ctx) => ctx.ask(sourceAgent, ctx.input as string),
+      });
+      runtime.register(wf);
+
+      const session = runtime.session('test-oneway-session');
+      await session.send('oneway-test', 'Run the task');
+      // Async metadata persistence — give it a tick to settle.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const records = await session.handoffs();
+      expect(records).toHaveLength(1);
+      expect(records[0].mode).toBe('oneway');
+      expect(records[0].toAskId).toBeTypeOf('string');
+      // The fix: oneway records now have a duration (target's ask_end.duration).
+      expect(typeof records[0].duration).toBe('number');
+      expect(records[0].duration).toBeGreaterThanOrEqual(0);
     });
   });
 });

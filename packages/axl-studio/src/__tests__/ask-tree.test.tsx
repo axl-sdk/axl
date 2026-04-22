@@ -179,12 +179,12 @@ describe('buildAskTree', () => {
     const events: AxlEvent[] = [
       ev({ type: 'ask_start', askId: 'src', depth: 0, agent: 's' }),
       ev({
-        type: 'handoff',
+        type: 'handoff_start',
         fromAskId: 'src',
         toAskId: 'dst',
         sourceDepth: 0,
         targetDepth: 1,
-        data: { source: 's', target: 'd', mode: 'oneway', duration: 1 },
+        data: { source: 's', target: 'd', mode: 'oneway' },
       }),
       ev({ type: 'ask_start', askId: 'dst', depth: 1, parentAskId: 'src', agent: 'd' }),
     ];
@@ -308,12 +308,12 @@ describe('<AskTree />', () => {
     const events: AxlEvent[] = [
       ev({ type: 'ask_start', askId: 'src', depth: 0, agent: 's' }),
       ev({
-        type: 'handoff',
+        type: 'handoff_start',
         fromAskId: 'src',
         toAskId: 'dst',
         sourceDepth: 0,
         targetDepth: 1,
-        data: { source: 's', target: 'specialist', mode: 'oneway', duration: 1 },
+        data: { source: 's', target: 'specialist', mode: 'oneway' },
       }),
     ];
     render(<AskTree events={events} />);
@@ -330,12 +330,12 @@ describe('<AskTree />', () => {
     const events: AxlEvent[] = [
       ev({ type: 'ask_start', askId: 'src', depth: 0, agent: 's' }),
       ev({
-        type: 'handoff',
+        type: 'handoff_start',
         fromAskId: 'src',
         toAskId: 'orphan-never-started',
         sourceDepth: 0,
         targetDepth: 1,
-        data: { source: 's', target: 'lost-specialist', mode: 'oneway', duration: 1 },
+        data: { source: 's', target: 'lost-specialist', mode: 'oneway' },
       }),
       // NOTE: no ask_start for 'orphan-never-started' — the target frame never
       // reported back.
@@ -364,12 +364,12 @@ describe('<AskTree />', () => {
     const events: AxlEvent[] = [
       ev({ type: 'ask_start', askId: 'src', depth: 0, agent: 's' }),
       ev({
-        type: 'handoff',
+        type: 'handoff_start',
         fromAskId: 'src',
         toAskId: 'dst',
         sourceDepth: 0,
         targetDepth: 1,
-        data: { source: 's', target: 'specialist', mode: 'oneway', duration: 1 },
+        data: { source: 's', target: 'specialist', mode: 'oneway' },
       }),
       ev({ type: 'ask_start', askId: 'dst', depth: 1, parentAskId: 'src', agent: 'specialist' }),
       ev({

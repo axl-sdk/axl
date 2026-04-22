@@ -40,8 +40,10 @@ function assertExhaustive(ev: AxlEvent): string {
       return ev.tool;
     case 'delegate':
       return ev.data.reason;
-    case 'handoff':
-      return ev.fromAskId;
+    case 'handoff_start':
+      return ev.fromAskId + ':' + ev.data.mode;
+    case 'handoff_return':
+      return ev.fromAskId + ':' + String(ev.data.duration);
     case 'pipeline':
       // Narrow further on `status` to verify the multi-state union shape.
       switch (ev.status) {

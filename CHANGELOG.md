@@ -40,6 +40,25 @@ for a step-by-step consumer migration guide.
 - **Trace event type renames:** `'agent_call'` → `'agent_call_end'`,
   `'tool_call'` → `'tool_call_end'`. The new `_end` variants pair with
   newly-emitted `_start` events (see Added).
+- **Handoff event split: `'handoff'` → `'handoff_start'` +
+  `'handoff_return'`.** The single post-hoc `handoff` event is gone.
+  `handoff_start` ALWAYS fires BEFORE the target ask begins — so it
+  orders correctly in step-sorted timelines (ahead of the target's
+  `ask_start` / `agent_call_*` / `ask_end`) — and carries
+  `{ source, target, mode, message? }`; `message` is populated only on
+  roundtrip mode with a custom message arg. `handoff_return` is
+  ROUNDTRIP-ONLY (oneway handoffs terminate at the target, no return
+  trip) and carries `{ source, target, duration }` where `duration` is
+  the round-trip wall-clock ms. Handoff target asks now also emit
+  `ask_start` / `ask_end` (previously skipped), so the target agent's
+  activity is symmetric with a regular `ctx.ask()` call and drill-downs
+  no longer show "unknown agent". **Migration:** consumers doing
+  `event.type === 'handoff'` must discriminate the two new variants;
+  the `HandoffData` type export is split into `HandoffStartData` and
+  `HandoffReturnData` (both exported from `@axlsdk/axl`).
+  `AXL_EVENT_TYPES` drops `'handoff'` and adds `'handoff_start'` +
+  `'handoff_return'`. (`HandoffRecord`, the session-history shape, is
+  unchanged.)
 - **`error` event scope narrowed.** Ask-internal failures (gate
   exhaustion, `ctx.verify` failure, handler error) surface via
   `ask_end({ outcome: { ok: false, error } })` — NOT via the
@@ -98,7 +117,7 @@ for a step-by-step consumer migration guide.
   Extract helper.
 - `AxlEventBase`, `AskScoped`, `CallbackMeta`, plus per-variant data
   shapes (`AgentCallData`, `ToolCallData`, `ToolCallStartData`,
-  `ToolApprovalData`, `ToolDeniedData`, `HandoffData`, `DelegateData`,
+  `ToolApprovalData`, `ToolDeniedData`, `HandoffStartData`, `HandoffReturnData`, `DelegateData`,
   `VerifyData`, `WorkflowStartData`, `WorkflowEndData`,
   `MemoryEventData`, `GuardrailData`, `SchemaCheckData`,
   `ValidateData`).
@@ -178,7 +197,7 @@ for a step-by-step consumer migration guide.
   who want nested-ask visibility enable it and see an `AskTree` of the
   agent-as-tool / delegate / race branches live. Tool activity reconstruction
   migrated to the AxlEvent shape (`tool_call_start` / `tool_call_end`,
-  `handoff.data.source/target/mode`, `tool_approval.data.approved`).
+  `handoff_start.data.source/target/mode`, `tool_approval.data.approved`).
 - **Workflow Runner panel**: `AskTree` is the new default timeline view
   (replacing the flat `TraceEventList`). A Tree / Flat toggle preserves
   the chronological list for users who prefer it. Clicking an ask opens

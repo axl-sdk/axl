@@ -909,7 +909,7 @@ for await (const event of stream) {
 | Accessor | Type | Description |
 |---|---|---|
 | `for await ... of stream` | `AsyncIterable<AxlEvent>` | Every `AxlEvent`, in the order emitted |
-| `stream.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only (`ask_*`, `agent_call_*`, `tool_call_*`, `tool_approval`, `tool_denied`, `handoff`, `delegate`, `pipeline`, `verify`, `workflow_*`). Skips token chatter |
+| `stream.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only (`ask_*`, `agent_call_*`, `tool_call_*`, `tool_approval`, `tool_denied`, `handoff_start`, `handoff_return`, `delegate`, `pipeline`, `verify`, `workflow_*`). Skips token chatter |
 | `stream.text` | `AsyncIterable<string>` | Root-only token stream (`depth === 0`). Nested-ask tokens (agent-as-tool handlers, `delegate`, `race` branches) are omitted — use `stream.textByAsk` or filter the raw stream on `event.depth >= 1` to see them |
 | `stream.textByAsk` | `AsyncIterable<{ askId, agent?, text }>` | **Every** token tagged with the producing ask frame. Complements `.text` — use for split-pane UIs that render each sub-agent's output in its own lane, grouped by `askId` |
 | `stream.fullText` | `string` | Accumulated text from root-only tokens, committed on `pipeline(committed)`. Retried-attempt tokens are discarded on `pipeline(failed)` or `ask_end({ok:false})` so only the winning attempt's text appears |
@@ -1187,7 +1187,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped, CallbackMeta } from
 | `depth` | `number` | `0` for root, `+1` per nested `ctx.ask()` |
 | `agent` | `string?` | Emitting agent's name |
 
-`handoff` is the single exception — it spans two asks atomically and carries `fromAskId` / `toAskId` / `sourceDepth` / `targetDepth` instead.
+`handoff_start` and `handoff_return` are the single exception — they span two asks atomically and carry `fromAskId` / `toAskId` / `sourceDepth` / `targetDepth` instead.
 
 ### `AxlEvent` variants
 
@@ -1206,7 +1206,8 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped, CallbackMeta } from
 | `tool_approval` | `AskScoped` | `tool: string`, `callId?`, `data: ToolApprovalData` | `requireApproval` gate fires (both approve and deny) |
 | `tool_denied` | `AskScoped` | `tool: string`, `callId?`, `data?: ToolDeniedData` | LLM names a tool the agent doesn't expose |
 | `delegate` | `AskScoped` | `data: DelegateData` | `ctx.delegate()` routes (including single-agent short-circuit) |
-| `handoff` | — (spans two asks) | `fromAskId`, `toAskId`, `sourceDepth`, `targetDepth`, `data: HandoffData` | One agent hands off to another |
+| `handoff_start` | — (spans two asks) | `fromAskId`, `toAskId`, `sourceDepth`, `targetDepth`, `data: HandoffStartData` | Fires BEFORE the target ask begins. Emitted on EVERY handoff (both oneway and roundtrip). Orders ahead of the target's `ask_start` in step-sorted timelines |
+| `handoff_return` | — (spans two asks) | `fromAskId`, `toAskId`, `sourceDepth`, `targetDepth`, `data: HandoffReturnData` | Fires AFTER control returns to the source agent. **Roundtrip mode only** — oneway handoffs are terminal at the target and emit no return event |
 | `pipeline` | `AskScoped` | `status: 'start'\|'failed'\|'committed'`, `stage`, `attempt`, `maxAttempts`, `reason?` | Retry/validation lifecycle; `AxlStream.fullText` commits on `pipeline(committed)` and discards in-progress tokens on `pipeline(failed)` |
 | `partial_object` | `AskScoped` | `attempt: number`, `data: { object: unknown }` | Progressive structured output — emitted at string-safe boundaries when a `schema` is set on `ctx.ask()` and no tools are registered |
 | `verify` | `AskScoped` | `data: VerifyData` | `ctx.verify()` completes (pass or fail) |
@@ -1216,7 +1217,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped, CallbackMeta } from
 | `done` | — | `data: { result: unknown }` | Terminal — workflow completed |
 | `error` | `Partial<AskScoped>` | `data: { message: string, name?, code? }` | Terminal — non-ask-internal error (top-level workflow throws, infra/abort errors) |
 
-Per-variant data shape exports from `@axlsdk/axl`: `AgentCallData`, `ToolCallData`, `ToolCallStartData`, `ToolApprovalData`, `ToolDeniedData`, `HandoffData`, `DelegateData`, `VerifyData`, `WorkflowStartData`, `WorkflowEndData`, `MemoryEventData`, `GuardrailData`, `SchemaCheckData`, `ValidateData`. The constant tuple `AXL_EVENT_TYPES` is the single source of truth for the discriminator.
+Per-variant data shape exports from `@axlsdk/axl`: `AgentCallData`, `ToolCallData`, `ToolCallStartData`, `ToolApprovalData`, `ToolDeniedData`, `HandoffStartData`, `HandoffReturnData`, `DelegateData`, `VerifyData`, `WorkflowStartData`, `WorkflowEndData`, `MemoryEventData`, `GuardrailData`, `SchemaCheckData`, `ValidateData`. The constant tuple `AXL_EVENT_TYPES` is the single source of truth for the discriminator.
 
 **Cost double-counting guard:** `ask_end.cost` is the per-ask rollup of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). Use the exported helper `eventCostContribution(event)` — returns `0` on `ask_end` and on non-finite values, `event.cost` otherwise. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, Studio's cost aggregator, and `AxlTestRuntime.totalCost()` all use this helper internally:
 
@@ -1265,15 +1266,26 @@ Also exported: `isCostBearingLeaf(event: AxlEvent): boolean` (takes an event, ch
 
 `ToolCallData` (on `tool_call_end`): `{ args, result, callId? }` — args, return value, and provider correlation id.
 
-### `HandoffData` (data on `handoff` events)
+### `HandoffStartData` (data on `handoff_start` events)
+
+Emitted BEFORE the target ask begins. Fires on every handoff (both oneway and roundtrip).
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `source` | `string` | Agent name that initiated the handoff. Mirrors `event.agent` for join-convenience |
 | `target` | `string` | Agent name receiving the handoff |
-| `mode` | `'oneway' \| 'roundtrip'` | Handoff mode |
-| `duration` | `number` | Wall-clock duration of the handoff in ms |
-| `message` | `string?` | The `message` argument the source agent passed when invoking `handoff_to_X` in roundtrip mode. Subject to `config.trace.redact` |
+| `mode` | `'oneway' \| 'roundtrip'` | Handoff mode. Determines whether a matching `handoff_return` will follow |
+| `message` | `string?` | The `message` argument the source agent passed when invoking `handoff_to_X` in roundtrip mode. Populated only on roundtrip handoffs with a custom message; subject to `config.trace.redact` |
+
+### `HandoffReturnData` (data on `handoff_return` events)
+
+Emitted AFTER control returns to the source agent. **Roundtrip mode only** — oneway handoffs are terminal at the target and emit no return event. The returned value itself is observable via the target ask's `ask_end.outcome`; this event marks the control transfer back to the source and carries the round-trip duration.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `source` | `string` | Agent name that initiated the handoff |
+| `target` | `string` | Agent name that received the handoff and has now returned |
+| `duration` | `number` | Wall-clock ms from `handoff_start` emission to control returning to source |
 
 ### `DelegateData` (data on `delegate` events)
 

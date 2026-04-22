@@ -193,7 +193,7 @@ describe('PlaygroundPanel integration', () => {
     pushEvent(ev({ type: 'token', askId: 'a', depth: 0, agent: 'router', data: 'Routing...' }));
     pushEvent(
       ev({
-        type: 'handoff',
+        type: 'handoff_start',
         fromAskId: 'a',
         toAskId: 'b',
         sourceDepth: 0,

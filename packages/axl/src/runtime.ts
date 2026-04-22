@@ -581,17 +581,46 @@ export class AxlRuntime extends EventEmitter {
         execInfo.totalCost += eventCostContribution(event);
         this.emit('trace', event);
         this.outputAxlEvent(event);
-        // Persist handoff records to session metadata
-        if (event.type === 'handoff') {
+        // Persist handoff records to session metadata. Records land on
+        // `handoff_start` carrying source/target/mode/toAskId.
+        // Duration backfill is mode-specific:
+        //   - oneway:    target's `ask_end.duration` (the target's full work)
+        //   - roundtrip: `handoff_return.data.duration` (round-trip wall-clock,
+        //                includes pushing the result back into source's convo)
+        // Both modes correlate to the target via `toAskId` (handoff_start)
+        // matched against `ask_end.askId`.
+        if (event.type === 'handoff_start') {
           const sessionId = options?.metadata?.sessionId as string | undefined;
           if (sessionId) {
-            const data = event.data as Record<string, unknown> | undefined;
             this.appendHandoffRecord(sessionId, {
-              source: event.agent ?? '',
-              target: (data?.target as string) ?? '',
-              mode: (data?.mode as 'oneway' | 'roundtrip') ?? 'oneway',
+              source: event.data.source,
+              target: event.data.target,
+              mode: event.data.mode,
               timestamp: event.timestamp,
-              duration: (data?.duration as number) ?? undefined,
+              toAskId: event.toAskId,
+            });
+          }
+        } else if (event.type === 'handoff_return') {
+          const sessionId = options?.metadata?.sessionId as string | undefined;
+          if (sessionId) {
+            this.updateHandoffDuration(sessionId, {
+              toAskId: event.toAskId,
+              duration: event.data.duration,
+            });
+          }
+        } else if (event.type === 'ask_end') {
+          // Backfill duration for ONEWAY handoffs whose target just ended.
+          // Oneway has no `handoff_return`; without this listener, the
+          // record stays `duration: undefined`. Roundtrip records also
+          // hit this path, but `handoff_return` fires AFTER the target's
+          // `ask_end` and overwrites with the round-trip duration —
+          // intentional (round-trip wall-clock is the more useful figure
+          // for roundtrip).
+          const sessionId = options?.metadata?.sessionId as string | undefined;
+          if (sessionId && event.askId && typeof event.duration === 'number') {
+            this.updateHandoffDuration(sessionId, {
+              toAskId: event.askId,
+              duration: event.duration,
             });
           }
         }
@@ -753,8 +782,9 @@ export class AxlRuntime extends EventEmitter {
           axlStream._push(event);
 
           // Side effect: persist handoff records to session metadata.
-          // This is observability persistence, not stream derivation.
-          if (event.type === 'handoff') {
+          // Mirrors the non-streaming path. See the comment block on the
+          // execute() onTrace handler for duration semantics.
+          if (event.type === 'handoff_start') {
             const sessionId = options?.metadata?.sessionId as string | undefined;
             if (sessionId) {
               this.appendHandoffRecord(sessionId, {
@@ -762,7 +792,23 @@ export class AxlRuntime extends EventEmitter {
                 target: event.data.target,
                 mode: event.data.mode,
                 timestamp: event.timestamp,
+                toAskId: event.toAskId,
+              });
+            }
+          } else if (event.type === 'handoff_return') {
+            const sessionId = options?.metadata?.sessionId as string | undefined;
+            if (sessionId) {
+              this.updateHandoffDuration(sessionId, {
+                toAskId: event.toAskId,
                 duration: event.data.duration,
+              });
+            }
+          } else if (event.type === 'ask_end') {
+            const sessionId = options?.metadata?.sessionId as string | undefined;
+            if (sessionId && event.askId && typeof event.duration === 'number') {
+              this.updateHandoffDuration(sessionId, {
+                toAskId: event.askId,
+                duration: event.duration,
               });
             }
           }
@@ -1476,6 +1522,43 @@ export class AxlRuntime extends EventEmitter {
         const history = (existing as HandoffRecord[]) ?? [];
         history.push(record);
         return this.stateStore.saveSessionMeta(sessionId, 'handoffHistory', history);
+      })
+      .catch(() => {
+        // Silently ignore persistence errors in the trace path
+      });
+  }
+
+  /**
+   * Patch `duration` on the handoff record matching `toAskId` (the target
+   * frame's askId, which the runtime stamps on `handoff_start` and which
+   * appears as `askId` on the target's `ask_end`).
+   *
+   * Called from two places per handoff:
+   *   - target's `ask_end` — first-write source for ONEWAY (no return event).
+   *   - `handoff_return`   — overwrites for ROUNDTRIP with the round-trip
+   *                          wall-clock figure (intentional: round-trip
+   *                          duration is the more useful metric for the
+   *                          source-paused-for-N-ms semantic).
+   *
+   * No-op if no record matches `toAskId` (e.g., stream subscribed mid-
+   * handoff, or session metadata got wiped) — `duration` stays undefined,
+   * which is the documented default for `HandoffRecord`.
+   */
+  private updateHandoffDuration(
+    sessionId: string,
+    match: { toAskId: string; duration: number },
+  ): void {
+    this.stateStore
+      .getSessionMeta(sessionId, 'handoffHistory')
+      .then((existing) => {
+        const history = (existing as HandoffRecord[]) ?? [];
+        for (const r of history) {
+          if (r.toAskId === match.toAskId) {
+            r.duration = match.duration;
+            return this.stateStore.saveSessionMeta(sessionId, 'handoffHistory', history);
+          }
+        }
+        return undefined;
       })
       .catch(() => {
         // Silently ignore persistence errors in the trace path

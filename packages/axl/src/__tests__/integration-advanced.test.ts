@@ -385,8 +385,8 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       question: 'What is 13 * 17?',
     });
 
-    // Verify handoff trace was emitted
-    const handoffs = traces.filter((t) => t.type === 'handoff');
+    // Verify handoff_start trace was emitted (always fires with target/mode).
+    const handoffs = traces.filter((t) => t.type === 'handoff_start');
     expect(handoffs.length).toBeGreaterThanOrEqual(1);
     expect((handoffs[0].data as any)?.target).toBe('math_expert');
 
@@ -1048,7 +1048,10 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
         question: 'What is 11 * 13?',
       });
 
-      const handoffs = traces.filter((t) => t.type === 'handoff');
+      // Two handoff_start events expected: router → specialist, then
+      // specialist → calculator_agent. Both are always emitted regardless
+      // of mode.
+      const handoffs = traces.filter((t) => t.type === 'handoff_start');
       expect(handoffs.length).toBeGreaterThanOrEqual(2);
 
       const targets = handoffs.map((h) => (h.data as any)?.target);

@@ -688,7 +688,9 @@ describe('trace events — handoff data completeness', () => {
     const { ctx, traces } = createTestCtx({ provider });
     await ctx.ask(source, 'help');
 
-    const handoffs = traces.filter((t) => t.type === 'handoff');
+    // `handoff_start` carries source/target/mode and (for roundtrip) the
+    // user-supplied message; fired before the target ask begins.
+    const handoffs = traces.filter((t) => t.type === 'handoff_start');
     expect(handoffs).toHaveLength(1);
     const data = handoffs[0].data as Record<string, unknown>;
     expect(data.source).toBe('source');
@@ -712,7 +714,9 @@ describe('trace events — handoff data completeness', () => {
     const { ctx, traces } = createTestCtx({ provider });
     await ctx.ask(source, 'help');
 
-    const handoffs = traces.filter((t) => t.type === 'handoff');
+    // Oneway emits only `handoff_start` (no return trip); message is
+    // never populated on oneway — only roundtrip carries user content.
+    const handoffs = traces.filter((t) => t.type === 'handoff_start');
     expect(handoffs).toHaveLength(1);
     const data = handoffs[0].data as Record<string, unknown>;
     expect(data.source).toBe('source');
@@ -1147,7 +1151,10 @@ describe('trace events — redaction', () => {
     });
     await ctx.ask(source, 'help');
 
-    const handoffs = traces.filter((t) => t.type === 'handoff');
+    // Redaction applies to `handoff_start.data.message` — the user-supplied
+    // roundtrip content. Structural fields (source/target/mode) are never
+    // scrubbed.
+    const handoffs = traces.filter((t) => t.type === 'handoff_start');
     expect(handoffs).toHaveLength(1);
     const data = handoffs[0].data as Record<string, unknown>;
     // Structural fields stay

@@ -387,10 +387,10 @@ describe('redactStreamEvent', () => {
     expect(!out.outcome.ok && out.outcome.error).toBe('[redacted]');
   });
 
-  it('scrubs handoff.data.message (roundtrip mode) but preserves source/target/mode', () => {
+  it('scrubs handoff_start.data.message (roundtrip) but preserves source/target/mode', () => {
     const event: AxlEvent = {
       ...baseEvent(),
-      type: 'handoff',
+      type: 'handoff_start',
       fromAskId: 'a1',
       toAskId: 'a2',
       sourceDepth: 0,
@@ -399,27 +399,38 @@ describe('redactStreamEvent', () => {
         source: 'a1',
         target: 'a2',
         mode: 'roundtrip',
-        duration: 30,
         message: 'sensitive handoff payload',
       },
     };
-    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'handoff' }>;
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'handoff_start' }>;
     expect(out.data.source).toBe('a1');
     expect(out.data.target).toBe('a2');
     expect(out.data.mode).toBe('roundtrip');
-    expect(out.data.duration).toBe(30);
     expect(out.data.message).toBe('[redacted]');
   });
 
-  it('passes through handoff with no message (oneway) unchanged', () => {
+  it('passes through handoff_start with no message (oneway) unchanged', () => {
     const event: AxlEvent = {
       ...baseEvent(),
-      type: 'handoff',
+      type: 'handoff_start',
       fromAskId: 'a1',
       toAskId: 'a2',
       sourceDepth: 0,
       targetDepth: 1,
-      data: { source: 'a1', target: 'a2', mode: 'oneway', duration: 30 },
+      data: { source: 'a1', target: 'a2', mode: 'oneway' },
+    };
+    expect(redactStreamEvent(event, true)).toBe(event);
+  });
+
+  it('passes through handoff_return unchanged (pure structural)', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      type: 'handoff_return',
+      fromAskId: 'a1',
+      toAskId: 'a2',
+      sourceDepth: 0,
+      targetDepth: 1,
+      data: { source: 'a1', target: 'a2', duration: 30 },
     };
     expect(redactStreamEvent(event, true)).toBe(event);
   });

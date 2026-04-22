@@ -200,9 +200,9 @@ describe('redactStreamEvent — spec §5.1 per-variant scrubbing', () => {
     expect(r.outcome.error).toBe(REDACTED);
   });
 
-  it('handoff: data.message scrubbed when present; structural fields preserved', () => {
+  it('handoff_start: data.message scrubbed when present; structural fields preserved', () => {
     const ev = {
-      ...baseFields('handoff'),
+      ...baseFields('handoff_start'),
       fromAskId: 'a1',
       toAskId: 'a2',
       sourceDepth: 0,
@@ -211,7 +211,6 @@ describe('redactStreamEvent — spec §5.1 per-variant scrubbing', () => {
         source: 's',
         target: 't',
         mode: 'roundtrip',
-        duration: 1,
         message: 'why I delegated',
       },
     } as unknown as AxlEvent;
@@ -224,6 +223,19 @@ describe('redactStreamEvent — spec §5.1 per-variant scrubbing', () => {
     expect(r.data.mode).toBe('roundtrip');
     expect(r.data.message).toBe(REDACTED);
     expect(r.fromAskId).toBe('a1');
+  });
+
+  it('handoff_return: structural marker passed through unchanged', () => {
+    const ev = {
+      ...baseFields('handoff_return'),
+      fromAskId: 'a1',
+      toAskId: 'a2',
+      sourceDepth: 0,
+      targetDepth: 1,
+      data: { source: 's', target: 't', duration: 42 },
+    } as unknown as AxlEvent;
+    const r = redactStreamEvent(ev, true);
+    expect(r).toBe(ev);
   });
 
   it('partial_object: data.object scrubbed; attempt preserved', () => {

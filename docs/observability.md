@@ -76,7 +76,8 @@ All events share the `AxlEventBase` shape; `data` and other variant-specific fie
 | `schema_check` | Every schema parse on a structured-output call — pass or fail | `valid`, `reason?`, `attempt`, `maxAttempts`, `feedbackMessage?` (on retry) |
 | `validate` | Post-schema business rule validator runs — pass or fail | `valid`, `reason?`, `attempt`, `maxAttempts`, `feedbackMessage?` (on retry) |
 | `delegate` | `ctx.delegate()` routes to a candidate (including the single-agent short-circuit) | `candidates`, `selected?`, `routerModel?`, `reason` (`'routed'` \| `'single_candidate'`) |
-| `handoff` | One agent hands off to another via a `handoff_to_*` tool. **Not** AskScoped — spans two asks via `fromAskId` / `toAskId`. | `target`, `mode`, `duration`, `source?`, `message?` (roundtrip only) |
+| `handoff_start` | Fires BEFORE the target ask begins, on every handoff. **Not** AskScoped — spans two asks via `fromAskId` / `toAskId`. | `source`, `target`, `mode`, `message?` (roundtrip only) |
+| `handoff_return` | Fires AFTER control returns to source. **Roundtrip mode only** (oneway terminates at target). **Not** AskScoped. | `source`, `target`, `duration` |
 | `verify` | `ctx.verify()` completes (pass or fail) | `attempts`, `passed`, `lastError?` |
 | `log` | `ctx.log()` user-emitted event | caller-provided |
 | `memory_remember` / `memory_recall` / `memory_forget` | Memory ops audit | `{ key, scope, hit?, count?, embed?, usage? }` |
@@ -111,7 +112,7 @@ for (const event of info.events) {
 }
 ```
 
-`handoff` is the single exception — it spans two asks atomically and carries `fromAskId` / `toAskId` / `sourceDepth` / `targetDepth` instead of the `AskScoped` shape. Treat it as an edge in your ask graph.
+`handoff_start` and `handoff_return` are the single exception — they span two asks atomically and carry `fromAskId` / `toAskId` / `sourceDepth` / `targetDepth` instead of the `AskScoped` shape. Treat each as an edge in your ask graph: `handoff_start` is the forward edge (always emitted, fires before the target ask begins so it orders correctly in step-sorted timelines), `handoff_return` is the back edge (roundtrip handoffs only — oneway handoffs are terminal at the target, so the target's `ask_end` IS the end of the chain).
 
 ### Cost: avoid double-counting in custom accumulators
 
@@ -212,7 +213,7 @@ The filter applies at three layers:
 - `guardrail` / `schema_check` / `validate`: `reason`, `feedbackMessage`
 - `tool_call_start.data.args`, `tool_call_end.data`: `args`, `result`
 - `tool_approval.data`: `args`, `reason`
-- `handoff.data.message` (roundtrip handoffs)
+- `handoff_start.data.message` (roundtrip handoffs only — `handoff_return` carries no user/LLM content)
 - `workflow_start.data.input`, `workflow_end.data.result`/`error`
 - `done.data.result`, `error.data.message`
 - `log` events: string fields, with a one-level walk so nested numeric fields like `memory_remember.data.usage.tokens` / `.cost` survive while string fields like `.usage.model` are scrubbed. Arrays and deeper nesting collapse to the `'[redacted]'` sentinel
@@ -236,7 +237,7 @@ The filter applies at three layers:
 - `tool_approval.data.args`/`.reason`
 - `ask_start.prompt`, `ask_end.outcome`
 - `done.data.result`, `error.data.message`
-- `handoff.data.message` (roundtrip only)
+- `handoff_start.data.message` (roundtrip only)
 - structural fields (`type`, `step`, `agent`, `tool`, `askId`, `parentAskId`, `depth`, cost/duration/token totals) pass through
 
 In 0.16.0 the trace WS channel applies `redactStreamEvent` directly so the firehose can no longer bypass the per-route scrub (closing a previous PII leak).

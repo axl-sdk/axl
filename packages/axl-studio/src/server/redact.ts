@@ -290,10 +290,17 @@ export function redactStreamEvent(event: AxlEvent, redact: boolean): AxlEvent {
       return event.outcome.ok
         ? { ...event, outcome: { ok: true, result: REDACTED } }
         : { ...event, outcome: { ok: false, error: REDACTED } };
-    case 'handoff':
+    case 'handoff_start':
+      // `message` on roundtrip is the user-supplied prompt passed to the
+      // target. Structural fields (source, target, mode) stay visible.
       return event.data.message !== undefined
         ? { ...event, data: { ...event.data, message: REDACTED } }
         : event;
+    case 'handoff_return':
+      // Pure structural marker — `source`, `target`, `duration` only.
+      // The return value lives on the target's ask_end.outcome, which
+      // is scrubbed by the ask_end case above.
+      return event;
     case 'partial_object':
       // Progressive structured-output snapshots — same risk surface as
       // the final result on `done`.

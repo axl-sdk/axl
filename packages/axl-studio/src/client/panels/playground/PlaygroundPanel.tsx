@@ -114,7 +114,11 @@ export function PlaygroundPanel() {
           : toolCalls.find((tc) => tc.name === event.tool && !tc.result);
         if (existing) existing.result = data?.result;
       }
-      if (event.type === 'handoff') {
+      // `handoff_start` carries the transition metadata (source, target,
+      // mode). `handoff_return` (roundtrip only) is a structural marker —
+      // the chat doesn't render a second row for it; the target's own
+      // response already shows up in the normal flow.
+      if (event.type === 'handoff_start') {
         const data = event.data as { source?: string; target?: string; mode?: string } | undefined;
         handoffs.push({
           source: data?.source ?? '',

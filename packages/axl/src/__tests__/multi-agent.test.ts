@@ -488,8 +488,10 @@ describe('dynamic handoffs', () => {
     // The handoff should succeed since metadata enables it
     expect(result).toBe('dynamic target response');
 
-    // Verify handoff trace was emitted
-    const handoffTraces = traces.filter((t) => t.type === 'handoff');
+    // Verify handoff_start trace was emitted (always fires, carries mode).
+    // Oneway handoff: no handoff_return follows — target's ask_end ends
+    // the chain.
+    const handoffTraces = traces.filter((t) => t.type === 'handoff_start');
     expect(handoffTraces).toHaveLength(1);
     expect((handoffTraces[0].data as Record<string, unknown>).target).toBe('dyn_target');
     expect((handoffTraces[0].data as Record<string, unknown>).mode).toBe('oneway');

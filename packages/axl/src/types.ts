@@ -161,8 +161,13 @@ export const AXL_EVENT_TYPES = [
   'tool_denied',
   // Delegation
   'delegate',
-  // Handoff (spans two asks; not AskScoped)
-  'handoff',
+  // Handoff (spans two asks; not AskScoped).
+  // `handoff_start` emits before the target ask begins; always fired.
+  // `handoff_return` emits when control returns to source; roundtrip only
+  // (oneway handoffs have no return trip — the target's `ask_end` IS the
+  // end of the chain).
+  'handoff_start',
+  'handoff_return',
   // Pipeline (retry/validation lifecycle) — added in PR 2; reserved here.
   'pipeline',
   // Progressive structured output — added in PR 2; reserved here.
@@ -241,18 +246,25 @@ export type ToolDeniedData = {
   callId?: string;
 };
 
-/** Data shape for `handoff` events. */
-export type HandoffData = {
+/** Data shape for `handoff_start` events (always emitted, pre-transition). */
+export type HandoffStartData = {
   source: string;
   target: string;
   mode: 'oneway' | 'roundtrip';
-  /** Wall-clock ms from handoff_to_X tool call to target agent completion.
-   *  Always emitted — the event only fires at the terminal point of the
-   *  handoff, so we always have a measurement. */
-  duration: number;
   /** The `message` arg the source agent passed when invoking `handoff_to_X`
    *  (roundtrip mode only). Subject to `config.trace.redact`. */
   message?: string;
+};
+
+/** Data shape for `handoff_return` events (roundtrip-only, post-return).
+ *  The returned value itself is observable via the target ask's
+ *  `ask_end.outcome`; this event marks the control transfer back to the
+ *  source agent and carries the round-trip duration. */
+export type HandoffReturnData = {
+  source: string;
+  target: string;
+  /** Wall-clock ms from `handoff_start` emission to control returning. */
+  duration: number;
 };
 
 /** Data shape for `delegate` events. */
@@ -529,14 +541,29 @@ export type AxlEvent =
   // ── Delegation ──────────────────────────────────────────────────────────
   | (AxlEventBase & AskScoped & { type: 'delegate'; data: DelegateData })
 
-  // ── Handoff (atomic; spans two asks — NOT AskScoped) ────────────────────
+  // ── Handoff (spans two asks — NOT AskScoped) ───────────────────────────
+  //
+  // Asymmetric by mode: oneway emits only `handoff_start` (no return trip);
+  // roundtrip emits both `handoff_start` and `handoff_return`. This matches
+  // the control flow — oneway terminates at the target, roundtrip returns
+  // to source. `handoff_start` fires BEFORE the target ask begins, so it
+  // orders correctly in step-sorted timelines (ahead of the target's
+  // ask_start/agent_call_*/ask_end).
   | (AxlEventBase & {
-      type: 'handoff';
+      type: 'handoff_start';
       fromAskId: string;
       toAskId: string;
       sourceDepth: number;
       targetDepth: number;
-      data: HandoffData;
+      data: HandoffStartData;
+    })
+  | (AxlEventBase & {
+      type: 'handoff_return';
+      fromAskId: string;
+      toAskId: string;
+      sourceDepth: number;
+      targetDepth: number;
+      data: HandoffReturnData;
     })
 
   // ── Pipeline (retry/validation lifecycle; multi-state via `status`) ─────
@@ -667,13 +694,26 @@ export type ExecutionInfo = {
   error?: string;
 };
 
-/** Record of an agent handoff event (persisted in session metadata). */
+/** Record of an agent handoff event (persisted in session metadata).
+ *
+ *  `duration` semantics:
+ *    - `oneway`:    target's full ask duration (start-to-completion).
+ *    - `roundtrip`: full round-trip wall-clock (handoff_start → handoff_return),
+ *                   includes the time to push the result back into the source's
+ *                   conversation. Both measurements are populated by the
+ *                   runtime once the corresponding event fires; if the target
+ *                   never completes (workflow aborted mid-handoff), `duration`
+ *                   stays undefined.
+ *
+ *  `toAskId` is the askId of the target frame — lets consumers correlate
+ *  the record to the target's `ask_end` event in the trace stream. */
 export type HandoffRecord = {
   source: string;
   target: string;
   mode: 'oneway' | 'roundtrip';
   timestamp: number;
   duration?: number;
+  toAskId?: string;
 };
 
 /** Information about a completed agent call, emitted via onAgentCallComplete. */

@@ -75,13 +75,16 @@ function buildAskTree(events: AxlEvent[]): AskNode[] {
       }
     }
 
-    // `handoff` spans two asks — attribute the handoff to `fromAskId`,
-    // and stub a target node so the tree still renders a row for the
-    // target even if it aborts before emitting any of its own events.
-    // Review UX-9: an orphan handoff (target produced nothing) used to
-    // disappear entirely from the tree; now we show it with a placeholder
-    // node that later events overwrite naturally if they arrive.
-    if (ev.type === 'handoff' && ev.fromAskId) {
+    // `handoff_start` spans two asks — attribute the handoff to
+    // `fromAskId`, and stub a target node so the tree still renders a
+    // row for the target even if it aborts before emitting any of its
+    // own events. `handoff_return` (roundtrip only) doesn't need to
+    // create nodes — the target already exists by then, and the return
+    // marker is just metadata for the timeline. Review UX-9: an orphan
+    // handoff (target produced nothing) used to disappear entirely
+    // from the tree; now we show it with a placeholder node that later
+    // events overwrite naturally if they arrive.
+    if (ev.type === 'handoff_start' && ev.fromAskId) {
       const node = nodes.get(ev.fromAskId);
       const target = (ev.data as { target?: string } | undefined)?.target ?? ev.toAskId ?? '';
       if (node && ev.toAskId) {
@@ -107,6 +110,9 @@ function buildAskTree(events: AxlEvent[]): AskNode[] {
       }
       continue;
     }
+    // handoff_return: structural marker only (roundtrip return point).
+    // The source node already exists; no tree mutation needed.
+    if (ev.type === 'handoff_return') continue;
 
     if (!ev.askId) continue;
     let node = nodes.get(ev.askId);
@@ -344,11 +350,38 @@ function AskNodeRow(props: {
 
 // ── Root component ─────────────────────────────────────────────────
 
+/** Extract workflow-lifecycle summary from the event stream.
+ *  `workflow_start`/`workflow_end` aren't AskScoped so they're not in the
+ *  tree — surface them as a header row so users don't lose the workflow
+ *  boundary in the AskTree view. */
+function workflowSummary(events: AxlEvent[]): {
+  name?: string;
+  status?: string;
+  duration?: number;
+} | null {
+  let name: string | undefined;
+  let status: string | undefined;
+  let duration: number | undefined;
+  for (const ev of events) {
+    if (ev.type === 'workflow_start') {
+      name = ev.workflow ?? name;
+    } else if (ev.type === 'workflow_end') {
+      name = ev.workflow ?? name;
+      const d = ev.data as { status?: string; duration?: number } | undefined;
+      status = d?.status ?? status;
+      duration = d?.duration ?? duration;
+    }
+  }
+  if (!name && !status) return null;
+  return { name, status, duration };
+}
+
 export function AskTree(props: AskTreeProps): ReactElement {
   const { events, selectedAskId, onSelectAsk } = props;
   const tree = useMemo(() => buildAskTree(events), [events]);
+  const wf = useMemo(() => workflowSummary(events), [events]);
 
-  if (tree.length === 0) {
+  if (tree.length === 0 && !wf) {
     return (
       <div className="text-sm text-slate-500 py-4 text-center">
         No asks recorded yet. Events will appear here as `ctx.ask()` calls fire.
@@ -358,6 +391,36 @@ export function AskTree(props: AskTreeProps): ReactElement {
 
   return (
     <div data-testid="ask-tree" className="space-y-0.5">
+      {wf && (
+        <div
+          data-testid="ask-tree-workflow-header"
+          className={cn(
+            'flex items-center gap-2 rounded px-2 py-1 text-xs font-medium',
+            'bg-slate-50 dark:bg-slate-800/40 border-l-2 border-slate-400 dark:border-slate-600',
+          )}
+        >
+          <span className="text-slate-700 dark:text-slate-200">
+            workflow · {wf.name ?? '(unnamed)'}
+          </span>
+          {wf.status && (
+            <span
+              className={cn(
+                'ml-auto inline-flex items-center rounded px-1.5 py-0.5 text-[10px]',
+                wf.status === 'completed'
+                  ? 'bg-emerald-100 text-emerald-900 dark:bg-emerald-900/30 dark:text-emerald-200'
+                  : wf.status === 'failed'
+                    ? 'bg-red-100 text-red-900 dark:bg-red-900/30 dark:text-red-200'
+                    : 'bg-sky-100 text-sky-900 dark:bg-sky-900/30 dark:text-sky-200',
+              )}
+            >
+              {wf.status}
+            </span>
+          )}
+          {wf.duration !== undefined && (
+            <span className="font-mono text-slate-500 dark:text-slate-400">{wf.duration}ms</span>
+          )}
+        </div>
+      )}
       {tree.map((root) => (
         <AskNodeRow
           key={root.askId}

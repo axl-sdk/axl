@@ -378,7 +378,12 @@ export function WorkflowRunnerPanel() {
                       </div>
                     </div>
                     {timelineView === 'tree' ? (
-                      <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-3">
+                      // Tree column is capped so the drill-down panel
+                      // stays adjacent to the tree on wide viewports.
+                      // Unbounded `1fr` stretches the tree to ~1200px+
+                      // on large monitors, pushing the 360px drill-down
+                      // out of the user's focal area.
+                      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px] gap-3 max-w-[960px]">
                         <AskTree
                           events={timelineEvents}
                           selectedAskId={selectedAskId}

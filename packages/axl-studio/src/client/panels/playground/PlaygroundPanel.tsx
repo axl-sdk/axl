@@ -82,6 +82,22 @@ export function PlaygroundPanel() {
           }
           return [...prev, { role: 'assistant', content: `Error: ${stream.error}` }];
         });
+      } else if (!stream.tokens && stream.result != null) {
+        // Late-subscribe race: tokens are excluded from the WS replay
+        // buffer (connection-manager.ts treats them as reconstructable
+        // from `done`/`agent_call_end`), so a fast-completing execution
+        // can finish before useWsStream subscribes. We get `done` with
+        // a populated `result` but no `tokens` to render. Fall back to
+        // `stream.result` so the assistant message still appears.
+        const text =
+          typeof stream.result === 'string' ? stream.result : JSON.stringify(stream.result);
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.role === 'assistant' && !last.content) {
+            return [...prev.slice(0, -1), { ...last, content: text }];
+          }
+          return [...prev, { role: 'assistant', content: text }];
+        });
       }
     }
   }, [stream.tokens, stream.done, stream.error, isStreaming]);

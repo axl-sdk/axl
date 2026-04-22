@@ -248,6 +248,26 @@ describe('PlaygroundPanel integration', () => {
     expect(matches.length).toBe(1);
   });
 
+  it('renders stream.result as assistant bubble when done arrives without tokens (late-subscribe race)', async () => {
+    // Regression: when an execution completes faster than the panel can
+    // subscribe to the WS channel (mock providers, fast workflows), the
+    // replay buffer does NOT include `token` events
+    // (connection-manager.ts treats them as reconstructable from
+    // `done`/`agent_call_end`). The panel sees `done` with a populated
+    // result but no accumulated tokens. Without the result fallback, the
+    // assistant bubble is never added — visible as "user message sent,
+    // nothing came back" in the UI. This was finding #1 from manual
+    // testing (orchestrator-agent ran fast enough to hit this race).
+    renderWithQuery(<PlaygroundPanel />);
+    await submitMessage('investigate x');
+
+    // Skip token events entirely — simulates the late-subscribe race
+    // where tokens were already discarded by the replay buffer.
+    pushEvent(ev({ type: 'done', data: { result: 'Orchestrator synthesis: final answer' } }));
+
+    expect(await screen.findByText(/Orchestrator synthesis: final answer/)).toBeInTheDocument();
+  });
+
   it('drops nested-ask tokens (depth >= 1) from the chat bubble', async () => {
     // The bug class this catches: a regression that loses the depth-0
     // filter in useWsStream would surface every sub-agent's tokens in

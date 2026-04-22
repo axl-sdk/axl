@@ -177,7 +177,7 @@ const stream = runtime.stream('solve', { question: 'What is 42 * 17?' });
 
 for await (const event of stream) {
   if (event.type === 'token') process.stdout.write(event.data);
-  if (event.type === 'tool_call') console.log(`Calling tool: ${event.name}`);
+  if (event.type === 'tool_call_end') console.log(`Called tool: ${event.tool}`);
 }
 
 const result = await stream.promise; // final output after stream completes

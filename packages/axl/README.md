@@ -303,8 +303,8 @@ const result = await runtime.execute('my-workflow', { query: 'Hello' });
 const stream = runtime.stream('my-workflow', { query: 'Hello' });
 for await (const event of stream) {
   if (event.type === 'token') process.stdout.write(event.data);
-  if (event.type === 'error') console.error('Stream error:', event.message);
-  if (event.type === 'done') console.log('Result:', event.data);
+  if (event.type === 'error') console.error('Stream error:', event.data.message);
+  if (event.type === 'done') console.log('Result:', event.data.result);
 }
 
 // Sessions

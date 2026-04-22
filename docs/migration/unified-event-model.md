@@ -137,7 +137,7 @@ If your code relied on the old isolation as a feature (e.g., your chat UI accide
  });
 ```
 
-In PR 2 the new `pipeline` events and `AxlStream.fullText` commit-on-success fix will provide retry-boundary visibility — until then, retried tokens still concatenate in the raw stream. Consumers buffering tokens for display should filter on `event.type === 'pipeline' && event.status === 'failed'` to discard.
+Retry boundaries are observable via `pipeline` events (`status: 'start' | 'failed' | 'committed'`). `AxlStream.fullText` commits on `pipeline(committed)` and discards the in-progress buffer on `pipeline(failed)` or `ask_end({ok: false})`, so retried attempts' tokens never leak into the committed text. Consumers buffering raw tokens for a custom display can do the same: reset the buffer on `pipeline(failed)`, flush on `pipeline(committed)`.
 
 ## New capability: ask-graph correlation
 

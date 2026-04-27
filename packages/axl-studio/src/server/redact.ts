@@ -317,18 +317,41 @@ export function redactStreamEvent(event: AxlEvent, redact: boolean): AxlEvent {
       return event.data.key !== undefined
         ? { ...event, data: { ...event.data, key: REDACTED } }
         : event;
+    case 'await_human':
+      // Prompt is user-facing copy that may echo workflow input. `channel`
+      // is structural routing — preserve.
+      return event.data.prompt !== undefined
+        ? { ...event, data: { ...event.data, prompt: REDACTED } }
+        : event;
+    case 'await_human_resolved': {
+      // Decision payload may carry user-supplied content (`data` on
+      // approval, `reason` on rejection). Approval bit + channel preserved.
+      const dec = event.data.decision;
+      if (!dec) return event;
+      const scrubbed: typeof dec = { ...dec };
+      if ('data' in scrubbed && scrubbed.data !== undefined) scrubbed.data = REDACTED;
+      if ('reason' in scrubbed && scrubbed.reason !== undefined) scrubbed.reason = REDACTED;
+      return { ...event, data: { ...event.data, decision: scrubbed } };
+    }
+    case 'checkpoint_save':
+    case 'checkpoint_replay':
+      // Pure structural marker — `name` is the caller-supplied stable
+      // identifier (or `__auto/<primitive>/<n>` for runtime auto-checkpoints).
+      // Treated as structural, not scrubbed; callers should avoid putting
+      // PII in checkpoint names.
+      return event;
     case 'pipeline':
       // Only the `failed` status carries `reason` (the feedback message
       // about to be injected into the conversation — may echo user
       // input or LLM output).
       return event.status === 'failed' ? { ...event, reason: REDACTED } : event;
-    // Structural / numeric events pass through. `agent_call_end` and
-    // legacy gate events (guardrail/schema_check/validate) are scrubbed
-    // at emission time by core `emitEvent` — second-pass would be
-    // wasteful and could mask a missing emitter-level scrub.
-    // `delegate`, `agent_call_start`, `tool_call_start` (data.args
-    // already scrubbed above), `workflow_*`, `log` (already scrubbed at
-    // emission) all fall through.
+    // Structural / numeric events pass through. `agent_call_start`
+    // (prompt/system/messages), `agent_call_end` (response/thinking),
+    // and legacy gate events (guardrail/schema_check/validate) are
+    // scrubbed at emission time by core `emitEvent` — second-pass
+    // would be wasteful and could mask a missing emitter-level scrub.
+    // `delegate`, `tool_call_start` (handled above), `workflow_*`,
+    // `log` (already scrubbed at emission) all fall through.
     default:
       return event;
   }

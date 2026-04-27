@@ -337,7 +337,7 @@ export class AxlRuntime extends EventEmitter {
        * When `true`, populate `EvalItem.traces` on every item (success + failure
        * paths). Forwards to `runEval({ captureTraces: true })`, which wraps each
        * item's execution in `runtime.trackExecution({ captureTraces: true })`.
-       * Verbose-mode `agent_call.data.messages` snapshots are stripped from
+       * Verbose-mode `agent_call_start.data.messages` snapshots are stripped from
        * captured traces to keep memory bounded.
        */
       captureTraces?: boolean;
@@ -1262,7 +1262,7 @@ export class AxlRuntime extends EventEmitter {
    * during `fn()`. This is opt-in because it keeps every event in memory for the
    * duration of the call — useful for eval per-item capture, debugging, and test
    * assertions, but overhead grows with trace volume. When enabled, verbose-mode
-   * `agent_call.data.messages` snapshots are omitted from captured events (still
+   * `agent_call_start.data.messages` snapshots are omitted from captured events (still
    * broadcast via onTrace) to keep memory bounded — callers who need the full
    * verbose snapshot should subscribe to `runtime.on('trace', ...)` directly.
    *
@@ -1343,10 +1343,11 @@ export class AxlRuntime extends EventEmitter {
         // tokens / progressive `partial_object` snapshots would blow memory
         // when `captureTraces: true` is set on `runEval`. Reviewer bug B3.
         if (event.type === 'token' || event.type === 'partial_object') return;
-        if (event.type === 'agent_call_end' && event.data) {
+        // Verbose `messages[]` snapshots live on agent_call_start (request
+        // side) under the start/end split. Strip to keep memory bounded.
+        if (event.type === 'agent_call_start' && event.data) {
           const d = event.data as Record<string, unknown>;
           if ('messages' in d) {
-            // Strip the verbose messages array by rebuilding without it.
             const rest: Record<string, unknown> = {};
             for (const k of Object.keys(d)) {
               if (k !== 'messages') rest[k] = d[k];
@@ -1495,7 +1496,7 @@ export class AxlRuntime extends EventEmitter {
       parts.push(`${workflowPrefix}log: ${JSON.stringify(event.data)}`);
     } else {
       parts.push(`${workflowPrefix}${event.type}`);
-      // Some variants don't carry `data` (e.g., `ask_start`, `agent_call_start`).
+      // Some variants don't carry `data` (e.g., `ask_start`).
       // Inspect dynamically so the logger remains a catch-all without
       // enumerating every variant.
       const data = (event as { data?: unknown }).data;

@@ -179,6 +179,12 @@ export const AXL_EVENT_TYPES = [
   'memory_remember',
   'memory_recall',
   'memory_forget',
+  // Durable execution checkpoints (`ctx.checkpoint`)
+  'checkpoint_save',
+  'checkpoint_replay',
+  // Human-in-the-loop (`ctx.awaitHuman`)
+  'await_human',
+  'await_human_resolved',
   // Legacy gate events — emitted by current code; collapsed into `pipeline`
   // in PR 2 (spec/16-streaming-wire-reliability §4.2).
   'guardrail',
@@ -192,32 +198,55 @@ export const AXL_EVENT_TYPES = [
 /** Discriminator union derived from `AXL_EVENT_TYPES`. */
 export type AxlEventType = (typeof AXL_EVENT_TYPES)[number];
 
-/** Data shape for `agent_call_end` events. Populated on every LLM call (pass or fail). */
-export type AgentCallData = {
+/** Resolved model parameters sent to the provider for an LLM call. */
+export type AgentCallParams = {
+  temperature?: number;
+  maxTokens?: number;
+  effort?: Effort;
+  thinkingBudget?: number;
+  includeThoughts?: boolean;
+  toolChoice?: ToolChoice;
+  stop?: string[];
+};
+
+/**
+ * Data shape for `agent_call_start` events — the **request** side of the call.
+ * Everything here is known at the moment the call is dispatched, before the
+ * provider responds. Consumers can render "what's being asked" without waiting
+ * for completion.
+ */
+export type AgentCallStartData = {
   /** Original user prompt passed to `ctx.ask()`. Does not include retry feedback or tool results. */
   prompt: string;
-  /** Final LLM response content for this turn. */
-  response: string;
   /** Resolved system prompt (after evaluating dynamic system selectors). */
   system?: string;
-  /** Reasoning/thinking content returned by the provider, when available. */
-  thinking?: string;
   /** Resolved model parameters sent to the provider for this call. */
-  params?: {
-    temperature?: number;
-    maxTokens?: number;
-    effort?: Effort;
-    thinkingBudget?: number;
-    includeThoughts?: boolean;
-    toolChoice?: ToolChoice;
-    stop?: string[];
-  };
+  params?: AgentCallParams;
   /** 1-indexed iteration of the tool-calling loop for this `ctx.ask()` call. */
-  turn?: number;
+  turn: number;
   /** When set, this call is a retry triggered by a failed gate check on the previous turn. */
   retryReason?: 'schema' | 'validate' | 'guardrail';
+  /** Names of tools exposed to the model on this call. Empty/omitted when no tools are bound. */
+  toolNames?: string[];
   /** Full ChatMessage[] sent to the provider this turn. Only populated when `trace.level === 'full'`. */
   messages?: ChatMessage[];
+};
+
+/**
+ * Data shape for `agent_call_end` events — the **response** side of the call.
+ * Populated when the provider returns (success or recoverable failure). The
+ * companion request-side payload lives on the matching `agent_call_start`.
+ */
+export type AgentCallEndData = {
+  /** Final LLM response content for this turn. */
+  response: string;
+  /** Reasoning/thinking content returned by the provider, when available. */
+  thinking?: string;
+  /** 1-indexed iteration of the tool-calling loop. Mirrors the matching `agent_call_start.data.turn`. */
+  turn: number;
+  /** Mirrors `agent_call_start.data.retryReason` so cost-attribution consumers
+   *  reading `agent_call_end` (cost lives here) can bucket without joining. */
+  retryReason?: 'schema' | 'validate' | 'guardrail';
 };
 
 /** Data shape for `tool_call_end` events. */
@@ -331,6 +360,33 @@ export type WorkflowEndData = {
   /** True when the failure was an `AbortError` (user cancellation, budget hard_stop,
    *  or consumer disconnect on streaming workflows). */
   aborted?: boolean;
+};
+
+/** Data shape for `checkpoint_save` / `checkpoint_replay` events.
+ *  Emitted by `ctx.checkpoint(name, fn)` — `save` on first execution,
+ *  `replay` when a saved value short-circuits the function call. */
+export type CheckpointEventData = {
+  /** Stable, caller-supplied identifier under which the checkpoint is
+   *  stored. Internal auto-checkpoints from ask/spawn/race/parallel/map
+   *  use names prefixed with `__auto/<primitive>/`. */
+  name: string;
+};
+
+/** Data shape for `await_human` events — emitted when execution suspends
+ *  for a human decision via `ctx.awaitHuman()`. The pending side of the
+ *  pair; `await_human_resolved` follows when the decision arrives. */
+export type AwaitHumanData = {
+  /** Optional human-facing prompt describing the decision needed. */
+  prompt?: string;
+  /** Channel routing the decision (e.g., 'slack', 'email', custom). */
+  channel?: string;
+};
+
+/** Data shape for `await_human_resolved` events — paired terminal of an
+ *  `await_human` request. Carries the `HumanDecision` returned to the workflow. */
+export type AwaitHumanResolvedData = {
+  channel?: string;
+  decision: HumanDecision;
 };
 
 /** Data shape for `memory_remember` / `memory_recall` / `memory_forget` events. */
@@ -488,6 +544,8 @@ export type AxlEvent =
         model: string;
         /** 1-indexed tool-calling loop iteration within the ask. */
         turn: number;
+        /** Request-side payload — prompt, system, params, messages, retry context. */
+        data: AgentCallStartData;
       })
   | (AxlEventBase &
       AskScoped & {
@@ -498,7 +556,8 @@ export type AxlEvent =
         cost: number;
         duration: number;
         tokens?: { input?: number; output?: number; reasoning?: number };
-        data: AgentCallData;
+        /** Response-side payload — response text, thinking. */
+        data: AgentCallEndData;
       })
 
   // ── Content delivery (stream-only; never in ExecutionInfo.events) ───────
@@ -589,6 +648,11 @@ export type AxlEvent =
       AskScoped & {
         type: 'pipeline';
         status: 'committed';
+        /** The stage of the most recent `pipeline(start)` — `'initial'` when
+         *  the ask committed on the first pass, otherwise the gate that last
+         *  retried before commit. Lets consumers tell "committed cleanly"
+         *  from "committed after a schema/validate/guardrail retry". */
+        stage: 'initial' | 'schema' | 'validate' | 'guardrail';
         /** The final successful attempt. */
         attempt: number;
         maxAttempts: number;
@@ -617,6 +681,25 @@ export type AxlEvent =
       Partial<AskScoped> & {
         type: 'memory_remember' | 'memory_recall' | 'memory_forget';
         data: MemoryEventData;
+      })
+
+  // ── Durable execution checkpoints (`ctx.checkpoint`) ────────────────────
+  | (AxlEventBase &
+      Partial<AskScoped> & {
+        type: 'checkpoint_save' | 'checkpoint_replay';
+        data: CheckpointEventData;
+      })
+
+  // ── Human-in-the-loop (`ctx.awaitHuman`) ────────────────────────────────
+  | (AxlEventBase &
+      Partial<AskScoped> & {
+        type: 'await_human';
+        data: AwaitHumanData;
+      })
+  | (AxlEventBase &
+      Partial<AskScoped> & {
+        type: 'await_human_resolved';
+        data: AwaitHumanResolvedData;
       })
 
   // ── Terminal workflow markers (idiomatic names; see decision 9) ─────────

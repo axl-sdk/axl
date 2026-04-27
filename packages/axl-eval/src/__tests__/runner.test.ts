@@ -1767,13 +1767,15 @@ describe('runEval: captureTraces', () => {
 
     // Verbose messages are intentionally omitted from captured traces to keep
     // memory bounded. The runtime still broadcasts them via onTrace for
-    // consumers who subscribe directly.
+    // consumers who subscribe directly. Verbose `messages` and `system` live
+    // on agent_call_start (request side) under the split.
     for (const item of result.items) {
-      const agentCall = item.traces?.find((t) => t.type === 'agent_call_end');
-      expect(agentCall).toBeDefined();
-      expect((agentCall!.data as Record<string, unknown>).messages).toBeUndefined();
-      // Non-verbose agent_call data (system, params, turn) is still present
-      expect((agentCall!.data as Record<string, unknown>).system).toBe('sys');
+      const agentStart = item.traces?.find((t) => t.type === 'agent_call_start');
+      expect(agentStart).toBeDefined();
+      const startData = agentStart!.data as Record<string, unknown>;
+      expect(startData.messages).toBeUndefined();
+      // Non-verbose request-side data (system, params, turn) is still present
+      expect(startData.system).toBe('sys');
     }
   });
 

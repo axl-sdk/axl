@@ -80,6 +80,33 @@ for a step-by-step consumer migration guide.
   see a single shared counter.
 - **`Embedder.embed()` signature unchanged in this release** (the
   0.15.0 `EmbedResult` change still applies).
+- **`ctx.checkpoint(fn)` → `ctx.checkpoint(name, fn)`.** The public
+  checkpoint API now requires a stable, caller-supplied identifier.
+  This closes a data-corruption bug where nested `WorkflowContext`
+  instances each had their own `0`-indexed counter and silently
+  overwrote each other's checkpoint slots in the state store
+  (e.g. a tool handler's `ctx.checkpoint()` clobbered the workflow's
+  step 0). Names are scoped to a single execution and must match
+  across runs for replay to work; the `__auto/` prefix is reserved
+  for runtime auto-checkpointing of `ctx.ask`/`spawn`/`race`/
+  `parallel`/`map`. Same model used by Temporal/Inngest/Restate. For
+  loops, compose names from the iterator: `ctx.checkpoint(`process-${id}`, fn)`.
+- **`StateStore.{save,get}Checkpoint(executionId, step: number)` →
+  `(executionId, name: string)`.** Custom `StateStore` impls must
+  switch the `step: number` parameter to `name: string`. Built-in
+  stores migrate transparently:
+  - `MemoryStore`: inner `Map<number>` → `Map<string>`, no-op for callers.
+  - `SQLiteStore`: schema v1→v2 renames `checkpoints.step` (INTEGER)
+    → `checkpoints.name` (TEXT). SQLite is dynamically typed, so
+    legacy integer values become string names like `"0"` — in-flight
+    executions keep replaying correctly.
+  - `RedisStore`: hash field is now the name directly (no `String(step)`).
+- **`StateStore.getLatestCheckpoint` removed.** Undefined semantics
+  under named keys (no implicit ordering); never called by the runtime.
+- **`CheckpointEventData` shape: `{ step: number }` → `{ name: string }`.**
+  Studio and trace consumers narrowing on `checkpoint_save` /
+  `checkpoint_replay` should read `event.data.name`. Internal
+  auto-checkpoints emit `__auto/<primitive>/<n>` names.
 
 ### Added — Unified event model
 

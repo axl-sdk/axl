@@ -201,23 +201,29 @@ describe('PlaygroundPanel integration', () => {
         data: { source: 'router', target: 'specialist', mode: 'oneway' },
       }),
     );
-    expect(screen.getByText('router')).toBeInTheDocument();
-    expect(screen.getByText('specialist')).toBeInTheDocument();
+    // The handoff renders in the chat bubble AND in the Activity drawer
+    // (which auto-opens on handoff_start), so use getAllByText.
+    expect(screen.getAllByText('router').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('specialist').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('(oneway)')).toBeInTheDocument();
   });
 
-  it('auto-opens the Subagent drawer on first nested-ask event (depth >= 1)', async () => {
+  it('auto-opens Activity drawer on first nested-ask event (depth >= 1)', async () => {
     renderWithQuery(<PlaygroundPanel />);
     await submitMessage('do nested work');
 
-    // No subagent activity yet — drawer is hidden.
-    expect(screen.queryByText('Subagent activity')).not.toBeInTheDocument();
+    // The "Activity" button always renders in the header; the drawer's
+    // <h3> heading only appears when the drawer is open.
+    const drawerOpen = () => screen.queryByRole('heading', { name: /activity/i });
 
-    // Outer activity (depth 0) does NOT trigger the drawer.
+    // No activity yet — drawer is hidden.
+    expect(drawerOpen()).not.toBeInTheDocument();
+
+    // Outer activity (depth 0, non-trigger type) does NOT open the drawer.
     pushEvent(
       ev({ type: 'agent_call_start', askId: 'a', depth: 0, agent: 'outer', model: 'mock' }),
     );
-    expect(screen.queryByText('Subagent activity')).not.toBeInTheDocument();
+    expect(drawerOpen()).not.toBeInTheDocument();
 
     // First nested event flips the latch — the drawer appears.
     pushEvent(
@@ -230,7 +236,27 @@ describe('PlaygroundPanel integration', () => {
         prompt: 'sub-q',
       }),
     );
-    expect(screen.getByText('Subagent activity')).toBeInTheDocument();
+    expect(drawerOpen()).toBeInTheDocument();
+  });
+
+  it('auto-opens Activity drawer on tool_call_start (even at depth 0)', async () => {
+    renderWithQuery(<PlaygroundPanel />);
+    await submitMessage('use a tool please');
+
+    const drawerOpen = () => screen.queryByRole('heading', { name: /activity/i });
+    expect(drawerOpen()).not.toBeInTheDocument();
+
+    pushEvent(
+      ev({
+        type: 'tool_call_start',
+        askId: 'a',
+        depth: 0,
+        tool: 'getWeather',
+        callId: 'c1',
+        data: { args: { city: 'SF' } },
+      }),
+    );
+    expect(drawerOpen()).toBeInTheDocument();
   });
 
   it('renders exactly ONE "Error:" message bubble on stream error (regression)', async () => {

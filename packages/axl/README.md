@@ -370,10 +370,12 @@ const decision = await ctx.awaitHuman({
   prompt: 'Approve this action?',
 });
 
-// Durable checkpoint — on first run, executes and saves the result.
-// On replay after a restart, returns the saved result without re-executing,
-// preventing duplicate side effects (double API calls, double charges, etc.)
-const checkpointed = await ctx.checkpoint(async () => expensiveOperation());
+// Durable checkpoint — on first run, executes and saves the result under
+// the given name. On replay after a restart, returns the saved result
+// without re-executing, preventing duplicate side effects (double API
+// calls, double charges, etc.). The name is a stable identifier and must
+// match across runs for replay to work.
+const checkpointed = await ctx.checkpoint('expensive-op', async () => expensiveOperation());
 ```
 
 ### OpenTelemetry Observability

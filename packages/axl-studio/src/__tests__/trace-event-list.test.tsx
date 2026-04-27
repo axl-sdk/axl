@@ -85,9 +85,10 @@ describe('TraceEventList', () => {
   });
 
   it('expand-all opens every row simultaneously', async () => {
+    // Prompt now lives on agent_call_start (request side), not _end.
     const events = [
-      makeEvent({ step: 0, type: 'agent_call_end', data: { prompt: 'first prompt' } }),
-      makeEvent({ step: 1, type: 'agent_call_end', data: { prompt: 'second prompt' } }),
+      makeEvent({ step: 0, type: 'agent_call_start', data: { prompt: 'first prompt', turn: 1 } }),
+      makeEvent({ step: 1, type: 'agent_call_start', data: { prompt: 'second prompt', turn: 1 } }),
     ];
     render(<TraceEventList events={events} />);
     const user = userEvent.setup();
@@ -106,8 +107,8 @@ describe('TraceEventList', () => {
   it('toggles a single row independently via click', async () => {
     const event = makeEvent({
       step: 0,
-      type: 'agent_call_end',
-      data: { prompt: 'solo prompt' },
+      type: 'agent_call_start',
+      data: { prompt: 'solo prompt', turn: 1 },
     });
     render(<TraceEventList events={[event]} />);
     const user = userEvent.setup();

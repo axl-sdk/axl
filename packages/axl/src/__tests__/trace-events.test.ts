@@ -27,16 +27,20 @@ describe('trace events — agent_call enrichment', () => {
     const { ctx, traces } = createTestCtx({ provider: createSequenceProvider(['ok']) });
     await ctx.ask(a, 'hi', { effort: 'low', toolChoice: 'auto' });
 
-    const agentCall = traces.find((t) => t.type === 'agent_call_end');
-    expect(agentCall).toBeDefined();
-    const data = agentCall!.data as Record<string, unknown>;
-    expect(data.system).toBe('You are a helpful assistant.');
-    expect(data.turn).toBe(1);
-    const params = data.params as Record<string, unknown>;
+    // Request-side metadata lives on agent_call_start.
+    const agentCallStart = traces.find((t) => t.type === 'agent_call_start');
+    expect(agentCallStart).toBeDefined();
+    const startData = agentCallStart!.data as Record<string, unknown>;
+    expect(startData.system).toBe('You are a helpful assistant.');
+    expect(startData.turn).toBe(1);
+    const params = startData.params as Record<string, unknown>;
     expect(params.temperature).toBe(0.5);
     expect(params.maxTokens).toBe(1024);
     expect(params.effort).toBe('low');
     expect(params.toolChoice).toBe('auto');
+    // agent_call_end mirrors `turn` so cost-bucketing consumers reading the end event have it.
+    const agentCallEnd = traces.find((t) => t.type === 'agent_call_end');
+    expect((agentCallEnd!.data as Record<string, unknown>).turn).toBe(1);
   });
 
   it('resolves dynamic system prompt at call time', async () => {
@@ -51,8 +55,8 @@ describe('trace events — agent_call enrichment', () => {
     });
     await ctx.ask(a, 'hi');
 
-    const agentCall = traces.find((t) => t.type === 'agent_call_end');
-    expect((agentCall!.data as Record<string, unknown>).system).toBe('Tenant: acme');
+    const agentCallStart = traces.find((t) => t.type === 'agent_call_start');
+    expect((agentCallStart!.data as Record<string, unknown>).system).toBe('Tenant: acme');
   });
 
   it('omits messages snapshot by default (verbose off)', async () => {
@@ -60,8 +64,8 @@ describe('trace events — agent_call enrichment', () => {
     const { ctx, traces } = createTestCtx({ provider: createSequenceProvider(['ok']) });
     await ctx.ask(a, 'hi');
 
-    const agentCall = traces.find((t) => t.type === 'agent_call_end');
-    expect((agentCall!.data as Record<string, unknown>).messages).toBeUndefined();
+    const agentCallStart = traces.find((t) => t.type === 'agent_call_start');
+    expect((agentCallStart!.data as Record<string, unknown>).messages).toBeUndefined();
   });
 
   it('includes messages snapshot when trace.level === full', async () => {
@@ -79,8 +83,8 @@ describe('trace events — agent_call enrichment', () => {
     });
     await ctx.ask(a, 'hi');
 
-    const agentCall = traces.find((t) => t.type === 'agent_call_end');
-    const data = agentCall!.data as Record<string, unknown>;
+    const agentCallStart = traces.find((t) => t.type === 'agent_call_start');
+    const data = agentCallStart!.data as Record<string, unknown>;
     expect(Array.isArray(data.messages)).toBe(true);
     const messages = data.messages as Array<{ role: string; content: string }>;
     expect(messages.some((m) => m.role === 'system' && m.content === 'you are helpful')).toBe(true);
@@ -179,7 +183,7 @@ describe('trace events — verbose messages snapshot across retries', () => {
     });
     await ctx.ask(a, 'hi', { schema: z.object({ answer: z.string() }) });
 
-    const calls = traces.filter((t) => t.type === 'agent_call_end');
+    const calls = traces.filter((t) => t.type === 'agent_call_start');
     expect(calls).toHaveLength(2);
     const turn1Messages = (calls[0].data as Record<string, unknown>).messages as Array<{
       role: string;
@@ -288,13 +292,15 @@ describe('trace events — nested child contexts (agent-as-tool)', () => {
 
     // Both parent and child agent_calls should appear, but neither should
     // carry retryReason since neither hit a gate failure.
-    const calls = traces.filter((t) => t.type === 'agent_call_end');
-    expect(calls.length).toBeGreaterThanOrEqual(2);
-    for (const call of calls) {
+    const ends = traces.filter((t) => t.type === 'agent_call_end');
+    expect(ends.length).toBeGreaterThanOrEqual(2);
+    for (const call of ends) {
       expect((call.data as Record<string, unknown>).retryReason).toBeUndefined();
     }
-    // Child agent's call should show system: 'child system', not 'parent'
-    const childCall = calls.find((c) => c.agent === 'child');
+    // Child agent's call should show system: 'child system', not 'parent'.
+    // The system prompt lives on agent_call_start (request side).
+    const starts = traces.filter((t) => t.type === 'agent_call_start');
+    const childCall = starts.find((c) => c.agent === 'child');
     expect(childCall).toBeDefined();
     expect((childCall!.data as Record<string, unknown>).system).toBe('child system');
   });
@@ -1035,21 +1041,27 @@ describe('trace events — redaction', () => {
     });
     await ctx.ask(a, 'secret prompt');
 
-    const agentCall = traces.find((t) => t.type === 'agent_call_end');
-    const data = agentCall!.data as Record<string, unknown>;
-    expect(data.prompt).toBe('[redacted]');
-    expect(data.response).toBe('[redacted]');
-    expect(data.system).toBe('[redacted]');
-    expect(data.thinking).toBe('[redacted]');
+    // Request-side fields (prompt, system, messages) live on agent_call_start.
+    const startCall = traces.find((t) => t.type === 'agent_call_start');
+    const startData = startCall!.data as Record<string, unknown>;
+    expect(startData.prompt).toBe('[redacted]');
+    expect(startData.system).toBe('[redacted]');
     // messages must stay an array so downstream narrowers don't crash
-    expect(Array.isArray(data.messages)).toBe(true);
-    const messages = data.messages as Array<{ role: string; content: string }>;
+    expect(Array.isArray(startData.messages)).toBe(true);
+    const messages = startData.messages as Array<{ role: string; content: string }>;
     expect(messages).toHaveLength(1);
     expect(messages[0].role).toBe('system');
     expect(messages[0].content).toMatch(/messages redacted/);
-    // Non-sensitive structural fields remain visible
-    expect(data.turn).toBe(1);
-    expect(data.params).toBeDefined();
+    // Non-sensitive structural fields remain visible on start
+    expect(startData.turn).toBe(1);
+    expect(startData.params).toBeDefined();
+
+    // Response-side fields (response, thinking) live on agent_call_end.
+    const endCall = traces.find((t) => t.type === 'agent_call_end');
+    const endData = endCall!.data as Record<string, unknown>;
+    expect(endData.response).toBe('[redacted]');
+    expect(endData.thinking).toBe('[redacted]');
+    expect(endData.turn).toBe(1);
   });
 
   it('redacts tool_call args and result when trace.redact is true', async () => {

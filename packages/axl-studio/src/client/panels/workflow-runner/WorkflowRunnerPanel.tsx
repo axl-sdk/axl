@@ -13,6 +13,7 @@ import { fetchWorkflows, fetchWorkflow, executeWorkflow } from '../../lib/api';
 import { useWsStream } from '../../hooks/use-ws-stream';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
 import { StatCard } from '../../components/shared/StatCard';
+import { ResizableSplit } from '../../components/shared/ResizableSplit';
 import { TraceEventList } from '../../components/shared/TraceEventList';
 import { AskTree } from '../../components/shared/AskTree';
 import { AskDetails } from '../../components/shared/AskDetails';
@@ -240,181 +241,188 @@ export function WorkflowRunnerPanel() {
 
       {/* ── Run Tab ───────────────────────────────────── */}
       {wfTab === 'run' && (
-        <div className="flex-1 min-h-0 flex">
-          {/* Left: Input configuration — narrower than before so Result +
-            Timeline get more horizontal room. */}
-          <div className="w-[320px] xl:w-[360px] shrink-0 border-r border-[hsl(var(--border))] overflow-y-auto p-5 space-y-4">
-            {/* Input mode toggle */}
-            {hasSchema && (
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => setUseSchemaForm(true)}
-                  className={cn(
-                    'px-3 py-1 text-xs rounded-lg transition-colors',
-                    useSchemaForm
-                      ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]'
-                      : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]',
-                  )}
-                >
-                  Form
-                </button>
-                <button
-                  onClick={() => setUseSchemaForm(false)}
-                  className={cn(
-                    'px-3 py-1 text-xs rounded-lg transition-colors',
-                    !useSchemaForm
-                      ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]'
-                      : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]',
-                  )}
-                >
-                  JSON
-                </button>
-              </div>
-            )}
-
-            {/* Input form or editor */}
-            {hasSchema && useSchemaForm ? (
-              <SchemaForm
-                schema={workflowDetail.inputSchema as Record<string, unknown>}
-                onSubmit={handleSchemaSubmit}
-                submitLabel={status === 'running' ? 'Running…' : 'Execute'}
-              />
-            ) : (
-              <div>
-                <label className="block text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
-                  Input (JSON)
-                </label>
-                <JsonEditor value={inputJson} onChange={setInputJson} />
-              </div>
-            )}
-
-            {/* Output schema (collapsed) */}
-            {workflowDetail?.outputSchema != null && (
-              <div>
-                <label className="block text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
-                  Output Schema
-                </label>
-                <JsonViewer data={workflowDetail.outputSchema} collapsed />
-              </div>
-            )}
-          </div>
-
-          {/* Right: Results */}
-          <div className="flex-1 overflow-y-auto p-5">
-            {status === 'idle' ? (
-              <div className="flex items-center justify-center h-full">
-                <EmptyState
-                  icon={<FlaskConical size={32} />}
-                  title="No execution"
-                  description="Select a workflow and click Run to see results."
-                />
-              </div>
-            ) : (
-              <div className="space-y-5">
-                {/* Stat cards */}
-                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-                  <StatCard label="Status" badge={<StatusBadge status={status} />} />
-                  <StatCard label="Steps" value={String(timelineEvents.length)} />
-                  <StatCard
-                    label="Duration"
-                    value={totalDuration > 0 ? formatDuration(totalDuration) : '\u2014'}
-                  />
-                  <StatCard label="Cost" value={totalCost > 0 ? formatCost(totalCost) : '\u2014'} />
+        <ResizableSplit
+          className="flex-1"
+          defaultPercent={30}
+          minPercent={15}
+          maxPercent={50}
+          left={
+            <div className="flex-1 overflow-y-auto p-5 space-y-4">
+              {/* Input mode toggle */}
+              {hasSchema && (
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => setUseSchemaForm(true)}
+                    className={cn(
+                      'px-3 py-1 text-xs rounded-lg transition-colors',
+                      useSchemaForm
+                        ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]'
+                        : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]',
+                    )}
+                  >
+                    Form
+                  </button>
+                  <button
+                    onClick={() => setUseSchemaForm(false)}
+                    className={cn(
+                      'px-3 py-1 text-xs rounded-lg transition-colors',
+                      !useSchemaForm
+                        ? 'bg-[hsl(var(--foreground))] text-[hsl(var(--background))]'
+                        : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]',
+                    )}
+                  >
+                    JSON
+                  </button>
                 </div>
+              )}
 
-                {/* Error */}
-                {error && (
-                  <div className="p-4 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm">
-                    {error}
+              {/* Input form or editor */}
+              {hasSchema && useSchemaForm ? (
+                <SchemaForm
+                  schema={workflowDetail.inputSchema as Record<string, unknown>}
+                  onSubmit={handleSchemaSubmit}
+                  submitLabel={status === 'running' ? 'Running…' : 'Execute'}
+                />
+              ) : (
+                <div>
+                  <label className="block text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
+                    Input (JSON)
+                  </label>
+                  <JsonEditor value={inputJson} onChange={setInputJson} />
+                </div>
+              )}
+
+              {/* Output schema (collapsed) */}
+              {workflowDetail?.outputSchema != null && (
+                <div>
+                  <label className="block text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
+                    Output Schema
+                  </label>
+                  <JsonViewer data={workflowDetail.outputSchema} collapsed />
+                </div>
+              )}
+            </div>
+          }
+          right={
+            <div className="flex-1 overflow-y-auto p-5">
+              {status === 'idle' ? (
+                <div className="flex items-center justify-center h-full">
+                  <EmptyState
+                    icon={<FlaskConical size={32} />}
+                    title="No execution"
+                    description="Select a workflow and click Run to see results."
+                  />
+                </div>
+              ) : (
+                <div className="space-y-5">
+                  {/* Stat cards */}
+                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                    <StatCard label="Status" badge={<StatusBadge status={status} />} />
+                    <StatCard label="Steps" value={String(timelineEvents.length)} />
+                    <StatCard
+                      label="Duration"
+                      value={totalDuration > 0 ? formatDuration(totalDuration) : '\u2014'}
+                    />
+                    <StatCard
+                      label="Cost"
+                      value={totalCost > 0 ? formatCost(totalCost) : '\u2014'}
+                    />
                   </div>
-                )}
 
-                {/* Result */}
-                {result !== undefined && (
-                  <div>
-                    <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
-                      Result
-                    </h3>
-                    <JsonViewer data={result} />
-                  </div>
-                )}
+                  {/* Error */}
+                  {error && (
+                    <div className="p-4 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm">
+                      {error}
+                    </div>
+                  )}
 
-                {/* Timeline — the new default is the AskTree (spec/16
+                  {/* Result */}
+                  {result !== undefined && (
+                    <div>
+                      <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] mb-2">
+                        Result
+                      </h3>
+                      <JsonViewer data={result} />
+                    </div>
+                  )}
+
+                  {/* Timeline — the new default is the AskTree (spec/16
                   §5.10.2) so users see the ask graph first; a toggle
                   falls back to the flat TraceEventList that historical
                   screenshots showed. Clicking an ask opens AskDetails
                   alongside (when tree view is active). */}
-                {timelineEvents.length > 0 && (
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
-                        Timeline
-                      </h3>
-                      <div className="flex gap-1 text-xs">
-                        <button
-                          type="button"
-                          onClick={() => setTimelineView('tree')}
-                          className={cn(
-                            'px-2 py-0.5 rounded',
-                            timelineView === 'tree'
-                              ? 'bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]'
-                              : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--secondary))]/50',
-                          )}
-                        >
-                          Tree
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setTimelineView('flat')}
-                          className={cn(
-                            'px-2 py-0.5 rounded',
-                            timelineView === 'flat'
-                              ? 'bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]'
-                              : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--secondary))]/50',
-                          )}
-                        >
-                          Flat
-                        </button>
+                  {timelineEvents.length > 0 && (
+                    <div>
+                      <div className="flex items-center justify-between mb-2">
+                        <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+                          Timeline
+                        </h3>
+                        <div className="flex gap-1 text-xs">
+                          <button
+                            type="button"
+                            onClick={() => setTimelineView('tree')}
+                            className={cn(
+                              'px-2 py-0.5 rounded',
+                              timelineView === 'tree'
+                                ? 'bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]'
+                                : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--secondary))]/50',
+                            )}
+                          >
+                            Tree
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setTimelineView('flat')}
+                            className={cn(
+                              'px-2 py-0.5 rounded',
+                              timelineView === 'flat'
+                                ? 'bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]'
+                                : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--secondary))]/50',
+                            )}
+                          >
+                            Flat
+                          </button>
+                        </div>
                       </div>
-                    </div>
-                    {timelineView === 'tree' ? (
-                      // Tree column is capped so the drill-down panel
-                      // stays adjacent to the tree on wide viewports.
-                      // Unbounded `1fr` stretches the tree to ~1200px+
-                      // on large monitors, pushing the 360px drill-down
-                      // out of the user's focal area.
-                      <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px] gap-3 max-w-[960px]">
-                        <AskTree
-                          events={timelineEvents}
-                          selectedAskId={selectedAskId}
-                          onSelectAsk={setSelectedAskId}
-                        />
-                        {selectedAskId && (
-                          <AskDetails
+                      {timelineView === 'tree' ? (
+                        // Tree column is capped so the drill-down panel
+                        // stays adjacent to the tree on wide viewports.
+                        // Unbounded `1fr` stretches the tree to ~1200px+
+                        // on large monitors, pushing the 360px drill-down
+                        // out of the user's focal area.
+                        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px] gap-3 max-w-[960px]">
+                          <AskTree
                             events={timelineEvents}
-                            askId={selectedAskId}
-                            onClose={() => setSelectedAskId(undefined)}
-                            className="max-h-[600px] rounded border border-slate-200 dark:border-slate-700"
+                            selectedAskId={selectedAskId}
+                            onSelectAsk={setSelectedAskId}
                           />
-                        )}
-                      </div>
-                    ) : (
-                      <TraceEventList events={timelineEvents} maxDuration={maxDuration} />
-                    )}
-                  </div>
-                )}
+                          {selectedAskId && (
+                            <AskDetails
+                              events={timelineEvents}
+                              askId={selectedAskId}
+                              onClose={() => setSelectedAskId(undefined)}
+                              className="max-h-[600px] rounded border border-slate-200 dark:border-slate-700"
+                            />
+                          )}
+                        </div>
+                      ) : (
+                        <TraceEventList events={timelineEvents} maxDuration={maxDuration} />
+                      )}
+                    </div>
+                  )}
 
-                {/* Loading indicator */}
-                {status === 'running' && timelineEvents.length === 0 && (
-                  <div className="flex items-center justify-center py-12 text-sm text-[hsl(var(--muted-foreground))]">
-                    <FlaskConical size={16} className="animate-pulse mr-2" />
-                    Executing workflow…
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        </div>
+                  {/* Loading indicator */}
+                  {status === 'running' && timelineEvents.length === 0 && (
+                    <div className="flex items-center justify-center py-12 text-sm text-[hsl(var(--muted-foreground))]">
+                      <FlaskConical size={16} className="animate-pulse mr-2" />
+                      Executing workflow…
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          }
+        />
       )}
     </div>
   );

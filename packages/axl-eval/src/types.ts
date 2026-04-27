@@ -60,7 +60,7 @@ export type EvalItem = {
   metadata?: Record<string, unknown>;
   /** Trace events captured during this item's execution. Only populated when
    *  `runEval` was called with `{ captureTraces: true }`. Verbose-mode
-   *  `agent_call.data.messages` snapshots are stripped to keep memory bounded;
+   *  `agent_call_start.data.messages` snapshots are stripped to keep memory bounded;
    *  subscribe to `runtime.on('trace', ...)` directly if you need those. */
   traces?: AxlEvent[];
 };
@@ -170,7 +170,7 @@ export type RunEvalOptions = {
    * so any `runtime.execute()` / `ctx.ask()` activity inside the callback is
    * captured and scoped to the current item.
    *
-   * Note: verbose-mode `agent_call.data.messages` snapshots are stripped from
+   * Note: verbose-mode `agent_call_start.data.messages` snapshots are stripped from
    * captured traces to keep memory bounded — if you need the full verbose
    * payload, subscribe to `runtime.on('trace', ...)` directly.
    */

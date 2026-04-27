@@ -14,6 +14,7 @@ import { useWs } from '../../hooks/use-ws';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
 import type { ExecutionInfo, AxlEvent } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
+import { ResizableSplit } from '../../components/shared/ResizableSplit';
 
 type FilterOption = { value: string; label: string };
 
@@ -223,10 +224,13 @@ export function TraceExplorerPanel() {
 
       {/* ── Events Tab ────────────────────────────────── */}
       {traceTab === 'events' && (
-        <div className="flex-1 min-h-0 overflow-auto p-6">
-          <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-            {/* Execution list (sidebar) */}
-            <div className="lg:col-span-1 space-y-2">
+        <ResizableSplit
+          className="flex-1"
+          defaultPercent={25}
+          minPercent={15}
+          maxPercent={40}
+          left={
+            <div className="flex-1 overflow-y-auto p-6 space-y-2">
               <h3 className="text-sm font-medium mb-2">Executions</h3>
               <button
                 onClick={() => {
@@ -280,9 +284,9 @@ export function TraceExplorerPanel() {
                 <p className="text-xs text-[hsl(var(--muted-foreground))]">No executions yet</p>
               )}
             </div>
-
-            {/* Trace waterfall */}
-            <div className="lg:col-span-3">
+          }
+          right={
+            <div className="flex-1 overflow-y-auto p-6">
               {/* Stat cards for selected execution */}
               {stats && (
                 <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
@@ -326,8 +330,8 @@ export function TraceExplorerPanel() {
                 <TraceEventList events={filteredEvents} maxDuration={maxDuration} />
               )}
             </div>
-          </div>
-        </div>
+          }
+        />
       )}
     </div>
   );

@@ -56,7 +56,9 @@ export type {
   // Per-type data shapes — consumers narrowing via `event.type` get
   // statically-typed access to `data`. Kept in the same export block as
   // `AxlEvent` so the discriminated union and its parts move together.
-  AgentCallData,
+  AgentCallStartData,
+  AgentCallEndData,
+  AgentCallParams,
   ToolCallData,
   ToolCallStartData,
   ToolApprovalData,
@@ -68,6 +70,9 @@ export type {
   WorkflowStartData,
   WorkflowEndData,
   MemoryEventData,
+  CheckpointEventData,
+  AwaitHumanData,
+  AwaitHumanResolvedData,
   GuardrailData,
   SchemaCheckData,
   ValidateData,

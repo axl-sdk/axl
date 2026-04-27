@@ -68,6 +68,13 @@ function assertExhaustive(ev: AxlEvent): string {
     case 'memory_recall':
     case 'memory_forget':
       return ev.data.scope;
+    case 'checkpoint_save':
+    case 'checkpoint_replay':
+      return ev.data.name;
+    case 'await_human':
+      return ev.data.channel ?? 'await_human';
+    case 'await_human_resolved':
+      return ev.data.decision.approved ? 'approved' : 'rejected';
     case 'guardrail':
       return ev.data?.guardrailType ?? 'guardrail';
     case 'schema_check':

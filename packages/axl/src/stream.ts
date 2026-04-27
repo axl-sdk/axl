@@ -185,6 +185,12 @@ export class AxlStream extends Readable {
       'verify',
       'workflow_start',
       'workflow_end',
+      // Durable-execution checkpoints — structural points in the timeline.
+      'checkpoint_save',
+      'checkpoint_replay',
+      // Human-in-the-loop — pause/resume are major timeline landmarks.
+      'await_human',
+      'await_human_resolved',
     ]);
     const self = this;
     return {

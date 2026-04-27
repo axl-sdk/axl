@@ -23,69 +23,53 @@ describe('MemoryStore', () => {
   describe('checkpoints', () => {
     it('save and load a checkpoint', async () => {
       const store = new MemoryStore();
-      await store.saveCheckpoint('exec-1', 0, { progress: 'step 0' });
+      await store.saveCheckpoint('exec-1', 'cp', { progress: 'step 0' });
 
-      const loaded = await store.getCheckpoint('exec-1', 0);
+      const loaded = await store.getCheckpoint('exec-1', 'cp');
       expect(loaded).toEqual({ progress: 'step 0' });
     });
 
     it('returns null for non-existent checkpoint', async () => {
       const store = new MemoryStore();
-      const result = await store.getCheckpoint('nonexistent', 0);
+      const result = await store.getCheckpoint('nonexistent', 'cp');
       expect(result).toBeNull();
     });
 
-    it('returns null for non-existent step', async () => {
+    it('returns null for non-existent name', async () => {
       const store = new MemoryStore();
-      await store.saveCheckpoint('exec-1', 0, 'data');
-      const result = await store.getCheckpoint('exec-1', 99);
+      await store.saveCheckpoint('exec-1', 'cp', 'data');
+      const result = await store.getCheckpoint('exec-1', 'unknown');
       expect(result).toBeNull();
     });
 
     it('save multiple checkpoints for same execution', async () => {
       const store = new MemoryStore();
-      await store.saveCheckpoint('exec-1', 0, { step: 0 });
-      await store.saveCheckpoint('exec-1', 1, { step: 1 });
-      await store.saveCheckpoint('exec-1', 2, { step: 2 });
+      await store.saveCheckpoint('exec-1', 'a', { step: 0 });
+      await store.saveCheckpoint('exec-1', 'b', { step: 1 });
+      await store.saveCheckpoint('exec-1', 'c', { step: 2 });
 
-      expect(await store.getCheckpoint('exec-1', 0)).toEqual({ step: 0 });
-      expect(await store.getCheckpoint('exec-1', 1)).toEqual({ step: 1 });
-      expect(await store.getCheckpoint('exec-1', 2)).toEqual({ step: 2 });
+      expect(await store.getCheckpoint('exec-1', 'a')).toEqual({ step: 0 });
+      expect(await store.getCheckpoint('exec-1', 'b')).toEqual({ step: 1 });
+      expect(await store.getCheckpoint('exec-1', 'c')).toEqual({ step: 2 });
     });
 
-    it('overwrites checkpoint for same step', async () => {
+    it('overwrites checkpoint for same name', async () => {
       const store = new MemoryStore();
-      await store.saveCheckpoint('exec-1', 0, 'original');
-      await store.saveCheckpoint('exec-1', 0, 'updated');
+      await store.saveCheckpoint('exec-1', 'cp', 'original');
+      await store.saveCheckpoint('exec-1', 'cp', 'updated');
 
-      expect(await store.getCheckpoint('exec-1', 0)).toBe('updated');
-    });
-
-    it('getLatestCheckpoint returns latest step', async () => {
-      const store = new MemoryStore();
-      await store.saveCheckpoint('exec-1', 0, 'first');
-      await store.saveCheckpoint('exec-1', 5, 'middle');
-      await store.saveCheckpoint('exec-1', 3, 'third');
-
-      const latest = await store.getLatestCheckpoint('exec-1');
-      expect(latest).toEqual({ step: 5, data: 'middle' });
-    });
-
-    it('getLatestCheckpoint returns null for unknown execution', async () => {
-      const store = new MemoryStore();
-      const latest = await store.getLatestCheckpoint('unknown');
-      expect(latest).toBeNull();
+      expect(await store.getCheckpoint('exec-1', 'cp')).toBe('updated');
     });
 
     it('stores deep copies (mutations do not affect stored data)', async () => {
       const store = new MemoryStore();
       const data = { items: [1, 2, 3] };
-      await store.saveCheckpoint('exec-1', 0, data);
+      await store.saveCheckpoint('exec-1', 'cp', data);
 
       // Mutate original
       data.items.push(4);
 
-      const loaded = await store.getCheckpoint('exec-1', 0);
+      const loaded = await store.getCheckpoint('exec-1', 'cp');
       expect(loaded).toEqual({ items: [1, 2, 3] });
     });
   });
@@ -95,16 +79,16 @@ describe('MemoryStore', () => {
   describe('deleteCheckpoints', () => {
     it('removes all checkpoints for a given executionId', async () => {
       const store = new MemoryStore();
-      await store.saveCheckpoint('exec-1', 0, { step: 0 });
-      await store.saveCheckpoint('exec-1', 1, { step: 1 });
-      await store.saveCheckpoint('exec-2', 0, { step: 0 });
+      await store.saveCheckpoint('exec-1', 'a', { step: 0 });
+      await store.saveCheckpoint('exec-1', 'b', { step: 1 });
+      await store.saveCheckpoint('exec-2', 'a', { step: 0 });
 
       await store.deleteCheckpoints('exec-1');
 
-      expect(await store.getCheckpoint('exec-1', 0)).toBeNull();
-      expect(await store.getCheckpoint('exec-1', 1)).toBeNull();
+      expect(await store.getCheckpoint('exec-1', 'a')).toBeNull();
+      expect(await store.getCheckpoint('exec-1', 'b')).toBeNull();
       // Other execution's checkpoints should be unaffected
-      expect(await store.getCheckpoint('exec-2', 0)).toEqual({ step: 0 });
+      expect(await store.getCheckpoint('exec-2', 'a')).toEqual({ step: 0 });
     });
 
     it('is a no-op for unknown executionId', async () => {
@@ -417,56 +401,38 @@ describe('SQLiteStore', () => {
   describe('checkpoints', () => {
     it('save and load a checkpoint', async () => {
       const store = createStore();
-      await store.saveCheckpoint('exec-1', 0, { progress: 'step 0' });
+      await store.saveCheckpoint('exec-1', 'cp', { progress: 'step 0' });
 
-      const loaded = await store.getCheckpoint('exec-1', 0);
+      const loaded = await store.getCheckpoint('exec-1', 'cp');
       expect(loaded).toEqual({ progress: 'step 0' });
       store.close();
     });
 
     it('returns null for non-existent checkpoint', async () => {
       const store = createStore();
-      const result = await store.getCheckpoint('nonexistent', 0);
+      const result = await store.getCheckpoint('nonexistent', 'cp');
       expect(result).toBeNull();
       store.close();
     });
 
     it('save multiple checkpoints for same execution', async () => {
       const store = createStore();
-      await store.saveCheckpoint('exec-1', 0, { step: 0 });
-      await store.saveCheckpoint('exec-1', 1, { step: 1 });
-      await store.saveCheckpoint('exec-1', 2, { step: 2 });
+      await store.saveCheckpoint('exec-1', 'a', { step: 0 });
+      await store.saveCheckpoint('exec-1', 'b', { step: 1 });
+      await store.saveCheckpoint('exec-1', 'c', { step: 2 });
 
-      expect(await store.getCheckpoint('exec-1', 0)).toEqual({ step: 0 });
-      expect(await store.getCheckpoint('exec-1', 1)).toEqual({ step: 1 });
-      expect(await store.getCheckpoint('exec-1', 2)).toEqual({ step: 2 });
+      expect(await store.getCheckpoint('exec-1', 'a')).toEqual({ step: 0 });
+      expect(await store.getCheckpoint('exec-1', 'b')).toEqual({ step: 1 });
+      expect(await store.getCheckpoint('exec-1', 'c')).toEqual({ step: 2 });
       store.close();
     });
 
-    it('overwrites checkpoint for same step', async () => {
+    it('overwrites checkpoint for same name', async () => {
       const store = createStore();
-      await store.saveCheckpoint('exec-1', 0, 'original');
-      await store.saveCheckpoint('exec-1', 0, 'updated');
+      await store.saveCheckpoint('exec-1', 'cp', 'original');
+      await store.saveCheckpoint('exec-1', 'cp', 'updated');
 
-      expect(await store.getCheckpoint('exec-1', 0)).toBe('updated');
-      store.close();
-    });
-
-    it('getLatestCheckpoint returns latest step', async () => {
-      const store = createStore();
-      await store.saveCheckpoint('exec-1', 0, 'first');
-      await store.saveCheckpoint('exec-1', 5, 'middle');
-      await store.saveCheckpoint('exec-1', 3, 'third');
-
-      const latest = await store.getLatestCheckpoint('exec-1');
-      expect(latest).toEqual({ step: 5, data: 'middle' });
-      store.close();
-    });
-
-    it('getLatestCheckpoint returns null for unknown execution', async () => {
-      const store = createStore();
-      const latest = await store.getLatestCheckpoint('unknown');
-      expect(latest).toBeNull();
+      expect(await store.getCheckpoint('exec-1', 'cp')).toBe('updated');
       store.close();
     });
   });
@@ -476,15 +442,15 @@ describe('SQLiteStore', () => {
   describe('deleteCheckpoints', () => {
     it('removes all checkpoints for a given executionId', async () => {
       const store = createStore();
-      await store.saveCheckpoint('exec-1', 0, { step: 0 });
-      await store.saveCheckpoint('exec-1', 1, { step: 1 });
-      await store.saveCheckpoint('exec-2', 0, { step: 0 });
+      await store.saveCheckpoint('exec-1', 'a', { step: 0 });
+      await store.saveCheckpoint('exec-1', 'b', { step: 1 });
+      await store.saveCheckpoint('exec-2', 'a', { step: 0 });
 
       await store.deleteCheckpoints('exec-1');
 
-      expect(await store.getCheckpoint('exec-1', 0)).toBeNull();
-      expect(await store.getCheckpoint('exec-1', 1)).toBeNull();
-      expect(await store.getCheckpoint('exec-2', 0)).toEqual({ step: 0 });
+      expect(await store.getCheckpoint('exec-1', 'a')).toBeNull();
+      expect(await store.getCheckpoint('exec-1', 'b')).toBeNull();
+      expect(await store.getCheckpoint('exec-2', 'a')).toEqual({ step: 0 });
       await store.close();
     });
   });
@@ -627,7 +593,7 @@ describe('SQLiteStore', () => {
 
       // Write data with one instance
       const store1 = new SQLiteStore(dbPath);
-      await store1.saveCheckpoint('exec-1', 0, { key: 'value' });
+      await store1.saveCheckpoint('exec-1', 'cp', { key: 'value' });
       await store1.saveSession('sess-1', [{ role: 'user', content: 'hello' }]);
       await store1.savePendingDecision('exec-2', {
         executionId: 'exec-2',
@@ -639,7 +605,7 @@ describe('SQLiteStore', () => {
 
       // Read data with a new instance
       const store2 = new SQLiteStore(dbPath);
-      expect(await store2.getCheckpoint('exec-1', 0)).toEqual({ key: 'value' });
+      expect(await store2.getCheckpoint('exec-1', 'cp')).toEqual({ key: 'value' });
       expect(await store2.getSession('sess-1')).toEqual([{ role: 'user', content: 'hello' }]);
       const decisions = await store2.getPendingDecisions();
       expect(decisions).toHaveLength(1);
@@ -847,11 +813,11 @@ describe('RedisStore', () => {
       const { store, mockClient } = createRedisStoreWithMockClient();
 
       // Save some checkpoints first
-      await store.saveCheckpoint('exec-1', 0, { step: 0 });
-      await store.saveCheckpoint('exec-1', 1, { step: 1 });
+      await store.saveCheckpoint('exec-1', 'a', { step: 0 });
+      await store.saveCheckpoint('exec-1', 'b', { step: 1 });
 
       // Verify they exist
-      const cp0 = await store.getCheckpoint('exec-1', 0);
+      const cp0 = await store.getCheckpoint('exec-1', 'a');
       expect(cp0).toEqual({ step: 0 });
 
       // Delete all checkpoints for exec-1
@@ -864,15 +830,15 @@ describe('RedisStore', () => {
     it('does not affect other execution checkpoints', async () => {
       const { store } = createRedisStoreWithMockClient();
 
-      await store.saveCheckpoint('exec-1', 0, { step: 0 });
-      await store.saveCheckpoint('exec-2', 0, { step: 0 });
+      await store.saveCheckpoint('exec-1', 'a', { step: 0 });
+      await store.saveCheckpoint('exec-2', 'a', { step: 0 });
 
       await store.deleteCheckpoints('exec-1');
 
       // exec-1 checkpoints deleted
-      expect(await store.getCheckpoint('exec-1', 0)).toBeNull();
+      expect(await store.getCheckpoint('exec-1', 'a')).toBeNull();
       // exec-2 checkpoints still exist
-      expect(await store.getCheckpoint('exec-2', 0)).toEqual({ step: 0 });
+      expect(await store.getCheckpoint('exec-2', 'a')).toEqual({ step: 0 });
     });
   });
 
@@ -889,15 +855,15 @@ describe('RedisStore', () => {
   describe('checkpoints', () => {
     it('save and load a checkpoint', async () => {
       const { store } = createRedisStoreWithMockClient();
-      await store.saveCheckpoint('exec-1', 0, { progress: 'step 0' });
+      await store.saveCheckpoint('exec-1', 'cp', { progress: 'step 0' });
 
-      const loaded = await store.getCheckpoint('exec-1', 0);
+      const loaded = await store.getCheckpoint('exec-1', 'cp');
       expect(loaded).toEqual({ progress: 'step 0' });
     });
 
     it('returns null for non-existent checkpoint', async () => {
       const { store } = createRedisStoreWithMockClient();
-      expect(await store.getCheckpoint('nonexistent', 0)).toBeNull();
+      expect(await store.getCheckpoint('nonexistent', 'cp')).toBeNull();
     });
 
     it('handles undefined from hGet (node-redis returns undefined for missing fields)', async () => {
@@ -906,22 +872,18 @@ describe('RedisStore', () => {
       const { store, mockClient } = createRedisStoreWithMockClient();
       mockClient.hGet.mockResolvedValueOnce(undefined);
 
-      expect(await store.getCheckpoint('exec-1', 99)).toBeNull();
+      expect(await store.getCheckpoint('exec-1', 'unknown')).toBeNull();
     });
 
-    it('save multiple checkpoints and get latest', async () => {
+    it('save multiple checkpoints with distinct names', async () => {
       const { store } = createRedisStoreWithMockClient();
-      await store.saveCheckpoint('exec-1', 0, 'first');
-      await store.saveCheckpoint('exec-1', 5, 'latest');
-      await store.saveCheckpoint('exec-1', 3, 'middle');
+      await store.saveCheckpoint('exec-1', 'a', 'first');
+      await store.saveCheckpoint('exec-1', 'b', 'latest');
+      await store.saveCheckpoint('exec-1', 'c', 'middle');
 
-      const latest = await store.getLatestCheckpoint('exec-1');
-      expect(latest).toEqual({ step: 5, data: 'latest' });
-    });
-
-    it('getLatestCheckpoint returns null for unknown execution', async () => {
-      const { store } = createRedisStoreWithMockClient();
-      expect(await store.getLatestCheckpoint('unknown')).toBeNull();
+      expect(await store.getCheckpoint('exec-1', 'a')).toBe('first');
+      expect(await store.getCheckpoint('exec-1', 'b')).toBe('latest');
+      expect(await store.getCheckpoint('exec-1', 'c')).toBe('middle');
     });
   });
 

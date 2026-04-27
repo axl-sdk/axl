@@ -4,7 +4,7 @@
  * (for the per-run timeline). Centralizes:
  *
  * - Row rendering: chevron, type pill, agent/tool, waterfall bar, duration, cost
- * - Body rendering: per-type bodies (agent_call_end, tool_approval, gate events)
+ * - Body rendering: per-type bodies (agent_call_start, agent_call_end, tool_approval, gate events)
  * - Expand/collapse state: local row state + trace-wide level via context
  * - Retry/gate failure amber tint
  * - Nested-depth indentation via `getDepth(event)`
@@ -23,7 +23,8 @@ import type { AxlEvent } from '../../lib/types';
 import {
   getEventColor,
   getDepth,
-  getAgentCallData,
+  getAgentCallStartData,
+  getAgentCallEndData,
   getGateData,
   isRetryCall,
 } from '../../lib/trace-utils';
@@ -127,7 +128,7 @@ export function TextBlock({
 
 // ── Per-type body renderers ─────────────────────────────────────────
 
-/** Small pill for key/value params on agent_call_end. */
+/** Small pill for key/value params on agent_call_start. */
 function ParamPill({ label, value }: { label: string; value: unknown }) {
   return (
     <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] rounded-full bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))]">
@@ -139,9 +140,50 @@ function ParamPill({ label, value }: { label: string; value: unknown }) {
   );
 }
 
-/** Rendered body for an expanded agent_call_end event. */
-export function AgentCallBody({ event }: { event: AxlEvent }) {
-  const d = getAgentCallData(event);
+/** Rendered body for an expanded agent_call_start event (request side). */
+export function AgentCallStartBody({ event }: { event: AxlEvent }) {
+  const d = getAgentCallStartData(event);
+  if (!d) return null;
+  return (
+    <>
+      {event.model && (
+        <p className="text-xs mb-1">
+          <strong>Model:</strong> {event.model}
+          {d.turn != null && (
+            <span className="ml-2 text-[hsl(var(--muted-foreground))]">· turn {d.turn}</span>
+          )}
+        </p>
+      )}
+      {d.params && Object.keys(d.params).length > 0 && (
+        <div className="flex flex-wrap gap-1.5 mb-2">
+          {Object.entries(d.params).map(([k, v]) => (
+            <ParamPill key={k} label={k} value={v} />
+          ))}
+        </div>
+      )}
+      {d.toolNames && d.toolNames.length > 0 && (
+        <p className="text-xs mb-1">
+          <strong>Tools:</strong>{' '}
+          <span className="font-mono text-[hsl(var(--muted-foreground))]">
+            {d.toolNames.join(', ')}
+          </span>
+        </p>
+      )}
+      {d.system && <TextBlock label="System prompt" content={d.system} tone="info" />}
+      {d.prompt && <TextBlock label="Prompt" content={d.prompt} defaultOpen />}
+      {d.messages && (
+        <TextBlock
+          label={`Messages (verbose) — ${d.messages.length}`}
+          content={d.messages.map((m) => `[${m.role}]\n${m.content ?? ''}`).join('\n\n───\n\n')}
+        />
+      )}
+    </>
+  );
+}
+
+/** Rendered body for an expanded agent_call_end event (response side). */
+export function AgentCallEndBody({ event }: { event: AxlEvent }) {
+  const d = getAgentCallEndData(event);
   if (!d) return null;
   return (
     <>
@@ -166,23 +208,8 @@ export function AgentCallBody({ event }: { event: AxlEvent }) {
           {event.tokens.reasoning ? ` reasoning=${event.tokens.reasoning}` : ''}
         </p>
       )}
-      {d.params && Object.keys(d.params).length > 0 && (
-        <div className="flex flex-wrap gap-1.5 mb-2">
-          {Object.entries(d.params).map(([k, v]) => (
-            <ParamPill key={k} label={k} value={v} />
-          ))}
-        </div>
-      )}
-      {d.system && <TextBlock label="System prompt" content={d.system} tone="info" />}
-      {d.prompt && <TextBlock label="Prompt" content={d.prompt} defaultOpen />}
       {d.thinking && <TextBlock label="Thinking" content={d.thinking} tone="info" />}
       {d.response && <TextBlock label="Response" content={d.response} defaultOpen />}
-      {d.messages && (
-        <TextBlock
-          label={`Messages (verbose) — ${d.messages.length}`}
-          content={d.messages.map((m) => `[${m.role}]\n${m.content ?? ''}`).join('\n\n───\n\n')}
-        />
-      )}
     </>
   );
 }
@@ -468,7 +495,7 @@ function TraceEventRow({
         {isRetry && (
           <span
             className="inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-amber-200 text-amber-900 dark:bg-amber-800 dark:text-amber-100"
-            title={`Retry after ${getAgentCallData(event)?.retryReason} failure`}
+            title={`Retry after ${getAgentCallStartData(event)?.retryReason ?? getAgentCallEndData(event)?.retryReason} failure`}
           >
             <RotateCw size={9} />
             retry
@@ -507,8 +534,10 @@ function TraceEventRow({
           className="mt-1 mb-2 p-3 rounded-xl bg-[hsl(var(--card))] border border-[hsl(var(--border))]"
           style={{ marginLeft: `${depth * 16 + 32}px` }}
         >
-          {event.type === 'agent_call_end' ? (
-            <AgentCallBody event={event} />
+          {event.type === 'agent_call_start' ? (
+            <AgentCallStartBody event={event} />
+          ) : event.type === 'agent_call_end' ? (
+            <AgentCallEndBody event={event} />
           ) : isGateEvent ? (
             <GateCheckBody event={event} />
           ) : event.type === 'tool_approval' ? (

@@ -663,11 +663,14 @@ describe('AxlTestRuntime', () => {
 
       await runtime.execute('SimpleAsk', { q: 'secret prompt' });
 
-      const agentCalls = runtime.traceLog().filter((t) => t.type === 'agent_call_end');
-      expect(agentCalls.length).toBeGreaterThan(0);
-      const data = agentCalls[0].data as Record<string, unknown>;
-      expect(data.prompt).toBe('[redacted]');
-      expect(data.response).toBe('[redacted]');
+      // prompt is on agent_call_start; response is on agent_call_end.
+      const startCalls = runtime.traceLog().filter((t) => t.type === 'agent_call_start');
+      expect(startCalls.length).toBeGreaterThan(0);
+      expect((startCalls[0].data as Record<string, unknown>).prompt).toBe('[redacted]');
+
+      const endCalls = runtime.traceLog().filter((t) => t.type === 'agent_call_end');
+      expect(endCalls.length).toBeGreaterThan(0);
+      expect((endCalls[0].data as Record<string, unknown>).response).toBe('[redacted]');
     });
 
     it('honors trace.level: full on agent_call events', async () => {
@@ -681,7 +684,8 @@ describe('AxlTestRuntime', () => {
 
       await runtime.execute('SimpleAsk', { q: 'hi' });
 
-      const agentCall = runtime.traceLog().find((t) => t.type === 'agent_call_end');
+      // verbose messages snapshot lives on agent_call_start.
+      const agentCall = runtime.traceLog().find((t) => t.type === 'agent_call_start');
       expect(agentCall).toBeDefined();
       const data = agentCall!.data as Record<string, unknown>;
       expect(Array.isArray(data.messages)).toBe(true);

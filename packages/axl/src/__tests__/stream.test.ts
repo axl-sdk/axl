@@ -620,6 +620,12 @@ describe('AxlStream', () => {
       handoff_return: 'lifecycle',
       pipeline: 'lifecycle',
       verify: 'lifecycle',
+      // Durable-execution checkpoints — structural points in the timeline.
+      checkpoint_save: 'lifecycle',
+      checkpoint_replay: 'lifecycle',
+      // Human-in-the-loop — pause/resume are major timeline landmarks.
+      await_human: 'lifecycle',
+      await_human_resolved: 'lifecycle',
       token: 'excluded',
       partial_object: 'excluded',
       log: 'excluded',
@@ -735,6 +741,13 @@ describe('AxlStream', () => {
         memory_remember: { type: 'memory_remember', data: { scope: 'global' } },
         memory_recall: { type: 'memory_recall', data: { scope: 'global' } },
         memory_forget: { type: 'memory_forget', data: { scope: 'global' } },
+        checkpoint_save: { type: 'checkpoint_save', data: { step: 0 } },
+        checkpoint_replay: { type: 'checkpoint_replay', data: { step: 0 } },
+        await_human: { type: 'await_human', data: { prompt: 'p' } },
+        await_human_resolved: {
+          type: 'await_human_resolved',
+          data: { decision: { approved: true } },
+        },
         guardrail: { type: 'guardrail', data: { guardrailType: 'input', blocked: false } },
         schema_check: {
           type: 'schema_check',

@@ -43,6 +43,7 @@ import { EvalHistoryTable } from './EvalHistoryTable';
 import { EvalCommandBar } from './EvalCommandBar';
 import { StatCard } from '../../components/shared/StatCard';
 import { JsonViewer } from '../../components/shared/JsonViewer';
+import { ResizableSplit } from '../../components/shared/ResizableSplit';
 
 export function EvalRunnerPanel() {
   const queryClient = useQueryClient();
@@ -1288,64 +1289,69 @@ export function EvalRunnerPanel() {
                   </div>
 
                   {/* Master-detail split */}
-                  <div className="flex flex-1 min-h-0 border-t border-[hsl(var(--border))]">
-                    {/* Left panel: compact item list */}
-                    <div className="w-[340px] xl:w-[380px] shrink-0 border-r border-[hsl(var(--border))] bg-[hsl(var(--card))]">
-                      <EvalItemSidebar
-                        items={displayResult.items}
-                        scorerNames={scorerNames}
-                        selectedIndex={selectedItem}
-                        onSelectItem={setSelectedItem}
-                        onDeselectItem={() => setSelectedItem(null)}
-                      />
-                    </div>
+                  <ResizableSplit
+                    className="flex-1 border-t border-[hsl(var(--border))]"
+                    defaultPercent={30}
+                    minPercent={15}
+                    maxPercent={50}
+                    left={
+                      <div className="flex-1 overflow-y-auto bg-[hsl(var(--card))]">
+                        <EvalItemSidebar
+                          items={displayResult.items}
+                          scorerNames={scorerNames}
+                          selectedIndex={selectedItem}
+                          onSelectItem={setSelectedItem}
+                          onDeselectItem={() => setSelectedItem(null)}
+                        />
+                      </div>
+                    }
+                    right={
+                      <div className="flex-1 overflow-y-auto">
+                        {selectedItem != null ? (
+                          <div className="p-6">
+                            <EvalItemDetail
+                              item={displayResult.items[selectedItem]}
+                              itemIndex={selectedItem}
+                              scorerNames={scorerNames}
+                              onBack={() => setSelectedItem(null)}
+                            />
+                          </div>
+                        ) : (
+                          <div className="p-6 space-y-6">
+                            <EvalSummaryTable
+                              summary={displayResult.summary}
+                              items={displayResult.items}
+                              totalCost={displayResult.totalCost}
+                              scorerTypes={scorerTypes}
+                            />
 
-                    {/* Right panel: overview or detail */}
-                    <div className="flex-1 overflow-y-auto">
-                      {selectedItem != null ? (
-                        <div className="p-6">
-                          <EvalItemDetail
-                            item={displayResult.items[selectedItem]}
-                            itemIndex={selectedItem}
-                            scorerNames={scorerNames}
-                            onBack={() => setSelectedItem(null)}
-                          />
-                        </div>
-                      ) : (
-                        <div className="p-6 space-y-6">
-                          <EvalSummaryTable
-                            summary={displayResult.summary}
-                            items={displayResult.items}
-                            totalCost={displayResult.totalCost}
-                            scorerTypes={scorerTypes}
-                          />
-
-                          <ScoreDistribution
-                            items={displayResult.items}
-                            scorerNames={scorerNames}
-                          />
-
-                          {displayResult.items.length > 0 && (
-                            <EvalItemList
+                            <ScoreDistribution
                               items={displayResult.items}
                               scorerNames={scorerNames}
-                              onSelectItem={setSelectedItem}
-                              errorFilter={errorFilter}
-                              onErrorFilterChange={setErrorFilter}
-                              scorerFilter={scorerFilter}
-                              onScorerFilterChange={setScorerFilter}
-                              threshold={threshold}
-                              onThresholdChange={setThreshold}
-                              sortField={sortField}
-                              onSortFieldChange={setSortField}
-                              sortDir={sortDir}
-                              onSortDirChange={setSortDir}
                             />
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  </div>
+
+                            {displayResult.items.length > 0 && (
+                              <EvalItemList
+                                items={displayResult.items}
+                                scorerNames={scorerNames}
+                                onSelectItem={setSelectedItem}
+                                errorFilter={errorFilter}
+                                onErrorFilterChange={setErrorFilter}
+                                scorerFilter={scorerFilter}
+                                onScorerFilterChange={setScorerFilter}
+                                threshold={threshold}
+                                onThresholdChange={setThreshold}
+                                sortField={sortField}
+                                onSortFieldChange={setSortField}
+                                sortDir={sortDir}
+                                onSortDirChange={setSortDir}
+                              />
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    }
+                  />
                 </>
               ) : null}
             </>

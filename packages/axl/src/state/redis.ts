@@ -98,30 +98,13 @@ export class RedisStore implements StateStore {
 
   // ── Checkpoints ──────────────────────────────────────────────────────
 
-  async saveCheckpoint(executionId: string, step: number, data: unknown): Promise<void> {
-    await this.client.hSet(this.checkpointKey(executionId), String(step), JSON.stringify(data));
+  async saveCheckpoint(executionId: string, name: string, data: unknown): Promise<void> {
+    await this.client.hSet(this.checkpointKey(executionId), name, JSON.stringify(data));
   }
 
-  async getCheckpoint(executionId: string, step: number): Promise<unknown | null> {
-    const raw = await this.client.hGet(this.checkpointKey(executionId), String(step));
+  async getCheckpoint(executionId: string, name: string): Promise<unknown | null> {
+    const raw = await this.client.hGet(this.checkpointKey(executionId), name);
     return raw != null ? JSON.parse(raw) : null;
-  }
-
-  async getLatestCheckpoint(executionId: string): Promise<{ step: number; data: unknown } | null> {
-    const all = await this.client.hGetAll(this.checkpointKey(executionId));
-    if (!all || Object.keys(all).length === 0) return null;
-
-    let maxStep = -1;
-    let maxData: unknown = null;
-    for (const [stepStr, raw] of Object.entries(all)) {
-      const step = Number(stepStr);
-      if (step > maxStep) {
-        maxStep = step;
-        maxData = JSON.parse(raw);
-      }
-    }
-
-    return { step: maxStep, data: maxData };
   }
 
   // ── Sessions ─────────────────────────────────────────────────────────

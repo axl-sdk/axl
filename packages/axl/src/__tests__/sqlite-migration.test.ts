@@ -40,7 +40,7 @@ describe('SQLiteStore — schema migration v0 → v1', () => {
       const names = cols.map((c) => c.name);
       expect(names).toContain('events');
       expect(names).not.toContain('steps');
-      expect(db.pragma('user_version', { simple: true })).toBe(1);
+      expect(db.pragma('user_version', { simple: true })).toBe(2);
     } finally {
       db.close();
       void store; // silence unused-locals
@@ -99,7 +99,7 @@ describe('SQLiteStore — schema migration v0 → v1', () => {
     new SQLiteStore(path);
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(1);
+      expect(db.pragma('user_version', { simple: true })).toBe(2);
       const cols = db.pragma('table_info(execution_history)') as Array<{ name: string }>;
       const names = cols.map((c) => c.name);
       expect(names).toContain('events');
@@ -142,7 +142,7 @@ describe('SQLiteStore — schema migration v0 → v1', () => {
 
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(1);
+      expect(db.pragma('user_version', { simple: true })).toBe(2);
       const cols = db.pragma('table_info(execution_history)') as Array<{ name: string }>;
       expect(cols.map((c) => c.name)).toContain('events');
     } finally {

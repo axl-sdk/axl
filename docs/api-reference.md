@@ -591,15 +591,24 @@ if (decision.approved) {
 
 ---
 
-### `ctx.checkpoint(fn)`
+### `ctx.checkpoint(name, fn)`
 
 Durable execution. If the workflow is replayed (e.g., after a process restart), checkpointed results are restored from the state store instead of re-executing.
 
 ```typescript
-const value = await ctx.checkpoint(async () => expensiveOperation());
+const value = await ctx.checkpoint('refund-customer', async () => expensiveOperation());
 ```
 
-No options. Returns the result of `fn`.
+| Param | Type | Description |
+|-------|------|-------------|
+| `name` | `string` | Stable, caller-supplied identifier. Must be the same across runs of the same execution for replay to work. Names starting with `__auto/` are reserved for runtime auto-checkpointing of `ctx.ask` / `spawn` / `race` / `parallel` / `map` and will throw |
+| `fn` | `() => Promise<T>` | Function whose result is checkpointed |
+
+Names are scoped to a single execution and must be unique within it. Reusing a name (e.g. inside a loop) gives last-write-wins behavior — for loops, compose names from the iterator: `ctx.checkpoint(\`process-${id}\`, fn)`.
+
+**Why named?** Anonymous positional checkpoints (a counter that auto-increments per call) silently break when you add or remove `ctx.checkpoint` calls between deployments — every subsequent step shifts and in-flight executions read stale values from the wrong slot. Named checkpoints are immune to structural drift. Same model used by Temporal, Inngest, and Restate.
+
+Returns the result of `fn`.
 
 ---
 

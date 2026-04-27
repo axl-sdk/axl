@@ -79,6 +79,13 @@ export class SQLiteStore implements StateStore {
    * - v1 (spec/16): rename `execution_history.steps` → `events`. The
    *   JS-level `ExecutionInfo.steps` was renamed to `.events` in PR 1
    *   commit 1; this brings the on-disk schema in line.
+   * - v2 (named checkpoints): rename `checkpoints.step` (INTEGER) →
+   *   `checkpoints.name` (TEXT). The runtime now requires
+   *   `ctx.checkpoint(name, fn)` so the per-context numeric counter is
+   *   gone — names are caller-supplied stable identifiers. Existing
+   *   numeric step values become stringified names ("0", "1", …) to
+   *   preserve replay continuity for in-flight executions across the
+   *   upgrade boundary.
    *
    * Applied BEFORE `initTables()` so the subsequent `CREATE TABLE
    * IF NOT EXISTS` runs against the post-migration column name. Fresh
@@ -96,7 +103,7 @@ export class SQLiteStore implements StateStore {
    * transactional re-read costs nothing.
    */
   private migrate(): void {
-    const TARGET_VERSION = 1;
+    const TARGET_VERSION = 2;
     const current = this.db.pragma('user_version', { simple: true }) as number;
     if (current >= TARGET_VERSION) return;
 
@@ -112,9 +119,22 @@ export class SQLiteStore implements StateStore {
       }
       // v0 → v1: rename `steps` column on `execution_history` if present.
       // `table_info()` is safe even if the table doesn't exist (returns []).
-      const cols = this.db.pragma('table_info(execution_history)') as Array<{ name: string }>;
-      if (cols.some((c) => c.name === 'steps') && !cols.some((c) => c.name === 'events')) {
-        this.db.exec('ALTER TABLE execution_history RENAME COLUMN steps TO events');
+      if (committed < 1) {
+        const cols = this.db.pragma('table_info(execution_history)') as Array<{ name: string }>;
+        if (cols.some((c) => c.name === 'steps') && !cols.some((c) => c.name === 'events')) {
+          this.db.exec('ALTER TABLE execution_history RENAME COLUMN steps TO events');
+        }
+      }
+      // v1 → v2: rename `checkpoints.step` (INTEGER) → `checkpoints.name`
+      // (TEXT). SQLite columns are dynamically typed so existing integer
+      // values continue to work; ALTER TABLE just updates the column name
+      // (and type hint) so new schemas match. Stored values become string
+      // names — e.g. legacy "0" → "0" — preserving replay continuity.
+      if (committed < 2) {
+        const cols = this.db.pragma('table_info(checkpoints)') as Array<{ name: string }>;
+        if (cols.some((c) => c.name === 'step') && !cols.some((c) => c.name === 'name')) {
+          this.db.exec('ALTER TABLE checkpoints RENAME COLUMN step TO name');
+        }
       }
       this.db.pragma(`user_version = ${TARGET_VERSION}`);
       this.db.exec('COMMIT');
@@ -128,9 +148,9 @@ export class SQLiteStore implements StateStore {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS checkpoints (
         execution_id TEXT NOT NULL,
-        step INTEGER NOT NULL,
+        name TEXT NOT NULL,
         data TEXT NOT NULL,
-        PRIMARY KEY (execution_id, step)
+        PRIMARY KEY (execution_id, name)
       );
 
       CREATE TABLE IF NOT EXISTS sessions (
@@ -196,27 +216,19 @@ export class SQLiteStore implements StateStore {
 
   // ── Checkpoints ────────────────────────────────────────────────────────
 
-  async saveCheckpoint(executionId: string, step: number, data: unknown): Promise<void> {
+  async saveCheckpoint(executionId: string, name: string, data: unknown): Promise<void> {
     const stmt = this.db.prepare(
-      'INSERT OR REPLACE INTO checkpoints (execution_id, step, data) VALUES (?, ?, ?)',
+      'INSERT OR REPLACE INTO checkpoints (execution_id, name, data) VALUES (?, ?, ?)',
     );
-    stmt.run(executionId, step, JSON.stringify(data));
+    stmt.run(executionId, name, JSON.stringify(data));
   }
 
-  async getCheckpoint(executionId: string, step: number): Promise<unknown | null> {
+  async getCheckpoint(executionId: string, name: string): Promise<unknown | null> {
     const stmt = this.db.prepare(
-      'SELECT data FROM checkpoints WHERE execution_id = ? AND step = ?',
+      'SELECT data FROM checkpoints WHERE execution_id = ? AND name = ?',
     );
-    const row = stmt.get(executionId, step) as { data: string } | undefined;
+    const row = stmt.get(executionId, name) as { data: string } | undefined;
     return row ? safeJsonParse(row.data) : null;
-  }
-
-  async getLatestCheckpoint(executionId: string): Promise<{ step: number; data: unknown } | null> {
-    const stmt = this.db.prepare(
-      'SELECT step, data FROM checkpoints WHERE execution_id = ? ORDER BY step DESC LIMIT 1',
-    );
-    const row = stmt.get(executionId) as { step: number; data: string } | undefined;
-    return row ? { step: row.step, data: safeJsonParse(row.data) } : null;
   }
 
   // ── Sessions ────────────────────────────────────────────────────────────

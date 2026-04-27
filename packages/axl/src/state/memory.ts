@@ -31,7 +31,7 @@ type PersistedAwaitHumanState = {
  * could take hours to respond, and losing that state is unacceptable.
  */
 export class MemoryStore implements StateStore {
-  private checkpoints = new Map<string, Map<number, unknown>>();
+  private checkpoints = new Map<string, Map<string, unknown>>();
   private sessions = new Map<string, ChatMessage[]>();
   private sessionMeta = new Map<string, Map<string, unknown>>();
   private decisions = new Map<string, PendingDecision>();
@@ -45,30 +45,20 @@ export class MemoryStore implements StateStore {
     this.loadPersistedState();
   }
 
-  async saveCheckpoint(executionId: string, step: number, data: unknown): Promise<void> {
-    let steps = this.checkpoints.get(executionId);
-    if (!steps) {
-      steps = new Map();
-      this.checkpoints.set(executionId, steps);
+  async saveCheckpoint(executionId: string, name: string, data: unknown): Promise<void> {
+    let entries = this.checkpoints.get(executionId);
+    if (!entries) {
+      entries = new Map();
+      this.checkpoints.set(executionId, entries);
     }
-    steps.set(step, structuredClone(data));
+    entries.set(name, structuredClone(data));
   }
 
-  async getCheckpoint(executionId: string, step: number): Promise<unknown | null> {
-    const steps = this.checkpoints.get(executionId);
-    if (!steps) return null;
-    const data = steps.get(step);
+  async getCheckpoint(executionId: string, name: string): Promise<unknown | null> {
+    const entries = this.checkpoints.get(executionId);
+    if (!entries) return null;
+    const data = entries.get(name);
     return data !== undefined ? structuredClone(data) : null;
-  }
-
-  async getLatestCheckpoint(executionId: string): Promise<{ step: number; data: unknown } | null> {
-    const steps = this.checkpoints.get(executionId);
-    if (!steps || steps.size === 0) return null;
-    let maxStep = -1;
-    for (const step of steps.keys()) {
-      if (step > maxStep) maxStep = step;
-    }
-    return { step: maxStep, data: structuredClone(steps.get(maxStep)) };
   }
 
   async saveSession(sessionId: string, history: ChatMessage[]): Promise<void> {

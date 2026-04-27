@@ -42,67 +42,66 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
     }
 
     const sessionId = body.sessionId ?? `playground-${Date.now()}`;
-    const executionId = `playground-${sessionId}-${Date.now()}`;
     const store = runtime.getStateStore();
 
     // Load session history for multi-turn conversations
     const history = await store.getSession(sessionId);
     history.push({ role: 'user', content: body.message });
 
-    // Shared scrubber — playground broadcasts token/done/error events
-    // over WS. Under trace.redact we scrub content before broadcast so
-    // WS subscribers (Studio UI, any filterTraceEvent consumer) never
-    // see raw LLM output.
     const redactOn = runtime.isRedactEnabled();
-    // The wire now carries `AxlEvent` directly. Build minimal events with
-    // the required base fields so `redactStreamEvent` can typecheck —
-    // `step`/`timestamp` are best-effort approximations because the
-    // playground route synthesizes events outside any AxlRuntime ALS frame.
-    let stepCounter = 0;
-    const broadcast = (event: AxlEvent) => {
+
+    // Create context — its auto-generated executionId becomes the WS channel name.
+    // Token events flow through emitEvent → runtime.emit('trace') → our listener below,
+    // so no manual onToken needed.
+    const ctx = runtime.createContext({ sessionHistory: history });
+    const executionId = ctx.executionId;
+
+    // Forward ALL AxlEvents from this execution to the WS channel.
+    // This gives the playground UI access to ask_start, agent_call, tool_call,
+    // handoff, pipeline, etc. — not just tokens.
+    const traceListener = (event: AxlEvent) => {
+      if (event.executionId !== executionId) return;
       connMgr.broadcastWithWildcard(`execution:${executionId}`, redactStreamEvent(event, redactOn));
     };
-    const baseFields = () => ({
-      executionId,
-      step: stepCounter++,
-      timestamp: Date.now(),
-    });
-
-    // Create a context wired to stream events to the WS channel
-    const ctx = runtime.createContext({
-      sessionHistory: history,
-      onToken: (token: string, meta) => {
-        broadcast({
-          ...baseFields(),
-          type: 'token',
-          data: token,
-          askId: meta.askId,
-          ...(meta.parentAskId ? { parentAskId: meta.parentAskId } : {}),
-          depth: meta.depth,
-          agent: meta.agent,
-        });
-      },
-    });
+    runtime.on('trace', traceListener);
 
     // Run the agent ask asynchronously, stream results via WS
     (async () => {
+      let stepCounter = Number.MAX_SAFE_INTEGER - 1;
+      const terminalFields = () => ({
+        executionId,
+        step: stepCounter++,
+        timestamp: Date.now(),
+      });
+
       try {
         const result = await ctx.ask(agent, body.message);
         const resultText = typeof result === 'string' ? result : JSON.stringify(result);
 
-        // Save assistant response to session history — raw, because
-        // redaction is an observability-boundary filter, not a data-at-
-        // rest transform. The next playground turn needs the real text.
         history.push({ role: 'assistant', content: resultText });
         await store.saveSession(sessionId, history);
 
-        broadcast({ ...baseFields(), type: 'done', data: { result: resultText } });
+        const doneEvent: AxlEvent = {
+          ...terminalFields(),
+          type: 'done',
+          data: { result: resultText },
+        };
+        connMgr.broadcastWithWildcard(
+          `execution:${executionId}`,
+          redactStreamEvent(doneEvent, redactOn),
+        );
       } catch (err) {
-        broadcast({
-          ...baseFields(),
+        const errorEvent: AxlEvent = {
+          ...terminalFields(),
           type: 'error',
           data: { message: err instanceof Error ? err.message : String(err) },
-        });
+        };
+        connMgr.broadcastWithWildcard(
+          `execution:${executionId}`,
+          redactStreamEvent(errorEvent, redactOn),
+        );
+      } finally {
+        runtime.off('trace', traceListener);
       }
     })();
 

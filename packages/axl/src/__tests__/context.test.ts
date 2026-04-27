@@ -860,12 +860,18 @@ describe('trace redaction', () => {
 
     await ctx.ask(testAgent, 'secret prompt');
 
-    const agentCallTrace = onTrace.mock.calls
+    // prompt lives on agent_call_start, response lives on agent_call_end
+    const startTrace = onTrace.mock.calls
+      .map((c) => c[0])
+      .find((e: any) => e.type === 'agent_call_start');
+    expect(startTrace).toBeDefined();
+    expect((startTrace.data as any).prompt).toBe('[redacted]');
+
+    const endTrace = onTrace.mock.calls
       .map((c) => c[0])
       .find((e: any) => e.type === 'agent_call_end');
-    expect(agentCallTrace).toBeDefined();
-    expect((agentCallTrace.data as any).prompt).toBe('[redacted]');
-    expect((agentCallTrace.data as any).response).toBe('[redacted]');
+    expect(endTrace).toBeDefined();
+    expect((endTrace.data as any).response).toBe('[redacted]');
   });
 
   it('does not redact when redact is false', async () => {
@@ -878,12 +884,17 @@ describe('trace redaction', () => {
 
     await ctx.ask(testAgent, 'visible prompt');
 
-    const agentCallTrace = onTrace.mock.calls
+    const startTrace = onTrace.mock.calls
+      .map((c) => c[0])
+      .find((e: any) => e.type === 'agent_call_start');
+    expect(startTrace).toBeDefined();
+    expect((startTrace.data as any).prompt).toBe('visible prompt');
+
+    const endTrace = onTrace.mock.calls
       .map((c) => c[0])
       .find((e: any) => e.type === 'agent_call_end');
-    expect(agentCallTrace).toBeDefined();
-    expect((agentCallTrace.data as any).prompt).toBe('visible prompt');
-    expect((agentCallTrace.data as any).response).toBe('visible response');
+    expect(endTrace).toBeDefined();
+    expect((endTrace.data as any).response).toBe('visible response');
   });
 });
 

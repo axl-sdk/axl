@@ -25,10 +25,13 @@ export type ExecutionState = {
  * Redis (production).
  */
 export interface StateStore {
-  // Checkpoints
-  saveCheckpoint(executionId: string, step: number, data: unknown): Promise<void>;
-  getCheckpoint(executionId: string, step: number): Promise<unknown | null>;
-  getLatestCheckpoint(executionId: string): Promise<{ step: number; data: unknown } | null>;
+  // Checkpoints — keyed by caller-supplied stable name (per `ctx.checkpoint(name, fn)`).
+  // Names are scoped to a single execution and must be unique within it; the
+  // runtime does not enforce uniqueness, so callers using the same name twice
+  // get last-write-wins behavior (intentional for loop iterations using
+  // composed names like `iter-${i}`).
+  saveCheckpoint(executionId: string, name: string, data: unknown): Promise<void>;
+  getCheckpoint(executionId: string, name: string): Promise<unknown | null>;
 
   // Sessions
   saveSession(sessionId: string, history: ChatMessage[]): Promise<void>;

@@ -73,7 +73,7 @@ describe('ctx.checkpoint()', () => {
     const ctx = createTestContext(provider, store, 'exec-cp-1');
 
     let callCount = 0;
-    const result = await ctx.checkpoint(async () => {
+    const result = await ctx.checkpoint('compute', async () => {
       callCount++;
       return { data: 'computed-result' };
     });
@@ -81,8 +81,8 @@ describe('ctx.checkpoint()', () => {
     expect(result).toEqual({ data: 'computed-result' });
     expect(callCount).toBe(1);
 
-    // Verify it was saved to the store
-    const saved = await store.getCheckpoint('exec-cp-1', 0);
+    // Verify it was saved to the store under the caller-supplied name.
+    const saved = await store.getCheckpoint('exec-cp-1', 'compute');
     expect(saved).toEqual({ data: 'computed-result' });
   });
 
@@ -90,90 +90,83 @@ describe('ctx.checkpoint()', () => {
     const store = new MemoryStore();
     const provider = new TestProvider([{ content: 'ok' }]);
 
-    // Pre-save a checkpoint (simulating a previous run)
-    await store.saveCheckpoint('exec-cp-2', 0, { data: 'saved-result' });
+    // Pre-save a checkpoint (simulating a previous run).
+    await store.saveCheckpoint('exec-cp-2', 'compute', { data: 'saved-result' });
 
     const ctx = createTestContext(provider, store, 'exec-cp-2');
 
     let callCount = 0;
-    const result = await ctx.checkpoint(async () => {
+    const result = await ctx.checkpoint('compute', async () => {
       callCount++;
       return { data: 'new-result' };
     });
 
-    // Should return saved result, not execute the function
+    // Should return saved result, not execute the function.
     expect(result).toEqual({ data: 'saved-result' });
     expect(callCount).toBe(0);
   });
 
-  it('multiple checkpoints use sequential step numbers', async () => {
+  it('multiple checkpoints with distinct names persist independently', async () => {
     const store = new MemoryStore();
     const provider = new TestProvider([{ content: 'ok' }]);
     const ctx = createTestContext(provider, store, 'exec-cp-3');
 
-    const r1 = await ctx.checkpoint(async () => 'first');
-    const r2 = await ctx.checkpoint(async () => 'second');
-    const r3 = await ctx.checkpoint(async () => 'third');
+    const r1 = await ctx.checkpoint('first', async () => 'first');
+    const r2 = await ctx.checkpoint('second', async () => 'second');
+    const r3 = await ctx.checkpoint('third', async () => 'third');
 
     expect(r1).toBe('first');
     expect(r2).toBe('second');
     expect(r3).toBe('third');
 
-    // Verify all checkpoints saved
-    expect(await store.getCheckpoint('exec-cp-3', 0)).toBe('first');
-    expect(await store.getCheckpoint('exec-cp-3', 1)).toBe('second');
-    expect(await store.getCheckpoint('exec-cp-3', 2)).toBe('third');
+    expect(await store.getCheckpoint('exec-cp-3', 'first')).toBe('first');
+    expect(await store.getCheckpoint('exec-cp-3', 'second')).toBe('second');
+    expect(await store.getCheckpoint('exec-cp-3', 'third')).toBe('third');
   });
 
-  it('replays completed steps and executes in-progress step on resume', async () => {
+  it('replays completed checkpoints and executes only missing ones', async () => {
     const store = new MemoryStore();
     const provider = new TestProvider([{ content: 'ok' }]);
 
-    // Simulate: steps 0 and 1 completed in previous run, step 2 not saved
-    await store.saveCheckpoint('exec-cp-4', 0, 'result-0');
-    await store.saveCheckpoint('exec-cp-4', 1, 'result-1');
+    // Simulate two checkpoints completed in a previous run; third missing.
+    await store.saveCheckpoint('exec-cp-4', 'a', 'result-0');
+    await store.saveCheckpoint('exec-cp-4', 'b', 'result-1');
 
     const ctx = createTestContext(provider, store, 'exec-cp-4');
 
     const executionLog: string[] = [];
 
-    const r0 = await ctx.checkpoint(async () => {
-      executionLog.push('executed-step-0');
+    const r0 = await ctx.checkpoint('a', async () => {
+      executionLog.push('executed-a');
       return 'fresh-result-0';
     });
 
-    const r1 = await ctx.checkpoint(async () => {
-      executionLog.push('executed-step-1');
+    const r1 = await ctx.checkpoint('b', async () => {
+      executionLog.push('executed-b');
       return 'fresh-result-1';
     });
 
-    const r2 = await ctx.checkpoint(async () => {
-      executionLog.push('executed-step-2');
+    const r2 = await ctx.checkpoint('c', async () => {
+      executionLog.push('executed-c');
       return 'fresh-result-2';
     });
 
-    // Steps 0 and 1 should return saved results (no execution)
     expect(r0).toBe('result-0');
     expect(r1).toBe('result-1');
-
-    // Step 2 should actually execute
     expect(r2).toBe('fresh-result-2');
-
-    // Only step 2 was actually executed
-    expect(executionLog).toEqual(['executed-step-2']);
+    expect(executionLog).toEqual(['executed-c']);
   });
 
   it('tool calls are not duplicated on replay', async () => {
     const store = new MemoryStore();
     const provider = new TestProvider([{ content: 'tool result from LLM' }]);
 
-    // Simulate: tool execution was checkpointed in previous run
-    await store.saveCheckpoint('exec-cp-5', 0, { toolOutput: 'saved-tool-result' });
+    await store.saveCheckpoint('exec-cp-5', 'tool', { toolOutput: 'saved-tool-result' });
 
     const ctx = createTestContext(provider, store, 'exec-cp-5');
 
     let toolExecuted = false;
-    const result = await ctx.checkpoint(async () => {
+    const result = await ctx.checkpoint('tool', async () => {
       toolExecuted = true;
       return { toolOutput: 'new-tool-result' };
     });
@@ -186,18 +179,24 @@ describe('ctx.checkpoint()', () => {
     const store = new MemoryStore();
     const provider = new TestProvider([{ content: 'hello' }]);
 
-    // Simulate: LLM response was checkpointed
-    await store.saveCheckpoint('exec-cp-6', 0, 'saved-llm-response');
+    await store.saveCheckpoint('exec-cp-6', 'llm', 'saved-llm-response');
 
     const ctx = createTestContext(provider, store, 'exec-cp-6');
 
-    const result = await ctx.checkpoint(async () => {
+    const result = await ctx.checkpoint('llm', async () => {
       return await ctx.ask(testAgent, 'Say hello');
     });
 
     expect(result).toBe('saved-llm-response');
-    // Provider should NOT have been called
     expect(provider.calls.length).toBe(0);
+  });
+
+  it('rejects names reserved for runtime auto-checkpoints', async () => {
+    const store = new MemoryStore();
+    const provider = new TestProvider([{ content: 'ok' }]);
+    const ctx = createTestContext(provider, store, 'exec-cp-reserved');
+
+    await expect(ctx.checkpoint('__auto/foo', async () => 'x')).rejects.toThrow(/reserved/);
   });
 
   it('works without a state store (no-op, always executes)', async () => {
@@ -215,7 +214,7 @@ describe('ctx.checkpoint()', () => {
     });
 
     let callCount = 0;
-    const result = await ctx.checkpoint(async () => {
+    const result = await ctx.checkpoint('compute', async () => {
       callCount++;
       return 'result';
     });
@@ -229,23 +228,52 @@ describe('ctx.checkpoint()', () => {
     const provider = new TestProvider([{ content: 'ok' }]);
     const onTrace = vi.fn();
 
-    // Pre-save step 0 for replay
-    await store.saveCheckpoint('exec-cp-trace', 0, 'saved');
+    await store.saveCheckpoint('exec-cp-trace', 'replayed', 'saved');
 
     const ctx = createTestContext(provider, store, 'exec-cp-trace', { onTrace });
 
-    // Step 0: replay
-    await ctx.checkpoint(async () => 'new');
-    // Step 1: fresh execution
-    await ctx.checkpoint(async () => 'fresh');
+    await ctx.checkpoint('replayed', async () => 'new');
+    await ctx.checkpoint('fresh', async () => 'fresh');
 
     const traceEvents = onTrace.mock.calls.map((c) => c[0]);
     const cpEvents = traceEvents.filter(
-      (e: any) => e.type === 'log' && e.data?.event?.startsWith('checkpoint_'),
+      (e: any) => e.type === 'checkpoint_save' || e.type === 'checkpoint_replay',
     );
 
     expect(cpEvents.length).toBe(2);
-    expect(cpEvents[0].data.event).toBe('checkpoint_replay');
-    expect(cpEvents[1].data.event).toBe('checkpoint_save');
+    expect(cpEvents[0].type).toBe('checkpoint_replay');
+    expect(cpEvents[0].data.name).toBe('replayed');
+    expect(cpEvents[1].type).toBe('checkpoint_save');
+    expect(cpEvents[1].data.name).toBe('fresh');
+  });
+
+  it('child contexts share the auto-checkpoint counter so nested asks do not collide', async () => {
+    // Prior to the named-checkpoint change, each WorkflowContext had its
+    // own counter starting at 0; a tool handler's nested ctx.ask() (which
+    // auto-checkpoints) wrote step 0 over the parent's step 0 in the
+    // store. The shared counter ref makes auto-checkpoint names globally
+    // unique within an execution.
+    const store = new MemoryStore();
+    const provider = new TestProvider([{ content: 'ok' }]);
+    const ctx = createTestContext(provider, store, 'exec-cp-child');
+
+    const child = ctx.createChildContext('tool-call-id');
+
+    // Each ctx.ask is internally auto-checkpointed. Run one in each
+    // context and verify the names don't collide.
+    await ctx.ask(testAgent, 'parent');
+    await child.ask(testAgent, 'child');
+
+    // Each agent has its own per-agent counter. The shared counter ref
+    // means parent and child contexts both bump the same map, but since
+    // they're calling different agents (this test calls testAgent in
+    // both, so the same agent), the counter increments per agent. The
+    // parent claims testAgent/ask/0; the child claims testAgent/ask/1.
+    expect(
+      await store.getCheckpoint('exec-cp-child', `__auto/${testAgent._name}/ask/0`),
+    ).not.toBeNull();
+    expect(
+      await store.getCheckpoint('exec-cp-child', `__auto/${testAgent._name}/ask/1`),
+    ).not.toBeNull();
   });
 });

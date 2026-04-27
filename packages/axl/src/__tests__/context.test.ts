@@ -978,6 +978,36 @@ describe('ctx.ask() MaxTurnsError', () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
+// ctx.awaitHuman() — synchronous handler emit pair invariant
+// ═════════════════════════════════════════════════════════════════════════
+
+describe('ctx.awaitHuman() synchronous handler', () => {
+  it('emits both await_human (start) and await_human_resolved (end)', async () => {
+    // Regression test for a bug where the sync `awaitHumanHandler` path
+    // emitted only `await_human_resolved`, breaking the start/end pair
+    // invariant the trace UI's waterfall and the decisions WS channel
+    // both rely on.
+    const provider = new TestProvider([{ content: 'unused' }]);
+    const onTrace = vi.fn();
+    const ctx = createTestContext(provider, {
+      onTrace,
+      awaitHumanHandler: () => ({ approved: true }),
+    });
+
+    const decision = await ctx.awaitHuman({
+      channel: 'tool_approval',
+      prompt: 'Approve operation X?',
+    });
+    expect(decision.approved).toBe(true);
+
+    const types = onTrace.mock.calls
+      .map((c) => (c[0] as { type: string }).type)
+      .filter((t) => t === 'await_human' || t === 'await_human_resolved');
+    expect(types).toEqual(['await_human', 'await_human_resolved']);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════
 // ctx.budget() — BudgetExceededError / hard_stop
 // ═════════════════════════════════════════════════════════════════════════
 

@@ -236,9 +236,14 @@ export type AgentCallStartData = {
  * Data shape for `agent_call_end` events — the **response** side of the call.
  * Populated when the provider returns (success or recoverable failure). The
  * companion request-side payload lives on the matching `agent_call_start`.
+ *
+ * Pair invariant: every `agent_call_start` is followed by exactly one
+ * `agent_call_end`, even on provider error. On the error path `response` is
+ * empty and `error` carries the provider's message; cost/tokens/duration are
+ * still emitted (top-level on the event) when partial usage is available.
  */
 export type AgentCallEndData = {
-  /** Final LLM response content for this turn. */
+  /** Final LLM response content for this turn. Empty string on error. */
   response: string;
   /** Reasoning/thinking content returned by the provider, when available. */
   thinking?: string;
@@ -247,6 +252,10 @@ export type AgentCallEndData = {
   /** Mirrors `agent_call_start.data.retryReason` so cost-attribution consumers
    *  reading `agent_call_end` (cost lives here) can bucket without joining. */
   retryReason?: 'schema' | 'validate' | 'guardrail';
+  /** Provider error message when the call threw (network failure, 4xx/5xx,
+   *  abort, etc). Mutually exclusive with `response` content. Subject to
+   *  `config.trace.redact` (vendor errors can echo prompt text). */
+  error?: string;
 };
 
 /** Data shape for `tool_call_end` events. */

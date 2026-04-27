@@ -15,7 +15,7 @@
  */
 import { useState, useEffect, useMemo, createContext, useContext, type ReactNode } from 'react';
 import { ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, RotateCw } from 'lucide-react';
-import { cn } from '../../lib/utils';
+import { cn, formatCost } from '../../lib/utils';
 import { CostBadge } from './CostBadge';
 import { DurationBadge } from './DurationBadge';
 import { JsonViewer } from './JsonViewer';
@@ -26,6 +26,7 @@ import {
   getAgentCallStartData,
   getAgentCallEndData,
   getGateData,
+  getToolApprovalData,
   isRetryCall,
 } from '../../lib/trace-utils';
 
@@ -210,17 +211,14 @@ export function AgentCallEndBody({ event }: { event: AxlEvent }) {
       )}
       {d.thinking && <TextBlock label="Thinking" content={d.thinking} tone="info" />}
       {d.response && <TextBlock label="Response" content={d.response} defaultOpen />}
+      {d.error && <TextBlock label="Provider error" content={d.error} tone="warning" defaultOpen />}
     </>
   );
 }
 
 /** Rendered body for an expanded tool_approval event. */
 export function ToolApprovalBody({ event }: { event: AxlEvent }) {
-  const d = (event.data ?? null) as {
-    approved?: boolean;
-    args?: unknown;
-    reason?: string;
-  } | null;
+  const d = getToolApprovalData(event);
   if (!d) return null;
   return (
     <>
@@ -335,7 +333,7 @@ function AskEndBody({ event }: { event: AxlEvent }) {
       )}
       {typeof cost === 'number' && (
         <p className="text-xs mb-1">
-          <strong>Ask cost:</strong> ${cost.toFixed(5)}
+          <strong>Ask cost:</strong> {formatCost(cost)}
         </p>
       )}
       {typeof duration === 'number' && (

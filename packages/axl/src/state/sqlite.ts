@@ -128,8 +128,14 @@ export class SQLiteStore implements StateStore {
       // v1 → v2: rename `checkpoints.step` (INTEGER) → `checkpoints.name`
       // (TEXT). SQLite columns are dynamically typed so existing integer
       // values continue to work; ALTER TABLE just updates the column name
-      // (and type hint) so new schemas match. Stored values become string
-      // names — e.g. legacy "0" → "0" — preserving replay continuity.
+      // (and type hint) so new schemas match. NOTE: legacy auto-checkpoint
+      // rows ("0", "1", …) are *structurally* preserved but become
+      // unreachable — the new runtime composes auto-checkpoint names like
+      // `__auto/<agent>/ask/<n>`, which never match the legacy integer
+      // strings. In-flight executions resumed under v2 will re-execute
+      // side effects (no replay match). Drain or cancel running
+      // executions before upgrading. User-named checkpoints (only
+      // possible on the new API) are unaffected.
       if (committed < 2) {
         const cols = this.db.pragma('table_info(checkpoints)') as Array<{ name: string }>;
         if (cols.some((c) => c.name === 'step') && !cols.some((c) => c.name === 'name')) {

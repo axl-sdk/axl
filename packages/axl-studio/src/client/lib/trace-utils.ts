@@ -7,7 +7,8 @@ import type { AxlEvent } from './types';
  *
  * Design rules:
  *   - Red is reserved for failure (set on the leaf `tool_denied` and applied
- *     dynamically by `isFailureEvent` to *_failed states across the union).
+ *     dynamically by `isFailureEvent` to gate/verify/ask_end/workflow_end
+ *     payload-encoded failures across the union).
  *   - Cool hues are rationed to avoid blue ≈ sky ≈ violet ≈ teal at dot size.
  *   - Streaming and diagnostic events (`token`, `partial_object`, `log`) use
  *     muted slate to recede behind structural events.
@@ -82,9 +83,18 @@ export const EVENT_COLORS: Record<string, string> = {
   log: 'bg-slate-400',
 
   // ── Terminal markers ───────────────────────────────────────────────
-  done: 'bg-slate-500',
+  // Distinct from log/token slate so the terminal `done` doesn't visually
+  // disappear into the stream of de-emphasized rows above it.
+  done: 'bg-zinc-700',
   error: 'bg-red-500',
 };
+
+/**
+ * Sentinel color for forward-compat — surfaced when the client sees an event
+ * type the palette doesn't know about. Distinct from `done` so a new variant
+ * doesn't masquerade as a terminal marker.
+ */
+const UNKNOWN_EVENT_COLOR = 'bg-pink-400';
 
 /**
  * Returns `true` when the event represents a failure signal in its payload —
@@ -136,7 +146,7 @@ export function isFailureEvent(event: AxlEvent): boolean {
  * failure state in the payload.
  */
 export function getBarColor(type: string): string {
-  return EVENT_COLORS[type] ?? 'bg-slate-500';
+  return EVENT_COLORS[type] ?? UNKNOWN_EVENT_COLOR;
 }
 
 /**
@@ -179,6 +189,8 @@ export type AgentCallEndData = {
   thinking?: string;
   turn?: number;
   retryReason?: 'schema' | 'validate' | 'guardrail';
+  /** Provider error message when the call threw (mutually exclusive with response). */
+  error?: string;
 };
 
 export type GateCheckData = {
@@ -211,6 +223,11 @@ export function getGateData(event: AxlEvent): GateCheckData | null {
   if (event.type !== 'guardrail' && event.type !== 'schema_check' && event.type !== 'validate')
     return null;
   return (event.data ?? null) as GateCheckData | null;
+}
+
+export function getToolApprovalData(event: AxlEvent): ToolApprovalData | null {
+  if (event.type !== 'tool_approval' || !event.data) return null;
+  return event.data as ToolApprovalData;
 }
 
 /** Returns true if this agent_call (start or end) is a retry triggered by a failed gate. */

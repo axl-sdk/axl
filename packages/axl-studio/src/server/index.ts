@@ -191,19 +191,16 @@ export function createServer(options: CreateServerOptions) {
       // Broadcast to trace channels — apply the same scrubbing as the
       // playground/workflow execution paths so the trace firehose doesn't
       // leak content the per-route broadcasts are scrubbing.
+      const redacted = redactStreamEvent(traceEvent, runtime.isRedactEnabled());
       if (traceEvent.executionId) {
-        connMgr.broadcastWithWildcard(
-          `trace:${traceEvent.executionId}`,
-          redactStreamEvent(traceEvent, runtime.isRedactEnabled()),
-        );
+        connMgr.broadcastWithWildcard(`trace:${traceEvent.executionId}`, redacted);
       }
 
-      // Broadcast pending decisions
-      if (
-        traceEvent.type === 'log' &&
-        (traceEvent.data as { event?: string })?.event === 'await_human'
-      ) {
-        connMgr.broadcast('decisions', traceEvent);
+      // Broadcast pending decisions. `await_human` is now a first-class
+      // AxlEvent type (was a `log` variant before 0.16). Send the redacted
+      // shape — `prompt` is user-visible LLM content that respects redact.
+      if (traceEvent.type === 'await_human') {
+        connMgr.broadcast('decisions', redacted);
       }
     } catch (err) {
       console.error(

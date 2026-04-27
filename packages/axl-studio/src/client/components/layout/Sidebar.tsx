@@ -35,6 +35,13 @@ function loadCollapsed(): boolean {
   }
 }
 
+function isEditableElement(el: HTMLElement): boolean {
+  const tag = el.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (el.isContentEditable) return true;
+  return false;
+}
+
 export function Sidebar() {
   const [collapsed, setCollapsed] = useState(loadCollapsed);
 
@@ -48,16 +55,27 @@ export function Sidebar() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'b') {
-        e.preventDefault();
-        setCollapsed((c) => !c);
-      }
+      // Require exactly Cmd/Ctrl + b — Cmd+Shift+B is browser bookmarks
+      // bar, Cmd+Alt+B is reserved on some platforms, Cmd+B alone is
+      // markdown-bold in many editors so we must not steal it from
+      // textareas/inputs. Bail when focus is in any editable element.
+      if (e.shiftKey || e.altKey) return;
+      if (!(e.metaKey || e.ctrlKey)) return;
+      if (e.key.toLowerCase() !== 'b') return;
+      const target = e.target as HTMLElement | null;
+      if (target && isEditableElement(target)) return;
+      e.preventDefault();
+      setCollapsed((c) => !c);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
   const ToggleIcon = collapsed ? PanelLeftOpen : PanelLeftClose;
+  const shortcutLabel =
+    typeof navigator !== 'undefined' && /Mac|iPhone|iPad/i.test(navigator.userAgent)
+      ? '⌘B'
+      : 'Ctrl+B';
 
   return (
     <aside
@@ -76,8 +94,9 @@ export function Sidebar() {
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
-          title={`${collapsed ? 'Expand' : 'Collapse'} sidebar (⌘B)`}
+          title={`${collapsed ? 'Expand' : 'Collapse'} sidebar (${shortcutLabel})`}
           aria-label={`${collapsed ? 'Expand' : 'Collapse'} sidebar`}
+          aria-keyshortcuts="Meta+B Control+B"
           className="p-1 rounded-md text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--accent-foreground))] transition-colors"
         >
           <ToggleIcon size={16} />

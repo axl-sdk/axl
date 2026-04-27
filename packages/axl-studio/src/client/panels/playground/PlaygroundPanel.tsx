@@ -25,6 +25,15 @@ type Message = {
   approvals?: Array<{ tool: string; approved: boolean }>;
 };
 
+// Stable Set hoisted out of render — re-creating per render means the
+// auto-open effect's dependency identity churns and triggers an extra
+// rescan on every render of the component.
+const ACTIVITY_TRIGGERS: ReadonlySet<string> = new Set([
+  'tool_call_start',
+  'handoff_start',
+  'tool_approval',
+]);
+
 export function PlaygroundPanel() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -38,6 +47,7 @@ export function PlaygroundPanel() {
   const userDismissedActivity = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const processedEventsCount = useRef(0);
+  const activityScannedCount = useRef(0);
 
   const { data: agents = [] } = useQuery({
     queryKey: ['agents'],
@@ -196,15 +206,24 @@ export function PlaygroundPanel() {
   // tool approvals. Simple single-agent chats stay clean.
   // Respects explicit user dismissal — once the user toggles it off,
   // auto-open won't fight them until a new chat starts.
-  const ACTIVITY_TRIGGERS = new Set(['tool_call_start', 'handoff_start', 'tool_approval']);
+  // Scan only the new tail to avoid O(n²) over a long execution; the
+  // ref is reset to 0 alongside `userDismissedActivity` when a new
+  // chat starts (see "New chat" handler below).
   useEffect(() => {
-    if (showActivity || userDismissedActivity.current) return;
-    for (const event of stream.events) {
+    if (showActivity || userDismissedActivity.current) {
+      activityScannedCount.current = stream.events.length;
+      return;
+    }
+    for (let i = activityScannedCount.current; i < stream.events.length; i++) {
+      const event = stream.events[i];
+      if (!event) continue;
       if (ACTIVITY_TRIGGERS.has(event.type) || ((event as { depth?: number }).depth ?? 0) >= 1) {
         setShowActivity(true);
+        activityScannedCount.current = stream.events.length;
         return;
       }
     }
+    activityScannedCount.current = stream.events.length;
   }, [stream.events, showActivity]);
 
   // Auto-scroll
@@ -479,6 +498,8 @@ export function PlaygroundPanel() {
                   setTotalTokens({ input: 0, output: 0 });
                   setShowActivity(false);
                   userDismissedActivity.current = false;
+                  processedEventsCount.current = 0;
+                  activityScannedCount.current = 0;
                 }}
                 className={cn(
                   'inline-flex items-center gap-1.5 pl-3.5 pr-4 py-2 text-sm font-medium cursor-pointer',

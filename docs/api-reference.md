@@ -1074,9 +1074,8 @@ Every `StateStore` implementation must provide these methods.
 
 | Method | Description |
 |--------|-------------|
-| `saveCheckpoint(executionId, step, data)` | Save a checkpoint |
-| `getCheckpoint(executionId, step)` | Get a specific checkpoint |
-| `getLatestCheckpoint(executionId)` | Get the most recent checkpoint for an execution |
+| `saveCheckpoint(executionId, name, data)` | Save a checkpoint under a caller-supplied stable name |
+| `getCheckpoint(executionId, name)` | Look up a specific checkpoint by name (returns `null` if missing) |
 
 **Sessions**:
 

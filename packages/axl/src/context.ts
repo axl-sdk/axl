@@ -947,145 +947,177 @@ export class WorkflowContext<TInput = unknown> {
 
       let response: ProviderResponse;
 
-      if (this.onToken) {
-        // Use streaming to emit tokens in real-time
-        let content = '';
-        const toolCalls: ToolCallMessage[] = [];
-        const toolCallBuffers = new Map<string, { id: string; name: string; arguments: string }>();
-        let streamProviderMetadata: Record<string, unknown> | undefined;
+      // Provider call wrapped so any throw still emits a paired
+      // `agent_call_end` — consumers (Studio waterfall, cost rollup, AsyncLocalStorage
+      // accumulators) rely on the start/end pair invariant. Without this, a
+      // provider 5xx or abort leaves an orphan start in the trace and the
+      // ask_end / workflow_end terminal events still fire — but downstream
+      // groupers never see the close, so per-ask cost rollup and ask-tree
+      // reconstruction silently drift. We rethrow after emit so the existing
+      // ask-loop error handling (ask_end({ok:false}), MaxTurnsError, etc.) is
+      // unchanged.
+      try {
+        if (this.onToken) {
+          // Use streaming to emit tokens in real-time
+          let content = '';
+          const toolCalls: ToolCallMessage[] = [];
+          const toolCallBuffers = new Map<
+            string,
+            { id: string; name: string; arguments: string }
+          >();
+          let streamProviderMetadata: Record<string, unknown> | undefined;
 
-        let thinkingContent = '';
+          let thinkingContent = '';
 
-        // partial_object emission gating (spec §4.2):
-        //   - schema is set
-        //   - no tools (JSON-mode response, not tool-calling)
-        //   - schema root is a ZodObject (only object roots get partials)
-        // Structural-boundary throttle: emit when we cross a `,`, `}`, or
-        // `]` that is OUTSIDE a string literal. A naive "last char of
-        // delta is a comma" check (review B-9) over-emits on prose-heavy
-        // fields like {"description": "short, comma-heavy text..."} —
-        // every comma inside the string triggered a parse. We track
-        // in-string + escape state across chunks with a small walker so
-        // each boundary fires exactly once at a real structural seam.
-        const partialObjectEnabled =
-          !!options?.schema && toolDefs.length === 0 && options.schema instanceof z.ZodObject;
-        const currentAttempt = schemaRetries + 1;
-        // Running parser state for the delta walker. Reset per ask
-        // invocation (not per retry — schema retry feeds the same
-        // conversation back, so we want a fresh parse of the new attempt).
-        let inString = false;
-        let escaped = false;
-        let boundaryPending = false;
+          // partial_object emission gating (spec §4.2):
+          //   - schema is set
+          //   - no tools (JSON-mode response, not tool-calling)
+          //   - schema root is a ZodObject (only object roots get partials)
+          // Structural-boundary throttle: emit when we cross a `,`, `}`, or
+          // `]` that is OUTSIDE a string literal. A naive "last char of
+          // delta is a comma" check (review B-9) over-emits on prose-heavy
+          // fields like {"description": "short, comma-heavy text..."} —
+          // every comma inside the string triggered a parse. We track
+          // in-string + escape state across chunks with a small walker so
+          // each boundary fires exactly once at a real structural seam.
+          const partialObjectEnabled =
+            !!options?.schema && toolDefs.length === 0 && options.schema instanceof z.ZodObject;
+          const currentAttempt = schemaRetries + 1;
+          // Running parser state for the delta walker. Reset per ask
+          // invocation (not per retry — schema retry feeds the same
+          // conversation back, so we want a fresh parse of the new attempt).
+          let inString = false;
+          let escaped = false;
+          let boundaryPending = false;
 
-        for await (const chunk of provider.stream(currentMessages, chatOptions)) {
-          if (chunk.type === 'text_delta') {
-            content += chunk.content;
-            // Emit a `token` AxlEvent so wire consumers (AxlStream) and
-            // trace listeners both see it. Stream-only — `runtime.execute`'s
-            // onTrace skips persisting tokens to ExecutionInfo.events.
-            this.emitEvent({ type: 'token', data: chunk.content });
-            this.onToken(chunk.content, callbackMeta);
-            if (partialObjectEnabled) {
-              // Walk `chunk.content` char-by-char, updating the
-              // in-string / escape state and recording whether a
-              // structural boundary landed outside a string. The
-              // running state survives across chunks because
-              // `inString` / `escaped` are closed over by the outer
-              // for-await loop.
-              for (const ch of chunk.content) {
-                if (escaped) {
-                  escaped = false;
-                  continue;
+          for await (const chunk of provider.stream(currentMessages, chatOptions)) {
+            if (chunk.type === 'text_delta') {
+              content += chunk.content;
+              // Emit a `token` AxlEvent so wire consumers (AxlStream) and
+              // trace listeners both see it. Stream-only — `runtime.execute`'s
+              // onTrace skips persisting tokens to ExecutionInfo.events.
+              this.emitEvent({ type: 'token', data: chunk.content });
+              this.onToken(chunk.content, callbackMeta);
+              if (partialObjectEnabled) {
+                // Walk `chunk.content` char-by-char, updating the
+                // in-string / escape state and recording whether a
+                // structural boundary landed outside a string. The
+                // running state survives across chunks because
+                // `inString` / `escaped` are closed over by the outer
+                // for-await loop.
+                for (const ch of chunk.content) {
+                  if (escaped) {
+                    escaped = false;
+                    continue;
+                  }
+                  if (ch === '\\') {
+                    // Inside a string, `\\` starts an escape. Outside,
+                    // a bare backslash is invalid JSON — treat the same
+                    // way (swallow the next char) so malformed input
+                    // doesn't derail our state machine.
+                    escaped = true;
+                    continue;
+                  }
+                  if (ch === '"') {
+                    inString = !inString;
+                    continue;
+                  }
+                  if (!inString && (ch === ',' || ch === '}' || ch === ']')) {
+                    boundaryPending = true;
+                  }
                 }
-                if (ch === '\\') {
-                  // Inside a string, `\\` starts an escape. Outside,
-                  // a bare backslash is invalid JSON — treat the same
-                  // way (swallow the next char) so malformed input
-                  // doesn't derail our state machine.
-                  escaped = true;
-                  continue;
-                }
-                if (ch === '"') {
-                  inString = !inString;
-                  continue;
-                }
-                if (!inString && (ch === ',' || ch === '}' || ch === ']')) {
-                  boundaryPending = true;
+                if (boundaryPending) {
+                  boundaryPending = false;
+                  let parsed: unknown;
+                  try {
+                    parsed = parsePartialJson(extractJson(content));
+                  } catch {
+                    // Mid-document malformed (not just truncation) — skip
+                    // this delta. The next structural boundary outside a
+                    // string will get another shot once the model writes
+                    // valid syntax.
+                    parsed = undefined;
+                  }
+                  if (parsed !== undefined) {
+                    this.emitEvent({
+                      type: 'partial_object',
+                      agent: agent._name,
+                      attempt: currentAttempt,
+                      data: { object: parsed },
+                    });
+                  }
                 }
               }
-              if (boundaryPending) {
-                boundaryPending = false;
-                let parsed: unknown;
-                try {
-                  parsed = parsePartialJson(extractJson(content));
-                } catch {
-                  // Mid-document malformed (not just truncation) — skip
-                  // this delta. The next structural boundary outside a
-                  // string will get another shot once the model writes
-                  // valid syntax.
-                  parsed = undefined;
-                }
-                if (parsed !== undefined) {
-                  this.emitEvent({
-                    type: 'partial_object',
-                    agent: agent._name,
-                    attempt: currentAttempt,
-                    data: { object: parsed },
-                  });
-                }
+            } else if (chunk.type === 'thinking_delta') {
+              thinkingContent += chunk.content;
+            } else if (chunk.type === 'tool_call_delta') {
+              let buffer = toolCallBuffers.get(chunk.id);
+              if (!buffer) {
+                buffer = { id: chunk.id, name: '', arguments: '' };
+                toolCallBuffers.set(chunk.id, buffer);
               }
-            }
-          } else if (chunk.type === 'thinking_delta') {
-            thinkingContent += chunk.content;
-          } else if (chunk.type === 'tool_call_delta') {
-            let buffer = toolCallBuffers.get(chunk.id);
-            if (!buffer) {
-              buffer = { id: chunk.id, name: '', arguments: '' };
-              toolCallBuffers.set(chunk.id, buffer);
-            }
-            if (chunk.name) buffer.name = chunk.name;
-            if (chunk.arguments) buffer.arguments += chunk.arguments;
-          } else if (chunk.type === 'done') {
-            streamProviderMetadata = chunk.providerMetadata;
-            // Usage and cost info from done chunk if available
-            if (chunk.usage) {
-              response = {
-                content,
-                tool_calls: undefined,
-                usage: chunk.usage,
-                cost: chunk.cost,
-              };
+              if (chunk.name) buffer.name = chunk.name;
+              if (chunk.arguments) buffer.arguments += chunk.arguments;
+            } else if (chunk.type === 'done') {
+              streamProviderMetadata = chunk.providerMetadata;
+              // Usage and cost info from done chunk if available
+              if (chunk.usage) {
+                response = {
+                  content,
+                  tool_calls: undefined,
+                  usage: chunk.usage,
+                  cost: chunk.cost,
+                };
+              }
             }
           }
-        }
 
-        // Convert tool call buffers to ToolCallMessage format
-        for (const buffer of toolCallBuffers.values()) {
-          toolCalls.push({
-            id: buffer.id,
-            type: 'function',
-            function: {
-              name: buffer.name,
-              arguments: buffer.arguments,
-            },
-          });
-        }
+          // Convert tool call buffers to ToolCallMessage format
+          for (const buffer of toolCallBuffers.values()) {
+            toolCalls.push({
+              id: buffer.id,
+              type: 'function',
+              function: {
+                name: buffer.name,
+                arguments: buffer.arguments,
+              },
+            });
+          }
 
-        response ??= {
-          content,
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        };
-        if (toolCalls.length > 0) {
-          response.tool_calls = toolCalls;
+          response ??= {
+            content,
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          };
+          if (toolCalls.length > 0) {
+            response.tool_calls = toolCalls;
+          }
+          if (streamProviderMetadata) {
+            response.providerMetadata = streamProviderMetadata;
+          }
+          if (thinkingContent) {
+            response.thinking_content = thinkingContent;
+          }
+        } else {
+          response = await provider.chat(currentMessages, chatOptions);
         }
-        if (streamProviderMetadata) {
-          response.providerMetadata = streamProviderMetadata;
-        }
-        if (thinkingContent) {
-          response.thinking_content = thinkingContent;
-        }
-      } else {
-        response = await provider.chat(currentMessages, chatOptions);
+      } catch (err) {
+        // Emit the paired `agent_call_end` before rethrowing. Empty response,
+        // error message in `data.error`. No usage/cost — provider didn't
+        // deliver one. `duration` reflects time-to-failure.
+        this.emitEvent({
+          type: 'agent_call_end',
+          agent: agent._name,
+          model: modelUri,
+          promptVersion: agent._config.version,
+          duration: Date.now() - turnStart,
+          data: {
+            response: '',
+            turn: turns,
+            ...(retryReason ? { retryReason } : {}),
+            error: err instanceof Error ? err.message : String(err),
+          },
+        });
+        throw err;
       }
 
       // Capture usage for span instrumentation (per-call, not per-instance)
@@ -2052,9 +2084,22 @@ export class WorkflowContext<TInput = unknown> {
    * auto-checkpointing of `ctx.ask` / spawn / race / parallel / map.
    */
   async checkpoint<T>(name: string, fn: () => Promise<T>): Promise<T> {
-    if (name.startsWith('__auto/')) {
+    // Defensive validation — checkpoint names are state-store keys, so
+    // empty/whitespace-only names round-trip silently and create
+    // hard-to-debug replay failures. The reserved-prefix check is
+    // case-insensitive and trim-aware so accidentally constructed names
+    // like '__AUTO/foo' or ' __auto/foo' don't sneak past.
+    if (typeof name !== 'string' || name.length === 0) {
+      throw new Error('ctx.checkpoint name must be a non-empty string.');
+    }
+    if (name !== name.trim()) {
       throw new Error(
-        `ctx.checkpoint name "${name}" is reserved — names starting with "__auto/" are used by the runtime for ask/spawn/race/parallel/map auto-checkpointing.`,
+        `ctx.checkpoint name "${name}" has leading/trailing whitespace — trim before passing.`,
+      );
+    }
+    if (name.toLowerCase().startsWith('__auto/')) {
+      throw new Error(
+        `ctx.checkpoint name "${name}" is reserved — names starting with "__auto/" (case-insensitive) are used by the runtime for ask/spawn/race/parallel/map auto-checkpointing.`,
       );
     }
     return this._checkpoint(name, fn);
@@ -2804,6 +2849,13 @@ export class WorkflowContext<TInput = unknown> {
 
   private async _awaitHumanImpl(options: AwaitHumanOptions): Promise<HumanDecision> {
     if (this.awaitHumanHandler) {
+      // Emit `await_human` BEFORE invoking the handler so consumers see the
+      // start/end pair regardless of which approval path is taken
+      // (synchronous handler vs runtime-mediated pendingDecisions).
+      this.emitEvent({
+        type: 'await_human',
+        data: { channel: options.channel, prompt: options.prompt },
+      });
       const decision = await this.awaitHumanHandler(options);
       this.emitEvent({
         type: 'await_human_resolved',
@@ -3398,14 +3450,18 @@ export class WorkflowContext<TInput = unknown> {
         }
         data = redacted;
       } else if (partial.type === 'agent_call_end') {
-        // Response side: scrub response + thinking. `turn`, `retryReason`,
-        // `cost`, `tokens`, `duration` (top-level) are structural — preserve.
+        // Response side: scrub response + thinking + error. `turn`,
+        // `retryReason`, `cost`, `tokens`, `duration` (top-level) are
+        // structural — preserve. Provider error messages can echo prompt
+        // text verbatim (e.g. "moderation failed for input 'foo'") so
+        // `data.error` is treated the same as `data.response`.
         const d = data as Record<string, unknown>;
         const redacted: Record<string, unknown> = {
           ...d,
           response: '[redacted]',
         };
         if (d.thinking !== undefined) redacted.thinking = '[redacted]';
+        if (d.error !== undefined) redacted.error = '[redacted]';
         data = redacted;
       } else if (
         partial.type === 'guardrail' ||

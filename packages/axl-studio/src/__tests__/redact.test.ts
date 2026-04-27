@@ -435,6 +435,101 @@ describe('redactStreamEvent', () => {
     expect(redactStreamEvent(event, true)).toBe(event);
   });
 
+  it('scrubs await_human prompt; preserves channel', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'await_human',
+      data: { channel: 'approve-purchase', prompt: 'Approve $5000 wire to Acme Corp?' },
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'await_human' }>;
+    expect(out.data.channel).toBe('approve-purchase');
+    expect(out.data.prompt).toBe('[redacted]');
+  });
+
+  it('passes through await_human with no prompt unchanged', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'await_human',
+      data: { channel: 'approve-purchase' },
+    };
+    expect(redactStreamEvent(event, true)).toBe(event);
+  });
+
+  it('scrubs await_human_resolved approval data; preserves approved + channel', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'await_human_resolved',
+      data: {
+        channel: 'approve-purchase',
+        decision: { approved: true, data: 'note: paid via wire' },
+      },
+    };
+    const out = redactStreamEvent(event, true) as Extract<
+      AxlEvent,
+      { type: 'await_human_resolved' }
+    >;
+    expect(out.data.channel).toBe('approve-purchase');
+    expect(out.data.decision.approved).toBe(true);
+    expect((out.data.decision as { data?: string }).data).toBe('[redacted]');
+  });
+
+  it('scrubs await_human_resolved rejection reason; preserves approved + channel', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'await_human_resolved',
+      data: {
+        channel: 'approve-purchase',
+        decision: { approved: false, reason: 'budget too high — alice@acme.com flagged it' },
+      },
+    };
+    const out = redactStreamEvent(event, true) as Extract<
+      AxlEvent,
+      { type: 'await_human_resolved' }
+    >;
+    expect(out.data.channel).toBe('approve-purchase');
+    expect(out.data.decision.approved).toBe(false);
+    expect((out.data.decision as { reason?: string }).reason).toBe('[redacted]');
+  });
+
+  it('passes through await_human_resolved approve-only (no PII fields)', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'await_human_resolved',
+      data: { channel: 'approve-purchase', decision: { approved: true } },
+    };
+    expect(redactStreamEvent(event, true)).toBe(event);
+  });
+
+  it('passes through checkpoint_save / checkpoint_replay (structural)', () => {
+    // Checkpoint events carry only the user-supplied stable name as their
+    // payload (`{ name }`). Names are caller-controlled and not LLM
+    // output, so no scrubbing is appropriate here. The default arm
+    // handles them.
+    const askMixin = askScoped();
+    const events: AxlEvent[] = [
+      {
+        ...baseEvent(),
+        ...askMixin,
+        type: 'checkpoint_save',
+        data: { name: 'fetch-user' },
+      },
+      {
+        ...baseEvent(),
+        ...askMixin,
+        type: 'checkpoint_replay',
+        data: { name: 'fetch-user' },
+      },
+    ];
+    for (const event of events) {
+      expect(redactStreamEvent(event, true)).toBe(event);
+    }
+  });
+
   it('passes through structural events (agent_call_start, agent_call_end)', () => {
     // These variants don't have user-content fields the wire-boundary scrubber
     // needs to touch. agent_call_end's rich `data` (prompt/response/messages)
@@ -448,6 +543,10 @@ describe('redactStreamEvent', () => {
         agent: 'a1',
         model: 'mock:gpt-4o',
         turn: 1,
+        data: {
+          prompt: '[already redacted]',
+          turn: 1,
+        },
       },
       {
         ...baseEvent(),
@@ -457,7 +556,7 @@ describe('redactStreamEvent', () => {
         model: 'mock:gpt-4o',
         cost: 0.05,
         duration: 100,
-        data: { prompt: '[already redacted]', response: '[already redacted]' },
+        data: { response: '[already redacted]', turn: 1 },
       },
     ];
     for (const event of events) {

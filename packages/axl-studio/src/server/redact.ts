@@ -326,11 +326,17 @@ export function redactStreamEvent(event: AxlEvent, redact: boolean): AxlEvent {
     case 'await_human_resolved': {
       // Decision payload may carry user-supplied content (`data` on
       // approval, `reason` on rejection). Approval bit + channel preserved.
+      // Short-circuit when there are no PII fields so the WS broadcast
+      // doesn't pay a spread for events that wouldn't be scrubbed anyway
+      // (the common "approve-only" approval click).
       const dec = event.data.decision;
       if (!dec) return event;
+      const hasData = 'data' in dec && dec.data !== undefined;
+      const hasReason = 'reason' in dec && dec.reason !== undefined;
+      if (!hasData && !hasReason) return event;
       const scrubbed: typeof dec = { ...dec };
-      if ('data' in scrubbed && scrubbed.data !== undefined) scrubbed.data = REDACTED;
-      if ('reason' in scrubbed && scrubbed.reason !== undefined) scrubbed.reason = REDACTED;
+      if (hasData) (scrubbed as { data?: string }).data = REDACTED;
+      if (hasReason) (scrubbed as { reason?: string }).reason = REDACTED;
       return { ...event, data: { ...event.data, decision: scrubbed } };
     }
     case 'checkpoint_save':
@@ -346,7 +352,7 @@ export function redactStreamEvent(event: AxlEvent, redact: boolean): AxlEvent {
       // input or LLM output).
       return event.status === 'failed' ? { ...event, reason: REDACTED } : event;
     // Structural / numeric events pass through. `agent_call_start`
-    // (prompt/system/messages), `agent_call_end` (response/thinking),
+    // (prompt/system/messages), `agent_call_end` (response/thinking/error),
     // and legacy gate events (guardrail/schema_check/validate) are
     // scrubbed at emission time by core `emitEvent` — second-pass
     // would be wasteful and could mask a missing emitter-level scrub.

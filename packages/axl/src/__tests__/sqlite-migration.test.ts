@@ -9,12 +9,14 @@ import type { ExecutionInfo } from '../types.js';
 const require_ = createRequire(import.meta.url);
 
 /**
- * Migration tests for the spec/16 schema bump:
- * `execution_history.steps` → `events`. The SQLiteStore constructor runs
- * `migrate()` before `initTables()` and tracks version via PRAGMA
- * `user_version`. Idempotent, transactional, rolls back on failure.
+ * Migration tests for the SQLiteStore schema:
+ * - v0 → v1: `execution_history.steps` → `events` (spec/16).
+ * - v1 → v2: `checkpoints.step` (INTEGER) → `checkpoints.name` (TEXT).
+ * The SQLiteStore constructor runs `migrate()` before `initTables()` and
+ * tracks version via PRAGMA `user_version`. Idempotent, transactional,
+ * rolls back on failure.
  */
-describe('SQLiteStore — schema migration v0 → v1', () => {
+describe('SQLiteStore — schema migration v0 → v2', () => {
   const tmps: string[] = [];
 
   afterEach(() => {
@@ -148,6 +150,63 @@ describe('SQLiteStore — schema migration v0 → v1', () => {
     } finally {
       db.close();
     }
+  });
+
+  it('v1 → v2: renames checkpoints.step → name and stringified rows round-trip', async () => {
+    const path = makeTmpFile();
+    const Database = require_('better-sqlite3');
+
+    // Pre-seed a v1 DB by hand: execution_history with `events` (post-v0→v1)
+    // and the OLD checkpoints schema with INTEGER `step`. user_version=1.
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE execution_history (
+        execution_id TEXT PRIMARY KEY,
+        workflow TEXT NOT NULL,
+        status TEXT NOT NULL,
+        total_cost REAL NOT NULL DEFAULT 0,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        duration INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        events TEXT NOT NULL
+      );
+      CREATE TABLE checkpoints (
+        execution_id TEXT NOT NULL,
+        step INTEGER NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (execution_id, step)
+      );
+      PRAGMA user_version = 1;
+    `);
+    seed
+      .prepare('INSERT INTO checkpoints (execution_id, step, data) VALUES (?, ?, ?)')
+      .run('exec-legacy', 0, JSON.stringify({ legacy: true }));
+    seed.close();
+
+    // Re-open via SQLiteStore — runs v1→v2 migration.
+    const store = new SQLiteStore(path);
+
+    // Verify column rename + version bump.
+    const db = new Database(path, { readonly: true });
+    try {
+      expect(db.pragma('user_version', { simple: true })).toBe(2);
+      const cols = db.pragma('table_info(checkpoints)') as Array<{ name: string }>;
+      const names = cols.map((c) => c.name);
+      expect(names).toContain('name');
+      expect(names).not.toContain('step');
+    } finally {
+      db.close();
+    }
+
+    // Stringified-integer reads MUST round-trip — SQLite is dynamically
+    // typed so the stored INTEGER 0 returns under name === '0'.
+    const got = await store.getCheckpoint('exec-legacy', '0');
+    expect(got).toEqual({ legacy: true });
+
+    // The new code never writes that name (auto-checkpoints use
+    // __auto/<agent>/ask/<n>), so legacy rows are stranded — but the
+    // raw lookup must still return them when explicitly addressed.
   });
 
   it('round-trip: saveExecution writes via new column name; getExecution reads back', async () => {

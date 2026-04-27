@@ -94,13 +94,22 @@ for a step-by-step consumer migration guide.
 - **`StateStore.{save,get}Checkpoint(executionId, step: number)` →
   `(executionId, name: string)`.** Custom `StateStore` impls must
   switch the `step: number` parameter to `name: string`. Built-in
-  stores migrate transparently:
+  stores:
   - `MemoryStore`: inner `Map<number>` → `Map<string>`, no-op for callers.
   - `SQLiteStore`: schema v1→v2 renames `checkpoints.step` (INTEGER)
-    → `checkpoints.name` (TEXT). SQLite is dynamically typed, so
-    legacy integer values become string names like `"0"` — in-flight
-    executions keep replaying correctly.
+    → `checkpoints.name` (TEXT). The migration is structurally clean,
+    but **legacy auto-checkpoint rows are stranded** — the new runtime
+    composes names like `__auto/<agent>/ask/<n>` and `__auto/<primitive>/<n>`,
+    which never match the legacy `"0"`, `"1"`, … strings produced by
+    the old integer counter. **In-flight v1 executions resumed under v2
+    will re-execute side effects** rather than replay from saved state.
+    Recommended migration: drain or cancel running executions before
+    upgrading. User-named checkpoints (`ctx.checkpoint('my-name', …)`
+    on the new API; never possible on the old single-arg form) are
+    unaffected.
   - `RedisStore`: hash field is now the name directly (no `String(step)`).
+    Same caveat — old hash fields with stringified-integer keys are
+    stranded after the upgrade.
 - **`StateStore.getLatestCheckpoint` removed.** Undefined semantics
   under named keys (no implicit ordering); never called by the runtime.
 - **`CheckpointEventData` shape: `{ step: number }` → `{ name: string }`.**

@@ -530,38 +530,54 @@ describe('redactStreamEvent', () => {
     }
   });
 
-  it('passes through structural events (agent_call_start, agent_call_end)', () => {
-    // These variants don't have user-content fields the wire-boundary scrubber
-    // needs to touch. agent_call_end's rich `data` (prompt/response/messages)
-    // is scrubbed at emission time by core `emitEvent` — second-pass here
-    // would be wasteful. Default branch returns the event as-is.
-    const events: AxlEvent[] = [
-      {
-        ...baseEvent(),
-        ...askScoped(),
-        type: 'agent_call_start',
-        agent: 'a1',
-        model: 'mock:gpt-4o',
+  it('scrubs agent_call_start.data.prompt (defense-in-depth re-scrub)', () => {
+    // The unified `REDACTION_RULES` table runs at both emit-time AND the
+    // WS boundary. If the runtime emitted an event under `redact: false`
+    // and a REST read picks it up under `redact: true`, the WS layer
+    // catches what emit missed. Idempotent — scrubbing an
+    // already-scrubbed event still returns a scrubbed event.
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'agent_call_start',
+      agent: 'a1',
+      model: 'mock:gpt-4o',
+      turn: 1,
+      data: { prompt: 'sensitive user input', turn: 1, system: 'sensitive system prompt' },
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'agent_call_start' }>;
+    expect(out.data.prompt).toBe('[redacted]');
+    expect(out.data.system).toBe('[redacted]');
+    // Structural fields preserved.
+    expect(out.data.turn).toBe(1);
+    expect(out.agent).toBe('a1');
+    expect(out.model).toBe('mock:gpt-4o');
+  });
+
+  it('scrubs agent_call_end.data.response/thinking/error (defense-in-depth re-scrub)', () => {
+    const event: AxlEvent = {
+      ...baseEvent(),
+      ...askScoped(),
+      type: 'agent_call_end',
+      agent: 'a1',
+      model: 'mock:gpt-4o',
+      cost: 0.05,
+      duration: 100,
+      data: {
+        response: 'sensitive completion',
+        thinking: 'sensitive reasoning',
+        error: 'leaked input value: secret',
         turn: 1,
-        data: {
-          prompt: '[already redacted]',
-          turn: 1,
-        },
       },
-      {
-        ...baseEvent(),
-        ...askScoped(),
-        type: 'agent_call_end',
-        agent: 'a1',
-        model: 'mock:gpt-4o',
-        cost: 0.05,
-        duration: 100,
-        data: { response: '[already redacted]', turn: 1 },
-      },
-    ];
-    for (const event of events) {
-      expect(redactStreamEvent(event, true)).toBe(event);
-    }
+    };
+    const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'agent_call_end' }>;
+    expect(out.data.response).toBe('[redacted]');
+    expect(out.data.thinking).toBe('[redacted]');
+    expect(out.data.error).toBe('[redacted]');
+    // Numeric/structural fields preserved (load-bearing for cost rails).
+    expect(out.cost).toBe(0.05);
+    expect(out.duration).toBe(100);
+    expect(out.data.turn).toBe(1);
   });
 });
 

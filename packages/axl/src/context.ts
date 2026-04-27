@@ -37,6 +37,7 @@ import {
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
 import { COST_BEARING_LEAF_TYPES } from './event-utils.js';
+import { redactEvent } from './redaction.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import type { AxlConfig } from './config.js';
@@ -3399,289 +3400,14 @@ export class WorkflowContext<TInput = unknown> {
     // responsible for pairing `type` with the matching variant fields.
     [key: string]: unknown;
   }): void {
-    // Top-level redaction for variants whose user/LLM payload sits outside
-    // `data` (e.g. `ask_start.prompt`, `ask_end.outcome.{result,error}`).
-    // Mutates `partial` in place — done before the `data`-branch redactor
-    // below to keep the two paths independent.
-    if (this.config.trace?.redact) {
-      if (partial.type === 'ask_start' && typeof partial.prompt === 'string') {
-        partial.prompt = '[redacted]';
-      } else if (partial.type === 'ask_end') {
-        const outcome = partial.outcome as
-          | { ok: true; result: unknown }
-          | { ok: false; error: string }
-          | undefined;
-        if (outcome?.ok) {
-          partial.outcome = { ok: true, result: '[redacted]' };
-        } else if (outcome) {
-          partial.outcome = { ok: false, error: '[redacted]' };
-        }
-      }
-    }
-    let data: unknown = partial.data;
-    if (this.config.trace?.redact && data) {
-      // Redact any field that can carry prompt/response/PII content. Structural
-      // fields (attempt, maxAttempts, params, turn, valid, blocked, etc.) are
-      // left visible so traces remain useful for debugging and observability.
-      // Redaction preserves the original field shape — strings become
-      // '[redacted]' strings, `messages` stays a `ChatMessage[]` (single stub
-      // entry preserving the count) — so downstream consumers can narrow
-      // types without special-casing redacted vs non-redacted events.
-      if (partial.type === 'token') {
-        // `token.data` is the raw LLM chunk — the highest-volume PII surface.
-        // Closes the CLAUDE.md three-layer contract: Studio's WS
-        // `redactStreamEvent` already scrubs `token.data`, but direct
-        // `runtime.on('trace', ...)` consumers bypassed that layer. Now the
-        // emit-time scrub catches them too.
-        data = '[redacted]';
-      } else if (partial.type === 'agent_call_start') {
-        // Request side: scrub prompt + system + verbose messages snapshot.
-        // `params`, `turn`, `retryReason`, `toolNames` are structural — preserve.
-        const d = data as Record<string, unknown>;
-        const redacted: Record<string, unknown> = {
-          ...d,
-          prompt: '[redacted]',
-        };
-        if (d.system !== undefined) redacted.system = '[redacted]';
-        if (Array.isArray(d.messages)) {
-          redacted.messages = [
-            { role: 'system', content: `[${d.messages.length} messages redacted]` },
-          ];
-        }
-        data = redacted;
-      } else if (partial.type === 'agent_call_end') {
-        // Response side: scrub response + thinking + error. `turn`,
-        // `retryReason`, `cost`, `tokens`, `duration` (top-level) are
-        // structural — preserve. Provider error messages can echo prompt
-        // text verbatim (e.g. "moderation failed for input 'foo'") so
-        // `data.error` is treated the same as `data.response`.
-        const d = data as Record<string, unknown>;
-        const redacted: Record<string, unknown> = {
-          ...d,
-          response: '[redacted]',
-        };
-        if (d.thinking !== undefined) redacted.thinking = '[redacted]';
-        if (d.error !== undefined) redacted.error = '[redacted]';
-        data = redacted;
-      } else if (
-        partial.type === 'guardrail' ||
-        partial.type === 'schema_check' ||
-        partial.type === 'validate'
-      ) {
-        const d = data as Record<string, unknown>;
-        // `reason` can trivially echo user input (e.g. "Value 'john@acme.com'
-        // is not a valid email") — redact it alongside `feedbackMessage`.
-        const needsRedact = d.feedbackMessage !== undefined || d.reason !== undefined;
-        if (needsRedact) {
-          data = {
-            ...d,
-            ...(d.reason !== undefined ? { reason: '[redacted]' } : {}),
-            ...(d.feedbackMessage !== undefined ? { feedbackMessage: '[redacted]' } : {}),
-          };
-        }
-      } else if (partial.type === 'tool_call_start') {
-        // Pre-execution args carry the same user PII as the post-execution
-        // tool_call_end. Scrub at emit time so direct `runtime.on('trace')`
-        // consumers and `ExecutionInfo.events` reads don't leak them.
-        const d = data as Record<string, unknown>;
-        data = { ...d, args: '[redacted]' };
-      } else if (partial.type === 'tool_call_end') {
-        // Tool args can carry user PII ("lookup SSN: 123-45-6789"), tool
-        // results can carry full records from internal systems. Redact both
-        // when the global trace.redact policy is on; callId stays visible so
-        // consumers can still correlate with other events in the stream.
-        const d = data as Record<string, unknown>;
-        data = {
-          ...d,
-          args: '[redacted]',
-          result: '[redacted]',
-        };
-      } else if (partial.type === 'tool_denied') {
-        // The LLM named a tool the agent doesn't expose. `args` and `reason`
-        // can echo user intent verbatim.
-        const d = (data ?? {}) as Record<string, unknown>;
-        data = {
-          ...d,
-          ...(d.args !== undefined ? { args: '[redacted]' } : {}),
-          ...(d.reason !== undefined ? { reason: '[redacted]' } : {}),
-        };
-      } else if (partial.type === 'partial_object') {
-        // Progressive structured-output snapshots carry the same payload
-        // as the final result — same PII surface. Stream-only, but still
-        // flows through `onTrace` to any direct subscriber.
-        const d = data as Record<string, unknown>;
-        if (d.object !== undefined) {
-          data = { ...d, object: '[redacted]' };
-        }
-      } else if (partial.type === 'verify') {
-        // `lastError` echoes the verify predicate's failure message, which
-        // often quotes the LLM's output (the same text that's scrubbed on
-        // agent_call_end).
-        const d = data as Record<string, unknown>;
-        if (d.lastError !== undefined) {
-          data = { ...d, lastError: '[redacted]' };
-        }
-      } else if (partial.type === 'pipeline') {
-        // Only the `failed` status carries `reason` (the feedback message
-        // about to be injected into the conversation — quotes LLM output).
-        // Mutate the top-level field in-place; pipeline events don't use
-        // `data` for the reason.
-        if ((partial as { status?: string }).status === 'failed') {
-          (partial as Record<string, unknown>).reason = '[redacted]';
-        }
-      } else if (partial.type === 'tool_approval') {
-        const d = data as Record<string, unknown>;
-        data = {
-          ...d,
-          args: '[redacted]',
-          ...(d.reason !== undefined ? { reason: '[redacted]' } : {}),
-        };
-      } else if (partial.type === 'handoff_start') {
-        // `message` on roundtrip handoff_start is the user-supplied prompt
-        // passed to the target. Structural fields (source, target, mode)
-        // stay visible.
-        const d = data as Record<string, unknown>;
-        if (d.message !== undefined) {
-          data = { ...d, message: '[redacted]' };
-        }
-      } else if (partial.type === 'await_human') {
-        // The prompt is user-facing copy describing the decision. May echo
-        // workflow input or LLM output; scrub. `channel` is structural
-        // (routing identifier) — preserve.
-        const d = data as Record<string, unknown>;
-        if (d.prompt !== undefined) {
-          data = { ...d, prompt: '[redacted]' };
-        }
-      } else if (partial.type === 'await_human_resolved') {
-        // The decision payload often carries user-supplied content (e.g.,
-        // a comment field on `{approved: true, data: ...}` or a rejection
-        // `reason`). Scrub the discriminant fields while preserving the
-        // approval bit and channel for routing/audit.
-        const d = data as Record<string, unknown>;
-        const dec = d.decision as Record<string, unknown> | undefined;
-        if (dec) {
-          const scrubbedDecision: Record<string, unknown> = { ...dec };
-          if (dec.data !== undefined) scrubbedDecision.data = '[redacted]';
-          if (dec.reason !== undefined) scrubbedDecision.reason = '[redacted]';
-          data = { ...d, decision: scrubbedDecision };
-        }
-      } else if (partial.type === 'workflow_start') {
-        // `input` is the user-supplied workflow input. Scrub it; keep shape so
-        // consumers can still detect the event. Structural fields (executionId
-        // on the parent event, workflow name) remain visible.
-        const d = data as Record<string, unknown>;
-        if (d.input !== undefined) {
-          data = { ...d, input: '[redacted]' };
-        }
-      } else if (partial.type === 'workflow_end') {
-        // `result` is the workflow return value, `error` is the thrown error
-        // message — both can echo user data (e.g., Zod error messages from
-        // outputSchema.parse failures quote the offending user value). Status,
-        // duration, and `aborted` are structural — keep visible.
-        const d = data as Record<string, unknown>;
-        const redacted: Record<string, unknown> = { ...d };
-        if (d.result !== undefined) redacted.result = '[redacted]';
-        if (d.error !== undefined) redacted.error = '[redacted]';
-        data = redacted;
-      } else if (
-        partial.type === 'memory_remember' ||
-        partial.type === 'memory_recall' ||
-        partial.type === 'memory_forget'
-      ) {
-        // Memory-event data fields can carry PII (`key` may echo user
-        // input like "user:john@x.com"; `usage.model` may expose the
-        // embedder URI). Conservative redaction: scrub string fields;
-        // preserve numeric/boolean fields (load-bearing for the Cost
-        // Dashboard's byEmbedder bucket + trace-explorer row metadata).
-        // `scope` is a structural discriminator (`'session' | 'global'`
-        // in practice) — preserved, matching the WS-layer policy in
-        // `redactStreamEvent` so consumers see consistent values across
-        // both redaction boundaries. One-level object walk on nested
-        // containers keeps `usage.tokens` / `usage.cost` visible while
-        // scrubbing string fields like `usage.model`.
-        const d = data as Record<string, unknown>;
-        const redacted: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(d)) {
-          if (k === 'scope' || typeof v === 'number' || typeof v === 'boolean') {
-            redacted[k] = v;
-          } else if (typeof v === 'string') {
-            redacted[k] = '[redacted]';
-          } else if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
-            const inner = v as Record<string, unknown>;
-            const innerRedacted: Record<string, unknown> = {};
-            for (const [ik, iv] of Object.entries(inner)) {
-              if (typeof iv === 'number' || typeof iv === 'boolean') {
-                innerRedacted[ik] = iv;
-              } else {
-                innerRedacted[ik] = '[redacted]';
-              }
-            }
-            redacted[k] = innerRedacted;
-          } else {
-            redacted[k] = '[redacted]';
-          }
-        }
-        data = redacted;
-      } else if (partial.type === 'done') {
-        // Terminal marker — `data.result` IS the workflow return value.
-        data = { result: '[redacted]' };
-      } else if (partial.type === 'error') {
-        // Terminal error marker — `data.message` can echo user / LLM
-        // content. `name` / `code` are structural and pass through.
-        const d = data as Record<string, unknown>;
-        data = {
-          ...d,
-          ...(d.message !== undefined ? { message: '[redacted]' } : {}),
-        };
-      } else if (partial.type === 'log') {
-        // `log` events can carry arbitrary user-emitted data (ctx.log) or
-        // system events like await_human that include user-supplied prompts.
-        // Conservative redaction: scrub string fields, preserve structural
-        // ones (event name, channel, step counts, numeric observability
-        // data). For nested objects, walk ONE level deep and apply the
-        // same rules — this preserves `usage.tokens` / `usage.cost` on
-        // memory events (numeric, non-PII, load-bearing for the Cost
-        // Dashboard's byEmbedder bucket) while still scrubbing string
-        // fields like `usage.model` that could carry tenant info.
-        //
-        // We deliberately don't recurse beyond one level. `ctx.log({ foo:
-        // { bar: { baz: 'secret' } } })` will have `foo.bar` replaced
-        // with an opaque sentinel — if a caller needs deeper structure
-        // preserved they should flatten before emitting. One level is
-        // exactly enough for the `usage` namespace shape we control.
-        const d = data as Record<string, unknown>;
-        const redacted: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(d)) {
-          // Keep the `event` discriminator and purely-numeric/boolean
-          // fields visible at the top level.
-          if (k === 'event' || typeof v === 'number' || typeof v === 'boolean') {
-            redacted[k] = v;
-          } else if (typeof v === 'string') {
-            redacted[k] = '[redacted]';
-          } else if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
-            // One-level walk: preserve numeric/boolean fields, scrub strings.
-            // Arrays skipped — they're more commonly user data than structured
-            // numeric buckets, and deep-scrubbing them loses shape.
-            const inner = v as Record<string, unknown>;
-            const innerRedacted: Record<string, unknown> = {};
-            for (const [ik, iv] of Object.entries(inner)) {
-              if (typeof iv === 'number' || typeof iv === 'boolean') {
-                innerRedacted[ik] = iv;
-              } else if (typeof iv === 'string') {
-                innerRedacted[ik] = '[redacted]';
-              } else {
-                innerRedacted[ik] = '[redacted]';
-              }
-            }
-            redacted[k] = innerRedacted;
-          } else {
-            // Arrays, null, or deeper nesting — opaque sentinel.
-            redacted[k] = '[redacted]';
-          }
-        }
-        data = redacted;
-      }
-    }
+    // Redaction is now table-driven: `REDACTION_RULES` in `redaction.ts`
+    // owns every per-variant scrub, applied below to the constructed
+    // event via `redactEvent(...)`. The legacy if/else ladder that used
+    // to live here was duplicated by Studio's `redactStreamEvent`; both
+    // sites now consult the same rules so adding a new event variant
+    // can't drift between layers. Per-variant scrub contracts live at
+    // the rule definitions in `redaction.ts`.
+    const data: unknown = partial.data;
     // `as unknown as AxlEvent`: the loose internal `partial` type can't be
     // narrowed to a single discriminated union member at compile time, but the
     // runtime invariant is maintained by the gate/emission call sites that
@@ -3762,12 +3488,18 @@ export class WorkflowContext<TInput = unknown> {
       ...partial,
       data,
     } as unknown as AxlEvent;
+    // Per-variant scrub via the shared `REDACTION_RULES` table — single
+    // source of truth shared with Studio's `redactStreamEvent`. Applied
+    // AFTER the event is constructed so cost-rail accumulation (above)
+    // sees the unscrubbed numeric fields. Top-level numerics (`cost`,
+    // `tokens`, `duration`) are preserved by every rule.
+    const finalEvent = this.config.trace?.redact ? redactEvent(event) : event;
     // Isolate consumer bugs: a buggy onTrace handler must not crash the
     // workflow. Swallow and forward to console.error so the caller sees
     // the failure in ops but the workflow keeps running.
     if (this.onTrace) {
       try {
-        this.onTrace(event);
+        this.onTrace(finalEvent);
       } catch (err) {
         console.error(
           '[axl] onTrace handler threw; trace event dropped:',

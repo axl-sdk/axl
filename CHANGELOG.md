@@ -597,6 +597,31 @@ function_declarations[0].parameters'`.
   stale `import { StreamEvent } from '../types.js'` (no longer
   exported).
 
+### Changed — Redaction consolidation
+
+- **Single source of truth for `config.trace.redact` per-variant
+  scrubbing.** Both core's emit-time scrub (in
+  `WorkflowContext.emitEvent`) and Studio's WS-boundary scrub (in
+  `redactStreamEvent`) now consult the same `REDACTION_RULES` table
+  exported from `@axlsdk/axl`. Previously each layer walked the
+  `AxlEvent` union with its own ladder; the WS layer missed
+  `workflow_start` / `workflow_end` / `log` / full `memory_*` fields
+  that core scrubbed, so REST reads of stored
+  `ExecutionInfo.events` could leak under flag-flip scenarios.
+  Adding a new event variant updates one place — `Record<AxlEventType,
+  RuleFor<...>>` makes a missing rule a typecheck error.
+- **New core exports:** `REDACTED`, `REDACTION_RULES`, `redactEvent`
+  from `@axlsdk/axl`. Custom observability sinks can apply the same
+  rules pre-export (e.g. when forwarding events to a third-party
+  observability platform).
+- **Behavior change at the WS boundary:** `redactStreamEvent` now also
+  scrubs `agent_call_start` / `agent_call_end` data fields when invoked
+  with `redact: true`. Previously these were considered emit-time-only;
+  now they're idempotent re-scrubs that close the gap when a runtime
+  emits under `redact: false` and a REST read serializes under
+  `redact: true`. Output for events that flowed through emit-time
+  scrubbing is identical.
+
 ### Deprecated
 
 - `AxlEventBase.parentToolCallId` is `@deprecated` (one-cycle window).

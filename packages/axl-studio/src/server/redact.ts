@@ -35,6 +35,7 @@ import type {
   AxlEvent,
   EvalHistoryEntry,
 } from '@axlsdk/axl';
+import { redactEvent } from '@axlsdk/axl';
 import type { EvalResult, EvalItem, ScorerDetail } from '@axlsdk/eval';
 
 // Stream events on the wire are `AxlEvent` — the translation layer was
@@ -217,150 +218,30 @@ export function redactSessionHistory(history: ChatMessage[], redact: boolean): C
 // ── Stream events (WS broadcast) ─────────────────────────────────────
 
 /**
- * Scrub an `AxlEvent` before broadcasting it to Studio WS subscribers.
- * Playground, workflow-execute, AND the trace-channel firehose all run
- * events through this function under `trace.redact: true`. The core
- * `emitEvent` already redacts most fields at emission time (prompts,
- * responses, system, etc.); this function is the wire-boundary
- * defense-in-depth pass.
+ * Scrub an `AxlEvent` before broadcasting it to Studio WS subscribers or
+ * serializing it through a REST response.
  *
- * Per-variant scrubbing per spec §5.1:
+ * Per-variant scrub logic lives in core's `REDACTION_RULES` table
+ * (`packages/axl/src/redaction.ts`). Both this WS-boundary scrubber and
+ * core's emit-time scrubber consult the same rules, so adding a new
+ * `AxlEvent` variant updates both layers in one place — no drift.
  *
- * | Event             | Scrubbed                          | Preserved (structural) |
- * | ----------------- | --------------------------------- | ---------------------- |
- * | token             | data (token text)                 | askId/depth/agent      |
- * | tool_call_start   | data.args                         | tool/callId/askId      |
- * | tool_call_end     | data.args, data.result            | tool/callId/duration   |
- * | tool_approval     | data.args, data.reason            | data.approved/tool     |
- * | tool_denied       | data.args, data.reason            | tool/callId            |
- * | ask_start         | prompt                            | askId/agent/depth      |
- * | ask_end           | outcome.{result,error}            | cost/duration/ok       |
- * | handoff           | data.message (roundtrip arg)      | source/target/mode     |
- * | partial_object    | data.object                       | attempt/askId          |
- * | verify            | data.lastError                    | passed/attempts        |
- * | memory_*          | data.key                          | scope/count/cost       |
- * | done              | data.result                       | -                      |
- * | error             | data.message                      | data.name/code         |
- * | delegate          | (nothing — all structural)        | all                    |
- * | pipeline          | reason (only on `failed`)         | stage/status/attempt   |
+ * The defense-in-depth value of this layer remains: when a runtime emits
+ * events with `redact: false` (rare but possible — e.g. a multi-tenant
+ * setup where the per-request decision is made later) and they land in
+ * `ExecutionInfo.events` for a REST read with `redact: true`, this
+ * second pass catches the missed scrub. Structural metadata
+ * (`executionId`/`step`/`timestamp`/`askId`/`agent`/etc.) and numeric
+ * observability fields (`cost`/`tokens`/`duration`) are preserved by
+ * every rule.
  *
- * Top-level `cost`, `tokens`, `duration` are NEVER scrubbed (numeric
- * observability metrics). `askId`/`parentAskId`/`depth`/`agent`/
- * `executionId`/`step`/`timestamp` are NEVER scrubbed (random IDs and
- * structural metadata).
+ * Programmatic callers of `runtime.execute()` and direct StateStore
+ * reads still receive raw events — redaction is an observability-boundary
+ * filter, not a data-at-rest transform.
  */
 export function redactStreamEvent(event: AxlEvent, redact: boolean): AxlEvent {
   if (!redact) return event;
-  switch (event.type) {
-    case 'token':
-      return { ...event, data: REDACTED };
-    case 'tool_call_start':
-      return { ...event, data: { args: REDACTED } };
-    case 'tool_call_end':
-      return { ...event, data: { args: REDACTED, result: REDACTED, callId: event.data.callId } };
-    case 'tool_approval':
-      return {
-        ...event,
-        data: {
-          ...event.data,
-          args: REDACTED,
-          ...(event.data.reason !== undefined ? { reason: REDACTED } : {}),
-        },
-      };
-    case 'tool_denied':
-      // The variant carries `data?: ToolDeniedData` — may be undefined.
-      // Scrub args/reason if present; preserve callId for correlation.
-      return event.data
-        ? {
-            ...event,
-            data: {
-              ...event.data,
-              ...(event.data.args !== undefined ? { args: REDACTED } : {}),
-              ...(event.data.reason !== undefined ? { reason: REDACTED } : {}),
-            },
-          }
-        : event;
-    case 'done':
-      return { ...event, data: { result: REDACTED } };
-    case 'error':
-      return { ...event, data: { ...event.data, message: REDACTED } };
-    case 'ask_start':
-      return { ...event, prompt: REDACTED };
-    case 'ask_end':
-      return event.outcome.ok
-        ? { ...event, outcome: { ok: true, result: REDACTED } }
-        : { ...event, outcome: { ok: false, error: REDACTED } };
-    case 'handoff_start':
-      // `message` on roundtrip is the user-supplied prompt passed to the
-      // target. Structural fields (source, target, mode) stay visible.
-      return event.data.message !== undefined
-        ? { ...event, data: { ...event.data, message: REDACTED } }
-        : event;
-    case 'handoff_return':
-      // Pure structural marker — `source`, `target`, `duration` only.
-      // The return value lives on the target's ask_end.outcome, which
-      // is scrubbed by the ask_end case above.
-      return event;
-    case 'partial_object':
-      // Progressive structured-output snapshots — same risk surface as
-      // the final result on `done`.
-      return { ...event, data: { object: REDACTED } };
-    case 'verify':
-      return event.data.lastError !== undefined
-        ? { ...event, data: { ...event.data, lastError: REDACTED } }
-        : event;
-    case 'memory_remember':
-    case 'memory_recall':
-    case 'memory_forget':
-      // `key` may echo user input on semantic recall. `scope`, `count`,
-      // numeric `cost` and `usage.tokens` are structural — preserve.
-      return event.data.key !== undefined
-        ? { ...event, data: { ...event.data, key: REDACTED } }
-        : event;
-    case 'await_human':
-      // Prompt is user-facing copy that may echo workflow input. `channel`
-      // is structural routing — preserve.
-      return event.data.prompt !== undefined
-        ? { ...event, data: { ...event.data, prompt: REDACTED } }
-        : event;
-    case 'await_human_resolved': {
-      // Decision payload may carry user-supplied content (`data` on
-      // approval, `reason` on rejection). Approval bit + channel preserved.
-      // Short-circuit when there are no PII fields so the WS broadcast
-      // doesn't pay a spread for events that wouldn't be scrubbed anyway
-      // (the common "approve-only" approval click).
-      const dec = event.data.decision;
-      if (!dec) return event;
-      const hasData = 'data' in dec && dec.data !== undefined;
-      const hasReason = 'reason' in dec && dec.reason !== undefined;
-      if (!hasData && !hasReason) return event;
-      const scrubbed: typeof dec = { ...dec };
-      if (hasData) (scrubbed as { data?: string }).data = REDACTED;
-      if (hasReason) (scrubbed as { reason?: string }).reason = REDACTED;
-      return { ...event, data: { ...event.data, decision: scrubbed } };
-    }
-    case 'checkpoint_save':
-    case 'checkpoint_replay':
-      // Pure structural marker — `name` is the caller-supplied stable
-      // identifier (or `__auto/<primitive>/<n>` for runtime auto-checkpoints).
-      // Treated as structural, not scrubbed; callers should avoid putting
-      // PII in checkpoint names.
-      return event;
-    case 'pipeline':
-      // Only the `failed` status carries `reason` (the feedback message
-      // about to be injected into the conversation — may echo user
-      // input or LLM output).
-      return event.status === 'failed' ? { ...event, reason: REDACTED } : event;
-    // Structural / numeric events pass through. `agent_call_start`
-    // (prompt/system/messages), `agent_call_end` (response/thinking/error),
-    // and legacy gate events (guardrail/schema_check/validate) are
-    // scrubbed at emission time by core `emitEvent` — second-pass
-    // would be wasteful and could mask a missing emitter-level scrub.
-    // `delegate`, `tool_call_start` (handled above), `workflow_*`,
-    // `log` (already scrubbed at emission) all fall through.
-    default:
-      return event;
-  }
+  return redactEvent(event);
 }
 
 // ── Eval results ─────────────────────────────────────────────────────

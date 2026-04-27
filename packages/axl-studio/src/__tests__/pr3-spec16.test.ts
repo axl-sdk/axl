@@ -346,7 +346,11 @@ describe('redactStreamEvent — spec §5.1 per-variant scrubbing', () => {
     expect(redactStreamEvent(ev, true)).toBe(ev);
   });
 
-  it('agent_call_end: passes through (core emitter scrubbed at emission)', () => {
+  it('agent_call_end: scrubs response/thinking/error via shared rules', () => {
+    // After unifying emit-time and WS-time scrubbing on the
+    // `REDACTION_RULES` table, the WS layer also scrubs `agent_call_end`
+    // — defense-in-depth for the case where the runtime emitted under
+    // `redact: false` and a REST read serializes it under `redact: true`.
     const ev = {
       ...baseFields('agent_call_end'),
       ...askScoped,
@@ -354,9 +358,13 @@ describe('redactStreamEvent — spec §5.1 per-variant scrubbing', () => {
       model: 'mock:test',
       cost: 0.01,
       duration: 5,
-      data: { prompt: '[redacted]', response: '[redacted]' },
+      data: { response: 'sensitive', thinking: 'sensitive', turn: 1 },
     } as unknown as AxlEvent;
-    expect(redactStreamEvent(ev, true)).toBe(ev);
+    const r = redactStreamEvent(ev, true) as Extract<AxlEvent, { type: 'agent_call_end' }>;
+    expect(r.data.response).toBe(REDACTED);
+    expect(r.data.thinking).toBe(REDACTED);
+    expect(r.cost).toBe(0.01);
+    expect(r.duration).toBe(5);
   });
 });
 

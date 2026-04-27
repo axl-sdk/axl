@@ -98,6 +98,7 @@ export type {
   AgentCallInfo,
 } from './types.js';
 export { AXL_EVENT_TYPES } from './types.js';
+export { REDACTED, REDACTION_RULES, redactEvent } from './redaction.js';
 
 // Errors
 export {

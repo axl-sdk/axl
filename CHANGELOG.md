@@ -7,936 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed — Documentation audit sweep (docs-only)
-
-Comprehensive doc audit pass. Fixed `AxlRuntime` constructor shape in
-`docs/security.md` and `packages/axl-studio/README.md` (the example
-showed `new AxlRuntime({ config: { ... } })` but the constructor takes
-the config directly). Reconciled migration version to `0.15.x → 0.16.0`
-in the unified-event-model migration guide and added dedicated sections
-for the `ctx.checkpoint(name, fn)` rename, the `parentToolCallId`
-removal, and an "Additive changes" summary covering `bufferCaps`,
-`config.state.maxEventsPerExecution`, `AnyWorkflow`, `parsePartialJson`,
-`fullText` per-askId scoping, and the new `await_human*` /
-`checkpoint_*` event variants. Renamed lingering `AgentCallData`
-references in `docs/api-reference.md` to the actual exports
-(`AgentCallStartData` / `AgentCallEndData` / `AgentCallParams`); added
-table rows for `await_human` / `await_human_resolved` / `checkpoint_save`
-/ `checkpoint_replay` / `pipeline` / `partial_object`. Documented
-`config.state.maxEventsPerExecution`, `AnyWorkflow`, and
-`parsePartialJson` in the API reference. Fixed scrubbed-fields paths
-(`handoff.data.message` → `handoff_start.data.message`,
-`tool_approval.args` → `tool_approval.data.args`). Replaced stale
-`CostAggregator` mention with `TraceAggregator<CostData>`. Updated
-`agent_call.data.messages` → `agent_call_end.data.messages` in the
-Studio README. Bumped the Studio replay-buffer cap from "500" to "1000"
-to match the implemented default. Fixed broken `#trace-event-types`
-anchor in `packages/axl/README.md`. Added `MockProvider.chunked()` and
-the per-response `chunks?: string[]` option, plus the `AxlTestRuntime`
-`{ config }` constructor option, to the `axl-testing` README. Smaller
-polish: architecture-doc pointer to the migration guide,
-`agent_call` → `agent_call_*` plural in the `askId` description, a
-"Migrating from 0.15?" callout in the core-package README, and a note
-that `captureTraces` strips verbose snapshots and token /
-`partial_object` events. No source code changes; `pnpm -r typecheck`
-clean.
-
-### Changed — Test coverage additions (defense-in-depth, test-only)
-
-Four ship-readiness audit items pinned with regression tests; no source
-code changes.
-
-- `runtime.test.ts` — new `runWorkflowBody parity` describe block
-  parameterizes 6 cases (execute|stream × success|throw|abort) and
-  asserts exactly one `workflow_start` and one `workflow_end` per run,
-  with `workflow_end.data.status` / `aborted` matching the outcome.
-  Catches drift in the start-iff-end pairing invariant on either path.
-- `runtime.test.ts:914-944` — extends the existing
-  `emits workflow_end trace with failed status on error` test with a
-  spec §9 assertion: a top-level workflow throw (NOT inside `ctx.ask`)
-  must emit zero `ask_end` events. Pins the boundary between the
-  workflow-level `error` channel and the ask-level `ask_end` failure
-  surface.
-- `fulltext-commit.test.ts` — new 3-branch test
-  (two successes + one failing branch) for the per-`askId` `fullText`
-  scoping invariant. The existing 2-branch test only proves "success
-  doesn't lose to failure" with a single survivor; with three branches
-  a future regression in the per-ask Map (e.g., wrong entry cleared on
-  concurrent failure) would corrupt one of the survivors — only
-  catchable with ≥3 branches.
-- `tests/smoke/smoke.test.ts` — new "Downstream Type Export Contract"
-  describe block. Packs the `@axlsdk/axl` tarball, installs it into a
-  sandbox npm project (with zod + typescript), writes a synthetic
-  consumer that exercises `AxlEvent` discriminated narrowing,
-  `AxlEventOf<T>`, and `AskScoped`, and runs `tsc --noEmit` under
-  strict mode. Catches the class of bug "we removed a type but forgot
-  to update the export" at the publication boundary. Adds ~1.5s to the
-  smoke suite (well under the existing 60s `testTimeout`).
-
-Test count delta: 2184 → 2191 (+7).
-
-### Removed — `parentToolCallId` (BREAKING)
-
-The deprecated `parentToolCallId` field on `AxlEventBase` is removed.
-Migrate to `parentAskId` (on `AskScoped`) — it's the going-forward
-correlation primitive and was already populated alongside
-`parentToolCallId` since the unified-event-model migration. The
-agent-as-tool nesting case has equivalent semantics: when a child
-`WorkflowContext` spawned via `ctx.createChildContext()` performs
-`ctx.ask()`, the nested ask's events all carry
-`parentAskId === outerAsk.askId`.
-
-`createChildContext()` no longer accepts a `parentToolCallId` argument
-— the signature is `createChildContext(): WorkflowContext`. Callers
-passing `toolCall.id` should drop the argument. Internal call sites
-were already correlating via the ALS frame's `parentAskId`, so no
-other migration is required.
-
-Affected exports:
-- `AxlEventBase.parentToolCallId` — removed.
-- `WorkflowContextInit.parentToolCallId` — removed.
-- `WorkflowContext#parentToolCallId` (private field) — removed.
-- `WorkflowContext.createChildContext(parentToolCallId?)` →
-  `createChildContext()` — argument dropped.
-
-### Added — `fullText` per-askId scoping (P1)
-
-`AxlStream.fullText` no longer interleaves tokens from concurrent
-root-level asks. Under `ctx.parallel()` / `ctx.spawn()` / `ctx.race()`
-/ `ctx.map()`, each branch's tokens are now scoped per-`askId` —
-chunks stay contiguous in the order each ask first emitted, and a
-`pipeline(failed)` or `ask_end({ok:false})` on one branch only
-discards THAT branch's in-progress buffer (sibling branches are
-unaffected). Internal storage changed from
-`currentAttemptTokens: string[]` and `committedText: string` to
-`attemptByAsk: Map<string, string[]>` and
-`committedByAsk: Map<string, string>`. Two regression tests pin the
-new invariants. Closes the FOLLOWUPS P1 "fullText interleaves
-concurrent root-level asks" item.
-
-### Added — `config.state.maxEventsPerExecution` (memory cap)
-
-New configuration option bounds the in-memory `ExecutionInfo.events`
-array per execution. Default 50_000; set to `Infinity` to opt out
-(legacy unbounded behavior). When the cap is hit, the cap-th slot
-is replaced with a sentinel `log` event
-(`data.event: 'events_truncated'`) carrying the cap and a hint
-message. Subsequent events are silently dropped from the array —
-but the trace channel (`runtime.on('trace')`) and WS broadcast
-continue to receive every event, so live observability isn't
-degraded. Pathological values (0 / negative / fractional / NaN) are
-rejected at construction with a `RangeError`. Pinned by 4 regression
-tests. Closes the FOLLOWUPS P5 "no memory bound on
-ExecutionInfo.events" item — production workloads (e.g., 50 nested
-asks × 20-turn tool loops) no longer risk OOM before terminal
-`done`.
-
-### Changed — Studio API tests adopt shared `readJson` helper (test-only)
-
-All Studio API test files (`tests/studio/api/*.test.ts`) now route response
-body decoding through the shared `readJson(res)` helper from
-`tests/studio/helpers/json.ts`. Previously each call site spelled out
-`(await res.json()) as ApiResponse<T>` or `(await res.json()) as any` —
-noisy and easy to forget, with `body` typed as `unknown` everywhere a
-cast was missed. The helper returns the same loose `TestApiBody` envelope
-already used by `evals.test.ts` (51 tests, prior reference adopter).
-Files migrated: `agents`, `aggregates`, `costs`, `decisions`,
-`eval-loader`, `executions`, `health`, `memory`, `middleware`,
-`playground`, `sessions`, `thinking`, `tools`, `workflows` — 14 files,
-~95 call sites. Also drops several now-redundant inline type casts (e.g.
-`as { ok: boolean; data: { ... } }`, `as Envelope`, `as any`). Eliminates
-~150 `TS18046 'body' is of type 'unknown'` diagnostics. Pure refactor —
-test count unchanged (145 studio tests still pass).
-
-### Changed — Polish + P3/P4 cleanup
-
-- `parentToolCallId` deprecation now pins removal to **0.16.0**
-  (`packages/axl/src/types.ts`, `docs/api-reference.md`,
-  `docs/migration/unified-event-model.md`). Users planning
-  migrations have a calendar date.
-- `CallbackMeta.agent` JSDoc now explicitly documents the required vs
-  optional asymmetry with `AskScoped.agent` (callback is always
-  invoked post-resolution; events can land pre-resolution).
-- Tightened weak test assertions (FOLLOWUPS P2):
-  - `ask-lifecycle.test.ts` guardrail-exhaustion now asserts
-    `outcome.error` matches `/guardrail|blocked/i` (was just
-    `length > 0`).
-  - `ask-lifecycle.test.ts` validate-exhaustion asserts
-    `outcome.error` matches `/valid/i`.
-  - `runtime.test.ts:1383` stream abort asserts
-    `/aborted|AbortError/i`.
-- Cleaned up two pre-existing TS diagnostics (FOLLOWUPS P3):
-  - `runtime.test.ts:135` ZodObject Promise variance — replaced
-    inner `as any` with a single boundary cast on the handler.
-  - `runtime.test.ts:1153` private `signal` access — narrow boundary
-    cast `(ctx as unknown as { signal? })` so the test pokes
-    internal state without growing the public API.
-
-### Changed — Independent-review hardening pass
-
-Six fixes from a fresh-eyes reviewer pass on the spec/16 hardening work.
-None blocking; each closes a robustness gap or edge case.
-
-- **`onAgentCallComplete` hook throws no longer corrupt `ask_end.outcome`**
-  (`packages/axl/src/context.ts`). Prior to this fix, a hook throw inside
-  the `ctx.ask()` try-block landed in the surrounding catch and overwrote
-  `outcome = { ok: false, error: hookErrorMessage }` — reliability
-  dashboards filtering on `ask_end.outcome.ok === false` would
-  misattribute hook bugs to ask failures. The hook is now wrapped in
-  `try/catch + console.error`, mirroring the existing `onTrace` consumer-
-  safety pattern: hook errors are logged and swallowed so the ask's
-  actual outcome survives intact. Pinned by a regression test in
-  `model-params.test.ts`.
-- **`bufferCaps` rejects pathological values at construction**
-  (`packages/axl-studio/src/server/ws/connection-manager.ts`). `0`,
-  negative numbers, fractions, and `NaN` are now rejected with a
-  `RangeError` naming the offending key — fail-loud beats silent
-  replay-buffer breakage when an operator passes `0` thinking it
-  disables buffering. Pinned by tests covering each pathological input.
-- **Tripwire now catches dynamic imports** (`client-no-core-import-tripwire.test.ts`).
-  Static `import { x }` was banned but `await import('@axlsdk/axl')` and
-  `import('@axlsdk/axl')` slipped through — same `async_hooks` browser
-  crash profile. New `dynamicImportRe` regex closes the bypass; contract
-  fixtures pin the boundary.
-- **Defensive narrowing in client SPA** (`use-ws-stream.ts`,
-  `AskTree.tsx`, `PlaygroundPanel.tsx`, `TraceEventList.tsx`). The
-  strict-types migration mandates `event.data` on most variants, but
-  malformed wire payloads (older runtimes, redaction edge cases, filter
-  pass-through) shouldn't crash the React render. Optional-chaining on
-  `event.data?.field` and outcome-presence guards on `ev.outcome` keep
-  type-safety wins while preserving graceful degradation.
-- **`event-utils.ts` mirror docstring updated** to clarify the type-side
-  duplication WAS resolved (via `import type`); only the runtime helper
-  remains mirrored, with two paths to eliminate the last duplication
-  flagged for future work.
-- **`multi-agent.test.ts` variable hoisting fixed** — `let outerCallCount = 0`
-  moved above the `provider` definition that closes over it.
-
-### Breaking changes — Unified event model (spec/16-streaming-wire-reliability)
-
-The two parallel event models (rich `TraceEvent` for traces, lean
-`StreamEvent` for the wire) collapse into a single `AxlEvent`
-discriminated union. Tokens, tool calls, ask boundaries, and agent turns
-are observable end-to-end with full fidelity. See
-[`docs/migration/unified-event-model.md`](docs/migration/unified-event-model.md)
-for a step-by-step consumer migration guide.
-
-- **`TraceEvent` and `StreamEvent` are deleted.** Both types collapse
-  into `AxlEvent` (exported from `@axlsdk/axl`). External TS consumers
-  get compile errors on `TraceEvent` / `StreamEvent` imports — switch
-  to `AxlEvent` and narrow on `event.type`. No type alias is kept.
-- **`ExecutionInfo.steps` → `ExecutionInfo.events`.** Read sites
-  rename verbatim. The on-disk SQLite column auto-migrates on first
-  open via `PRAGMA user_version` (transactional, idempotent).
-- **`AxlStream.steps` → `AxlStream.lifecycle`.** Same iterator shape;
-  the rename reflects that these are events, not pipeline steps. The
-  filter set expands to include `ask_*`, `agent_call_*`,
-  `tool_call_*`, `tool_approval`, `tool_denied`, `delegate`,
-  `pipeline`, `verify`, `workflow_*`.
-- **Streaming-callback signatures gain `meta`.** `onToken`,
-  `onToolCall`, `onAgentStart` now take a second
-  `meta: CallbackMeta = { askId, parentAskId?, depth, agent }`
-  parameter. Existing chat UIs that want root-only behavior add a one-
-  line `if (meta.depth === 0)` filter to preserve the prior behavior.
-- **`createChildContext` no longer isolates streaming callbacks.**
-  Nested asks now propagate tokens, tool calls, and agent starts to
-  the same callbacks as the parent — consumers filter via
-  `meta.depth` to recover root-only behavior. Spec §3.2.
-- **Trace event type renames:** `'agent_call'` → `'agent_call_end'`,
-  `'tool_call'` → `'tool_call_end'`. The new `_end` variants pair with
-  newly-emitted `_start` events (see Added).
-- **Handoff event split: `'handoff'` → `'handoff_start'` +
-  `'handoff_return'`.** The single post-hoc `handoff` event is gone.
-  `handoff_start` ALWAYS fires BEFORE the target ask begins — so it
-  orders correctly in step-sorted timelines (ahead of the target's
-  `ask_start` / `agent_call_*` / `ask_end`) — and carries
-  `{ source, target, mode, message? }`; `message` is populated only on
-  roundtrip mode with a custom message arg. `handoff_return` is
-  ROUNDTRIP-ONLY (oneway handoffs terminate at the target, no return
-  trip) and carries `{ source, target, duration }` where `duration` is
-  the round-trip wall-clock ms. Handoff target asks now also emit
-  `ask_start` / `ask_end` (previously skipped), so the target agent's
-  activity is symmetric with a regular `ctx.ask()` call and drill-downs
-  no longer show "unknown agent". **Migration:** consumers doing
-  `event.type === 'handoff'` must discriminate the two new variants;
-  the `HandoffData` type export is split into `HandoffStartData` and
-  `HandoffReturnData` (both exported from `@axlsdk/axl`).
-  `AXL_EVENT_TYPES` drops `'handoff'` and adds `'handoff_start'` +
-  `'handoff_return'`. (`HandoffRecord`, the session-history shape, is
-  unchanged.)
-- **`error` event scope narrowed.** Ask-internal failures (gate
-  exhaustion, `ctx.verify` failure, handler error) surface via
-  `ask_end({ outcome: { ok: false, error } })` — NOT via the
-  workflow-level `error` event. The workflow `error` event is reserved
-  for failures with no `ask_end` available (top-level workflow throws
-  before any ask runs, infrastructure / abort errors). Consumers must
-  never see both for the same failure. Spec decision 9.
-- **Runtime translation layer at `runtime.ts:709-783` deleted.** The
-  block that synthesized legacy `StreamEvent` shapes (`agent_end`,
-  `tool_result`, `step`) from `AxlEvent` traces is gone. Every event
-  flows verbatim from `emitEvent` to the wire. The wire format IS the
-  trace format.
-- **SQLite `execution_history` column rename:** `steps` → `events`.
-  Auto-migrated on first open of an existing DB; no manual migration
-  needed. Tracked via `PRAGMA user_version`.
-- **Step counter shared via AsyncLocalStorage.** `event.step` is now
-  monotonic across the whole execution tree (root ask + nested asks
-  + branch primitives), not per-context. Consumers ordering by `step`
-  see a single shared counter.
-- **`Embedder.embed()` signature unchanged in this release** (the
-  0.15.0 `EmbedResult` change still applies).
-- **`ctx.checkpoint(fn)` → `ctx.checkpoint(name, fn)`.** The public
-  checkpoint API now requires a stable, caller-supplied identifier.
-  This closes a data-corruption bug where nested `WorkflowContext`
-  instances each had their own `0`-indexed counter and silently
-  overwrote each other's checkpoint slots in the state store
-  (e.g. a tool handler's `ctx.checkpoint()` clobbered the workflow's
-  step 0). Names are scoped to a single execution and must match
-  across runs for replay to work; the `__auto/` prefix is reserved
-  for runtime auto-checkpointing of `ctx.ask`/`spawn`/`race`/
-  `parallel`/`map`. Same model used by Temporal/Inngest/Restate. For
-  loops, compose names from the iterator: `ctx.checkpoint(`process-${id}`, fn)`.
-- **`StateStore.{save,get}Checkpoint(executionId, step: number)` →
-  `(executionId, name: string)`.** Custom `StateStore` impls must
-  switch the `step: number` parameter to `name: string`. Built-in
-  stores:
-  - `MemoryStore`: inner `Map<number>` → `Map<string>`, no-op for callers.
-  - `SQLiteStore`: schema v1→v2 renames `checkpoints.step` (INTEGER)
-    → `checkpoints.name` (TEXT). The migration is structurally clean,
-    but **legacy auto-checkpoint rows are stranded** — the new runtime
-    composes names like `__auto/<agent>/ask/<n>` and `__auto/<primitive>/<n>`,
-    which never match the legacy `"0"`, `"1"`, … strings produced by
-    the old integer counter. **In-flight v1 executions resumed under v2
-    will re-execute side effects** rather than replay from saved state.
-    Recommended migration: drain or cancel running executions before
-    upgrading. User-named checkpoints (`ctx.checkpoint('my-name', …)`
-    on the new API; never possible on the old single-arg form) are
-    unaffected.
-  - `RedisStore`: hash field is now the name directly (no `String(step)`).
-    Same caveat — old hash fields with stringified-integer keys are
-    stranded after the upgrade.
-- **`StateStore.getLatestCheckpoint` removed.** Undefined semantics
-  under named keys (no implicit ordering); never called by the runtime.
-- **`CheckpointEventData` shape: `{ step: number }` → `{ name: string }`.**
-  Studio and trace consumers narrowing on `checkpoint_save` /
-  `checkpoint_replay` should read `event.data.name`. Internal
-  auto-checkpoints emit `__auto/<primitive>/<n>` names.
-
-### Added — Unified event model
-
-- New `AxlEvent` union variants:
-  - `ask_start` (carries `prompt`) and `ask_end` (carries
-    `outcome: {ok: true, result} | {ok: false, error}`, `cost`,
-    `duration`) bound every `ctx.ask()` call.
-  - `agent_call_start` (carries `agent`, `model`, `turn`) — pre-call
-    marker; pairs with `agent_call_end`.
-  - `tool_call_start` (carries `tool`, `callId`, `data: { args }`) —
-    pre-call marker; pairs with `tool_call_end` (which carries args
-    AND result).
-  - `pipeline` events (three statuses: `start`, `failed`, `committed`).
-    `start` fires once per LLM turn that contributes to the final
-    result (initial entry + each gate-rejection retry). Tool-calling
-    continuations within the same ask do NOT fire additional starts.
-    `failed` fires before each retry `continue` with the gate stage
-    (`schema` / `validate` / `guardrail`) and the feedback message
-    that's about to be injected. `committed` fires once on success
-    before `done`. Spec §4.2.
-  - `partial_object` events for progressive structured-output
-    streaming. Gated on `options?.schema && toolDefs.length === 0
-    && schema instanceof z.ZodObject`. Structural-boundary throttle:
-    emits only when a delta's last non-whitespace char is `,`, `}`,
-    or `]`. Backed by a hand-rolled tolerant JSON parser
-    (`packages/axl/src/partial-json.ts`, zero deps, ~250 LOC) that
-    handles trailing-truncation gracefully. Monotonicity guarantee:
-    each emission is a superset of the prior (no fields disappear
-    within an attempt).
-- `AskScoped` mixin adds `askId`, `parentAskId?`, `depth`, `agent?`
-  to every event originating within `ctx.ask()`. Tree reconstruction
-  via group-by(askId) + parent-link(parentAskId).
-- `AXL_EVENT_TYPES` const tuple — single source of truth for the
-  discriminator set; derived `AxlEventType` and `AxlEventOf<T>`
-  Extract helper.
-- `AxlEventBase`, `AskScoped`, `CallbackMeta`, plus per-variant data
-  shapes (`AgentCallData`, `ToolCallData`, `ToolCallStartData`,
-  `ToolApprovalData`, `ToolDeniedData`, `HandoffStartData`, `HandoffReturnData`, `DelegateData`,
-  `VerifyData`, `WorkflowStartData`, `WorkflowEndData`,
-  `MemoryEventData`, `GuardrailData`, `SchemaCheckData`,
-  `ValidateData`).
-- `MockProvider.sequence()` accepts an optional `chunks?: string[]`
-  per response; `MockProvider.chunked(contents, chunkSize?)` static
-  helper. `stream()` yields one `text_delta` per chunk — used by
-  partial-JSON, structural-boundary, and cross-attempt token tests.
-- Compile-time exhaustiveness fixture
-  (`packages/axl/src/__tests__/axl-event-exhaustive.test-d.ts`) —
-  switches on every `AxlEvent.type` and ends with
-  `const _exhaustive: never = ev`. New variants without a matching
-  case fail `pnpm -r typecheck`.
-- Fixed: `validate + onToken` no longer throws `INVALID_CONFIG` —
-  validate runs against the buffered streaming response. Spec §4.1.
-- Fixed: nested-ask events (tokens, tool calls, agent starts) now
-  propagate to outer-context callbacks. Spec §3.2.
-- Fixed: PII leak where the trace WS channel bypassed `redact`
-  scrubbing has been closed.
-- Fixed: `AxlStream.fullText` no longer concatenates retried-attempt
-  tokens. The buffer is split into in-progress and committed halves;
-  `pipeline(committed)` flushes in-progress to committed (before
-  `done`); `pipeline(failed)` discards in-progress. Mid-attempt reads
-  see the growing buffer; post-`pipeline(committed)` reads see the
-  canonical winning text. Spec §4.3.
-
-#### Studio — adoption (spec §5)
-
-- **Fixed: cost double-count in Studio reducers.** `reduceCost` now
-  skips `ask_end` events to match the per-ask rollup contract (decision
-  10) — previously the cost dashboard would double-charge any execution
-  that emitted an `ask_end` (every ctx.ask call). Mirrors the same
-  guard in core `runtime.ts` and `AxlTestRuntime`.
-- **`redactStreamEvent` covers the full per-variant table** (spec §5.1):
-  `tool_denied`, `partial_object`, `verify`, `memory_*`, `pipeline`
-  (failed.reason), in addition to the partial set landed in PR 1.
-  Numeric metrics (`cost`, `tokens`, `duration`) and structural
-  metadata (`askId`, `parentAskId`, `depth`, `agent`, `executionId`,
-  `step`, `timestamp`) are NEVER scrubbed.
-- **WS replay buffer excludes `token` and `partial_object`**
-  (spec §5.2). Late subscribers no longer receive 10k token events on
-  reconnect — they reconstruct the same info from the final
-  `agent_call_end` (token aggregates) and `done` (final result).
-  `MAX_BUFFER_EVENTS` raised from 500 → 1000 to absorb nested-ask
-  structural-event volume.
-- **Client `EVENT_COLORS` covers all new variants** (`ask_start`,
-  `ask_end`, `agent_call_start`, `tool_call_start`, `pipeline`,
-  `partial_object`, `memory_*`). The Trace Explorer now renders these
-  with their own colors instead of falling back to grey.
-- **`isFailureEvent` recognizes `pipeline(failed)` and
-  `ask_end(outcome.ok: false)`** as failure signals so the trace
-  waterfall highlights them in red.
-- **`getDepth(event)` reads the native `event.depth` field** (spec/16
-  §3.1) instead of inferring from the deprecated `parentToolCallId`.
-  Reflects the actual call graph including nested asks via
-  agent-as-tool / delegate / race / parallel paths.
-- Client `AxlEvent` type extended with all new optional fields:
-  `askId`, `parentAskId`, `depth`, `outcome`, `status`, `stage`,
-  `attempt`, `maxAttempts`, `reason`, `prompt`, `fromAskId`, `toAskId`,
-  `sourceDepth`, `targetDepth`. Loose on the client per the existing
-  pattern; strict server-side via `@axlsdk/axl#AxlEvent`.
-
-#### Studio — panel integration + REST pagination (spec §5.9, §5.10, §5.4)
-
-- **New shared components** (`packages/axl-studio/src/client/components/shared/`):
-  `AskTree` (hierarchical live ask graph by `askId`, parent-linked via
-  `parentAskId`, with status badges, inline `RetryIndicator`, cost rollup,
-  handoff arrows), `AskDetails` (side-panel event timeline for a selected
-  ask), `RetryIndicator` (inline pipeline-state badge), `PartialObjectRenderer`
-  (progressive JSON view that resets on `pipeline(failed)`). All four are
-  pure — take events, return JSX — so panels can plug them in against
-  either in-flight streams or historical execution events. 35 component
-  tests cover the `buildAskTree` reducer invariants (parent-link, temporal
-  sort, discarded overlay, handoff attribution, retry state, running-cost
-  accumulation + `ask_end.cost` override) plus rendering and interaction.
-- **Playground panel**: subagent activity drawer. Opt-in via a header
-  "Subagents" toggle so the default chat experience is unchanged; users
-  who want nested-ask visibility enable it and see an `AskTree` of the
-  agent-as-tool / delegate / race branches live. Tool activity reconstruction
-  migrated to the AxlEvent shape (`tool_call_start` / `tool_call_end`,
-  `handoff_start.data.source/target/mode`, `tool_approval.data.approved`).
-- **Workflow Runner panel**: `AskTree` is the new default timeline view
-  (replacing the flat `TraceEventList`). A Tree / Flat toggle preserves
-  the chronological list for users who prefer it. Clicking an ask opens
-  an `AskDetails` drawer alongside. Timeline cost calculation skips
-  `ask_end` to avoid double-counting against `agent_call_end` leaves
-  (spec decision 10).
-- **Trace Explorer panel**: no code changes needed — `TraceEventList`'s
-  `getDepth(event)` now reads the native `event.depth` field (PR 3
-  commit), so nested-ask rows indent correctly automatically.
-- **`useWsStream` hook**: switched from the legacy `StreamEvent` type to
-  `AxlEvent`. Token accumulation now filters root-only
-  (`event.depth === 0`) so nested-ask tokens don't leak into chat UIs;
-  consumers wanting nested tokens iterate `events` directly. `done` /
-  `error` event handlers updated for the wrapped `data.{result, message}`
-  shape.
-- **REST pagination** (`GET /api/executions/:id?since={step}`, spec §5.4):
-  filters `events` to those with `step > since`. Monotonic per-execution
-  and shared across nested asks (spec §3.7), so polling clients can
-  request only the tail since their last known step without missing
-  concurrent-branch events. `since=-1` is now an explicit "everything
-  from step 0" sentinel; malformed `since` (non-integer, NaN, Infinity,
-  fractional) returns a 400 `INVALID_PARAM` envelope instead of silently
-  falling through. Client `fetchExecution(id, since?)` helper added.
-
-#### Unified event model — post-spec multi-perspective review
-
-Follow-up hardening after the full review pass across UX, architecture,
-bugs/edge-cases, and security/operational perspectives. All fixes ship
-in this release; no separate minor cycle.
-
-- **`eventCostContribution(event)` helper** exported from `@axlsdk/axl`
-  as the single source of truth for the spec §10 "skip ask_end rollup,
-  finite-check, leaf-only" cost invariant. The runtime accumulator,
-  `AxlTestRuntime`, `trackExecution`, Studio's `reduceCost`, and the
-  Playground/Workflow Runner UI panels all now call the helper instead
-  of hand-rolling the guard. Also exported: `isRootLevel(event)`,
-  `isCostBearingLeaf(event)`, `COST_BEARING_LEAF_TYPES`.
-- **`parsePartialJson` exported** from `@axlsdk/axl` so consumers
-  building their own progressive-render pipelines can reuse the
-  truncation-recovery parser. 256-depth cap guards against
-  adversarial provider output.
-- **Token and `partial_object` events are NOT persisted** to
-  `ExecutionInfo.events` — they were already excluded from the WS
-  replay buffer; this change brings the REST `events[]` array into line
-  so REST consumers don't get token floods either, and per-route
-  redaction can't be bypassed by trusting emit-time scrub alone.
-- **Memory-op events are typed variants** (`memory_remember`,
-  `memory_recall`, `memory_forget`) instead of sub-discriminating the
-  `log` catch-all bucket. Consumers narrow directly on `event.type`
-  and get typed access to `data.{key,scope,usage,hit,…}` without
-  hand-casting.
-- **Emit-time redaction covers all variants** that carry LLM/user
-  content: `tool_call_start`, `tool_denied`, `partial_object`,
-  `verify`, `pipeline(failed).reason`, terminal `done`/`error`.
-  Previously these passed through unredacted on the trace channel.
-  `redactExecutionInfo` also pipes every event through
-  `redactStreamEvent` so REST serialization is a second-pass defense-
-  in-depth.
-- **`runtime.isRedactEnabled()` is consulted per-event** in the trace
-  listener (not cached at listener construction), so runtime config
-  flips propagate. The trace listener is wrapped in try/catch with a
-  fail-loud `console.error` so a buggy event shape can't starve
-  downstream listeners.
-- **Studio REST `GET /api/executions/:id?since=…` returns 400** with a
-  `{code: 'INVALID_PARAM', param: 'since'}` envelope for malformed
-  inputs (non-integer / NaN / Infinity). `since=-1` is a valid
-  "everything from step 0" sentinel.
-- **WS frame budget measured in bytes** via `Buffer.byteLength(msg,
-  'utf8')` instead of UTF-16 `msg.length`. Emoji / CJK payloads could
-  previously pass the 64KB length check yet serialize to >128KB on the
-  wire, re-introducing silent-drop behavior.
-- **Partial-JSON parser has a 256-level recursion cap.** Adversarial
-  `[[[[[...]]]]]` input used to exhaust V8's default ~10k-frame stack
-  and crash the workflow; now it throws a `SyntaxError` instead.
-- **`partial_object` throttle is string-safe.** A small char-by-char
-  walker tracks `inString` + `escaped` state across chunks so commas
-  inside string values no longer trigger per-comma parse+emit. On a
-  prose-heavy description field with 50 commas, this drops event
-  volume from 50+ emissions to 1.
-- **SQLite migration re-reads `user_version` inside `BEGIN IMMEDIATE`**
-  so a concurrent constructor race can't double-apply a non-idempotent
-  migration (the current v0→v1 ALTER is idempotent, but future steps
-  may not be).
-- **Handoff `toAskId` is a real ask frame.** The target agent's
-  `executeAgentCall` now runs under `askStorage.run(targetFrame, …)`
-  so its events carry `askId === handoffToAskId` and
-  `parentAskId === handoffFromAskId`. Consumers grouping by askId no
-  longer see the handoff as an orphan; UI tree-builders link the
-  target to the source automatically.
-- **WS replay buffer resource caps.** `MAX_ACTIVE_BUFFERS = 256` (global
-  concurrent buffer cap, oldest-complete-first eviction) and
-  `MAX_BUFFER_BYTES = 4 MB` (per-buffer byte budget, terminal `done`/
-  `error` always buffered). Closes DoS vectors on high-churn deployments.
-- **`AxlStream.textByAsk` iterator** yields `{askId, agent?, text}`
-  pairs tagged with the producing ask frame. Complements `.text`
-  (root-only) for split-pane UIs that render each sub-agent's output
-  in its own lane without iterating the raw event stream.
-- **`AxlEventBase.cost` JSDoc** clarifies the dual "leaf cost vs
-  per-ask rollup" semantics and points at `eventCostContribution` so
-  consumers don't write the naive accumulator.
-- **Playground subagent drawer auto-enables** the first time a
-  nested-ask event lands on the current stream — users with
-  agent-as-tool / delegate / race setups don't have to discover the
-  toggle to see what their system just did. Explicit user-off still
-  wins (one-way latch).
-- **`AxlStream._done` / `_error` require `executionId`** explicitly
-  (no default). `runtime.stream()` now allocates the id BEFORE the
-  async closure so terminal events always carry it, even when `run()`
-  throws before `execInfo` is assigned.
-- **Dead code purged from aggregators.** The `type: 'log'` +
-  `data.event: 'workflow_*'` / `'memory_*'` log-form fallback shipped
-  through 0.14.x was already removed from the emitter in 0.15.0 but
-  lingered in `reduceCost`, `CostAggregator`, and
-  `ExecutionAggregator.start`. All three read typed discriminators
-  directly now. `isLogEvent` helper deleted.
-
-#### Unified event model — user-scenario verification pass
-
-Follow-up after mapping user-facing scenarios (chat UX, ask-graph
-reconstruction, cost aggregation, retry observability, multi-tenancy,
-abort handling, session accumulation, test-runtime parity) to the
-implementation and closing gaps. No user-visible API changes — only
-correctness, parity, and test-coverage fixes.
-
-- **`memory_*.scope` is preserved under `trace.redact: true`** at the
-  core emit-time scrub. Previously it was overwritten with `'[redacted]'`
-  along with other string fields, diverging from the WS-layer
-  `redactStreamEvent` policy which correctly treats `scope` as a
-  structural discriminator (`'session' | 'global'`). Both layers now
-  preserve `scope` consistently.
-- **`AxlTestRuntime` emits `workflow_start` / `workflow_end` through
-  `ctx._emit*`** instead of a manual `_pushTrace` bypass. The previous
-  path skipped the `emitEvent` redaction pipeline, leaking raw
-  `input` / `result` through the test trace log even when
-  `config: { trace: { redact: true } }` was set. Parity with
-  production runtime is now unbroken.
-- **`AxlTestRuntime` emits `workflow_end(status: 'failed')` on handler
-  throw** with `aborted: true` when the error is an `AbortError`. The
-  previous implementation only emitted `workflow_end` on the success
-  path, so test assertions counting start↔end pairs saw unclosed
-  workflows on the failure path.
-- **`AxlTestRuntime` threads `workflowName` into `WorkflowContextInit`.**
-  The production runtime has always done this (`emitEvent` auto-stamps
-  `event.workflow` from it); the test runtime omitted it, so every
-  event emitted under test had `workflow: undefined`. Any consumer
-  grouping by workflow (Cost Dashboard `byWorkflow`,
-  `trackExecution.metadata.workflows`, eval runners) now sees correct
-  attribution in tests and production.
-- **`runtime.stream()` tightens the "workflow_start iff workflow_end"
-  invariant.** `ctx = wfCtx` is now assigned only AFTER
-  `_emitWorkflowStart` succeeds, so the outer `.catch` handler's
-  `ctx?._emitWorkflowEnd(...)` can never fire workflow_end without a
-  matching preceding workflow_start (e.g. if span setup throws
-  synchronously).
-- **`WorkflowLike` handler type uses bivariant parameter.** Switched
-  from `WorkflowContext` (defaults to `<unknown>`) to
-  `WorkflowContext<any>` so generic `Workflow<TInput>` instances
-  assign to `WorkflowLike` under strict function-parameter variance.
-  Unblocks `pnpm --filter @axlsdk/testing typecheck`; runtime behavior
-  is unchanged. (Pre-existing type error uncovered while adding tests.)
-
-**Test coverage added** to pin all the invariants above plus the ones
-that were correct but unpinned:
-
-- `event-utils.test.ts` (new file, 28 tests) — `eventCostContribution`
-  NaN/Infinity guards, ask_end exclusion, leaf-type table;
-  `isCostBearingLeaf`, `isRootLevel` depth handling,
-  `COST_BEARING_LEAF_TYPES` contents.
-- `stream.test.ts` — `.textByAsk` iterator (root + nested + `agent`
-  passthrough + non-token filtering); compile-time lifecycle
-  exhaustiveness via `Record<AxlEventType, 'lifecycle' | 'excluded'>`
-  + runtime check so a new `AxlEventType` can't silently fall out
-  of the `.lifecycle` iterator.
-- `ask-lifecycle.test.ts` — spec §9 `ask_end(ok:false)` invariant
-  expanded from "schema exhaustion only" to cover guardrail
-  exhaustion, validate exhaustion, and mid-ask
-  `BudgetExceededError`. Each pins: `ask_end.outcome.ok === false`
-  AND the failure does NOT emit a workflow-level `error`.
-- `runtime.test.ts` — stream abort rejects `.promise` with
-  `workflow_end.aborted === true`; `abortControllers` map cleanup
-  for all four paths (execute-success/failure,
-  stream-success/early-throw).
-- `connection-manager.test.ts` — 30-second TTL buffer cleanup
-  pinned via `vi.useFakeTimers()` with boundary coverage at
-  `TTL_MS - 1` (still present) and `TTL_MS + 1` (evicted).
-- `ask-tree.test.tsx` — orphan handoff placeholder renders when
-  `toAskId` has no matching `ask_start`; non-orphan comparison
-  confirms real `ask_start` replaces the placeholder.
-- `test-runtime.test.ts` — redaction applied to
-  `workflow_start`/`workflow_end`; raw values preserved when
-  redact is off; `workflow_end(failed)` on throw; `aborted: true`
-  on AbortError.
-
-**Docs:**
-
-- `docs/observability.md` + `docs/api-reference.md` now teach the
-  exported `eventCostContribution(event)` helper as the canonical
-  cost-aggregation API instead of the hand-rolled
-  `event.cost && event.type !== 'ask_end'` guard. Also documents
-  `isCostBearingLeaf`, `COST_BEARING_LEAF_TYPES`, and `isRootLevel`
-  as first-class exports.
-
-#### Unified event model — final multi-perspective review pass
-
-Five reviewer perspectives (architecture, bug-hunt, UX/DX,
-security/operational, test quality) on the entire spec/16 migration
-after the scenario-verification pass. Real correctness bugs and DX
-gaps fixed; resource caps tightened; docs corrected. All at the
-observability boundary — no breaking API changes.
-
-**Correctness bugs:**
-
-- **Double `workflow_end` emission** when a post-emit side-effect
-  (`stateStore.deleteCheckpoints`, `persistExecution`) throws after
-  `_emitWorkflowEnd(completed)`. The outer catch would fire a
-  second `_emitWorkflowEnd(failed)` with conflicting status, so
-  consumers saw two terminal events per execution. Now
-  `WorkflowContext._emitWorkflowStart` / `_emitWorkflowEnd` are
-  idempotent (first-wins) via `_workflowStartEmitted` /
-  `_workflowEndEmitted` flags. Regression test in `runtime.test.ts`.
-- **`AxlStream.fullText` cross-ask token leak** when `ctx.ask()`
-  throws terminally (max-turns exhaustion, guardrail exhaustion,
-  `VerifyError`, `ValidationError`). These paths emit
-  `ask_end({ok:false})` but NOT `pipeline(failed)`, so the failed
-  ask's in-progress tokens stayed buffered and flushed into the
-  NEXT ask's `pipeline(committed)`. `stream.ts._push` now treats
-  `ask_end({ok:false})` as a buffer-reset trigger for root asks.
-  Regression test in `fulltext-commit.test.ts`.
-- **`token.data` bypassed emit-time redaction**, contradicting
-  CLAUDE.md's three-layer contract claim. Direct
-  `runtime.on('trace', ...)` consumers received raw LLM output
-  under `config.trace.redact: true`; only Studio's WS layer was
-  scrubbing. Added a `token` branch to the emit-time redactor.
-  Regression test in `trace-events.test.ts`.
-- **`trackExecution({captureTraces: true})` memory blowout on
-  streaming workloads.** `execInfo.events` strips `token` and
-  `partial_object` to bound memory, but `capturedTraces.push` did
-  not — so `runEval({captureTraces: true})` on a streaming eval
-  item blew the captured-traces array. Filter added in
-  `runtime.ts`. Regression test in `runtime.test.ts`.
-- **`frame.askCost` hardcoded `agent_call_end | tool_call_end`**,
-  silently dropping embedder cost (`memory_remember` /
-  `memory_recall`) from the per-ask rollup when `ctx.recall()`
-  ran inside an ask. Now uses `COST_BEARING_LEAF_TYPES` so the
-  rollup stays in lockstep with `isCostBearingLeaf` /
-  `eventCostContribution`.
-- **`eventCostContribution` accepted negative `cost` values**,
-  silently crediting budgets on buggy providers or pricing-table
-  typos. Now matches the NaN/Infinity guard philosophy: negative
-  costs are silently dropped. Regression test in
-  `event-utils.test.ts`.
-- **`AxlTestRuntime._recordStep` duplicated workflow_start/end**
-  entries in `steps()` (one from the raw-data `_recordStep` call,
-  one from the onTrace handler) and bypassed redaction on the
-  `_recordStep` path. Removed the redundant `_recordStep` calls
-  so onTrace is the single source of truth for `_steps` — parity
-  with every other event type in the test runtime.
-
-**Security:**
-
-- **`POST /api/evals/compare` pooled-ID count cap** (reviewer HIGH
-  H1). `evalCompare` runs paired bootstrap CI (1000 resamples)
-  across all pooled run × item pairs. Without a cap, a readOnly
-  attacker could trigger ~50B operations per request. Capped at
-  25 ids per side to match the multi-run ceiling on
-  `POST /api/evals/:name/run`. Regression test in
-  `tests/studio/api/evals.test.ts`.
-
-**DX / docs:**
-
-- **`CreateContextOptions` gains `onToolCall` / `onAgentStart`**
-  to match what the docs already advertised. Previously only
-  `onToken` was wired through from `createContext` — the other
-  two were documented but not exposed on the public API.
-  Non-breaking additive change.
-- **Docs: stale "PR 2 / Reserved / emitted in a follow-up release"**
-  labels for `pipeline`, `partial_object`, and the gate-event
-  collapse removed from `docs/api-reference.md` and
-  `docs/observability.md`. These features shipped in 0.16.0.
-- **Docs: `isCostBearingLeaf` signature corrected** from
-  `(type)` to `(event: AxlEvent)` in `docs/api-reference.md`.
-- **Docs: `AxlStream.textByAsk` now in the accessor table** with
-  a description of the split-pane-UI use case and its
-  relationship to `.text` (root-only).
-- **Docs: `AxlStream.promise` unhandled-rejection suppression**
-  documented — errors are ALSO delivered via the iterator and
-  `.on('error', ...)`, and the promise has an internal no-op
-  catch so iterator-only consumers never see unhandled-rejection
-  warnings.
-- **Docs: `.text` JSDoc cross-references `.textByAsk`** so users
-  hitting "missing tokens from my nested asks" find the right
-  iterator on first read.
-
-#### Provider fixes — Gemini schema dialect
-
-Gemini's tool/responseSchema endpoint accepts a strict subset of OpenAPI
-3.0 Schema Object — narrower than standard JSON Schema. Zod v4's
-`z.toJSONSchema()` emits Draft 2020-12 fields that Gemini rejects with
-a 400, the most common being `additionalProperties: false` (emitted on
-EVERY object schema and EVERY nested object/array element). Caught by
-the live integration test pass — every Zod-defined tool 400'd on first
-Gemini call with `Unknown name 'additionalProperties' at 'tools[0].
-function_declarations[0].parameters'`.
-
-- **`sanitizeSchemaForGemini` recursively rewrites schemas** for
-  tool function parameters AND `responseSchema` (structured output
-  path) before sending. Strip list: `additionalProperties`,
-  `$schema`, `$ref`, `$defs`, `definitions`, `not`, `allOf`,
-  `patternProperties`, `unevaluatedProperties`, `unevaluatedItems`.
-  Recurses into every value so an inner `additionalProperties: false`
-  on a nested object also gets removed (the 400 fires at any depth).
-- **Two fields get TRANSLATED** rather than stripped because they're
-  load-bearing for common Zod patterns:
-  - `oneOf` → `anyOf` — `z.discriminatedUnion()` produces `oneOf`.
-    Naive stripping would erase the entire union shape and Gemini
-    would have no schema for the field. The two are semantically
-    identical for tool-use because the discriminator field already
-    enforces mutual exclusion at the consumer site.
-  - `const: x` → `enum: [x]` — `z.literal('foo')` produces `const`.
-    Naive stripping would lose the constraint entirely. `enum` with
-    a single value is Gemini's supported equivalent. Skipped if
-    `enum` is also explicitly set (don't clobber the schema author's
-    intent).
-- Loss without `additionalProperties: false`: the LLM has slightly
-  less guidance about strict-mode schemas, so it may occasionally
-  emit extra fields. Default Zod (`z.object`) silently strips them
-  on parse so the user sees clean data; `.strict()` schemas trigger
-  our schema retry loop. Net cost: a handful of extra tokens,
-  occasional retry. Not a correctness issue.
-- Regression coverage: 8 new unit tests in `gemini.test.ts` pinning
-  the strip + translate behavior on tools (nested + array-element +
-  `anyOf` branches), discriminatedUnion (`oneOf` → `anyOf`),
-  `z.literal` (`const` → `enum`), explicit-enum-not-clobbered, the
-  `responseSchema` (structured output), and no-op pass-through for
-  already-clean schemas.
-- Other providers verified clean: OpenAI Chat Completions and
-  Responses API both REQUIRE `additionalProperties: false` for
-  strict mode (Zod already provides it). Anthropic accepts standard
-  JSON Schema. No sanitization needed for either.
-- **Pre-existing bug, surfaced by 0.16.0 integration test pass** —
-  unrelated to the unified event model. The sanitizer would have
-  been correct in any prior release; we simply hadn't run a
-  Gemini-with-tools integration test against the live API.
-
-#### Test reliability — Gemini integration model
-
-- Switched the live Gemini integration test model from
-  `gemini-2.0-flash` to `gemini-2.5-flash-lite`. Both have the same
-  input/output pricing ($0.10 / $0.40 per 1M tokens) but 2.5-flash-lite
-  has a much higher free-tier per-minute quota; running the full Gemini
-  suite back-to-back against 2.0-flash hit 429s mid-suite. After the
-  switch, all 76 Gemini-touching integration tests pass cleanly.
-
-#### Spec/16 migration — straggler
-
-- **Fixed: `integration-advanced.test.ts` streaming test was reading
-  `event.name` on a `tool_call_end` event** — the field renamed to
-  `event.tool` in 0.16.0 but this test was missed in the migration
-  pass. Surfaced when the live Anthropic streaming test ran (since
-  `as any` silenced the would-be typecheck failure). Also dropped a
-  stale `import { StreamEvent } from '../types.js'` (no longer
-  exported).
-
-### Changed — Redaction consolidation
-
-- **Single source of truth for `config.trace.redact` per-variant
-  scrubbing.** Both core's emit-time scrub (in
-  `WorkflowContext.emitEvent`) and Studio's WS-boundary scrub (in
-  `redactStreamEvent`) now consult the same `REDACTION_RULES` table
-  exported from `@axlsdk/axl`. Previously each layer walked the
-  `AxlEvent` union with its own ladder; the WS layer missed
-  `workflow_start` / `workflow_end` / `log` / full `memory_*` fields
-  that core scrubbed, so REST reads of stored
-  `ExecutionInfo.events` could leak under flag-flip scenarios.
-  Adding a new event variant updates one place — `Record<AxlEventType,
-  RuleFor<...>>` makes a missing rule a typecheck error.
-- **New core exports:** `REDACTED`, `REDACTION_RULES`, `redactEvent`
-  from `@axlsdk/axl`. Custom observability sinks can apply the same
-  rules pre-export (e.g. when forwarding events to a third-party
-  observability platform).
-- **Behavior change at the WS boundary:** `redactStreamEvent` now also
-  scrubs `agent_call_start` / `agent_call_end` data fields when invoked
-  with `redact: true`. Previously these were considered emit-time-only;
-  now they're idempotent re-scrubs that close the gap when a runtime
-  emits under `redact: false` and a REST read serializes under
-  `redact: true`. Output for events that flowed through emit-time
-  scrubbing is identical.
-
-### Changed — Spec §9 invariant hardening
-
-- **`ctx.ask()` body refactored from `try/catch+rethrow` to
-  `try/catch/finally`.** Spec §9 ("ask-internal failures surface via
-  `ask_end(ok:false)` only, never workflow-level `error`") was
-  enforced by a single catch block that emitted `ask_end` then
-  re-threw. A future failure path added between `ask_start` and the
-  catch (e.g., a new gate after schema/validate, or any synchronous
-  throw inside the span/usage attribution code) would have skipped
-  `ask_end` entirely and broken the invariant. The body now sets a
-  local `outcome` from either the success or catch branch, and a
-  `finally` block ALWAYS emits `ask_end` with that outcome (or a
-  sentinel `'ask_end emitted without outcome — internal bug'` if
-  neither branch ran). Behavior is identical for every path tested
-  today; the change hardens against future drift. Hook errors in
-  `onAgentCallComplete` are now also caught into `outcome.ok:false`
-  rather than skipping `ask_end` — strictly stronger than before.
-- **§9 failure-path test coverage extended.** `ask-lifecycle.test.ts`
-  now pins the invariant for input-guardrail block, MaxTurnsError,
-  TimeoutError, and provider HTTP/transport throw — in addition to
-  the existing schema/validate/output-guardrail exhaustion, mid-ask
-  BudgetExceededError, and abort tests. Every recoverable AND
-  non-recoverable ask failure path asserts exactly one
-  `ask_end(ok:false)`, no workflow-level `error` event, and
-  `workflow_end` status reflecting the propagated throw.
-
-### Changed — Studio WS hardening (FOLLOWUPS M2 / M3)
-
-- **Inbound WS frame size check is now byte-aware
-  (`Buffer.byteLength`).** `handleWsMessage` previously used
-  `raw.length` (UTF-16 code units), asymmetric with the outbound
-  `truncateIfOversized` check in `connection-manager.ts` that already
-  measured bytes. A multi-byte client payload (emoji / CJK) could pass
-  the inbound length check while exceeding 64KB on the wire. Both
-  paths now use `Buffer.byteLength(_, 'utf8')`, closing the asymmetry.
-  Pinning test in `protocol.test.ts` constructs a payload that's
-  65540 bytes / 32770 UTF-16 code units to assert the byte-aware
-  rejection.
-- **WS replay-buffer resource caps are now operator-tunable.** New
-  `bufferCaps?: { maxEventsPerBuffer?, maxBytesPerBuffer?,
-  maxActiveBuffers? }` option on `createStudioMiddleware()`,
-  `createServer()`, and the `ConnectionManager` constructor. The
-  module-level constants (1000 events / 4 MiB per buffer, 256
-  concurrent buffers) are now defaults — production deployments under
-  sustained execution churn can dial them without forking. Worst-case
-  memory at defaults is `maxActiveBuffers × maxBytesPerBuffer` ≈ 1
-  GiB; tightening either dimension lowers the ceiling at the cost of
-  late-subscriber replay coverage. Terminal `done` / `error` events
-  are always buffered regardless of caps. New `BufferCaps` type
-  re-exported from `@axlsdk/studio` (server) and `@axlsdk/studio/middleware`.
-- **Filter-application invariant on `broadcastWithWildcard()`'s
-  wildcard branch is now pinned by a regression test.** Existing
-  coverage tested the wildcard + specific-subscriber path; the new
-  test exercises the wildcard-only case (no specific subscriber for
-  the broadcast channel) and asserts that a filter rejecting the
-  event does drop it from the wildcard subscriber. Hardens the
-  invariant against future refactors that consolidate the two
-  broadcast paths.
-
-### Deprecated
-
-- `AxlEventBase.parentToolCallId` is `@deprecated` (one-cycle window).
-  Use `parentAskId` (on `AskScoped`) for ask-graph correlation going
-  forward. Removal is tracked for the spec follow-up.
-
-### Changed — Small polish (FOLLOWUPS clean-up)
-
-- **`AnyWorkflow` is now a named type alias** exported from `@axlsdk/axl`
-  (`Workflow<any, any>` with explanatory JSDoc on why the bivariant `any`
-  is load-bearing). `AxlRuntime.register()` and
-  `AxlTestRuntime.register()` both reference it directly so neither
-  re-derives the workaround. The `WorkflowLike` shadow interface in
-  `@axlsdk/testing` is gone.
-- **`fetchExecution(id, since)` client helper accepts `since = -1`** as
-  a sentinel meaning "fetch everything from step 0", mirroring the
-  server's accept-any-finite-integer policy. Callers no longer need to
-  drop to raw `fetch()` for the initial-page case.
-- **`AxlStream.fullText` JSDoc warns about concurrent root-level asks.**
-  The buffer is shared across all root asks, so tokens from
-  `ctx.parallel` / `ctx.spawn` / `ctx.race` / `ctx.map` branches
-  interleave — and a `pipeline(failed)` from one branch can also
-  discard another branch's in-progress tokens. Multi-branch consumers
-  should use `textByAsk` instead. (The actual buffer fix is still
-  deferred — see `.internal/FOLLOWUPS.md`.)
-- **`ctx.checkpoint()` validation tests** extended to pin the full
-  rejection matrix: empty string, whitespace-only, leading/trailing
-  whitespace, and the case-insensitive reserved-prefix (`__auto/`,
-  `__Auto/`, `__AUTO/`) all assert the specific error message rather
-  than just "throws".
-- **Studio client now uses the strict `AxlEvent` discriminated union**
-  re-exported from `@axlsdk/axl` via type-only imports
-  (`import type { AxlEvent, AxlEventOf, AgentCallStartData, ... }`).
-  Previously the client declared a loose duplicate (`type: string`,
-  `data?: unknown`) so every panel needed `event.data as { args?: ...}`
-  casts. With the strict union, narrowing on `event.type === '...'`
-  gives statically-typed access to per-variant `data` (e.g.,
-  `event.data.args` on `tool_call_start`, `event.data.target` on
-  `handoff_start`, `event.data.approved` on `tool_approval`). Removed
-  ~10 inline `as { ... }` casts across `PlaygroundPanel`,
-  `WorkflowRunnerPanel`, `AskTree`, `AskDetails`, `TraceEventList`,
-  `PartialObjectRenderer`, `use-ws-stream`, and `trace-utils`.
-- **Tripwire `client-no-core-import-tripwire.test.ts` updated** to
-  permit `import type` and `export type` from `@axlsdk/axl` while
-  continuing to ban value imports (which would crash the Vite-bundled
-  SPA via `node:async_hooks`). Type-only imports are guaranteed erased
-  under `verbatimModuleSyntax: true` (enabled in `tsconfig.base.json`).
-  Mixed imports — `import { type X, y }` — remain banned because the
-  `y` value binding is still emitted at runtime. Synthetic fixtures
-  pin the regex contract (allow / ban table) so the boundary doesn't
-  drift.
+### Spec/16 — Unified Event Model
+
+The two parallel event models — rich `TraceEvent` (persisted to `ExecutionInfo.steps`) and lean `StreamEvent` (wire-only, derived by a translation layer that dropped fields) — collapse into a single `AxlEvent` discriminated union. The wire format IS the trace format. Tokens, tool calls, ask boundaries, and agent turns are observable end-to-end at full fidelity. Every event is correlated to its enclosing `ctx.ask()` via `askId` / `parentAskId` / `depth`, so consumers reconstruct the ask graph by group-by + parent-link.
+
+This release also lands named checkpoints (`ctx.checkpoint(name, fn)`), removes the deprecated `parentToolCallId` field, and ships the Studio panels needed to visualize the new model (live `AskTree`, `RetryIndicator`, `PartialObjectRenderer`).
+
+See [`docs/migration/unified-event-model.md`](docs/migration/unified-event-model.md) for a step-by-step consumer migration guide.
+
+### Breaking changes
+
+#### Event model
+
+- **`TraceEvent` and `StreamEvent` are deleted.** Both collapse into `AxlEvent` (exported from `@axlsdk/axl`). External TS imports of either get compile errors — switch to `AxlEvent` and narrow on `event.type`. No alias kept.
+- **`ExecutionInfo.steps` → `ExecutionInfo.events`.** Read sites rename verbatim. The on-disk SQLite column auto-migrates on first open via `PRAGMA user_version` (transactional, idempotent).
+- **`AxlStream.steps` → `AxlStream.lifecycle`.** Same iterator shape; the rename reflects that these are events, not pipeline steps. Filter set expanded to include `ask_*`, `agent_call_*`, `tool_call_*`, `tool_approval`, `tool_denied`, `delegate`, `handoff_start`, `handoff_return`, `pipeline`, `verify`, `workflow_*`, `checkpoint_*`, `await_human*`.
+- **Event type renames:** `'agent_call'` → `'agent_call_end'`, `'tool_call'` → `'tool_call_end'`. The new `_end` variants pair with newly-emitted `_start` events (see Added). `event.name` → `event.tool` on tool events; `event.message` → `event.data.message` on `error`; `done.data` → `done.data.result`.
+- **Handoff event split: `'handoff'` → `'handoff_start'` + `'handoff_return'`.** `handoff_start` always fires BEFORE the target ask begins so it orders correctly in step-sorted timelines. `handoff_return` is roundtrip-only (oneway terminates at target). `HandoffData` exports split into `HandoffStartData` + `HandoffReturnData`. Handoff target asks now also emit their own `ask_start` / `ask_end`, so drill-downs no longer show "unknown agent".
+- **Streaming-callback signatures gain `meta`.** `onToken`, `onToolCall`, `onAgentStart` now take a second `meta: CallbackMeta = { askId, parentAskId?, depth, agent }` parameter. Existing chat UIs that want root-only behavior add `if (meta.depth === 0)` to preserve the prior behavior.
+- **`createChildContext` no longer isolates streaming callbacks.** Nested asks now propagate tokens, tool calls, and agent starts to the same callbacks as the parent — consumers filter via `meta.depth` to recover root-only behavior. Spec §3.2.
+- **`createChildContext()` no longer accepts `parentToolCallId`** — the signature is `createChildContext(): WorkflowContext`. Callers passing `toolCall.id` should drop the argument; `parentAskId` from the ALS frame already correlates nested events to the outer ask.
+- **`error` event scope narrowed.** Ask-internal failures (gate exhaustion, `ctx.verify` failure, handler throw) surface via `ask_end({ outcome: { ok: false, error } })` ONLY — never the workflow-level `error` event. `error` is reserved for failures with no `ask_end` available (top-level workflow throw, infrastructure / abort errors). Consumers must never see both for the same failure. Spec decision 9.
+- **`step` is monotonic across the whole execution tree** via a single `AsyncLocalStorage`-shared counter. Consumers ordering by `step` see one shared counter spanning the root ask, every nested ask, and every branch primitive (spawn / parallel / race / map).
+- **`AxlEventBase.parentToolCallId` removed.** The deprecated correlation field announced in 0.15.0 is gone. Use `parentAskId` (on `AskScoped`).
+
+#### Checkpoint API
+
+- **`ctx.checkpoint(fn)` → `ctx.checkpoint(name, fn)`.** Names are user-supplied and stable across runs (required for replay). The `__auto/` prefix is reserved for runtime auto-checkpointing of `ctx.ask` / `spawn` / `race` / `parallel` / `map`. Closes a data-corruption bug where nested `WorkflowContext`s each had their own `0`-indexed counter and silently overwrote each other's checkpoint slots.
+- **`StateStore.{save,get}Checkpoint(executionId, step: number)` → `(executionId, name: string)`.** Custom `StateStore` impls switch the parameter type. `MemoryStore` / `SQLiteStore` / `RedisStore` already migrated.
+- **SQLite schema v1→v2:** `checkpoints.step` (INTEGER) → `checkpoints.name` (TEXT). Auto-migrated on first open. **Drain or cancel running executions before upgrading** — legacy auto-checkpoint rows (`"0"`, `"1"`, …) become unreachable under the new `__auto/<agent>/ask/<n>` naming, so in-flight v1 executions resumed under v2 will re-execute side effects rather than replay from saved state. User-named checkpoints are unaffected.
+- **`StateStore.getLatestCheckpoint` removed.** Undefined semantics under named keys.
+- **`CheckpointEventData.step` (number) → `CheckpointEventData.name` (string).**
+
+#### Other
+
+- **Runtime translation layer at `runtime.ts:709-783` deleted.** The block that derived `agent_end` / `tool_result` / `step` from `AxlEvent` traces is gone — every event flows verbatim from `emitEvent` to the wire.
+- **Studio: `costs` WS payload is `{ snapshots: Record<WindowId, CostData>, updatedAt }`** (was bare `CostData`). Custom WS subscribers update; the bundled client already handles this.
+
+### Added
+
+#### Event variants
+
+- **`ask_start` / `ask_end`** — bound every `ctx.ask()` call. `ask_start` carries `prompt`; `ask_end` carries `outcome: { ok: true, result } | { ok: false, error }`, `cost`, `duration`. `ask_end.cost` is the per-ask rollup (leaf cost summed within the frame, EXCLUDING nested asks — spec decision 10).
+- **`agent_call_start`** — pre-call marker per LLM turn, paired with `agent_call_end`. Carries `agent`, `model`, `turn`.
+- **`tool_call_start`** — pre-call marker per tool invocation, paired with `tool_call_end`. Carries `tool`, `callId`, `data: { args }`.
+- **`pipeline`** — retry/validation lifecycle (statuses: `start` / `failed` / `committed`). `start` fires once per LLM turn that contributes to the final result (initial + each gate-rejection retry). `failed` fires before each retry continue with the gate stage (`schema` / `validate` / `guardrail`) and feedback message. `committed` fires once on success before `done`. Tool-calling continuations within the same ask do NOT fire additional starts. Spec §4.2.
+- **`partial_object`** — progressive structured-output streaming for asks with a Zod object schema and no tools. Emits at structural boundaries (`,` / `}` / `]`, string-safe walker). Backed by a tolerant JSON parser (`parsePartialJson`, 256-depth cap, zero deps). Monotonicity guaranteed within an attempt.
+- **`memory_remember` / `memory_recall` / `memory_forget`** — first-class typed variants (previously sub-discriminated under `log`). Narrow on `event.type` for typed access to `data.{key, scope, usage, hit, ...}`.
+- **`checkpoint_save` / `checkpoint_replay`** — first-class typed variants for durable execution events.
+- **`await_human` / `await_human_resolved`** — first-class typed variants for human-in-the-loop pause/resume.
+- **`AskScoped` mixin** — every ask-scoped event carries `askId`, `parentAskId?`, `depth`, `agent?` for tree reconstruction.
+
+#### Helpers and types
+
+- **`eventCostContribution(event)`** exported from `@axlsdk/axl` as the single source of truth for spec §10 cost aggregation (skips `ask_end` rollups, finite-checks, leaf-only). Used by the runtime accumulator, `AxlTestRuntime`, `trackExecution`, Studio's `reduceCost`, and the Playground / Workflow Runner panels.
+- **`isCostBearingLeaf(event)`** / **`isRootLevel(event)`** / **`COST_BEARING_LEAF_TYPES`** — supporting helpers for custom cost aggregators.
+- **`parsePartialJson(text)`** — tolerant JSON parser for progressive-render pipelines. 256-depth recursion cap.
+- **`AxlEventOf<T>`** Extract helper, **`AXL_EVENT_TYPES`** const tuple (single source of truth for the discriminator), **`AxlEventBase`**, **`AskScoped`**, **`CallbackMeta`** type exports.
+- **Per-variant data shapes:** `AgentCallStartData`, `AgentCallEndData`, `AgentCallParams`, `ToolCallData`, `ToolCallStartData`, `ToolApprovalData`, `ToolDeniedData`, `HandoffStartData`, `HandoffReturnData`, `DelegateData`, `VerifyData`, `WorkflowStartData`, `WorkflowEndData`, `MemoryEventData`, `CheckpointEventData`, `AwaitHumanData`, `AwaitHumanResolvedData`, `GuardrailData`, `SchemaCheckData`, `ValidateData`.
+- **`AnyWorkflow`** type alias (`Workflow<any, any>`) — centralizes the bivariant escape hatch used by `AxlRuntime.register` and `AxlTestRuntime.register`.
+- **`REDACTION_RULES`** + **`redactEvent(event)`** + **`REDACTED`** sentinel — table-driven, exhaustive per-variant scrubbing shared between core's emit-time scrub and Studio's WS/REST scrub. Adding a new variant without a rule fails typecheck via `Record<AxlEventType, RuleFor<...>>`.
+- **`AxlStream.textByAsk`** iterator yields `{ askId, agent?, text }` per token chunk for split-pane UIs that render each sub-agent in its own lane.
+- **`AxlStream.fullText`** commits on `pipeline(committed)` and discards the in-progress buffer on `pipeline(failed)` or `ask_end({ok:false})`. Per-`askId` scoping (`Map<askId, string[]>`) means concurrent root-level asks (`ctx.parallel` / `spawn` / `race` / `map`) keep each branch's chunks contiguous and a failure on one branch only discards THAT branch's tokens.
+
+#### Configuration
+
+- **`config.state.maxEventsPerExecution`** — bounds the in-memory `ExecutionInfo.events` array per execution. Default `50_000`; `Infinity` opts out. When the cap is hit, the cap-th slot is replaced with a sentinel `log` event (`data.event: 'events_truncated'`); the trace channel and WS broadcast continue to receive every event. Pathological values (`0`, negative, fractional, `NaN`) rejected at construction with `RangeError`.
+- **`bufferCaps`** option on `createStudioMiddleware()` / `createServer()` / `ConnectionManager` — `{ maxEventsPerBuffer?, maxBytesPerBuffer?, maxActiveBuffers? }`. Production deployments under sustained execution churn can dial WS replay-buffer limits without forking. Defaults: `1000` events / `4 MiB` per buffer, `256` concurrent buffers. Pathological values rejected with `RangeError`.
+
+#### Testing
+
+- **`MockProvider.chunked(contents, chunkSize?)`** static helper builds a `sequence()` from plain strings split into fixed-size chunks (default 4 chars). Used for streaming, partial-JSON, and structural-boundary tests.
+- **`MockProvider.sequence()` accepts `chunks?: string[]`** per response. `stream()` yields one `text_delta` per chunk; `chunks.join('') === content` asserted at construction.
+- **`AxlTestRuntime` accepts `{ config }`** in its constructor options for `trace.level` / `trace.redact` parity with production.
+
+#### Studio panels
+
+- **New shared components:** `AskTree` (hierarchical live ask graph by `askId`, parent-linked via `parentAskId`, with status badges, inline `RetryIndicator`, cost rollup, handoff arrows), `AskDetails` (side-panel event timeline for a selected ask), `RetryIndicator` (inline pipeline-state badge), `PartialObjectRenderer` (progressive JSON view that resets on `pipeline(failed)`).
+- **Playground:** opt-in subagent activity drawer (auto-opens the first time a nested-ask event lands; one-way latch — explicit user-off wins). Tool activity reconstruction migrated to the AxlEvent shape.
+- **Workflow Runner:** `AskTree` is the new default timeline view with a Tree / Flat toggle. Clicking an ask opens an `AskDetails` drawer alongside.
+- **Cost Dashboard:** retry overhead breakdown — decomposes `agent_call` cost + call counts by `retryReason` (`primary` / `schema` / `validate` / `guardrail`).
+- **Trace Explorer:** native `event.depth` indentation, `pipeline(failed)` and `ask_end(ok:false)` highlighted as failure rows.
+- **Strict client types:** the Studio React client now imports the strict `AxlEvent` discriminated union from `@axlsdk/axl` via type-only imports (safe under `verbatimModuleSyntax: true`). ~10 inline `event.data as { ... }` casts removed across panels.
+
+#### Studio REST + WS
+
+- **`GET /api/executions/:id?since={step}`** — paginated tail. `step > since` filter; `since=-1` is an explicit "everything from step 0" sentinel; malformed values return `400 INVALID_PARAM` with diagnostic.
+- **WS replay buffer** excludes `token` and `partial_object` (reconstructable from final `agent_call_end` and `done`), uses byte-aware frame size checks (`Buffer.byteLength` on both inbound and outbound — closes an asymmetry where multi-byte payloads could pass `length` but exceed 64KB on the wire).
+
+### Fixed
+
+- **`AxlStream.fullText` no longer leaks retried-attempt tokens** — buffer split into in-progress and committed halves, flushed on `pipeline(committed)`, discarded on `pipeline(failed)` or terminal-throw `ask_end({ok:false})`. Spec §4.3.
+- **`validate` + streaming now coexist.** Was an `INVALID_CONFIG` hard error in 0.15.x as a defensive workaround for the retry-leak above; with the leak fixed at the source, the workaround is removed. Spec §4.1.
+- **Nested-ask events propagate to outer-context streaming callbacks.** `onToken`, `onToolCall`, `onAgentStart` from a parent context now fire for nested `ctx.ask()` invocations (with `meta.depth >= 1`). Filter on `meta.depth === 0` to recover root-only behavior. Spec §3.2.
+- **Workflow `workflow_end` is idempotent (first-wins).** A post-completion side effect (`stateStore.deleteCheckpoints`, `persistExecution`) that throws after `_emitWorkflowEnd(completed)` no longer triggers a second `workflow_end(failed)` with conflicting status.
+- **`onAgentCallComplete` hook throws no longer corrupt `ask_end.outcome`.** The hook is now wrapped in `try/catch + console.error` (mirroring the `onTrace` consumer-safety pattern); a buggy hook is logged but the ask's actual outcome survives intact.
+- **Spec §9 invariant hardened** — `ctx.ask()` body refactored to `try/catch/finally` so `ask_end` always emits regardless of which path exits. Pinned by tests for input-guardrail block, MaxTurnsError, TimeoutError, provider HTTP throw, and BudgetExceededError mid-ask.
+- **Per-ask cost rollup includes embedder cost.** `frame.askCost` previously hardcoded `agent_call_end | tool_call_end`, dropping `memory_remember` / `memory_recall` cost when `ctx.recall()` ran inside an ask. Now uses `COST_BEARING_LEAF_TYPES`.
+- **PII redaction gaps closed.** `token.data` is now scrubbed at emit time (was leaking on the direct trace channel). Emit-time scrub also covers `tool_call_start`, `tool_denied`, `partial_object`, `verify`, `pipeline(failed).reason`, and `done` / `error`. Studio's `redactStreamEvent` shares the same `REDACTION_RULES` table — single source of truth across emit, REST, and WS.
+- **Studio multi-tenant filter applied to replay-buffer events.** Late subscribers no longer see historical cross-tenant events on reconnect.
+- **DoS hardening** — WS replay buffer global cap (oldest-complete-first eviction) + per-buffer byte budget; `parsePartialJson` 256-depth recursion cap; `parseInt` validation on `?since=`; `POST /api/evals/compare` pooled-ID count cap (25/side).
+- **Browser SPA no longer crashes on `node:async_hooks`** — Studio client imports use type-only `import type { … } from '@axlsdk/axl'` (safe under `verbatimModuleSyntax: true`); the browser-compat tripwire test rejects value imports, side-effect imports, mixed-type imports, and dynamic `import('@axlsdk/axl')` at CI time.
+- **Handoff target is a real ask frame.** Target's `executeAgentCall` runs under `askStorage.run(targetFrame, ...)` so its events carry `askId === handoffToAskId` and `parentAskId === handoffFromAskId`. Consumers grouping by askId no longer see the target as an orphan.
+- **`partial_object` throttle is string-safe.** A char-by-char walker tracks `inString` + `escaped` state across chunks so commas inside string values no longer trigger per-comma parse+emit (50+ emissions on a prose-heavy field collapse to 1).
+- **SQLite migration races** — `user_version` is re-read inside `BEGIN IMMEDIATE` so a concurrent constructor race can't double-apply a non-idempotent migration.
+- **Gemini schema sanitizer** — Zod v4's `z.toJSONSchema()` emits Draft 2020-12 fields (`additionalProperties`, `oneOf`, `const`, `$ref`, `$defs`, `not`, `allOf`, ...) that Gemini's tool/responseSchema endpoint rejects with a 400. `sanitizeSchemaForGemini` recursively strips unsupported fields and translates `oneOf` → `anyOf` (preserves `z.discriminatedUnion()`) and `const: x` → `enum: [x]` (preserves `z.literal(x)`). Pre-existing bug surfaced by the live integration test pass; unrelated to spec/16.
+
+### Documentation
+
+- New migration guide at `docs/migration/unified-event-model.md` covering renames, callback `meta`, the named-checkpoints API, the `parentToolCallId` removal, and post-fix invariants for `fullText` / `validate + streaming`.
+- Comprehensive doc audit pass — fixed broken `new AxlRuntime({ config: { ... } })` examples in `docs/security.md` and `packages/axl-studio/README.md`, replaced lingering `AgentCallData` type references with the actual `AgentCallStartData` / `AgentCallEndData` exports, added missing event-table rows for `pipeline` / `partial_object` / `await_human*` / `checkpoint_*`, documented `config.state.maxEventsPerExecution` / `AnyWorkflow` / `parsePartialJson` / `MockProvider.chunked()`, fixed scrubbed-fields paths (`handoff.data.message` → `handoff_start.data.message`, `tool_approval.args` → `tool_approval.data.args`), corrected the Studio replay-buffer cap (500 → 1000), fixed a broken `#trace-event-types` anchor in the core README.
 
 ## [0.15.0] - 2026-04-17
 

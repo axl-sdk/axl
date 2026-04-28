@@ -8,6 +8,7 @@ import { redactStreamEvent } from './redact.js';
 import type { StudioEnv } from './types.js';
 import { errorHandler } from './middleware/error-handler.js';
 import { ConnectionManager } from './ws/connection-manager.js';
+import type { BufferCaps } from './ws/connection-manager.js';
 import { createWsHandlers } from './ws/handler.js';
 import { TraceAggregator } from './aggregates/trace-aggregator.js';
 import { ExecutionAggregator } from './aggregates/execution-aggregator.js';
@@ -41,7 +42,7 @@ import { createTraceStatsRoutes } from './routes/trace-stats.js';
 
 export type { StudioEnv } from './types.js';
 export { ConnectionManager } from './ws/connection-manager.js';
-export type { BroadcastTarget } from './ws/connection-manager.js';
+export type { BroadcastTarget, BufferCaps } from './ws/connection-manager.js';
 export { TraceAggregator } from './aggregates/trace-aggregator.js';
 export { ExecutionAggregator } from './aggregates/execution-aggregator.js';
 export { EvalAggregator } from './aggregates/eval-aggregator.js';
@@ -59,12 +60,18 @@ export type CreateServerOptions = {
   cors?: boolean;
   /** Lazy eval file loader. Called before eval routes access the runtime's registered evals. */
   evalLoader?: () => Promise<void>;
+  /**
+   * Override the default WS replay-buffer resource caps. All fields are
+   * optional; omitted fields keep their documented defaults
+   * (1000 events / 4 MiB per buffer, 256 concurrent buffers).
+   */
+  bufferCaps?: BufferCaps;
 };
 
 export function createServer(options: CreateServerOptions) {
   const { runtime, staticRoot, basePath = '', readOnly = false } = options;
   const app = new Hono<StudioEnv>();
-  const connMgr = new ConnectionManager();
+  const connMgr = new ConnectionManager(options.bufferCaps);
   const windows: WindowId[] = ['24h', '7d', '30d', 'all'];
 
   const costAggregator = new TraceAggregator({

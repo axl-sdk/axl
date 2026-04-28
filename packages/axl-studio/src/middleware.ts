@@ -7,10 +7,12 @@ import { createServer } from './server/index.js';
 import { handleWsMessage } from './server/ws/protocol.js';
 import { createEvalLoader } from './eval-loader.js';
 import type { EvalLoaderConfig } from './eval-loader.js';
+import type { BufferCaps } from './server/ws/connection-manager.js';
 import type { AxlRuntime } from '@axlsdk/axl';
 import type { IncomingMessage, ServerResponse, Server } from 'node:http';
 
 export type { EvalLoaderConfig } from './eval-loader.js';
+export type { BufferCaps } from './server/ws/connection-manager.js';
 
 export type StudioMiddlewareOptions = {
   /** The AxlRuntime instance to observe and control. */
@@ -140,6 +142,29 @@ export type StudioMiddlewareOptions = {
    * }
    */
   evals?: EvalLoaderConfig;
+
+  /**
+   * Override the default WebSocket replay-buffer resource caps for
+   * production deployments under sustained execution churn.
+   *
+   * Defaults: `maxEventsPerBuffer: 1000`, `maxBytesPerBuffer: 4 MiB`,
+   * `maxActiveBuffers: 256`. Worst-case memory is roughly
+   * `maxActiveBuffers × maxBytesPerBuffer` (≈1 GiB at defaults). Tighten
+   * either dimension to lower the ceiling at the cost of late-subscriber
+   * replay coverage; raise them if you need more event headroom on long
+   * verbose-mode streams.
+   *
+   * Terminal `done` / `error` events are always buffered regardless of
+   * caps, so a late subscriber to a completed stream still sees the
+   * outcome — only intermediate non-terminal events are dropped.
+   *
+   * All fields are optional; passing `{}` is a no-op.
+   *
+   * @example
+   * // Halve memory ceiling on a high-churn deployment
+   * bufferCaps: { maxActiveBuffers: 128, maxBytesPerBuffer: 2 * 1024 * 1024 }
+   */
+  bufferCaps?: BufferCaps;
 };
 
 /**
@@ -195,6 +220,7 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
     readOnly,
     cors: false, // Host framework owns CORS policy
     evalLoader,
+    bufferCaps: options.bufferCaps,
   });
 
   // Install the broadcast filter once at construction time. The connMgr

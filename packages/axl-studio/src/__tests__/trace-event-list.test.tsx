@@ -20,14 +20,30 @@ import userEvent from '@testing-library/user-event';
 import { TraceEventList } from '../client/components/shared/TraceEventList';
 import type { AxlEvent } from '../client/lib/types';
 
-function makeEvent(overrides: Partial<AxlEvent>): AxlEvent {
+/**
+ * Test-fixture builder. The strict `AxlEvent` discriminated union requires
+ * per-variant fields (e.g., `askId`/`depth` on AskScoped variants,
+ * `outcome`/`cost`/`duration` on `ask_end`); building these from an
+ * unbound `Partial<AxlEvent>` would force every test to spell out the
+ * full shape. Instead, we construct a generic envelope and cast at the
+ * boundary — the tests don't exercise field-presence invariants on the
+ * fixture itself, only render output.
+ */
+function makeEvent(overrides: Record<string, unknown>): AxlEvent {
   return {
     executionId: 'exec-1',
     step: 0,
     type: 'agent_call_end',
     timestamp: Date.now(),
+    askId: 'ask-1',
+    depth: 0,
+    agent: 'tester',
+    model: 'mock:test',
+    cost: 0,
+    duration: 0,
+    data: { response: '', turn: 1 },
     ...overrides,
-  };
+  } as unknown as AxlEvent;
 }
 
 describe('TraceEventList', () => {
@@ -65,7 +81,10 @@ describe('TraceEventList', () => {
   it('shows attempt counter "N/M" on guardrail events', () => {
     const event = makeEvent({
       type: 'guardrail',
-      data: { attempt: 2, maxAttempts: 3, valid: false },
+      // GuardrailData's failure signal is `blocked: true` (not `valid: false`,
+      // which lives on SchemaCheckData/ValidateData). The attempt counter is
+      // rendered regardless of pass/fail.
+      data: { attempt: 2, maxAttempts: 3, blocked: true, guardrailType: 'output' },
     });
     render(<TraceEventList events={[event]} />);
     expect(screen.getByText('2/3')).toBeInTheDocument();

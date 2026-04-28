@@ -1,4 +1,13 @@
-import type { AxlEvent } from './types';
+import type {
+  AxlEvent,
+  AxlEventOf,
+  AgentCallStartData,
+  AgentCallEndData,
+  GuardrailData,
+  SchemaCheckData,
+  ValidateData,
+  ToolApprovalData,
+} from './types';
 
 /**
  * Per-event-type bar/dot color. Organized by family — start/end pairs share
@@ -103,41 +112,40 @@ const UNKNOWN_EVENT_COLOR = 'bg-pink-400';
  * memory-audit events emit `error` on the failure path).
  */
 export function isFailureEvent(event: AxlEvent): boolean {
-  const type = event.type;
-  if (type === 'tool_denied') return true;
-  if (type === 'guardrail' || type === 'schema_check' || type === 'validate') {
-    const d = event.data as { valid?: boolean; blocked?: boolean } | undefined;
-    // Output-gate events use `valid: false`; input/output guardrails use `blocked: true`.
-    return d?.valid === false || d?.blocked === true;
+  switch (event.type) {
+    case 'tool_denied':
+      return true;
+    case 'guardrail':
+      // GuardrailData uses `blocked: boolean`. Input/output guardrails both
+      // share this shape; either one being blocked means failure.
+      return event.data?.blocked === true;
+    case 'schema_check':
+    case 'validate':
+      // SchemaCheckData / ValidateData both expose `valid: boolean` (not
+      // optional in the strict union — the runtime always populates it).
+      return event.data?.valid === false;
+    case 'pipeline':
+      // The unified-event-model retry lifecycle: `failed` status means the
+      // gate rejected the attempt and a retry is queued. Spec §4.2.
+      return event.status === 'failed';
+    case 'verify':
+      return event.data?.passed === false;
+    case 'tool_approval':
+      return event.data?.approved === false;
+    case 'ask_end':
+      // Discriminated outcome — ask-internal failures surface here per
+      // spec decision 9.
+      return event.outcome.ok === false;
+    case 'workflow_end':
+      return event.data?.status === 'failed' || event.data?.aborted === true;
+    case 'log': {
+      // `log.data` is `unknown` by design — narrow defensively.
+      const d = event.data as { error?: unknown } | undefined;
+      return d != null && typeof d === 'object' && 'error' in d && d.error != null;
+    }
+    default:
+      return false;
   }
-  if (type === 'pipeline') {
-    // The unified-event-model retry lifecycle: `failed` status means the
-    // gate rejected the attempt and a retry is queued. Spec §4.2.
-    return (event as { status?: string }).status === 'failed';
-  }
-  if (type === 'verify') {
-    const d = event.data as { passed?: boolean } | undefined;
-    return d?.passed === false;
-  }
-  if (type === 'tool_approval') {
-    const d = event.data as { approved?: boolean } | undefined;
-    return d?.approved === false;
-  }
-  if (type === 'ask_end') {
-    // Discriminated outcome — ask-internal failures surface here per
-    // spec decision 9.
-    const outcome = (event as { outcome?: { ok?: boolean } }).outcome;
-    return outcome?.ok === false;
-  }
-  if (type === 'workflow_end') {
-    const d = event.data as { status?: string; aborted?: boolean } | undefined;
-    return d?.status === 'failed' || d?.aborted === true;
-  }
-  if (type === 'log') {
-    const d = event.data as { error?: unknown } | undefined;
-    return d?.error !== undefined && d?.error !== null;
-  }
-  return false;
 }
 
 /**
@@ -162,37 +170,39 @@ export function getEventColor(event: AxlEvent): string {
 /**
  * Visual indent depth for a trace event in the waterfall view.
  *
- * `depth` is a first-class field on every AxlEvent — set from the ALS
- * frame for ask-scoped events (root = 0; +1 per nested ask), and stamped
- * to 0 by `emitEvent` for out-of-ask events (workflow lifecycle, logs,
- * workflow-scope memory/checkpoint/await_human). The fallback only fires
- * for malformed/legacy events that bypassed the emitter.
+ * `depth` is set from the ALS frame for AskScoped events (root = 0; +1 per
+ * nested ask). It's not present on out-of-ask variants (`workflow_*`,
+ * `done`) and on `handoff_*` (which carries `sourceDepth`/`targetDepth`
+ * separately because it spans two asks). For those, we fall back to 0 so
+ * the waterfall renders them at the root indent level.
  */
 export function getDepth(event: AxlEvent): number {
-  if (typeof event.depth === 'number') return event.depth;
+  // `'depth' in event` narrows out variants where `depth` isn't declared
+  // (workflow_*, handoff_*, done). For variants where depth is on
+  // `Partial<AskScoped>` (log/memory_*/checkpoint_*/await_human/error/
+  // gate events), the field may be undefined at runtime — guard with a
+  // typeof check.
+  if ('depth' in event && typeof event.depth === 'number') return event.depth;
   return 0;
 }
 
-/** Event data narrowers — mirrors packages/axl/src/types.ts. Loose on client. */
-export type AgentCallStartData = {
-  prompt?: string;
-  system?: string;
-  params?: Record<string, unknown>;
-  turn?: number;
-  retryReason?: 'schema' | 'validate' | 'guardrail';
-  toolNames?: string[];
-  messages?: Array<{ role: string; content: string }>;
-};
+/**
+ * Per-event-type data narrowers. These exist as a small ergonomic layer
+ * over `event.type === '...'` narrowing — both forms work, but the helpers
+ * keep TraceEventList's body renderers (which switch on event.type and
+ * reach into `event.data`) terse.
+ *
+ * Returns `null` instead of `undefined` so call sites can early-return on
+ * a single check (the data field is required on most variants but the
+ * helpers stay null-safe for forward-compat with future emit changes).
+ */
 
-export type AgentCallEndData = {
-  response?: string;
-  thinking?: string;
-  turn?: number;
-  retryReason?: 'schema' | 'validate' | 'guardrail';
-  /** Provider error message when the call threw (mutually exclusive with response). */
-  error?: string;
-};
-
+/**
+ * Unified gate-event data shape. Combines the on-pass (`valid: true`) and
+ * on-fail (`blocked: true` for guardrail; `valid: false` for schema_check
+ * /validate) cases into one read shape so the renderer doesn't have to
+ * branch on event.type.
+ */
 export type GateCheckData = {
   valid?: boolean;
   blocked?: boolean;
@@ -203,36 +213,51 @@ export type GateCheckData = {
   feedbackMessage?: string;
 };
 
-export type ToolApprovalData = {
-  approved: boolean;
-  args: unknown;
-  reason?: string;
-};
-
 export function getAgentCallStartData(event: AxlEvent): AgentCallStartData | null {
-  if (event.type !== 'agent_call_start' || !event.data) return null;
-  return event.data as AgentCallStartData;
+  if (event.type !== 'agent_call_start') return null;
+  return event.data ?? null;
 }
 
 export function getAgentCallEndData(event: AxlEvent): AgentCallEndData | null {
-  if (event.type !== 'agent_call_end' || !event.data) return null;
-  return event.data as AgentCallEndData;
+  if (event.type !== 'agent_call_end') return null;
+  return event.data ?? null;
 }
 
 export function getGateData(event: AxlEvent): GateCheckData | null {
-  if (event.type !== 'guardrail' && event.type !== 'schema_check' && event.type !== 'validate')
-    return null;
-  return (event.data ?? null) as GateCheckData | null;
+  // Three variants share a normalized read shape — `guardrail` carries
+  // `blocked` while `schema_check`/`validate` carry `valid`. Combining
+  // them via the shared `GateCheckData` lets the renderer treat all three
+  // uniformly.
+  if (event.type === 'guardrail') {
+    const d: GuardrailData | undefined = event.data;
+    return d ?? null;
+  }
+  if (event.type === 'schema_check') {
+    const d: SchemaCheckData | undefined = event.data;
+    return d ?? null;
+  }
+  if (event.type === 'validate') {
+    const d: ValidateData | undefined = event.data;
+    return d ?? null;
+  }
+  return null;
 }
 
 export function getToolApprovalData(event: AxlEvent): ToolApprovalData | null {
-  if (event.type !== 'tool_approval' || !event.data) return null;
-  return event.data as ToolApprovalData;
+  if (event.type !== 'tool_approval') return null;
+  return event.data ?? null;
 }
 
 /** Returns true if this agent_call (start or end) is a retry triggered by a failed gate. */
 export function isRetryCall(event: AxlEvent): boolean {
-  if (event.type === 'agent_call_start') return !!getAgentCallStartData(event)?.retryReason;
-  if (event.type === 'agent_call_end') return !!getAgentCallEndData(event)?.retryReason;
+  if (event.type === 'agent_call_start') return !!event.data?.retryReason;
+  if (event.type === 'agent_call_end') return !!event.data?.retryReason;
   return false;
 }
+
+// `AxlEventOf` is re-exported so importers of this module can narrow
+// without reaching into the client types barrel. Unused-export warnings
+// are suppressed by the import being used in the comment above (the
+// re-export is the value). Keeping it on the public surface for callers
+// that need explicit variant types.
+export type { AxlEventOf };

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Independent-review hardening pass
+
+Six fixes from a fresh-eyes reviewer pass on the spec/16 hardening work.
+None blocking; each closes a robustness gap or edge case.
+
+- **`onAgentCallComplete` hook throws no longer corrupt `ask_end.outcome`**
+  (`packages/axl/src/context.ts`). Prior to this fix, a hook throw inside
+  the `ctx.ask()` try-block landed in the surrounding catch and overwrote
+  `outcome = { ok: false, error: hookErrorMessage }` — reliability
+  dashboards filtering on `ask_end.outcome.ok === false` would
+  misattribute hook bugs to ask failures. The hook is now wrapped in
+  `try/catch + console.error`, mirroring the existing `onTrace` consumer-
+  safety pattern: hook errors are logged and swallowed so the ask's
+  actual outcome survives intact. Pinned by a regression test in
+  `model-params.test.ts`.
+- **`bufferCaps` rejects pathological values at construction**
+  (`packages/axl-studio/src/server/ws/connection-manager.ts`). `0`,
+  negative numbers, fractions, and `NaN` are now rejected with a
+  `RangeError` naming the offending key — fail-loud beats silent
+  replay-buffer breakage when an operator passes `0` thinking it
+  disables buffering. Pinned by tests covering each pathological input.
+- **Tripwire now catches dynamic imports** (`client-no-core-import-tripwire.test.ts`).
+  Static `import { x }` was banned but `await import('@axlsdk/axl')` and
+  `import('@axlsdk/axl')` slipped through — same `async_hooks` browser
+  crash profile. New `dynamicImportRe` regex closes the bypass; contract
+  fixtures pin the boundary.
+- **Defensive narrowing in client SPA** (`use-ws-stream.ts`,
+  `AskTree.tsx`, `PlaygroundPanel.tsx`, `TraceEventList.tsx`). The
+  strict-types migration mandates `event.data` on most variants, but
+  malformed wire payloads (older runtimes, redaction edge cases, filter
+  pass-through) shouldn't crash the React render. Optional-chaining on
+  `event.data?.field` and outcome-presence guards on `ev.outcome` keep
+  type-safety wins while preserving graceful degradation.
+- **`event-utils.ts` mirror docstring updated** to clarify the type-side
+  duplication WAS resolved (via `import type`); only the runtime helper
+  remains mirrored, with two paths to eliminate the last duplication
+  flagged for future work.
+- **`multi-agent.test.ts` variable hoisting fixed** — `let outerCallCount = 0`
+  moved above the `provider` definition that closes over it.
+
 ### Breaking changes — Unified event model (spec/16-streaming-wire-reliability)
 
 The two parallel event models (rich `TraceEvent` for traces, lean
@@ -622,11 +662,116 @@ function_declarations[0].parameters'`.
   `redact: true`. Output for events that flowed through emit-time
   scrubbing is identical.
 
+### Changed — Spec §9 invariant hardening
+
+- **`ctx.ask()` body refactored from `try/catch+rethrow` to
+  `try/catch/finally`.** Spec §9 ("ask-internal failures surface via
+  `ask_end(ok:false)` only, never workflow-level `error`") was
+  enforced by a single catch block that emitted `ask_end` then
+  re-threw. A future failure path added between `ask_start` and the
+  catch (e.g., a new gate after schema/validate, or any synchronous
+  throw inside the span/usage attribution code) would have skipped
+  `ask_end` entirely and broken the invariant. The body now sets a
+  local `outcome` from either the success or catch branch, and a
+  `finally` block ALWAYS emits `ask_end` with that outcome (or a
+  sentinel `'ask_end emitted without outcome — internal bug'` if
+  neither branch ran). Behavior is identical for every path tested
+  today; the change hardens against future drift. Hook errors in
+  `onAgentCallComplete` are now also caught into `outcome.ok:false`
+  rather than skipping `ask_end` — strictly stronger than before.
+- **§9 failure-path test coverage extended.** `ask-lifecycle.test.ts`
+  now pins the invariant for input-guardrail block, MaxTurnsError,
+  TimeoutError, and provider HTTP/transport throw — in addition to
+  the existing schema/validate/output-guardrail exhaustion, mid-ask
+  BudgetExceededError, and abort tests. Every recoverable AND
+  non-recoverable ask failure path asserts exactly one
+  `ask_end(ok:false)`, no workflow-level `error` event, and
+  `workflow_end` status reflecting the propagated throw.
+
+### Changed — Studio WS hardening (FOLLOWUPS M2 / M3)
+
+- **Inbound WS frame size check is now byte-aware
+  (`Buffer.byteLength`).** `handleWsMessage` previously used
+  `raw.length` (UTF-16 code units), asymmetric with the outbound
+  `truncateIfOversized` check in `connection-manager.ts` that already
+  measured bytes. A multi-byte client payload (emoji / CJK) could pass
+  the inbound length check while exceeding 64KB on the wire. Both
+  paths now use `Buffer.byteLength(_, 'utf8')`, closing the asymmetry.
+  Pinning test in `protocol.test.ts` constructs a payload that's
+  65540 bytes / 32770 UTF-16 code units to assert the byte-aware
+  rejection.
+- **WS replay-buffer resource caps are now operator-tunable.** New
+  `bufferCaps?: { maxEventsPerBuffer?, maxBytesPerBuffer?,
+  maxActiveBuffers? }` option on `createStudioMiddleware()`,
+  `createServer()`, and the `ConnectionManager` constructor. The
+  module-level constants (1000 events / 4 MiB per buffer, 256
+  concurrent buffers) are now defaults — production deployments under
+  sustained execution churn can dial them without forking. Worst-case
+  memory at defaults is `maxActiveBuffers × maxBytesPerBuffer` ≈ 1
+  GiB; tightening either dimension lowers the ceiling at the cost of
+  late-subscriber replay coverage. Terminal `done` / `error` events
+  are always buffered regardless of caps. New `BufferCaps` type
+  re-exported from `@axlsdk/studio` (server) and `@axlsdk/studio/middleware`.
+- **Filter-application invariant on `broadcastWithWildcard()`'s
+  wildcard branch is now pinned by a regression test.** Existing
+  coverage tested the wildcard + specific-subscriber path; the new
+  test exercises the wildcard-only case (no specific subscriber for
+  the broadcast channel) and asserts that a filter rejecting the
+  event does drop it from the wildcard subscriber. Hardens the
+  invariant against future refactors that consolidate the two
+  broadcast paths.
+
 ### Deprecated
 
 - `AxlEventBase.parentToolCallId` is `@deprecated` (one-cycle window).
   Use `parentAskId` (on `AskScoped`) for ask-graph correlation going
   forward. Removal is tracked for the spec follow-up.
+
+### Changed — Small polish (FOLLOWUPS clean-up)
+
+- **`AnyWorkflow` is now a named type alias** exported from `@axlsdk/axl`
+  (`Workflow<any, any>` with explanatory JSDoc on why the bivariant `any`
+  is load-bearing). `AxlRuntime.register()` and
+  `AxlTestRuntime.register()` both reference it directly so neither
+  re-derives the workaround. The `WorkflowLike` shadow interface in
+  `@axlsdk/testing` is gone.
+- **`fetchExecution(id, since)` client helper accepts `since = -1`** as
+  a sentinel meaning "fetch everything from step 0", mirroring the
+  server's accept-any-finite-integer policy. Callers no longer need to
+  drop to raw `fetch()` for the initial-page case.
+- **`AxlStream.fullText` JSDoc warns about concurrent root-level asks.**
+  The buffer is shared across all root asks, so tokens from
+  `ctx.parallel` / `ctx.spawn` / `ctx.race` / `ctx.map` branches
+  interleave — and a `pipeline(failed)` from one branch can also
+  discard another branch's in-progress tokens. Multi-branch consumers
+  should use `textByAsk` instead. (The actual buffer fix is still
+  deferred — see `.internal/FOLLOWUPS.md`.)
+- **`ctx.checkpoint()` validation tests** extended to pin the full
+  rejection matrix: empty string, whitespace-only, leading/trailing
+  whitespace, and the case-insensitive reserved-prefix (`__auto/`,
+  `__Auto/`, `__AUTO/`) all assert the specific error message rather
+  than just "throws".
+- **Studio client now uses the strict `AxlEvent` discriminated union**
+  re-exported from `@axlsdk/axl` via type-only imports
+  (`import type { AxlEvent, AxlEventOf, AgentCallStartData, ... }`).
+  Previously the client declared a loose duplicate (`type: string`,
+  `data?: unknown`) so every panel needed `event.data as { args?: ...}`
+  casts. With the strict union, narrowing on `event.type === '...'`
+  gives statically-typed access to per-variant `data` (e.g.,
+  `event.data.args` on `tool_call_start`, `event.data.target` on
+  `handoff_start`, `event.data.approved` on `tool_approval`). Removed
+  ~10 inline `as { ... }` casts across `PlaygroundPanel`,
+  `WorkflowRunnerPanel`, `AskTree`, `AskDetails`, `TraceEventList`,
+  `PartialObjectRenderer`, `use-ws-stream`, and `trace-utils`.
+- **Tripwire `client-no-core-import-tripwire.test.ts` updated** to
+  permit `import type` and `export type` from `@axlsdk/axl` while
+  continuing to ban value imports (which would crash the Vite-bundled
+  SPA via `node:async_hooks`). Type-only imports are guaranteed erased
+  under `verbatimModuleSyntax: true` (enabled in `tsconfig.base.json`).
+  Mixed imports — `import { type X, y }` — remain banned because the
+  `y` value binding is still emitted at runtime. Synthetic fixtures
+  pin the regex contract (allow / ban table) so the boundary doesn't
+  drift.
 
 ## [0.15.0] - 2026-04-17
 

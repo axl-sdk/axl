@@ -5,7 +5,7 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { AxlConfig } from './config.js';
 import { parseCost, resolveConfig } from './config.js';
-import type { Workflow } from './workflow.js';
+import type { Workflow, AnyWorkflow } from './workflow.js';
 import type { Tool } from './tool.js';
 import type { Agent } from './agent.js';
 import type { Provider } from './providers/types.js';
@@ -212,8 +212,7 @@ export class AxlRuntime extends EventEmitter {
   }
 
   /** Register a workflow with the runtime. */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  register(workflow: Workflow<any, any>): void {
+  register(workflow: AnyWorkflow): void {
     this.workflows.set(workflow.name, workflow);
   }
 

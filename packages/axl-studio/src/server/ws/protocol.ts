@@ -21,7 +21,11 @@ export function handleWsMessage(
 ): string | null {
   // Reject oversized messages. Shared cap with the outbound broadcast path
   // in connection-manager.ts — see `MAX_WS_FRAME_BYTES` for rationale.
-  if (raw.length > MAX_WS_FRAME_BYTES) {
+  // Measure bytes (not UTF-16 code units) so multi-byte payloads (emoji /
+  // CJK / other non-ASCII) can't pass `raw.length` while serializing past
+  // 64KB on the wire — keeping symmetry with the outbound `Buffer.byteLength`
+  // check in `connection-manager.ts:truncateIfOversized`.
+  if (Buffer.byteLength(raw, 'utf8') > MAX_WS_FRAME_BYTES) {
     return JSON.stringify({ type: 'error', message: 'Message too large' });
   }
 

@@ -3,6 +3,7 @@ import { WorkflowContext } from '../context.js';
 import type { WorkflowContextInit } from '../context.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { agent } from '../agent.js';
+import type { AxlEvent } from '../types.js';
 
 // ── Mock Provider ────────────────────────────────────────────────────────
 
@@ -186,6 +187,44 @@ describe('Configurable Model Parameters', () => {
       expect(captured.maxTokens).toBe(4096);
       expect(captured.temperature).toBeUndefined();
       expect(captured.effort).toBeUndefined();
+    });
+
+    it('hook throw does NOT corrupt ask_end.outcome.ok (post-success observability is isolated)', async () => {
+      // Reviewer concern: prior to this fix, an `onAgentCallComplete`
+      // throw landed in the surrounding catch and overwrote
+      // `outcome = { ok: false, error: hookErrorMessage }`. Reliability
+      // dashboards filtering on ask_end.outcome.ok === false would
+      // misattribute hook bugs to ask failures. The hook is now wrapped
+      // in try/catch + console.error so the agent's actual outcome
+      // survives intact.
+      const provider = new TestProvider([{ content: 'real result' }]);
+      const a = agent({ model: 'test:m', system: 'sys' });
+
+      const events: AxlEvent[] = [];
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const ctx = createTestContext(provider, {
+        onAgentCallComplete: () => {
+          throw new Error('hook is buggy');
+        },
+        onTrace: (e: AxlEvent) => {
+          events.push(e);
+        },
+      });
+
+      const result = await ctx.ask(a, 'hi');
+      consoleErrorSpy.mockRestore();
+
+      // Agent's real result is returned (hook throw doesn't propagate).
+      expect(result).toBe('real result');
+
+      // ask_end carries outcome.ok:true, NOT a misattributed false.
+      const askEnd = events.find((e) => e.type === 'ask_end');
+      expect(askEnd).toBeDefined();
+      expect(askEnd!.outcome).toEqual({ ok: true, result: 'real result' });
+
+      // No workflow-level error emitted (decision 9: only ask-internal
+      // failures surface via ask_end, and this WASN'T a failure).
+      expect(events.find((e) => e.type === 'error')).toBeUndefined();
     });
   });
 

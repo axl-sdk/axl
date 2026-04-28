@@ -199,6 +199,65 @@ describe('ctx.checkpoint()', () => {
     await expect(ctx.checkpoint('__auto/foo', async () => 'x')).rejects.toThrow(/reserved/);
   });
 
+  it('rejects empty-string names with non-empty-string message', async () => {
+    const store = new MemoryStore();
+    const provider = new TestProvider([{ content: 'ok' }]);
+    const ctx = createTestContext(provider, store, 'exec-cp-empty');
+
+    await expect(ctx.checkpoint('', async () => 'x')).rejects.toThrow(
+      'ctx.checkpoint name must be a non-empty string.',
+    );
+  });
+
+  it('rejects whitespace-only names with leading/trailing message', async () => {
+    const store = new MemoryStore();
+    const provider = new TestProvider([{ content: 'ok' }]);
+    const ctx = createTestContext(provider, store, 'exec-cp-ws-only');
+
+    await expect(ctx.checkpoint('   ', async () => 'x')).rejects.toThrow(
+      /leading\/trailing whitespace/,
+    );
+  });
+
+  it('rejects names with leading whitespace', async () => {
+    const store = new MemoryStore();
+    const provider = new TestProvider([{ content: 'ok' }]);
+    const ctx = createTestContext(provider, store, 'exec-cp-ws-lead');
+
+    await expect(ctx.checkpoint(' foo', async () => 'x')).rejects.toThrow(
+      /leading\/trailing whitespace/,
+    );
+  });
+
+  it('rejects names with trailing whitespace', async () => {
+    const store = new MemoryStore();
+    const provider = new TestProvider([{ content: 'ok' }]);
+    const ctx = createTestContext(provider, store, 'exec-cp-ws-trail');
+
+    await expect(ctx.checkpoint('foo ', async () => 'x')).rejects.toThrow(
+      /leading\/trailing whitespace/,
+    );
+  });
+
+  it('rejects reserved-prefix names case-insensitively', async () => {
+    const store = new MemoryStore();
+    const provider = new TestProvider([{ content: 'ok' }]);
+    const ctx = createTestContext(provider, store, 'exec-cp-reserved-cases');
+
+    // Lowercase
+    await expect(ctx.checkpoint('__auto/foo', async () => 'x')).rejects.toThrow(
+      /reserved.*"__auto\/" \(case-insensitive\)/,
+    );
+    // Mixed case
+    await expect(ctx.checkpoint('__Auto/foo', async () => 'x')).rejects.toThrow(
+      /reserved.*"__auto\/" \(case-insensitive\)/,
+    );
+    // Uppercase
+    await expect(ctx.checkpoint('__AUTO/foo', async () => 'x')).rejects.toThrow(
+      /reserved.*"__auto\/" \(case-insensitive\)/,
+    );
+  });
+
   it('works without a state store (no-op, always executes)', async () => {
     const provider = new TestProvider([{ content: 'ok' }]);
     const registry = new ProviderRegistry();

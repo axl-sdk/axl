@@ -210,9 +210,12 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
       )}
 
       {/* ── Per-item traces (captureTraces mode only) ─── */}
-      {item.traces && item.traces.length > 0 && (
-        <ItemTraces traces={item.traces as unknown as AxlEvent[]} />
-      )}
+      {/* `EvalItem.traces` is typed `unknown[]` on the wire (the eval payload
+          is shaped server-side and forwarded verbatim); cast to AxlEvent[]
+          at the render boundary so the strict union types reach the row
+          renderer. The runtime always emits AxlEvent on this field — the
+          type narrowing is purely a wire-layer formality. */}
+      {item.traces && item.traces.length > 0 && <ItemTraces traces={item.traces as AxlEvent[]} />}
 
       {/* ── Scorer details ────────────────────────────── */}
       {scorerNames.length > 0 && (

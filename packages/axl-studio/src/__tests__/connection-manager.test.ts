@@ -193,6 +193,34 @@ describe('ConnectionManager', () => {
 
       expect(msgsB).toHaveLength(0);
     });
+
+    it('drops events from a wildcard-only subscriber when the filter rejects (no specific subscriber present)', () => {
+      // Pin the case where ONLY a wildcard subscriber exists (no specific
+      // `trace:exec-1` subscriber) and the filter rejects the event.
+      // The wildcard branch in `broadcastWithWildcard` re-applies the filter
+      // independently of the per-channel `broadcast()` path; a future
+      // refactor that consolidated the two paths could regress filter
+      // application on the wildcard branch and silently leak events to
+      // wildcard-only listeners. This test pins that invariant.
+      const { ws: wildcardOnly, messages: wildcardMsgs } = createMockWs();
+      connMgr.add(wildcardOnly);
+      connMgr.setMetadata(wildcardOnly, { tenantId: 'A' });
+      connMgr.subscribe(wildcardOnly, 'trace:*');
+
+      connMgr.setFilter((event, metadata) => {
+        const e = event as { tenantId?: string };
+        const m = metadata as { tenantId?: string } | undefined;
+        return !!e.tenantId && e.tenantId === m?.tenantId;
+      });
+
+      // No subscriber on `trace:exec-1` itself. Broadcast a tenant-B event
+      // through the wildcard pathway — the wildcard subscriber is tenant A,
+      // so the filter rejects, and the wildcard subscriber must receive
+      // NOTHING.
+      connMgr.broadcastWithWildcard('trace:exec-1', { tenantId: 'B', data: 'secret-B' });
+
+      expect(wildcardMsgs).toHaveLength(0);
+    });
   });
 
   it('truncates oversized broadcast payloads to a placeholder event', () => {
@@ -349,6 +377,91 @@ describe('ConnectionManager', () => {
       connMgr.add(ws1);
       connMgr.subscribe(ws1, 'execution:live-1');
       expect(m1).toHaveLength(0);
+    });
+
+    it('respects a custom maxEventsPerBuffer cap from the constructor', () => {
+      // Build a manager with a much smaller per-buffer event cap than the
+      // 1000 default. Pushing past the cap drops non-terminal events but
+      // always keeps the terminal `done`. Pins the operator-tunable
+      // `bufferCaps` constructor option (FOLLOWUPS P2).
+      const tightMgr = new ConnectionManager({ maxEventsPerBuffer: 3 });
+      // 5 non-terminal pushes; the 4th and 5th should be dropped.
+      for (let i = 0; i < 5; i++) {
+        tightMgr.broadcast('execution:tight', {
+          type: 'agent_call_start',
+          step: i,
+          agent: 'a',
+        });
+      }
+      tightMgr.broadcast('execution:tight', { type: 'done', data: { result: 'ok' } });
+
+      const { ws, messages } = createMockWs();
+      tightMgr.add(ws);
+      tightMgr.subscribe(ws, 'execution:tight');
+
+      // Replay must be: first 3 non-terminals + the terminal done = 4 events.
+      expect(messages).toHaveLength(4);
+      const last = JSON.parse(messages[messages.length - 1]);
+      expect(last.data.type).toBe('done');
+    });
+
+    it('respects a custom maxActiveBuffers cap from the constructor', () => {
+      // With a tiny global cap, the oldest live buffer must be evicted
+      // before the (cap+1)th allocation succeeds. Pins the cap is wired
+      // into the eviction path (not just stored).
+      const tightMgr = new ConnectionManager({ maxActiveBuffers: 2 });
+      tightMgr.broadcast('execution:a', { type: 'agent_call_start' });
+      tightMgr.broadcast('execution:b', { type: 'agent_call_start' });
+      // Third channel → must evict the oldest (execution:a).
+      tightMgr.broadcast('execution:c', { type: 'agent_call_start' });
+
+      // execution:a had its buffer evicted: late subscriber gets nothing.
+      const { ws: wsA, messages: msgsA } = createMockWs();
+      tightMgr.add(wsA);
+      tightMgr.subscribe(wsA, 'execution:a');
+      expect(msgsA).toHaveLength(0);
+
+      // execution:c is still buffered: late subscriber replays its event.
+      const { ws: wsC, messages: msgsC } = createMockWs();
+      tightMgr.add(wsC);
+      tightMgr.subscribe(wsC, 'execution:c');
+      expect(msgsC).toHaveLength(1);
+    });
+
+    it('falls back to defaults when bufferCaps is omitted or empty', () => {
+      // `new ConnectionManager()` and `new ConnectionManager({})` must both
+      // behave identically to the pre-feature default — pushing 5 events at
+      // the default 1000 cap leaves all 5 in the buffer.
+      const defaults = new ConnectionManager({});
+      for (let i = 0; i < 5; i++) {
+        defaults.broadcast('execution:default', { type: 'agent_call_start', step: i });
+      }
+      const { ws, messages } = createMockWs();
+      defaults.add(ws);
+      defaults.subscribe(ws, 'execution:default');
+      expect(messages).toHaveLength(5);
+    });
+
+    it('rejects pathological bufferCaps values (0, negative, fractional, NaN)', () => {
+      // Operator following the JSDoc to "tighten memory pressure" might
+      // pass `0` thinking it disables buffering — silent breakage of
+      // replay UX. Negatives make eviction always fire. Fractions and
+      // NaN are nonsense. Fail-loud at construction time.
+      const cases: Array<{
+        caps: Record<string, number>;
+        keyword: RegExp;
+      }> = [
+        { caps: { maxEventsPerBuffer: 0 }, keyword: /maxEventsPerBuffer/ },
+        { caps: { maxEventsPerBuffer: -1 }, keyword: /maxEventsPerBuffer/ },
+        { caps: { maxEventsPerBuffer: 1.5 }, keyword: /maxEventsPerBuffer/ },
+        { caps: { maxEventsPerBuffer: NaN }, keyword: /maxEventsPerBuffer/ },
+        { caps: { maxBytesPerBuffer: 0 }, keyword: /maxBytesPerBuffer/ },
+        { caps: { maxBytesPerBuffer: -100 }, keyword: /maxBytesPerBuffer/ },
+        { caps: { maxActiveBuffers: 0 }, keyword: /maxActiveBuffers/ },
+      ];
+      for (const { caps, keyword } of cases) {
+        expect(() => new ConnectionManager(caps)).toThrow(keyword);
+      }
     });
 
     it('drops non-terminal events once per-buffer byte budget is exceeded but keeps the terminal', () => {

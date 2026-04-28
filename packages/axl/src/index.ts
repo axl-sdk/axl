@@ -6,7 +6,7 @@ export { agent } from './agent.js';
 export type { Agent, AgentConfig, HandoffDescriptor } from './agent.js';
 
 export { workflow } from './workflow.js';
-export type { Workflow, WorkflowConfig } from './workflow.js';
+export type { Workflow, WorkflowConfig, AnyWorkflow } from './workflow.js';
 
 // Runtime
 export { AxlRuntime } from './runtime.js';

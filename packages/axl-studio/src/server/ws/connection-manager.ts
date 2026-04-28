@@ -32,27 +32,51 @@ interface ChannelBuffer {
 }
 
 const BUFFER_TTL_MS = 30_000; // Clean up buffers 30s after stream completes
-const MAX_BUFFER_EVENTS = 1000; // Cap replay buffer size (raised from 500 in
-// spec/16 §5.2 to absorb nested-ask volume —
-// ~10 nested asks × ~20 structural events
-// each, with headroom).
 
-/** Per-buffer byte budget. 1000 events × 64KB max each would peak at
- *  ~64MB per stream; the real-world distribution is bimodal (hundreds of
- *  small structural events + a few verbose `agent_call_end` snapshots),
- *  so 4MB per buffer is generous. When exceeded, new non-terminal events
- *  are dropped (terminal `done`/`error` always buffered). Review B-4. */
-const MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+/** Default cap on per-channel buffered events (raised from 500 in
+ *  spec/16 §5.2 to absorb nested-ask volume — ~10 nested asks × ~20
+ *  structural events each, with headroom). Override via the
+ *  `bufferCaps.maxEventsPerBuffer` constructor option on
+ *  `ConnectionManager`. */
+const DEFAULT_MAX_BUFFER_EVENTS = 1000;
 
-/** Cap on the number of concurrently-live replay buffers. Each buffer
- *  is an open execution/eval stream; without a cap, a server that sees
- *  sustained churn (say, 10k short-lived executions / minute) holds
- *  10k × MAX_BUFFER_BYTES = 40GB of event-log memory across the
+/** Default per-buffer byte budget. 1000 events × 64KB max each would
+ *  peak at ~64MB per stream; the real-world distribution is bimodal
+ *  (hundreds of small structural events + a few verbose `agent_call_end`
+ *  snapshots), so 4MB per buffer is generous. When exceeded, new non-
+ *  terminal events are dropped (terminal `done`/`error` always
+ *  buffered). Review B-4. Override via
+ *  `bufferCaps.maxBytesPerBuffer`. */
+const DEFAULT_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+
+/** Default cap on the number of concurrently-live replay buffers. Each
+ *  buffer is an open execution/eval stream; without a cap, a server
+ *  that sees sustained churn (say, 10k short-lived executions / minute)
+ *  holds 10k × maxBytesPerBuffer = 40GB of event-log memory across the
  *  TTL window. When we hit the cap, the oldest complete buffer is
  *  evicted immediately; if all live buffers are still incomplete, the
  *  oldest one is dropped anyway (its late subscribers will miss the
- *  replay, which is degraded UX but NOT a crash). Review SEC-H5. */
-const MAX_ACTIVE_BUFFERS = 256;
+ *  replay, which is degraded UX but NOT a crash). Review SEC-H5.
+ *  Override via `bufferCaps.maxActiveBuffers`. */
+const DEFAULT_MAX_ACTIVE_BUFFERS = 256;
+
+/**
+ * Operator-tunable replay-buffer resource limits. Exposed via
+ * `createStudioMiddleware({ bufferCaps })` and `createServer({ bufferCaps })`
+ * so production deployments can tighten or relax memory pressure
+ * without forking the package.
+ *
+ * All three fields are optional; omitted fields fall back to their
+ * documented defaults, so passing `{}` is a no-op.
+ */
+export interface BufferCaps {
+  /** Per-channel buffered event count cap. Default: 1000. */
+  maxEventsPerBuffer?: number;
+  /** Per-channel buffered byte budget. Default: 4 MiB. */
+  maxBytesPerBuffer?: number;
+  /** Global concurrently-live buffer cap. Default: 256. */
+  maxActiveBuffers?: number;
+}
 
 /**
  * Stream-only event types excluded from the replay buffer entirely.
@@ -155,6 +179,30 @@ export class ConnectionManager {
   private buffers = new Map<string, ChannelBuffer>();
   private maxConnections = 100;
   private filter?: BroadcastFilter;
+  /** Resolved replay-buffer caps. Per-instance so embedders can dial them
+   *  without monkey-patching module-level constants. */
+  private readonly maxEventsPerBuffer: number;
+  private readonly maxBytesPerBuffer: number;
+  private readonly maxActiveBuffers: number;
+
+  constructor(bufferCaps?: BufferCaps) {
+    // Reject pathological values up-front. `0` would silently drop every
+    // non-terminal event (operators following the JSDoc to "tighten memory
+    // pressure" might pass 0 thinking it disables buffering); negatives
+    // make eviction always fire. Fail-loud beats degraded replay UX.
+    const validatePositiveInt = (key: keyof BufferCaps, value: number | undefined): void => {
+      if (value === undefined) return;
+      if (!Number.isFinite(value) || !Number.isInteger(value) || value < 1) {
+        throw new RangeError(`bufferCaps.${key} must be a positive integer (>= 1); got ${value}`);
+      }
+    };
+    validatePositiveInt('maxEventsPerBuffer', bufferCaps?.maxEventsPerBuffer);
+    validatePositiveInt('maxBytesPerBuffer', bufferCaps?.maxBytesPerBuffer);
+    validatePositiveInt('maxActiveBuffers', bufferCaps?.maxActiveBuffers);
+    this.maxEventsPerBuffer = bufferCaps?.maxEventsPerBuffer ?? DEFAULT_MAX_BUFFER_EVENTS;
+    this.maxBytesPerBuffer = bufferCaps?.maxBytesPerBuffer ?? DEFAULT_MAX_BUFFER_BYTES;
+    this.maxActiveBuffers = bufferCaps?.maxActiveBuffers ?? DEFAULT_MAX_ACTIVE_BUFFERS;
+  }
 
   /**
    * Register a broadcast filter. Called once at middleware construction.
@@ -256,7 +304,7 @@ export class ConnectionManager {
         // completed buffer if any exist — its late-subscriber window
         // is already effectively closed. Falls back to evicting the
         // eldest live buffer under sustained pressure.
-        if (this.buffers.size >= MAX_ACTIVE_BUFFERS) {
+        if (this.buffers.size >= this.maxActiveBuffers) {
           let victim: string | undefined;
           for (const [ch, buf] of this.buffers) {
             if (buf.complete) {
@@ -286,8 +334,8 @@ export class ConnectionManager {
       const isUnbuffered = event.type !== undefined && UNBUFFERED_EVENT_TYPES.has(event.type);
       if (!isUnbuffered) {
         const msgBytes = Buffer.byteLength(msg, 'utf8');
-        const atCountCap = buffer.events.length >= MAX_BUFFER_EVENTS;
-        const atByteCap = buffer.bytes + msgBytes > MAX_BUFFER_BYTES;
+        const atCountCap = buffer.events.length >= this.maxEventsPerBuffer;
+        const atByteCap = buffer.bytes + msgBytes > this.maxBytesPerBuffer;
         if (isTerminal || (!atCountCap && !atByteCap)) {
           buffer.events.push({ msg, data });
           buffer.bytes += msgBytes;

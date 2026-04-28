@@ -196,6 +196,124 @@ describe('child context', () => {
     expect(result).toBe('Final result: specialist answer');
   });
 
+  it('onToken meta.depth: 0 for root-ask tokens, >= 1 for nested-ask tokens', async () => {
+    // Pin spec/16 §3.2: callbacks now propagate into nested asks via the
+    // CallbackMeta `depth` field. Root-ask tokens carry meta.depth === 0;
+    // nested-ask tokens carry meta.depth >= 1. Consumers wanting
+    // root-only behavior filter on `meta.depth === 0`.
+    const subAgent = agent({
+      name: 'inner',
+      model: 'mock:test',
+      system: 'inner',
+    });
+    const askTool = tool({
+      name: 'ask_inner',
+      description: 'ask the inner sub-agent',
+      input: z.object({ q: z.string() }),
+      handler: async (input, ctx) => ctx.ask(subAgent, input.q),
+    });
+    const outerAgent = agent({
+      name: 'outer',
+      model: 'mock:test',
+      system: 'outer',
+      tools: [askTool],
+    });
+
+    // Provider sequence:
+    // Turn 1 (outer): tool_call to ask_inner — no text chunks
+    // Turn 2 (inner): text "INNER" — streamed
+    // Turn 3 (outer): text "OUTER" — streamed
+    let outerCallCount = 0;
+    const provider: Provider = {
+      name: 'mock',
+      chat: async () => ({
+        content: '',
+        usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+        cost: 0.001,
+      }),
+      stream: async function* (_messages, options) {
+        const toolNames = (options?.tools ?? []).map(
+          (t) => (t as { function?: { name?: string } }).function?.name,
+        );
+        // Outer agent has the ask_inner tool exposed; inner agent does
+        // not. Detect which agent is being called by checking tool names.
+        const isOuter = toolNames.includes('ask_inner');
+        if (isOuter) {
+          // Decide based on a per-test counter: first outer call =
+          // tool_call, second outer call = final text.
+          outerCallCount++;
+          if (outerCallCount === 1) {
+            yield {
+              type: 'tool_call_delta' as const,
+              id: 'tc1',
+              name: 'ask_inner',
+              arguments: '{"q":"go"}',
+            };
+            yield {
+              type: 'done' as const,
+              usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+            };
+            return;
+          }
+          // Second outer turn — emit final text.
+          for (const ch of ['OU', 'TER']) {
+            yield { type: 'text_delta' as const, content: ch };
+          }
+          yield {
+            type: 'done' as const,
+            usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+          };
+          return;
+        }
+        // Inner agent — emit text.
+        for (const ch of ['IN', 'NER']) {
+          yield { type: 'text_delta' as const, content: ch };
+        }
+        yield {
+          type: 'done' as const,
+          usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+        };
+      },
+    };
+
+    // Capture tokens with their depth metadata.
+    const tokens: Array<{ token: string; depth: number; agent?: string }> = [];
+
+    const { ctx } = createTestCtx({
+      provider,
+      onToken: (token: string, meta: { depth: number; agent?: string }) => {
+        tokens.push({ token, depth: meta.depth, agent: meta.agent });
+      },
+    });
+    await ctx.ask(outerAgent, 'start');
+
+    // Group tokens by depth.
+    const byDepth = new Map<number, string[]>();
+    for (const { token, depth } of tokens) {
+      if (!byDepth.has(depth)) byDepth.set(depth, []);
+      byDepth.get(depth)!.push(token);
+    }
+
+    // BOTH depth=0 (root) and depth>=1 (nested) MUST be represented.
+    expect(byDepth.has(0)).toBe(true);
+    const nestedDepths = [...byDepth.keys()].filter((d) => d >= 1);
+    expect(nestedDepths.length).toBeGreaterThan(0);
+
+    // Root-ask tokens are the outer agent's text; nested-ask tokens are
+    // the inner agent's text.
+    const rootText = byDepth.get(0)!.join('');
+    expect(rootText).toBe('OUTER');
+    // Sum across all nested depths (likely just depth=1) gives 'INNER'.
+    const nestedText = nestedDepths.flatMap((d) => byDepth.get(d) ?? []).join('');
+    expect(nestedText).toBe('INNER');
+
+    // Sanity: meta.agent is present and matches the lane.
+    const rootTokens = tokens.filter((t) => t.depth === 0);
+    const nestedTokens = tokens.filter((t) => t.depth >= 1);
+    expect(rootTokens.every((t) => t.agent === 'outer')).toBe(true);
+    expect(nestedTokens.every((t) => t.agent === 'inner')).toBe(true);
+  });
+
   it('agent-as-tool: nested traces appear in execution timeline', async () => {
     const subAgent = agent({
       name: 'inner_specialist',
@@ -721,12 +839,15 @@ describe('edge cases', () => {
 
     expect(result).toBe('outer done');
 
-    // Verify the mock was used (not the real handler)
+    // Verify the mock was used (not the real handler). Type predicate
+    // narrows to the strict `tool_call_end` variant so `data.result` is
+    // typed without a cast.
     const innerToolTraces = traces.filter(
-      (t) => t.type === 'tool_call_end' && t.tool === 'inner_tool',
+      (t): t is Extract<typeof t, { type: 'tool_call_end' }> =>
+        t.type === 'tool_call_end' && t.tool === 'inner_tool',
     );
     expect(innerToolTraces).toHaveLength(1);
-    expect((innerToolTraces[0].data as Record<string, unknown>).result).toBe('MOCKED');
+    expect(innerToolTraces[0].data.result).toBe('MOCKED');
   });
 
   it('dynamic handoff function that throws is handled gracefully', async () => {

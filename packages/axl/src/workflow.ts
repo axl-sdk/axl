@@ -24,6 +24,17 @@ export type Workflow<
 };
 
 /**
+ * Bivariant-parameter alias for `Workflow<any, any>`. Function parameters
+ * are contravariant under strict types, so `Workflow<TInput=MsgType>` won't
+ * satisfy a `Workflow<unknown, unknown>` slot. The standard escape hatch is
+ * to widen to `any`. This alias gives that workaround a name so call sites
+ * (e.g. `AxlRuntime.register`, `AxlTestRuntime.WorkflowLike.handler`) don't
+ * each independently re-derive it.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type AnyWorkflow = Workflow<any, any>;
+
+/**
  * Define a named workflow with Zod-validated input/output and an async handler.
  * Register workflows with `AxlRuntime.register()` to execute them.
  * @param config - Workflow configuration: name, input schema, optional output schema, and async handler receiving a WorkflowContext.

@@ -114,6 +114,84 @@ describe('AxlStream.fullText — commit-on-pipeline-committed', () => {
     expect(stream.fullText).toBe('winner');
   });
 
+  /**
+   * FOLLOWUPS P1: `fullText` interleaves concurrent root-level asks
+   * (`packages/axl/src/stream.ts:222-239`).
+   *
+   * `AxlStream.currentAttemptTokens` is a single shared buffer. Under
+   * `ctx.parallel()` / `ctx.spawn()` / `ctx.map()`, multiple root-level
+   * asks emit tokens concurrently (all `depth: 0`). Their tokens
+   * interleave, and a `pipeline(failed)` from one concurrent branch can
+   * discard another branch's successful in-progress tokens.
+   *
+   * This test PINS the current (limited) behavior — `fullText` contains
+   * BOTH branches' content concatenated in arrival order, with no
+   * per-askId scoping. If a future fix scopes the buffer per-askId,
+   * this test will fail and force a documented decision (either update
+   * the assertion to reflect scoped behavior, or keep the current
+   * concatenation as the documented contract).
+   *
+   * See FOLLOWUPS.md §"`fullText` interleaves concurrent root-level asks"
+   * for the architectural choice between (a) document-only — tell
+   * parallel-ask consumers to use `.textByAsk` — and (b) scope the
+   * buffer per-askId. Today's behavior is option (a) silently in effect.
+   */
+  it('parallel root-level asks: fullText concatenates both branches (FOLLOWUPS P1, current behavior)', async () => {
+    // Two ctx.parallel branches, each making a root-level ctx.ask. Both
+    // emit tokens concurrently (depth=0 for both — they share a stream
+    // and a buffer). Pin that fullText contains BOTH branches' content.
+    const provider = MockProvider.sequence([
+      { content: 'branchA-content', chunks: ['branchA-', 'content'] },
+      { content: 'branchB-content', chunks: ['branchB-', 'content'] },
+    ]);
+    const runtime = new AxlRuntime({ defaultProvider: 'mock' });
+    runtime.registerProvider('mock', provider);
+    const a = agent({ name: 'parallel-asks', model: 'mock:test', system: 'test' });
+    const wf = workflow({
+      name: 'parallel-asks-wf',
+      input: z.object({}),
+      handler: async (ctx) => {
+        const [r1, r2] = await ctx.parallel([() => ctx.ask(a, 'q1'), () => ctx.ask(a, 'q2')]);
+        return { r1, r2 };
+      },
+    });
+    runtime.register(wf);
+
+    const stream = runtime.stream('parallel-asks-wf', {});
+    for await (const event of stream) {
+      if (event.type === 'done') break;
+    }
+
+    // Current behavior: BOTH branches' chunks appear in fullText, but
+    // INTERLEAVED at chunk boundaries (push-order across the shared
+    // buffer, not askId-scoped). The chunks ['branchA-', 'content'] from
+    // one branch and ['branchB-', 'content'] from the other arrive in
+    // some interleaved order — we don't pin exact order (parallel
+    // scheduling is non-deterministic across runs) but we pin the
+    // INVARIANTS:
+    //
+    //   1. Every chunk from both branches is present in fullText (no
+    //      tokens are lost).
+    //   2. Total length equals the sum of all chunks (no de-dup).
+    //   3. The chunks may NOT recombine into the original strings
+    //      ('branchA-content', 'branchB-content') because of the
+    //      interleave — this is the LIMITATION the FOLLOWUPS item
+    //      describes. If you want clean per-branch streams, use
+    //      `.textByAsk`.
+    const fullText = stream.fullText;
+    // Every chunk substring is present (push order may interleave).
+    expect(fullText).toContain('branchA-');
+    expect(fullText).toContain('branchB-');
+    // 'content' appears twice (once per branch).
+    const contentMatches = fullText.match(/content/g);
+    expect(contentMatches?.length).toBe(2);
+
+    // Total length: 'branchA-' + 'content' + 'branchB-' + 'content' = sum.
+    const expectedTotal =
+      'branchA-'.length + 'content'.length + 'branchB-'.length + 'content'.length;
+    expect(fullText.length).toBe(expectedTotal);
+  });
+
   it('mid-attempt fullText reflects in-progress tokens until pipeline(committed) commits them', async () => {
     const provider = MockProvider.sequence([
       { content: 'one two three', chunks: ['one ', 'two ', 'three'] },

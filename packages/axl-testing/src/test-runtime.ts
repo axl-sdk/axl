@@ -7,24 +7,15 @@ import type {
   ProviderResponse,
   AgentCallInfo,
   AxlConfig,
+  AnyWorkflow,
 } from '@axlsdk/axl';
 import { WorkflowContext, MemoryStore, ProviderRegistry, eventCostContribution } from '@axlsdk/axl';
 import type { WorkflowContextInit } from '@axlsdk/axl';
 
-// `WorkflowContext<any>` here (rather than `<unknown>`) is load-bearing:
-// function parameters are contravariant under strict types, so a
-// `Workflow<TInput=MsgType>` whose handler takes `WorkflowContext<MsgType>`
-// would otherwise fail to satisfy `WorkflowLike` at `register()` call sites.
-// The test runtime never touches the input-shape narrowly; `any` here is
-// the standard bivariant-parameter workaround.
-
-interface WorkflowLike {
-  readonly name: string;
-  readonly inputSchema: { parse: (input: unknown) => unknown };
-  readonly outputSchema: { parse: (input: unknown) => unknown } | undefined;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  readonly handler: (ctx: WorkflowContext<any>) => Promise<unknown>;
-}
+// `AnyWorkflow` is a re-exported alias for `Workflow<any, any>` — see
+// the JSDoc on `AnyWorkflow` in `@axlsdk/axl/workflow.ts`. The bivariant
+// `any` is load-bearing for satisfying narrowly-typed handlers (e.g., a
+// `Workflow<TInput=MsgType>` whose handler takes `WorkflowContext<MsgType>`).
 
 export type RecordedToolCall = { name: string; args: unknown; result: unknown };
 export type RecordedAgentCall = Partial<AgentCallInfo> &
@@ -45,7 +36,7 @@ export type AxlTestRuntimeOptions = {
 };
 
 export class AxlTestRuntime {
-  private workflows = new Map<string, WorkflowLike>();
+  private workflows = new Map<string, AnyWorkflow>();
   private mockProviders = new Map<string, MockProvider>();
   private mockToolMap = new Map<string, MockTool>();
   private _toolCalls: RecordedToolCall[] = [];
@@ -66,7 +57,7 @@ export class AxlTestRuntime {
     this._config = options?.config ?? {};
   }
 
-  register(workflow: WorkflowLike): void {
+  register(workflow: AnyWorkflow): void {
     this.workflows.set(workflow.name, workflow);
   }
 

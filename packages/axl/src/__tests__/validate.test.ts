@@ -477,6 +477,104 @@ describe('validate (post-schema business rule validation)', () => {
       });
       expect(result).toEqual({ status: 'approved' });
     });
+
+    it('mixed-stage retries: pipeline(committed) carries the FINAL stage/attempt counters', async () => {
+      // Pin the implementation at `context.ts:855-857` (lastStartStage /
+      // lastStartAttempt / lastStartMaxAttempts updated on every pipeline
+      // `start`). The committed event at `:1910-1917` reads back from those
+      // three trackers — so the final committed event must reflect the
+      // counters from the LAST `start` (not the initial one).
+      //
+      // Scenario: guardrail retry → schema retry → validate retry → success.
+      // Stage history: initial(1) → guardrail(2) → schema(2) → validate(2) → COMMIT
+      //
+      // Each stage's attempt counter is independent; the committed event
+      // must carry the counters from the LAST start, which after a clean
+      // turn through validate is `(stage: 'validate', attempt: 2,
+      // maxAttempts: 3)` — NOT `(stage: 'initial', attempt: 1)` even
+      // though the initial turn was the first.
+      const a = agent({
+        model: 'mock:test',
+        system: 'Return JSON.',
+        guardrails: {
+          output: async (response) => {
+            if (response.includes('unsafe')) return { block: true, reason: 'Unsafe' };
+            return { block: false };
+          },
+          onBlock: 'retry',
+          maxRetries: 2,
+        },
+      });
+
+      const { ctx, traces } = createCtx({
+        responses: [
+          'unsafe content', // guardrail blocks (turn 1)
+          'not json', // guardrail passes, schema fails (turn 2)
+          JSON.stringify({ status: 'pending' }), // schema OK, validate fails (turn 3)
+          JSON.stringify({ status: 'approved' }), // all gates pass (turn 4)
+        ],
+      });
+
+      await ctx.ask(a, 'Check', {
+        schema: StatusSchema,
+        validate: (output) => {
+          if (output.status === 'approved') return { valid: true };
+          return { valid: false, reason: 'Status must be approved' };
+        },
+        validateRetries: 2,
+      });
+
+      const pipelineEvents = traces.filter(
+        (t): t is Extract<typeof t, { type: 'pipeline' }> => t.type === 'pipeline',
+      );
+      // 1 initial start + 3 failed/start pairs (guardrail, schema, validate) + 1 committed
+      // = 1 + 6 + 1 = 8 events, but we expect: start(initial), failed(guardrail),
+      // start(guardrail), failed(schema), start(schema), failed(validate),
+      // start(validate), committed = 8.
+      expect(pipelineEvents).toHaveLength(8);
+
+      // Walk through and pin each transition's counters.
+      const starts = pipelineEvents.filter((e) => e.status === 'start');
+      const fails = pipelineEvents.filter((e) => e.status === 'failed');
+      const committed = pipelineEvents.filter((e) => e.status === 'committed');
+
+      expect(starts).toHaveLength(4); // initial + 3 retry stages
+      expect(fails).toHaveLength(3); // 3 stage failures
+      expect(committed).toHaveLength(1);
+
+      // Initial start.
+      expect(starts[0].status).toBe('start');
+      if (starts[0].status === 'start') {
+        expect(starts[0].stage).toBe('initial');
+        expect(starts[0].attempt).toBe(1);
+      }
+      // Guardrail retry start (after guardrail block).
+      if (starts[1].status === 'start') {
+        expect(starts[1].stage).toBe('guardrail');
+        expect(starts[1].attempt).toBe(2);
+      }
+      // Schema retry start.
+      if (starts[2].status === 'start') {
+        expect(starts[2].stage).toBe('schema');
+        expect(starts[2].attempt).toBe(2);
+      }
+      // Validate retry start — the FINAL start.
+      if (starts[3].status === 'start') {
+        expect(starts[3].stage).toBe('validate');
+        expect(starts[3].attempt).toBe(2);
+      }
+
+      // The committed event MUST carry the FINAL start's counters, not the
+      // initial one. This pins `lastStartStage` / `lastStartAttempt` /
+      // `lastStartMaxAttempts` tracking across stage transitions.
+      const last = committed[0];
+      if (last.status === 'committed') {
+        expect(last.stage).toBe('validate');
+        expect(last.attempt).toBe(2);
+        // maxAttempts = validateRetries (2) + 1 = 3.
+        expect(last.maxAttempts).toBe(3);
+      }
+    });
   });
 
   describe('trace events', () => {

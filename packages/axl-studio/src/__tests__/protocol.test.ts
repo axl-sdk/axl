@@ -93,6 +93,27 @@ describe('handleWsMessage', () => {
     expect(parsed.message).toBe('Message too large');
   });
 
+  it('rejects multi-byte payloads that exceed 64KB by bytes but fit by code units', () => {
+    // A '😀' (U+1F600) is 4 bytes in UTF-8 but 2 UTF-16 code units in JS.
+    // 16385 of them = 65540 bytes / 32770 code units. The legacy
+    // `raw.length` check (UTF-16 code units) would let this pass; the
+    // byte-aware check rejects it. This pins the symmetry with the
+    // outbound `Buffer.byteLength` check in connection-manager.ts.
+    const { socket } = createMockSocket();
+    connMgr.add(socket);
+
+    const payload = '😀'.repeat(16385);
+    // Sanity-check the construction: legacy length passes, byte length
+    // exceeds the cap.
+    expect(payload.length).toBeLessThanOrEqual(65536);
+    expect(Buffer.byteLength(payload, 'utf8')).toBeGreaterThan(65536);
+
+    const reply = handleWsMessage(payload, socket, connMgr);
+    const parsed = JSON.parse(reply!);
+    expect(parsed.type).toBe('error');
+    expect(parsed.message).toBe('Message too large');
+  });
+
   it('subscribe with missing channel returns error', () => {
     const { socket } = createMockSocket();
     connMgr.add(socket);

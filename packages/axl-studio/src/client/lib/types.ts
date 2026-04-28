@@ -1,3 +1,73 @@
+// ── AxlEvent: re-export the strict discriminated union from `@axlsdk/axl` ──
+//
+// `tsconfig.base.json` enables `verbatimModuleSyntax: true`, which means
+// `import type` / `export type` declarations are FULLY ERASED at compile
+// time and never appear in the runtime bundle. That makes it safe for
+// browser-bundled client code to consume types from `@axlsdk/axl` even
+// though the package's runtime code uses `node:async_hooks` (which Vite
+// externalizes with a runtime-error stub).
+//
+// The tripwire test `__tests__/client-no-core-import-tripwire.test.ts`
+// enforces that only `import type` / `export type` reach into core.
+// Value imports remain banned — see `lib/event-utils.ts` for the pattern.
+import type {
+  AxlEvent,
+  AxlEventBase,
+  AxlEventType,
+  AxlEventOf,
+  AskScoped,
+  CallbackMeta,
+  AgentCallStartData,
+  AgentCallEndData,
+  AgentCallParams,
+  ToolCallData,
+  ToolCallStartData,
+  ToolApprovalData,
+  ToolDeniedData,
+  HandoffStartData,
+  HandoffReturnData,
+  DelegateData,
+  VerifyData,
+  WorkflowStartData,
+  WorkflowEndData,
+  MemoryEventData,
+  CheckpointEventData,
+  AwaitHumanData,
+  AwaitHumanResolvedData,
+  GuardrailData,
+  SchemaCheckData,
+  ValidateData,
+} from '@axlsdk/axl';
+
+export type {
+  AxlEvent,
+  AxlEventBase,
+  AxlEventType,
+  AxlEventOf,
+  AskScoped,
+  CallbackMeta,
+  AgentCallStartData,
+  AgentCallEndData,
+  AgentCallParams,
+  ToolCallData,
+  ToolCallStartData,
+  ToolApprovalData,
+  ToolDeniedData,
+  HandoffStartData,
+  HandoffReturnData,
+  DelegateData,
+  VerifyData,
+  WorkflowStartData,
+  WorkflowEndData,
+  MemoryEventData,
+  CheckpointEventData,
+  AwaitHumanData,
+  AwaitHumanResolvedData,
+  GuardrailData,
+  SchemaCheckData,
+  ValidateData,
+};
+
 declare global {
   interface Window {
     __AXL_STUDIO_BASE__?: string;
@@ -95,58 +165,6 @@ export type ExecutionInfo = {
   duration: number;
   result?: unknown;
   error?: string;
-};
-
-/** Axl event. Loose on the client — server types are the source of truth.
- *  Replaces the legacy `TraceEvent` + `StreamEvent` split; see
- *  `@axlsdk/axl#AxlEvent` for the strict discriminated union. */
-export type AxlEvent = {
-  executionId: string;
-  workflow?: string;
-  step: number;
-  type: string;
-  agent?: string;
-  tool?: string;
-  callId?: string;
-  model?: string;
-  promptVersion?: string;
-  timestamp: number;
-  duration?: number;
-  cost?: number;
-  tokens?: { input: number; output: number; reasoning?: number };
-  data?: unknown;
-  /** Ask correlation (spec/16 §2.1). Present on every ask-scoped variant
-   *  — group by `askId`, link parents via `parentAskId`, indent by
-   *  `depth` (0 = root ask; +1 per nested ctx.ask()). Absent on
-   *  workflow lifecycle / error / done events and on `handoff` (which
-   *  spans two asks via `fromAskId` / `toAskId` instead). */
-  askId?: string;
-  parentAskId?: string;
-  depth?: number;
-  /** Discriminated outcome on `ask_end` events. */
-  outcome?: { ok: true; result: unknown } | { ok: false; error: string };
-  /** `pipeline` event status (spec/16 §4.2). */
-  status?: 'start' | 'failed' | 'committed';
-  /** `pipeline` event stage. */
-  stage?: 'initial' | 'schema' | 'validate' | 'guardrail';
-  /** `pipeline` / `partial_object` attempt counter. */
-  attempt?: number;
-  maxAttempts?: number;
-  /** `pipeline(failed).reason`: feedback message about to be injected. */
-  reason?: string;
-  /** `ask_start.prompt`. */
-  prompt?: string;
-  /** `handoff` correlation: from/to askIds and their depths. */
-  fromAskId?: string;
-  toAskId?: string;
-  sourceDepth?: number;
-  targetDepth?: number;
-  /**
-   * @deprecated Use `parentAskId` for ask-graph correlation. Kept one
-   * minor cycle for telemetry consumers that still grep agent-as-tool
-   * call graphs by tool callId.
-   */
-  parentToolCallId?: string;
 };
 
 /** Cost data */
@@ -317,6 +335,7 @@ export type HealthData = {
   tools: number;
 };
 
-// Legacy `StreamEvent` removed in spec/16 PR 3 — the wire carries
+// Legacy `StreamEvent` removed in 0.16.0 — the wire carries
 // `AxlEvent` directly. Consumers import `AxlEvent` from this module
-// and narrow on `event.type`.
+// (re-exported above from `@axlsdk/axl` as a type-only binding) and
+// narrow on `event.type`.

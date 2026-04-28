@@ -2025,6 +2025,47 @@ describe('trackExecution()', () => {
   });
 });
 
+describe('budget exhaustion mid-workflow (workflow_end pairing)', () => {
+  it('BudgetExceededError thrown mid-workflow → exactly ONE workflow_end(failed)', async () => {
+    // Mirrors the existing workflow_end idempotency tests. The runtime's
+    // execute() catch path emits ONE workflow_end with status:'failed'
+    // when the workflow body throws — including when the throw is a
+    // BudgetExceededError that bubbled out of an untrapped budget check.
+    // No second event from cleanup side effects.
+    //
+    // Use a workflow that throws BudgetExceededError directly. This is
+    // equivalent to the path where a user calls ctx.ask() and the
+    // budgetContext.exceeded check at the top of executeAgentCall throws
+    // — both routes hit the same runtime.execute() catch.
+    const { runtime } = createRuntime();
+
+    runtime.register(
+      workflow({
+        name: 'budget-throw-direct',
+        input: z.object({}),
+        handler: async () => {
+          const { BudgetExceededError } = await import('../errors.js');
+          throw new BudgetExceededError(0.01, 1.0, 'finish_and_stop');
+        },
+      }),
+    );
+
+    const ends: AxlEvent[] = [];
+    runtime.on('trace', (event: AxlEvent) => {
+      if (event.type === 'workflow_end') ends.push(event);
+    });
+
+    await expect(runtime.execute('budget-throw-direct', {})).rejects.toThrow(/budget/i);
+
+    // EXACTLY ONE workflow_end fired, with status: 'failed'.
+    expect(ends).toHaveLength(1);
+    const data = ends[0].data as { status: string; aborted?: boolean };
+    expect(data.status).toBe('failed');
+    // BudgetExceededError is NOT an AbortError, so `aborted` must NOT be set.
+    expect(data.aborted).toBeUndefined();
+  });
+});
+
 describe('workflow_end idempotency', () => {
   it('does not fire workflow_end twice when post-emit side-effects throw', async () => {
     // Reviewer bug B1: `_emitWorkflowEnd(completed)` fires BEFORE

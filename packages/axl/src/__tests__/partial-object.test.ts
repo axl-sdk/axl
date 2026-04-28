@@ -217,4 +217,67 @@ describe('partial_object events (spec/16 §4.2)', () => {
     const lastPartial = partials[partials.length - 1];
     expect(lastPartial.attempt).toBeGreaterThanOrEqual(1);
   });
+
+  it('attempt counter bumps after a schema retry: turn 1 emissions carry attempt=1, turn 2 emissions carry attempt=2', async () => {
+    // Pins `context.ts:1007` — `currentAttempt = schemaRetries + 1` is
+    // captured FRESH per turn (inside the streaming branch), so partials
+    // emitted on turn 1 carry attempt=1 and partials emitted on turn 2
+    // (after the schema retry) carry attempt=2.
+    //
+    // Setup: first response is parseable enough to emit at least one
+    // structural-boundary partial BUT fails the final schema parse so
+    // a schema retry kicks in. Second response is valid AND chunks
+    // through structural boundaries so it also emits partials.
+    //
+    // Trick: '{"x":' followed by a STRING value '"bad",' creates a `,`
+    // boundary outside a string after a parseable partial; the final
+    // schema requires `x: number` so the parsed object fails Zod
+    // validation and triggers a retry.
+    const provider = MockProvider.sequence([
+      // Turn 1: streams structural boundaries that will produce at least
+      // one partial_object (after the `,`), but the parsed object
+      // `{"x":"bad","y":1}` fails the schema `{x: number}` → schema retry.
+      {
+        content: '{"x":"bad","y":1}',
+        chunks: ['{"x":"bad",', '"y":1', '}'],
+      },
+      // Turn 2: valid, also chunked so we get partial emissions.
+      {
+        content: '{"x":42,"y":1}',
+        chunks: ['{"x":42,', '"y":1', '}'],
+      },
+    ]);
+    const { ctx, traces } = makeCtx(provider);
+    const a = agent({ name: 'attempt-bump', model: 'mock:test', system: 'test' });
+
+    await ctx.ask(a, 'q', {
+      schema: z.object({ x: z.number(), y: z.number() }),
+      retries: 2,
+    });
+
+    const partials = partialObjectEvents(traces);
+    // We MUST have emissions from BOTH turns to verify the counter bumps.
+    expect(partials.length).toBeGreaterThanOrEqual(2);
+
+    // Group emissions by their `attempt` field. Both attempt=1 and
+    // attempt=2 must be represented — partials must NOT all share the
+    // same attempt number, which would indicate `currentAttempt` was
+    // captured outside the per-turn loop.
+    const attempts = new Set(partials.map((p) => p.attempt));
+    expect(attempts.has(1)).toBe(true);
+    expect(attempts.has(2)).toBe(true);
+
+    // Sanity: the partial_object events on turn 1 must come before any
+    // partial_object events on turn 2 (insertion-ordered by step).
+    const firstAttempt2Idx = partials.findIndex((p) => p.attempt === 2);
+    const lastAttempt1Idx = partials.map((p) => p.attempt).lastIndexOf(1);
+    expect(firstAttempt2Idx).toBeGreaterThan(lastAttempt1Idx);
+
+    // Sanity: a schema retry actually occurred (a pipeline `failed` with
+    // `stage: 'schema'` exists in the trace).
+    const schemaFails = traces.filter(
+      (t) => t.type === 'pipeline' && t.status === 'failed' && t.stage === 'schema',
+    );
+    expect(schemaFails.length).toBeGreaterThanOrEqual(1);
+  });
 });

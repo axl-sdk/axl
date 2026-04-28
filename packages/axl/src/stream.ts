@@ -338,7 +338,14 @@ export class AxlStream extends Readable {
    *  in-flight attempt. Retried (gate-rejected) attempts are excluded — see
    *  spec/16 §4.3. Reading mid-attempt returns the in-progress text;
    *  reading after `pipeline(committed)` (which fires before `done`)
-   *  returns the canonical winning text. */
+   *  returns the canonical winning text.
+   *
+   *  **Note:** With concurrent root-level asks (`ctx.parallel`, `ctx.spawn`,
+   *  `ctx.race`, `ctx.map`), tokens from different branches interleave in
+   *  `fullText` because the commit-on-success buffer is shared across all
+   *  root asks. A `pipeline(failed)` from one branch may also discard
+   *  another branch's in-progress tokens. For multi-branch consumers,
+   *  prefer `textByAsk` to receive per-ask chunks. */
   get fullText(): string {
     return this.committedText + this.currentAttemptTokens.join('');
   }

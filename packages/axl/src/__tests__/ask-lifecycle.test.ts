@@ -5,7 +5,13 @@ import { tool } from '../tool.js';
 import { workflow } from '../workflow.js';
 import { AxlRuntime } from '../runtime.js';
 import { createTestCtx, createSequenceProvider } from './helpers.js';
-import { GuardrailError, ValidationError, BudgetExceededError } from '../errors.js';
+import {
+  GuardrailError,
+  ValidationError,
+  BudgetExceededError,
+  MaxTurnsError,
+  TimeoutError,
+} from '../errors.js';
 import type { AxlEvent, AskScoped } from '../types.js';
 
 describe('ask_start / ask_end lifecycle (spec/16 §3.8)', () => {
@@ -368,6 +374,286 @@ describe('ask_start / ask_end lifecycle (spec/16 §3.8)', () => {
     const workflowEnds = collected.filter((e) => e.type === 'workflow_end');
     expect(workflowEnds.length).toBe(1);
     expect((workflowEnds[0].data as { status: string }).status).toBe('completed');
+  });
+
+  // ── Non-recoverable / immediate ask failure modes (spec §9) ──────────
+  //
+  // Pin the same invariant for failure paths that don't involve gate
+  // retries: input guardrail block (immediate throw, no retry), max-
+  // turns exhaustion in the tool-calling loop, ask-level timeout, and
+  // a provider HTTP/transport throw. With the try/finally refactor in
+  // place these all funnel through the same finally block as the
+  // existing recoverable cases — but each path runs through different
+  // throw sites in `executeAgentCall`, so each gets its own pin.
+  //
+  // Pattern: trigger the failure via a workflow, capture all events,
+  // assert exactly one ask_end with outcome.ok:false, no workflow-level
+  // `error` event, and workflow_end status reflecting the propagated
+  // throw (always 'failed' here — none of these paths are trapped).
+  type AskEndOutcome = AxlEvent & {
+    outcome: { ok: true; result: unknown } | { ok: false; error: string };
+  };
+
+  it('input guardrail block surfaces via ask_end(ok:false), not a workflow `error` event', async () => {
+    // Input guardrail throws GuardrailError immediately at the top of
+    // executeAgentCall (context.ts:~791) — before any agent_call.
+    // This path doesn't touch the gate-retry machinery.
+    const a = agent({
+      name: 'input-guarded',
+      model: 'mock:test',
+      system: 'system',
+      guardrails: {
+        input: () => ({ block: true, reason: 'never allowed' }),
+        // onBlock defaults to 'throw'; 'retry' for input behaves identically.
+      },
+    });
+    const wf = workflow({
+      name: 'input-guardrail-wf',
+      input: z.object({}),
+      handler: async (ctx) => ctx.ask(a, 'hi'),
+    });
+
+    const runtime = new AxlRuntime({ defaultProvider: 'mock' });
+    runtime.registerProvider('mock', {
+      name: 'mock',
+      chat: async () => ({
+        content: 'unreachable',
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        cost: 0.001,
+      }),
+      stream: async function* () {
+        yield {
+          type: 'done' as const,
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+      },
+    });
+    runtime.register(wf);
+
+    const collected: AxlEvent[] = [];
+    runtime.on('trace', (event: AxlEvent) => collected.push(event));
+
+    await expect(runtime.execute('input-guardrail-wf', {})).rejects.toThrow(GuardrailError);
+
+    const askEnds = collected.filter((e) => e.type === 'ask_end');
+    const errorEvents = collected.filter((e) => e.type === 'error');
+    const workflowEnds = collected.filter((e) => e.type === 'workflow_end');
+
+    expect(askEnds.length).toBe(1);
+    const end = askEnds[0] as AskEndOutcome;
+    expect(end.outcome.ok).toBe(false);
+    if (!end.outcome.ok) {
+      expect(end.outcome.error.length).toBeGreaterThan(0);
+      // Sanity: matches GuardrailError formatting — couples to error
+      // class behavior, not exact wording.
+      expect(end.outcome.error).toMatch(/guardrail|blocked|never allowed/i);
+    }
+
+    expect(errorEvents.length).toBe(0);
+    expect(workflowEnds.length).toBe(1);
+    expect((workflowEnds[0].data as { status: string }).status).toBe('failed');
+  });
+
+  it('MaxTurnsError surfaces via ask_end(ok:false), not a workflow `error` event', async () => {
+    // Tool-calling loop exhaustion: the provider always returns a tool
+    // call, the loop hits maxTurns=1 after one iteration, and throws
+    // MaxTurnsError from `context.ts:~1901` — outside the gate machinery.
+    const echoTool = tool({
+      name: 'echo',
+      description: 'always called',
+      input: z.object({ x: z.string() }),
+      handler: async ({ x }) => x,
+    });
+    const a = agent({
+      name: 'looper',
+      model: 'mock:test',
+      system: 'system',
+      maxTurns: 1,
+      tools: [echoTool],
+    });
+    const wf = workflow({
+      name: 'maxturns-wf',
+      input: z.object({}),
+      handler: async (ctx) => ctx.ask(a, 'go'),
+    });
+
+    const runtime = new AxlRuntime({ defaultProvider: 'mock' });
+    runtime.registerProvider('mock', {
+      name: 'mock',
+      // Always return a tool call so the loop never terminates naturally.
+      chat: async () => ({
+        content: '',
+        tool_calls: [
+          {
+            id: 'tc1',
+            type: 'function' as const,
+            function: { name: 'echo', arguments: '{"x":"hi"}' },
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        cost: 0.001,
+      }),
+      stream: async function* () {
+        yield {
+          type: 'done' as const,
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+      },
+    });
+    runtime.register(wf);
+
+    const collected: AxlEvent[] = [];
+    runtime.on('trace', (event: AxlEvent) => collected.push(event));
+
+    await expect(runtime.execute('maxturns-wf', {})).rejects.toThrow(MaxTurnsError);
+
+    const askEnds = collected.filter((e) => e.type === 'ask_end');
+    const errorEvents = collected.filter((e) => e.type === 'error');
+    const workflowEnds = collected.filter((e) => e.type === 'workflow_end');
+
+    expect(askEnds.length).toBe(1);
+    const end = askEnds[0] as AskEndOutcome;
+    expect(end.outcome.ok).toBe(false);
+    if (!end.outcome.ok) {
+      expect(end.outcome.error.length).toBeGreaterThan(0);
+      // MaxTurnsError message format: "ctx.ask() exceeded maximum of N turns"
+      expect(end.outcome.error).toMatch(/max.?turns|maximum.+turns/i);
+    }
+
+    expect(errorEvents.length).toBe(0);
+    expect(workflowEnds.length).toBe(1);
+    expect((workflowEnds[0].data as { status: string }).status).toBe('failed');
+  });
+
+  it('TimeoutError surfaces via ask_end(ok:false), not a workflow `error` event', async () => {
+    // Ask-level timeout: configured via `agent({ timeout })`. The check at
+    // the top of each loop iteration in `context.ts:~830` throws
+    // TimeoutError. We trigger it by setting a 1ms timeout on the agent
+    // and a provider whose first call takes longer than that — the
+    // timeout check on the SECOND iteration trips before any further work.
+    const slowTool = tool({
+      name: 'slow',
+      description: 'force a turn',
+      input: z.object({}),
+      handler: async () => {
+        // Make the tool slow enough that the next loop iteration's
+        // timeout check trips immediately on its first read of Date.now().
+        await new Promise((r) => setTimeout(r, 20));
+        return 'ok';
+      },
+    });
+    const a = agent({
+      name: 'timed',
+      model: 'mock:test',
+      system: 'system',
+      timeout: '1ms',
+      tools: [slowTool],
+    });
+    const wf = workflow({
+      name: 'timeout-wf',
+      input: z.object({}),
+      handler: async (ctx) => ctx.ask(a, 'go'),
+    });
+
+    const runtime = new AxlRuntime({ defaultProvider: 'mock' });
+    runtime.registerProvider('mock', {
+      name: 'mock',
+      // First call returns a tool call; the slow tool burns past the 1ms
+      // timeout; the second loop iteration's check trips.
+      chat: async () => ({
+        content: '',
+        tool_calls: [
+          {
+            id: 'tc1',
+            type: 'function' as const,
+            function: { name: 'slow', arguments: '{}' },
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        cost: 0.001,
+      }),
+      stream: async function* () {
+        yield {
+          type: 'done' as const,
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+      },
+    });
+    runtime.register(wf);
+
+    const collected: AxlEvent[] = [];
+    runtime.on('trace', (event: AxlEvent) => collected.push(event));
+
+    await expect(runtime.execute('timeout-wf', {})).rejects.toThrow(TimeoutError);
+
+    const askEnds = collected.filter((e) => e.type === 'ask_end');
+    const errorEvents = collected.filter((e) => e.type === 'error');
+    const workflowEnds = collected.filter((e) => e.type === 'workflow_end');
+
+    expect(askEnds.length).toBe(1);
+    const end = askEnds[0] as AskEndOutcome;
+    expect(end.outcome.ok).toBe(false);
+    if (!end.outcome.ok) {
+      expect(end.outcome.error.length).toBeGreaterThan(0);
+      // TimeoutError message format: "ctx.ask() exceeded timeout of Nms"
+      expect(end.outcome.error).toMatch(/timeout/i);
+    }
+
+    expect(errorEvents.length).toBe(0);
+    expect(workflowEnds.length).toBe(1);
+    expect((workflowEnds[0].data as { status: string }).status).toBe('failed');
+  });
+
+  it('provider HTTP/transport throw surfaces via ask_end(ok:false), not a workflow `error` event', async () => {
+    // A provider that throws synchronously from chat() — simulates an
+    // HTTP error or transport failure. Throw originates inside
+    // executeAgentCall's `provider.chat()` call, before any post-call
+    // gate runs. The try/finally in ctx.ask() funnels it into ask_end.
+    const a = agent({ name: 'http-fail', model: 'mock:test', system: 'system' });
+    const wf = workflow({
+      name: 'provider-error-wf',
+      input: z.object({}),
+      handler: async (ctx) => ctx.ask(a, 'q'),
+    });
+
+    const runtime = new AxlRuntime({ defaultProvider: 'mock' });
+    runtime.registerProvider('mock', {
+      name: 'mock',
+      chat: async () => {
+        throw new Error('upstream 503: backend unavailable');
+      },
+      stream: async function* () {
+        yield {
+          type: 'done' as const,
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+      },
+    });
+    runtime.register(wf);
+
+    const collected: AxlEvent[] = [];
+    runtime.on('trace', (event: AxlEvent) => collected.push(event));
+
+    await expect(runtime.execute('provider-error-wf', {})).rejects.toThrow(
+      /upstream 503|backend unavailable/,
+    );
+
+    const askEnds = collected.filter((e) => e.type === 'ask_end');
+    const errorEvents = collected.filter((e) => e.type === 'error');
+    const workflowEnds = collected.filter((e) => e.type === 'workflow_end');
+
+    expect(askEnds.length).toBe(1);
+    const end = askEnds[0] as AskEndOutcome;
+    expect(end.outcome.ok).toBe(false);
+    if (!end.outcome.ok) {
+      // The provider's raw error message should flow through verbatim
+      // since `executeAgentCall` doesn't wrap it.
+      expect(end.outcome.error).toMatch(/upstream 503|backend unavailable/);
+    }
+
+    expect(errorEvents.length).toBe(0);
+    expect(workflowEnds.length).toBe(1);
+    expect((workflowEnds[0].data as { status: string }).status).toBe('failed');
   });
 });
 

@@ -36,7 +36,9 @@ export function PartialObjectRenderer(props: PartialObjectRendererProps): ReactE
     // Filter to the requested ask. Without `askId`, the component tracks
     // whichever ask produced the latest partial_object event.
     let currentAskId = askId;
-    let latestPartial: AxlEvent | undefined;
+    // Use `AxlEventOf<'partial_object'>` so `latestPartial.data.object` is
+    // statically typed without a cast.
+    let latestPartial: import('../../lib/types').AxlEventOf<'partial_object'> | undefined;
     let latestFailed = false;
 
     for (const ev of events) {
@@ -44,7 +46,9 @@ export function PartialObjectRenderer(props: PartialObjectRendererProps): ReactE
       if (!askId && ev.type === 'partial_object') {
         currentAskId = ev.askId;
       }
-      if (ev.askId !== currentAskId) continue;
+      // `'askId' in ev` narrows out variants without an askId
+      // (workflow_*, done, handoff_*) before comparison.
+      if (!('askId' in ev) || ev.askId !== currentAskId) continue;
 
       if (ev.type === 'partial_object') {
         latestPartial = ev;
@@ -63,8 +67,7 @@ export function PartialObjectRenderer(props: PartialObjectRendererProps): ReactE
     }
 
     if (!latestPartial || latestFailed) return null;
-    const data = latestPartial.data as { object?: unknown } | undefined;
-    return data?.object;
+    return latestPartial.data.object;
   }, [events, askId, reset]);
 
   if (rendered === null || rendered === undefined) {

@@ -819,6 +819,173 @@ describe('agent handoff improvements', () => {
     });
   });
 
+  describe('handoff target ask_end.cost rollup independence (FOLLOWUPS P1, BLOCKER #2 verified)', () => {
+    // Pins the resolved FOLLOWUPS P1 issue: "Handoff target cost rollup
+    // may drop leaf costs". Investigation confirmed the implementation
+    // is correct — every handoff target's `ask_end.cost` reflects ITS
+    // own leaf cost only (excluding the source's), and the sum of all
+    // leaf event costs across the entire trace stream equals
+    // ExecutionInfo.totalCost. This test pins those invariants so a
+    // future regression (e.g., dropping target frame allocation, or
+    // accidentally pooling target leaves into source's frame) is caught.
+    it('source ask_end.cost contains source leaves only; target ask_end.cost contains target leaves only', async () => {
+      const targetAgent = agent({
+        name: 'cost_target',
+        model: 'mock:test',
+        system: 'You target.',
+      });
+      const sourceAgent = agent({
+        name: 'cost_source',
+        model: 'mock:test',
+        system: 'You source.',
+        handoffs: [{ agent: targetAgent }], // oneway
+      });
+
+      // Provider with distinguishable per-call costs so we can verify
+      // attribution (source's costs ≠ target's costs).
+      let callIndex = 0;
+      const provider: Provider = {
+        name: 'mock',
+        chat: async () => {
+          callIndex++;
+          if (callIndex === 1) {
+            // Source's first call: emits handoff tool_call. Cost = 0.10.
+            return {
+              content: '',
+              tool_calls: [
+                {
+                  id: 'tc1',
+                  type: 'function',
+                  function: { name: 'handoff_to_cost_target', arguments: '{}' },
+                },
+              ],
+              usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+              cost: 0.1,
+            };
+          }
+          // Target's call: returns final text. Cost = 0.07.
+          return {
+            content: 'target answer',
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+            cost: 0.07,
+          };
+        },
+        stream: async function* () {
+          yield {
+            type: 'done' as const,
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          };
+        },
+      };
+
+      const { ctx, traces } = createCtx({ provider });
+      await ctx.ask(sourceAgent, 'start');
+
+      // Find ask_end events scoped to source vs target by askId. Use the
+      // handoff_start event's fromAskId/toAskId as the source/target
+      // anchors.
+      type AskEnd = Extract<AxlEvent, { type: 'ask_end' }>;
+      type AgentCallEnd = Extract<AxlEvent, { type: 'agent_call_end' }>;
+      type HandoffStart = Extract<AxlEvent, { type: 'handoff_start' }>;
+
+      const handoff = traces.find((t): t is HandoffStart => t.type === 'handoff_start');
+      expect(handoff).toBeDefined();
+      const sourceAskId = handoff!.fromAskId;
+      const targetAskId = handoff!.toAskId;
+
+      const askEnds = traces.filter((t): t is AskEnd => t.type === 'ask_end');
+      // Both source and target frames should produce ask_end events.
+      const sourceAskEnd = askEnds.find((e) => e.askId === sourceAskId);
+      const targetAskEnd = askEnds.find((e) => e.askId === targetAskId);
+      expect(sourceAskEnd).toBeDefined();
+      expect(targetAskEnd).toBeDefined();
+
+      // Source's leaves (agent_call_end with askId === sourceAskId).
+      const sourceLeaves = traces.filter(
+        (t): t is AgentCallEnd => t.type === 'agent_call_end' && t.askId === sourceAskId,
+      );
+      // Target's leaves.
+      const targetLeaves = traces.filter(
+        (t): t is AgentCallEnd => t.type === 'agent_call_end' && t.askId === targetAskId,
+      );
+
+      const sumSource = sourceLeaves.reduce((s, e) => s + (e.cost ?? 0), 0);
+      const sumTarget = targetLeaves.reduce((s, e) => s + (e.cost ?? 0), 0);
+
+      // Source's ask_end.cost is the rollup of source's leaves ONLY —
+      // it does NOT contain target's leaf costs.
+      expect(sourceAskEnd!.cost).toBeCloseTo(sumSource, 5);
+      expect(sourceAskEnd!.cost).not.toBeCloseTo(sumSource + sumTarget, 5);
+
+      // Target's ask_end.cost reflects target's own leaf cost.
+      expect(targetAskEnd!.cost).toBeCloseTo(sumTarget, 5);
+
+      // Sanity: source's leaf cost is the 0.10 first-call charge; target's
+      // leaf cost is the 0.07 second-call charge. The two are distinguishable.
+      expect(sumSource).toBeCloseTo(0.1, 5);
+      expect(sumTarget).toBeCloseTo(0.07, 5);
+    });
+
+    it('sum of eventCostContribution(event) over the entire stream equals total leaf cost', async () => {
+      // Whole-stream invariant: summing eventCostContribution() over
+      // every emitted event equals the sum of leaf-event costs. The
+      // helper skips ask_end (per-ask rollup) so handoff target ask_end
+      // costs are NOT double-counted alongside their underlying leaves.
+      const { eventCostContribution } = await import('../event-utils.js');
+
+      const targetAgent = agent({
+        name: 'sum_target',
+        model: 'mock:test',
+        system: 'You target.',
+      });
+      const sourceAgent = agent({
+        name: 'sum_source',
+        model: 'mock:test',
+        system: 'You source.',
+        handoffs: [{ agent: targetAgent }], // oneway
+      });
+
+      const provider = createSequenceProvider([
+        {
+          tool_calls: [
+            {
+              id: 'tc1',
+              type: 'function',
+              function: { name: 'handoff_to_sum_target', arguments: '{}' },
+            },
+          ],
+        },
+        'target answer',
+      ]);
+
+      const { ctx, traces } = createCtx({ provider });
+      await ctx.ask(sourceAgent, 'start');
+
+      // Sum of every event's cost contribution (skips ask_end rollup).
+      const totalContribution = traces.reduce((sum, e) => sum + eventCostContribution(e), 0);
+
+      // Sum of just the cost-bearing leaves (agent_call_end + tool_call_end +
+      // memory_*).
+      const leafSum = traces
+        .filter(
+          (t) =>
+            t.type === 'agent_call_end' ||
+            t.type === 'tool_call_end' ||
+            t.type === 'memory_remember' ||
+            t.type === 'memory_recall',
+        )
+        .reduce((sum, e) => sum + ((e.cost as number | undefined) ?? 0), 0);
+
+      // The whole-stream sum equals leaf sum — ask_end rollups are
+      // correctly excluded. If a future bug double-counted ask_end's
+      // cost in eventCostContribution, totalContribution would be larger
+      // than leafSum (by the per-ask rollup amount).
+      expect(totalContribution).toBeCloseTo(leafSum, 5);
+      // Sanity: at least one cost-bearing event was emitted.
+      expect(leafSum).toBeGreaterThan(0);
+    });
+  });
+
   describe('HandoffRecord.duration backfill from target ask_end (gap 2)', () => {
     it('oneway handoff populates session HandoffRecord.duration from target ask_end', async () => {
       // Old behavior: oneway handoffs left `duration: undefined` because

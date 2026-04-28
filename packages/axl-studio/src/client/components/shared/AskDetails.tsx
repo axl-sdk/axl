@@ -27,20 +27,29 @@ export function AskDetails(props: AskDetailsProps): ReactElement {
   const { filtered, summary } = useMemo(() => {
     const filtered = events.filter(
       (e) =>
-        e.askId === askId ||
+        // 'askId' isn't on every variant; narrow before comparing.
+        ('askId' in e && e.askId === askId) ||
         // handoff_start/return span source→target and aren't AskScoped
         // themselves; surface them on the drill-down for either end.
         ((e.type === 'handoff_start' || e.type === 'handoff_return') &&
           (e.fromAskId === askId || e.toAskId === askId)),
     );
-    // Derive a one-line summary from the events we have.
-    const start = filtered.find((e) => e.type === 'ask_start');
-    const end = filtered.find((e) => e.type === 'ask_end');
+    // Derive a one-line summary from the events we have. `find` returns
+    // the broad `AxlEvent | undefined`, so we narrow on `e.type` before
+    // reaching into ask_start.prompt / ask_end.cost / ask_end.outcome.
+    const start = filtered.find(
+      (e): e is import('../../lib/types').AxlEventOf<'ask_start'> => e.type === 'ask_start',
+    );
+    const end = filtered.find(
+      (e): e is import('../../lib/types').AxlEventOf<'ask_end'> => e.type === 'ask_end',
+    );
     // Fallback for asks that don't emit ask_start (e.g., legacy handoff
     // targets from before the target-wrap fix): walk filtered events for
     // one with an `agent` field. Ensures the drill-down header never
     // renders "unknown agent" just because the first event isn't ask_start.
-    const agent = start?.agent ?? filtered.find((e) => 'agent' in e && e.agent)?.agent;
+    const agent =
+      start?.agent ??
+      filtered.find((e): e is typeof e & { agent: string } => 'agent' in e && !!e.agent)?.agent;
     const prompt = start?.prompt;
     const cost = end?.cost;
     const duration =

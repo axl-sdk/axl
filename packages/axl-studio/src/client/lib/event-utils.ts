@@ -1,22 +1,24 @@
 /**
  * Client-local mirror of `@axlsdk/axl#eventCostContribution`.
  *
- * We can't import from `@axlsdk/axl` directly in client code because
- * that package uses Node's `AsyncLocalStorage` (`node:async_hooks`)
- * for ALS-backed ask correlation — not browser-safe. Vite externalizes
- * `async_hooks` with a runtime-error stub, so any client module that
- * pulls in the core package crashes on first load ("Module 'async_hooks'
- * has been externalized for browser compatibility").
+ * Why this mirror persists even after the strict-types migration:
+ * `eventCostContribution` is a runtime VALUE, not a type. Importing it
+ * from `@axlsdk/axl` would pull the package's main bundle (including
+ * Node's `AsyncLocalStorage` from `node:async_hooks`) into the Vite SPA
+ * bundle and crash with "Module 'async_hooks' has been externalized for
+ * browser compatibility". The browser-compat tripwire enforces this.
  *
- * This is a trivial 5-line helper; duplication is the pragmatic choice.
- * The invariant — skip `ask_end` rollups (spec/16 §10), guard against
- * NaN/Infinity/negative costs — is simple enough that drift is unlikely.
- * Server-side code imports the real `eventCostContribution` from
- * `@axlsdk/axl`; anything in `src/client/` uses this local copy.
+ * The TYPE side of the duplication WAS resolved — `AxlEvent` here is
+ * imported via type-only re-export in `./types.ts` (safe, fully erased
+ * under `verbatimModuleSyntax: true`). Only the runtime helper still
+ * has to be mirrored. The two ways to eliminate this last duplication
+ * are (a) ship a browser-safe `@axlsdk/axl/browser` subpath with the
+ * pure helpers, or (b) extract `event-utils` into its own package with
+ * no `async_hooks` dep. Both are out of scope here.
  *
- * Tracked in `.internal/FOLLOWUPS.md` P1: "Studio client `AxlEvent`
- * loose-type duplication" — same root cause, same fix path (bundle an
- * event-utils entry point or make the core browser-safe).
+ * The invariant is simple — skip `ask_end` rollups (spec/16 §10), guard
+ * against NaN/Infinity/negative costs — so drift is unlikely. Pinning
+ * test in `event-utils.test.ts` mirrors the SDK suite for parity.
  */
 import type { AxlEvent } from './types.js';
 

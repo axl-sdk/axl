@@ -298,10 +298,12 @@ export function GateCheckBody({ event }: { event: AxlEvent }) {
 /** `ask_start` body — renders the user prompt at the top level of the
  *  event (not inside `event.data`, which is absent on this variant). */
 function AskStartBody({ event }: { event: AxlEvent }) {
-  const prompt = (event as { prompt?: unknown }).prompt;
+  if (event.type !== 'ask_start') return null;
+  // `prompt` is required on the `ask_start` variant.
+  const { prompt } = event;
   return (
     <>
-      {typeof prompt === 'string' && prompt.length > 0 ? (
+      {prompt.length > 0 ? (
         <TextBlock label="Prompt" content={prompt} defaultOpen />
       ) : (
         <p className="text-xs text-[hsl(var(--muted-foreground))]">(no prompt)</p>
@@ -313,35 +315,28 @@ function AskStartBody({ event }: { event: AxlEvent }) {
 /** `ask_end` body — renders outcome (narrowed on outcome.ok), plus the
  *  per-ask cost and duration from the top level of the event. */
 function AskEndBody({ event }: { event: AxlEvent }) {
-  const outcome = (event as { outcome?: { ok: boolean; result?: unknown; error?: string } })
-    .outcome;
-  const cost = (event as { cost?: number }).cost;
-  const duration = (event as { duration?: number }).duration;
+  if (event.type !== 'ask_end') return null;
+  // `outcome`, `cost`, `duration` are all required on `ask_end`.
+  const { outcome, cost, duration } = event;
   return (
     <>
-      {outcome && (
-        <p className="text-xs mb-1">
-          <strong>Outcome:</strong>{' '}
-          <span
-            className={
-              outcome.ok ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
-            }
-          >
-            {outcome.ok ? 'ok' : 'error'}
-          </span>
-        </p>
-      )}
-      {typeof cost === 'number' && (
-        <p className="text-xs mb-1">
-          <strong>Ask cost:</strong> {formatCost(cost)}
-        </p>
-      )}
-      {typeof duration === 'number' && (
-        <p className="text-xs mb-1">
-          <strong>Duration:</strong> {duration}ms
-        </p>
-      )}
-      {outcome?.ok && outcome.result !== undefined && (
+      <p className="text-xs mb-1">
+        <strong>Outcome:</strong>{' '}
+        <span
+          className={
+            outcome.ok ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'
+          }
+        >
+          {outcome.ok ? 'ok' : 'error'}
+        </span>
+      </p>
+      <p className="text-xs mb-1">
+        <strong>Ask cost:</strong> {formatCost(cost)}
+      </p>
+      <p className="text-xs mb-1">
+        <strong>Duration:</strong> {duration}ms
+      </p>
+      {outcome.ok && outcome.result !== undefined && (
         <TextBlock
           label="Result"
           content={
@@ -352,7 +347,7 @@ function AskEndBody({ event }: { event: AxlEvent }) {
           defaultOpen
         />
       )}
-      {outcome && !outcome.ok && outcome.error && (
+      {!outcome.ok && outcome.error && (
         <TextBlock label="Error" content={outcome.error} tone="warning" defaultOpen />
       )}
     </>
@@ -362,24 +357,18 @@ function AskEndBody({ event }: { event: AxlEvent }) {
 /** `pipeline` body — renders status/stage/attempt progression and the
  *  failure reason (only populated on `status: 'failed'`). */
 function PipelineBody({ event }: { event: AxlEvent }) {
-  const e = event as {
-    status?: string;
-    stage?: string;
-    attempt?: number;
-    maxAttempts?: number;
-    reason?: string;
-  };
+  if (event.type !== 'pipeline') return null;
+  // `status`, `stage`, `attempt`, `maxAttempts` are required across all
+  // three pipeline variants. `reason` exists only on the `failed` branch
+  // — narrow via the discriminated `status` field.
+  const { status, stage, attempt, maxAttempts } = event;
+  const reason = event.status === 'failed' ? event.reason : undefined;
   return (
     <>
       <p className="text-xs mb-1">
-        <strong>Pipeline:</strong> {e.stage ?? '(unknown stage)'} · {e.status ?? '(unknown status)'}
-        {e.attempt != null && e.maxAttempts != null
-          ? ` · attempt ${e.attempt}/${e.maxAttempts}`
-          : ''}
+        <strong>Pipeline:</strong> {stage} · {status} · attempt {attempt}/{maxAttempts}
       </p>
-      {e.reason && (
-        <TextBlock label="Failure reason" content={e.reason} tone="warning" defaultOpen />
-      )}
+      {reason && <TextBlock label="Failure reason" content={reason} tone="warning" defaultOpen />}
     </>
   );
 }
@@ -387,31 +376,51 @@ function PipelineBody({ event }: { event: AxlEvent }) {
 /** `handoff_start` / `handoff_return` body — shows source→target and
  *  (for roundtrip start) the message passed to the target. */
 function HandoffBody({ event }: { event: AxlEvent }) {
-  const data = event.data as
-    | { source?: string; target?: string; mode?: string; message?: string; duration?: number }
-    | undefined;
-  const isStart = event.type === 'handoff_start';
-  return (
-    <>
-      <p className="text-xs mb-1">
-        <strong>{isStart ? 'Handoff starts:' : 'Handoff returns:'}</strong> {data?.source ?? '?'} →{' '}
-        {data?.target ?? '?'}
-        {isStart && data?.mode ? ` · ${data.mode}` : ''}
-      </p>
-      {!isStart && typeof data?.duration === 'number' && (
+  // Both handoff variants are required to carry `data`; the strict
+  // discriminated union narrows directly on `event.type`. `message` lives
+  // only on `handoff_start.data`; `duration` only on `handoff_return.data`.
+  // Defense-in-depth: a malformed wire payload missing `data` shouldn't
+  // crash the row render.
+  if (event.type === 'handoff_start') {
+    if (!event.data) return null;
+    const { source, target, mode, message } = event.data;
+    return (
+      <>
         <p className="text-xs mb-1">
-          <strong>Round-trip duration:</strong> {data.duration}ms
+          <strong>Handoff starts:</strong> {source} → {target}
+          {mode ? ` · ${mode}` : ''}
         </p>
-      )}
-      {isStart && data?.message && (
-        <TextBlock label="Prompt to target" content={data.message} defaultOpen />
-      )}
-    </>
-  );
+        {message && <TextBlock label="Prompt to target" content={message} defaultOpen />}
+      </>
+    );
+  }
+  if (event.type === 'handoff_return') {
+    if (!event.data) return null;
+    const { source, target, duration } = event.data;
+    return (
+      <>
+        <p className="text-xs mb-1">
+          <strong>Handoff returns:</strong> {source} → {target}
+        </p>
+        {typeof duration === 'number' && (
+          <p className="text-xs mb-1">
+            <strong>Round-trip duration:</strong> {duration}ms
+          </p>
+        )}
+      </>
+    );
+  }
+  return null;
 }
 
 /** Generic fallback body for event types without a dedicated renderer. */
 function GenericBody({ event }: { event: AxlEvent }) {
+  // Most variants carry `data` (sometimes `unknown`, sometimes a strict
+  // shape); a few (`ask_start`, `token`) don't. Read defensively via
+  // `'data' in event` so the strict union doesn't reject the access.
+  // `model`, `promptVersion`, and `tokens` live on `AxlEventBase` and are
+  // available on every variant.
+  const data = 'data' in event ? event.data : undefined;
   return (
     <>
       {event.model && (
@@ -432,9 +441,7 @@ function GenericBody({ event }: { event: AxlEvent }) {
           {event.tokens.reasoning ? ` reasoning=${event.tokens.reasoning}` : ''}
         </p>
       )}
-      {event.data != null && (
-        <TraceJsonViewer data={event.data as Record<string, unknown>} collapsed />
-      )}
+      {data != null && <TraceJsonViewer data={data as Record<string, unknown>} collapsed />}
     </>
   );
 }
@@ -510,7 +517,10 @@ function TraceEventRow({
         {event.agent && (
           <span className="text-blue-600 dark:text-blue-400 w-28 truncate">{event.agent}</span>
         )}
-        {event.tool && (
+        {/* `tool` lives on the four tool-* variants (tool_call_start/end,
+            tool_approval, tool_denied) — narrow via `'tool' in event` so
+            the strict union admits the access on those rows only. */}
+        {'tool' in event && event.tool && (
           <span className="text-purple-600 dark:text-purple-400 w-28 truncate">{event.tool}</span>
         )}
         <div className="flex-1 h-3 bg-[hsl(var(--background))] rounded overflow-hidden">

@@ -540,6 +540,102 @@ describe('AxlStream', () => {
       expect(chunks[0].agent).toBeUndefined();
     });
 
+    it('groups chunks by askId across an outer + nested ask (agent-as-tool pattern)', async () => {
+      // Run a real workflow with an outer ctx.ask using an agent-as-tool
+      // pattern (the tool handler invokes a sub-agent via ctx.ask). The
+      // outer's tokens carry one askId and the nested's tokens carry a
+      // DIFFERENT askId. Both agents are reflected in the per-chunk
+      // `agent` field.
+      const { AxlRuntime } = await import('../runtime.js');
+      const { workflow } = await import('../workflow.js');
+      const { agent } = await import('../agent.js');
+      const { tool } = await import('../tool.js');
+      const { z } = await import('zod');
+      const { MockProvider } = await import('../../../axl-testing/src/mock-provider.js');
+
+      const subAgent = agent({
+        name: 'sub_specialist',
+        model: 'mock:test',
+        system: 'sub',
+      });
+      const askTool = tool({
+        name: 'ask_sub',
+        description: 'ask the sub specialist',
+        input: z.object({ q: z.string() }),
+        handler: async (input, ctx) => ctx.ask(subAgent, input.q),
+      });
+      const outerAgent = agent({
+        name: 'outer_coordinator',
+        model: 'mock:test',
+        system: 'outer',
+        tools: [askTool],
+      });
+
+      // Provider sequence:
+      // Turn 1 (outer): tool_call to ask_sub
+      // Turn 2 (sub):   text "INNER"
+      // Turn 3 (outer): text "OUTER"
+      const provider = MockProvider.sequence([
+        {
+          content: '',
+          chunks: [],
+          tool_calls: [
+            {
+              id: 'tc1',
+              type: 'function' as const,
+              function: { name: 'ask_sub', arguments: '{"q":"go"}' },
+            },
+          ],
+        },
+        { content: 'INNER', chunks: ['IN', 'NER'] },
+        { content: 'OUTER', chunks: ['OU', 'TER'] },
+      ]);
+      const runtime = new AxlRuntime({ defaultProvider: 'mock' });
+      runtime.registerProvider('mock', provider);
+
+      const wf = workflow({
+        name: 'nested-ask-stream',
+        input: z.object({}),
+        handler: async (ctx) => ctx.ask(outerAgent, 'start'),
+      });
+      runtime.register(wf);
+
+      const stream = runtime.stream('nested-ask-stream', {});
+      const chunks: Array<{ askId: string; agent?: string; text: string }> = [];
+      // Drain via textByAsk only — it pulls from the same internal queue
+      // as the main iterator, terminates on `done`, and yields one chunk
+      // per token event. Iterating BOTH `stream` and `stream.textByAsk`
+      // races: the first `for await` to enter pulls events out, leaving
+      // the second iterator empty of early events.
+      for await (const chunk of stream.textByAsk) {
+        chunks.push(chunk);
+      }
+      // Ensure the underlying promise settled (textByAsk completes when
+      // the stream's `done` event fires).
+      await stream.promise.catch(() => {});
+
+      // We must have chunks from BOTH the outer and the inner ask.
+      const outerChunks = chunks.filter((c) => c.agent === 'outer_coordinator');
+      const innerChunks = chunks.filter((c) => c.agent === 'sub_specialist');
+      expect(outerChunks.length).toBeGreaterThan(0);
+      expect(innerChunks.length).toBeGreaterThan(0);
+
+      // The outer's askId differs from the nested's askId — the iterator
+      // groups by askId, NOT by agent name, but we use agent as a proxy
+      // to identify the lane.
+      const outerAskIds = new Set(outerChunks.map((c) => c.askId));
+      const innerAskIds = new Set(innerChunks.map((c) => c.askId));
+      expect(outerAskIds.size).toBe(1);
+      expect(innerAskIds.size).toBe(1);
+      const [outerAskId] = outerAskIds;
+      const [innerAskId] = innerAskIds;
+      expect(outerAskId).not.toBe(innerAskId);
+
+      // Joined text per lane reconstructs the model's response per agent.
+      expect(outerChunks.map((c) => c.text).join('')).toBe('OUTER');
+      expect(innerChunks.map((c) => c.text).join('')).toBe('INNER');
+    });
+
     it('filters out non-token events', async () => {
       const stream = new AxlStream();
 

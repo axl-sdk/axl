@@ -108,6 +108,117 @@ describe('pipeline events (spec/16 §4.2)', () => {
     }
   });
 
+  it('validate retry: pipeline(failed, validate) followed by pipeline(start, validate, attempt: 2)', async () => {
+    // Mirrors the schema-retry test for the validate stage.
+    // Both responses parse cleanly under the schema; first fails the
+    // post-schema `validate` callback, second passes. Validate requires a
+    // schema (per the docs) — we provide one and it parses successfully on
+    // every attempt; only the validate gate flips between fail and pass.
+    const a = agent({ name: 'validate-retry', model: 'mock:test', system: 'test' });
+    const provider = createSequenceProvider([
+      JSON.stringify({ value: 1 }), // schema OK, validate FAILS
+      JSON.stringify({ value: 99 }), // schema OK, validate PASSES
+    ]);
+    const { ctx, traces } = createTestCtx({ provider });
+
+    await ctx.ask(a, 'q', {
+      schema: z.object({ value: z.number() }),
+      validate: (out) => (out.value > 50 ? { valid: true } : { valid: false, reason: 'too small' }),
+      validateRetries: 2,
+    });
+
+    const pipeline = pipelineEvents(traces);
+    // Expected: start(initial,1) → failed(validate,1) → start(validate,2) → committed(2)
+    expect(pipeline.length).toBe(4);
+
+    expect(pipeline[0].status).toBe('start');
+    if (pipeline[0].status === 'start') {
+      expect(pipeline[0].stage).toBe('initial');
+      expect(pipeline[0].attempt).toBe(1);
+    }
+
+    expect(pipeline[1].status).toBe('failed');
+    if (pipeline[1].status === 'failed') {
+      expect(pipeline[1].stage).toBe('validate');
+      expect(pipeline[1].attempt).toBe(1);
+      // The reason is the feedback message about the failure.
+      expect(typeof pipeline[1].reason).toBe('string');
+    }
+
+    expect(pipeline[2].status).toBe('start');
+    if (pipeline[2].status === 'start') {
+      expect(pipeline[2].stage).toBe('validate');
+      expect(pipeline[2].attempt).toBe(2);
+    }
+
+    expect(pipeline[3].status).toBe('committed');
+    if (pipeline[3].status === 'committed') {
+      expect(pipeline[3].attempt).toBe(2);
+    }
+
+    // Sanity: the validate gate fired twice in lockstep with the pipeline
+    // events (one fail, one pass).
+    const validateEvents = traces.filter((t) => t.type === 'validate');
+    expect(validateEvents).toHaveLength(2);
+  });
+
+  it('guardrail retry: pipeline(failed, guardrail) followed by pipeline(start, guardrail, attempt: 2)', async () => {
+    // Mirrors the schema-retry test for the output guardrail stage.
+    // First attempt is blocked by the output guardrail; second attempt passes.
+    const a = agent({
+      name: 'guardrail-retry',
+      model: 'mock:test',
+      system: 'test',
+      guardrails: {
+        output: async (response) => {
+          if (response.includes('unsafe')) return { block: true, reason: 'unsafe content' };
+          return { block: false };
+        },
+        onBlock: 'retry',
+        maxRetries: 2,
+      },
+    });
+    const provider = createSequenceProvider([
+      'unsafe content', // guardrail BLOCKS
+      'safe and approved', // guardrail PASSES
+    ]);
+    const { ctx, traces } = createTestCtx({ provider });
+
+    await ctx.ask(a, 'q');
+
+    const pipeline = pipelineEvents(traces);
+    // Expected: start(initial,1) → failed(guardrail,1) → start(guardrail,2) → committed(2)
+    expect(pipeline.length).toBe(4);
+
+    expect(pipeline[0].status).toBe('start');
+    if (pipeline[0].status === 'start') {
+      expect(pipeline[0].stage).toBe('initial');
+      expect(pipeline[0].attempt).toBe(1);
+    }
+
+    expect(pipeline[1].status).toBe('failed');
+    if (pipeline[1].status === 'failed') {
+      expect(pipeline[1].stage).toBe('guardrail');
+      expect(pipeline[1].attempt).toBe(1);
+      expect(typeof pipeline[1].reason).toBe('string');
+    }
+
+    expect(pipeline[2].status).toBe('start');
+    if (pipeline[2].status === 'start') {
+      expect(pipeline[2].stage).toBe('guardrail');
+      expect(pipeline[2].attempt).toBe(2);
+    }
+
+    expect(pipeline[3].status).toBe('committed');
+    if (pipeline[3].status === 'committed') {
+      expect(pipeline[3].attempt).toBe(2);
+    }
+
+    // Sanity: guardrail fired twice (blocked + passed).
+    const guardrailEvents = traces.filter((t) => t.type === 'guardrail');
+    expect(guardrailEvents).toHaveLength(2);
+  });
+
   it('tool-calling turns within a single ask do NOT produce extra pipeline starts', async () => {
     // Multi-turn agent (turn 1: tool call, turn 2: final answer). Pipeline
     // should fire ONE start (initial) and ONE committed — the inner tool

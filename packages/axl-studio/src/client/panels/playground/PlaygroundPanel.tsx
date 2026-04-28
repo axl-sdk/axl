@@ -116,40 +116,37 @@ export function PlaygroundPanel() {
     // Post-spec/16 wire (no translation layer): tool activity flows as
     // `tool_call_start` (args at dispatch) and `tool_call_end` (args +
     // result at completion); handoff's `source/target/mode` live under
-    // `data`; tool_approval carries `tool` + `data.approved`.
+    // `data`; tool_approval carries `tool` + `data.approved`. Each branch
+    // below narrows on `event.type` so `event.tool` / `event.data` /
+    // `event.callId` are statically typed via the strict AxlEvent union.
+    // Defense-in-depth: optional-chain through `data` since malformed wire
+    // payloads (older runtimes, redaction edge cases) shouldn't crash the
+    // SPA — degrade to undefined rendering instead.
     for (const event of stream.events) {
       if (event.type === 'tool_call_start') {
-        const data = event.data as { args?: unknown } | undefined;
         toolCalls.push({
-          name: event.tool ?? '',
-          args: data?.args,
+          name: event.tool,
+          args: event.data?.args,
           callId: event.callId,
         });
-      }
-      if (event.type === 'tool_call_end') {
+      } else if (event.type === 'tool_call_end') {
         // Prefer callId match; the top-level `tool` is the fallback
         // for legacy events that didn't stamp callId.
-        const data = event.data as { result?: unknown } | undefined;
         const existing = event.callId
           ? toolCalls.find((tc) => tc.callId === event.callId)
           : toolCalls.find((tc) => tc.name === event.tool && !tc.result);
-        if (existing) existing.result = data?.result;
-      }
-      // `handoff_start` carries the transition metadata (source, target,
-      // mode). `handoff_return` (roundtrip only) is a structural marker —
-      // the chat doesn't render a second row for it; the target's own
-      // response already shows up in the normal flow.
-      if (event.type === 'handoff_start') {
-        const data = event.data as { source?: string; target?: string; mode?: string } | undefined;
-        handoffs.push({
-          source: data?.source ?? '',
-          target: data?.target ?? '',
-          mode: (data?.mode as 'oneway' | 'roundtrip') ?? 'oneway',
-        });
-      }
-      if (event.type === 'tool_approval') {
-        const data = event.data as { approved?: boolean } | undefined;
-        approvals.push({ tool: event.tool ?? '', approved: data?.approved === true });
+        if (existing) existing.result = event.data?.result;
+      } else if (event.type === 'handoff_start') {
+        // `handoff_start` carries the transition metadata (source, target,
+        // mode). `handoff_return` (roundtrip only) is a structural marker —
+        // the chat doesn't render a second row for it; the target's own
+        // response already shows up in the normal flow.
+        const data = event.data;
+        if (data) {
+          handoffs.push({ source: data.source, target: data.target, mode: data.mode });
+        }
+      } else if (event.type === 'tool_approval') {
+        approvals.push({ tool: event.tool, approved: event.data?.approved === true });
       }
     }
 
@@ -217,7 +214,10 @@ export function PlaygroundPanel() {
     for (let i = activityScannedCount.current; i < stream.events.length; i++) {
       const event = stream.events[i];
       if (!event) continue;
-      if (ACTIVITY_TRIGGERS.has(event.type) || ((event as { depth?: number }).depth ?? 0) >= 1) {
+      // `depth` lives on AskScoped variants only — narrow via `'depth' in
+      // event` so the strict union admits the access without a cast.
+      const depth = 'depth' in event && typeof event.depth === 'number' ? event.depth : 0;
+      if (ACTIVITY_TRIGGERS.has(event.type) || depth >= 1) {
         setShowActivity(true);
         activityScannedCount.current = stream.events.length;
         return;

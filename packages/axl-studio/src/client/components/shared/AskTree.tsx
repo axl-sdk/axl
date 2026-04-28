@@ -86,15 +86,17 @@ function buildAskTree(events: AxlEvent[]): AskNode[] {
     // events overwrite naturally if they arrive.
     if (ev.type === 'handoff_start' && ev.fromAskId) {
       const node = nodes.get(ev.fromAskId);
-      const target = (ev.data as { target?: string } | undefined)?.target ?? ev.toAskId ?? '';
+      const target = ev.data?.target ?? ev.toAskId ?? '';
       if (node && ev.toAskId) {
         node.handoffsOut.push({ toAskId: ev.toAskId, target });
         if (!nodes.has(ev.toAskId)) {
           nodes.set(ev.toAskId, {
             askId: ev.toAskId,
             parentAskId: ev.fromAskId,
-            depth:
-              typeof ev.targetDepth === 'number' ? ev.targetDepth : (ev.depth ?? node.depth) + 1,
+            // handoff_start carries `targetDepth` (target's nesting level)
+            // as its own field — depth proper isn't on the variant since
+            // handoff spans two asks. Fall back to source-depth+1.
+            depth: typeof ev.targetDepth === 'number' ? ev.targetDepth : node.depth + 1,
             agent: target || undefined,
             cost: 0,
             // Status stays 'running' until a real ask_start/end for
@@ -114,7 +116,12 @@ function buildAskTree(events: AxlEvent[]): AskNode[] {
     // The source node already exists; no tree mutation needed.
     if (ev.type === 'handoff_return') continue;
 
-    if (!ev.askId) continue;
+    // AskScoped narrowing: only events with an `askId` field belong in
+    // the tree. The strict union excludes workflow_start/end, done, and
+    // handoff_* (handled above) from the AskScoped mixin; `'askId' in ev`
+    // narrows out those variants and lets us read AskScoped fields
+    // statically below.
+    if (!('askId' in ev) || typeof ev.askId !== 'string') continue;
     let node = nodes.get(ev.askId);
     if (!node) {
       node = {
@@ -141,10 +148,17 @@ function buildAskTree(events: AxlEvent[]): AskNode[] {
         node.endedAt = ev.timestamp;
         // ask_end.cost is the authoritative per-ask rollup (decision 10).
         if (typeof ev.cost === 'number') node.cost = ev.cost;
-        if (ev.outcome?.ok) {
+        // Defense-in-depth: the strict union mandates `outcome` on ask_end,
+        // but a malformed wire payload (older runtime, redaction edge case)
+        // could omit it. Treat missing outcome as "still running" rather
+        // than crashing the React render.
+        if (!ev.outcome) {
+          break;
+        }
+        if (ev.outcome.ok) {
           node.status = 'completed';
           node.outcomeResult = ev.outcome.result;
-        } else if (ev.outcome) {
+        } else {
           node.status = 'failed';
           node.outcomeError = ev.outcome.error;
         }
@@ -166,7 +180,7 @@ function buildAskTree(events: AxlEvent[]): AskNode[] {
         break;
       case 'pipeline':
         node.lastPipeline = {
-          status: ev.status ?? 'start',
+          status: ev.status,
           stage: ev.stage,
           attempt: ev.attempt,
           maxAttempts: ev.maxAttempts,
@@ -367,9 +381,10 @@ function workflowSummary(events: AxlEvent[]): {
       name = ev.workflow ?? name;
     } else if (ev.type === 'workflow_end') {
       name = ev.workflow ?? name;
-      const d = ev.data as { status?: string; duration?: number } | undefined;
-      status = d?.status ?? status;
-      duration = d?.duration ?? duration;
+      // `event.data` is `WorkflowEndData` with required `status`/`duration`
+      // fields; the union narrows directly.
+      status = ev.data.status ?? status;
+      duration = ev.data.duration ?? duration;
     }
   }
   if (!name && !status) return null;

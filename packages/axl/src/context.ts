@@ -543,9 +543,16 @@ export class WorkflowContext<TInput = unknown> {
             return result as T;
           };
 
-          let result: T;
+          // Spec decision 9 invariant: every `ask_start` has a matching
+          // `ask_end`. Implemented via try/finally so ANY exit path —
+          // current catches (gate exhaustion, budget, abort) AND any
+          // future failure path added between `ask_start` and the
+          // success emit — surfaces as `ask_end`. The workflow-level
+          // `error` event is reserved for failures with no ask_end
+          // available; consumers must never see both for the same failure.
+          let outcome: { ok: true; result: T } | { ok: false; error: string } | undefined;
           try {
-            result = this.spanManager
+            const result: T = this.spanManager
               ? await this.spanManager.withSpanAsync(
                   'axl.agent.ask',
                   {
@@ -576,45 +583,66 @@ export class WorkflowContext<TInput = unknown> {
                   },
                 )
               : await doCall();
+            outcome = { ok: true, result };
+
+            // Success path: invoke the legacy onAgentCallComplete hook.
+            // Isolate consumer bugs (mirror the onTrace pattern at
+            // emitEvent): a hook throw is post-success observability —
+            // the agent's run already succeeded, so we must NOT
+            // overwrite the outcome to ok:false. Swallow + console.error
+            // so reliability dashboards keyed off ask_end.outcome aren't
+            // poisoned by hook bugs.
+            const costAfter = this.budgetContext?.totalCost ?? 0;
+            if (this.onAgentCallComplete) {
+              try {
+                this.onAgentCallComplete({
+                  agent: agent._name,
+                  prompt,
+                  response: typeof result === 'string' ? result : JSON.stringify(result),
+                  model: agent.resolveModel(resolveCtx),
+                  cost: costAfter - costBefore,
+                  duration: Date.now() - askStart,
+                  promptVersion: agent._config.version,
+                  temperature: options?.temperature ?? agent._config.temperature,
+                  maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
+                  effort: options?.effort ?? agent._config.effort,
+                  thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
+                  includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
+                  toolChoice: options?.toolChoice ?? agent._config.toolChoice,
+                  stop: options?.stop ?? agent._config.stop,
+                  providerOptions: options?.providerOptions ?? agent._config.providerOptions,
+                });
+              } catch (hookErr) {
+                console.error(
+                  '[axl] onAgentCallComplete hook threw; ask outcome unchanged:',
+                  hookErr instanceof Error ? hookErr.message : String(hookErr),
+                );
+              }
+            }
+            return result;
           } catch (err) {
-            // Ask-internal failure surfaces via ask_end with outcome.ok:false
-            // (spec decision 9). The workflow-level `error` event is reserved
-            // for failures with no ask_end available — consumers must never
-            // see both for the same failure.
+            outcome = {
+              ok: false,
+              error: err instanceof Error ? err.message : String(err),
+            };
+            throw err;
+          } finally {
+            // Defensive: `outcome` is always set by either the success
+            // or catch branch above. The fallback covers an internal
+            // bug (e.g., a future synchronous throw before either
+            // branch runs) so we never silently drop the ask_end event.
             this.emitEvent({
               type: 'ask_end',
-              outcome: { ok: false, error: err instanceof Error ? err.message : String(err) },
+              outcome:
+                outcome ??
+                ({
+                  ok: false,
+                  error: 'ask_end emitted without outcome — internal bug',
+                } as const),
               cost: frame.askCost.value,
               duration: Date.now() - askStart,
             });
-            throw err;
           }
-
-          const costAfter = this.budgetContext?.totalCost ?? 0;
-          this.onAgentCallComplete?.({
-            agent: agent._name,
-            prompt,
-            response: typeof result === 'string' ? result : JSON.stringify(result),
-            model: agent.resolveModel(resolveCtx),
-            cost: costAfter - costBefore,
-            duration: Date.now() - askStart,
-            promptVersion: agent._config.version,
-            temperature: options?.temperature ?? agent._config.temperature,
-            maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
-            effort: options?.effort ?? agent._config.effort,
-            thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
-            includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
-            toolChoice: options?.toolChoice ?? agent._config.toolChoice,
-            stop: options?.stop ?? agent._config.stop,
-            providerOptions: options?.providerOptions ?? agent._config.providerOptions,
-          });
-          this.emitEvent({
-            type: 'ask_end',
-            outcome: { ok: true, result },
-            cost: frame.askCost.value,
-            duration: Date.now() - askStart,
-          });
-          return result;
         });
       },
       { agent: agentName },

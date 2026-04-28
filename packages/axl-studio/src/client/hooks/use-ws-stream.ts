@@ -75,27 +75,34 @@ export function useWsStream(executionId: string | null): StreamState {
           // Root-only token accumulation so nested-ask tokens don't leak
           // into chat UIs. Consumers wanting nested tokens iterate the
           // `events` array and filter on `event.depth` themselves.
+          // `token` is AskScoped (`depth: number` required) on the strict
+          // union — but the WS payload arrives as `unknown` and a malformed
+          // / pre-AskScoped event without `depth` should still land at the
+          // root. `?? 0` preserves that back-compat behavior; pinned by
+          // the "treats undefined depth as root" test.
           const depth = event.depth ?? 0;
           const nextTokens = depth === 0 ? prev.tokens + (event.data ?? '') : prev.tokens;
           return { ...prev, tokens: nextTokens, events: [...prev.events, event] };
         }
         case 'done': {
-          // AxlEvent `done` wraps the result as `data: { result }`.
-          const doneData = event.data as { result?: unknown } | undefined;
+          // `done.data` is `{ result: unknown }` — required on the strict
+          // variant. Defense-in-depth: if a malformed wire payload (older
+          // runtime, redaction-stripped, filter pass-through) drops `data`
+          // or `result`, fall back to `null` rather than crashing the SPA.
           return {
             ...prev,
             done: true,
-            result: doneData?.result ?? null,
+            result: event.data?.result ?? null,
             events: [...prev.events, event],
           };
         }
         case 'error': {
-          // AxlEvent `error` wraps the message as `data: { message, ... }`.
-          const errData = event.data as { message?: string } | undefined;
+          // `error.data` is `{ message: string; name?; code? }` — required
+          // on the strict variant. Same defense-in-depth rationale as `done`.
           return {
             ...prev,
             done: true,
-            error: errData?.message ?? 'Unknown error',
+            error: event.data?.message || 'Unknown error',
             events: [...prev.events, event],
           };
         }

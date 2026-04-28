@@ -225,6 +225,7 @@ studio.upgradeWebSocket(server);
 | `filterTraceEvent` | `(event, metadata) => boolean` | — | Per-connection broadcast filter for multi-tenant deployments. Called on every outbound trace event (and on replay buffer events for late subscribers, so historical cross-tenant events can't leak on reconnect). Predicate errors are fail-closed — event is dropped |
 | `readOnly` | `boolean` | `false` | Disable all mutating endpoints. `POST /api/evals/compare` is allowed (pure computation); `POST /api/evals/import`, `POST /api/evals/:name/run`, `POST /api/evals/:name/rescore`, `POST /api/evals/runs/:evalRunId/cancel`, and `DELETE /api/evals/history/:id` are blocked |
 | `evals` | `string \| string[] \| { files, conditions? }` | — | Lazy-load eval files for the Eval Runner panel |
+| `bufferCaps` | `{ maxEventsPerBuffer?, maxBytesPerBuffer?, maxActiveBuffers? }` | `{ 1000, 4 MiB, 256 }` | Override the default WebSocket replay-buffer resource caps for high-churn deployments. Worst-case memory is roughly `maxActiveBuffers × maxBytesPerBuffer` (≈1 GiB at defaults). Terminal `done`/`error` events are always buffered regardless of caps |
 
 ### Return value
 

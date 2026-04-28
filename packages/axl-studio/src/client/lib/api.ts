@@ -91,10 +91,15 @@ export const fetchExecutions = () => request<ExecutionInfo[]>('/executions');
  * Fetch an execution. When `since` is set, the server filters `events`
  * to those with `step > since` (spec/16 §5.4) — useful for panels that
  * poll and only want the tail. Omit for the full event array.
+ *
+ * Pass `since = -1` as a sentinel meaning "fetch all events from the
+ * beginning" (every event has `step >= 0`, so `step > -1` matches
+ * everything). Useful when the caller wants to thread a single number
+ * through a polling loop without special-casing the first request.
  */
 export const fetchExecution = (id: string, since?: number) => {
   const qs =
-    since !== undefined && Number.isFinite(since) && Number.isInteger(since) && since >= 0
+    since !== undefined && Number.isFinite(since) && Number.isInteger(since) && since >= -1
       ? `?since=${since}`
       : '';
   return request<ExecutionInfo>(`/executions/${encodeURIComponent(id)}${qs}`);

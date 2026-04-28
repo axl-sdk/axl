@@ -12,7 +12,7 @@ npm install @axlsdk/axl zod@^4
 
 > **Note:** `zod` is a peer dependency — your application and Axl share a single Zod instance. Zod v4 (`^4.0.0`) is required.
 
-> **Migrating from 0.15?** The 0.16+ unified event model collapses `TraceEvent` and `StreamEvent` into a single `AxlEvent` union and renames `ExecutionInfo.steps` → `.events`, `AxlStream.steps` → `.lifecycle`. The 0.17.0 release removes the deprecated `parentToolCallId` field and changes `ctx.checkpoint(fn)` to `ctx.checkpoint(name, fn)`. See the [migration guide](../../docs/migration/unified-event-model.md) for the full rename/move table.
+> **Migrating from 0.15?** The 0.16.0 unified event model collapses `TraceEvent` and `StreamEvent` into a single `AxlEvent` union, renames `ExecutionInfo.steps` → `.events` and `AxlStream.steps` → `.lifecycle`, removes the deprecated `parentToolCallId` field, and changes `ctx.checkpoint(fn)` to `ctx.checkpoint(name, fn)`. See the [migration guide](../../docs/migration/unified-event-model.md) for the full rename/move table.
 
 ## Project Structure
 

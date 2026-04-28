@@ -205,10 +205,10 @@ describe('trace events — verbose messages snapshot across retries', () => {
 
 describe('trace events — nested child contexts (agent-as-tool)', () => {
   it('stamps parentAskId on nested agent_call events so consumers can join to the outer ask', async () => {
-    // Replaces the pre-0.17.0 `parentToolCallId` test. Correlation is now
+    // Replaces the pre-0.16.0 `parentToolCallId` test. Correlation is now
     // entirely via `parentAskId` (on `AskScoped`) — the outer ask's askId
     // appears on every event emitted from the nested ask. The deprecated
-    // `parentToolCallId` field was removed in 0.17.0.
+    // `parentToolCallId` field was removed in 0.16.0.
     const childAgent = agent({
       name: 'child',
       model: 'mock:test',

@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Comprehensive doc audit pass. Fixed `AxlRuntime` constructor shape in
 `docs/security.md` and `packages/axl-studio/README.md` (the example
 showed `new AxlRuntime({ config: { ... } })` but the constructor takes
-the config directly). Reconciled migration version to `0.15.x → 0.17.0`
+the config directly). Reconciled migration version to `0.15.x → 0.16.0`
 in the unified-event-model migration guide and added dedicated sections
 for the `ctx.checkpoint(name, fn)` rename, the `parentToolCallId`
 removal, and an "Additive changes" summary covering `bufferCaps`,
@@ -150,7 +150,7 @@ test count unchanged (145 studio tests still pass).
 
 ### Changed — Polish + P3/P4 cleanup
 
-- `parentToolCallId` deprecation now pins removal to **0.17.0**
+- `parentToolCallId` deprecation now pins removal to **0.16.0**
   (`packages/axl/src/types.ts`, `docs/api-reference.md`,
   `docs/migration/unified-event-model.md`). Users planning
   migrations have a calendar date.

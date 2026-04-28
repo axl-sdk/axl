@@ -1,8 +1,8 @@
 # Migration: Unified Event Model
 
-> **Versions:** 0.15.x → 0.17.0
+> **Versions:** 0.15.x → 0.16.0
 > **Spec:** Internal `spec/16-streaming-wire-reliability`
-> **Scope:** Anyone consuming `TraceEvent`, `StreamEvent`, `ExecutionInfo.steps`, `AxlStream.steps`, or the `onToken` / `onToolCall` / `onAgentStart` callbacks. Also covers the `ctx.checkpoint()` named-checkpoint migration and the `parentToolCallId` removal that finalize in 0.17.0.
+> **Scope:** Anyone consuming `TraceEvent`, `StreamEvent`, `ExecutionInfo.steps`, `AxlStream.steps`, or the `onToken` / `onToolCall` / `onAgentStart` callbacks. Also covers the `ctx.checkpoint()` named-checkpoint migration and the `parentToolCallId` removal that finalize in 0.16.0.
 
 ## What changed
 
@@ -31,7 +31,7 @@ If you're migrating a typical consumer:
 6. If you wrap `done` events: read `data.result` instead of `data` (now always wrapped as `{ result }`).
 7. If you wrap `error` events: read `data.message` instead of top-level `message`.
 8. **`ctx.checkpoint(fn)` → `ctx.checkpoint(name, fn)`.** Add a stable, user-supplied name to every checkpoint call (see the [checkpoint section](#ctxcheckpointfn--ctxcheckpointname-fn) below). Drain or cancel running executions before upgrading — legacy auto-checkpoint rows become unreachable under the new naming scheme.
-9. **`parentToolCallId` removed in 0.17.0.** If you used it for telemetry correlation, switch to `parentAskId` (on `AskScoped`). The agent-as-tool nesting case has equivalent semantics. `createChildContext()` no longer takes a parameter.
+9. **`parentToolCallId` removed in 0.16.0.** If you used it for telemetry correlation, switch to `parentAskId` (on `AskScoped`). The agent-as-tool nesting case has equivalent semantics. `createChildContext()` no longer takes a parameter.
 10. **Optional but recommended:** start consuming the new `ask_start`/`ask_end` events for ask-level cost rollup (`ask_end.cost` per spec decision 10), and the new `agent_call_start`/`tool_call_start` events for pre-execution observability.
 
 ## Before / after — typical consumer
@@ -151,7 +151,7 @@ execution state. Migration:
 // Before (0.15.x)
 const result = await ctx.checkpoint(async () => expensiveOp());
 
-// After (0.17.0)
+// After (0.16.0)
 const result = await ctx.checkpoint('expensive-op', async () => expensiveOp());
 ```
 
@@ -255,7 +255,7 @@ Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, and Studio's
 Stamp the new required fields (`executionId`, `step`, `timestamp`) and use the new tag names. For ask-scoped events add `askId` and `depth`. Cast via `as unknown as AxlEvent` if your fixture is partial — the runtime invariants are what matter.
 
 **Q: I'm using `parentToolCallId` for telemetry correlation.**
-**Removed in 0.17.0.** Migrate to `parentAskId` (on `AskScoped`) — it's the going-forward correlation field. The semantics are equivalent for the agent-as-tool nesting case: when a child `WorkflowContext` spawned via `ctx.createChildContext()` runs a `ctx.ask()`, the nested ask's events all carry `parentAskId === outerAsk.askId`.
+**Removed in 0.16.0.** Migrate to `parentAskId` (on `AskScoped`) — it's the going-forward correlation field. The semantics are equivalent for the agent-as-tool nesting case: when a child `WorkflowContext` spawned via `ctx.createChildContext()` runs a `ctx.ask()`, the nested ask's events all carry `parentAskId === outerAsk.askId`.
 
 **Q: My consumer doesn't use TypeScript. Will my code break?**
 Most properties moved (`event.name` → `event.tool`, `event.message` → `event.data.message`, `event.data` → `event.data.result` on `done`). Expect runtime `undefined` reads where you accessed dropped fields. The migration steps in TL;DR apply identically.

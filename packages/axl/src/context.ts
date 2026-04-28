@@ -395,7 +395,7 @@ export class WorkflowContext<TInput = unknown> {
    * per-context counter to pass through anymore. Nested events are
    * correlated to their parent via `parentAskId` (set on every nested ask
    * by ALS frame allocation) — the deprecated `parentToolCallId` field
-   * was removed in 0.17.0.
+   * was removed in 0.16.0.
    */
   createChildContext(): WorkflowContext {
     return new WorkflowContext({

@@ -115,31 +115,30 @@ describe('AxlStream.fullText — commit-on-pipeline-committed', () => {
   });
 
   /**
-   * FOLLOWUPS P1: `fullText` interleaves concurrent root-level asks
-   * (`packages/axl/src/stream.ts:222-239`).
+   * FOLLOWUPS P1 — RESOLVED: `fullText` per-askId scoping.
    *
-   * `AxlStream.currentAttemptTokens` is a single shared buffer. Under
-   * `ctx.parallel()` / `ctx.spawn()` / `ctx.map()`, multiple root-level
-   * asks emit tokens concurrently (all `depth: 0`). Their tokens
-   * interleave, and a `pipeline(failed)` from one concurrent branch can
-   * discard another branch's successful in-progress tokens.
+   * Pre-fix behavior (0.16.0): `currentAttemptTokens` was a single
+   * shared buffer. Under `ctx.parallel()` / `ctx.spawn()` / `ctx.map()`,
+   * concurrent root-level asks contended on the buffer — chunks
+   * interleaved at push-order boundaries, and a `pipeline(failed)` on
+   * one branch discarded sibling branches' in-progress tokens.
    *
-   * This test PINS the current (limited) behavior — `fullText` contains
-   * BOTH branches' content concatenated in arrival order, with no
-   * per-askId scoping. If a future fix scopes the buffer per-askId,
-   * this test will fail and force a documented decision (either update
-   * the assertion to reflect scoped behavior, or keep the current
-   * concatenation as the documented contract).
+   * Post-fix: `attemptByAsk: Map<askId, string[]>` and
+   * `committedByAsk: Map<askId, string>` scope buffers per ask. Each
+   * branch's chunks stay contiguous in `fullText` (in the order the
+   * branch first emitted), and a failure on one branch only discards
+   * THAT branch's buffer.
    *
-   * See FOLLOWUPS.md §"`fullText` interleaves concurrent root-level asks"
-   * for the architectural choice between (a) document-only — tell
-   * parallel-ask consumers to use `.textByAsk` — and (b) scope the
-   * buffer per-askId. Today's behavior is option (a) silently in effect.
+   * Two tests pin the post-fix invariants:
+   *   1. concurrent successful asks → each branch contiguous, both
+   *      original strings recoverable.
+   *   2. one branch fails (pipeline(failed) or ask_end({ok:false})),
+   *      other branch unaffected.
    */
-  it('parallel root-level asks: fullText concatenates both branches (FOLLOWUPS P1, current behavior)', async () => {
+  it('parallel root-level asks: each branch stays contiguous in fullText (per-askId scoping)', async () => {
     // Two ctx.parallel branches, each making a root-level ctx.ask. Both
-    // emit tokens concurrently (depth=0 for both — they share a stream
-    // and a buffer). Pin that fullText contains BOTH branches' content.
+    // emit tokens concurrently. Per-ask scoping ensures each branch's
+    // chunks recombine cleanly without interleaving the other.
     const provider = MockProvider.sequence([
       { content: 'branchA-content', chunks: ['branchA-', 'content'] },
       { content: 'branchB-content', chunks: ['branchB-', 'content'] },
@@ -162,34 +161,104 @@ describe('AxlStream.fullText — commit-on-pipeline-committed', () => {
       if (event.type === 'done') break;
     }
 
-    // Current behavior: BOTH branches' chunks appear in fullText, but
-    // INTERLEAVED at chunk boundaries (push-order across the shared
-    // buffer, not askId-scoped). The chunks ['branchA-', 'content'] from
-    // one branch and ['branchB-', 'content'] from the other arrive in
-    // some interleaved order — we don't pin exact order (parallel
-    // scheduling is non-deterministic across runs) but we pin the
-    // INVARIANTS:
-    //
-    //   1. Every chunk from both branches is present in fullText (no
-    //      tokens are lost).
+    // Post-fix invariants:
+    //   1. Both original strings appear contiguously (chunks recombine).
     //   2. Total length equals the sum of all chunks (no de-dup).
-    //   3. The chunks may NOT recombine into the original strings
-    //      ('branchA-content', 'branchB-content') because of the
-    //      interleave — this is the LIMITATION the FOLLOWUPS item
-    //      describes. If you want clean per-branch streams, use
-    //      `.textByAsk`.
+    //   3. Order of branches in fullText reflects insertion order (which
+    //      ask emitted its first token first) — non-deterministic across
+    //      runs but consistent within a run.
     const fullText = stream.fullText;
-    // Every chunk substring is present (push order may interleave).
-    expect(fullText).toContain('branchA-');
-    expect(fullText).toContain('branchB-');
-    // 'content' appears twice (once per branch).
-    const contentMatches = fullText.match(/content/g);
-    expect(contentMatches?.length).toBe(2);
-
-    // Total length: 'branchA-' + 'content' + 'branchB-' + 'content' = sum.
-    const expectedTotal =
-      'branchA-'.length + 'content'.length + 'branchB-'.length + 'content'.length;
+    expect(fullText).toContain('branchA-content');
+    expect(fullText).toContain('branchB-content');
+    const expectedTotal = 'branchA-content'.length + 'branchB-content'.length;
     expect(fullText.length).toBe(expectedTotal);
+    // The two branches together must equal fullText (no extra characters,
+    // no missing characters, no interleave at chunk boundaries).
+    expect(
+      fullText === 'branchA-contentbranchB-content' ||
+        fullText === 'branchB-contentbranchA-content',
+    ).toBe(true);
+  });
+
+  it('parallel asks: one branch failing does NOT discard the sibling branch (per-askId failure isolation)', async () => {
+    // Two parallel ctx.ask calls where one fails terminally
+    // (ask_end({ok:false}) via verify-throw / max-turns / etc) and the
+    // other succeeds. Pre-fix, the failure discarded the shared buffer
+    // and corrupted the survivor's fullText. Post-fix, only the failing
+    // branch's tokens are dropped.
+    //
+    // Strategy: agent A succeeds normally; agent B exhausts its turn
+    // budget and throws (the workflow catches the throw to exercise the
+    // ask_end({ok:false}) path without failing the workflow).
+    const provider = MockProvider.fn(async (messages) => {
+      const last = messages[messages.length - 1];
+      const content = typeof last?.content === 'string' ? last.content : '';
+      if (content.includes('q-success')) {
+        return { content: 'success-text', chunks: ['success', '-', 'text'] };
+      }
+      // Fail branch: emit one streamed chunk before throwing on next turn
+      // by always returning a tool_call so the loop hits maxTurns: 1.
+      return {
+        content: '',
+        toolCalls: [{ id: 'tc1', name: 'noop', arguments: '{}' }],
+        chunks: ['fail-text-'],
+      };
+    });
+
+    const runtime = new AxlRuntime({ defaultProvider: 'mock' });
+    runtime.registerProvider('mock', provider);
+    const successAgent = agent({ name: 'success', model: 'mock:test', system: 'a' });
+    const failAgent = agent({
+      name: 'fail',
+      model: 'mock:test',
+      system: 'b',
+      maxTurns: 1,
+      tools: [
+        // Inline throwaway tool so the agent has something to "call"
+        // and trigger maxTurns exhaustion.
+        {
+          _name: 'noop',
+          _description: 'noop',
+          _inputSchema: z.object({}),
+          _retry: undefined,
+          _hooks: undefined,
+          _sensitive: false,
+          _requireApproval: false,
+          run: async () => ({ ok: true }),
+        } as never,
+      ],
+    });
+    const wf = workflow({
+      name: 'isolate-failure-wf',
+      input: z.object({}),
+      handler: async (ctx) => {
+        const [r1, r2] = await ctx.parallel([
+          () => ctx.ask(successAgent, 'q-success'),
+          async () => {
+            try {
+              return await ctx.ask(failAgent, 'q-fail');
+            } catch {
+              return 'CAUGHT';
+            }
+          },
+        ]);
+        return { r1, r2 };
+      },
+    });
+    runtime.register(wf);
+
+    const stream = runtime.stream('isolate-failure-wf', {});
+    for await (const event of stream) {
+      if (event.type === 'done') break;
+    }
+
+    // Survivor's tokens recombine correctly. Failure branch's partial
+    // 'fail-text-' was discarded by ask_end({ok:false}) per the
+    // per-ask scoping rule. fullText contains ONLY the success
+    // branch's content, no leakage from the failed branch.
+    const fullText = stream.fullText;
+    expect(fullText).toContain('success-text');
+    expect(fullText).not.toContain('fail-text');
   });
 
   it('mid-attempt fullText reflects in-progress tokens until pipeline(committed) commits them', async () => {

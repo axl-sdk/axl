@@ -27,6 +27,27 @@ import type { StateStore } from './state/types.js';
 export type StateConfig = {
   store?: StateStore | 'memory' | 'sqlite';
   sqlite?: { path: string };
+  /**
+   * Maximum number of events retained in `ExecutionInfo.events` per
+   * execution. Token and partial_object events are already excluded
+   * from the array (high-volume, stream-only); this cap bounds the
+   * remaining structural events (`agent_call_*`, `tool_call_*`, gate
+   * events, pipeline, etc).
+   *
+   * Pathological workloads (e.g., 50 nested asks × 20-turn tool loops)
+   * can otherwise accumulate tens of thousands of events totalling
+   * hundreds of MB before the terminal `done` event fires. When the
+   * cap is hit, further events are dropped from the array and a single
+   * `log` event with `data.event === 'events_truncated'` is appended
+   * recording the truncation. The trace channel (`runtime.on('trace')`)
+   * and WS broadcast continue to receive every event — only the
+   * in-memory `ExecutionInfo.events` array is bounded.
+   *
+   * Default: 50_000. Set to `Infinity` to disable the cap (legacy
+   * behavior; only safe for short-lived executions). Must be a positive
+   * integer or `Infinity`.
+   */
+  maxEventsPerExecution?: number;
 };
 
 /** Global defaults */

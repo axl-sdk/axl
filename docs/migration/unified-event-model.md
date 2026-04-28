@@ -215,7 +215,7 @@ Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, and Studio's
 Stamp the new required fields (`executionId`, `step`, `timestamp`) and use the new tag names. For ask-scoped events add `askId` and `depth`. Cast via `as unknown as AxlEvent` if your fixture is partial — the runtime invariants are what matter.
 
 **Q: I'm using `parentToolCallId` for telemetry correlation.**
-Still works for one more minor cycle (`@deprecated` JSDoc only). Migrate to `parentAskId` (on `AskScoped`) — it's the going-forward correlation field. Removal is in the next minor.
+Still works for one more minor cycle (`@deprecated` JSDoc only). Migrate to `parentAskId` (on `AskScoped`) — it's the going-forward correlation field. **Removal target: 0.17.0.**
 
 **Q: My consumer doesn't use TypeScript. Will my code break?**
 Most properties moved (`event.name` → `event.tool`, `event.message` → `event.data.message`, `event.data` → `event.data.result` on `done`). Expect runtime `undefined` reads where you accessed dropped fields. The migration steps in TL;DR apply identically.

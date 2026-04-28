@@ -17,15 +17,28 @@ import { isRootLevel } from './event-utils.js';
 export class AxlStream extends Readable {
   private bus = new EventEmitter();
   /**
-   * Token buffer split into "in-progress" and "committed" halves so
-   * `fullText` only includes tokens from attempts that actually won.
-   * On `pipeline(status: 'committed')`, the in-progress buffer flushes
-   * to `committedText`. On `pipeline(status: 'failed')`, the in-progress
-   * buffer is discarded — retried attempts no longer leak garbled
-   * output into `fullText`. Spec/16 §4.3.
+   * Per-ask token buffers split into "in-progress" and "committed"
+   * halves so `fullText` only includes tokens from attempts that
+   * actually won. Scoping is per-`askId` so concurrent root-level asks
+   * (`ctx.parallel`, `ctx.spawn`, `ctx.race`, `ctx.map`) don't
+   * interleave each other's tokens — each branch's chunks stay
+   * contiguous, and a `pipeline(failed)` on one branch only discards
+   * THAT branch's in-progress buffer (previously: shared buffer caused
+   * a failure on one branch to discard a peer's in-flight successful
+   * tokens). Insertion order in the Maps reflects which ask emitted
+   * its first token first, which is what `fullText` joins on.
+   *
+   * On `pipeline(status: 'committed')` for an ask, that ask's
+   * in-progress entry flushes to its committed entry. On
+   * `pipeline(status: 'failed')` or `ask_end({ok:false})` for an ask,
+   * that ask's in-progress entry is discarded. Spec/16 §4.3.
+   *
+   * Tokens emitted outside any ask (synthesized test fixtures with no
+   * `askId`) fall back to an empty-string sentinel key — preserves the
+   * single-buffer behavior for that legacy case.
    */
-  private currentAttemptTokens: string[] = [];
-  private committedText = '';
+  private attemptByAsk = new Map<string, string[]>();
+  private committedByAsk = new Map<string, string>();
   private result: unknown = undefined;
   private finished = false;
   readonly promise: Promise<unknown>;
@@ -229,32 +242,46 @@ export class AxlStream extends Readable {
     // Token accumulation for `fullText`. Root-only by default to preserve the
     // canonical "render this in a chat bubble" use case; nested-ask tokens
     // still flow through the iterator so consumers that want them can filter.
+    // Scoped by askId so concurrent root asks don't interleave.
     if (event.type === 'token' && isRootLevel(event)) {
-      this.currentAttemptTokens.push(event.data);
+      const key = event.askId ?? '';
+      const attempt = this.attemptByAsk.get(key);
+      if (attempt) {
+        attempt.push(event.data);
+      } else {
+        this.attemptByAsk.set(key, [event.data]);
+      }
     }
     // Pipeline lifecycle: commit on success, discard on failure. Spec §4.3.
     // Reading `fullText` between `committed` and `done` sees the correct
     // text — that's why we commit on `committed` (which fires before
-    // `done`) rather than on `done`.
+    // `done`) rather than on `done`. Per-ask scoping ensures a failed
+    // attempt on one branch doesn't discard a sibling branch's tokens.
     if (event.type === 'pipeline' && isRootLevel(event)) {
+      const key = event.askId ?? '';
       if (event.status === 'committed') {
-        this.committedText += this.currentAttemptTokens.join('');
-        this.currentAttemptTokens = [];
+        const attempt = this.attemptByAsk.get(key);
+        if (attempt && attempt.length > 0) {
+          const prev = this.committedByAsk.get(key) ?? '';
+          this.committedByAsk.set(key, prev + attempt.join(''));
+          this.attemptByAsk.set(key, []);
+        }
       } else if (event.status === 'failed') {
-        this.currentAttemptTokens = [];
+        this.attemptByAsk.set(key, []);
       }
     }
     // Terminal-throw safety net: `ctx.ask()` exit paths that throw
     // (max-turns, guardrail exhaustion, verify-throw, validate-throw) do
     // NOT emit `pipeline(failed)` — they emit `ask_end({ok:false})` and
-    // propagate the error. Without this reset, `currentAttemptTokens`
-    // from the failed ask would stay buffered and flush into the NEXT
+    // propagate the error. Without this reset, the failed ask's
+    // in-progress tokens would stay buffered and flush into the NEXT
     // ask's `pipeline(committed)`, corrupting `fullText`. Reviewer bug
-    // B2. Only applies to root asks; nested asks don't touch
-    // `currentAttemptTokens` (they're filtered out by `isRootLevel` on
-    // the token-accumulation path above).
+    // B2. Only applies to root asks; nested asks don't enter the
+    // per-ask buffer (they're filtered out by `isRootLevel` on the
+    // token-accumulation path above). Per-ask scoping means a failure
+    // on one root branch only clears its own buffer.
     if (event.type === 'ask_end' && isRootLevel(event) && !event.outcome.ok) {
-      this.currentAttemptTokens = [];
+      this.attemptByAsk.set(event.askId ?? '', []);
     }
     this.bus.emit(event.type, event);
     this.push(event);
@@ -334,19 +361,35 @@ export class AxlStream extends Readable {
     this.bus.emit('__reject', error);
   }
 
-  /** Concatenated root-only text from committed attempts plus the current
-   *  in-flight attempt. Retried (gate-rejected) attempts are excluded — see
-   *  spec/16 §4.3. Reading mid-attempt returns the in-progress text;
-   *  reading after `pipeline(committed)` (which fires before `done`)
-   *  returns the canonical winning text.
+  /** Concatenated root-only text from committed attempts plus the
+   *  current in-flight attempt(s). Retried (gate-rejected) attempts
+   *  are excluded — see spec/16 §4.3. Reading mid-attempt returns the
+   *  in-progress text; reading after `pipeline(committed)` (which
+   *  fires before `done`) returns the canonical winning text.
    *
-   *  **Note:** With concurrent root-level asks (`ctx.parallel`, `ctx.spawn`,
-   *  `ctx.race`, `ctx.map`), tokens from different branches interleave in
-   *  `fullText` because the commit-on-success buffer is shared across all
-   *  root asks. A `pipeline(failed)` from one branch may also discard
-   *  another branch's in-progress tokens. For multi-branch consumers,
-   *  prefer `textByAsk` to receive per-ask chunks. */
+   *  With concurrent root-level asks (`ctx.parallel`, `ctx.spawn`,
+   *  `ctx.race`, `ctx.map`), each branch's tokens are scoped per-`askId`
+   *  and emitted contiguously in the order each ask first started
+   *  emitting tokens. A `pipeline(failed)` or `ask_end({ok:false})` on
+   *  one branch only discards THAT branch's in-progress buffer —
+   *  sibling branches are unaffected. For UIs that want each sub-agent
+   *  in its own lane, prefer `textByAsk`. */
   get fullText(): string {
-    return this.committedText + this.currentAttemptTokens.join('');
+    let out = '';
+    // Iterate in insertion order. Map preserves it so `fullText` is
+    // deterministic given the same emission order.
+    for (const [key, committed] of this.committedByAsk) {
+      out += committed;
+      const attempt = this.attemptByAsk.get(key);
+      if (attempt && attempt.length > 0) out += attempt.join('');
+    }
+    // Asks that have emitted tokens but never committed (still in-flight,
+    // or failed) — append their in-progress buffers in insertion order
+    // after all committed text.
+    for (const [key, attempt] of this.attemptByAsk) {
+      if (this.committedByAsk.has(key)) continue;
+      if (attempt.length > 0) out += attempt.join('');
+    }
+    return out;
   }
 }

@@ -42,6 +42,57 @@ function hashInput(input: unknown): string {
   return (hash >>> 0).toString(16);
 }
 
+/** Default cap on `ExecutionInfo.events` per execution. Can be
+ *  overridden via `config.state.maxEventsPerExecution`. */
+const DEFAULT_MAX_EVENTS_PER_EXECUTION = 50_000;
+
+/** Bounded push to `execInfo.events`. Skips high-volume stream-only
+ *  variants (token, partial_object — never persisted).
+ *
+ *  Semantics: `cap` is the MAX array length. When pushing would cross
+ *  the cap, the cap-th slot is REPLACED with a sentinel `log` event
+ *  describing the truncation. Subsequent events are silently dropped
+ *  (the sentinel persists). The trace channel and WS broadcast still
+ *  see every event — only the in-memory array is bounded.
+ *
+ *  Trade-off: replacing rather than appending preserves the documented
+ *  "events.length ≤ cap" contract at the cost of dropping the cap-th
+ *  regular event. The sentinel itself encodes the cap and reason so
+ *  consumers know exactly what was lost. */
+function pushEventBounded(execInfo: ExecutionInfo, event: AxlEvent, cap: number): void {
+  if (event.type === 'token' || event.type === 'partial_object') return;
+  if (cap === Infinity || execInfo.events.length < cap) {
+    execInfo.events.push(event);
+    return;
+  }
+  // Length === cap. If the last entry is already the sentinel, this is
+  // a silent drop. Otherwise replace the last entry with the sentinel
+  // so consumers find a clear truncation marker at array tail.
+  const last = execInfo.events[execInfo.events.length - 1];
+  const alreadyTruncated =
+    last?.type === 'log' &&
+    typeof last.data === 'object' &&
+    last.data !== null &&
+    (last.data as { event?: string }).event === 'events_truncated';
+  if (!alreadyTruncated) {
+    execInfo.events[execInfo.events.length - 1] = {
+      type: 'log',
+      executionId: event.executionId,
+      step: event.step,
+      timestamp: Date.now(),
+      data: {
+        event: 'events_truncated',
+        cap,
+        message:
+          `ExecutionInfo.events truncated at ${cap} entries. ` +
+          `Subsequent events are still delivered to runtime.on('trace') ` +
+          `and the WS broadcast — only the in-memory array is bounded. ` +
+          `Raise via config.state.maxEventsPerExecution.`,
+      },
+    } as AxlEvent;
+  }
+}
+
 export type ExecuteOptions = {
   metadata?: Record<string, unknown>;
   /** Handler for tool approval requests. When provided, tools with `requireApproval` resolve
@@ -124,12 +175,36 @@ export class AxlRuntime extends EventEmitter {
   private historicalExecutionsLoadPromise: Promise<void> | null = null;
   private evalHistory: EvalHistoryEntry[] = [];
   private evalHistoryLoadPromise: Promise<void> | null = null;
+  /** Resolved cap on `ExecutionInfo.events` per execution. Cached on
+   *  the instance so per-event onTrace handlers don't reach into
+   *  `this.config.state` on every emission. */
+  private readonly maxEventsPerExecution: number;
 
   constructor(config?: AxlConfig) {
     super();
     this.config = resolveConfig(config ?? {});
     this.providerRegistry = new ProviderRegistry();
     this.stateStore = this.createStateStore();
+    // Resolve + validate the events cap once at construction. Reject
+    // 0 / negatives / fractions / NaN early; allow Infinity for the
+    // legacy "unbounded" opt-out.
+    const requested = this.config.state?.maxEventsPerExecution;
+    if (requested === undefined) {
+      this.maxEventsPerExecution = DEFAULT_MAX_EVENTS_PER_EXECUTION;
+    } else if (requested === Infinity) {
+      this.maxEventsPerExecution = Infinity;
+    } else if (
+      typeof requested !== 'number' ||
+      !Number.isFinite(requested) ||
+      !Number.isInteger(requested) ||
+      requested < 1
+    ) {
+      throw new RangeError(
+        `config.state.maxEventsPerExecution must be a positive integer or Infinity; got ${requested}`,
+      );
+    } else {
+      this.maxEventsPerExecution = requested;
+    }
     if (this.config.memory) {
       this.memoryManager = new MemoryManager({
         vectorStore: this.config.memory.vectorStore,
@@ -570,13 +645,13 @@ export class AxlRuntime extends EventEmitter {
       sessionHistory,
       signal: controller.signal,
       onTrace: (event: AxlEvent) => {
-        // High-volume stream-only events (`token`, `partial_object`) are
-        // never persisted to `ExecutionInfo.events` — spec §2 and §5.2.
-        // They'd blow up the array on long streams AND leak per-chunk
-        // PII through REST reads that trust emit-time redaction.
-        if (event.type !== 'token' && event.type !== 'partial_object') {
-          execInfo.events.push(event);
-        }
+        // High-volume stream-only events (`token`, `partial_object`)
+        // are never persisted, plus a bounded cap on the rest to avoid
+        // OOM on pathological workloads (50 nested asks × 20-turn tool
+        // loops can otherwise accumulate hundreds of MB before
+        // terminal `done`). Trace channel + WS broadcast still see
+        // every event; only the in-memory array is bounded.
+        pushEventBounded(execInfo, event, this.maxEventsPerExecution);
         execInfo.totalCost += eventCostContribution(event);
         this.emit('trace', event);
         this.outputAxlEvent(event);
@@ -766,11 +841,10 @@ export class AxlRuntime extends EventEmitter {
         // the wire through `onTrace` — this callback is just the gate.
         onToken: () => {},
         onTrace: (event: AxlEvent) => {
-          // High-volume stream-only events never persist to
-          // `ExecutionInfo.events` — spec §2, §5.2.
-          if (event.type !== 'token' && event.type !== 'partial_object') {
-            execInfo!.events.push(event);
-          }
+          // High-volume stream-only events never persist; remaining
+          // structural events are bounded by maxEventsPerExecution. See
+          // execute() for full rationale.
+          pushEventBounded(execInfo!, event, this.maxEventsPerExecution);
           execInfo!.totalCost += eventCostContribution(event);
           this.emit('trace', event);
           this.outputAxlEvent(event);

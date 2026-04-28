@@ -231,8 +231,10 @@ describe('ask_start / ask_end lifecycle (spec/16 §3.8)', () => {
     };
     expect(end.outcome.ok).toBe(false);
     if (!end.outcome.ok) {
-      // GuardrailError's message should flow into ask_end.outcome.error.
-      expect(end.outcome.error.length).toBeGreaterThan(0);
+      // GuardrailError's message names the gate that blocked — pin the
+      // message content (was "length > 0", which would pass for any
+      // non-empty error including unrelated regressions).
+      expect(end.outcome.error).toMatch(/guardrail|blocked/i);
     }
 
     // workflow_end fires with status 'failed'; no `error` discriminant event.
@@ -290,6 +292,11 @@ describe('ask_start / ask_end lifecycle (spec/16 §3.8)', () => {
       outcome: { ok: true; result: unknown } | { ok: false; error: string };
     };
     expect(end.outcome.ok).toBe(false);
+    if (!end.outcome.ok) {
+      // ValidationError's message references the validate stage —
+      // tighten from "length > 0" so unrelated errors don't satisfy.
+      expect(end.outcome.error).toMatch(/valid/i);
+    }
 
     expect(workflowEnds.length).toBe(1);
     expect((workflowEnds[0].data as { status: string }).status).toBe('failed');

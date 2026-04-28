@@ -481,9 +481,9 @@ export type AxlEventBase = {
    * @deprecated Use `parentAskId` (on `AskScoped`) for ask-graph correlation
    *  going forward. Retained for one minor cycle so existing telemetry
    *  consumers that grep agent-as-tool call graphs by tool callId keep
-   *  working — `WorkflowContext.createChildContext()` still populates this
-   *  during PR 1, so reading it is safe through this transition window.
-   *  Removal is tracked in the follow-up to spec/16-streaming-wire-reliability.
+   *  working — `WorkflowContext.createChildContext()` still populates this,
+   *  so reading it is safe through this transition window.
+   *  **Removal target: 0.17.0.** Migrate to `parentAskId` before upgrading.
    */
   parentToolCallId?: string;
 };
@@ -500,7 +500,16 @@ export type AskScoped = {
   agent?: string;
 };
 
-/** Meta carried alongside callback invocations so consumers can group/route by ask. */
+/**
+ * Meta carried alongside callback invocations (`onToken`, `onAgentStart`,
+ * `onToolCall`) so consumers can group/route by ask.
+ *
+ * Note: `agent` is **required** here (the callback is always invoked
+ * inside an ALS frame that has the agent name already resolved). On the
+ * event side (`AskScoped.agent`) the field is optional — events emitted
+ * before agent resolution (e.g., `ask_start` is fired before the
+ * dynamic agent selector runs) can land without it.
+ */
 export type CallbackMeta = {
   askId: string;
   parentAskId?: string;

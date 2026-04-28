@@ -124,7 +124,9 @@ describe('register() and execute()', () => {
   it('coerces output via Zod parse and returns the coerced result', async () => {
     const { runtime } = createRuntime();
 
-    // Zod coercion: z.coerce.number() converts string "42" to number 42
+    // Zod coercion: z.coerce.number() converts string "42" to number 42.
+    // Handler returns `{ value: '42' }` (typed loosely for the test) and the
+    // output schema parse coerces value to number 42 + applies the default.
     const coerceWorkflow = workflow({
       name: 'coerce',
       input: z.object({}),
@@ -132,7 +134,7 @@ describe('register() and execute()', () => {
         value: z.coerce.number(),
         label: z.string().default('default-label'),
       }),
-      handler: async () => ({ value: '42' as any }),
+      handler: (async () => ({ value: '42' })) as never,
     });
     runtime.register(coerceWorkflow);
 
@@ -1148,9 +1150,12 @@ describe('shutdown()', () => {
       name: 'long-running',
       input: z.any(),
       handler: async (ctx) => {
-        // Check if the signal gets aborted during shutdown
+        // Check if the signal gets aborted during shutdown. `signal` is
+        // a private field — narrow cast at the boundary so this test
+        // can poke it without growing the public API surface.
+        const internalSignal = (ctx as unknown as { signal?: AbortSignal }).signal;
         const checkSignal = () => {
-          if (ctx.signal?.aborted) {
+          if (internalSignal?.aborted) {
             signalAborted = true;
           }
         };
@@ -1374,8 +1379,10 @@ describe('abort()', () => {
 
     const stream = runtime.stream('stream-abort-rejects', {});
     // Attach the rejection handler before we abort so the test framework
-    // doesn't surface the rejection as unhandled.
-    const promiseRejection = expect(stream.promise).rejects.toThrow();
+    // doesn't surface the rejection as unhandled. Match on the abort
+    // signal so an unrelated regression that throws a different error
+    // doesn't silently satisfy this assertion.
+    const promiseRejection = expect(stream.promise).rejects.toThrow(/aborted|AbortError/i);
 
     // Wait for the handler to start, capture executionId, then abort.
     await new Promise((r) => setTimeout(r, 20));
@@ -2050,7 +2057,7 @@ describe('budget exhaustion mid-workflow (workflow_end pairing)', () => {
       }),
     );
 
-    const ends: AxlEvent[] = [];
+    const ends: Array<Extract<AxlEvent, { type: 'workflow_end' }>> = [];
     runtime.on('trace', (event: AxlEvent) => {
       if (event.type === 'workflow_end') ends.push(event);
     });
@@ -2059,10 +2066,83 @@ describe('budget exhaustion mid-workflow (workflow_end pairing)', () => {
 
     // EXACTLY ONE workflow_end fired, with status: 'failed'.
     expect(ends).toHaveLength(1);
-    const data = ends[0].data as { status: string; aborted?: boolean };
-    expect(data.status).toBe('failed');
+    expect(ends[0].data.status).toBe('failed');
     // BudgetExceededError is NOT an AbortError, so `aborted` must NOT be set.
-    expect(data.aborted).toBeUndefined();
+    expect(ends[0].data.aborted).toBeUndefined();
+  });
+});
+
+describe('config.state.maxEventsPerExecution (memory cap)', () => {
+  it('caps ExecutionInfo.events at the configured limit and appends a truncation sentinel', async () => {
+    // Pathological workloads (50 nested asks × 20-turn tool loops) can
+    // accumulate hundreds of MB before terminal `done`. A configurable
+    // cap bounds the in-memory array; trace channel still sees every
+    // event. Default is 50_000 — use a tiny cap here to exercise it.
+    const provider = new TestProvider([{ content: 'ok' }]);
+    const runtime = new AxlRuntime({
+      defaultProvider: 'test',
+      state: { maxEventsPerExecution: 5 },
+    });
+    runtime.registerProvider('test', provider as never);
+    runtime.register(
+      workflow({
+        name: 'noisy-wf',
+        input: z.object({}),
+        handler: async (ctx) => {
+          // Emit lots of log events from inside the workflow.
+          for (let i = 0; i < 50; i++) ctx.log('spam', { i });
+          return 'done';
+        },
+      }),
+    );
+
+    // Trace listener sees every event; the in-memory array is bounded.
+    let traceEventCount = 0;
+    runtime.on('trace', () => {
+      traceEventCount++;
+    });
+
+    const result = await runtime.execute('noisy-wf', {});
+    expect(result).toBe('done');
+
+    const all = await runtime.getExecutions();
+    const ours = all.find((e) => e.workflow === 'noisy-wf')!;
+    expect(ours).toBeDefined();
+
+    // The cap holds: events.length === cap (the cap-th slot is the sentinel).
+    expect(ours.events.length).toBe(5);
+    // Last entry is the truncation sentinel.
+    const last = ours.events[ours.events.length - 1] as Extract<AxlEvent, { type: 'log' }>;
+    expect(last.type).toBe('log');
+    const data = last.data as { event?: string; cap?: number };
+    expect(data.event).toBe('events_truncated');
+    expect(data.cap).toBe(5);
+    // Trace channel saw way more than the cap.
+    expect(traceEventCount).toBeGreaterThan(50);
+  });
+
+  it('defaults to 50_000 when state.maxEventsPerExecution is unset', () => {
+    const runtime = new AxlRuntime();
+    // Field is private but we can poke via the bracket index for the
+    // assertion. Pinning the default ensures a future refactor doesn't
+    // silently regress to an unbounded array.
+    expect((runtime as unknown as { maxEventsPerExecution: number }).maxEventsPerExecution).toBe(
+      50_000,
+    );
+  });
+
+  it('rejects pathological state.maxEventsPerExecution at construction', () => {
+    const cases = [0, -1, 1.5, NaN, -Infinity];
+    for (const value of cases) {
+      expect(
+        () => new AxlRuntime({ state: { maxEventsPerExecution: value } }),
+        `value=${value}`,
+      ).toThrow(/maxEventsPerExecution/);
+    }
+  });
+
+  it('accepts Infinity for explicit unbounded opt-out', () => {
+    expect(() => new AxlRuntime({ state: { maxEventsPerExecution: Infinity } })).not.toThrow();
   });
 });
 

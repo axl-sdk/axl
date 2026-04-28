@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `fullText` per-askId scoping (P1)
+
+`AxlStream.fullText` no longer interleaves tokens from concurrent
+root-level asks. Under `ctx.parallel()` / `ctx.spawn()` / `ctx.race()`
+/ `ctx.map()`, each branch's tokens are now scoped per-`askId` —
+chunks stay contiguous in the order each ask first emitted, and a
+`pipeline(failed)` or `ask_end({ok:false})` on one branch only
+discards THAT branch's in-progress buffer (sibling branches are
+unaffected). Internal storage changed from
+`currentAttemptTokens: string[]` and `committedText: string` to
+`attemptByAsk: Map<string, string[]>` and
+`committedByAsk: Map<string, string>`. Two regression tests pin the
+new invariants. Closes the FOLLOWUPS P1 "fullText interleaves
+concurrent root-level asks" item.
+
+### Added — `config.state.maxEventsPerExecution` (memory cap)
+
+New configuration option bounds the in-memory `ExecutionInfo.events`
+array per execution. Default 50_000; set to `Infinity` to opt out
+(legacy unbounded behavior). When the cap is hit, the cap-th slot
+is replaced with a sentinel `log` event
+(`data.event: 'events_truncated'`) carrying the cap and a hint
+message. Subsequent events are silently dropped from the array —
+but the trace channel (`runtime.on('trace')`) and WS broadcast
+continue to receive every event, so live observability isn't
+degraded. Pathological values (0 / negative / fractional / NaN) are
+rejected at construction with a `RangeError`. Pinned by 4 regression
+tests. Closes the FOLLOWUPS P5 "no memory bound on
+ExecutionInfo.events" item — production workloads (e.g., 50 nested
+asks × 20-turn tool loops) no longer risk OOM before terminal
+`done`.
+
+### Changed — Polish + P3/P4 cleanup
+
+- `parentToolCallId` deprecation now pins removal to **0.17.0**
+  (`packages/axl/src/types.ts`, `docs/api-reference.md`,
+  `docs/migration/unified-event-model.md`). Users planning
+  migrations have a calendar date.
+- `CallbackMeta.agent` JSDoc now explicitly documents the required vs
+  optional asymmetry with `AskScoped.agent` (callback is always
+  invoked post-resolution; events can land pre-resolution).
+- Tightened weak test assertions (FOLLOWUPS P2):
+  - `ask-lifecycle.test.ts` guardrail-exhaustion now asserts
+    `outcome.error` matches `/guardrail|blocked/i` (was just
+    `length > 0`).
+  - `ask-lifecycle.test.ts` validate-exhaustion asserts
+    `outcome.error` matches `/valid/i`.
+  - `runtime.test.ts:1383` stream abort asserts
+    `/aborted|AbortError/i`.
+- Cleaned up two pre-existing TS diagnostics (FOLLOWUPS P3):
+  - `runtime.test.ts:135` ZodObject Promise variance — replaced
+    inner `as any` with a single boundary cast on the handler.
+  - `runtime.test.ts:1153` private `signal` access — narrow boundary
+    cast `(ctx as unknown as { signal? })` so the test pokes
+    internal state without growing the public API.
+
 ### Changed — Independent-review hardening pass
 
 Six fixes from a fresh-eyes reviewer pass on the spec/16 hardening work.

@@ -583,11 +583,20 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('End-to-end workflow', () => {
     // Verify traces were emitted
     expect(traces.length).toBeGreaterThan(0);
 
-    // Should have workflow_start and workflow_end
+    // Should have workflow_start and workflow_end. spec/16: these are
+    // first-class event types (not `log` events with `data.event` =
+    // 'workflow_start' as in 0.14.x). `event.workflow` is top-level.
     const workflowStart = traces.find(
-      (t) => t.type === 'log' && (t.data as any)?.workflow === 'math-e2e',
+      (t): t is Extract<AxlEvent, { type: 'workflow_start' }> =>
+        t.type === 'workflow_start' && t.workflow === 'math-e2e',
     );
     expect(workflowStart).toBeDefined();
+    const workflowEnd = traces.find(
+      (t): t is Extract<AxlEvent, { type: 'workflow_end' }> =>
+        t.type === 'workflow_end' && t.workflow === 'math-e2e',
+    );
+    expect(workflowEnd).toBeDefined();
+    expect(workflowEnd!.data.status).toBe('completed');
 
     // Should have at least one agent_call trace
     const agentCalls = traces.filter(

@@ -1,8 +1,8 @@
 # Migration: Unified Event Model
 
-> **Versions:** 0.15.x → 0.16.x
+> **Versions:** 0.15.x → 0.17.0
 > **Spec:** Internal `spec/16-streaming-wire-reliability`
-> **Scope:** Anyone consuming `TraceEvent`, `StreamEvent`, `ExecutionInfo.steps`, `AxlStream.steps`, or the `onToken` / `onToolCall` / `onAgentStart` callbacks.
+> **Scope:** Anyone consuming `TraceEvent`, `StreamEvent`, `ExecutionInfo.steps`, `AxlStream.steps`, or the `onToken` / `onToolCall` / `onAgentStart` callbacks. Also covers the `ctx.checkpoint()` named-checkpoint migration and the `parentToolCallId` removal that finalize in 0.17.0.
 
 ## What changed
 
@@ -30,7 +30,9 @@ If you're migrating a typical consumer:
 5. Add `meta` parameter to your `onToken` / `onToolCall` / `onAgentStart` callbacks. If you want root-only behavior, filter on `meta.depth === 0`.
 6. If you wrap `done` events: read `data.result` instead of `data` (now always wrapped as `{ result }`).
 7. If you wrap `error` events: read `data.message` instead of top-level `message`.
-8. **Optional but recommended:** start consuming the new `ask_start`/`ask_end` events for ask-level cost rollup (`ask_end.cost` per spec decision 10), and the new `agent_call_start`/`tool_call_start` events for pre-execution observability.
+8. **`ctx.checkpoint(fn)` → `ctx.checkpoint(name, fn)`.** Add a stable, user-supplied name to every checkpoint call (see the [checkpoint section](#ctxcheckpointfn--ctxcheckpointname-fn) below). Drain or cancel running executions before upgrading — legacy auto-checkpoint rows become unreachable under the new naming scheme.
+9. **`parentToolCallId` removed in 0.17.0.** If you used it for telemetry correlation, switch to `parentAskId` (on `AskScoped`). The agent-as-tool nesting case has equivalent semantics. `createChildContext()` no longer takes a parameter.
+10. **Optional but recommended:** start consuming the new `ask_start`/`ask_end` events for ask-level cost rollup (`ask_end.cost` per spec decision 10), and the new `agent_call_start`/`tool_call_start` events for pre-execution observability.
 
 ## Before / after — typical consumer
 
@@ -139,6 +141,32 @@ If your code relied on the old isolation as a feature (e.g., your chat UI accide
 
 Retry boundaries are observable via `pipeline` events (`status: 'start' | 'failed' | 'committed'`). `AxlStream.fullText` commits on `pipeline(committed)` and discards the in-progress buffer on `pipeline(failed)` or `ask_end({ok: false})`, so retried attempts' tokens never leak into the committed text. Consumers buffering raw tokens for a custom display can do the same: reset the buffer on `pipeline(failed)`, flush on `pipeline(committed)`.
 
+### `ctx.checkpoint(fn)` → `ctx.checkpoint(name, fn)`
+
+Checkpoints now require a stable user-supplied name. Auto-generated indexes
+collided silently across nested `WorkflowContext`s, corrupting durable
+execution state. Migration:
+
+```ts
+// Before (0.15.x)
+const result = await ctx.checkpoint(async () => expensiveOp());
+
+// After (0.17.0)
+const result = await ctx.checkpoint('expensive-op', async () => expensiveOp());
+```
+
+The `__auto/` prefix is reserved for runtime-internal auto-checkpoints (ask, spawn, race, parallel, map). User-supplied names must:
+
+- be non-empty strings
+- have no leading or trailing whitespace
+- not start with `__auto/` (case-insensitive)
+
+**State store impact:** `StateStore.{save,get}Checkpoint(executionId, step)` → `(executionId, name)`. The SQLite store auto-migrates the `checkpoints.step` column to `name` on first open via `PRAGMA user_version`. **Drain or cancel running executions before upgrading** — legacy v1 auto-checkpoint rows ("0", "1", …) become unreachable under the new `__auto/<agent>/ask/<n>` naming.
+
+**Removed:** `StateStore.getLatestCheckpoint`. Use `getCheckpoint(executionId, name)` directly.
+
+**Event shape:** `CheckpointEventData.step` → `CheckpointEventData.name`.
+
 ## New capability: ask-graph correlation
 
 Every event originating within a `ctx.ask()` call now carries:
@@ -181,6 +209,18 @@ runtime.on('trace', (event) => {
 If your existing error handler did `runtime.on('trace', e => { if (e.type === 'error') ... })`, ask-internal failures will no longer trigger it. Either:
 - Add an `ask_end` handler for the ask-level outcome, or
 - Listen for `workflow_end({ status: 'failed' })` for execution-level failure.
+
+## Additive changes
+
+These shipped alongside the core unified-event-model rename. None require migration; all are opt-in.
+
+- **New event variants:** `await_human` / `await_human_resolved` (paired around `ctx.awaitHuman()`), `checkpoint_save` / `checkpoint_replay` (`ctx.checkpoint(name, fn)`). All are first-class `AxlEvent` types — extend your trace consumers' switch/match statements if you want to surface them.
+- **`AxlStream.fullText` per-askId scoping.** Previously interleaved tokens from concurrent root-level asks (`ctx.parallel` / `ctx.spawn` / `ctx.race` / `ctx.map`). Each branch's tokens now stay contiguous, and a `pipeline(failed)` on one branch only discards THAT branch's in-progress buffer.
+- **`config.state.maxEventsPerExecution`** (default `50_000`) — bounds the in-memory `ExecutionInfo.events` array per execution. Pathological values (`0`, negative, fractional, `NaN`) are rejected at construction. Set to `Infinity` for explicit unbounded opt-out.
+- **Studio middleware `bufferCaps`** — operator-tunable WS replay-buffer caps via `createStudioMiddleware({ bufferCaps: { maxEventsPerBuffer?, maxBytesPerBuffer?, maxActiveBuffers? } })`. Defaults: 1000 events, 4 MiB, 256 concurrent buffers.
+- **`AnyWorkflow` type alias** (export from `@axlsdk/axl`) — `Workflow<any, any>` for typing helpers that operate generically on registered workflows.
+- **`parsePartialJson`** export — tolerant JSON parser used internally for `partial_object` streaming. Available for consumers building their own progressive-render pipelines (256-depth cap, zero deps).
+- **`validate + streaming` now coexists end-to-end** (was `INVALID_CONFIG` in 0.15.x). Already documented in the [Validate + streaming now coexist](#validate--streaming-now-coexist) section above; included here for completeness.
 
 ## SQLite schema migration
 

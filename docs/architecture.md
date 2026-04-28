@@ -2,6 +2,8 @@
 
 Axl operates on an **Embedded Runtime Model**. In development, it runs in-process inside your Node.js application. In production, it can optionally be deployed as a standalone sidecar for isolation and scaling.
 
+> **Unified event model (0.16+).** Trace and stream rails share a single `AxlEvent` discriminated union — the wire format IS the trace format, with no translation layer. See the [migration guide](./migration/unified-event-model.md) for the rename map (`TraceEvent`/`StreamEvent` → `AxlEvent`, `ExecutionInfo.steps` → `.events`, `AxlStream.steps` → `.lifecycle`) and the new ask-tree correlation primitives (`askId` / `parentAskId` / `depth`).
+
 ## Components
 
 1. **The SDK (`@axlsdk/axl`):** A TypeScript library that embeds directly in your Node.js process. It manages the event loop, LLM context, tool dispatch, and state persistence. No separate binary, no separate process.

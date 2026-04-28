@@ -934,6 +934,13 @@ describe('error handling', () => {
     expect((endEvent!.data as any).error).toBe('traced error');
     // Failed non-abort workflows should NOT carry an aborted flag
     expect((endEvent!.data as any).aborted).toBeUndefined();
+
+    // Spec §9: a top-level workflow throw (NOT inside ctx.ask) should NOT
+    // emit any ask_end events. The workflow-level `error` channel covers
+    // failures with no ask available — the two surfaces never both fire
+    // for the same failure.
+    const askEnds = traces.filter((t) => t.type === 'ask_end');
+    expect(askEnds).toHaveLength(0);
   });
 
   it('re-throws the original error from execute()', async () => {
@@ -2334,4 +2341,151 @@ describe('workflow_end idempotency', () => {
     // transform a succeeded workflow into a failed one.
     expect(ends[0].data.status).toBe('completed');
   });
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// runWorkflowBody parity (audit SHOULD ADD #1)
+// ═════════════════════════════════════════════════════════════════════════
+
+/**
+ * Both `execute()` and `stream()` route through `runWorkflowBody()` and must
+ * emit `workflow_start` exactly once and `workflow_end` exactly once across
+ * success / throw / abort. Each path × outcome combination is tested below
+ * so a future refactor can't silently regress the start↔end pairing
+ * invariant on one path while leaving the other intact.
+ */
+describe('runWorkflowBody parity (execute vs stream × success/throw/abort)', () => {
+  type Path = 'execute' | 'stream';
+  type Outcome = 'success' | 'throw' | 'abort';
+
+  // Helper: drive a workflow via either execute() or stream() and capture
+  // every emitted AxlEvent off the runtime trace channel. For abort, we
+  // wait for the workflow_start event (signalling the body has started)
+  // before calling runtime.abort(), guaranteeing the abort happens
+  // mid-execution rather than racing the registration phase.
+  async function runAndCollect(
+    runtime: AxlRuntime,
+    path: Path,
+    outcome: Outcome,
+    workflowName: string,
+  ): Promise<AxlEvent[]> {
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (event: AxlEvent) => traces.push(event));
+
+    if (path === 'execute') {
+      if (outcome === 'abort') {
+        const promise = runtime.execute(workflowName, {});
+        // Wait for workflow_start so we know the controller is registered
+        // and the body has begun.
+        for (let i = 0; i < 50 && !traces.some((t) => t.type === 'workflow_start'); i++) {
+          await new Promise((r) => setImmediate(r));
+        }
+        const startEvent = traces.find((t) => t.type === 'workflow_start');
+        expect(startEvent).toBeDefined();
+        runtime.abort(startEvent!.executionId);
+        await expect(promise).rejects.toThrow();
+      } else if (outcome === 'throw') {
+        await expect(runtime.execute(workflowName, {})).rejects.toThrow();
+      } else {
+        await runtime.execute(workflowName, {});
+      }
+    } else {
+      const stream = runtime.stream(workflowName, {});
+      if (outcome === 'abort') {
+        // Drive the stream to completion in the background; abort once
+        // workflow_start has arrived. The stream consumer detaches via
+        // stream.promise, which surfaces the error.
+        const consumed = (async () => {
+          try {
+            await stream.promise;
+          } catch {
+            /* expected on abort */
+          }
+        })();
+        for (let i = 0; i < 50 && !traces.some((t) => t.type === 'workflow_start'); i++) {
+          await new Promise((r) => setImmediate(r));
+        }
+        const startEvent = traces.find((t) => t.type === 'workflow_start');
+        expect(startEvent).toBeDefined();
+        runtime.abort(startEvent!.executionId);
+        await consumed;
+      } else if (outcome === 'throw') {
+        await expect(stream.promise).rejects.toThrow();
+      } else {
+        await stream.promise;
+      }
+    }
+    return traces;
+  }
+
+  // Each combination registers a workflow whose handler triggers the
+  // requested outcome. For `success`, return immediately. For `throw`,
+  // throw a real error inside the body. For `abort`, await the runtime's
+  // internal signal (reached via the WorkflowContext private field) so
+  // we can stay outside ctx.ask — the audit's invariant is workflow-level
+  // and we want zero ask_end events to keep the regression scope clear.
+  function buildWorkflow(name: string, outcome: Outcome) {
+    return workflow({
+      name,
+      input: z.any(),
+      handler: async (ctx) => {
+        if (outcome === 'success') return 'ok';
+        if (outcome === 'throw') throw new Error(`${name} body throw`);
+        // abort: subscribe to the internal abort signal and reject when it
+        // fires. The internal signal (private field) is the same one
+        // `runtime.abort()` triggers via the runtime's controller map.
+        // Cast through `unknown` to avoid the ts(2341) private-field error.
+        const signal = (ctx as unknown as { signal: AbortSignal | undefined }).signal;
+        await new Promise<never>((_, reject) => {
+          if (signal?.aborted) {
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            reject(err);
+            return;
+          }
+          signal?.addEventListener('abort', () => {
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            reject(err);
+          });
+        });
+        return 'should-not-reach';
+      },
+    });
+  }
+
+  for (const path of ['execute', 'stream'] as Path[]) {
+    for (const outcome of ['success', 'throw', 'abort'] as Outcome[]) {
+      it(`${path} × ${outcome}: exactly one workflow_start and one workflow_end`, async () => {
+        const { runtime } = createRuntime();
+        const wfName = `parity-${path}-${outcome}`;
+        runtime.register(buildWorkflow(wfName, outcome));
+
+        const traces = await runAndCollect(runtime, path, outcome, wfName);
+
+        const starts = traces.filter((t) => t.type === 'workflow_start');
+        const ends = traces.filter(
+          (t): t is Extract<AxlEvent, { type: 'workflow_end' }> => t.type === 'workflow_end',
+        );
+
+        // Pairing invariant: exactly one start and exactly one end.
+        expect(starts).toHaveLength(1);
+        expect(ends).toHaveLength(1);
+
+        // Status / aborted flag agrees with the outcome we drove.
+        if (outcome === 'success') {
+          expect(ends[0].data.status).toBe('completed');
+          expect(ends[0].data.aborted).toBeUndefined();
+        } else if (outcome === 'throw') {
+          expect(ends[0].data.status).toBe('failed');
+          // A user-thrown error is NOT an abort.
+          expect(ends[0].data.aborted).toBeUndefined();
+        } else {
+          // abort
+          expect(ends[0].data.status).toBe('failed');
+          expect(ends[0].data.aborted).toBe(true);
+        }
+      });
+    }
+  }
 });

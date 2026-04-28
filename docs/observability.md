@@ -79,11 +79,16 @@ All events share the `AxlEventBase` shape; `data` and other variant-specific fie
 | `handoff_start` | Fires BEFORE the target ask begins, on every handoff. **Not** AskScoped — spans two asks via `fromAskId` / `toAskId`. | `source`, `target`, `mode`, `message?` (roundtrip only) |
 | `handoff_return` | Fires AFTER control returns to source. **Roundtrip mode only** (oneway terminates at target). **Not** AskScoped. | `source`, `target`, `duration` |
 | `verify` | `ctx.verify()` completes (pass or fail) | `attempts`, `passed`, `lastError?` |
+| `pipeline` | Retry/validation lifecycle (multi-state via `status`: `start` / `committed` / `failed`). Emitted alongside the legacy `guardrail` / `schema_check` / `validate` gate events | `status`, `stage` (`'initial' \| 'schema' \| 'validate' \| 'guardrail'`), `attempt`, `maxAttempts`, `reason?` (only on `status: 'failed'`) |
+| `partial_object` | Progressive structured output — emitted at string-safe boundaries when `ctx.ask()` has a `schema` and no tools. **Stream-only** — never persisted to `ExecutionInfo.events` | `attempt`, `data: { object: unknown }` (DeepPartial of the schema type) |
 | `log` | `ctx.log()` user-emitted event | caller-provided |
 | `memory_remember` / `memory_recall` / `memory_forget` | Memory ops audit | `{ key, scope, hit?, count?, embed?, usage? }` |
+| `checkpoint_save` / `checkpoint_replay` | `ctx.checkpoint(name, fn)` — `save` on first execution, `replay` when a saved value short-circuits the function call | `name` (caller-supplied stable id, or `__auto/<primitive>/...` for runtime-internal auto-checkpoints) |
+| `await_human` | `ctx.awaitHuman()` suspends execution waiting for a human decision. Paired with `await_human_resolved` when the decision arrives | `prompt?`, `channel?` |
+| `await_human_resolved` | Paired terminal of an `await_human` request — carries the `HumanDecision` returned to the workflow | `channel?`, `decision` |
 | `done` / `error` | Terminal workflow markers (wrap their payload under `data` — `done.data = { result }`, `error.data = { message, name?, code? }`) | see signatures |
 
-**`pipeline`** (retry/validation lifecycle, three statuses: `start` / `committed` / `failed`) and **`partial_object`** (progressive structured output, emitted at string-safe boundaries when `ctx.ask()` has a `schema` and no tools) are emitted. `AxlStream.fullText` commits on `pipeline(committed)` and discards the in-progress buffer on `pipeline(failed)` or `ask_end({ok: false})`, so retried attempts' tokens never leak into the committed text.
+`AxlStream.fullText` commits on `pipeline(committed)` and discards the in-progress buffer on `pipeline(failed)` or `ask_end({ok: false})`, so retried attempts' tokens never leak into the committed text.
 
 **`workflow_start` / `workflow_end` are first-class event types as of 0.15.0** — previously emitted as `log` events with `data.event === 'workflow_start'` / `'workflow_end'`. Consumers filtering on the old log-form shape must switch to `event.type === 'workflow_start'` / `'workflow_end'`; `event.workflow` is now top-level, `data` carries `WorkflowStartData { input }` / `WorkflowEndData { status, duration, result?, error?, aborted? }`. `runtime.stream()` now also emits `workflow_start` (was silently omitted). Aborted workflows emit `workflow_end` with `data.aborted: true` so consumers can distinguish cancellation / budget hard-stop from genuine errors without a separate event subscription.
 
@@ -95,7 +100,7 @@ Every event originating within a `ctx.ask()` call carries an `AskScoped` mixin:
 
 | Field | Type | Description |
 |---|---|---|
-| `askId` | `string` | The ask invocation. Stable for all events emitted within a single `ctx.ask()` (including its agent_call turns and tool calls) |
+| `askId` | `string` | The ask invocation. Stable for all events emitted within a single `ctx.ask()` (including its `agent_call_*` turns and tool calls) |
 | `parentAskId` | `string?` | The enclosing ask (absent on the root). Set when one ask invokes another via the agent-as-tool pattern |
 | `depth` | `number` | `0` for root; `+1` per nested `ctx.ask()` |
 | `agent` | `string?` | Emitting agent's name |
@@ -242,7 +247,7 @@ The filter applies at three layers:
 
 In 0.16.0 the trace WS channel applies `redactStreamEvent` directly so the firehose can no longer bypass the per-route scrub (closing a previous PII leak).
 
-**Top-level numeric fields (`cost`, `tokens`, `duration`) are never scrubbed**, even under `redact: true`. They're load-bearing — `trackExecution`'s cost-aggregation listener and Studio's `CostAggregator` both read `event.cost` directly, so zeroing them would silently break total cost tracking when redaction is enabled. If your compliance environment treats aggregate spend as sensitive, filter events out entirely in your `onTrace` / `filterTraceEvent` handler rather than relying on redaction to scrub them.
+**Top-level numeric fields (`cost`, `tokens`, `duration`) are never scrubbed**, even under `redact: true`. They're load-bearing — `trackExecution`'s cost-aggregation listener and Studio's `TraceAggregator<CostData>` both read `event.cost` directly, so zeroing them would silently break total cost tracking when redaction is enabled. If your compliance environment treats aggregate spend as sensitive, filter events out entirely in your `onTrace` / `filterTraceEvent` handler rather than relying on redaction to scrub them.
 
 **Redaction is an observability-boundary filter, not a data-at-rest transform.** Programmatic callers of `runtime.execute()`, `runtime.getExecution()`, and direct `StateStore` access still receive raw values. Write endpoints (`PUT /api/memory`, `POST /api/sessions/:id/send`) still accept raw data. If you need scrubbed state-at-rest, configure your own `StateStore` wrapper that stores scrubbed values.
 

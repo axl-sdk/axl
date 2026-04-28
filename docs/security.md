@@ -119,17 +119,15 @@ For **business rule validation** on the parsed typed object (not raw text), use 
 
 ```typescript
 const runtime = new AxlRuntime({
-  config: {
-    trace: { redact: true, level: 'steps' },
-  },
+  trace: { redact: true, level: 'steps' },
 });
 ```
 
 **The three layers:**
 
-1. **AxlEvents** at emission — `agent_call_end.data.prompt`/`.response`/`.system`/`.thinking`/`.messages`, `ask_start.prompt`, `ask_end.outcome` (`outcome.result` on success, `outcome.error` on failure), gate-event `reason`/`feedbackMessage`, `tool_call_start.data.args`, `tool_call_end.data.args`/`.result`, `tool_approval.data.args`/`.reason`, `handoff.data.message` (roundtrip), `workflow_start.data.input`, `workflow_end.data.result`/`.error`, `done.data.result`, `error.data.message`, string fields on `log` events (one-level walk — nested numeric/boolean fields like `usage.tokens` / `usage.cost` survive so the Cost Dashboard's byEmbedder bucket still works).
+1. **AxlEvents** at emission — `agent_call_end.data.prompt`/`.response`/`.system`/`.thinking`/`.messages`, `ask_start.prompt`, `ask_end.outcome` (`outcome.result` on success, `outcome.error` on failure), gate-event `reason`/`feedbackMessage`, `tool_call_start.data.args`, `tool_call_end.data.args`/`.result`, `tool_approval.data.args`/`.reason`, `handoff_start.data.message` (roundtrip only), `workflow_start.data.input`, `workflow_end.data.result`/`.error`, `done.data.result`, `error.data.message`, string fields on `log` events (one-level walk — nested numeric/boolean fields like `usage.tokens` / `usage.cost` survive so the Cost Dashboard's byEmbedder bucket still works).
 2. **Studio REST route responses** at serialization — `GET /api/executions{,/:id}`, `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser remains navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync).
-3. **Studio WebSocket broadcasts** — `AxlEvent` content scrubbed on `POST /api/workflows/:name/execute` with `stream: true` and `POST /api/playground/chat` (`token.data`, `tool_call_start.data.args`, `tool_call_end.data.args`/`.result`, `tool_approval.args/.reason`, `ask_start.prompt`, `ask_end.outcome`, `done.data.result`, `error.data.message`, `handoff.data.message`). The **trace firehose channel** (`trace:*`) also applies the same `redactStreamEvent` filter as of 0.16.0 — closing a previous gap where the live trace stream could bypass the per-route scrub.
+3. **Studio WebSocket broadcasts** — `AxlEvent` content scrubbed on `POST /api/workflows/:name/execute` with `stream: true` and `POST /api/playground/chat` (`token.data`, `tool_call_start.data.args`, `tool_call_end.data.args`/`.result`, `tool_approval.data.args`/`.reason`, `ask_start.prompt`, `ask_end.outcome`, `done.data.result`, `error.data.message`, `handoff_start.data.message`). The **trace firehose channel** (`trace:*`) also applies the same `redactStreamEvent` filter as of 0.16.0 — closing a previous gap where the live trace stream could bypass the per-route scrub.
 
 **What's NOT scrubbed:** Programmatic callers of `runtime.execute()` and direct `StateStore` access still receive raw data — redaction is an observability-boundary filter, **not** a data-at-rest transform. Write endpoints (`PUT /api/memory`, `POST /api/sessions/:id/send`) still accept raw data. Top-level numeric fields (`cost`, `tokens`, `duration`) on every event are never scrubbed — they're load-bearing for `trackExecution` and the cost aggregator. Structural ask-graph metadata (`askId`, `parentAskId`, `depth`, `executionId`, `step`, `timestamp`) is also preserved (random IDs, no PII surface).
 

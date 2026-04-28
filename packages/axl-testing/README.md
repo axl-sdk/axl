@@ -31,6 +31,20 @@ const provider = MockProvider.sequence([
   { content: 'World!' }, // uses defaults
 ]);
 
+// Per-response streaming chunks. Each response can carry an optional
+// `chunks?: string[]` that drives the streaming path one delta per chunk.
+// Must satisfy `chunks.join('') === content`.
+const provider = MockProvider.sequence([
+  { content: 'Hello world', chunks: ['Hel', 'lo ', 'world'] },
+]);
+
+// Chunked mode — convenience over `sequence()`. Takes plain content
+// strings and splits each into fixed-size chunks (default 4 chars ≈
+// 1 token). Use to exercise partial-JSON parsing, structural-boundary
+// throttling, and cross-attempt token retention.
+const provider = MockProvider.chunked(['Hello world', 'Goodbye world']);
+const provider2 = MockProvider.chunked(['{"answer":42}'], 2); // 2-char chunks
+
 // Echo mode — return the user's prompt back
 const provider = MockProvider.echo();
 
@@ -123,6 +137,22 @@ For testing human-in-the-loop flows:
 ```typescript
 const runtime = new AxlTestRuntime({
   humanDecisions: (opts) => ({ approved: true }),
+});
+```
+
+`AxlTestRuntime` also accepts a `config` option that is threaded into the underlying `WorkflowContext`. `trace.level` and `trace.redact` work identically in tests and production:
+
+```typescript
+import { AxlTestRuntime } from '@axlsdk/testing';
+
+// Verbose trace mode — populates agent_call_end.data.messages
+const runtime = new AxlTestRuntime({
+  config: { trace: { level: 'full' } },
+});
+
+// Redaction mode — scrubs prompt/response/messages on emitted events
+const redacted = new AxlTestRuntime({
+  config: { trace: { redact: true } },
 });
 ```
 

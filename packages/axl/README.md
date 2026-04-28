@@ -12,6 +12,8 @@ npm install @axlsdk/axl zod@^4
 
 > **Note:** `zod` is a peer dependency — your application and Axl share a single Zod instance. Zod v4 (`^4.0.0`) is required.
 
+> **Migrating from 0.15?** The 0.16+ unified event model collapses `TraceEvent` and `StreamEvent` into a single `AxlEvent` union and renames `ExecutionInfo.steps` → `.events`, `AxlStream.steps` → `.lifecycle`. The 0.17.0 release removes the deprecated `parentToolCallId` field and changes `ctx.checkpoint(fn)` to `ctx.checkpoint(name, fn)`. See the [migration guide](../../docs/migration/unified-event-model.md) for the full rename/move table.
+
 ## Project Structure
 
 The recommended pattern separates config, tools, agents, workflows, and runtime into their own modules. Dependencies flow one direction: tools → agents → workflows → runtime.
@@ -455,7 +457,7 @@ const relevant = await ctx.recall('knowledge-base', {
 
 Vector store implementations: `InMemoryVectorStore` (testing), `SqliteVectorStore` (production, requires `better-sqlite3`).
 
-**Embedder cost attribution.** `OpenAIEmbedder` reports `{ tokens, cost, model }` on every embed call — computed from the response's `prompt_tokens` and a pricing table (`text-embedding-3-small` $0.02/1M, `-large` $0.13/1M, `ada-002` $0.10/1M). The cost flows through `runtime.trackExecution()` the same way agent-call cost does, counts against `ctx.budget()`, and shows up in Studio's Cost Dashboard under "Memory (Embedder)". See [observability.md](../../docs/observability.md#trace-event-types) for the trace-event shape.
+**Embedder cost attribution.** `OpenAIEmbedder` reports `{ tokens, cost, model }` on every embed call — computed from the response's `prompt_tokens` and a pricing table (`text-embedding-3-small` $0.02/1M, `-large` $0.13/1M, `ada-002` $0.10/1M). The cost flows through `runtime.trackExecution()` the same way agent-call cost does, counts against `ctx.budget()`, and shows up in Studio's Cost Dashboard under "Memory (Embedder)". See [observability.md](../../docs/observability.md#event-types) for the trace-event shape.
 
 **Custom `Embedder` implementations** (breaking change in 0.15.0 — `embed()` previously returned `Promise<number[][]>`):
 

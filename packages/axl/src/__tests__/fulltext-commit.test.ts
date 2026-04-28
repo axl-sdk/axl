@@ -261,6 +261,90 @@ describe('AxlStream.fullText — commit-on-pipeline-committed', () => {
     expect(fullText).not.toContain('fail-text');
   });
 
+  it('parallel asks: 3 branches with one failing — survivors fully present, failed branch absent', async () => {
+    // Defense-in-depth for the per-askId scoping invariant: the existing
+    // 2-branch test only proves "success doesn't lose to failure" with a
+    // single survivor. With 3 branches (two successes A & C plus one
+    // failure B), a future regression in the per-ask Map (e.g., clearing
+    // the wrong entry on concurrent failure) would corrupt one of A or C
+    // — the 2-branch case can't catch that.
+    const provider = MockProvider.fn(async (messages) => {
+      const last = messages[messages.length - 1];
+      const content = typeof last?.content === 'string' ? last.content : '';
+      if (content.includes('q-a')) {
+        return { content: 'AAAAA', chunks: ['AA', 'AAA'] };
+      }
+      if (content.includes('q-c')) {
+        return { content: 'CCCCC', chunks: ['CC', 'CCC'] };
+      }
+      // q-b: emit one streamed chunk then drive maxTurns: 1 exhaustion.
+      return {
+        content: '',
+        toolCalls: [{ id: 'tc1', name: 'noop', arguments: '{}' }],
+        chunks: ['BBBBB'],
+      };
+    });
+
+    const runtime = new AxlRuntime({ defaultProvider: 'mock' });
+    runtime.registerProvider('mock', provider);
+    const aAgent = agent({ name: 'a-agent', model: 'mock:test', system: 'a' });
+    const cAgent = agent({ name: 'c-agent', model: 'mock:test', system: 'c' });
+    const bFailAgent = agent({
+      name: 'b-agent',
+      model: 'mock:test',
+      system: 'b',
+      maxTurns: 1,
+      tools: [
+        {
+          _name: 'noop',
+          _description: 'noop',
+          _inputSchema: z.object({}),
+          _retry: undefined,
+          _hooks: undefined,
+          _sensitive: false,
+          _requireApproval: false,
+          run: async () => ({ ok: true }),
+        } as never,
+      ],
+    });
+
+    const wf = workflow({
+      name: 'three-branch-wf',
+      input: z.object({}),
+      handler: async (ctx) => {
+        const [rA, rB, rC] = await ctx.parallel([
+          () => ctx.ask(aAgent, 'q-a'),
+          async () => {
+            try {
+              return await ctx.ask(bFailAgent, 'q-b');
+            } catch {
+              return 'CAUGHT';
+            }
+          },
+          () => ctx.ask(cAgent, 'q-c'),
+        ]);
+        return { rA, rB, rC };
+      },
+    });
+    runtime.register(wf);
+
+    const stream = runtime.stream('three-branch-wf', {});
+    for await (const event of stream) {
+      if (event.type === 'done') break;
+    }
+
+    const fullText = stream.fullText;
+    // Both surviving branches' content appears unmolested.
+    expect(fullText).toContain('AAAAA');
+    expect(fullText).toContain('CCCCC');
+    // The failed branch's partial chunk was discarded.
+    expect(fullText).not.toContain('BBBBB');
+    // Total length equals the sum of survivor lengths exactly — no
+    // leakage from the failed branch and no missing characters from the
+    // survivors (which would happen if the wrong Map entry got cleared).
+    expect(fullText.length).toBe('AAAAA'.length + 'CCCCC'.length);
+  });
+
   it('mid-attempt fullText reflects in-progress tokens until pipeline(committed) commits them', async () => {
     const provider = MockProvider.sequence([
       { content: 'one two three', chunks: ['one ', 'two ', 'three'] },

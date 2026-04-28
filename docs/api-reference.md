@@ -1066,6 +1066,16 @@ const runtime2 = new AxlRuntime({
 });
 ```
 
+### State configuration
+
+`config.state` accepts the following options:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `store` | `'memory' \| 'sqlite' \| StateStore` | `'memory'` | Backend implementation. Pass an instance for `RedisStore` (use `await RedisStore.create(url)`) or a custom store |
+| `sqlite` | `{ path: string }` | — | Path for the `'sqlite'` store. Required when `store === 'sqlite'` |
+| `maxEventsPerExecution` | `number` | `50_000` | Maximum number of events retained in `ExecutionInfo.events` per execution. When the cap is hit, subsequent events are dropped from the array (with a sentinel `log` event recording the truncation) — but the trace channel (`runtime.on('trace')`) and WS broadcast continue to receive every event, so live observability isn't degraded. Must be a positive integer or `Infinity` (explicit unbounded opt-out — only safe for short-lived executions). Pathological values (`0`, negative, fractional, `NaN`) are rejected at construction with a `RangeError` |
+
 ### Required Methods
 
 Every `StateStore` implementation must provide these methods.
@@ -1205,8 +1215,8 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped, CallbackMeta } from
 | `workflow_start` / `workflow_end` | — | `workflow`, `data: WorkflowStartData/WorkflowEndData` | Workflow lifecycle |
 | `ask_start` | `AskScoped` | `prompt: string` | Top of every `ctx.ask()` |
 | `ask_end` | `AskScoped` | `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration` | Every `ctx.ask()` exit. Ask-internal failures surface here, NOT via the workflow-level `error` event |
-| `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number` | Before each LLM call (one per loop turn) |
-| `agent_call_end` | `AskScoped` | `agent: string`, `model: string`, `cost: number`, `duration: number`, `data: AgentCallData` | After each LLM call returns |
+| `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number`, `data: AgentCallStartData` | Before each LLM call (one per loop turn) |
+| `agent_call_end` | `AskScoped` | `agent: string`, `model: string`, `cost: number`, `duration: number`, `data: AgentCallEndData` | After each LLM call returns |
 | `token` | `AskScoped` | `data: string` | Streaming text chunk. **Stream-only** — never persisted to `ExecutionInfo.events` |
 | `tool_call_start` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallStartData` | Before tool handler runs |
 | `tool_call_end` | `AskScoped` | `tool: string`, `callId: string`, `duration: number`, `cost?`, `data: ToolCallData` | After tool handler returns |
@@ -1221,10 +1231,13 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped, CallbackMeta } from
 | `guardrail` / `schema_check` / `validate` | `Partial<AskScoped>` | `data: GuardrailData/SchemaCheckData/ValidateData` | Per-gate retry events emitted alongside `pipeline` |
 | `log` | `Partial<AskScoped>` | `data: unknown` | `ctx.log()` user event |
 | `memory_remember` / `memory_recall` / `memory_forget` | `Partial<AskScoped>` | `data: MemoryEventData` | Memory ops audit |
+| `checkpoint_save` / `checkpoint_replay` | `Partial<AskScoped>` | `data: CheckpointEventData` | `ctx.checkpoint(name, fn)` — `save` on first execution, `replay` when a saved value short-circuits the function call |
+| `await_human` | `Partial<AskScoped>` | `data: AwaitHumanData` | `ctx.awaitHuman()` suspends execution for a human decision (paired with `await_human_resolved`) |
+| `await_human_resolved` | `Partial<AskScoped>` | `data: AwaitHumanResolvedData` | The decision arrives and resumes the workflow |
 | `done` | — | `data: { result: unknown }` | Terminal — workflow completed |
 | `error` | `Partial<AskScoped>` | `data: { message: string, name?, code? }` | Terminal — non-ask-internal error (top-level workflow throws, infra/abort errors) |
 
-Per-variant data shape exports from `@axlsdk/axl`: `AgentCallData`, `ToolCallData`, `ToolCallStartData`, `ToolApprovalData`, `ToolDeniedData`, `HandoffStartData`, `HandoffReturnData`, `DelegateData`, `VerifyData`, `WorkflowStartData`, `WorkflowEndData`, `MemoryEventData`, `GuardrailData`, `SchemaCheckData`, `ValidateData`. The constant tuple `AXL_EVENT_TYPES` is the single source of truth for the discriminator.
+Per-variant data shape exports from `@axlsdk/axl`: `AgentCallStartData`, `AgentCallEndData`, `AgentCallParams`, `ToolCallData`, `ToolCallStartData`, `ToolApprovalData`, `ToolDeniedData`, `HandoffStartData`, `HandoffReturnData`, `DelegateData`, `VerifyData`, `WorkflowStartData`, `WorkflowEndData`, `MemoryEventData`, `CheckpointEventData`, `AwaitHumanData`, `AwaitHumanResolvedData`, `GuardrailData`, `SchemaCheckData`, `ValidateData`. The constant tuple `AXL_EVENT_TYPES` is the single source of truth for the discriminator.
 
 **Cost double-counting guard:** `ask_end.cost` is the per-ask rollup of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). Use the exported helper `eventCostContribution(event)` — returns `0` on `ask_end` and on non-finite values, `event.cost` otherwise. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, Studio's cost aggregator, and `AxlTestRuntime.totalCost()` all use this helper internally:
 
@@ -1235,18 +1248,37 @@ const total = info.events.reduce((sum, e) => sum + eventCostContribution(e), 0);
 
 Also exported: `isCostBearingLeaf(event: AxlEvent): boolean` (takes an event, checks its `type` against the leaf set — pass the event, not the type string), `COST_BEARING_LEAF_TYPES` (the canonical `as const` tuple: `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall`), and `isRootLevel(event: AxlEvent): boolean` (true when `depth === 0` or undefined — used for root-only token filtering).
 
-### `AgentCallData` (data on `agent_call_end` events)
+**`parsePartialJson(text: string): unknown`** — tolerant JSON parser used internally for `partial_object` streaming. Recovers from truncated input (unclosed strings/objects/arrays) and is hardened against deeply-nested input via a 256-depth cap (returns `null` on overflow). Exported from `@axlsdk/axl` for consumers building their own progressive-render pipelines that need to share Axl's truncation-recovery and stack-overflow guard rails. Zero dependencies.
+
+**`AnyWorkflow`** — type alias for `Workflow<any, any>`, exported from `@axlsdk/axl`. Used by `AxlRuntime.register` (and `AxlTestRuntime.register`) to accept any workflow regardless of its specific input/output schema. Useful for typing helper functions that operate on registered workflows generically.
+
+### `AgentCallStartData` (data on `agent_call_start` events — request side)
+
+Populated at dispatch time, before the provider responds. Lets consumers render "what's being asked" without waiting for completion.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `prompt` | `string` | Original user prompt passed to `ctx.ask()` |
-| `response` | `string` | Final LLM response content for this turn |
+| `prompt` | `string` | Original user prompt passed to `ctx.ask()`. Does not include retry feedback or tool results |
 | `system` | `string?` | Resolved system prompt (dynamic selectors evaluated at call time) |
+| `params` | `AgentCallParams?` | Resolved model parameters sent to the provider: `{ temperature?, maxTokens?, effort?, thinkingBudget?, includeThoughts?, toolChoice?, stop? }` |
+| `turn` | `number` | 1-indexed iteration of the tool-calling loop for this `ctx.ask()` call |
+| `retryReason` | `'schema' \| 'validate' \| 'guardrail'?` | Set when this call is a retry triggered by a failed gate on the previous turn |
+| `toolNames` | `string[]?` | Names of tools exposed to the model on this call. Empty/omitted when no tools are bound |
+| `messages` | `ChatMessage[]?` | Full `ChatMessage[]` sent to the provider this turn. **Only populated when `config.trace.level === 'full'`** |
+
+### `AgentCallEndData` (data on `agent_call_end` events — response side)
+
+Populated when the provider returns (success or recoverable failure). Pair invariant: every `agent_call_start` is followed by exactly one `agent_call_end`, even on provider error.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `response` | `string` | Final LLM response content for this turn. Empty string on error |
 | `thinking` | `string?` | Reasoning/thinking content returned by the provider, when available |
-| `params` | `object?` | Resolved model parameters sent to the provider: `{ temperature?, maxTokens?, effort?, thinkingBudget?, includeThoughts?, toolChoice?, stop? }` |
-| `turn` | `number?` | 1-indexed iteration of the tool-calling loop for this `ctx.ask()` call |
-| `retryReason` | `'schema' \| 'validate' \| 'guardrail'?` | Set when this call was triggered by a failed gate on the previous turn |
-| `messages` | `ChatMessage[]?` | Full conversation sent to the provider this turn. **Only populated when `config.trace.level === 'full'`** |
+| `turn` | `number` | 1-indexed iteration of the tool-calling loop. Mirrors the matching `agent_call_start.data.turn` |
+| `retryReason` | `'schema' \| 'validate' \| 'guardrail'?` | Mirrors `agent_call_start.data.retryReason` so cost-attribution consumers reading `agent_call_end` (where `cost` lives) can bucket without joining |
+| `error` | `string?` | Provider error message when the call threw (network failure, 4xx/5xx, abort, etc). Mutually exclusive with `response` content. Subject to `config.trace.redact` |
+
+`AgentCallParams` is also exported from `@axlsdk/axl` for consumers needing to type the resolved parameters object directly.
 
 ### `GuardrailData` / `SchemaCheckData` / `ValidateData` (symmetric shape)
 

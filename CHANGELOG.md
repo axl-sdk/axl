@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Documentation audit sweep (docs-only)
+
+Comprehensive doc audit pass. Fixed `AxlRuntime` constructor shape in
+`docs/security.md` and `packages/axl-studio/README.md` (the example
+showed `new AxlRuntime({ config: { ... } })` but the constructor takes
+the config directly). Reconciled migration version to `0.15.x → 0.17.0`
+in the unified-event-model migration guide and added dedicated sections
+for the `ctx.checkpoint(name, fn)` rename, the `parentToolCallId`
+removal, and an "Additive changes" summary covering `bufferCaps`,
+`config.state.maxEventsPerExecution`, `AnyWorkflow`, `parsePartialJson`,
+`fullText` per-askId scoping, and the new `await_human*` /
+`checkpoint_*` event variants. Renamed lingering `AgentCallData`
+references in `docs/api-reference.md` to the actual exports
+(`AgentCallStartData` / `AgentCallEndData` / `AgentCallParams`); added
+table rows for `await_human` / `await_human_resolved` / `checkpoint_save`
+/ `checkpoint_replay` / `pipeline` / `partial_object`. Documented
+`config.state.maxEventsPerExecution`, `AnyWorkflow`, and
+`parsePartialJson` in the API reference. Fixed scrubbed-fields paths
+(`handoff.data.message` → `handoff_start.data.message`,
+`tool_approval.args` → `tool_approval.data.args`). Replaced stale
+`CostAggregator` mention with `TraceAggregator<CostData>`. Updated
+`agent_call.data.messages` → `agent_call_end.data.messages` in the
+Studio README. Bumped the Studio replay-buffer cap from "500" to "1000"
+to match the implemented default. Fixed broken `#trace-event-types`
+anchor in `packages/axl/README.md`. Added `MockProvider.chunked()` and
+the per-response `chunks?: string[]` option, plus the `AxlTestRuntime`
+`{ config }` constructor option, to the `axl-testing` README. Smaller
+polish: architecture-doc pointer to the migration guide,
+`agent_call` → `agent_call_*` plural in the `askId` description, a
+"Migrating from 0.15?" callout in the core-package README, and a note
+that `captureTraces` strips verbose snapshots and token /
+`partial_object` events. No source code changes; `pnpm -r typecheck`
+clean.
+
+### Changed — Test coverage additions (defense-in-depth, test-only)
+
+Four ship-readiness audit items pinned with regression tests; no source
+code changes.
+
+- `runtime.test.ts` — new `runWorkflowBody parity` describe block
+  parameterizes 6 cases (execute|stream × success|throw|abort) and
+  asserts exactly one `workflow_start` and one `workflow_end` per run,
+  with `workflow_end.data.status` / `aborted` matching the outcome.
+  Catches drift in the start-iff-end pairing invariant on either path.
+- `runtime.test.ts:914-944` — extends the existing
+  `emits workflow_end trace with failed status on error` test with a
+  spec §9 assertion: a top-level workflow throw (NOT inside `ctx.ask`)
+  must emit zero `ask_end` events. Pins the boundary between the
+  workflow-level `error` channel and the ask-level `ask_end` failure
+  surface.
+- `fulltext-commit.test.ts` — new 3-branch test
+  (two successes + one failing branch) for the per-`askId` `fullText`
+  scoping invariant. The existing 2-branch test only proves "success
+  doesn't lose to failure" with a single survivor; with three branches
+  a future regression in the per-ask Map (e.g., wrong entry cleared on
+  concurrent failure) would corrupt one of the survivors — only
+  catchable with ≥3 branches.
+- `tests/smoke/smoke.test.ts` — new "Downstream Type Export Contract"
+  describe block. Packs the `@axlsdk/axl` tarball, installs it into a
+  sandbox npm project (with zod + typescript), writes a synthetic
+  consumer that exercises `AxlEvent` discriminated narrowing,
+  `AxlEventOf<T>`, and `AskScoped`, and runs `tsc --noEmit` under
+  strict mode. Catches the class of bug "we removed a type but forgot
+  to update the export" at the publication boundary. Adds ~1.5s to the
+  smoke suite (well under the existing 60s `testTimeout`).
+
+Test count delta: 2184 → 2191 (+7).
+
 ### Removed — `parentToolCallId` (BREAKING)
 
 The deprecated `parentToolCallId` field on `AxlEventBase` is removed.

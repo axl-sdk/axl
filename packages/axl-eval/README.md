@@ -353,6 +353,8 @@ for (const item of results.items) {
 }
 ```
 
+`captureTraces` strips verbose-mode `agent_call_end.data.messages` snapshots and high-volume events (`token`, `partial_object`) from the captured array to keep memory bounded. The structural events you'd want for debugging — `agent_call_start`/`agent_call_end`, `tool_call_*`, gate events, `pipeline`, `verify`, `handoff_*` — are all retained.
+
 ## Comparing Results
 
 Compare two runs to detect regressions and improvements. Runs must use the same dataset and scorers.

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { MockProvider } from '@axlsdk/testing';
 import { createTestServer } from '../helpers/setup.js';
+import { readJson } from '../helpers/json.js';
 
 describe('Studio API: Evals', () => {
   it('GET /api/evals lists registered eval configs', async () => {
@@ -8,7 +9,7 @@ describe('Studio API: Evals', () => {
     const res = await app.request('/api/evals');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.length).toBe(1);
     expect(body.data[0].name).toBe('test-eval');
@@ -26,7 +27,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
 
     // Validate the full EvalResult shape that the Eval Runner panel depends on
@@ -63,7 +64,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(404);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('NOT_FOUND');
   });
@@ -73,7 +74,7 @@ describe('Studio API: Evals', () => {
     const res = await app.request('/api/evals/history');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data).toEqual([]);
   });
@@ -87,7 +88,7 @@ describe('Studio API: Evals', () => {
     const res = await app.request('/api/evals/test-eval/run', {
       method: 'POST',
     });
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
 
     // Per-item content scrubbed
@@ -114,7 +115,7 @@ describe('Studio API: Evals', () => {
     await app.request('/api/evals/test-eval/run', { method: 'POST' });
 
     const res = await app.request('/api/evals/history');
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.length).toBe(1);
     const result = body.data[0].data;
@@ -137,7 +138,7 @@ describe('Studio API: Evals', () => {
     const histRes = await app.request('/api/evals/history');
     expect(histRes.status).toBe(200);
 
-    const body = await histRes.json();
+    const body = await readJson(histRes);
     expect(body.ok).toBe(true);
     expect(body.data.length).toBe(1);
     expect(body.data[0].eval).toBe('test-eval');
@@ -155,7 +156,7 @@ describe('Studio API: Evals', () => {
     // Run an eval first to get a result in history
     const runRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
     expect(runRes.status).toBe(200);
-    const runBody = await runRes.json();
+    const runBody = await readJson(runRes);
     const resultId = runBody.data.id;
 
     // Rescore that result
@@ -166,7 +167,7 @@ describe('Studio API: Evals', () => {
     });
     expect(rescoreRes.status).toBe(200);
 
-    const body = await rescoreRes.json();
+    const body = await readJson(rescoreRes);
     expect(body.ok).toBe(true);
     expect(body.data).toHaveProperty('id');
     expect(body.data.id).not.toBe(resultId); // New result ID
@@ -187,7 +188,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(400);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('BAD_REQUEST');
   });
@@ -202,7 +203,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(404);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('NOT_FOUND');
   });
@@ -217,7 +218,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(404);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('NOT_FOUND');
     expect(body.error.message).toContain('nonexistent-result-id');
@@ -240,7 +241,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = (await res.json()) as any;
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
 
     // Multi-run response wraps first result with _multiRun
@@ -277,7 +278,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = (await res.json()) as any;
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data._multiRun.allRuns.length).toBe(25);
     expect(body.data._multiRun.aggregate.runCount).toBe(25);
@@ -294,7 +295,7 @@ describe('Studio API: Evals', () => {
     const res = await app.request('/api/evals/test-eval/run', { method: 'POST' });
     expect(res.status).toBe(200);
 
-    const body = (await res.json()) as any;
+    const body = await readJson(res);
     const data = body.data;
 
     // Per-item: workflows array captured from trace events
@@ -317,7 +318,7 @@ describe('Studio API: Evals', () => {
     const res = await app.request('/api/evals/test-eval/run', { method: 'POST' });
     expect(res.status).toBe(200);
 
-    const body = (await res.json()) as any;
+    const body = await readJson(res);
     const item = body.data.items[0];
 
     // The test setup uses MockProvider registered as 'test' provider with model 'default'
@@ -344,7 +345,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = (await res.json()) as any;
+    const body = await readJson(res);
     for (const run of body.data._multiRun.allRuns) {
       expect(run.items[0].metadata).toBeDefined();
       expect(run.items[0].metadata.models).toBeInstanceOf(Array);
@@ -368,11 +369,11 @@ describe('Studio API: Evals', () => {
 
     const baselineRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
     expect(baselineRes.status).toBe(200);
-    const baselineId = (await baselineRes.json()).data.id;
+    const baselineId = (await readJson(baselineRes)).data.id;
 
     const candidateRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
     expect(candidateRes.status).toBe(200);
-    const candidateId = (await candidateRes.json()).data.id;
+    const candidateId = (await readJson(candidateRes)).data.id;
 
     const compareRes = await app.request('/api/evals/compare', {
       method: 'POST',
@@ -381,7 +382,7 @@ describe('Studio API: Evals', () => {
     });
     expect(compareRes.status).toBe(200);
 
-    const body = await compareRes.json();
+    const body = await readJson(compareRes);
     expect(body.ok).toBe(true);
 
     const data = body.data;
@@ -400,10 +401,10 @@ describe('Studio API: Evals', () => {
     const { app } = createTestServer(provider);
 
     const baselineId = (
-      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
     ).data.id;
     const candidateId = (
-      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
     ).data.id;
 
     const compareRes = await app.request('/api/evals/compare', {
@@ -417,7 +418,7 @@ describe('Studio API: Evals', () => {
     });
     expect(compareRes.status).toBe(200);
 
-    const body = await compareRes.json();
+    const body = await readJson(compareRes);
     expect(body.ok).toBe(true);
     expect(body.data.scorers['always-pass']).toBeDefined();
     expect(typeof body.data.scorers['always-pass'].baselineMean).toBe('number');
@@ -434,13 +435,13 @@ describe('Studio API: Evals', () => {
     const { app } = createTestServer(provider);
 
     // Two baseline runs and two candidate runs.
-    const b1 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+    const b1 = (await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' })))
       .data.id;
-    const b2 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+    const b2 = (await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' })))
       .data.id;
-    const c1 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+    const c1 = (await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' })))
       .data.id;
-    const c2 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+    const c2 = (await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' })))
       .data.id;
 
     const compareRes = await app.request('/api/evals/compare', {
@@ -450,7 +451,7 @@ describe('Studio API: Evals', () => {
     });
     expect(compareRes.status).toBe(200);
 
-    const body = await compareRes.json();
+    const body = await readJson(compareRes);
     expect(body.ok).toBe(true);
     expect(body.data.scorers['always-pass']).toBeDefined();
   });
@@ -460,7 +461,7 @@ describe('Studio API: Evals', () => {
     const { app } = createTestServer(provider);
 
     const baselineId = (
-      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
     ).data.id;
 
     const res = await app.request('/api/evals/compare', {
@@ -470,7 +471,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(404);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('NOT_FOUND');
     expect(body.error.message).toContain('does-not-exist');
@@ -486,7 +487,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(400);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('BAD_REQUEST');
   });
@@ -507,7 +508,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(400);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.error.code).toBe('BAD_REQUEST');
     expect(body.error.message).toMatch(/baselineId.*25.*ids.*pooled/i);
   });
@@ -548,7 +549,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(typeof body.data.id).toBe('string');
     expect(body.data.id).not.toBe('original-cli-id'); // Fresh UUID
@@ -557,7 +558,7 @@ describe('Studio API: Evals', () => {
 
     // History contains the imported entry under the new ID
     const histRes = await app.request('/api/evals/history');
-    const histBody = await histRes.json();
+    const histBody = await readJson(histRes);
     const entry = histBody.data.find((e: { id: string }) => e.id === body.data.id);
     expect(entry).toBeDefined();
     expect(entry.eval).toBe('imported-wf');
@@ -596,7 +597,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     // Primary path wins: first entry from metadata.workflows becomes the eval name.
     expect(body.data.eval).toBe('modern-wf');
   });
@@ -622,7 +623,7 @@ describe('Studio API: Evals', () => {
       }),
     });
     expect(res.status).toBe(200);
-    expect((await res.json()).data.eval).toBe('my-custom-name');
+    expect((await readJson(res)).data.eval).toBe('my-custom-name');
   });
 
   it('POST /api/evals/import then compare round-trip works end-to-end', async () => {
@@ -631,7 +632,7 @@ describe('Studio API: Evals', () => {
 
     // Run a native eval to use as the baseline.
     const nativeId = (
-      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
     ).data.id;
 
     // Import a CLI artifact to use as the candidate. Dataset and scorer names
@@ -656,7 +657,7 @@ describe('Studio API: Evals', () => {
         },
       }),
     });
-    const importedId = (await importRes.json()).data.id;
+    const importedId = (await readJson(importRes)).data.id;
 
     const compareRes = await app.request('/api/evals/compare', {
       method: 'POST',
@@ -665,7 +666,7 @@ describe('Studio API: Evals', () => {
     });
     expect(compareRes.status).toBe(200);
 
-    const body = await compareRes.json();
+    const body = await readJson(compareRes);
     expect(body.ok).toBe(true);
     expect(body.data.scorers['always-pass']).toBeDefined();
   });
@@ -680,7 +681,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(400);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('BAD_REQUEST');
   });
@@ -706,7 +707,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(405);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('READ_ONLY');
   });
@@ -722,7 +723,7 @@ describe('Studio API: Evals', () => {
     });
     // Reaches the route handler (returns 400 for missing IDs, not 405 for readOnly).
     expect(res.status).toBe(400);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.error.code).toBe('BAD_REQUEST');
   });
 
@@ -736,7 +737,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(400);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('BAD_REQUEST');
   });
@@ -755,7 +756,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(400);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.error.code).toBe('BAD_REQUEST');
     expect(body.error.message).toContain('non-empty');
   });
@@ -768,11 +769,11 @@ describe('Studio API: Evals', () => {
     ]);
     const { app } = createTestServer(provider);
 
-    const b1 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+    const b1 = (await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' })))
       .data.id;
-    const c1 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+    const c1 = (await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' })))
       .data.id;
-    const c2 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+    const c2 = (await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' })))
       .data.id;
 
     const res = await app.request('/api/evals/compare', {
@@ -782,7 +783,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.scorers['always-pass']).toBeDefined();
   });
@@ -793,9 +794,9 @@ describe('Studio API: Evals', () => {
     const provider = MockProvider.sequence([{ content: 'b1' }, { content: 'c1' }]);
     const { app } = createTestServer(provider);
 
-    const b1 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+    const b1 = (await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' })))
       .data.id;
-    const c1 = (await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json())
+    const c1 = (await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' })))
       .data.id;
 
     const res = await app.request('/api/evals/compare', {
@@ -804,7 +805,7 @@ describe('Studio API: Evals', () => {
       body: JSON.stringify({ baselineId: [b1, b1, b1], candidateId: [c1, c1] }),
     });
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
   });
 
@@ -815,7 +816,7 @@ describe('Studio API: Evals', () => {
     const { app } = createTestServer(provider);
 
     const baselineId = (
-      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
     ).data.id;
 
     // Import a candidate with a different dataset name.
@@ -839,7 +840,7 @@ describe('Studio API: Evals', () => {
         },
       }),
     });
-    const candidateId = (await importRes.json()).data.id;
+    const candidateId = (await readJson(importRes)).data.id;
 
     const res = await app.request('/api/evals/compare', {
       method: 'POST',
@@ -847,7 +848,7 @@ describe('Studio API: Evals', () => {
       body: JSON.stringify({ baselineId, candidateId }),
     });
     expect(res.status).toBe(400);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.error.code).toBe('COMPARE_FAILED');
     expect(body.error.message).toContain('dataset');
   });
@@ -872,7 +873,7 @@ describe('Studio API: Evals', () => {
       }),
     });
     expect(res.status).toBe(400);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.error.code).toBe('BAD_REQUEST');
     expect(body.error.message).toContain('dataset');
   });
@@ -917,7 +918,7 @@ describe('Studio API: Evals', () => {
       }),
     });
     expect(res.status).toBe(400);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.error.code).toBe('BAD_REQUEST');
     expect(body.error.message).toContain('phantom-scorer');
   });
@@ -933,7 +934,7 @@ describe('Studio API: Evals', () => {
       body: JSON.stringify({ baselineId: [null], candidateId: 'some-id' }),
     });
     expect(res.status).toBe(400);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.error.code).toBe('BAD_REQUEST');
     expect(body.error.message).toContain('baselineId');
   });
@@ -969,7 +970,7 @@ describe('Studio API: Evals', () => {
       }),
     });
     expect(res.status).toBe(400);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.error.code).toBe('BAD_REQUEST');
     expect(body.error.message).toContain('rogue-scorer');
   });
@@ -995,7 +996,7 @@ describe('Studio API: Evals', () => {
       }),
     });
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.data.eval).toBe('fallback-wf');
   });
 
@@ -1022,8 +1023,8 @@ describe('Studio API: Evals', () => {
     expect(res.status).toBe(200);
 
     const histRes = await app.request('/api/evals/history');
-    const histBody = await histRes.json();
-    const id = (await res.json()).data.id;
+    const histBody = await readJson(histRes);
+    const id = (await readJson(res)).data.id;
     const entry = histBody.data.find((e: { id: string }) => e.id === id);
     expect(entry.data.metadata).toEqual({});
   });
@@ -1036,21 +1037,21 @@ describe('Studio API: Evals', () => {
 
     // Run an eval to populate history.
     const runRes = await app.request('/api/evals/test-eval/run', { method: 'POST' });
-    const id = (await runRes.json()).data.id;
+    const id = (await readJson(runRes)).data.id;
 
     // Confirm it's in history first.
-    const histBefore = await (await app.request('/api/evals/history')).json();
+    const histBefore = await readJson(await app.request('/api/evals/history'));
     expect(histBefore.data.find((e: { id: string }) => e.id === id)).toBeDefined();
 
     // Delete.
     const delRes = await app.request(`/api/evals/history/${id}`, { method: 'DELETE' });
     expect(delRes.status).toBe(200);
-    const delBody = await delRes.json();
+    const delBody = await readJson(delRes);
     expect(delBody.ok).toBe(true);
     expect(delBody.data).toEqual({ id, deleted: true });
 
     // Confirm it's gone.
-    const histAfter = await (await app.request('/api/evals/history')).json();
+    const histAfter = await readJson(await app.request('/api/evals/history'));
     expect(histAfter.data.find((e: { id: string }) => e.id === id)).toBeUndefined();
   });
 
@@ -1060,7 +1061,7 @@ describe('Studio API: Evals', () => {
     const res = await app.request('/api/evals/history/does-not-exist', { method: 'DELETE' });
     expect(res.status).toBe(404);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('NOT_FOUND');
     expect(body.error.message).toContain('does-not-exist');
@@ -1078,7 +1079,7 @@ describe('Studio API: Evals', () => {
 
     const res = await app.request('/api/evals/history/any-id', { method: 'DELETE' });
     expect(res.status).toBe(405);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('READ_ONLY');
   });
@@ -1089,10 +1090,10 @@ describe('Studio API: Evals', () => {
     const { app } = createTestServer(provider);
 
     const baselineId = (
-      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
     ).data.id;
     const candidateId = (
-      await (await app.request('/api/evals/test-eval/run', { method: 'POST' })).json()
+      await readJson(await app.request('/api/evals/test-eval/run', { method: 'POST' }))
     ).data.id;
 
     // Delete the baseline.
@@ -1105,7 +1106,7 @@ describe('Studio API: Evals', () => {
       body: JSON.stringify({ baselineId, candidateId }),
     });
     expect(res.status).toBe(404);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.error.message).toContain(baselineId);
   });
 
@@ -1122,7 +1123,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.evalRunId).toBeDefined();
     expect(typeof body.data.evalRunId).toBe('string');
@@ -1131,7 +1132,7 @@ describe('Studio API: Evals', () => {
     // Give the async eval a moment to complete so history gets populated
     await new Promise((resolve) => setTimeout(resolve, 100));
     const histRes = await app.request('/api/evals/history');
-    const histBody = await histRes.json();
+    const histBody = await readJson(histRes);
     expect(histBody.data.length).toBeGreaterThan(0);
   });
 
@@ -1149,12 +1150,12 @@ describe('Studio API: Evals', () => {
       body: JSON.stringify({ runs: 3, stream: true }),
     });
     expect(res.status).toBe(200);
-    expect((await res.json()).data.evalRunId).toBeDefined();
+    expect((await readJson(res)).data.evalRunId).toBeDefined();
 
     // Wait for async completion
     await new Promise((resolve) => setTimeout(resolve, 200));
     const histRes = await app.request('/api/evals/history');
-    const histBody = await histRes.json();
+    const histBody = await readJson(histRes);
     // Multi-run produces N individual entries (each run saved separately)
     expect(histBody.data.length).toBe(3);
   });
@@ -1166,7 +1167,7 @@ describe('Studio API: Evals', () => {
       method: 'POST',
     });
     expect(res.status).toBe(404);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.error.code).toBe('NOT_FOUND');
   });
 
@@ -1175,7 +1176,7 @@ describe('Studio API: Evals', () => {
 
     const res = await app.request('/api/evals/runs/any-id/cancel', { method: 'POST' });
     expect(res.status).toBe(405);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('READ_ONLY');
   });
@@ -1198,19 +1199,23 @@ describe('Studio API: Evals', () => {
       body: JSON.stringify({ stream: true }),
     });
     expect(res.status).toBe(200);
-    const evalRunId = ((await res.json()) as any).data.evalRunId;
+    const evalRunId = (await readJson(res)).data.evalRunId;
 
     // Cancel while the eval is still running (provider is blocked)
     const cancelRes = await app.request(`/api/evals/runs/${evalRunId}/cancel`, {
       method: 'POST',
     });
     expect(cancelRes.status).toBe(200);
-    const cancelBody = await cancelRes.json();
+    const cancelBody = await readJson(cancelRes);
     expect(cancelBody.ok).toBe(true);
     expect((cancelBody as any).data.cancelled).toBe(true);
 
-    // Unblock the provider so the async IIFE can complete
-    resolveCall?.();
+    // Unblock the provider so the async IIFE can complete.
+    // Cast: TS's CFA narrows `resolveCall` to `null` because the assignment
+    // happens in a closure that hasn't run from CFA's point of view; at
+    // runtime the provider has executed and assigned `resolveCall` before
+    // the cancel REST call returns.
+    (resolveCall as null | (() => void))?.();
 
     // Second cancel should 404 — the run was already cleaned up
     const cancelRes2 = await app.request(`/api/evals/runs/${evalRunId}/cancel`, {
@@ -1228,7 +1233,7 @@ describe('Studio API: Evals', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     // Synchronous mode returns the full result, not an evalRunId
     expect(body.data.evalRunId).toBeUndefined();
@@ -1276,8 +1281,8 @@ describe('Studio API: Evals', () => {
     expect(res.status).toBe(200);
 
     const histRes = await app.request('/api/evals/history');
-    const histBody = await histRes.json();
-    const id = (await res.json()).data.id;
+    const histBody = await readJson(histRes);
+    const id = (await readJson(res)).data.id;
     const entry = histBody.data.find((e: { id: string }) => e.id === id);
     expect(entry.data._multiRun).toBeDefined();
     expect(entry.data._multiRun.allRuns.length).toBe(3);

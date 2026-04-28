@@ -718,17 +718,21 @@ describe('trace events', () => {
 
     await runtime.execute('named-workflow', {});
 
-    const startEvent = traces.find((t) => t.type === 'workflow_start');
-    const endEvent = traces.find((t) => t.type === 'workflow_end');
+    const startEvent = traces.find(
+      (t): t is Extract<AxlEvent, { type: 'workflow_start' }> => t.type === 'workflow_start',
+    );
+    const endEvent = traces.find(
+      (t): t is Extract<AxlEvent, { type: 'workflow_end' }> => t.type === 'workflow_end',
+    );
 
     expect(startEvent).toBeDefined();
     expect(startEvent!.workflow).toBe('named-workflow');
 
     expect(endEvent).toBeDefined();
     expect(endEvent!.workflow).toBe('named-workflow');
-    expect((endEvent!.data as any).status).toBe('completed');
+    expect(endEvent!.data.status).toBe('completed');
     // result is captured on completed end events
-    expect((endEvent!.data as any).result).toBe('ok');
+    expect(endEvent!.data.result).toBe('ok');
   });
 });
 
@@ -2069,6 +2073,147 @@ describe('budget exhaustion mid-workflow (workflow_end pairing)', () => {
     expect(ends[0].data.status).toBe('failed');
     // BudgetExceededError is NOT an AbortError, so `aborted` must NOT be set.
     expect(ends[0].data.aborted).toBeUndefined();
+  });
+
+  it('concurrent ctx.spawn under budget exhaustion: branches emit ask_end({ok:false}), exactly one workflow_end({failed})', async () => {
+    // Pin the COMBINED behavior of `ctx.spawn` (concurrent branches sharing a
+    // budget) under hard_stop budget exhaustion:
+    //   • Each branch's `ctx.ask` calls eventually hit
+    //     `executeAgentCall`'s `budgetContext.exceeded` check and throw
+    //     BudgetExceededError.
+    //   • Because `ctx.ask` wraps in try/finally, the failing ask emits
+    //     `ask_end({outcome.ok: false})` per spec §9.
+    //   • The error propagates up: spawn (default no-quorum) catches
+    //     per-branch errors into Result.ok:false, so the workflow
+    //     unwraps and re-throws BudgetExceededError manually.
+    //   • Runtime.execute() catches and emits exactly ONE
+    //     `workflow_end({status:'failed'})` (matching idempotency
+    //     invariants pinned elsewhere in this file).
+    //
+    // Cost shape: 3 branches × 2 sequential ctx.ask each. Each ask costs
+    // $0.10. Budget limit: $0.15. After 2 of the first-round asks finish,
+    // totalCost = $0.20 > $0.15 → exceeded=true. The remaining asks
+    // (whether second-round or stragglers) trip the exceeded check.
+    const provider = new TestProvider([
+      { content: 'a', cost: 0.1 },
+      { content: 'b', cost: 0.1 },
+      { content: 'c', cost: 0.1 },
+      { content: 'd', cost: 0.1 },
+      { content: 'e', cost: 0.1 },
+      { content: 'f', cost: 0.1 },
+    ]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    runtime.register(
+      workflow({
+        name: 'spawn-budget-exhaust',
+        input: z.object({}),
+        handler: async (ctx) => {
+          const result = await ctx.budget({ cost: '$0.15', onExceed: 'hard_stop' }, async () =>
+            ctx.spawn(3, async () => {
+              // Two sequential asks per branch — guarantees the budget
+              // trips on a later call (the first round's accumulated
+              // cost from sibling branches will set `exceeded`).
+              await ctx.ask(testAgent, 'q1');
+              await ctx.ask(testAgent, 'q2');
+              return 'branch-ok';
+            }),
+          );
+          // ctx.budget swallows BudgetExceededError into the result; the
+          // workflow re-throws so runtime.execute() emits workflow_end(failed).
+          if (result.budgetExceeded) {
+            const { BudgetExceededError } = await import('../errors.js');
+            throw new BudgetExceededError(0.15, result.totalCost, 'hard_stop');
+          }
+          return result.value;
+        },
+      }),
+    );
+
+    const askEnds: Array<Extract<AxlEvent, { type: 'ask_end' }>> = [];
+    const wfEnds: Array<Extract<AxlEvent, { type: 'workflow_end' }>> = [];
+    runtime.on('trace', (event: AxlEvent) => {
+      if (event.type === 'ask_end') askEnds.push(event);
+      else if (event.type === 'workflow_end') wfEnds.push(event);
+    });
+
+    await expect(runtime.execute('spawn-budget-exhaust', {})).rejects.toThrow(/budget/i);
+
+    // At least one branch's ctx.ask threw BudgetExceededError mid-spawn,
+    // surfacing as ask_end({outcome.ok: false}) per spec §9.
+    const failedAsks = askEnds.filter((e) => e.outcome.ok === false);
+    expect(failedAsks.length).toBeGreaterThan(0);
+
+    // Exactly ONE workflow_end fired, with status: 'failed'. Matches the
+    // idempotency invariants pinned for sequential budget exhaustion above.
+    expect(wfEnds).toHaveLength(1);
+    expect(wfEnds[0].data.status).toBe('failed');
+    expect(wfEnds[0].data.error).toMatch(/budget/i);
+
+    // abortControllers map is cleaned up after execute() resolves
+    // (the finally block at runtime.ts:778-780).
+    expect(
+      (runtime as unknown as { abortControllers: Map<string, AbortController> }).abortControllers
+        .size,
+    ).toBe(0);
+  });
+
+  it('budget hard_stop sets workflow_end.aborted=false (NOT a user AbortError)', async () => {
+    // The aborted flag on workflow_end is reserved for genuine
+    // AbortSignal cancellation (user-driven). Budget hard_stop
+    // internally fires an AbortController to cancel in-flight
+    // operations — but the resulting BudgetExceededError must NOT
+    // be classified as `aborted: true`. This test pins the
+    // distinction: budget exhaustion → status:'failed' AND
+    // `aborted` is undefined/false (the runtime catch only sets
+    // `aborted: true` when err.name === 'AbortError').
+    const provider = new TestProvider([
+      { content: 'a', cost: 0.1 },
+      { content: 'b', cost: 0.1 },
+      { content: 'c', cost: 0.1 },
+      { content: 'd', cost: 0.1 },
+    ]);
+    const { runtime } = createRuntime(provider);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    runtime.register(
+      workflow({
+        name: 'budget-hard-stop-aborted-flag',
+        input: z.object({}),
+        handler: async (ctx) => {
+          const result = await ctx.budget({ cost: '$0.15', onExceed: 'hard_stop' }, async () => {
+            // Two sequential asks: first succeeds, second exhausts and
+            // would in turn cause the third (here represented by the
+            // catch path inside ctx.budget) to short-circuit.
+            await ctx.ask(testAgent, 'q1');
+            await ctx.ask(testAgent, 'q2');
+            return await ctx.ask(testAgent, 'q3');
+          });
+          if (result.budgetExceeded) {
+            const { BudgetExceededError } = await import('../errors.js');
+            throw new BudgetExceededError(0.15, result.totalCost, 'hard_stop');
+          }
+          return result.value;
+        },
+      }),
+    );
+
+    const wfEnds: Array<Extract<AxlEvent, { type: 'workflow_end' }>> = [];
+    runtime.on('trace', (event: AxlEvent) => {
+      if (event.type === 'workflow_end') wfEnds.push(event);
+    });
+
+    await expect(runtime.execute('budget-hard-stop-aborted-flag', {})).rejects.toThrow(/budget/i);
+
+    expect(wfEnds).toHaveLength(1);
+    expect(wfEnds[0].data.status).toBe('failed');
+    // The /budget/i error message is pinned to disambiguate from a generic throw.
+    expect(wfEnds[0].data.error).toMatch(/budget/i);
+    // KEY ASSERTION: aborted must NOT be true. BudgetExceededError is
+    // NOT an AbortError, so the runtime catch path leaves `aborted`
+    // unset (the runtime sets it ONLY when err.name === 'AbortError').
+    expect(wfEnds[0].data.aborted).toBeFalsy();
   });
 });
 

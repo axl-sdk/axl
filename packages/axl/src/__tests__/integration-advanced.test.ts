@@ -109,7 +109,10 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       }
 
       // Should have made at least 2 calculator calls
-      const toolCalls = traces.filter((t) => t.type === 'tool_call_end' && t.tool === 'calculator');
+      const toolCalls = traces.filter(
+        (t): t is Extract<AxlEvent, { type: 'tool_call_end' }> =>
+          t.type === 'tool_call_end' && t.tool === 'calculator',
+      );
       expect(toolCalls.length).toBeGreaterThanOrEqual(2);
     },
   );
@@ -386,12 +389,17 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
     });
 
     // Verify handoff_start trace was emitted (always fires with target/mode).
-    const handoffs = traces.filter((t) => t.type === 'handoff_start');
+    const handoffs = traces.filter(
+      (t): t is Extract<AxlEvent, { type: 'handoff_start' }> => t.type === 'handoff_start',
+    );
     expect(handoffs.length).toBeGreaterThanOrEqual(1);
-    expect((handoffs[0].data as any)?.target).toBe('math_expert');
+    expect(handoffs[0].data.target).toBe('math_expert');
 
     // Calculator should have been used by the math expert
-    const toolCalls = traces.filter((t) => t.type === 'tool_call_end' && t.tool === 'calculator');
+    const toolCalls = traces.filter(
+      (t): t is Extract<AxlEvent, { type: 'tool_call_end' }> =>
+        t.type === 'tool_call_end' && t.tool === 'calculator',
+    );
     expect(toolCalls.length).toBeGreaterThanOrEqual(1);
 
     expect(String(result)).toContain('221');
@@ -439,7 +447,9 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
     expect(String(result)).toContain('100');
 
     // Verify the trace recorded the model URI
-    const agentCalls = traces.filter((t) => t.type === 'agent_call_end');
+    const agentCalls = traces.filter(
+      (t): t is Extract<AxlEvent, { type: 'agent_call_end' }> => t.type === 'agent_call_end',
+    );
     expect(agentCalls.length).toBeGreaterThan(0);
     expect(agentCalls[0].model).toBe(model);
   });
@@ -710,7 +720,10 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       expect(result.result).toBe(50);
 
       // Multiple calculator tool calls should have been made (one per agent)
-      const toolCalls = traces.filter((t) => t.type === 'tool_call_end' && t.tool === 'calculator');
+      const toolCalls = traces.filter(
+        (t): t is Extract<AxlEvent, { type: 'tool_call_end' }> =>
+          t.type === 'tool_call_end' && t.tool === 'calculator',
+      );
       expect(toolCalls.length).toBeGreaterThanOrEqual(2);
     },
     60_000,
@@ -758,7 +771,9 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       // and fewer than 10 agent_call traces should exist
       expect(result.value).toBeNull();
       expect(result.totalCost).toBeGreaterThan(0);
-      const agentCalls = traces.filter((t) => t.type === 'agent_call_end');
+      const agentCalls = traces.filter(
+        (t): t is Extract<AxlEvent, { type: 'agent_call_end' }> => t.type === 'agent_call_end',
+      );
       expect(agentCalls.length).toBeLessThan(10);
     } else {
       // Provider didn't report cost — all 10 calls completed normally
@@ -821,7 +836,9 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       caughtError = err;
     }
 
-    const toolCalls = traces.filter((t) => t.type === 'tool_call_end');
+    const toolCalls = traces.filter(
+      (t): t is Extract<AxlEvent, { type: 'tool_call_end' }> => t.type === 'tool_call_end',
+    );
     if (toolCalls.length > 0) {
       // Agent used a tool → with maxTurns:1 the loop exits → MaxTurnsError required
       expect(caughtError).toBeInstanceOf(MaxTurnsError);
@@ -997,7 +1014,9 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
     });
 
     expect(String(result)).toContain('15');
-    const toolCalls = traces.filter((t) => t.type === 'tool_call_end');
+    const toolCalls = traces.filter(
+      (t): t is Extract<AxlEvent, { type: 'tool_call_end' }> => t.type === 'tool_call_end',
+    );
     expect(toolCalls.length).toBeGreaterThanOrEqual(2);
     const toolNames = toolCalls.map((t) => t.tool);
     expect(toolNames).toContain('failing_tool');
@@ -1051,10 +1070,12 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       // Two handoff_start events expected: router → specialist, then
       // specialist → calculator_agent. Both are always emitted regardless
       // of mode.
-      const handoffs = traces.filter((t) => t.type === 'handoff_start');
+      const handoffs = traces.filter(
+        (t): t is Extract<AxlEvent, { type: 'handoff_start' }> => t.type === 'handoff_start',
+      );
       expect(handoffs.length).toBeGreaterThanOrEqual(2);
 
-      const targets = handoffs.map((h) => (h.data as any)?.target);
+      const targets = handoffs.map((h) => h.data.target);
       expect(targets).toContain('specialist');
       expect(targets).toContain('calculator_agent');
 

@@ -309,7 +309,7 @@ function AskNodeRow(props: {
         >
           {node.status}
         </span>
-        <span className="font-medium truncate" title={node.askId}>
+        <span data-testid="ask-node-agent" className="font-medium truncate" title={node.askId}>
           {node.agent ?? '<unknown>'}
         </span>
         {node.model && (

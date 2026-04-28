@@ -30,7 +30,7 @@ import type {
 import { eventCostContribution } from './event-utils.js';
 import { NoopSpanManager } from './telemetry/noop.js';
 import { createSpanManager } from './telemetry/index.js';
-import type { SpanManager } from './telemetry/types.js';
+import type { SpanManager, SpanHandle } from './telemetry/types.js';
 
 /** Simple DJB2 hash of input for span correlation. */
 function hashInput(input: unknown): string {
@@ -45,6 +45,16 @@ function hashInput(input: unknown): string {
 /** Default cap on `ExecutionInfo.events` per execution. Can be
  *  overridden via `config.state.maxEventsPerExecution`. */
 const DEFAULT_MAX_EVENTS_PER_EXECUTION = 50_000;
+
+/** Detect AbortError from both `DOMException` (browser / Node fetch path)
+ *  and a plain `Error` with `name === 'AbortError'` (signal.throwIfAborted,
+ *  user-thrown abort). A strict instanceof check misses cancellations
+ *  thrown by other code paths. */
+function isAbortError(err: unknown): boolean {
+  return (
+    typeof err === 'object' && err !== null && (err as { name?: unknown }).name === 'AbortError'
+  );
+}
 
 /** Bounded push to `execInfo.events`. Skips high-volume stream-only
  *  variants (token, partial_object — never persisted).
@@ -263,6 +273,86 @@ export class AxlRuntime extends EventEmitter {
       case 'memory':
       default:
         return new MemoryStore();
+    }
+  }
+
+  /**
+   * Run a workflow body inside an ALREADY-CONSTRUCTED `WorkflowContext`
+   * with full lifecycle invariants: emit `workflow_start` → run handler
+   * → parse output → emit `workflow_end` → delete checkpoints → persist.
+   *
+   * Shared between `execute()` and `stream()`. Centralizes the
+   * "start iff end" pairing invariant so a future emit path
+   * (e.g., `resumeExecution`) can inherit correct behavior by routing
+   * through this helper. Also factors out the AbortError detection.
+   *
+   * Side effects on `execInfo`: sets `status` / `completedAt` /
+   * `duration` / `result` (or `error`) before emitting `workflow_end`.
+   * On throw: emits `workflow_end({status: 'failed', aborted?})` and
+   * persists before rethrowing. `abortControllers.delete` runs in
+   * `finally` regardless of outcome.
+   *
+   * Caller responsibilities:
+   * - Allocate `executionId` and register it in `abortControllers` map
+   *   BEFORE calling this helper (so early-throw paths still have a
+   *   correlation id available for terminal events).
+   * - Construct `execInfo` and `ctx` before calling.
+   * - Pass `span` if the call site is inside a tracer span — this
+   *   helper sets `axl.workflow.cost` / `.duration` attributes on
+   *   success.
+   */
+  private async runWorkflowBody(args: {
+    workflow: AnyWorkflow;
+    ctx: WorkflowContext;
+    execInfo: ExecutionInfo;
+    validated: unknown;
+    span?: SpanHandle;
+  }): Promise<unknown> {
+    const { workflow, ctx, execInfo, validated, span } = args;
+    try {
+      // Spec/16 §3.6a: workflow_start is a first-class trace event
+      // emitted inside the span context so OTel exporters that correlate
+      // events to spans via active-context see it.
+      ctx._emitWorkflowStart(validated);
+      const raw = await workflow.handler(ctx);
+      const result = workflow.outputSchema ? workflow.outputSchema.parse(raw) : raw;
+
+      execInfo.status = 'completed';
+      execInfo.completedAt = Date.now();
+      execInfo.duration = execInfo.completedAt - execInfo.startedAt;
+      execInfo.result = result;
+      ctx._emitWorkflowEnd({
+        status: 'completed',
+        duration: execInfo.duration,
+        result,
+      });
+
+      // Clean up checkpoints for completed execution
+      if (this.stateStore.deleteCheckpoints) {
+        await this.stateStore.deleteCheckpoints(execInfo.executionId);
+      }
+
+      span?.setAttribute('axl.workflow.cost', execInfo.totalCost);
+      span?.setAttribute('axl.workflow.duration', execInfo.duration);
+
+      this.persistExecution(execInfo);
+      return result;
+    } catch (err) {
+      const aborted = isAbortError(err);
+      execInfo.status = 'failed';
+      execInfo.completedAt = Date.now();
+      execInfo.duration = execInfo.completedAt - execInfo.startedAt;
+      execInfo.error = err instanceof Error ? err.message : String(err);
+      ctx._emitWorkflowEnd({
+        status: 'failed',
+        duration: execInfo.duration,
+        error: execInfo.error,
+        ...(aborted ? { aborted: true } : {}),
+      });
+      this.persistExecution(execInfo);
+      throw err;
+    } finally {
+      this.abortControllers.delete(execInfo.executionId);
     }
   }
 
@@ -722,63 +812,14 @@ export class AxlRuntime extends EventEmitter {
         'axl.execution.id': executionId,
         'axl.workflow.input_hash': hashInput(validated),
       },
-      async (span) => {
-        try {
-          // Emit workflow_start inside the span context so OTel exporters
-          // that correlate trace events to spans via active-context see it.
-          // BREAKING CHANGE from v0.14.x — previously emitted as
-          // `type: 'log'` with `data.event: 'workflow_start'`.
-          ctx._emitWorkflowStart(validated);
-          const result = await workflow.handler(ctx);
-
-          // Validate (and coerce) output if schema exists
-          const output = workflow.outputSchema ? workflow.outputSchema.parse(result) : result;
-
-          execInfo.status = 'completed';
-          execInfo.completedAt = Date.now();
-          execInfo.duration = execInfo.completedAt - execInfo.startedAt;
-          execInfo.result = output;
-          ctx._emitWorkflowEnd({
-            status: 'completed',
-            duration: execInfo.duration,
-            result: output,
-          });
-
-          // Clean up checkpoints for completed execution
-          if (this.stateStore.deleteCheckpoints) {
-            await this.stateStore.deleteCheckpoints(executionId);
-          }
-
-          span.setAttribute('axl.workflow.cost', execInfo.totalCost);
-          span.setAttribute('axl.workflow.duration', execInfo.duration);
-
-          this.persistExecution(execInfo);
-          return output;
-        } catch (err) {
-          // Detect AbortError from both `DOMException` (browser / Node fetch path)
-          // and a plain `Error` with `name === 'AbortError'` (signal.throwIfAborted,
-          // user-thrown abort). A strict instanceof check misses cancellations
-          // thrown by other code paths.
-          const aborted =
-            typeof err === 'object' &&
-            err !== null &&
-            (err as { name?: unknown }).name === 'AbortError';
-          execInfo.status = 'failed';
-          execInfo.completedAt = Date.now();
-          execInfo.duration = execInfo.completedAt - execInfo.startedAt;
-          execInfo.error = err instanceof Error ? err.message : String(err);
-          ctx._emitWorkflowEnd({
-            status: 'failed',
-            duration: execInfo.duration,
-            error: execInfo.error,
-            ...(aborted ? { aborted: true } : {}),
-          });
-          this.persistExecution(execInfo);
-          throw err;
-        } finally {
-          this.abortControllers.delete(executionId);
-        }
-      },
+      (span) =>
+        this.runWorkflowBody({
+          workflow,
+          ctx,
+          execInfo,
+          validated,
+          span,
+        }),
     );
   }
 
@@ -798,12 +839,11 @@ export class AxlRuntime extends EventEmitter {
     // correlating the terminal event with the execution.
     const executionId = randomUUID();
     this.abortControllers.set(executionId, controller);
-    // ctx is captured by the closure so the catch handler can call
-    // `_emitWorkflowEnd` on it. `execInfo` is also closure-captured but
+    // `execInfo` is closure-captured for the outer `.catch` so it can
+    // tell whether the early-throw safety net needs to fire (it's
     // allocated inside `run()` — the catch path is defensive about
-    // running before `execInfo` is assigned.
+    // running before `execInfo` is assigned).
     let execInfo: ExecutionInfo | undefined;
-    let ctx: WorkflowContext | undefined;
 
     const run = async () => {
       const workflow = this.workflows.get(name);
@@ -909,79 +949,45 @@ export class AxlRuntime extends EventEmitter {
           'axl.execution.id': executionId,
           'axl.workflow.input_hash': hashInput(validated),
         },
-        async (span) => {
-          try {
-            // Parity fix: stream() used to never emit workflow_start
-            // (execute() did). Now both code paths emit it inside the span
-            // context as a first-class trace event.
-            //
-            // Invariant: `ctx` is captured by the outer `.catch(err => …)`
-            // to fire `workflow_end(failed)` on failures. We assign it
-            // ONLY after `_emitWorkflowStart` succeeds so the catch
-            // handler never emits `workflow_end` without a preceding
-            // `workflow_start` — pairing is unconditional.
-            wfCtx._emitWorkflowStart(validated);
-            ctx = wfCtx;
-            const rawResult = await workflow.handler(wfCtx);
-            const result = workflow.outputSchema
-              ? workflow.outputSchema.parse(rawResult)
-              : rawResult;
-
-            execInfo!.status = 'completed';
-            execInfo!.completedAt = Date.now();
-            execInfo!.duration = execInfo!.completedAt - execInfo!.startedAt;
-            execInfo!.result = result;
-            wfCtx._emitWorkflowEnd({
-              status: 'completed',
-              duration: execInfo!.duration,
-              result,
-            });
-
-            // Clean up checkpoints for completed execution
-            if (this.stateStore.deleteCheckpoints) {
-              await this.stateStore.deleteCheckpoints(executionId);
-            }
-
-            span.setAttribute('axl.workflow.cost', execInfo!.totalCost);
-            span.setAttribute('axl.workflow.duration', execInfo!.duration);
-
-            this.persistExecution(execInfo!);
-            return result;
-          } finally {
-            this.abortControllers.delete(executionId);
-          }
-        },
+        (span) =>
+          this.runWorkflowBody({
+            workflow,
+            ctx: wfCtx,
+            execInfo: execInfo!,
+            validated,
+            span,
+          }),
       );
     };
 
     run()
       .then((result) => axlStream._done(result, executionId))
       .catch((err) => {
-        // Update execution status on error
-        if (execInfo) {
-          // Detect AbortError from both `DOMException` (browser / Node fetch path)
-          // and a plain `Error` with `name === 'AbortError'` (signal.throwIfAborted,
-          // user-thrown abort). A strict instanceof check misses cancellations
-          // thrown by other code paths.
-          const aborted =
-            typeof err === 'object' &&
-            err !== null &&
-            (err as { name?: unknown }).name === 'AbortError';
+        // Early-throw safety net: if `runWorkflowBody` was never reached
+        // (input parse, ctx construction, or registry lookup threw before
+        // it ran), `execInfo.status` is still 'running' — the helper's
+        // lifecycle emit/persist/cleanup didn't happen. Update + persist
+        // here. If the helper DID run, it left status as 'failed' and
+        // already persisted; we skip redundant work.
+        if (execInfo && execInfo.status === 'running') {
           execInfo.status = 'failed';
           execInfo.completedAt = Date.now();
           execInfo.duration = execInfo.completedAt - execInfo.startedAt;
           execInfo.error = err instanceof Error ? err.message : String(err);
-          ctx?._emitWorkflowEnd({
-            status: 'failed',
-            duration: execInfo.duration,
-            error: execInfo.error,
-            ...(aborted ? { aborted: true } : {}),
-          });
+          // No `ctx` available on this path — `wfCtx` lives inside the
+          // run() closure and was never assigned to a closure variable.
+          // workflow_start was also never emitted (helper hadn't run),
+          // so the start↔end pairing invariant holds: neither emitted.
+          // `isAbortError` doesn't apply here either: `aborted: true` is
+          // documented as "user-driven cancellation that reached an
+          // emitted workflow_end". With no workflow_end, there's no
+          // place to set the flag.
           this.persistExecution(execInfo);
         }
         // Clean up the abort controller even on pre-execInfo throws
-        // (e.g., "workflow not registered") — the successful path clears
-        // it in the `finally` inside `run`, but early-throw never gets there.
+        // (e.g., "workflow not registered") — the helper's `finally`
+        // clears it on the success path, but early-throw never reaches
+        // the helper.
         this.abortControllers.delete(executionId);
         axlStream._error(err instanceof Error ? err : new Error(String(err)), executionId);
       });

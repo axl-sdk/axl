@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { agent, workflow } from '@axlsdk/axl';
+import { agent, workflow, type AxlEvent } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
 import { createTestRuntime } from '../helpers/setup.js';
 
@@ -53,7 +53,9 @@ describe('Handoffs E2E', () => {
     // `handoff_start` always fires before the target ask begins; oneway
     // handoffs emit no `handoff_return` because control doesn't return
     // to the source.
-    const handoffTraces = traces.filter((t) => t.type === 'handoff_start');
+    const handoffTraces = traces.filter(
+      (t): t is Extract<AxlEvent, { type: 'handoff_start' }> => t.type === 'handoff_start',
+    );
     expect(handoffTraces.length).toBeGreaterThanOrEqual(1);
   });
 
@@ -155,10 +157,11 @@ describe('Handoffs E2E', () => {
     const result = await runtime.execute('delegate-wf', { question: 'What is my balance?' });
     expect(result).toBe('Your balance is $100');
 
-    const delegateTraces = traces.filter((t) => t.type === 'delegate');
+    const delegateTraces = traces.filter(
+      (t): t is Extract<AxlEvent, { type: 'delegate' }> => t.type === 'delegate',
+    );
     expect(delegateTraces.length).toBe(1);
-    const data = delegateTraces[0].data as Record<string, unknown>;
-    expect(data.candidates).toEqual(['billing', 'shipping']);
+    expect(delegateTraces[0].data.candidates).toEqual(['billing', 'shipping']);
   });
 
   it('handoff trace events include correct target', async () => {
@@ -206,10 +209,10 @@ describe('Handoffs E2E', () => {
 
     // `handoff_start.data.target` names the destination agent; fired
     // before the target ask begins.
-    const handoffTraces = traces.filter((t) => t.type === 'handoff_start');
+    const handoffTraces = traces.filter(
+      (t): t is Extract<AxlEvent, { type: 'handoff_start' }> => t.type === 'handoff_start',
+    );
     expect(handoffTraces.length).toBeGreaterThanOrEqual(1);
-    const handoff = handoffTraces[0];
-    const data = handoff.data as Record<string, unknown>;
-    expect(data.target).toBe('trace-target');
+    expect(handoffTraces[0].data.target).toBe('trace-target');
   });
 });

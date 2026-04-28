@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { workflow, agent, tool } from '@axlsdk/axl';
+import type { AxlEvent } from '@axlsdk/axl';
 import { AxlTestRuntime, MockProvider } from '../index.js';
 
 // ── Test Fixtures ────────────────────────────────────────────────────────────
@@ -317,7 +318,8 @@ describe('AxlTestRuntime', () => {
       expect(logs.length).toBeGreaterThanOrEqual(1);
 
       const receivedLog = logs.find(
-        (l) => l.type === 'log' && (l.data as any)?.event === 'received_input',
+        (l): l is Extract<AxlEvent, { type: 'log' }> =>
+          l.type === 'log' && (l.data as any)?.event === 'received_input',
       );
       expect(receivedLog).toBeDefined();
       expect((receivedLog!.data as any).greeting).toEqual('Test');
@@ -337,7 +339,10 @@ describe('AxlTestRuntime', () => {
 
       // Second execution should not include first execution's logs
       const inputs = secondLogs
-        .filter((l) => l.type === 'log' && (l.data as any)?.event === 'received_input')
+        .filter(
+          (l): l is Extract<AxlEvent, { type: 'log' }> =>
+            l.type === 'log' && (l.data as any)?.event === 'received_input',
+        )
         .map((l) => (l.data as any).greeting);
       expect(inputs).toEqual(['Second']);
     });
@@ -777,6 +782,45 @@ describe('AxlTestRuntime', () => {
       expect(endData.error).toBe('cancelled');
       expect(endData.aborted).toBe(true);
     });
+
+    it('redacts workflow_end.error when redact:true AND the workflow fails (combined invariant)', async () => {
+      // Two parity fixes interact here:
+      //   (a) AxlTestRuntime emits workflow_start/workflow_end through
+      //       `_emitWorkflowStart`/`_emitWorkflowEnd`, so redaction applies.
+      //   (b) The failure path emits workflow_end({status:'failed'}) with
+      //       `error` in `data`.
+      // Each is tested individually above, but a future regression in
+      // either one would silently break PII protection on the failure
+      // path. This test pins the COMBINED case so the failure-side
+      // `error` field is scrubbed when redact is enabled.
+      const runtime = new AxlTestRuntime({
+        config: { trace: { redact: true } },
+      });
+      runtime.register(SecretThrowingWorkflow);
+
+      await expect(runtime.execute('SecretThrowing', { secret: 'hunter2' })).rejects.toThrow(
+        'leaked secret hunter2',
+      );
+
+      const startEvents = runtime.traceLog().filter((t) => t.type === 'workflow_start');
+      const endEvents = runtime.traceLog().filter((t) => t.type === 'workflow_end');
+
+      expect(startEvents).toHaveLength(1);
+      expect(endEvents).toHaveLength(1);
+
+      const startData = startEvents[0].data as Record<string, unknown>;
+      const endData = endEvents[0].data as Record<string, unknown>;
+
+      // input on workflow_start is scrubbed (the `{ secret }` object).
+      expect(startData.input).toBe('[redacted]');
+
+      // workflow_end carries the failure outcome with redaction applied.
+      expect(endData.status).toBe('failed');
+      // The error message contains the secret — must be scrubbed.
+      expect(endData.error).toBe('[redacted]');
+      // Plain failures (not AbortError) leave `aborted` unset.
+      expect(endData.aborted).toBeUndefined();
+    });
   });
 });
 
@@ -804,6 +848,17 @@ const AbortingWorkflow = workflow({
     const err = new Error('cancelled');
     err.name = 'AbortError';
     throw err;
+  },
+});
+
+// Throws an error whose message embeds the input secret — pins that
+// `workflow_end.data.error` is scrubbed under redact:true on the
+// failure path (combined invariant: failure path + redaction).
+const SecretThrowingWorkflow = workflow({
+  name: 'SecretThrowing',
+  input: z.object({ secret: z.string() }),
+  handler: async (ctx) => {
+    throw new Error(`leaked secret ${(ctx.input as { secret: string }).secret}`);
   },
 });
 

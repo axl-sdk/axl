@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { agent, workflow } from '@axlsdk/axl';
+import { agent, workflow, type AxlEvent } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
 import { createTestRuntime } from '../helpers/setup.js';
 
@@ -350,7 +350,9 @@ describe('Thinking E2E', () => {
 
     await runtime.execute('trace-thinking-wf', { message: 'trace me' });
 
-    const agentCallTraces = traces.filter((t) => t.type === 'agent_call_end');
+    const agentCallTraces = traces.filter(
+      (t): t is Extract<AxlEvent, { type: 'agent_call_end' }> => t.type === 'agent_call_end',
+    );
     expect(agentCallTraces.length).toBeGreaterThanOrEqual(1);
   });
 });

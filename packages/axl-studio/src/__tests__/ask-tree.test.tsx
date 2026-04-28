@@ -354,7 +354,11 @@ describe('<AskTree />', () => {
     // target never reported back.
     expect(orphan!.getAttribute('data-status')).toBe('running');
     // Agent label falls back to the `target` field from the handoff data.
-    expect(within(orphan as HTMLElement).getByText('lost-specialist')).toBeInTheDocument();
+    // Locate via the stable `ask-node-agent` testid rather than getByText so
+    // the assertion isn't brittle to whitespace, label renames, or i18n.
+    expect(within(orphan as HTMLElement).getByTestId('ask-node-agent')).toHaveTextContent(
+      'lost-specialist',
+    );
   });
 
   it('does NOT synthesize a placeholder when the target has a real ask_start', () => {

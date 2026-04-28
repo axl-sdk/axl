@@ -65,8 +65,14 @@ export class AxlTestRuntime {
     this.mockProviders.set(name, provider);
   }
 
-  mockTool(name: string, handler: (input: unknown) => unknown | Promise<unknown>): void {
-    this.mockToolMap.set(name, MockTool.create(name, handler));
+  mockTool<TInput = unknown>(
+    name: string,
+    handler: (input: TInput) => unknown | Promise<unknown>,
+  ): void {
+    // The MockTool registry is type-erased (`(input: unknown) => unknown`)
+    // because the runtime can't statically know each tool's input shape; tests
+    // opt in to a typed input via the generic, and we cast on storage.
+    this.mockToolMap.set(name, MockTool.create(name, handler as (input: unknown) => unknown));
   }
 
   async execute(
@@ -151,7 +157,8 @@ export class AxlTestRuntime {
 
         if (event.type === 'tool_call_end' && event.data) {
           const { args, result } = event.data as { args: unknown; result: unknown };
-          this._toolCalls.push({ name: event.tool!, args, result });
+          // `tool: string` is required on `tool_call_end`; narrowing makes it non-null.
+          this._toolCalls.push({ name: event.tool, args, result });
         }
 
         // Single-source-of-truth cost accumulator. Skips ask_end

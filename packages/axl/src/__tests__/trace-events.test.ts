@@ -242,6 +242,9 @@ describe('trace events — nested child contexts (agent-as-tool)', () => {
     );
     expect(outerToolCall).toBeDefined();
 
+    // `parentToolCallId` is deprecated (slated for removal in 0.17.0) — these
+    // assertions exercise the back-compat field while it's still emitted, so
+    // existing telemetry consumers keep working through the deprecation window.
     const childEvents = traces.filter((t) => t.parentToolCallId === 'outer-tc-1');
     expect(childEvents.length).toBeGreaterThan(0);
     // The child agent's LLM call should be in that set
@@ -249,7 +252,7 @@ describe('trace events — nested child contexts (agent-as-tool)', () => {
       (t) => t.type === 'agent_call_end' && t.agent === 'child',
     );
     expect(childAgentCall).toBeDefined();
-    // Outer parent agent_call should NOT carry parentToolCallId
+    // Outer parent agent_call should NOT carry parentToolCallId (deprecated; see above)
     const parentAgentCall = traces.find((t) => t.type === 'agent_call_end' && t.agent === 'parent');
     expect(parentAgentCall!.parentToolCallId).toBeUndefined();
   });
@@ -387,7 +390,7 @@ describe('trace events — guardrail attempt tracking', () => {
     await ctx.ask(a, 'hi');
 
     const outputChecks = traces.filter(
-      (t) =>
+      (t): t is Extract<AxlEvent, { type: 'guardrail' }> =>
         t.type === 'guardrail' && (t.data as Record<string, unknown>)?.guardrailType === 'output',
     );
     expect(outputChecks).toHaveLength(2);
@@ -398,7 +401,9 @@ describe('trace events — guardrail attempt tracking', () => {
     expect(first.feedbackMessage).toContain('blocked by a safety guardrail');
 
     // Second agent_call should be tagged as a guardrail retry
-    const calls = traces.filter((t) => t.type === 'agent_call_end');
+    const calls = traces.filter(
+      (t): t is Extract<AxlEvent, { type: 'agent_call_end' }> => t.type === 'agent_call_end',
+    );
     expect((calls[1].data as Record<string, unknown>).retryReason).toBe('guardrail');
   });
 });
@@ -783,8 +788,14 @@ describe('trace events — workflow_start/end redaction', () => {
     await runtime.execute('success-wf', {});
     await expect(runtime.execute('failing-wf', {})).rejects.toThrow();
 
-    const successEnd = traces.find((t) => t.type === 'workflow_end' && t.workflow === 'success-wf');
-    const failedEnd = traces.find((t) => t.type === 'workflow_end' && t.workflow === 'failing-wf');
+    const successEnd = traces.find(
+      (t): t is Extract<AxlEvent, { type: 'workflow_end' }> =>
+        t.type === 'workflow_end' && t.workflow === 'success-wf',
+    );
+    const failedEnd = traces.find(
+      (t): t is Extract<AxlEvent, { type: 'workflow_end' }> =>
+        t.type === 'workflow_end' && t.workflow === 'failing-wf',
+    );
     expect(successEnd).toBeDefined();
     expect(failedEnd).toBeDefined();
 
@@ -1222,7 +1233,8 @@ describe('trace events — redaction', () => {
     await ctx.ask(a, 'hi', { schema: z.object({ answer: z.string() }) });
 
     const failed = traces.find(
-      (t) => t.type === 'schema_check' && (t.data as Record<string, unknown>).valid === false,
+      (t): t is Extract<AxlEvent, { type: 'schema_check' }> =>
+        t.type === 'schema_check' && (t.data as Record<string, unknown>).valid === false,
     );
     expect(failed).toBeDefined();
     const data = failed!.data as Record<string, unknown>;

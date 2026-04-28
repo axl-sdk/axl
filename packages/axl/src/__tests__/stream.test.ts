@@ -664,6 +664,108 @@ describe('AxlStream', () => {
 
       expect(chunks.map((c) => c.text)).toEqual(['hi', ' there']);
     });
+
+    it('groups chunks by askId across two concurrent siblings at the same depth (parallel root-level asks)', async () => {
+      // The per-askId fullText fix landed in 0.16.x replaced the global
+      // `currentAttemptTokens`/`committedText` with per-askId Maps, so
+      // sibling branches in `ctx.parallel` no longer interleave their
+      // commit/discard buffers. This pins that `.textByAsk` — the
+      // split-pane view that fans out per ask — also keeps each
+      // sibling's chunks correctly tagged with that sibling's askId.
+      //
+      // Setup: workflow runs `ctx.parallel(() => ctx.ask(A, ...),
+      // () => ctx.ask(B, ...))`. Both asks are at depth=0 (siblings),
+      // each emits multiple chunks. We assert (a) two distinct askIds
+      // appear, (b) chunks group cleanly by askId, (c) each lane's
+      // joined text equals the corresponding agent's full content with
+      // no cross-contamination.
+      const { AxlRuntime } = await import('../runtime.js');
+      const { workflow } = await import('../workflow.js');
+      const { agent } = await import('../agent.js');
+      const { z } = await import('zod');
+      const { MockProvider } = await import('../../../axl-testing/src/mock-provider.js');
+
+      const branchA = agent({
+        name: 'branch_a',
+        model: 'mock:test',
+        system: 'a',
+      });
+      const branchB = agent({
+        name: 'branch_b',
+        model: 'mock:test',
+        system: 'b',
+      });
+
+      // Two responses keyed by which agent fires each call. The two
+      // ctx.ask() calls execute concurrently under ctx.parallel, but
+      // MockProvider returns from `chat()` synchronously per-call, so
+      // the call order is deterministic in callIndex order. We use
+      // `MockProvider.fn` to dispatch by the system prompt so each
+      // branch always gets its own content regardless of interleaving.
+      const provider = MockProvider.fn((messages) => {
+        const sys = messages.find((m) => m.role === 'system')?.content ?? '';
+        if (sys === 'a') return { content: 'AAAAA' };
+        if (sys === 'b') return { content: 'BBBBB' };
+        throw new Error(`unexpected system prompt: ${sys}`);
+      });
+      // Configure chunked streaming so each branch emits multiple
+      // tokens — the contention case the per-askId fix actually exercises.
+      // `MockProvider.fn` doesn't set chunkSequence; reach in to set it.
+      (provider as unknown as { chunkSequence?: Array<string[] | undefined> }).chunkSequence = [
+        ['AA', 'AAA'],
+        ['BB', 'BBB'],
+      ];
+
+      const runtime = new AxlRuntime({ defaultProvider: 'mock' });
+      runtime.registerProvider('mock', provider);
+
+      const wf = workflow({
+        name: 'parallel-sibling-asks',
+        input: z.object({}),
+        handler: async (ctx) =>
+          ctx.parallel([() => ctx.ask(branchA, 'go-a'), () => ctx.ask(branchB, 'go-b')]),
+      });
+      runtime.register(wf);
+
+      const stream = runtime.stream('parallel-sibling-asks', {});
+      const chunks: Array<{ askId: string; agent?: string; text: string }> = [];
+      for await (const chunk of stream.textByAsk) {
+        chunks.push(chunk);
+      }
+      await stream.promise.catch(() => {});
+
+      // Group chunks by askId.
+      const byAskId = new Map<string, Array<{ agent?: string; text: string }>>();
+      for (const c of chunks) {
+        const arr = byAskId.get(c.askId) ?? [];
+        arr.push({ agent: c.agent, text: c.text });
+        byAskId.set(c.askId, arr);
+      }
+
+      // Two sibling asks → two distinct askIds (no chunks lost to a
+      // shared key, no chunks misattributed to one askId).
+      expect(byAskId.size).toBe(2);
+
+      // Each lane's chunks all carry the SAME agent label — no
+      // cross-contamination from the sibling's emitter.
+      for (const lane of byAskId.values()) {
+        const agents = new Set(lane.map((c) => c.agent));
+        expect(agents.size).toBe(1);
+      }
+
+      // Reconstruct each lane's text and pin it to the agent's full content.
+      const laneByAgent = new Map<string, string>();
+      for (const lane of byAskId.values()) {
+        const agentLabel = lane[0].agent!;
+        laneByAgent.set(agentLabel, lane.map((c) => c.text).join(''));
+      }
+      expect(laneByAgent.get('branch_a')).toBe('AAAAA');
+      expect(laneByAgent.get('branch_b')).toBe('BBBBB');
+
+      // Total chunk count: 2 from branch_a (chunks: ['AA','AAA']) +
+      // 2 from branch_b (['BB','BBB']) = 4. No duplication, no loss.
+      expect(chunks.length).toBe(4);
+    });
   });
 
   // ── Block B: Lifecycle exhaustiveness guard ─────────────────────────────

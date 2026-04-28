@@ -11,6 +11,7 @@ import { MockProvider } from '@axlsdk/testing';
 import { dataset, scorer } from '@axlsdk/eval';
 import { createStudioMiddleware } from '@axlsdk/studio/middleware';
 import { WebSocket } from 'ws';
+import { readJson } from '../helpers/json.js';
 
 function createTestRuntime() {
   const runtime = new AxlRuntime();
@@ -133,7 +134,7 @@ describe('Studio Middleware Integration', () => {
     // Test through Hono app directly
     const res = await studio.app.request('/api/health');
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.status).toBe('healthy');
     expect(body.data.workflows).toBe(1);
@@ -151,7 +152,7 @@ describe('Studio Middleware Integration', () => {
 
     const res = await fetch(`http://localhost:${port}/api/health`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as any;
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.status).toBe('healthy');
   });
@@ -163,7 +164,7 @@ describe('Studio Middleware Integration', () => {
     // API routes are still at /api/* relative to the app
     const res = await studio.app.request('/api/health');
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
   });
 
@@ -315,7 +316,7 @@ describe('Studio Middleware Integration', () => {
     // Returns 503 after close
     const res2 = await fetch(`http://localhost:${port}/api/health`);
     expect(res2.status).toBe(503);
-    const body = (await res2.json()) as any;
+    const body = await readJson(res2);
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('CLOSED');
   });
@@ -381,7 +382,7 @@ describe('Studio Middleware Integration', () => {
     });
 
     expect(res.status).toBe(200);
-    const body = (await res.json()) as any;
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.result).toBe('Hello, World!');
   });
@@ -406,7 +407,7 @@ describe('Studio Middleware Integration', () => {
     });
 
     expect(res.status).toBe(200);
-    const body = (await res.json()) as any;
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data._multiRun).toBeDefined();
     expect(body.data._multiRun.allRuns).toHaveLength(3);
@@ -437,7 +438,7 @@ describe('Studio Middleware Integration', () => {
     });
 
     expect(res.status).toBe(200);
-    const body = (await res.json()) as any;
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     // stream: true should return evalRunId, not the full result
     expect(body.data.evalRunId).toBeDefined();
@@ -447,7 +448,7 @@ describe('Studio Middleware Integration', () => {
     // Wait for async completion then verify result is in history
     await new Promise((resolve) => setTimeout(resolve, 100));
     const histRes = await fetch(`http://localhost:${port}/api/evals/history`);
-    const histBody = (await histRes.json()) as any;
+    const histBody = await readJson(histRes);
     expect(histBody.data.length).toBeGreaterThan(0);
   });
 
@@ -467,7 +468,7 @@ describe('Studio Middleware Integration', () => {
     });
 
     expect(res.status).toBe(200);
-    const body = (await res.json()) as any;
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.result).toBe('Hello, Direct!');
   });
@@ -482,7 +483,7 @@ describe('Studio Middleware Integration', () => {
 
     const res = await fetch(`http://localhost:${port}/api/health`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as any;
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.status).toBe('healthy');
   });
@@ -497,7 +498,7 @@ describe('Studio Middleware Integration', () => {
 
     const res = await studio.app.request('/api/workflows');
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
   });
 

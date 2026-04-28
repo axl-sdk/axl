@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createTestServer } from '../helpers/setup.js';
+import { readJson } from '../helpers/json.js';
 
 describe('Studio API: Tools', () => {
   it('GET /api/tools lists registered tools with schema', async () => {
@@ -7,7 +8,7 @@ describe('Studio API: Tools', () => {
     const res = await app.request('/api/tools');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.length).toBe(1);
     expect(body.data[0].name).toBe('greet');
@@ -31,7 +32,7 @@ describe('Studio API: Tools', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.result).toBe('Hello, World!');
   });
@@ -41,7 +42,7 @@ describe('Studio API: Tools', () => {
     const res = await app.request('/api/tools/nonexistent');
     expect(res.status).toBe(404);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
   });
 
@@ -53,7 +54,7 @@ describe('Studio API: Tools', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ input: { name: 'World' } }),
     });
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     // Tool output is scrubbed — tool results can be arbitrary user/LLM
     // content (the tool's return value) and are covered by the same

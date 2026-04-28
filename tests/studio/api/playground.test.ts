@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { MockProvider } from '@axlsdk/testing';
 import { createTestServer } from '../helpers/setup.js';
+import { readJson } from '../helpers/json.js';
 
 // Wait for the async WS broadcast loop to flush. Playground fires
 // `runtime.ask()` in the background and pipes stream events to the
@@ -22,7 +23,7 @@ describe('Studio API: Playground', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.sessionId).toBeDefined();
   });

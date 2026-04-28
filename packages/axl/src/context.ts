@@ -63,10 +63,6 @@ const signalStorage = new AsyncLocalStorage<AbortSignal>();
  *   parent context.
  * - `parentAskId`: set on every nested frame so the consumer can reconstruct
  *   the ask tree; absent on the root ask.
- * - `parentToolCallId`: bridges the legacy correlation field. The tool
- *   execution path threads the outer tool's `callId` here so child contexts
- *   keep stamping `parentToolCallId` for telemetry consumers that haven't
- *   migrated yet (kept for one minor cycle alongside the new field).
  * - `stepRef`: a single mutable counter shared across the entire execution
  *   (root ask + every nested ask + every branch primitive). Atomically
  *   incremented on each event emission so `event.step` is monotonic across
@@ -77,7 +73,6 @@ type AskFrame = {
   parentAskId?: string;
   depth: number;
   agent?: string;
-  parentToolCallId?: string;
   stepRef: { value: number };
   /**
    * Cost incurred by THIS ask only — agent_call_end + tool_call_end events
@@ -253,10 +248,6 @@ export type WorkflowContextInit = {
   onAgentStart?: (info: { agent: string; model: string }, meta: CallbackMeta) => void;
   /** Callback fired after each ctx.ask() completes (once per ask invocation). */
   onAgentCallComplete?: (call: AgentCallInfo) => void;
-  /** Set by `createChildContext(parentToolCallId)` — stamped on every trace event
-   *  emitted from this child so consumers can join nested agent calls back to
-   *  the outer tool call that spawned them. */
-  parentToolCallId?: string;
   /** Internal: shared auto-checkpoint counters. Set by `createChildContext`
    *  so parent + child share the same number space, preventing checkpoint
    *  store key collisions across nested `WorkflowContext` instances.
@@ -350,7 +341,6 @@ export class WorkflowContext<TInput = unknown> {
   ) => HumanDecision | Promise<HumanDecision>;
   private onAgentStart?: (info: { agent: string; model: string }, meta: CallbackMeta) => void;
   private onAgentCallComplete?: (call: AgentCallInfo) => void;
-  private parentToolCallId?: string;
   constructor(init: WorkflowContextInit) {
     this.input = init.input as TInput;
     this.executionId = init.executionId;
@@ -381,7 +371,6 @@ export class WorkflowContext<TInput = unknown> {
       byAgent: new Map(),
       root: 0,
     };
-    this.parentToolCallId = init.parentToolCallId;
     // Restore cached summary from session metadata (survives across requests)
     if (init.metadata?.summaryCache) {
       this.summaryCache = init.metadata.summaryCache as string;
@@ -403,13 +392,12 @@ export class WorkflowContext<TInput = unknown> {
    * "nested ask visibility" fix from spec §3.2.
    *
    * The shared step counter lives in `askStorage` (ALS), so there is no
-   * per-context counter to pass through anymore.
-   *
-   * @param parentToolCallId - The `callId` of the outer `tool_call` that
-   *   spawned this child. Threaded through `askStorage` so nested asks can
-   *   stamp `parentToolCallId` on their events for legacy telemetry consumers.
+   * per-context counter to pass through anymore. Nested events are
+   * correlated to their parent via `parentAskId` (set on every nested ask
+   * by ALS frame allocation) — the deprecated `parentToolCallId` field
+   * was removed in 0.17.0.
    */
-  createChildContext(parentToolCallId?: string): WorkflowContext {
+  createChildContext(): WorkflowContext {
     return new WorkflowContext({
       input: this.input,
       executionId: this.executionId,
@@ -432,10 +420,6 @@ export class WorkflowContext<TInput = unknown> {
       toolOverrides: this.toolOverrides,
       signal: this.signal,
       workflowName: this.workflowName,
-      // Join key for nested event correlation. Inherit the parent's
-      // `parentToolCallId` when this child is itself nested inside another
-      // child — so grand-children still point to the outermost tool call.
-      parentToolCallId: parentToolCallId ?? this.parentToolCallId,
       // Share the parent's auto-checkpoint counters so internal checkpoints
       // emitted from `ctx.ask` / spawn / race / parallel / map in this
       // child context don't collide with the parent's in the state store.
@@ -499,10 +483,6 @@ export class WorkflowContext<TInput = unknown> {
           parentAskId: parentFrame?.askId,
           depth,
           agent: agent._name,
-          // Inherit the parent's tool-call correlation so legacy consumers
-          // see the outermost tool call across nested asks. The instance-level
-          // `parentToolCallId` (set by `createChildContext`) takes priority.
-          parentToolCallId: this.parentToolCallId ?? parentFrame?.parentToolCallId,
           stepRef,
           askCost: { value: 0 },
         };
@@ -1236,7 +1216,6 @@ export class WorkflowContext<TInput = unknown> {
                 parentAskId: handoffFromAskId,
                 depth: handoffTargetDepth,
                 agent: descriptor.agent._name,
-                parentToolCallId: sourceFrame?.parentToolCallId,
                 stepRef: sourceFrame?.stepRef ?? this.stepRefRoot,
                 askCost: { value: 0 },
               };
@@ -1605,10 +1584,12 @@ export class WorkflowContext<TInput = unknown> {
                 resultContent = JSON.stringify(toolResult);
               }
             } else if (tool) {
-              // Execute local tool with a child context for nested agent invocations.
-              // Pass toolCall.id so any nested trace events can be joined back
-              // to this outer tool_call via `parentToolCallId`.
-              const childCtx = this.createChildContext(toolCall.id);
+              // Execute local tool with a child context for nested agent
+              // invocations (agent-as-tool pattern). Nested events are
+              // correlated to the outer ask via `parentAskId` from the
+              // ALS frame, so the child context doesn't need to thread
+              // anything explicitly.
+              const childCtx = this.createChildContext();
               try {
                 toolResult = await tool._execute(toolArgs, childCtx);
               } catch (err) {
@@ -3487,17 +3468,11 @@ export class WorkflowContext<TInput = unknown> {
     ) {
       frame.askCost.value += cost;
     }
-    // Inherit `parentToolCallId` from the ALS frame if present; this lets
-    // tool-execution contexts thread the outer tool callId through nested
-    // asks even when the WorkflowContext instance itself wasn't constructed
-    // with `parentToolCallId` set.
-    const parentToolCallId = this.parentToolCallId ?? frame?.parentToolCallId;
     const event = {
       executionId: this.executionId,
       step,
       timestamp: Date.now(),
       ...(this.workflowName ? { workflow: this.workflowName } : {}),
-      ...(parentToolCallId ? { parentToolCallId } : {}),
       // Stamp ask correlation from ALS. Variants like `workflow_start` /
       // `workflow_end` and out-of-ask events (log/memory/checkpoint/await_human
       // when emitted at workflow scope) may legitimately have no frame —

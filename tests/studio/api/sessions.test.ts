@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { MockProvider } from '@axlsdk/testing';
 import { createTestServer } from '../helpers/setup.js';
+import { readJson } from '../helpers/json.js';
 
 describe('Studio API: Sessions', () => {
   it('POST /api/sessions/:id/send returns response', async () => {
@@ -14,7 +15,7 @@ describe('Studio API: Sessions', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.result).toBe('session response');
   });
@@ -34,7 +35,7 @@ describe('Studio API: Sessions', () => {
     const res = await app.request('/api/sessions/detail-test');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.id).toBe('detail-test');
     expect(body.data.history.length).toBeGreaterThanOrEqual(2);
@@ -57,7 +58,7 @@ describe('Studio API: Sessions', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.deleted).toBe(true);
   });
@@ -77,7 +78,7 @@ describe('Studio API: Sessions', () => {
     });
 
     const res = await app.request('/api/sessions/redact-test');
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.id).toBe('redact-test');
     expect(body.data.history.length).toBeGreaterThanOrEqual(2);

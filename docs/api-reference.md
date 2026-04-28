@@ -1184,7 +1184,6 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped, CallbackMeta } from
 | `duration` | `number?` | Duration in ms (set on `_end` variants) |
 | `data` | event-specific | Variant-specific payload — narrow via `type` |
 | `timestamp` | `number` | Event timestamp (ms) |
-| `parentToolCallId` | `string?` | **@deprecated** — use `parentAskId` (on `AskScoped`) for ask-graph correlation. **Removal target: 0.17.0.** Retained until then for back-compat with telemetry consumers that grep agent-as-tool call graphs |
 
 ### `AskScoped` (mixin on every event originating within `ctx.ask()`)
 

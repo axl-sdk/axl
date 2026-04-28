@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { createTestServer } from '../helpers/setup.js';
+import { readJson } from '../helpers/json.js';
 
 describe('Studio API: Decisions', () => {
   // MemoryStore persists pending decisions to a temp file
@@ -21,7 +22,7 @@ describe('Studio API: Decisions', () => {
     const res = await app.request('/api/decisions');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data).toEqual([]);
   });
@@ -36,7 +37,7 @@ describe('Studio API: Decisions', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.resolved).toBe(true);
   });
@@ -56,7 +57,7 @@ describe('Studio API: Decisions', () => {
     });
 
     const res = await app.request('/api/decisions');
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.length).toBe(1);
     // Prompt scrubbed
@@ -79,7 +80,7 @@ describe('Studio API: Decisions', () => {
     });
 
     const res = await app.request('/api/decisions');
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.data[0].prompt).toBe('Approve X?');
   });
 });

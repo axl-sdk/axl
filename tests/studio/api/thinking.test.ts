@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { AxlRuntime, agent, tool, workflow } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
 import { createServer } from '@axlsdk/studio';
+import { readJson } from '../helpers/json.js';
 
 function createThinkingTestServer() {
   const runtime = new AxlRuntime();
@@ -62,7 +63,7 @@ describe('Studio API: Thinking', () => {
     const res = await app.request('/api/agents');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
 
     const effortAgent = body.data.find((a: any) => a.name === 'effort-agent');
@@ -75,7 +76,7 @@ describe('Studio API: Thinking', () => {
   it('GET /api/agents lists agents with thinkingBudget field', async () => {
     const { app } = createThinkingTestServer();
     const res = await app.request('/api/agents');
-    const body = await res.json();
+    const body = await readJson(res);
 
     const budgetAgent = body.data.find((a: any) => a.name === 'budget-agent');
     expect(budgetAgent).toBeDefined();
@@ -87,7 +88,7 @@ describe('Studio API: Thinking', () => {
     const res = await app.request('/api/agents/effort-agent');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.name).toBe('effort-agent');
     expect(body.data.effort).toBe('high');
@@ -98,7 +99,7 @@ describe('Studio API: Thinking', () => {
     const res = await app.request('/api/agents/budget-agent');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.thinkingBudget).toBe(5000);
   });
@@ -106,7 +107,7 @@ describe('Studio API: Thinking', () => {
   it('GET /api/agents lists agents with effort "max"', async () => {
     const { app } = createThinkingTestServer();
     const res = await app.request('/api/agents');
-    const body = await res.json();
+    const body = await readJson(res);
 
     const maxAgent = body.data.find((a: any) => a.name === 'max-agent');
     expect(maxAgent).toBeDefined();
@@ -118,7 +119,7 @@ describe('Studio API: Thinking', () => {
     const res = await app.request('/api/agents/max-agent');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.effort).toBe('max');
   });
@@ -136,7 +137,7 @@ describe('Studio API: Thinking', () => {
 
     const { app } = createServer({ runtime });
     const res = await app.request('/api/agents');
-    const body = await res.json();
+    const body = await readJson(res);
 
     const a = body.data.find((a: any) => a.name === 'plain-agent');
     expect(a).toBeDefined();

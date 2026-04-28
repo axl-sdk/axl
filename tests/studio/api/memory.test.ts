@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createTestServer } from '../helpers/setup.js';
+import { readJson } from '../helpers/json.js';
 
 describe('Studio API: Memory', () => {
   it('PUT /api/memory/:scope/:key saves a memory entry', async () => {
@@ -12,7 +13,7 @@ describe('Studio API: Memory', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.saved).toBe(true);
   });
@@ -31,7 +32,7 @@ describe('Studio API: Memory', () => {
     const res = await app.request('/api/memory/global/key1');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.key).toBe('key1');
     expect(body.data.value).toBe('saved-data');
@@ -53,14 +54,14 @@ describe('Studio API: Memory', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.deleted).toBe(true);
 
     // Verify subsequent GET returns 404
     const getRes = await app.request('/api/memory/global/delkey');
     expect(getRes.status).toBe(404);
-    const getBody = await getRes.json();
+    const getBody = await readJson(getRes);
     expect(getBody.ok).toBe(false);
     expect(getBody.error.code).toBe('NOT_FOUND');
   });
@@ -84,14 +85,14 @@ describe('Studio API: Memory', () => {
 
     // Detail: value scrubbed, key preserved.
     const detailRes = await app.request('/api/memory/global/user_profile');
-    const detailBody = await detailRes.json();
+    const detailBody = await readJson(detailRes);
     expect(detailBody.ok).toBe(true);
     expect(detailBody.data.key).toBe('user_profile');
     expect(detailBody.data.value).toBe('[redacted]');
 
     // List: every value scrubbed, keys preserved for navigation.
     const listRes = await app.request('/api/memory/global');
-    const listBody = await listRes.json();
+    const listBody = await readJson(listRes);
     expect(listBody.ok).toBe(true);
     const entries = listBody.data as Array<{ key: string; value: unknown }>;
     expect(entries.length).toBeGreaterThanOrEqual(2);

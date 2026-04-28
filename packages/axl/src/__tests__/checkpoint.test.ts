@@ -316,7 +316,7 @@ describe('ctx.checkpoint()', () => {
     const provider = new TestProvider([{ content: 'ok' }]);
     const ctx = createTestContext(provider, store, 'exec-cp-child');
 
-    const child = ctx.createChildContext('tool-call-id');
+    const child = ctx.createChildContext();
 
     // Each ctx.ask is internally auto-checkpointed. Run one in each
     // context and verify the names don't collide.

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createTestServer } from '../helpers/setup.js';
+import { readJson } from '../helpers/json.js';
 
 describe('Studio API: Health', () => {
   it('GET /api/health returns healthy status with counts', async () => {
@@ -7,7 +8,7 @@ describe('Studio API: Health', () => {
     const res = await app.request('/api/health');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.status).toBe('healthy');
     expect(body.data.readOnly).toBe(false);
@@ -21,7 +22,7 @@ describe('Studio API: Health', () => {
     const res = await app.request('/api/health');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.data.readOnly).toBe(true);
   });
 });

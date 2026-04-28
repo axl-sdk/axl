@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { MockProvider } from '@axlsdk/testing';
 import { createTestServer } from '../helpers/setup.js';
+import { readJson } from '../helpers/json.js';
 
 describe('Studio API: Executions', () => {
   it('GET /api/executions is empty, then populated after workflow execution', async () => {
@@ -10,7 +11,7 @@ describe('Studio API: Executions', () => {
     // Initially empty
     const res1 = await app.request('/api/executions');
     expect(res1.status).toBe(200);
-    const body1 = await res1.json();
+    const body1 = await readJson(res1);
     expect(body1.ok).toBe(true);
     expect(body1.data).toEqual([]);
 
@@ -23,7 +24,7 @@ describe('Studio API: Executions', () => {
 
     // Now should have an execution
     const res2 = await app.request('/api/executions');
-    const body2 = await res2.json();
+    const body2 = await readJson(res2);
     expect(body2.ok).toBe(true);
     expect(body2.data.length).toBe(1);
     expect(body2.data[0].workflow).toBe('test-wf');
@@ -38,7 +39,7 @@ describe('Studio API: Executions', () => {
       method: 'POST',
     });
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.aborted).toBe(true);
   });
@@ -55,7 +56,7 @@ describe('Studio API: Executions', () => {
 
     // List endpoint: result should be `[redacted]`.
     const res = await app.request('/api/executions');
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.length).toBe(1);
     expect(body.data[0].result).toBe('[redacted]');
@@ -66,7 +67,7 @@ describe('Studio API: Executions', () => {
     // Detail endpoint: same scrubbing.
     const id = body.data[0].executionId;
     const detailRes = await app.request(`/api/executions/${id}`);
-    const detailBody = await detailRes.json();
+    const detailBody = await readJson(detailRes);
     expect(detailBody.ok).toBe(true);
     expect(detailBody.data.result).toBe('[redacted]');
     expect(detailBody.data.workflow).toBe('test-wf');
@@ -83,7 +84,7 @@ describe('Studio API: Executions', () => {
     });
 
     const res = await app.request('/api/executions');
-    const body = await res.json();
+    const body = await readJson(res);
     // Assert the exact raw content — a weaker `.not.toBe('[redacted]')`
     // assertion would miss regressions like `'[redacted]-suffix'` or
     // null-coerced-to-'empty' that still bypass the scrub.
@@ -93,12 +94,6 @@ describe('Studio API: Executions', () => {
   it('GET /api/executions/:id?since={step} filters events to the tail', async () => {
     // Spec/16 §5.4. Polling clients can request only events with
     // `step > since` so the wire payload stays bounded on long runs.
-    type Envelope = {
-      ok: boolean;
-      data: { executionId: string; events: Array<{ step: number }> };
-    };
-    type ListEnvelope = { ok: boolean; data: Array<{ executionId: string }> };
-
     const provider = MockProvider.sequence([{ content: 'done' }]);
     const { app } = createTestServer(provider);
 
@@ -108,26 +103,22 @@ describe('Studio API: Executions', () => {
       body: JSON.stringify({ input: { message: 'test' } }),
     });
 
-    const list = (await (await app.request('/api/executions')).json()) as ListEnvelope;
+    const list = await readJson(await app.request('/api/executions'));
     const id = list.data[0].executionId;
 
     // Full fetch — note the total event count so we have a baseline.
-    const full = (await (await app.request(`/api/executions/${id}`)).json()) as Envelope;
+    const full = await readJson(await app.request(`/api/executions/${id}`));
     const total = full.data.events.length;
     expect(total).toBeGreaterThan(1);
 
     // `?since=0` drops only events with step === 0 (workflow_start).
-    const sinceZero = (await (
-      await app.request(`/api/executions/${id}?since=0`)
-    ).json()) as Envelope;
+    const sinceZero = await readJson(await app.request(`/api/executions/${id}?since=0`));
     expect(sinceZero.data.events.length).toBe(total - 1);
-    expect(sinceZero.data.events.every((e) => e.step > 0)).toBe(true);
+    expect(sinceZero.data.events.every((e: { step: number }) => e.step > 0)).toBe(true);
 
     // `?since={lastStep}` returns an empty array (no events beyond the last).
     const lastStep = full.data.events[full.data.events.length - 1].step;
-    const tail = (await (
-      await app.request(`/api/executions/${id}?since=${lastStep}`)
-    ).json()) as Envelope;
+    const tail = await readJson(await app.request(`/api/executions/${id}?since=${lastStep}`));
     expect(tail.data.events).toEqual([]);
 
     // Malformed `since` param: server returns 400 with a diagnostic
@@ -135,10 +126,7 @@ describe('Studio API: Executions', () => {
     // balloon the payload; a 400 surfaces the bug instead.
     const malformedRes = await app.request(`/api/executions/${id}?since=notanumber`);
     expect(malformedRes.status).toBe(400);
-    const malformed = (await malformedRes.json()) as {
-      ok: false;
-      error: { code: string; param: string };
-    };
+    const malformed = await readJson(malformedRes);
     expect(malformed.ok).toBe(false);
     expect(malformed.error.code).toBe('INVALID_PARAM');
     expect(malformed.error.param).toBe('since');
@@ -150,9 +138,7 @@ describe('Studio API: Executions', () => {
     expect(infRes.status).toBe(400);
 
     // Negative `since=-1` is a valid "everything from step 0" sentinel.
-    const negative = (await (
-      await app.request(`/api/executions/${id}?since=-1`)
-    ).json()) as Envelope;
+    const negative = await readJson(await app.request(`/api/executions/${id}?since=-1`));
     expect(negative.data.events.length).toBe(total);
   });
 });

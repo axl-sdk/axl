@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { AxlRuntime } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
 import { createStudioMiddleware } from '@axlsdk/studio/middleware';
+import { readJson } from '../helpers/json.js';
 
 const FIXTURES_DIR = resolve(import.meta.dirname!, '..', 'fixtures');
 const PROJECT_ROOT = process.cwd();
@@ -64,7 +65,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     const res = await studio.app.request('/api/evals');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
 
     // Both valid eval files should be registered (names are cwd-relative)
@@ -96,7 +97,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     const res = await studio.app.request('/api/evals');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.data).toEqual([]);
 
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Skipping'));
@@ -119,7 +120,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     const res = await studio.app.request('/api/evals');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     // The throwing file is skipped, the valid file is still loaded
     expect(body.data.length).toBe(1);
     expect(body.data[0].name).toBe(expectedName(resolve(FIXTURES_DIR, 'sample.eval.mjs')));
@@ -166,7 +167,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.items.length).toBe(2);
     expect(body.data.items[0].output).toBe('result for hello');
@@ -194,8 +195,8 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     expect(res2.status).toBe(200);
     expect(registerSpy.mock.calls.length).toBe(1);
 
-    const body1 = await res1.json();
-    const body2 = await res2.json();
+    const body1 = await readJson(res1);
+    const body2 = await readJson(res2);
     expect(body1.data.length).toBe(1);
     expect(body2.data.length).toBe(1);
 
@@ -211,7 +212,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     });
 
     const res = await studio.app.request('/api/evals');
-    const body = await res.json();
+    const body = await readJson(res);
     const names = body.data.map((e: { name: string }) => e.name).sort();
     expect(names).toEqual([
       expectedName(resolve(FIXTURES_DIR, 'another.eval.mjs')),
@@ -230,7 +231,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     });
 
     const res = await studio.app.request('/api/evals');
-    const body = await res.json();
+    const body = await readJson(res);
     const names = body.data.map((e: { name: string }) => e.name);
     expect(names).toContain(expectedName(resolve(FIXTURES_DIR, 'sample.eval.mjs')));
     expect(names).toContain(expectedName(resolve(FIXTURES_DIR, 'another.eval.mjs')));
@@ -249,7 +250,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
 
     const res = await studio.app.request('/api/evals');
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.data).toEqual([]);
 
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('No eval files found'));
@@ -276,7 +277,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     });
 
     const res = await studio.app.request('/api/evals');
-    const body = await res.json();
+    const body = await readJson(res);
     const names = body.data.map((e: { name: string }) => e.name).sort();
 
     // Names are project-relative, not glob-relative
@@ -311,7 +312,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     });
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.items[0].output).toBe('ok');
 
@@ -335,7 +336,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     });
 
     const res1 = await studio1.app.request('/api/evals');
-    const names1 = (await res1.json()).data.map((e: { name: string }) => e.name);
+    const names1 = (await readJson(res1)).data.map((e: { name: string }) => e.name);
     studio1.close();
 
     // Second: both files
@@ -347,7 +348,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     });
 
     const res2 = await studio2.app.request('/api/evals');
-    const names2 = (await res2.json()).data.map((e: { name: string }) => e.name);
+    const names2 = (await readJson(res2)).data.map((e: { name: string }) => e.name);
     studio2.close();
 
     // The first file's name should be identical in both configs
@@ -370,7 +371,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     });
 
     const res = await studio.app.request('/api/evals');
-    const body = await res.json();
+    const body = await readJson(res);
     const names = body.data.map((e: { name: string }) => e.name).sort();
     expect(names).toContain('direct-eval');
     expect(names).toContain(expectedName(resolve(FIXTURES_DIR, 'sample.eval.mjs')));
@@ -385,7 +386,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
 
     const res = await studio.app.request('/api/evals');
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.data).toEqual([]);
 
     studio.close();

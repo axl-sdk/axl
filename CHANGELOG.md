@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed — `parentToolCallId` (BREAKING)
+
+The deprecated `parentToolCallId` field on `AxlEventBase` is removed.
+Migrate to `parentAskId` (on `AskScoped`) — it's the going-forward
+correlation primitive and was already populated alongside
+`parentToolCallId` since the unified-event-model migration. The
+agent-as-tool nesting case has equivalent semantics: when a child
+`WorkflowContext` spawned via `ctx.createChildContext()` performs
+`ctx.ask()`, the nested ask's events all carry
+`parentAskId === outerAsk.askId`.
+
+`createChildContext()` no longer accepts a `parentToolCallId` argument
+— the signature is `createChildContext(): WorkflowContext`. Callers
+passing `toolCall.id` should drop the argument. Internal call sites
+were already correlating via the ALS frame's `parentAskId`, so no
+other migration is required.
+
+Affected exports:
+- `AxlEventBase.parentToolCallId` — removed.
+- `WorkflowContextInit.parentToolCallId` — removed.
+- `WorkflowContext#parentToolCallId` (private field) — removed.
+- `WorkflowContext.createChildContext(parentToolCallId?)` →
+  `createChildContext()` — argument dropped.
+
 ### Added — `fullText` per-askId scoping (P1)
 
 `AxlStream.fullText` no longer interleaves tokens from concurrent
@@ -38,6 +62,23 @@ tests. Closes the FOLLOWUPS P5 "no memory bound on
 ExecutionInfo.events" item — production workloads (e.g., 50 nested
 asks × 20-turn tool loops) no longer risk OOM before terminal
 `done`.
+
+### Changed — Studio API tests adopt shared `readJson` helper (test-only)
+
+All Studio API test files (`tests/studio/api/*.test.ts`) now route response
+body decoding through the shared `readJson(res)` helper from
+`tests/studio/helpers/json.ts`. Previously each call site spelled out
+`(await res.json()) as ApiResponse<T>` or `(await res.json()) as any` —
+noisy and easy to forget, with `body` typed as `unknown` everywhere a
+cast was missed. The helper returns the same loose `TestApiBody` envelope
+already used by `evals.test.ts` (51 tests, prior reference adopter).
+Files migrated: `agents`, `aggregates`, `costs`, `decisions`,
+`eval-loader`, `executions`, `health`, `memory`, `middleware`,
+`playground`, `sessions`, `thinking`, `tools`, `workflows` — 14 files,
+~95 call sites. Also drops several now-redundant inline type casts (e.g.
+`as { ok: boolean; data: { ... } }`, `as Envelope`, `as any`). Eliminates
+~150 `TS18046 'body' is of type 'unknown'` diagnostics. Pure refactor —
+test count unchanged (145 studio tests still pass).
 
 ### Changed — Polish + P3/P4 cleanup
 

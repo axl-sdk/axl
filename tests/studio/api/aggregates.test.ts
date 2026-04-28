@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createTestServer } from '../helpers/setup.js';
+import { readJson } from '../helpers/json.js';
 
 describe('Studio API: Aggregate Endpoints', () => {
   // ── Cost endpoint ──────────────────────────────────────────
@@ -10,7 +11,7 @@ describe('Studio API: Aggregate Endpoints', () => {
       const res = await app.request('/api/costs');
       expect(res.status).toBe(200);
 
-      const body = (await res.json()) as { ok: boolean; data: Record<string, unknown> };
+      const body = await readJson(res);
       expect(body.ok).toBe(true);
       expect(body.data.totalCost).toBe(0);
       expect(body.data.totalTokens).toBeDefined();
@@ -20,7 +21,7 @@ describe('Studio API: Aggregate Endpoints', () => {
       const { app } = createTestServer();
       const res = await app.request('/api/costs?window=24h');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as { ok: boolean; data: Record<string, unknown> };
+      const body = await readJson(res);
       expect(body.ok).toBe(true);
       expect(body.data.totalCost).toBe(0);
     });
@@ -29,7 +30,7 @@ describe('Studio API: Aggregate Endpoints', () => {
       const { app } = createTestServer();
       const res = await app.request('/api/costs?window=all');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as { ok: boolean; data: Record<string, unknown> };
+      const body = await readJson(res);
       expect(body.ok).toBe(true);
     });
 
@@ -37,7 +38,7 @@ describe('Studio API: Aggregate Endpoints', () => {
       const { app } = createTestServer();
       const res = await app.request('/api/costs?window=bogus');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as { ok: boolean; data: Record<string, unknown> };
+      const body = await readJson(res);
       expect(body.ok).toBe(true);
     });
 
@@ -45,7 +46,7 @@ describe('Studio API: Aggregate Endpoints', () => {
       const { app } = createTestServer();
       const res = await app.request('/api/costs?windows=all');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as { ok: boolean; data: Record<string, unknown> };
+      const body = await readJson(res);
       expect(body.ok).toBe(true);
       expect(body.data['24h']).toBeDefined();
       expect(body.data['7d']).toBeDefined();
@@ -67,10 +68,7 @@ describe('Studio API: Aggregate Endpoints', () => {
       const { app } = createTestServer();
       const res = await app.request('/api/eval-trends');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as {
-        ok: boolean;
-        data: { totalRuns: number; totalCost: number; byEval: Record<string, unknown> };
-      };
+      const body = await readJson(res);
       expect(body.ok).toBe(true);
       expect(body.data.totalRuns).toBe(0);
       expect(body.data.totalCost).toBe(0);
@@ -81,7 +79,7 @@ describe('Studio API: Aggregate Endpoints', () => {
       const { app } = createTestServer();
       const res = await app.request('/api/eval-trends?window=30d');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as { ok: boolean };
+      const body = await readJson(res);
       expect(body.ok).toBe(true);
     });
   });
@@ -93,14 +91,7 @@ describe('Studio API: Aggregate Endpoints', () => {
       const { app } = createTestServer();
       const res = await app.request('/api/workflow-stats');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as {
-        ok: boolean;
-        data: {
-          totalExecutions: number;
-          failureRate: number;
-          byWorkflow: Record<string, unknown>;
-        };
-      };
+      const body = await readJson(res);
       expect(body.ok).toBe(true);
       expect(body.data.totalExecutions).toBe(0);
       expect(body.data.failureRate).toBe(0);
@@ -111,7 +102,7 @@ describe('Studio API: Aggregate Endpoints', () => {
       const { app } = createTestServer();
       const res = await app.request('/api/workflow-stats?window=24h');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as { ok: boolean };
+      const body = await readJson(res);
       expect(body.ok).toBe(true);
     });
   });
@@ -123,15 +114,7 @@ describe('Studio API: Aggregate Endpoints', () => {
       const { app } = createTestServer();
       const res = await app.request('/api/trace-stats');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as {
-        ok: boolean;
-        data: {
-          totalEvents: number;
-          eventTypeCounts: Record<string, number>;
-          byTool: Record<string, unknown>;
-          retryByAgent: Record<string, unknown>;
-        };
-      };
+      const body = await readJson(res);
       expect(body.ok).toBe(true);
       expect(body.data.totalEvents).toBe(0);
       expect(body.data.eventTypeCounts).toBeDefined();
@@ -143,7 +126,7 @@ describe('Studio API: Aggregate Endpoints', () => {
       const { app } = createTestServer();
       const res = await app.request('/api/trace-stats?window=all');
       expect(res.status).toBe(200);
-      const body = (await res.json()) as { ok: boolean };
+      const body = await readJson(res);
       expect(body.ok).toBe(true);
     });
   });

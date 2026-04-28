@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { agent } from '@axlsdk/axl';
 import { createTestServer } from '../helpers/setup.js';
+import { readJson } from '../helpers/json.js';
 
 describe('Studio API: Agents', () => {
   it('GET /api/agents lists registered agents', async () => {
@@ -8,7 +9,7 @@ describe('Studio API: Agents', () => {
     const res = await app.request('/api/agents');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.length).toBe(1);
     expect(body.data[0].name).toBe('test-agent');
@@ -20,7 +21,7 @@ describe('Studio API: Agents', () => {
     const res = await app.request('/api/agents/nonexistent');
     expect(res.status).toBe(404);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(false);
   });
 
@@ -44,7 +45,7 @@ describe('Studio API: Agents', () => {
     const res = await app.request('/api/agents');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     const entry = body.data.find(
       (a: Record<string, unknown>) => a.name === 'dynamic-handoff-agent',
     );
@@ -72,7 +73,7 @@ describe('Studio API: Agents', () => {
     const res = await app.request('/api/agents/dynamic-detail-agent');
     expect(res.status).toBe(200);
 
-    const body = await res.json();
+    const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.handoffs).toEqual([
       {

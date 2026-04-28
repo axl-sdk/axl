@@ -477,15 +477,6 @@ export type AxlEventBase = {
   tokens?: { input?: number; output?: number; reasoning?: number };
   /** Duration in ms (set on `_end` variants and a few single-point events). */
   duration?: number;
-  /**
-   * @deprecated Use `parentAskId` (on `AskScoped`) for ask-graph correlation
-   *  going forward. Retained for one minor cycle so existing telemetry
-   *  consumers that grep agent-as-tool call graphs by tool callId keep
-   *  working — `WorkflowContext.createChildContext()` still populates this,
-   *  so reading it is safe through this transition window.
-   *  **Removal target: 0.17.0.** Migrate to `parentAskId` before upgrading.
-   */
-  parentToolCallId?: string;
 };
 
 /** Fields on every event that originates within a specific `ctx.ask()` call. */

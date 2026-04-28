@@ -204,7 +204,11 @@ describe('trace events — verbose messages snapshot across retries', () => {
 });
 
 describe('trace events — nested child contexts (agent-as-tool)', () => {
-  it('stamps parentToolCallId on nested agent_call events so consumers can join to the outer tool_call', async () => {
+  it('stamps parentAskId on nested agent_call events so consumers can join to the outer ask', async () => {
+    // Replaces the pre-0.17.0 `parentToolCallId` test. Correlation is now
+    // entirely via `parentAskId` (on `AskScoped`) — the outer ask's askId
+    // appears on every event emitted from the nested ask. The deprecated
+    // `parentToolCallId` field was removed in 0.17.0.
     const childAgent = agent({
       name: 'child',
       model: 'mock:test',
@@ -234,27 +238,34 @@ describe('trace events — nested child contexts (agent-as-tool)', () => {
     const { ctx, traces } = createTestCtx({ provider });
     await ctx.ask(parentAgent, 'go');
 
-    // The outer tool_call gets the `callId: 'outer-tc-1'` on its data,
-    // and any nested trace events (e.g. child agent_call) carry the same
-    // id as `parentToolCallId` at the top level.
-    const outerToolCall = traces.find(
-      (t) => t.type === 'tool_call_end' && t.tool === 'nested_call',
+    // The outer ask's ask_start gives us the parent askId; the nested
+    // ask's events should all carry that as `parentAskId`.
+    const parentAskStart = traces.find(
+      (t): t is Extract<AxlEvent, { type: 'ask_start' }> =>
+        t.type === 'ask_start' && t.agent === 'parent',
     );
-    expect(outerToolCall).toBeDefined();
+    expect(parentAskStart).toBeDefined();
+    const parentAskId = parentAskStart!.askId;
 
-    // `parentToolCallId` is deprecated (slated for removal in 0.17.0) — these
-    // assertions exercise the back-compat field while it's still emitted, so
-    // existing telemetry consumers keep working through the deprecation window.
-    const childEvents = traces.filter((t) => t.parentToolCallId === 'outer-tc-1');
-    expect(childEvents.length).toBeGreaterThan(0);
-    // The child agent's LLM call should be in that set
-    const childAgentCall = childEvents.find(
-      (t) => t.type === 'agent_call_end' && t.agent === 'child',
+    // Every event from the nested ask carries parentAskId === parent's askId
+    // and has depth >= 1 (root parent ask is depth 0). `parentAskId` is on
+    // the AskScoped mixin so workflow_start/end (no AskScoped) need an
+    // `'parentAskId' in t` guard before the read.
+    const nestedEvents = traces.filter((t) => 'parentAskId' in t && t.parentAskId === parentAskId);
+    expect(nestedEvents.length).toBeGreaterThan(0);
+    const childAgentCall = nestedEvents.find(
+      (t): t is Extract<AxlEvent, { type: 'agent_call_end' }> =>
+        t.type === 'agent_call_end' && t.agent === 'child',
     );
     expect(childAgentCall).toBeDefined();
-    // Outer parent agent_call should NOT carry parentToolCallId (deprecated; see above)
-    const parentAgentCall = traces.find((t) => t.type === 'agent_call_end' && t.agent === 'parent');
-    expect(parentAgentCall!.parentToolCallId).toBeUndefined();
+    expect((childAgentCall!.depth ?? 0) >= 1).toBe(true);
+
+    // The outer parent agent_call is the root ask — no parentAskId.
+    const parentAgentCall = traces.find(
+      (t): t is Extract<AxlEvent, { type: 'agent_call_end' }> =>
+        t.type === 'agent_call_end' && t.agent === 'parent',
+    );
+    expect(parentAgentCall!.parentAskId).toBeUndefined();
   });
 
   it('isolates retryReason between parent and child ctx.ask()', async () => {

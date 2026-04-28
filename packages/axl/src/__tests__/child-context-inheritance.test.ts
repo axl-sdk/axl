@@ -16,7 +16,7 @@ describe('createChildContext — streaming-callback inheritance (spec/16 §3.2)'
         agentStarts.push({ agent: info.agent, meta }),
     });
 
-    const child = ctx.createChildContext('outer-tool-call-id');
+    const child = ctx.createChildContext();
     const a = agent({ name: 'child-agent', model: 'mock:test', system: 'go' });
 
     await child.ask(a, 'hi');

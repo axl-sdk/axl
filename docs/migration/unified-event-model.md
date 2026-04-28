@@ -1,7 +1,6 @@
 # Migration: Unified Event Model
 
 > **Versions:** 0.15.x → 0.16.0
-> **Spec:** Internal `spec/16-streaming-wire-reliability`
 > **Scope:** Anyone consuming `TraceEvent`, `StreamEvent`, `ExecutionInfo.steps`, `AxlStream.steps`, or the `onToken` / `onToolCall` / `onAgentStart` callbacks. Also covers the `ctx.checkpoint()` named-checkpoint migration and the `parentToolCallId` removal that finalize in 0.16.0.
 
 ## What changed
@@ -32,7 +31,7 @@ If you're migrating a typical consumer:
 7. If you wrap `error` events: read `data.message` instead of top-level `message`.
 8. **`ctx.checkpoint(fn)` → `ctx.checkpoint(name, fn)`.** Add a stable, user-supplied name to every checkpoint call (see the [checkpoint section](#ctxcheckpointfn--ctxcheckpointname-fn) below). Drain or cancel running executions before upgrading — legacy auto-checkpoint rows become unreachable under the new naming scheme.
 9. **`parentToolCallId` removed in 0.16.0.** If you used it for telemetry correlation, switch to `parentAskId` (on `AskScoped`). The agent-as-tool nesting case has equivalent semantics. `createChildContext()` no longer takes a parameter.
-10. **Optional but recommended:** start consuming the new `ask_start`/`ask_end` events for ask-level cost rollup (`ask_end.cost` per spec decision 10), and the new `agent_call_start`/`tool_call_start` events for pre-execution observability.
+10. **Optional but recommended:** start consuming the new `ask_start`/`ask_end` events for ask-level cost rollup (`ask_end.cost` is the per-ask leaf-cost sum, excluding nested asks), and the new `agent_call_start`/`tool_call_start` events for pre-execution observability.
 
 ## Before / after — typical consumer
 
@@ -188,7 +187,7 @@ for (const event of info.events) {
 }
 ```
 
-`ask_end.cost` is the per-ask rollup of `agent_call_end.cost` + `tool_call_end.cost` **emitted within this ask, excluding nested asks** (spec decision 10). Nested asks contribute to their own `ask_end`. The whole-execution total is `ExecutionInfo.totalCost` (or sum the leaf events yourself).
+`ask_end.cost` is the per-ask rollup of `agent_call_end.cost` + `tool_call_end.cost` **emitted within this ask, excluding nested asks**. Nested asks contribute to their own `ask_end`. The whole-execution total is `ExecutionInfo.totalCost` (or sum the leaf events yourself).
 
 ## Failure surfacing — `error` vs `ask_end`
 
@@ -263,5 +262,4 @@ Most properties moved (`event.name` → `event.tool`, `event.message` → `event
 ## Reference
 
 - Full event union: `packages/axl/src/types.ts` (search `export type AxlEvent`).
-- Spec: `.internal/spec/16-streaming-wire-reliability.md`.
 - CHANGELOG: see [`Unreleased` section](../../CHANGELOG.md).

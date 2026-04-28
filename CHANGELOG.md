@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Spec/16 — Unified Event Model
+### Unified Event Model
 
 The two parallel event models — rich `TraceEvent` (persisted to `ExecutionInfo.steps`) and lean `StreamEvent` (wire-only, derived by a translation layer that dropped fields) — collapse into a single `AxlEvent` discriminated union. The wire format IS the trace format. Tokens, tool calls, ask boundaries, and agent turns are observable end-to-end at full fidelity. Every event is correlated to its enclosing `ctx.ask()` via `askId` / `parentAskId` / `depth`, so consumers reconstruct the ask graph by group-by + parent-link.
 
@@ -25,9 +25,9 @@ See [`docs/migration/unified-event-model.md`](docs/migration/unified-event-model
 - **Event type renames:** `'agent_call'` → `'agent_call_end'`, `'tool_call'` → `'tool_call_end'`. The new `_end` variants pair with newly-emitted `_start` events (see Added). `event.name` → `event.tool` on tool events; `event.message` → `event.data.message` on `error`; `done.data` → `done.data.result`.
 - **Handoff event split: `'handoff'` → `'handoff_start'` + `'handoff_return'`.** `handoff_start` always fires BEFORE the target ask begins so it orders correctly in step-sorted timelines. `handoff_return` is roundtrip-only (oneway terminates at target). `HandoffData` exports split into `HandoffStartData` + `HandoffReturnData`. Handoff target asks now also emit their own `ask_start` / `ask_end`, so drill-downs no longer show "unknown agent".
 - **Streaming-callback signatures gain `meta`.** `onToken`, `onToolCall`, `onAgentStart` now take a second `meta: CallbackMeta = { askId, parentAskId?, depth, agent }` parameter. Existing chat UIs that want root-only behavior add `if (meta.depth === 0)` to preserve the prior behavior.
-- **`createChildContext` no longer isolates streaming callbacks.** Nested asks now propagate tokens, tool calls, and agent starts to the same callbacks as the parent — consumers filter via `meta.depth` to recover root-only behavior. Spec §3.2.
+- **`createChildContext` no longer isolates streaming callbacks.** Nested asks now propagate tokens, tool calls, and agent starts to the same callbacks as the parent — consumers filter via `meta.depth` to recover root-only behavior.
 - **`createChildContext()` no longer accepts `parentToolCallId`** — the signature is `createChildContext(): WorkflowContext`. Callers passing `toolCall.id` should drop the argument; `parentAskId` from the ALS frame already correlates nested events to the outer ask.
-- **`error` event scope narrowed.** Ask-internal failures (gate exhaustion, `ctx.verify` failure, handler throw) surface via `ask_end({ outcome: { ok: false, error } })` ONLY — never the workflow-level `error` event. `error` is reserved for failures with no `ask_end` available (top-level workflow throw, infrastructure / abort errors). Consumers must never see both for the same failure. Spec decision 9.
+- **`error` event scope narrowed.** Ask-internal failures (gate exhaustion, `ctx.verify` failure, handler throw) surface via `ask_end({ outcome: { ok: false, error } })` ONLY — never the workflow-level `error` event. `error` is reserved for failures with no `ask_end` available (top-level workflow throw, infrastructure / abort errors). Consumers must never see both for the same failure.
 - **`step` is monotonic across the whole execution tree** via a single `AsyncLocalStorage`-shared counter. Consumers ordering by `step` see one shared counter spanning the root ask, every nested ask, and every branch primitive (spawn / parallel / race / map).
 - **`AxlEventBase.parentToolCallId` removed.** The deprecated correlation field announced in 0.15.0 is gone. Use `parentAskId` (on `AskScoped`).
 
@@ -48,10 +48,10 @@ See [`docs/migration/unified-event-model.md`](docs/migration/unified-event-model
 
 #### Event variants
 
-- **`ask_start` / `ask_end`** — bound every `ctx.ask()` call. `ask_start` carries `prompt`; `ask_end` carries `outcome: { ok: true, result } | { ok: false, error }`, `cost`, `duration`. `ask_end.cost` is the per-ask rollup (leaf cost summed within the frame, EXCLUDING nested asks — spec decision 10).
+- **`ask_start` / `ask_end`** — bound every `ctx.ask()` call. `ask_start` carries `prompt`; `ask_end` carries `outcome: { ok: true, result } | { ok: false, error }`, `cost`, `duration`. `ask_end.cost` is the per-ask rollup (leaf cost summed within the frame, EXCLUDING nested asks).
 - **`agent_call_start`** — pre-call marker per LLM turn, paired with `agent_call_end`. Carries `agent`, `model`, `turn`.
 - **`tool_call_start`** — pre-call marker per tool invocation, paired with `tool_call_end`. Carries `tool`, `callId`, `data: { args }`.
-- **`pipeline`** — retry/validation lifecycle (statuses: `start` / `failed` / `committed`). `start` fires once per LLM turn that contributes to the final result (initial + each gate-rejection retry). `failed` fires before each retry continue with the gate stage (`schema` / `validate` / `guardrail`) and feedback message. `committed` fires once on success before `done`. Tool-calling continuations within the same ask do NOT fire additional starts. Spec §4.2.
+- **`pipeline`** — retry/validation lifecycle (statuses: `start` / `failed` / `committed`). `start` fires once per LLM turn that contributes to the final result (initial + each gate-rejection retry). `failed` fires before each retry continue with the gate stage (`schema` / `validate` / `guardrail`) and feedback message. `committed` fires once on success before `done`. Tool-calling continuations within the same ask do NOT fire additional starts.
 - **`partial_object`** — progressive structured-output streaming for asks with a Zod object schema and no tools. Emits at structural boundaries (`,` / `}` / `]`, string-safe walker). Backed by a tolerant JSON parser (`parsePartialJson`, 256-depth cap, zero deps). Monotonicity guaranteed within an attempt.
 - **`memory_remember` / `memory_recall` / `memory_forget`** — first-class typed variants (previously sub-discriminated under `log`). Narrow on `event.type` for typed access to `data.{key, scope, usage, hit, ...}`.
 - **`checkpoint_save` / `checkpoint_replay`** — first-class typed variants for durable execution events.
@@ -60,7 +60,7 @@ See [`docs/migration/unified-event-model.md`](docs/migration/unified-event-model
 
 #### Helpers and types
 
-- **`eventCostContribution(event)`** exported from `@axlsdk/axl` as the single source of truth for spec §10 cost aggregation (skips `ask_end` rollups, finite-checks, leaf-only). Used by the runtime accumulator, `AxlTestRuntime`, `trackExecution`, Studio's `reduceCost`, and the Playground / Workflow Runner panels.
+- **`eventCostContribution(event)`** exported from `@axlsdk/axl` as the single source of truth for cost aggregation — skips `ask_end` rollups (otherwise per-ask rollups would double-count their leaves), guards NaN/Infinity/negative values, and only credits cost-bearing leaf events. Used by the runtime accumulator, `AxlTestRuntime`, `trackExecution`, Studio's `reduceCost`, and the Playground / Workflow Runner panels.
 - **`isCostBearingLeaf(event)`** / **`isRootLevel(event)`** / **`COST_BEARING_LEAF_TYPES`** — supporting helpers for custom cost aggregators.
 - **`parsePartialJson(text)`** — tolerant JSON parser for progressive-render pipelines. 256-depth recursion cap.
 - **`AxlEventOf<T>`** Extract helper, **`AXL_EVENT_TYPES`** const tuple (single source of truth for the discriminator), **`AxlEventBase`**, **`AskScoped`**, **`CallbackMeta`** type exports.
@@ -97,12 +97,12 @@ See [`docs/migration/unified-event-model.md`](docs/migration/unified-event-model
 
 ### Fixed
 
-- **`AxlStream.fullText` no longer leaks retried-attempt tokens** — buffer split into in-progress and committed halves, flushed on `pipeline(committed)`, discarded on `pipeline(failed)` or terminal-throw `ask_end({ok:false})`. Spec §4.3.
-- **`validate` + streaming now coexist.** Was an `INVALID_CONFIG` hard error in 0.15.x as a defensive workaround for the retry-leak above; with the leak fixed at the source, the workaround is removed. Spec §4.1.
-- **Nested-ask events propagate to outer-context streaming callbacks.** `onToken`, `onToolCall`, `onAgentStart` from a parent context now fire for nested `ctx.ask()` invocations (with `meta.depth >= 1`). Filter on `meta.depth === 0` to recover root-only behavior. Spec §3.2.
+- **`AxlStream.fullText` no longer leaks retried-attempt tokens** — buffer split into in-progress and committed halves, flushed on `pipeline(committed)`, discarded on `pipeline(failed)` or terminal-throw `ask_end({ok:false})`.
+- **`validate` + streaming now coexist.** Was an `INVALID_CONFIG` hard error in 0.15.x as a defensive workaround for the retry-leak above; with the leak fixed at the source, the workaround is removed.
+- **Nested-ask events propagate to outer-context streaming callbacks.** `onToken`, `onToolCall`, `onAgentStart` from a parent context now fire for nested `ctx.ask()` invocations (with `meta.depth >= 1`). Filter on `meta.depth === 0` to recover root-only behavior.
 - **Workflow `workflow_end` is idempotent (first-wins).** A post-completion side effect (`stateStore.deleteCheckpoints`, `persistExecution`) that throws after `_emitWorkflowEnd(completed)` no longer triggers a second `workflow_end(failed)` with conflicting status.
 - **`onAgentCallComplete` hook throws no longer corrupt `ask_end.outcome`.** The hook is now wrapped in `try/catch + console.error` (mirroring the `onTrace` consumer-safety pattern); a buggy hook is logged but the ask's actual outcome survives intact.
-- **Spec §9 invariant hardened** — `ctx.ask()` body refactored to `try/catch/finally` so `ask_end` always emits regardless of which path exits. Pinned by tests for input-guardrail block, MaxTurnsError, TimeoutError, provider HTTP throw, and BudgetExceededError mid-ask.
+- **Ask-failure invariant hardened** — `ctx.ask()` body refactored to `try/catch/finally` so `ask_end` always emits regardless of which path exits, locking in "ask-internal failures emit `ask_end({ok:false})` only, never workflow-level `error`". Pinned by tests for input-guardrail block, MaxTurnsError, TimeoutError, provider HTTP throw, and BudgetExceededError mid-ask.
 - **Per-ask cost rollup includes embedder cost.** `frame.askCost` previously hardcoded `agent_call_end | tool_call_end`, dropping `memory_remember` / `memory_recall` cost when `ctx.recall()` ran inside an ask. Now uses `COST_BEARING_LEAF_TYPES`.
 - **PII redaction gaps closed.** `token.data` is now scrubbed at emit time (was leaking on the direct trace channel). Emit-time scrub also covers `tool_call_start`, `tool_denied`, `partial_object`, `verify`, `pipeline(failed).reason`, and `done` / `error`. Studio's `redactStreamEvent` shares the same `REDACTION_RULES` table — single source of truth across emit, REST, and WS.
 - **Studio multi-tenant filter applied to replay-buffer events.** Late subscribers no longer see historical cross-tenant events on reconnect.
@@ -111,7 +111,7 @@ See [`docs/migration/unified-event-model.md`](docs/migration/unified-event-model
 - **Handoff target is a real ask frame.** Target's `executeAgentCall` runs under `askStorage.run(targetFrame, ...)` so its events carry `askId === handoffToAskId` and `parentAskId === handoffFromAskId`. Consumers grouping by askId no longer see the target as an orphan.
 - **`partial_object` throttle is string-safe.** A char-by-char walker tracks `inString` + `escaped` state across chunks so commas inside string values no longer trigger per-comma parse+emit (50+ emissions on a prose-heavy field collapse to 1).
 - **SQLite migration races** — `user_version` is re-read inside `BEGIN IMMEDIATE` so a concurrent constructor race can't double-apply a non-idempotent migration.
-- **Gemini schema sanitizer** — Zod v4's `z.toJSONSchema()` emits Draft 2020-12 fields (`additionalProperties`, `oneOf`, `const`, `$ref`, `$defs`, `not`, `allOf`, ...) that Gemini's tool/responseSchema endpoint rejects with a 400. `sanitizeSchemaForGemini` recursively strips unsupported fields and translates `oneOf` → `anyOf` (preserves `z.discriminatedUnion()`) and `const: x` → `enum: [x]` (preserves `z.literal(x)`). Pre-existing bug surfaced by the live integration test pass; unrelated to spec/16.
+- **Gemini schema sanitizer** — Zod v4's `z.toJSONSchema()` emits Draft 2020-12 fields (`additionalProperties`, `oneOf`, `const`, `$ref`, `$defs`, `not`, `allOf`, ...) that Gemini's tool/responseSchema endpoint rejects with a 400. `sanitizeSchemaForGemini` recursively strips unsupported fields and translates `oneOf` → `anyOf` (preserves `z.discriminatedUnion()`) and `const: x` → `enum: [x]` (preserves `z.literal(x)`). Pre-existing bug surfaced by the 0.16.0 integration test pass; unrelated to the unified event model.
 
 ### Documentation
 

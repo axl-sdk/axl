@@ -54,37 +54,51 @@ function isEditableElement(el: HTMLElement): boolean {
 
 export function Sidebar() {
   // Initial collapse: stored preference wins, otherwise auto-collapse on
-  // narrow viewports so phones/tablets get the icon rail by default.
-  const [collapsed, setCollapsedState] = useState(() => {
+  // narrow viewports so phones/tablets get the icon rail by default. Read
+  // localStorage exactly once via a lazy initializer — both the collapsed
+  // state and the user-override flag derive from the same read.
+  const [{ collapsed, hasExplicitPreference }, setState] = useState(() => {
     const stored = loadStoredCollapsed();
-    return stored ?? isNarrowViewport();
+    return {
+      collapsed: stored ?? isNarrowViewport(),
+      hasExplicitPreference: stored !== null,
+    };
   });
 
-  // Track whether the user has explicitly toggled. Once they do, the stored
-  // preference takes over and the media-query auto-collapse stops firing —
-  // resizing the window won't override an intentional choice.
-  const userOverrideRef = useRef(loadStoredCollapsed() !== null);
+  // Mirror `hasExplicitPreference` into a ref so the matchMedia listener
+  // (registered once at mount) can check the latest value without us
+  // having to tear the listener down and re-register on every toggle.
+  const userOverrideRef = useRef(hasExplicitPreference);
+  useEffect(() => {
+    userOverrideRef.current = hasExplicitPreference;
+  }, [hasExplicitPreference]);
 
   const toggle = useCallback(() => {
-    setCollapsedState((c) => {
-      const next = !c;
-      userOverrideRef.current = true;
+    setState((s) => {
+      const next = !s.collapsed;
       try {
         localStorage.setItem(STORAGE_KEY, next ? '1' : '0');
       } catch {
         // localStorage unavailable — ignore
       }
-      return next;
+      return { collapsed: next, hasExplicitPreference: true };
     });
   }, []);
 
-  // Auto-collapse / re-expand when viewport crosses the narrow breakpoint,
-  // but only while the user hasn't expressed an explicit preference.
+  // Auto-collapse / re-expand when the viewport crosses the narrow
+  // breakpoint, but only while the user hasn't expressed an explicit
+  // preference. Re-checking `userOverrideRef.current` inside the handler
+  // (rather than at registration time) is what makes the lock-out actually
+  // work — empty-deps `useEffect` only runs the body once, but the handler
+  // it installs lives until unmount and must respect user choices made
+  // after registration.
   useEffect(() => {
-    if (userOverrideRef.current) return;
     if (typeof window === 'undefined' || !window.matchMedia) return;
     const mq = window.matchMedia(NARROW_QUERY);
-    const apply = () => setCollapsedState(mq.matches);
+    const apply = () => {
+      if (userOverrideRef.current) return;
+      setState((s) => ({ ...s, collapsed: mq.matches }));
+    };
     mq.addEventListener('change', apply);
     return () => mq.removeEventListener('change', apply);
   }, []);
@@ -132,13 +146,15 @@ export function Sidebar() {
           onClick={toggle}
           title={`${collapsed ? 'Expand' : 'Collapse'} sidebar (${shortcutLabel})`}
           aria-label={`${collapsed ? 'Expand' : 'Collapse'} sidebar`}
+          aria-expanded={!collapsed}
+          aria-controls="axl-studio-sidebar-nav"
           aria-keyshortcuts="Meta+B Control+B"
-          className="p-1 rounded-md text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--accent-foreground))] transition-colors"
+          className="p-1 rounded-md text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--accent-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] transition-colors"
         >
           <ToggleIcon size={16} />
         </button>
       </div>
-      <nav className="flex-1 p-2 space-y-0.5">
+      <nav id="axl-studio-sidebar-nav" className="flex-1 p-2 space-y-0.5">
         {links.map(({ to, label, icon: Icon }) => (
           <NavLink
             key={to}

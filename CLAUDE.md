@@ -186,13 +186,14 @@ packages/axl-studio/src/
       utils.ts       — cn(), formatCost(), formatDuration(), formatTokens(), extractLabel()
       trace-utils.ts — Trace data extraction helpers for the Trace Explorer panel
       types.ts       — Client-side types mirroring server API
+      theme.ts       — auto/light/dark mode storage + OS preference resolution + cross-tab sync (`startThemeAutoApply`, `applyResolvedTheme`, `subscribeToThemeChanges`); shared `STORAGE_KEY`/`DARK_QUERY`/`THEME_CLASS` constants kept aligned with the inline FOUC script in `index.html` via a tripwire test
     hooks/
       use-ws.ts      — useWs(channel, callback)
       use-ws-stream.ts — useWsStream(executionId)
       use-aggregate.ts — useAggregate<T>(channel, fetchFn): window state, REST fetch, WS subscription, updatedAt — used by all four aggregate panels
     components/
-      layout/        — Sidebar, PanelShell, PanelHeader
-      shared/        — JsonEditor, JsonViewer, CostBadge, StatusBadge, SchemaForm, StreamingText, StatCard, EmptyState, DurationBadge, TokenBadge, WindowSelector, CommandPicker, TraceEventList
+      layout/        — Sidebar (auto-collapses below 768px until user override; `aria-expanded`/`aria-controls`/`Cmd+B`), PanelShell, PanelHeader (title `truncate`s; actions `flex-wrap` below the title on narrow viewports), ThemeToggle (auto/light/dark cycle, `LucideIcon` typed, `focus-visible` ring, `aria-label` describes current state + next click)
+      shared/        — JsonEditor, JsonViewer, CostBadge, StatusBadge, SchemaForm, StreamingText, StatCard, EmptyState, DurationBadge, TokenBadge, WindowSelector, CommandPicker, TraceEventList, ResizableSplit (drag-to-resize panes; auto-stacks vertically via `ResizeObserver` when container `< 2*minPx + gutter`)
       shared/charts/ — LineChart (auto y-scale, clamp, hover, point-click), SparkLine (inline fill line), BarChart + StackedBarChart (horizontal bars, stacked segments)
     panels/
       playground/    — Agent Playground (chat, streaming, tool calls)

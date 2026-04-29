@@ -13,6 +13,7 @@ import {
   PanelLeftOpen,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
+import { ThemeToggle } from './ThemeToggle';
 
 const links = [
   { to: '/playground', label: 'Playground', icon: MessageSquare },
@@ -158,11 +159,17 @@ export function Sidebar() {
           </NavLink>
         ))}
       </nav>
-      {!collapsed && (
-        <div className="p-4 border-t border-[hsl(var(--border))] text-xs text-[hsl(var(--muted-foreground))]">
-          @axlsdk/studio
-        </div>
-      )}
+      <div
+        className={cn(
+          'border-t border-[hsl(var(--border))]',
+          collapsed ? 'p-2 flex justify-center' : 'p-3 flex items-center justify-between gap-2',
+        )}
+      >
+        {!collapsed && (
+          <span className="text-xs text-[hsl(var(--muted-foreground))]">@axlsdk/studio</span>
+        )}
+        <ThemeToggle compact={collapsed} />
+      </div>
     </aside>
   );
 }

@@ -4,6 +4,24 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Axl Studio</title>
+    <script>
+      // Apply theme synchronously before any paint to avoid a light/dark
+      // flash. Mirrors the lib/theme.ts contract: localStorage key
+      // 'axl.studio.theme' holds 'auto' | 'light' | 'dark'; 'auto' falls
+      // back to the OS prefers-color-scheme.
+      (function () {
+        try {
+          var stored = localStorage.getItem('axl.studio.theme');
+          var mode = stored === 'light' || stored === 'dark' || stored === 'auto' ? stored : 'auto';
+          var dark =
+            mode === 'dark' ||
+            (mode === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (dark) document.documentElement.classList.add('dark');
+        } catch (e) {
+          // localStorage / matchMedia unavailable — default to light.
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

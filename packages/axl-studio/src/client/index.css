@@ -1,5 +1,14 @@
 @import 'tailwindcss';
 
+/*
+ * Bind Tailwind's `dark:` variant to the `.dark` class on <html> instead of
+ * the default `prefers-color-scheme: dark` media query. This lets the
+ * Studio theme toggle (light / dark / auto) flip both our CSS variables
+ * (which already key off `.dark`) and every `dark:bg-*` / `dark:text-*`
+ * utility from the same single source of truth.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   --background: 0 0% 100%;
   --foreground: 240 10% 3.9%;

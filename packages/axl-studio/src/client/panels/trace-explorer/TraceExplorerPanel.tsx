@@ -194,7 +194,7 @@ export function TraceExplorerPanel() {
       <div
         role="tablist"
         aria-label="Trace views"
-        className="shrink-0 flex items-center gap-1 px-6 border-b border-[hsl(var(--border))]"
+        className="shrink-0 flex items-center gap-1 px-4 sm:px-6 border-b border-[hsl(var(--border))]"
       >
         {(['events', 'stats'] as const).map((t) => (
           <button
@@ -230,7 +230,7 @@ export function TraceExplorerPanel() {
           minPercent={15}
           maxPercent={40}
           left={
-            <div className="flex-1 overflow-y-auto p-6 space-y-2">
+            <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-2">
               <h3 className="text-sm font-medium mb-2">Executions</h3>
               <button
                 onClick={() => {
@@ -286,7 +286,7 @@ export function TraceExplorerPanel() {
             </div>
           }
           right={
-            <div className="flex-1 overflow-y-auto p-6">
+            <div className="flex-1 overflow-y-auto p-4 sm:p-6">
               {/* Stat cards for selected execution */}
               {stats && (
                 <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">

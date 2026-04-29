@@ -676,7 +676,7 @@ export function EvalRunnerPanel() {
       <div
         role="tablist"
         aria-label="Eval views"
-        className="shrink-0 flex items-center gap-1 px-6 border-b border-[hsl(var(--border))]"
+        className="shrink-0 flex items-center gap-1 px-4 sm:px-6 border-b border-[hsl(var(--border))]"
       >
         {tabs.map((t) => (
           <button
@@ -1371,7 +1371,7 @@ export function EvalRunnerPanel() {
 
       {/* ── History Tab ──────────────────────────────────── */}
       {tab === 'history' && (
-        <div className="flex-1 overflow-auto p-6">
+        <div className="flex-1 overflow-auto p-4 sm:p-6">
           {history.length === 0 ? (
             <EmptyState title="No eval history" description="Run evaluations to build history." />
           ) : (
@@ -1425,7 +1425,7 @@ export function EvalRunnerPanel() {
 
       {/* ── Compare Tab ──────────────────────────────────── */}
       {tab === 'compare' && (
-        <div className="flex-1 overflow-auto p-6">
+        <div className="flex-1 overflow-auto p-4 sm:p-6">
           <div className="space-y-4">
             {history.length < 2 ? (
               <EmptyState

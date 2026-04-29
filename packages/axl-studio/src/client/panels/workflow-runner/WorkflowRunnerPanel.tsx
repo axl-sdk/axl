@@ -205,7 +205,7 @@ export function WorkflowRunnerPanel() {
       <div
         role="tablist"
         aria-label="Workflow Runner views"
-        className="shrink-0 flex items-center gap-1 px-6 border-b border-[hsl(var(--border))]"
+        className="shrink-0 flex items-center gap-1 px-4 sm:px-6 border-b border-[hsl(var(--border))]"
       >
         {(['run', 'stats'] as const).map((t) => (
           <button
@@ -228,7 +228,7 @@ export function WorkflowRunnerPanel() {
 
       {/* ── Stats Tab ─────────────────────────────────── */}
       {wfTab === 'stats' && (
-        <div className="flex-1 min-h-0 overflow-auto p-5">
+        <div className="flex-1 min-h-0 overflow-auto p-3 sm:p-5">
           <WorkflowStatsBar
             onWorkflowClick={(name) => {
               handleSelectWorkflow(name);
@@ -247,7 +247,7 @@ export function WorkflowRunnerPanel() {
           minPercent={15}
           maxPercent={50}
           left={
-            <div className="flex-1 overflow-y-auto p-5 space-y-4">
+            <div className="flex-1 overflow-y-auto p-3 sm:p-5 space-y-4">
               {/* Input mode toggle */}
               {hasSchema && (
                 <div className="flex items-center gap-1">
@@ -304,7 +304,7 @@ export function WorkflowRunnerPanel() {
             </div>
           }
           right={
-            <div className="flex-1 overflow-y-auto p-5">
+            <div className="flex-1 overflow-y-auto p-3 sm:p-5">
               {status === 'idle' ? (
                 <div className="flex items-center justify-center h-full">
                   <EmptyState

@@ -84,7 +84,7 @@ export function ToolInspectorPanel() {
         minPercent={20}
         maxPercent={50}
         left={
-          <div className="flex-1 overflow-y-auto p-6">
+          <div className="flex-1 overflow-y-auto p-4 sm:p-6">
             <div className="space-y-2">
               <h3 className="text-sm font-medium mb-2">Tools ({tools.length})</h3>
               {tools.length === 0 ? (
@@ -132,7 +132,7 @@ export function ToolInspectorPanel() {
           </div>
         }
         right={
-          <div className="flex-1 overflow-y-auto p-6">
+          <div className="flex-1 overflow-y-auto p-4 sm:p-6">
             {!selectedToolName ? (
               <EmptyState
                 title="Select a tool"

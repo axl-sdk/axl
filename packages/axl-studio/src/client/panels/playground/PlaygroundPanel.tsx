@@ -276,7 +276,7 @@ export function PlaygroundPanel() {
 
   const chatPanel = (
     <>
-      <div className="flex-1 overflow-auto p-5 space-y-4">
+      <div className="flex-1 overflow-auto p-3 sm:p-5 space-y-4">
         {messages.length === 0 && (
           <EmptyState
             title="Start a conversation"
@@ -521,7 +521,7 @@ export function PlaygroundPanel() {
           className="flex-1"
           left={chatPanel}
           right={
-            <div className="flex-1 overflow-y-auto p-5 space-y-4">
+            <div className="flex-1 overflow-y-auto p-3 sm:p-5 space-y-4">
               <h3 className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
                 Activity
               </h3>

@@ -99,7 +99,7 @@ export function SessionManagerPanel() {
         minPercent={20}
         maxPercent={50}
         left={
-          <div className="flex-1 overflow-y-auto p-6 space-y-2">
+          <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-2">
             <h3 className="text-sm font-medium mb-2">Sessions ({sessions.length})</h3>
             {sessions.length === 0 ? (
               <EmptyState
@@ -136,7 +136,7 @@ export function SessionManagerPanel() {
           </div>
         }
         right={
-          <div className="flex-1 overflow-y-auto p-6">
+          <div className="flex-1 overflow-y-auto p-4 sm:p-6">
             {!sessionDetail ? (
               <EmptyState
                 title="Select a session"

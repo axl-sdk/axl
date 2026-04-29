@@ -18,6 +18,15 @@ type ResizableSplitProps = {
 
 const STORAGE_PREFIX = 'axl.studio.split.';
 const ARROW_KEY_STEP = 2;
+const GUTTER_WIDTH = 6; // matches w-1.5
+// When the container is narrower than two min panes + gutter, the split
+// can't honor `minPx` — clamp(min, max) where min > max degenerates and
+// we end up with two crushed columns. Switch to a vertical stack so each
+// pane gets full width and the user just scrolls.
+function shouldStack(containerWidth: number, minPx: number): boolean {
+  if (containerWidth <= 0) return false;
+  return containerWidth < 2 * minPx + GUTTER_WIDTH;
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -45,6 +54,7 @@ export function ResizableSplit({
       return defaultPercent;
     }
   });
+  const [stacked, setStacked] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
   const moveHandlerRef = useRef<((ev: MouseEvent | TouchEvent) => void) | null>(null);
@@ -59,6 +69,27 @@ export function ResizableSplit({
       // localStorage unavailable — ignore.
     }
   }, [storageKey, splitPercent]);
+
+  // Track container width so we can flip into stacked mode when both
+  // panes can't fit at their minimum widths. ResizeObserver fires on
+  // initial layout AND on every resize, so we don't need a separate
+  // window listener.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') {
+      // Fallback: set once from initial layout if RO is unavailable.
+      if (el) setStacked(shouldStack(el.getBoundingClientRect().width, minPx));
+      return;
+    }
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const width = entry.contentRect.width;
+      setStacked(shouldStack(width, minPx));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [minPx]);
 
   // Compute container-aware bounds. minPx clamps so a 20% pane on a 600px
   // container doesn't collapse to 120px.
@@ -167,6 +198,24 @@ export function ResizableSplit({
     },
     [computeBounds],
   );
+
+  // Stacked mode: container is too narrow to honor `minPx` for both
+  // panes. Render top/bottom with each pane full-width — drop the
+  // resizer entirely since dragging in this layout is unergonomic and
+  // the panes are already at their minimums.
+  if (stacked) {
+    return (
+      <div ref={containerRef} className={cn('flex flex-col min-h-0', className)}>
+        <div className="min-h-0 min-w-0 flex flex-col flex-1 overflow-auto">{left}</div>
+        <div
+          role="separator"
+          aria-orientation="horizontal"
+          className="h-px shrink-0 bg-[hsl(var(--border))]"
+        />
+        <div className="min-h-0 min-w-0 flex flex-col flex-1 overflow-auto">{right}</div>
+      </div>
+    );
+  }
 
   return (
     <div ref={containerRef} className={cn('flex min-h-0', className)}>

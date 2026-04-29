@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Studio: system theme detection with auto / light / dark toggle.** Studio now respects the OS color scheme by default and exposes a three-mode toggle in the sidebar footer. Mode is persisted to `localStorage['axl.studio.theme']` and synchronized across tabs. An inline script in `index.html` applies the resolved theme before the bundle loads to avoid a light/dark flash. `index.css` declares `@custom-variant dark (&:where(.dark, .dark *))` so Tailwind's `dark:` variants and the existing `.dark` CSS variable block flip from a single source of truth instead of `prefers-color-scheme`.
+
+### Fixed
+
+- **Studio: stat cards and badges no longer overflow at narrow widths.** `StatCard` values clip cleanly with ellipsis (and a `title` for hover) instead of spilling past the rounded card; large values scale `text-xl sm:text-2xl`. `CostBadge`, `DurationBadge`, `TokenBadge`, and `StatusBadge` now hold to a single line via `whitespace-nowrap` so they don't break mid-value in tight tables.
+- **Studio: responsive layout for narrow viewports.** Sidebar auto-collapses below 768px on first load (until the user explicitly toggles, which then takes over). Cost-dashboard and workflow-stats tables scroll horizontally on narrow viewports instead of pushing the surrounding panel. Panel chrome (header gap, body padding) tightens to `gap-3 / px-4` below `sm` and relaxes to `gap-6 / px-6` at `sm+`.
+
 ## [0.16.0] - 2026-04-28
 
 ### Unified Event Model

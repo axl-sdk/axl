@@ -21,22 +21,34 @@ export function StatCard({
   return (
     <div
       className={cn(
-        'px-4 py-3.5 rounded-xl',
+        'px-4 py-3.5 rounded-xl min-w-0',
         tint ? tint : 'bg-[hsl(var(--card))] border border-[hsl(var(--border))]',
       )}
     >
-      <p className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))]">
+      <p className="text-[11px] font-medium uppercase tracking-wider text-[hsl(var(--muted-foreground))] truncate">
         {label}
       </p>
       {badge ? (
         <div className="mt-1">{badge}</div>
       ) : (
-        <p className={cn('text-2xl font-semibold mt-1 font-mono tracking-tight', accent)}>
+        <p
+          className={cn(
+            'text-xl sm:text-2xl font-semibold mt-1 font-mono tracking-tight truncate',
+            accent,
+          )}
+          title={value}
+        >
           {value}
         </p>
       )}
       {subtitle && (
-        <p className={cn('text-xs mt-0.5', subtitleColor ?? 'text-[hsl(var(--muted-foreground))]')}>
+        <p
+          className={cn(
+            'text-xs mt-0.5 truncate',
+            subtitleColor ?? 'text-[hsl(var(--muted-foreground))]',
+          )}
+          title={subtitle}
+        >
           {subtitle}
         </p>
       )}

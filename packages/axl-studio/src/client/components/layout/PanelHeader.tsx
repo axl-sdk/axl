@@ -12,21 +12,32 @@ interface PanelHeaderProps {
 }
 
 // Canonical header for every studio panel — single source of truth for
-// vertical sizing, typography, and layout. `min-h-[68px]` locks the row
-// height so tall action controls (rounded-pill pickers) and short ones
-// (flat buttons) produce the same header height, and an always-rendered
-// description slot (collapsing to a non-breaking space when absent)
-// keeps the title anchored at the same baseline across all tabs.
+// vertical sizing, typography, and layout.
+//
+// Desktop (sm+): one row, title left, actions pinned right via
+// `justify-between`. `min-h-[68px]` (sm+) locks the row height so tall
+// action controls (rounded-pill pickers) and short ones (flat buttons)
+// render the same height across tabs.
+//
+// Phones (<sm): the workflow-runner / eval-runner pack 200-320px of
+// actions next to the title. Forcing one row would either crush the title
+// to "…" or push actions off-screen. `flex-wrap` lets actions drop below
+// the title when the row would overflow; the title gets `basis-[200px]`
+// so it claims the full row when it has to (instead of degenerating to
+// a 1px ellipsis-only column).
+//
+// An always-rendered description slot (non-breaking space when absent)
+// keeps the title anchored at the same baseline across tabs.
 export function PanelHeader({ title, description, actions, className }: PanelHeaderProps) {
   return (
     <header
       className={cn(
-        'shrink-0 flex items-center justify-between gap-3 sm:gap-6 px-4 sm:px-6 py-4 min-h-[68px]',
+        'shrink-0 flex flex-wrap items-center justify-between gap-y-3 gap-x-3 sm:gap-x-6 px-4 sm:px-6 py-4 sm:min-h-[68px]',
         'border-b border-[hsl(var(--border))]',
         className,
       )}
     >
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1 basis-[200px]">
         <h2 className="text-xl font-semibold leading-tight truncate" title={title}>
           {title}
         </h2>
@@ -43,7 +54,9 @@ export function PanelHeader({ title, description, actions, className }: PanelHea
           {description ?? '\u00A0'}
         </div>
       </div>
-      {actions && <div className="flex items-center gap-2 shrink-0">{actions}</div>}
+      {actions && (
+        <div className="flex items-center gap-2 flex-wrap shrink-0 ml-auto">{actions}</div>
+      )}
     </header>
   );
 }

@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, XCircle, AlertTriangle } from 'lucide-react';
 import { cn, formatCost, formatDuration, extractLabel } from '../../lib/utils';
 import type { EvalItem } from './types';
 import { scoreTextColor } from './types';
@@ -230,13 +230,21 @@ export function EvalItemList({
                     <td className="px-3 py-2 font-mono text-[hsl(var(--muted-foreground))]">
                       {index + 1}
                       {item.error && (
-                        <span className="ml-1 text-red-500" title="Workflow error">
-                          !
+                        <span
+                          className="ml-1 inline-flex items-center text-red-500"
+                          title="Workflow error"
+                          aria-label="Workflow error"
+                        >
+                          <XCircle size={12} />
                         </span>
                       )}
                       {!item.error && item.scorerErrors && item.scorerErrors.length > 0 && (
-                        <span className="ml-1 text-amber-500" title="Scorer errors">
-                          !
+                        <span
+                          className="ml-1 inline-flex items-center text-amber-500"
+                          title="Scorer errors"
+                          aria-label="Scorer errors"
+                        >
+                          <AlertTriangle size={12} />
                         </span>
                       )}
                     </td>

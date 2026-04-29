@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, XCircle, AlertTriangle } from 'lucide-react';
 import { cn, extractLabel } from '../../lib/utils';
 import type { EvalItem } from './types';
 import { scoreTextColor } from './types';
@@ -106,15 +106,26 @@ export function EvalItemSidebar({
                 {label}
               </span>
 
-              {/* Error indicator */}
+              {/* Error indicator — distinct icon + color so colorblind users
+                  and touch users (no `title` hover) can still tell workflow
+                  failures (red XCircle) apart from scorer-only failures
+                  (amber AlertTriangle). */}
               {item.error && (
-                <span className="text-[10px] text-red-500 shrink-0" title="Workflow error">
-                  !
+                <span
+                  className="inline-flex items-center text-red-500 shrink-0"
+                  title="Workflow error"
+                  aria-label="Workflow error"
+                >
+                  <XCircle size={11} />
                 </span>
               )}
               {!item.error && item.scorerErrors && item.scorerErrors.length > 0 && (
-                <span className="text-[10px] text-amber-500 shrink-0" title="Scorer errors">
-                  !
+                <span
+                  className="inline-flex items-center text-amber-500 shrink-0"
+                  title="Scorer errors"
+                  aria-label="Scorer errors"
+                >
+                  <AlertTriangle size={11} />
                 </span>
               )}
 

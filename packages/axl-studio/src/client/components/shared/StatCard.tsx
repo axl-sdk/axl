@@ -33,7 +33,12 @@ export function StatCard({
       ) : (
         <p
           className={cn(
-            'text-xl sm:text-2xl font-semibold mt-1 font-mono tracking-tight truncate',
+            // Phones get a smaller value font so long mono strings (e.g.
+            // `anthropic:claude-3-5-sonnet-20241022`) fit more characters
+            // before the truncate kicks in. `select-text` lets touch users
+            // long-press to select and copy the truncated value, since
+            // `title` only surfaces on desktop hover.
+            'text-lg sm:text-2xl font-semibold mt-1 font-mono tracking-tight truncate select-text',
             accent,
           )}
           title={value}

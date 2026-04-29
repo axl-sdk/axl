@@ -149,7 +149,7 @@ export function Sidebar() {
           aria-expanded={!collapsed}
           aria-controls="axl-studio-sidebar-nav"
           aria-keyshortcuts="Meta+B Control+B"
-          className="p-1 rounded-md text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--accent-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] transition-colors"
+          className="p-2 rounded-md text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--accent-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] transition-colors"
         >
           <ToggleIcon size={16} />
         </button>
@@ -163,7 +163,7 @@ export function Sidebar() {
             className={({ isActive }) =>
               cn(
                 'flex items-center gap-2.5 rounded-md text-sm transition-colors',
-                collapsed ? 'justify-center px-2 py-2' : 'px-3 py-2',
+                collapsed ? 'justify-center px-2 py-2.5' : 'px-3 py-2',
                 isActive
                   ? 'bg-[hsl(var(--accent))] text-[hsl(var(--accent-foreground))] font-medium'
                   : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--accent-foreground))]',

@@ -70,7 +70,7 @@ export function ThemeToggle({ compact = false }: Props) {
         'inline-flex items-center gap-2 rounded-md text-xs transition-colors',
         'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--accent-foreground))]',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))]',
-        compact ? 'p-1.5 justify-center' : 'px-2 py-1.5',
+        compact ? 'p-2 justify-center' : 'px-2 py-1.5',
       )}
     >
       <Icon size={14} />

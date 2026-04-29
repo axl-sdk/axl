@@ -27,7 +27,9 @@ export function PanelHeader({ title, description, actions, className }: PanelHea
       )}
     >
       <div className="min-w-0 flex-1">
-        <h2 className="text-xl font-semibold leading-tight">{title}</h2>
+        <h2 className="text-xl font-semibold leading-tight truncate" title={title}>
+          {title}
+        </h2>
         {/*
           Block + truncate: `white-space: nowrap` inherits to inline span
           children, overflow:hidden clips the whole inline flow, and

@@ -82,3 +82,23 @@ body {
   animation: popover-enter 140ms cubic-bezier(0.16, 1, 0.3, 1);
   transform-origin: top right;
 }
+
+/*
+ * Honor `prefers-reduced-motion: reduce` globally. Sidebar collapse,
+ * theme transitions, popover entrance, hover color fades, and Tailwind's
+ * `transition-*` utilities all collapse to a near-zero duration so users
+ * with vestibular sensitivity don't get whipped around. We don't drop to
+ * 0ms because some libraries (and our own focus styles) rely on the
+ * transitionend event firing — 0.01ms preserves the event without
+ * producing visible motion.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

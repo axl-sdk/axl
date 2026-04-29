@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import {
   MessageSquare,
@@ -26,13 +26,22 @@ const links = [
 ];
 
 const STORAGE_KEY = 'axl.studio.sidebar.collapsed';
+const NARROW_QUERY = '(max-width: 767px)';
 
-function loadCollapsed(): boolean {
+function loadStoredCollapsed(): boolean | null {
   try {
-    return localStorage.getItem(STORAGE_KEY) === '1';
+    const v = localStorage.getItem(STORAGE_KEY);
+    if (v === '1') return true;
+    if (v === '0') return false;
+    return null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+function isNarrowViewport(): boolean {
+  if (typeof window === 'undefined' || !window.matchMedia) return false;
+  return window.matchMedia(NARROW_QUERY).matches;
 }
 
 function isEditableElement(el: HTMLElement): boolean {
@@ -43,15 +52,41 @@ function isEditableElement(el: HTMLElement): boolean {
 }
 
 export function Sidebar() {
-  const [collapsed, setCollapsed] = useState(loadCollapsed);
+  // Initial collapse: stored preference wins, otherwise auto-collapse on
+  // narrow viewports so phones/tablets get the icon rail by default.
+  const [collapsed, setCollapsedState] = useState(() => {
+    const stored = loadStoredCollapsed();
+    return stored ?? isNarrowViewport();
+  });
 
+  // Track whether the user has explicitly toggled. Once they do, the stored
+  // preference takes over and the media-query auto-collapse stops firing —
+  // resizing the window won't override an intentional choice.
+  const userOverrideRef = useRef(loadStoredCollapsed() !== null);
+
+  const toggle = useCallback(() => {
+    setCollapsedState((c) => {
+      const next = !c;
+      userOverrideRef.current = true;
+      try {
+        localStorage.setItem(STORAGE_KEY, next ? '1' : '0');
+      } catch {
+        // localStorage unavailable — ignore
+      }
+      return next;
+    });
+  }, []);
+
+  // Auto-collapse / re-expand when viewport crosses the narrow breakpoint,
+  // but only while the user hasn't expressed an explicit preference.
   useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, collapsed ? '1' : '0');
-    } catch {
-      // localStorage unavailable — ignore
-    }
-  }, [collapsed]);
+    if (userOverrideRef.current) return;
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mq = window.matchMedia(NARROW_QUERY);
+    const apply = () => setCollapsedState(mq.matches);
+    mq.addEventListener('change', apply);
+    return () => mq.removeEventListener('change', apply);
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -65,11 +100,11 @@ export function Sidebar() {
       const target = e.target as HTMLElement | null;
       if (target && isEditableElement(target)) return;
       e.preventDefault();
-      setCollapsed((c) => !c);
+      toggle();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  }, [toggle]);
 
   const ToggleIcon = collapsed ? PanelLeftOpen : PanelLeftClose;
   const shortcutLabel =
@@ -93,7 +128,7 @@ export function Sidebar() {
         {!collapsed && <h1 className="text-lg font-semibold tracking-tight">Axl Studio</h1>}
         <button
           type="button"
-          onClick={() => setCollapsed((c) => !c)}
+          onClick={toggle}
           title={`${collapsed ? 'Expand' : 'Collapse'} sidebar (${shortcutLabel})`}
           aria-label={`${collapsed ? 'Expand' : 'Collapse'} sidebar`}
           aria-keyshortcuts="Meta+B Control+B"

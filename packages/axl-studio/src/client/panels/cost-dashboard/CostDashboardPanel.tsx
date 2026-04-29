@@ -498,8 +498,8 @@ function CostTable<T>({
   };
 
   return (
-    <div className="rounded-xl border border-[hsl(var(--border))] overflow-hidden">
-      <table className="w-full text-xs">
+    <div className="rounded-xl border border-[hsl(var(--border))] overflow-x-auto">
+      <table className="w-full text-xs min-w-[480px]">
         <thead>
           <tr className="border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]">
             {columns.map((col, i) => {

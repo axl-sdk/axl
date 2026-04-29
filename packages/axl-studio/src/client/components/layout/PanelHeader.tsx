@@ -21,7 +21,7 @@ export function PanelHeader({ title, description, actions, className }: PanelHea
   return (
     <header
       className={cn(
-        'shrink-0 flex items-center justify-between gap-6 px-6 py-4 min-h-[68px]',
+        'shrink-0 flex items-center justify-between gap-3 sm:gap-6 px-4 sm:px-6 py-4 min-h-[68px]',
         'border-b border-[hsl(var(--border))]',
         className,
       )}

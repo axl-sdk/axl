@@ -15,7 +15,7 @@ export function PanelShell({ title, description, actions, children }: Props) {
   return (
     <div className="flex flex-col h-screen">
       <PanelHeader title={title} description={description} actions={actions} />
-      <main className="flex-1 overflow-auto p-6">{children}</main>
+      <main className="flex-1 overflow-auto p-4 sm:p-6">{children}</main>
     </div>
   );
 }

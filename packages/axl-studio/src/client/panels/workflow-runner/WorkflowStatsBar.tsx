@@ -68,8 +68,8 @@ export function WorkflowStatsBar({
       </div>
 
       {workflows.length > 0 && (
-        <div className="rounded-xl border border-[hsl(var(--border))] overflow-hidden">
-          <table className="w-full text-xs">
+        <div className="rounded-xl border border-[hsl(var(--border))] overflow-x-auto">
+          <table className="w-full text-xs min-w-[560px]">
             <thead>
               <tr className="border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]">
                 <th className="py-2 px-3 text-left font-medium">Workflow</th>

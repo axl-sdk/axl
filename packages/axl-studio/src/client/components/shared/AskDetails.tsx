@@ -72,7 +72,7 @@ export function AskDetails(props: AskDetailsProps): ReactElement {
       <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-slate-700">
         <div className="flex items-center gap-2">
           <span className="font-medium truncate">{summary.agent ?? '<unknown agent>'}</span>
-          <span className="text-xs font-mono text-slate-400" title={askId}>
+          <span className="text-xs font-mono text-[hsl(var(--muted-foreground))]" title={askId}>
             {askId.slice(0, 8)}
           </span>
         </div>
@@ -105,13 +105,17 @@ export function AskDetails(props: AskDetailsProps): ReactElement {
       </div>
       {summary.prompt && (
         <div className="px-4 py-2 border-b border-slate-200 text-sm dark:border-slate-700">
-          <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">Prompt</div>
+          <div className="text-xs uppercase tracking-wide text-[hsl(var(--muted-foreground))] mb-1">
+            Prompt
+          </div>
           <div className="font-mono whitespace-pre-wrap break-words">{summary.prompt}</div>
         </div>
       )}
       <div className="flex-1 overflow-auto px-2 py-2">
         {filtered.length === 0 ? (
-          <div className="text-sm text-slate-500 py-4 text-center">No events for this ask.</div>
+          <div className="text-sm text-[hsl(var(--muted-foreground))] py-4 text-center">
+            No events for this ask.
+          </div>
         ) : (
           <TraceEventList events={filtered} />
         )}

@@ -30,12 +30,6 @@
   --input: 240 5.9% 90%;
   --ring: 240 5.9% 10%;
   --radius: 0.5rem;
-
-  /* Studio accent colors */
-  --studio-green: 142 71% 45%;
-  --studio-blue: 217 91% 60%;
-  --studio-amber: 38 92% 50%;
-  --studio-red: 0 84% 60%;
 }
 
 .dark {

@@ -290,7 +290,7 @@ function AskNodeRow(props: {
               e.stopPropagation();
               setExpanded((v) => !v);
             }}
-            className="text-slate-500"
+            className="text-[hsl(var(--muted-foreground))]"
           >
             {expanded ? (
               <ChevronDown className="h-3.5 w-3.5" />
@@ -313,9 +313,14 @@ function AskNodeRow(props: {
           {node.agent ?? '<unknown>'}
         </span>
         {node.model && (
-          <span className="text-xs text-slate-500 font-mono truncate">{node.model}</span>
+          <span className="text-xs text-[hsl(var(--muted-foreground))] font-mono truncate">
+            {node.model}
+          </span>
         )}
-        <span className="text-xs text-slate-400 font-mono truncate" title={node.askId}>
+        <span
+          className="text-xs text-[hsl(var(--muted-foreground))] font-mono truncate"
+          title={node.askId}
+        >
           {node.askId.slice(0, 8)}
         </span>
         <span className="ml-auto flex items-center gap-2">
@@ -344,7 +349,9 @@ function AskNodeRow(props: {
             <span key={i} className="inline-flex items-center gap-1">
               <ArrowRight className="h-3 w-3" />
               handoff → {h.target}
-              <span className="font-mono text-slate-400">({h.toAskId.slice(0, 8)})</span>
+              <span className="font-mono text-[hsl(var(--muted-foreground))]">
+                ({h.toAskId.slice(0, 8)})
+              </span>
             </span>
           ))}
         </div>
@@ -398,7 +405,7 @@ export function AskTree(props: AskTreeProps): ReactElement {
 
   if (tree.length === 0 && !wf) {
     return (
-      <div className="text-sm text-slate-500 py-4 text-center">
+      <div className="text-sm text-[hsl(var(--muted-foreground))] py-4 text-center">
         No asks recorded yet. Events will appear here as `ctx.ask()` calls fire.
       </div>
     );

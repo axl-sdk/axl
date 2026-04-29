@@ -90,6 +90,6 @@ export function statusColor(status: string): string {
     case 'waiting':
       return 'text-amber-500';
     default:
-      return 'text-gray-500';
+      return 'text-[hsl(var(--muted-foreground))]';
   }
 }

@@ -22,4 +22,34 @@ describe('StatCard', () => {
     // No numeric value node.
     expect(screen.queryByText('$0.01', { selector: 'p' })).not.toBeInTheDocument();
   });
+
+  // Regression coverage for the narrow-viewport overflow fix:
+  // unbreakable mono values like "1,234,567" or "openai:gpt-4o" used to
+  // spill past the rounded card. The fix relies on three classes — drop
+  // any of them and the bug returns silently. Class-presence assertions
+  // are an explicit reminder to the next refactor.
+  describe('overflow handling', () => {
+    it('truncates long unbreakable values with ellipsis + hover title', () => {
+      const longValue = '1,234,567,890.12';
+      render(<StatCard label="Tokens" value={longValue} />);
+      const valueNode = screen.getByText(longValue);
+      expect(valueNode).toHaveClass('truncate');
+      expect(valueNode).toHaveAttribute('title', longValue);
+    });
+
+    it('truncates long subtitles too', () => {
+      render(<StatCard label="Model" value="-" subtitle="anthropic:claude-opus-4-7" />);
+      const subtitleNode = screen.getByText('anthropic:claude-opus-4-7');
+      expect(subtitleNode).toHaveClass('truncate');
+      expect(subtitleNode).toHaveAttribute('title', 'anthropic:claude-opus-4-7');
+    });
+
+    it('does not set a title attribute when value is omitted (badge variant)', () => {
+      render(<StatCard label="Cost" badge={<span data-testid="cb">$0.01</span>} />);
+      // No <p title="..."> for the value slot, since there is no value.
+      // Asserting the badge container has no inappropriate title attribute.
+      const badge = screen.getByTestId('cb');
+      expect(badge.closest('[title]')).toBeNull();
+    });
+  });
 });

@@ -268,6 +268,10 @@ export function LineChart({
                 />
                 {sorted.map((p, i) =>
                   p.partial ? (
+                    // SVG <title> renders as a native browser tooltip on
+                    // hover for screen-readers and mouse users alike, so
+                    // the hollow-ring convention becomes self-describing
+                    // even outside the legend.
                     <circle
                       key={i}
                       cx={scaleX(p.x)}
@@ -276,7 +280,12 @@ export function LineChart({
                       fill="hsl(var(--background))"
                       stroke={s.color}
                       strokeWidth={1.5}
-                    />
+                    >
+                      <title>
+                        Partial batch{p.label ? ` — ${p.label}` : ''} (fewer runs completed than
+                        planned)
+                      </title>
+                    </circle>
                   ) : (
                     <circle key={i} cx={scaleX(p.x)} cy={scaleY(p.y)} r={2.5} fill={s.color} />
                   ),

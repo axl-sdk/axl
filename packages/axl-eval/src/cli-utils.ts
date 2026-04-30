@@ -1,14 +1,22 @@
 /**
  * CLI utilities for config detection, runtime resolution, and loader registration.
  *
- * These are duplicated from @axlsdk/studio (cli-utils.ts, resolve-runtime.ts,
- * eval-loader.ts, cli.ts) because @axlsdk/eval cannot depend on @axlsdk/studio.
- * Keep in sync with the studio versions if either changes.
+ * Module-resolution helpers (`resolveRuntime`, `pickDefault`, `pickExport`)
+ * live in `@axlsdk/axl` so the eval CLI and Studio middleware share one
+ * implementation of the ESM/CJS interop walk. Re-exported here so existing
+ * imports from `./cli-utils` keep working.
+ *
+ * The remaining helpers (config detection, tsx loader registration, glob
+ * expansion) duplicate equivalents in `@axlsdk/studio/cli-utils`. Studio
+ * cannot import from this package and vice versa; keeping these aligned is
+ * a manual discipline.
  */
 
 import { resolve, dirname, basename } from 'node:path';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+
+export { resolveRuntime, pickDefault, pickExport } from '@axlsdk/axl';
 
 // ── Config auto-detection ──────────────────────────────────────────
 
@@ -32,61 +40,6 @@ export function findConfig(cwd: string): string | undefined {
 /** Returns true if the file is TypeScript and needs tsx to load. */
 export function needsTsxLoader(filePath: string): boolean {
   return /\.[mc]?tsx?$/.test(filePath);
-}
-
-// ── Runtime resolution ─────────────────────────────────────────────
-
-/**
- * Resolve the AxlRuntime from a dynamically imported config module.
- *
- * Module shapes handled:
- * - ESM `export default runtime` → mod.default is the runtime
- * - CJS compiled from `export default runtime` → mod.default.default is the runtime
- * - CJS `module.exports = runtime` → mod.default is the runtime
- * - Named `export { runtime }` → mod.runtime is the runtime
- */
-export function resolveRuntime(mod: Record<string, any>): unknown {
-  const def = mod.default as Record<string, any> | undefined;
-  return def?.default ?? def ?? mod.runtime;
-}
-
-/**
- * Look up the default-ish export from a dynamically imported module. Walks
- * the ESM/CJS interop chain plus a `config` named-export fallback that some
- * eval modules use.
- *
- * Module shapes handled:
- * - ESM `export default cfg`:          `mod.default`
- * - CJS-wrapped-as-ESM:                `mod.default.default`
- * - Named `export const config = cfg`: `mod.config`
- * - Bare module value:                 `mod`
- *
- * Mirrors the chain `pickExport()` walks for named exports — keep them in
- * sync so resolution is symmetric.
- */
-export function pickDefault<T>(mod: Record<string, any>): T {
-  return (mod.default?.default ?? mod.default ?? mod.config ?? mod) as T;
-}
-
-/**
- * Look up a named export from a dynamically imported module, walking the
- * ESM/CJS interop chain symmetrically with `resolveRuntime` and `pickDefault`.
- *
- * Module shapes handled:
- * - ESM:                   `mod[key]`
- * - CJS-wrapped-as-ESM:    `mod.default[key]`         (tsx/ts compiled to CJS)
- * - CJS double-wrap:       `mod.default.default[key]` (rare interop edge)
- *
- * Without this helper, named exports would be silently invisible whenever the
- * module loads as CJS (e.g. a `.ts` file in a package without `"type": "module"`),
- * even though the default export resolves correctly via the chain walk.
- *
- * `null`-valued exports are treated as "absent" (the `??` chain falls through),
- * matching how a missing export presents at the language level. Callers that
- * need to distinguish "explicitly null" from "missing" should not use this helper.
- */
-export function pickExport<T>(mod: Record<string, any>, key: string): T | undefined {
-  return (mod[key] ?? mod.default?.[key] ?? mod.default?.default?.[key]) as T | undefined;
 }
 
 // ── Module loading ────────────────────────────────────────────────

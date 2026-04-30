@@ -318,6 +318,23 @@ export function EvalTrendsView({
                         </span>
                       </div>
                     ))}
+                    {partialIds.size > 0 && (
+                      <div
+                        className="flex items-center gap-1"
+                        title="Hollow ring marks a partial-batch run (fewer runs completed than were planned). The line still passes through it; the marker style is the only difference."
+                      >
+                        <span
+                          className="inline-block h-2 w-2 rounded-full border"
+                          style={{
+                            borderColor: 'hsl(var(--muted-foreground))',
+                            backgroundColor: 'hsl(var(--background))',
+                          }}
+                        />
+                        <span className="font-mono text-[hsl(var(--muted-foreground))]">
+                          partial
+                        </span>
+                      </div>
+                    )}
                   </div>
                 </div>
                 {missingReason ? (

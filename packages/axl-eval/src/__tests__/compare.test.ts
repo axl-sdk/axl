@@ -5,9 +5,8 @@ import type { EvalResult } from '../types.js';
 function makeEvalResult(overrides: Partial<EvalResult> = {}): EvalResult {
   return {
     id: 'test-baseline',
-    workflow: 'test',
     dataset: 'test-ds',
-    metadata: {},
+    metadata: { workflows: ['test'] },
     timestamp: new Date().toISOString(),
     totalCost: 0,
     duration: 100,
@@ -1129,6 +1128,38 @@ describe('evalCompare()', () => {
       // — guard against it so a metadata typo can't paint complete results
       // amber.
       expect(comparison.baseline.partial).toBeUndefined();
+    });
+
+    it('finds batchAttempted on later runs when first run lacks it', () => {
+      // User cherry-picks [legacy_single_run, partial_batch_run] from the
+      // compare picker. The first run has no batch metadata; the second
+      // does. The pre-fix behavior read only `runs[0].metadata` and
+      // silently produced an "apples-to-apples" comparison that mixed a
+      // legacy single-run with a partial-batch run from a 5-run group —
+      // the same silent-partial UX failure the artifact-side fix aimed
+      // to prevent.
+      const baseline = [
+        makeEvalResult({ id: 'b1' }), // No batch metadata
+        makeEvalResult({ id: 'b2', metadata: { batchAttempted: 5, runGroupId: 'g' } }),
+      ];
+      const candidate = makeEvalResult({ id: 'c' });
+      const comparison = evalCompare(baseline, candidate);
+      expect(comparison.baseline.partial).toEqual({ completed: 2, attempted: 5 });
+    });
+
+    it('omits partial when more runs were pooled than were planned (data corruption signal)', () => {
+      // 3 runs in the pool but `batchAttempted: 2`. The metadata is
+      // suspicious — silently treating this as "complete" would mask the
+      // corruption. The detector returns undefined so the consumer can
+      // either ignore or surface a different signal.
+      const runs = [
+        makeEvalResult({ id: 'r1', metadata: { batchAttempted: 2, runGroupId: 'g' } }),
+        makeEvalResult({ id: 'r2', metadata: { batchAttempted: 2, runGroupId: 'g' } }),
+        makeEvalResult({ id: 'r3', metadata: { batchAttempted: 2, runGroupId: 'g' } }),
+      ];
+      const comparison = evalCompare(runs, runs);
+      expect(comparison.baseline.partial).toBeUndefined();
+      expect(comparison.candidate.partial).toBeUndefined();
     });
   });
 });

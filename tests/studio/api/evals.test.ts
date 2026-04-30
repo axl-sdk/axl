@@ -1252,12 +1252,21 @@ describe('Studio API: Evals', () => {
   it('POST /api/evals/:name/run with stream: true preserves partial multi-run batch', async () => {
     // Streaming-mode partial preservation. Runs differ from sync-mode in
     // delivery (events on the WS channel) but share the same per-run
-    // try/catch + break + batchAttempted-stamping pattern. This covers the
-    // failure-path persistence: completed runs land in history with
-    // metadata.batchAttempted, even though no terminal `done` event was
-    // broadcast for the failed run.
+    // try/catch + break + batchAttempted-stamping pattern. This covers
+    // BOTH state persistence AND the wire-event sequence:
+    //
+    //   1. run_done broadcast for run 1 (success)
+    //   2. run_failed broadcast for run 2 (with redacted error message)
+    //   3. terminal `done` broadcast carrying partial markers
+    //
+    // The original test only asserted persisted state via REST. A
+    // refactor that broadcast `run_done` for the FAILED run, or skipped
+    // the `run_failed` event entirely, or never reached the terminal
+    // `done`, would all silently regress the streaming UX while leaving
+    // the persisted-history assertion green. The WS subscriber here is
+    // the tripwire.
     const provider = MockProvider.echo();
-    const { app, runtime } = createTestServer(provider);
+    const { app, runtime, connMgr } = createTestServer(provider);
 
     let getItemsCalls = 0;
     const partialDataset = dataset({
@@ -1278,6 +1287,18 @@ describe('Studio API: Evals', () => {
       scorers: [scorer({ name: 's', description: 's', score: () => 1 })],
     });
 
+    // Subscribe a fake WS to the wildcard eval channel BEFORE kicking off
+    // the run. Replay buffers cover late subscribers, but pre-subscribing
+    // makes the assertion deterministic without depending on buffer TTL.
+    const messages: string[] = [];
+    const fakeWs = {
+      send: (msg: string) => {
+        messages.push(msg);
+      },
+    } as Parameters<typeof connMgr.add>[0];
+    connMgr.add(fakeWs);
+    connMgr.subscribe(fakeWs, 'eval:*');
+
     const res = await app.request('/api/evals/partial-stream-eval/run', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1287,9 +1308,74 @@ describe('Studio API: Evals', () => {
     const { evalRunId } = (await readJson(res)).data;
     expect(evalRunId).toBeDefined();
 
-    // Give the async IIFE time to attempt run 1 (success), run 2 (fails),
-    // then break out of the loop and broadcast the partial done event.
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    // Wait until we see the terminal `done` event (or `error` if things
+    // went sideways). Polling is bounded so a hang surfaces fast as a
+    // test failure rather than an indefinite block.
+    const deadline = Date.now() + 2000;
+    let terminal: Record<string, unknown> | undefined;
+    while (Date.now() < deadline) {
+      for (const raw of messages) {
+        const parsed = JSON.parse(raw) as {
+          type: string;
+          channel: string;
+          data: Record<string, unknown>;
+        };
+        if (parsed.data.type === 'done' || parsed.data.type === 'error') {
+          terminal = parsed.data;
+          break;
+        }
+      }
+      if (terminal) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(terminal, 'streaming run never reached a terminal done/error event').toBeDefined();
+
+    // Decode the full event stream and pin its key invariants.
+    const events = messages.map(
+      (raw) =>
+        (JSON.parse(raw) as { data: Record<string, unknown> }).data as {
+          type: string;
+          run?: number;
+          totalRuns?: number;
+          message?: string;
+        },
+    );
+    const runDones = events.filter((e) => e.type === 'run_done');
+    const runFails = events.filter((e) => e.type === 'run_failed');
+
+    // Exactly one successful run before the failure.
+    expect(runDones.map((e) => e.run)).toEqual([1]);
+    expect(runDones[0].totalRuns).toBe(3);
+
+    // Exactly one failure event, matching the failed run number.
+    expect(runFails.length).toBe(1);
+    expect(runFails[0].run).toBe(2);
+    expect(runFails[0].totalRuns).toBe(3);
+    expect(runFails[0].message).toContain('STREAM_RUN_2_FAILURE');
+
+    // Terminal `done` carries partial markers and the result-id pointer
+    // the client uses to refetch the persisted artifact.
+    expect(terminal!.type).toBe('done');
+    expect(terminal!.partial).toBe(true);
+    expect(terminal!.batchCompleted).toBe(1);
+    expect(terminal!.batchAttempted).toBe(3);
+    expect(terminal!.batchFailure).toContain('STREAM_RUN_2_FAILURE');
+    expect(terminal!.evalResultId).toBeDefined();
+    expect(terminal!.runGroupId).toBeDefined();
+
+    // Run-failed and the terminal done MUST come AFTER run_done(1) so the
+    // client can render its banner update from a coherent sequence. This
+    // ordering check is the actual tripwire: a refactor that broadcasts
+    // `done` before `run_failed` would still pass all the per-event
+    // assertions above but break the client's UI state machine.
+    const indexOf = (predicate: (e: { type: string; run?: number }) => boolean) =>
+      events.findIndex(predicate);
+    const idxRun1 = indexOf((e) => e.type === 'run_done' && e.run === 1);
+    const idxFail2 = indexOf((e) => e.type === 'run_failed' && e.run === 2);
+    const idxDone = indexOf((e) => e.type === 'done');
+    expect(idxRun1).toBeGreaterThan(-1);
+    expect(idxFail2).toBeGreaterThan(idxRun1);
+    expect(idxDone).toBeGreaterThan(idxFail2);
 
     // Persisted history should contain exactly one run (the one that
     // completed) carrying `batchAttempted: 3` so any consumer reloading

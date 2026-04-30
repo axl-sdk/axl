@@ -114,4 +114,40 @@ describe('buildMultiRunResult', () => {
     ]);
     expect(result!._multiRun?.batchFailure).toBe('Real failure');
   });
+
+  it('finds batchAttempted even if only later runs carry it', () => {
+    // Mirror of the batchFailure walk: if persistence ever ends up with a
+    // legacy single-run at index 0 (no batch metadata) followed by a
+    // partial-batch run, we must still detect the partial-ness. The
+    // pre-fix behavior read `runs[0].metadata.batchAttempted` only and
+    // would silently treat this as "complete," reintroducing the
+    // silent-partial UX failure mode the artifact-side fix prevented.
+    const result = buildMultiRunResult([
+      makeRun(0), // No batchAttempted — legacy single run
+      makeRun(1, { batchAttempted: 5 }),
+    ]);
+    expect(result!._multiRun?.partial).toBe(true);
+    expect(result!._multiRun?.batchAttempted).toBe(5);
+    expect(result!._multiRun?.batchCompleted).toBe(2);
+  });
+
+  it('handles batchAttempted: 0 without falsely marking as partial', () => {
+    // A run with `batchAttempted: 0` is almost certainly bad metadata,
+    // but treating it as partial (because `runs.length > 0`) would be
+    // wrong: 1-of-0 partial doesn't make sense. The current heuristic
+    // (`allRuns.length < batchAttempted`) returns false here since
+    // `1 < 0` is false. Pin the behavior explicitly.
+    const result = buildMultiRunResult([makeRun(0, { batchAttempted: 0 })]);
+    expect(result!._multiRun?.partial).toBeUndefined();
+  });
+
+  it('ignores non-finite batchAttempted values', () => {
+    // Defensive against NaN/Infinity from corrupted artifacts; same
+    // guard the runtime detectPartial uses.
+    const result = buildMultiRunResult([
+      makeRun(0, { batchAttempted: NaN }),
+      makeRun(1, { batchAttempted: NaN }),
+    ]);
+    expect(result!._multiRun?.partial).toBeUndefined();
+  });
 });

@@ -20,37 +20,7 @@ import {
   expandGlob,
   CONFIG_CANDIDATES,
 } from './cli-utils.js';
-
-/**
- * Validate an eval config's required fields and produce a diagnostic string
- * if invalid. Returns `undefined` when the config passes.
- *
- * Returns a single-line message tail (caller prepends the file path) so the
- * full error reads like: `Error: <file> <message>`.
- *
- * Goes beyond a falsy check to catch (a) `scorers: []` which previously
- * silently ran with no scorers and (b) provide a `Got: { keys: [...] }`
- * hint so users can spot a typo like `scorerS` vs `scorers` immediately.
- */
-function validateEvalConfig(cfg: unknown): string | undefined {
-  if (!cfg || typeof cfg !== 'object') {
-    return `does not export a valid eval config — got ${cfg === null ? 'null' : typeof cfg}.`;
-  }
-  const c = cfg as Partial<EvalConfig>;
-  const missing: string[] = [];
-  if (!c.workflow) missing.push('workflow');
-  if (!c.dataset) missing.push('dataset');
-  if (!c.scorers) missing.push('scorers');
-  else if (!Array.isArray(c.scorers) || c.scorers.length === 0) {
-    return `exports an empty scorers array — at least one scorer is required.`;
-  }
-  if (missing.length > 0) {
-    const keys = Object.keys(c as object).slice(0, 10);
-    const got = keys.length > 0 ? ` Got: { ${keys.join(', ')} }.` : '';
-    return `does not export a valid eval config (missing ${missing.join(', ')}).${got}`;
-  }
-  return undefined;
-}
+import { validateEvalConfig } from './cli-validate.js';
 
 const KNOWN_FLAGS = new Set([
   '--output',
@@ -606,12 +576,34 @@ async function runEvalCommand(args: string[]) {
           // "fail loudly, not silently" rule is meant to prevent. If you
           // genuinely want identity, export it explicitly:
           //   export const executeWorkflow = async (input) => ({ output: input });
+          //
+          // Surface what WAS exported (top-level + .default) so users
+          // recognize a typo like `execute_workflow` and can spot the
+          // CJS-interop case that motivates this whole code path: when tsx
+          // loads a `.ts` file as CJS, all named exports land on
+          // `mod.default.<name>`. The chain walk above already handled this,
+          // but a user who removed `executeWorkflow` will see exactly what
+          // export names ARE present.
+          const exportShape = (() => {
+            const top = Object.keys(mod).filter((k) => k !== 'default');
+            const fromDefault =
+              mod.default && typeof mod.default === 'object'
+                ? Object.keys(mod.default as Record<string, unknown>)
+                : [];
+            const all = [...new Set([...top, ...fromDefault])];
+            return all.length > 0 ? `Found exports: [${all.join(', ')}].` : '';
+          })();
           console.error(
             `[axl-eval] Error: ${filePath} does not export an executeWorkflow function ` +
               `and no workflow named "${evalConfig.workflow}" is registered on the runtime.\n` +
+              (exportShape ? `  ${exportShape}\n` : '') +
               `  Add either:\n` +
               `    export async function executeWorkflow(input, runtime) { ... }\n` +
-              `  or register the workflow on your runtime via runtime.registerWorkflow(workflow).`,
+              `  or register the workflow on your runtime via runtime.registerWorkflow(workflow).\n` +
+              `  Tip: if your eval previously worked, your package.json may be missing\n` +
+              `    "type": "module" — tsx loads .ts as CJS, putting named exports on\n` +
+              `    mod.default.<name>. The CLI handles that interop, but if you renamed\n` +
+              `    or removed the export the file path is your fix.`,
           );
           failedFiles++;
           continue;
@@ -677,11 +669,20 @@ async function runEvalCommand(args: string[]) {
             // `result.metadata` sees the partial-batch context. `aggregateRuns`
             // computes statistics over `runResults.length`, which is the
             // honest sample size to report.
+            //
+            // `runFailure?.message` can be empty (e.g. `new Error('')` from a
+            // misbehaving provider); fall back to `String(runFailure)` so the
+            // banner never renders a blank "Stopped after:" line. Skip the
+            // field entirely if both are empty so `buildMultiRunResult`'s
+            // empty-string filter doesn't have to defensively guess.
+            const failureMsg = runFailure
+              ? runFailure.message || String(runFailure) || undefined
+              : undefined;
             for (const r of runResults) {
               r.metadata.partialBatch = true;
               r.metadata.batchCompleted = runResults.length;
               r.metadata.batchAttempted = runs;
-              r.metadata.batchFailure = runFailure?.message;
+              if (failureMsg) r.metadata.batchFailure = failureMsg;
             }
             console.error(
               `[axl-eval] PARTIAL: ${runResults.length} of ${runs} runs completed for ${filePath}.`,

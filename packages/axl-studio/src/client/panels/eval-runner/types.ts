@@ -219,8 +219,20 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
   // already include explicit `_multiRun.partial`; we recompute it here for
   // groups adopted from history (the persisted shape doesn't carry the
   // top-level `_multiRun.partial`, only the per-run `metadata.batchAttempted`).
-  const batchAttempted =
-    typeof first.metadata?.batchAttempted === 'number' ? first.metadata.batchAttempted : undefined;
+  //
+  // Walk every run for the first finite value rather than trusting
+  // `first.metadata` — runs persisted before `batchAttempted` was stamped
+  // (legacy data, manually-imported artifacts, or future code paths) may
+  // appear at index 0 with no batch metadata while siblings carry it.
+  // Mirrors how `batchFailure` is walked below.
+  let batchAttempted: number | undefined;
+  for (const run of allRuns) {
+    const v = run.metadata?.batchAttempted;
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      batchAttempted = v;
+      break;
+    }
+  }
   const partial = batchAttempted !== undefined && allRuns.length < batchAttempted;
   // Persisted runs from a partial CLI/Studio batch may carry the failure
   // message on per-run metadata. Lift it onto the aggregate so the panel

@@ -11,6 +11,11 @@ export type { Workflow, WorkflowConfig, AnyWorkflow } from './workflow.js';
 // Runtime
 export { AxlRuntime } from './runtime.js';
 export type { CreateContextOptions, ExecuteOptions, EvalExecuteWorkflow } from './runtime.js';
+
+// Module-resolution helpers — internal but exported so the eval CLI and
+// Studio middleware share one implementation of the ESM/CJS interop walk.
+// Not part of the stable public API.
+export { resolveRuntime, pickDefault, pickExport } from './module-resolve.js';
 export { defineConfig } from './config.js';
 export type { AxlConfig } from './config.js';
 

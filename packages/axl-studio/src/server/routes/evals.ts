@@ -169,6 +169,15 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
 
             if (results.length > 0) {
               const partial = results.length < runs;
+              // Coalesce empty-message errors so the banner never shows a
+              // blank "Stopped after:" line. `new Error('')` produces
+              // `message === ''`; `redactErrorMessage` preserves that under
+              // safe-error-name allow-listing, so we fall through to
+              // `String(runFailure)` (which yields at least the constructor
+              // name) before omitting the field entirely.
+              const failureMsg = runFailure
+                ? redactErrorMessage(runFailure, redactOn) || String(runFailure) || undefined
+                : undefined;
               connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
                 type: 'done',
                 evalResultId: results[0].id,
@@ -177,7 +186,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
                   partial: true,
                   batchCompleted: results.length,
                   batchAttempted: runs,
-                  batchFailure: runFailure ? redactErrorMessage(runFailure, redactOn) : undefined,
+                  ...(failureMsg ? { batchFailure: failureMsg } : {}),
                 }),
               });
             } else if (runFailure) {
@@ -257,6 +266,13 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
         const aggregate = aggregateRuns(results);
         const first = results[0];
         const partial = results.length < runs;
+        // Coalesce empty-message errors so the response never carries a
+        // blank batchFailure (downstream `buildMultiRunResult` filters
+        // empty strings, so an empty value here just becomes silent —
+        // worse than omitting the field).
+        const failureMsg = runFailure
+          ? redactErrorMessage(runFailure, redactOn) || String(runFailure) || undefined
+          : undefined;
         const result = {
           ...first,
           _multiRun: {
@@ -266,7 +282,7 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
               partial: true,
               batchCompleted: results.length,
               batchAttempted: runs,
-              batchFailure: runFailure ? redactErrorMessage(runFailure, redactOn) : undefined,
+              ...(failureMsg ? { batchFailure: failureMsg } : {}),
             }),
           },
         } as EvalResult;

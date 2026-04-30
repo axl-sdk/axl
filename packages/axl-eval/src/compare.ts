@@ -277,17 +277,34 @@ export function evalCompare(
  * Detect whether one side of a comparison was pooled from a partial batch
  * (or a user-selected subset). Returns `{ completed, attempted }` when the
  * pooled run count is less than the original batch's planned run count
- * (read from `metadata.batchAttempted`); `undefined` otherwise.
+ * (read from `metadata.batchAttempted` on any run in the pool); `undefined`
+ * otherwise.
  *
  * The signal is the same regardless of cause (batch failed mid-way vs user
  * cherry-picked from the picker) — both result in a smaller-N pool that
  * the consumer should mark visually so the comparison isn't mistaken for
  * an apples-to-apples run.
+ *
+ * Walks every run looking for the first finite `batchAttempted` rather than
+ * trusting `runs[0]` alone — when a user cherry-picks runs from the compare
+ * picker, the array order is the user's order, so the first item may be a
+ * legacy single-run with no batch metadata while a sibling carries it.
+ *
+ * If `runs.length > attempted` (more results than were planned), treats the
+ * data as suspicious and returns `undefined` — silently marking it "complete"
+ * would mask data corruption.
  */
 function detectPartial(runs: EvalResult[]): { completed: number; attempted: number } | undefined {
   if (runs.length === 0) return undefined;
-  const attempted = runs[0].metadata?.batchAttempted;
-  if (typeof attempted !== 'number' || !Number.isFinite(attempted)) return undefined;
+  let attempted: number | undefined;
+  for (const r of runs) {
+    const v = r.metadata?.batchAttempted;
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      attempted = v;
+      break;
+    }
+  }
+  if (attempted === undefined) return undefined;
   if (runs.length >= attempted) return undefined;
   return { completed: runs.length, attempted };
 }

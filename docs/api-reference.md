@@ -1494,6 +1494,10 @@ Full result from an eval run.
 | `scorerTypes` | `Record<string, 'llm' \| 'deterministic'>` | Scorer kind for threshold calibration |
 | `runGroupId` | `string?` | Shared ID across multi-run groups (`--runs N`) |
 | `runIndex` | `number?` | Position within a multi-run group |
+| `batchAttempted` | `number?` | Planned multi-run count. Stamped on every persisted run by both the CLI and Studio's run endpoint so any later viewer (compare, history, trends) can derive partial-batch state by comparing the actual run count against this |
+| `batchCompleted` | `number?` | Number of runs actually completed when the batch is partial (only set when `batchCompleted < batchAttempted`) |
+| `fromPartialBatch` | `boolean?` | Set on every successful run from a partial batch — flags "this run came from a batch that did not complete," NOT "this run is partial." Defensive consumers should NOT skip runs based on this flag (they completed and have valid data) |
+| `batchFailure` | `string?` | The error message that stopped a partial batch. Coalesced from `Error.message \|\| String(error)` so it's never blank; omitted when the partial state came from user cancellation rather than a thrown failure |
 
 > `EvalResult` used to have a top-level `workflow: string` field. It was removed in 0.14.x because it could not honestly represent multi-workflow runs (nested execution, heterogeneous callbacks). Use `metadata.workflows` instead. `EvalConfig.workflow` (the scheduling input) is unchanged.
 
@@ -1546,14 +1550,23 @@ Result from `evalCompare()` comparing a baseline and candidate eval run.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `baseline` | `{ id, metadata }` | Baseline run identity |
-| `candidate` | `{ id, metadata }` | Candidate run identity |
+| `baseline` | `{ id, metadata, runCount, partial? }` | Baseline run identity. `runCount` is the number of runs actually used in mean / regression / timing / cost computation — `evalCompare` truncates both sides to `min(baseline.length, candidate.length)` so the displayed means align with the paired bootstrap CI's sample. `partial` (an `EvalComparisonPartial`) is set when the pooled run count is less than the original batch's planned count |
+| `candidate` | `{ id, metadata, runCount, partial? }` | Candidate run identity. Same shape as `baseline` |
 | `scorers` | `Record<string, { baselineMean, candidateMean, delta, deltaPercent, ci?, significant?, pRegression?, pImprovement?, n? }>` | Per-scorer mean comparison. `ci` is `{ lower: number; upper: number }` (95% bootstrap CI on paired differences). `significant` is `true` when the CI excludes zero and \|delta\| exceeds the threshold. `pRegression`/`pImprovement` are bootstrap probability estimates. `n` is the number of paired differences used for CI |
 | `timing` | `{ baselineMean, candidateMean, delta, deltaPercent }?` | Per-item duration comparison |
 | `cost` | `{ baselineTotal, candidateTotal, delta, deltaPercent }?` | Total cost comparison |
 | `regressions` | `EvalRegression[]` | Items that got worse |
 | `improvements` | `EvalImprovement[]` | Items that got better |
 | `summary` | `string` | Human-readable summary |
+
+### `EvalComparisonPartial`
+
+Sample-size context for one side of a comparison. Set on `EvalComparison.baseline.partial` / `.candidate.partial` when the pooled runs reflect fewer than the original batch's planned count — either because the batch failed mid-way (`metadata.batchAttempted > runs.length`) or the user picked a subset from the comparison picker.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `completed` | `number` | Number of runs actually included in this side's pool |
+| `attempted` | `number` | Original planned run count (read from `metadata.batchAttempted` on any run in the pool) |
 
 ### `EvalRegression` / `EvalImprovement`
 

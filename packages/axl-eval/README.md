@@ -589,6 +589,19 @@ Eval: qa-eval x qa-basics — 5 runs
 
 The output JSON contains all individual run results (as an array). Each run has `metadata.runGroupId` and `metadata.runIndex`.
 
+### Partial batches
+
+If a run fails mid-batch (e.g. provider rate-limit on run 3 of 5), completed runs are preserved — they cost real money and have statistical signal — and the CLI exits non-zero so CI still flags the failure. Each preserved run is tagged with:
+
+| Metadata key | Type | Description |
+|--------------|------|-------------|
+| `fromPartialBatch` | `boolean` | This run came from a batch that did not complete. The flag describes the BATCH, not the run — these runs are still valid and their data is honest |
+| `batchCompleted` | `number` | How many runs actually completed (`< batchAttempted`) |
+| `batchAttempted` | `number` | The originally-planned `--runs N` count |
+| `batchFailure` | `string?` | The error message that stopped the batch. Omitted when the partial state came from user cancellation rather than a thrown error |
+
+The aggregate is computed over the completed runs only (the honest sample size); `aggregateRuns().runCount` reflects this. When *every* run fails (`runResults.length === 0`), no artifact is written.
+
 Programmatically, use `aggregateRuns()`:
 
 ```typescript
@@ -637,7 +650,8 @@ const comparison = evalCompare(baselineRuns, candidateRuns);
 | `EvalResult` | Full eval output (items, summary, cost, duration) |
 | `EvalItem` | Per-item result (input, output, scores, scoreDetails, metadata, traces?) |
 | `EvalSummary` | Aggregate statistics (count, failures, scorer stats, timing) |
-| `EvalComparison` | Comparison output (scorer deltas, CI, pRegression/pImprovement, n, regressions, improvements) |
+| `EvalComparison` | Comparison output (scorer deltas, CI, pRegression/pImprovement, n, per-side `runCount` / `partial?`, regressions, improvements). Both sides truncate to `min(baseline.length, candidate.length)` so means align with the paired bootstrap CI's sample |
+| `EvalComparisonPartial` | `{ completed, attempted }` set on a comparison side when the pooled run count is less than the original batch's planned count |
 | `EvalCompareOptions` | Options for `evalCompare()` (`thresholds`) |
 | `EvalRegression` / `EvalImprovement` | Per-item change record (itemIndex, scorer, scores, delta) |
 | `ScorerDetail` | Per-scorer detail (score, metadata, duration, cost) |

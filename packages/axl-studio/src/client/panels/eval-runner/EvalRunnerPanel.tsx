@@ -158,25 +158,45 @@ export function EvalRunnerPanel() {
         } catch {
           throw new Error(`${file.name} is not valid JSON`);
         }
-        const { id } = await importEvalResult(parsed);
+        const importResponse = await importEvalResult(parsed);
+        // The response is either flat (single import, back-compat) or
+        // `{ imported: [...] }` (multi-run array). Normalize to a list
+        // so the rest of the UX works the same — we auto-select the
+        // first id either way, and display the count in the status.
+        const importedList =
+          'imported' in importResponse ? importResponse.imported : [importResponse];
+        const importedCount = importedList.length;
+        const firstId = importedList[0]?.id;
+
         // Refetch history so the imported entry appears before we auto-select it.
         await queryClient.invalidateQueries({ queryKey: ['evalHistory'] });
 
-        // Auto-select the imported run into whichever slot is open. When both
-        // slots are full we don't stomp on an existing selection — instead we
-        // show a status message so the user knows the import succeeded.
+        // Auto-select the first imported run into whichever slot is open.
+        // For multi-run imports all runs share a runGroupId so the History
+        // tab will render them as a coherent group regardless of which
+        // single id we wired into the compare slot. When both slots are
+        // full we don't stomp on existing selections — instead we show a
+        // status message so the user knows the import succeeded.
         //
         // baselineSelection/candidateSelection come from the callback closure,
         // which is refreshed by the deps array on every state change, so they
         // reflect the latest values at click time.
+        const countSuffix = importedCount > 1 ? ` (${importedCount} runs)` : '';
+        if (!firstId) {
+          // Defensive — server should never return an empty array, but
+          // failing loudly here beats silently doing nothing.
+          throw new Error(`Import succeeded but no entries were returned`);
+        }
         if (!baselineSelection) {
-          setBaselineSelection({ id });
-          setImportStatus(`Imported ${file.name} — selected as baseline`);
+          setBaselineSelection({ id: firstId });
+          setImportStatus(`Imported ${file.name}${countSuffix} — selected as baseline`);
         } else if (!candidateSelection) {
-          setCandidateSelection({ id });
-          setImportStatus(`Imported ${file.name} — selected as candidate`);
+          setCandidateSelection({ id: firstId });
+          setImportStatus(`Imported ${file.name}${countSuffix} — selected as candidate`);
         } else {
-          setImportStatus(`Imported ${file.name} — added to history (both compare slots full)`);
+          setImportStatus(
+            `Imported ${file.name}${countSuffix} — added to history (both compare slots full)`,
+          );
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));

@@ -218,8 +218,18 @@ export const compareEvals = (
     body: JSON.stringify({ baselineId, candidateId, options }),
   });
 
+/**
+ * Response polymorphism: single-result imports get a flat
+ * `{ id, eval, timestamp }` envelope (back-compat with the original API);
+ * array imports (multi-run CLI artifacts) get `{ imported: [...] }`.
+ * The flat form is preserved so older callers don't break.
+ */
+export type ImportEvalResponse =
+  | { id: string; eval: string; timestamp: number }
+  | { imported: Array<{ id: string; eval: string; timestamp: number }> };
+
 export const importEvalResult = (result: unknown, evalName?: string) =>
-  request<{ id: string; eval: string; timestamp: number }>('/evals/import', {
+  request<ImportEvalResponse>('/evals/import', {
     method: 'POST',
     body: JSON.stringify({ result, eval: evalName }),
   });

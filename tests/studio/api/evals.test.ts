@@ -760,6 +760,127 @@ describe('Studio API: Evals', () => {
     expect(body.data.scorers['always-pass']).toBeDefined();
   });
 
+  it('POST /api/evals/import accepts an array of EvalResults (multi-run CLI artifact)', async () => {
+    // The CLI's `--output` writes a JSON array when `--runs N > 1`,
+    // including for partial batches (e.g. 2-of-5). Pre-fix the import
+    // endpoint required a single object, so a partial multi-run
+    // artifact couldn't be imported in one request — undermining the
+    // partial-batch story. Now: array form imports each as its own
+    // history entry, sharing runGroupId so they appear as a group.
+    const { app } = createTestServer();
+
+    const runGroupId = 'cli-group-abc';
+    const makeRun = (runIndex: number) => ({
+      id: `cli-run-${runIndex}`,
+      dataset: 'partial-ds',
+      metadata: {
+        runGroupId,
+        runIndex,
+        batchAttempted: 5,
+        batchCompleted: 2,
+        fromPartialBatch: true,
+        batchFailure: 'Provider 503',
+        workflows: ['imported-wf'],
+      },
+      timestamp: new Date().toISOString(),
+      totalCost: 0.01,
+      duration: 1000,
+      items: [{ input: 'in', output: 'out', scores: { 'always-pass': 1 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: { 'always-pass': { mean: 1, min: 1, max: 1, p50: 1, p95: 1 } },
+      },
+    });
+
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ result: [makeRun(0), makeRun(1)] }),
+    });
+    expect(res.status).toBe(200);
+    const body = await readJson(res);
+    expect(body.ok).toBe(true);
+    // Multi-import returns the array shape (single-import returns flat
+    // for back-compat).
+    expect(Array.isArray(body.data.imported)).toBe(true);
+    expect(body.data.imported.length).toBe(2);
+    // Both runs share the same eval name (derived once from the first
+    // run's metadata), but each gets a fresh UUID so reimports don't
+    // collide.
+    expect(body.data.imported[0].eval).toBe('imported-wf');
+    expect(body.data.imported[1].eval).toBe('imported-wf');
+    expect(body.data.imported[0].id).not.toBe(body.data.imported[1].id);
+    expect(body.data.imported[0].id).not.toBe('cli-run-0');
+
+    // History contains both entries, sharing runGroupId so the History
+    // tab renders them as a group with the X/N PARTIAL badge.
+    const histRes = await app.request('/api/evals/history');
+    const histBody = await readJson(histRes);
+    const importedEntries = histBody.data.filter((e: { eval: string }) => e.eval === 'imported-wf');
+    expect(importedEntries.length).toBe(2);
+    const groupIds = new Set(
+      importedEntries.map(
+        (e: { data: { metadata?: { runGroupId?: string } } }) => e.data.metadata?.runGroupId,
+      ),
+    );
+    expect(groupIds.size).toBe(1);
+    expect([...groupIds][0]).toBe(runGroupId);
+    // Partial-batch metadata round-trips so the History badge fires.
+    for (const entry of importedEntries) {
+      expect(entry.data.metadata.batchAttempted).toBe(5);
+      expect(entry.data.metadata.fromPartialBatch).toBe(true);
+    }
+  });
+
+  it('POST /api/evals/import rejects empty arrays with a clear message', async () => {
+    const { app } = createTestServer();
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ result: [] }),
+    });
+    expect(res.status).toBe(400);
+    const body = await readJson(res);
+    expect(body.error.message).toMatch(/non-empty/);
+  });
+
+  it('POST /api/evals/import points to the offending index when one entry of a multi-run array is malformed', async () => {
+    // A 5-element CLI artifact where item[2] has a corrupted
+    // summary.scorers shape would otherwise produce a confusing
+    // generic error. The error pinpoints the index so the user
+    // can find the bad entry in the source JSON.
+    const { app } = createTestServer();
+    const goodRun = {
+      id: 'good',
+      dataset: 'ds',
+      metadata: {},
+      timestamp: new Date().toISOString(),
+      totalCost: 0,
+      duration: 0,
+      items: [{ input: 'a', output: 'b', scores: { s: 1 } }],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: { s: { mean: 1, min: 1, max: 1, p50: 1, p95: 1 } },
+      },
+    };
+    const badRun = { ...goodRun, summary: null }; // broken
+    const res = await app.request('/api/evals/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ result: [goodRun, badRun, goodRun] }),
+    });
+    expect(res.status).toBe(400);
+    const body = await readJson(res);
+    expect(body.error.message).toMatch(/result\[1\]\.summary/);
+    // Good runs in the array should NOT have been partially saved —
+    // the import is all-or-nothing per request.
+    const histRes = await app.request('/api/evals/history');
+    const histBody = await readJson(histRes);
+    expect(histBody.data.length).toBe(0);
+  });
+
   it('POST /api/evals/import returns 400 for invalid shape', async () => {
     const { app } = createTestServer();
 

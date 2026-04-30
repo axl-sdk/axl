@@ -502,11 +502,18 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
 
   // Import a CLI eval artifact into runtime history.
   //
-  // Accepts a parsed EvalResult JSON (typically produced by `axl-eval --output`).
-  // Generates a fresh UUID for the history entry (overwriting result.id) so
-  // repeated imports of the same file don't collide. The imported entry is
-  // indistinguishable from a natively-run result in the history picker, run
-  // detail view, and comparison flows.
+  // Accepts a parsed EvalResult JSON (single object) OR an array of
+  // EvalResults (multi-run output). The CLI writes a single object when
+  // `results.length === 1` and an array otherwise — including for partial
+  // batches (e.g. 2-of-5 produces a 2-element array). Without array
+  // support, partial multi-run artifacts couldn't be imported in one
+  // request, undermining the partial-batch story we worked to preserve.
+  //
+  // For arrays: every result is imported as its own history entry; if the
+  // artifact's per-run `metadata.runGroupId` is consistent across the
+  // array, the entries appear together as a multi-run group in the
+  // History tab. A fresh UUID is generated per entry so repeated imports
+  // don't collide.
   //
   // Note: this is the one Studio endpoint whose request bodies can be large.
   // If mounted as middleware and importing sizeable eval files, raise the
@@ -521,103 +528,110 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     const bad = (message: string) =>
       c.json({ ok: false, error: { code: 'BAD_REQUEST', message } }, 400);
 
-    if (!body.result || typeof body.result !== 'object') {
+    if (body.result === undefined || body.result === null) {
       return bad('result is required');
     }
 
-    const result = body.result as Record<string, unknown>;
+    // Normalize to an array up front. Single-object form is just a
+    // 1-element array internally — keeps the validation/import loop
+    // uniform and avoids two divergent code paths that could drift.
+    const resultsRaw = Array.isArray(body.result) ? body.result : [body.result];
+    if (resultsRaw.length === 0) {
+      return bad('result must be a non-empty array or object');
+    }
 
-    // Shape validation — catch obvious garbage early with a clear error,
-    // rather than letting downstream compare/rescore throw with a confusing
-    // stack. Keep the check narrow: verify the fields Studio actually reads.
-    if (!Array.isArray(result.items)) {
-      return bad('result.items must be an array');
-    }
-    if (typeof result.summary !== 'object' || result.summary == null) {
-      return bad('result.summary must be an object');
-    }
-    if (typeof result.dataset !== 'string' || !result.dataset) {
-      return bad('result.dataset must be a non-empty string (required for compare)');
-    }
-    const summary = result.summary as Record<string, unknown>;
-    if (typeof summary.scorers !== 'object' || summary.scorers == null) {
-      return bad('result.summary.scorers must be an object');
-    }
-    const summaryScorerNames = Object.keys(summary.scorers as Record<string, unknown>);
-
-    // Verify that per-item score keys are covered by summary.scorers across
-    // ALL items — a heterogeneous artifact where item[0] is well-formed but
-    // item[N] references unknown scorers would otherwise break compare
-    // downstream with a cryptic error.
-    const items = result.items as Array<Record<string, unknown>>;
-    const summaryScorerSet = new Set(summaryScorerNames);
-    const uncoveredAcrossItems = new Set<string>();
-    for (const item of items) {
-      const itemScores = item?.scores;
-      if (itemScores && typeof itemScores === 'object') {
-        for (const name of Object.keys(itemScores as Record<string, unknown>)) {
-          if (!summaryScorerSet.has(name)) uncoveredAcrossItems.add(name);
+    // Validate each entry separately so a heterogeneous batch (one bad
+    // run in a 5-run array) reports a precise index rather than rejecting
+    // the whole import or accepting it half-formed.
+    const validatedResults: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < resultsRaw.length; i++) {
+      const entry = resultsRaw[i];
+      const prefix = resultsRaw.length > 1 ? `result[${i}]` : 'result';
+      if (!entry || typeof entry !== 'object') {
+        return bad(`${prefix} must be an object`);
+      }
+      const r = entry as Record<string, unknown>;
+      if (!Array.isArray(r.items)) {
+        return bad(`${prefix}.items must be an array`);
+      }
+      if (typeof r.summary !== 'object' || r.summary == null) {
+        return bad(`${prefix}.summary must be an object`);
+      }
+      if (typeof r.dataset !== 'string' || !r.dataset) {
+        return bad(`${prefix}.dataset must be a non-empty string (required for compare)`);
+      }
+      const summary = r.summary as Record<string, unknown>;
+      if (typeof summary.scorers !== 'object' || summary.scorers == null) {
+        return bad(`${prefix}.summary.scorers must be an object`);
+      }
+      const summaryScorerNames = Object.keys(summary.scorers as Record<string, unknown>);
+      const items = r.items as Array<Record<string, unknown>>;
+      const summaryScorerSet = new Set(summaryScorerNames);
+      const uncoveredAcrossItems = new Set<string>();
+      for (const item of items) {
+        const itemScores = item?.scores;
+        if (itemScores && typeof itemScores === 'object') {
+          for (const name of Object.keys(itemScores as Record<string, unknown>)) {
+            if (!summaryScorerSet.has(name)) uncoveredAcrossItems.add(name);
+          }
         }
       }
-    }
-    if (uncoveredAcrossItems.size > 0) {
-      return bad(
-        `item scores reference scorer(s) not in summary.scorers: ${[...uncoveredAcrossItems].join(', ')}`,
-      );
+      if (uncoveredAcrossItems.size > 0) {
+        return bad(
+          `${prefix} item scores reference scorer(s) not in summary.scorers: ${[...uncoveredAcrossItems].join(', ')}`,
+        );
+      }
+      validatedResults.push(r);
     }
 
-    // EvalResult has no eval-name field of its own — the name lives on the
-    // history entry. Prefer an explicit body.eval (client may know the
-    // registered eval name), then fall back to the first workflow observed
-    // in metadata.workflows (primary workflow of the run), then to the
-    // legacy top-level workflow field for pre-0.14 CLI artifacts, then to
-    // a generic label.
-    //
-    // Normalize via trim() to reject strings that are whitespace-only or
-    // empty (would otherwise silently fall through to the next branch).
+    // Eval-name resolution uses the FIRST run's metadata as the
+    // representative — multi-run groups always share a workflow today
+    // (the runner produces homogeneous batches), and falling back across
+    // all runs would silently mask a heterogeneous import the user
+    // probably didn't intend.
     const trim = (v: unknown): string | undefined =>
       typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined;
-
-    // metadata.workflows is the canonical source post-0.14.
+    const firstResult = validatedResults[0];
     const metadataObj =
-      typeof result.metadata === 'object' && result.metadata != null
-        ? (result.metadata as Record<string, unknown>)
+      typeof firstResult.metadata === 'object' && firstResult.metadata != null
+        ? (firstResult.metadata as Record<string, unknown>)
         : {};
     const workflowsFromMeta = Array.isArray(metadataObj.workflows)
       ? (metadataObj.workflows as unknown[])
       : [];
     const primaryWorkflow = workflowsFromMeta.find((w): w is string => typeof w === 'string');
-
     const evalName =
       trim(body.eval) ??
       trim(primaryWorkflow) ??
-      // Legacy fallback: pre-0.14 CLI artifacts had workflow at the top level.
-      trim((result as { workflow?: unknown }).workflow) ??
+      trim((firstResult as { workflow?: unknown }).workflow) ??
       'imported';
 
-    const id = randomUUID();
     const timestamp = Date.now();
+    const imported: Array<{ id: string; eval: string; timestamp: number }> = [];
+    for (const r of validatedResults) {
+      const id = randomUUID();
+      // Overwrite id so repeated imports of the same file get distinct
+      // entries. Preserve metadata so per-run runGroupId / batchAttempted
+      // / fromPartialBatch flow through to compare and trends views.
+      const entry: EvalResult = {
+        ...(r as unknown as EvalResult),
+        id,
+        metadata:
+          typeof r.metadata === 'object' && r.metadata != null
+            ? (r.metadata as Record<string, unknown>)
+            : {},
+      };
+      await runtime.saveEvalResult({ id, eval: evalName, timestamp, data: entry });
+      imported.push({ id, eval: evalName, timestamp });
+    }
 
-    // Overwrite id so repeated imports of the same file get distinct entries.
-    // Default metadata to {} since downstream code assumes it exists
-    // (e.g. evalCompare reads metadata.scorerTypes).
-    const imported: EvalResult = {
-      ...(result as unknown as EvalResult),
-      id,
-      metadata:
-        typeof result.metadata === 'object' && result.metadata != null
-          ? (result.metadata as Record<string, unknown>)
-          : {},
-    };
-
-    await runtime.saveEvalResult({
-      id,
-      eval: evalName,
-      timestamp,
-      data: imported,
-    });
-
-    return c.json({ ok: true, data: { id, eval: evalName, timestamp } });
+    // Back-compat: single-import callers still get the flat shape they
+    // expected. Multi-import callers get an array indistinguishable
+    // from the input order.
+    if (imported.length === 1) {
+      return c.json({ ok: true, data: imported[0] });
+    }
+    return c.json({ ok: true, data: { imported } });
   });
 
   function closeActiveRuns() {

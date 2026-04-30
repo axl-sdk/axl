@@ -459,7 +459,9 @@ console.log(ci); // { lower: -0.02, upper: 0.15, mean: 0.065, pRegression: 0.12,
 
 ### Execution function
 
-By default, the runner calls `runtime.execute(workflow, input)` for each item. Export `executeWorkflow` to override:
+By default, the runner calls `runtime.execute(workflow, input)` for each item. Export `executeWorkflow` to override.
+
+If neither an `executeWorkflow` export nor a registered workflow matching `workflow` exists, the CLI exits non-zero with an explanatory error. (This used to fall through to identity passthrough with a warning, which silently produced all-zero scores in CI — see CHANGELOG for the breaking-change note.)
 
 ```typescript
 // evals/qa.eval.ts

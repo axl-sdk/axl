@@ -630,6 +630,142 @@ export async function executeWorkflow(input) {
     }
   });
 
+  it('axl-eval --runs preserves partial batch when a run fails mid-way', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'axl-eval-partial-'));
+    try {
+      const evalFile = join(tmpDir, 'partial.eval.mjs');
+      const outputFile = join(tmpDir, 'results.json');
+
+      // Module-scoped counter survives across runEval invocations within the
+      // same CLI process. Run 1's getItems returns items normally; run 2's
+      // throws, which propagates out of runEval. Run 3 is never attempted —
+      // we break on first failure rather than burn more API calls.
+      writeFileSync(
+        evalFile,
+        `
+let getItemsCalls = 0;
+export default {
+  workflow: 'partial-test',
+  dataset: {
+    name: 'partial-ds',
+    getItems: async () => {
+      getItemsCalls++;
+      if (getItemsCalls === 2) throw new Error('SIMULATED_RUN_2_FAILURE');
+      return [{ input: { q: 'hello' } }];
+    },
+  },
+  scorers: [{
+    name: 'always-one',
+    score: () => 1,
+  }],
+};
+
+export async function executeWorkflow(input) {
+  return { output: 'result for ' + input.q, cost: 0.01 };
+}
+`,
+      );
+
+      const ROOT = join(import.meta.dirname, '../../..');
+      const cliPath = join(ROOT, 'packages/axl-eval/dist/cli.js');
+
+      let stderr = '';
+      let exitCode = 0;
+      try {
+        execSync(`node ${cliPath} ${evalFile} --runs 3 --output ${outputFile}`, {
+          encoding: 'utf-8',
+          cwd: ROOT,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (err: unknown) {
+        const e = err as { status?: number; stdout?: string; stderr?: string };
+        exitCode = e.status ?? 1;
+        stderr = String(e.stderr ?? '');
+      }
+
+      // Partial batch must exit non-zero so CI knows something failed.
+      expect(exitCode).not.toBe(0);
+
+      // User-facing signals make the partial-ness obvious.
+      expect(stderr).toContain('Run 2/3 failed');
+      expect(stderr).toContain('SIMULATED_RUN_2_FAILURE');
+      expect(stderr).toContain('PARTIAL: 1 of 3');
+
+      // The completed run is still on disk — info that cost real money is
+      // not thrown away. The artifact carries explicit partial-batch
+      // metadata so consumers don't mistake it for a complete batch.
+      const results = JSON.parse(readFileSync(outputFile, 'utf-8'));
+      // results array contains one EvalResult (the run that completed). The
+      // CLI emits an array when there are multiple results, but this
+      // partial batch happens to contain exactly one — the CLI normalizes
+      // single-element results to a bare object on output.
+      const result = Array.isArray(results) ? results[0] : results;
+      expect(result.metadata.partialBatch).toBe(true);
+      expect(result.metadata.batchCompleted).toBe(1);
+      expect(result.metadata.batchAttempted).toBe(3);
+      expect(result.metadata.batchFailure).toContain('SIMULATED_RUN_2_FAILURE');
+      expect(result.metadata.runGroupId).toBeDefined();
+      expect(result.metadata.runIndex).toBe(0);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('axl-eval --runs exits non-zero with no artifact when every run fails', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'axl-eval-allfail-'));
+    try {
+      const evalFile = join(tmpDir, 'allfail.eval.mjs');
+      const outputFile = join(tmpDir, 'results.json');
+
+      writeFileSync(
+        evalFile,
+        `
+export default {
+  workflow: 'allfail-test',
+  dataset: {
+    name: 'allfail-ds',
+    getItems: async () => { throw new Error('SIMULATED_TOTAL_FAILURE'); },
+  },
+  scorers: [{ name: 's', score: () => 1 }],
+};
+export async function executeWorkflow(input) { return { output: 'x' }; }
+`,
+      );
+
+      const ROOT = join(import.meta.dirname, '../../..');
+      const cliPath = join(ROOT, 'packages/axl-eval/dist/cli.js');
+
+      let exitCode = 0;
+      let stderr = '';
+      try {
+        execSync(`node ${cliPath} ${evalFile} --runs 3 --output ${outputFile}`, {
+          encoding: 'utf-8',
+          cwd: ROOT,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (err: unknown) {
+        const e = err as { status?: number; stderr?: string };
+        exitCode = e.status ?? 1;
+        stderr = String(e.stderr ?? '');
+      }
+
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain('Run 1/3 failed');
+      expect(stderr).toContain('Aborting');
+      expect(stderr).toContain('no runs completed');
+      // No artifact written — there's nothing to preserve.
+      let outputExists = true;
+      try {
+        readFileSync(outputFile, 'utf-8');
+      } catch {
+        outputExists = false;
+      }
+      expect(outputExists).toBe(false);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('axl-eval rescore re-scores saved outputs', () => {
     const tmpDir = mkdtempSync(join(tmpdir(), 'axl-eval-rescore-'));
     try {

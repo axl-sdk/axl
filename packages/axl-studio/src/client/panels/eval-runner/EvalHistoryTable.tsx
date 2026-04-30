@@ -601,6 +601,24 @@ export function EvalHistoryTable({
                     (sum, e) => sum + (e.data as EvalResultData).summary.count,
                     0,
                   );
+                  // Detect a partial-batch group: any entry whose persisted
+                  // metadata.batchAttempted exceeds the actual entry count
+                  // signals the multi-run batch did not complete. Without a
+                  // table-level marker, a partial 2-of-5 group renders
+                  // identically to a complete 2-run batch — the same
+                  // silent-partial UX failure mode the artifact-side fix
+                  // was designed to prevent. The badge gives users a
+                  // scannable signal in the history list before they have
+                  // to drill into the run-detail view.
+                  const batchAttempted = (() => {
+                    for (const e of row.entries) {
+                      const v = (e.data as EvalResultData).metadata?.batchAttempted;
+                      if (typeof v === 'number') return v;
+                    }
+                    return undefined;
+                  })();
+                  const isPartial =
+                    batchAttempted !== undefined && row.entries.length < batchAttempted;
                   const totalDuration = row.entries.reduce(
                     (sum, e) => sum + (e.data as EvalResultData).duration,
                     0,
@@ -683,9 +701,30 @@ export function EvalHistoryTable({
                         </td>
                         <td className="px-3 py-2.5 text-right font-mono">{totalItems}</td>
                         <td className="px-3 py-2.5 text-right">
-                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-[hsl(var(--secondary))] text-[hsl(var(--muted-foreground))]">
+                          <span
+                            className={cn(
+                              'inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md',
+                              isPartial
+                                ? 'bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-200'
+                                : 'bg-[hsl(var(--secondary))] text-[hsl(var(--muted-foreground))]',
+                            )}
+                            title={
+                              isPartial
+                                ? `Partial batch — ${row.entries.length} of ${batchAttempted} runs completed`
+                                : undefined
+                            }
+                          >
                             <Layers size={10} />
-                            {row.entries.length} runs
+                            {isPartial ? (
+                              <>
+                                {row.entries.length}/{batchAttempted} runs
+                                <span className="font-medium uppercase tracking-wide text-[9px] ml-1">
+                                  partial
+                                </span>
+                              </>
+                            ) : (
+                              <>{row.entries.length} runs</>
+                            )}
                           </span>
                         </td>
                         <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">

@@ -1,7 +1,20 @@
 import { useState } from 'react';
 import { cn } from '../../../lib/utils';
 
-export type LinePoint = { x: number; y: number; label?: string; meta?: unknown };
+export type LinePoint = {
+  x: number;
+  y: number;
+  label?: string;
+  meta?: unknown;
+  /**
+   * Render the marker hollow (stroked, no fill) instead of solid. Used to
+   * mark partial-batch trend points so a 2-of-5 partial doesn't visually
+   * impersonate a complete data point at the same y-value. Series line
+   * still passes through the partial point — the visual difference is in
+   * the marker only.
+   */
+  partial?: boolean;
+};
 export type LineSeries = {
   name: string;
   color: string;
@@ -253,9 +266,21 @@ export function LineChart({
                   strokeWidth={isActive && activeNames ? 2 : 1.5}
                   fill="none"
                 />
-                {sorted.map((p, i) => (
-                  <circle key={i} cx={scaleX(p.x)} cy={scaleY(p.y)} r={2.5} fill={s.color} />
-                ))}
+                {sorted.map((p, i) =>
+                  p.partial ? (
+                    <circle
+                      key={i}
+                      cx={scaleX(p.x)}
+                      cy={scaleY(p.y)}
+                      r={3}
+                      fill="hsl(var(--background))"
+                      stroke={s.color}
+                      strokeWidth={1.5}
+                    />
+                  ) : (
+                    <circle key={i} cx={scaleX(p.x)} cy={scaleY(p.y)} r={2.5} fill={s.color} />
+                  ),
+                )}
               </g>
             );
           });

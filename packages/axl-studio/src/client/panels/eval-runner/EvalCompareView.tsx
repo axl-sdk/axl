@@ -107,6 +107,16 @@ export function EvalCompareView({
     ? `averaged across ${baselineRunCount === candidateRunCount ? `${baselineRunCount} runs` : `${baselineRunCount} / ${candidateRunCount} runs`}`
     : null;
 
+  // Partial-batch context comes from the server (`compareResult.baseline.partial`
+  // / `.candidate.partial`) — set when the runs pooled for that side reflect
+  // fewer runs than the original batch planned. We render a small amber
+  // chip next to the section title so the user can't mistake a 3-of-5
+  // partial candidate for a complete 5-run apples-to-apples comparison.
+  // Either side can be partial independently (e.g., complete baseline vs
+  // partial candidate after a provider hiccup).
+  const baselinePartial = compareResult.baseline?.partial;
+  const candidatePartial = compareResult.candidate?.partial;
+
   // Sort scorer entries — derive from compareResult.scorers directly to keep stable deps
   const sortedScorerEntries = useMemo(() => {
     const entries = Object.entries(compareResult.scorers);
@@ -162,6 +172,44 @@ export function EvalCompareView({
 
   return (
     <div className="space-y-6">
+      {/*
+       * Partial-batch notice. When one or both sides of the comparison were
+       * pooled from a partial batch (or a user-selected subset), the
+       * verdict the table conveys is computed against a smaller-N pool than
+       * the user may realize. Surface this prominently — bootstrap CI
+       * handles sample size correctly, but the user shouldn't read a
+       * "+0.05 candidate improvement" without knowing one side had only 2
+       * of an attempted 5 runs.
+       */}
+      {(baselinePartial || candidatePartial) && (
+        <div
+          className="flex items-start gap-2.5 px-4 py-3 rounded-xl border border-amber-300/60 dark:border-amber-500/40 bg-amber-50 dark:bg-amber-950/40"
+          role="status"
+        >
+          <div className="text-sm text-amber-900 dark:text-amber-200">
+            <div className="font-medium">Partial batch in this comparison.</div>
+            <ul className="mt-1 space-y-0.5 text-amber-800/90 dark:text-amber-300/90 list-disc list-inside">
+              {baselinePartial && (
+                <li>
+                  Baseline pooled {baselinePartial.completed} of an attempted{' '}
+                  {baselinePartial.attempted} runs.
+                </li>
+              )}
+              {candidatePartial && (
+                <li>
+                  Candidate pooled {candidatePartial.completed} of an attempted{' '}
+                  {candidatePartial.attempted} runs.
+                </li>
+              )}
+            </ul>
+            <div className="mt-1 text-amber-800/80 dark:text-amber-300/80">
+              Statistics below are computed honestly for the included runs, but cross-side deltas
+              reflect different sample sizes.
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Verdict banner */}
       {sortedScorerEntries.length > 0 &&
         (() => {
@@ -580,6 +628,14 @@ export function EvalCompareView({
                     {isGroupComparison && baselineRunCount > 1 && (
                       <span className="font-normal opacity-60 ml-0.5">({baselineRunCount})</span>
                     )}
+                    {baselinePartial && (
+                      <span
+                        className="font-normal ml-1 px-1 py-0.5 rounded text-[9px] uppercase tracking-wide bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-200"
+                        title={`Partial batch — ${baselinePartial.completed} of ${baselinePartial.attempted} runs included`}
+                      >
+                        {baselinePartial.completed}/{baselinePartial.attempted}
+                      </span>
+                    )}
                     {sortIndicator('baseline')}
                   </th>
                   <th
@@ -589,6 +645,14 @@ export function EvalCompareView({
                     Candidate
                     {isGroupComparison && candidateRunCount > 1 && (
                       <span className="font-normal opacity-60 ml-0.5">({candidateRunCount})</span>
+                    )}
+                    {candidatePartial && (
+                      <span
+                        className="font-normal ml-1 px-1 py-0.5 rounded text-[9px] uppercase tracking-wide bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-200"
+                        title={`Partial batch — ${candidatePartial.completed} of ${candidatePartial.attempted} runs included`}
+                      >
+                        {candidatePartial.completed}/{candidatePartial.attempted}
+                      </span>
                     )}
                     {sortIndicator('candidate')}
                   </th>

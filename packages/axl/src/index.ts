@@ -10,7 +10,7 @@ export type { Workflow, WorkflowConfig, AnyWorkflow } from './workflow.js';
 
 // Runtime
 export { AxlRuntime } from './runtime.js';
-export type { CreateContextOptions, ExecuteOptions } from './runtime.js';
+export type { CreateContextOptions, ExecuteOptions, EvalExecuteWorkflow } from './runtime.js';
 export { defineConfig } from './config.js';
 export type { AxlConfig } from './config.js';
 

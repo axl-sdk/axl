@@ -101,9 +101,7 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     expect(body.data).toEqual([]);
 
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Skipping'));
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('missing workflow, dataset, or scorers'),
-    );
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('not a valid eval config'));
 
     studio.close();
   });
@@ -388,6 +386,80 @@ describe('Studio Middleware: Lazy Eval Loading', () => {
     expect(res.status).toBe(200);
     const body = await readJson(res);
     expect(body.data).toEqual([]);
+
+    studio.close();
+  });
+
+  // Regression coverage for the symmetric `pickExport` path. When tsx loads
+  // a `.ts` eval module from a CJS-typed package, `executeWorkflow` can end
+  // up nested under `mod.default`. Studio's loader must find it there too —
+  // the `.cjs` fixture reproduces a comparable interop shape directly.
+  it('finds executeWorkflow in a CJS-shaped eval module and registers it correctly', async () => {
+    const tempDir = createTempDir();
+    const fixturePath = resolve(tempDir, 'cjs.eval.cjs');
+    writeFileSync(
+      fixturePath,
+      `module.exports = {
+  default: {
+    workflow: 'cjs-wf',
+    dataset: { name: 'cjs-ds', getItems: async () => [{ input: 'hi' }] },
+    scorers: [{ name: 'len', score: (output) => (typeof output === 'string' ? 1 : 0) }],
+  },
+  executeWorkflow: async (input) => ({ output: 'cjs:' + input }),
+};
+`,
+    );
+
+    const runtime = createTestRuntime();
+    const studio = createStudioMiddleware({
+      runtime,
+      serveClient: false,
+      evals: fixturePath,
+    });
+
+    const name = expectedName(fixturePath);
+    const runRes = await studio.app.request(`/api/evals/${encodeURIComponent(name)}/run`, {
+      method: 'POST',
+    });
+    expect(runRes.status).toBe(200);
+    const runBody = await readJson(runRes);
+    expect(runBody.ok).toBe(true);
+    // If pickExport had missed the named export, runtime.execute('cjs-wf', ...)
+    // would have thrown ("workflow not registered"). Finding the export and
+    // invoking it produces our 'cjs:hi' output.
+    expect(runBody.data.items[0].output).toBe('cjs:hi');
+    expect(runBody.data.items[0].scores.len).toBe(1);
+
+    studio.close();
+  });
+
+  it('skips eval module with empty scorers array', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const tempDir = createTempDir();
+    const fixturePath = resolve(tempDir, 'empty.eval.mjs');
+    writeFileSync(
+      fixturePath,
+      `export default {
+  workflow: 'wf',
+  dataset: { name: 'ds', getItems: async () => [] },
+  scorers: [],
+};
+`,
+    );
+
+    const runtime = createTestRuntime();
+    const studio = createStudioMiddleware({
+      runtime,
+      serveClient: false,
+      evals: fixturePath,
+    });
+
+    const res = await studio.app.request('/api/evals');
+    expect(res.status).toBe(200);
+    const body = await readJson(res);
+    expect(body.data).toEqual([]);
+
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('scorers array is empty'));
 
     studio.close();
   });

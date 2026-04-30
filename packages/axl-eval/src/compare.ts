@@ -250,9 +250,20 @@ export function evalCompare(
   }
   const summaryStr = `candidate ${parts.length > 0 ? parts.join(', ') : 'no meaningful changes'} with ${regressions.length} regressions and ${improvements.length} improvements`;
 
+  const baselinePartial = detectPartial(baselineRuns);
+  const candidatePartial = detectPartial(candidateRuns);
+
   return {
-    baseline: { id: baselineRef.id, metadata: baselineRef.metadata },
-    candidate: { id: candidateRef.id, metadata: candidateRef.metadata },
+    baseline: {
+      id: baselineRef.id,
+      metadata: baselineRef.metadata,
+      ...(baselinePartial ? { partial: baselinePartial } : {}),
+    },
+    candidate: {
+      id: candidateRef.id,
+      metadata: candidateRef.metadata,
+      ...(candidatePartial ? { partial: candidatePartial } : {}),
+    },
     scorers,
     timing,
     cost,
@@ -260,4 +271,23 @@ export function evalCompare(
     improvements,
     summary: summaryStr,
   };
+}
+
+/**
+ * Detect whether one side of a comparison was pooled from a partial batch
+ * (or a user-selected subset). Returns `{ completed, attempted }` when the
+ * pooled run count is less than the original batch's planned run count
+ * (read from `metadata.batchAttempted`); `undefined` otherwise.
+ *
+ * The signal is the same regardless of cause (batch failed mid-way vs user
+ * cherry-picked from the picker) — both result in a smaller-N pool that
+ * the consumer should mark visually so the comparison isn't mistaken for
+ * an apples-to-apples run.
+ */
+function detectPartial(runs: EvalResult[]): { completed: number; attempted: number } | undefined {
+  if (runs.length === 0) return undefined;
+  const attempted = runs[0].metadata?.batchAttempted;
+  if (typeof attempted !== 'number' || !Number.isFinite(attempted)) return undefined;
+  if (runs.length >= attempted) return undefined;
+  return { completed: runs.length, attempted };
 }

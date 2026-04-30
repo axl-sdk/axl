@@ -23,6 +23,7 @@ export type {
   EvalItem,
   EvalSummary,
   EvalComparison,
+  EvalComparisonPartial,
   EvalCompareOptions,
   EvalRegression,
   EvalImprovement,

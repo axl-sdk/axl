@@ -174,6 +174,19 @@ export type EvalTrendRun = {
   model?: string;
   /** Total run duration in ms (from `EvalResult.duration`). */
   duration?: number;
+  /**
+   * Multi-run group id (`metadata.runGroupId`). Forwarded so the client can
+   * detect partial batches by counting runs sharing this id and comparing
+   * against `batchAttempted`.
+   */
+  runGroupId?: string;
+  /**
+   * Original planned multi-run count (`metadata.batchAttempted`). Set on
+   * every run that was part of a multi-run batch; absent on single-run
+   * results. The client compares this against the count of sibling runs in
+   * the same `runGroupId` to mark partial trend points distinctly.
+   */
+  batchAttempted?: number;
 };
 
 export type EvalTrendEntry = {
@@ -289,6 +302,18 @@ export function reduceEvalTrends(acc: EvalTrendData, entry: EvalHistoryEntry): E
   const cost = extractCost(entry.data);
   const model = extractModel(entry.data);
   const duration = extractDuration(entry.data);
+  // Forward multi-run identity fields (`runGroupId`, `batchAttempted`) so
+  // the client can detect partial batches at render time. We can't decide
+  // partial-ness here because it's a group property: partial iff
+  // count(group) < batchAttempted, and the reducer processes one entry at
+  // a time without knowledge of siblings in the same group.
+  const metadata = (entry.data as { metadata?: Record<string, unknown> })?.metadata;
+  const runGroupId = typeof metadata?.runGroupId === 'string' ? metadata.runGroupId : undefined;
+  const batchAttempted =
+    typeof metadata?.batchAttempted === 'number' && Number.isFinite(metadata.batchAttempted)
+      ? metadata.batchAttempted
+      : undefined;
+
   const run: EvalTrendRun = {
     timestamp: entry.timestamp,
     id: entry.id,
@@ -296,6 +321,8 @@ export function reduceEvalTrends(acc: EvalTrendData, entry: EvalHistoryEntry): E
     cost,
     ...(model !== undefined ? { model } : {}),
     ...(duration !== undefined ? { duration } : {}),
+    ...(runGroupId !== undefined ? { runGroupId } : {}),
+    ...(batchAttempted !== undefined ? { batchAttempted } : {}),
   };
 
   const byEval = { ...acc.byEval };

@@ -289,6 +289,13 @@ export type EvalTrendData = {
         model?: string;
         /** Total run duration in ms. */
         duration?: number;
+        /** Multi-run group id (`metadata.runGroupId`). Forwarded so the
+         *  client can detect partial batches by counting siblings sharing
+         *  this id and comparing against `batchAttempted`. */
+        runGroupId?: string;
+        /** Original planned multi-run count (`metadata.batchAttempted`).
+         *  Set on every run that was part of a multi-run batch. */
+        batchAttempted?: number;
       }>;
       latestScores: Record<string, number>;
       scoreMean: Record<string, number>;

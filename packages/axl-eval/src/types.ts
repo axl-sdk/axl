@@ -87,9 +87,32 @@ export type EvalSummary = {
   };
 };
 
+/**
+ * Sample-size context for one side of a comparison.
+ *
+ * Set when the runs pooled for this side reflect fewer runs than the
+ * original batch planned (`runs.length < runs[0].metadata.batchAttempted`).
+ * Two causes are conflated under the same label:
+ *   - The batch failed mid-way (e.g. 2 of 5 runs completed). `evalCompare`
+ *     can't safely conclude statistical significance against a complete
+ *     side without highlighting the smaller-N source.
+ *   - The user deliberately picked a subset of completed runs from the
+ *     comparison picker. Same wire-level signal; same warning is fair.
+ *
+ * Consumers (UI compare view) render this as `(partial: 2 of 5 runs)` so
+ * the user doesn't mistake a smaller-N candidate for an apples-to-apples
+ * comparison against a complete baseline.
+ */
+export type EvalComparisonPartial = {
+  /** Number of runs actually included in this side's pool. */
+  completed: number;
+  /** Original planned run count (from `metadata.batchAttempted`). */
+  attempted: number;
+};
+
 export type EvalComparison = {
-  baseline: { id: string; metadata: Record<string, unknown> };
-  candidate: { id: string; metadata: Record<string, unknown> };
+  baseline: { id: string; metadata: Record<string, unknown>; partial?: EvalComparisonPartial };
+  candidate: { id: string; metadata: Record<string, unknown>; partial?: EvalComparisonPartial };
   scorers: Record<
     string,
     {

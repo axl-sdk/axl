@@ -82,6 +82,20 @@ export type EvalResultData = {
   _multiRun?: {
     aggregate: MultiRunAggregate;
     allRuns: EvalResultData[];
+    /**
+     * Set when the multi-run batch did not complete the planned number of
+     * runs (e.g. run 3 of 5 threw). The aggregate is honest — computed over
+     * `allRuns.length` actual runs — but the partial flag tells the UI to
+     * render a distinct badge so a partial batch can't visually impersonate
+     * a complete one.
+     */
+    partial?: boolean;
+    /** How many runs actually completed (= allRuns.length). */
+    batchCompleted?: number;
+    /** How many runs were planned. */
+    batchAttempted?: number;
+    /** Redacted message from the run that failed, if any. */
+    batchFailure?: string;
   };
 };
 
@@ -106,7 +120,27 @@ export type ComparisonScorerEntry = {
   n?: number;
 };
 
+/**
+ * Sample-size context for one side of a comparison. Mirrors
+ * `EvalComparisonPartial` from `@axlsdk/eval`. Set when the runs pooled
+ * for this side reflect fewer runs than the original batch planned —
+ * either because the batch failed mid-way, or the user picked a subset
+ * from the comparison picker. Surfaced as a "(partial: 2 of 5 runs)"
+ * caption so the user doesn't mistake a smaller-N candidate for an
+ * apples-to-apples comparison.
+ */
+export type ComparisonPartial = {
+  completed: number;
+  attempted: number;
+};
+
 export type ComparisonResult = {
+  /**
+   * Baseline-side identifier and per-side metadata. `partial` is set when
+   * the pooled run count is less than the original batch's planned count.
+   */
+  baseline?: { id: string; metadata?: Record<string, unknown>; partial?: ComparisonPartial };
+  candidate?: { id: string; metadata?: Record<string, unknown>; partial?: ComparisonPartial };
   regressions: ComparisonRegressionItem[];
   improvements: ComparisonRegressionItem[];
   scorers: Record<string, ComparisonScorerEntry>;
@@ -179,7 +213,38 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
     workflows: aggWorkflows.length > 0 ? aggWorkflows : undefined,
     scorers: aggScorers,
   };
-  return { ...first, _multiRun: { aggregate, allRuns } };
+  // Derive partial-batch state from `metadata.batchAttempted` (stamped on
+  // each persisted run by the server's run endpoint) when fewer runs are
+  // present than were planned. Server-rendered freshly-completed groups
+  // already include explicit `_multiRun.partial`; we recompute it here for
+  // groups adopted from history (the persisted shape doesn't carry the
+  // top-level `_multiRun.partial`, only the per-run `metadata.batchAttempted`).
+  const batchAttempted =
+    typeof first.metadata?.batchAttempted === 'number' ? first.metadata.batchAttempted : undefined;
+  const partial = batchAttempted !== undefined && allRuns.length < batchAttempted;
+  // Persisted runs from a partial CLI/Studio batch may carry the failure
+  // message on per-run metadata. Lift it onto the aggregate so the panel
+  // banner can render "Stopped after: ..." for groups loaded from history.
+  // Any run in the group will do — they all share the same failure
+  // message in our partial-batch-preservation model.
+  const batchFailure = partial
+    ? allRuns
+        .map((r) => r.metadata?.batchFailure)
+        .find((m): m is string => typeof m === 'string' && m.length > 0)
+    : undefined;
+  return {
+    ...first,
+    _multiRun: {
+      aggregate,
+      allRuns,
+      ...(partial && {
+        partial: true,
+        batchCompleted: allRuns.length,
+        batchAttempted,
+        ...(batchFailure ? { batchFailure } : {}),
+      }),
+    },
+  };
 }
 
 // ── Score color utilities ─────────────────────────────────────────

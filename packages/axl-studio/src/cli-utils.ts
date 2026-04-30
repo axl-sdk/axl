@@ -82,39 +82,59 @@ export function needsTsxLoader(configPath: string): boolean {
 
 // ── Module loading ────────────────────────────────────────────────
 
-// Lazily resolved tsImport function from tsx. `undefined` = not yet checked,
-// `null` = tsx not available.
-let tsImportFn:
-  | ((specifier: string, parentURL: string) => Promise<Record<string, any>>)
-  | null
-  | undefined;
+// Tracks whether we've already activated tsx's process-wide ESM loader hooks.
+// `undefined` = not yet attempted, `true` = active, `false` = tsx unavailable.
+let tsxRegistered: boolean | undefined;
 
 /**
- * Import a module, using tsx's `tsImport()` for TypeScript files.
+ * Import a module, activating tsx's loader hooks process-wide for TypeScript
+ * files so chained imports (workspace `.ts` sources resolved via custom
+ * conditions, transitive imports between TS files) are transformed too.
  *
- * `tsImport()` handles ESM/CJS format correctly without process-wide side effects —
- * no need for `register()` hooks or ESM-forcing workarounds. Falls back to regular
- * `import()` for non-TypeScript files or when tsx is not installed.
+ * Implementation note: tsx's `tsImport(specifier, parent)` uses a unique
+ * namespace per call — it only transforms the entry import. Chained imports
+ * MADE BY the entry file fall back to native Node ESM resolution, which
+ * can't load `.ts` sources. That broke `--conditions development` whenever a
+ * monorepo's `development` export pointed at `.ts` files. We instead call
+ * `register()` (no namespace) once and rely on plain `await import()` for
+ * each file — tsx then intercepts the entire ESM module graph for the
+ * process lifetime.
+ *
+ * Process-wide registration is what tsx's own CLI does. The hook is
+ * idempotent and only acts on TypeScript-extension specifiers. Falls back
+ * to regular `import()` if tsx is not installed.
  */
+async function ensureTsxRegistered(): Promise<boolean> {
+  if (tsxRegistered !== undefined) return tsxRegistered;
+  try {
+    const mod = await import('tsx/esm/api');
+    if (typeof mod.register === 'function') {
+      mod.register();
+      tsxRegistered = true;
+    } else {
+      tsxRegistered = false;
+    }
+  } catch {
+    tsxRegistered = false;
+  }
+  return tsxRegistered;
+}
+
 export async function importModule(
   filePath: string,
-  parentURL: string,
+  _parentURL: string,
 ): Promise<Record<string, any>> {
   if (needsTsxLoader(filePath)) {
-    if (tsImportFn === undefined) {
-      try {
-        const mod = await import('tsx/esm/api');
-        tsImportFn = mod.tsImport ?? null;
-      } catch {
-        tsImportFn = null;
-        console.warn(
-          '[axl-studio] Warning: tsx is not installed. TypeScript config files require tsx as a dependency.\n' +
-            '  Install it with: npm install -D tsx',
-        );
-      }
-    }
-    if (tsImportFn) {
-      return (await tsImportFn(pathToFileURL(filePath).href, parentURL)) as Record<string, any>;
+    const registered = await ensureTsxRegistered();
+    if (!registered) {
+      // Pre-check: don't let the subsequent `await import()` throw Node's
+      // cryptic "Unknown file extension '.ts'" error. Surface a clean,
+      // actionable message instead. Throw rather than warn — the caller
+      // can't proceed without TS support.
+      throw new Error(
+        `Cannot load TypeScript file ${filePath}: tsx is not installed.\n` +
+          `  Install it as a dev dependency: npm install -D tsx (or pnpm add -D tsx)`,
+      );
     }
   }
   return await import(pathToFileURL(filePath).href);

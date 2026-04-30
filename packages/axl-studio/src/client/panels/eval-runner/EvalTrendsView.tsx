@@ -123,6 +123,33 @@ export function EvalTrendsView({
         const scorerNames = Object.keys(entry.scoreMean).sort();
         const sortedRuns = [...entry.runs].sort((a, b) => a.timestamp - b.timestamp);
 
+        // Partial-batch detection. A run is "partial" if it shares a
+        // runGroupId with fewer siblings than `metadata.batchAttempted`
+        // planned. Group counts are derived once per render so all three
+        // chart modes (scorer/model/duration) share the same partial set.
+        // Without this, a 2-of-5 partial point would render as a normal
+        // dot — the same silent-partial UX failure mode the artifact-side
+        // fix prevented.
+        const partialIds = (() => {
+          const groupCounts = new Map<string, number>();
+          for (const r of sortedRuns) {
+            if (r.runGroupId) {
+              groupCounts.set(r.runGroupId, (groupCounts.get(r.runGroupId) ?? 0) + 1);
+            }
+          }
+          const ids = new Set<string>();
+          for (const r of sortedRuns) {
+            if (
+              r.runGroupId &&
+              typeof r.batchAttempted === 'number' &&
+              (groupCounts.get(r.runGroupId) ?? 0) < r.batchAttempted
+            ) {
+              ids.add(r.id);
+            }
+          }
+          return ids;
+        })();
+
         // ── Series per view mode ──────────────────────────────────
         let series: LineSeries[] = [];
         let legendEntries: Array<{ name: string; color: string }> = [];
@@ -143,6 +170,7 @@ export function EvalTrendsView({
                 y: r.scores[scorer],
                 label: r.model ? `${r.id.slice(0, 8)}… · ${r.model}` : r.id,
                 meta: r,
+                ...(partialIds.has(r.id) ? { partial: true } : {}),
               })),
           }));
           legendEntries = scorerNames.map((s, idx) => ({
@@ -178,6 +206,7 @@ export function EvalTrendsView({
                     y: avg,
                     label: `${r.id.slice(0, 8)}… · ${model}`,
                     meta: r,
+                    ...(partialIds.has(r.id) ? { partial: true } : {}),
                   };
                 })
                 .filter((p): p is NonNullable<typeof p> => p !== null),
@@ -212,6 +241,7 @@ export function EvalTrendsView({
                 y: r.duration!,
                 label: `${r.id.slice(0, 8)}… · ${model}`,
                 meta: r,
+                ...(partialIds.has(r.id) ? { partial: true } : {}),
               })),
             };
           });

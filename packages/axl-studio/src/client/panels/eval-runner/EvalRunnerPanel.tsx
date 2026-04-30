@@ -781,6 +781,36 @@ export function EvalRunnerPanel() {
                 </div>
               )}
 
+              {/*
+               * Partial-batch banner. Without it, a partial batch would
+               * render visually identical to a complete batch — exactly the
+               * silent-partial UX failure that the persistence-side fix
+               * prevented in the artifact. The banner names the planned vs
+               * completed counts and includes the underlying failure
+               * message so users don't have to dig through history to
+               * understand why their batch ended early.
+               */}
+              {multiRun?.partial && (
+                <div
+                  className="shrink-0 mx-6 mt-4 rounded-md border border-amber-300/60 bg-amber-50 dark:border-amber-500/40 dark:bg-amber-950/40 px-4 py-3 text-sm text-amber-900 dark:text-amber-200"
+                  role="status"
+                >
+                  <div className="font-medium">
+                    Partial batch — {multiRun.batchCompleted ?? multiRun.allRuns.length} of{' '}
+                    {multiRun.batchAttempted ?? '?'} runs completed.
+                  </div>
+                  {multiRun.batchFailure && (
+                    <div className="mt-1 text-amber-800/90 dark:text-amber-300/90">
+                      Stopped after: {multiRun.batchFailure}
+                    </div>
+                  )}
+                  <div className="mt-1 text-amber-800/80 dark:text-amber-300/80">
+                    Aggregate stats below are computed over the {multiRun.allRuns.length} completed
+                    run{multiRun.allRuns.length === 1 ? '' : 's'}.
+                  </div>
+                </div>
+              )}
+
               {isAggregateView ? (
                 <>
                   {/* Aggregate stat cards + compare button */}

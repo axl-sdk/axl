@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { z } from 'zod';
 import { MockProvider } from '@axlsdk/testing';
+import { dataset, scorer } from '@axlsdk/eval';
 import { createTestServer } from '../helpers/setup.js';
 import { readJson } from '../helpers/json.js';
 
@@ -263,6 +265,93 @@ describe('Studio API: Evals', () => {
       expect(data._multiRun.allRuns[i].metadata.runGroupId).toBeDefined();
       expect(data._multiRun.allRuns[i].metadata.runIndex).toBe(i);
     }
+  });
+
+  it('POST /api/evals/:name/run preserves partial batch when run N fails mid-way', async () => {
+    // Simulates the same class of failure the CLI fix addresses: run 1
+    // succeeds, run 2's getItems() throws (e.g. transient provider hiccup,
+    // network blip, exhausted resource). Without the fix, the whole batch
+    // would error out and run 1's completed work would be discarded.
+    const provider = MockProvider.echo();
+    const { app, runtime } = createTestServer(provider);
+
+    let getItemsCalls = 0;
+    const partialDataset = dataset({
+      name: 'partial-dataset',
+      schema: z.object({ message: z.string() }),
+      items: [{ input: { message: 'hello' } }],
+      // Override getItems via a wrapper — first call succeeds, second throws.
+      // Note: dataset() returns an object with getItems, so we monkey-patch.
+    });
+    const originalGetItems = partialDataset.getItems.bind(partialDataset);
+    partialDataset.getItems = async () => {
+      getItemsCalls++;
+      if (getItemsCalls === 2) throw new Error('SIMULATED_RUN_2_FAILURE');
+      return originalGetItems();
+    };
+
+    runtime.registerEval('partial-eval', {
+      workflow: 'test-wf',
+      dataset: partialDataset,
+      scorers: [scorer({ name: 's', description: 's', score: () => 1 })],
+    });
+
+    const res = await app.request('/api/evals/partial-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 3 }),
+    });
+    expect(res.status).toBe(200);
+
+    const body = await readJson(res);
+    expect(body.ok).toBe(true);
+
+    // Completed run is preserved — the work we paid for is not thrown away.
+    expect(body.data._multiRun.allRuns.length).toBe(1);
+    expect(body.data._multiRun.aggregate.runCount).toBe(1);
+
+    // Partial flags make the partial-ness explicit so the UI can render a
+    // distinct badge instead of letting a 1-of-3 batch impersonate a 1-run
+    // batch.
+    expect(body.data._multiRun.partial).toBe(true);
+    expect(body.data._multiRun.batchCompleted).toBe(1);
+    expect(body.data._multiRun.batchAttempted).toBe(3);
+    expect(body.data._multiRun.batchFailure).toContain('SIMULATED_RUN_2_FAILURE');
+
+    // The completed run carries `batchAttempted` in its persisted metadata
+    // so any later viewer (history reload, comparison, rescore) can derive
+    // partial-ness without relying on the live response payload.
+    expect(body.data._multiRun.allRuns[0].metadata.batchAttempted).toBe(3);
+    expect(body.data._multiRun.allRuns[0].metadata.runIndex).toBe(0);
+  });
+
+  it('POST /api/evals/:name/run returns error when every run fails', async () => {
+    const provider = MockProvider.echo();
+    const { app, runtime } = createTestServer(provider);
+
+    const failDataset = dataset({
+      name: 'fail-dataset',
+      schema: z.object({ message: z.string() }),
+      items: [{ input: { message: 'x' } }],
+    });
+    failDataset.getItems = async () => {
+      throw new Error('TOTAL_FAILURE');
+    };
+
+    runtime.registerEval('fail-eval', {
+      workflow: 'test-wf',
+      dataset: failDataset,
+      scorers: [scorer({ name: 's', description: 's', score: () => 1 })],
+    });
+
+    const res = await app.request('/api/evals/fail-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 3 }),
+    });
+
+    // No runs completed → error response, not a partial.
+    expect(res.status).not.toBe(200);
   });
 
   it('POST /api/evals/:name/run caps runs at 25', async () => {
@@ -1158,6 +1247,62 @@ describe('Studio API: Evals', () => {
     const histBody = await readJson(histRes);
     // Multi-run produces N individual entries (each run saved separately)
     expect(histBody.data.length).toBe(3);
+  });
+
+  it('POST /api/evals/:name/run with stream: true preserves partial multi-run batch', async () => {
+    // Streaming-mode partial preservation. Runs differ from sync-mode in
+    // delivery (events on the WS channel) but share the same per-run
+    // try/catch + break + batchAttempted-stamping pattern. This covers the
+    // failure-path persistence: completed runs land in history with
+    // metadata.batchAttempted, even though no terminal `done` event was
+    // broadcast for the failed run.
+    const provider = MockProvider.echo();
+    const { app, runtime } = createTestServer(provider);
+
+    let getItemsCalls = 0;
+    const partialDataset = dataset({
+      name: 'partial-stream-dataset',
+      schema: z.object({ message: z.string() }),
+      items: [{ input: { message: 'hello' } }],
+    });
+    const originalGetItems = partialDataset.getItems.bind(partialDataset);
+    partialDataset.getItems = async () => {
+      getItemsCalls++;
+      if (getItemsCalls === 2) throw new Error('STREAM_RUN_2_FAILURE');
+      return originalGetItems();
+    };
+
+    runtime.registerEval('partial-stream-eval', {
+      workflow: 'test-wf',
+      dataset: partialDataset,
+      scorers: [scorer({ name: 's', description: 's', score: () => 1 })],
+    });
+
+    const res = await app.request('/api/evals/partial-stream-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 3, stream: true }),
+    });
+    expect(res.status).toBe(200);
+    const { evalRunId } = (await readJson(res)).data;
+    expect(evalRunId).toBeDefined();
+
+    // Give the async IIFE time to attempt run 1 (success), run 2 (fails),
+    // then break out of the loop and broadcast the partial done event.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // Persisted history should contain exactly one run (the one that
+    // completed) carrying `batchAttempted: 3` so any consumer reloading
+    // the group can derive partial-ness.
+    const histRes = await app.request('/api/evals/history');
+    const histBody = await readJson(histRes);
+    const partialEntries = histBody.data.filter(
+      (e: { eval: string }) => e.eval === 'partial-stream-eval',
+    );
+    expect(partialEntries.length).toBe(1);
+    expect(partialEntries[0].data.metadata.batchAttempted).toBe(3);
+    expect(partialEntries[0].data.metadata.runIndex).toBe(0);
+    expect(partialEntries[0].data.metadata.runGroupId).toBeDefined();
   });
 
   it('POST /api/evals/runs/:evalRunId/cancel returns 404 for unknown run', async () => {

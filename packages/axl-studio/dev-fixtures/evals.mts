@@ -161,6 +161,20 @@ export const schemaRetryDataset = dataset({
   ],
 });
 
+// Same shape as miniDataset — used by the partial-batch eval. The `seed.mts`
+// helper exercises the partial-batch path by registering this dataset, then
+// running it as a multi-run group where only some of the planned runs land
+// in history. The Eval Runner panel's partial-batch banner is the visual
+// confirmation of the partial-preservation fix.
+export const partialBatchDataset = dataset({
+  name: 'partial-batch-basics',
+  schema: z.object({ question: z.string() }),
+  items: [
+    { input: { question: 'Why is the sky blue?' } },
+    { input: { question: 'How does HTTPS work?' } },
+  ],
+});
+
 // Every item fails with a `ValidationError` whose `.message` echoes the
 // user question. Run with `AXL_DEV_REDACT=1` to verify the REST error
 // envelope and `eval:*` WS error broadcast both scrub the message via
@@ -213,5 +227,11 @@ export function registerEvals(runtime: AxlRuntime): void {
     workflow: 'leaky-workflow',
     dataset: leakyDataset,
     scorers: [notEmpty],
+  });
+
+  runtime.registerEval('partial-batch-eval', {
+    workflow: 'qa-workflow',
+    dataset: partialBatchDataset,
+    scorers: [notEmpty, quality],
   });
 }

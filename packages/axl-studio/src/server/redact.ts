@@ -294,11 +294,24 @@ function redactEvalItem(item: EvalItem): EvalItem {
  * `timestamp`, `totalCost`, `duration`, `summary`, `metadata`) is
  * preserved so the Eval Runner UI can still render summary stats,
  * timing, score distributions, and cost aggregates under compliance mode.
+ *
+ * One narrow exception: `metadata.batchFailure` is the raw error message
+ * from a partial-batch failure. Studio-generated batches pre-redact this
+ * at the run endpoint, but CLI-imported artifacts can carry an unredacted
+ * error string that may quote user input (e.g. a guardrail rejection that
+ * echoes the prompt). Scrub it here so imports under redact mode don't
+ * leak.
  */
 export function redactEvalResult(result: EvalResult, redact: boolean): EvalResult {
   if (!redact) return result;
+  const meta = result.metadata as Record<string, unknown> | undefined;
+  const scrubbedMetadata =
+    meta && typeof meta.batchFailure === 'string'
+      ? { ...meta, batchFailure: REDACTED }
+      : result.metadata;
   return {
     ...result,
+    metadata: scrubbedMetadata,
     items: result.items.map(redactEvalItem),
   };
 }

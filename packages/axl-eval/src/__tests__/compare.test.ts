@@ -1070,4 +1070,65 @@ describe('evalCompare()', () => {
     expect(comparison.regressions).toHaveLength(0);
     expect(comparison.improvements).toHaveLength(0);
   });
+
+  describe('partial-batch detection', () => {
+    // The `partial` field on each side reflects whether the runs pooled for
+    // that side cover fewer runs than `metadata.batchAttempted` planned.
+    // Either cause (mid-batch failure or user-selected subset) produces the
+    // same wire signal — the consumer renders a "(partial: X of N)" caption
+    // so the user doesn't mistake a smaller-N candidate for an apples-to-
+    // apples comparison.
+
+    it('marks baseline partial when array length < batchAttempted', () => {
+      const baseline = [
+        makeEvalResult({ id: 'b1', metadata: { batchAttempted: 5, runGroupId: 'g' } }),
+        makeEvalResult({ id: 'b2', metadata: { batchAttempted: 5, runGroupId: 'g' } }),
+      ];
+      const candidate = makeEvalResult({ id: 'c' });
+      const comparison = evalCompare(baseline, candidate);
+      expect(comparison.baseline.partial).toEqual({ completed: 2, attempted: 5 });
+      expect(comparison.candidate.partial).toBeUndefined();
+    });
+
+    it('marks candidate partial independently of baseline', () => {
+      const baseline = makeEvalResult({ id: 'b' });
+      const candidate = [
+        makeEvalResult({ id: 'c1', metadata: { batchAttempted: 3, runGroupId: 'g' } }),
+      ];
+      const comparison = evalCompare(baseline, candidate);
+      expect(comparison.baseline.partial).toBeUndefined();
+      expect(comparison.candidate.partial).toEqual({ completed: 1, attempted: 3 });
+    });
+
+    it('omits partial when run count equals batchAttempted (complete batch)', () => {
+      const runs = [
+        makeEvalResult({ id: 'r1', metadata: { batchAttempted: 2, runGroupId: 'g1' } }),
+        makeEvalResult({ id: 'r2', metadata: { batchAttempted: 2, runGroupId: 'g1' } }),
+      ];
+      const comparison = evalCompare(runs, runs);
+      expect(comparison.baseline.partial).toBeUndefined();
+      expect(comparison.candidate.partial).toBeUndefined();
+    });
+
+    it('omits partial when batchAttempted is missing (single-run history)', () => {
+      const baseline = makeEvalResult({ id: 'b' });
+      const candidate = makeEvalResult({ id: 'c' });
+      const comparison = evalCompare(baseline, candidate);
+      expect(comparison.baseline.partial).toBeUndefined();
+      expect(comparison.candidate.partial).toBeUndefined();
+    });
+
+    it('ignores non-finite batchAttempted (defensive against poisoned metadata)', () => {
+      const baseline = makeEvalResult({
+        id: 'b',
+        metadata: { batchAttempted: Number.POSITIVE_INFINITY },
+      });
+      const candidate = makeEvalResult({ id: 'c' });
+      const comparison = evalCompare(baseline, candidate);
+      // Infinity > 1 would falsely tag every single-run baseline as partial
+      // — guard against it so a metadata typo can't paint complete results
+      // amber.
+      expect(comparison.baseline.partial).toBeUndefined();
+    });
+  });
 });

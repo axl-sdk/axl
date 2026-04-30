@@ -3,7 +3,7 @@
 import { readdirSync, statSync } from 'node:fs';
 import { readFile as readFileAsync, writeFile as writeFileAsync, mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
-import type { AxlRuntime } from '@axlsdk/axl';
+import type { AxlRuntime, EvalExecuteWorkflow } from '@axlsdk/axl';
 import { evalCompare } from './compare.js';
 import { runEval } from './runner.js';
 import { rescore } from './rescore.js';
@@ -15,8 +15,42 @@ import {
   resolveRuntime,
   importModule,
   registerConditions,
+  pickDefault,
+  pickExport,
+  expandGlob,
   CONFIG_CANDIDATES,
 } from './cli-utils.js';
+
+/**
+ * Validate an eval config's required fields and produce a diagnostic string
+ * if invalid. Returns `undefined` when the config passes.
+ *
+ * Returns a single-line message tail (caller prepends the file path) so the
+ * full error reads like: `Error: <file> <message>`.
+ *
+ * Goes beyond a falsy check to catch (a) `scorers: []` which previously
+ * silently ran with no scorers and (b) provide a `Got: { keys: [...] }`
+ * hint so users can spot a typo like `scorerS` vs `scorers` immediately.
+ */
+function validateEvalConfig(cfg: unknown): string | undefined {
+  if (!cfg || typeof cfg !== 'object') {
+    return `does not export a valid eval config — got ${cfg === null ? 'null' : typeof cfg}.`;
+  }
+  const c = cfg as Partial<EvalConfig>;
+  const missing: string[] = [];
+  if (!c.workflow) missing.push('workflow');
+  if (!c.dataset) missing.push('dataset');
+  if (!c.scorers) missing.push('scorers');
+  else if (!Array.isArray(c.scorers) || c.scorers.length === 0) {
+    return `exports an empty scorers array — at least one scorer is required.`;
+  }
+  if (missing.length > 0) {
+    const keys = Object.keys(c as object).slice(0, 10);
+    const got = keys.length > 0 ? ` Got: { ${keys.join(', ')} }.` : '';
+    return `does not export a valid eval config (missing ${missing.join(', ')}).${got}`;
+  }
+  return undefined;
+}
 
 const KNOWN_FLAGS = new Set([
   '--output',
@@ -190,10 +224,16 @@ async function runRescore(args: string[]) {
   const runtime = await getRuntime(configArg, conditions);
   try {
     const mod = await importModule(path.resolve(evalFilePath), import.meta.url);
-    const evalConfig: EvalConfig = mod.default?.default ?? mod.default ?? mod.config ?? mod;
+    const evalConfig = pickDefault<EvalConfig>(mod);
 
-    if (!evalConfig.scorers || evalConfig.scorers.length === 0) {
-      console.error(`Error: ${evalFilePath} does not export scorers`);
+    if (!evalConfig || typeof evalConfig !== 'object') {
+      console.error(
+        `Error: ${evalFilePath} does not export an eval config object — got ${evalConfig === null ? 'null' : typeof evalConfig}.`,
+      );
+      process.exit(1);
+    }
+    if (!Array.isArray(evalConfig.scorers) || evalConfig.scorers.length === 0) {
+      console.error(`Error: ${evalFilePath} does not export a non-empty scorers array.`);
       process.exit(1);
     }
 
@@ -218,7 +258,21 @@ async function runRescore(args: string[]) {
   }
 }
 
+/**
+ * Resolve a CLI path argument into a list of eval files.
+ *
+ * Accepts:
+ * - An explicit file path (`path/to/foo.eval.ts`)
+ * - A directory (lists `*.eval.[mc]?[jt]sx?` inside, non-recursive)
+ * - A glob pattern: `evals/*.eval.ts`, `evals/**\/*.eval.ts`, `**\/*.eval.ts`
+ *
+ * Glob expansion mirrors the studio eval-loader's so users get the same
+ * behavior in both places. Without it, users running on Windows or with
+ * quoted patterns hit confusing "file not found" errors when the shell
+ * couldn't expand the glob.
+ */
 function collectEvalFiles(p: string): string[] {
+  if (p.includes('*')) return expandGlob(p, process.cwd());
   const resolved = path.resolve(p);
   try {
     const stat = statSync(resolved);
@@ -486,27 +540,43 @@ async function runEvalCommand(args: string[]) {
 
   const runtime = await getRuntime(configArg, conditions);
   const results: EvalResult[] = [];
+  let failedFiles = 0;
 
   try {
     for (const filePath of evalFiles) {
       try {
         const mod = await importModule(path.resolve(filePath), import.meta.url);
-        const evalConfig: EvalConfig = mod.default?.default ?? mod.default ?? mod.config ?? mod;
+        const evalConfig = pickDefault<EvalConfig>(mod);
 
-        if (!evalConfig.workflow || !evalConfig.dataset || !evalConfig.scorers) {
-          console.error(
-            `Error: ${filePath} does not export a valid eval config (missing workflow, dataset, or scorers)`,
-          );
+        const validationError = validateEvalConfig(evalConfig);
+        if (validationError) {
+          console.error(`Error: ${filePath} ${validationError}`);
+          failedFiles++;
           continue;
         }
 
-        // Resolve executeWorkflow: custom export > registered workflow > passthrough
-        let executeWorkflow: (
-          input: unknown,
-          rt?: unknown,
-        ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>;
+        // Resolve executeWorkflow: custom export > registered workflow > error
+        // Walk the ESM/CJS interop chain symmetrically with the default export
+        // so named exports stay visible when tsx loads the eval module as CJS.
+        const exported = pickExport<unknown>(mod, 'executeWorkflow');
 
-        if (mod.executeWorkflow) {
+        // Validate that the export, if present, is callable. Catches the
+        // `export const executeWorkflow = 'foo'` typo at the boundary instead
+        // of crashing deep inside trackExecution with a confusing stack.
+        let customExecute: EvalExecuteWorkflow | undefined;
+        if (typeof exported === 'function') {
+          customExecute = exported as EvalExecuteWorkflow;
+        } else if (exported !== undefined) {
+          console.error(
+            `[axl-eval] Error: ${filePath} exports executeWorkflow but it is ${typeof exported}, not a function.`,
+          );
+          failedFiles++;
+          continue;
+        }
+
+        let executeWorkflow: EvalExecuteWorkflow;
+
+        if (customExecute) {
           // Wrap custom executeWorkflow with trackExecution for cost + metadata attribution
           executeWorkflow = async (input, rt) => {
             const {
@@ -514,7 +584,7 @@ async function runEvalCommand(args: string[]) {
               cost: trackedCost,
               metadata,
             } = await runtime.trackExecution(async () => {
-              return mod.executeWorkflow(input, rt);
+              return customExecute(input, rt);
             });
             return {
               output: result.output,
@@ -531,10 +601,20 @@ async function runEvalCommand(args: string[]) {
             return { output: result, cost, metadata };
           };
         } else {
-          console.warn(
-            `[axl-eval] Warning: ${filePath} does not export executeWorkflow — using input passthrough`,
+          // Fail loudly. The previous identity-passthrough fallback silently
+          // produced all-zero scores in CI — exactly the kind of footgun the
+          // "fail loudly, not silently" rule is meant to prevent. If you
+          // genuinely want identity, export it explicitly:
+          //   export const executeWorkflow = async (input) => ({ output: input });
+          console.error(
+            `[axl-eval] Error: ${filePath} does not export an executeWorkflow function ` +
+              `and no workflow named "${evalConfig.workflow}" is registered on the runtime.\n` +
+              `  Add either:\n` +
+              `    export async function executeWorkflow(input, runtime) { ... }\n` +
+              `  or register the workflow on your runtime via runtime.registerWorkflow(workflow).`,
           );
-          executeWorkflow = async (input) => ({ output: input });
+          failedFiles++;
+          continue;
         }
 
         // When --capture-traces is set, forward it to runEval so the runner
@@ -547,22 +627,71 @@ async function runEvalCommand(args: string[]) {
         const runOptions = captureTraces ? { captureTraces: true } : undefined;
 
         if (runs > 1) {
-          // Multi-run mode
+          // Multi-run mode. Buffer per-run results locally so we can mark the
+          // batch correctly before committing to outer `results[]`. The
+          // original bug was the opposite: results pushed eagerly per-run, a
+          // throw mid-batch left partial results posing as a complete run
+          // (no `partialBatch` marker, aggregate never ran). The fix ISN'T
+          // to throw the partials away — those runs cost money and have
+          // statistical signal. Instead we preserve them with explicit
+          // partial-batch metadata, aggregate over what completed, and exit
+          // non-zero so CI knows the batch wasn't clean.
           const { randomUUID } = await import('node:crypto');
           const runGroupId = randomUUID();
           const runResults: EvalResult[] = [];
+          let runFailure: Error | undefined;
 
           for (let r = 0; r < runs; r++) {
             console.error(`[axl-eval] Run ${r + 1}/${runs}...`);
-            const result = await runEval(evalConfig, executeWorkflow, runtime, runOptions);
-            result.metadata.runGroupId = runGroupId;
-            result.metadata.runIndex = r;
-            runResults.push(result);
-            results.push(result);
+            try {
+              const result = await runEval(evalConfig, executeWorkflow, runtime, runOptions);
+              result.metadata.runGroupId = runGroupId;
+              result.metadata.runIndex = r;
+              runResults.push(result);
+            } catch (err) {
+              runFailure = err instanceof Error ? err : new Error(String(err));
+              console.error(`[axl-eval] Run ${r + 1}/${runs} failed: ${runFailure.message}`);
+              // Stop attempting further runs — we don't know whether this is
+              // transient (rate limit) or permanent (auth failure), and
+              // burning more API calls speculatively is hostile. Preserve
+              // what completed.
+              break;
+            }
+          }
+
+          if (runResults.length === 0) {
+            // Nothing completed — surface as a per-file failure. No partial
+            // artifact to write; the outer try/catch error message would
+            // duplicate the "Run 1/N failed" line we already printed, so
+            // increment and continue without re-throwing.
+            console.error(
+              `[axl-eval] Aborting ${filePath}: no runs completed (${runFailure?.message ?? 'unknown failure'}).`,
+            );
+            failedFiles++;
+            continue;
+          }
+
+          const partial = runResults.length < runs;
+          if (partial) {
+            // Mark every completed run so any consumer reading
+            // `result.metadata` sees the partial-batch context. `aggregateRuns`
+            // computes statistics over `runResults.length`, which is the
+            // honest sample size to report.
+            for (const r of runResults) {
+              r.metadata.partialBatch = true;
+              r.metadata.batchCompleted = runResults.length;
+              r.metadata.batchAttempted = runs;
+              r.metadata.batchFailure = runFailure?.message;
+            }
+            console.error(
+              `[axl-eval] PARTIAL: ${runResults.length} of ${runs} runs completed for ${filePath}.`,
+            );
+            failedFiles++;
           }
 
           const summary = aggregateRuns(runResults);
           console.log('\n' + formatMultiRunTable(summary) + '\n');
+          for (const r of runResults) results.push(r);
         } else {
           const result = await runEval(evalConfig, executeWorkflow, runtime, runOptions);
           results.push(result);
@@ -573,6 +702,7 @@ async function runEvalCommand(args: string[]) {
         console.error(
           `Error running eval ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
         );
+        failedFiles++;
       }
     }
 
@@ -587,8 +717,10 @@ async function runEvalCommand(args: string[]) {
     await runtime.shutdown().catch(() => {});
   }
 
-  // Exit with non-zero code if no evals succeeded
-  if (results.length === 0) {
+  // Exit non-zero if any eval file failed to load/run. Previously we only
+  // exited non-zero when zero evals succeeded, which silently masked
+  // misconfigured files in mixed-success runs (a CI footgun).
+  if (failedFiles > 0 || results.length === 0) {
     process.exit(1);
   }
 }

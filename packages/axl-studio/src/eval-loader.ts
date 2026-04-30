@@ -1,8 +1,9 @@
 import { resolve, relative, dirname, basename } from 'node:path';
 import { readdirSync, statSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import type { AxlRuntime } from '@axlsdk/axl';
+import type { AxlRuntime, EvalExecuteWorkflow } from '@axlsdk/axl';
 import { importModule } from './cli-utils.js';
+import { pickDefault, pickExport } from './resolve-runtime.js';
 
 // In the CJS bundle, tsup stubs import.meta as {} so import.meta.url is
 // undefined. Fall back to __filename (which CJS defines) converted to a
@@ -97,12 +98,37 @@ async function loadEvalFiles(
   for (const file of files) {
     try {
       const mod = await importModule(file, parentURL);
-      const evalConfig = mod.default?.default ?? mod.default ?? mod.config ?? mod;
+      const evalConfig = pickDefault<{
+        workflow?: string;
+        dataset?: unknown;
+        scorers?: unknown;
+      }>(mod);
 
-      if (!evalConfig.workflow || !evalConfig.dataset || !evalConfig.scorers) {
+      if (!evalConfig || typeof evalConfig !== 'object') {
         console.warn(
-          `[axl-studio] Skipping ${file}: not a valid eval config ` +
-            `(missing workflow, dataset, or scorers)`,
+          `[axl-studio] Skipping ${file}: default export is ` +
+            `${evalConfig === null ? 'null' : typeof evalConfig}, expected an eval config object.`,
+        );
+        continue;
+      }
+      if (Array.isArray(evalConfig.scorers) && evalConfig.scorers.length === 0) {
+        console.warn(
+          `[axl-studio] Skipping ${file}: scorers array is empty — at least one scorer is required.`,
+        );
+        continue;
+      }
+      if (!evalConfig.workflow || !evalConfig.dataset || !evalConfig.scorers) {
+        const missing = [
+          !evalConfig.workflow && 'workflow',
+          !evalConfig.dataset && 'dataset',
+          !evalConfig.scorers && 'scorers',
+        ]
+          .filter(Boolean)
+          .join(', ');
+        const keys = Object.keys(evalConfig).slice(0, 10);
+        const got = keys.length > 0 ? ` Got: { ${keys.join(', ')} }.` : '';
+        console.warn(
+          `[axl-studio] Skipping ${file}: not a valid eval config (missing ${missing}).${got}`,
         );
         continue;
       }
@@ -116,7 +142,23 @@ async function loadEvalFiles(
         );
       }
 
-      runtime.registerEval(name, evalConfig, mod.executeWorkflow);
+      // Walk the ESM/CJS interop chain symmetrically with the default export
+      // so `executeWorkflow` stays visible when tsx loads the eval module as CJS
+      // (e.g. a `.ts` file in a package without `"type": "module"`). Validate
+      // the export is callable — a non-function `executeWorkflow` is silently
+      // ignored so registration falls back to `runtime.execute()`, with a
+      // warning so the user knows their export was rejected.
+      const exported = pickExport<unknown>(mod, 'executeWorkflow');
+      let customExecute: EvalExecuteWorkflow | undefined;
+      if (typeof exported === 'function') {
+        customExecute = exported as EvalExecuteWorkflow;
+      } else if (exported !== undefined) {
+        console.warn(
+          `[axl-studio] ${file} exports executeWorkflow but it is ${typeof exported}, ` +
+            `not a function — ignoring and falling back to runtime.execute()`,
+        );
+      }
+      runtime.registerEval(name, evalConfig, customExecute);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[axl-studio] Failed to load eval ${file}: ${msg}`);

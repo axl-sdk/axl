@@ -32,6 +32,23 @@ import { NoopSpanManager } from './telemetry/noop.js';
 import { createSpanManager } from './telemetry/index.js';
 import type { SpanManager, SpanHandle } from './telemetry/types.js';
 
+/**
+ * Function exported from an eval module that overrides the default
+ * `runtime.execute(workflow, input)` behavior. The runtime injects itself as
+ * the second argument so user code can call `runtime.createContext()` etc.
+ *
+ * Returns `{ output, cost?, metadata? }` — cost and metadata are optional and
+ * fall back to values derived from `runtime.trackExecution()` when omitted.
+ *
+ * Single source of truth for the eval-execution contract; consumed by
+ * `registerEval`, `getRegisteredEval`, the `axl-eval` CLI, and
+ * `@axlsdk/studio`'s eval-loader.
+ */
+export type EvalExecuteWorkflow = (
+  input: unknown,
+  runtime?: AxlRuntime,
+) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>;
+
 /** Simple DJB2 hash of input for span correlation. */
 function hashInput(input: unknown): string {
   const str = JSON.stringify(input) ?? '';
@@ -170,13 +187,7 @@ export class AxlRuntime extends EventEmitter {
   private abortControllers = new Map<string, AbortController>();
   private registeredEvals = new Map<
     string,
-    {
-      config: unknown;
-      executeWorkflow?: (
-        input: unknown,
-        runtime?: AxlRuntime,
-      ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>;
-    }
+    { config: unknown; executeWorkflow?: EvalExecuteWorkflow }
   >();
   private mcpManager?: McpManager;
   private memoryManager?: MemoryManager;
@@ -439,14 +450,7 @@ export class AxlRuntime extends EventEmitter {
    * An optional `executeWorkflow` function can override the default behavior
    * of calling `runtime.execute()`.
    */
-  registerEval(
-    name: string,
-    config: unknown,
-    executeWorkflow?: (
-      input: unknown,
-      runtime?: AxlRuntime,
-    ) => Promise<{ output: unknown; cost?: number }>,
-  ): void {
+  registerEval(name: string, config: unknown, executeWorkflow?: EvalExecuteWorkflow): void {
     this.registeredEvals.set(name, { config, executeWorkflow });
   }
 
@@ -476,15 +480,9 @@ export class AxlRuntime extends EventEmitter {
   }
 
   /** Get a registered eval config by name. */
-  getRegisteredEval(name: string):
-    | {
-        config: unknown;
-        executeWorkflow?: (
-          input: unknown,
-          runtime?: AxlRuntime,
-        ) => Promise<{ output: unknown; cost?: number; metadata?: Record<string, unknown> }>;
-      }
-    | undefined {
+  getRegisteredEval(
+    name: string,
+  ): { config: unknown; executeWorkflow?: EvalExecuteWorkflow } | undefined {
     return this.registeredEvals.get(name);
   }
 

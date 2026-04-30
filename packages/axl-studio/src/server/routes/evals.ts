@@ -118,39 +118,73 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
           if (runs > 1) {
             const runGroupId = randomUUID();
             const results: EvalResult[] = [];
+            // Per-run failure no longer tanks the whole batch — completed
+            // runs cost real money and have statistical signal. We capture
+            // the first failure, stop attempting further runs (same
+            // reasoning as the CLI: don't speculatively burn API calls on a
+            // potentially-permanent failure), and emit a partial-aware
+            // `done` event so the client can render the partial result
+            // distinctly. `batchAttempted` is stamped on every run's
+            // metadata up front so persisted history records carry the
+            // expected count, letting any later viewer derive partial-ness.
+            let runFailure: Error | undefined;
 
             for (let r = 0; r < runs; r++) {
               if (ac.signal.aborted) break;
-              const result = (await runtime.runRegisteredEval(name, {
-                metadata: { runGroupId, runIndex: r },
-                signal: ac.signal,
-                captureTraces,
-                onProgress: (event) => {
-                  // Library-level `run_done` fires after every iteration with
-                  // `{ totalItems, failures }`; Studio emits its own wire-level
-                  // `run_done` below with `{ run, totalRuns }` semantics, so we
-                  // drop the library variant to avoid collision on the client.
-                  if (event.type === 'run_done') return;
-                  connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
-                    ...event,
-                    run: r + 1,
-                    totalRuns: runs,
-                  });
-                },
-              })) as EvalResult;
-              results.push(result);
-              connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
-                type: 'run_done',
-                run: r + 1,
-                totalRuns: runs,
-              });
+              try {
+                const result = (await runtime.runRegisteredEval(name, {
+                  metadata: { runGroupId, runIndex: r, batchAttempted: runs },
+                  signal: ac.signal,
+                  captureTraces,
+                  onProgress: (event) => {
+                    // Library-level `run_done` fires after every iteration with
+                    // `{ totalItems, failures }`; Studio emits its own wire-level
+                    // `run_done` below with `{ run, totalRuns }` semantics, so we
+                    // drop the library variant to avoid collision on the client.
+                    if (event.type === 'run_done') return;
+                    connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
+                      ...event,
+                      run: r + 1,
+                      totalRuns: runs,
+                    });
+                  },
+                })) as EvalResult;
+                results.push(result);
+                connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
+                  type: 'run_done',
+                  run: r + 1,
+                  totalRuns: runs,
+                });
+              } catch (err) {
+                runFailure = err instanceof Error ? err : new Error(String(err));
+                connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
+                  type: 'run_failed',
+                  run: r + 1,
+                  totalRuns: runs,
+                  message: redactErrorMessage(runFailure, redactOn),
+                });
+                break;
+              }
             }
 
             if (results.length > 0) {
+              const partial = results.length < runs;
               connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
                 type: 'done',
                 evalResultId: results[0].id,
                 runGroupId,
+                ...(partial && {
+                  partial: true,
+                  batchCompleted: results.length,
+                  batchAttempted: runs,
+                  batchFailure: runFailure ? redactErrorMessage(runFailure, redactOn) : undefined,
+                }),
+              });
+            } else if (runFailure) {
+              // No runs completed — a hard error, not a partial.
+              connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
+                type: 'error',
+                message: redactErrorMessage(runFailure, redactOn),
               });
             } else {
               connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
@@ -198,20 +232,43 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       if (runs > 1) {
         const { aggregateRuns } = await import('@axlsdk/eval');
         const runGroupId = randomUUID();
-        const results = [];
+        const results: EvalResult[] = [];
+        // Same partial-preservation pattern as the streaming path: catch
+        // per-run failures, break, return the partial batch with explicit
+        // markers. Differs from streaming only in delivery — here partial
+        // info rides on the JSON response (`_multiRun.partial` etc.)
+        // instead of a WS event.
+        let runFailure: Error | undefined;
         for (let r = 0; r < runs; r++) {
-          const result = await runtime.runRegisteredEval(name, {
-            metadata: { runGroupId, runIndex: r },
-            captureTraces,
-          });
-          results.push(result);
+          try {
+            const result = await runtime.runRegisteredEval(name, {
+              metadata: { runGroupId, runIndex: r, batchAttempted: runs },
+              captureTraces,
+            });
+            results.push(result as EvalResult);
+          } catch (err) {
+            runFailure = err instanceof Error ? err : new Error(String(err));
+            break;
+          }
         }
-        const typedResults = results as EvalResult[];
-        const aggregate = aggregateRuns(typedResults);
-        const first = typedResults[0]!;
+        if (results.length === 0) {
+          throw runFailure ?? new Error('No runs completed');
+        }
+        const aggregate = aggregateRuns(results);
+        const first = results[0];
+        const partial = results.length < runs;
         const result = {
           ...first,
-          _multiRun: { aggregate, allRuns: typedResults },
+          _multiRun: {
+            aggregate,
+            allRuns: results,
+            ...(partial && {
+              partial: true,
+              batchCompleted: results.length,
+              batchAttempted: runs,
+              batchFailure: runFailure ? redactErrorMessage(runFailure, redactOn) : undefined,
+            }),
+          },
         } as EvalResult;
         return c.json({
           ok: true,

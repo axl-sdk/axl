@@ -215,6 +215,7 @@ export async function seedLive(runtime: AxlRuntime): Promise<void> {
     // qa-eval model-upgrade story: three cohorts spread across 10 days.
     await seedQaEvalCohorts(runtime);
     await seedRagEval(runtime);
+    await seedPartialBatchEval(runtime);
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn(
@@ -376,4 +377,68 @@ async function seedRagEval(runtime: AxlRuntime): Promise<void> {
     timestamp: Date.now() - 2 * DAY,
     data: ragResult,
   });
+}
+
+// ── Partial-batch eval (2 of 5 completed) ────────────────────────────
+//
+// Simulates the failure mode that the multi-run partial-preservation fix
+// addresses: a 5-run batch where runs 1 + 2 succeed and run 3 throws
+// (e.g. provider 503). The fix preserves the completed runs in history
+// with `metadata.batchAttempted: 5` so the Eval Runner panel can derive
+// partial-ness. We seed the post-failure state directly: two history
+// entries sharing a `runGroupId`, each tagged with `batchAttempted: 5`
+// plus the explicit partial markers on every entry. When the user opens
+// the Eval Runner panel and selects this group from history, the panel's
+// partial-batch banner ("Partial batch — 2 of 5 runs completed") and the
+// "Stopped after: ..." line should render distinctly from a complete run.
+async function seedPartialBatchEval(runtime: AxlRuntime): Promise<void> {
+  const entry = runtime.getRegisteredEval('partial-batch-eval');
+  if (!entry) return;
+  const { randomUUID } = await import('node:crypto');
+  const config = entry.config as EvalConfig;
+  const exec = async (input: unknown) => {
+    const { result, cost, metadata } = await runtime.trackExecution(async () =>
+      runtime.execute('qa-workflow', input),
+    );
+    return { output: result, cost, metadata };
+  };
+
+  // Two partial-batch groups so the Compare panel has a distinct
+  // baseline / candidate pair (otherwise the picker won't let the user
+  // run the comparison — datasets must match but groups must differ).
+  // First group: 2 of 5 (provider 503). Second: 3 of 5 (rate limit).
+  // Both render the partial-batch banner; comparing them produces the
+  // partial-on-both-sides verdict view.
+  const failures: Array<{ completed: number; failure: string; offsetMin: number }> = [
+    {
+      completed: 2,
+      failure: 'Provider returned 503 Service Unavailable after 3 retries',
+      offsetMin: 30,
+    },
+    {
+      completed: 3,
+      failure: 'Rate-limited by provider (429); aborted to preserve quota',
+      offsetMin: 12,
+    },
+  ];
+  const attempted = 5;
+
+  for (const f of failures) {
+    const groupId = randomUUID();
+    for (let i = 0; i < f.completed; i++) {
+      const result = await runEval(config, exec, runtime);
+      result.metadata.runGroupId = groupId;
+      result.metadata.runIndex = i;
+      result.metadata.batchAttempted = attempted;
+      result.metadata.partialBatch = true;
+      result.metadata.batchCompleted = f.completed;
+      result.metadata.batchFailure = f.failure;
+      await runtime.saveEvalResult({
+        id: result.id,
+        eval: 'partial-batch-eval',
+        timestamp: Date.now() - f.offsetMin * 60 * 1000 + i * 1000,
+        data: result,
+      });
+    }
+  }
 }

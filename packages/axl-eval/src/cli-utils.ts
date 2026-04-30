@@ -6,8 +6,8 @@
  * Keep in sync with the studio versions if either changes.
  */
 
-import { resolve } from 'node:path';
-import { existsSync } from 'node:fs';
+import { resolve, dirname, basename } from 'node:path';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 // ── Config auto-detection ──────────────────────────────────────────
@@ -50,45 +50,164 @@ export function resolveRuntime(mod: Record<string, any>): unknown {
   return def?.default ?? def ?? mod.runtime;
 }
 
-// ── Module loading ────────────────────────────────────────────────
-
-// Lazily resolved tsImport function from tsx. `undefined` = not yet checked,
-// `null` = tsx not available.
-let tsImportFn:
-  | ((specifier: string, parentURL: string) => Promise<Record<string, any>>)
-  | null
-  | undefined;
+/**
+ * Look up the default-ish export from a dynamically imported module. Walks
+ * the ESM/CJS interop chain plus a `config` named-export fallback that some
+ * eval modules use.
+ *
+ * Module shapes handled:
+ * - ESM `export default cfg`:          `mod.default`
+ * - CJS-wrapped-as-ESM:                `mod.default.default`
+ * - Named `export const config = cfg`: `mod.config`
+ * - Bare module value:                 `mod`
+ *
+ * Mirrors the chain `pickExport()` walks for named exports — keep them in
+ * sync so resolution is symmetric.
+ */
+export function pickDefault<T>(mod: Record<string, any>): T {
+  return (mod.default?.default ?? mod.default ?? mod.config ?? mod) as T;
+}
 
 /**
- * Import a module, using tsx's `tsImport()` for TypeScript files.
+ * Look up a named export from a dynamically imported module, walking the
+ * ESM/CJS interop chain symmetrically with `resolveRuntime` and `pickDefault`.
  *
- * `tsImport()` handles ESM/CJS format correctly without process-wide side effects —
- * no need for `register()` hooks or ESM-forcing workarounds. Falls back to regular
- * `import()` for non-TypeScript files or when tsx is not installed.
+ * Module shapes handled:
+ * - ESM:                   `mod[key]`
+ * - CJS-wrapped-as-ESM:    `mod.default[key]`         (tsx/ts compiled to CJS)
+ * - CJS double-wrap:       `mod.default.default[key]` (rare interop edge)
+ *
+ * Without this helper, named exports would be silently invisible whenever the
+ * module loads as CJS (e.g. a `.ts` file in a package without `"type": "module"`),
+ * even though the default export resolves correctly via the chain walk.
+ *
+ * `null`-valued exports are treated as "absent" (the `??` chain falls through),
+ * matching how a missing export presents at the language level. Callers that
+ * need to distinguish "explicitly null" from "missing" should not use this helper.
  */
+export function pickExport<T>(mod: Record<string, any>, key: string): T | undefined {
+  return (mod[key] ?? mod.default?.[key] ?? mod.default?.default?.[key]) as T | undefined;
+}
+
+// ── Module loading ────────────────────────────────────────────────
+
+// Tracks whether we've already activated tsx's process-wide ESM loader hooks.
+// `undefined` = not yet attempted, `true` = active, `false` = tsx unavailable.
+let tsxRegistered: boolean | undefined;
+
+/**
+ * Import a module, activating tsx's loader hooks process-wide for TypeScript
+ * files so chained imports (workspace `.ts` sources resolved via custom
+ * conditions, transitive imports between TS files) are transformed too.
+ *
+ * Implementation note: tsx's `tsImport(specifier, parent)` uses a unique
+ * namespace per call — it only transforms the entry import. Chained imports
+ * MADE BY the entry file fall back to native Node ESM resolution, which
+ * can't load `.ts` sources. That broke `--conditions development` whenever a
+ * monorepo's `development` export pointed at `.ts` files. We instead call
+ * `register()` (no namespace) once and rely on plain `await import()` for
+ * each file — tsx then intercepts the entire ESM module graph for the
+ * process lifetime.
+ *
+ * Process-wide registration is what tsx's own CLI does. The hook is
+ * idempotent and only acts on TypeScript-extension specifiers. Falls back
+ * to regular `import()` if tsx is not installed.
+ */
+async function ensureTsxRegistered(): Promise<boolean> {
+  if (tsxRegistered !== undefined) return tsxRegistered;
+  try {
+    // @ts-expect-error — tsx is an optional runtime dependency
+    const mod = await import('tsx/esm/api');
+    if (typeof mod.register === 'function') {
+      mod.register();
+      tsxRegistered = true;
+    } else {
+      tsxRegistered = false;
+    }
+  } catch {
+    tsxRegistered = false;
+  }
+  return tsxRegistered;
+}
+
 export async function importModule(
   filePath: string,
-  parentURL: string,
+  _parentURL: string,
 ): Promise<Record<string, any>> {
   if (needsTsxLoader(filePath)) {
-    if (tsImportFn === undefined) {
-      try {
-        // @ts-expect-error — tsx is an optional runtime dependency
-        const mod = await import('tsx/esm/api');
-        tsImportFn = mod.tsImport ?? null;
-      } catch {
-        tsImportFn = null;
-        console.warn(
-          '[axl-eval] Warning: tsx is not installed. TypeScript files require tsx.\n' +
-            '  Install it with: npm install -D tsx',
-        );
-      }
-    }
-    if (tsImportFn) {
-      return (await tsImportFn(pathToFileURL(filePath).href, parentURL)) as Record<string, any>;
+    const registered = await ensureTsxRegistered();
+    if (!registered) {
+      // Pre-check: don't let the subsequent `await import()` throw Node's
+      // cryptic "Unknown file extension '.ts'" error. Surface a clean,
+      // actionable message instead. Throw rather than warn — the caller
+      // can't proceed without TS support.
+      throw new Error(
+        `Cannot load TypeScript file ${filePath}: tsx is not installed.\n` +
+          `  Install it as a dev dependency: npm install -D tsx (or pnpm add -D tsx)`,
+      );
     }
   }
   return await import(pathToFileURL(filePath).href);
+}
+
+// ── Glob expansion ────────────────────────────────────────────────
+
+/**
+ * Minimal glob expander matching studio's eval-loader semantics so users get
+ * the same behavior whether they run `axl-eval` or load files via the studio
+ * middleware. Without this, CLI users on Windows (or with quoted patterns
+ * the shell didn't expand) hit confusing "file not found" errors.
+ *
+ * Supported forms:
+ * - `dir/*.eval.ts`     — match files in dir/
+ * - `dir/**\/*.eval.ts` — recursively match under dir/
+ * - `**\/*.eval.ts`     — recursively match under cwd
+ *
+ * Multi-segment `**` (e.g. `a/**\/b/**\/*.ts`) is not supported — deliberate
+ * scope limit; users with that need can pre-expand themselves.
+ */
+export function expandGlob(pattern: string, cwd: string): string[] {
+  if (pattern.includes('**/')) {
+    const sepIdx = pattern.indexOf('**/');
+    const baseDir = resolve(cwd, pattern.slice(0, sepIdx) || '.');
+    const fileGlob = pattern.slice(sepIdx + 3) || '*';
+    return findFiles(baseDir, fileGlob, true);
+  }
+  const dir = resolve(cwd, dirname(pattern));
+  const fileGlob = basename(pattern);
+  return findFiles(dir, fileGlob, false);
+}
+
+const MAX_GLOB_DEPTH = 20;
+
+function findFiles(dir: string, fileGlob: string, recursive: boolean, depth = 0): string[] {
+  if (depth > MAX_GLOB_DEPTH) return [];
+  const matcher = globToRegex(fileGlob);
+  const results: string[] = [];
+  try {
+    const entries = readdirSync(dir);
+    for (const entry of entries) {
+      const full = resolve(dir, entry);
+      try {
+        const stat = statSync(full);
+        if (stat.isFile() && matcher.test(entry)) {
+          results.push(full);
+        } else if (stat.isDirectory() && recursive) {
+          results.push(...findFiles(full, fileGlob, true, depth + 1));
+        }
+      } catch {
+        // Skip unreadable entries
+      }
+    }
+  } catch {
+    // Directory missing — return empty
+  }
+  return results;
+}
+
+function globToRegex(glob: string): RegExp {
+  const escaped = glob.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  return new RegExp(`^${escaped}$`);
 }
 
 // ── Conditions ────────────────────────────────────────────────────

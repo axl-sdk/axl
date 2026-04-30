@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-04-30
+
 ### Fixed
 
 - **`@axlsdk/eval`: `tsx` is now declared as an optional peer dependency.** Previously the CLI imported `tsx/esm/api` at runtime to load `.ts` config and eval files, but `tsx` wasn't declared anywhere in `@axlsdk/eval`'s `package.json` — it relied on the consumer hoisting it to project root. Under pnpm strict isolation (e.g., Nx workspaces), this resolution failed, and `@nx/dependency-checks` flagged the workaround (declaring `tsx` as a peerDep on the consumer's package + an eslint override) as undeclared-in-source. Now declared properly: pnpm 8+ and npm 7+ install it automatically via `auto-install-peers`; the runtime error message points Yarn Classic / opt-out users at the explicit install. No behavior change for consumers who already had `tsx` resolvable. Fixes a long-term plan item to make the TS loader pluggable rather than hardcoding `tsx` (tracked in `ROADMAP.md`).

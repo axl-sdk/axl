@@ -700,7 +700,11 @@ export async function executeWorkflow(input) {
       // partial batch happens to contain exactly one — the CLI normalizes
       // single-element results to a bare object on output.
       const result = Array.isArray(results) ? results[0] : results;
-      expect(result.metadata.partialBatch).toBe(true);
+      expect(result.metadata.fromPartialBatch).toBe(true);
+      // The legacy `partialBatch` key was renamed in the same release —
+      // verify it isn't shipped under the old name to prevent a silent
+      // resurrection.
+      expect(result.metadata.partialBatch).toBeUndefined();
       expect(result.metadata.batchCompleted).toBe(1);
       expect(result.metadata.batchAttempted).toBe(3);
       expect(result.metadata.batchFailure).toContain('SIMULATED_RUN_2_FAILURE');
@@ -761,6 +765,77 @@ export async function executeWorkflow(input) { return { output: 'x' }; }
         outputExists = false;
       }
       expect(outputExists).toBe(false);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('axl-eval hard-errors with an actionable message when executeWorkflow is missing and no matching registered workflow', () => {
+    // End-to-end coverage of the silent-passthrough removal — the
+    // original bug ran an eval with NO executeWorkflow and an
+    // unregistered workflow, identity-passthrough'd the input, and
+    // shipped all-zero scores with a successful exit code.
+    //
+    // The fix: hard error, exit non-zero, mention the most likely
+    // upgrade-path cause (`"type": "module"`) so a user whose eval
+    // previously worked sees a concrete fix in the message rather
+    // than a baffling "executeWorkflow not found" on a file they
+    // know exports it (under tsx's CJS interop, named exports land
+    // on `mod.default.executeWorkflow` — the chain walk handles that,
+    // but if a user is hitting "not found" the package.json shape is
+    // their first thing to check).
+    //
+    // We can't deterministically reproduce the EXACT pre-fix shape
+    // (`mod.default.executeWorkflow` defined while `mod.executeWorkflow`
+    // is undefined) because modern Node promotes named exports of CJS
+    // modules, so the unit-level test in `cli-utils.test.ts` covers
+    // the chain walk by synthesizing the shape directly. Here we
+    // verify the user-facing failure path: when the lookup truly
+    // can't find executeWorkflow, the CLI is loud about it.
+    const tmpDir = mkdtempSync(join(tmpdir(), 'axl-eval-no-executor-'));
+    try {
+      const evalFile = join(tmpDir, 'silent.eval.mjs');
+      // No executeWorkflow export. workflow is unregistered on the
+      // bare runtime axl-eval creates without --config. Pre-fix this
+      // would have silent-passthrough'd; post-fix it hard-errors.
+      writeFileSync(
+        evalFile,
+        `
+export default {
+  workflow: 'unregistered-workflow',
+  dataset: { name: 'ds', getItems: async () => [{ input: { q: 'a' } }] },
+  scorers: [{ name: 'always-one', score: () => 1 }],
+};
+`,
+      );
+
+      const ROOT = join(import.meta.dirname, '../../..');
+      const cliPath = join(ROOT, 'packages/axl-eval/dist/cli.js');
+
+      let stderr = '';
+      let exitCode = 0;
+      try {
+        execSync(`node ${cliPath} ${evalFile}`, {
+          encoding: 'utf-8',
+          cwd: ROOT,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (err: unknown) {
+        const e = err as { status?: number; stderr?: string };
+        exitCode = e.status ?? 1;
+        stderr = String(e.stderr ?? '');
+      }
+
+      // Hard error, not silent success.
+      expect(exitCode).not.toBe(0);
+      // The error explains what's missing AND the most likely
+      // root cause for users hitting this after the upgrade.
+      // The message change is what gives them a path forward.
+      expect(stderr).toContain('does not export an executeWorkflow function');
+      expect(stderr).toContain('"type": "module"');
+      // And surfaces what WAS exported, so a typo (e.g.
+      // `execute_workflow`) is immediately spotted.
+      expect(stderr).toContain('Found exports');
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }

@@ -16,6 +16,19 @@ export type { CreateContextOptions, ExecuteOptions, EvalExecuteWorkflow } from '
 // Studio middleware share one implementation of the ESM/CJS interop walk.
 // Not part of the stable public API.
 export { resolveRuntime, pickDefault, pickExport } from './module-resolve.js';
+
+// CLI internals — internal helpers for tsx loader registration, glob
+// expansion, conditions registration, and config-file detection. Shared
+// between axl-eval and axl-studio so a fix to (e.g.) the tsx loader
+// applies to both atomically. Not part of the stable public API.
+export {
+  CONFIG_CANDIDATES,
+  findConfig,
+  needsTsxLoader,
+  importModule,
+  expandGlob,
+  registerConditions,
+} from './cli-internals.js';
 export { defineConfig } from './config.js';
 export type { AxlConfig } from './config.js';
 

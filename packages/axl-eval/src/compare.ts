@@ -47,16 +47,34 @@ export function evalCompare(
   candidate: EvalResult | EvalResult[],
   options?: EvalCompareOptions,
 ): EvalComparison {
-  const baselineRuns = Array.isArray(baseline) ? baseline : [baseline];
-  const candidateRuns = Array.isArray(candidate) ? candidate : [candidate];
+  const baselineRunsRaw = Array.isArray(baseline) ? baseline : [baseline];
+  const candidateRunsRaw = Array.isArray(candidate) ? candidate : [candidate];
 
-  if (baselineRuns.length === 0 || candidateRuns.length === 0) {
+  if (baselineRunsRaw.length === 0 || candidateRunsRaw.length === 0) {
     throw new Error('Cannot compare empty eval result arrays');
   }
 
-  // Use the first run as representative for metadata, dataset, scorers
-  const baselineRef = baselineRuns[0];
-  const candidateRef = candidateRuns[0];
+  // Truncate both sides to a common run count BEFORE computing anything. The
+  // paired bootstrap CI was already restricted to `min(baseline, candidate)`
+  // runs (a CI over paired diffs requires equal-length sides), but means /
+  // regressions / timing / cost previously used the full-length pool on each
+  // side. That hybrid produced an internally inconsistent view: a 5-run
+  // baseline vs 2-run candidate showed `delta = mean(5) - mean(2)` next to
+  // a CI computed over only 2 paired diffs, so the user couldn't tell the
+  // numbers were drawn from different samples. Truncating symmetrically
+  // here keeps every per-scorer figure aligned with the CI's sample size,
+  // and the `runCount` field on each side surfaces the truncation
+  // explicitly so the UI can render "n=2 of 5 pooled".
+  const runCount = Math.min(baselineRunsRaw.length, candidateRunsRaw.length);
+  const baselineRuns = baselineRunsRaw.slice(0, runCount);
+  const candidateRuns = candidateRunsRaw.slice(0, runCount);
+
+  // Use the first run as representative for metadata, dataset, scorers.
+  // `partial` detection downstream still walks the FULL pool so
+  // pre-truncation history (`metadata.batchAttempted` from any pooled run)
+  // is honored.
+  const baselineRef = baselineRunsRaw[0];
+  const candidateRef = candidateRunsRaw[0];
 
   if (baselineRef.dataset !== candidateRef.dataset) {
     throw new Error(
@@ -76,7 +94,6 @@ export function evalCompare(
   for (const name of baselineScorerNames) {
     pairedDiffs[name] = [];
   }
-  const runCount = Math.min(baselineRuns.length, candidateRuns.length);
   for (let r = 0; r < runCount; r++) {
     const bRun = baselineRuns[r];
     const cRun = candidateRuns[r];
@@ -95,7 +112,7 @@ export function evalCompare(
     }
   }
 
-  // Compute aggregate means across runs
+  // Compute aggregate means across the truncated runs (matches the CI's sample).
   const baselineMeans: Record<string, number> = {};
   const candidateMeans: Record<string, number> = {};
   for (const name of baselineScorerNames) {
@@ -250,18 +267,24 @@ export function evalCompare(
   }
   const summaryStr = `candidate ${parts.length > 0 ? parts.join(', ') : 'no meaningful changes'} with ${regressions.length} regressions and ${improvements.length} improvements`;
 
-  const baselinePartial = detectPartial(baselineRuns);
-  const candidatePartial = detectPartial(candidateRuns);
+  // Run partial detection against the FULL pre-truncation pool. The user's
+  // original selection (e.g. 5 of an attempted 10 runs) determines partial
+  // status; the truncation we did above is a stats-consistency concern, not
+  // a partial-batch one.
+  const baselinePartial = detectPartial(baselineRunsRaw);
+  const candidatePartial = detectPartial(candidateRunsRaw);
 
   return {
     baseline: {
       id: baselineRef.id,
       metadata: baselineRef.metadata,
+      runCount,
       ...(baselinePartial ? { partial: baselinePartial } : {}),
     },
     candidate: {
       id: candidateRef.id,
       metadata: candidateRef.metadata,
+      runCount,
       ...(candidatePartial ? { partial: candidatePartial } : {}),
     },
     scorers,

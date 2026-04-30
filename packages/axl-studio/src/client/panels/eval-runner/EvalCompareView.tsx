@@ -117,6 +117,21 @@ export function EvalCompareView({
   const baselinePartial = compareResult.baseline?.partial;
   const candidatePartial = compareResult.candidate?.partial;
 
+  // Asymmetric-pool detection. When the user pools 5 baseline vs 2 candidate
+  // runs, `evalCompare` truncates both sides to 2 so the means align with
+  // the paired CI's sample. Without surfacing this, the user sees a
+  // "Baseline: 5 runs" subtitle next to a delta computed over only 2 — the
+  // same silent-mismatch UX failure mode the partial-batch fix prevented.
+  // `runCount` is optional in the type for back-compat; a null/equal value
+  // means no truncation happened.
+  const baselineUsedRuns = compareResult.baseline?.runCount;
+  const candidateUsedRuns = compareResult.candidate?.runCount;
+  const baselineTruncated =
+    baselineUsedRuns != null && baselineRuns != null && baselineUsedRuns < baselineRuns.length;
+  const candidateTruncated =
+    candidateUsedRuns != null && candidateRuns != null && candidateUsedRuns < candidateRuns.length;
+  const sidesTruncated = baselineTruncated || candidateTruncated;
+
   // Sort scorer entries — derive from compareResult.scorers directly to keep stable deps
   const sortedScorerEntries = useMemo(() => {
     const entries = Object.entries(compareResult.scorers);
@@ -203,8 +218,37 @@ export function EvalCompareView({
               )}
             </ul>
             <div className="mt-1 text-amber-800/80 dark:text-amber-300/80">
-              Statistics below are computed honestly for the included runs, but cross-side deltas
-              reflect different sample sizes.
+              Statistics below are computed honestly for the included runs.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/*
+       * Asymmetric-pool notice. When the user pools different numbers of
+       * runs on each side, `evalCompare` truncates both sides to the
+       * smaller count so means and the paired bootstrap CI use the same
+       * sample (otherwise the displayed "delta" sat between means computed
+       * over different N). Render a separate banner explaining the
+       * truncation — distinct from the partial-batch banner above, which
+       * is about the original batch being incomplete.
+       */}
+      {sidesTruncated && (
+        <div
+          className="flex items-start gap-2.5 px-4 py-3 rounded-xl border border-blue-300/60 dark:border-blue-500/40 bg-blue-50 dark:bg-blue-950/40"
+          role="status"
+        >
+          <div className="text-sm text-blue-900 dark:text-blue-200">
+            <div className="font-medium">
+              Comparing {baselineUsedRuns} baseline vs {candidateUsedRuns} candidate run
+              {candidateUsedRuns === 1 ? '' : 's'}.
+            </div>
+            <div className="mt-1 text-blue-800/90 dark:text-blue-300/90">
+              You pooled {baselineRuns?.length ?? 1} baseline and {candidateRuns?.length ?? 1}{' '}
+              candidate run{(candidateRuns?.length ?? 1) === 1 ? '' : 's'}; the comparison uses the
+              first {Math.min(baselineUsedRuns ?? 0, candidateUsedRuns ?? 0)} from each side so the
+              displayed means and paired bootstrap CI are computed over the same sample. Re-pool
+              symmetrically if you want every selected run included.
             </div>
           </div>
         </div>

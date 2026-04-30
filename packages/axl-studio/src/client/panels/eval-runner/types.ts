@@ -138,9 +138,24 @@ export type ComparisonResult = {
   /**
    * Baseline-side identifier and per-side metadata. `partial` is set when
    * the pooled run count is less than the original batch's planned count.
+   * `runCount` is the number of runs actually used in mean / regression /
+   * timing / cost computation — `evalCompare` truncates both sides to
+   * `min(baseline.length, candidate.length)` so means and the paired
+   * bootstrap CI use the same sample. Optional for backward compat with
+   * pre-fix server responses; treat absence as "matches the pooled length."
    */
-  baseline?: { id: string; metadata?: Record<string, unknown>; partial?: ComparisonPartial };
-  candidate?: { id: string; metadata?: Record<string, unknown>; partial?: ComparisonPartial };
+  baseline?: {
+    id: string;
+    metadata?: Record<string, unknown>;
+    partial?: ComparisonPartial;
+    runCount?: number;
+  };
+  candidate?: {
+    id: string;
+    metadata?: Record<string, unknown>;
+    partial?: ComparisonPartial;
+    runCount?: number;
+  };
   regressions: ComparisonRegressionItem[];
   improvements: ComparisonRegressionItem[];
   scorers: Record<string, ComparisonScorerEntry>;

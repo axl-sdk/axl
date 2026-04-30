@@ -111,8 +111,26 @@ export type EvalComparisonPartial = {
 };
 
 export type EvalComparison = {
-  baseline: { id: string; metadata: Record<string, unknown>; partial?: EvalComparisonPartial };
-  candidate: { id: string; metadata: Record<string, unknown>; partial?: EvalComparisonPartial };
+  baseline: {
+    id: string;
+    metadata: Record<string, unknown>;
+    partial?: EvalComparisonPartial;
+    /**
+     * Number of runs from this side actually included in mean / regression /
+     * timing / cost calculations. When the user pools 5 baseline runs vs 2
+     * candidate runs, both sides truncate to `min(5, 2) = 2` so the means
+     * the UI displays are computed over the same sample as the paired
+     * bootstrap CI. The discarded tail of runs is still in history for the
+     * user to re-pool intentionally if they want a 5-vs-5 comparison.
+     */
+    runCount: number;
+  };
+  candidate: {
+    id: string;
+    metadata: Record<string, unknown>;
+    partial?: EvalComparisonPartial;
+    runCount: number;
+  };
   scorers: Record<
     string,
     {

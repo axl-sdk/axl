@@ -623,7 +623,7 @@ async function runEvalCommand(args: string[]) {
           // batch correctly before committing to outer `results[]`. The
           // original bug was the opposite: results pushed eagerly per-run, a
           // throw mid-batch left partial results posing as a complete run
-          // (no `partialBatch` marker, aggregate never ran). The fix ISN'T
+          // (no `fromPartialBatch` marker, aggregate never ran). The fix ISN'T
           // to throw the partials away — those runs cost money and have
           // statistical signal. Instead we preserve them with explicit
           // partial-batch metadata, aggregate over what completed, and exit
@@ -670,6 +670,14 @@ async function runEvalCommand(args: string[]) {
             // computes statistics over `runResults.length`, which is the
             // honest sample size to report.
             //
+            // The flag is `fromPartialBatch` — a per-run marker meaning
+            // "this run came from a batch that did not complete." It is
+            // NOT named `partialBatch` because that read as "this run is
+            // partial," and a defensive consumer wrote
+            // `if (run.metadata.partialBatch) skipThisRun()`, throwing
+            // away successful work that cost real money. The flag describes
+            // the BATCH the run belongs to, not the run itself.
+            //
             // `runFailure?.message` can be empty (e.g. `new Error('')` from a
             // misbehaving provider); fall back to `String(runFailure)` so the
             // banner never renders a blank "Stopped after:" line. Skip the
@@ -679,7 +687,7 @@ async function runEvalCommand(args: string[]) {
               ? runFailure.message || String(runFailure) || undefined
               : undefined;
             for (const r of runResults) {
-              r.metadata.partialBatch = true;
+              r.metadata.fromPartialBatch = true;
               r.metadata.batchCompleted = runResults.length;
               r.metadata.batchAttempted = runs;
               if (failureMsg) r.metadata.batchFailure = failureMsg;

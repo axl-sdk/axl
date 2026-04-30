@@ -1,9 +1,7 @@
-import { resolve, relative, dirname, basename } from 'node:path';
-import { readdirSync, statSync } from 'node:fs';
+import { resolve, relative, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { AxlRuntime, EvalExecuteWorkflow } from '@axlsdk/axl';
-import { importModule } from './cli-utils.js';
-import { pickDefault, pickExport } from './resolve-runtime.js';
+import { importModule, expandGlob, registerConditions, pickDefault, pickExport } from '@axlsdk/axl';
 
 // In the CJS bundle, tsup stubs import.meta as {} so import.meta.url is
 // undefined. Fall back to __filename (which CJS defines) converted to a
@@ -232,76 +230,6 @@ function resolvePatterns(patterns: string[], cwd: string): string[] {
   return files;
 }
 
-/**
- * Expand a glob pattern to matching file paths.
- *
- * Supported forms:
- * - `dir/*.eval.ts`     — match files in dir/
- * - `dir/**\/*.eval.ts` — recursively match under dir/
- * - `**\/*.eval.ts`     — recursively match under cwd
- */
-function expandGlob(pattern: string, cwd: string): string[] {
-  if (pattern.includes('**/')) {
-    const sepIdx = pattern.indexOf('**/');
-    const baseDir = resolve(cwd, pattern.slice(0, sepIdx) || '.');
-    const fileGlob = pattern.slice(sepIdx + 3) || '*';
-    return findFiles(baseDir, fileGlob, true);
-  }
-
-  const dir = resolve(cwd, dirname(pattern));
-  const fileGlob = basename(pattern);
-  return findFiles(dir, fileGlob, false);
-}
-
-const MAX_DEPTH = 20;
-
-function findFiles(dir: string, fileGlob: string, recursive: boolean, depth = 0): string[] {
-  if (depth > MAX_DEPTH) return [];
-  const matcher = globToRegex(fileGlob);
-  const results: string[] = [];
-
-  try {
-    const entries = readdirSync(dir);
-    for (const entry of entries) {
-      const full = resolve(dir, entry);
-      try {
-        const stat = statSync(full);
-        if (stat.isFile() && matcher.test(entry)) {
-          results.push(full);
-        } else if (stat.isDirectory() && recursive) {
-          results.push(...findFiles(full, fileGlob, true, depth + 1));
-        }
-      } catch {
-        // Skip unreadable entries
-      }
-    }
-  } catch {
-    // Directory doesn't exist or unreadable
-  }
-
-  return results;
-}
-
-/** Convert a simple glob pattern (e.g., `*.eval.ts`) to a RegExp. */
-function globToRegex(glob: string): RegExp {
-  const escaped = glob.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-  return new RegExp(`^${escaped}$`);
-}
-
-async function registerConditions(conditions: string[]): Promise<void> {
-  try {
-    const nodeModule = await import('node:module');
-    const hookCode = [
-      `const extra = ${JSON.stringify(conditions)};`,
-      `export async function resolve(specifier, context, nextResolve) {`,
-      `  return nextResolve(specifier, {`,
-      `    ...context,`,
-      `    conditions: [...new Set([...context.conditions, ...extra])],`,
-      `  });`,
-      `}`,
-    ].join('\n');
-    nodeModule.register(`data:text/javascript,${encodeURIComponent(hookCode)}`);
-  } catch {
-    console.warn('[axl-studio] Warning: import conditions require Node.js 20.6+');
-  }
-}
+// `expandGlob` and `registerConditions` are imported from @axlsdk/axl above.
+// The studio-specific glob helpers and conditions registration that used to
+// live here are now shared with @axlsdk/eval to prevent drift.

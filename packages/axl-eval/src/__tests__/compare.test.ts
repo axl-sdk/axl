@@ -1147,6 +1147,100 @@ describe('evalCompare()', () => {
       expect(comparison.baseline.partial).toEqual({ completed: 2, attempted: 5 });
     });
 
+    it('exposes runCount on each side and truncates symmetrically when sides differ', () => {
+      // 5 baseline runs vs 2 candidate runs. Pre-fix: paired CI was
+      // computed over `min(5, 2) = 2` paired diffs, but the per-scorer
+      // means were computed over 5 baseline + 2 candidate runs — so the
+      // "delta" the user saw didn't correspond to the CI's sample. The
+      // fix truncates both sides to runCount=2 BEFORE means are computed,
+      // and surfaces runCount so consumers can render "n=2 of 5 pooled".
+      const baselineRuns = [
+        makeEvalResult({
+          id: 'b0',
+          summary: {
+            count: 0,
+            failures: 0,
+            scorers: { acc: { mean: 0.9, min: 0.9, max: 0.9, p50: 0.9, p95: 0.9 } },
+          },
+        }),
+        makeEvalResult({
+          id: 'b1',
+          summary: {
+            count: 0,
+            failures: 0,
+            scorers: { acc: { mean: 0.9, min: 0.9, max: 0.9, p50: 0.9, p95: 0.9 } },
+          },
+        }),
+        // These trailing runs are silently truncated — pre-fix they would
+        // have skewed the baseline mean.
+        makeEvalResult({
+          id: 'b2',
+          summary: {
+            count: 0,
+            failures: 0,
+            scorers: { acc: { mean: 0.1, min: 0.1, max: 0.1, p50: 0.1, p95: 0.1 } },
+          },
+        }),
+        makeEvalResult({
+          id: 'b3',
+          summary: {
+            count: 0,
+            failures: 0,
+            scorers: { acc: { mean: 0.1, min: 0.1, max: 0.1, p50: 0.1, p95: 0.1 } },
+          },
+        }),
+        makeEvalResult({
+          id: 'b4',
+          summary: {
+            count: 0,
+            failures: 0,
+            scorers: { acc: { mean: 0.1, min: 0.1, max: 0.1, p50: 0.1, p95: 0.1 } },
+          },
+        }),
+      ];
+      const candidateRuns = [
+        makeEvalResult({
+          id: 'c0',
+          summary: {
+            count: 0,
+            failures: 0,
+            scorers: { acc: { mean: 0.7, min: 0.7, max: 0.7, p50: 0.7, p95: 0.7 } },
+          },
+        }),
+        makeEvalResult({
+          id: 'c1',
+          summary: {
+            count: 0,
+            failures: 0,
+            scorers: { acc: { mean: 0.7, min: 0.7, max: 0.7, p50: 0.7, p95: 0.7 } },
+          },
+        }),
+      ];
+      const comparison = evalCompare(baselineRuns, candidateRuns);
+      expect(comparison.baseline.runCount).toBe(2);
+      expect(comparison.candidate.runCount).toBe(2);
+      // Baseline mean is the average of the FIRST 2 runs (0.9 + 0.9) / 2 = 0.9,
+      // NOT (0.9 + 0.9 + 0.1 + 0.1 + 0.1) / 5 = 0.42. If the trailing 3 had
+      // been included the delta would be opposite-signed.
+      expect(comparison.scorers.acc.baselineMean).toBe(0.9);
+      expect(comparison.scorers.acc.candidateMean).toBe(0.7);
+      expect(comparison.scorers.acc.delta).toBe(-0.2);
+    });
+
+    it('runCount on equal-length sides equals the input length', () => {
+      const a = makeEvalResult({ id: 'a' });
+      const b = makeEvalResult({ id: 'b' });
+      const c = evalCompare([a, b], [a, b]);
+      expect(c.baseline.runCount).toBe(2);
+      expect(c.candidate.runCount).toBe(2);
+    });
+
+    it('runCount on single-run inputs is 1', () => {
+      const c = evalCompare(makeEvalResult(), makeEvalResult());
+      expect(c.baseline.runCount).toBe(1);
+      expect(c.candidate.runCount).toBe(1);
+    });
+
     it('omits partial when more runs were pooled than were planned (data corruption signal)', () => {
       // 3 runs in the pool but `batchAttempted: 2`. The metadata is
       // suspicious — silently treating this as "complete" would mask the

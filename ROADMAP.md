@@ -169,6 +169,16 @@ Two approaches under consideration:
 
 Both can coexist — (1) is simpler and deterministic, (2) handles large tool sets better.
 
+#### Native-First, Pluggable TypeScript Loader
+
+`@axlsdk/eval` and `@axlsdk/studio` currently hardcode [tsx](https://github.com/privatenumber/tsx) as the loader for `.ts` config and eval files (declared as an optional peer dependency since 0.17.x). This couples the SDK to tsx's release cadence, ships esbuild to consumers who only use `.js` configs, and ignores Node's own trajectory.
+
+- **Native first.** Node 22.6+ ships `--experimental-strip-types`; Node 23.6+ enables it by default. For most config/eval files (no enums, no JSX, no namespaces), native type stripping is sufficient — no loader needed. The CLI should detect this capability and prefer it over tsx.
+- **Pluggable loader.** Demote tsx from "the loader" to "one supported fallback." Add a `--loader` flag (or `loader` config option) that accepts `tsx`, `ts-node`, or a custom loader path. Auto-detect what's already in the consumer's `devDependencies` so monorepos that standardize on a different TS loader don't fight us.
+- **Drop the hard tsx coupling at 1.0.** Once native support is stable across our supported Node range, tsx becomes purely opt-in for users with TS features that strip-types can't handle (enums, namespaces, JSX in config files — rare in practice).
+
+This is the long-term answer to the resolution complaint that drove the 0.17.x peerDep declaration. The peerDep is correct *given* tsx is the loader; the deeper fix is to stop assuming it has to be.
+
 #### Portable Run State
 
 `ctx.checkpoint()` + StateStore provides durable execution, but state is tied to a specific store instance. For serverless environments (Lambda, Cloudflare Workers) where there's no persistent store between invocations, a portable serializable state blob would be valuable.

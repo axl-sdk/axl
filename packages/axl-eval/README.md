@@ -10,7 +10,7 @@ Evaluation framework for [Axl](https://github.com/axl-sdk/axl) agentic workflows
 npm install @axlsdk/eval
 ```
 
-TypeScript eval files require [tsx](https://github.com/privatenumber/tsx) as a dev dependency (`npm install -D tsx`).
+TypeScript eval files are loaded via [tsx](https://github.com/privatenumber/tsx), declared as an optional peer dependency. pnpm 8+ and npm 7+ install it automatically; on Yarn Classic or pnpm with `auto-install-peers=false`, install it explicitly: `npm install -D tsx`.
 
 ## Quick Start
 

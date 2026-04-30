@@ -116,7 +116,9 @@ export async function importModule(
     if (!registered) {
       throw new Error(
         `Cannot load TypeScript file ${filePath}: tsx is not installed.\n` +
-          `  Install it as a dev dependency: npm install -D tsx (or pnpm add -D tsx)`,
+          `  tsx is declared by @axlsdk/eval / @axlsdk/studio so pnpm 8+ and npm 7+\n` +
+          `  install it automatically. On Yarn Classic or with auto-install-peers\n` +
+          `  disabled, install it explicitly: npm install -D tsx`,
       );
     }
   }

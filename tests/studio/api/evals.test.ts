@@ -1576,6 +1576,128 @@ describe('Studio API: Evals', () => {
     expect(cancelRes2.status).toBe(404);
   });
 
+  it('cancel between runs surfaces as done.cancelled, NOT batchFailure', async () => {
+    // The user-facing distinction matters: a real provider failure
+    // ("Provider 503") and a user-cancellation should not look the
+    // same in the History badge or Compare banner. Pre-fix, the
+    // terminal `done` event had no way to mark "cancellation" as
+    // distinct from completion — both produced the same shape, and
+    // a partial batch coming from a cancel was indistinguishable
+    // from one with a `batchFailure` not yet stamped.
+    //
+    // Post-fix: the terminal `done` carries `cancelled: true` when
+    // the loop's between-runs signal check detects cancellation,
+    // and `batchFailure` only when a real provider error is caught.
+    // The two are mutually exclusive on the wire.
+    //
+    // Note: today's `runEval` doesn't throw AbortError on mid-run
+    // cancellation — it marks items as `error: 'Cancelled'` and
+    // returns. So the test exercises the BETWEEN-runs path: cancel
+    // after run 1 completes but before run 2 starts. The catch-block
+    // AbortError detection in the route handler is forward-compatible
+    // for a future `runEval` that throws on cancel.
+    const provider = MockProvider.echo();
+    const { app, runtime, connMgr } = createTestServer(provider);
+
+    // Park between runs so the cancel can land before run 2 starts.
+    // The route's onProgress is called inline during the run; we
+    // hijack it here to gate run 2 on a release signal.
+    let getItemsCalls = 0;
+    let releaseBeforeRun2: (() => void) | null = null;
+    const cancelDataset = dataset({
+      name: 'cancel-dataset',
+      schema: z.object({ message: z.string() }),
+      items: [{ input: { message: 'hello' } }],
+    });
+    const originalGetItems = cancelDataset.getItems.bind(cancelDataset);
+    cancelDataset.getItems = async () => {
+      getItemsCalls++;
+      // Run 2's getItems parks until we explicitly release. We cancel
+      // BEFORE releasing so the loop's top-of-iteration signal check
+      // can fire on the next iteration. The release path is never hit
+      // because the abort short-circuits the loop.
+      if (getItemsCalls === 2) {
+        await new Promise<void>((resolve) => {
+          releaseBeforeRun2 = resolve;
+        });
+      }
+      return originalGetItems();
+    };
+
+    runtime.registerEval('cancel-eval', {
+      workflow: 'test-wf',
+      dataset: cancelDataset,
+      scorers: [scorer({ name: 's', description: 's', score: () => 1 })],
+    });
+
+    const messages: string[] = [];
+    const fakeWs = {
+      send: (msg: string) => messages.push(msg),
+    } as Parameters<typeof connMgr.add>[0];
+    connMgr.add(fakeWs);
+    connMgr.subscribe(fakeWs, 'eval:*');
+
+    const res = await app.request('/api/evals/cancel-eval/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: 3, stream: true }),
+    });
+    const { evalRunId } = (await readJson(res)).data;
+
+    // Wait until run 1 has completed and run 2 is parked at getItems.
+    const startedDeadline = Date.now() + 2000;
+    while (Date.now() < startedDeadline && !releaseBeforeRun2) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(releaseBeforeRun2, 'run 2 never reached the parking point').toBeTruthy();
+
+    // Cancel — abort signal fires while run 2's getItems is parked.
+    await app.request(`/api/evals/runs/${evalRunId}/cancel`, { method: 'POST' });
+    // Release run 2 so it can finish (with cancelled items, since
+    // the signal is aborted). The IIFE will then loop to iteration 3,
+    // hit the top-of-loop signal check, and break with cancelled=true.
+    releaseBeforeRun2!();
+
+    // Wait for the terminal frame.
+    const deadline = Date.now() + 2000;
+    let terminal: Record<string, unknown> | undefined;
+    while (Date.now() < deadline) {
+      for (const raw of messages) {
+        const parsed = JSON.parse(raw) as { data: Record<string, unknown> };
+        if (parsed.data.type === 'done' || parsed.data.type === 'error') {
+          terminal = parsed.data;
+          break;
+        }
+      }
+      if (terminal) break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(terminal).toBeDefined();
+
+    const events = messages.map(
+      (raw) =>
+        (JSON.parse(raw) as { data: Record<string, unknown> }).data as {
+          type: string;
+          run?: number;
+          message?: string;
+        },
+    );
+
+    // No `run_failed` was emitted — there was no provider failure,
+    // just a user-initiated cancel. This is the load-bearing assertion:
+    // pre-fix, the terminal `done` had no way to encode "cancelled vs
+    // failed", so the partial batch landed in History looking like a
+    // provider hiccup.
+    expect(events.find((e) => e.type === 'run_failed')).toBeUndefined();
+
+    // Terminal done flags partial + cancelled, NOT batchFailure.
+    expect(terminal!.type).toBe('done');
+    expect(terminal!.partial).toBe(true);
+    expect(terminal!.cancelled).toBe(true);
+    expect(terminal!.batchFailure).toBeUndefined();
+    expect(terminal!.batchAttempted).toBe(3);
+  });
+
   it('POST /api/evals/:name/run without stream remains synchronous', async () => {
     const provider = MockProvider.sequence([{ content: 'sync output' }]);
     const { app } = createTestServer(provider);

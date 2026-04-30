@@ -129,8 +129,18 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
             // expected count, letting any later viewer derive partial-ness.
             let runFailure: Error | undefined;
 
+            // Tracks user cancellation separately from genuine failure
+            // so the terminal `done` event can label the partial batch
+            // correctly (`cancelled: true` vs `batchFailure: "<msg>"`).
+            // Without this distinction, a mid-run cancel would show as
+            // "Run 3/5 failed: AbortError: ..." — confusing UX since the
+            // user knows they pressed cancel.
+            let cancelled = false;
             for (let r = 0; r < runs; r++) {
-              if (ac.signal.aborted) break;
+              if (ac.signal.aborted) {
+                cancelled = true;
+                break;
+              }
               try {
                 const result = (await runtime.runRegisteredEval(name, {
                   metadata: { runGroupId, runIndex: r, batchAttempted: runs },
@@ -156,6 +166,23 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
                   totalRuns: runs,
                 });
               } catch (err) {
+                // Distinguish user cancellation from genuine failure. An
+                // AbortError thrown mid-`runRegisteredEval` (signal fired
+                // while the run was in flight) is the user pressing
+                // cancel, not the provider failing. Don't stamp a
+                // `batchFailure` for it — that field reads as a fault
+                // signal in the History badge and Compare banners.
+                const isAbort =
+                  ac.signal.aborted || (err instanceof Error && err.name === 'AbortError');
+                if (isAbort) {
+                  cancelled = true;
+                  connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
+                    type: 'run_cancelled',
+                    run: r + 1,
+                    totalRuns: runs,
+                  });
+                  break;
+                }
                 runFailure = err instanceof Error ? err : new Error(String(err));
                 connMgr.broadcastWithWildcard(`eval:${evalRunId}`, {
                   type: 'run_failed',
@@ -186,6 +213,13 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
                   partial: true,
                   batchCompleted: results.length,
                   batchAttempted: runs,
+                  // `cancelled` and `batchFailure` are mutually exclusive:
+                  // the catch block sets at most one of {cancelled,
+                  // runFailure}. The client uses `cancelled` to render a
+                  // neutral "Cancelled — X of N runs completed" caption
+                  // instead of the amber "Stopped after: <message>"
+                  // failure caption.
+                  ...(cancelled ? { cancelled: true } : {}),
                   ...(failureMsg ? { batchFailure: failureMsg } : {}),
                 }),
               });

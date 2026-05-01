@@ -106,7 +106,7 @@ Sub-cent cost values use tiered precision (`< $0.000001` sentinel, `< $0.0001` s
 View and manage agent memory (session and global scope). Create, edit, and delete entries. Test semantic recall queries.
 
 ### Session Manager
-Browse active sessions with conversation history. Replay sessions step by step. View handoff chains between agents.
+Browse active sessions with conversation history. Replay sessions step by step. View handoff chains between agents. In multi-agent sessions, each assistant message is badged with its originating agent's name (`ChatMessage.agent`); click a badge to highlight all messages from that agent.
 
 ### Tool Inspector
 Browse all registered tools with their schemas rendered as forms. Test any tool directly with custom input and see the result.

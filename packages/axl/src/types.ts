@@ -847,8 +847,9 @@ export type ChatMessage = {
    *  This is observability metadata only — it is NOT sent on the wire to
    *  any provider. Provider adapters cherry-pick the fields they need
    *  (`role`, `content`, `name`, `tool_calls`, `tool_call_id`) and ignore
-   *  the rest. Future per-agent history filtering (`AgentConfig.sessionScope`)
-   *  will use this field; today it is purely informational. */
+   *  the rest. Future per-agent history filtering may consume this field
+   *  (the option name and shape are not yet stable); today it is purely
+   *  informational. */
   agent?: string;
 };
 

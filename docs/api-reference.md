@@ -890,12 +890,12 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 
 | Method | Description |
 |--------|-------------|
-| `session.send(workflow, input)` | Execute a workflow with session history. Returns the result |
-| `session.stream(workflow, input)` | Execute a workflow with session history. Returns an `AxlStream` |
-| `session.history()` | Get the full message history |
-| `session.handoffs()` | Get the handoff history for this session |
-| `session.end()` | Close the session and delete history from the store |
-| `session.fork(newId)` | Create a copy of this session with a new ID (including history and metadata) |
+| `session.send(workflow, input)` | Execute a workflow with session history. Returns the result. Serialized per `sessionId` (see [Concurrency](#concurrency-and-races)) |
+| `session.stream(workflow, input)` | Execute a workflow with session history. Returns an `AxlStream`. Serialized per `sessionId` — the lock is held until the stream's terminal `done`/`error` event fires |
+| `session.history()` | Get the last persisted message history snapshot from the store. Does **not** await in-flight `send()`/`stream()` — returns the previously committed state, which may be stale by one exchange |
+| `session.handoffs()` | Get the handoff history for this session. Same snapshot semantics as `history()` |
+| `session.end()` | Close the session and delete history from the store. Serialized: queues behind any in-flight `send`/`stream` so the delete is the final state |
+| `session.fork(newId)` | Create a copy of this session with a new ID (including history and metadata). Acquires both source and target locks so it captures a committed snapshot and does not race a concurrent `runtime.session(newId).send(...)`. Throws if `newId === source id` |
 
 ### What's stored
 
@@ -906,7 +906,7 @@ A session's persisted state is a flat `ChatMessage[]` of `user` and `assistant` 
 History is **session-scoped, not agent-scoped or workflow-scoped**. Concretely:
 
 - **Across workflows.** `session.send('workflowA', ...)` followed by `session.send('workflowB', ...)` shares one history. Workflow B sees A's prior `user`/`assistant` turns as ordinary conversation; workflow names are not encoded in messages.
-- **Across agents within one workflow.** `ctx.ask(agentA)` and `ctx.ask(agentB)` in the same `WorkflowContext` share the same `sessionHistory` array. Agent B sees A's reply as a prior assistant turn. As of 0.18, every assistant message committed via `ctx.ask()` is stamped with `ChatMessage.agent` (the agent's `name`), so consumers and tooling can attribute history; the field is observability-only today and does not yet alter what is included in subsequent prompts. Per-agent filtering is on the roadmap (`AgentConfig.sessionScope`).
+- **Across agents within one workflow.** `ctx.ask(agentA)` and `ctx.ask(agentB)` in the same `WorkflowContext` share the same `sessionHistory` array. Agent B sees A's reply as a prior assistant turn. As of 0.18, every assistant message committed via `ctx.ask()` is stamped with `ChatMessage.agent` (the agent's `name`), so consumers and tooling can attribute history; the field is observability-only today and does not yet alter what is included in subsequent prompts. Per-agent filtering is on the roadmap.
 - **Child contexts (agent-as-tool).** `ctx.createChildContext()` deliberately starts with empty session history, so nested asks invoked from a tool handler do not pollute the parent conversation.
 - **Failed retries.** Schema/validate/guardrail retry attempts within a single `ctx.ask()` are stripped from the persisted history — only the final committed assistant message is recorded.
 
@@ -925,7 +925,26 @@ If you are coming from other LLM SDKs where "turn" means a conversational round-
 
 ### Concurrency and races
 
-`session.send()` performs a read-modify-write cycle against the store with no locking. Calling `send()` (or `stream()`) concurrently on the same `sessionId` will race — both calls read the same history snapshot, append independently, and the later writer overwrites the earlier one. Serialize calls on a session id, or use distinct ids for parallel exchanges.
+`Session.send()`, `stream()`, `end()`, and `fork()` are **serialized per session id within one runtime instance**. Concurrent calls on the same id queue FIFO behind the in-flight task; reads (`history()`, `handoffs()`) bypass the queue and return the last persisted snapshot.
+
+Mechanism: the runtime keeps a per-id `Promise` chain (`AxlRuntime._serializeSession`, internal). Two `runtime.session('x')` handles share the same lock — the lock lives on the runtime, not the `Session` instance. When a queue forms, the runtime emits a `'session_lock_contended'` event:
+
+```typescript
+runtime.on('session_lock_contended', ({ sessionId }) => {
+  console.warn(`[axl] session ${sessionId} has contention`);
+});
+```
+
+Useful when you suspect a session is slow because of queueing (rather than the LLM itself).
+
+> **⚠️ Cross-process locking is NOT provided.** The lock is in-process — multiple Node workers (e.g., a horizontally-scaled web app) all hitting the same Redis-backed `sessionId` will still race. Production deployments behind a load balancer must either:
+>
+> - **Pin sessions to workers** (sticky routing on `sessionId`), so all writes for a given session go through the same process, or
+> - **Use distinct `sessionId`s per request** if cross-request continuity isn't required.
+>
+> A future release may offer optimistic concurrency on the StateStore — in the meantime, treat session ids as single-writer.
+
+**Lifecycle ordering.** `end()` sets a per-instance `closed` flag synchronously, then queues the delete behind the lock. After `await session.end()` resolves, no further calls on that `Session` instance succeed (`closed` short-circuits at the top of `send`/`stream`). However, `closed` is per-instance — a *different* `Session` object on the same id (e.g., from a fresh `runtime.session(id)` call elsewhere) is unaffected. If you need a global "this id is dead" signal, coordinate it at the application layer.
 
 ### Summarization
 

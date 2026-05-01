@@ -309,10 +309,20 @@ for await (const event of stream) {
   if (event.type === 'done') console.log('Result:', event.data.result);
 }
 
-// Sessions
+// Sessions — multi-turn conversations with persisted history.
+// `send`/`stream`/`end`/`fork` are serialized per session id within
+// the runtime; concurrent calls on the same id queue FIFO. Cross-process
+// locking is NOT provided — see docs/api-reference.md for details.
 const session = runtime.session('user-123');
 await session.send('my-workflow', { query: 'Hello' });
 await session.send('my-workflow', { query: 'Follow-up' });
+
+// In multi-agent workflows, each committed assistant message carries
+// `ChatMessage.agent` (the originating agent's name) so consumers can
+// attribute history. Surfaced as a clickable badge in Studio.
+const history = await session.history();
+//   [{ role: 'user', content: '...' },
+//    { role: 'assistant', content: '...', agent: 'triage' }, ...]
 
 // Stream a session turn
 const sessionStream = await session.stream('my-workflow', { query: 'Hello' });

@@ -46,6 +46,8 @@ app.listen(3000);
 
 The same pattern works with any Node.js framework (Hono, Fastify, NestJS, Next.js API routes, etc.). The runtime is a plain TypeScript object — no middleware or plugin system required.
 
+> **⚠️ Multi-worker deployments need sticky sessions.** `Session.send` is serialized per id within ONE Node process. If you run multiple workers behind a load balancer, you must route requests with the same `sessionId` to the same worker (sticky routing) — otherwise two workers may concurrently `send` on the same session id and the later writer will clobber the earlier one's update. See [API Reference → Sessions → Concurrency](./api-reference.md#concurrency-and-races).
+
 ## Axl Studio
 
 Axl Studio provides a browser-based development UI for any Axl project.

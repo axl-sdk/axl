@@ -921,6 +921,25 @@ describe('RedisStore', () => {
       expect(sessions).toContain('session-1');
       expect(sessions).toContain('session-2');
     });
+
+    it('round-trips ChatMessage.agent through JSON serialization', async () => {
+      // Tripwire: future serialization changes (e.g., field whitelisting)
+      // could silently drop the `agent` stamp from persisted history,
+      // breaking multi-agent attribution for Redis-backed deployments.
+      const { store } = createRedisStoreWithMockClient();
+      const history = [
+        { role: 'user' as const, content: 'q' },
+        { role: 'assistant' as const, content: 'a1', agent: 'triage' },
+        { role: 'assistant' as const, content: 'a2', agent: 'billing' },
+      ];
+      await store.saveSession('multi-agent', history);
+      const restored = await store.getSession('multi-agent');
+      expect(restored).toEqual(history);
+      expect(restored[1].agent).toBe('triage');
+      expect(restored[2].agent).toBe('billing');
+      // user message has no agent — must remain undefined post round-trip
+      expect(restored[0].agent).toBeUndefined();
+    });
   });
 
   describe('session metadata', () => {

@@ -21,6 +21,18 @@ export type SessionOptions = {
 /**
  * A stateful conversation session.
  * Persists message history across multiple interactions.
+ *
+ * **Concurrency contract:** `send`, `stream`, `end`, and `fork` are
+ * serialized per session id within one runtime instance. Two
+ * `runtime.session('x')` handles share the same lock (it lives on
+ * `AxlRuntime`, not the `Session` instance). `history()` and
+ * `handoffs()` bypass the lock and return the last persisted snapshot.
+ *
+ * **⚠️ Cross-process locking is NOT provided.** Multiple Node workers
+ * behind a load balancer hitting the same Redis-backed `sessionId`
+ * will still race. Pin sessions to workers (sticky routing) or use
+ * distinct ids per request. See `docs/api-reference.md` →
+ * Sessions → Concurrency.
  */
 export class Session {
   private closed = false;
@@ -39,14 +51,27 @@ export class Session {
     return this.sessionId;
   }
 
-  async send(workflowName: string, input: unknown): Promise<unknown> {
+  async send(
+    workflowName: string,
+    input: unknown,
+    options?: { signal?: AbortSignal },
+  ): Promise<unknown> {
     if (this.closed) throw new Error('Session has been ended');
-    return this.runtime._serializeSession(this.sessionId, () => this.sendImpl(workflowName, input));
+    // Fast-path: a pre-aborted signal short-circuits before we acquire the
+    // per-session lock, so an aborted call never blocks other waiters.
+    options?.signal?.throwIfAborted?.();
+    return this.runtime._serializeSession(this.sessionId, () =>
+      this.sendImpl(workflowName, input, options?.signal),
+    );
   }
 
-  private async sendImpl(workflowName: string, input: unknown): Promise<unknown> {
+  private async sendImpl(
+    workflowName: string,
+    input: unknown,
+    signal: AbortSignal | undefined,
+  ): Promise<unknown> {
     const { history, metadata } = await this.prepareHistory(input);
-    const result = await this.runtime.execute(workflowName, input, { metadata });
+    const result = await this.runtime.execute(workflowName, input, { metadata, signal });
     await this.commitHistory(history, result);
     return result;
   }
@@ -126,8 +151,13 @@ export class Session {
     }
   }
 
-  async stream(workflowName: string, input: unknown): Promise<AxlStream> {
+  async stream(
+    workflowName: string,
+    input: unknown,
+    options?: { signal?: AbortSignal },
+  ): Promise<AxlStream> {
     if (this.closed) throw new Error('Session has been ended');
+    options?.signal?.throwIfAborted?.();
 
     // The serializer holds the lock until `done`/`error` so the next caller
     // sees a saved history. `streamReady` resolves once the AxlStream object
@@ -222,7 +252,7 @@ export class Session {
     });
   }
 
-  async fork(newId: string): Promise<Session> {
+  async fork(newId: string, options?: { overwrite?: boolean }): Promise<Session> {
     if (newId === this.sessionId) {
       throw new Error(`Session.fork: newId must differ from source id (${this.sessionId})`);
     }
@@ -234,6 +264,19 @@ export class Session {
     const [first, second] = [this.sessionId, newId].sort();
     return this.runtime._serializeSession(first, () =>
       this.runtime._serializeSession(second, async () => {
+        // Refuse to clobber an existing target unless the caller opted in.
+        // This prevents accidental data loss when a fork is fired into a
+        // session id that's already in use.
+        if (!options?.overwrite) {
+          const existing = await this.store.getSession(newId);
+          if (existing.length > 0) {
+            throw new Error(
+              `Session.fork: target id "${newId}" already has history. ` +
+                `Pass { overwrite: true } to replace it, or choose a different id.`,
+            );
+          }
+        }
+
         const history = await this.store.getSession(this.sessionId);
         const forked = new Session(newId, this.runtime, this.store, this.options);
         await this.store.saveSession(newId, [...history]);
@@ -247,6 +290,21 @@ export class Session {
         const handoffHistory = await this.store.getSessionMeta(this.sessionId, 'handoffHistory');
         if (handoffHistory !== null) {
           await this.store.saveSessionMeta(newId, 'handoffHistory', handoffHistory);
+        }
+
+        // Copy session-scoped key-value memory. Vector embeddings (when
+        // `remember(..., {embed: true})`) are NOT copied — re-embed on
+        // the fork if you need semantic recall there. Stores that don't
+        // implement `getAllMemory`/`saveMemory` (e.g., the current
+        // RedisStore) silently skip this; their memory uses the
+        // sessionMeta fallback path which isn't enumerable per session.
+        if (this.store.getAllMemory && this.store.saveMemory) {
+          const sourceScope = `session:${this.sessionId}`;
+          const targetScope = `session:${newId}`;
+          const entries = await this.store.getAllMemory(sourceScope);
+          for (const { key, value } of entries) {
+            await this.store.saveMemory(targetScope, key, value);
+          }
         }
 
         return forked;

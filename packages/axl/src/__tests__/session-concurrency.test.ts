@@ -504,40 +504,63 @@ describe('Session concurrency — per-session serializer', () => {
   });
 
   // ────────────────────────────────────────────────────────────────────
-  // 12b. fork() locks the TARGET id too (not just source)
+  // 12b. fork() refuses to clobber an existing target id by default
   // ────────────────────────────────────────────────────────────────────
-  it('session.fork() does not race a concurrent send on the target id', async () => {
-    // Pre-fix, fork() acquired only the source's lock and then wrote to
-    // `newId` — racing any concurrent `runtime.session(newId).send(...)`
-    // for control of the target's saveSession. With the both-locks fix,
-    // fork's writes to newId serialize against any in-flight send on the
-    // target.
-    const { runtime } = makeDelayedRuntime(60);
-    const source = runtime.session('fork-src');
-    // Pre-populate source so fork has something to copy.
+  it('session.fork() throws when target id already has history (no overwrite opt-in)', async () => {
+    const { runtime } = makeEchoRuntime();
+    const source = runtime.session('fork-src-a');
     await source.send('chat', 'src-turn');
 
-    const target = runtime.session('fork-target');
-    // Fire a send on target FIRST, give it ~10ms head start, then fork
-    // into target. The fork must observe the target's committed state
-    // and not corrupt it.
+    // Make the target have history.
+    await runtime.session('fork-target-a').send('chat', 'pre-existing');
+
+    await expect(source.fork('fork-target-a')).rejects.toThrow(
+      /target id "fork-target-a" already has history/,
+    );
+    await runtime.shutdown();
+  });
+
+  it('session.fork({ overwrite: true }) replaces existing target history', async () => {
+    const { runtime } = makeEchoRuntime();
+    const source = runtime.session('fork-src-b');
+    await source.send('chat', 'A');
+    await source.send('chat', 'B');
+
+    await runtime.session('fork-target-b').send('chat', 'pre-existing');
+    const forked = await source.fork('fork-target-b', { overwrite: true });
+
+    const forkedHistory = await forked.history();
+    const sourceHistory = await source.history();
+    // Fork now mirrors source; target's previous content is replaced.
+    expect(forkedHistory).toEqual(sourceHistory);
+    expect(forkedHistory.length).toBe(4);
+    await runtime.shutdown();
+  });
+
+  it('session.fork() with overwrite still serializes against in-flight sends on the target', async () => {
+    // The both-locks behavior must hold even on the overwrite path —
+    // fork's writes to `newId` must not interleave with a concurrent
+    // send's saveSession on `newId`.
+    const { runtime } = makeDelayedRuntime(60);
+    const source = runtime.session('fork-src-c');
+    await source.send('chat', 'src-turn');
+
+    const target = runtime.session('fork-target-c');
+    // Fire a send on target FIRST so the target's lock is held when
+    // fork tries to acquire it.
     const sendPromise = target.send('chat', 'target-pre-existing');
     await new Promise((r) => setTimeout(r, 10));
-    const forked = await source.fork('fork-target');
+    const forked = await source.fork('fork-target-c', { overwrite: true });
     await sendPromise;
 
-    // The order in which fork vs send acquired the target lock is
-    // either-or; what matters is that neither corrupted the other. The
-    // resulting persisted history at `fork-target` is whichever wrote
-    // LAST under the lock — both outcomes are valid, but both must be
-    // self-consistent (alternating user/assistant, no torn writes).
+    // Whichever wrote LAST under the lock wins; both outcomes valid,
+    // but both must be self-consistent (no torn writes).
     const finalHistory = await forked.history();
     expect(finalHistory.length % 2).toBe(0);
     for (let i = 0; i < finalHistory.length; i += 2) {
       expect(finalHistory[i].role).toBe('user');
       expect(finalHistory[i + 1].role).toBe('assistant');
     }
-
     await runtime.shutdown();
   });
 
@@ -545,6 +568,143 @@ describe('Session concurrency — per-session serializer', () => {
     const { runtime } = makeEchoRuntime();
     const session = runtime.session('self-fork');
     await expect(session.fork('self-fork')).rejects.toThrow(/must differ from source/);
+    await runtime.shutdown();
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // 12c. fork() copies session-scoped memory to the new id
+  // ────────────────────────────────────────────────────────────────────
+  it('session.fork() copies session-scoped key-value memory entries', async () => {
+    // Pre-fix, fork() copied summaryCache + handoffHistory but NOT
+    // memory keyed by sessionId — forked sessions silently "forgot"
+    // things the source had remembered. This test pins the contract
+    // that KV memory survives fork (vector embeddings do NOT and
+    // must be re-embedded if needed).
+    const { runtime } = makeEchoRuntime();
+    const store = runtime['stateStore'] as MemoryStore;
+    const source = runtime.session('memory-source');
+    await source.send('chat', 'init');
+
+    // Stash some session-scoped memory directly via the store (mirrors
+    // what `ctx.remember(..., { scope: 'session' })` would do).
+    await store.saveMemory('session:memory-source', 'preferences', { theme: 'dark' });
+    await store.saveMemory('session:memory-source', 'last_intent', 'refund');
+
+    const forked = await source.fork('memory-fork');
+    const copied = await store.getAllMemory('session:memory-fork');
+    const byKey = Object.fromEntries(copied.map((e) => [e.key, e.value]));
+    expect(byKey.preferences).toEqual({ theme: 'dark' });
+    expect(byKey.last_intent).toBe('refund');
+
+    // Source's memory is unchanged.
+    const sourceMem = await store.getAllMemory('session:memory-source');
+    expect(sourceMem.length).toBe(2);
+
+    // Mutating the fork's memory does not leak back to the source.
+    await store.saveMemory('session:memory-fork', 'preferences', { theme: 'light' });
+    const sourceAfter = await store.getAllMemory('session:memory-source');
+    const sourceByKey = Object.fromEntries(sourceAfter.map((e) => [e.key, e.value]));
+    expect(sourceByKey.preferences).toEqual({ theme: 'dark' });
+    void forked;
+
+    await runtime.shutdown();
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // 17. Session.send/stream accept AbortSignal
+  // ────────────────────────────────────────────────────────────────────
+  it('session.send rejects with AbortError when signal fires mid-flight', async () => {
+    // Use a hand-built provider that honors options.signal during its
+    // delay — `MockProvider.fn`'s handler signature drops options, so
+    // we drop down a level here. This mirrors the pattern used by
+    // `abort.test.ts` for the same reason.
+    let aborted = false;
+    const provider = {
+      name: 'sig-mock',
+      async chat(_messages: ChatMessage[], options: { signal?: AbortSignal }) {
+        await new Promise<void>((resolve, reject) => {
+          if (options.signal?.aborted) {
+            aborted = true;
+            reject(new DOMException('Aborted', 'AbortError'));
+            return;
+          }
+          const t = setTimeout(resolve, 200);
+          options.signal?.addEventListener('abort', () => {
+            clearTimeout(t);
+            aborted = true;
+            reject(new DOMException('Aborted', 'AbortError'));
+          });
+        });
+        return {
+          content: 'unreachable',
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          cost: 0,
+        };
+      },
+      async *stream() {
+        yield {
+          type: 'done' as const,
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'sig-mock' });
+
+    runtime.registerProvider('sig-mock', provider as any);
+    const a = agent({ name: 'echo', model: 'sig-mock:test', system: 'sys' });
+    runtime.register(
+      workflow({
+        name: 'chat',
+        input: z.string(),
+        handler: async (ctx) => ctx.ask(a, ctx.input as string),
+      }),
+    );
+
+    const session = runtime.session('abortable-send');
+    const controller = new AbortController();
+    const promise = session.send('chat', 'will be aborted', { signal: controller.signal });
+    setTimeout(() => controller.abort(), 30);
+    await expect(promise).rejects.toThrow();
+    expect(aborted).toBe(true);
+
+    // After abort, the next send (with a fresh, non-aborted call) must
+    // proceed — the lock was released. Use a faster controller-less
+    // call against the same provider, but trigger via a separate
+    // controller signal that's never fired.
+    const next = await Promise.race([
+      session.send('chat', 'after-abort'),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('deadlock')), 1500)),
+    ]);
+    // The provider returns 'unreachable' content — we just care that
+    // the call completed (no deadlock) and resolved a real value.
+    expect(typeof next).toBe('string');
+
+    await runtime.shutdown();
+  });
+
+  it('session.send fast-paths a pre-aborted signal (does not acquire the lock)', async () => {
+    const { runtime } = makeEchoRuntime();
+    const session = runtime.session('pre-aborted');
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      session.send('chat', 'never runs', { signal: controller.signal }),
+    ).rejects.toThrow();
+    // The lock map should never have had an entry for this session id —
+    // abort fired BEFORE _serializeSession was called.
+    const locks = (runtime as unknown as { sessionLocks: Map<string, unknown> }).sessionLocks;
+    expect(locks.has('pre-aborted')).toBe(false);
+    await runtime.shutdown();
+  });
+
+  it('session.stream rejects on a pre-aborted signal (no lock acquired)', async () => {
+    const { runtime } = makeEchoRuntime();
+    const session = runtime.session('pre-aborted-stream');
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      session.stream('chat', 'never runs', { signal: controller.signal }),
+    ).rejects.toThrow();
     await runtime.shutdown();
   });
 

@@ -127,6 +127,11 @@ export type ExecuteOptions = {
    *  Useful for in-process testing and ad-hoc invocations where you don't want to poll
    *  `runtime.getPendingDecisions()` and call `runtime.resolveDecision()`. */
   awaitHumanHandler?: (options: AwaitHumanOptions) => Promise<HumanDecision>;
+  /** External AbortSignal. When fired, aborts the workflow exactly as
+   *  `runtime.abort(executionId)` would. Lets callers use the standard
+   *  JS cancellation pattern (e.g., AbortController from a UI's "stop"
+   *  button) without having to track the execution id. */
+  signal?: AbortSignal;
 };
 
 /**
@@ -168,6 +173,20 @@ type CostScope = {
 };
 
 const costScopeStorage = new AsyncLocalStorage<CostScope>();
+
+/** Wire `external` into `internal` so an abort on either fires the
+ *  internal controller. Used by `execute` and `stream` so callers can
+ *  use a standard `AbortController` instead of having to track
+ *  `executionId` for `runtime.abort()`. No-op when `external` is
+ *  undefined; immediate-aborts when `external` is already aborted. */
+function forwardAbortSignal(external: AbortSignal | undefined, internal: AbortController): void {
+  if (!external) return;
+  if (external.aborted) {
+    internal.abort();
+    return;
+  }
+  external.addEventListener('abort', () => internal.abort(), { once: true });
+}
 
 /**
  * The main entry point for executing Axl workflows.
@@ -711,6 +730,10 @@ export class AxlRuntime extends EventEmitter {
     const executionId = randomUUID();
     const controller = new AbortController();
     this.abortControllers.set(executionId, controller);
+    // Forward an external AbortSignal (if the caller passed one) into
+    // our internal controller so `runtime.abort(executionId)` and the
+    // user's own signal converge on a single shared abort path.
+    forwardAbortSignal(options?.signal, controller);
 
     // Register with active cost scope for trackCost() attribution
     this.registerWithCostScope(executionId);
@@ -835,6 +858,10 @@ export class AxlRuntime extends EventEmitter {
 
     // Cancel workflow when consumer disconnects (stops reading the stream)
     axlStream.on('close', () => controller.abort());
+    // Forward an external AbortSignal into our internal controller so
+    // both `runtime.abort(executionId)` and the user's own signal
+    // converge on a single shared abort path.
+    forwardAbortSignal(options?.signal, controller);
 
     // Generate executionId BEFORE the async closure so it's available on
     // terminal `done` / `error` events even when `run()` throws early

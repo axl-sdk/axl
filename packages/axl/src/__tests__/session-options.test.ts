@@ -21,6 +21,7 @@ function createMockRuntime(
       }),
     emit: overrides?.emit ?? vi.fn(),
     summarizeMessages: overrides?.summarizeMessages ?? vi.fn().mockResolvedValue('default summary'),
+    _serializeSession: <T>(_id: string, fn: () => Promise<T>) => fn(),
   } as unknown as AxlRuntime;
 }
 

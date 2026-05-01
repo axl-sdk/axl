@@ -194,6 +194,13 @@ export class AxlRuntime extends EventEmitter {
   private spanManager: SpanManager = new NoopSpanManager();
   private historicalExecutions = new Map<string, ExecutionInfo>();
   private historicalExecutionsLoadPromise: Promise<void> | null = null;
+  /** Per-session in-process serialization. Each entry is a chain of pending
+   *  work for that session id — `Session.send` / `Session.stream` await the
+   *  prior entry before reading history, so concurrent calls produce a
+   *  sequenced conversation log instead of last-writer-wins corruption.
+   *  Cross-process locking is NOT provided; use distinct session ids when
+   *  multiple processes share a store. */
+  private sessionLocks = new Map<string, Promise<void>>();
   private evalHistory: EvalHistoryEntry[] = [];
   private evalHistoryLoadPromise: Promise<void> | null = null;
   /** Resolved cap on `ExecutionInfo.events` per execution. Cached on
@@ -998,13 +1005,54 @@ export class AxlRuntime extends EventEmitter {
     return new Session(id, this, this.stateStore, options);
   }
 
-  /** Gracefully shut down the runtime, aborting in-flight executions and closing state stores and MCP servers. */
+  /** @internal Serialize work per session id within this runtime instance.
+   *  Subsequent calls await the prior task's settlement (success or failure)
+   *  before running. Used by `Session.send` / `Session.stream` / `end` /
+   *  `fork` to eliminate read-modify-write races on `StateStore.saveSession`
+   *  (and on `delete`/`getSession` ordering vs in-flight saves). */
+  async _serializeSession<T>(id: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.sessionLocks.get(id) ?? Promise.resolve();
+    // Run fn after prev settles, regardless of how prev settled. `ours`
+    // carries fn's value/error through to the caller.
+    const ours = prev.then(fn, fn);
+    // The chain entry is a void-typed, error-swallowed handle so the next
+    // caller awaits it without inheriting our success value or rejection.
+    const chained = ours.then(
+      () => {},
+      () => {},
+    );
+    this.sessionLocks.set(id, chained);
+    void chained.finally(() => {
+      // Only drop the entry if no successor has overwritten it.
+      if (this.sessionLocks.get(id) === chained) {
+        this.sessionLocks.delete(id);
+      }
+    });
+    return ours;
+  }
+
+  /** Gracefully shut down the runtime, aborting in-flight executions and
+   *  closing state stores and MCP servers. Drains in-flight per-session
+   *  work (Session.send / Session.stream) before closing the state store.
+   *
+   *  This is a drain of EXISTING work, not a barrier against new calls —
+   *  callers should stop accepting work (e.g., close their HTTP server)
+   *  before invoking `shutdown()`. A `Session.send` invoked after the
+   *  drain snapshot is taken can still race a closed state store. */
   async shutdown(): Promise<void> {
     // Abort all in-flight executions
     for (const [, controller] of this.abortControllers) {
       controller.abort();
     }
     this.abortControllers.clear();
+
+    // Drain in-flight per-session work before closing the state store —
+    // otherwise a Session.send/stream that's mid-save will write to a
+    // closed SQLite/Redis connection. The chain entries are void+swallowed
+    // (see _serializeSession), so allSettled is sufficient.
+    if (this.sessionLocks.size > 0) {
+      await Promise.allSettled([...this.sessionLocks.values()]);
+    }
 
     const errors: Error[] = [];
     const safeClose = async (label: string, fn: () => Promise<void>) => {

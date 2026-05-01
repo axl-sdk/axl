@@ -19,6 +19,9 @@ function createMockRuntime(overrides?: Partial<Pick<AxlRuntime, 'execute' | 'str
         return s;
       }),
     emit: overrides?.emit ?? vi.fn(),
+    // Identity stub — these tests don't exercise the real per-session lock.
+    // Concurrency is covered by tests that construct an actual AxlRuntime.
+    _serializeSession: <T>(_id: string, fn: () => Promise<T>) => fn(),
   } as unknown as AxlRuntime;
 }
 

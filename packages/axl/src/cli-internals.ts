@@ -166,12 +166,16 @@ export async function importModule(
 }
 
 /** Detect Node's "this extension has no loader" error so we can decide
- *  whether to attempt tsx registration. Both ESM and CJS branches surface
- *  recognizable substrings; user code throwing for unrelated reasons must
- *  NOT trigger our registration fallback. */
+ *  whether to attempt tsx registration. Prefer Node's stable error codes
+ *  over message-text matching where available — `ERR_UNKNOWN_FILE_EXTENSION`
+ *  is the documented code for the ESM "no loader for .ts" path. The CJS
+ *  branch (`Cannot use import statement outside a module`) is a SyntaxError
+ *  with no documented code, so we still pattern-match its message there. */
 function isMissingLoaderError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
-  return /Unknown file extension|Cannot use import statement outside a module/i.test(err.message);
+  const code = (err as { code?: unknown }).code;
+  if (code === 'ERR_UNKNOWN_FILE_EXTENSION') return true;
+  return /Cannot use import statement outside a module/i.test(err.message);
 }
 
 // ── Glob expansion ────────────────────────────────────────────────

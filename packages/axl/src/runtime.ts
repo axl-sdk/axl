@@ -1009,12 +1009,28 @@ export class AxlRuntime extends EventEmitter {
    *  Subsequent calls await the prior task's settlement (success or failure)
    *  before running. Used by `Session.send` / `Session.stream` / `end` /
    *  `fork` to eliminate read-modify-write races on `StateStore.saveSession`
-   *  (and on `delete`/`getSession` ordering vs in-flight saves). */
+   *  (and on `delete`/`getSession` ordering vs in-flight saves).
+   *
+   *  ⚠️ NOT REENTRANT. Calling this from inside an `fn` already running
+   *  under `_serializeSession(sameId, ...)` will deadlock — the inner
+   *  call awaits the outer's settlement, the outer awaits the inner's
+   *  return. `Session.fork` deliberately calls with TWO different ids
+   *  (source and target) and never the same id twice. Any future caller
+   *  must follow the same rule. */
   async _serializeSession<T>(id: string, fn: () => Promise<T>): Promise<T> {
-    const prev = this.sessionLocks.get(id) ?? Promise.resolve();
+    const prev = this.sessionLocks.get(id);
+    // Emit a runtime-level event when a lock is already held so users
+    // debugging "why is my session slow?" can see the queueing without
+    // guessing. Listen via `runtime.on('session_lock_contended', ...)`.
+    // Cheap: only fires when prev exists, which means the id is in
+    // active use.
+    if (prev !== undefined) {
+      this.emit('session_lock_contended', { sessionId: id });
+    }
+    const base = prev ?? Promise.resolve();
     // Run fn after prev settles, regardless of how prev settled. `ours`
     // carries fn's value/error through to the caller.
-    const ours = prev.then(fn, fn);
+    const ours = base.then(fn, fn);
     // The chain entry is a void-typed, error-swallowed handle so the next
     // caller awaits it without inheriting our success value or rejection.
     const chained = ours.then(

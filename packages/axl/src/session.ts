@@ -223,25 +223,34 @@ export class Session {
   }
 
   async fork(newId: string): Promise<Session> {
-    // Read the source under the source's lock so we capture history
-    // *after* any in-flight send/stream commits, not a torn snapshot.
-    return this.runtime._serializeSession(this.sessionId, async () => {
-      const history = await this.store.getSession(this.sessionId);
-      const forked = new Session(newId, this.runtime, this.store, this.options);
-      await this.store.saveSession(newId, [...history]);
+    if (newId === this.sessionId) {
+      throw new Error(`Session.fork: newId must differ from source id (${this.sessionId})`);
+    }
+    // Acquire BOTH the source and target locks. Source so we read a
+    // committed snapshot (not torn vs an in-flight send); target so the
+    // writes to `newId` don't race a concurrent `runtime.session(newId)`
+    // operation. Acquired in lexicographic order to make crossed forks
+    // (A→B and B→A concurrent) deadlock-free.
+    const [first, second] = [this.sessionId, newId].sort();
+    return this.runtime._serializeSession(first, () =>
+      this.runtime._serializeSession(second, async () => {
+        const history = await this.store.getSession(this.sessionId);
+        const forked = new Session(newId, this.runtime, this.store, this.options);
+        await this.store.saveSession(newId, [...history]);
 
-      // Copy session metadata (e.g. summaryCache, handoffHistory) to the forked session
-      const summaryCache = await this.store.getSessionMeta(this.sessionId, 'summaryCache');
-      if (summaryCache !== null) {
-        await this.store.saveSessionMeta(newId, 'summaryCache', summaryCache);
-      }
+        // Copy session metadata (e.g. summaryCache, handoffHistory) to the forked session
+        const summaryCache = await this.store.getSessionMeta(this.sessionId, 'summaryCache');
+        if (summaryCache !== null) {
+          await this.store.saveSessionMeta(newId, 'summaryCache', summaryCache);
+        }
 
-      const handoffHistory = await this.store.getSessionMeta(this.sessionId, 'handoffHistory');
-      if (handoffHistory !== null) {
-        await this.store.saveSessionMeta(newId, 'handoffHistory', handoffHistory);
-      }
+        const handoffHistory = await this.store.getSessionMeta(this.sessionId, 'handoffHistory');
+        if (handoffHistory !== null) {
+          await this.store.saveSessionMeta(newId, 'handoffHistory', handoffHistory);
+        }
 
-      return forked;
-    });
+        return forked;
+      }),
+    );
   }
 }

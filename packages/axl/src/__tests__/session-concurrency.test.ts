@@ -504,6 +504,81 @@ describe('Session concurrency — per-session serializer', () => {
   });
 
   // ────────────────────────────────────────────────────────────────────
+  // 12b. fork() locks the TARGET id too (not just source)
+  // ────────────────────────────────────────────────────────────────────
+  it('session.fork() does not race a concurrent send on the target id', async () => {
+    // Pre-fix, fork() acquired only the source's lock and then wrote to
+    // `newId` — racing any concurrent `runtime.session(newId).send(...)`
+    // for control of the target's saveSession. With the both-locks fix,
+    // fork's writes to newId serialize against any in-flight send on the
+    // target.
+    const { runtime } = makeDelayedRuntime(60);
+    const source = runtime.session('fork-src');
+    // Pre-populate source so fork has something to copy.
+    await source.send('chat', 'src-turn');
+
+    const target = runtime.session('fork-target');
+    // Fire a send on target FIRST, give it ~10ms head start, then fork
+    // into target. The fork must observe the target's committed state
+    // and not corrupt it.
+    const sendPromise = target.send('chat', 'target-pre-existing');
+    await new Promise((r) => setTimeout(r, 10));
+    const forked = await source.fork('fork-target');
+    await sendPromise;
+
+    // The order in which fork vs send acquired the target lock is
+    // either-or; what matters is that neither corrupted the other. The
+    // resulting persisted history at `fork-target` is whichever wrote
+    // LAST under the lock — both outcomes are valid, but both must be
+    // self-consistent (alternating user/assistant, no torn writes).
+    const finalHistory = await forked.history();
+    expect(finalHistory.length % 2).toBe(0);
+    for (let i = 0; i < finalHistory.length; i += 2) {
+      expect(finalHistory[i].role).toBe('user');
+      expect(finalHistory[i + 1].role).toBe('assistant');
+    }
+
+    await runtime.shutdown();
+  });
+
+  it('session.fork() throws when newId equals source id', async () => {
+    const { runtime } = makeEchoRuntime();
+    const session = runtime.session('self-fork');
+    await expect(session.fork('self-fork')).rejects.toThrow(/must differ from source/);
+    await runtime.shutdown();
+  });
+
+  // ────────────────────────────────────────────────────────────────────
+  // Lock contention observability
+  // ────────────────────────────────────────────────────────────────────
+  it('emits session_lock_contended on the runtime when a session lock is queued', async () => {
+    const { runtime } = makeDelayedRuntime(50);
+    const events: Array<{ sessionId: string }> = [];
+    runtime.on('session_lock_contended', (e: { sessionId: string }) => events.push(e));
+
+    const session = runtime.session('contended-id');
+    // Two concurrent sends — first acquires the lock, second queues
+    // and triggers the event.
+    await Promise.all([session.send('chat', 'A'), session.send('chat', 'B')]);
+
+    expect(events.length).toBeGreaterThanOrEqual(1);
+    expect(events.every((e) => e.sessionId === 'contended-id')).toBe(true);
+
+    await runtime.shutdown();
+  });
+
+  it('does NOT emit session_lock_contended on the first uncontended call', async () => {
+    const { runtime } = makeEchoRuntime();
+    const events: unknown[] = [];
+    runtime.on('session_lock_contended', (e: unknown) => events.push(e));
+
+    await runtime.session('solo').send('chat', 'hello');
+    expect(events.length).toBe(0);
+
+    await runtime.shutdown();
+  });
+
+  // ────────────────────────────────────────────────────────────────────
   // 13. Adversarial: forced interleaving via a delayed store
   // ────────────────────────────────────────────────────────────────────
   it('serializes 20 concurrent sends even when getSession/saveSession have random delays', async () => {

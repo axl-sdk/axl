@@ -57,15 +57,27 @@ export function needsTsxLoader(filePath: string): boolean {
 
 // ── Module loading ────────────────────────────────────────────────
 
-// Tracks whether we've already activated tsx's process-wide ESM loader hooks.
-// `undefined` = not yet attempted, `true` = active, `false` = tsx unavailable.
-// Module-scoped so the second consumer (e.g. studio after eval) reuses
-// eval's registration instead of attempting to re-register.
+// Tracks whether we've already activated tsx's process-wide loader hooks.
+// `undefined` = not yet attempted, `true` = ESM hook active (CJS hook is
+// best-effort and tracked separately by tsx itself), `false` = tsx
+// unavailable. Module-scoped so the second consumer (e.g. studio after
+// eval) reuses eval's registration instead of attempting to re-register.
 let tsxRegistered: boolean | undefined;
 
 /**
- * Activate tsx's process-wide ESM loader hooks once per Node process so any
- * subsequent `await import('./foo.ts')` is transformed.
+ * Activate tsx's process-wide loader hooks once per Node process so any
+ * subsequent `await import('./foo.ts')` AND any transitive `require('./foo.ts')`
+ * from a CJS workspace dep are transformed.
+ *
+ * Why both hooks: tsx ships separate ESM (`tsx/esm/api`) and CJS
+ * (`tsx/cjs/api`) hook APIs. The ESM hook intercepts `import()`. The CJS
+ * hook patches `require.extensions` so `require('./x.ts')` from a CJS
+ * package also gets transformed. tsx's own CLI registers both for the same
+ * reason. Registering only ESM means a `.ts` eval file in a CJS-typed
+ * package whose chain goes `import → cjs-pkg → require('./helper.ts')`
+ * trips Node's `require(esm)` path (since the .ts has no CJS handler) and
+ * fails with `ES Module ... cycle` / `Unknown file extension '.ts'`. The
+ * ESM hook can't help — it doesn't see `require()` calls.
  *
  * Implementation note: tsx's `tsImport(specifier, parent)` uses a unique
  * namespace per call — it only transforms the entry import. Chained imports
@@ -76,9 +88,12 @@ let tsxRegistered: boolean | undefined;
  * each file — tsx then intercepts the entire ESM module graph for the
  * process lifetime.
  *
- * Process-wide registration is what tsx's own CLI does. The hook is
- * idempotent and only acts on TypeScript-extension specifiers. Falls back
- * to false if tsx is not installed.
+ * Process-wide registration is what tsx's own CLI does. Both hooks are
+ * idempotent and only act on TypeScript-extension specifiers. ESM is the
+ * critical hook (powers our entry-file `import()` below); CJS is
+ * best-effort — if its API import fails on some unusual tsx build the ESM
+ * hook still works, leaving callers in the pre-fix state for CJS chains
+ * rather than worse. Falls back to false if tsx is not installed.
  *
  * @internal
  */
@@ -86,15 +101,27 @@ async function ensureTsxRegistered(): Promise<boolean> {
   if (tsxRegistered !== undefined) return tsxRegistered;
   try {
     // @ts-expect-error — tsx is an optional runtime dependency
-    const mod = await import('tsx/esm/api');
-    if (typeof mod.register === 'function') {
-      mod.register();
-      tsxRegistered = true;
-    } else {
+    const esm = await import('tsx/esm/api');
+    if (typeof esm.register !== 'function') {
       tsxRegistered = false;
+      return tsxRegistered;
     }
+    esm.register();
+    tsxRegistered = true;
   } catch {
     tsxRegistered = false;
+    return tsxRegistered;
+  }
+  try {
+    // @ts-expect-error — tsx is an optional runtime dependency
+    const cjs = await import('tsx/cjs/api');
+    if (typeof cjs.register === 'function') {
+      cjs.register();
+    }
+  } catch {
+    // CJS api unavailable — `require('./x.ts')` chains from CJS workspace
+    // deps will still trip require(esm) cycles (pre-fix behavior). Leave
+    // tsxRegistered=true so the ESM-driven entry load proceeds.
   }
   return tsxRegistered;
 }
@@ -194,10 +221,18 @@ function globToRegex(glob: string): RegExp {
  * `exports` use a `development` condition to point at `.ts` source instead
  * of built `dist`.
  *
- * Caveat: ESM-only. CJS `require()` chains bypass the hook. Files tsx
- * compiles to CJS (`.cts`, or `.ts` in a package without
- * `"type": "module"`) issue `require()` calls that don't see the extra
- * conditions — workaround is to add `"type": "module"` or rename to `.mts`.
+ * Caveat: ESM-only. `node:module.register()` only installs ESM resolve
+ * hooks; Node's CJS resolver never sees them. So when tsx compiles a
+ * `.ts` file in a CJS-typed package, its `import` statements become
+ * `require()` calls, those `require()`s use the CJS resolver, and the
+ * extra conditions don't propagate — meaning a workspace package whose
+ * `exports.development → "./src/foo.ts"` resolves to the `default`
+ * entry (e.g. built `./dist/foo.js`) instead of the `.ts` source. This
+ * is independent of the `tsx/cjs/api` hook (which fixes `.ts` *file
+ * loading* under require, but can't make the CJS resolver consult ESM
+ * conditions). Workaround for full condition coverage: add
+ * `"type": "module"` to the importer's package, or rename it to `.mts`,
+ * so its internal imports stay as `import` and hit the ESM resolve hook.
  *
  * @internal
  */

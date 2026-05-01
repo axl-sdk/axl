@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-04-30
+
+### Fixed
+
+- **`@axlsdk/eval` / `@axlsdk/studio`: register tsx's CJS hook alongside the ESM hook.** When a `.ts` eval (or config) file lived in a CJS-typed package and its import chain reached a CJS workspace dep that did `require('./helper.ts')` transitively, the load failed with `ES Module ... cycle` / `Unknown file extension '.ts'`. Cause: 0.17.0 switched to `tsx/esm/api`'s `register()` for chained `.ts` imports, but only the ESM hook was registered — `require()` calls have their own resolution path and bypass it, falling through to Node's `require(esm)` machinery, which can't bridge to a `.ts` file with no CJS handler. `ensureTsxRegistered()` in `@axlsdk/axl`'s shared `cli-internals` now also registers `tsx/cjs/api`, mirroring what tsx's own CLI does. The `--conditions` caveat about CJS chains is unchanged — that's about Node's `module.register()` being ESM-only for *resolution* hooks, which is independent of which file extensions tsx can transform.
+
 ## [0.17.1] - 2026-04-30
 
 ### Fixed

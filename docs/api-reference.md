@@ -295,7 +295,7 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 
 **Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a system message explaining the error. On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
 
-**Streaming + validate:** As of 0.16.0, `validate` and streaming callbacks (`onToken`) coexist — validate runs against the buffered response after streaming completes. (Pre-0.16.0 this combination threw `INVALID_CONFIG`.) For structured output, the typed result is still only available after the full response arrives.
+**Streaming + validate:** As of 0.16.0, `validate` and token streaming (via `runtime.stream()`) coexist — validate runs against the buffered response after streaming completes. (Pre-0.16.0 this combination threw `INVALID_CONFIG`.) For structured output, the typed result is still only available after the full response arrives.
 
 ---
 
@@ -969,8 +969,9 @@ const runtime = new AxlRuntime({
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `metadata` | `Record<string, unknown>` | `{}` | Metadata passed to the workflow context. Reserved keys: `sessionId`, `sessionHistory`, `resumeMode` |
-| `onToken` | `(token: string, meta: CallbackMeta) => void` | — | Token streaming callback. `meta`: `{ askId, parentAskId?, depth, agent }`. Filter on `meta.depth === 0` for root-only |
 | `awaitHumanHandler` | `(options) => Promise<HumanDecision>` | — | In-process approval handler for tool calls with `requireApproval`. Parity with `CreateContextOptions.awaitHumanHandler` — lets tests and embedded use cases resolve approvals inline instead of suspending execution and polling `getPendingDecisions()` |
+
+> **No `onToken` here.** `runtime.execute()` is final-result-only by design. To observe tokens, tool calls, or any other event during a workflow run, use `runtime.stream()` and consume the returned `AxlStream` (see [`AxlStream`](#axlstream)). Per-execution callbacks (`onToken` / `onToolCall` / `onAgentStart`) only exist on `runtime.createContext()`, where there is no stream object to subscribe to.
 
 ### Execution History
 

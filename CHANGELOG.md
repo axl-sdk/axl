@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Corrected: `runtime.execute()` does not accept `onToken`.** The `ExecuteOptions` table in `docs/api-reference.md` and the "Streaming callbacks" section in `docs/observability.md` claimed `onToken` / `onToolCall` / `onAgentStart` were accepted on `runtime.execute()` and `runtime.stream()`. The runtime never read those fields off the options object — they only exist on `runtime.createContext()`. Removed the fabricated rows, scoped the callback section to `createContext()`, added a new "Observation paths" table distinguishing per-execution (`runtime.stream()` → `AxlStream`), cross-execution (`runtime.on('trace', …)`), and ad-hoc context (`createContext` callbacks). Added a clarifying note to the README's Streaming section. Reported by a customer; no code change. Long-term plan to unify ad-hoc contexts behind the same `AsyncIterable<AxlEvent>` surface as `AxlStream` is tracked in `ROADMAP.md` ("Stream-First Observation API").
+
 ## [0.17.2] - 2026-04-30
 
 ### Fixed

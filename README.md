@@ -183,6 +183,8 @@ for await (const event of stream) {
 const result = await stream.promise; // final output after stream completes
 ```
 
+`runtime.execute()` is final-result-only and does **not** accept `onToken` or any other event callback — `runtime.stream()` is the streaming surface. For background telemetry across every run, subscribe with `runtime.on('trace', event => …)` instead.
+
 ## Sessions
 
 Multi-turn conversations with persistent history. Pass a session ID to `runtime.session()` — messages are grouped by this ID, so the same user gets continuity across calls:

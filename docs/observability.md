@@ -170,9 +170,21 @@ Unknown models report `tokens` but no `cost`. The Studio Cost Dashboard renders 
 
 **Memory cost + budget.** Embedder cost feeds the same `budgetContext` as agent calls via `_accumulateBudgetCost` — `ctx.budget({ cost, onExceed: 'hard_stop' })` enforces across both. `ctx.remember` / `ctx.recall` also check `budgetContext.exceeded` at call top and throw `BudgetExceededError` before hitting the embedder if a prior call already breached the limit. The composed `AbortSignal` (user-abort + budget hard-stop) is forwarded to the embedder fetch so in-flight calls cancel.
 
+### Observation paths
+
+Three ways to observe what happens during a workflow run. Pick by scope:
+
+| Path | Scope | When to use |
+|------|-------|-------------|
+| `runtime.stream(name, input)` → `AxlStream` | One specific execution | Per-run UIs (chat streaming, progress bars, waterfalls). Returns an `AsyncIterable<AxlEvent>` plus curated views (`.text`, `.lifecycle`, `.textByAsk`, `.fullText`) and a `.promise` for the final result |
+| `runtime.on('trace', event => …)` | Every execution | Cross-execution observability (background telemetry, cost dashboards, audit logs). Receives every `AxlEvent` from every `execute()` / `stream()` / `createContext()` call |
+| `onToken` / `onToolCall` / `onAgentStart` on `runtime.createContext()` | One ad-hoc context | Tool tests, evals, prototyping — situations where there's no top-level execution to subscribe to and you're calling `ctx.ask()` directly |
+
+`runtime.execute()` itself is final-result-only by design — it does **not** accept `onToken` or any other event callback. To observe a workflow run, use `runtime.stream()` (per-execution) or `runtime.on('trace', …)` (cross-execution). The unified event model (0.16.0) made `AxlEvent` the canonical wire format; the curated stream views supersede legacy callbacks.
+
 ### Streaming callbacks: `meta` parameter
 
-`onToken`, `onToolCall`, and `onAgentStart` (on `runtime.createContext()`, `runtime.execute()`, and `runtime.stream()`) receive a second `meta: CallbackMeta` parameter:
+The `onToken` / `onToolCall` / `onAgentStart` callbacks on `runtime.createContext()` receive a second `meta: CallbackMeta` parameter:
 
 ```typescript
 type CallbackMeta = {
@@ -193,7 +205,7 @@ const ctx = runtime.createContext({
 });
 ```
 
-Drop the `depth === 0` filter to display tokens from nested asks too.
+Drop the `depth === 0` filter to display tokens from nested asks too. The same filtering pattern is available on `runtime.stream()` via `event.depth` on each `AxlEvent` (or use the prebuilt `.text` / `.textByAsk` views).
 
 ### Debugging retries
 

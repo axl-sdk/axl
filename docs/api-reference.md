@@ -890,12 +890,12 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 
 | Method | Description |
 |--------|-------------|
-| `session.send(workflow, input)` | Execute a workflow with session history. Returns the result. Serialized per `sessionId` (see [Concurrency](#concurrency-and-races)) |
-| `session.stream(workflow, input)` | Execute a workflow with session history. Returns an `AxlStream`. Serialized per `sessionId` — the lock is held until the stream's terminal `done`/`error` event fires |
+| `session.send(workflow, input, { signal? })` | Execute a workflow with session history. Returns the result. Serialized per `sessionId` (see [Concurrency](#concurrency-and-races)). Pass `signal` to cancel via `AbortSignal` — fires the same path as `runtime.abort(executionId)`. A pre-aborted signal short-circuits before acquiring the lock |
+| `session.stream(workflow, input, { signal? })` | Execute a workflow with session history. Returns an `AxlStream`. Serialized per `sessionId` — the lock is held until the stream's terminal `done`/`error` event fires. `signal` aborts the stream and releases the lock |
 | `session.history()` | Get the last persisted message history snapshot from the store. Does **not** await in-flight `send()`/`stream()` — returns the previously committed state, which may be stale by one exchange |
 | `session.handoffs()` | Get the handoff history for this session. Same snapshot semantics as `history()` |
 | `session.end()` | Close the session and delete history from the store. Serialized: queues behind any in-flight `send`/`stream` so the delete is the final state |
-| `session.fork(newId)` | Create a copy of this session with a new ID (including history and metadata). Acquires both source and target locks so it captures a committed snapshot and does not race a concurrent `runtime.session(newId).send(...)`. Throws if `newId === source id` |
+| `session.fork(newId, { overwrite? })` | Create a copy of this session with a new ID. Copies: history, `summaryCache`, `handoffHistory`, and session-scoped key-value memory entries (vector embeddings are NOT copied — re-embed on the fork if you need semantic recall). Acquires both source and target locks so it captures a committed snapshot and does not race a concurrent `runtime.session(newId).send(...)`. Throws if `newId === source id` or if the target id already has history (pass `{ overwrite: true }` to replace it) |
 
 ### What's stored
 

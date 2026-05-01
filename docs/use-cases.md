@@ -487,6 +487,29 @@ const CustomerSupport = workflow({
 
 The triage agent uses a cheap model just for routing. Each specialist only has access to its own tools — ShippingBot cannot call `processPayment`. See [API Reference > `HandoffDescriptor`](./api-reference.md#handoffdescriptor) for handoff modes.
 
+### Inspecting which agent answered each turn
+
+Every assistant message committed via `ctx.ask()` is stamped with `ChatMessage.agent` (the agent's `name`). Filter or group session history by agent for analytics, eval cohorts, or QA review:
+
+```typescript
+const session = runtime.session('support-12345');
+await session.send('triage-workflow', { text: 'I want to return my order' });
+await session.send('triage-workflow', { text: 'It arrived damaged' });
+
+const history = await session.history();
+
+// All messages produced by the billing specialist
+const billingTurns = history.filter((m) => m.agent === 'BillingBot');
+
+// Group counts per agent — useful for "which specialist did most of the work?"
+const agentLoad = history.reduce<Record<string, number>>((acc, m) => {
+  if (m.agent) acc[m.agent] = (acc[m.agent] ?? 0) + 1;
+  return acc;
+}, {});
+```
+
+The field is observability metadata — it never appears on outbound provider HTTP payloads. The Studio Session Manager renders it as a clickable badge so you can highlight all turns from a given agent visually.
+
 ## MCP-Powered Development Assistant
 
 A coding assistant that uses tools from external MCP servers alongside local tools:

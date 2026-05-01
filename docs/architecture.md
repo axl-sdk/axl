@@ -104,3 +104,11 @@ const runtime = new AxlRuntime({ state: { store } });
 ```
 
 `RedisStore.create()` is async and connects before returning — wire it up before constructing the runtime. `runtime.shutdown()` closes the connection automatically.
+
+> **⚠️ Multi-process session writes are NOT serialized.** RedisStore makes session state visible across processes, but the per-session-id lock that protects `Session.send`/`stream`/`end`/`fork` from read-modify-write races is **in-process only**. Two Node workers behind a load balancer concurrently calling `runtime.session('user-123').send(...)` will both read the same Redis snapshot, both append, and the later write will clobber the earlier one — losing an entire user/assistant exchange.
+>
+> For multi-worker deployments you must either:
+> - **Pin sessions to workers** (sticky routing on `sessionId`) so all writes for a given session go through the same Node process, or
+> - **Use distinct `sessionId`s per request** if continuity isn't required.
+>
+> This is a known limitation; a future release may add optimistic concurrency on top of the StateStore. See [Sessions → Concurrency](api-reference.md#concurrency-and-races).

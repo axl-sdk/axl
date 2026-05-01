@@ -109,7 +109,7 @@ const myAgent = agent({
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool |
 | `stop` | `string[]` | — | Stop sequences — generation stops when any sequence is encountered. Not supported by the `openai-responses` provider (silently ignored) |
 | `providerOptions` | `Record<string, unknown>` | — | Provider-specific options shallow-merged into the raw API request body via `Object.assign`. Not portable across providers. See [shallow merge caveat](providers.md#provideroptions) |
-| `maxTurns` | `number` | `25` | Maximum tool-call loop iterations before throwing `MaxTurnsError` |
+| `maxTurns` | `number` | `25` | Maximum tool-call loop iterations before throwing `MaxTurnsError`. **A "turn" in axl is one provider call inside a single `ctx.ask()`** — not a user↔assistant exchange. Schema/validate/guardrail retries also consume turns. See [Sessions → Turns vs. Exchanges](#turns-vs-exchanges) |
 | `timeout` | `string` | none | Duration string (e.g., `'30s'`, `'5m'`, `'1h'`). Throws `TimeoutError` when exceeded |
 | `maxContext` | `number` | — | Estimated token limit for context window management |
 | `version` | `string` | — | Prompt version label attached to trace events |
@@ -896,6 +896,45 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 | `session.handoffs()` | Get the handoff history for this session |
 | `session.end()` | Close the session and delete history from the store |
 | `session.fork(newId)` | Create a copy of this session with a new ID (including history and metadata) |
+
+### What's stored
+
+A session's persisted state is a flat `ChatMessage[]` of `user` and `assistant` turns, keyed by `sessionId` in the configured `StateStore`. Summarization caches and handoff history are stored alongside as session metadata. The `Session` object itself holds no message cache — every `send()`/`stream()` reads history from the store, mutates it during execution, and writes it back. Calling `runtime.session(id)` does not pre-load anything and does not check whether the id exists.
+
+### Sharing semantics
+
+History is **session-scoped, not agent-scoped or workflow-scoped**. Concretely:
+
+- **Across workflows.** `session.send('workflowA', ...)` followed by `session.send('workflowB', ...)` shares one history. Workflow B sees A's prior `user`/`assistant` turns as ordinary conversation; workflow names are not encoded in messages.
+- **Across agents within one workflow.** `ctx.ask(agentA)` and `ctx.ask(agentB)` in the same `WorkflowContext` share the same `sessionHistory` array. Agent B sees A's reply as a prior assistant turn with no agent attribution.
+- **Child contexts (agent-as-tool).** `ctx.createChildContext()` deliberately starts with empty session history, so nested asks invoked from a tool handler do not pollute the parent conversation.
+- **Failed retries.** Schema/validate/guardrail retry attempts within a single `ctx.ask()` are stripped from the persisted history — only the final committed assistant message is recorded.
+
+If you want per-agent or per-workflow scoping, use distinct `sessionId`s. There is no built-in sub-scoping today.
+
+### Turns vs. exchanges
+
+These are different concepts in axl:
+
+| Term | Meaning |
+|------|---------|
+| **Turn** | One iteration of the tool-call loop inside a single `ctx.ask()` — i.e., one provider HTTP call. Capped by `AgentConfig.maxTurns` (default 25). Schema/validate/guardrail retries each consume a turn. Stamped on `agent_call_start`/`agent_call_end` events as `turn: N` |
+| **Exchange** (or "round") | One user↔assistant round-trip at the session level — roughly one `session.send()` call. An exchange can internally invoke multiple `ctx.ask()` calls, each running its own turn loop |
+
+If you are coming from other LLM SDKs where "turn" means a conversational round-trip, mentally rename axl's `maxTurns` to "max provider calls per ask".
+
+### Concurrency and races
+
+`session.send()` performs a read-modify-write cycle against the store with no locking. Calling `send()` (or `stream()`) concurrently on the same `sessionId` will race — both calls read the same history snapshot, append independently, and the later writer overwrites the earlier one. Serialize calls on a session id, or use distinct ids for parallel exchanges.
+
+### Summarization
+
+Two independent summarization paths exist:
+
+- **Session-level** (controlled here via `history.maxMessages` + `history.summarize`). Triggers when persisted history exceeds `maxMessages`. Drops the oldest excess messages, summarizes them with `summaryModel`, and stores the rolling summary as session metadata so it carries across `send()` calls.
+- **Ask-level** (controlled by `AgentConfig.maxContext`). Triggers inside `ctx.ask()` when the prompt + history would exceed the agent's configured context window. Independent of `SessionOptions`.
+
+Both can fire in the same `send()`.
 
 ---
 

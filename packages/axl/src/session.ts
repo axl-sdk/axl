@@ -45,6 +45,23 @@ export class Session {
   }
 
   private async sendImpl(workflowName: string, input: unknown): Promise<unknown> {
+    const { history, metadata } = await this.prepareHistory(input);
+    const result = await this.runtime.execute(workflowName, input, { metadata });
+    await this.commitHistory(history, result);
+    return result;
+  }
+
+  /** Read history + summary, apply maxMessages limit (with optional
+   *  summarization), and push the new user message. Returns the mutable
+   *  `history` array (which `executeAgentCall` will append the assistant
+   *  reply to in-place) and the `metadata` payload to forward to
+   *  `runtime.execute()` / `runtime.stream()`. Shared by `sendImpl` and
+   *  `streamImpl` so future fixes (e.g., to summarization wiring) land in
+   *  one place. */
+  private async prepareHistory(input: unknown): Promise<{
+    history: ChatMessage[];
+    metadata: Record<string, unknown>;
+  }> {
     const history = await this.store.getSession(this.sessionId);
     let cachedSummary = (await this.store.getSessionMeta(this.sessionId, 'summaryCache')) as
       | string
@@ -76,20 +93,24 @@ export class Session {
       history.push(...trimmed);
     }
 
-    const userMessage: ChatMessage = {
+    history.push({
       role: 'user',
       content: typeof input === 'string' ? input : JSON.stringify(input),
-    };
-    history.push(userMessage);
-
-    const result = await this.runtime.execute(workflowName, input, {
-      metadata: {
-        sessionId: this.sessionId,
-        sessionHistory: history,
-        ...(cachedSummary ? { summaryCache: cachedSummary } : {}),
-      },
     });
 
+    const metadata: Record<string, unknown> = {
+      sessionId: this.sessionId,
+      sessionHistory: history,
+      ...(cachedSummary ? { summaryCache: cachedSummary } : {}),
+    };
+    return { history, metadata };
+  }
+
+  /** Push the assistant reply (if `executeAgentCall` didn't already) and
+   *  persist. Shared by `sendImpl` and `streamImpl`. The fallback assistant
+   *  push has no agent context and so leaves `agent` undefined — see the
+   *  `ChatMessage.agent` field doc. */
+  private async commitHistory(history: ChatMessage[], result: unknown): Promise<void> {
     // executeAgentCall may have already pushed the assistant message (with
     // providerMetadata for Gemini thought signatures etc.). Only add one if needed.
     const lastMsg = history[history.length - 1];
@@ -103,7 +124,6 @@ export class Session {
     if (this.options.persist !== false) {
       await this.store.saveSession(this.sessionId, history);
     }
-    return result;
   }
 
   async stream(workflowName: string, input: unknown): Promise<AxlStream> {
@@ -147,71 +167,13 @@ export class Session {
     let history: ChatMessage[];
     let axlStream: AxlStream;
     try {
-      history = await this.store.getSession(this.sessionId);
-      let cachedSummary = (await this.store.getSessionMeta(this.sessionId, 'summaryCache')) as
-        | string
-        | null;
-
-      // Apply maxMessages limit
-      const maxMessages = this.options.history?.maxMessages;
-      if (maxMessages && history.length > maxMessages) {
-        if (this.options.history?.summarize) {
-          const summaryModel = this.options.history?.summaryModel;
-          if (!summaryModel) {
-            throw new Error(
-              'SessionOptions.history.summaryModel is required when summarize is true',
-            );
-          }
-          const messagesToDrop = history.slice(0, history.length - maxMessages);
-          // Include existing summary as context for the new summarization
-          const toSummarize: ChatMessage[] = cachedSummary
-            ? [
-                { role: 'system', content: `Previous conversation summary: ${cachedSummary}` },
-                ...messagesToDrop,
-              ]
-            : messagesToDrop;
-          const summary = await this.runtime.summarizeMessages(toSummarize, summaryModel);
-          await this.store.saveSessionMeta(this.sessionId, 'summaryCache', summary);
-          // Update local reference so the workflow receives the fresh summary
-          cachedSummary = summary;
-        }
-        const trimmed = history.slice(-maxMessages);
-        history.length = 0;
-        history.push(...trimmed);
-      }
-
-      const userMessage: ChatMessage = {
-        role: 'user',
-        content: typeof input === 'string' ? input : JSON.stringify(input),
-      };
-      history.push(userMessage);
-
-      axlStream = this.runtime.stream(workflowName, input, {
-        metadata: {
-          sessionId: this.sessionId,
-          sessionHistory: history,
-          ...(cachedSummary ? { summaryCache: cachedSummary } : {}),
-        },
-      });
+      const prepared = await this.prepareHistory(input);
+      history = prepared.history;
+      axlStream = this.runtime.stream(workflowName, input, { metadata: prepared.metadata });
     } catch (err) {
       rejectReady(err);
       throw err;
     }
-
-    const updateHistory = async (result: unknown): Promise<void> => {
-      // executeAgentCall may have already pushed the assistant message (with
-      // providerMetadata for Gemini thought signatures etc.). Only add one if needed.
-      const lastMsg = history[history.length - 1];
-      if (!(lastMsg && lastMsg.role === 'assistant')) {
-        history.push({
-          role: 'assistant',
-          content: typeof result === 'string' ? result : JSON.stringify(result),
-        });
-      }
-      if (this.options.persist !== false) {
-        await this.store.saveSession(this.sessionId, history);
-      }
-    };
 
     // Hand the stream to the caller now — the lock is still held by the
     // `await completion` below, so the next session call queues behind it.
@@ -224,7 +186,7 @@ export class Session {
     // errored stream has no committed result.
     const completion = axlStream.promise.then(
       (result) =>
-        updateHistory(result).catch((err) => {
+        this.commitHistory(history, result).catch((err) => {
           this.runtime.emit('error', {
             type: 'session_history_save_failed',
             sessionId: this.sessionId,

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Studio Session Manager: badge each assistant message with its originating agent.** The Session Manager panel now renders the new `ChatMessage.agent` (added in this release) as a small badge next to the role label on each assistant turn, so you can see at a glance which agent committed which reply in a multi-agent session. Studio's client `ChatMessage` type was extended with the optional field, and `redactChatMessage` preserves the agent name (it's a non-PII config-time identifier, like a tool name) when redact mode is on.
 - **`ChatMessage.agent` — assistant messages carry the originating agent name.** Phase 1 of multi-agent session support. Every assistant message committed via `ctx.ask()` is now stamped with `agent: agent._name` in the persisted session history. The field is additive and optional — `user` messages and external assistant pushes (e.g., the `Session.send` fallback when no agent context is available) leave it `undefined`. Provider adapters cherry-pick the wire fields they need (`role`, `content`, `name`, `tool_calls`, `tool_call_id`) and ignore everything else, so the field never appears on outbound HTTP payloads. Backward compatible: existing serialized sessions without the field deserialize cleanly. The field is observability-only today; per-agent history filtering will land in phase 2 as `AgentConfig.sessionScope`.
 
 ### Fixed

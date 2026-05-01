@@ -213,10 +213,15 @@ export type SessionDetail = {
   handoffHistory?: HandoffRecord[];
 };
 
-/** Chat message */
+/** Chat message. Mirrors the public `ChatMessage` shape from `@axlsdk/axl`,
+ *  narrowed to the fields the Session Manager and other panels need to
+ *  render. `agent` is populated on assistant messages committed via
+ *  `ctx.ask()` (added in 0.18) — used by the panel to badge each
+ *  assistant turn with its originating agent. */
 export type ChatMessage = {
   role: string;
   content: string;
+  agent?: string;
   tool_calls?: Array<{
     id: string;
     function: { name: string; arguments: string };

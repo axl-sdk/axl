@@ -244,7 +244,17 @@ export function SessionManagerPanel() {
                             : 'bg-[hsl(var(--muted))] text-xs font-mono'
                       }`}
                     >
-                      <div className="text-xs font-medium mb-1 opacity-70">{msg.role}</div>
+                      <div className="text-xs font-medium mb-1 opacity-70 flex items-center gap-1.5">
+                        <span>{msg.role}</span>
+                        {msg.agent && (
+                          <span
+                            className="px-1.5 py-0.5 rounded font-mono text-[10px] bg-[hsl(var(--background))]/40"
+                            title={`Committed by agent: ${msg.agent}`}
+                          >
+                            {msg.agent}
+                          </span>
+                        )}
+                      </div>
                       {renderContent(msg.content, msg.role)}
                       {msg.tool_calls && msg.tool_calls.length > 0 && (
                         <div className="mt-2 space-y-1">

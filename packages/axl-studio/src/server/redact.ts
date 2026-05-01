@@ -165,6 +165,8 @@ export function redactMemoryList(
  *   - `role`                                       — system/user/assistant/tool
  *   - `name`                                       — tool/function name on
  *     role='tool' messages (non-PII identifier)
+ *   - `agent`                                      — config-time agent name on
+ *     assistant messages (non-PII identifier)
  *   - `tool_call_id`                               — join key for tool responses
  *   - `tool_calls[*].id`                           — call ID
  *   - `tool_calls[*].type`                         — always 'function'
@@ -186,6 +188,7 @@ function redactChatMessage(msg: ChatMessage): ChatMessage {
     role: msg.role,
     content: REDACTED,
     ...(msg.name !== undefined ? { name: msg.name } : {}),
+    ...(msg.agent !== undefined ? { agent: msg.agent } : {}),
     ...(msg.tool_call_id !== undefined ? { tool_call_id: msg.tool_call_id } : {}),
     ...(msg.tool_calls !== undefined
       ? {

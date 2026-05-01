@@ -357,9 +357,13 @@ describe('Session concurrency — per-session serializer', () => {
     // First exchange (abandoned stream) + second exchange (send) = 4 entries.
     expect(history.length).toBe(4);
     expect(history[0]).toEqual({ role: 'user', content: 'abandoned' });
-    expect(history[1]).toEqual({ role: 'assistant', content: 'reply-to-abandoned' });
+    expect(history[1]).toEqual({ role: 'assistant', content: 'reply-to-abandoned', agent: 'echo' });
     expect(history[2]).toEqual({ role: 'user', content: 'after-abandoned' });
-    expect(history[3]).toEqual({ role: 'assistant', content: 'reply-to-after-abandoned' });
+    expect(history[3]).toEqual({
+      role: 'assistant',
+      content: 'reply-to-after-abandoned',
+      agent: 'echo',
+    });
 
     await runtime.shutdown();
   });
@@ -399,7 +403,7 @@ describe('Session concurrency — per-session serializer', () => {
     const persisted = await session.history();
     expect(persisted).toEqual([
       { role: 'user', content: 'second' },
-      { role: 'assistant', content: 'reply-to-second' },
+      { role: 'assistant', content: 'reply-to-second', agent: 'echo' },
     ]);
 
     // For stream(): the saveSession failure is caught inside the `done`

@@ -839,6 +839,17 @@ export type ChatMessage = {
   tool_call_id?: string;
   /** Provider-specific opaque metadata that must round-trip through conversation history. */
   providerMetadata?: Record<string, unknown>;
+  /** Name of the agent that produced this message. Populated on `assistant`
+   *  messages committed via `ctx.ask()`; absent on `user` messages and on
+   *  assistant messages pushed by external callers (e.g., the
+   *  `Session.send` fallback when no agent context is available).
+   *
+   *  This is observability metadata only — it is NOT sent on the wire to
+   *  any provider. Provider adapters cherry-pick the fields they need
+   *  (`role`, `content`, `name`, `tool_calls`, `tool_call_id`) and ignore
+   *  the rest. Future per-agent history filtering (`AgentConfig.sessionScope`)
+   *  will use this field; today it is purely informational. */
+  agent?: string;
 };
 
 export type ToolCallMessage = {

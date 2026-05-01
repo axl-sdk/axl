@@ -233,6 +233,21 @@ describe('redactSessionHistory', () => {
   it('handles zero-length history', () => {
     expect(redactSessionHistory([], true)).toEqual([]);
   });
+
+  it('preserves agent stamp on assistant messages (non-PII config-time identifier)', () => {
+    const history: ChatMessage[] = [
+      { role: 'assistant', content: 'private response', agent: 'triage' },
+    ];
+    const out = redactSessionHistory(history, true);
+    expect(out[0].content).toBe('[redacted]');
+    expect(out[0].agent).toBe('triage');
+  });
+
+  it('omits agent when undefined (no spurious key on user messages)', () => {
+    const history: ChatMessage[] = [{ role: 'user', content: 'hi' }];
+    const out = redactSessionHistory(history, true);
+    expect('agent' in out[0]).toBe(false);
+  });
 });
 
 describe('redactValue (generic scalar)', () => {

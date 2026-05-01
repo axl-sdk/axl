@@ -1903,7 +1903,7 @@ export class WorkflowContext<TInput = unknown> {
         attempt: lastStartAttempt,
         maxAttempts: lastStartMaxAttempts,
       });
-      this.pushAssistantToSessionHistory(content, response.providerMetadata);
+      this.pushAssistantToSessionHistory(content, agent._name, response.providerMetadata);
       return validated ?? content;
     }
 
@@ -1912,15 +1912,18 @@ export class WorkflowContext<TInput = unknown> {
 
   /**
    * Push the final assistant message into session history, preserving providerMetadata
-   * (e.g., Gemini thought signatures needed for multi-turn reasoning context).
+   * (e.g., Gemini thought signatures needed for multi-turn reasoning context) and
+   * stamping the agent name for observability + future per-agent scoping.
    */
   private pushAssistantToSessionHistory(
     content: string,
+    agentName: string,
     providerMetadata?: Record<string, unknown>,
   ): void {
     this.sessionHistory.push({
       role: 'assistant',
       content,
+      agent: agentName,
       ...(providerMetadata ? { providerMetadata } : {}),
     });
   }

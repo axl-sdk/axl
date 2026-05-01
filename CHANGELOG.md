@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ChatMessage.agent` — assistant messages carry the originating agent name.** Phase 1 of multi-agent session support. Every assistant message committed via `ctx.ask()` is now stamped with `agent: agent._name` in the persisted session history. The field is additive and optional — `user` messages and external assistant pushes (e.g., the `Session.send` fallback when no agent context is available) leave it `undefined`. Provider adapters cherry-pick the wire fields they need (`role`, `content`, `name`, `tool_calls`, `tool_call_id`) and ignore everything else, so the field never appears on outbound HTTP payloads. Backward compatible: existing serialized sessions without the field deserialize cleanly. The field is observability-only today; per-agent history filtering will land in phase 2 as `AgentConfig.sessionScope`.
+
 ### Fixed
 
 - **Sessions: serialize `send()`/`stream()`/`end()`/`fork()` per session id.** Concurrent calls on the same `sessionId` previously had a read-modify-write race on `StateStore.saveSession` — both calls read the same history snapshot, both appended, and the later writer clobbered the earlier one. `runtime.session('x').send(...)` followed by another `send(...)` on the same id from a parallel handler could lose an entire user/assistant exchange. The fix adds a per-session-id Promise chain (`AxlRuntime._serializeSession`) that `Session.send` / `stream` / `end` / `fork` all thread through. Two `runtime.session('x')` calls now share the same lock (it lives on the runtime, not the Session instance). `end()` no longer "resurrects" a session by racing the in-flight save; `fork()` no longer captures a torn pre-save snapshot. `runtime.shutdown()` drains in-flight session work before closing the state store. Cross-process locking is NOT provided — multiple Node processes hitting the same Redis-backed session id will still race; use distinct ids if you need that.

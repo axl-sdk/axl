@@ -138,7 +138,20 @@ export async function importModule(
   filePath: string,
   _parentURL?: string,
 ): Promise<Record<string, unknown>> {
-  if (needsTsxLoader(filePath)) {
+  const url = pathToFileURL(filePath).href;
+  if (!needsTsxLoader(filePath)) {
+    return await import(url);
+  }
+  // For .ts/.tsx/.mts/.cts: try the import first. If the parent process
+  // already registered tsx (e.g. `tsx watch src/cli.ts` for axl-studio
+  // dev mode, or `tsx`-launched user scripts), the import succeeds with
+  // no further work. Only fall back to ensureTsxRegistered when Node
+  // surfaces the "no loader" signature — and only at that point require
+  // tsx to be resolvable from this module's location.
+  try {
+    return await import(url);
+  } catch (err) {
+    if (!isMissingLoaderError(err)) throw err;
     const registered = await ensureTsxRegistered();
     if (!registered) {
       throw new Error(
@@ -148,8 +161,17 @@ export async function importModule(
           `  disabled, install it explicitly: npm install -D tsx`,
       );
     }
+    return await import(url);
   }
-  return await import(pathToFileURL(filePath).href);
+}
+
+/** Detect Node's "this extension has no loader" error so we can decide
+ *  whether to attempt tsx registration. Both ESM and CJS branches surface
+ *  recognizable substrings; user code throwing for unrelated reasons must
+ *  NOT trigger our registration fallback. */
+function isMissingLoaderError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return /Unknown file extension|Cannot use import statement outside a module/i.test(err.message);
 }
 
 // ── Glob expansion ────────────────────────────────────────────────

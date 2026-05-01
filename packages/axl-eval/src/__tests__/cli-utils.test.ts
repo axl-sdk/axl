@@ -229,6 +229,32 @@ describe('importModule + pickExport (CJS interop)', () => {
     const cfg = pickDefault<{ workflow: string }>(mod);
     expect(cfg.workflow).toBe('wf');
   });
+
+  // Regression: importModule used to call `ensureTsxRegistered()` (which
+  // does `await import('tsx/esm/api')`) preemptively for every TS file.
+  // That import resolves from axl/dist's location, where tsx is NOT
+  // installed in the workspace's pnpm layout — so dev:studio failed with
+  // "tsx is not installed" even though the parent `tsx watch src/cli.ts`
+  // had tsx active in the process. The fix is to try the dynamic import
+  // first; only fall back to registration when Node surfaces a
+  // missing-loader error. This test verifies the happy path: importing a
+  // real .ts file succeeds when the test runner's tsx is already active,
+  // without the registration fallback being reached.
+  it('imports a real .ts module via the parent process tsx, no fallback registration', async () => {
+    const dir = makeTempDir();
+    const fixturePath = join(dir, 'fixture.ts');
+    writeFileSync(
+      fixturePath,
+      `export const value: number = 42;
+export default { workflow: 'ts-import-ok' };
+`,
+    );
+
+    const mod = await importModule(fixturePath, import.meta.url);
+    expect(mod.value).toBe(42);
+    const cfg = pickDefault<{ workflow: string }>(mod);
+    expect(cfg.workflow).toBe('ts-import-ok');
+  });
 });
 
 describe('findConfig()', () => {

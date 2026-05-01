@@ -212,6 +212,18 @@ export async function seedLive(runtime: AxlRuntime): Promise<void> {
     await session4.send('structured-workflow', { question: 'What are TypeScript generics?' });
     await session4.send('structured-workflow', { question: 'Explain React Server Components' });
 
+    // Multi-agent session — exercises ChatMessage.agent stamps. The
+    // qa-workflow-multistep workflow calls ctx.ask(mathAgent) then
+    // ctx.ask(qaAgent), so the persisted history alternates between the
+    // two agents and the Session Manager panel renders distinct badges.
+    const session5 = runtime.session('session-multi-agent-attribution');
+    await session5.send('qa-workflow-multistep', {
+      question: 'What is the time complexity of quicksort?',
+    });
+    await session5.send('qa-workflow-multistep', {
+      question: 'Explain the difference between BFS and DFS',
+    });
+
     // qa-eval model-upgrade story: three cohorts spread across 10 days.
     await seedQaEvalCohorts(runtime);
     await seedRagEval(runtime);

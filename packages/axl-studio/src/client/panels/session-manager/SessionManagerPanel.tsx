@@ -35,6 +35,11 @@ export function SessionManagerPanel() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [replayIndex, setReplayIndex] = useState<number | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  // When set, the message list dims rows whose `agent` doesn't match.
+  // Click an agent badge to set/clear. Phase-1 polish for multi-agent
+  // sessions; doesn't filter the array (so indices and replay slider
+  // semantics stay intact).
+  const [highlightedAgent, setHighlightedAgent] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
   const { data: sessions = [] } = useQuery({
@@ -233,43 +238,65 @@ export function SessionManagerPanel() {
 
                 {/* Messages */}
                 <div className="space-y-3">
-                  {displayMessages.map((msg: ChatMessage, i: number) => (
-                    <div
-                      key={i}
-                      className={`p-3 rounded-xl text-sm ${
-                        msg.role === 'user'
-                          ? 'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] ml-8'
-                          : msg.role === 'assistant'
-                            ? 'bg-[hsl(var(--secondary))] mr-8'
-                            : 'bg-[hsl(var(--muted))] text-xs font-mono'
-                      }`}
-                    >
-                      <div className="text-xs font-medium mb-1 opacity-70 flex items-center gap-1.5">
-                        <span>{msg.role}</span>
-                        {msg.agent && (
-                          <span
-                            className="px-1.5 py-0.5 rounded font-mono text-[10px] bg-[hsl(var(--background))]/40"
-                            title={`Committed by agent: ${msg.agent}`}
-                          >
-                            {msg.agent}
-                          </span>
+                  {displayMessages.map((msg: ChatMessage, i: number) => {
+                    const dimmed =
+                      highlightedAgent !== null &&
+                      msg.role === 'assistant' &&
+                      msg.agent !== highlightedAgent;
+                    return (
+                      <div
+                        key={i}
+                        className={`p-3 rounded-xl text-sm transition-opacity ${
+                          dimmed ? 'opacity-30' : ''
+                        } ${
+                          msg.role === 'user'
+                            ? 'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] ml-8'
+                            : msg.role === 'assistant'
+                              ? 'bg-[hsl(var(--secondary))] mr-8'
+                              : 'bg-[hsl(var(--muted))] text-xs font-mono'
+                        }`}
+                      >
+                        <div className="text-xs font-medium mb-1 flex items-center gap-1.5">
+                          <span className="opacity-70">{msg.role}</span>
+                          {msg.agent && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setHighlightedAgent(
+                                  highlightedAgent === msg.agent ? null : (msg.agent ?? null),
+                                )
+                              }
+                              className={`px-1.5 py-0.5 rounded font-mono text-[10px] truncate max-w-[12rem] cursor-pointer transition-colors ${
+                                highlightedAgent === msg.agent
+                                  ? 'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))]'
+                                  : 'bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--accent-foreground))]'
+                              }`}
+                              title={
+                                highlightedAgent === msg.agent
+                                  ? `Click to clear filter`
+                                  : `Click to highlight messages from ${msg.agent}`
+                              }
+                            >
+                              {msg.agent}
+                            </button>
+                          )}
+                        </div>
+                        {renderContent(msg.content, msg.role)}
+                        {msg.tool_calls && msg.tool_calls.length > 0 && (
+                          <div className="mt-2 space-y-1">
+                            {msg.tool_calls.map((tc) => (
+                              <details key={tc.id} className="text-xs">
+                                <summary className="cursor-pointer font-mono">
+                                  {tc.function.name}
+                                </summary>
+                                <JsonViewer data={safeParseJson(tc.function.arguments)} collapsed />
+                              </details>
+                            ))}
+                          </div>
                         )}
                       </div>
-                      {renderContent(msg.content, msg.role)}
-                      {msg.tool_calls && msg.tool_calls.length > 0 && (
-                        <div className="mt-2 space-y-1">
-                          {msg.tool_calls.map((tc) => (
-                            <details key={tc.id} className="text-xs">
-                              <summary className="cursor-pointer font-mono">
-                                {tc.function.name}
-                              </summary>
-                              <JsonViewer data={safeParseJson(tc.function.arguments)} collapsed />
-                            </details>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}

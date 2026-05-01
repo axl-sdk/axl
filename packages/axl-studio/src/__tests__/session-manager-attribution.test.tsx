@@ -96,4 +96,74 @@ describe('SessionManagerPanel — agent attribution badge', () => {
     const userHits = screen.queryAllByText('user');
     expect(userHits.length).toBe(1);
   });
+
+  it('clicking an agent badge highlights only matching assistant rows; clicking again clears', async () => {
+    fetchSessionsMock.mockResolvedValue([{ id: 'sess-3' }]);
+    fetchSessionMock.mockResolvedValue({
+      id: 'sess-3',
+      history: [
+        { role: 'user', content: 'q1' },
+        { role: 'assistant', content: 'a1', agent: 'triage' },
+        { role: 'user', content: 'q2' },
+        { role: 'assistant', content: 'a2', agent: 'billing' },
+        { role: 'assistant', content: 'a3', agent: 'triage' },
+      ],
+    });
+
+    renderWithQuery(<SessionManagerPanel />);
+    fireEvent.click(await screen.findByText('sess-3'));
+    await waitFor(() => expect(screen.getByText('a1')).toBeInTheDocument());
+
+    // Each message renders content via <div className="whitespace-pre-wrap">{content}</div>;
+    // that's a direct child of the bubble div. Walk up one level.
+    const rowOf = (text: string): HTMLElement => screen.getByText(text).parentElement!;
+
+    // Initially nothing is dimmed.
+    expect(rowOf('a1').className).not.toMatch(/opacity-30/);
+    expect(rowOf('a2').className).not.toMatch(/opacity-30/);
+    expect(rowOf('a3').className).not.toMatch(/opacity-30/);
+
+    // Click the first 'triage' badge (button).
+    const triageBadge = screen.getAllByRole('button', { name: /triage/i })[0];
+    fireEvent.click(triageBadge);
+
+    // Only the 'billing' assistant row should be dimmed; user rows are
+    // untouched (we only dim assistant rows).
+    expect(rowOf('a1').className).not.toMatch(/opacity-30/);
+    expect(rowOf('a2').className).toMatch(/opacity-30/);
+    expect(rowOf('a3').className).not.toMatch(/opacity-30/);
+    expect(rowOf('q1').className).not.toMatch(/opacity-30/);
+    expect(rowOf('q2').className).not.toMatch(/opacity-30/);
+
+    // Click again to clear.
+    fireEvent.click(triageBadge);
+    expect(rowOf('a1').className).not.toMatch(/opacity-30/);
+    expect(rowOf('a2').className).not.toMatch(/opacity-30/);
+    expect(rowOf('a3').className).not.toMatch(/opacity-30/);
+  });
+
+  it('badge has its own color (not inheriting opacity-70 from the role row)', async () => {
+    // Regression: pre-fix the role+badge wrapper had `opacity-70`, which
+    // applied to the badge too — bad contrast on light themes. The fix
+    // moves opacity to just the role span and gives the badge muted-fg
+    // colors. Tripwire so a future refactor doesn't bring the bug back.
+    fetchSessionsMock.mockResolvedValue([{ id: 'sess-4' }]);
+    fetchSessionMock.mockResolvedValue({
+      id: 'sess-4',
+      history: [{ role: 'assistant', content: 'reply', agent: 'triage' }],
+    });
+
+    renderWithQuery(<SessionManagerPanel />);
+    fireEvent.click(await screen.findByText('sess-4'));
+    await waitFor(() => expect(screen.getByText('reply')).toBeInTheDocument());
+
+    const badge = screen.getByRole('button', { name: /triage/i });
+    const wrapper = badge.parentElement!;
+    // The wrapper must NOT carry `opacity-70` (which would propagate to the
+    // badge child and crush contrast).
+    expect(wrapper.className).not.toMatch(/(?:^|\s)opacity-70(?:\s|$)/);
+    // The badge should carry its own muted-foreground color so it's
+    // visible regardless of theme.
+    expect(badge.className).toMatch(/text-\[hsl\(var\(--muted-foreground\)\)\]/);
+  });
 });

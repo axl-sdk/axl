@@ -217,7 +217,17 @@ export type SessionDetail = {
  *  narrowed to the fields the Session Manager and other panels need to
  *  render. `agent` is populated on assistant messages committed via
  *  `ctx.ask()` (added in 0.18) — used by the panel to badge each
- *  assistant turn with its originating agent. */
+ *  assistant turn with its originating agent.
+ *
+ *  Drift tripwire: the inline type assertion below makes adding a key
+ *  to the client type that does NOT exist on `@axlsdk/axl`'s
+ *  `ChatMessage` a typecheck error. Value types may widen
+ *  intentionally (e.g., `role: string` vs core's `ChatRole` union — UIs
+ *  must render unknown roles defensively); only the key set is locked
+ *  down here.
+ *
+ *  When core adds a new field that this panel SHOULD render (the way
+ *  `agent` was added in 0.18), update this type. */
 export type ChatMessage = {
   role: string;
   content: string;
@@ -227,6 +237,18 @@ export type ChatMessage = {
     function: { name: string; arguments: string };
   }>;
 };
+
+// Compile-time tripwire: every key on the client `ChatMessage` must
+// also exist on the core `@axlsdk/axl` `ChatMessage`. Both the type
+// alias chain below and the import are erased at build
+// (verbatimModuleSyntax + types-only) so this adds zero runtime cost.
+import type { ChatMessage as _CoreChatMessage } from '@axlsdk/axl';
+type _AssertTrue<T extends true> = T;
+type _ClientKeysSubsetOfCore =
+  Exclude<keyof ChatMessage, keyof _CoreChatMessage> extends never ? true : false;
+type _DriftTripwire = _AssertTrue<_ClientKeysSubsetOfCore>;
+// Reference the alias once so unused-warnings stay quiet — purely type-level.
+export type _ChatMessageDriftCheck = _DriftTripwire;
 
 /** Handoff record. `duration` is target ask duration (oneway) or
  *  round-trip wall-clock (roundtrip); `toAskId` correlates to the

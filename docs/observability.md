@@ -172,15 +172,66 @@ Unknown models report `tokens` but no `cost`. The Studio Cost Dashboard renders 
 
 ### Observation paths
 
-Three ways to observe what happens during a workflow run. Pick by scope:
+Four ways to observe what happens during a workflow run. Pick by scope:
 
 | Path | Scope | When to use |
 |------|-------|-------------|
-| `runtime.stream(name, input)` → `AxlStream` | One specific execution | Per-run UIs (chat streaming, progress bars, waterfalls). Returns an `AsyncIterable<AxlEvent>` plus curated views (`.text`, `.lifecycle`, `.textByAsk`, `.fullText`) and a `.promise` for the final result |
+| `runtime.stream(name, input)` → `AxlStream` | One specific execution (wire) | Per-run UIs (chat streaming, progress bars, waterfalls). Returns an `AsyncIterable<AxlEvent>` plus curated views (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`, `.fullText`) and a `.promise` for the final result |
+| `ctx.events` (`AxlEventBus`) | One specific context (inside the workflow handler) | Observe events **between `ctx.ask()` calls** in a workflow handler, or on ad-hoc contexts from `runtime.createContext()`. Same `AxlEvent` union as `AxlStream`; same curated views (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`). Lazy — zero overhead if no consumer subscribes |
 | `runtime.on('trace', event => …)` | Every execution | Cross-execution observability (background telemetry, cost dashboards, audit logs). Receives every `AxlEvent` from every `execute()` / `stream()` / `createContext()` call |
-| `onToken` / `onToolCall` / `onAgentStart` on `runtime.createContext()` | One ad-hoc context | Tool tests, evals, prototyping — situations where there's no top-level execution to subscribe to and you're calling `ctx.ask()` directly |
+| `onToken` / `onToolCall` / `onAgentStart` on `runtime.createContext()` | One ad-hoc context (legacy) | Tool tests, evals, prototyping. Superseded by `ctx.events` — the callbacks remain for back-compat but the iterable is the unified path forward |
 
-`runtime.execute()` itself is final-result-only by design — it does **not** accept `onToken` or any other event callback. To observe a workflow run, use `runtime.stream()` (per-execution) or `runtime.on('trace', …)` (cross-execution). The unified event model (0.16.0) made `AxlEvent` the canonical wire format; the curated stream views supersede legacy callbacks.
+`runtime.execute()` itself is final-result-only by design — it does **not** accept `onToken` or any other event callback. To observe a workflow run from inside the handler, read `ctx.events`; from outside, use `runtime.stream()` (per-execution) or `runtime.on('trace', …)` (cross-execution).
+
+#### `ctx.events` — observing between `ctx.ask()` calls
+
+The customer use case: a workflow handler that runs several `ctx.ask()` calls and wants to stream `partial_object` events to a UI as they happen.
+
+```typescript
+const wf = workflow({
+  name: 'multi-step',
+  input: z.object({ topic: z.string() }),
+  handler: async (ctx, input) => {
+    // Subscribe BEFORE the first ask — see "Subscribe early" note below.
+    void (async () => {
+      for await (const partial of ctx.events.partialObjects) {
+        ws.send(JSON.stringify({ askId: partial.askId, object: partial.object }));
+      }
+    })();
+
+    const outline = await ctx.ask(planner, input.topic, { schema: outlineSchema });
+    const draft = await ctx.ask(writer, outline, { schema: draftSchema });
+    return draft;
+  },
+});
+```
+
+- **`ctx.events.partialObjects`** is the coalescing view — yields the latest `partial_object` payload per `askId`. When the LLM streams faster than your UI renders, intermediate snapshots are silently superseded; the consumer sees only the most recent state per ask. Memory-bounded by `O(active asks)`, not `O(events emitted)`. Listener-based, so it does NOT race with the main `for await (const e of ctx.events)` iterator.
+- **`ctx.events.lifecycle`** filters to structural events (`ask_start`, `ask_end`, `agent_call_*`, `tool_call_*`, `handoff_*`, etc.) — useful for waterfall UIs.
+- **`ctx.events.text`** yields root-only token chunks (chat-bubble view).
+- **`ctx.events.textByAsk`** yields `{ askId, agent?, text }` for split-pane UIs that render each sub-agent in its own lane.
+- **Subscribe early.** The bus is allocated lazily on first `ctx.events` access, AND the streaming code path inside `ctx.ask()` activates only when an observer is present at the time the ask starts. If you allocate `ctx.events` AFTER a `ctx.ask()` has begun, that in-flight ask will not stream `token` / `partial_object` events. Subsequent asks (started after the bus exists) stream normally — the gate is re-checked per ask. Subscribe before your first ask to capture everything.
+- **Auto-termination.** The bus is finished automatically when the runtime emits `workflow_end` or `error`, so iterators resolve with `done: true` cleanly. For ad-hoc `runtime.createContext()` flows that never run a workflow, call `ctx.disposeEvents()` when done observing.
+- **Child contexts** (the agent-as-tool pattern) share the parent's bus via a mutable slot, so nested-ask events bubble up to the parent's `ctx.events` iterator with full `askId` / `parentAskId` / `depth` correlation.
+
+#### Bounded queue and overflow policy
+
+Both `AxlStream` and `ctx.events` apply a default-on safety cap on their iterator queue. Configure via the `events` option on `runtime.execute()` / `runtime.stream()` / `runtime.createContext()`:
+
+```typescript
+runtime.execute('my-workflow', input, {
+  events: {
+    maxQueued: 5_000,                          // default 10_000
+    onOverflow: 'drop-oldest-non-terminal',    // default; or 'throw'
+  },
+});
+```
+
+- **`maxQueued`** (default `10_000`): soft cap on events buffered while waiting for a consumer. Set to `Infinity` to disable.
+- **`onOverflow: 'drop-oldest-non-terminal'`** (default): when the cap is hit, the oldest non-terminal event is dropped to make room. Terminal events (`done`, `error`, `workflow_end`) always pass through. The first drop per bus emits a one-shot `console.warn` so saturating consumers see the signal without log spam.
+- **`onOverflow: 'throw'`**: throw at the producer call site (i.e., inside `ctx.ask()` / `runtime.execute()`). **This will fail the active workflow** — the throw unwinds the agent loop and the runtime promise rejects. Use only in tests or strict environments where silent drop would mask a problem.
+
+Existing 0.x consumers gain the cap automatically with this release. If your workflow somehow relied on unbounded queueing, opt out with `events: { maxQueued: Infinity }`.
 
 ### Streaming callbacks: `meta` parameter
 

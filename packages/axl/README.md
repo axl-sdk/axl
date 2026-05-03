@@ -331,6 +331,36 @@ for await (const event of sessionStream) {
 }
 ```
 
+#### Observing inside a workflow handler with `ctx.events`
+
+To observe events between `ctx.ask()` calls — e.g., streaming `partial_object` snapshots to a UI as a multi-step structured-output workflow runs — read `ctx.events`. Same `AxlEvent` union and curated views (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`) as `AxlStream`, scoped to the current context (and its children — agent-as-tool nested asks bubble up).
+
+```typescript
+const wf = workflow({
+  name: 'two-step',
+  input: z.object({ topic: z.string() }),
+  handler: async (ctx, input) => {
+    // Subscribe BEFORE the first ask. The bus is allocated lazily, AND
+    // the streaming code path inside ctx.ask() activates only when an
+    // observer is present at the time the ask starts.
+    void (async () => {
+      for await (const partial of ctx.events.partialObjects) {
+        // .partialObjects is the coalescing view: yields the LATEST
+        // payload per askId. Memory bounded by O(active asks), not
+        // O(events). Designed for streaming-structured-output UIs.
+        ws.send(JSON.stringify({ askId: partial.askId, object: partial.object }));
+      }
+    })();
+
+    const outline = await ctx.ask(planner, input.topic, { schema: outlineSchema });
+    const draft = await ctx.ask(writer, outline, { schema: draftSchema });
+    return draft;
+  },
+});
+```
+
+Subscribe before the first `ctx.ask()` — the streaming code path inside `ctx.ask()` only activates when an observer is present at the time the ask starts. The bus auto-terminates on `workflow_end` / `error`. Configure the iterator-queue cap and overflow policy via `runtime.execute(..., { events: { maxQueued, onOverflow } })` — defaults (`maxQueued: 10_000`, `onOverflow: 'drop-oldest-non-terminal'`) are a default-on safety net against slow consumers. See [`docs/observability.md`](../../docs/observability.md#observation-paths) for the full Observation paths comparison and [`docs/api-reference.md`](../../docs/api-reference.md#ctxevents) for the type table.
+
 ### Context Primitives
 
 All available on `ctx` inside workflow handlers. See the [API Reference](../../docs/api-reference.md) for complete option types, valid values, and defaults.

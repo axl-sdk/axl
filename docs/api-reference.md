@@ -193,6 +193,9 @@ console.log(ctx.totalCost); // accumulated cost from all agent calls
 | `onToolCall` | `(call: { name, args, callId? }, meta: CallbackMeta) => void` | — | Fires when an agent invokes a tool. Same `meta` shape as `onToken` |
 | `onAgentStart` | `(info: { agent, model }, meta: CallbackMeta) => void` | — | Fires when an agent begins processing. Same `meta` shape as `onToken` |
 | `awaitHumanHandler` | `(options) => Promise<HumanDecision>` | — | Handler for tool approval requests. Required when the agent uses tools with `requireApproval` — without it, the call throws a clear error |
+| `events` | `EventStreamOptions` | `{ maxQueued: 10_000, onOverflow: 'drop-oldest-non-terminal' }` | Configures the iterator-queue cap and overflow policy on the lazy `ctx.events` bus. See [`EventStreamOptions`](#eventstreamoptions) |
+
+> **`onToken` / `onToolCall` / `onAgentStart` are superseded by `ctx.events`.** The callbacks remain for back-compat. New code should iterate `ctx.events` (an `AxlEventBus` — same `AsyncIterable<AxlEvent>` + `EventEmitter` shape as `AxlStream`). See [`ctx.events`](#ctxevents) below.
 
 **When to use vs. workflows:** Use `createContext()` when you want to call agents without registering a workflow — eval files, one-off scripts, tests, API endpoints. Use `runtime.execute()` when you want execution lifecycle tracking (status, duration, history in Studio's executions panel).
 
@@ -502,6 +505,67 @@ const ctx = runtime.createContext();
 await ctx.ask(agent, 'hello');
 console.log(ctx.totalCost); // e.g. 0.05
 ```
+
+---
+
+### `ctx.events`
+
+Lazy `AxlEventBus` exposing every `AxlEvent` emitted by this context (and its child contexts — agent-as-tool nested asks bubble up). Same `AsyncIterable<AxlEvent>` + `EventEmitter` shape as `AxlStream`, with the same curated views.
+
+```typescript
+const wf = workflow({
+  name: 'two-step',
+  input: z.object({ topic: z.string() }),
+  handler: async (ctx, input) => {
+    // Subscribe BEFORE the first ctx.ask() — events are not buffered for
+    // late subscribers, AND the streaming code path inside ctx.ask()
+    // activates only when an observer is present at the time the ask starts.
+    void (async () => {
+      for await (const partial of ctx.events.partialObjects) {
+        ws.send(JSON.stringify({ askId: partial.askId, object: partial.object }));
+      }
+    })();
+
+    const outline = await ctx.ask(planner, input.topic, { schema: outlineSchema });
+    const draft = await ctx.ask(writer, outline, { schema: draftSchema });
+    return draft;
+  },
+});
+```
+
+| Member | Type | Description |
+|--------|------|-------------|
+| `[Symbol.asyncIterator]` | `AsyncIterator<AxlEvent>` | Iterate every event in emission order via `for await` |
+| `.text` | `AsyncIterable<string>` | Root-only token chunks (chat-bubble view) |
+| `.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only — `ask_*`, `agent_call_*`, `tool_call_*`, `handoff_*`, `pipeline`, `verify`, `workflow_*`, `checkpoint_*`, `await_human*`. Skips per-token chatter |
+| `.textByAsk` | `AsyncIterable<{ askId, agent?, text }>` | Per-ask token chunks for split-pane UIs |
+| `.partialObjects` | `AsyncIterable<{ askId, agent?, object }>` | **Coalescing view** — yields the latest `partial_object` payload per `askId`. Listener-based: does NOT race with the main iterator; running both concurrently each receive every event. Memory bounded by `O(active asks)`, not `O(events emitted)` |
+| `.on(type, handler)` / `.off(type, handler)` | `(this)` | Subscribe/unsubscribe per AxlEvent type. Names outside `AxlEventType` are silently ignored |
+| `.isFinished` | `boolean` | Whether the bus has been finalized (auto-set on `workflow_end` / `error`) |
+
+**Lifecycle:**
+
+- The bus is allocated lazily on first `ctx.events` access. Contexts that never observe pay zero overhead.
+- Auto-terminates when `emitEvent` fires `workflow_end` or `error`. Iterators resolve with `done: true`.
+- For ad-hoc `runtime.createContext()` flows that never run a workflow, call `ctx.disposeEvents()` to terminate iterators manually.
+- Child contexts (created via `ctx.createChildContext()`, used internally by the agent-as-tool pattern) share the parent's bus through a mutable slot, so a late subscription on the parent still receives events from a child that already exists.
+
+**Subscribe early.** Events are not buffered for late subscribers, AND the streaming code path inside `ctx.ask()` only activates when an observer is present at the time the ask starts. If you allocate `ctx.events` AFTER a `ctx.ask()` has begun, that in-flight ask will not stream `token` / `partial_object` events. Subsequent asks (started after the bus exists) stream normally — the gate is re-checked per ask. Subscribe at the top of the workflow handler to capture everything.
+
+#### `EventStreamOptions`
+
+Configures the iterator-queue cap and overflow policy on `ctx.events` and on the `AxlStream` returned by `runtime.stream()`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `maxQueued` | `number` | `10_000` | Soft cap on events buffered while waiting for a consumer. Terminal events (`done`, `error`, `workflow_end`) are exempt. Set to `Infinity` to disable |
+| `onOverflow` | `'drop-oldest-non-terminal' \| 'throw'` | `'drop-oldest-non-terminal'` | Policy on cap exceeded. `'drop-oldest-non-terminal'` drops the oldest non-terminal event and emits a one-shot `console.warn` per bus instance. `'throw'` throws at the producer call site — **this will fail the active workflow** (the throw unwinds the agent loop and the runtime promise rejects). Use only in tests / strict environments |
+
+**Behavior change in this release.** Existing `AxlStream` consumers on 0.x gain the cap automatically. If your workflow somehow relied on unbounded queueing, opt out via `events: { maxQueued: Infinity }`.
+
+### `ctx.disposeEvents()`
+
+Manually finish the `ctx.events` bus, terminating any active iterators with `done: true`. Idempotent. Useful for ad-hoc `runtime.createContext()` flows that never emit a `workflow_end` / `error` terminal — without this call, observers iterating `for await (const e of ctx.events)` would hang. Workflow-driven contexts (`runtime.execute` / `runtime.stream`) terminate automatically and don't need this.
 
 ---
 
@@ -976,9 +1040,10 @@ for await (const event of stream) {
 | Accessor | Type | Description |
 |---|---|---|
 | `for await ... of stream` | `AsyncIterable<AxlEvent>` | Every `AxlEvent`, in the order emitted |
-| `stream.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only (`ask_*`, `agent_call_*`, `tool_call_*`, `tool_approval`, `tool_denied`, `handoff_start`, `handoff_return`, `delegate`, `pipeline`, `verify`, `workflow_*`). Skips token chatter |
+| `stream.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only — `ask_*`, `agent_call_*`, `tool_call_*`, `tool_approval`, `tool_denied`, `handoff_start`, `handoff_return`, `delegate`, `pipeline`, `verify`, `workflow_*`, `checkpoint_save`, `checkpoint_replay`, `await_human`, `await_human_resolved`. Skips token chatter |
 | `stream.text` | `AsyncIterable<string>` | Root-only token stream (`depth === 0`). Nested-ask tokens (agent-as-tool handlers, `delegate`, `race` branches) are omitted — use `stream.textByAsk` or filter the raw stream on `event.depth >= 1` to see them |
 | `stream.textByAsk` | `AsyncIterable<{ askId, agent?, text }>` | **Every** token tagged with the producing ask frame. Complements `.text` — use for split-pane UIs that render each sub-agent's output in its own lane, grouped by `askId` |
+| `stream.partialObjects` | `AsyncIterable<{ askId, agent?, object }>` | **Coalescing view** — yields the latest `partial_object` payload per `askId`. Listener-based: does NOT race with the main iterator. Memory bounded by `O(active asks)`, not `O(events)`. The right shape for streaming-structured-output UIs |
 | `stream.fullText` | `string` | Accumulated text from root-only tokens, committed on `pipeline(committed)`. Retried-attempt tokens are discarded on `pipeline(failed)` or `ask_end({ok:false})` so only the winning attempt's text appears |
 | `stream.promise` | `Promise<unknown>` | Resolves with the workflow result; rejects with the thrown error. Errors are ALSO delivered via the iterator and `.on('error', ...)` (as a synthesized `AxlEvent{type:'error'}`). The promise has an internal no-op `.catch(() => {})` so consumers who only read the iterator never see unhandled-rejection warnings |
 | `stream.on('done', ...)` / `.on('error', ...)` | `EventEmitter` | Terminal events. `done.data = { result }`, `error.data = { message, name?, code? }` |
@@ -1028,8 +1093,10 @@ const runtime = new AxlRuntime({
 |--------|------|---------|-------------|
 | `metadata` | `Record<string, unknown>` | `{}` | Metadata passed to the workflow context. Reserved keys: `sessionId`, `sessionHistory`, `resumeMode` |
 | `awaitHumanHandler` | `(options) => Promise<HumanDecision>` | — | In-process approval handler for tool calls with `requireApproval`. Parity with `CreateContextOptions.awaitHumanHandler` — lets tests and embedded use cases resolve approvals inline instead of suspending execution and polling `getPendingDecisions()` |
+| `signal` | `AbortSignal` | — | External abort signal. Cancels the workflow exactly as `runtime.abort(executionId)` would. Lets callers use the standard JS pattern without having to track the execution id |
+| `events` | `EventStreamOptions` | `{ maxQueued: 10_000, onOverflow: 'drop-oldest-non-terminal' }` | Configures the iterator-queue cap and overflow policy on `ctx.events` (and on the `AxlStream` returned by `runtime.stream()`). See [`EventStreamOptions`](#eventstreamoptions) |
 
-> **No `onToken` here.** `runtime.execute()` is final-result-only by design. To observe tokens, tool calls, or any other event during a workflow run, use `runtime.stream()` and consume the returned `AxlStream` (see [`AxlStream`](#axlstream)). Per-execution callbacks (`onToken` / `onToolCall` / `onAgentStart`) only exist on `runtime.createContext()`, where there is no stream object to subscribe to.
+> **No `onToken` here.** `runtime.execute()` is final-result-only by design. To observe tokens, tool calls, or any other event from inside the workflow handler, read `ctx.events` (see [`ctx.events`](#ctxevents)). To observe from outside, use `runtime.stream()` and consume the returned `AxlStream`. Per-execution callbacks (`onToken` / `onToolCall` / `onAgentStart`) only exist on `runtime.createContext()`, where they remain for back-compat (the iterable surface on `ctx.events` is the unified path forward).
 
 ### Execution History
 

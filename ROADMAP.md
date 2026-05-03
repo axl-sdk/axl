@@ -24,25 +24,18 @@
 - **Evaluation Framework** — `dataset()`, `scorer()`, `llmScorer()`, `evalCompare()`, `rescore()`, `aggregateRuns()`, CLI with `compare`, `rescore` subcommands, `--runs` multi-run support
 - **Configurable Model Parameters** — `temperature`, `maxTokens`, `effort`, `thinkingBudget`, `includeThoughts`, `toolChoice`, `stop` on `AgentConfig` and per-call via `AskOptions`
 - **Unified Effort** — Cross-provider `effort` parameter (`'none'` | `'low'` | `'medium'` | `'high'` | `'max'`) maps to reasoning_effort (OpenAI o-series + GPT-5.x), adaptive thinking + output_config.effort (Anthropic 4.6), thinkingLevel (Gemini 3.x), thinkingBudget (Gemini 2.x)
+- **Stream-First Observation API (Phase 1)** — `ctx.events` on every `WorkflowContext` exposes the same `AxlEvent` iterable + curated views as `AxlStream` (`.text`, `.lifecycle`, `.textByAsk`, plus the new `.partialObjects` coalescing view). Observe events between `ctx.ask()` calls inside a workflow handler. Bounded-queue safety net (`maxQueued` + `onOverflow`) shipped on both `AxlStream` and `ctx.events`. The `onToken` / `onToolCall` / `onAgentStart` callbacks on `runtime.createContext()` remain for back-compat — Phase 2 (deprecation warning) and Phase 3 (removal at next major) tracked separately
 
 ### Planned
 
-#### Stream-First Observation API
+#### Stream-First Observation API — Phases 2 & 3
 
-Today the SDK has two distinct shapes for observing what happens during agent execution:
+Phase 1 (above) shipped `ctx.events` and the bounded-queue safety net. Remaining work:
 
-- **Workflow runs** (`runtime.stream()`) — return an `AxlStream` (`AsyncIterable<AxlEvent>` + curated `.text` / `.lifecycle` / `.textByAsk` / `.fullText` views).
-- **Ad-hoc contexts** (`runtime.createContext()`) — accept legacy `onToken` / `onToolCall` / `onAgentStart` callbacks because there is no top-level stream object to subscribe to.
+- **Phase 2.** Soft-deprecate `onToken` / `onToolCall` / `onAgentStart` on `CreateContextOptions` — keep them working with a one-time console warning pointing at the new iterable. Migrate all in-tree examples (`docs/`, `packages/*/README.md`, `tests/e2e/`) to the iterable.
+- **Phase 3.** Remove the callback options at the next major. Audit `packages/axl-studio/src/server/routes/playground.ts` and `tools.ts` for any embed paths that read the callbacks before removing them.
 
-The callbacks predate the unified event model (0.16.0) where `AxlEvent` became the single canonical wire format. They're a closed set (every new event type would need a new callback), they don't compose, and they force consumers to switch between two paradigms depending on which entry point they used. Cross-execution `runtime.on('trace', …)` is already a third path that papers over the gap.
-
-Plan to unify around the stream/iterable shape:
-
-- **Phase 1.** Expose an `AsyncIterable<AxlEvent>` on the context returned by `runtime.createContext()` (e.g., `ctx.events` or `for await (const e of ctx)`). Same `AxlEvent` union as `AxlStream`. Lets consumers move off callbacks at their own pace.
-- **Phase 2.** Soft-deprecate `onToken` / `onToolCall` / `onAgentStart` on `CreateContextOptions` — keep them working with a one-time console warning pointing at the new iterable.
-- **Phase 3.** Remove the callback options at the next major. Ad-hoc contexts and workflow streams expose the same event shape; `runtime.on('trace', …)` remains the cross-execution path.
-
-Out of scope: adding `onToken` to `runtime.execute()` / `ExecuteOptions`. That would entrench the callback model in a third place. `runtime.execute()` stays final-result-only by design — observation belongs on `stream()` or the runtime trace emitter.
+Out of scope (decided): adding `onToken` to `runtime.execute()` / `ExecuteOptions`. That would entrench the callback model in a third place. `runtime.execute()` stays final-result-only by design — observation belongs on `ctx.events` (inside the handler), `stream()` (per-execution), or the runtime trace emitter (cross-execution).
 
 #### Configurable Session Summarization
 

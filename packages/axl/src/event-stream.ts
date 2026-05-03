@@ -178,6 +178,26 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
    *  curated views (e.g., `partialObjects`) that are listener-based and
    *  need a termination signal independent of any synthetic `done` event. */
   private finishCallbacks: Array<() => void> = [];
+  /**
+   * Latest coalesced partial-object snapshot per `askId`, maintained on
+   * every `_push` regardless of consumer state. Seeds the
+   * `partialObjects` view's `pending` map at subscription time so a
+   * late subscriber recovers the most recent state per ask even if
+   * earlier `partial_object` events were already delivered to a prior
+   * iterator's waiter (and thus removed from `eventQueue`).
+   *
+   * The pre-fix snapshot walked `eventQueue` directly — that misses
+   * events already drained by past consumers. The map walks past
+   * `_push` calls instead, which is the actual definition of "what's
+   * the latest partial per ask". `pipeline(status: 'failed')` clears
+   * the entry for the affected askId so a discarded attempt can't
+   * surface to a future subscriber.
+   *
+   * Memory bound: O(active asks holding a pending partial). Cleared
+   * on `pipeline(failed)` (per ask) and otherwise grows with the
+   * number of distinct askIds that emitted at least one partial.
+   */
+  private latestPartialByAsk = new Map<string, CoalescedPartialObject>();
 
   constructor(options?: EventStreamOptions) {
     const requestedMax = options?.maxQueued ?? DEFAULT_MAX_QUEUED;
@@ -442,35 +462,28 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
           });
         };
 
-        // Snapshot any relevant events ALREADY in the bus's queue at
-        // subscription time. Without this, a consumer that calls
-        // `for await (const p of bus.partialObjects)` AFTER events have
-        // been pushed would see nothing — the listener-based path only
-        // catches future emissions. The snapshot is read-only (does not
-        // mutate `eventQueue`), so the main iterator can still drain
-        // those same events via its own iteration. Coalescing happens
-        // here too: if multiple snapshots exist for the same askId, only
-        // the last one wins.
+        // Seed `pending` from the bus's `latestPartialByAsk` map.
+        // Without this, a consumer that subscribes AFTER `partial_object`
+        // events have been emitted sees nothing — the listener-based
+        // path only catches future emissions, and the `eventQueue`
+        // snapshot misses events already drained by past iterators (a
+        // common case when an `AxlStream` consumer started iterating
+        // before a Studio-style late subscriber connects, or when the
+        // workflow handler iterates `ctx.events` while running).
         //
-        // We replay BOTH partial_object AND pipeline(failed) events from
-        // the queue in original emission order so the same
-        // attempt-discard semantics apply to historical events as to
-        // future ones — without this, a consumer that subscribed after
-        // attempt-N's partial AND a subsequent pipeline(failed) would
-        // still see the discarded snapshot in its first .next() call.
+        // The bus updates `latestPartialByAsk` on every `_push` (in the
+        // `_push` method below) and clears entries on
+        // `pipeline(status: 'failed')`, so the same attempt-discard
+        // semantics apply to historical events as to future ones —
+        // without this, a consumer subscribing after attempt-N's
+        // partial AND a subsequent pipeline(failed) would still see
+        // the discarded snapshot.
         //
-        // Snapshot + subscribe together is atomic under the JS
-        // run-to-completion model: no `_push` can interleave between the
-        // synchronous loop below and the `bus.on(...)` call. If a future
-        // refactor ever introduces async between them, an event could be
-        // missed; pin the invariant if you change the surrounding code.
-        for (const event of self.eventQueue) {
-          if (event.type === 'partial_object') {
-            recordPartial(event);
-          } else if (event.type === 'pipeline' && event.status === 'failed') {
-            const askId = event.askId ?? '';
-            pending.delete(askId);
-          }
+        // Seeding + subscribe together is atomic under the JS
+        // run-to-completion model: no `_push` can interleave between
+        // the synchronous loop below and the `bus.on(...)` call.
+        for (const [askId, value] of self.latestPartialByAsk) {
+          pending.set(askId, value);
         }
 
         // Listener subscribes directly to the inner bus (bypassing the
@@ -610,6 +623,22 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
         err instanceof Error ? err.message : String(err),
       );
     }
+    // Track the latest partial-object snapshot per ask for the
+    // `partialObjects` view's late-subscriber seed. Maintained on every
+    // _push so events delivered to past waiters (and thus absent from
+    // `eventQueue`) still contribute. `pipeline(failed)` clears the
+    // entry so the next subscriber doesn't see a discarded attempt.
+    if (event.type === 'partial_object' && event.data?.object !== undefined) {
+      const askId = event.askId ?? '';
+      this.latestPartialByAsk.set(askId, {
+        askId,
+        agent: event.agent,
+        object: event.data.object,
+        attempt: event.attempt,
+      });
+    } else if (event.type === 'pipeline' && event.status === 'failed') {
+      this.latestPartialByAsk.delete(event.askId ?? '');
+    }
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter({ value: event, done: false });
@@ -633,8 +662,8 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     // 'drop-oldest-non-terminal': scan from head for the oldest non-terminal
     // and splice it out. Terminal events queued earlier (rare in practice
     // but possible) are preserved; if every queued event is terminal, push
-    // the new event anyway and let the queue exceed the cap by one — losing
-    // a terminal event would be worse than a brief overrun.
+    // the new event anyway and let the queue exceed the cap — losing a
+    // terminal event would be worse than a brief overrun.
     let droppedIdx = -1;
     for (let i = 0; i < this.eventQueue.length; i++) {
       if (!TERMINAL_TYPES.has(this.eventQueue[i].type)) {
@@ -642,18 +671,24 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
         break;
       }
     }
+    // One-shot per bus instance — saturating producers shouldn't spam the
+    // console. Warn even on the all-terminal branch (`droppedIdx === -1`)
+    // so the cap-exceeded path is visible: a queue full of terminals is
+    // rare but possible (e.g., a producer hammering pre-failure events
+    // after termination), and silently growing past the cap there would
+    // hide a real problem.
+    if (!this.overflowWarned) {
+      this.overflowWarned = true;
+      console.warn(
+        `[axl] AxlEventBus queue exceeded maxQueued=${this.maxQueued}` +
+          (droppedIdx >= 0
+            ? `; dropping oldest non-terminal events (consumer is slower than producer).`
+            : `; queue is all terminals (preserved past cap so no terminal is lost).`) +
+          ` This warning fires once per bus instance.`,
+      );
+    }
     if (droppedIdx >= 0) {
       this.eventQueue.splice(droppedIdx, 1);
-      if (!this.overflowWarned) {
-        this.overflowWarned = true;
-        // One-shot per bus instance — saturating producers shouldn't spam
-        // the console. Subsequent drops are silent.
-        console.warn(
-          `[axl] AxlEventBus queue exceeded maxQueued=${this.maxQueued}; ` +
-            `dropping oldest non-terminal events (consumer is slower than producer). ` +
-            `This warning fires once per bus instance.`,
-        );
-      }
     }
     this.eventQueue.push(event);
   }

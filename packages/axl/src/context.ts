@@ -754,17 +754,44 @@ export class WorkflowContext<TInput = unknown> {
             // or catch branch above. The fallback covers an internal
             // bug (e.g., a future synchronous throw before either
             // branch runs) so we never silently drop the ask_end event.
-            this.emitEvent({
-              type: 'ask_end',
-              outcome:
-                outcome ??
-                ({
-                  ok: false,
-                  error: 'ask_end emitted without outcome — internal bug',
-                } as const),
-              cost: frame.askCost.value,
-              duration: Date.now() - askStart,
-            });
+            //
+            // Overflow protection on the error path: under `onOverflow:
+            // 'throw'`, this `emitEvent` can throw
+            // `EventStreamOverflowError`. If we're already unwinding
+            // an in-flight error from the catch branch, letting the
+            // overflow propagate would replace it — the user wants to
+            // see WHY their ask failed, not that an unrelated event
+            // couldn't be queued. Log the overflow so it's still
+            // observable; preserve the original error.
+            try {
+              this.emitEvent({
+                type: 'ask_end',
+                outcome:
+                  outcome ??
+                  ({
+                    ok: false,
+                    error: 'ask_end emitted without outcome — internal bug',
+                  } as const),
+                cost: frame.askCost.value,
+                duration: Date.now() - askStart,
+              });
+            } catch (emitErr) {
+              if (emitErr instanceof EventStreamOverflowError && outcome && !outcome.ok) {
+                console.error(
+                  '[axl] ask_end emit overflowed during error path; preserving original error:',
+                  emitErr.message,
+                );
+              } else {
+                // Success-path overflow MUST propagate (documented
+                // strict-mode policy); non-overflow emit errors
+                // (unexpected) shouldn't be silently dropped either.
+                // The branch above explicitly protects the
+                // in-flight-error case where masking would be wrong;
+                // everything else legitimately surfaces from here.
+                // eslint-disable-next-line no-unsafe-finally
+                throw emitErr;
+              }
+            }
           }
         });
       },
@@ -3656,32 +3683,65 @@ export class WorkflowContext<TInput = unknown> {
     // Isolate consumer bugs: a buggy onTrace handler must not crash the
     // workflow. Swallow and forward to console.error so the caller sees
     // the failure in ops but the workflow keeps running.
+    //
+    // Overflow handling: under `onOverflow: 'throw'`, both the wire
+    // bus (AxlStream) and the ctx.events bus can throw
+    // `EventStreamOverflowError`. We push to BOTH and DEFER the throw
+    // until both have run, so a saturating wire-side bus doesn't deny
+    // ctx.events consumers the same event (or vice versa). The
+    // documented policy is "fail the workflow on overflow" — that
+    // still happens, but consumers on the surviving channel see the
+    // last event before the failure cascades. If both buses overflow
+    // for the same event, the first one's error is kept (the second
+    // is logged via console.error so it's still observable).
+    let overflowErr: EventStreamOverflowError | undefined;
     if (this.onTrace) {
       try {
         this.onTrace(finalEvent);
       } catch (err) {
-        // EventStreamOverflowError is a strict-mode signal from the
-        // AxlStream's bus (the runtime's `onTrace` handler in
-        // `runtime.stream()` calls `axlStream._push(event)`, which can
-        // throw under `onOverflow: 'throw'`). The user opted into
-        // failing the workflow on overflow — we must propagate it.
-        // Other exceptions are buggy trace listeners; swallow + log.
-        if (err instanceof EventStreamOverflowError) throw err;
-        console.error(
-          '[axl] onTrace handler threw; trace event dropped:',
-          err instanceof Error ? err.message : String(err),
-        );
+        if (err instanceof EventStreamOverflowError) {
+          overflowErr = err;
+        } else {
+          console.error(
+            '[axl] onTrace handler threw; trace event dropped:',
+            err instanceof Error ? err.message : String(err),
+          );
+        }
       }
     }
     // Fan out to the `ctx.events` bus if any consumer subscribed. Read
     // `_busRef.current` on every call so a late `ctx.events` access
-    // (after this child context already exists) is picked up here. The
-    // throw under `onOverflow: 'throw'` propagates up through this
-    // emitEvent call and unwinds the active ctx.* primitive — that's
-    // the documented behavior of the policy.
+    // (after this child context already exists) is picked up here.
     const bus = this._busRef.current;
     if (bus) {
-      bus._push(finalEvent);
+      try {
+        bus._push(finalEvent);
+      } catch (err) {
+        if (err instanceof EventStreamOverflowError) {
+          if (!overflowErr) {
+            overflowErr = err;
+          } else {
+            // Both buses overflowed on the same event. Keep the first
+            // error (already preserves the failure-first semantic) but
+            // log the second so operators investigating overflow see
+            // both saturating sites.
+            console.error(
+              '[axl] ctx.events bus also overflowed for event "' +
+                finalEvent.type +
+                '"; first overflow already in flight:',
+              err.message,
+            );
+          }
+        } else {
+          // _push catches listener exceptions internally (commit
+          // bf17409). Anything reaching here is unexpected; log and
+          // continue.
+          console.error(
+            '[axl] AxlEventBus._push threw unexpectedly:',
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+      }
     }
     // Auto-terminate the bus on workflow terminals so iterators resolve
     // with `done: true`, and remove the constructor's abort listener so
@@ -3693,5 +3753,6 @@ export class WorkflowContext<TInput = unknown> {
       bus?._finish();
       this.abortListenerCleanup?.();
     }
+    if (overflowErr) throw overflowErr;
   }
 }

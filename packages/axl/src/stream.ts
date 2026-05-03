@@ -30,7 +30,7 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
   /** Composed event bus — owns iterator queue, EventEmitter gating, and
    *  curated views (`.text`, `.lifecycle`, `.textByAsk`). Private; the
    *  public surface is via the delegating methods below. */
-  private readonly events: AxlStreamEventBus;
+  private readonly events: AxlEventBus;
 
   /**
    * Per-ask token buffers split into "in-progress" and "committed" halves
@@ -63,9 +63,10 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
   constructor(options?: EventStreamOptions) {
     super({ objectMode: true, read() {} });
 
-    this.events = new AxlStreamEventBus(() => {
-      this.destroy();
-    }, options);
+    // Inject the iterator-dispose hook so `await using` on a bus
+    // iterator cascades to `Readable.destroy()`. Replaces the previous
+    // private subclass that only existed to override `_disposeIterator`.
+    this.events = new AxlEventBus(options, () => this.destroy());
 
     this.promise = new Promise((resolve, reject) => {
       this.resolvePromise = resolve;
@@ -300,23 +301,5 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
       if (attempt.length > 0) out += attempt.join('');
     }
     return out;
-  }
-}
-
-/** AxlEventBus subclass that hooks `_disposeIterator` to call back into
- *  the owning AxlStream's `destroy()`. The base class provides
- *  `knowsEventName`, which AxlStream's `.on()` uses to route AxlEvent
- *  names here and Readable-level names ('close', 'data', ...) to super. */
-class AxlStreamEventBus extends AxlEventBus {
-  constructor(
-    private readonly disposeOwner: () => void,
-    options?: EventStreamOptions,
-  ) {
-    super(options);
-  }
-
-  protected override _disposeIterator(): Promise<void> {
-    this.disposeOwner();
-    return Promise.resolve();
   }
 }

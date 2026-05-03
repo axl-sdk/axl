@@ -441,6 +441,20 @@ export class WorkflowContext<TInput = unknown> {
     this.abortListenerCleanup?.();
   }
 
+  /** True if any observer wants per-token streaming for asks started
+   *  from this context: either the legacy `onToken` callback is set
+   *  (e.g., `runtime.stream()` plumbs a sentinel) OR `ctx.events` has
+   *  been allocated (a workflow-handler consumer subscribed before
+   *  the ask). `ctx.ask` reads this to decide whether to enter the
+   *  streaming code path; the gate is re-checked per ask, so a
+   *  consumer subscribing AFTER the first ask started still gets
+   *  streaming on the next one. The check `_busRef.current !== undefined`
+   *  is a one-way flag — `_finish` does not unset the reference, so
+   *  once an observer was present, every subsequent ask streams. */
+  private get _streamingEnabled(): boolean {
+    return this.onToken !== undefined || this._busRef.current !== undefined;
+  }
+
   constructor(init: WorkflowContextInit) {
     this.input = init.input as TInput;
     this.executionId = init.executionId;
@@ -1144,7 +1158,7 @@ export class WorkflowContext<TInput = unknown> {
         //   or similar). Without this branch, runtime.execute() would skip
         //   streaming and the partial_object events the customer wanted to
         //   observe would never fire.
-        if (this.onToken || this._busRef.current) {
+        if (this._streamingEnabled) {
           // Use streaming to emit tokens in real-time
           let content = '';
           const toolCalls: ToolCallMessage[] = [];

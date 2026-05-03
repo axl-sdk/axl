@@ -199,7 +199,28 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
    */
   private latestPartialByAsk = new Map<string, CoalescedPartialObject>();
 
-  constructor(options?: EventStreamOptions) {
+  /**
+   * Hook fired when an iterator obtained from `[Symbol.asyncIterator]`
+   * is `await using`-disposed. Set via the second constructor argument.
+   * Used by `AxlStream` to call `Readable.destroy()` on its owning
+   * stream so disposing the iterator cascades to the Readable contract.
+   * Set once at construction; never reassigned.
+   *
+   * Replaces the previous `AxlStreamEventBus extends AxlEventBus`
+   * subclass — composition over inheritance for what is essentially a
+   * single function-pointer hook.
+   *
+   * @internal
+   */
+  protected readonly onIteratorDispose?: () => void;
+
+  /**
+   * @param options Public stream options (queue cap, overflow policy).
+   * @param onIteratorDispose @internal Invoked from `_disposeIterator`
+   *   when an iterator obtained from this bus is `await using`-disposed.
+   *   Used by `AxlStream` to forward to `Readable.destroy()`.
+   */
+  constructor(options?: EventStreamOptions, onIteratorDispose?: () => void) {
     const requestedMax = options?.maxQueued ?? DEFAULT_MAX_QUEUED;
     // Validate `maxQueued`. `0` and negative values silently disabled the
     // cap before this check (every push hit `handleOverflow`, which then
@@ -218,17 +239,24 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     }
     this.maxQueued = requestedMax;
     this.onOverflow = options?.onOverflow ?? DEFAULT_OVERFLOW;
+    this.onIteratorDispose = onIteratorDispose;
     // Prevent unhandled 'error' events on the inner emitter from crashing
-    // the process. AxlStream subclasses re-emit through their Readable
-    // 'error' channel for the standard Node stream contract; bus-level
-    // 'error' subscribers (if any) get the AxlEvent payload directly.
+    // the process. Bus consumers re-emit through their own surface
+    // (e.g., `AxlStream`'s Readable 'error' channel for the Node stream
+    // contract); bus-level 'error' subscribers (if any) get the AxlEvent
+    // payload directly.
     this.bus.on('error', () => {});
   }
 
-  /** Subscribe to an `AxlEvent` variant by type. Names outside `AXL_EVENT_TYPES`
-   *  are silently dropped — the bus only ever emits those names. Subclasses
-   *  may override to fall through to a wider emitter (e.g., `AxlStream`
-   *  routes non-`AxlEvent` names like `'close'` to its underlying Readable). */
+  private unknownEventWarned = false;
+
+  /** Subscribe to an `AxlEvent` variant by type. Names outside
+   *  `AXL_EVENT_TYPES` are dropped (the bus only emits those names) but
+   *  the first such call per bus instance fires a one-shot
+   *  `console.warn` so a typo (`'agent_call_ended'`) doesn't silently
+   *  vanish. Subclasses (e.g., `AxlStream`) pre-filter via
+   *  `knowsEventName` so their own routing for non-`AxlEvent` names
+   *  like `'close'` doesn't trip the warn. */
   on<T extends AxlEventType>(event: T, handler: (e: AxlEventOf<T>) => void): this;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   on(event: string, handler: (event: any) => void): this;
@@ -236,6 +264,8 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
   on(event: string, handler: (event: any) => void): this {
     if (STREAM_EVENTS.has(event as AxlEventType)) {
       this.bus.on(event, handler as (...args: unknown[]) => void);
+    } else {
+      this.warnUnknownEventName('on', event);
     }
     return this;
   }
@@ -247,8 +277,23 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
   off(event: string, handler: (event: any) => void): this {
     if (STREAM_EVENTS.has(event as AxlEventType)) {
       this.bus.off(event, handler as (...args: unknown[]) => void);
+    } else {
+      this.warnUnknownEventName('off', event);
     }
     return this;
+  }
+
+  /** One-shot warn on subscribe/unsubscribe for an event name outside
+   *  `AXL_EVENT_TYPES`. Pre-fix this branch silently dropped, which
+   *  meant a typo like `'agent_call_ended'` produced no signal. */
+  private warnUnknownEventName(method: 'on' | 'off', event: string): void {
+    if (this.unknownEventWarned) return;
+    this.unknownEventWarned = true;
+    console.warn(
+      `[axl] AxlEventBus.${method}('${event}', ...) — '${event}' is not an AxlEventType; ` +
+        `subscription dropped. Valid names: ${AXL_EVENT_TYPES.join(', ')}. ` +
+        `This warning fires once per bus instance.`,
+    );
   }
 
   // No explicit return-type annotation: structural inference yields a type
@@ -307,10 +352,12 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     };
   }
 
-  /** Hook for iterator disposal. AxlStream overrides to call `destroy()`
-   *  on the underlying Readable. The default implementation is a no-op
-   *  because a plain bus has no Node-stream resource to release. */
+  /** Hook for iterator disposal. Calls the constructor-supplied
+   *  `onIteratorDispose` callback if any. The default behavior is a
+   *  no-op when no callback was passed — a plain bus has no
+   *  Node-stream resource to release. */
   protected _disposeIterator(): Promise<void> {
+    this.onIteratorDispose?.();
     return Promise.resolve();
   }
 

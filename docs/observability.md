@@ -179,7 +179,7 @@ Four ways to observe what happens during a workflow run. Pick by scope:
 | `runtime.stream(name, input)` → `AxlStream` | One specific execution (wire) | Per-run UIs (chat streaming, progress bars, waterfalls). Returns an `AsyncIterable<AxlEvent>` plus curated views (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`, `.fullText`) and a `.promise` for the final result |
 | `ctx.events` (`AxlEventBus`) | One specific context (inside the workflow handler) | Observe events **between `ctx.ask()` calls** in a workflow handler, or on ad-hoc contexts from `runtime.createContext()`. Same `AxlEvent` union as `AxlStream`; same curated views (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`). Lazy — zero overhead if no consumer subscribes |
 | `runtime.on('trace', event => …)` | Every execution | Cross-execution observability (background telemetry, cost dashboards, audit logs). Receives every `AxlEvent` from every `execute()` / `stream()` / `createContext()` call |
-| `onToken` / `onToolCall` / `onAgentStart` on `runtime.createContext()` | One ad-hoc context (legacy) | Tool tests, evals, prototyping. Superseded by `ctx.events` — the callbacks remain for back-compat but the iterable is the unified path forward |
+| `onToken` / `onToolCall` / `onAgentStart` on `runtime.createContext()` | One ad-hoc context (back-compat) | Tool tests, evals, prototyping. Superseded by `ctx.events` — the callbacks remain for back-compat but the iterable is the unified path forward |
 
 `runtime.execute()` itself is final-result-only by design — it does **not** accept `onToken` or any other event callback. To observe a workflow run from inside the handler, read `ctx.events`; from outside, use `runtime.stream()` (per-execution) or `runtime.on('trace', …)` (cross-execution).
 
@@ -191,15 +191,22 @@ The customer use case: a workflow handler that runs several `ctx.ask()` calls an
 const wf = workflow({
   name: 'multi-step',
   input: z.object({ topic: z.string() }),
-  handler: async (ctx, input) => {
+  handler: async (ctx) => {
     // Subscribe BEFORE the first ask — see "Subscribe early" note below.
+    // Background observer. `.catch` keeps consumer errors visible — without
+    // it, a throw inside `ws.send` (e.g., closed socket) would surface as
+    // an unhandled rejection at the process level.
     void (async () => {
       for await (const partial of ctx.events.partialObjects) {
-        ws.send(JSON.stringify({ askId: partial.askId, object: partial.object }));
+        ws.send(JSON.stringify({
+          askId: partial.askId,
+          attempt: partial.attempt,
+          object: partial.object,
+        }));
       }
-    })();
+    })().catch((err) => ctx.log('observer.failed', { error: String(err) }));
 
-    const outline = await ctx.ask(planner, input.topic, { schema: outlineSchema });
+    const outline = await ctx.ask(planner, ctx.input.topic, { schema: outlineSchema });
     const draft = await ctx.ask(writer, outline, { schema: draftSchema });
     return draft;
   },
@@ -214,7 +221,7 @@ const wf = workflow({
 - **`ctx.events` does NOT bridge across `ctx.awaitHuman()` suspension.** When a workflow suspends and is later resumed via `runtime.resumeExecution()`, the resumed run gets a fresh `WorkflowContext` with its own bus. An observer holding the original `ctx.events` reference sees nothing from the resumed run. For cross-suspension observation, subscribe to `runtime.on('trace', …)` instead — that channel spans every execution.
 - **`ctx.race()` losers emit complete event trails.** When `ctx.race([fn1, fn2])` resolves to fn1's result, fn2 keeps running until its abort signal fires. Bus consumers see partial events from BOTH branches (full fidelity by design — if a loser made provider calls before being cancelled, those costs and events are real). Consumers reconstructing "what won" must filter on the resolved value/winner, not on event presence. Same applies to `ctx.spawn()` quorum overflow and `ctx.map()` early termination.
 - **Pick one cost-accumulation channel.** Subscribing to `ctx.events` AND `runtime.on('trace', ...)` simultaneously and summing `event.cost` in both would double-count — the same event flows to both surfaces. The channels are alternatives: `ctx.events` for in-handler observation; `runtime.on('trace', ...)` for cross-execution telemetry. Use one for cost rollup at any given layer, or use the runtime's pre-aggregated `ExecutionInfo.totalCost` instead.
-- **Auto-dispose on signal abort.** When `runtime.createContext({ signal })` is constructed with an `AbortSignal` and the signal fires, the bus is auto-disposed (iterators terminate with `done: true`). This protects the long-lived ad-hoc context case — a consumer that iterates `ctx.events` and never sees a workflow terminal would otherwise leak the iterator. If `signal` is already aborted at the time `ctx.events` is first accessed, the bus terminates immediately on access.
+- **Auto-dispose on signal abort.** When `runtime.createContext({ signal })` is constructed with an `AbortSignal` and the signal fires, the bus is auto-disposed (iterators terminate with `done: true`). This protects the long-lived ad-hoc context case — a consumer that iterates `ctx.events` and never sees a workflow terminal would otherwise leak the iterator. If `signal` is already aborted at the time `ctx.events` is first accessed, the bus terminates immediately on access. (Implementation detail: only the root context registers the abort listener; child contexts inherit the parent's bus slot and would otherwise double-fire `_finish`.)
 - **Auto-termination.** The bus is finished automatically when the runtime emits `workflow_end` or `error`, so iterators resolve with `done: true` cleanly. For ad-hoc `runtime.createContext()` flows that never run a workflow, call `ctx.disposeEvents()` when done observing.
 - **Child contexts** (the agent-as-tool pattern) share the parent's bus via a mutable slot, so nested-ask events bubble up to the parent's `ctx.events` iterator with full `askId` / `parentAskId` / `depth` correlation.
 
@@ -235,7 +242,7 @@ runtime.execute('my-workflow', input, {
 - **`onOverflow: 'drop-oldest-non-terminal'`** (default): when the cap is hit, the oldest non-terminal event is dropped to make room. Terminal events (`done`, `error`, `workflow_end`) always pass through. The first drop per bus emits a one-shot `console.warn` so saturating consumers see the signal without log spam.
 - **`onOverflow: 'throw'`**: throw an `EventStreamOverflowError` at the producer call site. **This will fail the active workflow** — the throw unwinds the agent loop and the runtime promise rejects with the typed error. Catch with `instanceof EventStreamOverflowError` (exported from `@axlsdk/axl`) to distinguish overflow from other workflow errors. **Where the throw fires depends on which bus saturates:** on `runtime.stream()`, the wire-side `AxlStream` bus is always active, so any saturation throws. On `runtime.execute()`, the workflow has no `AxlStream` — the throw fires only when the workflow handler allocated `ctx.events` and that bus saturates. If you want strict overflow detection on `runtime.execute()`, allocate `ctx.events` at the top of the handler. Use only in tests or strict environments where silent drop would mask a problem.
 
-Existing 0.x consumers gain the cap automatically with this release. If your workflow somehow relied on unbounded queueing, opt out with `events: { maxQueued: Infinity }`.
+Existing 0.x consumers gain the cap automatically with this release. If your workflow somehow relied on unbounded queueing, opt out with `events: { maxQueued: Infinity }`. See the full upgrade notes in [docs/migration/stream-first-observation.md](migration/stream-first-observation.md).
 
 ### Streaming callbacks: `meta` parameter
 

@@ -116,6 +116,61 @@ const agentCalls = runtime.traceLog().filter((e) => e.type === 'agent_call_end')
 const toolCalls = runtime.traceLog().filter((e) => e.type === 'tool_call_end');
 ```
 
+## Testing observability — `ctx.events`, `partialObjects`, overflow
+
+For workflows that consumers observe via `ctx.events`, drive deterministic streaming with `MockProvider.sequence([{ chunks }])` or `MockProvider.chunked(...)`. The streaming code path activates when an observer is present (the test below subscribes via `ctx.events`), so `partial_object` events fire as the chunked content crosses each structural boundary.
+
+```typescript
+import { AxlTestRuntime, MockProvider } from '@axlsdk/testing';
+import { z } from 'zod';
+
+const provider = MockProvider.sequence([
+  { content: '{"v":3}', chunks: ['{"v":', '3', '}'] },
+]);
+const runtime = new AxlTestRuntime();
+runtime.mockProvider('openai', provider);
+
+const seen: Array<{ attempt: number; v: unknown }> = [];
+runtime.register(workflow({
+  name: 'observe',
+  input: z.object({}),
+  handler: async (ctx) => {
+    void (async () => {
+      for await (const partial of ctx.events.partialObjects) {
+        seen.push({ attempt: partial.attempt, v: (partial.object as { v: unknown }).v });
+      }
+    })().catch(() => {});
+    return ctx.ask(myAgent, 'go', { schema: z.object({ v: z.number() }) });
+  },
+}));
+await runtime.execute('observe', {});
+
+// `partialObjects` coalesces to the latest snapshot per ask. With chunks
+// crossing one structural boundary (`}`), one yield is expected.
+expect(seen).toEqual([{ attempt: 1, v: 3 }]);
+```
+
+To test the overflow safety net or strict-mode failure, pass `events` config to `execute()`:
+
+```typescript
+import { EventStreamOverflowError } from '@axlsdk/axl';
+
+await expect(
+  runtime.execute('observe', {}, { events: { maxQueued: 1, onOverflow: 'throw' } }),
+).rejects.toBeInstanceOf(EventStreamOverflowError);
+```
+
+To test schema-retry coalescing — that attempt-N partials don't leak across a `pipeline(failed)` boundary — drive a `MockProvider.sequence` with two responses where the first fails the schema:
+
+```typescript
+const provider = MockProvider.sequence([
+  { content: '{"v":"oops"}', chunks: ['{"v":"', 'oops', '"}'] }, // attempt 1: wrong type
+  { content: '{"v":2}', chunks: ['{"v":', '2', '}'] },           // attempt 2: corrects
+]);
+// ... after execute, assert that `seen` shows attempt: 2 only (or with the
+// final coalesced value), and that no attempt-1 snapshot leaked through.
+```
+
 ## AxlTestRuntime
 
 `AxlTestRuntime` supports the **full `ctx.*` primitive set** — `ask`, `spawn`, `vote`, `verify`, `budget`, `race`, `parallel`, `map`, `awaitHuman`, `checkpoint`, and `log` — so that workflows under test exercise the same code paths as production.

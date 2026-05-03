@@ -1,5 +1,9 @@
 import { Readable } from 'node:stream';
-import { AxlEventBus, type EventStreamOptions } from './event-stream.js';
+import {
+  AxlEventBus,
+  type CoalescedPartialObject,
+  type EventStreamOptions,
+} from './event-stream.js';
 import { type AxlEvent, type AxlEventOf, type AxlEventType } from './types.js';
 import { isRootLevel } from './event-utils.js';
 
@@ -129,8 +133,10 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
    *  are silently superseded and the next `.next()` await sees only the
    *  most recent state per ask. Listener-based, so does NOT race with the
    *  main `for await (const e of stream)` iterator. See
-   *  `AxlEventBus.partialObjects` for full semantics. */
-  get partialObjects(): AsyncIterable<{ askId: string; agent?: string; object: unknown }> {
+   *  `AxlEventBus.partialObjects` for full semantics. The yielded
+   *  `CoalescedPartialObject` shape is shared with the bus so the two
+   *  surfaces can never drift on the `attempt` field. */
+  get partialObjects(): AsyncIterable<CoalescedPartialObject> {
     return this.events.partialObjects;
   }
 

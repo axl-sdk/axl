@@ -40,7 +40,7 @@ export { AxlStream } from './stream.js';
 // behind `AxlStream`'s iterator + curated views (`.text`, `.lifecycle`,
 // `.textByAsk`, `.partialObjects`).
 export { AxlEventBus, EventStreamOverflowError } from './event-stream.js';
-export type { EventStreamOptions } from './event-stream.js';
+export type { CoalescedPartialObject, EventStreamOptions } from './event-stream.js';
 
 // Event helpers — consumer-facing utilities for accumulators / reducers
 // that need to honor spec invariants (cost-rollup skip, root-level

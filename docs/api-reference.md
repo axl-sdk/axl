@@ -516,17 +516,24 @@ Lazy `AxlEventBus` exposing every `AxlEvent` emitted by this context (and its ch
 const wf = workflow({
   name: 'two-step',
   input: z.object({ topic: z.string() }),
-  handler: async (ctx, input) => {
+  handler: async (ctx) => {
     // Subscribe BEFORE the first ctx.ask() — events are not buffered for
     // late subscribers, AND the streaming code path inside ctx.ask()
     // activates only when an observer is present at the time the ask starts.
+    // Background observer. `.catch` keeps consumer errors visible — without
+    // it, a throw inside `ws.send` (e.g., closed socket) would surface as
+    // an unhandled rejection at the process level.
     void (async () => {
       for await (const partial of ctx.events.partialObjects) {
-        ws.send(JSON.stringify({ askId: partial.askId, object: partial.object }));
+        ws.send(JSON.stringify({
+          askId: partial.askId,
+          attempt: partial.attempt,
+          object: partial.object,
+        }));
       }
-    })();
+    })().catch((err) => ctx.log('observer.failed', { error: String(err) }));
 
-    const outline = await ctx.ask(planner, input.topic, { schema: outlineSchema });
+    const outline = await ctx.ask(planner, ctx.input.topic, { schema: outlineSchema });
     const draft = await ctx.ask(writer, outline, { schema: draftSchema });
     return draft;
   },
@@ -537,10 +544,10 @@ const wf = workflow({
 |--------|------|-------------|
 | `[Symbol.asyncIterator]` | `AsyncIterator<AxlEvent>` | Iterate every event in emission order via `for await` |
 | `.text` | `AsyncIterable<string>` | Root-only token chunks (chat-bubble view) |
-| `.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only — `ask_*`, `agent_call_*`, `tool_call_*`, `handoff_*`, `pipeline`, `verify`, `workflow_*`, `checkpoint_*`, `await_human*`. Skips per-token chatter |
+| `.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only — `ask_*`, `agent_call_*`, `tool_call_*`, `tool_approval`, `tool_denied`, `handoff_start`, `handoff_return`, `delegate`, `pipeline`, `verify`, `workflow_*`, `checkpoint_save`, `checkpoint_replay`, `await_human`, `await_human_resolved`. Skips per-token chatter and progressive `partial_object` emissions. Identical to `AxlStream.lifecycle` (single source of truth: `LIFECYCLE_TYPES` in `event-stream.ts`) |
 | `.textByAsk` | `AsyncIterable<{ askId, agent?, text }>` | Per-ask token chunks for split-pane UIs |
-| `.partialObjects` | `AsyncIterable<{ askId, agent?, object }>` | **Coalescing view** — yields the latest `partial_object` payload per `askId`. Listener-based: does NOT race with the main iterator; running both concurrently each receive every event. Memory bounded by `O(active asks)`, not `O(events emitted)` |
-| `.on(type, handler)` / `.off(type, handler)` | `(this)` | Subscribe/unsubscribe per AxlEvent type. Names outside `AxlEventType` are silently ignored |
+| `.partialObjects` | `AsyncIterable<CoalescedPartialObject>` (`{ askId, agent?, object, attempt }`) | **Coalescing view** — yields the latest `partial_object` payload per `askId`. `attempt` is the 1-indexed attempt number; on schema/validate/guardrail retry, the runtime emits `pipeline(failed)` and the view drops any undrained pending value for the affected ask, so attempt-N snapshots cannot leak across the retry boundary. Listener-based: does NOT race with the main iterator; running both concurrently each receive every event. Memory bounded by `O(active asks)`, not `O(events emitted)` |
+| `.on(type, handler)` / `.off(type, handler)` | `(this)` | Subscribe/unsubscribe per AxlEvent type. Names outside `AxlEventType` are silently ignored on `AxlEventBus` (the bus emits no other names). On `AxlStream`, non-AxlEvent names like `'close'`, `'data'`, `'end'`, `'error'`, `'pause'`, `'resume'`, `'readable'` fall through to the underlying Node `Readable` — those work as standard Node stream events |
 | `.isFinished` | `boolean` | Whether the bus has been finalized (auto-set on `workflow_end` / `error`) |
 
 **Lifecycle:**
@@ -1043,7 +1050,7 @@ for await (const event of stream) {
 | `stream.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only — `ask_*`, `agent_call_*`, `tool_call_*`, `tool_approval`, `tool_denied`, `handoff_start`, `handoff_return`, `delegate`, `pipeline`, `verify`, `workflow_*`, `checkpoint_save`, `checkpoint_replay`, `await_human`, `await_human_resolved`. Skips token chatter |
 | `stream.text` | `AsyncIterable<string>` | Root-only token stream (`depth === 0`). Nested-ask tokens (agent-as-tool handlers, `delegate`, `race` branches) are omitted — use `stream.textByAsk` or filter the raw stream on `event.depth >= 1` to see them |
 | `stream.textByAsk` | `AsyncIterable<{ askId, agent?, text }>` | **Every** token tagged with the producing ask frame. Complements `.text` — use for split-pane UIs that render each sub-agent's output in its own lane, grouped by `askId` |
-| `stream.partialObjects` | `AsyncIterable<{ askId, agent?, object }>` | **Coalescing view** — yields the latest `partial_object` payload per `askId`. Listener-based: does NOT race with the main iterator. Memory bounded by `O(active asks)`, not `O(events)`. The right shape for streaming-structured-output UIs |
+| `stream.partialObjects` | `AsyncIterable<CoalescedPartialObject>` (`{ askId, agent?, object, attempt }`) | **Coalescing view** — yields the latest `partial_object` payload per `askId`. `attempt` is the 1-indexed attempt number; the view drops pending snapshots on `pipeline(failed)` so attempt-N values never leak after a schema/validate/guardrail retry begins. Listener-based: does NOT race with the main iterator. Memory bounded by `O(active asks)`, not `O(events)`. The right shape for streaming-structured-output UIs |
 | `stream.fullText` | `string` | Accumulated text from root-only tokens, committed on `pipeline(committed)`. Retried-attempt tokens are discarded on `pipeline(failed)` or `ask_end({ok:false})` so only the winning attempt's text appears |
 | `stream.promise` | `Promise<unknown>` | Resolves with the workflow result; rejects with the thrown error. Errors are ALSO delivered via the iterator and `.on('error', ...)` (as a synthesized `AxlEvent{type:'error'}`). The promise has an internal no-op `.catch(() => {})` so consumers who only read the iterator never see unhandled-rejection warnings |
 | `stream.on('done', ...)` / `.on('error', ...)` | `EventEmitter` | Terminal events. `done.data = { result }`, `error.data = { message, name?, code? }` |

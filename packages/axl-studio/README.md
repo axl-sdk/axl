@@ -94,6 +94,8 @@ Execute workflows with custom JSON input. View execution timelines showing each 
 ### Trace Explorer
 Waterfall visualization of execution traces. Filter by type, agent, or tool. View token counts, cost per step, and duration.
 
+> **Studio vs `ctx.events`.** Studio consumes the same `AxlEvent` firehose via `runtime.on('trace', …)` — every event from every execution. Inside a workflow handler, `ctx.events` is the in-handler counterpart (per-context, scoped to the current workflow). The two coexist: Studio is for cross-execution observability and replay; `ctx.events` is for in-handler streaming UIs and per-execution business logic. See [`docs/observability.md`](../../docs/observability.md#observation-paths).
+
 ### Cost Dashboard
 Track spending across agents, models, workflows, and embedders with time-window filtering (24h/7d/30d/all). Live cost updates via WebSocket; all breakdown tables are user-sortable by any column. Two sections appear conditionally:
 

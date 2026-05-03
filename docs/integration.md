@@ -30,6 +30,21 @@ app.post('/api/support/stream', async (req, res) => {
     msg: req.body.msg,
   });
   stream.pipe(res);
+  // Defaults already protect against slow consumers — `maxQueued: 10_000`
+  // events with `onOverflow: 'drop-oldest-non-terminal'`. Terminal events
+  // (`done`, `error`, `workflow_end`) are never dropped, and the first
+  // overflow per stream emits a one-shot `console.warn`. For most
+  // production webserver embeds this is the right policy: a temporarily
+  // slow client should degrade gracefully, not abort the workflow.
+  //
+  // To opt into strict-mode failure (rare — typically only test/CI envs):
+  //
+  //   const stream = runtime.stream('HandleSupport', input, {
+  //     events: { onOverflow: 'throw' },
+  //   });
+  //   stream.promise.catch((err) => {
+  //     if (err instanceof EventStreamOverflowError) { ... }
+  //   });
 });
 
 // Multi-turn sessions

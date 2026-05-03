@@ -47,8 +47,8 @@ import type { StateStore, ExecutionState, PendingDecision, EvalHistoryEntry } fr
 import type { Effort, ToolChoice, ChatOptions, DelegateOptions, CreateContextOptions } from '@axlsdk/axl';
 
 // Event bus (ctx.events surface; same shape as AxlStream's iterator + curated views)
-import { AxlEventBus } from '@axlsdk/axl';
-import type { EventStreamOptions } from '@axlsdk/axl';
+import { AxlEventBus, EventStreamOverflowError } from '@axlsdk/axl';
+import type { CoalescedPartialObject, EventStreamOptions } from '@axlsdk/axl';
 
 // Testing
 import { AxlTestRuntime, MockProvider, MockTool } from '@axlsdk/testing';

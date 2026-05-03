@@ -156,6 +156,27 @@ const redacted = new AxlTestRuntime({
 });
 ```
 
+`execute()` accepts `events: EventStreamOptions` to test the iterator-queue cap and overflow policy on `ctx.events` end-to-end:
+
+```typescript
+import { AxlTestRuntime, MockProvider } from '@axlsdk/testing';
+import { EventStreamOverflowError } from '@axlsdk/axl';
+
+const runtime = new AxlTestRuntime();
+runtime.register(myWorkflow);
+runtime.mockProvider('openai', MockProvider.sequence([{ content: '42' }]));
+
+// Strict mode: tiny cap + 'throw' policy. The workflow rejects with
+// EventStreamOverflowError if events arrive faster than the consumer.
+await expect(
+  runtime.execute('my-workflow', input, {
+    events: { maxQueued: 1, onOverflow: 'throw' },
+  }),
+).rejects.toBeInstanceOf(EventStreamOverflowError);
+```
+
+The default policy (`drop-oldest-non-terminal` at `maxQueued: 10_000`) preserves terminal events while dropping the oldest non-terminal under saturation. Use `maxQueued: Infinity` to disable the cap entirely in tests that explicitly want unbounded queueing.
+
 ### Assertions
 
 ```typescript

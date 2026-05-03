@@ -183,7 +183,28 @@ for await (const event of stream) {
 const result = await stream.promise; // final output after stream completes
 ```
 
-`runtime.execute()` is final-result-only and does **not** accept `onToken` or any other event callback — `runtime.stream()` is the streaming surface. For background telemetry across every run, subscribe with `runtime.on('trace', event => …)` instead.
+`runtime.execute()` is final-result-only and does **not** accept `onToken` or any other event callback — `runtime.stream()` is the streaming surface from the outside. For observation **from inside a workflow handler** — e.g., streaming `partial_object` snapshots between two `ctx.ask()` calls — read `ctx.events`:
+
+```typescript
+const wf = workflow({
+  name: 'two-step',
+  input: z.object({ topic: z.string() }),
+  handler: async (ctx) => {
+    // Subscribe BEFORE the first ask — the bus is allocated lazily and
+    // only events emitted after subscription are seen.
+    void (async () => {
+      for await (const partial of ctx.events.partialObjects) {
+        ws.send(JSON.stringify(partial)); // { askId, agent?, object, attempt }
+      }
+    })().catch(console.error);
+
+    const outline = await ctx.ask(planner, ctx.input.topic, { schema: outlineSchema });
+    return ctx.ask(writer, outline, { schema: draftSchema });
+  },
+});
+```
+
+`ctx.events` exposes the same `AxlEvent` iterable + curated views as `AxlStream` (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`). For background telemetry across every run, subscribe with `runtime.on('trace', event => …)` instead. See [docs/observability.md](docs/observability.md#observation-paths) for the full comparison.
 
 ## Sessions
 

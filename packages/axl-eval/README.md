@@ -355,6 +355,40 @@ for (const item of results.items) {
 
 `captureTraces` strips verbose-mode `agent_call_end.data.messages` snapshots and high-volume events (`token`, `partial_object`) from the captured array to keep memory bounded. The structural events you'd want for debugging — `agent_call_start`/`agent_call_end`, `tool_call_*`, gate events, `pipeline`, `verify`, `handoff_*` — are all retained.
 
+#### Per-item live observation with `ctx.events`
+
+`captureTraces` collects events for post-hoc inspection on `EvalItem.traces`. For **live** per-item observation — e.g., printing each item's `partial_object` snapshots as they stream during eval execution — use `ctx.events` inside your top-level `executeWorkflow` export. The two are complementary: `captureTraces` records the structural timeline; `ctx.events` is the live firehose.
+
+```typescript
+// evals/extract.eval.ts
+import { defineEval, dataset, scorer } from '@axlsdk/eval';
+import { z } from 'zod';
+
+const extractSchema = z.object({ /* ... */ });
+
+export default defineEval({
+  workflow: 'extract-fields',
+  dataset: dataset({ /* ... */ }),
+  scorers: [scorer({ /* ... */ })],
+});
+
+export async function executeWorkflow(
+  input: { id: string; text: string },
+  runtime: AxlRuntime,
+) {
+  const ctx = runtime.createContext({ signal: AbortSignal.timeout(30_000) });
+  void (async () => {
+    for await (const partial of ctx.events.partialObjects) {
+      console.log(`[${input.id}] attempt ${partial.attempt}:`, partial.object);
+    }
+  })().catch((err) => console.error('observer failed:', err));
+  const output = await ctx.ask(extractor, input.text, { schema: extractSchema });
+  return { output };
+}
+```
+
+The `signal` from `createContext` auto-disposes the bus on timeout, so the iterator terminates cleanly even if the eval item never emits a workflow terminal. See [`ctx.events`](../../docs/api-reference.md#ctxevents) for the full type reference.
+
 ## Comparing Results
 
 Compare two runs to detect regressions and improvements. Runs must use the same dataset and scorers.

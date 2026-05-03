@@ -85,6 +85,24 @@ export interface EventStreamOptions {
 }
 
 /**
+ * The shape yielded by `AxlEventBus.partialObjects` (and `AxlStream.partialObjects`).
+ * Coalesced latest-per-`askId` snapshot of a `partial_object` event.
+ *
+ * `attempt` is the 1-indexed attempt number from the underlying
+ * `partial_object` event — pinned in the public type so consumers can
+ * conditionally render a "regenerating" indicator when it jumps from 1
+ * to 2. Failed attempts are dropped from the view via the
+ * `pipeline(failed)` listener before they leak across the retry
+ * boundary.
+ */
+export type CoalescedPartialObject = {
+  askId: string;
+  agent?: string;
+  object: unknown;
+  attempt: number;
+};
+
+/**
  * Thrown when an `AxlEventBus` queue exceeds `maxQueued` and `onOverflow`
  * is set to `'throw'`. Surfaced as a typed error so the runtime's emit
  * pipeline can distinguish a legitimate overflow signal (which must
@@ -342,27 +360,11 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
    * Termination: yields any pending coalesced values first, then `done: true`
    * once the bus is finished (via `_finish()`).
    */
-  get partialObjects(): AsyncIterable<{
-    askId: string;
-    agent?: string;
-    object: unknown;
-    attempt: number;
-  }> {
+  get partialObjects(): AsyncIterable<CoalescedPartialObject> {
     const self = this;
     return {
       [Symbol.asyncIterator]() {
-        type Coalesced = {
-          askId: string;
-          agent?: string;
-          object: unknown;
-          /** The 1-indexed attempt number this snapshot belongs to. Surfaces
-           *  schema-retry transitions to the consumer — UIs can flash a
-           *  "regenerating" indicator when the value jumps from `attempt: 1`
-           *  to `attempt: 2`. Failed attempts are also discarded by the
-           *  pipeline-listener below before they can leak across the
-           *  retry boundary. */
-          attempt: number;
-        };
+        type Coalesced = CoalescedPartialObject;
         // Latest-per-askId. Map insertion order = first-seen-askId order
         // when the consumer drains. We delete on yield so a slow consumer
         // gets the freshest value at await time.

@@ -339,20 +339,31 @@ To observe events between `ctx.ask()` calls — e.g., streaming `partial_object`
 const wf = workflow({
   name: 'two-step',
   input: z.object({ topic: z.string() }),
-  handler: async (ctx, input) => {
+  handler: async (ctx) => {
     // Subscribe BEFORE the first ask. The bus is allocated lazily, AND
     // the streaming code path inside ctx.ask() activates only when an
     // observer is present at the time the ask starts.
+    // Background observer. The IIFE returns a promise; attaching a `.catch`
+    // ensures errors thrown by the consumer (e.g., `ws.send` failing on a
+    // closed socket) surface in your logs instead of being swallowed by
+    // the unhandled-rejection handler. The bus auto-finishes on
+    // `workflow_end` / `error`, so the iterator terminates with the run.
     void (async () => {
       for await (const partial of ctx.events.partialObjects) {
         // .partialObjects is the coalescing view: yields the LATEST
-        // payload per askId. Memory bounded by O(active asks), not
-        // O(events). Designed for streaming-structured-output UIs.
-        ws.send(JSON.stringify({ askId: partial.askId, object: partial.object }));
+        // payload per askId, with the 1-indexed `attempt` (UIs can flag
+        // a regenerating draft when it bumps to 2). Memory bounded by
+        // O(active asks), not O(events). Designed for
+        // streaming-structured-output UIs.
+        ws.send(JSON.stringify({
+          askId: partial.askId,
+          attempt: partial.attempt,
+          object: partial.object,
+        }));
       }
-    })();
+    })().catch((err) => ctx.log('observer.failed', { error: String(err) }));
 
-    const outline = await ctx.ask(planner, input.topic, { schema: outlineSchema });
+    const outline = await ctx.ask(planner, ctx.input.topic, { schema: outlineSchema });
     const draft = await ctx.ask(writer, outline, { schema: draftSchema });
     return draft;
   },

@@ -10,7 +10,7 @@ import type {
   AnyWorkflow,
 } from '@axlsdk/axl';
 import { WorkflowContext, MemoryStore, ProviderRegistry, eventCostContribution } from '@axlsdk/axl';
-import type { WorkflowContextInit } from '@axlsdk/axl';
+import type { EventStreamOptions, WorkflowContextInit } from '@axlsdk/axl';
 
 // `AnyWorkflow` is a re-exported alias for `Workflow<any, any>` — see
 // the JSDoc on `AnyWorkflow` in `@axlsdk/axl/workflow.ts`. The bivariant
@@ -78,7 +78,7 @@ export class AxlTestRuntime {
   async execute(
     workflowName: string,
     input: unknown,
-    options?: { metadata?: Record<string, unknown> },
+    options?: { metadata?: Record<string, unknown>; events?: EventStreamOptions },
   ): Promise<unknown> {
     const workflow = this.workflows.get(workflowName);
     if (!workflow) throw new Error(`Workflow "${workflowName}" not registered`);
@@ -134,6 +134,9 @@ export class AxlTestRuntime {
       // Thread the constructor-provided config so tests can exercise
       // trace.level === 'full' and trace.redact behavior end-to-end.
       config: this._config,
+      // Thread `events` config so tests can exercise the queue cap and
+      // overflow policy on `ctx.events`. Mirrors the production runtime.
+      eventStreamOptions: options?.events,
       // Production runtime threads this (see `runtime.ts:594` in
       // `execute()` and `:765` in `stream()`). `emitEvent` auto-stamps
       // `event.workflow` from it, so consumers grouping by workflow

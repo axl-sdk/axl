@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AxlEventBus } from '../event-stream.js';
+import { AxlEventBus, EventStreamOverflowError } from '../event-stream.js';
 import type { AxlEvent } from '../types.js';
 
 let _step = 0;
@@ -80,10 +80,19 @@ describe('AxlEventBus — overflow safety net', () => {
     expect(String(warnSpy.mock.calls[0][0])).toMatch(/maxQueued=2/);
   });
 
-  it('throws when onOverflow is "throw"', () => {
+  it('throws an EventStreamOverflowError when onOverflow is "throw"', () => {
     const bus = new AxlEventBus({ maxQueued: 1, onOverflow: 'throw' });
     bus._push(ev({ type: 'token', data: 'a', ...ASK }));
-    expect(() => bus._push(ev({ type: 'token', data: 'b', ...ASK }))).toThrow(/maxQueued=1/);
+    let caught: unknown;
+    try {
+      bus._push(ev({ type: 'token', data: 'b', ...ASK }));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(EventStreamOverflowError);
+    expect((caught as EventStreamOverflowError).maxQueued).toBe(1);
+    expect((caught as EventStreamOverflowError).eventType).toBe('token');
+    expect((caught as Error).message).toMatch(/maxQueued=1/);
   });
 
   it('"throw" policy does not affect terminal events', () => {
@@ -366,6 +375,177 @@ describe('AxlEventBus — partialObjects coalescing view', () => {
     expect(seen).toEqual([100]);
   });
 
+  it('drops pending partial on pipeline(failed) so attempt-N snapshots do not leak across retries', async () => {
+    // The customer hazard: a fast consumer renders attempt-1's last
+    // partial, then schema validation fails and attempt-2 starts. Without
+    // this fix, the consumer would render attempt-1 final → attempt-2
+    // partials, mixing two different streamed objects (with potentially
+    // different shapes if the model regenerated more carefully). The
+    // pipeline-failed listener clears `pending` for the askId so an
+    // undrained attempt-1 snapshot doesn't reach the consumer.
+    const bus = new AxlEventBus();
+    bus._push(
+      ev({
+        type: 'partial_object',
+        attempt: 1,
+        data: { object: { v: 'attempt-1-final' } },
+        ...ASK,
+      }),
+    );
+    // Simulate schema validation failure → retry begins.
+    bus._push(
+      ev({
+        type: 'pipeline',
+        status: 'failed',
+        stage: 'schema',
+        attempt: 1,
+        maxAttempts: 4,
+        ...ASK,
+      }),
+    );
+    // attempt-2 begins emitting.
+    bus._push(
+      ev({
+        type: 'partial_object',
+        attempt: 2,
+        data: { object: { v: 'attempt-2-start' } },
+        ...ASK,
+      }),
+    );
+    bus._finish();
+    const seen: Array<{ v: string; attempt: number }> = [];
+    for await (const p of bus.partialObjects) {
+      seen.push({ v: (p.object as { v: string }).v, attempt: p.attempt });
+    }
+    // Only attempt-2 should be visible. attempt-1's pending entry was
+    // dropped on pipeline(failed) before the consumer drained it.
+    expect(seen).toEqual([{ v: 'attempt-2-start', attempt: 2 }]);
+  });
+
+  it('yields attempt number on each coalesced value (UI can flag retries)', async () => {
+    const bus = new AxlEventBus();
+    bus._push(
+      ev({ type: 'partial_object', attempt: 1, data: { object: { x: 1 } }, askId: 'a', depth: 0 }),
+    );
+    bus._push(
+      ev({ type: 'partial_object', attempt: 2, data: { object: { x: 2 } }, askId: 'b', depth: 0 }),
+    );
+    bus._finish();
+    const seen = new Map<string, number>();
+    for await (const p of bus.partialObjects) seen.set(p.askId, p.attempt);
+    expect(seen.get('a')).toBe(1);
+    expect(seen.get('b')).toBe(2);
+  });
+
+  it("pipeline(failed) on a different askId does not affect another ask's pending partial", async () => {
+    const bus = new AxlEventBus();
+    bus._push(
+      ev({
+        type: 'partial_object',
+        attempt: 1,
+        data: { object: { who: 'a' } },
+        askId: 'a',
+        depth: 0,
+      }),
+    );
+    bus._push(
+      ev({
+        type: 'partial_object',
+        attempt: 1,
+        data: { object: { who: 'b' } },
+        askId: 'b',
+        depth: 0,
+      }),
+    );
+    // pipeline(failed) for askId='a' ONLY.
+    bus._push(
+      ev({
+        type: 'pipeline',
+        status: 'failed',
+        stage: 'schema',
+        attempt: 1,
+        maxAttempts: 4,
+        askId: 'a',
+        depth: 0,
+      }),
+    );
+    bus._finish();
+    const seen = new Map<string, unknown>();
+    for await (const p of bus.partialObjects) seen.set(p.askId, p.object);
+    // ask 'a' was cleared, ask 'b' survives.
+    expect(seen.has('a')).toBe(false);
+    expect(seen.get('b')).toEqual({ who: 'b' });
+  });
+
+  it('clears pending on pipeline(failed) at validate stage (not just schema)', async () => {
+    // The pending-clear listener gates on `status === 'failed'` (any
+    // stage), because validate-stage retries also re-enter the streaming
+    // loop and can re-emit partial_object events for the same askId.
+    // Without this, attempt-1's final partial would leak across a
+    // validate retry boundary the same way it would across schema.
+    const bus = new AxlEventBus();
+    bus._push(ev({ type: 'partial_object', attempt: 1, data: { object: { v: 'a1' } }, ...ASK }));
+    bus._push(
+      ev({
+        type: 'pipeline',
+        status: 'failed',
+        stage: 'validate',
+        attempt: 1,
+        maxAttempts: 4,
+        ...ASK,
+      }),
+    );
+    bus._push(ev({ type: 'partial_object', attempt: 2, data: { object: { v: 'a2' } }, ...ASK }));
+    bus._finish();
+    const seen: string[] = [];
+    for await (const p of bus.partialObjects) seen.push((p.object as { v: string }).v);
+    expect(seen).toEqual(['a2']);
+  });
+
+  it('clears pending on pipeline(failed) at guardrail stage (not just schema)', async () => {
+    // Same rationale as the validate-stage test — guardrail retries
+    // re-enter the streaming loop too. Pinning all three retry stages
+    // (schema/validate/guardrail) protects against a future change to
+    // gate ordering or partial-emission gating from silently regressing
+    // attempt isolation.
+    const bus = new AxlEventBus();
+    bus._push(ev({ type: 'partial_object', attempt: 1, data: { object: { v: 'a1' } }, ...ASK }));
+    bus._push(
+      ev({
+        type: 'pipeline',
+        status: 'failed',
+        stage: 'guardrail',
+        attempt: 1,
+        maxAttempts: 4,
+        ...ASK,
+      }),
+    );
+    bus._push(ev({ type: 'partial_object', attempt: 2, data: { object: { v: 'a2' } }, ...ASK }));
+    bus._finish();
+    const seen: string[] = [];
+    for await (const p of bus.partialObjects) seen.push((p.object as { v: string }).v);
+    expect(seen).toEqual(['a2']);
+  });
+
+  it('pipeline(committed) does NOT clear pending — the attempt won, its final partial is canonical', async () => {
+    const bus = new AxlEventBus();
+    bus._push(ev({ type: 'partial_object', attempt: 1, data: { object: { v: 'final' } }, ...ASK }));
+    bus._push(
+      ev({
+        type: 'pipeline',
+        status: 'committed',
+        stage: 'schema',
+        attempt: 1,
+        maxAttempts: 4,
+        ...ASK,
+      }),
+    );
+    bus._finish();
+    const seen: unknown[] = [];
+    for await (const p of bus.partialObjects) seen.push(p.object);
+    expect(seen).toEqual([{ v: 'final' }]);
+  });
+
   it('coalescing across many askIds (100 asks × 100 partials each)', async () => {
     const bus = new AxlEventBus();
     // Push 100 partials per ask × 100 asks = 10_000 events. Latest per
@@ -412,6 +592,28 @@ describe('AxlEventBus — partialObjects coalescing view', () => {
     // Three partial_objects pushed total + nothing else. The bus iterator
     // sees them all (independent of the partialObjects view).
     expect(mainCount).toBe(3);
+  });
+});
+
+describe('AxlEventBus — constructor validation', () => {
+  it('rejects maxQueued: 0', () => {
+    expect(() => new AxlEventBus({ maxQueued: 0 })).toThrow(/must be >= 1 or Infinity/);
+  });
+
+  it('rejects negative maxQueued', () => {
+    expect(() => new AxlEventBus({ maxQueued: -10 })).toThrow(/must be >= 1 or Infinity/);
+  });
+
+  it('rejects NaN maxQueued', () => {
+    expect(() => new AxlEventBus({ maxQueued: Number.NaN })).toThrow(/must be >= 1 or Infinity/);
+  });
+
+  it('accepts maxQueued: 1 (smallest valid cap)', () => {
+    expect(() => new AxlEventBus({ maxQueued: 1 })).not.toThrow();
+  });
+
+  it('accepts maxQueued: Infinity', () => {
+    expect(() => new AxlEventBus({ maxQueued: Infinity })).not.toThrow();
   });
 });
 

@@ -559,7 +559,7 @@ Configures the iterator-queue cap and overflow policy on `ctx.events` and on the
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `maxQueued` | `number` | `10_000` | Soft cap on events buffered while waiting for a consumer. Terminal events (`done`, `error`, `workflow_end`) are exempt. Set to `Infinity` to disable |
-| `onOverflow` | `'drop-oldest-non-terminal' \| 'throw'` | `'drop-oldest-non-terminal'` | Policy on cap exceeded. `'drop-oldest-non-terminal'` drops the oldest non-terminal event and emits a one-shot `console.warn` per bus instance. `'throw'` throws at the producer call site — **this will fail the active workflow** (the throw unwinds the agent loop and the runtime promise rejects). Use only in tests / strict environments |
+| `onOverflow` | `'drop-oldest-non-terminal' \| 'throw'` | `'drop-oldest-non-terminal'` | Policy on cap exceeded. `'drop-oldest-non-terminal'` drops the oldest non-terminal event and emits a one-shot `console.warn` per bus instance. `'throw'` throws an `EventStreamOverflowError` at the producer call site — **this will fail the active workflow** (the throw unwinds the agent loop and the runtime promise rejects with the typed error; catch via `instanceof EventStreamOverflowError`). Note: on `runtime.execute()` (no `AxlStream`), the throw only fires if the handler allocated `ctx.events` and that bus saturates. On `runtime.stream()`, the wire-side `AxlStream` bus always applies the policy. Use only in tests / strict environments |
 
 **Behavior change in this release.** Existing `AxlStream` consumers on 0.x gain the cap automatically. If your workflow somehow relied on unbounded queueing, opt out via `events: { maxQueued: Infinity }`.
 
@@ -954,8 +954,8 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 
 | Method | Description |
 |--------|-------------|
-| `session.send(workflow, input, { signal? })` | Execute a workflow with session history. Returns the result. Serialized per `sessionId` (see [Concurrency](#concurrency-and-races)). Pass `signal` to cancel via `AbortSignal` — fires the same path as `runtime.abort(executionId)`. A pre-aborted signal short-circuits before acquiring the lock |
-| `session.stream(workflow, input, { signal? })` | Execute a workflow with session history. Returns an `AxlStream`. Serialized per `sessionId` — the lock is held until the stream's terminal `done`/`error` event fires. `signal` aborts the stream and releases the lock |
+| `session.send(workflow, input, { signal?, events? })` | Execute a workflow with session history. Returns the result. Serialized per `sessionId` (see [Concurrency](#concurrency-and-races)). Pass `signal` to cancel via `AbortSignal` — fires the same path as `runtime.abort(executionId)`. A pre-aborted signal short-circuits before acquiring the lock. `events` configures the iterator-queue cap and overflow policy on the underlying `ctx.events` bus (see [`EventStreamOptions`](#eventstreamoptions)) |
+| `session.stream(workflow, input, { signal?, events? })` | Execute a workflow with session history. Returns an `AxlStream`. Serialized per `sessionId` — the lock is held until the stream's terminal `done`/`error` event fires. `signal` aborts the stream and releases the lock. `events` configures the iterator-queue cap and overflow policy on both the returned `AxlStream` and the workflow's `ctx.events` bus |
 | `session.history()` | Get the last persisted message history snapshot from the store. Does **not** await in-flight `send()`/`stream()` — returns the previously committed state, which may be stale by one exchange |
 | `session.handoffs()` | Get the handoff history for this session. Same snapshot semantics as `history()` |
 | `session.end()` | Close the session and delete history from the store. Serialized: queues behind any in-flight `send`/`stream` so the delete is the final state |

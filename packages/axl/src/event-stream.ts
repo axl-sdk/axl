@@ -66,20 +66,56 @@ export interface EventStreamOptions {
    *    splice out the oldest non-terminal event, push the new one. The first
    *    drop per bus instance fires a one-shot `console.warn` so saturating
    *    consumers see the signal without log spam.
-   *  - `'throw'`: throw an `Error` at the producer call site. **This will
-   *    fail the active workflow** — `_push` is called from
-   *    `WorkflowContext.emitEvent`, which runs inside `ctx.ask()` /
+   *  - `'throw'`: throw an `EventStreamOverflowError` at the producer call
+   *    site. **This will fail the active workflow** — `_push` is called
+   *    from `WorkflowContext.emitEvent`, which runs inside `ctx.ask()` /
    *    `runtime.execute()`. The throw unwinds the agent loop and the
-   *    `runtime.execute()` (or `runtime.stream()`) promise rejects with the
-   *    error. Useful in tests or strict environments where silent drop
-   *    would mask a problem; not the right default for production where
-   *    a slow consumer should degrade gracefully rather than abort the
-   *    workflow.
+   *    `runtime.execute()` (or `runtime.stream()`) promise rejects with
+   *    the typed error. Useful in tests or strict environments where
+   *    silent drop would mask a problem; not the right default for
+   *    production where a slow consumer should degrade gracefully rather
+   *    than abort the workflow. Catch with `instanceof
+   *    EventStreamOverflowError` to distinguish from other workflow
+   *    errors.
    *
    *  `'block'` is intentionally absent: `_push` is synchronous and there's no
    *  producer to suspend. To bound queue growth via backpressure, the
    *  producer side has to model it explicitly (out of scope for v1). */
   onOverflow?: 'drop-oldest-non-terminal' | 'throw';
+}
+
+/**
+ * Thrown when an `AxlEventBus` queue exceeds `maxQueued` and `onOverflow`
+ * is set to `'throw'`. Surfaced as a typed error so the runtime's emit
+ * pipeline can distinguish a legitimate overflow signal (which must
+ * propagate to fail the workflow) from a buggy trace-listener exception
+ * (which gets swallowed).
+ *
+ * Consumers using `instanceof` to handle overflow specifically:
+ * ```typescript
+ * try {
+ *   await runtime.execute('wf', input, { events: { onOverflow: 'throw' } });
+ * } catch (err) {
+ *   if (err instanceof EventStreamOverflowError) {
+ *     // overflow — back off, retry, or surface to user
+ *   }
+ * }
+ * ```
+ */
+export class EventStreamOverflowError extends Error {
+  readonly maxQueued: number;
+  readonly eventType: string;
+
+  constructor(maxQueued: number, eventType: string) {
+    super(
+      `AxlEventBus queue exceeded maxQueued=${maxQueued} (event type: ${eventType}). ` +
+        `Consumer is too slow or the producer is unbounded. Configure ` +
+        `\`maxQueued\`/\`onOverflow\` on the runtime, or set maxQueued: Infinity to disable.`,
+    );
+    this.name = 'EventStreamOverflowError';
+    this.maxQueued = maxQueued;
+    this.eventType = eventType;
+  }
 }
 
 /** 10_000 is ~1 MB at typical event sizes (a few hundred bytes per event,
@@ -126,7 +162,23 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
   private finishCallbacks: Array<() => void> = [];
 
   constructor(options?: EventStreamOptions) {
-    this.maxQueued = options?.maxQueued ?? DEFAULT_MAX_QUEUED;
+    const requestedMax = options?.maxQueued ?? DEFAULT_MAX_QUEUED;
+    // Validate `maxQueued`. `0` and negative values silently disabled the
+    // cap before this check (every push hit `handleOverflow`, which then
+    // found no non-terminal to drop in an empty queue and fell through to
+    // a regular push). That's a footgun — callers wanting "no cap" should
+    // pass `Infinity`. Reject anything below 1.
+    if (
+      typeof requestedMax !== 'number' ||
+      Number.isNaN(requestedMax) ||
+      (requestedMax !== Infinity && requestedMax < 1)
+    ) {
+      throw new Error(
+        `EventStreamOptions.maxQueued must be >= 1 or Infinity (got ${String(requestedMax)}). ` +
+          `To disable the cap, pass Infinity.`,
+      );
+    }
+    this.maxQueued = requestedMax;
     this.onOverflow = options?.onOverflow ?? DEFAULT_OVERFLOW;
     // Prevent unhandled 'error' events on the inner emitter from crashing
     // the process. AxlStream subclasses re-emit through their Readable
@@ -265,6 +317,16 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
    * accumulate ≈10k pending entries (~1 MB), which is the realistic
    * ceiling for this view.
    *
+   * Schema-retry awareness: each yielded value carries the 1-indexed
+   * `attempt` field from the underlying `partial_object` event. When a
+   * schema check fails and the agent retries, the runtime emits
+   * `pipeline(status: 'failed')`; this view drops any undrained pending
+   * partial for the affected ask so the consumer never sees stale
+   * attempt-N snapshots after attempt-N+1 has begun. Mirrors the
+   * per-attempt buffer reset that `AxlStream.fullText` applies to
+   * tokens. (Validate-stage and guardrail retries trigger the same
+   * reset.)
+   *
    * Malformed `partial_object` events (those missing `data.object`) are
    * silently filtered — the variant shape requires the field, so an
    * undefined value is a producer bug rather than a meaningful state.
@@ -280,11 +342,27 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
    * Termination: yields any pending coalesced values first, then `done: true`
    * once the bus is finished (via `_finish()`).
    */
-  get partialObjects(): AsyncIterable<{ askId: string; agent?: string; object: unknown }> {
+  get partialObjects(): AsyncIterable<{
+    askId: string;
+    agent?: string;
+    object: unknown;
+    attempt: number;
+  }> {
     const self = this;
     return {
       [Symbol.asyncIterator]() {
-        type Coalesced = { askId: string; agent?: string; object: unknown };
+        type Coalesced = {
+          askId: string;
+          agent?: string;
+          object: unknown;
+          /** The 1-indexed attempt number this snapshot belongs to. Surfaces
+           *  schema-retry transitions to the consumer — UIs can flash a
+           *  "regenerating" indicator when the value jumps from `attempt: 1`
+           *  to `attempt: 2`. Failed attempts are also discarded by the
+           *  pipeline-listener below before they can leak across the
+           *  retry boundary. */
+          attempt: number;
+        };
         // Latest-per-askId. Map insertion order = first-seen-askId order
         // when the consumer drains. We delete on yield so a slow consumer
         // gets the freshest value at await time.
@@ -312,11 +390,12 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
             askId,
             agent: event.agent,
             object: event.data.object,
+            attempt: event.attempt,
           });
         };
 
-        // Snapshot any `partial_object` events ALREADY in the bus's queue
-        // at subscription time. Without this, a consumer that calls
+        // Snapshot any relevant events ALREADY in the bus's queue at
+        // subscription time. Without this, a consumer that calls
         // `for await (const p of bus.partialObjects)` AFTER events have
         // been pushed would see nothing — the listener-based path only
         // catches future emissions. The snapshot is read-only (does not
@@ -325,13 +404,25 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
         // here too: if multiple snapshots exist for the same askId, only
         // the last one wins.
         //
+        // We replay BOTH partial_object AND pipeline(failed) events from
+        // the queue in original emission order so the same
+        // attempt-discard semantics apply to historical events as to
+        // future ones — without this, a consumer that subscribed after
+        // attempt-N's partial AND a subsequent pipeline(failed) would
+        // still see the discarded snapshot in its first .next() call.
+        //
         // Snapshot + subscribe together is atomic under the JS
         // run-to-completion model: no `_push` can interleave between the
         // synchronous loop below and the `bus.on(...)` call. If a future
         // refactor ever introduces async between them, an event could be
         // missed; pin the invariant if you change the surrounding code.
         for (const event of self.eventQueue) {
-          if (event.type === 'partial_object') recordPartial(event);
+          if (event.type === 'partial_object') {
+            recordPartial(event);
+          } else if (event.type === 'pipeline' && event.status === 'failed') {
+            const askId = event.askId ?? '';
+            pending.delete(askId);
+          }
         }
 
         // Listener subscribes directly to the inner bus (bypassing the
@@ -344,21 +435,43 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
         };
         self.bus.on('partial_object', handler);
 
+        // Drop pending partials on schema retry. Without this, an undrained
+        // attempt-N partial sits in `pending` while the producer kicks off
+        // attempt-N+1; the next consumer await would surface attempt-N's
+        // (now-superseded) snapshot before the new attempt's first partial
+        // arrives, causing UI flicker and potential shape pollution
+        // (attempt-N might emit malformed-but-mid-parse JSON that attempt-N+1
+        // corrects). Mirrors AxlStream.fullText's per-attempt buffer reset
+        // on `pipeline(failed)`. We listen on `pipeline` (any stage) and
+        // gate on `status === 'failed'` so the same handler fires for
+        // schema, validate, and guardrail retries — a consumer rendering
+        // a coalesced view never wants stale partials from a discarded
+        // attempt regardless of why it was discarded.
+        const pipelineHandler = (event: AxlEvent) => {
+          if (event.type !== 'pipeline') return;
+          if (event.status !== 'failed') return;
+          const askId = event.askId ?? '';
+          pending.delete(askId);
+        };
+        self.bus.on('pipeline', pipelineHandler);
+
         const unsubscribe = () => {
           if (unsubscribed) return;
           unsubscribed = true;
           self.bus.off('partial_object', handler);
+          self.bus.off('pipeline', pipelineHandler);
           unsubscribeFinish();
         };
 
-        // On bus finish, eagerly drop the listener so it can't leak when
-        // the consumer obtains the iterator but never drains it. The
+        // On bus finish, eagerly drop the listeners so they can't leak
+        // when the consumer obtains the iterator but never drains it. The
         // iterator's `next()` / `return()` paths still call `unsubscribe`
         // for the iteration-driven case; this handles the
         // never-iterated-but-bus-finished case.
         const unsubscribeFinish = self._onFinish(() => {
           finished = true;
           self.bus.off('partial_object', handler);
+          self.bus.off('pipeline', pipelineHandler);
           wakeWaiter();
         });
 
@@ -447,11 +560,7 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
    *  (checked by the caller). */
   private handleOverflow(event: AxlEvent): void {
     if (this.onOverflow === 'throw') {
-      throw new Error(
-        `AxlEventBus queue exceeded maxQueued=${this.maxQueued} (event type: ${event.type}). ` +
-          `Consumer is too slow or the producer is unbounded. Configure ` +
-          `\`maxQueued\`/\`onOverflow\` on the runtime, or set maxQueued: Infinity to disable.`,
-      );
+      throw new EventStreamOverflowError(this.maxQueued, event.type);
     }
     // 'drop-oldest-non-terminal': scan from head for the oldest non-terminal
     // and splice it out. Terminal events queued earlier (rare in practice

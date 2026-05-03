@@ -37,7 +37,7 @@ import {
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
 import { COST_BEARING_LEAF_TYPES } from './event-utils.js';
-import { AxlEventBus, type EventStreamOptions } from './event-stream.js';
+import { AxlEventBus, EventStreamOverflowError, type EventStreamOptions } from './event-stream.js';
 import { redactEvent } from './redaction.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
 import type { ProviderRegistry } from './providers/registry.js';
@@ -404,6 +404,14 @@ export class WorkflowContext<TInput = unknown> {
   get events(): AxlEventBus {
     if (!this._busRef.current) {
       this._busRef.current = new AxlEventBus(this._eventStreamOptions);
+      // If the context's signal was already aborted at construction time,
+      // the constructor's abort listener was skipped (it only attaches
+      // when the signal is still alive). A consumer accessing `ctx.events`
+      // after abort would otherwise get a never-finishing bus. Finish
+      // immediately so iterators resolve cleanly with `done: true`.
+      if (this.signal?.aborted) {
+        this._busRef.current._finish();
+      }
     }
     return this._busRef.current;
   }
@@ -450,6 +458,25 @@ export class WorkflowContext<TInput = unknown> {
     // constructed.
     this._busRef = init._busRef ?? { current: undefined };
     this._eventStreamOptions = init.eventStreamOptions;
+    // Auto-dispose the events bus when this context's signal aborts.
+    // The leak this prevents: a `runtime.createContext({ signal })` flow
+    // that iterates `ctx.events` and never emits a `workflow_end` /
+    // `error` terminal (because there's no workflow). Without this, an
+    // aborted signal would orphan the iterator and leak the listener
+    // pool. For workflow-driven flows the natural terminal already
+    // dominates; this hook is harmless when both fire (`_finish` is
+    // idempotent). Only the root context registers the listener — child
+    // contexts share the same `_busRef` and would otherwise double-fire.
+    // `init._busRef === undefined` is the root-context marker.
+    if (init._busRef === undefined && this.signal && !this.signal.aborted) {
+      this.signal.addEventListener(
+        'abort',
+        () => {
+          this._busRef.current?._finish();
+        },
+        { once: true },
+      );
+    }
     // Inherit auto-checkpoint counters from parent if provided; otherwise
     // start a fresh ref. Shared by reference so child contexts increment
     // the same counters and never collide with the parent in the store.
@@ -3610,6 +3637,13 @@ export class WorkflowContext<TInput = unknown> {
       try {
         this.onTrace(finalEvent);
       } catch (err) {
+        // EventStreamOverflowError is a strict-mode signal from the
+        // AxlStream's bus (the runtime's `onTrace` handler in
+        // `runtime.stream()` calls `axlStream._push(event)`, which can
+        // throw under `onOverflow: 'throw'`). The user opted into
+        // failing the workflow on overflow — we must propagate it.
+        // Other exceptions are buggy trace listeners; swallow + log.
+        if (err instanceof EventStreamOverflowError) throw err;
         console.error(
           '[axl] onTrace handler threw; trace event dropped:',
           err instanceof Error ? err.message : String(err),

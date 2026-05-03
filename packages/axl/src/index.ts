@@ -39,7 +39,7 @@ export { AxlStream } from './stream.js';
 // Event bus — public type returned by `ctx.events` and the implementation
 // behind `AxlStream`'s iterator + curated views (`.text`, `.lifecycle`,
 // `.textByAsk`, `.partialObjects`).
-export { AxlEventBus } from './event-stream.js';
+export { AxlEventBus, EventStreamOverflowError } from './event-stream.js';
 export type { EventStreamOptions } from './event-stream.js';
 
 // Event helpers — consumer-facing utilities for accumulators / reducers

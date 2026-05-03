@@ -2,6 +2,7 @@ import type { ChatMessage, HandoffRecord } from './types.js';
 import type { StateStore } from './state/types.js';
 import type { AxlRuntime } from './runtime.js';
 import type { AxlStream } from './stream.js';
+import type { EventStreamOptions } from './event-stream.js';
 
 /** Options for configuring a session. */
 export type SessionOptions = {
@@ -54,14 +55,14 @@ export class Session {
   async send(
     workflowName: string,
     input: unknown,
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; events?: EventStreamOptions },
   ): Promise<unknown> {
     if (this.closed) throw new Error('Session has been ended');
     // Fast-path: a pre-aborted signal short-circuits before we acquire the
     // per-session lock, so an aborted call never blocks other waiters.
     options?.signal?.throwIfAborted?.();
     return this.runtime._serializeSession(this.sessionId, () =>
-      this.sendImpl(workflowName, input, options?.signal),
+      this.sendImpl(workflowName, input, options?.signal, options?.events),
     );
   }
 
@@ -69,9 +70,10 @@ export class Session {
     workflowName: string,
     input: unknown,
     signal: AbortSignal | undefined,
+    events: EventStreamOptions | undefined,
   ): Promise<unknown> {
     const { history, metadata } = await this.prepareHistory(input);
-    const result = await this.runtime.execute(workflowName, input, { metadata, signal });
+    const result = await this.runtime.execute(workflowName, input, { metadata, signal, events });
     await this.commitHistory(history, result);
     return result;
   }
@@ -154,7 +156,7 @@ export class Session {
   async stream(
     workflowName: string,
     input: unknown,
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; events?: EventStreamOptions },
   ): Promise<AxlStream> {
     if (this.closed) throw new Error('Session has been ended');
     options?.signal?.throwIfAborted?.();
@@ -179,7 +181,14 @@ export class Session {
     // the rejection through.
     void this.runtime
       ._serializeSession(this.sessionId, () =>
-        this.streamImpl(workflowName, input, resolveReady, rejectReady),
+        this.streamImpl(
+          workflowName,
+          input,
+          resolveReady,
+          rejectReady,
+          options?.signal,
+          options?.events,
+        ),
       )
       .catch(() => {
         /* surfaced via rejectReady */
@@ -193,13 +202,19 @@ export class Session {
     input: unknown,
     resolveReady: (s: AxlStream) => void,
     rejectReady: (e: unknown) => void,
+    signal: AbortSignal | undefined,
+    events: EventStreamOptions | undefined,
   ): Promise<void> {
     let history: ChatMessage[];
     let axlStream: AxlStream;
     try {
       const prepared = await this.prepareHistory(input);
       history = prepared.history;
-      axlStream = this.runtime.stream(workflowName, input, { metadata: prepared.metadata });
+      axlStream = this.runtime.stream(workflowName, input, {
+        metadata: prepared.metadata,
+        signal,
+        events,
+      });
     } catch (err) {
       rejectReady(err);
       throw err;

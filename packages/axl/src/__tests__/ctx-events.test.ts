@@ -4,6 +4,7 @@ import { AxlRuntime } from '../runtime.js';
 import { workflow } from '../workflow.js';
 import { agent } from '../agent.js';
 import { tool } from '../tool.js';
+import { EventStreamOverflowError } from '../event-stream.js';
 import { MockProvider } from '../../../axl-testing/src/mock-provider.js';
 import type { AxlEvent } from '../types.js';
 
@@ -249,6 +250,72 @@ describe('ctx.events — createContext (ad-hoc) usage', () => {
     expect(allocated).toBeUndefined();
   });
 
+  it('signal abort auto-disposes ctx.events on createContext flows (no workflow terminal needed)', async () => {
+    const runtime = buildRuntime(MockProvider.sequence([{ content: 'x' }]));
+    const ac = new AbortController();
+    const ctx = runtime.createContext({ signal: ac.signal });
+
+    let count = 0;
+    let terminated = false;
+    const consumer = (async () => {
+      for await (const _e of ctx.events) {
+        void _e;
+        count++;
+      }
+      terminated = true;
+    })();
+    // Park the consumer.
+    await new Promise((r) => setImmediate(r));
+    // Abort. The constructor-attached listener should call disposeEvents.
+    ac.abort();
+    await consumer;
+    expect(count).toBe(0);
+    expect(terminated).toBe(true);
+  });
+
+  it('pre-aborted signal at createContext time disposes the bus on first ctx.events access', async () => {
+    const runtime = buildRuntime(MockProvider.sequence([{ content: 'x' }]));
+    const ac = new AbortController();
+    ac.abort(); // pre-abort BEFORE createContext
+    const ctx = runtime.createContext({ signal: ac.signal });
+
+    // ctx.events is created lazily here. The getter must finish it
+    // immediately so the iterator terminates cleanly instead of hanging.
+    let terminated = false;
+    for await (const _e of ctx.events) {
+      void _e;
+    }
+    terminated = true;
+    expect(terminated).toBe(true);
+  });
+
+  it('child contexts do NOT register their own abort listener (only the root does)', async () => {
+    // Pin the `init._busRef === undefined` gate in WorkflowContext's
+    // constructor: if a child context (which inherits the parent's
+    // `_busRef`) ALSO attached an abort listener, the bus would try to
+    // _finish multiple times on abort. _finish is idempotent so the
+    // bug isn't user-observable, but the listener pool would grow with
+    // each child context — a leak under fan-out workloads.
+    //
+    // AbortSignal (EventTarget) does not expose listener count, so spy
+    // on addEventListener instead. Each *root* WorkflowContext is
+    // expected to call this exactly once with 'abort'; child contexts
+    // (sharing the parent's `_busRef`) must call it zero times.
+    const runtime = buildRuntime(MockProvider.sequence([{ content: 'x' }]));
+    const ac = new AbortController();
+    const addSpy = vi.spyOn(ac.signal, 'addEventListener');
+    const ctx = runtime.createContext({ signal: ac.signal });
+    const abortAfterRoot = addSpy.mock.calls.filter((c) => c[0] === 'abort').length;
+    // Spawn 5 child contexts.
+    for (let i = 0; i < 5; i++) ctx.createChildContext();
+    const abortAfterChildren = addSpy.mock.calls.filter((c) => c[0] === 'abort').length;
+    // Root context registered exactly one 'abort' listener.
+    expect(abortAfterRoot).toBe(1);
+    // Child contexts must not have added any. Total still 1.
+    expect(abortAfterChildren).toBe(1);
+    addSpy.mockRestore();
+  });
+
   it('disposeEvents() after workflow_end auto-finished the bus is a safe no-op', async () => {
     // After `runtime.execute()` completes, the bus has been auto-finished
     // by the `workflow_end` emit path. Calling `disposeEvents` is then
@@ -275,6 +342,90 @@ describe('ctx.events — createContext (ad-hoc) usage', () => {
     runtime.register(wf);
     await runtime.execute('post-finish-dispose', {});
     expect(() => (captured as { disposeEvents: () => void }).disposeEvents()).not.toThrow();
+  });
+});
+
+describe('ctx.events — Session and AxlTestRuntime events plumbing', () => {
+  it('Session.send forwards `events` option to runtime.execute', async () => {
+    // Simplest verification: build an actual runtime, register a workflow
+    // that sets onOverflow:'throw' and overflows the cap. The throw must
+    // propagate through session.send → runtime.execute.
+    const provider = MockProvider.sequence([{ content: 'x' }]);
+    const runtime = buildRuntime(provider);
+    const a = agent({ name: 'a', model: 'mock:test', system: 's' });
+    runtime.register(
+      workflow({
+        name: 'overflow-via-session',
+        input: z.object({}),
+        handler: async (ctx) => {
+          void ctx.events; // allocate the bus
+          await ctx.ask(a, 'hi');
+          return null;
+        },
+      }),
+    );
+    const session = runtime.session('sess-events');
+    await expect(
+      session.send('overflow-via-session', {}, { events: { maxQueued: 1, onOverflow: 'throw' } }),
+    ).rejects.toThrow(/maxQueued=1/);
+  });
+
+  it('Session.stream forwards `events` option to runtime.stream', async () => {
+    const provider = MockProvider.sequence([{ content: 'x' }]);
+    const runtime = buildRuntime(provider);
+    const a = agent({ name: 'a', model: 'mock:test', system: 's' });
+    runtime.register(
+      workflow({
+        name: 'overflow-via-session-stream',
+        input: z.object({}),
+        handler: async (ctx) => {
+          void ctx.events;
+          await ctx.ask(a, 'hi');
+          return null;
+        },
+      }),
+    );
+    const session = runtime.session('sess-events-stream');
+    const stream = await session.stream(
+      'overflow-via-session-stream',
+      {},
+      { events: { maxQueued: 1, onOverflow: 'throw' } },
+    );
+    // The throw propagates through the stream's promise rejection as a
+    // typed EventStreamOverflowError (the runtime's onTrace try/catch
+    // re-throws this specific class to preserve the "fail loudly on
+    // saturation" contract).
+    await expect(stream.promise).rejects.toBeInstanceOf(EventStreamOverflowError);
+  });
+
+  it('AxlStream onOverflow:"throw" propagates as EventStreamOverflowError (not silently swallowed by onTrace try/catch)', async () => {
+    // Regression test for a pre-existing bug exposed during the gap-fix
+    // pass: emitEvent's try/catch around `this.onTrace(finalEvent)` was
+    // swallowing the throw from `axlStream._push` (which the runtime's
+    // onTrace handler in runtime.stream() invokes). Strict-mode users
+    // who set onOverflow:'throw' want the workflow to fail; the typed
+    // error class lets emitEvent re-throw selectively.
+    const provider = MockProvider.sequence([{ content: 'x' }]);
+    const runtime = buildRuntime(provider);
+    const a = agent({ name: 'a', model: 'mock:test', system: 's' });
+    runtime.register(
+      workflow({
+        name: 'overflow-on-stream',
+        input: z.object({}),
+        handler: async (ctx) => {
+          // Don't allocate ctx.events — only the AxlStream's bus has the
+          // cap and would throw. This isolates the regression.
+          await ctx.ask(a, 'hi');
+          return null;
+        },
+      }),
+    );
+    const stream = runtime.stream(
+      'overflow-on-stream',
+      {},
+      { events: { maxQueued: 1, onOverflow: 'throw' } },
+    );
+    await expect(stream.promise).rejects.toBeInstanceOf(EventStreamOverflowError);
   });
 });
 

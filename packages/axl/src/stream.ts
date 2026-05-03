@@ -1,5 +1,5 @@
 import { Readable } from 'node:stream';
-import { AxlEventBus } from './event-stream.js';
+import { AxlEventBus, type EventStreamOptions } from './event-stream.js';
 import { type AxlEvent, type AxlEventOf, type AxlEventType } from './types.js';
 import { isRootLevel } from './event-utils.js';
 
@@ -56,12 +56,12 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
   private resolvePromise!: (value: unknown) => void;
   private rejectPromise!: (error: Error) => void;
 
-  constructor() {
+  constructor(options?: EventStreamOptions) {
     super({ objectMode: true, read() {} });
 
     this.events = new AxlStreamEventBus(() => {
       this.destroy();
-    });
+    }, options);
 
     this.promise = new Promise((resolve, reject) => {
       this.resolvePromise = resolve;
@@ -302,8 +302,11 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
  *  `knowsEventName`, which AxlStream's `.on()` uses to route AxlEvent
  *  names here and Readable-level names ('close', 'data', ...) to super. */
 class AxlStreamEventBus extends AxlEventBus {
-  constructor(private readonly disposeOwner: () => void) {
-    super();
+  constructor(
+    private readonly disposeOwner: () => void,
+    options?: EventStreamOptions,
+  ) {
+    super(options);
   }
 
   protected override _disposeIterator(): Promise<void> {

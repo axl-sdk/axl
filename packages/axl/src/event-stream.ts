@@ -344,17 +344,23 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
         };
         self.bus.on('partial_object', handler);
 
-        const unsubscribeFinish = self._onFinish(() => {
-          finished = true;
-          wakeWaiter();
-        });
-
         const unsubscribe = () => {
           if (unsubscribed) return;
           unsubscribed = true;
           self.bus.off('partial_object', handler);
           unsubscribeFinish();
         };
+
+        // On bus finish, eagerly drop the listener so it can't leak when
+        // the consumer obtains the iterator but never drains it. The
+        // iterator's `next()` / `return()` paths still call `unsubscribe`
+        // for the iteration-driven case; this handles the
+        // never-iterated-but-bus-finished case.
+        const unsubscribeFinish = self._onFinish(() => {
+          finished = true;
+          self.bus.off('partial_object', handler);
+          wakeWaiter();
+        });
 
         return {
           async next(): Promise<IteratorResult<Coalesced>> {

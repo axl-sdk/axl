@@ -16,6 +16,7 @@ import { SQLiteStore } from './state/sqlite.js';
 import { WorkflowContext } from './context.js';
 import { Session, type SessionOptions } from './session.js';
 import { AxlStream } from './stream.js';
+import type { EventStreamOptions } from './event-stream.js';
 import { McpManager } from './mcp/manager.js';
 import { MemoryManager } from './memory/manager.js';
 import type {
@@ -132,6 +133,12 @@ export type ExecuteOptions = {
    *  JS cancellation pattern (e.g., AbortController from a UI's "stop"
    *  button) without having to track the execution id. */
   signal?: AbortSignal;
+  /** Configuration for the workflow context's `ctx.events` bus and the
+   *  `AxlStream` returned by `runtime.stream()`. Both consume the same
+   *  `EventStreamOptions` (queue cap + overflow policy). When omitted,
+   *  defaults are `maxQueued: 10_000` and `onOverflow:
+   *  'drop-oldest-non-terminal'`. */
+  events?: EventStreamOptions;
 };
 
 /**
@@ -163,6 +170,10 @@ export type CreateContextOptions = {
   onAgentStart?: (info: { agent: string; model?: string }, meta: CallbackMeta) => void;
   /** Handler for tool approval requests. Called when an agent invokes a tool with requireApproval. */
   awaitHumanHandler?: (options: AwaitHumanOptions) => Promise<HumanDecision>;
+  /** Configuration for the lazy `ctx.events` bus on the returned context.
+   *  Defaults: `maxQueued: 10_000`, `onOverflow:
+   *  'drop-oldest-non-terminal'`. */
+  events?: EventStreamOptions;
 };
 
 /** Cost scope for tracking cost across async boundaries via AsyncLocalStorage. */
@@ -693,6 +704,7 @@ export class AxlRuntime extends EventEmitter {
       onToolCall: options?.onToolCall,
       onAgentStart: options?.onAgentStart,
       awaitHumanHandler: options?.awaitHumanHandler,
+      eventStreamOptions: options?.events,
       onTrace: (event: AxlEvent) => {
         this.emit('trace', event);
         this.outputAxlEvent(event);
@@ -762,6 +774,7 @@ export class AxlRuntime extends EventEmitter {
       providerRegistry: this.providerRegistry,
       sessionHistory,
       signal: controller.signal,
+      eventStreamOptions: options?.events,
       onTrace: (event: AxlEvent) => {
         // High-volume stream-only events (`token`, `partial_object`)
         // are never persisted, plus a bounded cap on the rest to avoid
@@ -853,7 +866,11 @@ export class AxlRuntime extends EventEmitter {
 
   /** Execute a workflow and return a stream. */
   stream(name: string, input: unknown, options?: ExecuteOptions): AxlStream {
-    const axlStream = new AxlStream();
+    // Forward `events` config to BOTH the AxlStream's internal bus (queue
+    // cap on the wire) and the WorkflowContext's `ctx.events` bus (queue
+    // cap inside the workflow). They're independent buses but share the
+    // same configured behavior.
+    const axlStream = new AxlStream(options?.events);
     const controller = new AbortController();
 
     // Cancel workflow when consumer disconnects (stops reading the stream)
@@ -907,6 +924,7 @@ export class AxlRuntime extends EventEmitter {
         providerRegistry: this.providerRegistry,
         sessionHistory,
         signal: controller.signal,
+        eventStreamOptions: options?.events,
         // Sentinel `onToken` so the streaming code path in WorkflowContext
         // is entered (it's gated on `this.onToken` being defined). The
         // actual `token` AxlEvents are emitted via `emitEvent` and reach

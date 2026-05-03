@@ -37,6 +37,7 @@ import {
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
 import { COST_BEARING_LEAF_TYPES } from './event-utils.js';
+import { AxlEventBus, type EventStreamOptions } from './event-stream.js';
 import { redactEvent } from './redaction.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
 import type { ProviderRegistry } from './providers/registry.js';
@@ -248,6 +249,20 @@ export type WorkflowContextInit = {
   onAgentStart?: (info: { agent: string; model: string }, meta: CallbackMeta) => void;
   /** Callback fired after each ctx.ask() completes (once per ask invocation). */
   onAgentCallComplete?: (call: AgentCallInfo) => void;
+  /** Options for the lazy `ctx.events` `AxlEventBus`. Forwarded by
+   *  `runtime.createContext({ events })` / `runtime.execute(name, input,
+   *  { events })` / `runtime.stream(name, input, { events })`. If unset,
+   *  the bus uses its built-in defaults (`maxQueued: 10_000`,
+   *  `onOverflow: 'drop-oldest-non-terminal'`). Child contexts share the
+   *  parent's bus instance, so this option has no effect on
+   *  `createChildContext()` callers. */
+  eventStreamOptions?: EventStreamOptions;
+  /** Internal: shared mutable holder for the lazy `AxlEventBus`. Set by
+   *  `createChildContext` so parent + children read and write the same
+   *  slot — late allocation in the parent (after children exist) is
+   *  visible to those children, and child allocation is visible to the
+   *  parent. Direct callers should not pass this. */
+  _busRef?: { current: AxlEventBus | undefined };
   /** Internal: shared auto-checkpoint counters. Set by `createChildContext`
    *  so parent + child share the same number space, preventing checkpoint
    *  store key collisions across nested `WorkflowContext` instances.
@@ -341,6 +356,69 @@ export class WorkflowContext<TInput = unknown> {
   ) => HumanDecision | Promise<HumanDecision>;
   private onAgentStart?: (info: { agent: string; model: string }, meta: CallbackMeta) => void;
   private onAgentCallComplete?: (call: AgentCallInfo) => void;
+
+  /** Shared mutable slot for the lazy `AxlEventBus`. The slot is shared
+   *  by reference across parent/child contexts so a late allocation
+   *  (consumer subscribes after a child context exists) is visible
+   *  everywhere. Until first access `_busRef.current` is undefined and
+   *  `emitEvent` skips the bus fan-out entirely (zero overhead for
+   *  contexts that never observe). */
+  private readonly _busRef: { current: AxlEventBus | undefined };
+  private readonly _eventStreamOptions?: EventStreamOptions;
+
+  /**
+   * Iterable + EventEmitter view over every `AxlEvent` emitted by this
+   * context (and its child contexts — agent-as-tool nested asks bubble up).
+   *
+   * Use cases:
+   *  - **Inside a workflow handler**: subscribe before the first `ctx.ask()`
+   *    to observe `partial_object`, `agent_call_*`, `tool_call_*`, etc.
+   *    *between* asks. `ctx.events.partialObjects` is the coalescing view
+   *    designed for streaming-structured-output UIs.
+   *  - **Ad-hoc contexts** from `runtime.createContext()`: the same
+   *    iterable replaces the legacy `onToken` / `onToolCall` /
+   *    `onAgentStart` callbacks.
+   *  - **Cross-execution**: prefer `runtime.on('trace', …)` instead — that
+   *    fans out across all executions, while `ctx.events` is per-context.
+   *
+   * Lazy: the bus is allocated on first access. Iterators that subscribe
+   * before any event is emitted see the full sequence; iterators that
+   * subscribe after an event has been emitted miss it (events are not
+   * buffered for late subscribers — subscribe at the top of the workflow
+   * handler).
+   *
+   * **Subscribe before the first `ctx.ask()`.** The streaming code path
+   * inside `ctx.ask()` activates only when an observer is present at the
+   * time the ask starts (either `onToken` is set or `_busRef.current`
+   * exists). If you allocate `ctx.events` AFTER a `ctx.ask()` has begun,
+   * that in-flight ask will not stream `token` / `partial_object` events
+   * — only structural events (`agent_call_*`, `tool_call_*`, etc.) will
+   * fan out. Subsequent asks will stream normally.
+   *
+   * Auto-termination: `emitEvent` calls `_eventBus._finish()` after
+   * emitting `workflow_end` or `error`, so iterators terminate cleanly
+   * with `done: true`. For ad-hoc contexts that never run a workflow
+   * (no terminal event), call `ctx.disposeEvents()` when done observing
+   * to release iterator consumers.
+   */
+  get events(): AxlEventBus {
+    if (!this._busRef.current) {
+      this._busRef.current = new AxlEventBus(this._eventStreamOptions);
+    }
+    return this._busRef.current;
+  }
+
+  /** Manually finish the `ctx.events` bus, terminating any active
+   *  iterators with `done: true`. Idempotent. Useful for ad-hoc contexts
+   *  from `runtime.createContext()` that never emit a `workflow_end` /
+   *  `error` terminal — observers iterating `for await (const e of
+   *  ctx.events)` would otherwise hang. Workflow-driven contexts
+   *  (`runtime.execute` / `runtime.stream`) terminate automatically and
+   *  don't need this. */
+  disposeEvents(): void {
+    this._busRef.current?._finish();
+  }
+
   constructor(init: WorkflowContextInit) {
     this.input = init.input as TInput;
     this.executionId = init.executionId;
@@ -364,6 +442,14 @@ export class WorkflowContext<TInput = unknown> {
     this.awaitHumanHandler = init.awaitHumanHandler;
     this.onAgentStart = init.onAgentStart;
     this.onAgentCallComplete = init.onAgentCallComplete;
+    // The bus slot is shared mutable state across parent + children so a
+    // late allocation in either is visible to all of them. Root contexts
+    // get a fresh `{ current: undefined }`; child contexts inherit the
+    // parent's ref. `emitEvent` reads `_busRef.current` on every call so
+    // it picks up an allocation that happened after this context was
+    // constructed.
+    this._busRef = init._busRef ?? { current: undefined };
+    this._eventStreamOptions = init.eventStreamOptions;
     // Inherit auto-checkpoint counters from parent if provided; otherwise
     // start a fresh ref. Shared by reference so child contexts increment
     // the same counters and never collide with the parent in the store.
@@ -424,6 +510,13 @@ export class WorkflowContext<TInput = unknown> {
       // emitted from `ctx.ask` / spawn / race / parallel / map in this
       // child context don't collide with the parent's in the state store.
       autoCheckpointCounters: this.autoCheckpointCounters,
+      // Share the parent's bus slot (mutable ref). Late allocation in
+      // either parent or child propagates because both read the same
+      // slot. Nested-ask events (agent-as-tool pattern) bubble up to
+      // the parent's iterator with `parentAskId`/`depth` correlation
+      // intact.
+      _busRef: this._busRef,
+      eventStreamOptions: this._eventStreamOptions,
       // Isolated: sessionHistory (empty)
     });
   }
@@ -966,7 +1059,15 @@ export class WorkflowContext<TInput = unknown> {
       // ask-loop error handling (ask_end({ok:false}), MaxTurnsError, etc.) is
       // unchanged.
       try {
-        if (this.onToken) {
+        // Activate the streaming code path when ANY observer is interested:
+        // - `onToken` is set (legacy callback path; runtime.stream() sets a
+        //   sentinel `() => {}` to enable streaming without any consumer)
+        // - `ctx.events` has been allocated (a workflow-handler consumer
+        //   subscribed via `for await (const p of ctx.events.partialObjects)`
+        //   or similar). Without this branch, runtime.execute() would skip
+        //   streaming and the partial_object events the customer wanted to
+        //   observe would never fire.
+        if (this.onToken || this._busRef.current) {
           // Use streaming to emit tokens in real-time
           let content = '';
           const toolCalls: ToolCallMessage[] = [];
@@ -1006,7 +1107,9 @@ export class WorkflowContext<TInput = unknown> {
               // trace listeners both see it. Stream-only — `runtime.execute`'s
               // onTrace skips persisting tokens to ExecutionInfo.events.
               this.emitEvent({ type: 'token', data: chunk.content });
-              this.onToken(chunk.content, callbackMeta);
+              // `onToken` is optional — the streaming branch can also be
+              // entered solely because `ctx.events` is being observed.
+              this.onToken?.(chunk.content, callbackMeta);
               if (partialObjectEnabled) {
                 // Walk `chunk.content` char-by-char, updating the
                 // in-string / escape state and recording whether a
@@ -3511,6 +3614,26 @@ export class WorkflowContext<TInput = unknown> {
           '[axl] onTrace handler threw; trace event dropped:',
           err instanceof Error ? err.message : String(err),
         );
+      }
+    }
+    // Fan out to the `ctx.events` bus if any consumer subscribed. Read
+    // `_busRef.current` on every call so a late `ctx.events` access
+    // (after this child context already exists) is picked up here. The
+    // throw under `onOverflow: 'throw'` propagates up through this
+    // emitEvent call and unwinds the active ctx.* primitive — that's
+    // the documented behavior of the policy.
+    const bus = this._busRef.current;
+    if (bus) {
+      bus._push(finalEvent);
+      // Auto-terminate the bus on workflow terminals so iterators
+      // resolve with `done: true`. Done here (rather than in the
+      // runtime) so any path that emits these events (including
+      // AxlTestRuntime, programmatic emits, etc.) gets the same
+      // termination semantics. createContext-style flows that never
+      // emit a terminal can call `ctx.disposeEvents()` for the same
+      // effect.
+      if (finalEvent.type === 'workflow_end' || finalEvent.type === 'error') {
+        bus._finish();
       }
     }
   }

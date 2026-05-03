@@ -36,6 +36,12 @@ export type { AxlConfig } from './config.js';
 // narrow on `event.type` from the `AxlEvent` union (spec/16 decision 8).
 export { AxlStream } from './stream.js';
 
+// Event bus — public type returned by `ctx.events` and the implementation
+// behind `AxlStream`'s iterator + curated views (`.text`, `.lifecycle`,
+// `.textByAsk`, `.partialObjects`).
+export { AxlEventBus } from './event-stream.js';
+export type { EventStreamOptions } from './event-stream.js';
+
 // Event helpers — consumer-facing utilities for accumulators / reducers
 // that need to honor spec invariants (cost-rollup skip, root-level
 // filter, leaf-cost detection). Use these instead of hand-rolling the

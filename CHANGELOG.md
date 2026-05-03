@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.3] - 2026-05-03
+
 ### Added — Stream-First Observation API (Phase 1)
 
 The headline customer feature this release. Iterate workflow events from inside the handler, between `ctx.ask()` calls.

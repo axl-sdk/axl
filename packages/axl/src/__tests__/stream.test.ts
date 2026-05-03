@@ -768,6 +768,43 @@ describe('AxlStream', () => {
     });
   });
 
+  // ── partialObjects coalescing view (delegates to AxlEventBus) ──────────
+
+  describe('.partialObjects', () => {
+    it('exposes the coalescing view from the underlying bus', async () => {
+      const stream = new AxlStream();
+      stream._push(ev({ type: 'partial_object', attempt: 1, data: { object: { v: 1 } }, ...ASK }));
+      stream._push(ev({ type: 'partial_object', attempt: 1, data: { object: { v: 2 } }, ...ASK }));
+      stream._push(ev({ type: 'partial_object', attempt: 1, data: { object: { v: 3 } }, ...ASK }));
+      stream._done('result', 'test-exec');
+
+      const seen: Array<{ object: unknown }> = [];
+      for await (const p of stream.partialObjects) seen.push(p);
+      // All three coalesce into the latest per askId.
+      expect(seen).toHaveLength(1);
+      expect((seen[0].object as { v: number }).v).toBe(3);
+    });
+
+    it('preserves partials per askId when consumer is fast', async () => {
+      const stream = new AxlStream();
+      const seen: number[] = [];
+      const consumer = (async () => {
+        for await (const p of stream.partialObjects) {
+          seen.push((p.object as { v: number }).v);
+          if (seen.length === 3) break;
+        }
+      })();
+      await new Promise((r) => setImmediate(r));
+      stream._push(ev({ type: 'partial_object', attempt: 1, data: { object: { v: 1 } }, ...ASK }));
+      await new Promise((r) => setImmediate(r));
+      stream._push(ev({ type: 'partial_object', attempt: 1, data: { object: { v: 2 } }, ...ASK }));
+      await new Promise((r) => setImmediate(r));
+      stream._push(ev({ type: 'partial_object', attempt: 1, data: { object: { v: 3 } }, ...ASK }));
+      await consumer;
+      expect(seen).toEqual([1, 2, 3]);
+    });
+  });
+
   // ── Block B: Lifecycle exhaustiveness guard ─────────────────────────────
   //
   // `stream.ts` hard-codes the set of types that `.lifecycle` yields. If a

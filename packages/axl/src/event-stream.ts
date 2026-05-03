@@ -18,6 +18,17 @@ const STREAM_EVENTS: ReadonlySet<AxlEventType> = new Set<AxlEventType>(AXL_EVENT
  *  `__tests__/stream.test.ts` — adding a new `AxlEventType` forces a
  *  conscious lifecycle/excluded decision.
  */
+/** Terminal event types — never dropped on overflow. `done` / `error` are
+ *  synthesized by `AxlStream` for stream-level termination. `workflow_end`
+ *  is the runtime's terminal marker for a workflow execution; preserving
+ *  it ensures consumers always see "the workflow finished" even if the
+ *  queue saturated mid-flight. */
+const TERMINAL_TYPES: ReadonlySet<AxlEventType> = new Set<AxlEventType>([
+  'done',
+  'error',
+  'workflow_end',
+]);
+
 const LIFECYCLE_TYPES: ReadonlySet<AxlEventType> = new Set<AxlEventType>([
   'ask_start',
   'ask_end',
@@ -39,6 +50,44 @@ const LIFECYCLE_TYPES: ReadonlySet<AxlEventType> = new Set<AxlEventType>([
   'await_human',
   'await_human_resolved',
 ]);
+
+/** Options shared between `AxlEventBus` (and therefore `AxlStream` and
+ *  `ctx.events`). Controls the overflow safety net on the iterator queue. */
+export interface EventStreamOptions {
+  /** Soft cap on the number of events held in the iterator queue while
+   *  waiting for a consumer. Terminal events (`done`, `error`,
+   *  `workflow_end`) are exempt and always pass through. Default 10_000.
+   *
+   *  Set to `Infinity` to disable the cap (matches pre-0.x behavior). */
+  maxQueued?: number;
+  /** Policy when an event arrives and the queue is at `maxQueued`.
+   *
+   *  - `'drop-oldest-non-terminal'` (default): scan the queue head-to-tail,
+   *    splice out the oldest non-terminal event, push the new one. The first
+   *    drop per bus instance fires a one-shot `console.warn` so saturating
+   *    consumers see the signal without log spam.
+   *  - `'throw'`: throw an `Error` at the producer call site. **This will
+   *    fail the active workflow** — `_push` is called from
+   *    `WorkflowContext.emitEvent`, which runs inside `ctx.ask()` /
+   *    `runtime.execute()`. The throw unwinds the agent loop and the
+   *    `runtime.execute()` (or `runtime.stream()`) promise rejects with the
+   *    error. Useful in tests or strict environments where silent drop
+   *    would mask a problem; not the right default for production where
+   *    a slow consumer should degrade gracefully rather than abort the
+   *    workflow.
+   *
+   *  `'block'` is intentionally absent: `_push` is synchronous and there's no
+   *  producer to suspend. To bound queue growth via backpressure, the
+   *  producer side has to model it explicitly (out of scope for v1). */
+  onOverflow?: 'drop-oldest-non-terminal' | 'throw';
+}
+
+/** 10_000 is ~1 MB at typical event sizes (a few hundred bytes per event,
+ *  with the structured-output `partial_object` payloads being the largest
+ *  outliers at a few KB). High enough that no normal consumer hits it;
+ *  low enough that a runaway producer surfaces the warn before OOM. */
+const DEFAULT_MAX_QUEUED = 10_000;
+const DEFAULT_OVERFLOW: NonNullable<EventStreamOptions['onOverflow']> = 'drop-oldest-non-terminal';
 
 /**
  * Iterable + EventEmitter event bus carrying `AxlEvent`.
@@ -68,7 +117,17 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
   protected waiters: Array<(value: IteratorResult<AxlEvent>) => void> = [];
   protected finished = false;
 
-  constructor() {
+  private readonly maxQueued: number;
+  private readonly onOverflow: NonNullable<EventStreamOptions['onOverflow']>;
+  private overflowWarned = false;
+  /** Callbacks fired exactly once when `_finish()` is called. Used by
+   *  curated views (e.g., `partialObjects`) that are listener-based and
+   *  need a termination signal independent of any synthetic `done` event. */
+  private finishCallbacks: Array<() => void> = [];
+
+  constructor(options?: EventStreamOptions) {
+    this.maxQueued = options?.maxQueued ?? DEFAULT_MAX_QUEUED;
+    this.onOverflow = options?.onOverflow ?? DEFAULT_OVERFLOW;
     // Prevent unhandled 'error' events on the inner emitter from crashing
     // the process. AxlStream subclasses re-emit through their Readable
     // 'error' channel for the standard Node stream contract; bus-level
@@ -189,6 +248,147 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     };
   }
 
+  /**
+   * Coalescing iterator over `partial_object` events — yields the latest
+   * payload per `askId`. When a newer `partial_object` arrives for an
+   * `askId` while the consumer is busy, the older value is silently
+   * superseded; the consumer sees only the most recent state per ask on
+   * its next `.next()` await.
+   *
+   * Memory bound: O(active asks holding a pending partial), not O(events).
+   * This is what UIs streaming structured output actually want — rendering
+   * every intermediate snapshot just to overwrite it ms later is wasted
+   * work, and unbounded queueing of intermediate JSON snapshots is the
+   * memory-pressure scenario this view is designed to avoid. In practice
+   * "active asks" is small (1-10 even for fan-out workflows); a workflow
+   * fanning out to 10k concurrent asks each producing partials would
+   * accumulate ≈10k pending entries (~1 MB), which is the realistic
+   * ceiling for this view.
+   *
+   * Malformed `partial_object` events (those missing `data.object`) are
+   * silently filtered — the variant shape requires the field, so an
+   * undefined value is a producer bug rather than a meaningful state.
+   *
+   * Implementation note: this is a listener-based view (subscribes to the
+   * bus's `partial_object` channel via `.on()`), not an iterator-based
+   * filter like `.text` / `.lifecycle` / `.textByAsk`. As a result it does
+   * NOT race with the main async iterator — running `for await (const e of bus)`
+   * concurrently with `for await (const p of bus.partialObjects)` works
+   * cleanly (each `partial_object` event fires the listener AND queues for
+   * iterators).
+   *
+   * Termination: yields any pending coalesced values first, then `done: true`
+   * once the bus is finished (via `_finish()`).
+   */
+  get partialObjects(): AsyncIterable<{ askId: string; agent?: string; object: unknown }> {
+    const self = this;
+    return {
+      [Symbol.asyncIterator]() {
+        type Coalesced = { askId: string; agent?: string; object: unknown };
+        // Latest-per-askId. Map insertion order = first-seen-askId order
+        // when the consumer drains. We delete on yield so a slow consumer
+        // gets the freshest value at await time.
+        const pending = new Map<string, Coalesced>();
+        let resolveWaiter: (() => void) | null = null;
+        let finished = self.finished;
+        let unsubscribed = false;
+
+        const wakeWaiter = () => {
+          const r = resolveWaiter;
+          resolveWaiter = null;
+          r?.();
+        };
+
+        // Update `pending` from a partial_object event. Filters malformed
+        // events whose `data.object` is undefined — those are producer
+        // bugs (the payload is required by the variant shape), and yielding
+        // `{object: undefined}` shifts the burden to consumers. Defined
+        // falsy values (`null`, `0`, `false`, `''`) are valid JSON and pass
+        // through unchanged.
+        const recordPartial = (event: Extract<AxlEvent, { type: 'partial_object' }>): void => {
+          if (event.data?.object === undefined) return;
+          const askId = event.askId ?? '';
+          pending.set(askId, {
+            askId,
+            agent: event.agent,
+            object: event.data.object,
+          });
+        };
+
+        // Snapshot any `partial_object` events ALREADY in the bus's queue
+        // at subscription time. Without this, a consumer that calls
+        // `for await (const p of bus.partialObjects)` AFTER events have
+        // been pushed would see nothing — the listener-based path only
+        // catches future emissions. The snapshot is read-only (does not
+        // mutate `eventQueue`), so the main iterator can still drain
+        // those same events via its own iteration. Coalescing happens
+        // here too: if multiple snapshots exist for the same askId, only
+        // the last one wins.
+        //
+        // Snapshot + subscribe together is atomic under the JS
+        // run-to-completion model: no `_push` can interleave between the
+        // synchronous loop below and the `bus.on(...)` call. If a future
+        // refactor ever introduces async between them, an event could be
+        // missed; pin the invariant if you change the surrounding code.
+        for (const event of self.eventQueue) {
+          if (event.type === 'partial_object') recordPartial(event);
+        }
+
+        // Listener subscribes directly to the inner bus (bypassing the
+        // public `.on` gate so the same wiring works whether or not the
+        // consumer attaches their own `.on('partial_object', ...)`).
+        const handler = (event: AxlEvent) => {
+          if (event.type !== 'partial_object') return;
+          recordPartial(event);
+          wakeWaiter();
+        };
+        self.bus.on('partial_object', handler);
+
+        const unsubscribeFinish = self._onFinish(() => {
+          finished = true;
+          wakeWaiter();
+        });
+
+        const unsubscribe = () => {
+          if (unsubscribed) return;
+          unsubscribed = true;
+          self.bus.off('partial_object', handler);
+          unsubscribeFinish();
+        };
+
+        return {
+          async next(): Promise<IteratorResult<Coalesced>> {
+            while (true) {
+              if (pending.size > 0) {
+                // Drain in insertion order — oldest pending askId first.
+                const it = pending.entries().next();
+                if (!it.done) {
+                  const [key, value] = it.value;
+                  pending.delete(key);
+                  return { value, done: false };
+                }
+              }
+              if (finished) {
+                unsubscribe();
+                return { value: undefined as unknown as Coalesced, done: true };
+              }
+              await new Promise<void>((res) => {
+                resolveWaiter = res;
+              });
+            }
+          },
+          async return(): Promise<IteratorResult<Coalesced>> {
+            unsubscribe();
+            return { value: undefined as unknown as Coalesced, done: true };
+          },
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+        };
+      },
+    };
+  }
+
   /** Iterator over structural lifecycle events only — skips per-token chatter
    *  and progressive `partial_object` emissions. Useful for waterfall UIs
    *  and any consumer that wants the "what happened" timeline. */
@@ -226,9 +426,53 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter({ value: event, done: false });
-    } else {
-      this.eventQueue.push(event);
+      return;
     }
+    // No active waiter — queue. Enforce the soft cap on non-terminal events.
+    if (this.eventQueue.length >= this.maxQueued && !TERMINAL_TYPES.has(event.type)) {
+      this.handleOverflow(event);
+      return;
+    }
+    this.eventQueue.push(event);
+  }
+
+  /** Apply the overflow policy when the queue is at `maxQueued` and a
+   *  non-terminal event arrives. Terminal events bypass this path entirely
+   *  (checked by the caller). */
+  private handleOverflow(event: AxlEvent): void {
+    if (this.onOverflow === 'throw') {
+      throw new Error(
+        `AxlEventBus queue exceeded maxQueued=${this.maxQueued} (event type: ${event.type}). ` +
+          `Consumer is too slow or the producer is unbounded. Configure ` +
+          `\`maxQueued\`/\`onOverflow\` on the runtime, or set maxQueued: Infinity to disable.`,
+      );
+    }
+    // 'drop-oldest-non-terminal': scan from head for the oldest non-terminal
+    // and splice it out. Terminal events queued earlier (rare in practice
+    // but possible) are preserved; if every queued event is terminal, push
+    // the new event anyway and let the queue exceed the cap by one — losing
+    // a terminal event would be worse than a brief overrun.
+    let droppedIdx = -1;
+    for (let i = 0; i < this.eventQueue.length; i++) {
+      if (!TERMINAL_TYPES.has(this.eventQueue[i].type)) {
+        droppedIdx = i;
+        break;
+      }
+    }
+    if (droppedIdx >= 0) {
+      this.eventQueue.splice(droppedIdx, 1);
+      if (!this.overflowWarned) {
+        this.overflowWarned = true;
+        // One-shot per bus instance — saturating producers shouldn't spam
+        // the console. Subsequent drops are silent.
+        console.warn(
+          `[axl] AxlEventBus queue exceeded maxQueued=${this.maxQueued}; ` +
+            `dropping oldest non-terminal events (consumer is slower than producer). ` +
+            `This warning fires once per bus instance.`,
+        );
+      }
+    }
+    this.eventQueue.push(event);
   }
 
   /**
@@ -252,6 +496,42 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
       w({ value: undefined as unknown as AxlEvent, done: true });
     }
     this.waiters.length = 0;
+    // Drain finish callbacks. Snapshot first so the iteration is over a
+    // fixed list — callbacks registered DURING this loop go through
+    // `_onFinish`'s `finished === true` branch and fire synchronously
+    // there, NOT from this loop. (See `_onFinish` below.)
+    const callbacks = this.finishCallbacks;
+    this.finishCallbacks = [];
+    for (const cb of callbacks) {
+      try {
+        cb();
+      } catch (err) {
+        console.error('[axl] AxlEventBus finish callback threw:', err);
+      }
+    }
+  }
+
+  /** Register a one-shot callback fired when `_finish()` is called.
+   *  Returns an unsubscribe function. If the bus is already finished,
+   *  the callback is invoked synchronously and the returned unsubscribe
+   *  is a no-op.
+   *
+   *  Used by listener-based curated views (e.g., `partialObjects`) that
+   *  need a termination signal independent of any synthesized `done`
+   *  event. Iterator consumers don't need this — `[Symbol.asyncIterator]`
+   *  resolves with `done: true` automatically.
+   *
+   *  @internal */
+  _onFinish(cb: () => void): () => void {
+    if (this.finished) {
+      cb();
+      return () => {};
+    }
+    this.finishCallbacks.push(cb);
+    return () => {
+      const i = this.finishCallbacks.indexOf(cb);
+      if (i >= 0) this.finishCallbacks.splice(i, 1);
+    };
   }
 
   /** Whether `event` is one of the `AxlEventType` names this bus emits.

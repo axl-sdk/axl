@@ -123,6 +123,17 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
     return this.events.lifecycle;
   }
 
+  /** Coalescing iterator over `partial_object` events — yields the latest
+   *  object payload per `askId`. Designed for streaming-structured-output
+   *  UIs: when the producer outpaces the consumer, intermediate snapshots
+   *  are silently superseded and the next `.next()` await sees only the
+   *  most recent state per ask. Listener-based, so does NOT race with the
+   *  main `for await (const e of stream)` iterator. See
+   *  `AxlEventBus.partialObjects` for full semantics. */
+  get partialObjects(): AsyncIterable<{ askId: string; agent?: string; object: unknown }> {
+    return this.events.partialObjects;
+  }
+
   pipe<T extends NodeJS.WritableStream>(destination: T, options?: { end?: boolean }): T {
     const shouldEnd = options?.end !== false;
     this.events.on('token', (event: AxlEvent) => {

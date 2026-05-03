@@ -188,26 +188,39 @@ Four ways to observe what happens during a workflow run. Pick by scope:
 The customer use case: a workflow handler that runs several `ctx.ask()` calls and wants to stream `partial_object` events to a UI as they happen.
 
 ```typescript
+// Schemas + agents the example uses — declared so the snippet is
+// self-contained.
+const outlineSchema = z.object({ outline: z.array(z.string()) });
+const draftSchema = z.object({ draft: z.string() });
+const planner = agent({ model: 'openai:gpt-4o', system: 'Plan an outline.' });
+const writer = agent({ model: 'openai:gpt-4o', system: 'Write the draft.' });
+
 const wf = workflow({
   name: 'multi-step',
   input: z.object({ topic: z.string() }),
   handler: async (ctx) => {
-    // Subscribe BEFORE the first ask — see "Subscribe early" note below.
-    // Background observer. `.catch` keeps consumer errors visible — without
-    // it, a throw inside `ws.send` (e.g., closed socket) would surface as
-    // an unhandled rejection at the process level.
+    // Allocate the bus first — `ctx.events` is a lazy getter; the
+    // streaming code path inside ctx.ask() only activates when an
+    // observer was present at the time the ask started. Touching the
+    // getter synchronously here wires every ask in this handler. See
+    // "Subscribe early" below.
+    const events = ctx.events;
+    // Background observer. `.catch` keeps consumer errors visible —
+    // without it, a throw inside the body would surface as an
+    // unhandled rejection at the process level.
     void (async () => {
-      for await (const partial of ctx.events.partialObjects) {
-        ws.send(JSON.stringify({
-          askId: partial.askId,
-          attempt: partial.attempt,
-          object: partial.object,
-        }));
+      for await (const partial of events.partialObjects) {
+        console.log(
+          `[ask ${partial.askId} attempt ${partial.attempt}]`,
+          partial.object,
+        );
       }
     })().catch((err) => ctx.log('observer.failed', { error: String(err) }));
 
     const outline = await ctx.ask(planner, ctx.input.topic, { schema: outlineSchema });
-    const draft = await ctx.ask(writer, outline, { schema: draftSchema });
+    // ctx.ask's second arg is a string prompt — serialize the
+    // structured outline for the next agent.
+    const draft = await ctx.ask(writer, JSON.stringify(outline), { schema: draftSchema });
     return draft;
   },
 });

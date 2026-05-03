@@ -336,41 +336,52 @@ for await (const event of sessionStream) {
 To observe events between `ctx.ask()` calls — e.g., streaming `partial_object` snapshots to a UI as a multi-step structured-output workflow runs — read `ctx.events`. Same `AxlEvent` union and curated views (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`) as `AxlStream`, scoped to the current context (and its children — agent-as-tool nested asks bubble up).
 
 ```typescript
+// Schemas + agents the example references — declared so the snippet
+// compiles standalone.
+const outlineSchema = z.object({ outline: z.array(z.string()) });
+const draftSchema = z.object({ draft: z.string() });
+const planner = agent({ model: 'openai:gpt-4o', system: 'Plan an outline.' });
+const writer = agent({ model: 'openai:gpt-4o', system: 'Write a draft.' });
+
 const wf = workflow({
   name: 'two-step',
   input: z.object({ topic: z.string() }),
   handler: async (ctx) => {
-    // Subscribe BEFORE the first ask. The bus is allocated lazily, AND
-    // the streaming code path inside ctx.ask() activates only when an
-    // observer is present at the time the ask starts.
+    // Allocate the bus first — `ctx.events` is a lazy getter; the
+    // streaming code path inside ctx.ask() only activates when an
+    // observer was present at the time the ask started. Touching the
+    // getter synchronously here wires every ask in this handler.
+    // Defensive `void ctx.events;` (or `const events = ctx.events;`) is
+    // the unambiguous pattern — relying on the IIFE alone is correct
+    // but subtle, since the synchronous `for await (...ctx.events.partialObjects)`
+    // expression evaluates the getter before the first suspension.
+    const events = ctx.events;
     // Background observer. The IIFE returns a promise; attaching a `.catch`
-    // ensures errors thrown by the consumer (e.g., `ws.send` failing on a
-    // closed socket) surface in your logs instead of being swallowed by
-    // the unhandled-rejection handler. The bus auto-finishes on
-    // `workflow_end` / `error`, so the iterator terminates with the run.
+    // ensures consumer errors surface in your logs instead of being
+    // swallowed by the unhandled-rejection handler. The bus
+    // auto-finishes on `workflow_end` / `error`, so the iterator
+    // terminates with the run.
     void (async () => {
-      for await (const partial of ctx.events.partialObjects) {
+      for await (const partial of events.partialObjects) {
         // .partialObjects is the coalescing view: yields the LATEST
         // payload per askId, with the 1-indexed `attempt` (UIs can flag
         // a regenerating draft when it bumps to 2). Memory bounded by
         // O(active asks), not O(events). Designed for
         // streaming-structured-output UIs.
-        ws.send(JSON.stringify({
-          askId: partial.askId,
-          attempt: partial.attempt,
-          object: partial.object,
-        }));
+        console.log(`[ask ${partial.askId} attempt ${partial.attempt}]`, partial.object);
       }
     })().catch((err) => ctx.log('observer.failed', { error: String(err) }));
 
     const outline = await ctx.ask(planner, ctx.input.topic, { schema: outlineSchema });
-    const draft = await ctx.ask(writer, outline, { schema: draftSchema });
+    // ctx.ask's second arg is a string prompt — serialize the
+    // structured outline for the next agent.
+    const draft = await ctx.ask(writer, JSON.stringify(outline), { schema: draftSchema });
     return draft;
   },
 });
 ```
 
-Subscribe before the first `ctx.ask()` — the streaming code path inside `ctx.ask()` only activates when an observer is present at the time the ask starts. The bus auto-terminates on `workflow_end` / `error`. Configure the iterator-queue cap and overflow policy via `runtime.execute(..., { events: { maxQueued, onOverflow } })` — defaults (`maxQueued: 10_000`, `onOverflow: 'drop-oldest-non-terminal'`) are a default-on safety net against slow consumers. See [`docs/observability.md`](../../docs/observability.md#observation-paths) for the full Observation paths comparison and [`docs/api-reference.md`](../../docs/api-reference.md#ctxevents) for the type table.
+Subscribe before the first `ctx.ask()` — the streaming code path inside `ctx.ask()` only activates when an observer is present at the time the ask starts. The bus auto-terminates on `workflow_end` / `error` (and on signal abort, for ad-hoc `runtime.createContext({ signal })` flows). Configure the iterator-queue cap and overflow policy via `runtime.execute(..., { events: { maxQueued, onOverflow } })` — defaults (`maxQueued: 10_000`, `onOverflow: 'drop-oldest-non-terminal'`) are a default-on safety net against slow consumers. See [`docs/observability.md`](../../docs/observability.md#observation-paths) for the full Observation paths comparison, [`docs/api-reference.md`](../../docs/api-reference.md#ctxevents) for the type table, and [`docs/migration/stream-first-observation.md`](../../docs/migration/stream-first-observation.md) for upgrade notes.
 
 ### Context Primitives
 

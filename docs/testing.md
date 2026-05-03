@@ -122,7 +122,10 @@ For workflows that consumers observe via `ctx.events`, drive deterministic strea
 
 ```typescript
 import { AxlTestRuntime, MockProvider } from '@axlsdk/testing';
+import { agent, workflow } from '@axlsdk/axl';
 import { z } from 'zod';
+
+const myAgent = agent({ model: 'openai:gpt-4o', system: 'extract' });
 
 const provider = MockProvider.sequence([
   { content: '{"v":3}', chunks: ['{"v":', '3', '}'] },
@@ -135,8 +138,11 @@ runtime.register(workflow({
   name: 'observe',
   input: z.object({}),
   handler: async (ctx) => {
+    // Allocate the bus before the first ctx.ask() so the streaming
+    // code path activates for it.
+    const events = ctx.events;
     void (async () => {
-      for await (const partial of ctx.events.partialObjects) {
+      for await (const partial of events.partialObjects) {
         seen.push({ attempt: partial.attempt, v: (partial.object as { v: unknown }).v });
       }
     })().catch(() => {});
@@ -167,8 +173,11 @@ const provider = MockProvider.sequence([
   { content: '{"v":"oops"}', chunks: ['{"v":"', 'oops', '"}'] }, // attempt 1: wrong type
   { content: '{"v":2}', chunks: ['{"v":', '2', '}'] },           // attempt 2: corrects
 ]);
-// ... after execute, assert that `seen` shows attempt: 2 only (or with the
-// final coalesced value), and that no attempt-1 snapshot leaked through.
+
+// After execute, assert: NO attempt: 1 snapshot leaked through, only
+// attempt: 2 surfaces.
+expect(seen.find((s) => s.attempt === 1)).toBeUndefined();
+expect(seen.some((s) => s.attempt === 2 && s.v === 2)).toBe(true);
 ```
 
 ## AxlTestRuntime

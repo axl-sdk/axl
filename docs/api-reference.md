@@ -513,28 +513,41 @@ console.log(ctx.totalCost); // e.g. 0.05
 Lazy `AxlEventBus` exposing every `AxlEvent` emitted by this context (and its child contexts — agent-as-tool nested asks bubble up). Same `AsyncIterable<AxlEvent>` + `EventEmitter` shape as `AxlStream`, with the same curated views.
 
 ```typescript
+// Schemas + agents the example uses — declared so the snippet is
+// self-contained.
+const outlineSchema = z.object({ outline: z.array(z.string()) });
+const draftSchema = z.object({ draft: z.string() });
+const planner = agent({ model: 'openai:gpt-4o', system: 'Plan an outline.' });
+const writer = agent({ model: 'openai:gpt-4o', system: 'Write the draft.' });
+
 const wf = workflow({
   name: 'two-step',
   input: z.object({ topic: z.string() }),
   handler: async (ctx) => {
-    // Subscribe BEFORE the first ctx.ask() — events are not buffered for
-    // late subscribers, AND the streaming code path inside ctx.ask()
-    // activates only when an observer is present at the time the ask starts.
-    // Background observer. `.catch` keeps consumer errors visible — without
-    // it, a throw inside `ws.send` (e.g., closed socket) would surface as
-    // an unhandled rejection at the process level.
+    // Allocate the bus first — `ctx.events` is a lazy getter; the
+    // streaming code path inside ctx.ask() only activates when an
+    // observer was present at the time the ask started. Touching the
+    // getter synchronously here wires every ask in this handler.
+    // (The IIFE pattern alone is correct, since `for await
+    // (...ctx.events.partialObjects)` evaluates the getter
+    // synchronously before the first await — but the explicit
+    // `const events = ctx.events;` is unambiguous and survives
+    // refactors that move the iterator setup into a helper.)
+    const events = ctx.events;
     void (async () => {
-      for await (const partial of ctx.events.partialObjects) {
-        ws.send(JSON.stringify({
-          askId: partial.askId,
-          attempt: partial.attempt,
-          object: partial.object,
-        }));
+      for await (const partial of events.partialObjects) {
+        // partial: { askId, agent?, object, attempt }
+        console.log(
+          `[ask ${partial.askId} attempt ${partial.attempt}]`,
+          partial.object,
+        );
       }
     })().catch((err) => ctx.log('observer.failed', { error: String(err) }));
 
     const outline = await ctx.ask(planner, ctx.input.topic, { schema: outlineSchema });
-    const draft = await ctx.ask(writer, outline, { schema: draftSchema });
+    // ctx.ask's second arg is a string prompt — serialize the
+    // structured outline for the next agent.
+    const draft = await ctx.ask(writer, JSON.stringify(outline), { schema: draftSchema });
     return draft;
   },
 });
@@ -557,7 +570,15 @@ const wf = workflow({
 - For ad-hoc `runtime.createContext()` flows that never run a workflow, call `ctx.disposeEvents()` to terminate iterators manually.
 - Child contexts (created via `ctx.createChildContext()`, used internally by the agent-as-tool pattern) share the parent's bus through a mutable slot, so a late subscription on the parent still receives events from a child that already exists.
 
-**Subscribe early.** Events are not buffered for late subscribers, AND the streaming code path inside `ctx.ask()` only activates when an observer is present at the time the ask starts. If you allocate `ctx.events` AFTER a `ctx.ask()` has begun, that in-flight ask will not stream `token` / `partial_object` events. Subsequent asks (started after the bus exists) stream normally — the gate is re-checked per ask. Subscribe at the top of the workflow handler to capture everything.
+**Subscribe early.** The streaming code path inside `ctx.ask()` only activates when an observer is present at the time the ask starts. If you allocate `ctx.events` AFTER a `ctx.ask()` has begun, that in-flight ask will not stream `token` / `partial_object` events at all (the agent loop went through the non-streaming `provider.chat` code path). Subsequent asks (started after the bus exists) stream normally — the gate is re-checked per ask. Subscribe at the top of the workflow handler — `const events = ctx.events;` on the first line is the unambiguous pattern.
+
+The bus's iterator queue retains events emitted before any consumer iterates, so a late `for await (const e of ctx.events)` will still drain whatever is already queued. The `partialObjects` view additionally seeds from a per-bus `latestPartialByAsk` map at subscription time, so a late subscriber may see the latest coalesced state from earlier in the run. **Neither mechanism rescues you from the streaming-gate behavior** — for full token/partial fidelity, allocate the bus before the first ask.
+
+**Cost rollup — pick one channel.** `event.cost` flows on `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall` (cost-bearing leaves) and on `ask_end` (per-ask rollup excluding nested asks). Naive `total += event.cost` from `ctx.events` PLUS `runtime.on('trace', …)` double-counts because the same events fan out to both. Use `eventCostContribution(event)` from `@axlsdk/axl` (skips `ask_end` rollups), or read pre-aggregated `ctx.totalCost`. The four observation channels — `ctx.events`, `runtime.stream()`, `runtime.on('trace', …)`, `runtime.execute()` final result — are alternatives, not additive.
+
+**Handler exceptions still terminate the bus.** When a workflow handler throws, the runtime emits a terminal `error` event and finishes the bus, so `for await (const e of ctx.events)` resolves cleanly with `done: true`. You don't need defensive `try/finally` around the observer iteration; the thrown error is independently rejected on the `runtime.execute()` / `runtime.stream()` promise.
+
+**Agent-as-tool nested asks bubble up.** Tool handlers receive `(input, ctx)` where `ctx` is a child `WorkflowContext` that shares the parent's bus through a mutable slot. Partials emitted from `ctx.ask()` calls inside a tool handler surface on the OUTER workflow's `ctx.events.partialObjects` iterator, scoped via `askId`/`parentAskId`/`depth`. Filter on `event.depth >= 1` to isolate nested-ask events.
 
 #### `EventStreamOptions`
 
@@ -572,7 +593,21 @@ Configures the iterator-queue cap and overflow policy on `ctx.events` and on the
 
 ### `ctx.disposeEvents()`
 
-Manually finish the `ctx.events` bus, terminating any active iterators with `done: true`. Idempotent. Useful for ad-hoc `runtime.createContext()` flows that never emit a `workflow_end` / `error` terminal — without this call, observers iterating `for await (const e of ctx.events)` would hang. Workflow-driven contexts (`runtime.execute` / `runtime.stream`) terminate automatically and don't need this.
+Manually finish the `ctx.events` bus, terminating any active iterators with `done: true`, and remove the constructor-registered abort listener so a long-lived `signal` reused across many ad-hoc contexts doesn't accumulate listeners. Idempotent.
+
+**Prefer signal-based auto-dispose** for ad-hoc contexts — `runtime.createContext({ signal })` auto-finishes the bus when the signal aborts, which composes naturally with `AbortSignal.timeout(...)`, user cancellation, and budget hard-stops. `disposeEvents()` is the explicit fallback for flows where you can't pin a signal — e.g., a one-shot context iterated from a script:
+
+```typescript
+const ctx = runtime.createContext();
+const observer = (async () => {
+  for await (const e of ctx.events) console.log(e.type);
+})();
+await ctx.ask(myAgent, 'hello');
+ctx.disposeEvents();  // tell the observer to stop iterating
+await observer;
+```
+
+Workflow-driven contexts (`runtime.execute` / `runtime.stream`) terminate automatically — `emitEvent` finishes the bus on `workflow_end` / `error`. Don't need `disposeEvents()` there.
 
 ---
 

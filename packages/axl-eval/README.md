@@ -362,23 +362,31 @@ for (const item of results.items) {
 ```typescript
 // evals/extract.eval.ts
 import { defineEval, dataset, scorer } from '@axlsdk/eval';
+import type { AxlRuntime } from '@axlsdk/axl';
 import { z } from 'zod';
+import { extractor } from '../src/agents/extractor.js'; // your agent
 
-const extractSchema = z.object({ /* ... */ });
+const extractSchema = z.object({ id: z.string(), summary: z.string() });
 
 export default defineEval({
   workflow: 'extract-fields',
-  dataset: dataset({ /* ... */ }),
-  scorers: [scorer({ /* ... */ })],
+  dataset: dataset({ items: [{ id: 'a', text: 'hello world' }] }),
+  scorers: [scorer({ name: 'has-id', score: ({ output }) => (output.id ? 1 : 0) })],
 });
 
+// Top-level export, NOT nested inside defineEval. The eval runner
+// imports both the default-exported config AND this named function.
 export async function executeWorkflow(
   input: { id: string; text: string },
   runtime: AxlRuntime,
 ) {
   const ctx = runtime.createContext({ signal: AbortSignal.timeout(30_000) });
+  // Allocate the bus before the first ctx.ask() — the streaming gate
+  // is per-ask, and a late subscription leaves the in-flight ask
+  // through the non-streaming code path.
+  const events = ctx.events;
   void (async () => {
-    for await (const partial of ctx.events.partialObjects) {
+    for await (const partial of events.partialObjects) {
       console.log(`[${input.id}] attempt ${partial.attempt}:`, partial.object);
     }
   })().catch((err) => console.error('observer failed:', err));

@@ -19,19 +19,32 @@ For most consumers there is **nothing to do** — defaults preserve existing beh
 ## New API at a glance
 
 ```typescript
-// Inside a workflow handler — observe between asks
+// Inside a workflow handler — observe between asks. Self-contained
+// snippet (declare the agents/schemas it uses, allocate the bus
+// before the first ask).
+const outlineSchema = z.object({ outline: z.array(z.string()) });
+const draftSchema = z.object({ draft: z.string() });
+const planner = agent({ model: 'openai:gpt-4o', system: 'Plan an outline.' });
+const writer = agent({ model: 'openai:gpt-4o', system: 'Write the draft.' });
+
 const wf = workflow({
   name: 'two-step',
   input: z.object({ topic: z.string() }),
   handler: async (ctx) => {
+    // `ctx.events` is a lazy getter; touch it synchronously before
+    // the first ctx.ask() so the streaming gate fires for every ask
+    // in this handler. Defensive `void ctx.events;` (or
+    // `const events = ctx.events;`) is the unambiguous pattern.
+    const events = ctx.events;
     void (async () => {
-      for await (const partial of ctx.events.partialObjects) {
-        ws.send(JSON.stringify({ askId: partial.askId, attempt: partial.attempt, object: partial.object }));
+      for await (const partial of events.partialObjects) {
+        // partial: { askId, agent?, object, attempt }
+        console.log(`[ask ${partial.askId} attempt ${partial.attempt}]`, partial.object);
       }
     })().catch((err) => ctx.log('observer.failed', { error: String(err) }));
 
     const outline = await ctx.ask(planner, ctx.input.topic, { schema: outlineSchema });
-    return ctx.ask(writer, outline, { schema: draftSchema });
+    return ctx.ask(writer, JSON.stringify(outline), { schema: draftSchema });
   },
 });
 
@@ -110,9 +123,12 @@ The four channels are **alternatives**, not additive — accumulating cost from 
 
 ## Lifecycle gotchas
 
-- **Subscribe early.** The `ctx.events` bus is allocated on first access. The streaming code path inside `ctx.ask()` activates only when an observer is present at the time the ask starts. If you allocate `ctx.events` AFTER a `ctx.ask()` has begun, that in-flight ask will not stream `token` / `partial_object` events. Subsequent asks (started after the bus exists) stream normally — the gate is re-checked per ask.
+- **Subscribe early.** The `ctx.events` bus is allocated on first access. The streaming code path inside `ctx.ask()` activates only when an observer is present at the time the ask starts. If you allocate `ctx.events` AFTER a `ctx.ask()` has begun, that in-flight ask will not stream `token` / `partial_object` events at all (the agent loop went through `provider.chat` instead of `provider.stream`). Subsequent asks (started after the bus exists) stream normally — the gate is re-checked per ask. The unambiguous pattern is `const events = ctx.events;` on the first line of the handler — touching the getter synchronously wires every subsequent ask. (The IIFE pattern works because `for await (...ctx.events.partialObjects)` evaluates the getter before its first await, but the explicit allocation is foolproof against refactors that move the iterator setup into a helper.)
+- **Late subscription is partly recoverable for `partialObjects`.** The bus's iterator queue retains events emitted before any consumer iterates, so a late `for await (const e of ctx.events)` will still drain whatever is already queued. The `partialObjects` view additionally seeds from a per-bus `latestPartialByAsk` map so a late subscriber sees the latest coalesced state from earlier in the run. Neither rescues you from the streaming-gate behavior — for full token/partial fidelity, allocate the bus before the first ask.
+- **Handler exceptions still terminate the bus.** When the workflow handler throws, the runtime emits a terminal `error` event and finishes the bus, so `for await (const e of ctx.events)` resolves cleanly with `done: true`. You don't need defensive `try/finally` around the observer iteration. The thrown error is independently rejected on the `runtime.execute()` / `runtime.stream()` promise.
 - **Auto-dispose on signal abort.** When `runtime.createContext({ signal })` is constructed with an `AbortSignal` and the signal fires, the bus is auto-disposed (iterators terminate with `done: true`). If `signal` is already aborted at the time `ctx.events` is first accessed, the bus terminates immediately on access. This protects long-lived ad-hoc context flows from leaking iterator consumers.
-- **Manual disposal for ad-hoc contexts without a signal.** `ctx.disposeEvents()` is idempotent and safe to call after `workflow_end` / `error` already auto-finished the bus. Workflow-driven contexts (`runtime.execute` / `runtime.stream`) terminate automatically and don't need this.
+- **Manual disposal for ad-hoc contexts without a signal.** `ctx.disposeEvents()` is idempotent and safe to call after `workflow_end` / `error` already auto-finished the bus. Workflow-driven contexts (`runtime.execute` / `runtime.stream`) terminate automatically and don't need this. Prefer `signal: AbortSignal.timeout(...)` over manual disposal — it composes with timeout/cancellation/budget without manual threading.
+- **Cost rollup — pick one channel.** Don't `total += event.cost` from `ctx.events` AND `runtime.on('trace', …)` — same events fan out to both, you'll double-count. Use `eventCostContribution(event)` from `@axlsdk/axl` (skips per-ask `ask_end` rollups) or read `ctx.totalCost`. The four observation channels are alternatives, not additive.
 - **`ctx.events` does not bridge across `awaitHuman` suspension.** When a workflow suspends and is later resumed via `runtime.resumeExecution()`, the resumed run gets a fresh `WorkflowContext` with its own bus. For cross-suspension observation, use `runtime.on('trace', …)` instead.
 
 ## See also

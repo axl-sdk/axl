@@ -186,25 +186,34 @@ const result = await stream.promise; // final output after stream completes
 `runtime.execute()` is final-result-only and does **not** accept `onToken` or any other event callback — `runtime.stream()` is the streaming surface from the outside. For observation **from inside a workflow handler** — e.g., streaming `partial_object` snapshots between two `ctx.ask()` calls — read `ctx.events`:
 
 ```typescript
+const planSchema = z.object({ outline: z.array(z.string()) });
+const draftSchema = z.object({ draft: z.string() });
+const planner = agent({ model: 'openai:gpt-4o', system: 'Plan an outline.' });
+const writer = agent({ model: 'openai:gpt-4o', system: 'Write the draft.' });
+
 const wf = workflow({
   name: 'two-step',
   input: z.object({ topic: z.string() }),
   handler: async (ctx) => {
-    // Subscribe BEFORE the first ask — the bus is allocated lazily and
-    // only events emitted after subscription are seen.
+    // Allocate the bus first — `ctx.events` is a lazy getter; until
+    // any code accesses it the bus is undefined and `ctx.ask` skips
+    // the streaming path. Touching it here (synchronously) wires
+    // subsequent asks for streaming.
+    const events = ctx.events;
     void (async () => {
-      for await (const partial of ctx.events.partialObjects) {
-        ws.send(JSON.stringify(partial)); // { askId, agent?, object, attempt }
+      for await (const partial of events.partialObjects) {
+        // partial: { askId, agent?, object, attempt }
+        console.log(`[ask ${partial.askId} attempt ${partial.attempt}]`, partial.object);
       }
-    })().catch(console.error);
+    })().catch((err) => console.error('observer failed:', err));
 
-    const outline = await ctx.ask(planner, ctx.input.topic, { schema: outlineSchema });
-    return ctx.ask(writer, outline, { schema: draftSchema });
+    const plan = await ctx.ask(planner, ctx.input.topic, { schema: planSchema });
+    return ctx.ask(writer, JSON.stringify(plan), { schema: draftSchema });
   },
 });
 ```
 
-`ctx.events` exposes the same `AxlEvent` iterable + curated views as `AxlStream` (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`). For background telemetry across every run, subscribe with `runtime.on('trace', event => …)` instead. See [docs/observability.md](docs/observability.md#observation-paths) for the full comparison.
+`ctx.events` exposes the same `AxlEvent` iterable + curated views as `AxlStream` (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`). For background telemetry across every run, subscribe with `runtime.on('trace', event => …)` instead — those four channels are alternatives, not additive (don't sum costs from two of them). See [docs/observability.md](docs/observability.md#observation-paths) for the full comparison and the [migration guide](docs/migration/stream-first-observation.md) for upgrade notes.
 
 ## Sessions
 

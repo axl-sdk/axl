@@ -237,6 +237,14 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
   // shape for direct AxlEventBus consumers.
   [Symbol.asyncIterator]() {
     const self = this;
+    // Track only this iterator's parked resolver so `return()` can pull it
+    // out of the bus's shared `waiters` array on early `break`. Without
+    // this, an early-break consumer's resolver stays in `waiters`, and the
+    // next `_push` shifts that dead resolver off and delivers an event to
+    // a Promise nobody awaits — that event is lost. Each iterator owns
+    // its own slot, so multi-iterator scenarios (one breaks, the other
+    // keeps consuming) clean up independently.
+    let myResolver: ((value: IteratorResult<AxlEvent>) => void) | null = null;
     return {
       next: (): Promise<IteratorResult<AxlEvent>> => {
         if (self.eventQueue.length > 0) {
@@ -246,8 +254,31 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
           return Promise.resolve({ value: undefined as unknown as AxlEvent, done: true });
         }
         return new Promise((resolve) => {
-          self.waiters.push(resolve);
+          // The same resolver goes into both the bus's waiter queue (for
+          // `_push` to wake) and our local `myResolver` slot (for
+          // `return()` to splice). When `_push` shifts and resolves, we
+          // null out via the wrapper below so `return()` later is a no-op.
+          const wrapped = (value: IteratorResult<AxlEvent>) => {
+            myResolver = null;
+            resolve(value);
+          };
+          myResolver = wrapped;
+          self.waiters.push(wrapped);
         });
+      },
+      return: (): Promise<IteratorResult<AxlEvent>> => {
+        // Called by JS when the consumer breaks out of `for await`. Pull
+        // our parked resolver out of `waiters` so a subsequent `_push`
+        // doesn't deliver to a dead consumer. Resolve with `done: true`
+        // so any in-flight `next()` promise settles.
+        if (myResolver) {
+          const idx = self.waiters.indexOf(myResolver);
+          if (idx >= 0) self.waiters.splice(idx, 1);
+          const r = myResolver;
+          myResolver = null;
+          r({ value: undefined as unknown as AxlEvent, done: true });
+        }
+        return Promise.resolve({ value: undefined as unknown as AxlEvent, done: true });
       },
       [Symbol.asyncIterator]() {
         return this;
@@ -281,6 +312,14 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
               }
             }
           },
+          // Propagate `return()` to the underlying bus iterator so its
+          // parked resolver (if any) is spliced out of `waiters`. Without
+          // this, breaking out of `for await (const t of bus.text)` would
+          // orphan the inner waiter and lose the next event.
+          async return(): Promise<IteratorResult<string>> {
+            await iter.return?.();
+            return { value: undefined as unknown as string, done: true };
+          },
         };
       },
     };
@@ -312,6 +351,13 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
                 };
               }
             }
+          },
+          async return(): Promise<IteratorResult<{ askId: string; agent?: string; text: string }>> {
+            await iter.return?.();
+            return {
+              value: undefined as unknown as { askId: string; agent?: string; text: string },
+              done: true,
+            };
           },
         };
       },
@@ -526,6 +572,10 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
               if (LIFECYCLE_TYPES.has(value.type)) return { value, done: false };
             }
           },
+          async return(): Promise<IteratorResult<AxlEvent>> {
+            await iter.return?.();
+            return { value: undefined as unknown as AxlEvent, done: true };
+          },
         };
       },
     };
@@ -543,7 +593,23 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
    */
   _push(event: AxlEvent): void {
     if (this.finished) return;
-    this.bus.emit(event.type, event);
+    // Isolate listener exceptions from the workflow. Node's EventEmitter
+    // propagates listener throws to the caller synchronously, so a single
+    // buggy `bus.on('agent_call_end', () => { throw … })` would unwind
+    // the active `ctx.ask()` and fail the workflow. Mirror the `onTrace`
+    // isolation pattern in `WorkflowContext.emitEvent`: swallow + log via
+    // `console.error`, keep the workflow running. The
+    // `EventStreamOverflowError` thrown by `handleOverflow` (below) is
+    // NOT in this try/catch — that's a different code path and must
+    // propagate to fail the workflow as the strict-mode policy promises.
+    try {
+      this.bus.emit(event.type, event);
+    } catch (err) {
+      console.error(
+        `[axl] AxlEventBus listener for "${event.type}" threw; ignoring:`,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter({ value: event, done: false });

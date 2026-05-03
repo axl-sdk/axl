@@ -189,14 +189,29 @@ const costScopeStorage = new AsyncLocalStorage<CostScope>();
  *  internal controller. Used by `execute` and `stream` so callers can
  *  use a standard `AbortController` instead of having to track
  *  `executionId` for `runtime.abort()`. No-op when `external` is
- *  undefined; immediate-aborts when `external` is already aborted. */
-function forwardAbortSignal(external: AbortSignal | undefined, internal: AbortController): void {
-  if (!external) return;
+ *  undefined; immediate-aborts when `external` is already aborted.
+ *
+ *  Returns a cleanup function the caller MUST invoke when the
+ *  execution completes (success or failure). Without cleanup, a
+ *  long-lived external signal (e.g., a process-wide shutdown signal,
+ *  a request-scoped signal that completes for each request) would
+ *  accumulate one listener per `runtime.execute()` call. After ~10
+ *  calls Node prints `MaxListenersExceededWarning`; under sustained
+ *  load it's a real memory leak. `{ once: true }` only auto-removes
+ *  the listener if the signal aborts — the success path leaves it
+ *  attached, which the cleanup fn fixes. */
+function forwardAbortSignal(
+  external: AbortSignal | undefined,
+  internal: AbortController,
+): () => void {
+  if (!external) return () => {};
   if (external.aborted) {
     internal.abort();
-    return;
+    return () => {};
   }
-  external.addEventListener('abort', () => internal.abort(), { once: true });
+  const onAbort = () => internal.abort();
+  external.addEventListener('abort', onAbort, { once: true });
+  return () => external.removeEventListener('abort', onAbort);
 }
 
 /**
@@ -337,8 +352,9 @@ export class AxlRuntime extends EventEmitter {
    * Side effects on `execInfo`: sets `status` / `completedAt` /
    * `duration` / `result` (or `error`) before emitting `workflow_end`.
    * On throw: emits `workflow_end({status: 'failed', aborted?})` and
-   * persists before rethrowing. `abortControllers.delete` runs in
-   * `finally` regardless of outcome.
+   * persists before rethrowing. `abortControllers.delete` and
+   * `cleanupAbortForwarder` (if provided) both run in `finally`
+   * regardless of outcome.
    *
    * Caller responsibilities:
    * - Allocate `executionId` and register it in `abortControllers` map
@@ -348,6 +364,10 @@ export class AxlRuntime extends EventEmitter {
    * - Pass `span` if the call site is inside a tracer span — this
    *   helper sets `axl.workflow.cost` / `.duration` attributes on
    *   success.
+   * - Pass `cleanupAbortForwarder` (the cleanup fn returned from
+   *   `forwardAbortSignal`) so the listener on the user's external
+   *   signal is removed when the workflow completes — see the
+   *   helper's docstring for the leak this prevents.
    */
   private async runWorkflowBody(args: {
     workflow: AnyWorkflow;
@@ -355,8 +375,9 @@ export class AxlRuntime extends EventEmitter {
     execInfo: ExecutionInfo;
     validated: unknown;
     span?: SpanHandle;
+    cleanupAbortForwarder?: () => void;
   }): Promise<unknown> {
-    const { workflow, ctx, execInfo, validated, span } = args;
+    const { workflow, ctx, execInfo, validated, span, cleanupAbortForwarder } = args;
     try {
       // Spec/16 §3.6a: workflow_start is a first-class trace event
       // emitted inside the span context so OTel exporters that correlate
@@ -401,6 +422,7 @@ export class AxlRuntime extends EventEmitter {
       throw err;
     } finally {
       this.abortControllers.delete(execInfo.executionId);
+      cleanupAbortForwarder?.();
     }
   }
 
@@ -744,8 +766,11 @@ export class AxlRuntime extends EventEmitter {
     this.abortControllers.set(executionId, controller);
     // Forward an external AbortSignal (if the caller passed one) into
     // our internal controller so `runtime.abort(executionId)` and the
-    // user's own signal converge on a single shared abort path.
-    forwardAbortSignal(options?.signal, controller);
+    // user's own signal converge on a single shared abort path. Capture
+    // the cleanup fn — it removes the listener on `options.signal` when
+    // the workflow completes, which prevents listener accumulation when
+    // a long-lived signal is reused across many `execute()` calls.
+    const cleanupAbortForwarder = forwardAbortSignal(options?.signal, controller);
 
     // Register with active cost scope for trackCost() attribution
     this.registerWithCostScope(executionId);
@@ -860,6 +885,7 @@ export class AxlRuntime extends EventEmitter {
           execInfo,
           validated,
           span,
+          cleanupAbortForwarder,
         }),
     );
   }
@@ -877,8 +903,11 @@ export class AxlRuntime extends EventEmitter {
     axlStream.on('close', () => controller.abort());
     // Forward an external AbortSignal into our internal controller so
     // both `runtime.abort(executionId)` and the user's own signal
-    // converge on a single shared abort path.
-    forwardAbortSignal(options?.signal, controller);
+    // converge on a single shared abort path. Capture the cleanup fn —
+    // it removes the listener on `options.signal` when the workflow
+    // settles, preventing listener accumulation when a long-lived
+    // signal is reused across many `stream()` calls.
+    const cleanupAbortForwarder = forwardAbortSignal(options?.signal, controller);
 
     // Generate executionId BEFORE the async closure so it's available on
     // terminal `done` / `error` events even when `run()` throws early
@@ -1006,6 +1035,7 @@ export class AxlRuntime extends EventEmitter {
             execInfo: execInfo!,
             validated,
             span,
+            cleanupAbortForwarder,
           }),
       );
     };
@@ -1037,8 +1067,11 @@ export class AxlRuntime extends EventEmitter {
         // Clean up the abort controller even on pre-execInfo throws
         // (e.g., "workflow not registered") — the helper's `finally`
         // clears it on the success path, but early-throw never reaches
-        // the helper.
+        // the helper. Same for the abort-forwarder cleanup; without
+        // this, a "workflow not registered" thrown synchronously would
+        // leak a listener on the user's signal forever.
         this.abortControllers.delete(executionId);
+        cleanupAbortForwarder();
         axlStream._error(err instanceof Error ? err : new Error(String(err)), executionId);
       });
 

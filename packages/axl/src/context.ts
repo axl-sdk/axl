@@ -365,6 +365,15 @@ export class WorkflowContext<TInput = unknown> {
    *  contexts that never observe). */
   private readonly _busRef: { current: AxlEventBus | undefined };
   private readonly _eventStreamOptions?: EventStreamOptions;
+  /** Removes the constructor-registered `'abort'` listener from
+   *  `this.signal` so a long-lived signal (e.g., a request-scoped or
+   *  process-wide signal reused across many `runtime.createContext()` /
+   *  `runtime.execute()` calls) doesn't accumulate listeners forever.
+   *  Called from `disposeEvents()` and from the workflow_end/error
+   *  emission in `emitEvent`. Undefined when no abort listener was
+   *  registered (no signal, signal already aborted, or non-root
+   *  context). */
+  private abortListenerCleanup?: () => void;
 
   /**
    * Iterable + EventEmitter view over every `AxlEvent` emitted by this
@@ -422,9 +431,14 @@ export class WorkflowContext<TInput = unknown> {
    *  `error` terminal — observers iterating `for await (const e of
    *  ctx.events)` would otherwise hang. Workflow-driven contexts
    *  (`runtime.execute` / `runtime.stream`) terminate automatically and
-   *  don't need this. */
+   *  don't need this.
+   *
+   *  Also removes the constructor-registered abort listener so a
+   *  long-lived `signal` reused across many ad-hoc contexts doesn't
+   *  accumulate listeners. */
   disposeEvents(): void {
     this._busRef.current?._finish();
+    this.abortListenerCleanup?.();
   }
 
   constructor(init: WorkflowContextInit) {
@@ -468,14 +482,23 @@ export class WorkflowContext<TInput = unknown> {
     // idempotent). Only the root context registers the listener — child
     // contexts share the same `_busRef` and would otherwise double-fire.
     // `init._busRef === undefined` is the root-context marker.
+    //
+    // The listener is auto-removed by `{ once: true }` if the signal
+    // ever aborts, but the success path leaves it attached. To prevent
+    // listener accumulation when a long-lived signal is reused across
+    // many contexts, capture the removal fn and call it from
+    // `disposeEvents()` and from the workflow_end/error path in
+    // `emitEvent`.
     if (init._busRef === undefined && this.signal && !this.signal.aborted) {
-      this.signal.addEventListener(
-        'abort',
-        () => {
-          this._busRef.current?._finish();
-        },
-        { once: true },
-      );
+      const signal = this.signal;
+      const onAbort = () => {
+        this._busRef.current?._finish();
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      this.abortListenerCleanup = () => {
+        signal.removeEventListener('abort', onAbort);
+        this.abortListenerCleanup = undefined;
+      };
     }
     // Inherit auto-checkpoint counters from parent if provided; otherwise
     // start a fresh ref. Shared by reference so child contexts increment
@@ -3659,16 +3682,16 @@ export class WorkflowContext<TInput = unknown> {
     const bus = this._busRef.current;
     if (bus) {
       bus._push(finalEvent);
-      // Auto-terminate the bus on workflow terminals so iterators
-      // resolve with `done: true`. Done here (rather than in the
-      // runtime) so any path that emits these events (including
-      // AxlTestRuntime, programmatic emits, etc.) gets the same
-      // termination semantics. createContext-style flows that never
-      // emit a terminal can call `ctx.disposeEvents()` for the same
-      // effect.
-      if (finalEvent.type === 'workflow_end' || finalEvent.type === 'error') {
-        bus._finish();
-      }
+    }
+    // Auto-terminate the bus on workflow terminals so iterators resolve
+    // with `done: true`, and remove the constructor's abort listener so
+    // a long-lived signal reused across executions doesn't accumulate
+    // listeners. Both run regardless of whether a bus was ever
+    // allocated — the cleanup is for the listener on `this.signal`,
+    // not the bus.
+    if (finalEvent.type === 'workflow_end' || finalEvent.type === 'error') {
+      bus?._finish();
+      this.abortListenerCleanup?.();
     }
   }
 }

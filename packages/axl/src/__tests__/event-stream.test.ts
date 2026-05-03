@@ -682,3 +682,310 @@ describe('AxlEventBus — _onFinish callbacks', () => {
     expect(fired).toBe(1);
   });
 });
+
+// ─── Iterator cleanup on early break (regression for commit bf17409) ───
+// Without `return()`, breaking out of `for await` orphaned the parked
+// resolver in `self.waiters`. The next `_push` would then `shift()`
+// that dead resolver, deliver an event to a Promise nobody awaits, and
+// the event would be lost. These tests would hang or assert wrong
+// counts under the broken implementation.
+
+describe('AxlEventBus — iterator return() cleanup', () => {
+  it('main iterator early-break does not orphan its waiter (no event loss)', async () => {
+    const bus = new AxlEventBus();
+    const seen: AxlEvent[] = [];
+    // Park a consumer that breaks after the first event.
+    const consumer = (async () => {
+      for await (const e of bus) {
+        seen.push(e);
+        break;
+      }
+    })();
+    // Wait for the consumer to park inside `next()`.
+    await new Promise((r) => setImmediate(r));
+    bus._push(ev({ type: 'token', data: 'a', ...ASK }));
+    await consumer;
+    // Push two more events. Under the buggy implementation, the next
+    // `_push` would shift the dead resolver and deliver the event to
+    // a Promise nobody awaits; here it should queue normally.
+    bus._push(ev({ type: 'token', data: 'b', ...ASK }));
+    bus._push(ev({ type: 'token', data: 'c', ...ASK }));
+    bus._finish();
+    const remaining: AxlEvent[] = [];
+    for await (const e of bus) remaining.push(e);
+    // Total events seen across both consumers should equal what was
+    // pushed. Under the bug, 'b' would be lost to the dead waiter.
+    expect(seen.length + remaining.length).toBe(3);
+    expect(remaining.map((e) => (e as { data: string }).data)).toEqual(['b', 'c']);
+  });
+
+  it('curated views (text, lifecycle, textByAsk) propagate return() to underlying iterator', async () => {
+    // Each view wraps `bus[Symbol.asyncIterator]()`. If view.return() doesn't
+    // call the underlying iter.return(), the inner waiter leaks and the next
+    // _push sends to a dead consumer. Verify by interleaving a break in each
+    // view with subsequent pushes that must still reach a fresh consumer.
+    for (const view of ['text', 'lifecycle', 'textByAsk'] as const) {
+      const bus = new AxlEventBus();
+      const consumer = (async () => {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        for await (const _v of bus[view]) {
+          break;
+        }
+      })();
+      await new Promise((r) => setImmediate(r));
+      // Trigger a value through the view so its inner loop awaits the bus.
+      // text/textByAsk filter on type 'token'; lifecycle filters on
+      // structural events. Push something that matches and then breaks.
+      const matching: AxlEvent =
+        view === 'lifecycle'
+          ? ev({ type: 'agent_call_start', data: { agent: 'x', model: 'y', turn: 1 }, ...ASK })
+          : ev({ type: 'token', data: 'a', ...ASK });
+      bus._push(matching);
+      await consumer;
+      // Subsequent pushes after the break must still queue, not be
+      // delivered to a dead resolver.
+      bus._push(ev({ type: 'token', data: 'b', ...ASK }));
+      bus._finish();
+      const tail: AxlEvent[] = [];
+      for await (const e of bus) tail.push(e);
+      // Under the bug we'd see 0 here (the 'b' delivered to a dead
+      // waiter). Should see exactly 1 ('b' — the matching event was
+      // already consumed by the broken-out view).
+      expect(tail.map((e) => (e as { data: string }).data ?? e.type)).toEqual(['b']);
+    }
+  });
+});
+
+// ─── Listener exception isolation (regression for commit bf17409) ───
+// `bus.emit` propagates listener throws synchronously. Without isolation,
+// a buggy `.on('agent_call_end', () => { throw … })` would unwind the
+// active ctx.* primitive and fail the workflow.
+
+describe('AxlEventBus — listener exception isolation', () => {
+  let errSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    errSpy.mockRestore();
+  });
+
+  it('throwing listener does not propagate from _push', () => {
+    const bus = new AxlEventBus();
+    bus.on('agent_call_end', () => {
+      throw new Error('listener bug');
+    });
+    // _push must not throw.
+    expect(() => {
+      bus._push(
+        ev({
+          type: 'agent_call_end',
+          data: { agent: 'x', model: 'y', cost: 0, duration: 0, response: '' },
+          ...ASK,
+        }),
+      );
+    }).not.toThrow();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(String(errSpy.mock.calls[0][0])).toMatch(/listener for "agent_call_end" threw/);
+  });
+
+  it('throwing listener does not block iterator queue delivery', async () => {
+    // Node's EventEmitter stops calling subsequent listeners once one
+    // throws (the throw propagates through `emit`). Our isolation
+    // catches that throw before it reaches `_push`'s caller, so the
+    // queue/waiter logic that follows in `_push` still runs and the
+    // workflow keeps moving. We don't promise to restart the listener
+    // chain — that's the user's responsibility — but the workflow IS
+    // protected.
+    const bus = new AxlEventBus();
+    bus.on('token', () => {
+      throw new Error('listener bug');
+    });
+    bus._push(ev({ type: 'token', data: 'x', ...ASK }));
+    bus._finish();
+    const seen: AxlEvent[] = [];
+    for await (const e of bus) seen.push(e);
+    expect(seen).toHaveLength(1);
+  });
+
+  it('EventStreamOverflowError still propagates (handleOverflow is on a different code path)', () => {
+    const bus = new AxlEventBus({ maxQueued: 1, onOverflow: 'throw' });
+    bus._push(ev({ type: 'token', data: 'a', ...ASK }));
+    // Queue at cap; non-terminal arrives → handleOverflow throws.
+    // The listener-isolation try/catch is around `bus.emit`, not
+    // around handleOverflow, so this throw must propagate.
+    expect(() => {
+      bus._push(ev({ type: 'token', data: 'b', ...ASK }));
+    }).toThrow(EventStreamOverflowError);
+  });
+});
+
+// ─── partialObjects late-subscriber via latestPartialByAsk
+// (regression for commit aed6b98) ───
+// Pre-fix the snapshot walked `eventQueue`. Events delivered to past
+// waiters are no longer in the queue, so a late subscriber missed
+// them. The `latestPartialByAsk` map fixes this — updated on every
+// `_push` regardless of consumer state.
+
+describe('AxlEventBus — partialObjects late subscriber after past delivery', () => {
+  it('seeds from latestPartialByAsk so events drained by another iterator are still recovered', async () => {
+    const bus = new AxlEventBus();
+
+    // First consumer drains the bus so partial_object events leave
+    // `eventQueue` (they're shifted into a resolver and then a
+    // Promise). Run concurrently with the producer.
+    const drained: AxlEvent[] = [];
+    const drainer = (async () => {
+      for await (const e of bus) drained.push(e);
+    })();
+
+    // Producer.
+    await new Promise((r) => setImmediate(r));
+    bus._push(
+      ev({
+        type: 'partial_object',
+        data: { object: { v: 1 } },
+        attempt: 1,
+        ...ASK,
+      }),
+    );
+    bus._push(
+      ev({
+        type: 'partial_object',
+        data: { object: { v: 2 } },
+        attempt: 1,
+        ...ASK,
+      }),
+    );
+
+    // Wait so the drainer pulls both events out of the queue.
+    await new Promise((r) => setImmediate(r));
+    expect(drained.length).toBe(2);
+
+    // Now subscribe a SECOND consumer to partialObjects. Pre-fix it
+    // would walk an empty eventQueue and yield nothing. Post-fix it
+    // seeds from `latestPartialByAsk` and yields the latest snapshot.
+    const seen: Array<{ object: unknown; attempt: number }> = [];
+    const late = (async () => {
+      for await (const p of bus.partialObjects) {
+        seen.push({ object: p.object, attempt: p.attempt });
+        break;
+      }
+    })();
+    await new Promise((r) => setImmediate(r));
+    bus._finish();
+    await late;
+    await drainer;
+
+    expect(seen).toEqual([{ object: { v: 2 }, attempt: 1 }]);
+  });
+
+  it('pipeline(failed) clears the latestPartialByAsk entry so late subscriber does not see discarded attempt', async () => {
+    const bus = new AxlEventBus();
+    bus._push(ev({ type: 'partial_object', data: { object: { v: 1 } }, attempt: 1, ...ASK }));
+    bus._push(ev({ type: 'pipeline', status: 'failed', stage: 'schema', ...ASK }));
+    bus._finish();
+    const seen: Array<{ object: unknown; attempt: number }> = [];
+    for await (const p of bus.partialObjects) {
+      seen.push({ object: p.object, attempt: p.attempt });
+    }
+    // Discarded attempt: late subscriber should see nothing.
+    expect(seen).toEqual([]);
+  });
+
+  it('multiple subscribers each see the latest snapshot independently (map is shared but pending is per-subscriber)', async () => {
+    const bus = new AxlEventBus();
+    bus._push(ev({ type: 'partial_object', data: { object: { v: 7 } }, attempt: 1, ...ASK }));
+    bus._finish();
+
+    const a: unknown[] = [];
+    const b: unknown[] = [];
+    for await (const p of bus.partialObjects) a.push(p.object);
+    for await (const p of bus.partialObjects) b.push(p.object);
+    expect(a).toEqual([{ v: 7 }]);
+    expect(b).toEqual([{ v: 7 }]);
+  });
+});
+
+// ─── _push after _finish silently dropped ───
+// Documented contract; pin so a future refactor doesn't regress it.
+
+describe('AxlEventBus — _push after _finish', () => {
+  it('silently drops events pushed after _finish (no throw, no enqueue)', async () => {
+    const bus = new AxlEventBus();
+    bus._finish();
+    expect(() => bus._push(ev({ type: 'token', data: 'late', ...ASK }))).not.toThrow();
+    const seen: AxlEvent[] = [];
+    for await (const e of bus) seen.push(e);
+    expect(seen).toHaveLength(0);
+  });
+});
+
+// ─── Multi-iterator FIFO contract ───
+// Documented at AxlEventBus class JSDoc: multiple `for await` consumers
+// share the FIFO queue (each event is consumed by exactly one).
+// Pinned so a refactor doesn't accidentally turn the iterator into a
+// broadcast.
+
+describe('AxlEventBus — multi-iterator FIFO contract', () => {
+  it('two iterators share the FIFO queue (each event seen by exactly one)', async () => {
+    const bus = new AxlEventBus();
+    const a: AxlEvent[] = [];
+    const b: AxlEvent[] = [];
+    const consumeA = (async () => {
+      for await (const e of bus) a.push(e);
+    })();
+    const consumeB = (async () => {
+      for await (const e of bus) b.push(e);
+    })();
+    await new Promise((r) => setImmediate(r));
+    for (let i = 0; i < 4; i++) {
+      bus._push(ev({ type: 'token', data: `t${i}`, ...ASK }));
+    }
+    bus._finish();
+    await Promise.all([consumeA, consumeB]);
+    // Each event seen exactly once across both consumers.
+    expect(a.length + b.length).toBe(4);
+    // Neither saw all of them (the iteration is shared FIFO).
+    expect(a.length).toBeLessThan(4);
+    expect(b.length).toBeLessThan(4);
+  });
+});
+
+// ─── Unknown event-name warn (regression for commit 54c24ae) ───
+
+describe('AxlEventBus — unknown event-name warn', () => {
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('warns once per bus when on() is called with a name outside AXL_EVENT_TYPES', () => {
+    const bus = new AxlEventBus();
+    bus.on('agent_call_ended', () => {}); // typo
+    bus.on('totally_made_up', () => {}); // also unknown
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0][0])).toMatch(/agent_call_ended/);
+  });
+
+  it('does NOT warn for valid AxlEventType names', () => {
+    const bus = new AxlEventBus();
+    bus.on('agent_call_end', () => {});
+    bus.on('token', () => {});
+    bus.on('workflow_end', () => {});
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('off() also warns for unknown names (same one-shot flag)', () => {
+    const bus = new AxlEventBus();
+    bus.off('typo', () => {});
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+});

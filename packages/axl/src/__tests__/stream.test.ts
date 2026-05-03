@@ -803,6 +803,25 @@ describe('AxlStream', () => {
       await consumer;
       expect(seen).toEqual([1, 2, 3]);
     });
+
+    it('clears attempt-N snapshot on pipeline(failed); yields only attempt-N+1', async () => {
+      // AxlStream and AxlEventBus share the same bus class but
+      // AxlStream._push does extra work (`accountForToken`). This pin
+      // verifies the schema-retry coalescing semantics survive that
+      // extra layer end-to-end through AxlStream.
+      const stream = new AxlStream();
+      stream._push(ev({ type: 'partial_object', attempt: 1, data: { object: { v: 1 } }, ...ASK }));
+      stream._push(ev({ type: 'pipeline', status: 'failed', stage: 'schema', ...ASK }));
+      stream._push(ev({ type: 'partial_object', attempt: 2, data: { object: { v: 2 } }, ...ASK }));
+      stream._done('result', 'test-exec');
+
+      const seen: Array<{ attempt: number; v: number }> = [];
+      for await (const p of stream.partialObjects) {
+        seen.push({ attempt: p.attempt, v: (p.object as { v: number }).v });
+      }
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toEqual({ attempt: 2, v: 2 });
+    });
   });
 
   // ── Block B: Lifecycle exhaustiveness guard ─────────────────────────────

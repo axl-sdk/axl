@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { getEventListeners } from 'node:events';
 import { z } from 'zod';
 import { AxlRuntime } from '../runtime.js';
 import { workflow } from '../workflow.js';
@@ -620,5 +621,211 @@ describe('ctx.events — overflow propagation through emitEvent', () => {
     const result = await runtime.execute('overflow-drop', {}, { events: { maxQueued: 1 } });
     expect(result).toEqual({ ok: true });
     warnSpy.mockRestore();
+  });
+});
+
+// ─── Test BLOCKING #3: instanceof EventStreamOverflowError ───
+// Pre-fix the ctx-events overflow test only checked the error message
+// matched a regex. The whole point of the typed class is so consumers
+// can `instanceof`-discriminate; pin that.
+
+describe('ctx.events — EventStreamOverflowError type preservation', () => {
+  it('runtime.execute rejects with an instanceof EventStreamOverflowError (not just matching message)', async () => {
+    const provider = MockProvider.sequence([{ content: 'hello' }]);
+    const runtime = buildRuntime(provider);
+    const a = agent({ name: 'a', model: 'mock:test', system: 's' });
+
+    const wf = workflow({
+      name: 'overflow-instanceof',
+      input: z.object({}),
+      handler: async (ctx) => {
+        void ctx.events;
+        await ctx.ask(a, 'hi');
+        return { ok: true };
+      },
+    });
+    runtime.register(wf);
+
+    const result = runtime
+      .execute('overflow-instanceof', {}, { events: { maxQueued: 1, onOverflow: 'throw' } })
+      .then(
+        () => ({ ok: true as const }),
+        (err: unknown) => ({ ok: false as const, err }),
+      );
+    const settled = await result;
+    expect(settled.ok).toBe(false);
+    if (!settled.ok) {
+      expect(settled.err).toBeInstanceOf(EventStreamOverflowError);
+      expect((settled.err as EventStreamOverflowError).maxQueued).toBe(1);
+      expect((settled.err as EventStreamOverflowError).eventType).toMatch(/\w+/);
+    }
+  });
+});
+
+// ─── Test BLOCKING #2: late ctx.events subscription ───
+// Documented behavior: "subscribe before the first ctx.ask()" — late
+// allocation means the in-flight ask doesn't stream tokens, but
+// subsequent asks DO. This pin catches a regression in the streaming
+// gate (`_streamingEnabled`).
+
+describe('ctx.events — streaming-gate behavior on late subscription', () => {
+  it('subscribing AFTER first ask started: no tokens for ask #1, but tokens for ask #2', async () => {
+    const provider = MockProvider.sequence([
+      { content: 'hello', chunks: ['h', 'e', 'l', 'lo'] },
+      { content: 'world', chunks: ['w', 'o', 'r', 'ld'] },
+    ]);
+    const runtime = buildRuntime(provider);
+    const a = agent({ name: 'a', model: 'mock:test', system: 's' });
+
+    const tokenAskIds: string[] = [];
+    const wf = workflow({
+      name: 'late-subscribe',
+      input: z.object({}),
+      handler: async (ctx) => {
+        // First ask STARTS without ctx.events allocated. The
+        // streaming gate is closed for this one — provider.chat path
+        // is taken, no token events fire.
+        await ctx.ask(a, 'first');
+
+        // Allocate ctx.events AFTER ask #1 has fully completed.
+        // From now on, the streaming gate is open and ask #2 streams.
+        void (async () => {
+          for await (const e of ctx.events) {
+            if (e.type === 'token') {
+              tokenAskIds.push((e as { askId: string }).askId);
+            }
+          }
+        })().catch(() => {});
+
+        await ctx.ask(a, 'second');
+        return { ok: true };
+      },
+    });
+    runtime.register(wf);
+    await runtime.execute('late-subscribe', {});
+
+    // We expect tokens from ask #2 only — they all share one askId.
+    // Ask #1 had no observer at start, so the streaming code path was
+    // skipped entirely. Without `_streamingEnabled` (or via the
+    // pre-fix gate `onToken || _busRef.current` reading the slot
+    // correctly), this would either fire 0 tokens (everything skipped
+    // streaming) or 8 tokens (both asks streamed). The pin here is
+    // exactly: "between 1 and 4 tokens, all from a single askId".
+    expect(tokenAskIds.length).toBeGreaterThan(0);
+    expect(tokenAskIds.length).toBeLessThanOrEqual(4);
+    const uniqueAskIds = new Set(tokenAskIds);
+    expect(uniqueAskIds.size).toBe(1);
+  });
+});
+
+// Note on ask_end finally masking-protection: the protection (commit
+// aed6b98) wraps the ask_end emit so that under `onOverflow: 'throw'`,
+// an overflow during the finally doesn't replace an in-flight error
+// from the catch branch. Verifying this in isolation requires
+// instrumenting the bus to selectively fail at ask_end time only — at
+// `maxQueued: 1` every emit overflows, so any in-flight error already
+// IS an EventStreamOverflowError, indistinguishable from the
+// finally's. The overflow + retry-rejection paths are pinned in the
+// other tests; the protection is a behavioral guarantee verified by
+// not seeing the documented "ask_end emit overflowed during error
+// path; preserving original error" log surface as an unhandled
+// rejection — covered implicitly by the throw-policy tests above
+// passing with stderr logs but no spurious rejections.
+
+// ─── AbortSignal listener cleanup (regression for commit bf17409) ───
+// The pre-fix `forwardAbortSignal` and constructor abort listener used
+// `{ once: true }`, which only auto-removes on abort. The success path
+// left listeners attached. With a long-lived signal reused across
+// many `runtime.execute()` calls, this caused MaxListenersExceededWarning
+// after ~10 calls and a real memory leak under sustained load.
+
+describe('runtime — AbortSignal listener cleanup on long-lived signals', () => {
+  it('forwardAbortSignal removes its listener after successful runtime.execute completion', async () => {
+    const runtime = buildRuntime(MockProvider.echo());
+    const a = agent({ name: 'a', model: 'mock:test', system: 's' });
+    const wf = workflow({
+      name: 'forwarder-cleanup',
+      input: z.object({}),
+      handler: async (ctx) => {
+        await ctx.ask(a, 'hi');
+        return { ok: true };
+      },
+    });
+    runtime.register(wf);
+
+    const userController = new AbortController();
+    // Run 30 executions on the SAME signal. Pre-fix this would
+    // accumulate 30 listeners; post-fix each cleanup runs in the
+    // workflow's `finally`, so after each completes we're back to 0.
+    for (let i = 0; i < 30; i++) {
+      await runtime.execute('forwarder-cleanup', {}, { signal: userController.signal });
+    }
+    expect(getEventListeners(userController.signal, 'abort').length).toBe(0);
+  });
+
+  it('forwardAbortSignal removes its listener after early-throw in runtime.stream', async () => {
+    const runtime = buildRuntime(MockProvider.echo());
+    // Don't register the workflow → "not registered" pre-execInfo throw.
+    const userController = new AbortController();
+
+    for (let i = 0; i < 10; i++) {
+      const stream = runtime.stream('does-not-exist', {}, { signal: userController.signal });
+      await stream.promise.catch(() => {});
+    }
+    expect(getEventListeners(userController.signal, 'abort').length).toBe(0);
+  });
+
+  it('forwardAbortSignal removes its listener after streaming workflow completion', async () => {
+    const runtime = buildRuntime(MockProvider.echo());
+    const a = agent({ name: 'a', model: 'mock:test', system: 's' });
+    const wf = workflow({
+      name: 'stream-forwarder-cleanup',
+      input: z.object({}),
+      handler: async (ctx) => {
+        await ctx.ask(a, 'hi');
+        return { ok: true };
+      },
+    });
+    runtime.register(wf);
+
+    const userController = new AbortController();
+    for (let i = 0; i < 10; i++) {
+      const stream = runtime.stream(
+        'stream-forwarder-cleanup',
+        {},
+        { signal: userController.signal },
+      );
+      await stream.promise;
+    }
+    expect(getEventListeners(userController.signal, 'abort').length).toBe(0);
+  });
+
+  it('WorkflowContext constructor abort listener is removed after workflow_end', async () => {
+    // The constructor registers an abort listener on `this.signal` so
+    // an aborted signal disposes the bus. On the success path
+    // (workflow_end), `emitEvent`'s terminal block calls
+    // `abortListenerCleanup()`. Pin: 30 executions, 0 leftover
+    // listeners.
+    const runtime = buildRuntime(MockProvider.echo());
+    const a = agent({ name: 'a', model: 'mock:test', system: 's' });
+    const wf = workflow({
+      name: 'ctx-listener-cleanup',
+      input: z.object({}),
+      handler: async (ctx) => {
+        // Allocate ctx.events so the constructor listener is wired.
+        void ctx.events;
+        await ctx.ask(a, 'hi');
+        return { ok: true };
+      },
+    });
+    runtime.register(wf);
+
+    const userController = new AbortController();
+    for (let i = 0; i < 30; i++) {
+      await runtime.execute('ctx-listener-cleanup', {}, { signal: userController.signal });
+    }
+    // Pre-fix: at least 30 listeners (one from forwarder + one from
+    // ctx constructor per execution). Post-fix: 0.
+    expect(getEventListeners(userController.signal, 'abort').length).toBe(0);
   });
 });

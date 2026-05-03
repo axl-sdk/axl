@@ -390,25 +390,33 @@ export class WorkflowContext<TInput = unknown> {
    *  - **Cross-execution**: prefer `runtime.on('trace', …)` instead — that
    *    fans out across all executions, while `ctx.events` is per-context.
    *
-   * Lazy: the bus is allocated on first access. Iterators that subscribe
-   * before any event is emitted see the full sequence; iterators that
-   * subscribe after an event has been emitted miss it (events are not
-   * buffered for late subscribers — subscribe at the top of the workflow
-   * handler).
+   * Lazy: the bus is allocated on first access. The bus's iterator
+   * queue retains events emitted before any consumer iterates, so a
+   * late `for await (const e of ctx.events)` still drains queued
+   * events. The `partialObjects` view additionally seeds from a
+   * per-bus `latestPartialByAsk` map, so a late subscriber may see
+   * the latest coalesced state per ask even when earlier events were
+   * already drained by another iterator. **Neither rescues a late
+   * subscriber from the streaming-gate behavior** (see below).
    *
-   * **Subscribe before the first `ctx.ask()`.** The streaming code path
-   * inside `ctx.ask()` activates only when an observer is present at the
-   * time the ask starts (either `onToken` is set or `_busRef.current`
-   * exists). If you allocate `ctx.events` AFTER a `ctx.ask()` has begun,
-   * that in-flight ask will not stream `token` / `partial_object` events
-   * — only structural events (`agent_call_*`, `tool_call_*`, etc.) will
-   * fan out. Subsequent asks will stream normally.
+   * **Subscribe before the first `ctx.ask()`.** The streaming code
+   * path inside `ctx.ask()` activates only when an observer is
+   * present at the time the ask starts (`_streamingEnabled` — either
+   * the legacy `onToken` callback is set or `ctx.events` has been
+   * allocated). If you allocate `ctx.events` AFTER a `ctx.ask()` has
+   * begun, that in-flight ask will not stream `token` /
+   * `partial_object` events at all (the agent loop went through
+   * `provider.chat` instead of `provider.stream`). Subsequent asks
+   * will stream normally — the gate is re-checked per ask. The
+   * unambiguous pattern is `const events = ctx.events;` on the first
+   * line of the handler.
    *
    * Auto-termination: `emitEvent` calls `_eventBus._finish()` after
-   * emitting `workflow_end` or `error`, so iterators terminate cleanly
-   * with `done: true`. For ad-hoc contexts that never run a workflow
-   * (no terminal event), call `ctx.disposeEvents()` when done observing
-   * to release iterator consumers.
+   * emitting `workflow_end` or `error`, so iterators terminate
+   * cleanly with `done: true`. For ad-hoc contexts that never run a
+   * workflow (no terminal event), pass `signal: AbortSignal.timeout(...)`
+   * to `runtime.createContext` (the bus auto-disposes on abort) or
+   * call `ctx.disposeEvents()` when done observing.
    */
   get events(): AxlEventBus {
     if (!this._busRef.current) {

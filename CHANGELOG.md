@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.4] - 2026-05-04
+
+### Fixed
+
+- **Studio aggregator no longer crashes on a malformed stored execution.** When `runtime.getExecutions()` / `runtime.getExecution()` loaded an `ExecutionInfo` from a `StateStore` where `events` was missing, `null`, or otherwise non-array (custom store implementations, schema drift, partial deserialization), Studio's `TraceAggregator.rebuild()` threw `TypeError: exec.events is not iterable` at startup — and because all four aggregators boot under `Promise.all`, a single bad row took down the Cost Dashboard, Trace Stats, Workflow Stats, and Eval Trends panels together. The same crash was reachable from `GET /api/executions/:id` and the redaction layer, which both iterate `events`. Fix is at the runtime boundary: `getExecutions()` and `getExecution()` now coerce non-array `events` to `[]` before returning, restoring the `events: AxlEvent[]` type contract for every consumer. One `console.warn` per offending `executionId` (deduped) flags the bad row so operators can investigate the underlying store. Built-in `SQLiteStore` was already safe; `RedisStore` and custom stores were the exposed paths.
+
 ## [0.17.3] - 2026-05-03
 
 ### Added — Stream-First Observation API (Phase 1)

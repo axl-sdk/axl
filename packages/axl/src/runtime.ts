@@ -252,6 +252,10 @@ export class AxlRuntime extends EventEmitter {
    *  the instance so per-event onTrace handlers don't reach into
    *  `this.config.state` on every emission. */
   private readonly maxEventsPerExecution: number;
+  /** Tracks executionIds for which we've already warned about a malformed
+   *  `events` field — keeps the log to one line per row instead of one per
+   *  rebuild tick. */
+  private warnedMalformedExecutions = new Set<string>();
 
   constructor(config?: AxlConfig) {
     super();
@@ -666,6 +670,27 @@ export class AxlRuntime extends EventEmitter {
   }
 
   /** Get all execution info (running + completed + historical). */
+  /** Normalize an `ExecutionInfo` loaded from a `StateStore` so the
+   *  `events: AxlEvent[]` type contract holds for downstream consumers
+   *  (Studio aggregators, REST routes, redaction). Custom or legacy stores
+   *  may persist rows without `events` (or with a non-array value) — without
+   *  this guard, a single malformed row crashes every iterator over
+   *  `exec.events` and takes down dependent features. Mutates the row
+   *  in place; logs at most one warning per `executionId`. */
+  private normalizeStoredExecution(exec: ExecutionInfo): ExecutionInfo {
+    if (!Array.isArray(exec.events)) {
+      if (!this.warnedMalformedExecutions.has(exec.executionId)) {
+        this.warnedMalformedExecutions.add(exec.executionId);
+        console.warn(
+          `[axl] StateStore returned execution ${exec.executionId} with non-array events ` +
+            `(got ${exec.events === null ? 'null' : typeof exec.events}); coercing to []`,
+        );
+      }
+      exec.events = [];
+    }
+    return exec;
+  }
+
   async getExecutions(): Promise<ExecutionInfo[]> {
     // Lazy-load historical executions from store on first access (once-guard)
     if (!this.historicalExecutionsLoadPromise && this.stateStore.listExecutions) {
@@ -677,7 +702,7 @@ export class AxlRuntime extends EventEmitter {
               !this.executions.has(exec.executionId) &&
               !this.historicalExecutions.has(exec.executionId)
             ) {
-              this.historicalExecutions.set(exec.executionId, exec);
+              this.historicalExecutions.set(exec.executionId, this.normalizeStoredExecution(exec));
             }
           }
         })
@@ -1192,8 +1217,9 @@ export class AxlRuntime extends EventEmitter {
     if (this.stateStore.getExecution) {
       const stored = await this.stateStore.getExecution(executionId);
       if (stored) {
-        this.historicalExecutions.set(executionId, stored);
-        return stored;
+        const normalized = this.normalizeStoredExecution(stored);
+        this.historicalExecutions.set(executionId, normalized);
+        return normalized;
       }
     }
 

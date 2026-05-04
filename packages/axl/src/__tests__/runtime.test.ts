@@ -562,6 +562,114 @@ describe('getExecution()', () => {
     expect(info).toBeDefined();
     expect(info!.totalCost).toBeGreaterThan(0);
   });
+
+  // Regression: a custom or legacy StateStore can return ExecutionInfo rows
+  // where `events` is missing, null, or otherwise non-array. The runtime
+  // normalizes these at the StateStore boundary so downstream consumers
+  // (Studio's TraceAggregator, REST routes, redaction) never see a
+  // contract-violating row and crash on iteration.
+  it('coerces non-array events from StateStore to [] and warns once', async () => {
+    const malformed = [
+      { executionId: 'e1', events: undefined },
+      { executionId: 'e2', events: null },
+      { executionId: 'e3', events: 'not-an-array' },
+      { executionId: 'e4', events: 42 },
+    ];
+
+    const fakeStore = {
+      saveExecution: vi.fn(async () => {}),
+      getExecution: vi.fn(async (id: string) => {
+        const row = malformed.find((m) => m.executionId === id);
+        if (!row) return null;
+        return {
+          executionId: row.executionId,
+          workflow: 'wf',
+          status: 'completed',
+          totalCost: 0,
+          startedAt: 1,
+          duration: 0,
+          events: row.events,
+        } as any;
+      }),
+      listExecutions: vi.fn(async () =>
+        malformed.map(
+          (m) =>
+            ({
+              executionId: m.executionId,
+              workflow: 'wf',
+              status: 'completed',
+              totalCost: 0,
+              startedAt: 1,
+              duration: 0,
+              events: m.events,
+            }) as any,
+        ),
+      ),
+    };
+
+    const runtime = new AxlRuntime({
+      defaultProvider: 'test',
+      state: { store: fakeStore as any },
+    });
+    runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const all = await runtime.getExecutions();
+    expect(all).toHaveLength(4);
+    for (const exec of all) {
+      expect(Array.isArray(exec.events)).toBe(true);
+      expect(exec.events).toEqual([]);
+    }
+
+    // One warning per malformed execution id.
+    expect(warn).toHaveBeenCalledTimes(4);
+    const warnedIds = warn.mock.calls.map((args) => String(args[0]));
+    expect(warnedIds.some((m) => m.includes('e1'))).toBe(true);
+    expect(warnedIds.some((m) => m.includes('e2') && m.includes('null'))).toBe(true);
+    expect(warnedIds.some((m) => m.includes('e3') && m.includes('string'))).toBe(true);
+    expect(warnedIds.some((m) => m.includes('e4') && m.includes('number'))).toBe(true);
+
+    // Re-fetching the same id does not re-warn.
+    warn.mockClear();
+    const refetched = await runtime.getExecutions();
+    expect(refetched).toHaveLength(4);
+    expect(warn).not.toHaveBeenCalled();
+
+    warn.mockRestore();
+  });
+
+  it('coerces non-array events on getExecution() store fall-through', async () => {
+    const fakeStore = {
+      saveExecution: vi.fn(async () => {}),
+      getExecution: vi.fn(async (id: string) => ({
+        executionId: id,
+        workflow: 'wf',
+        status: 'completed',
+        totalCost: 0,
+        startedAt: 1,
+        duration: 0,
+        events: null,
+      })),
+      listExecutions: vi.fn(async () => []),
+    };
+
+    const runtime = new AxlRuntime({
+      defaultProvider: 'test',
+      state: { store: fakeStore as any },
+    });
+    runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const info = await runtime.getExecution('only-in-store');
+    expect(info).toBeDefined();
+    expect(Array.isArray(info!.events)).toBe(true);
+    expect(info!.events).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    warn.mockRestore();
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════

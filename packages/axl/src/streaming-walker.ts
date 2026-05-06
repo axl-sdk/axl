@@ -434,8 +434,17 @@ export class StreamingWalker {
     return true;
   }
 
-  /** Pop a frame on `}` or `]`, fire boundary, transition to next state. */
+  /** Pop a frame on `}` or `]`, fire boundary, transition to next state.
+   *  Defensive on empty stack — the state machine never invokes this
+   *  without an enclosing container today (callers gate on state, and
+   *  state transitions out of `pre-json` / `done` only after pushing),
+   *  but a future state-machine bug could land us here with nothing to
+   *  pop. Fail closed (move to `done`, no spurious boundary fire). */
   private popFrame(): void {
+    if (this.stack.length === 0) {
+      this.state = 'done';
+      return;
+    }
     this.stack.pop();
     this.boundaryPending = true;
     if (this.stack.length === 0) {

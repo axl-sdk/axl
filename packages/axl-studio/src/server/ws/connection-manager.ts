@@ -80,13 +80,16 @@ export interface BufferCaps {
 
 /**
  * Stream-only event types excluded from the replay buffer entirely.
- * Late subscribers to an in-flight stream don't need per-token chatter
- * or per-delta progressive-render snapshots — they reconstruct the same
- * info from the final `agent_call_end` (token aggregates) and `done`
- * (final result). Both types are stream-only ergonomics, not
- * correctness-critical for replay. Spec/16 §5.2.
+ * Late subscribers to an in-flight stream don't need per-token chatter,
+ * per-delta progressive-render snapshots, or per-char string deltas —
+ * they reconstruct the same info from the final `agent_call_end` (token
+ * aggregates) and `done` (final result), and the `AxlEventBus`'s in-memory
+ * accumulators (`latestPartialByAsk`, `stringStreamByAsk`) seed late
+ * `partialObjects` / `stringStream` view subscribers with the current
+ * state. All three types are stream-only ergonomics, not correctness-
+ * critical for replay. Spec/16 §5.2 + spec/17 §12 (risk register decision).
  */
-const UNBUFFERED_EVENT_TYPES = new Set(['token', 'partial_object']);
+const UNBUFFERED_EVENT_TYPES = new Set(['token', 'partial_object', 'string_delta']);
 
 /** WS frame size soft cap. Used for both the inbound message reject in
  *  `protocol.ts` and the outbound broadcast truncation below — keeping them

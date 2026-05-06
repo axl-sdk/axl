@@ -1193,9 +1193,11 @@ export class WorkflowContext<TInput = unknown> {
           //     `parsePartialJson` and a snapshot is emitted. Same trigger
           //     as the pre-spec-17 walker; the structural-boundary throttle
           //     avoids parse cost on every char.
-          // The walker is re-created per ask invocation (not per retry —
-          // schema retry replays the conversation, so a fresh walker on
-          // attempt 2 starts cleanly).
+          // The walker is re-created per agent-call (per turn). Each
+          // streaming response from the provider gets a fresh walker —
+          // including across schema retries (which is what we want, since
+          // attempt N+1 replays the conversation and re-streams from a
+          // clean slate).
           const streamingObjectEnabled =
             !!options?.schema && toolDefs.length === 0 && options.schema instanceof z.ZodObject;
           const currentAttempt = schemaRetries + 1;

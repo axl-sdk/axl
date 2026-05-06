@@ -781,11 +781,16 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
           if (event.type !== 'string_delta') return;
           const askId = event.askId ?? '';
           if (!matchesFilter(askId, event.data.path)) return;
-          // The bus accumulator was already updated for this event in
-          // `_push` (which runs before listeners on the same emit call —
-          // EventEmitter dispatches listeners synchronously after the
-          // accumulator update site below in `_push`). So reading
-          // `acc.text` here gives the post-this-event accumulated value.
+          // INVARIANT: by the time this listener runs, `_push` has already
+          // updated `stringStreamByAsk` for this event (the accumulator
+          // update is intentionally ordered BEFORE `bus.emit`). So
+          // `acc.text` reflects post-this-event state. The `?? delta`
+          // fallback is pure belt-and-braces — it would only fire if the
+          // _push order were inverted by a future refactor, in which case
+          // tests pinning the `accumulated` field would catch it. Leaving
+          // the fallback in keeps a malformed-state path from crashing the
+          // listener (which would unwind the bus's emit() and propagate to
+          // the workflow).
           const paths = self.stringStreamByAsk.get(askId);
           const acc = paths?.get(event.data.path);
           const accumulated = acc?.text ?? event.data.delta;

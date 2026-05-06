@@ -103,6 +103,61 @@ export type CoalescedPartialObject = {
 };
 
 /**
+ * The shape yielded by `AxlEventBus.stringStream` (and `AxlStream.stringStream`).
+ *
+ * A live `string_delta` event carries `delta` (the new chars from this chunk)
+ * and `accumulated` (every char emitted so far for this ask + path,
+ * i.e. `delta1 + delta2 + ...`). Consumers rendering full-field state set
+ * their UI text to `accumulated`; consumers rendering incrementally use
+ * `delta` and append themselves.
+ *
+ * For LATE SUBSCRIBERS — those who attach `stringStream(...)` after one or
+ * more `string_delta` events have already fired for an askId/path —
+ * one synthetic event is yielded at subscribe time with `delta` ===
+ * `accumulated` === the full text-so-far. This guarantees the consumer's
+ * first render reflects the current state of the field, with no manual
+ * catch-up logic.
+ *
+ * `attempt` matches the underlying `string_delta.attempt` (1-indexed
+ * schema-retry counter). `pipeline(failed)` drops the accumulator AND
+ * any pending events for that ask before they reach the consumer, so a
+ * UI subscribed during attempt-N never sees stale text after attempt-N+1
+ * begins.
+ */
+export type StringStreamEvent = {
+  askId: string;
+  agent?: string;
+  /** RFC 6901 JSON Pointer; matches the source `string_delta.data.path`. */
+  path: string;
+  /** Chars added in this delta. For seeded synthetic events on subscribe,
+   *  equals `accumulated` (the full text-so-far). */
+  delta: string;
+  /** Concatenation of every delta this ask + path has emitted in the
+   *  current attempt. Cleared on `pipeline(failed)` and `ask_end`. */
+  accumulated: string;
+  /** 1-indexed schema-retry attempt; mirrors the source event. */
+  attempt: number;
+};
+
+/**
+ * Optional filter applied at subscribe time. Filtering happens in the bus's
+ * listener so non-matching events neither buffer nor wake the consumer's
+ * waiter — cheaper than filtering in the consumer.
+ *
+ * - `path`: yield only events for this exact JSON Pointer. The walker
+ *   produces RFC 6901-encoded paths, so callers binding to a key with
+ *   special chars must encode (`a/b` → `/a~1b`).
+ * - `askId`: yield only events from this ask. Useful when watching a
+ *   specific ask in a fan-out workflow.
+ *
+ * Both fields are AND-combined when both are set. Omit a field to wildcard.
+ */
+export type StringStreamFilter = {
+  path?: string;
+  askId?: string;
+};
+
+/**
  * Thrown when an `AxlEventBus` queue exceeds `maxQueued` and `onOverflow`
  * is set to `'throw'`. Surfaced as a typed error so the runtime's emit
  * pipeline can distinguish a legitimate overflow signal (which must
@@ -198,6 +253,31 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
    * number of distinct askIds that emitted at least one partial.
    */
   private latestPartialByAsk = new Map<string, CoalescedPartialObject>();
+
+  /**
+   * Per-ask, per-path running accumulator for `string_delta` events,
+   * updated on every `_push(string_delta)` regardless of consumer state.
+   * Used to seed late `stringStream` subscribers with the current text-
+   * so-far per (askId, path) pair, so a UI binding to `/summary` mid-
+   * stream renders the field's current state on first event instead of
+   * waiting for the next chunk.
+   *
+   * Cleared per-askId on `pipeline(failed)` (discarded attempt — old
+   * deltas must not leak into the next attempt's view) and on `ask_end`
+   * (frees memory; stream-event accumulators don't outlive the ask).
+   *
+   * Memory bound: O(active asks × distinct paths × total chars per
+   * field). For typical chat workflows (1 ask, 1-3 streaming string
+   * fields) this is a few KB. The clear-on-`ask_end` cap keeps a
+   * long-running runtime from accumulating per-ask entries forever
+   * (the way `latestPartialByAsk` does — partial snapshots are tiny by
+   * comparison so that map's growth is acceptable; string accumulators
+   * can be 4 KB+ each, hence the more aggressive cleanup here).
+   */
+  private stringStreamByAsk = new Map<
+    string,
+    Map<string, { agent?: string; text: string; attempt: number }>
+  >();
 
   /**
    * Hook fired when an iterator obtained from `[Symbol.asyncIterator]`
@@ -616,6 +696,171 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     };
   }
 
+  /**
+   * Listener-based view over `string_delta` events with optional
+   * filtering by `path` and/or `askId`. Yields `StringStreamEvent`s
+   * carrying `delta` (the new chars) and `accumulated` (the full text-
+   * so-far for that ask + path).
+   *
+   * Designed for chat-style typewriter rendering of long string fields:
+   * a React component binding to `path: '/summary'` sets its text to
+   * `event.accumulated` on every yield, getting smooth char-by-char
+   * progression with no parser of its own.
+   *
+   * Late-subscriber seeding: at subscribe time, the bus's per-ask
+   * accumulator is walked and one synthetic `StringStreamEvent` is
+   * yielded per matching (askId, path) entry, with `delta ===
+   * accumulated === <full text-so-far>`. After that, live deltas flow
+   * normally. A consumer who attaches mid-ask sees the field's current
+   * state on first iteration, then incremental updates.
+   *
+   * Like `partialObjects`, this view is listener-based — it does NOT
+   * race the main async iterator (`for await (const e of bus)`).
+   * Running both concurrently each receives every matching event.
+   *
+   * Schema-retry awareness: on `pipeline(status: 'failed')`, the
+   * accumulator and any pending events for the affected ask are
+   * dropped, so a consumer iterating during attempt-N never observes
+   * stale text after attempt-N+1 begins. Mirrors `partialObjects`'
+   * per-attempt reset.
+   *
+   * Termination: yields any pending events first (live + seeded), then
+   * `done: true` once the bus is finished via `_finish()`.
+   */
+  stringStream(opts?: StringStreamFilter): AsyncIterable<StringStreamEvent> {
+    const self = this;
+    const filterPath = opts?.path;
+    const filterAskId = opts?.askId;
+    return {
+      [Symbol.asyncIterator]() {
+        // FIFO buffer of events to yield. Listener pushes; iterator pops.
+        // Unlike `partialObjects` (which uses a per-askId Map for coalescing),
+        // string deltas are NOT coalesced — every delta is meaningful for
+        // typewriter rendering. The buffer can grow if the consumer is slow,
+        // but the producer cap (default 10k events on the underlying queue)
+        // bounds it.
+        const pending: StringStreamEvent[] = [];
+        let resolveWaiter: (() => void) | null = null;
+        let finished = self.finished;
+        let unsubscribed = false;
+
+        const wakeWaiter = () => {
+          const r = resolveWaiter;
+          resolveWaiter = null;
+          r?.();
+        };
+
+        const matchesFilter = (askId: string, path: string): boolean => {
+          if (filterAskId !== undefined && askId !== filterAskId) return false;
+          if (filterPath !== undefined && path !== filterPath) return false;
+          return true;
+        };
+
+        // Seed: walk the bus accumulator, push synthetic events for
+        // every matching (askId, path) entry. Iteration is over the
+        // outer `Map<string, Map<string, ...>>` in insertion order — so
+        // earlier-started asks come first; within an ask, paths come
+        // in the order they first emitted.
+        for (const [askId, paths] of self.stringStreamByAsk) {
+          for (const [path, acc] of paths) {
+            if (!matchesFilter(askId, path)) continue;
+            pending.push({
+              askId,
+              agent: acc.agent,
+              path,
+              delta: acc.text,
+              accumulated: acc.text,
+              attempt: acc.attempt,
+            });
+          }
+        }
+
+        // Subscribe to live events. Filter at the listener so non-
+        // matching events don't even reach `pending`.
+        const handler = (event: AxlEvent) => {
+          if (event.type !== 'string_delta') return;
+          const askId = event.askId ?? '';
+          if (!matchesFilter(askId, event.data.path)) return;
+          // The bus accumulator was already updated for this event in
+          // `_push` (which runs before listeners on the same emit call —
+          // EventEmitter dispatches listeners synchronously after the
+          // accumulator update site below in `_push`). So reading
+          // `acc.text` here gives the post-this-event accumulated value.
+          const paths = self.stringStreamByAsk.get(askId);
+          const acc = paths?.get(event.data.path);
+          const accumulated = acc?.text ?? event.data.delta;
+          pending.push({
+            askId,
+            agent: event.agent,
+            path: event.data.path,
+            delta: event.data.delta,
+            accumulated,
+            attempt: event.attempt,
+          });
+          wakeWaiter();
+        };
+        self.bus.on('string_delta', handler);
+
+        // Drop pending events on schema retry. Without this, undrained
+        // attempt-N deltas sit in `pending` while attempt-N+1 begins;
+        // the consumer's next iteration would surface attempt-N text
+        // BEFORE attempt-N+1's first delta arrives, causing the
+        // typewriter to render the wrong text. Mirrors partialObjects'
+        // per-attempt reset.
+        const pipelineHandler = (event: AxlEvent) => {
+          if (event.type !== 'pipeline') return;
+          if (event.status !== 'failed') return;
+          const askId = event.askId ?? '';
+          // Splice out pending events for this askId. Walk
+          // backwards so indices stay valid as we remove.
+          for (let i = pending.length - 1; i >= 0; i--) {
+            if (pending[i].askId === askId) pending.splice(i, 1);
+          }
+        };
+        self.bus.on('pipeline', pipelineHandler);
+
+        const unsubscribe = () => {
+          if (unsubscribed) return;
+          unsubscribed = true;
+          self.bus.off('string_delta', handler);
+          self.bus.off('pipeline', pipelineHandler);
+          unsubscribeFinish();
+        };
+
+        const unsubscribeFinish = self._onFinish(() => {
+          finished = true;
+          self.bus.off('string_delta', handler);
+          self.bus.off('pipeline', pipelineHandler);
+          wakeWaiter();
+        });
+
+        return {
+          async next(): Promise<IteratorResult<StringStreamEvent>> {
+            while (true) {
+              if (pending.length > 0) {
+                return { value: pending.shift()!, done: false };
+              }
+              if (finished) {
+                unsubscribe();
+                return { value: undefined as unknown as StringStreamEvent, done: true };
+              }
+              await new Promise<void>((res) => {
+                resolveWaiter = res;
+              });
+            }
+          },
+          async return(): Promise<IteratorResult<StringStreamEvent>> {
+            unsubscribe();
+            return { value: undefined as unknown as StringStreamEvent, done: true };
+          },
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+        };
+      },
+    };
+  }
+
   /** Iterator over structural lifecycle events only — skips per-token chatter
    *  and progressive `partial_object` emissions. Useful for waterfall UIs
    *  and any consumer that wants the "what happened" timeline. */
@@ -653,6 +898,45 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
    */
   _push(event: AxlEvent): void {
     if (this.finished) return;
+    // Update late-subscriber accumulators BEFORE emitting to listeners.
+    // Listeners (specifically the `stringStream` view) read from these
+    // maps to compute `accumulated` for the event they're about to be
+    // notified of, so the maps must reflect post-this-event state when
+    // listeners run. Order also ensures bookkeeping survives listener
+    // throws (the emit() below is wrapped in try/catch).
+    //
+    // `partial_object`: write the latest snapshot. `pipeline(failed)`:
+    // clear both accumulators for the ask. `ask_end`: free the string
+    // accumulator (text can be KB+; partial snapshots are tiny so we
+    // don't bother for `latestPartialByAsk`).
+    if (event.type === 'partial_object' && event.data?.object !== undefined) {
+      const askId = event.askId ?? '';
+      this.latestPartialByAsk.set(askId, {
+        askId,
+        agent: event.agent,
+        object: event.data.object,
+        attempt: event.attempt,
+      });
+    } else if (event.type === 'string_delta') {
+      const askId = event.askId ?? '';
+      let paths = this.stringStreamByAsk.get(askId);
+      if (!paths) {
+        paths = new Map();
+        this.stringStreamByAsk.set(askId, paths);
+      }
+      const existing = paths.get(event.data.path);
+      paths.set(event.data.path, {
+        agent: event.agent,
+        text: (existing?.text ?? '') + event.data.delta,
+        attempt: event.attempt,
+      });
+    } else if (event.type === 'pipeline' && event.status === 'failed') {
+      const askId = event.askId ?? '';
+      this.latestPartialByAsk.delete(askId);
+      this.stringStreamByAsk.delete(askId);
+    } else if (event.type === 'ask_end') {
+      this.stringStreamByAsk.delete(event.askId ?? '');
+    }
     // Isolate listener exceptions from the workflow. Node's EventEmitter
     // propagates listener throws to the caller synchronously, so a single
     // buggy `bus.on('agent_call_end', () => { throw … })` would unwind
@@ -669,22 +953,6 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
         `[axl] AxlEventBus listener for "${event.type}" threw; ignoring:`,
         err instanceof Error ? err.message : String(err),
       );
-    }
-    // Track the latest partial-object snapshot per ask for the
-    // `partialObjects` view's late-subscriber seed. Maintained on every
-    // _push so events delivered to past waiters (and thus absent from
-    // `eventQueue`) still contribute. `pipeline(failed)` clears the
-    // entry so the next subscriber doesn't see a discarded attempt.
-    if (event.type === 'partial_object' && event.data?.object !== undefined) {
-      const askId = event.askId ?? '';
-      this.latestPartialByAsk.set(askId, {
-        askId,
-        agent: event.agent,
-        object: event.data.object,
-        attempt: event.attempt,
-      });
-    } else if (event.type === 'pipeline' && event.status === 'failed') {
-      this.latestPartialByAsk.delete(event.askId ?? '');
     }
     const waiter = this.waiters.shift();
     if (waiter) {

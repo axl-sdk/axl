@@ -3,6 +3,8 @@ import {
   AxlEventBus,
   type CoalescedPartialObject,
   type EventStreamOptions,
+  type StringStreamEvent,
+  type StringStreamFilter,
 } from './event-stream.js';
 import { type AxlEvent, type AxlEventOf, type AxlEventType } from './types.js';
 import { isRootLevel } from './event-utils.js';
@@ -139,6 +141,21 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
    *  surfaces can never drift on the `attempt` field. */
   get partialObjects(): AsyncIterable<CoalescedPartialObject> {
     return this.events.partialObjects;
+  }
+
+  /** Listener-based view over `string_delta` events, with optional filter
+   *  on `path` and/or `askId`. Yields `StringStreamEvent`s carrying the new
+   *  `delta` and full text-so-far `accumulated`. Designed for chat-style
+   *  typewriter rendering of long string fields — bind a UI component to
+   *  one path and set its text to `event.accumulated` per yield.
+   *
+   *  Late subscribers receive a synthetic event seeded from the bus's
+   *  per-ask accumulator (so the field's current state renders on the
+   *  first iteration, not after the next char arrives). Doesn't race the
+   *  main async iterator. See `AxlEventBus.stringStream` for full
+   *  semantics. */
+  stringStream(opts?: StringStreamFilter): AsyncIterable<StringStreamEvent> {
+    return this.events.stringStream(opts);
   }
 
   pipe<T extends NodeJS.WritableStream>(destination: T, options?: { end?: boolean }): T {

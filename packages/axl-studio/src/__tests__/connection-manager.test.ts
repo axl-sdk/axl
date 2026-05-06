@@ -194,6 +194,59 @@ describe('ConnectionManager', () => {
       expect(msgsB).toHaveLength(0);
     });
 
+    it('applies the filter to string_delta events (spec/17 regression guard)', () => {
+      // Pins that the per-event filter is type-agnostic and correctly
+      // scopes `string_delta` events alongside everything else. The
+      // researcher's spec/17 audit found no test exercising the filter
+      // with `string_delta` specifically; the broadcast path is shared
+      // so this is defensive — a future "type-aware" optimization that
+      // skipped filtering for high-volume events would silently leak
+      // tenant data without this regression.
+      const { ws: tenantA, messages: msgsA } = createMockWs();
+      const { ws: tenantB, messages: msgsB } = createMockWs();
+      connMgr.add(tenantA);
+      connMgr.add(tenantB);
+      connMgr.setMetadata(tenantA, { tenantId: 'A' });
+      connMgr.setMetadata(tenantB, { tenantId: 'B' });
+      connMgr.subscribe(tenantA, 'execution:run-1');
+      connMgr.subscribe(tenantB, 'execution:run-1');
+
+      connMgr.setFilter((event, metadata) => {
+        const e = event as { tenantId?: string };
+        const m = metadata as { tenantId?: string } | undefined;
+        return !!e.tenantId && e.tenantId === m?.tenantId;
+      });
+
+      // Two `string_delta` events for different tenants. Each tenant
+      // must see ONLY their own — no cross-leak.
+      connMgr.broadcast('execution:run-1', {
+        tenantId: 'A',
+        type: 'string_delta',
+        askId: 'ask-A',
+        depth: 0,
+        agent: 'a',
+        attempt: 1,
+        data: { path: '/summary', delta: 'tenant-A-secret' },
+      });
+      connMgr.broadcast('execution:run-1', {
+        tenantId: 'B',
+        type: 'string_delta',
+        askId: 'ask-B',
+        depth: 0,
+        agent: 'b',
+        attempt: 1,
+        data: { path: '/summary', delta: 'tenant-B-secret' },
+      });
+
+      expect(msgsA).toHaveLength(1);
+      expect(msgsB).toHaveLength(1);
+      expect(JSON.parse(msgsA[0]).data.data.delta).toBe('tenant-A-secret');
+      expect(JSON.parse(msgsB[0]).data.data.delta).toBe('tenant-B-secret');
+      // Critical: tenant A never saw B's secret, vice versa.
+      expect(msgsA[0]).not.toContain('tenant-B-secret');
+      expect(msgsB[0]).not.toContain('tenant-A-secret');
+    });
+
     it('drops events from a wildcard-only subscriber when the filter rejects (no specific subscriber present)', () => {
       // Pin the case where ONLY a wildcard subscriber exists (no specific
       // `trace:exec-1` subscriber) and the filter rejects the event.

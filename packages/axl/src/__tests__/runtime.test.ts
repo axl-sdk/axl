@@ -2063,11 +2063,15 @@ describe('trackExecution()', () => {
     expect(cost).toBeCloseTo(0.07);
   });
 
-  it('captureTraces strips high-volume token and partial_object events', async () => {
-    // Reviewer bug B3: `execInfo.events` (runtime.ts:570, :735) strips
-    // `token` and `partial_object` to bound memory, but the
-    // `captureTraces` path did not — so `runEval({captureTraces: true})`
-    // on a streaming eval item blew the captured-traces array.
+  it('captureTraces strips high-volume token, partial_object, and string_delta events', async () => {
+    // Reviewer bug B3 + spec/17 follow-up: `execInfo.events`
+    // (runtime.ts:570, :735) strips `token` and `partial_object` to bound
+    // memory, but the `captureTraces` path did not — so
+    // `runEval({captureTraces: true})` on a streaming eval item blew the
+    // captured-traces array. `string_delta` joined the strip list in
+    // spec/17: a 4 KB summary streamed at 80-char chunks is ~50 deltas
+    // per item, ~7-300 KB total — same rationale, same fix as the Studio
+    // replay-buffer exclusion (`UNBUFFERED_EVENT_TYPES`).
     const provider = new TestProvider([{ content: 'hello world', cost: 0.01 }]);
     const { runtime } = createRuntime(provider);
     const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
@@ -2084,6 +2088,7 @@ describe('trackExecution()', () => {
     // High-volume stream-only events must NOT be captured.
     expect(traces!.some((t) => t.type === 'token')).toBe(false);
     expect(traces!.some((t) => t.type === 'partial_object')).toBe(false);
+    expect(traces!.some((t) => t.type === 'string_delta')).toBe(false);
     // But structural events (agent_call_end) still are.
     expect(traces!.some((t) => t.type === 'agent_call_end')).toBe(true);
   });

@@ -1584,10 +1584,20 @@ export class AxlRuntime extends EventEmitter {
       if (capturedTraces) {
         // Skip high-volume stream-only events for the same reason
         // `runtime.execute()` / `runtime.stream()` drop them from
-        // `ExecutionInfo.events`: a streaming eval item with thousands of
-        // tokens / progressive `partial_object` snapshots would blow memory
-        // when `captureTraces: true` is set on `runEval`. Reviewer bug B3.
-        if (event.type === 'token' || event.type === 'partial_object') return;
+        // `ExecutionInfo.events` and Studio's WS replay buffer drops them
+        // (`UNBUFFERED_EVENT_TYPES`): a streaming eval item with thousands
+        // of tokens, progressive `partial_object` snapshots, or per-chunk
+        // `string_delta` events would blow memory when `captureTraces:
+        // true` is set on `runEval`. `string_delta` joined this list in
+        // spec/17 — same rationale, same fix as the Studio replay-buffer
+        // exclusion. Reviewer bug B3.
+        if (
+          event.type === 'token' ||
+          event.type === 'partial_object' ||
+          event.type === 'string_delta'
+        ) {
+          return;
+        }
         // Verbose `messages[]` snapshots live on agent_call_start (request
         // side) under the start/end split. Strip to keep memory bounded.
         if (event.type === 'agent_call_start' && event.data) {

@@ -296,6 +296,40 @@ Notes:
 - **Schema retries reset the stream.** On `pipeline(failed)`, the per-ask accumulator is cleared and pending events are dropped, so attempt-N text never leaks into attempt-N+1's render. Watch `event.attempt` to render a "regenerating" indicator.
 - **Same gating as `partial_object`.** Schema must be set, no tools registered, schema root must be a `z.object(...)`.
 
+##### Recipe: typewriter rendering on the wire (browser SPA)
+
+The pattern above assumes the consumer holds a live `AxlStream` instance — true for Node-side servers, but not for a browser SPA receiving events over WebSocket / SSE. There the events arrive as raw JSON and there's no bus accumulator on the client.
+
+`stringStreamFromEvents(source, opts?)` is a browser-safe reconstructor: same shape and filter API as `bus.stringStream(...)`, but takes any `AsyncIterable<AxlEvent>` as input. Pure ECMAScript, no Node deps.
+
+```typescript
+import { stringStreamFromEvents } from '@axlsdk/axl';
+
+// Adapt your transport (here: a WebSocket emitting JSON-encoded AxlEvents)
+async function* readWs(ws: WebSocket): AsyncIterable<AxlEvent> {
+  const queue: AxlEvent[] = [];
+  let resolver: (() => void) | null = null;
+  ws.addEventListener('message', (m) => {
+    queue.push(JSON.parse(m.data).data); // adjust to your wire envelope
+    resolver?.();
+  });
+  while (true) {
+    while (queue.length) yield queue.shift()!;
+    await new Promise<void>((r) => (resolver = r));
+  }
+}
+
+for await (const e of stringStreamFromEvents(readWs(ws), { path: '/summary' })) {
+  setText(e.accumulated);
+}
+```
+
+Differences from the live-bus view:
+
+- **No late-subscriber seeding.** The helper accumulates only events handed to its iterator. If the source has already produced `string_delta` events before iteration begins, those are missed. For cross-reconnect recovery, the server has to surface the current accumulator state on resubscribe (out of scope — the wire transport is the caller's responsibility).
+- **No race-with-bus-iterator concern.** This is a stateless consumer of an iterable; iterating it twice on the same source consumes events twice (fork the source first if you need that).
+- **Identical retry behaviour for re-rendered fields.** `pipeline(failed)` clears the helper's per-ask accumulator just like the bus view does, so the next yielded event starts with `accumulated === delta`. A UI re-rendering `event.accumulated` per yield naturally overwrites stale attempt-N text in place when attempt-N+1 begins — no explicit retry handling needed.
+
 - **`ctx.events.partialObjects`** is the coalescing view — yields the latest `partial_object` payload per `askId`. When the LLM streams faster than your UI renders, intermediate snapshots are silently superseded; the consumer sees only the most recent state per ask. Memory-bounded by `O(active asks)`, not `O(events emitted)`. Listener-based, so it does NOT race with the main `for await (const e of ctx.events)` iterator.
 - **`ctx.events.stringStream({ path?, askId? })`** is the per-field streaming view for **chat-style typewriter rendering of long string fields**. `partial_object` snapshots are throttled to structural JSON boundaries — they don't fire while a long string is being written, so a 4 KB `summary` field appears all at once when the closing quote lands. `string_delta` events fill that gap by emitting per-chunk batches of unescaped chars inside string values, keyed by RFC 6901 JSON Pointer (`/summary`, `/sources/0/title`). The view yields `{ askId, agent?, path, delta, accumulated, attempt }` — bind a UI component to one `path` and set its text to `event.accumulated` per yield. Late subscribers see one synthetic event with `delta === accumulated === <full text-so-far>`, then live deltas. Listener-based: does NOT race with the main iterator.
 - **`ctx.events.lifecycle`** filters to structural events (`ask_start`, `ask_end`, `agent_call_*`, `tool_call_*`, `handoff_*`, etc.) — useful for waterfall UIs.

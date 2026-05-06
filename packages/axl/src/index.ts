@@ -100,6 +100,7 @@ export type {
   GuardrailData,
   SchemaCheckData,
   ValidateData,
+  StringDeltaData,
   AskOptions,
   DelegateOptions,
   RaceOptions,

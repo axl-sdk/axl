@@ -172,6 +172,12 @@ export const AXL_EVENT_TYPES = [
   'pipeline',
   // Progressive structured output — added in PR 2; reserved here.
   'partial_object',
+  // Character-level deltas inside string values of progressive structured
+  // output. Same gating as `partial_object` (schema set, no tools, root is
+  // ZodObject); fires per text-delta chunk when the walker is inside a
+  // string value at a known JSON Pointer path. Designed for chat-style
+  // typewriter rendering of long string fields.
+  'string_delta',
   // Verification
   'verify',
   // Observability
@@ -321,6 +327,40 @@ export type VerifyData = {
   attempts: number;
   passed: boolean;
   lastError?: string;
+};
+
+/**
+ * Data shape for `string_delta` events.
+ *
+ * Emitted while the streaming walker is inside a string VALUE (not a key)
+ * during a schema-mode response. Each event carries the unescaped chars
+ * appended within a single text-delta chunk for one path; consumers
+ * concatenate `delta` per (`askId`, `path`) to reconstruct the running text.
+ *
+ * Splitting an escape sequence across chunks is supported — the walker
+ * holds escape state across chunks, so a `\\u00` in chunk N and `41` in
+ * chunk N+1 produces a single `A` in the chunk-N+1 delta.
+ */
+export type StringDeltaData = {
+  /**
+   * RFC 6901 JSON Pointer to the string value. Examples:
+   *   - `/summary` (root-level field)
+   *   - `/sources/0/title` (nested through array)
+   *   - keys containing `~` or `/` are escaped to `~0`/`~1` per RFC.
+   *
+   * Path is structural metadata (preserved under `trace.redact`).
+   */
+  path: string;
+  /**
+   * Unescaped characters appended this chunk. JSON escapes are translated:
+   * `\\n` → "\n", `\\t` → "\t", `\\"` → '"', `\\\\` → "\\", `\\uXXXX` → the
+   * corresponding UTF-16 code unit. Surrogate pairs (e.g. `\\uD83D\\uDE00`)
+   * are emitted as two code units in the order they parse — matches what
+   * `JSON.parse` produces.
+   *
+   * Subject to `config.trace.redact` (always scrubbed when redaction is on).
+   */
+  delta: string;
 };
 
 /** Data shape for legacy `guardrail` events. Replaced by `pipeline` in PR 2. */
@@ -674,6 +714,18 @@ export type AxlEvent =
         attempt: number;
         /** DeepPartial<T>; consumers cast at the render site. */
         data: { object: unknown };
+      })
+
+  // ── Character-level deltas inside string values ─────────────────────────
+  // Fires per text-delta chunk while the streaming walker is inside a
+  // string value at a known path. Same gating as `partial_object`.
+  // Stream-only — never persisted to `ExecutionInfo.events`.
+  | (AxlEventBase &
+      AskScoped & {
+        type: 'string_delta';
+        /** 1-indexed schema-retry attempt; mirrors `partial_object.attempt`. */
+        attempt: number;
+        data: StringDeltaData;
       })
 
   // ── Verification ────────────────────────────────────────────────────────

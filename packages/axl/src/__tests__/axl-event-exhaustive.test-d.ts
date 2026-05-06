@@ -60,6 +60,8 @@ function assertExhaustive(ev: AxlEvent): string {
       }
     case 'partial_object':
       return String(ev.attempt);
+    case 'string_delta':
+      return ev.data.path + ':' + ev.data.delta;
     case 'verify':
       return String(ev.data.passed);
     case 'log':

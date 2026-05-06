@@ -188,6 +188,9 @@ export const REDACTION_RULES: { [K in AxlEventType]: RuleFor<K> } = {
   handoff_return: passthrough as unknown as RuleFor<'handoff_return'>,
   pipeline: (e) => (e.status === 'failed' ? { ...e, reason: REDACTED } : e),
   partial_object: (e) => ({ ...e, data: { ...e.data, object: REDACTED } }),
+  // `path` is structural (schema-shape, no PII); `delta` is user content.
+  // Scrub only the delta — preserving path keeps "which fields stream" telemetry.
+  string_delta: (e) => ({ ...e, data: { ...e.data, delta: REDACTED } }),
   verify: (e) =>
     e.data.lastError !== undefined ? { ...e, data: { ...e.data, lastError: REDACTED } } : e,
   log: (e) => {

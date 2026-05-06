@@ -36,6 +36,7 @@ import {
 } from './errors.js';
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
+import { StreamingWalker } from './streaming-walker.js';
 import { COST_BEARING_LEAF_TYPES } from './event-utils.js';
 import { AxlEventBus, EventStreamOverflowError, type EventStreamOptions } from './event-stream.js';
 import { redactEvent } from './redaction.js';
@@ -1178,26 +1179,38 @@ export class WorkflowContext<TInput = unknown> {
 
           let thinkingContent = '';
 
-          // partial_object emission gating (spec §4.2):
+          // Streaming structured-output emission gating (spec/17):
           //   - schema is set
           //   - no tools (JSON-mode response, not tool-calling)
           //   - schema root is a ZodObject (only object roots get partials)
-          // Structural-boundary throttle: emit when we cross a `,`, `}`, or
-          // `]` that is OUTSIDE a string literal. A naive "last char of
-          // delta is a comma" check (review B-9) over-emits on prose-heavy
-          // fields like {"description": "short, comma-heavy text..."} —
-          // every comma inside the string triggered a parse. We track
-          // in-string + escape state across chunks with a small walker so
-          // each boundary fires exactly once at a real structural seam.
-          const partialObjectEnabled =
+          // When enabled, a `StreamingWalker` is fed each text chunk and
+          // emits two AxlEvent variants:
+          //   - `string_delta`: per-chunk batches of unescaped chars inside
+          //     string values, keyed by JSON Pointer path. For chat-style
+          //     typewriter rendering of long string fields.
+          //   - `partial_object`: at structural boundaries (`,` / `}` / `]`
+          //     outside strings), the accumulated content is re-parsed via
+          //     `parsePartialJson` and a snapshot is emitted. Same trigger
+          //     as the pre-spec-17 walker; the structural-boundary throttle
+          //     avoids parse cost on every char.
+          // The walker is re-created per ask invocation (not per retry —
+          // schema retry replays the conversation, so a fresh walker on
+          // attempt 2 starts cleanly).
+          const streamingObjectEnabled =
             !!options?.schema && toolDefs.length === 0 && options.schema instanceof z.ZodObject;
           const currentAttempt = schemaRetries + 1;
-          // Running parser state for the delta walker. Reset per ask
-          // invocation (not per retry — schema retry feeds the same
-          // conversation back, so we want a fresh parse of the new attempt).
-          let inString = false;
-          let escaped = false;
-          let boundaryPending = false;
+          const walker = streamingObjectEnabled
+            ? new StreamingWalker({
+                onStringDelta: (path, delta) => {
+                  this.emitEvent({
+                    type: 'string_delta',
+                    agent: agent._name,
+                    attempt: currentAttempt,
+                    data: { path, delta },
+                  });
+                },
+              })
+            : undefined;
 
           for await (const chunk of provider.stream(currentMessages, chatOptions)) {
             if (chunk.type === 'text_delta') {
@@ -1209,36 +1222,16 @@ export class WorkflowContext<TInput = unknown> {
               // `onToken` is optional — the streaming branch can also be
               // entered solely because `ctx.events` is being observed.
               this.onToken?.(chunk.content, callbackMeta);
-              if (partialObjectEnabled) {
-                // Walk `chunk.content` char-by-char, updating the
-                // in-string / escape state and recording whether a
-                // structural boundary landed outside a string. The
-                // running state survives across chunks because
-                // `inString` / `escaped` are closed over by the outer
-                // for-await loop.
-                for (const ch of chunk.content) {
-                  if (escaped) {
-                    escaped = false;
-                    continue;
-                  }
-                  if (ch === '\\') {
-                    // Inside a string, `\\` starts an escape. Outside,
-                    // a bare backslash is invalid JSON — treat the same
-                    // way (swallow the next char) so malformed input
-                    // doesn't derail our state machine.
-                    escaped = true;
-                    continue;
-                  }
-                  if (ch === '"') {
-                    inString = !inString;
-                    continue;
-                  }
-                  if (!inString && (ch === ',' || ch === '}' || ch === ']')) {
-                    boundaryPending = true;
-                  }
-                }
-                if (boundaryPending) {
-                  boundaryPending = false;
+              if (walker) {
+                // Walker drives both `string_delta` (via the onStringDelta
+                // callback above) and structural-boundary detection (via
+                // `consumeBoundary()` below). Order within a chunk:
+                // string_delta events fire first (from inside processChunk),
+                // then partial_object on boundary — so a consumer subscribed
+                // to both sees deltas land before the snapshot reflecting
+                // them, matching natural read order.
+                walker.processChunk(chunk.content);
+                if (walker.consumeBoundary()) {
                   let parsed: unknown;
                   try {
                     parsed = parsePartialJson(extractJson(content));

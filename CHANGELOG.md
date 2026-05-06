@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Character-level streaming for long string fields
+
+- **New `string_delta` AxlEvent variant.** Per-chunk, character-level deltas inside string VALUES of progressive structured output. Fires when the streaming walker is inside a string field at a known JSON Pointer path; `data.path` is RFC 6901 (`/summary`, `/sources/0/title`), `data.delta` is the unescaped chars added in this chunk. Same gating as `partial_object` (schema set, no tools, root is `ZodObject`). Solves the chat-style typewriter rendering problem that boundary-throttled `partial_object` could not — a 4 KB summary field no longer waits for the closing `"` to surface. Stream-only event, never persisted to `ExecutionInfo.events`. New `StringDeltaData` type export from `@axlsdk/axl`. Spec: `.internal/spec/17-string-deltas.md`.
+- **`AxlEventBus.stringStream(opts?)` and `AxlStream.stringStream(opts?)` view helpers.** Listener-based view yielding `StringStreamEvent` (`{ askId, agent?, path, delta, accumulated, attempt }`). Optional filter by `path` and/or `askId`. Yields `delta` (new chars) and `accumulated` (full text-so-far for that ask + path). Late subscribers are seeded with one synthetic event per matching `(askId, path)` carrying `delta === accumulated === <full text-so-far>`, so a UI binding mid-ask renders current state immediately. Per-ask accumulator at the bus level cleared on `pipeline(failed)` (discarded attempt) and on `ask_end` (memory hygiene). Listener-based: does NOT race with the main async iterator. New `StringStreamEvent` and `StringStreamFilter` type exports.
+- **Path-tracking JSON walker (`StreamingWalker`).** Replaces the inline `partial_object` walker in `context.ts` with a unified state machine (`packages/axl/src/streaming-walker.ts`) that tracks JSON Pointer paths via a frame stack. Drives both `string_delta` and `partial_object` emissions from one parser. Also fixes a latent prefix-prose bug in the old walker: a `"` in pre-JSON prose (e.g. `Here's the answer: ...`) no longer flips the in-string flag. Reset per agent-call (per turn).
+- **Studio: Playground panel filters `string_delta` from the activity feed.** Same treatment as `token` and `partial_object` — high-volume content events would otherwise produce 100+ rows per long string. `string_delta` is also excluded from the Studio WS replay buffer (`UNBUFFERED_EVENT_TYPES`); late subscribers recover field state via the `stringStream` view's accumulator-seed instead.
+
+### Added — Bus accumulator timing for live listeners
+
+- **`AxlEventBus._push` now updates per-ask accumulators BEFORE `bus.emit(...)`.** The reorder lets the new `stringStream` listener read post-this-event accumulated state when computing `event.accumulated`. Side benefit: accumulator updates are now exception-safe (they survive listener throws). No external code reads the private accumulator maps (`latestPartialByAsk`, `stringStreamByAsk`), so the reorder is invisible to all existing consumers.
+
 ## [0.17.4] - 2026-05-04
 
 ### Fixed

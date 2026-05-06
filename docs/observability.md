@@ -81,6 +81,7 @@ All events share the `AxlEventBase` shape; `data` and other variant-specific fie
 | `verify` | `ctx.verify()` completes (pass or fail) | `attempts`, `passed`, `lastError?` |
 | `pipeline` | Retry/validation lifecycle (multi-state via `status`: `start` / `committed` / `failed`). Emitted alongside the legacy `guardrail` / `schema_check` / `validate` gate events | `status`, `stage` (`'initial' \| 'schema' \| 'validate' \| 'guardrail'`), `attempt`, `maxAttempts`, `reason?` (only on `status: 'failed'`) |
 | `partial_object` | Progressive structured output — emitted at string-safe boundaries when `ctx.ask()` has a `schema` and no tools. **Stream-only** — never persisted to `ExecutionInfo.events` | `attempt`, `data: { object: unknown }` (DeepPartial of the schema type) |
+| `string_delta` | Per-chunk character-level deltas inside string VALUES of progressive structured output. Same gating as `partial_object` (schema set, no tools, root is `ZodObject`). **Stream-only** — never persisted. Designed for chat-style typewriter rendering of long string fields via the `stringStream` view helper | `attempt`, `data: { path, delta }` (`path` = RFC 6901 JSON Pointer; `delta` = unescaped chars added in this chunk) |
 | `log` | `ctx.log()` user-emitted event | caller-provided |
 | `memory_remember` / `memory_recall` / `memory_forget` | Memory ops audit | `{ key, scope, hit?, count?, embed?, usage? }` |
 | `checkpoint_save` / `checkpoint_replay` | `ctx.checkpoint(name, fn)` — `save` on first execution, `replay` when a saved value short-circuits the function call | `name` (caller-supplied stable id, or `__auto/<primitive>/...` for runtime-internal auto-checkpoints) |
@@ -226,7 +227,77 @@ const wf = workflow({
 });
 ```
 
+##### Recipe: chat-style typewriter rendering of a long string field
+
+For a schema with a long `summary` string, `partial_object` doesn't fire mid-string — it waits for the closing `"`. To render the field char-by-char as it arrives, subscribe to `stringStream`:
+
+```typescript
+import { agent, workflow } from '@axlsdk/axl';
+import { z } from 'zod';
+
+const summarizer = agent({
+  name: 'summarizer',
+  model: 'openai:gpt-4o',
+  system: 'Summarize the input thoroughly.',
+});
+
+const wf = workflow({
+  name: 'streaming-summary',
+  input: z.object({ text: z.string() }),
+  handler: async (ctx) => {
+    const events = ctx.events;
+    void (async () => {
+      // Renders one (or many) ask's `/summary` field char-by-char.
+      // Bind your UI component to `event.accumulated` for the running
+      // text, or `event.delta` for incremental append.
+      for await (const e of events.stringStream({ path: '/summary' })) {
+        process.stdout.write(e.delta); // typewriter effect
+      }
+    })().catch(() => {});
+
+    return await ctx.ask(summarizer, ctx.input.text, {
+      schema: z.object({ summary: z.string(), keywords: z.array(z.string()) }),
+    });
+  },
+});
+```
+
+In a React UI consuming `runtime.stream(...)`:
+
+```tsx
+import { useState, useEffect } from 'react';
+import type { AxlStream } from '@axlsdk/axl';
+
+function StreamingField({ stream, path }: { stream: AxlStream; path: string }) {
+  const [text, setText] = useState('');
+  useEffect(() => {
+    const iter = stream.stringStream({ path });
+    let cancelled = false;
+    (async () => {
+      for await (const e of iter) {
+        if (cancelled) break;
+        setText(e.accumulated); // re-render with running text
+      }
+    })();
+    return () => {
+      cancelled = true;
+      void (iter[Symbol.asyncIterator]() as { return?: () => Promise<unknown> }).return?.();
+    };
+  }, [stream, path]);
+  return <span>{text}</span>;
+}
+```
+
+Notes:
+
+- **Late mount renders current state immediately.** The view seeds late subscribers with a synthetic event carrying `delta === accumulated === <full text-so-far>`, so a component mounting mid-ask doesn't render empty.
+- **Filter by path or askId.** Both are optional; `stringStream({ path: '/summary' })` matches across all asks; `stringStream({ askId })` matches all paths within one ask; passing both narrows.
+- **Concatenate per (askId, path).** If you don't filter and want to reconstruct each field separately, key your UI state on `${event.askId}|${event.path}`.
+- **Schema retries reset the stream.** On `pipeline(failed)`, the per-ask accumulator is cleared and pending events are dropped, so attempt-N text never leaks into attempt-N+1's render. Watch `event.attempt` to render a "regenerating" indicator.
+- **Same gating as `partial_object`.** Schema must be set, no tools registered, schema root must be a `z.object(...)`.
+
 - **`ctx.events.partialObjects`** is the coalescing view — yields the latest `partial_object` payload per `askId`. When the LLM streams faster than your UI renders, intermediate snapshots are silently superseded; the consumer sees only the most recent state per ask. Memory-bounded by `O(active asks)`, not `O(events emitted)`. Listener-based, so it does NOT race with the main `for await (const e of ctx.events)` iterator.
+- **`ctx.events.stringStream({ path?, askId? })`** is the per-field streaming view for **chat-style typewriter rendering of long string fields**. `partial_object` snapshots are throttled to structural JSON boundaries — they don't fire while a long string is being written, so a 4 KB `summary` field appears all at once when the closing quote lands. `string_delta` events fill that gap by emitting per-chunk batches of unescaped chars inside string values, keyed by RFC 6901 JSON Pointer (`/summary`, `/sources/0/title`). The view yields `{ askId, agent?, path, delta, accumulated, attempt }` — bind a UI component to one `path` and set its text to `event.accumulated` per yield. Late subscribers see one synthetic event with `delta === accumulated === <full text-so-far>`, then live deltas. Listener-based: does NOT race with the main iterator.
 - **`ctx.events.lifecycle`** filters to structural events (`ask_start`, `ask_end`, `agent_call_*`, `tool_call_*`, `handoff_*`, etc.) — useful for waterfall UIs.
 - **`ctx.events.text`** yields root-only token chunks (chat-bubble view).
 - **`ctx.events.textByAsk`** yields `{ askId, agent?, text }` for split-pane UIs that render each sub-agent in its own lane.

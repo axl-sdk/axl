@@ -269,9 +269,20 @@ export function PlaygroundPanel() {
   const hasCostData = totalCost > 0 || totalTokens.input > 0;
   const messageCount = messages.length;
 
+  // Filter out high-volume content events from the activity feed — they're
+  // already rendered via the streaming chat bubble (`StreamingText`) and
+  // would otherwise produce hundreds of useless rows for a long response.
+  // `string_delta` joined this list in spec/17 alongside `token` and
+  // `partial_object`. Customers wanting per-field char-by-char rendering
+  // should subscribe to `AxlStream.stringStream({ path })` in their own
+  // UI (see docs/observability.md).
   const activityEvents = stream.events.filter(
     (e) =>
-      e.type !== 'token' && e.type !== 'partial_object' && e.type !== 'done' && e.type !== 'error',
+      e.type !== 'token' &&
+      e.type !== 'partial_object' &&
+      e.type !== 'string_delta' &&
+      e.type !== 'done' &&
+      e.type !== 'error',
   );
 
   const chatPanel = (

@@ -1,8 +1,30 @@
 import { Hono } from 'hono';
+import { z } from 'zod';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import { redactStreamEvent } from '../redact.js';
 import type { AxlEvent } from '@axlsdk/axl';
+
+// Demo schemas keyed by agent name. When the playground UI selects an agent
+// in this map, the chat-bubble render path exercises the spec/17
+// typewriter UX (partial_object snapshots + string_delta events). Without
+// a schema, `ctx.ask` returns plain text and the streamingStructuredAgent's
+// JSON-shaped content would render as raw text mid-stream — which is
+// exactly the gibberish the chat-bubble fix replaces.
+//
+// Keep this map narrow: dev-fixture agents only. The intent is "make the
+// streaming-structured demo work end-to-end in the Playground", not "let
+// any agent become schema-aware via convention". Production customers
+// using the playground for schema'd asks should add `schema` to the
+// request body explicitly (planned follow-up).
+const DEMO_SCHEMA_BY_AGENT: Record<string, z.ZodObject<Record<string, z.ZodTypeAny>>> = {
+  'streaming-structured-agent': z.object({
+    title: z.string(),
+    summary: z.string(),
+    bulletPoints: z.array(z.string()),
+    confidence: z.number().min(0).max(1),
+  }),
+};
 
 export function createPlaygroundRoutes(connMgr: ConnectionManager) {
   const app = new Hono<StudioEnv>();
@@ -55,6 +77,14 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
     // so no manual onToken needed.
     const ctx = runtime.createContext({ sessionHistory: history });
     const executionId = ctx.executionId;
+    // Touch `ctx.events` to allocate the bus — this activates the
+    // streaming code path inside `ctx.ask()` so token / partial_object /
+    // string_delta events fire. Without this, ctx.ask falls back to the
+    // non-streaming `provider.chat` and the chat bubble never sees
+    // mid-stream events. The events themselves still flow to the WS
+    // channel via the `runtime.on('trace', ...)` listener below — we
+    // don't need to drain `ctx.events` ourselves, just allocate it.
+    void ctx.events;
 
     // Forward ALL AxlEvents from this execution to the WS channel.
     // This gives the playground UI access to ask_start, agent_call, tool_call,
@@ -75,7 +105,12 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
       });
 
       try {
-        const result = await ctx.ask(agent, body.message);
+        // Look up a demo schema by agent name (dev-fixture demo only).
+        // If found, the ask is schema'd and emits partial_object +
+        // string_delta — exercising the typewriter UX in the chat
+        // bubble. Without a match, the ask is plain free-text.
+        const schema = DEMO_SCHEMA_BY_AGENT[agent._name];
+        const result = await ctx.ask(agent, body.message, schema ? { schema } : undefined);
         const resultText = typeof result === 'string' ? result : JSON.stringify(result);
 
         history.push({ role: 'assistant', content: resultText });

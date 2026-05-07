@@ -40,6 +40,13 @@ type ChunkingFnResponse = {
   }>;
   cost?: number;
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+  /** Optional ms delay between chunks during `stream()`. Useful for
+   *  visual demos of the typewriter UX — without this, mock chunks fire
+   *  synchronously and the entire stream completes in microseconds,
+   *  invisible to a human watching the Playground panel. The Playground's
+   *  spec/17 typewriter rendering is well-tested mechanically; this delay
+   *  exists so a human can SEE it work end-to-end. */
+  chunkDelayMs?: number;
 };
 
 export function chunkingFnProvider(
@@ -60,8 +67,13 @@ export function chunkingFnProvider(
     async *stream(messages: ChatMessage[], _options: ChatOptions): AsyncGenerator<StreamChunk> {
       const r = fn(messages);
       const chunks = r.chunks && r.chunks.length > 0 ? r.chunks : [r.content];
-      for (const c of chunks) {
+      const delay = r.chunkDelayMs ?? 0;
+      for (let i = 0; i < chunks.length; i++) {
+        const c = chunks[i];
         if (c) yield { type: 'text_delta', content: c };
+        if (delay > 0 && i < chunks.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
       }
       if (r.tool_calls) {
         for (const tc of r.tool_calls) {
@@ -203,19 +215,34 @@ export const mockTaggedProvider = chunkingFnProvider((messages) => {
       return { content: 'not-json-at-all', chunks: ['not-json', '-at-all'], cost: 0.001 };
 
     case 'chunked-structured': {
+      // Long summary so the typewriter UX in the Playground is visible
+      // to a human (without ~2s of stream time, the entire response
+      // completes in a few render frames and the in-flight bubble
+      // never shows). Each chunk delays 60ms — short enough that the
+      // demo doesn't feel slow, long enough that the structured-output
+      // bubble + typewriter line have time to render frame-by-frame.
       const content = JSON.stringify(
         {
-          title: 'Market Analysis',
+          title: 'Market Analysis Q3',
           summary:
-            'The market shows resilience despite short-term volatility. Three drivers stand out.',
-          bulletPoints: ['Strong fundamentals', 'Sector rotation underway', 'Policy tailwind'],
-          confidence: 0.82,
+            'The AI sector outlook for Q3 2026 shows continued momentum across infrastructure ' +
+            'and applications layers. Capex commitments from hyperscalers remain elevated, ' +
+            'with three load-bearing drivers stabilizing the medium-term thesis: regulatory ' +
+            'clarity in major markets, deeper enterprise adoption beyond pilots, and a ' +
+            'tightening compute supply that benefits incumbents with reserved capacity.',
+          bulletPoints: [
+            'Hyperscaler capex remains elevated through 2026',
+            'Enterprise adoption shifts from pilot to production',
+            'Compute supply tightens; capacity reservations matter',
+            'Regulatory clarity in EU/US reduces tail risk',
+          ],
+          confidence: 0.78,
         },
         null,
         2,
       );
-      const chunks = content.match(/.{1,4}/g) ?? [content];
-      return { content, chunks, cost: 0.005 };
+      const chunks = content.match(/.{1,8}/g) ?? [content];
+      return { content, chunks, cost: 0.005, chunkDelayMs: 60 };
     }
 
     case 'generalist': {

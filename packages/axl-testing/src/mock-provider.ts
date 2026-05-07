@@ -60,6 +60,15 @@ export class MockProvider implements Provider {
    *  `stream()` can yield one `text_delta` per chunk. Per-call indexed
    *  alongside the response sequence. */
   private chunkSequence?: Array<string[] | undefined>;
+  /** Optional ms delay between successive chunks during `stream()`. Useful
+   *  for dev fixtures that need to demonstrate streaming UX visually
+   *  (without a delay, mock chunks fire synchronously and complete in
+   *  microseconds — invisible to a human watching). Default 0 keeps
+   *  every existing test fast.
+   *
+   *  Set via `provider.chunkDelayMs = 50` after construction. Not part of
+   *  any factory's surface to keep the test API minimal. */
+  chunkDelayMs = 0;
 
   private constructor(
     private responseFn: (
@@ -92,8 +101,11 @@ export class MockProvider implements Provider {
             `chunks="${joined}" content="${response.content}"`,
         );
       }
-      for (const chunk of chunks) {
-        yield { type: 'text_delta', content: chunk };
+      for (let i = 0; i < chunks.length; i++) {
+        yield { type: 'text_delta', content: chunks[i] };
+        if (this.chunkDelayMs > 0 && i < chunks.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, this.chunkDelayMs));
+        }
       }
     } else if (response.content) {
       yield { type: 'text_delta', content: response.content };

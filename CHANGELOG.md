@@ -17,6 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Eval `captureTraces` strips `string_delta`.** `runtime.trackExecution({ captureTraces: true })` (used by `runEval` for per-item traces) now drops `string_delta` events alongside `token` and `partial_object`. Same "high-volume stream-only" rationale as the Studio replay-buffer exclusion; previously a 100-item eval with streaming summary fields could accumulate ~7-300 KB per item × 100 items = tens of MB of unnecessary trace memory.
 - **Multi-tenant filter regression guard.** New test in `connection-manager.test.ts` pins that the WS broadcast filter is type-agnostic and correctly scopes `string_delta` events per tenant — defends against future "type-aware" optimizations silently leaking tenant data on the high-volume path.
 
+### Self-review pass — defense and ergonomics
+
+After shipping the spec/17 work, a self-audit (skeptical perspective walk + researcher subagent) surfaced four more items, all addressed below:
+
+- **`stringStreamFromEvents` lives in its own file.** Previously co-located in `event-stream.ts` alongside `AxlEventBus extends EventEmitter`. Conservative bundlers (webpack default) would pull `node:events` into the browser SPA bundle when only the helper was imported, despite the helper having no `EventEmitter` dependency. Split into `string-stream-from-events.ts` with type-only imports — guaranteed tree-shaking at the file level, no bundler aggressiveness required.
+- **`sideEffects: false` declared in `packages/axl/package.json`.** Belt-and-braces alongside the file split. Audit confirmed no top-level side-effect imports anywhere in the package; declaration is safe and unlocks better tree-shaking in downstream apps.
+- **Path validation on `stringStream({ path })` and `stringStreamFromEvents({ path })`.** `path: 'summary'` (no leading `/`) silently never matched before — a typo that left the consumer's UI blank with no signal. Now throws a clear error citing RFC 6901. Empty string and undefined remain valid.
+- **Multi-ask abort regression test.** Researcher confirmed that `Promise.all([ctx.ask, ctx.ask])` with `signal.abort()` correctly emits `ask_end` for both asks via finally and clears both accumulator entries — but no test pinned this. Added explicit cases at both the bus-view and wire-helper layers using a fresh-subscriber-after-termination probe (no private state needed).
+
+### Documentation
+
+- **Decision matrix** in `docs/observability.md` for picking between `.text` / `.partialObjects` / `.stringStream` / `stringStreamFromEvents` / raw firehose. Maps each customer use case (free chat, structured form, typewrite long fields, browser SPA, audit log) to the right view.
+- **"Common pitfalls"** troubleshooting list documenting silent failure modes: schema not a `z.object`, agent has tools/handoffs, late `ctx.events` allocation, malformed paths, attempt-N text leaks from manual buffers, Studio's intentional filtering of `string_delta` from the Trace Explorer / Playground, MockProvider chunking gotchas.
+- **Handoff/string_delta gating note.** Agents with `handoffs: [...]` configured never emit `string_delta` because handoffs are tools internally — flagged explicitly in the api-reference event table so customers expecting typewriter on a router agent know to look at the leaf agent instead.
+
 ### Added — Bus accumulator timing for live listeners
 
 - **`AxlEventBus._push` now updates per-ask accumulators BEFORE `bus.emit(...)`.** The reorder lets the new `stringStream` listener read post-this-event accumulated state when computing `event.accumulated`. Side benefit: accumulator updates are now exception-safe (they survive listener throws). No external code reads the private accumulator maps (`latestPartialByAsk`, `stringStreamByAsk`), so the reorder is invisible to all existing consumers.

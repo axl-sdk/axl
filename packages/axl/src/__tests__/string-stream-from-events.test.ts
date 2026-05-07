@@ -10,7 +10,7 @@
  * paths and asks.
  */
 import { describe, it, expect } from 'vitest';
-import { stringStreamFromEvents } from '../event-stream.js';
+import { stringStreamFromEvents } from '../string-stream-from-events.js';
 import type { AxlEvent } from '../types.js';
 
 const ASK = 'ask-1';
@@ -126,6 +126,32 @@ describe('stringStreamFromEvents (wire-side reconstructor)', () => {
     ]);
   });
 
+  it('clears accumulators for multiple concurrent asks on their respective ask_end', async () => {
+    // Multi-ask abort regression: a workflow doing
+    // `Promise.all([ctx.ask, ctx.ask])` with `signal.abort()` mid-flight
+    // emits ask_end for BOTH asks via their finally blocks. The wire
+    // helper must clear the per-ask accumulator for each, so a downstream
+    // consumer iterating after termination doesn't accidentally append to
+    // either ask's stale state.
+    const events = [
+      delta('A1', '/x', 'A1-text'),
+      delta('A2', '/x', 'A2-text'),
+      askEnd('A1'),
+      askEnd('A2'),
+      // Same askIds reused (defensive — would be a UUID collision in
+      // practice). With clean accumulators, deltas start fresh.
+      delta('A1', '/x', 'restart-A1'),
+      delta('A2', '/x', 'restart-A2'),
+    ];
+    const out = await collect(stringStreamFromEvents(fromArray(events)));
+    expect(out.map((e) => `${e.askId}=${e.accumulated}`)).toEqual([
+      'A1=A1-text',
+      'A2=A2-text',
+      'A1=restart-A1', // accumulator was cleared by the first ask_end
+      'A2=restart-A2', // accumulator was cleared by the second ask_end
+    ]);
+  });
+
   it('clears accumulator on ask_end (so a later same-askId stream restarts)', async () => {
     // Same askId reused across two asks (rare but defensible) — accumulator
     // should not leak across the boundary.
@@ -159,6 +185,25 @@ describe('stringStreamFromEvents (wire-side reconstructor)', () => {
     const events = [delta(ASK, '/a~1b~0c', 'value')];
     const out = await collect(stringStreamFromEvents(fromArray(events)));
     expect(out[0].path).toBe('/a~1b~0c');
+  });
+
+  it('rejects malformed path (no leading slash) with a clear error', async () => {
+    // Mirrors `AxlEventBus.stringStream` validation. Async generators
+    // surface `throw` as a rejected promise from `next()`, not as a
+    // sync throw — so we assert via `.rejects` on the promise.
+    const iter = stringStreamFromEvents(fromArray([]), { path: 'no-slash' });
+    await expect(iter[Symbol.asyncIterator]().next()).rejects.toThrow(/must start with/);
+    // Valid paths and undefined path do NOT throw on first iteration.
+    const ok1 = stringStreamFromEvents(fromArray([]), { path: '/summary' });
+    const ok2 = stringStreamFromEvents(fromArray([]));
+    await expect(ok1[Symbol.asyncIterator]().next()).resolves.toEqual({
+      value: undefined,
+      done: true,
+    });
+    await expect(ok2[Symbol.asyncIterator]().next()).resolves.toEqual({
+      value: undefined,
+      done: true,
+    });
   });
 
   it('emits zero events for an empty source', async () => {

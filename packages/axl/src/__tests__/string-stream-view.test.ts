@@ -189,6 +189,32 @@ describe('AxlEventBus.stringStream', () => {
     expect(events.map((e) => e.delta + '@' + e.attempt)).toEqual(['good@2']);
   });
 
+  it('clears accumulator for BOTH asks on multi-ask termination (abort regression guard)', async () => {
+    // Researcher gap: signal.abort() + Promise.all([ctx.ask, ctx.ask])
+    // must clean up `stringStreamByAsk` for every concurrent ask. Both
+    // asks emit `ask_end` via finally on abort; the bus deletes their
+    // accumulator entries; a fresh subscriber after termination sees
+    // nothing seeded. If a future refactor accidentally moved the
+    // ask_end clear into a path that didn't fire on abort, this test
+    // would catch the leak via the seed mechanism.
+    const bus = new AxlEventBus();
+    bus._push(delta('A1', '/x', 'A1-text'));
+    bus._push(delta('A2', '/x', 'A2-text'));
+    bus._push(delta('A1', '/x', '-more'));
+    // Both asks abort: both `ask_end` events emit via finally.
+    bus._push(askEnd('A1'));
+    bus._push(askEnd('A2'));
+
+    // A fresh subscriber AFTER both asks ended sees no seeded events —
+    // both accumulator entries were cleared. If either ask_end had been
+    // skipped, the subscriber would see a synthetic seed for that askId.
+    const iter = bus.stringStream();
+    bus._finish();
+    const out: Array<{ askId: string }> = [];
+    for await (const e of iter) out.push({ askId: e.askId });
+    expect(out).toEqual([]);
+  });
+
   it('clears accumulator on ask_end (memory hygiene)', async () => {
     const bus = new AxlEventBus();
     bus._push(delta(ASK, '/x', 'done text'));
@@ -275,6 +301,19 @@ describe('AxlEventBus.stringStream', () => {
       { askId: ASK, accumulated: 'A1A2' },
       { askId: ASK2, accumulated: 'B1B2' },
     ]);
+  });
+
+  it('rejects malformed path (no leading slash) with a clear error', () => {
+    // Defensive validation — without this, `path: 'summary'` silently
+    // never matches and the consumer's UI stays blank with no signal.
+    const bus = new AxlEventBus();
+    expect(() => bus.stringStream({ path: 'summary' })).toThrow(/must start with/);
+    expect(() => bus.stringStream({ path: 'no-slash' })).toThrow(/JSON Pointer/);
+    // Valid paths and undefined path still work.
+    expect(() => bus.stringStream({ path: '/summary' })).not.toThrow();
+    expect(() => bus.stringStream({ path: '' })).not.toThrow(); // RFC 6901 root (matches nothing in practice but syntactically valid)
+    expect(() => bus.stringStream()).not.toThrow();
+    expect(() => bus.stringStream({ askId: 'x' })).not.toThrow();
   });
 
   it('terminates with done:true after _finish() with no events', async () => {

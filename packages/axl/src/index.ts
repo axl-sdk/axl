@@ -39,13 +39,19 @@ export { AxlStream } from './stream.js';
 // Event bus — public type returned by `ctx.events` and the implementation
 // behind `AxlStream`'s iterator + curated views (`.text`, `.lifecycle`,
 // `.textByAsk`, `.partialObjects`).
-export { AxlEventBus, EventStreamOverflowError, stringStreamFromEvents } from './event-stream.js';
+export { AxlEventBus, EventStreamOverflowError } from './event-stream.js';
 export type {
   CoalescedPartialObject,
   EventStreamOptions,
   StringStreamEvent,
   StringStreamFilter,
 } from './event-stream.js';
+
+// Wire-side reconstructor for the `stringStream` view. Lives in its own
+// module — independent of `EventEmitter`-using `AxlEventBus` — so a
+// browser SPA bundle cannot pull `node:events` when only this helper is
+// imported, regardless of bundler tree-shaking aggressiveness.
+export { stringStreamFromEvents } from './string-stream-from-events.js';
 
 // Event helpers — consumer-facing utilities for accumulators / reducers
 // that need to honor spec invariants (cost-rollup skip, root-level

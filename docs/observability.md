@@ -330,6 +330,30 @@ Differences from the live-bus view:
 - **No race-with-bus-iterator concern.** This is a stateless consumer of an iterable; iterating it twice on the same source consumes events twice (fork the source first if you need that).
 - **Identical retry behaviour for re-rendered fields.** `pipeline(failed)` clears the helper's per-ask accumulator just like the bus view does, so the next yielded event starts with `accumulated === delta`. A UI re-rendering `event.accumulated` per yield naturally overwrites stale attempt-N text in place when attempt-N+1 begins — no explicit retry handling needed.
 
+##### Picking the right view: `token` vs. `partial_object` vs. `string_delta`
+
+| Use case | Right view | Why |
+|---|---|---|
+| Free-text chat response (no schema) | `.text` / `.textByAsk` (token) | Tokens are the raw response stream; no schema means no structure to render. |
+| Structured response, render whole object as it builds (form, card, validation UI) | `.partialObjects` | Each event has the complete current state of the object. Throttled to structural JSON seams so consumers don't re-render mid-key. |
+| Structured response with one (or more) long string fields you want to typewrite | `.stringStream({ path: '/summary' })` | `partial_object` doesn't emit while the string is mid-flight. `stringStream` emits per chunk with running `accumulated`. |
+| Both — render the structure AND typewrite long fields inside it | Subscribe to BOTH on the same bus | Listener-based views don't race; one consumer of each is fine. |
+| Wire/SSE/WebSocket from browser, no `AxlStream` access | `stringStreamFromEvents(source, opts)` | Browser-safe reconstructor with the same shape as `.stringStream`. |
+| Audit log / debugging — every event in order | `for await (const e of ctx.events)` | Raw firehose. Use the curated views to filter. |
+
+##### Common pitfalls (when things look broken)
+
+- **No `string_delta` events at all.** The gate is `schema set` AND `no tools` AND `schema root is z.object(...)`. Common misses:
+  - You set `schema: z.array(...)` — non-object roots are gated off. Wrap in `z.object({ items: z.array(...) })`.
+  - Your agent has `handoffs: [...]` configured — handoffs are tools internally, so the agent runs in tool-calling mode and `string_delta` is suppressed. The handoff target's own `ctx.ask` (with no further handoffs and a schema) DOES emit. If you want typewriter on the source, restructure so the schema'd response comes from a leaf agent.
+  - Your agent has `tools: [...]` — same reason. Tool-calling mode produces JSON that goes to the tool, not to a UI.
+- **Subscriber sees nothing despite events firing.** You allocated `ctx.events` AFTER the first `ctx.ask()` started. The streaming code path is gated per ask on whether an observer is present. The fix: `const events = ctx.events;` on the first line of the workflow handler, before any `ctx.ask()`.
+- **`stringStream({ path: 'summary' })` returns nothing.** The walker emits RFC 6901 paths — leading `/`. Use `'/summary'`, not `'summary'`. Since 0.18 this throws a clear error instead of silently never matching.
+- **Path with `/` or `~` in the schema key.** The walker percent-encodes these per RFC 6901: `~` → `~0`, `/` → `~1`. So a schema key `"a/b"` produces path `/a~1b`. The encoding is automatic but the consumer-side filter must use the encoded form.
+- **Attempt-N text leaks into the UI.** You're appending `event.delta` to your own buffer rather than re-rendering `event.accumulated`. The accumulator clear on `pipeline(failed)` only affects what the runtime tracks; if you maintain your own buffer, you must reset on `event.attempt` change. Re-rendering `event.accumulated` per yield avoids this entirely.
+- **Studio's Trace Explorer shows no `string_delta` rows.** They're not persisted to `ExecutionInfo.events` (stream-only). Studio's Playground also filters them from the activity feed (alongside `token` and `partial_object`) since they'd produce hundreds of rows. The chat bubble shows the streaming response via raw tokens — for a structured response that means you'll see raw JSON syntax char-by-char. Customer-facing typewriter UX is meant to live in the customer's own chat UI, subscribed to `stringStream`, not in Studio.
+- **`MockProvider` test driving the wrong chunks.** The walker is per-chunk batching. If you pass `chunks: ['{"x":"foo"}']` (one big chunk), you get ONE `string_delta` with `delta: 'foo'` — not three single-char events. Use `MockProvider.chunked(content, 1)` for per-char tests.
+
 - **`ctx.events.partialObjects`** is the coalescing view — yields the latest `partial_object` payload per `askId`. When the LLM streams faster than your UI renders, intermediate snapshots are silently superseded; the consumer sees only the most recent state per ask. Memory-bounded by `O(active asks)`, not `O(events emitted)`. Listener-based, so it does NOT race with the main `for await (const e of ctx.events)` iterator.
 - **`ctx.events.stringStream({ path?, askId? })`** is the per-field streaming view for **chat-style typewriter rendering of long string fields**. `partial_object` snapshots are throttled to structural JSON boundaries — they don't fire while a long string is being written, so a 4 KB `summary` field appears all at once when the closing quote lands. `string_delta` events fill that gap by emitting per-chunk batches of unescaped chars inside string values, keyed by RFC 6901 JSON Pointer (`/summary`, `/sources/0/title`). The view yields `{ askId, agent?, path, delta, accumulated, attempt }` — bind a UI component to one `path` and set its text to `event.accumulated` per yield. Late subscribers see one synthetic event with `delta === accumulated === <full text-so-far>`, then live deltas. Listener-based: does NOT race with the main iterator.
 - **`ctx.events.lifecycle`** filters to structural events (`ask_start`, `ask_end`, `agent_call_*`, `tool_call_*`, `handoff_*`, etc.) — useful for waterfall UIs.

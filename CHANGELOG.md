@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.5] - 2026-05-07
+
 ### Char-by-char streaming for long string fields
 
 The headline feature this release. `partial_object` snapshots are throttled to JSON structural seams — they don't fire while a string is mid-flight, so a 4 KB `summary` field used to appear all at once when the closing quote landed. Chat-style typewriter rendering now works out of the box.
@@ -50,8 +52,6 @@ The implementation work behind the customer-facing additions, captured for archa
 - **`stringStreamFromEvents` is its own module + `sideEffects: false`** in `packages/axl/package.json`. Defense-in-depth so a browser SPA importing only the helper can't pull `node:events` from `AxlEventBus`'s file regardless of bundler configuration.
 - **Multi-ask abort regression guard.** Pins that `Promise.all([ctx.ask, ctx.ask])` with `signal.abort()` clears both per-ask accumulator entries via finally.
 - **Multi-tenant filter regression guard.** Pins that the WS broadcast filter applies uniformly to `string_delta` — defends against future "type-aware" optimizations silently leaking tenant data on the high-volume path.
-
-Spec: `.internal/spec/17-string-deltas.md`.
 
 ## [0.17.4] - 2026-05-04
 
@@ -951,6 +951,7 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 ### Added
 
 #### Core SDK (`axl`)
+
 - `tool()` factory with Zod input validation, retry policies, and sensitive output redaction
 - `agent()` factory with dynamic model/system selection, tool binding, handoffs, and prompt versioning
 - `workflow()` factory for named async functions with typed input/output schemas
@@ -978,11 +979,13 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - Error hierarchy: `AxlError`, `VerifyError`, `QuorumNotMet`, `NoConsensus`, `TimeoutError`, `BudgetExceededError`, `MaxTurnsError`, `ToolDenied`
 
 #### Testing Utilities (`axl-testing`)
+
 - `MockProvider` with sequence, echo, json, replay, and fn modes
 - `MockTool` wrapper for tool mocking
 - `AxlTestRuntime` mirroring `WorkflowContext` for deterministic testing
 
 #### Evaluation Framework (`axl-eval`)
+
 - `dataset()` factory with inline and file loading
 - `scorer()` for deterministic scoring functions
 - `llmScorer()` for LLM-as-judge evaluation
@@ -992,6 +995,7 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - CLI entry point (`axl-eval`) for running evaluations
 
 #### Studio (`axl-studio`)
+
 - `npx @axlsdk/studio` local development UI wrapping `AxlRuntime` with a Hono server + React SPA
 - REST API (`/api/*`) for workflows, executions, sessions, agents, tools, memory, decisions, costs, evals, and playground
 - WebSocket (`/ws`) with channel multiplexing for real-time streaming and trace events

@@ -294,6 +294,118 @@ describe('PlaygroundPanel integration', () => {
     expect(await screen.findByText(/Orchestrator synthesis: final answer/)).toBeInTheDocument();
   });
 
+  it('renders schema response as JSON tree + typewriter line (not raw JSON syntax)', async () => {
+    // Spec/17 follow-up: prior to this fix, a schema-mode ask streamed
+    // raw tokens like `{"summary":"H` into `StreamingText`, showing
+    // gibberish to the operator. Now the panel detects partial_object
+    // events and switches to a JSON tree view + a typewriter line for
+    // the actively-streaming string field.
+    renderWithQuery(<PlaygroundPanel />);
+    await submitMessage('summarize this');
+
+    // Tokens arrive — but for a schema response these are raw JSON
+    // syntax. The bubble shouldn't show them as the primary content
+    // once partial_object snapshots start firing.
+    pushEvent(
+      ev({ type: 'token', askId: 'a', depth: 0, agent: 'summarizer', data: '{"summary":"H' }),
+    );
+
+    // First string_delta — the actively-writing field.
+    pushEvent(
+      ev({
+        type: 'string_delta',
+        askId: 'a',
+        depth: 0,
+        agent: 'summarizer',
+        attempt: 1,
+        data: { path: '/summary', delta: 'Hello world' },
+      }),
+    );
+
+    // First partial_object snapshot lands on the structural seam after the
+    // closing `"`. Now the bubble should render the JSON tree.
+    pushEvent(
+      ev({
+        type: 'partial_object',
+        askId: 'a',
+        depth: 0,
+        agent: 'summarizer',
+        attempt: 1,
+        data: { object: { summary: 'Hello world' } },
+      }),
+    );
+
+    // The structured-output bubble must render after the partial_object
+    // event lands. Wait for the header — proves we switched away from
+    // raw-token render.
+    await waitFor(
+      () => {
+        const body = document.body.textContent ?? '';
+        if (!body.includes('Streaming structured output')) {
+          throw new Error(
+            `Expected "Streaming structured output" in body. Got first 800 chars: ${body.slice(0, 800)}`,
+          );
+        }
+      },
+      { timeout: 2000 },
+    );
+    // The accumulated text appears somewhere — typewriter line OR
+    // JsonViewer's quoted string. Either is fine.
+    const body = document.body.textContent ?? '';
+    expect(body).toContain('Hello world');
+    // Crucially: the raw `{"summary":"H` token blob must NOT be the
+    // primary content — we replaced that with the structured view.
+    // (It may still appear inside the JSON tree's preview as "H" but
+    // not as the standalone token text the bubble used to show.)
+
+    // Crucially: the raw JSON token literal `{"summary":"H` MUST NOT
+    // appear as bubble content (this was the bug — operators saw the
+    // truncated JSON syntax mid-stream).
+    expect(screen.queryByText('{"summary":"H')).not.toBeInTheDocument();
+
+    pushEvent(
+      ev({
+        type: 'ask_end',
+        askId: 'a',
+        depth: 0,
+        agent: 'summarizer',
+        outcome: { ok: true, result: { summary: 'Hello world' } },
+        cost: 0,
+        duration: 1,
+      }),
+    );
+    pushEvent(ev({ type: 'done', data: { result: { summary: 'Hello world' } } }));
+
+    // Post-completion: the bubble renders the parsed object as a JSON
+    // tree. The "Hello world" text remains visible.
+    await waitFor(() => {
+      expect(document.body.textContent ?? '').toContain('Hello world');
+    });
+  });
+
+  it('post-completion: JSON-shaped result content renders as JSON tree, not stringified', async () => {
+    // When a workflow returns a structured object, useWsStream's done
+    // fallback path (no tokens replayed) stringifies it into msg.content.
+    // The bubble should detect the JSON shape and render via JsonViewer
+    // instead of showing literal `{"summary":"..."}` text.
+    renderWithQuery(<PlaygroundPanel />);
+    await submitMessage('return JSON');
+
+    pushEvent(ev({ type: 'done', data: { result: { summary: 'JSON result text' } } }));
+
+    // The string value renders inside the tree as a quoted span.
+    // textContent walk handles mixed-content nodes without matcher
+    // brittleness.
+    await waitFor(() => {
+      expect(document.body.textContent ?? '').toContain('JSON result text');
+    });
+    // The bubble must NOT show the literal stringified-JSON form as a
+    // single text node — that was the pre-fix behavior. The JsonViewer
+    // renders structured, so a literal exact-match of the JSON-with-
+    // braces should not exist as a single text node.
+    expect(screen.queryByText('{"summary":"JSON result text"}')).not.toBeInTheDocument();
+  });
+
   it('drops nested-ask tokens (depth >= 1) from the chat bubble', async () => {
     // The bug class this catches: a regression that loses the depth-0
     // filter in useWsStream would surface every sub-agent's tokens in

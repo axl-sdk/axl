@@ -7,34 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added — Character-level streaming for long string fields
+### Char-by-char streaming for long string fields
 
-- **New `string_delta` AxlEvent variant.** Per-chunk, character-level deltas inside string VALUES of progressive structured output. Fires when the streaming walker is inside a string field at a known JSON Pointer path; `data.path` is RFC 6901 (`/summary`, `/sources/0/title`), `data.delta` is the unescaped chars added in this chunk. Same gating as `partial_object` (schema set, no tools, root is `ZodObject`). Solves the chat-style typewriter rendering problem that boundary-throttled `partial_object` could not — a 4 KB summary field no longer waits for the closing `"` to surface. Stream-only event, never persisted to `ExecutionInfo.events`. New `StringDeltaData` type export from `@axlsdk/axl`. Spec: `.internal/spec/17-string-deltas.md`.
-- **`AxlEventBus.stringStream(opts?)` and `AxlStream.stringStream(opts?)` view helpers.** Listener-based view yielding `StringStreamEvent` (`{ askId, agent?, path, delta, accumulated, attempt }`). Optional filter by `path` and/or `askId`. Yields `delta` (new chars) and `accumulated` (full text-so-far for that ask + path). Late subscribers are seeded with one synthetic event per matching `(askId, path)` carrying `delta === accumulated === <full text-so-far>`, so a UI binding mid-ask renders current state immediately. Per-ask accumulator at the bus level cleared on `pipeline(failed)` (discarded attempt) and on `ask_end` (memory hygiene). Listener-based: does NOT race with the main async iterator. New `StringStreamEvent` and `StringStreamFilter` type exports.
-- **Path-tracking JSON walker (`StreamingWalker`).** Replaces the inline `partial_object` walker in `context.ts` with a unified state machine (`packages/axl/src/streaming-walker.ts`) that tracks JSON Pointer paths via a frame stack. Drives both `string_delta` and `partial_object` emissions from one parser. Also fixes a latent prefix-prose bug in the old walker: a `"` in pre-JSON prose (e.g. `Here's the answer: ...`) no longer flips the in-string flag. Reset per agent-call (per turn).
-- **Studio: Playground panel filters `string_delta` from the activity feed.** Same treatment as `token` and `partial_object` — high-volume content events would otherwise produce 100+ rows per long string. `string_delta` is also excluded from the Studio WS replay buffer (`UNBUFFERED_EVENT_TYPES`); late subscribers recover field state via the `stringStream` view's accumulator-seed instead.
-- **`stringStreamFromEvents(source, opts?)` browser-safe reconstructor.** New export from `@axlsdk/axl` for SPA consumers receiving raw `AxlEvent` JSON over WebSocket / SSE. Same `{ path?, askId? }` filter as `AxlEventBus.stringStream`, same retry/`ask_end`-clear semantics, no Node dependencies. Yields `StringStreamEvent` with `accumulated` text-so-far. Closes the wire-side ergonomics gap a researcher audit identified — without it, browser consumers had to re-implement the per-(askId, path) accumulator from scratch. Recipe in `docs/observability.md`.
-- **Eval `captureTraces` strips `string_delta`.** `runtime.trackExecution({ captureTraces: true })` (used by `runEval` for per-item traces) now drops `string_delta` events alongside `token` and `partial_object`. Same "high-volume stream-only" rationale as the Studio replay-buffer exclusion; previously a 100-item eval with streaming summary fields could accumulate ~7-300 KB per item × 100 items = tens of MB of unnecessary trace memory.
-- **Multi-tenant filter regression guard.** New test in `connection-manager.test.ts` pins that the WS broadcast filter is type-agnostic and correctly scopes `string_delta` events per tenant — defends against future "type-aware" optimizations silently leaking tenant data on the high-volume path.
+The headline feature this release. `partial_object` snapshots are throttled to JSON structural seams — they don't fire while a string is mid-flight, so a 4 KB `summary` field used to appear all at once when the closing quote landed. Chat-style typewriter rendering now works out of the box.
 
-### Self-review pass — defense and ergonomics
+```typescript
+// Render `/summary` char-by-char as it streams
+for await (const e of stream.stringStream({ path: '/summary' })) {
+  setText(e.accumulated); // running text-so-far
+}
+```
 
-After shipping the spec/17 work, a self-audit (skeptical perspective walk + researcher subagent) surfaced four more items, all addressed below:
+- **`stream.stringStream(opts?)` and `ctx.events.stringStream(opts?)`.** Listener-based view yielding `StringStreamEvent` (`{ askId, agent?, path, delta, accumulated, attempt }`). `path` is an RFC 6901 JSON Pointer (`/summary`, `/sources/0/title`); filter by `path` and/or `askId`. `delta` is the new chars from this chunk; `accumulated` is the running text — bind your UI to `accumulated` for one-line typewriter UX. Late subscribers see the current state on first iteration. Doesn't race with the main async iterator. Same gating as `partial_object` (schema set, no tools, root is `z.object`).
+- **`stringStreamFromEvents(source, opts?)`** for browser SPAs consuming raw events over WebSocket / SSE. Same shape and filter API as the bus view, pure ECMAScript with zero Node deps, ships in its own module so bundlers can tree-shake away `node:events` cleanly. [Recipe in observability docs](./docs/observability.md#recipe-typewriter-rendering-on-the-wire-browser-spa).
+- **New `string_delta` AxlEvent variant.** The wire-format primitive behind the views — `data: { path, delta }` per chunk inside string values. Stream-only (never persisted to `ExecutionInfo.events`). New type exports: `StringDeltaData`, `StringStreamEvent`, `StringStreamFilter`.
 
-- **`stringStreamFromEvents` lives in its own file.** Previously co-located in `event-stream.ts` alongside `AxlEventBus extends EventEmitter`. Conservative bundlers (webpack default) would pull `node:events` into the browser SPA bundle when only the helper was imported, despite the helper having no `EventEmitter` dependency. Split into `string-stream-from-events.ts` with type-only imports — guaranteed tree-shaking at the file level, no bundler aggressiveness required.
-- **`sideEffects: false` declared in `packages/axl/package.json`.** Belt-and-braces alongside the file split. Audit confirmed no top-level side-effect imports anywhere in the package; declaration is safe and unlocks better tree-shaking in downstream apps.
-- **Path validation on `stringStream({ path })` and `stringStreamFromEvents({ path })`.** `path: 'summary'` (no leading `/`) silently never matched before — a typo that left the consumer's UI blank with no signal. Now throws a clear error citing RFC 6901. Empty string and undefined remain valid.
-- **Multi-ask abort regression test.** Researcher confirmed that `Promise.all([ctx.ask, ctx.ask])` with `signal.abort()` correctly emits `ask_end` for both asks via finally and clears both accumulator entries — but no test pinned this. Added explicit cases at both the bus-view and wire-helper layers using a fresh-subscriber-after-termination probe (no private state needed).
+#### Heads up
+
+- **Agents with `handoffs: [...]` don't emit `string_delta`.** Handoffs are tools internally, and `string_delta` (like `partial_object`) gates off when tools are bound. Typewriter renders on the leaf agent, not the router.
+- **Schema must have an object root.** `z.array(...)` is gated off; wrap in `z.object({ items: z.array(...) })` if you want streaming.
+- **`path: 'summary'` throws** — paths must start with `/` (RFC 6901). Catches the typo at subscribe time instead of silently rendering nothing.
+- **Subscribe before the first `ctx.ask()`** — the streaming code path activates only when an observer is present at the time the ask starts. The unambiguous pattern: `const events = ctx.events;` on the first line of your handler.
+
+### Studio
+
+- **Playground renders schema responses as a live JSON tree + typewriter line for the actively-writing field.** Pre-fix, the chat bubble streamed raw JSON tokens (`{"summary":"H...`) char-by-char — visible gibberish for any schema'd ask. Now the panel detects `partial_object` events and switches to a structured render: the latest snapshot in a `JsonViewer` with the currently-streaming string field shown live below it (with cursor). After completion, JSON-shaped result content renders as a tree, not as a stringified blob. Free-text (no-schema) responses keep the existing token-streaming behavior.
 
 ### Documentation
 
-- **Decision matrix** in `docs/observability.md` for picking between `.text` / `.partialObjects` / `.stringStream` / `stringStreamFromEvents` / raw firehose. Maps each customer use case (free chat, structured form, typewrite long fields, browser SPA, audit log) to the right view.
-- **"Common pitfalls"** troubleshooting list documenting silent failure modes: schema not a `z.object`, agent has tools/handoffs, late `ctx.events` allocation, malformed paths, attempt-N text leaks from manual buffers, Studio's intentional filtering of `string_delta` from the Trace Explorer / Playground, MockProvider chunking gotchas.
-- **Handoff/string_delta gating note.** Agents with `handoffs: [...]` configured never emit `string_delta` because handoffs are tools internally — flagged explicitly in the api-reference event table so customers expecting typewriter on a router agent know to look at the leaf agent instead.
+- **["Picking the right view" decision matrix](./docs/observability.md#picking-the-right-view-token-vs-partial_object-vs-string_delta)** in `docs/observability.md` — maps customer use cases (free chat / structured form / typewrite long fields / browser SPA / audit log) to the right view.
+- **["Common pitfalls" troubleshooting list](./docs/observability.md#common-pitfalls-when-things-look-broken)** covering silent failure modes — schema gating, late `ctx.events` allocation, malformed paths, attempt-N leaks from manual buffers, Studio's intentional filtering, MockProvider chunking.
+- **README** surfaces the streaming-string-fields feature with a one-block recipe and updates the comparison table.
 
-### Added — Bus accumulator timing for live listeners
+### Internal
 
-- **`AxlEventBus._push` now updates per-ask accumulators BEFORE `bus.emit(...)`.** The reorder lets the new `stringStream` listener read post-this-event accumulated state when computing `event.accumulated`. Side benefit: accumulator updates are now exception-safe (they survive listener throws). No external code reads the private accumulator maps (`latestPartialByAsk`, `stringStreamByAsk`), so the reorder is invisible to all existing consumers.
+The implementation work behind the customer-facing additions, captured for archaeology:
+
+- **Path-tracking JSON walker (`StreamingWalker`).** Replaces the inline `partial_object` walker in `context.ts` with a unified state machine that tracks JSON Pointer paths via a frame stack and drives both `string_delta` and `partial_object` emissions from one parser. Per-chunk batching keeps emission rate close to provider chunk rate (~5-150 events/sec on typical traffic). Also fixes a latent prefix-prose bug in the old walker — a `"` in pre-JSON prose (e.g., `Here's the answer: ...`) no longer flips the in-string flag.
+- **Bus accumulator ordering.** `AxlEventBus._push` now updates per-ask accumulators (`stringStreamByAsk`, `latestPartialByAsk`) BEFORE `bus.emit(...)`, so live listeners reading those maps observe post-this-event state. Side benefit: accumulator updates are exception-safe (survive listener throws). No external code reads the private maps, so the reorder is invisible to existing consumers.
+- **`string_delta` excluded from Studio's WS replay buffer** (`UNBUFFERED_EVENT_TYPES`) and from the Playground activity feed — same treatment as `token` and `partial_object`. Late subscribers recover field state via the `stringStream` view's accumulator-seed.
+- **Eval `captureTraces` strips `string_delta`.** A 100-item eval with streaming summary fields would otherwise accumulate ~7-300 KB per item × 100 items = tens of MB of trace memory.
+- **`stringStreamFromEvents` is its own module + `sideEffects: false`** in `packages/axl/package.json`. Defense-in-depth so a browser SPA importing only the helper can't pull `node:events` from `AxlEventBus`'s file regardless of bundler configuration.
+- **Multi-ask abort regression guard.** Pins that `Promise.all([ctx.ask, ctx.ask])` with `signal.abort()` clears both per-ask accumulator entries via finally.
+- **Multi-tenant filter regression guard.** Pins that the WS broadcast filter applies uniformly to `string_delta` — defends against future "type-aware" optimizations silently leaking tenant data on the high-volume path.
+
+Spec: `.internal/spec/17-string-deltas.md`.
 
 ## [0.17.4] - 2026-05-04
 

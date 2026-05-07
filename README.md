@@ -213,7 +213,22 @@ const wf = workflow({
 });
 ```
 
-`ctx.events` exposes the same `AxlEvent` iterable + curated views as `AxlStream` (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`). For background telemetry across every run, subscribe with `runtime.on('trace', event => …)` instead — those four channels are alternatives, not additive (don't sum costs from two of them). See [docs/observability.md](docs/observability.md#observation-paths) for the full comparison and the [migration guide](docs/migration/stream-first-observation.md) for upgrade notes.
+`ctx.events` exposes the same `AxlEvent` iterable + curated views as `AxlStream` (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`, `.stringStream`). For background telemetry across every run, subscribe with `runtime.on('trace', event => …)` instead — those four channels are alternatives, not additive (don't sum costs from two of them). See [docs/observability.md](docs/observability.md#observation-paths) for the full comparison and the [migration guide](docs/migration/stream-first-observation.md) for upgrade notes.
+
+### Char-by-char streaming of long string fields
+
+`partial_object` snapshots are throttled to JSON structural seams — they don't fire while a string is mid-flight, so a 4 KB `summary` field appears all at once when the closing quote lands. For chat-style typewriter rendering, subscribe to `stringStream` and bind your UI to `event.accumulated`:
+
+```typescript
+const stream = runtime.stream('summarize', { text });
+
+// Render `/summary` char-by-char as it streams
+for await (const e of stream.stringStream({ path: '/summary' })) {
+  setText(e.accumulated); // running text-so-far
+}
+```
+
+`path` is an [RFC 6901](https://datatracker.ietf.org/doc/html/rfc6901) JSON Pointer — `/summary`, `/sources/0/title`. Late subscribers see the current state on first iteration. Filter by `askId` for fan-out workflows. For browser SPAs receiving raw events over WebSocket / SSE, `stringStreamFromEvents(source, opts)` reconstructs the same view client-side without pulling Node deps. See [docs/observability.md](./docs/observability.md#picking-the-right-view) for the decision matrix and the React recipe.
 
 ## Sessions
 
@@ -342,7 +357,7 @@ Axl competes primarily with [Mastra](https://mastra.ai) and [LangGraph.js](https
 | **Agent handoffs**     | `handoffs` with ACL isolation, oneway + roundtrip, agent-as-tool | Sub-agents as tools                                                 | Subgraphs as nodes                    |
 | **Memory**             | Working memory + semantic recall (vector stores)     | Working memory + semantic recall + observational (auto-compression) | Checkpointer-based                    |
 | **Observability**      | OpenTelemetry with cost-per-span                     | OpenTelemetry built-in                                              | LangSmith integration                 |
-| **Streaming**          | `AxlStream` (Readable + AsyncIterable)               | Via Vercel AI SDK                                                   | Multiple modes                        |
+| **Streaming**          | `AxlStream` + `stringStream` (per-field char-level)   | Via Vercel AI SDK (`streamObject` partials)                         | Multiple modes (token / values / updates) |
 | **Local dev UI**       | Axl Studio                                           | Mastra Studio                                                       | LangGraph Studio                      |
 | **Deployment**         | Manual                                               | One-command (Vercel, CF, Netlify)                                   | LangGraph Platform                    |
 | **Dependencies**       | Zero (raw `fetch`)                                   | Vercel AI SDK                                                       | `@langchain/core` ecosystem           |

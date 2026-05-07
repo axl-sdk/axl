@@ -1,7 +1,8 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Send, ArrowRight, ShieldCheck, MessageSquarePlus, Activity } from 'lucide-react';
 import { eventCostContribution } from '../../lib/event-utils';
+import type { AxlEvent } from '../../lib/types';
 import { PanelHeader } from '../../components/layout/PanelHeader';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { StreamingText } from '../../components/shared/StreamingText';
@@ -33,6 +34,138 @@ const ACTIVITY_TRIGGERS: ReadonlySet<string> = new Set([
   'handoff_start',
   'tool_approval',
 ]);
+
+/**
+ * Derive the in-flight structured-output state from the running event
+ * stream. Used to switch the chat bubble from raw-token rendering
+ * (`{"summary":"H...` gibberish for schema responses) to a JSON-tree
+ * snapshot + typewriter view of the currently-streaming string field.
+ *
+ * Mirrors the bus-side `stringStream` accumulator semantics:
+ *   - On `string_delta`: append to per-(askId, path) text.
+ *   - On `pipeline(failed)`: clear the failed ask's accumulator so a
+ *     retry's first delta starts at `accumulated === delta`.
+ *   - On `ask_end`: clear (frees memory, hides stale state from the
+ *     UI once an ask completes).
+ *   - `latestPartial`: most recent `partial_object` snapshot, regardless
+ *     of askId. For the typical chat use case there's one schema'd ask
+ *     in flight at a time; multi-ask workflows (planner → writer) get
+ *     the most recently emitting one, which matches the chat-bubble's
+ *     "what's the agent saying RIGHT NOW" UX.
+ *   - `latestStringDelta`: most recently appended (askId, path) — the
+ *     field the agent is actively writing. Becomes null when its ask
+ *     ends or its attempt is discarded.
+ */
+function deriveStructuredOutputView(events: AxlEvent[]): {
+  latestPartial: { askId: string; object: unknown } | null;
+  latestStringDelta: { askId: string; path: string; accumulated: string } | null;
+} {
+  let latestPartial: { askId: string; object: unknown } | null = null;
+  // key: `${askId}|${path}`
+  const stringAcc = new Map<string, { askId: string; path: string; accumulated: string }>();
+  let latestKey: string | null = null;
+
+  const clearAsk = (askId: string) => {
+    for (const k of [...stringAcc.keys()]) {
+      if (k.startsWith(askId + '|')) {
+        stringAcc.delete(k);
+        if (latestKey === k) latestKey = null;
+      }
+    }
+  };
+
+  for (const e of events) {
+    if (e.type === 'partial_object') {
+      latestPartial = { askId: e.askId ?? '', object: e.data?.object };
+    } else if (e.type === 'string_delta') {
+      const askId = e.askId ?? '';
+      const key = `${askId}|${e.data.path}`;
+      const existing = stringAcc.get(key);
+      stringAcc.set(key, {
+        askId,
+        path: e.data.path,
+        accumulated: (existing?.accumulated ?? '') + e.data.delta,
+      });
+      latestKey = key;
+    } else if (e.type === 'pipeline' && e.status === 'failed') {
+      clearAsk(e.askId ?? '');
+    } else if (e.type === 'ask_end') {
+      clearAsk(e.askId ?? '');
+    }
+  }
+
+  return {
+    latestPartial,
+    latestStringDelta: latestKey ? (stringAcc.get(latestKey) ?? null) : null,
+  };
+}
+
+/**
+ * Chat-bubble render for an in-flight schema response. Shows the latest
+ * `partial_object` snapshot as a JSON tree + the field currently being
+ * written as typewriter text below it.
+ *
+ * Why both: `partial_object` snapshots only fire at JSON structural
+ * seams (after `,` / `}` / `]` outside strings) — they don't update
+ * while a string is mid-flight. So a 4 KB summary field appears all at
+ * once when the closing quote lands. The `streamingField` line shows
+ * the in-progress text live (char-by-char) below the JSON, so the
+ * operator never wonders "is the agent still running?" during a long
+ * write.
+ *
+ * When the snapshot catches up (the field appears statically in the
+ * tree with the same value), the live line is redundant but harmless —
+ * it'll clear on `ask_end` regardless.
+ */
+function StructuredStreamingBubble({
+  partial,
+  streamingField,
+}: {
+  partial: unknown;
+  streamingField: { askId: string; path: string; accumulated: string } | null;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="text-[10px] uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
+        Streaming structured output
+      </div>
+      <JsonViewer data={partial} defaultExpandDepth={3} />
+      {streamingField && streamingField.accumulated.length > 0 && (
+        <div className="border-t border-[hsl(var(--border))] pt-2">
+          <div className="text-[10px] uppercase tracking-wide text-[hsl(var(--muted-foreground))] mb-1">
+            Writing <code className="font-mono">{streamingField.path}</code>
+          </div>
+          <div className="whitespace-pre-wrap font-mono text-xs">
+            {streamingField.accumulated}
+            <span className="inline-block w-1.5 h-3 ml-0.5 align-middle bg-[hsl(var(--foreground))] animate-pulse" />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Try to parse `text` as JSON. Used at chat-bubble render time for
+ * post-completion messages: when the workflow returned a structured
+ * object, the runtime stringifies it (in `useWsStream`'s `done`
+ * fallback path) so it can fit the `Message.content: string` shape.
+ * Render-time round-trip keeps the JSON tree view without changing
+ * the persistence shape.
+ *
+ * Returns `undefined` for non-JSON strings (most common case — free-
+ * text responses) so callers fall back to plain-text rendering.
+ */
+function tryParseJsonObject(text: string): unknown {
+  if (!text) return undefined;
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return undefined;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+}
 
 export function PlaygroundPanel() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -87,18 +220,31 @@ export function PlaygroundPanel() {
           }
           return [...prev, { role: 'assistant', content: `Error: ${stream.error}` }];
         });
-      } else if (!stream.tokens && stream.result != null) {
-        // Late-subscribe race: tokens are excluded from the WS replay
-        // buffer (connection-manager.ts treats them as reconstructable
-        // from `done`/`agent_call_end`), so a fast-completing execution
-        // can finish before useWsStream subscribes. We get `done` with
-        // a populated `result` but no `tokens` to render. Fall back to
-        // `stream.result` so the assistant message still appears.
+      } else if (stream.result != null) {
+        // Two scenarios both end up here:
+        //
+        // 1. Late-subscribe race: tokens are excluded from the WS replay
+        //    buffer, so a fast-completing execution can finish before
+        //    useWsStream subscribes. We get `done` with a populated
+        //    `result` but no `tokens` to render — fall back to
+        //    `stream.result` so the assistant message still appears.
+        //
+        // 2. Structured (schema) response: even when tokens DID arrive,
+        //    they're raw JSON syntax (`{"summary":"H...`) which is
+        //    gibberish for an operator reading the chat bubble. When
+        //    the result is a non-string value (object/array), overwrite
+        //    msg.content with the stringified form so the post-completion
+        //    render path can `JSON.parse` it back and render via
+        //    JsonViewer. Free-text responses (string result) keep their
+        //    token-accumulated content.
+        const isStructuredResult = stream.result !== null && typeof stream.result === 'object';
+        const shouldOverwriteContent = !stream.tokens || isStructuredResult;
+        if (!shouldOverwriteContent) return;
         const text =
           typeof stream.result === 'string' ? stream.result : JSON.stringify(stream.result);
         setMessages((prev) => {
           const last = prev[prev.length - 1];
-          if (last?.role === 'assistant' && !last.content) {
+          if (last?.role === 'assistant') {
             return [...prev.slice(0, -1), { ...last, content: text }];
           }
           return [...prev, { role: 'assistant', content: text }];
@@ -269,6 +415,15 @@ export function PlaygroundPanel() {
   const hasCostData = totalCost > 0 || totalTokens.input > 0;
   const messageCount = messages.length;
 
+  // Derive the structured-output view from the running event stream.
+  // When the in-flight ask has emitted `partial_object`, render the JSON
+  // tree instead of raw token text (which for schema responses is just
+  // JSON syntax char-by-char — gibberish to a human reader). When a
+  // `string_delta` is currently streaming, render it as a typewriter line
+  // below the snapshot so the user can see the actual text appear in
+  // real-time, not just at structural seams.
+  const structuredView = useMemo(() => deriveStructuredOutputView(stream.events), [stream.events]);
+
   // Filter out high-volume content events from the activity feed — they're
   // already rendered via the streaming chat bubble (`StreamingText`) and
   // would otherwise produce hundreds of useless rows for a long response.
@@ -303,11 +458,38 @@ export function PlaygroundPanel() {
                   : 'bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]'
               }`}
             >
-              {msg.role === 'assistant' && isStreaming && i === messages.length - 1 ? (
-                <StreamingText text={msg.content} />
-              ) : (
-                <div className="whitespace-pre-wrap">{msg.content}</div>
-              )}
+              {(() => {
+                const isInFlight =
+                  msg.role === 'assistant' && isStreaming && i === messages.length - 1;
+                // In-flight schema response — render the partial_object
+                // snapshot as a JSON tree, plus the actively-streaming
+                // string field as typewriter text. Switches automatically
+                // when partial_object events fire; falls back to raw
+                // tokens otherwise (free-text chat, no schema).
+                if (isInFlight && structuredView.latestPartial) {
+                  return (
+                    <StructuredStreamingBubble
+                      partial={structuredView.latestPartial.object}
+                      streamingField={structuredView.latestStringDelta}
+                    />
+                  );
+                }
+                if (isInFlight) {
+                  return <StreamingText text={msg.content} />;
+                }
+                // Post-completion. If the message content is JSON-shaped
+                // (the workflow returned a structured object that
+                // useWsStream's done-fallback path stringified into
+                // `msg.content`), render it as a JSON tree instead of a
+                // raw `{"summary":"..."}` blob. Free-text falls through
+                // to the existing plain-text render.
+                const parsed =
+                  msg.role === 'assistant' ? tryParseJsonObject(msg.content) : undefined;
+                if (parsed !== undefined) {
+                  return <JsonViewer data={parsed} defaultExpandDepth={3} />;
+                }
+                return <div className="whitespace-pre-wrap">{msg.content}</div>;
+              })()}
 
               {msg.handoffs && msg.handoffs.length > 0 && (
                 <div className="mt-2 space-y-1 border-t border-[hsl(var(--border))] pt-2">

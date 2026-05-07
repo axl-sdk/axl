@@ -383,6 +383,49 @@ describe('PlaygroundPanel integration', () => {
     });
   });
 
+  it('post-completion: JSON-string result with token gibberish renders as JSON tree (not raw text)', async () => {
+    // Real-world regression: the playground server stringifies a parsed
+    // object into `done.data.result: string` (canonical compact form),
+    // while tokens stream the raw LLM JSON (often pretty-printed,
+    // potentially with chunk-boundary artifacts). Pre-fix the
+    // done-handler's overwrite-content gate didn't recognize a
+    // string-typed structured result, so msg.content stayed as the
+    // token accumulation — and if the tokens had any chunk-boundary
+    // weirdness (e.g. dev fixture's regex strips newlines, leaving a
+    // valid-but-unusual whitespace pattern), `tryParseJsonObject` could
+    // fail and the bubble fell back to plain-text rendering. User-visible
+    // symptom: structured render during stream → reverts to plain JSON
+    // text after done.
+    //
+    // Fix: detect JSON-string result and canonicalize via parse →
+    // re-stringify, overwriting msg.content so the post-completion
+    // render gets a reliable input.
+    renderWithQuery(<PlaygroundPanel />);
+    await submitMessage('summarize via tokens then JSON-string result');
+
+    // Tokens stream messy raw JSON (with leading whitespace artifacts,
+    // simulating the dev-fixture's newline-stripping regex).
+    pushEvent(ev({ type: 'token', askId: 'a', depth: 0, agent: 'sx', data: '{' }));
+    pushEvent(
+      ev({ type: 'token', askId: 'a', depth: 0, agent: 'sx', data: '  "summary": "Hi"  ' }),
+    );
+    pushEvent(ev({ type: 'token', askId: 'a', depth: 0, agent: 'sx', data: '}' }));
+
+    // Server sends `done` with the canonical JSON-string form.
+    pushEvent(ev({ type: 'done', data: { result: '{"summary":"Hi"}' } }));
+
+    // The bubble must render the parsed JSON, NOT the stringified literal.
+    // We verify by checking the JsonViewer's Expand button is present.
+    await waitFor(() => {
+      const buttons = Array.from(document.querySelectorAll('button'));
+      const hasExpand = buttons.some((b) => /Expand|Collapse/i.test(b.textContent ?? ''));
+      if (!hasExpand) throw new Error('JsonViewer not rendered');
+    });
+    // The literal `{"summary":"Hi"}` text node should NOT exist as the
+    // primary bubble content (would mean we didn't switch to JsonViewer).
+    expect(screen.queryByText('{"summary":"Hi"}')).not.toBeInTheDocument();
+  });
+
   it('post-completion: JSON-shaped result content renders as JSON tree, not stringified', async () => {
     // When a workflow returns a structured object, useWsStream's done
     // fallback path (no tokens replayed) stringifies it into msg.content.

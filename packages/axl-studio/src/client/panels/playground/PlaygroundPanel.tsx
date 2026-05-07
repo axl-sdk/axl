@@ -221,27 +221,59 @@ export function PlaygroundPanel() {
           return [...prev, { role: 'assistant', content: `Error: ${stream.error}` }];
         });
       } else if (stream.result != null) {
-        // Two scenarios both end up here:
+        // Three scenarios end up here. In all of them we may want to
+        // overwrite the token-accumulated `msg.content` with a canonical
+        // form so the post-completion render path picks the right shape:
         //
-        // 1. Late-subscribe race: tokens are excluded from the WS replay
-        //    buffer, so a fast-completing execution can finish before
-        //    useWsStream subscribes. We get `done` with a populated
-        //    `result` but no `tokens` to render — fall back to
-        //    `stream.result` so the assistant message still appears.
+        // 1. Late-subscribe race: tokens excluded from the WS replay
+        //    buffer; a fast-completing execution finishes before
+        //    `useWsStream` subscribes. `stream.tokens` is empty, so we
+        //    must fall back to `stream.result` to render anything.
         //
-        // 2. Structured (schema) response: even when tokens DID arrive,
-        //    they're raw JSON syntax (`{"summary":"H...`) which is
-        //    gibberish for an operator reading the chat bubble. When
-        //    the result is a non-string value (object/array), overwrite
-        //    msg.content with the stringified form so the post-completion
-        //    render path can `JSON.parse` it back and render via
-        //    JsonViewer. Free-text responses (string result) keep their
-        //    token-accumulated content.
-        const isStructuredResult = stream.result !== null && typeof stream.result === 'object';
-        const shouldOverwriteContent = !stream.tokens || isStructuredResult;
+        // 2. Structured (schema) response, server sent a stringified
+        //    result: the playground endpoint serializes the parsed
+        //    object via `JSON.stringify(result)` and emits it as
+        //    `done.data.result: string`. The token stream is the raw
+        //    LLM JSON (often pretty-printed with newlines that get
+        //    stripped by the chunking regex on the way through —
+        //    leading to subtly-malformed strings that `JSON.parse`
+        //    rejects). We detect a JSON-shaped string result and
+        //    re-canonicalize it: parse, re-stringify, store the clean
+        //    form. The render path's `tryParseJsonObject` then has a
+        //    reliable input and `JsonViewer` renders.
+        //
+        // 3. Structured (schema) response, server sent the raw object
+        //    (typeof === 'object'): the parsed object goes straight
+        //    into `JSON.stringify` for `msg.content`.
+        //
+        // Free-text (no schema): `stream.result` is a plain string
+        // that doesn't parse as JSON. We keep the token-accumulated
+        // content untouched.
+        let canonical: string | null = null;
+        if (typeof stream.result === 'string') {
+          const trimmed = stream.result.trim();
+          if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+            try {
+              canonical = JSON.stringify(JSON.parse(trimmed));
+            } catch {
+              // Not parseable JSON despite the leading brace/bracket —
+              // treat as plain text and keep tokens.
+            }
+          }
+        } else if (typeof stream.result === 'object') {
+          canonical = JSON.stringify(stream.result);
+        }
+
+        // Overwrite when:
+        //   - we have nothing else to show (late-subscribe with no tokens), OR
+        //   - we recognized a structured (JSON) result — the canonical
+        //     form is more reliable than token accumulation, which can
+        //     have artifacts from chunk-boundary effects.
+        const shouldOverwriteContent = !stream.tokens || canonical !== null;
         if (!shouldOverwriteContent) return;
         const text =
-          typeof stream.result === 'string' ? stream.result : JSON.stringify(stream.result);
+          canonical ??
+          (typeof stream.result === 'string' ? stream.result : JSON.stringify(stream.result));
         setMessages((prev) => {
           const last = prev[prev.length - 1];
           if (last?.role === 'assistant') {

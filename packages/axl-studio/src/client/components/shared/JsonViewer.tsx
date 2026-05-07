@@ -74,8 +74,12 @@ const GUTTER = 'w-3.5 shrink-0 flex items-center justify-center pt-0.5';
 
 // ── CopyButton ───────────────────────────────────────────────
 
+// Solid `bg-[hsl(var(--popover))]` + `shadow-sm` mask the underlying tree
+// text when the floating toolbar overlays a collapsed/short preview row.
+// Without the backdrop, the button labels visually merge with the JSON
+// preview behind them on hover (reported visual bug).
 const TOOLBAR_BTN =
-  'inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium rounded-md border border-[hsl(var(--border))] text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] hover:bg-[hsl(var(--accent))] transition-colors cursor-pointer';
+  'inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--popover))] shadow-sm text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))] hover:bg-[hsl(var(--accent))] transition-colors cursor-pointer';
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -319,7 +323,7 @@ export function JsonViewer({
   return (
     <div className={cn('relative group/json', className)}>
       {/* Toolbar: appears on hover */}
-      <div className="absolute top-2 right-2 flex items-center gap-1 opacity-0 group-hover/json:opacity-100 transition-opacity z-10">
+      <div className="absolute top-2 right-2 flex items-center gap-0.5 opacity-0 group-hover/json:opacity-100 transition-opacity z-10">
         {hasNesting && (
           <button
             onClick={(e) => {

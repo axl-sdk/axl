@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.6] - 2026-05-13
+
+### Added
+- **`google:gemini-3.1-flash-lite` GA pricing.** Adds the GA identifier alongside the existing `-preview` entry at the same rate ($0.25 / $1.50 per 1M tokens). The 3.x code paths (`isGemini3x` regex, `thinkingLevel` mapping, `minThinkingLevel`) already covered the GA identifier — this release adds pricing only. The preview identifier `gemini-3.1-flash-lite-preview` continues to work until Google shuts it down on 2026-05-25; migrate before then.
+
 ## [0.17.5] - 2026-05-07
 
 ### Char-by-char streaming for long string fields

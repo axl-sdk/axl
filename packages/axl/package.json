@@ -1,6 +1,6 @@
 {
   "name": "@axlsdk/axl",
-  "version": "0.17.5",
+  "version": "0.17.6",
   "description": "TypeScript SDK for orchestrating Agentic Systems",
   "type": "module",
   "sideEffects": false,

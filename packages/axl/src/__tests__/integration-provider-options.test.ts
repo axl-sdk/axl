@@ -17,7 +17,7 @@ import { agent } from '../agent.js';
 //
 // Uses the cheapest modern models to minimize cost:
 //   OpenAI:    gpt-5-nano  ($0.05 / $0.40 per M tokens)
-//   Gemini:    gemini-2.5-flash ($0.30 / $2.50) + gemini-3.1-flash-lite-preview ($0.25 / $1.50)
+//   Gemini:    gemini-2.5-flash ($0.30 / $2.50) + gemini-3.1-flash-lite ($0.25 / $1.50)
 //   Anthropic: claude-haiku-4-5 ($1.00 / $5.00)
 // ---------------------------------------------------------------------------
 
@@ -257,11 +257,11 @@ describe.skipIf(!hasGoogle)('providerOptions: Gemini 2.x', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Gemini 3.x (gemini-3.1-flash-lite-preview) — uses thinkingLevel code path
+// Gemini 3.x (gemini-3.1-flash-lite) — uses thinkingLevel code path
 // ---------------------------------------------------------------------------
 
 describe.skipIf(!hasGoogle)('providerOptions: Gemini 3.x', () => {
-  const model = 'google:gemini-3.1-flash-lite-preview';
+  const model = 'google:gemini-3.1-flash-lite';
 
   it('passes safetySettings via providerOptions on 3.x model', async () => {
     const a = agent({

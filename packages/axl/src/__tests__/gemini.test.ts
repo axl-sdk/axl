@@ -342,6 +342,28 @@ describe('GeminiProvider', () => {
       expect(response.cost).toBeCloseTo(0.0001, 8);
     });
 
+    it('estimates cost for gemini-3.1-flash-lite GA identifier (same rate as preview)', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve(
+            makeGeminiResponse('Hi', {
+              promptTokenCount: 100,
+              candidatesTokenCount: 50,
+              totalTokenCount: 150,
+            }),
+          ),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.1-flash-lite',
+      });
+
+      // gemini-3.1-flash-lite (GA): [0.25e-6, 1.5e-6], identical to preview
+      // Expected: 100 * 0.25e-6 + 50 * 1.5e-6 = 0.0001
+      expect(response.cost).toBeCloseTo(0.0001, 8);
+    });
+
     it('returns cost: 0 for unknown models (not undefined)', async () => {
       mockFetch({
         json: () =>

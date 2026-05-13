@@ -115,6 +115,7 @@ const GEMINI_PRICING: Record<string, [number, number]> = {
   'gemini-3-pro-preview': [2e-6, 12e-6],
   'gemini-3-flash-preview': [0.5e-6, 3e-6],
   'gemini-3.1-pro-preview': [2e-6, 12e-6],
+  'gemini-3.1-flash-lite': [0.25e-6, 1.5e-6],
   'gemini-3.1-flash-lite-preview': [0.25e-6, 1.5e-6],
 };
 

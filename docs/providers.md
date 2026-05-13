@@ -74,13 +74,14 @@ anthropic:claude-3-haiku        # Legacy
 ```
 google:gemini-3.1-pro-preview        # Most capable (preview)
 google:gemini-3-flash-preview        # Fast (preview)
-google:gemini-3.1-flash-lite-preview # Cheapest (preview)
+google:gemini-3.1-flash-lite         # Cheapest (GA)
 google:gemini-2.5-pro                # Previous gen (most capable)
 google:gemini-2.5-flash              # Previous gen (fast)
 google:gemini-2.5-flash-lite         # Previous gen (cheapest)
 google:gemini-2.0-flash              # Legacy
 google:gemini-2.0-flash-lite         # Legacy
 google:gemini-3-pro-preview          # Deprecated (shut down March 9, 2026)
+google:gemini-3.1-flash-lite-preview # Deprecated (shuts down May 25, 2026)
 ```
 
 ## Configuration

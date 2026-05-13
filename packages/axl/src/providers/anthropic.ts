@@ -2,6 +2,7 @@ import type {
   Provider,
   ChatOptions,
   ChatMessage,
+  Effort,
   ProviderResponse,
   StreamChunk,
   ToolDefinition,
@@ -19,6 +20,7 @@ const ANTHROPIC_API_VERSION = '2023-06-01';
 // ---------------------------------------------------------------------------
 
 const ANTHROPIC_PRICING: Record<string, [number, number]> = {
+  'claude-opus-4-7': [5e-6, 25e-6],
   'claude-opus-4-6': [5e-6, 25e-6],
   'claude-sonnet-4-6': [3e-6, 15e-6],
   'claude-opus-4-5': [5e-6, 25e-6],
@@ -85,28 +87,55 @@ const THINKING_BUDGETS: Record<string, number> = {
 
 /**
  * Check if a model supports Anthropic's adaptive thinking mode.
- * Adaptive thinking is supported on Claude Opus 4.6 and Sonnet 4.6.
+ * Adaptive thinking is supported on Claude Opus 4.7, Opus 4.6, and Sonnet 4.6.
  */
 function supportsAdaptiveThinking(model: string): boolean {
-  return model.startsWith('claude-opus-4-6') || model.startsWith('claude-sonnet-4-6');
+  return (
+    model.startsWith('claude-opus-4-7') ||
+    model.startsWith('claude-opus-4-6') ||
+    model.startsWith('claude-sonnet-4-6')
+  );
 }
 
 /**
  * Check if a model supports effort: 'max' in adaptive thinking mode.
- * Only Opus 4.6 supports max effort. Sonnet 4.6 supports adaptive mode
+ * Opus 4.7 and Opus 4.6 support max effort. Sonnet 4.6 supports adaptive mode
  * but not the 'max' effort level.
  */
 function supportsMaxEffort(model: string): boolean {
-  return model.startsWith('claude-opus-4-6');
+  return model.startsWith('claude-opus-4-7') || model.startsWith('claude-opus-4-6');
 }
 
-/** Models that support output_config.effort (Opus 4.6, Sonnet 4.6, Opus 4.5). */
+/**
+ * Check if a model supports effort: 'xhigh' (extra-high tier between 'high' and 'max').
+ * Introduced on Claude Opus 4.7.
+ */
+function supportsXhigh(model: string): boolean {
+  return model.startsWith('claude-opus-4-7');
+}
+
+/** Models that support output_config.effort (Opus 4.7, Opus 4.6, Sonnet 4.6, Opus 4.5). */
 function supportsEffort(model: string): boolean {
   return (
+    model.startsWith('claude-opus-4-7') ||
     model.startsWith('claude-opus-4-6') ||
     model.startsWith('claude-sonnet-4-6') ||
     model.startsWith('claude-opus-4-5')
   );
+}
+
+/**
+ * Clamp the Axl effort tier to the wire value the model supports.
+ * - `'max'` → `'high'` on models that don't support max
+ * - `'xhigh'` → `'high'` on models that don't support xhigh
+ */
+function clampAnthropicEffort(
+  model: string,
+  effort: Exclude<Effort, 'none'>,
+): Exclude<Effort, 'none'> {
+  if (effort === 'max' && !supportsMaxEffort(model)) return 'high';
+  if (effort === 'xhigh' && !supportsXhigh(model)) return 'high';
+  return effort;
 }
 
 /**
@@ -252,10 +281,9 @@ export class AnthropicProvider implements Provider {
     // Build thinking/effort config
     const { thinkingBudget, thinkingDisabled, activeEffort, hasBudgetOverride } =
       resolveThinkingOptions(options);
-    let resolvedEffort = activeEffort;
-    if (resolvedEffort === 'max' && !supportsMaxEffort(options.model)) {
-      resolvedEffort = 'high';
-    }
+    const resolvedEffort = activeEffort
+      ? clampAnthropicEffort(options.model, activeEffort)
+      : undefined;
 
     if (hasBudgetOverride) {
       // Explicit budget → manual mode (precise override), regardless of model

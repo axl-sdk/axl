@@ -10,7 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.17.6] - 2026-05-13
 
 ### Added
+- **Anthropic Claude Opus 4.7 support.** New model ID `claude-opus-4-7` at the same pricing as Opus 4.6 ($5 input / $25 output per 1M tokens). Helpers `supportsAdaptiveThinking`, `supportsEffort`, and `supportsMaxEffort` now match the 4.7 prefix, so adaptive thinking + `output_config.effort` flow works out of the box. Versioned variants (`claude-opus-4-7-YYYYMMDD`) resolve automatically via the existing prefix-match.
+- **`'xhigh'` cross-provider effort tier.** New `Effort` value positioned between `'high'` and `'max'`. Maps to:
+  - Anthropic Opus 4.7 → `output_config.effort: 'xhigh'` (alongside adaptive thinking)
+  - OpenAI gpt-5.2+ → `reasoning_effort: 'xhigh'` (already supported internally; now reachable from the public `Effort` type)
+  - Anthropic 4.6 / 4.5 / older, OpenAI gpt-5.1 and earlier, Gemini 3.x → clamps to `'high'`
+  - Gemini 2.x → `thinkingBudget: 16384` (between high's 10000 and max's 24576)
+
+  Additive change — existing code that uses `'low'`/`'medium'`/`'high'`/`'max'` is unaffected.
 - **`google:gemini-3.1-flash-lite` GA pricing.** Adds the GA identifier alongside the existing `-preview` entry at the same rate ($0.25 / $1.50 per 1M tokens). The 3.x code paths (`isGemini3x` regex, `thinkingLevel` mapping, `minThinkingLevel`) already covered the GA identifier — this release adds pricing only. The preview identifier `gemini-3.1-flash-lite-preview` continues to work until Google shuts it down on 2026-05-25; migrate before then.
+
+### Deferred
+- **Anthropic task budgets** (public beta in Opus 4.7) — waiting on Anthropic's official API reference before wiring a typed param. Axl's `ctx.budget()` already covers the orchestration-side use case.
 
 ## [0.17.5] - 2026-05-07
 

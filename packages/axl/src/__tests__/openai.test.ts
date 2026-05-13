@@ -479,6 +479,48 @@ describe('OpenAIProvider', () => {
       expect(body.reasoning_effort).toBe('xhigh');
     });
 
+    it('passes reasoning_effort "xhigh" on gpt-5.4 (xhigh supported)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-xhigh-54',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5.4',
+        maxTokens: 1024,
+        effort: 'xhigh',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('xhigh');
+    });
+
+    it('clamps reasoning_effort "xhigh" to "high" on gpt-5.1', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-xhigh-51',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5.1',
+        maxTokens: 1024,
+        effort: 'xhigh',
+      });
+
+      const body = getRequestBody(fetchMock);
+      expect(body.reasoning_effort).toBe('high');
+    });
+
     it('maps thinkingBudget to nearest reasoning_effort level', async () => {
       const fetchMock = mockFetch({
         json: () =>

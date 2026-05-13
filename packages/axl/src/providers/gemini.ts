@@ -153,6 +153,7 @@ const THINKING_BUDGETS: Record<string, number> = {
   low: 1024,
   medium: 5000,
   high: 10000,
+  xhigh: 16384, // between high (10000) and max (24576)
   max: 24576,
 };
 
@@ -161,6 +162,7 @@ const THINKING_LEVELS: Record<string, string> = {
   low: 'low',
   medium: 'medium',
   high: 'high',
+  xhigh: 'high', // 3.x has no xhigh tier; clamp to 'high'
   max: 'high', // 3.x caps at 'high'
 };
 

@@ -236,9 +236,9 @@ The `effort` parameter provides a unified way to control reasoning depth across 
 ```typescript
 // Simple levels — works on any provider
 const reasoner = agent({
-  model: 'anthropic:claude-opus-4-6',
+  model: 'anthropic:claude-opus-4-7',
   system: 'You are a careful analyst.',
-  effort: 'high', // 'none' | 'low' | 'medium' | 'high' | 'max'
+  effort: 'high', // 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 });
 
 // Explicit thinking budget (in tokens — supported on Gemini 2.x and Anthropic)
@@ -679,7 +679,7 @@ Four built-in providers using the `provider:model` URI scheme:
 ```
 openai-responses:gpt-5.4               # OpenAI Responses API (preferred over Chat Completions)
 openai:gpt-5.4                         # OpenAI Chat Completions
-anthropic:claude-sonnet-4-6            # Anthropic
+anthropic:claude-opus-4-7              # Anthropic (supports effort: 'xhigh')
 google:gemini-3.1-pro-preview          # Google Gemini
 ```
 

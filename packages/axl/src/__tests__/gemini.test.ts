@@ -641,6 +641,41 @@ describe('GeminiProvider', () => {
       });
     });
 
+    it('maps effort "xhigh" to thinkingBudget 16384 for 2.x models', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-pro',
+        effort: 'xhigh',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      // xhigh slots between high (10000) and max (24576) for 2.x
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingBudget: 16384,
+      });
+    });
+
+    it('maps effort "xhigh" to thinkingLevel "high" for 3.x models (no xhigh tier)', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('ok')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3-pro',
+        effort: 'xhigh',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'high',
+      });
+    });
+
     it('maps effort "high" to thinkingLevel for 3.x models', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),

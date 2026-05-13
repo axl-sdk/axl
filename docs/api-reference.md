@@ -103,7 +103,7 @@ const myAgent = agent({
 | `mcpTools` | `string[]` | — | Whitelist: only expose these specific MCP tools |
 | `temperature` | `number` | provider default | LLM sampling temperature |
 | `maxTokens` | `number` | `4096` | Maximum tokens in the LLM response |
-| `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'max'`. Controls reasoning depth across all providers |
+| `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'`. Controls reasoning depth across all providers. `'xhigh'` is supported natively on Anthropic Opus 4.7 and OpenAI gpt-5.2+; clamps to `'high'` on other models |
 | `thinkingBudget` | `number` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. Set to `0` to disable thinking while keeping effort |
 | `includeThoughts` | `boolean` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini |
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool |

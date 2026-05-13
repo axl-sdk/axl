@@ -24,17 +24,22 @@ export type ToolDefinition = {
  *   minimum thinking level (3.1 Pro: 'low', others: 'minimal'). On other providers,
  *   fully disables reasoning.
  * - `'low'` through `'max'` — Increasing levels of reasoning depth and token spend.
+ * - `'xhigh'` — Extra-high tier between `'high'` and `'max'`. Supported natively on
+ *   Anthropic Opus 4.7 (`output_config.effort: 'xhigh'`) and OpenAI gpt-5.2+
+ *   (`reasoning_effort: 'xhigh'`). Clamps to `'high'` on providers/models that
+ *   don't expose a distinct xhigh level.
  *
  * Provider mapping:
- * - Anthropic 4.6: adaptive thinking + output_config.effort
- * - Anthropic Opus 4.5: output_config.effort (no adaptive)
+ * - Anthropic 4.7: adaptive thinking + output_config.effort (incl. 'xhigh')
+ * - Anthropic 4.6: adaptive thinking + output_config.effort (xhigh clamps to 'high')
+ * - Anthropic Opus 4.5: output_config.effort (no adaptive; xhigh clamps to 'high')
  * - Anthropic older: thinking.budget_tokens fallback
  * - OpenAI o-series: reasoning_effort
- * - OpenAI GPT-5.x: reasoning.effort / reasoning_effort
- * - Gemini 3.x: thinkingLevel (`'none'` → model min: `'minimal'` or `'low'` for 3.1 Pro)
+ * - OpenAI GPT-5.x: reasoning.effort / reasoning_effort (xhigh on gpt-5.2+)
+ * - Gemini 3.x: thinkingLevel (`'none'` → model min: `'minimal'` or `'low'` for 3.1 Pro; xhigh → 'high')
  * - Gemini 2.x: thinkingBudget (`'none'` → 0; some models have minimums)
  */
-export type Effort = 'none' | 'low' | 'medium' | 'high' | 'max';
+export type Effort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 /** Tool choice strategy for LLM calls. */
 export type ToolChoice =

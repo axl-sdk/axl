@@ -174,6 +174,10 @@ export class MemoryStore implements StateStore {
     return result.map((e) => structuredClone(e));
   }
 
+  async deleteExecution(executionId: string): Promise<boolean> {
+    return this.executionHistory.delete(executionId);
+  }
+
   // ── Eval History ──────────────────────────────────────────────────
 
   async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {

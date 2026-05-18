@@ -141,4 +141,55 @@ describe('Studio API: Executions', () => {
     const negative = await readJson(await app.request(`/api/executions/${id}?since=-1`));
     expect(negative.data.events.length).toBe(total);
   });
+
+  it('DELETE /api/executions/:id removes a historical execution from history', async () => {
+    const provider = MockProvider.sequence([{ content: 'done' }]);
+    const { app } = createTestServer(provider);
+
+    // Seed a completed execution
+    await app.request('/api/workflows/test-wf/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: { message: 'hi' } }),
+    });
+    const listBefore = await readJson(await app.request('/api/executions'));
+    expect(listBefore.data.length).toBe(1);
+    const id = listBefore.data[0].executionId;
+
+    // Delete it
+    const delRes = await app.request(`/api/executions/${id}`, { method: 'DELETE' });
+    expect(delRes.status).toBe(200);
+    const delBody = await readJson(delRes);
+    expect(delBody.ok).toBe(true);
+    expect(delBody.data).toEqual({ id, deleted: true });
+
+    // Confirm it's gone — both list and single-fetch
+    const listAfter = await readJson(await app.request('/api/executions'));
+    expect(listAfter.data).toEqual([]);
+    const fetchAfter = await app.request(`/api/executions/${id}`);
+    expect(fetchAfter.status).toBe(404);
+  });
+
+  it('DELETE /api/executions/:id returns 404 for unknown id', async () => {
+    const { app } = createTestServer();
+    const res = await app.request('/api/executions/does-not-exist', { method: 'DELETE' });
+    expect(res.status).toBe(404);
+    const body = await readJson(res);
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('NOT_FOUND');
+    expect(body.error.message).toContain('does-not-exist');
+  });
+
+  it('DELETE /api/executions/:id is blocked in readOnly mode', async () => {
+    const provider = MockProvider.sequence([{ content: 'done' }]);
+    const { app } = createTestServer(provider, { readOnly: true });
+
+    // In readOnly mode, mutating routes are blocked before they hit the
+    // route handler — 405 (Method Not Allowed) with a READ_ONLY error.
+    const res = await app.request('/api/executions/anything', { method: 'DELETE' });
+    expect(res.status).toBe(405);
+    const body = await readJson(res);
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe('READ_ONLY');
+  });
 });

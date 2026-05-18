@@ -69,6 +69,12 @@ export interface StateStore {
   getExecution?(executionId: string): Promise<ExecutionInfo | null>;
   /** List recent executions (most recent first). */
   listExecutions?(limit?: number): Promise<ExecutionInfo[]>;
+  /**
+   * Delete an execution from history by ID. Returns `true` if an entry was
+   * deleted, `false` if the ID didn't exist. Used for GDPR right-to-be-
+   * forgotten and operator-driven cleanup. Symmetric to `deleteEvalResult`.
+   */
+  deleteExecution?(executionId: string): Promise<boolean>;
 
   // Eval history
   /** Save an eval result to history. */

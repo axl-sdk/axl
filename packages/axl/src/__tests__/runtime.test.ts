@@ -2674,3 +2674,122 @@ describe('runWorkflowBody parity (execute vs stream × success/throw/abort)', ()
     }
   }
 });
+
+describe('deleteExecution()', () => {
+  it('removes a historical execution from memory and the store, returning true', async () => {
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
+    const wf = workflow({
+      name: 'wf',
+      input: z.object({ msg: z.string() }),
+      handler: async (ctx) => ctx.input.msg,
+    });
+    runtime.register(wf);
+
+    await runtime.execute('wf', { msg: 'hello' });
+    const all = await runtime.getExecutions();
+    expect(all).toHaveLength(1);
+    const executionId = all[0].executionId;
+
+    const deleted = await runtime.deleteExecution(executionId);
+    expect(deleted).toBe(true);
+
+    expect(await runtime.getExecution(executionId)).toBeUndefined();
+    expect(await runtime.getExecutions()).toEqual([]);
+  });
+
+  it('returns false for an unknown id', async () => {
+    const runtime = new AxlRuntime();
+    expect(await runtime.deleteExecution('does-not-exist')).toBe(false);
+  });
+
+  it('deletes from the StateStore (lazy-loaded history)', async () => {
+    // Simulate an execution that's only in the store (not in memory) — e.g.
+    // a previous process saved it, then this process started fresh.
+    let storeDeleteCalledWith: string | null = null;
+    const fakeStore = {
+      saveCheckpoint: async () => {},
+      getCheckpoint: async () => null,
+      saveSession: async () => {},
+      getSession: async () => [],
+      deleteSession: async () => {},
+      saveSessionMeta: async () => {},
+      getSessionMeta: async () => null,
+      savePendingDecision: async () => {},
+      getPendingDecisions: async () => [],
+      resolveDecision: async () => {},
+      saveExecutionState: async () => {},
+      getExecutionState: async () => null,
+      listPendingExecutions: async () => [],
+      saveExecution: async () => {},
+      getExecution: async () => null,
+      listExecutions: async () => [
+        {
+          executionId: 'in-store',
+          workflow: 'wf',
+          status: 'completed' as const,
+          events: [],
+          totalCost: 0,
+          startedAt: 0,
+          completedAt: 0,
+          duration: 0,
+        },
+      ],
+      deleteExecution: async (id: string): Promise<boolean> => {
+        storeDeleteCalledWith = id;
+        return true;
+      },
+    };
+
+    const runtime = new AxlRuntime({
+      state: { store: fakeStore as any },
+    });
+
+    const deleted = await runtime.deleteExecution('in-store');
+    expect(deleted).toBe(true);
+    expect(storeDeleteCalledWith).toBe('in-store');
+
+    // Subsequent reads no longer see the deleted entry
+    expect(await runtime.getExecution('in-store')).toBeUndefined();
+  });
+
+  it('does not crash when the store lacks deleteExecution (older custom stores)', async () => {
+    const fakeStore = {
+      saveCheckpoint: async () => {},
+      getCheckpoint: async () => null,
+      saveSession: async () => {},
+      getSession: async () => [],
+      deleteSession: async () => {},
+      saveSessionMeta: async () => {},
+      getSessionMeta: async () => null,
+      savePendingDecision: async () => {},
+      getPendingDecisions: async () => [],
+      resolveDecision: async () => {},
+      saveExecutionState: async () => {},
+      getExecutionState: async () => null,
+      listPendingExecutions: async () => [],
+      // No saveExecution / getExecution / deleteExecution — store can't persist
+      // history. deleteExecution should still report the in-memory deletion.
+    };
+
+    const runtime = new AxlRuntime({
+      defaultProvider: 'test',
+      state: { store: fakeStore as any },
+    });
+    runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
+    const wf = workflow({
+      name: 'wf',
+      input: z.object({}).strict(),
+      handler: async (_ctx) => 'ok',
+    });
+    runtime.register(wf);
+
+    await runtime.execute('wf', {});
+    const all = await runtime.getExecutions();
+    const id = all[0].executionId;
+
+    // Store doesn't implement deleteExecution but the in-memory cache does
+    const deleted = await runtime.deleteExecution(id);
+    expect(deleted).toBe(true);
+  });
+});

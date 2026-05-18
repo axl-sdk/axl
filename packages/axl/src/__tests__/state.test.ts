@@ -322,6 +322,25 @@ describe('MemoryStore', () => {
       const loaded = await store.getExecution('e1');
       expect(loaded!.metadata).toEqual({ userId: 'u1', tenantId: 't42', tag: 'priority' });
     });
+
+    it('deleteExecution removes the entry and returns true', async () => {
+      const store = new MemoryStore();
+      await store.saveExecution(makeExec('e1', 1000));
+      await store.saveExecution(makeExec('e2', 2000));
+
+      const deleted = await store.deleteExecution('e1');
+      expect(deleted).toBe(true);
+
+      expect(await store.getExecution('e1')).toBeNull();
+      const list = await store.listExecutions();
+      expect(list.map((e) => e.executionId)).toEqual(['e2']);
+    });
+
+    it('deleteExecution returns false for unknown id', async () => {
+      const store = new MemoryStore();
+      const deleted = await store.deleteExecution('nonexistent');
+      expect(deleted).toBe(false);
+    });
   });
 
   // ── Eval History ──────────────────────────────────────────────────
@@ -704,6 +723,39 @@ describe('SQLiteStore', () => {
       // strict equality with `{ ...exec }` round-trip checks.
       expect('metadata' in (loaded as object)).toBe(false);
       store.close();
+    });
+
+    it('deleteExecution removes the row and returns true', async () => {
+      const store = createStore();
+      await store.saveExecution(makeExec('e1', 1000));
+      await store.saveExecution(makeExec('e2', 2000));
+
+      expect(await store.deleteExecution('e1')).toBe(true);
+      expect(await store.getExecution('e1')).toBeNull();
+      const list = await store.listExecutions();
+      expect(list.map((e) => e.executionId)).toEqual(['e2']);
+      store.close();
+    });
+
+    it('deleteExecution returns false for unknown id', async () => {
+      const store = createStore();
+      expect(await store.deleteExecution('nonexistent')).toBe(false);
+      store.close();
+    });
+
+    it('deleteExecution persists across instances (committed to disk)', async () => {
+      const dbPath = join(tmpdir(), `axl-test-del-exec-${randomUUID()}.db`);
+      dbFiles.push(dbPath);
+
+      const store1 = new SQLiteStore(dbPath);
+      await store1.saveExecution(makeExec('e1', 1000));
+      await store1.deleteExecution('e1');
+      store1.close();
+
+      // Reopen — the deletion must have been written to disk
+      const store2 = new SQLiteStore(dbPath);
+      expect(await store2.getExecution('e1')).toBeNull();
+      store2.close();
     });
   });
 
@@ -1451,6 +1503,58 @@ describe('RedisStore', () => {
 
       const loaded = await store.getExecution('e1');
       expect(loaded!.metadata).toEqual({ userId: 'u1', correlationId: 'abc-123' });
+    });
+
+    it('deleteExecution removes the entry and returns true', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveExecution(makeExec('e1', 1000));
+      await store.saveExecution(makeExec('e2', 2000));
+
+      expect(await store.deleteExecution('e1')).toBe(true);
+      expect(await store.getExecution('e1')).toBeNull();
+      const list = await store.listExecutions();
+      expect(list.map((e) => e.executionId)).toEqual(['e2']);
+    });
+
+    it('deleteExecution returns false for unknown id', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      expect(await store.deleteExecution('nonexistent')).toBe(false);
+    });
+
+    it('deleteExecution cleans up the sorted-set index too', async () => {
+      // Critical: if deleteExecution only zaps the data + legacy SET but
+      // leaves the ZSET entry, future listExecutions would return an ID
+      // whose mGet result is null, polluting the result set.
+      const { store, zsetData, setData } = createRedisStoreWithMockClient();
+      await store.saveExecution(makeExec('e1', 1000));
+      expect(zsetData.get('axl:exec-history-z')?.has('e1')).toBe(true);
+      expect(setData.get('axl:exec-history-ids')?.has('e1')).toBe(true);
+
+      await store.deleteExecution('e1');
+      expect(zsetData.get('axl:exec-history-z')?.has('e1')).toBe(false);
+      expect(setData.get('axl:exec-history-ids')?.has('e1')).toBe(false);
+    });
+
+    it('deleteExecution is atomic — sRem + del + zRem queued in one MULTI', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      await store.saveExecution(makeExec('e1', 1000));
+
+      const captured: Array<ReturnType<typeof createMockMulti>> = [];
+      const original = mockClient.multi.getMockImplementation()!;
+      mockClient.multi.mockImplementation(() => {
+        const chain = original();
+        captured.push(chain);
+        return chain;
+      });
+
+      await store.deleteExecution('e1');
+      expect(captured).toHaveLength(1);
+      expect(captured[0]._queueLength()).toBe(3); // sRem + del + zRem
+
+      // No single-op delete commands escaped the MULTI
+      expect(mockClient.sRem).not.toHaveBeenCalled();
+      expect(mockClient.del).not.toHaveBeenCalled();
+      expect(mockClient.zRem).not.toHaveBeenCalled();
     });
   });
 

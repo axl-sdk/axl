@@ -425,6 +425,13 @@ export class SQLiteStore implements StateStore {
     return rows.map(rowToExecutionInfo);
   }
 
+  async deleteExecution(executionId: string): Promise<boolean> {
+    const result = this.db
+      .prepare('DELETE FROM execution_history WHERE execution_id = ?')
+      .run(executionId);
+    return result.changes > 0;
+  }
+
   // ── Eval History ────────────────────────────────────────────────────────
 
   async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {

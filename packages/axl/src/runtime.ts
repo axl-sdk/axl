@@ -1243,6 +1243,39 @@ export class AxlRuntime extends EventEmitter {
   }
 
   /**
+   * Delete an execution from history by id. Removes from BOTH the active
+   * map (if still running) and the historical cache, and from the
+   * configured StateStore. Returns true if an entry was actually removed
+   * from any of the three.
+   *
+   * Use cases: GDPR right-to-be-forgotten, operator-driven cleanup of
+   * specific runs (e.g. a workflow that recorded PII the user requested
+   * scrubbed). For bulk eviction by age, use a `RedisStore` TTL instead
+   * (`defaultTtl` / `ttls.executionHistory`).
+   *
+   * Note: this removes the execution from observability, but does NOT
+   * abort an in-flight execution. To abort first, call `runtime.abort(id)`,
+   * then `deleteExecution(id)` after it finishes.
+   */
+  async deleteExecution(id: string): Promise<boolean> {
+    // Force a lazy-load so the in-memory historical cache reflects
+    // everything in the store before we mutate it. Otherwise we could
+    // "delete" something only-in-store and leave a duplicate in memory
+    // on the next list call after lazy-load fires.
+    await this.getExecutions();
+
+    const removedFromActive = this.executions.delete(id);
+    const removedFromHistorical = this.historicalExecutions.delete(id);
+
+    let removedFromStore = false;
+    if (this.stateStore.deleteExecution) {
+      removedFromStore = await this.stateStore.deleteExecution(id);
+    }
+
+    return removedFromActive || removedFromHistorical || removedFromStore;
+  }
+
+  /**
    * Delete an eval history entry by id. Removes from in-memory cache and
    * the configured StateStore. Returns true if an entry was actually removed.
    *

@@ -1150,6 +1150,7 @@ Completed and failed executions are automatically persisted to the state store (
 |--------|---------|-------------|
 | `getExecutions()` | `Promise<ExecutionInfo[]>` | All executions (active + historical), sorted by `startedAt` descending. Merges in-memory active executions with historical data from the state store |
 | `getExecution(id)` | `Promise<ExecutionInfo \| undefined>` | Look up a specific execution. Checks in-memory first, then falls through to the state store |
+| `deleteExecution(id)` | `Promise<boolean>` | Remove an execution from in-memory caches and the state store. Returns `true` if anything was removed. Used for GDPR right-to-be-forgotten and operator cleanup. Does NOT abort an in-flight execution — call `runtime.abort(id)` first |
 
 `ExecutionInfo`:
 
@@ -1324,6 +1325,7 @@ These methods are optional (`?` on the interface). The runtime checks for their 
 | `saveExecution?(execution)` | Save a completed/failed `ExecutionInfo` to history |
 | `getExecution?(executionId)` | Get a specific execution from history |
 | `listExecutions?(limit?)` | List recent executions, most recent first. Pass `undefined` for no limit |
+| `deleteExecution?(executionId)` | Delete an execution from history. Returns `true` if an entry was removed. Symmetric to `deleteEvalResult` |
 
 **Eval history** (for `runtime.getEvalHistory()`):
 

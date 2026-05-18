@@ -128,6 +128,7 @@ export function createServer(options: CreateServerOptions) {
     const blocked: RegExp[] = [
       /^POST \/api\/workflows(\/|$)/,
       /^POST \/api\/executions(\/|$)/,
+      /^DELETE \/api\/executions\/[^/]+$/,
       /^POST \/api\/sessions(\/|$)/,
       /^DELETE \/api\/sessions(\/|$)/,
       /^PUT \/api\/memory(\/|$)/,

@@ -81,4 +81,28 @@ app.post('/executions/:id/abort', (c) => {
   return c.json({ ok: true, data: { aborted: true } });
 });
 
+// Delete an execution from history.
+//
+// Use cases: GDPR right-to-be-forgotten, operator-driven cleanup of specific
+// runs (e.g. a workflow that recorded PII the user requested scrubbed). Does
+// NOT abort an in-flight execution — call POST /executions/:id/abort first
+// if the run is still running, then DELETE after it finishes.
+//
+// Symmetric to DELETE /api/evals/history/:id. Blocked in readOnly mode.
+app.delete('/executions/:id', async (c) => {
+  const runtime = c.get('runtime');
+  const id = c.req.param('id');
+  const deleted = await runtime.deleteExecution(id);
+  if (!deleted) {
+    return c.json(
+      {
+        ok: false,
+        error: { code: 'NOT_FOUND', message: `Execution "${id}" not found` },
+      },
+      404,
+    );
+  }
+  return c.json({ ok: true, data: { id, deleted: true } });
+});
+
 export default app;

@@ -550,6 +550,21 @@ export class RedisStore implements StateStore {
     );
   }
 
+  async deleteExecution(executionId: string): Promise<boolean> {
+    // Atomic: data + legacy SET membership + sorted-set membership all
+    // removed together. del()'s return is the "did it exist" signal —
+    // second result in the exec() array (sRem queued first, del second,
+    // zRem third). Symmetric to deleteEvalResult.
+    const [, deletedCount] = await this.client
+      .multi()
+      .sRem(this.execHistorySetKey(), executionId)
+      .del(this.execHistoryKey(executionId))
+      .zRem(this.execHistoryZsetKey(), executionId)
+      .exec();
+    const deleted = typeof deletedCount === 'number' ? deletedCount : 0;
+    return deleted > 0;
+  }
+
   // ── Eval History ────────────────────────────────────────────────────
 
   async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`RedisStore` now implements the optional memory methods** (`saveMemory`, `getMemory`, `getAllMemory`, `deleteMemory`). Before this fix, `ctx.remember()` against `RedisStore` silently took a sessionMeta-based fallback path inside `MemoryManager` — which (a) dropped the `metadata` option, (b) made entries invisible to `getAllMemory`, and (c) silently skipped `session.fork()`'s memory migration. The docs already claimed all three built-in stores implemented every optional method; that claim is now true.
+
+  **Upgrade path is automatic.** `getMemory` checks the new hash location first, then falls back to the legacy sessionMeta location and migrates the value forward race-safely via `HSETNX` (so a concurrent write from another process can't be clobbered by the migration). `deleteMemory` cleans both locations. `getAllMemory` does **not** include legacy entries — that method didn't exist on `RedisStore` pre-patch, so no caller can depend on it returning them; legacy entries surface naturally on first `getMemory` for that key.
+
+  **Studio's Memory Browser and `session.fork()` use `getAllMemory`.** If you have pre-patch memory data on `RedisStore`, it won't appear in Studio's Memory Browser and won't be copied by `session.fork()` until each key has been read once (via `ctx.recall()` or any other `getMemory` call), which auto-migrates it to the new layout. For most users the next `ctx.recall()` happens on the very next turn — the gap closes itself.
+
+  Layout: `{prefix}memory:{scope}` is a hash, fields are user-supplied keys, values are JSON-serialized. Hash-per-scope keeps related entries together (good cohesion for the TTL eviction landing in `[0.18.0]`) and bounds the keyspace to O(scopes) instead of O(scopes × keys).
+
+- **`MemoryManager` emits a one-shot `console.warn` when used against a custom `StateStore` that doesn't implement memory methods.** Previously, the sessionMeta-fallback path was completely silent — users on custom stores lost `metadata` and `getAllMemory` enumeration with zero signal. Now they get a single warning per offending store listing the four methods to implement. All three built-in stores implement the methods, so no warning fires for users on `MemoryStore` / `SQLiteStore` / `RedisStore`.
+
 ### Added
 - **`RedisStore.create({ keyPrefix })` for shared-cluster deployments.** Pass an options object instead of a URL string to override the default `'axl:'` key prefix. Useful when multiple Axl deployments coexist on one Redis cluster (e.g. `'axl:prod:'` vs `'axl:staging:'`) or when sharing a cluster with other applications. The prefix is concatenated as-given — no normalization — so include a trailing colon if you want one. Empty string is rejected at the factory to prevent accidental collisions with non-Axl keys. The URL-only `RedisStore.create('redis://...')` form is unchanged and remains the recommended shorthand when you just want the default prefix.
 

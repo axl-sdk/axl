@@ -309,10 +309,10 @@ export class Session {
 
         // Copy session-scoped key-value memory. Vector embeddings (when
         // `remember(..., {embed: true})`) are NOT copied — re-embed on
-        // the fork if you need semantic recall there. Stores that don't
-        // implement `getAllMemory`/`saveMemory` (e.g., the current
-        // RedisStore) silently skip this; their memory uses the
-        // sessionMeta fallback path which isn't enumerable per session.
+        // the fork if you need semantic recall there. All built-in stores
+        // implement these methods; custom stores that don't will silently
+        // skip the copy (and emit a one-shot warning via MemoryManager
+        // the first time their store is used for `ctx.remember`).
         if (this.store.getAllMemory && this.store.saveMemory) {
           const sourceScope = `session:${this.sessionId}`;
           const targetScope = `session:${newId}`;

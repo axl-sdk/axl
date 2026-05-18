@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { MemoryManager } from '../memory/manager.js';
 import { InMemoryVectorStore } from '../memory/vector-memory.js';
 import { SqliteVectorStore } from '../memory/vector-sqlite.js';
@@ -336,6 +336,89 @@ describe('memory', () => {
       await store.saveMemory('global', 'key', 'new');
       const result = await store.getMemory('global', 'key');
       expect(result).toBe('new');
+    });
+  });
+
+  describe('MemoryManager fallback warning (stores missing memory methods)', () => {
+    // Custom StateStore impls that don't implement the optional memory
+    // methods get a one-shot console.warn so silent fidelity loss is loud.
+    // All three built-in stores implement the methods, so this only fires
+    // on user-authored stores.
+
+    function makeStubStoreMissingMemory() {
+      // Minimal stub that satisfies StateStore's *required* methods only.
+      const meta = new Map<string, Map<string, unknown>>();
+      return {
+        saveCheckpoint: async () => {},
+        getCheckpoint: async () => null,
+        saveSession: async () => {},
+        getSession: async () => [],
+        deleteSession: async () => {},
+        saveSessionMeta: async (sid: string, key: string, value: unknown) => {
+          if (!meta.has(sid)) meta.set(sid, new Map());
+          meta.get(sid)!.set(key, value);
+        },
+        getSessionMeta: async (sid: string, key: string) => meta.get(sid)?.get(key) ?? null,
+        savePendingDecision: async () => {},
+        getPendingDecisions: async () => [],
+        resolveDecision: async () => {},
+        saveExecutionState: async () => {},
+        getExecutionState: async () => null,
+        listPendingExecutions: async () => [],
+      };
+    }
+
+    it('fires console.warn once per offending store on first ctx.remember', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const store = makeStubStoreMissingMemory();
+        const mgr = new MemoryManager();
+
+        await mgr.remember('k1', 'v1', store, 'sess-1');
+        await mgr.remember('k2', 'v2', store, 'sess-1');
+        await mgr.remember('k3', 'v3', store, 'sess-1');
+
+        // Exactly one warning, mentioning the four missing methods so users
+        // know what to implement.
+        expect(warn).toHaveBeenCalledTimes(1);
+        const msg = warn.mock.calls[0][0] as string;
+        expect(msg).toContain('saveMemory');
+        expect(msg).toContain('getMemory');
+        expect(msg).toContain('getAllMemory');
+        expect(msg).toContain('deleteMemory');
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('warns independently for two different stores', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const storeA = makeStubStoreMissingMemory();
+        const storeB = makeStubStoreMissingMemory();
+        const mgr = new MemoryManager();
+
+        await mgr.remember('k', 'v', storeA, 'sess-1');
+        await mgr.remember('k', 'v', storeA, 'sess-1'); // dedup'd
+        await mgr.remember('k', 'v', storeB, 'sess-1'); // distinct store
+        await mgr.remember('k', 'v', storeB, 'sess-1'); // dedup'd
+
+        expect(warn).toHaveBeenCalledTimes(2);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('does NOT warn when the store implements saveMemory', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const store = new MemoryStore(); // implements memory methods
+        const mgr = new MemoryManager();
+        await mgr.remember('k', 'v', store, 'sess-1');
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
     });
   });
 

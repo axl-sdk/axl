@@ -5,6 +5,11 @@ import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } fr
 // Avoids a hard compile-time dependency on the redis package.
 interface RedisClient {
   hSet(key: string, field: string, value: string): Promise<number>;
+  // hSetNX is the atomic "set field iff absent" primitive (HSETNX).
+  // Used by `getMemory` to migrate legacy data forward without clobbering a
+  // concurrent fresh write. Returns 1 if the field was set, 0 if it already
+  // existed.
+  hSetNX(key: string, field: string, value: string): Promise<number | boolean>;
   hGet(key: string, field: string): Promise<string | null | undefined>;
   hGetAll(key: string): Promise<Record<string, string>>;
   hDel(key: string, field: string | string[]): Promise<number>;
@@ -145,6 +150,10 @@ export class RedisStore implements StateStore {
     return `${this.keyPrefix}eval-history-ids`;
   }
 
+  private memoryKey(scope: string): string {
+    return `${this.keyPrefix}memory:${scope}`;
+  }
+
   // ── Checkpoints ──────────────────────────────────────────────────────
 
   async saveCheckpoint(executionId: string, name: string, data: unknown): Promise<void> {
@@ -218,6 +227,74 @@ export class RedisStore implements StateStore {
 
   async listPendingExecutions(): Promise<string[]> {
     return this.client.sMembers(this.pendingExecSetKey());
+  }
+
+  // ── Memory ──────────────────────────────────────────────────────────
+  //
+  // Layout: `{prefix}memory:{scope}` is a hash. Fields are user-supplied
+  // keys; values are JSON-serialized. Hash-per-scope keeps related entries
+  // together (good cohesion for TTL eviction once #3 lands) and bounds the
+  // keyspace to O(scopes) instead of O(scopes × keys).
+  //
+  // Pre-this-patch, RedisStore had no memory methods, so MemoryManager fell
+  // back to writing memory at synthetic sessionMeta keys
+  // (`{prefix}session-meta:memory:{scope}:{key}` hash field `value`). To
+  // preserve user data on upgrade, `getMemory` checks the legacy location on
+  // miss and migrates forward; `deleteMemory` also cleans the legacy entry.
+  // No legacy support on `getAllMemory` — that method didn't exist before,
+  // so no user can depend on it returning legacy data.
+
+  async saveMemory(scope: string, key: string, value: unknown): Promise<void> {
+    await this.client.hSet(this.memoryKey(scope), key, JSON.stringify(value));
+  }
+
+  async getMemory(scope: string, key: string): Promise<unknown | null> {
+    const raw = await this.client.hGet(this.memoryKey(scope), key);
+    if (raw != null) return JSON.parse(raw);
+
+    // Legacy fallback: pre-patch data lives at the sessionMeta location.
+    // NOTE: the legacy key construction `memory:{scope}:{key}` is internally
+    // ambiguous if `scope` or `key` contain colons, but the new path
+    // (`memoryKey(scope)` as hash key, `key` as field name) is collision-free
+    // because field names and key names are stored in separate namespaces.
+    const legacyRaw = await this.client.hGet(
+      this.sessionMetaKey(`memory:${scope}:${key}`),
+      'value',
+    );
+    if (legacyRaw == null) return null;
+
+    // Race-safe migrate-forward. HSETNX is atomic and only writes if the
+    // new field is still absent — so a concurrent `saveMemory` from another
+    // process can't be clobbered by our migration of the legacy value.
+    //
+    // If HSETNX no-ops (returns 0/false), some other writer beat us to the
+    // canonical location between our primary-read and our migration-write.
+    // Return THEIR value, not the (now-stale) legacy value, or we'd hand
+    // the caller stale data to act on.
+    const inserted = await this.client.hSetNX(this.memoryKey(scope), key, legacyRaw);
+    if (inserted === 0 || inserted === false) {
+      const winner = await this.client.hGet(this.memoryKey(scope), key);
+      if (winner != null) return JSON.parse(winner);
+      // HSETNX said the field exists, but a follow-up hGet says it doesn't.
+      // This can only happen if a concurrent `deleteMemory` raced between
+      // HSETNX and the re-read — in which case "deleted" is the freshest
+      // truth and we should return null, not the legacy value.
+      return null;
+    }
+    return JSON.parse(legacyRaw);
+  }
+
+  async getAllMemory(scope: string): Promise<Array<{ key: string; value: unknown }>> {
+    const all = await this.client.hGetAll(this.memoryKey(scope));
+    if (!all) return [];
+    return Object.entries(all).map(([key, raw]) => ({ key, value: JSON.parse(raw) }));
+  }
+
+  async deleteMemory(scope: string, key: string): Promise<void> {
+    await this.client.hDel(this.memoryKey(scope), key);
+    // Also clean the legacy location so a re-read can't resurrect a value
+    // the caller asked to forget.
+    await this.client.hDel(this.sessionMetaKey(`memory:${scope}:${key}`), 'value');
   }
 
   // ── Execution History ────────────────────────────────────────────────

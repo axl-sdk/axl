@@ -116,6 +116,14 @@ export class MemoryManager {
     if (stateStore.saveMemory) {
       await stateStore.saveMemory(storeScope, key, value);
     } else {
+      // Loud signal for users on custom StateStore impls that don't
+      // implement memory: the fallback path silently drops metadata, can't
+      // be enumerated via getAllMemory (so session.fork() can't migrate
+      // memory across), and uses a different on-disk shape from native
+      // implementations. All three built-in stores implement the methods
+      // — anyone seeing this warning is on a custom store and should
+      // implement saveMemory/getMemory/getAllMemory/deleteMemory.
+      warnMissingMemoryMethodsOnce(stateStore);
       const storeKey = `memory:${storeScope}:${key}`;
       await stateStore.saveSessionMeta(storeKey, 'value', value);
       if (options?.metadata) {
@@ -259,4 +267,22 @@ export class MemoryManager {
       await this.vectorStore.close();
     }
   }
+}
+
+// Tracks which StateStore instances we've already warned about, so a single
+// process with one offending store sees the warning exactly once — but two
+// distinct stores each get their own warning. WeakSet lets the entries be
+// reclaimed when stores are GC'd, so long-lived processes don't accumulate.
+// Tests rely on fresh store instances per `it()` for isolation.
+const _warnedStoresMissingMemory = new WeakSet<StateStore>();
+
+function warnMissingMemoryMethodsOnce(stateStore: StateStore): void {
+  if (_warnedStoresMissingMemory.has(stateStore)) return;
+  _warnedStoresMissingMemory.add(stateStore);
+  console.warn(
+    '[axl] ctx.remember() against a StateStore without saveMemory/getMemory/getAllMemory/deleteMemory — ' +
+      'falling back to a sessionMeta-based path that drops metadata and is not enumerable. ' +
+      'Implement the four optional memory methods on your StateStore for full fidelity. ' +
+      'This warning fires once per offending store.',
+  );
 }

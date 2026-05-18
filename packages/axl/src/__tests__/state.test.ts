@@ -741,6 +741,15 @@ describe('RedisStore', () => {
         hashData.get(key)!.set(field, value);
         return 1;
       }),
+      // HSETNX semantics: set field only if it doesn't already exist.
+      // Returns 1 (set) or 0 (already existed). Mirrors node-redis v5 behavior.
+      hSetNX: vi.fn(async (key: string, field: string, value: string) => {
+        if (!hashData.has(key)) hashData.set(key, new Map());
+        const map = hashData.get(key)!;
+        if (map.has(field)) return 0;
+        map.set(field, value);
+        return 1;
+      }),
       // node-redis returns undefined (not null) for missing hash fields
       hGet: vi.fn(async (key: string, field: string): Promise<string | undefined> => {
         return hashData.get(key)?.get(field);
@@ -1227,6 +1236,259 @@ describe('RedisStore', () => {
     it('deleteEvalResult returns false for unknown id', async () => {
       const { store } = createRedisStoreWithMockClient();
       expect(await store.deleteEvalResult('does-not-exist')).toBe(false);
+    });
+  });
+
+  describe('memory', () => {
+    it('saveMemory + getMemory round-trip', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveMemory('session:s1', 'name', 'Alice');
+      expect(await store.getMemory('session:s1', 'name')).toBe('Alice');
+    });
+
+    it('getMemory returns null for missing key', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      expect(await store.getMemory('session:s1', 'nope')).toBeNull();
+    });
+
+    it('handles undefined from hGet (node-redis returns undefined for missing fields)', async () => {
+      // Same tripwire as other hash-backed methods — `hGet` returning
+      // undefined (not null) must normalize to null.
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      mockClient.hGet.mockResolvedValueOnce(undefined); // primary miss
+      mockClient.hGet.mockResolvedValueOnce(undefined); // legacy miss
+      expect(await store.getMemory('global', 'absent')).toBeNull();
+    });
+
+    it('getAllMemory returns all entries in a scope', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveMemory('global', 'a', 1);
+      await store.saveMemory('global', 'b', { nested: 'value' });
+      await store.saveMemory('other-scope', 'c', 'isolated');
+
+      const all = await store.getAllMemory('global');
+      expect(all).toHaveLength(2);
+      expect(all).toEqual(
+        expect.arrayContaining([
+          { key: 'a', value: 1 },
+          { key: 'b', value: { nested: 'value' } },
+        ]),
+      );
+      // Other scope must not bleed in
+      expect(all.find((e) => e.key === 'c')).toBeUndefined();
+    });
+
+    it('getAllMemory returns empty array for unknown scope', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      expect(await store.getAllMemory('nope')).toEqual([]);
+    });
+
+    it('saveMemory overwrites existing value', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveMemory('global', 'k', 'old');
+      await store.saveMemory('global', 'k', 'new');
+      expect(await store.getMemory('global', 'k')).toBe('new');
+    });
+
+    it('deleteMemory removes the entry', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.saveMemory('session:s1', 'k', 'v');
+      await store.deleteMemory('session:s1', 'k');
+      expect(await store.getMemory('session:s1', 'k')).toBeNull();
+    });
+
+    it('serializes complex values losslessly via JSON', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      const complex = { arr: [1, 2, 3], nested: { foo: 'bar' }, n: 42, b: true, nil: null };
+      await store.saveMemory('global', 'k', complex);
+      expect(await store.getMemory('global', 'k')).toEqual(complex);
+    });
+
+    it('uses the configured keyPrefix in the memory hash key', async () => {
+      // Tripwire: changes to memoryKey() must compose with the keyPrefix
+      // option from patch #8. Custom-prefix users would otherwise lose
+      // memory data on upgrade.
+      const { store, hashData } = createRedisStoreWithMockClient('myapp:prod:');
+      await store.saveMemory('session:s1', 'k', 'v');
+      expect(hashData.has('myapp:prod:memory:session:s1')).toBe(true);
+      // And NOT under the default prefix
+      expect(hashData.has('axl:memory:session:s1')).toBe(false);
+    });
+
+    describe('legacy fallback (pre-patch sessionMeta data)', () => {
+      // Pre-patch, ctx.remember() against RedisStore wrote via MemoryManager's
+      // sessionMeta fallback: `{prefix}session-meta:memory:{scope}:{key}`
+      // hash field `value`. After upgrade we must keep that data reachable.
+
+      it('getMemory falls back to legacy sessionMeta location and migrates forward', async () => {
+        const { store, hashData, mockClient } = createRedisStoreWithMockClient();
+
+        // Plant legacy data the way pre-patch MemoryManager would have
+        const legacyKey = 'axl:session-meta:memory:session:s1:my-key';
+        hashData.set(legacyKey, new Map([['value', JSON.stringify('legacy-value')]]));
+
+        // First read hits the legacy path
+        expect(await store.getMemory('session:s1', 'my-key')).toBe('legacy-value');
+
+        // Migrate-forward used HSETNX (race-safe)
+        expect(mockClient.hSetNX).toHaveBeenCalledWith(
+          'axl:memory:session:s1',
+          'my-key',
+          JSON.stringify('legacy-value'),
+        );
+
+        // Second read serves from the new location (no further hSetNX calls)
+        mockClient.hSetNX.mockClear();
+        expect(await store.getMemory('session:s1', 'my-key')).toBe('legacy-value');
+        expect(mockClient.hSetNX).not.toHaveBeenCalled();
+      });
+
+      it('legacy migration does not clobber a concurrent fresh write (HSETNX is atomic)', async () => {
+        // Simpler case: B's fresh write already exists when A starts reading.
+        // A's primary hGet hits and returns fresh — no migration path entered.
+        const { store, hashData } = createRedisStoreWithMockClient();
+
+        const legacyKey = 'axl:session-meta:memory:session:s1:k';
+        hashData.set(legacyKey, new Map([['value', JSON.stringify('legacy-value')]]));
+        hashData.set('axl:memory:session:s1', new Map([['k', JSON.stringify('fresh-value')]]));
+
+        expect(await store.getMemory('session:s1', 'k')).toBe('fresh-value');
+      });
+
+      it("returns the WINNING (fresh) value when B writes between A's primary read and migration write", async () => {
+        // The harder race: A's primary hGet sees no data (B hasn't written yet),
+        // A's legacy hGet returns legacy data, B's hSet lands BEFORE A's HSETNX,
+        // A's HSETNX no-ops (returns 0). A must NOT return the stale legacy value
+        // — it must re-read the canonical location and return B's fresh write.
+        const { store, mockClient, hashData } = createRedisStoreWithMockClient();
+
+        // Plant legacy data
+        const legacyKey = 'axl:session-meta:memory:session:s1:k';
+        hashData.set(legacyKey, new Map([['value', JSON.stringify('legacy')]]));
+
+        // Hook: between A's primary-read (returns undefined) and A's HSETNX,
+        // simulate process B's fresh write landing.
+        const realHGet = mockClient.hGet.getMockImplementation()!;
+        let primaryReadsSoFar = 0;
+        mockClient.hGet.mockImplementation(async (key: string, field: string) => {
+          if (key === 'axl:memory:session:s1' && field === 'k') {
+            primaryReadsSoFar++;
+            if (primaryReadsSoFar === 1) {
+              // First read: primary is empty. Schedule B's write to happen
+              // *before* A's eventual HSETNX runs.
+              return undefined;
+            }
+          }
+          return realHGet(key, field);
+        });
+
+        // Insert B's write right after A's first hGet returns undefined.
+        // The mock's HSETNX checks `map.has(field)` synchronously, so we
+        // populate the map BEFORE A reaches HSETNX. Easiest way: prime the
+        // map directly in the mock helper before the call lands.
+        const realHSetNX = mockClient.hSetNX.getMockImplementation()!;
+        mockClient.hSetNX.mockImplementationOnce(
+          async (key: string, field: string, value: string) => {
+            // Simulate B's hSet landing right before our HSETNX
+            if (!hashData.has(key)) hashData.set(key, new Map());
+            hashData.get(key)!.set(field, JSON.stringify('fresh-from-B'));
+            // Now run the real HSETNX — it'll see the field and no-op
+            return realHSetNX(key, field, value);
+          },
+        );
+
+        const result = await store.getMemory('session:s1', 'k');
+        // Critical: must return 'fresh-from-B', NOT 'legacy'. Returning legacy
+        // would be the bug — handing the caller stale data to act on.
+        expect(result).toBe('fresh-from-B');
+
+        // And HSETNX was called and no-op'd (proving we exercised the race path)
+        expect(mockClient.hSetNX).toHaveBeenCalledTimes(1);
+      });
+
+      it('returns null when a concurrent delete races between HSETNX and re-read', async () => {
+        // Edge of the edge: HSETNX no-ops (field exists), but then a deleteMemory
+        // races in between — the canonical truth is "deleted" so we must NOT
+        // resurrect the legacy value.
+        const { store, mockClient, hashData } = createRedisStoreWithMockClient();
+
+        const legacyKey = 'axl:session-meta:memory:session:s1:k';
+        hashData.set(legacyKey, new Map([['value', JSON.stringify('legacy')]]));
+
+        // Primary read returns undefined (no canonical data yet)
+        const realHGet = mockClient.hGet.getMockImplementation()!;
+        let primaryReads = 0;
+        mockClient.hGet.mockImplementation(async (key: string, field: string) => {
+          if (key === 'axl:memory:session:s1' && field === 'k') {
+            primaryReads++;
+            if (primaryReads === 1) return undefined; // primary miss
+            if (primaryReads === 2) return undefined; // re-read after HSETNX no-op (delete won)
+          }
+          return realHGet(key, field);
+        });
+
+        // HSETNX no-ops because B's fresh write landed
+        mockClient.hSetNX.mockResolvedValueOnce(0);
+
+        const result = await store.getMemory('session:s1', 'k');
+        expect(result).toBeNull(); // delete wins, no resurrection
+      });
+
+      it('mock HSETNX returns 0 when field already exists (sanity check)', async () => {
+        // Direct test of the mock's HSETNX semantics so future test authors
+        // can trust the underlying primitive.
+        const { mockClient } = createRedisStoreWithMockClient();
+        await mockClient.hSet('h', 'f', 'fresh');
+        const result = await mockClient.hSetNX('h', 'f', 'would-clobber');
+        expect(result).toBe(0);
+        expect(await mockClient.hGet('h', 'f')).toBe('fresh'); // not clobbered
+      });
+
+      it('deleteMemory also cleans the legacy location so it cannot resurrect', async () => {
+        const { store, hashData } = createRedisStoreWithMockClient();
+
+        // Plant ONLY legacy data (no new entry)
+        const legacyKey = 'axl:session-meta:memory:session:s1:k';
+        hashData.set(legacyKey, new Map([['value', JSON.stringify('legacy')]]));
+
+        // First read migrates it forward
+        expect(await store.getMemory('session:s1', 'k')).toBe('legacy');
+
+        // Delete should wipe both new AND legacy
+        await store.deleteMemory('session:s1', 'k');
+
+        // Even if the migration's new write somehow gets dropped (e.g., TTL
+        // eviction), a subsequent read must NOT resurrect from legacy.
+        hashData.delete('axl:memory:session:s1'); // simulate new entry dropped
+        expect(await store.getMemory('session:s1', 'k')).toBeNull();
+      });
+
+      it('getAllMemory does NOT include legacy data', async () => {
+        // Intentional: getAllMemory didn't exist pre-patch, so no caller
+        // can depend on it returning legacy entries. Surface the new
+        // location only; legacy entries become visible via getMemory's
+        // migration path on direct lookup.
+        const { store, hashData } = createRedisStoreWithMockClient();
+
+        const legacyKey = 'axl:session-meta:memory:global:legacy-only';
+        hashData.set(legacyKey, new Map([['value', JSON.stringify('hidden')]]));
+
+        await store.saveMemory('global', 'visible', 'shown');
+
+        const all = await store.getAllMemory('global');
+        expect(all).toEqual([{ key: 'visible', value: 'shown' }]);
+        // 'legacy-only' is NOT enumerated by design
+      });
+
+      it('legacy fallback honors custom keyPrefix', async () => {
+        const { store, hashData } = createRedisStoreWithMockClient('tenant-a:');
+
+        // Plant legacy data under the CUSTOM prefix
+        const legacyKey = 'tenant-a:session-meta:memory:session:s1:k';
+        hashData.set(legacyKey, new Map([['value', JSON.stringify('tenant-legacy')]]));
+
+        expect(await store.getMemory('session:s1', 'k')).toBe('tenant-legacy');
+      });
     });
   });
 });

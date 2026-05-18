@@ -1,4 +1,4 @@
-import type { ChatMessage, ExecutionInfo, HumanDecision } from '../types.js';
+import type { AxlEvent, ChatMessage, ExecutionInfo, HumanDecision } from '../types.js';
 import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } from './types.js';
 
 // Minimal interface for the node-redis client methods we use.
@@ -31,6 +31,11 @@ interface RedisClient {
   sRem(key: string, member: string | string[]): Promise<number>;
   sCard(key: string): Promise<number>;
   sMembers(key: string): Promise<string[]>;
+  // List ops for streaming-event persistence. RPUSH appends batches of
+  // JSON-serialized events to a per-execution list; LRANGE 0 -1 reads
+  // them back on recovery. Used by appendStreamingEvents / getStreamingEvents.
+  rPush(key: string, values: string | string[]): Promise<number>;
+  lRange(key: string, start: number, stop: number): Promise<string[]>;
   // Sorted-set ops drive the listExecutions / listEvalResults fast path.
   // zAdd adds a member with a score; zRevRangeByScore returns members in
   // descending-score order (optionally limited); zCard counts; zRem deletes.
@@ -65,6 +70,7 @@ interface RedisMulti {
   expire(key: string, seconds: number, mode?: 'NX' | 'XX' | 'GT' | 'LT'): RedisMulti;
   zAdd(key: string, member: { score: number; value: string }): RedisMulti;
   zRem(key: string, member: string | string[]): RedisMulti;
+  rPush(key: string, values: string | string[]): RedisMulti;
   // exec() returns the per-command results in queued order. We don't
   // type-narrow individual results because the callers that need a result
   // (e.g. deleteEvalResult) cast at the call site.
@@ -457,6 +463,26 @@ export class RedisStore implements StateStore {
 
   private memoryKey(scope: string): string {
     return `${this.keyPrefix}memory:${scope}`;
+  }
+
+  // ── Streaming event buffer (for `state.persist: 'streaming'`) ─────────
+  // Layout:
+  //   `{prefix}exec-events:{id}` — a Redis list. Events are RPUSH'd as
+  //     JSON-serialized AxlEvent objects, in batches. The runtime LRANGEs
+  //     the whole list on recovery and deletes it via `finalizeStreamingEvents`
+  //     once the canonical `executionHistory` blob has been written at
+  //     terminal exit.
+  //   `{prefix}streaming-exec-ids` — a Redis set tracking which executions
+  //     have an active streaming buffer. Used by `listStreamingExecutions`
+  //     to find runs whose process died mid-flight (no corresponding
+  //     `executionHistory` blob).
+
+  private streamingEventsKey(executionId: string): string {
+    return `${this.keyPrefix}exec-events:${executionId}`;
+  }
+
+  private streamingIdsKey(): string {
+    return `${this.keyPrefix}streaming-exec-ids`;
   }
 
   // ── Checkpoints ──────────────────────────────────────────────────────
@@ -863,6 +889,54 @@ export class RedisStore implements StateStore {
     // Redis doesn't have a built-in way to list keys by pattern without SCAN,
     // so we maintain a set of session IDs alongside the session data.
     return this.client.sMembers(this.sessionIdsKey());
+  }
+
+  // ── Streaming events (for state.persist: 'streaming') ──────────────────
+
+  async appendStreamingEvents(executionId: string, events: AxlEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    // Serialize once; RPUSH multiple values in a single round-trip.
+    const serialized = events.map((e) => JSON.stringify(e));
+    // Wrap RPUSH + SADD in a MULTI so the streaming-exec-ids set membership
+    // and the data list stay in sync. A crash between would otherwise leave
+    // events orphaned (in the list but not in the index, so listStreamingExecutions
+    // wouldn't find them on recovery).
+    await this.client
+      .multi()
+      .rPush(this.streamingEventsKey(executionId), serialized)
+      .sAdd(this.streamingIdsKey(), executionId)
+      .exec();
+  }
+
+  async finalizeStreamingEvents(executionId: string): Promise<void> {
+    // Atomic: drop the events list + un-register from the in-flight index
+    // together. Called from the runtime's finally hook AFTER the canonical
+    // `executionHistory` blob has been written — so this deletion just
+    // releases the streaming buffer (which is no longer load-bearing).
+    await this.client
+      .multi()
+      .del(this.streamingEventsKey(executionId))
+      .sRem(this.streamingIdsKey(), executionId)
+      .exec();
+  }
+
+  async listStreamingExecutions(): Promise<string[]> {
+    return this.client.sMembers(this.streamingIdsKey());
+  }
+
+  async getStreamingEvents(executionId: string): Promise<AxlEvent[]> {
+    const raws = await this.client.lRange(this.streamingEventsKey(executionId), 0, -1);
+    if (raws.length === 0) return [];
+    const events: AxlEvent[] = [];
+    for (const raw of raws) {
+      try {
+        events.push(JSON.parse(raw) as AxlEvent);
+      } catch {
+        // Skip malformed entries — same posture as the listExecutions
+        // slow-path fallback. A corrupt event shouldn't crash recovery.
+      }
+    }
+    return events;
   }
 
   /** Close the Redis connection. */

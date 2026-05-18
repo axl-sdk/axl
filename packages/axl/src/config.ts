@@ -48,6 +48,44 @@ export type StateConfig = {
    * integer or `Infinity`.
    */
   maxEventsPerExecution?: number;
+  /**
+   * When to persist execution events to the state store.
+   *
+   * - `'terminal'` (default, back-compat) — events are buffered in memory
+   *   and written to `executionHistory` only at the terminal `done`/`error`
+   *   event. Fastest path; if the process crashes mid-run, the events are
+   *   lost. Fine for development and short-running workflows.
+   *
+   * - `'streaming'` — events are batched and written to a streaming buffer
+   *   throughout the run (via `StateStore.appendStreamingEvents`), then the
+   *   buffer is finalized when the canonical `executionHistory` is saved at
+   *   terminal exit. If the process crashes mid-run, call
+   *   `runtime.recoverIncompleteStreams()` on the next process to reconstruct
+   *   the partial `ExecutionInfo` from the streaming buffer (status: `'failed'`,
+   *   error: `'process terminated'`). Use this in production when you need to
+   *   know "what did the workflow do up to the crash."
+   *
+   * Excluded from streaming flush even in `'streaming'` mode: `token`,
+   * `partial_object`, `string_delta` (high-volume, reconstructable from
+   * the persisted `agent_call_end.data`).
+   */
+  persist?: 'terminal' | 'streaming';
+  /**
+   * Number of events buffered before flushing to the streaming store.
+   * Default `100`. Set to `1` for per-event flush (highest durability,
+   * one Redis round-trip per emit — adds latency proportional to RTT).
+   *
+   * Only meaningful when `persist === 'streaming'`.
+   */
+  streamingBatchSize?: number;
+  /**
+   * Max milliseconds between flushes when the batch hasn't filled up.
+   * Default `1000`. Together with `streamingBatchSize`, bounds the
+   * "events lost on crash" window to `min(batchSize-of-events, interval-of-time)`.
+   *
+   * Only meaningful when `persist === 'streaming'`.
+   */
+  streamingBatchInterval?: number;
 };
 
 /** Global defaults */

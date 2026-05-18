@@ -1151,6 +1151,7 @@ Completed and failed executions are automatically persisted to the state store (
 | `getExecutions()` | `Promise<ExecutionInfo[]>` | All executions (active + historical), sorted by `startedAt` descending. Merges in-memory active executions with historical data from the state store |
 | `getExecution(id)` | `Promise<ExecutionInfo \| undefined>` | Look up a specific execution. Checks in-memory first, then falls through to the state store |
 | `deleteExecution(id)` | `Promise<boolean>` | Remove an execution from in-memory caches and the state store. Returns `true` if anything was removed. Used for GDPR right-to-be-forgotten and operator cleanup. Does NOT abort an in-flight execution — call `runtime.abort(id)` first |
+| `recoverIncompleteStreams()` | `Promise<ExecutionInfo[]>` | Synthesize partial `ExecutionInfo`s for executions whose process died while `state.persist: 'streaming'` was configured. Reads from `StateStore.listStreamingExecutions` + `getStreamingEvents`, synthesizes with `status: 'failed'` and `error: 'process terminated'`, persists via `saveExecution`, and finalizes the streaming buffer. Idempotent and safe to re-run. Wire into your process startup AFTER lazy-loading historical state. Returns `[]` when the configured store doesn't implement streaming methods |
 
 `ExecutionInfo`:
 
@@ -1269,6 +1270,9 @@ const runtime3 = new AxlRuntime({
 | `store` | `'memory' \| 'sqlite' \| StateStore` | `'memory'` | Backend implementation. Pass an instance for `RedisStore` (use `await RedisStore.create(url)`) or a custom store |
 | `sqlite` | `{ path: string }` | — | Path for the `'sqlite'` store. Required when `store === 'sqlite'` |
 | `maxEventsPerExecution` | `number` | `50_000` | Maximum number of events retained in `ExecutionInfo.events` per execution. When the cap is hit, subsequent events are dropped from the array (with a sentinel `log` event recording the truncation) — but the trace channel (`runtime.on('trace')`) and WS broadcast continue to receive every event, so live observability isn't degraded. Must be a positive integer or `Infinity` (explicit unbounded opt-out — only safe for short-lived executions). Pathological values (`0`, negative, fractional, `NaN`) are rejected at construction with a `RangeError` |
+| `persist` | `'terminal' \| 'streaming'` | `'terminal'` | When to write events to the state store. `'terminal'` (default, back-compat): events buffered in memory, written at the terminal `done`/`error` event. Fastest path; if the process crashes mid-run, events are lost. `'streaming'`: events batched and written throughout the run via `StateStore.appendStreamingEvents`; on a process crash, call `runtime.recoverIncompleteStreams()` from the next process to reconstruct a partial `ExecutionInfo` from the surviving buffer. Excluded from streaming flush: `token`, `partial_object`, `string_delta` (high-volume stream-only, reconstructable from persisted `agent_call_end.data`) |
+| `streamingBatchSize` | `number` | `100` | Number of events buffered before flushing to the streaming store. Set to `1` for per-event flush (highest durability, one Redis round-trip per emit — adds latency proportional to RTT). Only meaningful when `persist === 'streaming'` |
+| `streamingBatchInterval` | `number` | `1000` | Max milliseconds between flushes when the batch hasn't filled up. With `streamingBatchSize`, bounds the "events lost on crash" window. Only meaningful when `persist === 'streaming'` |
 
 ### Required Methods
 
@@ -1328,6 +1332,10 @@ These methods are optional (`?` on the interface). The runtime checks for their 
 | `getExecution?(executionId)` | Get a specific execution from history |
 | `listExecutions?(limit?)` | List recent executions, most recent first. Pass `undefined` for no limit |
 | `deleteExecution?(executionId)` | Delete an execution from history. Returns `true` if an entry was removed. Symmetric to `deleteEvalResult` |
+| `appendStreamingEvents?(executionId, events)` | Append a batch of events to the streaming buffer. Called by the runtime when `state.persist: 'streaming'` is configured. Should register the executionId in an in-flight index on first call |
+| `finalizeStreamingEvents?(executionId)` | Delete the streaming buffer + un-register from the in-flight index. Called by the runtime after the canonical `executionHistory` blob has been written |
+| `listStreamingExecutions?()` | List execution IDs that have a streaming buffer but no corresponding completed `executionHistory`. Used by `runtime.recoverIncompleteStreams()` |
+| `getStreamingEvents?(executionId)` | Read the events accumulated in the streaming buffer for an execution. Returns `[]` if no buffer exists |
 
 **Eval history** (for `runtime.getEvalHistory()`):
 

@@ -200,6 +200,39 @@ export class MemoryStore implements StateStore {
     return [...this.sessions.keys()];
   }
 
+  // ── Streaming events (for state.persist: 'streaming') ────────────────
+  //
+  // MemoryStore's raison d'être is in-process / ephemeral. We implement
+  // the streaming methods so tests and dev workflows behave correctly,
+  // but on a process crash these buffers are lost — same as the rest of
+  // MemoryStore's state. For real crash-survival, use RedisStore or
+  // SQLiteStore.
+
+  private streamingEvents = new Map<string, import('../types.js').AxlEvent[]>();
+
+  async appendStreamingEvents(
+    executionId: string,
+    events: import('../types.js').AxlEvent[],
+  ): Promise<void> {
+    if (events.length === 0) return;
+    const existing = this.streamingEvents.get(executionId) ?? [];
+    existing.push(...events.map((e) => structuredClone(e)));
+    this.streamingEvents.set(executionId, existing);
+  }
+
+  async finalizeStreamingEvents(executionId: string): Promise<void> {
+    this.streamingEvents.delete(executionId);
+  }
+
+  async listStreamingExecutions(): Promise<string[]> {
+    return [...this.streamingEvents.keys()];
+  }
+
+  async getStreamingEvents(executionId: string): Promise<import('../types.js').AxlEvent[]> {
+    const events = this.streamingEvents.get(executionId) ?? [];
+    return events.map((e) => structuredClone(e));
+  }
+
   // ── Lifecycle ──────────────────────────────────────────────────────
 
   async close(): Promise<void> {}

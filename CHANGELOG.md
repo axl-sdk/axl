@@ -38,6 +38,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`MemoryManager` emits a one-shot `console.warn` when used against a custom `StateStore` that doesn't implement memory methods.** Previously, the sessionMeta-fallback path was completely silent — users on custom stores lost `metadata` and `getAllMemory` enumeration with zero signal. Now they get a single warning per offending store listing the four methods to implement. All three built-in stores implement the methods, so no warning fires for users on `MemoryStore` / `SQLiteStore` / `RedisStore`.
 
 ### Added
+- **`state.persist: 'streaming'` for in-flight trace durability.** New `StateConfig` options:
+  - `persist?: 'terminal' | 'streaming'` — when `'streaming'`, events are batched and flushed to a streaming buffer throughout the run via `StateStore.appendStreamingEvents`. The buffer is finalized when the canonical `executionHistory` blob lands at terminal exit. If the process crashes mid-run, call `runtime.recoverIncompleteStreams()` on the next process to reconstruct a partial `ExecutionInfo` (`status: 'failed'`, `error: 'process terminated (recovered from streaming buffer)'`) from the surviving buffer. Default `'terminal'` (back-compat).
+  - `streamingBatchSize?: number` — flush every N events. Default `100`. Set to `1` for per-event flush (one Redis round-trip per emit, highest durability at the cost of latency).
+  - `streamingBatchInterval?: number` — flush at most every N milliseconds. Default `1000`. The "events lost on crash" window is bounded by `min(batchSize-of-events, interval-of-time)`.
+
+  Excluded from the streaming flush even in `'streaming'` mode: `token`, `partial_object`, `string_delta`. These are high-volume stream-only events already filtered from `ExecutionInfo.events`; tokens/partials can be reconstructed from the persisted `agent_call_end.data.response`.
+
+  Four new optional `StateStore` methods (additive — custom stores can adopt incrementally): `appendStreamingEvents`, `finalizeStreamingEvents`, `listStreamingExecutions`, `getStreamingEvents`. `RedisStore` implements all four atomically (RPUSH + SADD in one MULTI on append; DEL + SREM in one MULTI on finalize). `MemoryStore` implements functional stubs (useful for tests; doesn't survive a process crash by design). `SQLiteStore` does not implement streaming — single-process file storage gets less value from crash-survival; configure `state.persist: 'terminal'` (the default) for SQLite-backed installs.
+
+  Save-order is correct on failure: `persistExecution` saves the canonical `executionHistory` blob FIRST, then finalizes the streaming buffer. If `saveExecution` fails, the buffer stays in place so the next process's `recoverIncompleteStreams()` can still reconstruct the partial ExecutionInfo. `runtime.shutdown()` drains the flusher before closing the state store, so an orderly shutdown doesn't lose the last 1s of events.
+
+  ```typescript
+  // Production: stream events to Redis for crash-survival
+  const runtime = new AxlRuntime({
+    state: {
+      store: await RedisStore.create('redis://localhost:6379'),
+      persist: 'streaming',
+    },
+  });
+
+  // On the NEXT process, after the previous one crashed:
+  const recovered = await runtime.recoverIncompleteStreams();
+  console.log(`Recovered ${recovered.length} crashed executions`);
+  ```
+
 - **`RedisStore` TTL config: `defaultTtl` + per-category overrides.** Without TTLs, every `save*` accumulates forever and Redis eventually OOMs. New options let operators bound the lifetime of each storage category:
 
   ```typescript

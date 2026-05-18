@@ -829,6 +829,7 @@ describe('RedisStore', () => {
     setData: Map<string, Set<string>>,
     zsetData: Map<string, Map<string, number>>,
     ttls: Map<string, number>,
+    listData: Map<string, string[]>,
   ) {
     type QueuedOp = () => unknown;
     const queue: QueuedOp[] = [];
@@ -867,6 +868,7 @@ describe('RedisStore', () => {
           for (const k of keys) {
             if (data.delete(k)) count++;
             if (hashData.delete(k)) count++;
+            if (listData.delete(k)) count++;
           }
           return count;
         });
@@ -936,6 +938,16 @@ describe('RedisStore', () => {
         });
         return chain;
       },
+      rPush(key: string, values: string | string[]) {
+        queue.push(() => {
+          if (!listData.has(key)) listData.set(key, []);
+          const list = listData.get(key)!;
+          const arr = Array.isArray(values) ? values : [values];
+          for (const v of arr) list.push(v);
+          return list.length;
+        });
+        return chain;
+      },
       async exec(): Promise<unknown[]> {
         // Apply queued ops in order. A real Redis MULTI is atomic — we
         // don't simulate failure scenarios here, but the per-op results
@@ -981,6 +993,8 @@ describe('RedisStore', () => {
     // Tracks the TTL last applied to each key (seconds, not absolute time).
     // The mock doesn't simulate actual expiration — tests assert what was set.
     const ttls = new Map<string, number>();
+    // Lists for streaming-event persistence (RPUSH / LRANGE).
+    const listData = new Map<string, string[]>();
 
     const mockClient = {
       hSet: vi.fn(async (key: string, field: string, value: string) => {
@@ -1046,6 +1060,7 @@ describe('RedisStore', () => {
         for (const k of keys) {
           if (data.delete(k)) count++;
           if (hashData.delete(k)) count++;
+          if (listData.delete(k)) count++;
         }
         return count;
       }),
@@ -1076,6 +1091,19 @@ describe('RedisStore', () => {
       }),
       sCard: vi.fn(async (key: string) => {
         return setData.get(key)?.size ?? 0;
+      }),
+      rPush: vi.fn(async (key: string, values: string | string[]) => {
+        if (!listData.has(key)) listData.set(key, []);
+        const list = listData.get(key)!;
+        const arr = Array.isArray(values) ? values : [values];
+        for (const v of arr) list.push(v);
+        return list.length;
+      }),
+      lRange: vi.fn(async (key: string, start: number, stop: number) => {
+        const list = listData.get(key);
+        if (!list) return [];
+        const end = stop < 0 ? list.length + stop : stop;
+        return list.slice(start, end + 1);
       }),
       mGet: vi.fn(async (keys: string[]): Promise<Array<string | null>> => {
         return keys.map((k) => data.get(k) ?? null);
@@ -1136,7 +1164,7 @@ describe('RedisStore', () => {
       // MULTI/EXEC is all-or-nothing, but our mock isn't simulating that
       // — it just guarantees the queued ops run together without other
       // mock interleaving (which is what callers actually care about).
-      multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData, ttls)),
+      multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData, ttls, listData)),
       quit: vi.fn(async () => undefined),
     };
 
@@ -1156,7 +1184,7 @@ describe('RedisStore', () => {
       memory: ttlConfig?.memory ?? null,
     };
 
-    return { store, mockClient, data, hashData, setData, zsetData, ttls };
+    return { store, mockClient, data, hashData, setData, zsetData, ttls, listData };
   }
 
   describe('keyPrefix', () => {
@@ -2407,6 +2435,133 @@ describe('RedisStore', () => {
         expect((store as any).ttlFor('session')).toBeUndefined();
         expect((store as any).ttlFor('sessionMeta')).toBe(7200);
       });
+    });
+  });
+
+  describe('streaming events (state.persist: streaming, #1)', () => {
+    const sampleEvent = (n: number) =>
+      ({
+        executionId: 'e1',
+        step: n,
+        type: 'agent_call_end',
+        timestamp: 1000 + n,
+        askId: 'ask-1',
+        depth: 0,
+        agent: 'A',
+        model: 'openai:gpt-4o',
+        cost: 0.001,
+        duration: 50,
+        data: { prompt: 'p', response: 'r', params: {}, turn: 1 },
+      }) as unknown as import('../types.js').AxlEvent;
+
+    it('appendStreamingEvents writes JSON-serialized events to the list and registers in the in-flight set', async () => {
+      const { store, listData, setData } = createRedisStoreWithMockClient();
+
+      await store.appendStreamingEvents('e1', [sampleEvent(0), sampleEvent(1)]);
+
+      const list = listData.get('axl:exec-events:e1');
+      expect(list).toBeDefined();
+      expect(list).toHaveLength(2);
+      expect(JSON.parse(list![0]).step).toBe(0);
+      expect(JSON.parse(list![1]).step).toBe(1);
+
+      // In-flight index registered
+      expect(setData.get('axl:streaming-exec-ids')?.has('e1')).toBe(true);
+    });
+
+    it('appendStreamingEvents is a no-op for empty arrays', async () => {
+      const { store, mockClient, listData, setData } = createRedisStoreWithMockClient();
+      await store.appendStreamingEvents('e1', []);
+
+      // No RPUSH/SADD/MULTI calls — fast bail at the top
+      expect(mockClient.multi).not.toHaveBeenCalled();
+      expect(mockClient.rPush).not.toHaveBeenCalled();
+      expect(listData.size).toBe(0);
+      expect(setData.size).toBe(0);
+    });
+
+    it('multiple append calls accumulate in order into the same list', async () => {
+      const { store, listData } = createRedisStoreWithMockClient();
+      await store.appendStreamingEvents('e1', [sampleEvent(0)]);
+      await store.appendStreamingEvents('e1', [sampleEvent(1), sampleEvent(2)]);
+      await store.appendStreamingEvents('e1', [sampleEvent(3)]);
+
+      const list = listData.get('axl:exec-events:e1');
+      expect(list).toHaveLength(4);
+      const steps = list!.map((raw) => JSON.parse(raw).step);
+      expect(steps).toEqual([0, 1, 2, 3]);
+    });
+
+    it('appendStreamingEvents is atomic — RPUSH + SADD in one MULTI', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      await store.appendStreamingEvents('e1', [sampleEvent(0)]);
+
+      expect(mockClient.multi).toHaveBeenCalledTimes(1);
+      // No single-op RPUSH escaped — went through the multi() chain
+      expect(mockClient.rPush).not.toHaveBeenCalled();
+      expect(mockClient.sAdd).not.toHaveBeenCalled();
+    });
+
+    it('finalizeStreamingEvents deletes the list + un-registers from the in-flight set', async () => {
+      const { store, listData, setData } = createRedisStoreWithMockClient();
+      await store.appendStreamingEvents('e1', [sampleEvent(0)]);
+      expect(listData.has('axl:exec-events:e1')).toBe(true);
+      expect(setData.get('axl:streaming-exec-ids')?.has('e1')).toBe(true);
+
+      await store.finalizeStreamingEvents('e1');
+
+      expect(listData.has('axl:exec-events:e1')).toBe(false);
+      expect(setData.get('axl:streaming-exec-ids')?.has('e1')).toBe(false);
+    });
+
+    it('listStreamingExecutions returns IDs with active streaming buffers', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.appendStreamingEvents('e1', [sampleEvent(0)]);
+      await store.appendStreamingEvents('e2', [sampleEvent(0)]);
+      await store.appendStreamingEvents('e3', [sampleEvent(0)]);
+      await store.finalizeStreamingEvents('e2'); // simulate graceful completion
+
+      const ids = await store.listStreamingExecutions();
+      expect(ids.sort()).toEqual(['e1', 'e3']); // e2 already finalized
+    });
+
+    it('getStreamingEvents reads back the appended events in order', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      const events = [sampleEvent(0), sampleEvent(1), sampleEvent(2)];
+      await store.appendStreamingEvents('e1', events);
+
+      const recovered = await store.getStreamingEvents('e1');
+      expect(recovered).toHaveLength(3);
+      expect(recovered.map((e) => (e as { step: number }).step)).toEqual([0, 1, 2]);
+    });
+
+    it('getStreamingEvents returns empty array for unknown id', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      expect(await store.getStreamingEvents('unknown')).toEqual([]);
+    });
+
+    it('getStreamingEvents skips malformed JSON without crashing recovery', async () => {
+      const { store, listData } = createRedisStoreWithMockClient();
+      listData.set('axl:exec-events:e1', [
+        JSON.stringify(sampleEvent(0)),
+        '{ not valid json',
+        JSON.stringify(sampleEvent(2)),
+      ]);
+
+      const recovered = await store.getStreamingEvents('e1');
+      expect(recovered).toHaveLength(2);
+      expect((recovered[0] as { step: number }).step).toBe(0);
+      expect((recovered[1] as { step: number }).step).toBe(2);
+    });
+
+    it('uses the configured keyPrefix for both the events list and the in-flight set', async () => {
+      const { store, listData, setData } = createRedisStoreWithMockClient('tenant-a:');
+      await store.appendStreamingEvents('e1', [sampleEvent(0)]);
+      expect(listData.has('tenant-a:exec-events:e1')).toBe(true);
+      expect(setData.has('tenant-a:streaming-exec-ids')).toBe(true);
+      // And NOT under the default prefix
+      expect(listData.has('axl:exec-events:e1')).toBe(false);
+      expect(setData.has('axl:streaming-exec-ids')).toBe(false);
     });
   });
 

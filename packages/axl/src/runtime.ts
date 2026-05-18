@@ -63,6 +63,175 @@ function hashInput(input: unknown): string {
 /** Default cap on `ExecutionInfo.events` per execution. Can be
  *  overridden via `config.state.maxEventsPerExecution`. */
 const DEFAULT_MAX_EVENTS_PER_EXECUTION = 50_000;
+const DEFAULT_STREAMING_BATCH_SIZE = 100;
+const DEFAULT_STREAMING_BATCH_INTERVAL = 1_000; // ms
+
+/**
+ * Event types excluded from the streaming buffer (high-volume, stream-only
+ * by design — already filtered from `ExecutionInfo.events` via
+ * `pushEventBounded`). Including these would multiply Redis traffic by
+ * 10–100× for no recovery benefit: token streams can be reconstructed from
+ * the persisted `agent_call_end.data.response`, and partial objects from
+ * `agent_call_end.data` similarly. `string_delta` is incremental UI state
+ * with no value post-crash.
+ */
+const STREAMING_EXCLUDED_TYPES: ReadonlySet<string> = new Set([
+  'token',
+  'partial_object',
+  'string_delta',
+]);
+
+/**
+ * Per-execution streaming-event buffer with size-and-time-bounded flushes.
+ *
+ * Lifecycle:
+ *   1. `append(executionId, event)` is called on every emitted event. The
+ *      event is added to the per-execution buffer; if the buffer reaches
+ *      `batchSize`, it flushes immediately. Otherwise a timer is armed to
+ *      flush after `batchInterval` ms.
+ *   2. `finalize(executionId)` is called by the runtime's terminal path
+ *      AFTER the canonical `executionHistory` has been saved. It flushes
+ *      any remaining buffer + calls `stateStore.finalizeStreamingEvents`
+ *      to release the per-execution buffer in the store.
+ *   3. `flushAll()` is called on `runtime.shutdown()` — best-effort drain
+ *      so an orderly shutdown doesn't lose the last 1s of events.
+ *
+ * Failure posture: flush errors are caught and logged (`console.error`),
+ * NOT propagated — the workflow's hot path must not crash because the
+ * streaming store is temporarily unavailable. The buffer is dropped on
+ * flush failure to bound memory; users who need exactly-once delivery
+ * should configure their backing store for high availability.
+ */
+class StreamingFlusher {
+  private buffers = new Map<string, AxlEvent[]>();
+  private timers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * Tracks the most recent in-flight `appendStreamingEvents` per execution
+   * so `finalize` can await it. Without this, a size-triggered fire-and-
+   * forget flush whose RPUSH lands AFTER `finalize`'s DEL would resurrect
+   * the buffer + re-register the execution in the streaming-exec-ids set
+   * — a phantom orphan that recoverIncompleteStreams would later mis-recover.
+   */
+  private inflight = new Map<string, Promise<void>>();
+
+  constructor(
+    private store: StateStore,
+    private batchSize: number,
+    private batchInterval: number,
+  ) {}
+
+  append(executionId: string, event: AxlEvent): void {
+    if (STREAMING_EXCLUDED_TYPES.has(event.type)) return;
+
+    let buffer = this.buffers.get(executionId);
+    if (!buffer) {
+      buffer = [];
+      this.buffers.set(executionId, buffer);
+    }
+    buffer.push(event);
+
+    if (buffer.length >= this.batchSize) {
+      // Synchronous flush trigger; the actual write is async via Promise.
+      // The returned Promise is registered in `inflight` so finalize can
+      // await it.
+      void this.flush(executionId);
+      return;
+    }
+
+    // Arm a timer if one isn't already armed for this execution
+    if (!this.timers.has(executionId)) {
+      const timer = setTimeout(() => {
+        this.timers.delete(executionId);
+        void this.flush(executionId);
+      }, this.batchInterval);
+      // Don't block process exit on the timer
+      if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+        (timer as { unref?: () => void }).unref?.();
+      }
+      this.timers.set(executionId, timer);
+    }
+  }
+
+  /** Flush this execution's buffer immediately. Awaits any prior in-flight
+   *  flush for the same execution so writes land in order. */
+  async flush(executionId: string): Promise<void> {
+    const buffer = this.buffers.get(executionId);
+    if (!buffer || buffer.length === 0) return;
+    // Swap the buffer atomically (synchronously) so concurrent appends
+    // go to a fresh array, not the one we're about to write.
+    this.buffers.set(executionId, []);
+    // Cancel any pending timer for this execution (we just flushed)
+    const timer = this.timers.get(executionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.timers.delete(executionId);
+    }
+    // Chain after any prior in-flight write so order is preserved AND so
+    // `finalize` only needs to await the most recent promise to wait on
+    // all pending writes.
+    const prior = this.inflight.get(executionId) ?? Promise.resolve();
+    const next = prior.then(async () => {
+      try {
+        await this.store.appendStreamingEvents?.(executionId, buffer);
+      } catch (err) {
+        // Workflow hot path must not crash on a streaming-store hiccup.
+        // Log and drop — exactly-once delivery is not promised here.
+
+        console.error(
+          `[axl] StreamingFlusher: failed to append ${buffer.length} events for ` +
+            `executionId=${executionId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    });
+    this.inflight.set(executionId, next);
+    return next;
+  }
+
+  /** Finalize an execution — flush remaining buffer + release store-side buffer.
+   *  Critically, awaits the most recent in-flight `appendStreamingEvents` BEFORE
+   *  calling `finalizeStreamingEvents`, so a late-landing RPUSH can't resurrect
+   *  the buffer after we've deleted it. */
+  async finalize(executionId: string): Promise<void> {
+    await this.flush(executionId);
+    // Drain any prior in-flight writes BEFORE deleting the store-side buffer.
+    // `flush` updated `inflight` to chain after the prior write; awaiting that
+    // promise covers ALL pending writes (they're chained).
+    const pending = this.inflight.get(executionId);
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        // Already logged inside flush(). Don't double-log.
+      }
+      this.inflight.delete(executionId);
+    }
+    // Drop any in-memory state for this execution
+    this.buffers.delete(executionId);
+    const timer = this.timers.get(executionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.timers.delete(executionId);
+    }
+    try {
+      await this.store.finalizeStreamingEvents?.(executionId);
+    } catch (err) {
+      console.error(
+        `[axl] StreamingFlusher: failed to finalize executionId=${executionId}: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
+  }
+
+  /** Best-effort drain of every pending buffer. Called from `runtime.shutdown()`. */
+  async flushAll(): Promise<void> {
+    const ids = [...this.buffers.keys()];
+    // Flush all buffers, then await any chained writes for each so shutdown
+    // doesn't return while a streaming write is still racing.
+    await Promise.all(ids.map((id) => this.flush(id)));
+    const pendings = [...this.inflight.values()];
+    await Promise.allSettled(pendings);
+  }
+}
 
 /** Detect AbortError from both `DOMException` (browser / Node fetch path)
  *  and a plain `Error` with `name === 'AbortError'` (signal.throwIfAborted,
@@ -256,6 +425,9 @@ export class AxlRuntime extends EventEmitter {
    *  `events` field — keeps the log to one line per row instead of one per
    *  rebuild tick. */
   private warnedMalformedExecutions = new Set<string>();
+  /** Streaming-mode flusher. `undefined` when persist === 'terminal'
+   *  (back-compat default — no buffering overhead, no batching timer). */
+  private streamingFlusher?: StreamingFlusher;
 
   constructor(config?: AxlConfig) {
     super();
@@ -287,6 +459,28 @@ export class AxlRuntime extends EventEmitter {
         vectorStore: this.config.memory.vectorStore,
         embedder: this.config.memory.embedder,
       });
+    }
+    // Stand up the streaming flusher iff `state.persist === 'streaming'`
+    // AND the configured store implements the streaming methods. If the
+    // store doesn't support streaming (e.g. a custom StateStore, or SQLite
+    // which doesn't implement these methods), we leave the flusher
+    // undefined and emit a one-shot warning so users don't think they're
+    // getting durability they're not.
+    if (this.config.state?.persist === 'streaming') {
+      if (this.stateStore.appendStreamingEvents) {
+        this.streamingFlusher = new StreamingFlusher(
+          this.stateStore,
+          this.config.state.streamingBatchSize ?? DEFAULT_STREAMING_BATCH_SIZE,
+          this.config.state.streamingBatchInterval ?? DEFAULT_STREAMING_BATCH_INTERVAL,
+        );
+      } else {
+        console.warn(
+          `[axl] config.state.persist === 'streaming' but the configured StateStore ` +
+            `does not implement appendStreamingEvents. Streaming durability is disabled. ` +
+            `Use RedisStore for crash-survival, or implement the optional streaming ` +
+            `methods on your custom StateStore.`,
+        );
+      }
     }
   }
 
@@ -436,16 +630,43 @@ export class AxlRuntime extends EventEmitter {
    */
   private persistExecution(execInfo: ExecutionInfo): void {
     const snapshot = structuredClone(execInfo);
+    const id = execInfo.executionId;
 
     if (this.stateStore.saveExecution) {
-      this.stateStore.saveExecution(snapshot).catch(() => {
-        // Best-effort persistence — execution still succeeded/failed normally
-      });
+      // Chain: save canonical executionHistory first, THEN finalize the
+      // streaming buffer. Order matters — if the canonical save fails, we
+      // want the streaming buffer left in place so the next process's
+      // `recoverIncompleteStreams()` can still reconstruct the partial
+      // ExecutionInfo. Releasing the buffer before the canonical save
+      // would lose data on a failed save.
+      //
+      // The two failure modes are kept distinct:
+      //   - saveExecution fails → buffer left in place (recovery posture).
+      //   - saveExecution succeeds → finalize fails → orphan buffer that
+      //     the next process's recoverIncompleteStreams will reap via its
+      //     "canonical-exists, drop orphan" branch. Best-effort cleanup.
+      this.stateStore
+        .saveExecution(snapshot)
+        .then(() => {
+          // Save succeeded — fire finalize but isolate its failure mode
+          // so it doesn't get conflated with save-failure in the outer catch.
+          this.streamingFlusher?.finalize(id).catch(() => {
+            // Buffer becomes an orphan; recoverIncompleteStreams cleans up.
+          });
+        })
+        .catch(() => {
+          // Save failed; leave buffer in place for next-process recovery.
+        });
+    } else if (this.streamingFlusher) {
+      // No saveExecution but streaming is enabled (custom store). Drop
+      // the streaming buffer anyway — the workflow has completed in this
+      // process, and the buffer wasn't going to be load-bearing without
+      // a saveExecution path to gate against.
+      this.streamingFlusher.finalize(id).catch(() => {});
     }
 
     // Move from active to historical cache to bound active map growth.
     // Use the snapshot so the cached entry is not mutated by lingering closures.
-    const id = execInfo.executionId;
     this.historicalExecutions.set(id, snapshot);
     this.executions.delete(id);
   }
@@ -753,6 +974,7 @@ export class AxlRuntime extends EventEmitter {
       awaitHumanHandler: options?.awaitHumanHandler,
       eventStreamOptions: options?.events,
       onTrace: (event: AxlEvent) => {
+        this.streamingFlusher?.append(executionId, event);
         this.emit('trace', event);
         this.outputAxlEvent(event);
       },
@@ -835,6 +1057,11 @@ export class AxlRuntime extends EventEmitter {
         // every event; only the in-memory array is bounded.
         pushEventBounded(execInfo, event, this.maxEventsPerExecution);
         execInfo.totalCost += eventCostContribution(event);
+        // Streaming durability: in `state.persist: 'streaming'` mode the
+        // flusher batches events to the store throughout the run, so a
+        // mid-run crash leaves a recoverable buffer. No-op when
+        // `persist === 'terminal'` (the back-compat default).
+        this.streamingFlusher?.append(executionId, event);
         this.emit('trace', event);
         this.outputAxlEvent(event);
         // Persist handoff records to session metadata. Records land on
@@ -992,6 +1219,7 @@ export class AxlRuntime extends EventEmitter {
           // execute() for full rationale.
           pushEventBounded(execInfo!, event, this.maxEventsPerExecution);
           execInfo!.totalCost += eventCostContribution(event);
+          this.streamingFlusher?.append(executionId, event);
           this.emit('trace', event);
           this.outputAxlEvent(event);
           // Single fan-out: every event flows verbatim to the wire. The
@@ -1184,6 +1412,13 @@ export class AxlRuntime extends EventEmitter {
       }
     };
 
+    // Drain the streaming flusher BEFORE closing the state store — the
+    // flush writes to the store, so closing first would lose the last
+    // batch (up to 1s of events by default).
+    if (this.streamingFlusher) {
+      await safeClose('streamingFlusher', () => this.streamingFlusher!.flushAll());
+    }
+
     if (this.mcpManager) await safeClose('mcpManager', () => this.mcpManager!.shutdown());
     if (this.memoryManager) await safeClose('memoryManager', () => this.memoryManager!.close());
     if (this.stateStore.close) await safeClose('stateStore', () => this.stateStore.close!());
@@ -1194,6 +1429,98 @@ export class AxlRuntime extends EventEmitter {
         `shutdown encountered ${errors.length} error(s): ${errors.map((e) => e.message).join('; ')}`,
       );
     }
+  }
+
+  /**
+   * Recover executions whose process died mid-run when `state.persist:
+   * 'streaming'` was configured. Synthesizes a partial `ExecutionInfo`
+   * from the streaming buffer for each — `status: 'failed'`, error
+   * `'process terminated'` — registers them in the historical cache so
+   * they show up in `getExecutions()`, persists them via the store's
+   * `saveExecution`, and finalizes the streaming buffer.
+   *
+   * Idempotent — if the streaming buffer is already gone (or
+   * `listStreamingExecutions` is empty), this is a no-op. Returns the
+   * list of recovered `ExecutionInfo`s for caller introspection.
+   *
+   * Wire this into your process startup AFTER `runtime.getExecutions()`
+   * has lazy-loaded the historical cache. Order matters: completed
+   * executions already in the store should not be overwritten by a
+   * stale streaming buffer that the previous process didn't get to
+   * finalize. The implementation checks the historical store before
+   * synthesizing, so a re-run is safe.
+   */
+  async recoverIncompleteStreams(): Promise<ExecutionInfo[]> {
+    if (!this.stateStore.listStreamingExecutions || !this.stateStore.getStreamingEvents) {
+      // Store doesn't support streaming — nothing to recover.
+      return [];
+    }
+
+    const ids = await this.stateStore.listStreamingExecutions();
+    if (ids.length === 0) return [];
+
+    // Ensure historicalExecutions is populated so we don't double-recover
+    // an execution that already has a complete `executionHistory` blob.
+    // (Race: a previous process might have finalized after writing
+    // saveExecution, but our streaming list still has the entry. Defensive
+    // check.)
+    await this.getExecutions();
+
+    const recovered: ExecutionInfo[] = [];
+    for (const id of ids) {
+      // If a canonical execution already exists, just drop the orphan buffer.
+      const existing = this.historicalExecutions.get(id);
+      if (existing) {
+        await this.stateStore.finalizeStreamingEvents?.(id);
+        continue;
+      }
+
+      const events = await this.stateStore.getStreamingEvents(id);
+      if (events.length === 0) {
+        // Empty buffer — drop the orphan index entry.
+        await this.stateStore.finalizeStreamingEvents?.(id);
+        continue;
+      }
+
+      // Synthesize a partial ExecutionInfo. We don't have the original
+      // input or workflow name on hand, but we can pull them off events
+      // when available (`workflow_start` carries the workflow name in
+      // `data.input` context).
+      const firstEvent = events[0];
+      const lastEvent = events[events.length - 1];
+      const startedAt = firstEvent.timestamp ?? Date.now();
+      const completedAt = lastEvent.timestamp ?? startedAt;
+
+      // workflow_start carries `workflow` on the event itself (auto-stamped
+      // by the ctx layer). Fall back to <unknown> if absent.
+      const workflowStartEvent = events.find((e) => e.type === 'workflow_start');
+      const workflowName = workflowStartEvent?.workflow ?? '<unknown>';
+
+      // Sum cost from cost-bearing leaf events
+      const totalCost = events.reduce((sum, e) => sum + eventCostContribution(e), 0);
+
+      const synthesized: ExecutionInfo = {
+        executionId: id,
+        workflow: workflowName,
+        status: 'failed',
+        events,
+        totalCost,
+        startedAt,
+        completedAt,
+        duration: completedAt - startedAt,
+        error: 'process terminated (recovered from streaming buffer)',
+      };
+
+      // Persist + register
+      if (this.stateStore.saveExecution) {
+        await this.stateStore.saveExecution(synthesized);
+      }
+      this.historicalExecutions.set(id, synthesized);
+      await this.stateStore.finalizeStreamingEvents?.(id);
+      recovered.push(synthesized);
+    }
+
+    return recovered;
   }
 
   /** Abort a running execution by its ID. */

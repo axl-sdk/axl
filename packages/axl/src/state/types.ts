@@ -1,4 +1,4 @@
-import type { ChatMessage, ExecutionInfo, HumanDecision } from '../types.js';
+import type { AxlEvent, ChatMessage, ExecutionInfo, HumanDecision } from '../types.js';
 
 /** A pending human decision awaiting resolution. */
 export type PendingDecision = {
@@ -87,6 +87,49 @@ export interface StateStore {
   // Sessions (Studio introspection)
   /** List all session IDs (used by Studio session browser). */
   listSessions?(): Promise<string[]>;
+
+  // Streaming trace persistence (for `state.persist: 'streaming'`)
+  //
+  // These methods power the "in-flight durability" path: events are batched
+  // and appended to a transient streaming buffer throughout the run, then
+  // finalized (the buffer dropped) once the canonical `executionHistory`
+  // blob lands at terminal exit. If the process crashes mid-run, the
+  // streaming buffer is the only surviving record — `listStreamingExecutions`
+  // + `getStreamingEvents` let the next process reconstruct a partial
+  // `ExecutionInfo` via `runtime.recoverIncompleteStreams()`.
+  //
+  // All four methods are OPTIONAL. Stores that don't implement them treat
+  // `state.persist: 'streaming'` as a soft no-op (no streaming durability,
+  // but the workflow still runs normally). RedisStore implements all four;
+  // MemoryStore and SQLiteStore implement them as in-memory / on-disk
+  // stubs that work for tests but don't survive a process crash (their
+  // raison d'être is in-process / single-process anyway).
+
+  /**
+   * Append a batch of events to the streaming buffer for an execution.
+   * Should be idempotent w.r.t. the executionId being new vs existing
+   * (first call also registers the id in the "in-flight" index used by
+   * `listStreamingExecutions`).
+   */
+  appendStreamingEvents?(executionId: string, events: AxlEvent[]): Promise<void>;
+  /**
+   * Finalize a streaming execution — delete its buffer + un-register it
+   * from the in-flight index. Called by the runtime after the canonical
+   * `executionHistory` blob has been written, so the streaming buffer
+   * is no longer the source of truth for this execution.
+   */
+  finalizeStreamingEvents?(executionId: string): Promise<void>;
+  /**
+   * List execution IDs that have a streaming buffer but no corresponding
+   * completed `executionHistory` — i.e., runs whose process died mid-flight.
+   * The runtime calls this from `recoverIncompleteStreams()`.
+   */
+  listStreamingExecutions?(): Promise<string[]>;
+  /**
+   * Read the events accumulated in the streaming buffer for an execution.
+   * Returns `[]` if no buffer exists.
+   */
+  getStreamingEvents?(executionId: string): Promise<AxlEvent[]>;
 
   // Lifecycle
   close?(): Promise<void>;

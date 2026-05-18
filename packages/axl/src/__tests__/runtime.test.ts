@@ -2793,3 +2793,402 @@ describe('deleteExecution()', () => {
     expect(deleted).toBe(true);
   });
 });
+
+describe("state.persist: 'streaming' (#1)", () => {
+  // Use MemoryStore for these tests — its streaming methods are functional
+  // stubs that work in-process. Production users get crash-survival via
+  // RedisStore, but the runtime-side flusher logic is store-agnostic.
+
+  function makeRuntime(
+    persist: 'terminal' | 'streaming',
+    extras?: { batchSize?: number; batchInterval?: number },
+  ) {
+    const runtime = new AxlRuntime({
+      state: {
+        store: 'memory',
+        persist,
+        streamingBatchSize: extras?.batchSize,
+        streamingBatchInterval: extras?.batchInterval,
+      },
+    });
+    runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
+    const wf = workflow({
+      name: 'wf',
+      input: z.object({ msg: z.string() }),
+      handler: async (ctx) => `echo: ${ctx.input.msg}`,
+    });
+    runtime.register(wf);
+    return runtime;
+  }
+
+  it('terminal mode (default) does not buffer events to the streaming store', async () => {
+    const runtime = makeRuntime('terminal');
+    const store = runtime.getStateStore();
+
+    await runtime.execute('wf', { msg: 'hi' });
+
+    // No streaming buffer was created — there's nothing to recover.
+    const ids = (await store.listStreamingExecutions?.()) ?? [];
+    expect(ids).toEqual([]);
+  });
+
+  it('streaming mode flushes events to the store and finalizes on graceful exit', async () => {
+    const runtime = makeRuntime('streaming', { batchSize: 1, batchInterval: 10 });
+    const store = runtime.getStateStore();
+
+    await runtime.execute('wf', { msg: 'hi' });
+    // persistExecution chains save→finalize fire-and-forget after execute()
+    // returns. Wait a tick for the chain to settle before asserting.
+    await new Promise((r) => setTimeout(r, 50));
+
+    // After the workflow completes successfully, the streaming buffer is
+    // finalized — listStreamingExecutions should be empty.
+    const ids = (await store.listStreamingExecutions?.()) ?? [];
+    expect(ids).toEqual([]);
+  });
+
+  it('streaming mode leaves the buffer in place when saveExecution fails', async () => {
+    // Custom store that has streaming methods but fails saveExecution.
+    const buffers = new Map<string, import('../types.js').AxlEvent[]>();
+    const fakeStore = {
+      saveCheckpoint: async () => {},
+      getCheckpoint: async () => null,
+      saveSession: async () => {},
+      getSession: async () => [],
+      deleteSession: async () => {},
+      saveSessionMeta: async () => {},
+      getSessionMeta: async () => null,
+      savePendingDecision: async () => {},
+      getPendingDecisions: async () => [],
+      resolveDecision: async () => {},
+      saveExecutionState: async () => {},
+      getExecutionState: async () => null,
+      listPendingExecutions: async () => [],
+      // Streaming methods
+      appendStreamingEvents: async (id: string, events: import('../types.js').AxlEvent[]) => {
+        const existing = buffers.get(id) ?? [];
+        existing.push(...events);
+        buffers.set(id, existing);
+      },
+      finalizeStreamingEvents: async (id: string) => {
+        buffers.delete(id);
+      },
+      listStreamingExecutions: async () => [...buffers.keys()],
+      getStreamingEvents: async (id: string) => buffers.get(id) ?? [],
+      // Failing saveExecution
+      saveExecution: async () => {
+        throw new Error('store unavailable');
+      },
+    };
+
+    const runtime = new AxlRuntime({
+      state: {
+        store: fakeStore as any,
+        persist: 'streaming',
+        streamingBatchSize: 1,
+        streamingBatchInterval: 10,
+      },
+    });
+    runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
+    const wf = workflow({
+      name: 'wf',
+      input: z.object({}).strict(),
+      handler: async () => 'ok',
+    });
+    runtime.register(wf);
+
+    await runtime.execute('wf', {});
+
+    // Give the chained promise (.then(finalize).catch) a tick to settle
+    await new Promise((r) => setTimeout(r, 50));
+
+    // The streaming buffer is preserved because saveExecution failed.
+    // Buffer-finalize is gated on saveExecution success — this preserves
+    // the buffer for next-process recovery.
+    const ids = await fakeStore.listStreamingExecutions();
+    expect(ids.length).toBe(1);
+  });
+
+  it('streaming mode excludes token/partial_object/string_delta events', async () => {
+    const buffers = new Map<string, import('../types.js').AxlEvent[]>();
+    const fakeStore = {
+      saveCheckpoint: async () => {},
+      getCheckpoint: async () => null,
+      saveSession: async () => {},
+      getSession: async () => [],
+      deleteSession: async () => {},
+      saveSessionMeta: async () => {},
+      getSessionMeta: async () => null,
+      savePendingDecision: async () => {},
+      getPendingDecisions: async () => [],
+      resolveDecision: async () => {},
+      saveExecutionState: async () => {},
+      getExecutionState: async () => null,
+      listPendingExecutions: async () => [],
+      saveExecution: async () => {},
+      getExecution: async () => null,
+      listExecutions: async () => [],
+      appendStreamingEvents: async (id: string, events: import('../types.js').AxlEvent[]) => {
+        const existing = buffers.get(id) ?? [];
+        existing.push(...events);
+        buffers.set(id, existing);
+      },
+      finalizeStreamingEvents: async () => {},
+      listStreamingExecutions: async () => [],
+      getStreamingEvents: async () => [],
+    };
+
+    const runtime = new AxlRuntime({
+      state: { store: fakeStore as any, persist: 'streaming', streamingBatchSize: 1 },
+    });
+
+    // Manually call the runtime's createContext to get a ctx and emit
+    // various event types into the flusher
+    const ctx = runtime.createContext();
+    (ctx as any).emitEvent({ type: 'token', data: 'x' });
+    (ctx as any).emitEvent({ type: 'partial_object', data: { object: {} } });
+    (ctx as any).emitEvent({ type: 'string_delta', data: { path: '/x', delta: 'a' } });
+    (ctx as any).emitEvent({ type: 'agent_call_start', agent: 'A' });
+
+    // Wait for the 1s default flush interval (or any pending immediate flushes)
+    await new Promise((r) => setTimeout(r, 1100));
+
+    // Only the agent_call_start was kept — the three excluded types were dropped
+    const allBufferedEvents = [...buffers.values()].flat();
+    const types = new Set(allBufferedEvents.map((e) => e.type));
+    expect(types.has('token')).toBe(false);
+    expect(types.has('partial_object')).toBe(false);
+    expect(types.has('string_delta')).toBe(false);
+    expect(types.has('agent_call_start')).toBe(true);
+  });
+
+  it('recoverIncompleteStreams synthesizes ExecutionInfo for orphaned buffers', async () => {
+    const buffers = new Map<string, import('../types.js').AxlEvent[]>();
+    const saved: import('../types.js').ExecutionInfo[] = [];
+    const fakeStore = {
+      saveCheckpoint: async () => {},
+      getCheckpoint: async () => null,
+      saveSession: async () => {},
+      getSession: async () => [],
+      deleteSession: async () => {},
+      saveSessionMeta: async () => {},
+      getSessionMeta: async () => null,
+      savePendingDecision: async () => {},
+      getPendingDecisions: async () => [],
+      resolveDecision: async () => {},
+      saveExecutionState: async () => {},
+      getExecutionState: async () => null,
+      listPendingExecutions: async () => [],
+      saveExecution: async (exec: import('../types.js').ExecutionInfo) => {
+        saved.push(exec);
+      },
+      getExecution: async () => null,
+      listExecutions: async () => [],
+      appendStreamingEvents: async () => {},
+      finalizeStreamingEvents: async (id: string) => {
+        buffers.delete(id);
+      },
+      listStreamingExecutions: async () => [...buffers.keys()],
+      getStreamingEvents: async (id: string) => buffers.get(id) ?? [],
+    };
+
+    // Plant an orphaned streaming buffer simulating a crashed execution.
+    buffers.set('orphan-1', [
+      {
+        executionId: 'orphan-1',
+        step: 0,
+        type: 'workflow_start',
+        workflow: 'my-workflow',
+        timestamp: 1000,
+        data: { input: { foo: 'bar' } },
+      } as any,
+      {
+        executionId: 'orphan-1',
+        step: 1,
+        type: 'agent_call_end',
+        agent: 'A',
+        model: 'm',
+        cost: 0.05,
+        duration: 50,
+        timestamp: 1100,
+        askId: 'a',
+        depth: 0,
+        data: {},
+      } as any,
+    ]);
+
+    const runtime = new AxlRuntime({
+      state: { store: fakeStore as any, persist: 'streaming' },
+    });
+
+    const recovered = await runtime.recoverIncompleteStreams();
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0].executionId).toBe('orphan-1');
+    expect(recovered[0].status).toBe('failed');
+    expect(recovered[0].error).toContain('process terminated');
+    expect(recovered[0].workflow).toBe('my-workflow');
+    // totalCost summed from cost-bearing events
+    expect(recovered[0].totalCost).toBeCloseTo(0.05);
+    // Events preserved
+    expect(recovered[0].events).toHaveLength(2);
+
+    // Saved to store + buffer finalized
+    expect(saved).toHaveLength(1);
+    expect(buffers.has('orphan-1')).toBe(false);
+  });
+
+  it('recoverIncompleteStreams is a no-op when no orphans exist', async () => {
+    const runtime = makeRuntime('streaming');
+    const recovered = await runtime.recoverIncompleteStreams();
+    expect(recovered).toEqual([]);
+  });
+
+  it('recoverIncompleteStreams returns [] when the store does not support streaming', async () => {
+    const runtime = new AxlRuntime(); // MemoryStore default; persist not set
+    const recovered = await runtime.recoverIncompleteStreams();
+    expect(recovered).toEqual([]);
+  });
+
+  it('finalize awaits in-flight flush — no orphan buffer when size-flush races with finalize', async () => {
+    // Reproduces the race: (1) append triggers size-cap flush → in-flight
+    // RPUSH starts. (2) finalize called concurrently. Without the inflight
+    // tracking, finalize's DEL/SREM lands BEFORE the late RPUSH, which then
+    // resurrects the buffer + re-registers the executionId — creating a
+    // phantom orphan that recoverIncompleteStreams would later mis-recover.
+    let resolveAppend!: () => void;
+    const appendPromise = new Promise<void>((res) => {
+      resolveAppend = res;
+    });
+    let appendDone = false;
+    let finalizeCalledAt: number | null = null;
+    let appendCompletedAt: number | null = null;
+
+    const fakeStore = {
+      saveCheckpoint: async () => {},
+      getCheckpoint: async () => null,
+      saveSession: async () => {},
+      getSession: async () => [],
+      deleteSession: async () => {},
+      saveSessionMeta: async () => {},
+      getSessionMeta: async () => null,
+      savePendingDecision: async () => {},
+      getPendingDecisions: async () => [],
+      resolveDecision: async () => {},
+      saveExecutionState: async () => {},
+      getExecutionState: async () => null,
+      listPendingExecutions: async () => [],
+      saveExecution: async () => {},
+      appendStreamingEvents: async () => {
+        // Slow append — blocks on appendPromise. Lets the test interleave
+        // a finalize call while this is in-flight.
+        await appendPromise;
+        appendDone = true;
+        appendCompletedAt = Date.now();
+      },
+      finalizeStreamingEvents: async () => {
+        finalizeCalledAt = Date.now();
+      },
+      listStreamingExecutions: async () => [],
+      getStreamingEvents: async () => [],
+    };
+
+    const runtime = new AxlRuntime({
+      state: {
+        store: fakeStore as any,
+        persist: 'streaming',
+        streamingBatchSize: 1, // every append triggers size-flush
+        streamingBatchInterval: 10_000,
+      },
+    });
+    // Reach into the flusher directly so we control the executionId
+    // (createContext generates a UUID we'd have to discover).
+    const flusher = (runtime as any).streamingFlusher;
+
+    // First append — fires the size-cap flush, which blocks awaiting appendPromise
+    flusher.append('race-1', {
+      type: 'log',
+      executionId: 'race-1',
+      step: 0,
+      timestamp: 1000,
+      data: {},
+    });
+
+    // Start finalize. The fix's correctness: finalize must AWAIT the
+    // in-flight appendPromise before calling finalizeStreamingEvents.
+    const finalizePromise = flusher.finalize('race-1');
+
+    // Give finalize a tick to reach the await
+    await new Promise((r) => setTimeout(r, 20));
+    // appendPromise hasn't resolved yet, so finalize hasn't progressed
+    // to the finalizeStreamingEvents call.
+    expect(finalizeCalledAt).toBeNull();
+    expect(appendDone).toBe(false);
+
+    // Now resolve the in-flight append. Finalize should:
+    //   (a) wait for it to land
+    //   (b) THEN call finalizeStreamingEvents
+    resolveAppend();
+    await finalizePromise;
+
+    expect(appendDone).toBe(true);
+    expect(appendCompletedAt).not.toBeNull();
+    expect(finalizeCalledAt).not.toBeNull();
+    // Ordering: the late RPUSH landed BEFORE finalizeStreamingEvents.
+    // Without the inflight-await fix, finalizeCalledAt would be < appendCompletedAt.
+    expect(appendCompletedAt!).toBeLessThanOrEqual(finalizeCalledAt!);
+  });
+
+  it('shutdown() drains the streaming flusher before closing the store', async () => {
+    let saveAttempts = 0;
+    const fakeStore = {
+      saveCheckpoint: async () => {},
+      getCheckpoint: async () => null,
+      saveSession: async () => {},
+      getSession: async () => [],
+      deleteSession: async () => {},
+      saveSessionMeta: async () => {},
+      getSessionMeta: async () => null,
+      savePendingDecision: async () => {},
+      getPendingDecisions: async () => [],
+      resolveDecision: async () => {},
+      saveExecutionState: async () => {},
+      getExecutionState: async () => null,
+      listPendingExecutions: async () => [],
+      saveExecution: async () => {},
+      appendStreamingEvents: async () => {
+        saveAttempts++;
+      },
+      finalizeStreamingEvents: async () => {},
+      listStreamingExecutions: async () => [],
+      getStreamingEvents: async () => [],
+      close: async () => {},
+    };
+
+    const runtime = new AxlRuntime({
+      state: {
+        store: fakeStore as any,
+        persist: 'streaming',
+        streamingBatchSize: 1000, // big — events won't trigger size-flush
+        streamingBatchInterval: 60_000, // long — won't trigger time-flush
+      },
+    });
+
+    const ctx = runtime.createContext();
+    (ctx as any).emitEvent({
+      type: 'log',
+      executionId: 'manual',
+      step: 0,
+      timestamp: 1000,
+      data: { msg: 'pre-shutdown event' },
+    });
+
+    // Before shutdown — flush hasn't fired (cap not reached, timer not expired)
+    expect(saveAttempts).toBe(0);
+
+    // Shutdown should drain
+    await runtime.shutdown();
+
+    // Drain happened
+    expect(saveAttempts).toBeGreaterThan(0);
+  });
+});

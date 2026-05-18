@@ -809,6 +809,7 @@ export class AxlRuntime extends EventEmitter {
       totalCost: 0,
       startedAt: Date.now(),
       duration: 0,
+      metadata: options?.metadata,
     };
     this.executions.set(executionId, execInfo);
 
@@ -967,6 +968,7 @@ export class AxlRuntime extends EventEmitter {
         totalCost: 0,
         startedAt: Date.now(),
         duration: 0,
+        metadata: options?.metadata,
       };
       this.executions.set(executionId, execInfo);
 

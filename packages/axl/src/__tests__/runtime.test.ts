@@ -528,6 +528,78 @@ describe('getExecution()', () => {
     expect(info!.error).toBe('kaboom');
   });
 
+  it('threads ExecuteOptions.metadata onto ExecutionInfo.metadata', async () => {
+    const { runtime } = createRuntime();
+
+    const wf = workflow({
+      name: 'meta-on-info',
+      input: z.any(),
+      handler: async () => 'ok',
+    });
+    runtime.register(wf);
+
+    let executionId: string | undefined;
+    runtime.on('trace', (event: AxlEvent) => {
+      executionId = event.executionId;
+    });
+
+    await runtime.execute('meta-on-info', 'input', {
+      metadata: { userId: 'u1', tag: 'x' },
+    });
+
+    const info = await runtime.getExecution(executionId!);
+    expect(info).toBeDefined();
+    expect(info!.metadata).toEqual({ userId: 'u1', tag: 'x' });
+  });
+
+  it('threads ExecuteOptions.metadata onto ExecutionInfo.metadata for stream()', async () => {
+    const { runtime } = createRuntime();
+
+    const wf = workflow({
+      name: 'meta-on-info-stream',
+      input: z.any(),
+      handler: async () => 'ok',
+    });
+    runtime.register(wf);
+
+    const stream = runtime.stream('meta-on-info-stream', 'input', {
+      metadata: { userId: 'u-stream', correlationId: 'corr-42' },
+    });
+    // Drain the stream to completion so the execution finishes and
+    // `getExecution` resolves the historical (persisted) snapshot.
+    let executionId: string | undefined;
+    for await (const event of stream) {
+      executionId = event.executionId;
+    }
+
+    expect(executionId).toBeDefined();
+    const info = await runtime.getExecution(executionId!);
+    expect(info).toBeDefined();
+    expect(info!.metadata).toEqual({ userId: 'u-stream', correlationId: 'corr-42' });
+  });
+
+  it('omits metadata field when no ExecuteOptions.metadata is provided', async () => {
+    const { runtime } = createRuntime();
+
+    const wf = workflow({
+      name: 'no-meta-on-info',
+      input: z.any(),
+      handler: async () => 'ok',
+    });
+    runtime.register(wf);
+
+    let executionId: string | undefined;
+    runtime.on('trace', (event: AxlEvent) => {
+      executionId = event.executionId;
+    });
+
+    await runtime.execute('no-meta-on-info', 'input');
+
+    const info = await runtime.getExecution(executionId!);
+    expect(info).toBeDefined();
+    expect(info!.metadata).toBeUndefined();
+  });
+
   it('accumulates totalCost across trace events', async () => {
     const provider = new TestProvider([
       { content: 'response-1', cost: 0.05 },

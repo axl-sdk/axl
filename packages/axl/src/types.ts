@@ -836,6 +836,14 @@ export type ExecutionInfo = {
   duration: number;
   result?: unknown;
   error?: string;
+  /** Caller-supplied metadata threaded verbatim from `ExecuteOptions.metadata`
+   *  (or `runtime.stream()`'s `options.metadata`). Persisted as part of the
+   *  `ExecutionInfo` snapshot so callers have a stable, queryable surface for
+   *  tags like `userId`, `tenantId`, or correlation ids without parsing the
+   *  event timeline. Filter via `runtime.getExecutions()` + an in-process
+   *  `.filter()`; secondary indexes on this field are intentionally not
+   *  provided — `StateStore` is a persistence boundary, not a query engine. */
+  metadata?: Record<string, unknown>;
 };
 
 /** Record of an agent handoff event (persisted in session metadata).

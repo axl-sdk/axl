@@ -24,10 +24,11 @@ type ExecutionHistoryRow = {
   duration: number;
   error: string | null;
   events: string;
+  metadata: string | null;
 };
 
 function rowToExecutionInfo(row: ExecutionHistoryRow): ExecutionInfo {
-  return {
+  const info: ExecutionInfo = {
     executionId: row.execution_id,
     workflow: row.workflow,
     status: row.status as ExecutionInfo['status'],
@@ -38,6 +39,16 @@ function rowToExecutionInfo(row: ExecutionHistoryRow): ExecutionInfo {
     error: row.error ?? undefined,
     events: (safeJsonParse(row.events) as ExecutionInfo['events']) ?? [],
   };
+  // `metadata` is optional on the type so only attach when present —
+  // keeps `.toEqual()` round-trip checks tight (no spurious `undefined`
+  // keys) and matches `MemoryStore`'s `structuredClone` semantics.
+  if (row.metadata != null) {
+    const parsed = safeJsonParse(row.metadata);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      info.metadata = parsed as Record<string, unknown>;
+    }
+  }
+  return info;
 }
 
 /**
@@ -86,6 +97,10 @@ export class SQLiteStore implements StateStore {
    *   numeric step values become stringified names ("0", "1", …) to
    *   preserve replay continuity for in-flight executions across the
    *   upgrade boundary.
+   * - v3 (ExecutionInfo.metadata): add `execution_history.metadata`
+   *   column (TEXT, nullable, JSON-serialized) so caller-supplied
+   *   `ExecuteOptions.metadata` round-trips through history. Existing
+   *   rows get `NULL`, deserialized as `metadata: undefined`.
    *
    * Applied BEFORE `initTables()` so the subsequent `CREATE TABLE
    * IF NOT EXISTS` runs against the post-migration column name. Fresh
@@ -103,7 +118,7 @@ export class SQLiteStore implements StateStore {
    * transactional re-read costs nothing.
    */
   private migrate(): void {
-    const TARGET_VERSION = 2;
+    const TARGET_VERSION = 3;
     const current = this.db.pragma('user_version', { simple: true }) as number;
     if (current >= TARGET_VERSION) return;
 
@@ -140,6 +155,17 @@ export class SQLiteStore implements StateStore {
         const cols = this.db.pragma('table_info(checkpoints)') as Array<{ name: string }>;
         if (cols.some((c) => c.name === 'step') && !cols.some((c) => c.name === 'name')) {
           this.db.exec('ALTER TABLE checkpoints RENAME COLUMN step TO name');
+        }
+      }
+      // v2 → v3: add `execution_history.metadata` (TEXT, nullable) so
+      // `ExecutionInfo.metadata` round-trips through history. Idempotent —
+      // skips the ALTER when the column is already present (e.g., fresh
+      // installs that hit the new CREATE TABLE in `initTables` first, or
+      // a partial earlier migration).
+      if (committed < 3) {
+        const cols = this.db.pragma('table_info(execution_history)') as Array<{ name: string }>;
+        if (cols.length > 0 && !cols.some((c) => c.name === 'metadata')) {
+          this.db.exec('ALTER TABLE execution_history ADD COLUMN metadata TEXT');
         }
       }
       this.db.pragma(`user_version = ${TARGET_VERSION}`);
@@ -205,7 +231,8 @@ export class SQLiteStore implements StateStore {
         completed_at INTEGER,
         duration INTEGER NOT NULL DEFAULT 0,
         error TEXT,
-        events TEXT NOT NULL
+        events TEXT NOT NULL,
+        metadata TEXT
       );
 
       CREATE TABLE IF NOT EXISTS eval_history (
@@ -365,7 +392,7 @@ export class SQLiteStore implements StateStore {
   async saveExecution(execution: ExecutionInfo): Promise<void> {
     this.db
       .prepare(
-        'INSERT OR REPLACE INTO execution_history (execution_id, workflow, status, total_cost, started_at, completed_at, duration, error, events) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT OR REPLACE INTO execution_history (execution_id, workflow, status, total_cost, started_at, completed_at, duration, error, events, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         execution.executionId,
@@ -377,6 +404,7 @@ export class SQLiteStore implements StateStore {
         execution.duration,
         execution.error ?? null,
         JSON.stringify(execution.events),
+        execution.metadata !== undefined ? JSON.stringify(execution.metadata) : null,
       );
   }
 

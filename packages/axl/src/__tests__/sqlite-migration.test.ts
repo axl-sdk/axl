@@ -12,11 +12,13 @@ const require_ = createRequire(import.meta.url);
  * Migration tests for the SQLiteStore schema:
  * - v0 → v1: `execution_history.steps` → `events` (spec/16).
  * - v1 → v2: `checkpoints.step` (INTEGER) → `checkpoints.name` (TEXT).
+ * - v2 → v3: add `execution_history.metadata` (TEXT, nullable) so
+ *            `ExecutionInfo.metadata` round-trips through history.
  * The SQLiteStore constructor runs `migrate()` before `initTables()` and
  * tracks version via PRAGMA `user_version`. Idempotent, transactional,
  * rolls back on failure.
  */
-describe('SQLiteStore — schema migration v0 → v2', () => {
+describe('SQLiteStore — schema migration v0 → v3', () => {
   const tmps: string[] = [];
 
   afterEach(() => {
@@ -32,7 +34,7 @@ describe('SQLiteStore — schema migration v0 → v2', () => {
     return join(dir, 'state.sqlite');
   }
 
-  it('fresh install: creates table with `events` column and sets user_version=1', () => {
+  it('fresh install: creates table with `events` + `metadata` columns and sets user_version=3', () => {
     const path = makeTmpFile();
     const store = new SQLiteStore(path);
     const Database = require_('better-sqlite3');
@@ -42,7 +44,8 @@ describe('SQLiteStore — schema migration v0 → v2', () => {
       const names = cols.map((c) => c.name);
       expect(names).toContain('events');
       expect(names).not.toContain('steps');
-      expect(db.pragma('user_version', { simple: true })).toBe(2);
+      expect(names).toContain('metadata');
+      expect(db.pragma('user_version', { simple: true })).toBe(3);
     } finally {
       db.close();
       void store; // silence unused-locals
@@ -97,11 +100,11 @@ describe('SQLiteStore — schema migration v0 → v2', () => {
     const Database = require_('better-sqlite3');
     new SQLiteStore(path); // First open: applies v0 → v1 (or fresh install).
 
-    // Reopen — version stays 1, table still has `events`.
+    // Reopen — version stays at TARGET_VERSION, table still has `events`.
     new SQLiteStore(path);
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(2);
+      expect(db.pragma('user_version', { simple: true })).toBe(3);
       const cols = db.pragma('table_info(execution_history)') as Array<{ name: string }>;
       const names = cols.map((c) => c.name);
       expect(names).toContain('events');
@@ -144,7 +147,7 @@ describe('SQLiteStore — schema migration v0 → v2', () => {
 
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(2);
+      expect(db.pragma('user_version', { simple: true })).toBe(3);
       const cols = db.pragma('table_info(execution_history)') as Array<{ name: string }>;
       expect(cols.map((c) => c.name)).toContain('events');
     } finally {
@@ -190,7 +193,7 @@ describe('SQLiteStore — schema migration v0 → v2', () => {
     // Verify column rename + version bump.
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(2);
+      expect(db.pragma('user_version', { simple: true })).toBe(3);
       const cols = db.pragma('table_info(checkpoints)') as Array<{ name: string }>;
       const names = cols.map((c) => c.name);
       expect(names).toContain('name');
@@ -207,6 +210,75 @@ describe('SQLiteStore — schema migration v0 → v2', () => {
     // The new code never writes that name (auto-checkpoints use
     // __auto/<agent>/ask/<n>), so legacy rows are stranded — but the
     // raw lookup must still return them when explicitly addressed.
+  });
+
+  it('v2 → v3: adds execution_history.metadata column and preserves existing rows', async () => {
+    const path = makeTmpFile();
+    const Database = require_('better-sqlite3');
+
+    // Pre-seed a v2 DB by hand: post-v0→v1→v2 schema (events column,
+    // renamed checkpoints.name), and user_version=2. Critically, the
+    // execution_history table is missing the `metadata` column that v3
+    // adds.
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE execution_history (
+        execution_id TEXT PRIMARY KEY,
+        workflow TEXT NOT NULL,
+        status TEXT NOT NULL,
+        total_cost REAL NOT NULL DEFAULT 0,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        duration INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        events TEXT NOT NULL
+      );
+      CREATE TABLE checkpoints (
+        execution_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (execution_id, name)
+      );
+      PRAGMA user_version = 2;
+    `);
+    seed
+      .prepare('INSERT INTO execution_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run('exec-v2', 'wf', 'completed', 0.1, 1000, 2000, 1000, null, JSON.stringify([]));
+    seed.close();
+
+    // Re-open via SQLiteStore — runs v2→v3 migration (ALTER TABLE ADD COLUMN).
+    const store = new SQLiteStore(path);
+
+    const db = new Database(path, { readonly: true });
+    try {
+      expect(db.pragma('user_version', { simple: true })).toBe(3);
+      const cols = db.pragma('table_info(execution_history)') as Array<{ name: string }>;
+      expect(cols.map((c) => c.name)).toContain('metadata');
+    } finally {
+      db.close();
+    }
+
+    // Existing row's metadata is NULL (not set on the v2 row), and
+    // deserializes as `undefined` on the resulting ExecutionInfo (no
+    // metadata key present).
+    const got = await store.getExecution!('exec-v2');
+    expect(got).toBeDefined();
+    expect(got!.metadata).toBeUndefined();
+    expect('metadata' in (got as object)).toBe(false);
+
+    // New writes can populate metadata; round-trip works after migration.
+    await store.saveExecution!({
+      executionId: 'exec-v3',
+      workflow: 'wf',
+      status: 'completed',
+      events: [],
+      totalCost: 0,
+      startedAt: 3000,
+      duration: 0,
+      metadata: { userId: 'u1' },
+    });
+    const got2 = await store.getExecution!('exec-v3');
+    expect(got2!.metadata).toEqual({ userId: 'u1' });
   });
 
   it('round-trip: saveExecution writes via new column name; getExecution reads back', async () => {

@@ -1165,6 +1165,7 @@ Completed and failed executions are automatically persisted to the state store (
 | `duration` | `number` | Duration in ms |
 | `result` | `unknown \| undefined` | Workflow return value (when `status === 'completed'`) |
 | `error` | `string \| undefined` | Error message (when `status === 'failed'`) |
+| `metadata` | `Record<string, unknown> \| undefined` | Caller-supplied metadata threaded verbatim from `ExecuteOptions.metadata` (or `runtime.stream()`'s `options.metadata`). Stable, queryable surface for tags like `userId`, `tenantId`, or correlation ids — filter via `runtime.getExecutions()` + an in-process `.filter()`. Persisted by all three built-in stores (`MemoryStore`/`SQLiteStore`/`RedisStore`); `SQLiteStore` adds a `metadata` column in schema v3 (auto-migrated on first open). Secondary indexes are intentionally not provided — `StateStore` is a persistence boundary, not a query engine |
 
 ### Eval History
 

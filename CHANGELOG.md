@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 ### Changed
 - **`RedisStore.listExecutions` / `listEvalResults` are now O(log N) instead of O(N).** Both methods used to `SMEMBERS` the full ID set, issue N independent `GET` round-trips, and JS-sort by timestamp — fine at a few hundred entries, painful at 10k+. Each `saveExecution` / `saveEvalResult` now dual-writes the ID into a Redis sorted set scored by `startedAt` / `timestamp` (inside the same MULTI as the data blob, so atomicity is preserved). Reads use `ZREVRANGEBYSCORE` + a single `MGET` for the data blobs — one indexed range lookup + one pipelined bulk fetch, regardless of total entry count. The legacy ID set is still maintained as a fallback read path; `deleteEvalResult` (and `deleteExecution` once #10 lands) remove from both indexes inside the same atomic MULTI. Public method signatures unchanged.
 
@@ -37,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`MemoryManager` emits a one-shot `console.warn` when used against a custom `StateStore` that doesn't implement memory methods.** Previously, the sessionMeta-fallback path was completely silent — users on custom stores lost `metadata` and `getAllMemory` enumeration with zero signal. Now they get a single warning per offending store listing the four methods to implement. All three built-in stores implement the methods, so no warning fires for users on `MemoryStore` / `SQLiteStore` / `RedisStore`.
 
 ### Added
+- **`ExecutionInfo.metadata`.** Caller-supplied metadata from `ExecuteOptions.metadata` (and `runtime.stream()`'s `options.metadata`) now round-trips through `runtime.getExecution()` / `getExecutions()` as a stable, queryable surface for tags like `userId`, `tenantId`, or correlation ids — no event-parsing required. Persisted by all three built-in stores; `SQLiteStore` adds a `metadata` column in schema v3 (auto-migrated on first open). Additive — existing code is unaffected; the field is `undefined` when no metadata is passed. Filter via `runtime.getExecutions()` + an in-process `.filter()`; secondary indexes are intentionally not provided (`StateStore` is a persistence boundary, not a query engine).
 - **`RedisStore.create({ keyPrefix })` for shared-cluster deployments.** Pass an options object instead of a URL string to override the default `'axl:'` key prefix. Useful when multiple Axl deployments coexist on one Redis cluster (e.g. `'axl:prod:'` vs `'axl:staging:'`) or when sharing a cluster with other applications. The prefix is concatenated as-given — no normalization — so include a trailing colon if you want one. Empty string is rejected at the factory to prevent accidental collisions with non-Axl keys. The URL-only `RedisStore.create('redis://...')` form is unchanged and remains the recommended shorthand when you just want the default prefix.
 
   ```typescript

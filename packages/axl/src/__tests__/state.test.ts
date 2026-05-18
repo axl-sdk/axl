@@ -310,6 +310,18 @@ describe('MemoryStore', () => {
       const loaded = await store.getExecution('e1');
       expect(loaded!.totalCost).toBe(0.01);
     });
+
+    it('metadata round-trips through saveExecution/getExecution', async () => {
+      const store = new MemoryStore();
+      const exec: import('../types.js').ExecutionInfo = {
+        ...makeExec('e1', 1000),
+        metadata: { userId: 'u1', tenantId: 't42', tag: 'priority' },
+      };
+      await store.saveExecution(exec);
+
+      const loaded = await store.getExecution('e1');
+      expect(loaded!.metadata).toEqual({ userId: 'u1', tenantId: 't42', tag: 'priority' });
+    });
   });
 
   // ── Eval History ──────────────────────────────────────────────────
@@ -664,6 +676,34 @@ describe('SQLiteStore', () => {
       const loaded = await store2.getExecution('e1');
       expect(loaded).toEqual(makeExec('e1', 1000));
       store2.close();
+    });
+
+    it('metadata round-trips through the metadata column', async () => {
+      const store = createStore();
+      const exec: import('../types.js').ExecutionInfo = {
+        ...makeExec('e1', 1000),
+        metadata: { userId: 'u1', nested: { score: 0.9 } },
+      };
+      await store.saveExecution(exec);
+
+      const loaded = await store.getExecution('e1');
+      expect(loaded!.metadata).toEqual({ userId: 'u1', nested: { score: 0.9 } });
+      store.close();
+    });
+
+    it('omits metadata when not provided (round-trip preserves absence)', async () => {
+      const store = createStore();
+      const exec = makeExec('e1', 1000);
+      // makeExec does not set metadata, so it should be absent on the loaded row.
+      expect((exec as { metadata?: unknown }).metadata).toBeUndefined();
+      await store.saveExecution(exec);
+
+      const loaded = await store.getExecution('e1');
+      expect(loaded).toEqual(exec);
+      // Defense against silent `metadata: undefined` keys that would break
+      // strict equality with `{ ...exec }` round-trip checks.
+      expect('metadata' in (loaded as object)).toBe(false);
+      store.close();
     });
   });
 
@@ -1386,6 +1426,31 @@ describe('RedisStore', () => {
       expect(pending).toContain('exec-1');
       expect(pending).not.toContain('exec-2');
       expect(pending).toContain('exec-3');
+    });
+  });
+
+  describe('execution history', () => {
+    const makeExec = (id: string, startedAt: number): import('../types.js').ExecutionInfo => ({
+      executionId: id,
+      workflow: 'test-wf',
+      status: 'completed',
+      events: [{ executionId: id, step: 0, type: 'log', timestamp: startedAt, data: {} }],
+      totalCost: 0.01,
+      startedAt,
+      completedAt: startedAt + 100,
+      duration: 100,
+    });
+
+    it('metadata round-trips through saveExecution/getExecution (JSON serialization)', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      const exec: import('../types.js').ExecutionInfo = {
+        ...makeExec('e1', 1000),
+        metadata: { userId: 'u1', correlationId: 'abc-123' },
+      };
+      await store.saveExecution(exec);
+
+      const loaded = await store.getExecution('e1');
+      expect(loaded!.metadata).toEqual({ userId: 'u1', correlationId: 'abc-123' });
     });
   });
 

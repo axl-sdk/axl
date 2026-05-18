@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`RedisStore.create({ keyPrefix })` for shared-cluster deployments.** Pass an options object instead of a URL string to override the default `'axl:'` key prefix. Useful when multiple Axl deployments coexist on one Redis cluster (e.g. `'axl:prod:'` vs `'axl:staging:'`) or when sharing a cluster with other applications. The prefix is concatenated as-given — no normalization — so include a trailing colon if you want one. Empty string is rejected at the factory to prevent accidental collisions with non-Axl keys. The URL-only `RedisStore.create('redis://...')` form is unchanged and remains the recommended shorthand when you just want the default prefix.
+
+  ```typescript
+  await RedisStore.create({ url: 'redis://localhost:6379', keyPrefix: 'axl:prod:' });
+  ```
+
 ## [0.17.6] - 2026-05-13
 
 ### Added

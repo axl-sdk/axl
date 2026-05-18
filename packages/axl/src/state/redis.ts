@@ -17,6 +17,24 @@ interface RedisClient {
   quit(): Promise<void>;
 }
 
+/** Options accepted by {@link RedisStore.create}. */
+export interface RedisStoreOptions {
+  /** Redis connection URL (e.g. `redis://localhost:6379`). Defaults to `redis://localhost:6379`. */
+  url?: string;
+  /**
+   * Prefix prepended to every Redis key written by this store. Defaults to
+   * `'axl:'`. Useful when multiple Axl deployments share a Redis cluster
+   * (e.g. `'axl:prod:'` vs `'axl:staging:'`) or when coexisting with other
+   * applications' keys.
+   *
+   * The prefix is concatenated as-given — no normalization. If you want a
+   * trailing colon, include it. Whitespace and unusual characters are
+   * accepted as-is. Only the empty string is rejected, to prevent accidental
+   * collisions with non-Axl keys.
+   */
+  keyPrefix?: string;
+}
+
 /**
  * Redis-backed StateStore using the official `redis` (node-redis) client.
  *
@@ -27,15 +45,42 @@ interface RedisClient {
  * async `RedisStore.create()` factory, which connects before returning.
  */
 export class RedisStore implements StateStore {
-  private constructor(private client: RedisClient) {}
+  private constructor(
+    private client: RedisClient,
+    private keyPrefix: string,
+  ) {}
 
   /**
    * Create a connected RedisStore instance.
    *
-   * @param url - Redis connection URL (e.g. `redis://localhost:6379`). Defaults to `redis://localhost:6379`.
+   * Accepts either a URL string (back-compat) or a {@link RedisStoreOptions}
+   * object. The object form is required to set a custom `keyPrefix`.
+   *
+   * @example
+   * ```ts
+   * // Default prefix 'axl:'
+   * const store = await RedisStore.create('redis://localhost:6379');
+   *
+   * // Custom prefix for shared-cluster deployments
+   * const store = await RedisStore.create({
+   *   url: 'redis://localhost:6379',
+   *   keyPrefix: 'axl:prod:',
+   * });
+   * ```
    */
-  static async create(url?: string): Promise<RedisStore> {
-    let createClient: (opts?: { url?: string }) => RedisClient & { connect(): Promise<void> };
+  static async create(options?: string | RedisStoreOptions): Promise<RedisStore> {
+    const opts: RedisStoreOptions =
+      typeof options === 'string' ? { url: options } : (options ?? {});
+    const keyPrefix = opts.keyPrefix ?? 'axl:';
+    // Reject empty string — guarding against accidental collisions with
+    // unrelated keys in a shared cluster. `undefined` gets the default.
+    if (keyPrefix === '') {
+      throw new Error(
+        'RedisStore: keyPrefix cannot be empty string. Omit it for the default "axl:" prefix.',
+      );
+    }
+
+    let createClient: (clientOpts?: { url?: string }) => RedisClient & { connect(): Promise<void> };
     try {
       const mod = require('redis');
       createClient = mod.createClient ?? mod.default?.createClient;
@@ -49,51 +94,55 @@ export class RedisStore implements StateStore {
       throw new Error('redis is required for RedisStore. Install it with: npm install redis');
     }
 
-    const client = url ? createClient({ url }) : createClient();
+    const client = opts.url ? createClient({ url: opts.url }) : createClient();
     await client.connect();
-    return new RedisStore(client);
+    return new RedisStore(client, keyPrefix);
   }
 
   // ── Key helpers ──────────────────────────────────────────────────────
 
   private checkpointKey(executionId: string): string {
-    return `axl:checkpoint:${executionId}`;
+    return `${this.keyPrefix}checkpoint:${executionId}`;
   }
 
   private sessionKey(sessionId: string): string {
-    return `axl:session:${sessionId}`;
+    return `${this.keyPrefix}session:${sessionId}`;
   }
 
   private sessionMetaKey(sessionId: string): string {
-    return `axl:session-meta:${sessionId}`;
+    return `${this.keyPrefix}session-meta:${sessionId}`;
+  }
+
+  private sessionIdsKey(): string {
+    return `${this.keyPrefix}session-ids`;
   }
 
   private decisionsKey(): string {
-    return 'axl:decisions';
+    return `${this.keyPrefix}decisions`;
   }
 
   private executionStateKey(executionId: string): string {
-    return `axl:exec-state:${executionId}`;
+    return `${this.keyPrefix}exec-state:${executionId}`;
   }
 
   private pendingExecSetKey(): string {
-    return 'axl:pending-executions';
+    return `${this.keyPrefix}pending-executions`;
   }
 
   private execHistoryKey(executionId: string): string {
-    return `axl:exec-history:${executionId}`;
+    return `${this.keyPrefix}exec-history:${executionId}`;
   }
 
   private execHistorySetKey(): string {
-    return 'axl:exec-history-ids';
+    return `${this.keyPrefix}exec-history-ids`;
   }
 
   private evalHistoryKey(id: string): string {
-    return `axl:eval-history:${id}`;
+    return `${this.keyPrefix}eval-history:${id}`;
   }
 
   private evalHistorySetKey(): string {
-    return 'axl:eval-history-ids';
+    return `${this.keyPrefix}eval-history-ids`;
   }
 
   // ── Checkpoints ──────────────────────────────────────────────────────
@@ -111,7 +160,7 @@ export class RedisStore implements StateStore {
 
   async saveSession(sessionId: string, history: ChatMessage[]): Promise<void> {
     await this.client.set(this.sessionKey(sessionId), JSON.stringify(history));
-    await this.client.sAdd('axl:session-ids', sessionId);
+    await this.client.sAdd(this.sessionIdsKey(), sessionId);
   }
 
   async getSession(sessionId: string): Promise<ChatMessage[]> {
@@ -122,7 +171,7 @@ export class RedisStore implements StateStore {
   async deleteSession(sessionId: string): Promise<void> {
     await this.client.del(this.sessionKey(sessionId));
     await this.client.del(this.sessionMetaKey(sessionId));
-    await this.client.sRem('axl:session-ids', sessionId);
+    await this.client.sRem(this.sessionIdsKey(), sessionId);
   }
 
   async saveSessionMeta(sessionId: string, key: string, value: unknown): Promise<void> {
@@ -233,7 +282,7 @@ export class RedisStore implements StateStore {
   async listSessions(): Promise<string[]> {
     // Redis doesn't have a built-in way to list keys by pattern without SCAN,
     // so we maintain a set of session IDs alongside the session data.
-    return this.client.sMembers('axl:session-ids');
+    return this.client.sMembers(this.sessionIdsKey());
   }
 
   /** Close the Redis connection. */

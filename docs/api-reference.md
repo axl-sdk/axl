@@ -1234,7 +1234,26 @@ const runtime = new AxlRuntime({ state: { store: 'sqlite' } });
 const runtime2 = new AxlRuntime({
   state: { store: await RedisStore.create('redis://localhost:6379') },
 });
+
+// RedisStore with a custom key prefix (e.g. for shared-cluster deployments)
+const runtime3 = new AxlRuntime({
+  state: {
+    store: await RedisStore.create({
+      url: 'redis://localhost:6379',
+      keyPrefix: 'axl:prod:',
+    }),
+  },
+});
 ```
+
+### RedisStore options
+
+`RedisStore.create()` accepts either a URL string (back-compat) or an options object:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | `string?` | `'redis://localhost:6379'` | Redis connection URL |
+| `keyPrefix` | `string?` | `'axl:'` | Prepended to every key written by this store. Concatenated as-given — no normalization (include the trailing colon if you want one). Empty string is rejected. Useful when two Axl deployments share a Redis cluster, or when coexisting with other applications' keys |
 
 ### State configuration
 

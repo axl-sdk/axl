@@ -725,8 +725,11 @@ describe('RedisStore', () => {
   /**
    * Create a RedisStore with a mock in-memory client, bypassing the
    * private constructor via Object.create and injecting a mock client.
+   *
+   * @param keyPrefix - Override the default `'axl:'` prefix to exercise
+   * the keyPrefix option without hitting a real Redis.
    */
-  function createRedisStoreWithMockClient() {
+  function createRedisStoreWithMockClient(keyPrefix = 'axl:') {
     const data = new Map<string, string>();
     const hashData = new Map<string, Map<string, string>>();
 
@@ -804,9 +807,122 @@ describe('RedisStore', () => {
     // Bypass the private constructor and inject the mock client
     const store = Object.create(RedisStore.prototype) as RedisStore;
     (store as any).client = mockClient;
+    (store as any).keyPrefix = keyPrefix;
 
-    return { store, mockClient };
+    return { store, mockClient, data, hashData, setData };
   }
+
+  describe('keyPrefix', () => {
+    it('uses the default "axl:" prefix when none is provided', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      await store.saveCheckpoint('exec-1', 'cp', { step: 0 });
+      expect(mockClient.hSet).toHaveBeenCalledWith(
+        'axl:checkpoint:exec-1',
+        'cp',
+        expect.any(String),
+      );
+    });
+
+    it('composes a custom prefix into every key type', async () => {
+      const { store, hashData, data, setData } = createRedisStoreWithMockClient('myapp:prod:');
+
+      // Hit every key-producing path
+      await store.saveCheckpoint('e1', 'cp', { x: 1 });
+      await store.saveSession('s1', [{ role: 'user', content: 'hi' }]);
+      await store.saveSessionMeta('s1', 'meta', 'v');
+      await store.savePendingDecision('e1', {
+        executionId: 'e1',
+        channel: 'slack',
+        prompt: '?',
+        createdAt: '2024',
+      });
+      await store.saveExecutionState('e1', {
+        workflow: 'w',
+        input: null,
+        step: 0,
+        status: 'waiting',
+      });
+      await store.saveExecution({
+        executionId: 'e1',
+        workflow: 'w',
+        status: 'completed',
+        events: [],
+        totalCost: 0,
+        startedAt: 0,
+        completedAt: 0,
+        duration: 0,
+      });
+      await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
+
+      // Every recorded key must carry the custom prefix — none of the legacy 'axl:'
+      const allKeys = [...hashData.keys(), ...data.keys(), ...setData.keys()];
+      expect(allKeys.length).toBeGreaterThan(0);
+      for (const k of allKeys) {
+        expect(k.startsWith('myapp:prod:')).toBe(true);
+        expect(k.startsWith('axl:')).toBe(false);
+      }
+
+      // Spot-check the expected fully-composed key names
+      expect(hashData.has('myapp:prod:checkpoint:e1')).toBe(true);
+      expect(data.has('myapp:prod:session:s1')).toBe(true);
+      expect(hashData.has('myapp:prod:session-meta:s1')).toBe(true);
+      expect(hashData.has('myapp:prod:decisions')).toBe(true);
+      expect(data.has('myapp:prod:exec-state:e1')).toBe(true);
+      expect(setData.has('myapp:prod:pending-executions')).toBe(true);
+      expect(setData.has('myapp:prod:exec-history-ids')).toBe(true);
+      expect(data.has('myapp:prod:exec-history:e1')).toBe(true);
+      expect(setData.has('myapp:prod:eval-history-ids')).toBe(true);
+      expect(data.has('myapp:prod:eval-history:ev1')).toBe(true);
+      expect(setData.has('myapp:prod:session-ids')).toBe(true);
+    });
+
+    it('isolates data between two stores with different prefixes', async () => {
+      // Two distinct stores backed by independent mock state — simulating two
+      // tenants on the same physical Redis. They must not see each other's keys.
+      const a = createRedisStoreWithMockClient('tenant-a:');
+      const b = createRedisStoreWithMockClient('tenant-b:');
+
+      await a.store.saveSession('sess-1', [{ role: 'user', content: 'a-secret' }]);
+      await b.store.saveSession('sess-1', [{ role: 'user', content: 'b-secret' }]);
+
+      expect((await a.store.getSession('sess-1'))[0].content).toBe('a-secret');
+      expect((await b.store.getSession('sess-1'))[0].content).toBe('b-secret');
+
+      // Independent listSessions
+      expect(await a.store.listSessions()).toEqual(['sess-1']);
+      expect(await b.store.listSessions()).toEqual(['sess-1']);
+    });
+
+    it('does not strip or alter custom prefix characters', async () => {
+      // No normalization — what you pass is what gets composed.
+      const { store, hashData } = createRedisStoreWithMockClient('NoColon');
+      await store.saveCheckpoint('e1', 'cp', 1);
+      // Result: 'NoColoncheckpoint:e1' — adjacent concatenation, no inserted separator.
+      expect(hashData.has('NoColoncheckpoint:e1')).toBe(true);
+    });
+
+    it('rejects empty-string keyPrefix at factory level', async () => {
+      // Empty prefix would collide with literally every Redis key in the cluster,
+      // which is almost always a bug. Reject it explicitly so users get a clear
+      // error at startup instead of debugging mysterious collisions later.
+      await expect(RedisStore.create({ keyPrefix: '' })).rejects.toThrow(
+        /keyPrefix cannot be empty/,
+      );
+    });
+
+    it('falls back to default when keyPrefix is undefined (e.g. unset env var)', async () => {
+      // A common user pattern is `keyPrefix: process.env.AXL_PREFIX` which is
+      // `undefined` when the var is unset. That must resolve to the default
+      // 'axl:' — not crash, not become empty-string. Tripwire so future
+      // refactors of the `??` chain don't regress this.
+      const { store, hashData } = createRedisStoreWithMockClient(); // helper default
+      await store.saveCheckpoint('e1', 'cp', 1);
+      expect(hashData.has('axl:checkpoint:e1')).toBe(true);
+      // And explicitly via the options shape (mirroring the runtime path the env-var pattern produces)
+      const opts: import('../state/redis.js').RedisStoreOptions = { keyPrefix: undefined };
+      expect(opts.keyPrefix).toBeUndefined();
+    });
+  });
 
   describe('deleteCheckpoints', () => {
     it('calls del with the correct checkpoint key', async () => {

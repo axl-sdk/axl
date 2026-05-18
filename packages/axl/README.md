@@ -630,6 +630,17 @@ await runtime.shutdown();
 
 `RedisStore.create()` connects before returning, so any connection error surfaces at startup rather than on first use. The runtime's `shutdown()` closes the connection automatically.
 
+Pass an options object instead of a URL string to set a custom `keyPrefix` (default `'axl:'`) — useful when multiple Axl deployments share a Redis cluster:
+
+```typescript
+const store = await RedisStore.create({
+  url: 'redis://localhost:6379',
+  keyPrefix: 'axl:prod:', // staging would use 'axl:staging:'
+});
+```
+
+The prefix is concatenated as-given — no normalization. Include a trailing colon if you want one. Empty string is rejected.
+
 ### Session Options
 
 ```typescript

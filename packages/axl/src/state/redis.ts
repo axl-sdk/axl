@@ -19,7 +19,28 @@ interface RedisClient {
   sAdd(key: string, member: string | string[]): Promise<number>;
   sRem(key: string, member: string | string[]): Promise<number>;
   sMembers(key: string): Promise<string[]>;
+  // multi() opens a transaction. Queued commands execute atomically on
+  // exec() — a crash mid-MULTI leaves none of the queued writes applied,
+  // which is what we want for the multi-key writes (saveSession,
+  // saveExecution, etc.) that previously could half-commit on failure.
+  multi(): RedisMulti;
   quit(): Promise<void>;
+}
+
+// Chainable transaction builder returned by `client.multi()`. Queues
+// commands client-side; sends them in a single MULTI/EXEC round-trip
+// when `.exec()` is awaited. Same surface as node-redis v5's `RedisMulti`,
+// scoped to commands we actually use.
+interface RedisMulti {
+  set(key: string, value: string): RedisMulti;
+  del(key: string | string[]): RedisMulti;
+  sAdd(key: string, member: string | string[]): RedisMulti;
+  sRem(key: string, member: string | string[]): RedisMulti;
+  hDel(key: string, field: string | string[]): RedisMulti;
+  // exec() returns the per-command results in queued order. We don't
+  // type-narrow individual results because the callers that need a result
+  // (e.g. deleteEvalResult) cast at the call site.
+  exec(): Promise<unknown[]>;
 }
 
 /** Options accepted by {@link RedisStore.create}. */
@@ -168,8 +189,15 @@ export class RedisStore implements StateStore {
   // ── Sessions ─────────────────────────────────────────────────────────
 
   async saveSession(sessionId: string, history: ChatMessage[]): Promise<void> {
-    await this.client.set(this.sessionKey(sessionId), JSON.stringify(history));
-    await this.client.sAdd(this.sessionIdsKey(), sessionId);
+    // Atomic: data blob + index-set membership commit together. A crash
+    // between the writes would otherwise leave the session unreachable via
+    // listSessions (data exists, index doesn't) or visible-but-empty (index
+    // exists, data doesn't).
+    await this.client
+      .multi()
+      .set(this.sessionKey(sessionId), JSON.stringify(history))
+      .sAdd(this.sessionIdsKey(), sessionId)
+      .exec();
   }
 
   async getSession(sessionId: string): Promise<ChatMessage[]> {
@@ -178,9 +206,13 @@ export class RedisStore implements StateStore {
   }
 
   async deleteSession(sessionId: string): Promise<void> {
-    await this.client.del(this.sessionKey(sessionId));
-    await this.client.del(this.sessionMetaKey(sessionId));
-    await this.client.sRem(this.sessionIdsKey(), sessionId);
+    // Atomic: data + metadata + index-set entry removed together.
+    await this.client
+      .multi()
+      .del(this.sessionKey(sessionId))
+      .del(this.sessionMetaKey(sessionId))
+      .sRem(this.sessionIdsKey(), sessionId)
+      .exec();
   }
 
   async saveSessionMeta(sessionId: string, key: string, value: unknown): Promise<void> {
@@ -211,13 +243,24 @@ export class RedisStore implements StateStore {
   // ── Execution State ──────────────────────────────────────────────────
 
   async saveExecutionState(executionId: string, state: ExecutionState): Promise<void> {
-    await this.client.set(this.executionStateKey(executionId), JSON.stringify(state));
-
+    // Atomic: state blob + pending-set membership commit together. A crash
+    // between writes would otherwise leave `listPendingExecutions()` and
+    // `getExecutionState()` disagreeing on what's waiting.
+    //
+    // NOTE for future contributors: MULTI/EXEC is atomic, but it does NOT
+    // serialize concurrent writers — two processes simultaneously calling
+    // saveExecutionState(id, ...) will both commit their batches, with
+    // last-write-wins on the state blob. If you ever add a read-modify-write
+    // pattern here (e.g. "increment step iff state.status === 'running'"),
+    // you'll need `WATCH` for true cross-process safety. The current writes
+    // are full-replacement, so this isn't a concern today.
+    const tx = this.client.multi().set(this.executionStateKey(executionId), JSON.stringify(state));
     if (state.status === 'waiting') {
-      await this.client.sAdd(this.pendingExecSetKey(), executionId);
+      tx.sAdd(this.pendingExecSetKey(), executionId);
     } else {
-      await this.client.sRem(this.pendingExecSetKey(), executionId);
+      tx.sRem(this.pendingExecSetKey(), executionId);
     }
+    await tx.exec();
   }
 
   async getExecutionState(executionId: string): Promise<ExecutionState | null> {
@@ -291,19 +334,29 @@ export class RedisStore implements StateStore {
   }
 
   async deleteMemory(scope: string, key: string): Promise<void> {
-    await this.client.hDel(this.memoryKey(scope), key);
-    // Also clean the legacy location so a re-read can't resurrect a value
-    // the caller asked to forget.
-    await this.client.hDel(this.sessionMetaKey(`memory:${scope}:${key}`), 'value');
+    // Atomic: new + legacy locations cleaned together so a crash between
+    // them can't leave a "forgotten" value live in only one place where
+    // a subsequent migrate-on-read could resurrect it.
+    await this.client
+      .multi()
+      .hDel(this.memoryKey(scope), key)
+      .hDel(this.sessionMetaKey(`memory:${scope}:${key}`), 'value')
+      .exec();
   }
 
   // ── Execution History ────────────────────────────────────────────────
 
   async saveExecution(execution: ExecutionInfo): Promise<void> {
-    // Write set membership first — if we crash between the two writes,
-    // listExecutions gracefully skips IDs with missing values.
-    await this.client.sAdd(this.execHistorySetKey(), execution.executionId);
-    await this.client.set(this.execHistoryKey(execution.executionId), JSON.stringify(execution));
+    // Atomic: index-set membership + data blob commit together. Before
+    // MULTI/EXEC was wired up, a crash between the two writes left
+    // `listExecutions` returning IDs whose data was absent — and the
+    // graceful-skip fallback in the reader was load-bearing. Now the
+    // partial-write hazard is gone at the source.
+    await this.client
+      .multi()
+      .sAdd(this.execHistorySetKey(), execution.executionId)
+      .set(this.execHistoryKey(execution.executionId), JSON.stringify(execution))
+      .exec();
   }
 
   async getExecution(executionId: string): Promise<ExecutionInfo | null> {
@@ -327,8 +380,12 @@ export class RedisStore implements StateStore {
   // ── Eval History ────────────────────────────────────────────────────
 
   async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
-    await this.client.sAdd(this.evalHistorySetKey(), entry.id);
-    await this.client.set(this.evalHistoryKey(entry.id), JSON.stringify(entry));
+    // Atomic, same partial-write concern as saveExecution.
+    await this.client
+      .multi()
+      .sAdd(this.evalHistorySetKey(), entry.id)
+      .set(this.evalHistoryKey(entry.id), JSON.stringify(entry))
+      .exec();
   }
 
   async listEvalResults(limit?: number): Promise<EvalHistoryEntry[]> {
@@ -345,12 +402,15 @@ export class RedisStore implements StateStore {
   }
 
   async deleteEvalResult(id: string): Promise<boolean> {
-    // Remove from both the index set and the data key. del() returns the
-    // number of keys actually deleted, which we use as the "existed" signal
-    // so callers can distinguish "not found" from "deleted" without a
-    // separate EXISTS round-trip.
-    await this.client.sRem(this.evalHistorySetKey(), id);
-    const deleted = await this.client.del(this.evalHistoryKey(id));
+    // Atomic: index-set removal + data deletion commit together. del()'s
+    // return is the "did it exist" signal. Destructure to keep the
+    // ordering self-documenting — survives a future reorder of the chain.
+    const [, deletedCount] = await this.client
+      .multi()
+      .sRem(this.evalHistorySetKey(), id)
+      .del(this.evalHistoryKey(id))
+      .exec();
+    const deleted = typeof deletedCount === 'number' ? deletedCount : 0;
     return deleted > 0;
   }
 

@@ -723,6 +723,99 @@ describe('SQLiteStore', () => {
 
 describe('RedisStore', () => {
   /**
+   * Build a chainable mock RedisMulti that queues commands and applies them
+   * on `.exec()`. Mirrors node-redis v5's RedisMulti shape (set/del/sAdd/
+   * sRem/hDel + exec) at the surface we use.
+   *
+   * Two callers reach this: the mock client's `multi()` builds one with
+   * the shared backing Maps; tests that want to inspect the queue can
+   * spy on the returned chain.
+   */
+  function createMockMulti(
+    data: Map<string, string>,
+    hashData: Map<string, Map<string, string>>,
+    setData: Map<string, Set<string>>,
+  ) {
+    type QueuedOp = () => unknown;
+    const queue: QueuedOp[] = [];
+    const chain = {
+      set(key: string, value: string) {
+        queue.push(() => {
+          data.set(key, value);
+          return 'OK';
+        });
+        return chain;
+      },
+      del(key: string | string[]) {
+        queue.push(() => {
+          const keys = Array.isArray(key) ? key : [key];
+          let count = 0;
+          for (const k of keys) {
+            if (data.delete(k)) count++;
+            if (hashData.delete(k)) count++;
+          }
+          return count;
+        });
+        return chain;
+      },
+      sAdd(key: string, member: string | string[]) {
+        queue.push(() => {
+          if (!setData.has(key)) setData.set(key, new Set());
+          const members = Array.isArray(member) ? member : [member];
+          let count = 0;
+          for (const m of members) {
+            if (!setData.get(key)!.has(m)) {
+              setData.get(key)!.add(m);
+              count++;
+            }
+          }
+          return count;
+        });
+        return chain;
+      },
+      sRem(key: string, member: string | string[]) {
+        queue.push(() => {
+          const set = setData.get(key);
+          if (!set) return 0;
+          const members = Array.isArray(member) ? member : [member];
+          let count = 0;
+          for (const m of members) {
+            if (set.delete(m)) count++;
+          }
+          return count;
+        });
+        return chain;
+      },
+      hDel(key: string, field: string | string[]) {
+        queue.push(() => {
+          const map = hashData.get(key);
+          if (!map) return 0;
+          const fields = Array.isArray(field) ? field : [field];
+          let count = 0;
+          for (const f of fields) {
+            if (map.delete(f)) count++;
+          }
+          return count;
+        });
+        return chain;
+      },
+      async exec(): Promise<unknown[]> {
+        // Apply queued ops in order. A real Redis MULTI is atomic — we
+        // don't simulate failure scenarios here, but the per-op results
+        // match the node-redis return convention.
+        return queue.map((op) => op());
+      },
+    };
+    // Test-only inspection hook. Non-enumerable so it doesn't appear in
+    // Object.keys/JSON.stringify and can't be mistaken for production API.
+    Object.defineProperty(chain, '_queueLength', {
+      enumerable: false,
+      value: () => queue.length,
+    });
+    return chain as typeof chain & { _queueLength: () => number };
+  }
+
+  /**
    * Create a RedisStore with a mock in-memory client, bypassing the
    * private constructor via Object.create and injecting a mock client.
    *
@@ -810,6 +903,12 @@ describe('RedisStore', () => {
       sMembers: vi.fn(async (key: string) => {
         return [...(setData.get(key) ?? [])];
       }),
+      // multi() returns a chain object. Queue commands; on .exec(), apply
+      // them all atomically against the same backing Maps. Real Redis
+      // MULTI/EXEC is all-or-nothing, but our mock isn't simulating that
+      // — it just guarantees the queued ops run together without other
+      // mock interleaving (which is what callers actually care about).
+      multi: vi.fn(() => createMockMulti(data, hashData, setData)),
       quit: vi.fn(async () => undefined),
     };
 
@@ -1236,6 +1335,187 @@ describe('RedisStore', () => {
     it('deleteEvalResult returns false for unknown id', async () => {
       const { store } = createRedisStoreWithMockClient();
       expect(await store.deleteEvalResult('does-not-exist')).toBe(false);
+    });
+  });
+
+  describe('atomicity (MULTI/EXEC)', () => {
+    // These tests prove that multi-key writes go through a single multi()
+    // chain — so a crash mid-operation can't leave the store in a partial
+    // state. Each `it()` asserts both that multi() was called the right
+    // number of times AND that the chain captured the expected number of
+    // queued ops before exec().
+    //
+    // We instrument by replacing the mock's `multi` with a spy that wraps
+    // the original implementation and records the chain returned, so we
+    // can inspect `_queueLength()` after exec().
+
+    function instrumentMulti(
+      mockClient: ReturnType<typeof createRedisStoreWithMockClient>['mockClient'],
+    ) {
+      const chains: Array<
+        ReturnType<typeof createRedisStoreWithMockClient>['mockClient']['multi'] extends (
+          ...args: never
+        ) => infer R
+          ? R
+          : never
+      > = [];
+      const original = mockClient.multi.getMockImplementation()!;
+      mockClient.multi.mockImplementation(() => {
+        const chain = original();
+        chains.push(chain);
+        return chain;
+      });
+      return chains;
+    }
+
+    it('saveSession queues data + sessionIds in one MULTI', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      const chains = instrumentMulti(mockClient);
+      await store.saveSession('s1', [{ role: 'user', content: 'hi' }]);
+
+      expect(mockClient.multi).toHaveBeenCalledTimes(1);
+      expect(chains).toHaveLength(1);
+      // Two ops queued: set + sAdd
+      expect(chains[0]._queueLength()).toBe(2);
+    });
+
+    it('deleteSession queues data + meta + sessionIds in one MULTI', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      const chains = instrumentMulti(mockClient);
+      await store.deleteSession('s1');
+
+      expect(mockClient.multi).toHaveBeenCalledTimes(1);
+      expect(chains[0]._queueLength()).toBe(3);
+    });
+
+    it('saveExecutionState queues blob + pending-set membership (waiting case)', async () => {
+      const { store, mockClient, setData } = createRedisStoreWithMockClient();
+      const chains = instrumentMulti(mockClient);
+      await store.saveExecutionState('e1', {
+        workflow: 'w',
+        input: null,
+        step: 0,
+        status: 'waiting',
+      });
+
+      expect(chains[0]._queueLength()).toBe(2);
+      // Pending set must have the entry after exec()
+      expect(setData.get('axl:pending-executions')?.has('e1')).toBe(true);
+    });
+
+    it('saveExecutionState queues blob + pending-set REMOVAL (non-waiting case)', async () => {
+      const { store, mockClient, setData } = createRedisStoreWithMockClient();
+      // Pre-populate the pending set so we can verify removal
+      setData.set('axl:pending-executions', new Set(['e1']));
+
+      const chains = instrumentMulti(mockClient);
+      await store.saveExecutionState('e1', {
+        workflow: 'w',
+        input: null,
+        step: 0,
+        status: 'running',
+      });
+
+      expect(chains[0]._queueLength()).toBe(2);
+      expect(setData.get('axl:pending-executions')?.has('e1')).toBe(false);
+    });
+
+    it('saveExecution queues set membership + data in one MULTI', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      const chains = instrumentMulti(mockClient);
+      await store.saveExecution({
+        executionId: 'e1',
+        workflow: 'w',
+        status: 'completed',
+        events: [],
+        totalCost: 0,
+        startedAt: 0,
+        completedAt: 0,
+        duration: 0,
+      });
+
+      expect(mockClient.multi).toHaveBeenCalledTimes(1);
+      expect(chains[0]._queueLength()).toBe(2);
+    });
+
+    it('saveEvalResult queues set membership + data in one MULTI', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      const chains = instrumentMulti(mockClient);
+      await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
+
+      expect(chains[0]._queueLength()).toBe(2);
+    });
+
+    it('deleteEvalResult queues sRem + del in one MULTI and reads del() for the boolean', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
+
+      const chains = instrumentMulti(mockClient);
+      const result = await store.deleteEvalResult('ev1');
+
+      expect(chains[0]._queueLength()).toBe(2);
+      expect(result).toBe(true);
+    });
+
+    it('deleteEvalResult returns false when the entry does not exist (still atomic)', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      const chains = instrumentMulti(mockClient);
+      const result = await store.deleteEvalResult('does-not-exist');
+
+      expect(chains[0]._queueLength()).toBe(2);
+      expect(result).toBe(false);
+    });
+
+    it('deleteMemory queues new + legacy hDel in one MULTI', async () => {
+      const { store, mockClient } = createRedisStoreWithMockClient();
+      const chains = instrumentMulti(mockClient);
+      await store.deleteMemory('session:s1', 'k');
+
+      expect(chains[0]._queueLength()).toBe(2);
+    });
+
+    it('multi-key writes do NOT issue per-command client calls during MULTI', async () => {
+      // Regression guard: if a refactor accidentally mixes plain client.set
+      // alongside the multi() chain, the atomicity guarantee is silently
+      // lost. Assert that the underlying single-op methods aren't called
+      // during these write paths.
+      const { store, mockClient } = createRedisStoreWithMockClient();
+
+      mockClient.set.mockClear();
+      mockClient.sAdd.mockClear();
+      mockClient.del.mockClear();
+      mockClient.sRem.mockClear();
+      mockClient.hDel.mockClear();
+
+      await store.saveSession('s1', [{ role: 'user', content: 'hi' }]);
+      await store.saveExecution({
+        executionId: 'e1',
+        workflow: 'w',
+        status: 'completed',
+        events: [],
+        totalCost: 0,
+        startedAt: 0,
+        completedAt: 0,
+        duration: 0,
+      });
+      await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
+      await store.saveExecutionState('e1', {
+        workflow: 'w',
+        input: null,
+        step: 0,
+        status: 'waiting',
+      });
+      await store.deleteEvalResult('ev1');
+      await store.deleteSession('s1');
+      await store.deleteMemory('session:s1', 'k');
+
+      // None of the single-op methods should have been called for these
+      // multi-key writes — every command went through multi() / exec().
+      expect(mockClient.set).not.toHaveBeenCalled();
+      expect(mockClient.sAdd).not.toHaveBeenCalled();
+      expect(mockClient.del).not.toHaveBeenCalled();
+      expect(mockClient.sRem).not.toHaveBeenCalled();
+      expect(mockClient.hDel).not.toHaveBeenCalled();
     });
   });
 

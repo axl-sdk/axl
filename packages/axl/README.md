@@ -630,16 +630,23 @@ await runtime.shutdown();
 
 `RedisStore.create()` connects before returning, so any connection error surfaces at startup rather than on first use. The runtime's `shutdown()` closes the connection automatically.
 
-Pass an options object instead of a URL string to set a custom `keyPrefix` (default `'axl:'`) — useful when multiple Axl deployments share a Redis cluster:
+Pass an options object instead of a URL string to set a custom `keyPrefix` (default `'axl:'`) — useful when multiple Axl deployments share a Redis cluster — or to configure TTLs:
 
 ```typescript
 const store = await RedisStore.create({
   url: 'redis://localhost:6379',
   keyPrefix: 'axl:prod:', // staging would use 'axl:staging:'
+  defaultTtl: 60 * 60 * 24 * 30, // 30 days for everything
+  ttls: {
+    checkpoint: 60 * 60 * 24 * 7,  // shorter for checkpoints
+    sessionMeta: null,             // explicit opt-out
+  },
 });
 ```
 
 The prefix is concatenated as-given — no normalization. Include a trailing colon if you want one. Empty string is rejected.
+
+**TTLs are strongly recommended in production** — without them every `save*` accumulates forever and Redis eventually OOMs. Memory category uses sliding-window semantics (active users keep their data); others use fixed-window. See [api-reference.md](../../docs/api-reference.md#redisstore-options) for full details.
 
 ### Session Options
 

@@ -38,6 +38,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`MemoryManager` emits a one-shot `console.warn` when used against a custom `StateStore` that doesn't implement memory methods.** Previously, the sessionMeta-fallback path was completely silent — users on custom stores lost `metadata` and `getAllMemory` enumeration with zero signal. Now they get a single warning per offending store listing the four methods to implement. All three built-in stores implement the methods, so no warning fires for users on `MemoryStore` / `SQLiteStore` / `RedisStore`.
 
 ### Added
+- **`RedisStore` TTL config: `defaultTtl` + per-category overrides.** Without TTLs, every `save*` accumulates forever and Redis eventually OOMs. New options let operators bound the lifetime of each storage category:
+
+  ```typescript
+  await RedisStore.create({
+    url: 'redis://localhost:6379',
+    defaultTtl: 60 * 60 * 24 * 30, // 30 days for everything
+    ttls: {
+      checkpoint: 60 * 60 * 24 * 7,   // shorter for checkpoints
+      executionState: 60 * 60 * 24,   // 1 day for suspend/resume state
+      sessionMeta: null,              // explicit opt-out, even with defaultTtl
+    },
+  });
+  ```
+
+  Categories: `session`, `sessionMeta`, `checkpoint`, `executionState`, `executionHistory`, `evalHistory`, `memory`. Resolution: per-category override beats `defaultTtl`; `null` in an override explicitly opts that category out; omission falls back to `defaultTtl`; non-positive values are treated as "no TTL" defensively (Redis EXPIRE 0 would immediately delete).
+
+  **Window semantics:**
+  - **Sliding** (`memory`, `session`): every write resets the TTL. Active users keep their data; inactive users forget after the configured idle period. Sessions are sliding for the same reason memory is — they're user-activity-driven, and an active chat should not time out mid-conversation. (This is a deliberate refinement of the original spec proposal, which classed sessions as fixed-window; live-chat use cases made that wrong.) Memory uses `EXPIRE`; session uses `SET ... EX` because of its underlying string storage.
+  - **Fixed-creation** (`checkpoint`, `sessionMeta`): TTL set on first write via `EXPIRE NX`; subsequent writes don't extend the window. Matches the "owned by an execution / session" lifecycle.
+  - **Fixed-refresh** (`executionState`, `executionHistory`, `evalHistory`): TTL applied via `SET ... EX`, which always refreshes on overwrite. `executionState` refreshes so a long-suspended workflow doesn't disappear mid-flight. Execution / eval history entries are immutable after the first write, so refresh-vs-NX is moot for them in practice.
+
+  **Per-category TTLs are independent.** Setting `session: 3600` and `sessionMeta: 86400` will leave orphaned metadata for a session that has already expired, until the metadata TTL fires. If you want session + meta to age out together, set them to the same value (or rely on the same `defaultTtl`).
+
+  **`pendingDecision` is intentionally NOT configurable.** Pending decisions share a single `axl:decisions` hash; a TTL on that key would expire ALL pending decisions at once. Resolve decisions individually via `resolveDecision()` instead.
+
+  **Index-set growth caveat:** TTLs apply only to data blobs. The legacy ID set + sorted-set indexes (for `executionHistory` / `evalHistory`) have no TTL — they're small (just IDs) and reads filter null mGet results, so correctness is preserved. Indexes grow over time as data ages out; manual `ZREMRANGEBYSCORE` + `SREM` during a maintenance window can prune the bloat. Sweeps are not yet automatic — file an issue if you hit the size where this matters.
+
 - **`runtime.deleteExecution(id)` for on-demand cleanup.** Removes an execution from the in-memory active+historical caches and from the configured `StateStore`. Returns `true` if anything was actually removed, `false` if the id was unknown. Symmetric to `runtime.deleteEvalResult(id)`. Use cases: GDPR right-to-be-forgotten, operator-driven cleanup of runs that captured PII the user asked to scrub. New optional `StateStore.deleteExecution?(id): Promise<boolean>` interface method — all three built-in stores implement it; `RedisStore` removes from all three indexes (legacy SET, sorted-set, data blob) inside a single atomic MULTI. Does NOT abort an in-flight execution — call `runtime.abort(id)` first, then `deleteExecution(id)` after it finishes. For bulk eviction by age, use `RedisStore` TTLs instead (coming in this release as #3).
 - **`DELETE /api/executions/:id` Studio endpoint** wrapping `runtime.deleteExecution`. Returns `{ id, deleted: true }` on success or 404 on unknown id. Blocked in `readOnly` mode (405 with `error.code: 'READ_ONLY'`).
 - **`ExecutionInfo.metadata`.** Caller-supplied metadata from `ExecuteOptions.metadata` (and `runtime.stream()`'s `options.metadata`) now round-trips through `runtime.getExecution()` / `getExecutions()` as a stable, queryable surface for tags like `userId`, `tenantId`, or correlation ids — no event-parsing required. Persisted by all three built-in stores; `SQLiteStore` adds a `metadata` column in schema v3 (auto-migrated on first open). Additive — existing code is unaffected; the field is `undefined` when no metadata is passed. Filter via `runtime.getExecutions()` + an in-process `.filter()`; secondary indexes are intentionally not provided (`StateStore` is a persistence boundary, not a query engine).

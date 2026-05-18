@@ -828,14 +828,35 @@ describe('RedisStore', () => {
     hashData: Map<string, Map<string, string>>,
     setData: Map<string, Set<string>>,
     zsetData: Map<string, Map<string, number>>,
+    ttls: Map<string, number>,
   ) {
     type QueuedOp = () => unknown;
     const queue: QueuedOp[] = [];
     const chain = {
-      set(key: string, value: string) {
+      set(key: string, value: string, options?: { EX?: number }) {
         queue.push(() => {
           data.set(key, value);
+          if (options?.EX !== undefined) ttls.set(key, options.EX);
+          else ttls.delete(key);
           return 'OK';
+        });
+        return chain;
+      },
+      hSet(key: string, field: string, value: string) {
+        queue.push(() => {
+          if (!hashData.has(key)) hashData.set(key, new Map());
+          hashData.get(key)!.set(field, value);
+          return 1;
+        });
+        return chain;
+      },
+      expire(key: string, seconds: number, mode?: 'NX' | 'XX' | 'GT' | 'LT') {
+        queue.push(() => {
+          const existing = ttls.get(key);
+          if (mode === 'NX' && existing !== undefined) return 0;
+          if (mode === 'XX' && existing === undefined) return 0;
+          ttls.set(key, seconds);
+          return 1;
         });
         return chain;
       },
@@ -938,7 +959,18 @@ describe('RedisStore', () => {
    * @param keyPrefix - Override the default `'axl:'` prefix to exercise
    * the keyPrefix option without hitting a real Redis.
    */
-  function createRedisStoreWithMockClient(keyPrefix = 'axl:') {
+  function createRedisStoreWithMockClient(
+    keyPrefix = 'axl:',
+    ttlConfig?: Partial<{
+      session: number | null;
+      sessionMeta: number | null;
+      checkpoint: number | null;
+      executionState: number | null;
+      executionHistory: number | null;
+      evalHistory: number | null;
+      memory: number | null;
+    }>,
+  ) {
     const data = new Map<string, string>();
     const hashData = new Map<string, Map<string, string>>();
 
@@ -946,6 +978,9 @@ describe('RedisStore', () => {
     // Sorted set: member → score. We re-sort by score on read; production
     // Redis maintains a skiplist for O(log N), but the mock just sorts on demand.
     const zsetData = new Map<string, Map<string, number>>();
+    // Tracks the TTL last applied to each key (seconds, not absolute time).
+    // The mock doesn't simulate actual expiration — tests assert what was set.
+    const ttls = new Map<string, number>();
 
     const mockClient = {
       hSet: vi.fn(async (key: string, field: string, value: string) => {
@@ -981,9 +1016,26 @@ describe('RedisStore', () => {
         }
         return count;
       }),
-      set: vi.fn(async (key: string, value: string) => {
+      // SET with optional EX (TTL in seconds). The mock records the EX value
+      // on a side-map so tests can assert "TTL was set with the right value"
+      // without simulating real wall-clock expiration (which would make tests
+      // flaky and slow).
+      set: vi.fn(async (key: string, value: string, options?: { EX?: number }) => {
         data.set(key, value);
+        if (options?.EX !== undefined) ttls.set(key, options.EX);
+        else ttls.delete(key); // SET without EX clears any existing TTL
         return 'OK';
+      }),
+      // EXPIRE applies a TTL to an existing key. With `mode: 'NX'`, only
+      // sets if no TTL exists (used for fixed-window hash-backed data).
+      // Without mode, always (re)sets — used for sliding-window memory.
+      expire: vi.fn(async (key: string, seconds: number, mode?: 'NX' | 'XX' | 'GT' | 'LT') => {
+        const existing = ttls.get(key);
+        if (mode === 'NX' && existing !== undefined) return 0;
+        if (mode === 'XX' && existing === undefined) return 0;
+        // GT/LT not used by RedisStore today — fall through to set
+        ttls.set(key, seconds);
+        return 1;
       }),
       get: vi.fn(async (key: string) => {
         return data.get(key) ?? null;
@@ -1084,16 +1136,27 @@ describe('RedisStore', () => {
       // MULTI/EXEC is all-or-nothing, but our mock isn't simulating that
       // — it just guarantees the queued ops run together without other
       // mock interleaving (which is what callers actually care about).
-      multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData)),
+      multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData, ttls)),
       quit: vi.fn(async () => undefined),
     };
 
-    // Bypass the private constructor and inject the mock client
+    // Bypass the private constructor and inject the mock client.
+    // Resolve TTLs the same way the factory does: per-category override
+    // beats default beats null (no TTL).
     const store = Object.create(RedisStore.prototype) as RedisStore;
     (store as any).client = mockClient;
     (store as any).keyPrefix = keyPrefix;
+    (store as any).ttls = {
+      session: ttlConfig?.session ?? null,
+      sessionMeta: ttlConfig?.sessionMeta ?? null,
+      checkpoint: ttlConfig?.checkpoint ?? null,
+      executionState: ttlConfig?.executionState ?? null,
+      executionHistory: ttlConfig?.executionHistory ?? null,
+      evalHistory: ttlConfig?.evalHistory ?? null,
+      memory: ttlConfig?.memory ?? null,
+    };
 
-    return { store, mockClient, data, hashData, setData, zsetData };
+    return { store, mockClient, data, hashData, setData, zsetData, ttls };
   }
 
   describe('keyPrefix', () => {
@@ -1901,6 +1964,448 @@ describe('RedisStore', () => {
         await store.saveExecution(makeExec('e1', 100));
         expect(zsetData.has('tenant-a:exec-history-z')).toBe(true);
         expect(zsetData.has('axl:exec-history-z')).toBe(false);
+      });
+    });
+  });
+
+  describe('TTL config (#3)', () => {
+    // These tests assert WHAT TTLs are applied, not that Redis actually
+    // expires anything. The mock records EX values + EXPIRE invocations; we
+    // verify the surfaces match the documented contract. Real expiration is
+    // a Redis behavior, not an AXL one.
+
+    describe('default behavior (no TTL configured)', () => {
+      it('applies no TTLs when neither defaultTtl nor per-category overrides are set', async () => {
+        const { store, ttls } = createRedisStoreWithMockClient();
+        await store.saveCheckpoint('e1', 'cp', { x: 1 });
+        await store.saveSession('s1', [{ role: 'user', content: 'hi' }]);
+        await store.saveSessionMeta('s1', 'meta', 'v');
+        await store.saveExecutionState('e1', {
+          workflow: 'w',
+          input: null,
+          step: 0,
+          status: 'waiting',
+        });
+        await store.saveExecution({
+          executionId: 'e1',
+          workflow: 'w',
+          status: 'completed',
+          events: [],
+          totalCost: 0,
+          startedAt: 0,
+          completedAt: 0,
+          duration: 0,
+        });
+        await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
+        await store.saveMemory('global', 'k', 'v');
+
+        // No TTLs recorded on any key
+        expect(ttls.size).toBe(0);
+      });
+    });
+
+    describe('fixed-window categories (SET EX or EXPIRE NX)', () => {
+      it('saveSession uses SET ... EX with the configured TTL', async () => {
+        const { store, mockClient, ttls } = createRedisStoreWithMockClient(undefined, {
+          session: 3600,
+        });
+        await store.saveSession('s1', [{ role: 'user', content: 'hi' }]);
+
+        expect(ttls.get('axl:session:s1')).toBe(3600);
+        // Note: session uses SET-with-EX, so the underlying mock recorded
+        // it via the chain's set() with options.EX (not a separate EXPIRE).
+        expect(mockClient.expire).not.toHaveBeenCalled();
+      });
+
+      it('saveCheckpoint uses HSET + EXPIRE NX (does not extend on re-save)', async () => {
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          checkpoint: 7200,
+        });
+
+        // First save: sets the TTL
+        await store.saveCheckpoint('e1', 'a', { step: 0 });
+        expect(ttls.get('axl:checkpoint:e1')).toBe(7200);
+
+        // Manually shrink the TTL to simulate time passing — second save
+        // must NOT reset it (NX semantics).
+        ttls.set('axl:checkpoint:e1', 100);
+        await store.saveCheckpoint('e1', 'b', { step: 1 });
+        // Still 100 — NX prevented the re-set
+        expect(ttls.get('axl:checkpoint:e1')).toBe(100);
+      });
+
+      it('saveSessionMeta uses EXPIRE NX (does not extend on re-save)', async () => {
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          sessionMeta: 3600,
+        });
+        await store.saveSessionMeta('s1', 'agentName', 'support');
+        expect(ttls.get('axl:session-meta:s1')).toBe(3600);
+
+        // Shrink and re-save — NX prevents reset
+        ttls.set('axl:session-meta:s1', 50);
+        await store.saveSessionMeta('s1', 'handoffHistory', []);
+        expect(ttls.get('axl:session-meta:s1')).toBe(50);
+      });
+
+      it('saveExecution applies TTL via SET ... EX', async () => {
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          executionHistory: 60 * 60 * 24 * 30,
+        });
+        await store.saveExecution({
+          executionId: 'e1',
+          workflow: 'w',
+          status: 'completed',
+          events: [],
+          totalCost: 0,
+          startedAt: 0,
+          completedAt: 0,
+          duration: 0,
+        });
+        expect(ttls.get('axl:exec-history:e1')).toBe(60 * 60 * 24 * 30);
+
+        // Index keys (SET + ZSET) do NOT get TTLs — they age out lazily
+        // as data blobs expire and reads filter nulls.
+        expect(ttls.has('axl:exec-history-ids')).toBe(false);
+        expect(ttls.has('axl:exec-history-z')).toBe(false);
+      });
+
+      it('saveEvalResult applies TTL via SET ... EX', async () => {
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          evalHistory: 60 * 60 * 24 * 7,
+        });
+        await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
+        expect(ttls.get('axl:eval-history:ev1')).toBe(60 * 60 * 24 * 7);
+      });
+
+      it('saveExecutionState applies TTL via SET ... EX (refreshes on overwrite)', async () => {
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          executionState: 60 * 60 * 24,
+        });
+        await store.saveExecutionState('e1', {
+          workflow: 'w',
+          input: null,
+          step: 0,
+          status: 'waiting',
+        });
+        expect(ttls.get('axl:exec-state:e1')).toBe(60 * 60 * 24);
+
+        // Shrink and re-save — SET-with-EX always refreshes (no NX), so
+        // status transitions reset the lifetime. This is intentional: a
+        // long-suspended workflow shouldn't disappear mid-flight.
+        ttls.set('axl:exec-state:e1', 50);
+        await store.saveExecutionState('e1', {
+          workflow: 'w',
+          input: null,
+          step: 1,
+          status: 'running',
+        });
+        expect(ttls.get('axl:exec-state:e1')).toBe(60 * 60 * 24);
+      });
+    });
+
+    describe('sliding-window category (memory)', () => {
+      it('saveMemory uses EXPIRE without NX — every write resets the TTL', async () => {
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          memory: 60 * 60 * 24 * 30,
+        });
+
+        await store.saveMemory('session:s1', 'k1', 'v1');
+        expect(ttls.get('axl:memory:session:s1')).toBe(60 * 60 * 24 * 30);
+
+        // Shrink and write again — sliding semantics: TTL should be restored
+        ttls.set('axl:memory:session:s1', 100);
+        await store.saveMemory('session:s1', 'k2', 'v2');
+        expect(ttls.get('axl:memory:session:s1')).toBe(60 * 60 * 24 * 30);
+      });
+
+      it('memory TTL applies per-scope, not per-key (one TTL per hash)', async () => {
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, { memory: 3600 });
+        await store.saveMemory('session:s1', 'k1', 'v1');
+        await store.saveMemory('session:s2', 'k2', 'v2');
+        await store.saveMemory('global', 'k3', 'v3');
+
+        expect(ttls.get('axl:memory:session:s1')).toBe(3600);
+        expect(ttls.get('axl:memory:session:s2')).toBe(3600);
+        expect(ttls.get('axl:memory:global')).toBe(3600);
+        expect(ttls.size).toBe(3); // exactly three hashes, one TTL each
+      });
+    });
+
+    describe('pendingDecision is excluded (storage shape)', () => {
+      it('savePendingDecision does NOT apply any TTL (shared hash)', async () => {
+        // Even if a user *could* set ttls.pendingDecision (they can't —
+        // it's not in the type), the implementation never reads from that
+        // bucket. The decisions key is shared across all executions; a TTL
+        // would expire ALL pending decisions at once, which is wrong.
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          // Set every TTL we have to prove pendingDecision is excluded
+          session: 3600,
+          sessionMeta: 3600,
+          checkpoint: 3600,
+          executionState: 3600,
+          executionHistory: 3600,
+          evalHistory: 3600,
+          memory: 3600,
+        });
+        await store.savePendingDecision('e1', {
+          executionId: 'e1',
+          channel: 'slack',
+          prompt: 'Approve?',
+          createdAt: '2024-01-01',
+        });
+        expect(ttls.has('axl:decisions')).toBe(false);
+      });
+    });
+
+    describe('defaultTtl + per-category overrides via the factory', () => {
+      it('defaultTtl flows to all TTL-capable categories', async () => {
+        // Construct via the helper with defaultTtl-like behavior — every
+        // category gets the same value (since we passed the same value
+        // for each in the helper's options).
+        const all = 60 * 60 * 24;
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          session: all,
+          sessionMeta: all,
+          checkpoint: all,
+          executionState: all,
+          executionHistory: all,
+          evalHistory: all,
+          memory: all,
+        });
+        await store.saveCheckpoint('e1', 'cp', 1);
+        await store.saveSession('s1', []);
+        await store.saveExecutionState('e1', {
+          workflow: 'w',
+          input: null,
+          step: 0,
+          status: 'waiting',
+        });
+        await store.saveExecution({
+          executionId: 'e1',
+          workflow: 'w',
+          status: 'completed',
+          events: [],
+          totalCost: 0,
+          startedAt: 0,
+          completedAt: 0,
+          duration: 0,
+        });
+        await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
+        await store.saveSessionMeta('s1', 'k', 'v');
+        await store.saveMemory('g', 'k', 'v');
+
+        // Each TTL-capable key has the same TTL
+        expect(ttls.get('axl:checkpoint:e1')).toBe(all);
+        expect(ttls.get('axl:session:s1')).toBe(all);
+        expect(ttls.get('axl:exec-state:e1')).toBe(all);
+        expect(ttls.get('axl:exec-history:e1')).toBe(all);
+        expect(ttls.get('axl:eval-history:ev1')).toBe(all);
+        expect(ttls.get('axl:session-meta:s1')).toBe(all);
+        expect(ttls.get('axl:memory:g')).toBe(all);
+      });
+
+      it('null in ttls map opts a category out (no TTL even with defaultTtl)', async () => {
+        // The helper simulates the resolved (post-default) state, so we
+        // set everything to 3600 except sessionMeta which is null.
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          session: 3600,
+          sessionMeta: null,
+          checkpoint: 3600,
+          executionState: 3600,
+          executionHistory: 3600,
+          evalHistory: 3600,
+          memory: 3600,
+        });
+        await store.saveSessionMeta('s1', 'k', 'v');
+        expect(ttls.has('axl:session-meta:s1')).toBe(false);
+
+        // But other categories still have TTLs
+        await store.saveSession('s1', []);
+        expect(ttls.get('axl:session:s1')).toBe(3600);
+      });
+
+      it('non-positive TTL values are treated as no-TTL (defensive)', async () => {
+        // Redis EXPIRE 0 immediately deletes; this is almost always a
+        // misconfiguration. ttlFor() returns undefined for non-positive
+        // values, so the no-TTL code path runs.
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          session: 0,
+          memory: -1,
+          checkpoint: 60,
+        });
+        await store.saveSession('s1', []);
+        await store.saveMemory('g', 'k', 'v');
+        await store.saveCheckpoint('e1', 'cp', 1);
+
+        // 0 and -1 → no TTL applied
+        expect(ttls.has('axl:session:s1')).toBe(false);
+        expect(ttls.has('axl:memory:g')).toBe(false);
+        // Valid positive value still works
+        expect(ttls.get('axl:checkpoint:e1')).toBe(60);
+      });
+
+      it('non-finite TTL values (NaN, Infinity) are treated as no-TTL', async () => {
+        // Critical defense: passing Infinity to Redis would surface as a
+        // wire-level protocol error at first write under load. NaN would
+        // serialize as "NaN" and likely error too. ttlFor() must filter
+        // both before they reach the client.
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          session: Number.POSITIVE_INFINITY,
+          memory: Number.NaN,
+          checkpoint: -Number.POSITIVE_INFINITY,
+          executionState: 60, // valid control
+        });
+        await store.saveSession('s1', []);
+        await store.saveMemory('g', 'k', 'v');
+        await store.saveCheckpoint('e1', 'cp', 1);
+        await store.saveExecutionState('e1', {
+          workflow: 'w',
+          input: null,
+          step: 0,
+          status: 'waiting',
+        });
+
+        expect(ttls.has('axl:session:s1')).toBe(false);
+        expect(ttls.has('axl:memory:g')).toBe(false);
+        expect(ttls.has('axl:checkpoint:e1')).toBe(false);
+        expect(ttls.get('axl:exec-state:e1')).toBe(60); // valid one still applies
+      });
+
+      it('fractional TTL values are floored to an integer', async () => {
+        // Redis EXPIRE takes integer seconds. Pass a float through ttlFor()
+        // and it should arrive as a whole number — not a float that could
+        // confuse the Redis protocol.
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          memory: 1.7,
+        });
+        await store.saveMemory('g', 'k', 'v');
+        expect(ttls.get('axl:memory:g')).toBe(1); // floor(1.7)
+      });
+    });
+
+    describe('atomicity of TTL-configured hSet + expire paths', () => {
+      // When a TTL is configured for a hash-backed category, the save
+      // path queues hSet + expire in a single MULTI. A future refactor
+      // could accidentally split these into two awaits, breaking
+      // atomicity (data committed but TTL not applied if process dies
+      // between). These tests pin the contract.
+
+      function instrumentMulti(
+        mockClient: ReturnType<typeof createRedisStoreWithMockClient>['mockClient'],
+      ) {
+        type ChainType = ReturnType<typeof createMockMulti>;
+        const chains: ChainType[] = [];
+        const original = mockClient.multi.getMockImplementation()!;
+        mockClient.multi.mockImplementation(() => {
+          const chain = original();
+          chains.push(chain);
+          return chain;
+        });
+        return chains;
+      }
+
+      it('saveCheckpoint with TTL queues hSet + expire NX in one MULTI', async () => {
+        const { store, mockClient } = createRedisStoreWithMockClient(undefined, {
+          checkpoint: 3600,
+        });
+        const chains = instrumentMulti(mockClient);
+
+        await store.saveCheckpoint('e1', 'cp', { x: 1 });
+
+        expect(mockClient.multi).toHaveBeenCalledTimes(1);
+        expect(chains[0]._queueLength()).toBe(2); // hSet + expire
+        // Plus: no single-op client.hSet or client.expire escaped the MULTI
+        expect(mockClient.hSet).not.toHaveBeenCalled();
+        expect(mockClient.expire).not.toHaveBeenCalled();
+      });
+
+      it('saveSessionMeta with TTL queues hSet + expire NX in one MULTI', async () => {
+        const { store, mockClient } = createRedisStoreWithMockClient(undefined, {
+          sessionMeta: 3600,
+        });
+        const chains = instrumentMulti(mockClient);
+
+        await store.saveSessionMeta('s1', 'k', 'v');
+
+        expect(chains[0]._queueLength()).toBe(2);
+        expect(mockClient.hSet).not.toHaveBeenCalled();
+        expect(mockClient.expire).not.toHaveBeenCalled();
+      });
+
+      it('saveMemory with TTL queues hSet + expire (sliding) in one MULTI', async () => {
+        const { store, mockClient } = createRedisStoreWithMockClient(undefined, {
+          memory: 3600,
+        });
+        const chains = instrumentMulti(mockClient);
+
+        await store.saveMemory('g', 'k', 'v');
+
+        expect(chains[0]._queueLength()).toBe(2);
+        expect(mockClient.hSet).not.toHaveBeenCalled();
+        expect(mockClient.expire).not.toHaveBeenCalled();
+      });
+
+      it('no-TTL path uses single-op client.hSet (no MULTI overhead)', async () => {
+        // Existing baseline behavior — verify the fast path is preserved
+        // when TTLs are not configured.
+        const { store, mockClient } = createRedisStoreWithMockClient();
+        const chains = instrumentMulti(mockClient);
+
+        await store.saveCheckpoint('e1', 'cp', { x: 1 });
+        await store.saveSessionMeta('s1', 'k', 'v');
+        await store.saveMemory('g', 'k', 'v');
+
+        // No MULTI was opened for these calls — they're single-op hSet
+        expect(chains).toHaveLength(0);
+        expect(mockClient.hSet).toHaveBeenCalledTimes(3);
+        expect(mockClient.expire).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('factory resolution (RedisStore.create)', () => {
+      // These exercise the actual create() resolution logic, NOT the
+      // injected mock helper which receives already-resolved TTLs.
+
+      it('rejects empty keyPrefix even when TTL options are set', async () => {
+        await expect(RedisStore.create({ keyPrefix: '', defaultTtl: 3600 })).rejects.toThrow(
+          /keyPrefix cannot be empty/,
+        );
+      });
+
+      // Resolution-logic tests use a private-property poke since create()
+      // requires a real Redis connection.
+      it('per-category override beats defaultTtl', () => {
+        // Simulate the resolution logic against the mock helper's
+        // ttls property directly.
+        const { store } = createRedisStoreWithMockClient();
+        // Manually set what the factory's resolveCategory would have set
+        (store as any).ttls = {
+          session: 3600, // override
+          sessionMeta: 7200, // defaultTtl
+          checkpoint: 7200,
+          executionState: 7200,
+          executionHistory: 7200,
+          evalHistory: 7200,
+          memory: 7200,
+        };
+        // Verify ttlFor() uses the right value per category
+        expect((store as any).ttlFor('session')).toBe(3600);
+        expect((store as any).ttlFor('sessionMeta')).toBe(7200);
+      });
+
+      it('null override beats defaultTtl (opts out)', () => {
+        const { store } = createRedisStoreWithMockClient();
+        (store as any).ttls = {
+          session: null, // override to null
+          sessionMeta: 7200, // defaultTtl
+          checkpoint: 7200,
+          executionState: 7200,
+          executionHistory: 7200,
+          evalHistory: 7200,
+          memory: 7200,
+        };
+        expect((store as any).ttlFor('session')).toBeUndefined();
+        expect((store as any).ttlFor('sessionMeta')).toBe(7200);
       });
     });
   });

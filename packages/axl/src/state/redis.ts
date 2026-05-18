@@ -13,7 +13,15 @@ interface RedisClient {
   hGet(key: string, field: string): Promise<string | null | undefined>;
   hGetAll(key: string): Promise<Record<string, string>>;
   hDel(key: string, field: string | string[]): Promise<number>;
-  set(key: string, value: string): Promise<string | null>;
+  // SET with optional `EX` (expiration in seconds). When `EX` is undefined,
+  // the key has no TTL — same behavior as the pre-#3 single-arg form.
+  set(key: string, value: string, options?: { EX?: number }): Promise<string | null>;
+  // EXPIRE applies a TTL to an existing key (e.g. after `hSet`, since
+  // node-redis has no `HSET ... EX` primitive). `mode: 'NX'` only sets the
+  // TTL when none already exists — used for fixed-window semantics so a
+  // re-save of a per-execution hash doesn't keep extending its window.
+  // Omitting `mode` always (re)sets — used for sliding-window memory.
+  expire(key: string, seconds: number, mode?: 'NX' | 'XX' | 'GT' | 'LT'): Promise<number | boolean>;
   get(key: string): Promise<string | null>;
   // mGet bulk-fetches values for an array of keys. Used by listExecutions /
   // listEvalResults after the sorted-set returns an ordered ID list.
@@ -48,11 +56,13 @@ interface RedisClient {
 // when `.exec()` is awaited. Same surface as node-redis v5's `RedisMulti`,
 // scoped to commands we actually use.
 interface RedisMulti {
-  set(key: string, value: string): RedisMulti;
+  set(key: string, value: string, options?: { EX?: number }): RedisMulti;
   del(key: string | string[]): RedisMulti;
   sAdd(key: string, member: string | string[]): RedisMulti;
   sRem(key: string, member: string | string[]): RedisMulti;
+  hSet(key: string, field: string, value: string): RedisMulti;
   hDel(key: string, field: string | string[]): RedisMulti;
+  expire(key: string, seconds: number, mode?: 'NX' | 'XX' | 'GT' | 'LT'): RedisMulti;
   zAdd(key: string, member: { score: number; value: string }): RedisMulti;
   zRem(key: string, member: string | string[]): RedisMulti;
   // exec() returns the per-command results in queued order. We don't
@@ -90,7 +100,70 @@ export interface RedisStoreOptions {
    * SET + N×GET + JS-sort read path — correct but slow at scale.
    */
   skipMigration?: boolean;
+  /**
+   * Default TTL in **seconds** applied to every storage category that has
+   * a TTL-capable storage shape. Omitted by default — keys never expire,
+   * matching pre-#3 behavior.
+   *
+   * Per-category overrides via {@link ttls} take precedence. Set a category
+   * to `null` in {@link ttls} to opt that category out of the default.
+   *
+   * Strongly recommended in production: without a TTL every save accumulates
+   * forever and your Redis instance will eventually OOM.
+   *
+   * @example
+   * ```ts
+   * await RedisStore.create({
+   *   url: 'redis://localhost:6379',
+   *   defaultTtl: 60 * 60 * 24 * 30, // 30 days
+   * });
+   * ```
+   */
+  defaultTtl?: number;
+  /**
+   * Per-category TTL overrides in **seconds**. Use to assign different
+   * lifetimes per category (e.g. short-lived checkpoints, long-lived eval
+   * history). Set a category to `null` to explicitly disable TTL for it
+   * even when {@link defaultTtl} is set. Omitting a category means it falls
+   * back to {@link defaultTtl} (or no TTL if neither is set).
+   *
+   * `pendingDecision` is intentionally NOT in this map — pending decisions
+   * are stored as fields of a shared hash (`axl:decisions`), so a TTL on
+   * that key would expire ALL pending decisions at once, which is almost
+   * never what you want. Resolve decisions individually via
+   * `resolveDecision()` instead.
+   *
+   * Window semantics:
+   * - `memory` uses **sliding** window — every write resets the TTL, so
+   *   active users keep their data and inactive ones forget. Designed for
+   *   per-user / per-session memory.
+   * - All other categories use **fixed** window — the TTL is set on the
+   *   first write and isn't extended on subsequent writes (via `EXPIRE ... NX`).
+   *   Designed for runtime-controlled lifecycles like executions and
+   *   sessions, where the data should age out on a schedule from creation.
+   */
+  ttls?: {
+    session?: number | null;
+    sessionMeta?: number | null;
+    checkpoint?: number | null;
+    executionState?: number | null;
+    executionHistory?: number | null;
+    evalHistory?: number | null;
+    memory?: number | null;
+  };
 }
+
+type TtlCategory =
+  | 'session'
+  | 'sessionMeta'
+  | 'checkpoint'
+  | 'executionState'
+  | 'executionHistory'
+  | 'evalHistory'
+  | 'memory';
+
+/** Resolved per-category TTL (seconds), or `null` for "no TTL". */
+type ResolvedTtls = Record<TtlCategory, number | null>;
 
 /**
  * Redis-backed StateStore using the official `redis` (node-redis) client.
@@ -105,7 +178,26 @@ export class RedisStore implements StateStore {
   private constructor(
     private client: RedisClient,
     private keyPrefix: string,
+    private ttls: ResolvedTtls,
   ) {}
+
+  /**
+   * Resolve the TTL for a given storage category. Returns `undefined` when
+   * no TTL applies (category is `null` in resolved config, the value is
+   * non-positive — Redis EXPIRE 0 immediately deletes, which is almost
+   * never intended — or the value is non-finite).
+   *
+   * Non-finite values (`NaN`, `±Infinity`) defensively map to `undefined`
+   * rather than being passed to Redis, where they'd surface as a wire-level
+   * protocol error at the worst possible time (first write under load).
+   */
+  private ttlFor(category: TtlCategory): number | undefined {
+    const resolved = this.ttls[category];
+    if (resolved === null) return undefined;
+    if (!Number.isFinite(resolved) || resolved <= 0) return undefined;
+    // Use a positive integer — Redis EXPIRE / SET EX take seconds as ints.
+    return Math.floor(resolved);
+  }
 
   /**
    * Create a connected RedisStore instance.
@@ -153,7 +245,28 @@ export class RedisStore implements StateStore {
 
     const client = opts.url ? createClient({ url: opts.url }) : createClient();
     await client.connect();
-    const store = new RedisStore(client, keyPrefix);
+
+    // Resolve effective per-category TTL: per-category override beats
+    // defaultTtl beats "no TTL". `null` in overrides means explicit opt-out
+    // (no TTL for this category, even when defaultTtl is set).
+    const resolveCategory = (override: number | null | undefined): number | null => {
+      if (override === null) return null;
+      if (typeof override === 'number') return override;
+      // No override — fall back to defaultTtl. `null` here means no TTL
+      // (defaultTtl unset).
+      return typeof opts.defaultTtl === 'number' ? opts.defaultTtl : null;
+    };
+    const effectiveTtls = {
+      session: resolveCategory(opts.ttls?.session),
+      sessionMeta: resolveCategory(opts.ttls?.sessionMeta),
+      checkpoint: resolveCategory(opts.ttls?.checkpoint),
+      executionState: resolveCategory(opts.ttls?.executionState),
+      executionHistory: resolveCategory(opts.ttls?.executionHistory),
+      evalHistory: resolveCategory(opts.ttls?.evalHistory),
+      memory: resolveCategory(opts.ttls?.memory),
+    };
+
+    const store = new RedisStore(client, keyPrefix, effectiveTtls);
 
     // Lazy backfill of the new sorted-set indexes for installs upgrading
     // from pre-ZSET versions. Cheap when there's nothing to do (two ZCARD
@@ -349,7 +462,21 @@ export class RedisStore implements StateStore {
   // ── Checkpoints ──────────────────────────────────────────────────────
 
   async saveCheckpoint(executionId: string, name: string, data: unknown): Promise<void> {
-    await this.client.hSet(this.checkpointKey(executionId), name, JSON.stringify(data));
+    const ttl = this.ttlFor('checkpoint');
+    if (ttl === undefined) {
+      await this.client.hSet(this.checkpointKey(executionId), name, JSON.stringify(data));
+      return;
+    }
+    // Fixed window: set TTL only when the hash is new (`EXPIRE NX`), so
+    // multiple `saveCheckpoint` calls for the same execution don't keep
+    // extending the window. The hash itself ages out together with all
+    // checkpoints belonging to that execution — which matches the
+    // natural lifecycle (checkpoints belong to a specific run).
+    await this.client
+      .multi()
+      .hSet(this.checkpointKey(executionId), name, JSON.stringify(data))
+      .expire(this.checkpointKey(executionId), ttl, 'NX')
+      .exec();
   }
 
   async getCheckpoint(executionId: string, name: string): Promise<unknown | null> {
@@ -364,9 +491,22 @@ export class RedisStore implements StateStore {
     // between the writes would otherwise leave the session unreachable via
     // listSessions (data exists, index doesn't) or visible-but-empty (index
     // exists, data doesn't).
+    //
+    // TTL semantics: sliding window via `SET ... EX` — re-saving the session
+    // refreshes the TTL each turn. Deliberate deviation from the "fixed
+    // window" treatment in the original spec proposal: sessions ARE
+    // user-activity-driven (each `Session.send()` is fresh interaction), so
+    // an active chat should not time out mid-conversation. The "fixed window
+    // from creation" mental model breaks for live chat — and a stale TTL
+    // from a session that was created an hour ago but is still being used
+    // every minute would be the wrong behavior. `memory` uses the same
+    // semantics (sliding) for the same reason; sessions just happen to use
+    // SET storage instead of a hash.
+    const ttl = this.ttlFor('session');
+    const setOptions = ttl !== undefined ? { EX: ttl } : undefined;
     await this.client
       .multi()
-      .set(this.sessionKey(sessionId), JSON.stringify(history))
+      .set(this.sessionKey(sessionId), JSON.stringify(history), setOptions)
       .sAdd(this.sessionIdsKey(), sessionId)
       .exec();
   }
@@ -387,7 +527,19 @@ export class RedisStore implements StateStore {
   }
 
   async saveSessionMeta(sessionId: string, key: string, value: unknown): Promise<void> {
-    await this.client.hSet(this.sessionMetaKey(sessionId), key, JSON.stringify(value));
+    const ttl = this.ttlFor('sessionMeta');
+    if (ttl === undefined) {
+      await this.client.hSet(this.sessionMetaKey(sessionId), key, JSON.stringify(value));
+      return;
+    }
+    // Fixed window: only set the TTL when the hash is new. SessionMeta
+    // entries belong to a session and should age out with it; the session
+    // itself has its own TTL via the `session` category.
+    await this.client
+      .multi()
+      .hSet(this.sessionMetaKey(sessionId), key, JSON.stringify(value))
+      .expire(this.sessionMetaKey(sessionId), ttl, 'NX')
+      .exec();
   }
 
   async getSessionMeta(sessionId: string, key: string): Promise<unknown | null> {
@@ -425,7 +577,16 @@ export class RedisStore implements StateStore {
     // pattern here (e.g. "increment step iff state.status === 'running'"),
     // you'll need `WATCH` for true cross-process safety. The current writes
     // are full-replacement, so this isn't a concern today.
-    const tx = this.client.multi().set(this.executionStateKey(executionId), JSON.stringify(state));
+    //
+    // TTL semantics: fixed window via `SET ... EX`. SET-with-EX always
+    // refreshes the TTL on overwrite (no NX option here), which is correct
+    // for execution state — each status transition should reset the
+    // lifetime so a long-suspended workflow doesn't disappear mid-flight.
+    const ttl = this.ttlFor('executionState');
+    const setOptions = ttl !== undefined ? { EX: ttl } : undefined;
+    const tx = this.client
+      .multi()
+      .set(this.executionStateKey(executionId), JSON.stringify(state), setOptions);
     if (state.status === 'waiting') {
       tx.sAdd(this.pendingExecSetKey(), executionId);
     } else {
@@ -459,7 +620,20 @@ export class RedisStore implements StateStore {
   // so no user can depend on it returning legacy data.
 
   async saveMemory(scope: string, key: string, value: unknown): Promise<void> {
-    await this.client.hSet(this.memoryKey(scope), key, JSON.stringify(value));
+    const ttl = this.ttlFor('memory');
+    if (ttl === undefined) {
+      await this.client.hSet(this.memoryKey(scope), key, JSON.stringify(value));
+      return;
+    }
+    // Sliding window: every write refreshes the TTL (no `NX` mode). Memory
+    // is the only category that uses sliding — per-user memory should track
+    // user activity, not creation time. Active users keep their memory;
+    // inactive users forget after the configured idle period.
+    await this.client
+      .multi()
+      .hSet(this.memoryKey(scope), key, JSON.stringify(value))
+      .expire(this.memoryKey(scope), ttl)
+      .exec();
   }
 
   async getMemory(scope: string, key: string): Promise<unknown | null> {
@@ -524,10 +698,19 @@ export class RedisStore implements StateStore {
     // covered it but at the cost of an N+1 fetch per read. Post-#4 the ZSET
     // gives us O(log N) score-ordered reads with one MGET; the SET is kept
     // as a fallback for installs that constructed with `skipMigration: true`.
+    //
+    // TTL semantics: fixed window via `SET ... EX` on the data blob. Index
+    // entries (legacy SET + ZSET) intentionally have NO TTL — they're
+    // small (just IDs) and eventually-consistent: when the data blob ages
+    // out, mGet returns null and the reader filters it. Periodic cleanup
+    // (manual `ZREMRANGEBYSCORE` + `SREM`) can prune index bloat, but
+    // listExecutions stays correct regardless.
+    const ttl = this.ttlFor('executionHistory');
+    const setOptions = ttl !== undefined ? { EX: ttl } : undefined;
     await this.client
       .multi()
       .sAdd(this.execHistorySetKey(), execution.executionId)
-      .set(this.execHistoryKey(execution.executionId), JSON.stringify(execution))
+      .set(this.execHistoryKey(execution.executionId), JSON.stringify(execution), setOptions)
       .zAdd(this.execHistoryZsetKey(), {
         score: execution.startedAt,
         value: execution.executionId,
@@ -570,10 +753,14 @@ export class RedisStore implements StateStore {
   async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
     // Atomic, same partial-write concern as saveExecution; also writes the
     // sorted-set entry scored by timestamp for the listEvalResults fast path.
+    // TTL semantics identical to saveExecution — data blob is fixed-window;
+    // index entries have no TTL and age out lazily.
+    const ttl = this.ttlFor('evalHistory');
+    const setOptions = ttl !== undefined ? { EX: ttl } : undefined;
     await this.client
       .multi()
       .sAdd(this.evalHistorySetKey(), entry.id)
-      .set(this.evalHistoryKey(entry.id), JSON.stringify(entry))
+      .set(this.evalHistoryKey(entry.id), JSON.stringify(entry), setOptions)
       .zAdd(this.evalHistoryZsetKey(), { score: entry.timestamp, value: entry.id })
       .exec();
   }

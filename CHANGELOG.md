@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`RedisStore.listExecutions` / `listEvalResults` are now O(log N) instead of O(N).** Both methods used to `SMEMBERS` the full ID set, issue N independent `GET` round-trips, and JS-sort by timestamp — fine at a few hundred entries, painful at 10k+. Each `saveExecution` / `saveEvalResult` now dual-writes the ID into a Redis sorted set scored by `startedAt` / `timestamp` (inside the same MULTI as the data blob, so atomicity is preserved). Reads use `ZREVRANGEBYSCORE` + a single `MGET` for the data blobs — one indexed range lookup + one pipelined bulk fetch, regardless of total entry count. The legacy ID set is still maintained as a fallback read path; `deleteEvalResult` (and `deleteExecution` once #10 lands) remove from both indexes inside the same atomic MULTI. Public method signatures unchanged.
+
+  **Upgrade path is automatic.** On `RedisStore.create()`, a one-time lazy backfill scans the legacy ID set in 500-entry chunks and populates the sorted set — one round-trip per chunk plus two probes, cheap when there's nothing to do. The call logs `[axl] RedisStore: backfilled N entries into sorted-set index` on completion. For installs at six-figure execution counts where the startup cost is unacceptable, pass `skipMigration: true` to `RedisStore.create()` and call `await store.backfillExecutionIndex()` / `backfillEvalIndex()` manually during a maintenance window. While the sorted set is behind the ID set (skip-migration installs pre-backfill), `listExecutions` / `listEvalResults` transparently fall back to the legacy SET + N×GET + JS-sort path — slower but correct, no missing data.
+
+  ```typescript
+  // Default: lazy backfill on startup (recommended for most installs)
+  const store = await RedisStore.create('redis://localhost:6379');
+
+  // Six-figure execution counts: skip startup hit, backfill on demand
+  const store = await RedisStore.create({ url, skipMigration: true });
+  // ...later, during a maintenance window:
+  await store.backfillExecutionIndex();
+  await store.backfillEvalIndex();
+  ```
+
 ### Fixed
 - **`RedisStore` multi-key writes are now atomic via `MULTI/EXEC`.** Every write path that touches more than one Redis key — `saveSession` (data + sessionIds set), `deleteSession` (data + meta + sessionIds), `saveExecutionState` (state blob + pending-set membership), `saveExecution` (index-set + data blob), `saveEvalResult` (index-set + data blob), `deleteEvalResult` (sRem + del), `deleteMemory` (new + legacy hDel) — is now queued in a single `client.multi()` chain and committed atomically. Before this fix, a crash between the two writes could leave half-committed state (e.g. an `executionId` in the index set with no corresponding data blob, surfacing as a "missing execution" through `getExecution`; or a session visible in `listSessions` whose history reads empty). `deleteEvalResult` still returns the correct boolean by reading `del()`'s result from the `exec()` array. The per-command client surface is unchanged for single-key writes (checkpoints, sessionMeta, pending decisions, memory writes) which remain single-op.
 

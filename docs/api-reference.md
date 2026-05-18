@@ -1254,6 +1254,7 @@ const runtime3 = new AxlRuntime({
 |-------|------|---------|-------------|
 | `url` | `string?` | `'redis://localhost:6379'` | Redis connection URL |
 | `keyPrefix` | `string?` | `'axl:'` | Prepended to every key written by this store. Concatenated as-given — no normalization (include the trailing colon if you want one). Empty string is rejected. Useful when two Axl deployments share a Redis cluster, or when coexisting with other applications' keys |
+| `skipMigration` | `boolean?` | `false` | Skip the one-time lazy backfill of the execution / eval-history sorted-set indexes on startup. Set to `true` for installs at six-figure execution counts where the startup cost is unacceptable, then call `store.backfillExecutionIndex()` / `store.backfillEvalIndex()` manually during a maintenance window. Until then, `listExecutions` / `listEvalResults` fall back to the legacy SET + N×GET + JS-sort read path — correct but slow at scale |
 
 ### State configuration
 

@@ -735,6 +735,7 @@ describe('RedisStore', () => {
     data: Map<string, string>,
     hashData: Map<string, Map<string, string>>,
     setData: Map<string, Set<string>>,
+    zsetData: Map<string, Map<string, number>>,
   ) {
     type QueuedOp = () => unknown;
     const queue: QueuedOp[] = [];
@@ -799,6 +800,29 @@ describe('RedisStore', () => {
         });
         return chain;
       },
+      zAdd(key: string, member: { score: number; value: string }) {
+        queue.push(() => {
+          if (!zsetData.has(key)) zsetData.set(key, new Map());
+          const set = zsetData.get(key)!;
+          const isNew = !set.has(member.value);
+          set.set(member.value, member.score);
+          return isNew ? 1 : 0;
+        });
+        return chain;
+      },
+      zRem(key: string, member: string | string[]) {
+        queue.push(() => {
+          const set = zsetData.get(key);
+          if (!set) return 0;
+          const members = Array.isArray(member) ? member : [member];
+          let count = 0;
+          for (const m of members) {
+            if (set.delete(m)) count++;
+          }
+          return count;
+        });
+        return chain;
+      },
       async exec(): Promise<unknown[]> {
         // Apply queued ops in order. A real Redis MULTI is atomic — we
         // don't simulate failure scenarios here, but the per-op results
@@ -827,6 +851,9 @@ describe('RedisStore', () => {
     const hashData = new Map<string, Map<string, string>>();
 
     const setData = new Map<string, Set<string>>();
+    // Sorted set: member → score. We re-sort by score on read; production
+    // Redis maintains a skiplist for O(log N), but the mock just sorts on demand.
+    const zsetData = new Map<string, Map<string, number>>();
 
     const mockClient = {
       hSet: vi.fn(async (key: string, field: string, value: string) => {
@@ -903,12 +930,69 @@ describe('RedisStore', () => {
       sMembers: vi.fn(async (key: string) => {
         return [...(setData.get(key) ?? [])];
       }),
+      sCard: vi.fn(async (key: string) => {
+        return setData.get(key)?.size ?? 0;
+      }),
+      mGet: vi.fn(async (keys: string[]): Promise<Array<string | null>> => {
+        return keys.map((k) => data.get(k) ?? null);
+      }),
+      // ZADD semantics: if member is new, add and return 1; if member
+      // exists, update score and return 0. node-redis v5 returns the
+      // count of NEW members.
+      zAdd: vi.fn(async (key: string, member: { score: number; value: string }) => {
+        if (!zsetData.has(key)) zsetData.set(key, new Map());
+        const set = zsetData.get(key)!;
+        const isNew = !set.has(member.value);
+        set.set(member.value, member.score);
+        return isNew ? 1 : 0;
+      }),
+      zCard: vi.fn(async (key: string) => {
+        return zsetData.get(key)?.size ?? 0;
+      }),
+      zRem: vi.fn(async (key: string, member: string | string[]) => {
+        const set = zsetData.get(key);
+        if (!set) return 0;
+        const members = Array.isArray(member) ? member : [member];
+        let count = 0;
+        for (const m of members) {
+          if (set.delete(m)) count++;
+        }
+        return count;
+      }),
+      // ZREVRANGEBYSCORE: returns members in descending-score order.
+      // Production accepts any bounds; this mock only handles the
+      // '+inf' / '-inf' pair that our store uses, plus optional LIMIT.
+      zRevRangeByScore: vi.fn(
+        async (
+          key: string,
+          max: number | '+inf',
+          min: number | '-inf',
+          options?: { LIMIT?: { offset: number; count: number } },
+        ) => {
+          const set = zsetData.get(key);
+          if (!set) return [];
+          let entries = [...set.entries()];
+          // Filter by score range (mock only really supports +inf/-inf but
+          // gracefully handles numeric bounds too)
+          if (max !== '+inf') entries = entries.filter(([, score]) => score <= max);
+          if (min !== '-inf') entries = entries.filter(([, score]) => score >= min);
+          // Descending by score, with insertion-order stability on ties
+          entries.sort((a, b) => b[1] - a[1]);
+          if (options?.LIMIT) {
+            entries = entries.slice(
+              options.LIMIT.offset,
+              options.LIMIT.offset + options.LIMIT.count,
+            );
+          }
+          return entries.map(([value]) => value);
+        },
+      ),
       // multi() returns a chain object. Queue commands; on .exec(), apply
       // them all atomically against the same backing Maps. Real Redis
       // MULTI/EXEC is all-or-nothing, but our mock isn't simulating that
       // — it just guarantees the queued ops run together without other
       // mock interleaving (which is what callers actually care about).
-      multi: vi.fn(() => createMockMulti(data, hashData, setData)),
+      multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData)),
       quit: vi.fn(async () => undefined),
     };
 
@@ -917,7 +1001,7 @@ describe('RedisStore', () => {
     (store as any).client = mockClient;
     (store as any).keyPrefix = keyPrefix;
 
-    return { store, mockClient, data, hashData, setData };
+    return { store, mockClient, data, hashData, setData, zsetData };
   }
 
   describe('keyPrefix', () => {
@@ -1338,6 +1422,320 @@ describe('RedisStore', () => {
     });
   });
 
+  describe('sorted-set perf (ZSET fast path + legacy fallback + backfill)', () => {
+    // Helper: build the `makeExec` factory once
+    const makeExec = (id: string, startedAt: number): import('../types.js').ExecutionInfo => ({
+      executionId: id,
+      workflow: 'wf',
+      status: 'completed',
+      events: [],
+      totalCost: 0,
+      startedAt,
+      completedAt: startedAt + 100,
+      duration: 100,
+    });
+
+    describe('ZSET fast path', () => {
+      it('saveExecution writes the ID into the sorted-set with startedAt as the score', async () => {
+        const { store, zsetData } = createRedisStoreWithMockClient();
+        await store.saveExecution(makeExec('e1', 1700_000_000));
+        await store.saveExecution(makeExec('e2', 1700_000_100));
+
+        const zset = zsetData.get('axl:exec-history-z');
+        expect(zset?.get('e1')).toBe(1700_000_000);
+        expect(zset?.get('e2')).toBe(1700_000_100);
+      });
+
+      it('saveEvalResult writes the ID into the eval-history sorted-set with timestamp as the score', async () => {
+        const { store, zsetData } = createRedisStoreWithMockClient();
+        await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 1000, data: {} });
+        await store.saveEvalResult({ id: 'ev2', eval: 't', timestamp: 2000, data: {} });
+
+        const zset = zsetData.get('axl:eval-history-z');
+        expect(zset?.get('ev1')).toBe(1000);
+        expect(zset?.get('ev2')).toBe(2000);
+      });
+
+      it('listExecutions uses ZREVRANGEBYSCORE + MGET (one ZSET call + one MGET, NOT N×GET)', async () => {
+        const { store, mockClient } = createRedisStoreWithMockClient();
+        for (let i = 0; i < 5; i++) await store.saveExecution(makeExec(`e${i}`, i * 100));
+
+        mockClient.zRevRangeByScore.mockClear();
+        mockClient.mGet.mockClear();
+        mockClient.get.mockClear();
+
+        const result = await store.listExecutions();
+
+        expect(result.map((e) => e.executionId)).toEqual(['e4', 'e3', 'e2', 'e1', 'e0']);
+        // Fast path: exactly ONE zRevRangeByScore + ONE mGet
+        expect(mockClient.zRevRangeByScore).toHaveBeenCalledTimes(1);
+        expect(mockClient.mGet).toHaveBeenCalledTimes(1);
+        // And NO per-ID get() — the legacy N+1 path
+        expect(mockClient.get).not.toHaveBeenCalled();
+      });
+
+      it('listExecutions respects limit via LIMIT clause (not JS slice)', async () => {
+        const { store, mockClient } = createRedisStoreWithMockClient();
+        for (let i = 0; i < 10; i++) await store.saveExecution(makeExec(`e${i}`, i * 100));
+
+        mockClient.zRevRangeByScore.mockClear();
+        const result = await store.listExecutions(3);
+
+        expect(result).toHaveLength(3);
+        expect(result.map((e) => e.executionId)).toEqual(['e9', 'e8', 'e7']);
+        // Limit was pushed down to the ZSET (not done with a slice in JS)
+        expect(mockClient.zRevRangeByScore).toHaveBeenCalledWith(
+          'axl:exec-history-z',
+          '+inf',
+          '-inf',
+          { LIMIT: { offset: 0, count: 3 } },
+        );
+      });
+
+      it('listEvalResults uses ZSET fast path', async () => {
+        const { store, mockClient } = createRedisStoreWithMockClient();
+        await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 1000, data: {} });
+        await store.saveEvalResult({ id: 'ev2', eval: 't', timestamp: 2000, data: {} });
+
+        mockClient.zRevRangeByScore.mockClear();
+        mockClient.mGet.mockClear();
+        const result = await store.listEvalResults();
+
+        expect(result.map((e) => e.id)).toEqual(['ev2', 'ev1']);
+        expect(mockClient.zRevRangeByScore).toHaveBeenCalledTimes(1);
+        expect(mockClient.mGet).toHaveBeenCalledTimes(1);
+      });
+
+      it('deleteEvalResult also removes from the sorted-set', async () => {
+        const { store, zsetData } = createRedisStoreWithMockClient();
+        await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 1000, data: {} });
+        await store.saveEvalResult({ id: 'ev2', eval: 't', timestamp: 2000, data: {} });
+
+        expect(zsetData.get('axl:eval-history-z')?.size).toBe(2);
+        await store.deleteEvalResult('ev1');
+        expect(zsetData.get('axl:eval-history-z')?.size).toBe(1);
+        expect(zsetData.get('axl:eval-history-z')?.has('ev1')).toBe(false);
+        expect(zsetData.get('axl:eval-history-z')?.has('ev2')).toBe(true);
+      });
+
+      it('listExecutions returns empty array when there are no entries (no SET probe noise)', async () => {
+        const { store, mockClient } = createRedisStoreWithMockClient();
+        const result = await store.listExecutions();
+        expect(result).toEqual([]);
+        // Early-out at the SCARD probe — no need to hit the ZSET or mGet
+        expect(mockClient.zRevRangeByScore).not.toHaveBeenCalled();
+        expect(mockClient.mGet).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('legacy SET fallback (skipMigration path)', () => {
+      it('listExecutions falls back to SET + N×GET when ZSET is empty but SET has entries', async () => {
+        // Simulate a skipMigration: true install — SET has entries from
+        // pre-#4 writes, but ZSET hasn't been backfilled yet. New writes
+        // (post-create) would dual-write, but here we plant ONLY SET data
+        // by reaching past the store API.
+        const { store, mockClient, data, setData } = createRedisStoreWithMockClient();
+
+        // Plant 3 entries directly in SET + GET, NOT in ZSET
+        setData.set('axl:exec-history-ids', new Set(['legacy-1', 'legacy-2', 'legacy-3']));
+        data.set('axl:exec-history:legacy-1', JSON.stringify(makeExec('legacy-1', 100)));
+        data.set('axl:exec-history:legacy-2', JSON.stringify(makeExec('legacy-2', 300)));
+        data.set('axl:exec-history:legacy-3', JSON.stringify(makeExec('legacy-3', 200)));
+
+        mockClient.zRevRangeByScore.mockClear();
+        mockClient.mGet.mockClear();
+        const result = await store.listExecutions();
+
+        // Fallback used the SET path (N per-key gets + JS sort)
+        expect(mockClient.zRevRangeByScore).not.toHaveBeenCalled();
+        expect(mockClient.mGet).not.toHaveBeenCalled();
+        expect(mockClient.get).toHaveBeenCalledTimes(3);
+        // Still ordered correctly (JS sort post-fetch)
+        expect(result.map((e) => e.executionId)).toEqual(['legacy-2', 'legacy-3', 'legacy-1']);
+      });
+
+      it('listExecutions falls back when ZSET is partially populated (mid-migration)', async () => {
+        // 5 SET entries, only 2 in ZSET — read must use SET path so users
+        // don't see a shrunken list.
+        const { store, mockClient, data, setData, zsetData } = createRedisStoreWithMockClient();
+        setData.set('axl:exec-history-ids', new Set());
+        for (let i = 0; i < 5; i++) {
+          setData.get('axl:exec-history-ids')!.add(`e${i}`);
+          data.set(`axl:exec-history:e${i}`, JSON.stringify(makeExec(`e${i}`, i * 100)));
+        }
+        // Only the latest 2 made it into the ZSET
+        zsetData.set(
+          'axl:exec-history-z',
+          new Map([
+            ['e3', 300],
+            ['e4', 400],
+          ]),
+        );
+
+        const result = await store.listExecutions();
+        expect(result).toHaveLength(5); // SET fallback returns all 5
+        expect(mockClient.zRevRangeByScore).not.toHaveBeenCalled();
+      });
+
+      it('legacy fallback handles missing data blobs and malformed JSON gracefully', async () => {
+        const { store, data, setData } = createRedisStoreWithMockClient();
+        setData.set('axl:exec-history-ids', new Set(['ok', 'missing-data', 'malformed']));
+        data.set('axl:exec-history:ok', JSON.stringify(makeExec('ok', 100)));
+        // 'missing-data' is in the SET but has no data key
+        data.set('axl:exec-history:malformed', '{not valid json');
+
+        const result = await store.listExecutions();
+        expect(result.map((e) => e.executionId)).toEqual(['ok']);
+      });
+    });
+
+    describe('backfillExecutionIndex', () => {
+      // Backfill emits one console.log per run when it migrates anything,
+      // which pollutes test output. Silence for the whole describe block.
+      let logSpy: ReturnType<typeof vi.spyOn>;
+      beforeEach(() => {
+        logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      });
+      afterEach(() => {
+        logSpy.mockRestore();
+      });
+
+      it('migrates SET entries into the ZSET with the correct scores', async () => {
+        // Plant pre-existing SET data with no ZSET equivalent
+        const { store, data, setData, zsetData } = createRedisStoreWithMockClient();
+        setData.set('axl:exec-history-ids', new Set(['e1', 'e2', 'e3']));
+        data.set('axl:exec-history:e1', JSON.stringify(makeExec('e1', 100)));
+        data.set('axl:exec-history:e2', JSON.stringify(makeExec('e2', 300)));
+        data.set('axl:exec-history:e3', JSON.stringify(makeExec('e3', 200)));
+
+        await store.backfillExecutionIndex();
+
+        expect(zsetData.get('axl:exec-history-z')?.get('e1')).toBe(100);
+        expect(zsetData.get('axl:exec-history-z')?.get('e2')).toBe(300);
+        expect(zsetData.get('axl:exec-history-z')?.get('e3')).toBe(200);
+      });
+
+      it('is idempotent — re-running after migration is a no-op', async () => {
+        const { store, mockClient, data, setData } = createRedisStoreWithMockClient();
+        setData.set('axl:exec-history-ids', new Set(['e1']));
+        data.set('axl:exec-history:e1', JSON.stringify(makeExec('e1', 100)));
+
+        await store.backfillExecutionIndex(); // first run
+        mockClient.mGet.mockClear();
+        mockClient.multi.mockClear();
+        await store.backfillExecutionIndex(); // second run — should bail at zCard >= sCard
+
+        // No work attempted on re-run
+        expect(mockClient.mGet).not.toHaveBeenCalled();
+        expect(mockClient.multi).not.toHaveBeenCalled();
+      });
+
+      it('skips entries with missing data blobs (SET has ID, no data)', async () => {
+        const { store, data, setData, zsetData } = createRedisStoreWithMockClient();
+        setData.set('axl:exec-history-ids', new Set(['has-data', 'orphan']));
+        data.set('axl:exec-history:has-data', JSON.stringify(makeExec('has-data', 100)));
+        // 'orphan' is in the SET but has no data key
+
+        await store.backfillExecutionIndex();
+
+        // Only the entry with data made it into the ZSET
+        expect(zsetData.get('axl:exec-history-z')?.size).toBe(1);
+        expect(zsetData.get('axl:exec-history-z')?.has('has-data')).toBe(true);
+        expect(zsetData.get('axl:exec-history-z')?.has('orphan')).toBe(false);
+      });
+
+      it('skips malformed JSON without crashing the whole backfill', async () => {
+        const { store, data, setData, zsetData } = createRedisStoreWithMockClient();
+        setData.set('axl:exec-history-ids', new Set(['good', 'bad']));
+        data.set('axl:exec-history:good', JSON.stringify(makeExec('good', 100)));
+        data.set('axl:exec-history:bad', '{ not valid json');
+
+        await store.backfillExecutionIndex();
+
+        expect(zsetData.get('axl:exec-history-z')?.size).toBe(1);
+        expect(zsetData.get('axl:exec-history-z')?.has('good')).toBe(true);
+      });
+
+      it('handles entries missing startedAt (skips, does not crash)', async () => {
+        const { store, data, setData, zsetData } = createRedisStoreWithMockClient();
+        setData.set('axl:exec-history-ids', new Set(['has-score', 'no-score']));
+        data.set('axl:exec-history:has-score', JSON.stringify(makeExec('has-score', 100)));
+        // Plant an entry with no startedAt — corrupt data shouldn't crash
+        data.set(
+          'axl:exec-history:no-score',
+          JSON.stringify({ executionId: 'no-score', workflow: 'w' }),
+        );
+
+        await store.backfillExecutionIndex();
+
+        expect(zsetData.get('axl:exec-history-z')?.has('has-score')).toBe(true);
+        expect(zsetData.get('axl:exec-history-z')?.has('no-score')).toBe(false);
+      });
+
+      it('chunks large SETs to bound MGET pipeline size', async () => {
+        // Plant 1200 entries to force multiple chunks (chunk size 500)
+        const { store, mockClient, data, setData, zsetData } = createRedisStoreWithMockClient();
+        const ids = new Set<string>();
+        for (let i = 0; i < 1200; i++) {
+          ids.add(`e${i}`);
+          data.set(`axl:exec-history:e${i}`, JSON.stringify(makeExec(`e${i}`, i)));
+        }
+        setData.set('axl:exec-history-ids', ids);
+
+        await store.backfillExecutionIndex();
+
+        // 1200 / 500 = 2.4 → 3 chunks → 3 mGet calls, 3 multi() calls
+        expect(mockClient.mGet).toHaveBeenCalledTimes(3);
+        expect(zsetData.get('axl:exec-history-z')?.size).toBe(1200);
+      });
+
+      it('bails early when SET is empty (no I/O work)', async () => {
+        const { store, mockClient } = createRedisStoreWithMockClient();
+        await store.backfillExecutionIndex();
+        // Two probes (sCard + zCard) then early return — no mGet, no multi
+        expect(mockClient.mGet).not.toHaveBeenCalled();
+        expect(mockClient.multi).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('backfillEvalIndex', () => {
+      let logSpy: ReturnType<typeof vi.spyOn>;
+      beforeEach(() => {
+        logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      });
+      afterEach(() => {
+        logSpy.mockRestore();
+      });
+
+      it('migrates SET entries into the eval ZSET with timestamp scores', async () => {
+        const { store, data, setData, zsetData } = createRedisStoreWithMockClient();
+        setData.set('axl:eval-history-ids', new Set(['ev1', 'ev2']));
+        data.set(
+          'axl:eval-history:ev1',
+          JSON.stringify({ id: 'ev1', eval: 't', timestamp: 100, data: {} }),
+        );
+        data.set(
+          'axl:eval-history:ev2',
+          JSON.stringify({ id: 'ev2', eval: 't', timestamp: 200, data: {} }),
+        );
+
+        await store.backfillEvalIndex();
+
+        expect(zsetData.get('axl:eval-history-z')?.get('ev1')).toBe(100);
+        expect(zsetData.get('axl:eval-history-z')?.get('ev2')).toBe(200);
+      });
+    });
+
+    describe('keyPrefix interaction', () => {
+      it('uses the custom prefix for the ZSET key', async () => {
+        const { store, zsetData } = createRedisStoreWithMockClient('tenant-a:');
+        await store.saveExecution(makeExec('e1', 100));
+        expect(zsetData.has('tenant-a:exec-history-z')).toBe(true);
+        expect(zsetData.has('axl:exec-history-z')).toBe(false);
+      });
+    });
+  });
+
   describe('atomicity (MULTI/EXEC)', () => {
     // These tests prove that multi-key writes go through a single multi()
     // chain — so a crash mid-operation can't leave the store in a partial
@@ -1420,7 +1818,7 @@ describe('RedisStore', () => {
       expect(setData.get('axl:pending-executions')?.has('e1')).toBe(false);
     });
 
-    it('saveExecution queues set membership + data in one MULTI', async () => {
+    it('saveExecution queues set membership + data + zAdd in one MULTI', async () => {
       const { store, mockClient } = createRedisStoreWithMockClient();
       const chains = instrumentMulti(mockClient);
       await store.saveExecution({
@@ -1435,25 +1833,28 @@ describe('RedisStore', () => {
       });
 
       expect(mockClient.multi).toHaveBeenCalledTimes(1);
-      expect(chains[0]._queueLength()).toBe(2);
+      // sAdd + set + zAdd — three ops, all atomic
+      expect(chains[0]._queueLength()).toBe(3);
     });
 
-    it('saveEvalResult queues set membership + data in one MULTI', async () => {
+    it('saveEvalResult queues set membership + data + zAdd in one MULTI', async () => {
       const { store, mockClient } = createRedisStoreWithMockClient();
       const chains = instrumentMulti(mockClient);
       await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
 
-      expect(chains[0]._queueLength()).toBe(2);
+      // sAdd + set + zAdd
+      expect(chains[0]._queueLength()).toBe(3);
     });
 
-    it('deleteEvalResult queues sRem + del in one MULTI and reads del() for the boolean', async () => {
+    it('deleteEvalResult queues sRem + del + zRem in one MULTI and reads del() for the boolean', async () => {
       const { store, mockClient } = createRedisStoreWithMockClient();
       await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 0, data: {} });
 
       const chains = instrumentMulti(mockClient);
       const result = await store.deleteEvalResult('ev1');
 
-      expect(chains[0]._queueLength()).toBe(2);
+      // sRem + del + zRem
+      expect(chains[0]._queueLength()).toBe(3);
       expect(result).toBe(true);
     });
 
@@ -1462,7 +1863,7 @@ describe('RedisStore', () => {
       const chains = instrumentMulti(mockClient);
       const result = await store.deleteEvalResult('does-not-exist');
 
-      expect(chains[0]._queueLength()).toBe(2);
+      expect(chains[0]._queueLength()).toBe(3);
       expect(result).toBe(false);
     });
 
@@ -1516,6 +1917,11 @@ describe('RedisStore', () => {
       expect(mockClient.del).not.toHaveBeenCalled();
       expect(mockClient.sRem).not.toHaveBeenCalled();
       expect(mockClient.hDel).not.toHaveBeenCalled();
+      // ZSET ops added by #4 must also be inside the MULTI, not lifted out.
+      // Without these assertions, a future refactor could accidentally
+      // bypass atomicity for the sorted-set writes.
+      expect(mockClient.zAdd).not.toHaveBeenCalled();
+      expect(mockClient.zRem).not.toHaveBeenCalled();
     });
   });
 

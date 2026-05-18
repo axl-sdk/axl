@@ -15,10 +15,26 @@ interface RedisClient {
   hDel(key: string, field: string | string[]): Promise<number>;
   set(key: string, value: string): Promise<string | null>;
   get(key: string): Promise<string | null>;
+  // mGet bulk-fetches values for an array of keys. Used by listExecutions /
+  // listEvalResults after the sorted-set returns an ordered ID list.
+  mGet(keys: string[]): Promise<Array<string | null>>;
   del(key: string | string[]): Promise<number>;
   sAdd(key: string, member: string | string[]): Promise<number>;
   sRem(key: string, member: string | string[]): Promise<number>;
+  sCard(key: string): Promise<number>;
   sMembers(key: string): Promise<string[]>;
+  // Sorted-set ops drive the listExecutions / listEvalResults fast path.
+  // zAdd adds a member with a score; zRevRangeByScore returns members in
+  // descending-score order (optionally limited); zCard counts; zRem deletes.
+  zAdd(key: string, member: { score: number; value: string }): Promise<number>;
+  zCard(key: string): Promise<number>;
+  zRem(key: string, member: string | string[]): Promise<number>;
+  zRevRangeByScore(
+    key: string,
+    max: number | '+inf',
+    min: number | '-inf',
+    options?: { LIMIT?: { offset: number; count: number } },
+  ): Promise<string[]>;
   // multi() opens a transaction. Queued commands execute atomically on
   // exec() — a crash mid-MULTI leaves none of the queued writes applied,
   // which is what we want for the multi-key writes (saveSession,
@@ -37,6 +53,8 @@ interface RedisMulti {
   sAdd(key: string, member: string | string[]): RedisMulti;
   sRem(key: string, member: string | string[]): RedisMulti;
   hDel(key: string, field: string | string[]): RedisMulti;
+  zAdd(key: string, member: { score: number; value: string }): RedisMulti;
+  zRem(key: string, member: string | string[]): RedisMulti;
   // exec() returns the per-command results in queued order. We don't
   // type-narrow individual results because the callers that need a result
   // (e.g. deleteEvalResult) cast at the call site.
@@ -59,6 +77,19 @@ export interface RedisStoreOptions {
    * collisions with non-Axl keys.
    */
   keyPrefix?: string;
+  /**
+   * Skip the lazy backfill of legacy execution / eval-history entries into
+   * the sorted-set indexes during `RedisStore.create()`. Default `false`
+   * (backfill runs on startup, one MULTI per 500-entry chunk plus two
+   * probes — cheap when there's nothing to do).
+   *
+   * Set to `true` for installs at six-figure execution counts where the
+   * startup cost is unacceptable. Until you call `backfillExecutionIndex()` /
+   * `backfillEvalIndex()` manually (e.g. during a maintenance window),
+   * `listExecutions` / `listEvalResults` fall back to the legacy
+   * SET + N×GET + JS-sort read path — correct but slow at scale.
+   */
+  skipMigration?: boolean;
 }
 
 /**
@@ -122,7 +153,125 @@ export class RedisStore implements StateStore {
 
     const client = opts.url ? createClient({ url: opts.url }) : createClient();
     await client.connect();
-    return new RedisStore(client, keyPrefix);
+    const store = new RedisStore(client, keyPrefix);
+
+    // Lazy backfill of the new sorted-set indexes for installs upgrading
+    // from pre-ZSET versions. Cheap when there's nothing to do (two ZCARD
+    // calls); typically a few seconds for installs with sub-10k entries.
+    // Users at six-figure counts opt out via `skipMigration: true`.
+    if (!opts.skipMigration) {
+      await store.backfillExecutionIndex();
+      await store.backfillEvalIndex();
+    }
+
+    return store;
+  }
+
+  /**
+   * Backfill the execution-history sorted-set from the legacy ID set.
+   * Idempotent — runs only if the ZSET is missing entries the SET has.
+   * Safe to call manually if you constructed the store with
+   * `skipMigration: true`.
+   */
+  async backfillExecutionIndex(): Promise<void> {
+    await this.backfillHistoryIndex(
+      this.execHistorySetKey(),
+      this.execHistoryZsetKey(),
+      (id) => this.execHistoryKey(id),
+      (raw) => {
+        const exec = JSON.parse(raw) as ExecutionInfo;
+        return typeof exec.startedAt === 'number'
+          ? { score: exec.startedAt, value: exec.executionId }
+          : null;
+      },
+      'execution-history',
+    );
+  }
+
+  /** Backfill the eval-history sorted-set. Symmetric to `backfillExecutionIndex`. */
+  async backfillEvalIndex(): Promise<void> {
+    await this.backfillHistoryIndex(
+      this.evalHistorySetKey(),
+      this.evalHistoryZsetKey(),
+      (id) => this.evalHistoryKey(id),
+      (raw) => {
+        const entry = JSON.parse(raw) as EvalHistoryEntry;
+        return typeof entry.timestamp === 'number'
+          ? { score: entry.timestamp, value: entry.id }
+          : null;
+      },
+      'eval-history',
+    );
+  }
+
+  /**
+   * Shared implementation for both backfill paths. Reads SET members,
+   * batch-MGETs their data blobs in chunks, and ZADDs each into the new
+   * sorted-set inside a single MULTI per chunk.
+   */
+  private async backfillHistoryIndex(
+    setKey: string,
+    zsetKey: string,
+    dataKey: (id: string) => string,
+    scoreOf: (raw: string) => { score: number; value: string } | null,
+    label: string,
+  ): Promise<void> {
+    const [setSize, zsetSize] = await Promise.all([
+      this.client.sCard(setKey),
+      this.client.zCard(zsetKey),
+    ]);
+
+    // ZSET has at least as many entries as the SET — backfill already done
+    // (or the SET is empty and there's nothing to do). Bail.
+    if (zsetSize >= setSize) return;
+
+    const allIds = await this.client.sMembers(setKey);
+    if (allIds.length === 0) return;
+
+    const CHUNK_SIZE = 500;
+    let migrated = 0;
+    let skipped = 0;
+
+    for (let i = 0; i < allIds.length; i += CHUNK_SIZE) {
+      const chunk = allIds.slice(i, i + CHUNK_SIZE);
+      const dataKeys = chunk.map((id) => dataKey(id));
+      const raws = await this.client.mGet(dataKeys);
+
+      const tx = this.client.multi();
+      let queuedInChunk = 0;
+      for (let j = 0; j < chunk.length; j++) {
+        const raw = raws[j];
+        if (raw == null) {
+          // SET has the ID but no data blob — partial state from a
+          // pre-MULTI/EXEC release. Skip; the reader's null-guard catches
+          // this too.
+          skipped++;
+          continue;
+        }
+        try {
+          const entry = scoreOf(raw);
+          if (entry == null) {
+            skipped++;
+            continue;
+          }
+          tx.zAdd(zsetKey, entry);
+          queuedInChunk++;
+          migrated++;
+        } catch {
+          // Malformed JSON — skip and move on.
+          skipped++;
+        }
+      }
+
+      if (queuedInChunk > 0) await tx.exec();
+    }
+
+    if (migrated > 0 || skipped > 0) {
+      console.log(
+        `[axl] RedisStore: backfilled ${migrated} ${label} entries into sorted-set index` +
+          (skipped > 0 ? ` (${skipped} skipped — missing or malformed)` : ''),
+      );
+    }
   }
 
   // ── Key helpers ──────────────────────────────────────────────────────
@@ -159,8 +308,25 @@ export class RedisStore implements StateStore {
     return `${this.keyPrefix}exec-history:${executionId}`;
   }
 
+  // NOTE for future implementer of #3 (TTL config): when the executionHistory
+  // and evalHistory data blobs gain TTLs, eviction MUST be driven by
+  // ZREMRANGEBYSCORE on the ZSET below — NOT by SREM on these legacy ID sets.
+  // The slow-path fallback (`listHistoryByZset`) reads from the SET when
+  // `zsetCard < setCard`, so SET-based eviction would race with the fallback
+  // and surface dead IDs whose data has been TTL'd away. ZSET eviction +
+  // dual-write `SREM` is the clean path; doc the assumption then.
   private execHistorySetKey(): string {
     return `${this.keyPrefix}exec-history-ids`;
+  }
+
+  /**
+   * Sorted-set index for execution history, scored by `startedAt`. Drives
+   * the O(log N) `listExecutions` fast path; the legacy SET above is kept
+   * as a fallback for users running with `skipMigration: true` before
+   * they've called `backfillExecutionIndex()` manually.
+   */
+  private execHistoryZsetKey(): string {
+    return `${this.keyPrefix}exec-history-z`;
   }
 
   private evalHistoryKey(id: string): string {
@@ -169,6 +335,11 @@ export class RedisStore implements StateStore {
 
   private evalHistorySetKey(): string {
     return `${this.keyPrefix}eval-history-ids`;
+  }
+
+  /** Sorted-set index for eval history, scored by `timestamp`. See above. */
+  private evalHistoryZsetKey(): string {
+    return `${this.keyPrefix}eval-history-z`;
   }
 
   private memoryKey(scope: string): string {
@@ -347,15 +518,20 @@ export class RedisStore implements StateStore {
   // ── Execution History ────────────────────────────────────────────────
 
   async saveExecution(execution: ExecutionInfo): Promise<void> {
-    // Atomic: index-set membership + data blob commit together. Before
-    // MULTI/EXEC was wired up, a crash between the two writes left
-    // `listExecutions` returning IDs whose data was absent — and the
-    // graceful-skip fallback in the reader was load-bearing. Now the
-    // partial-write hazard is gone at the source.
+    // Atomic: index-set membership + data blob + sorted-set score commit
+    // together. Before MULTI/EXEC, a crash between writes left
+    // `listExecutions` returning IDs whose data was absent — graceful skip
+    // covered it but at the cost of an N+1 fetch per read. Post-#4 the ZSET
+    // gives us O(log N) score-ordered reads with one MGET; the SET is kept
+    // as a fallback for installs that constructed with `skipMigration: true`.
     await this.client
       .multi()
       .sAdd(this.execHistorySetKey(), execution.executionId)
       .set(this.execHistoryKey(execution.executionId), JSON.stringify(execution))
+      .zAdd(this.execHistoryZsetKey(), {
+        score: execution.startedAt,
+        value: execution.executionId,
+      })
       .exec();
   }
 
@@ -365,53 +541,118 @@ export class RedisStore implements StateStore {
   }
 
   async listExecutions(limit?: number): Promise<ExecutionInfo[]> {
-    const ids = await this.client.sMembers(this.execHistorySetKey());
-    if (ids.length === 0) return [];
-
-    const entries: ExecutionInfo[] = [];
-    for (const id of ids) {
-      const raw = await this.client.get(this.execHistoryKey(id));
-      if (raw) entries.push(JSON.parse(raw));
-    }
-    entries.sort((a, b) => b.startedAt - a.startedAt);
-    return limit ? entries.slice(0, limit) : entries;
+    return this.listHistoryByZset(
+      this.execHistorySetKey(),
+      this.execHistoryZsetKey(),
+      (id) => this.execHistoryKey(id),
+      (a, b) => b.startedAt - a.startedAt,
+      limit,
+    );
   }
 
   // ── Eval History ────────────────────────────────────────────────────
 
   async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
-    // Atomic, same partial-write concern as saveExecution.
+    // Atomic, same partial-write concern as saveExecution; also writes the
+    // sorted-set entry scored by timestamp for the listEvalResults fast path.
     await this.client
       .multi()
       .sAdd(this.evalHistorySetKey(), entry.id)
       .set(this.evalHistoryKey(entry.id), JSON.stringify(entry))
+      .zAdd(this.evalHistoryZsetKey(), { score: entry.timestamp, value: entry.id })
       .exec();
   }
 
   async listEvalResults(limit?: number): Promise<EvalHistoryEntry[]> {
-    const ids = await this.client.sMembers(this.evalHistorySetKey());
-    if (ids.length === 0) return [];
-
-    const entries: EvalHistoryEntry[] = [];
-    for (const id of ids) {
-      const raw = await this.client.get(this.evalHistoryKey(id));
-      if (raw) entries.push(JSON.parse(raw));
-    }
-    entries.sort((a, b) => b.timestamp - a.timestamp);
-    return limit ? entries.slice(0, limit) : entries;
+    return this.listHistoryByZset(
+      this.evalHistorySetKey(),
+      this.evalHistoryZsetKey(),
+      (id) => this.evalHistoryKey(id),
+      (a, b) => b.timestamp - a.timestamp,
+      limit,
+    );
   }
 
   async deleteEvalResult(id: string): Promise<boolean> {
-    // Atomic: index-set removal + data deletion commit together. del()'s
-    // return is the "did it exist" signal. Destructure to keep the
-    // ordering self-documenting — survives a future reorder of the chain.
+    // Atomic: index-set removal + data deletion + sorted-set removal commit
+    // together. del()'s return is the "did it exist" signal — destructured
+    // out of the exec() result so reordering the chain doesn't break the
+    // boolean.
     const [, deletedCount] = await this.client
       .multi()
       .sRem(this.evalHistorySetKey(), id)
       .del(this.evalHistoryKey(id))
+      .zRem(this.evalHistoryZsetKey(), id)
       .exec();
     const deleted = typeof deletedCount === 'number' ? deletedCount : 0;
     return deleted > 0;
+  }
+
+  /**
+   * Shared list-by-sorted-set implementation. Uses ZREVRANGEBYSCORE +
+   * MGET when the ZSET is populated (post-migration). Falls back to the
+   * legacy SET + N×GET + JS-sort path when the ZSET is empty or smaller
+   * than the SET (covers users that constructed with `skipMigration: true`
+   * before calling backfill).
+   */
+  private async listHistoryByZset<T>(
+    setKey: string,
+    zsetKey: string,
+    dataKey: (id: string) => string,
+    sortCmp: (a: T, b: T) => number,
+    limit?: number,
+  ): Promise<T[]> {
+    // Cheap probe: if the SET is empty, both indexes are empty and there's
+    // nothing to list.
+    const setSize = await this.client.sCard(setKey);
+    if (setSize === 0) return [];
+
+    const zsetSize = await this.client.zCard(zsetKey);
+
+    // Fast path: ZSET has caught up with the SET (post-migration or only
+    // ever had post-#4 writes). Use ZREVRANGEBYSCORE for ordered IDs, then
+    // bulk MGET for the data.
+    if (zsetSize >= setSize) {
+      const ids = await this.client.zRevRangeByScore(
+        zsetKey,
+        '+inf',
+        '-inf',
+        limit ? { LIMIT: { offset: 0, count: limit } } : undefined,
+      );
+      if (ids.length === 0) return [];
+      const keys = ids.map(dataKey);
+      const raws = await this.client.mGet(keys);
+      // Filter nulls (data dropped by TTL after the ZSET was queried) AND
+      // parse failures. JSON.parse can throw — guard each row.
+      const entries: T[] = [];
+      for (const raw of raws) {
+        if (raw == null) continue;
+        try {
+          entries.push(JSON.parse(raw) as T);
+        } catch {
+          // Malformed JSON; skip silently. Same posture as the SET path.
+        }
+      }
+      return entries;
+    }
+
+    // Slow path (legacy SET): the ZSET is behind the SET — either
+    // backfill hasn't run yet (skipMigration: true) or it errored partway.
+    // Read via SET + N×GET so users aren't blocked on the data they have.
+    const ids = await this.client.sMembers(setKey);
+    if (ids.length === 0) return [];
+    const entries: T[] = [];
+    for (const id of ids) {
+      const raw = await this.client.get(dataKey(id));
+      if (raw == null) continue;
+      try {
+        entries.push(JSON.parse(raw) as T);
+      } catch {
+        // skip malformed
+      }
+    }
+    entries.sort(sortCmp);
+    return limit ? entries.slice(0, limit) : entries;
   }
 
   // ── Sessions (Studio introspection) ────────────────────────────────────

@@ -173,13 +173,14 @@ Unknown models report `tokens` but no `cost`. The Studio Cost Dashboard renders 
 
 ### Observation paths
 
-Four ways to observe what happens during a workflow run. Pick by scope:
+Five ways to observe what happens during a workflow run. Pick by scope:
 
 | Path | Scope | When to use |
 |------|-------|-------------|
 | `runtime.stream(name, input)` → `AxlStream` | One specific execution (wire) | Per-run UIs (chat streaming, progress bars, waterfalls). Returns an `AsyncIterable<AxlEvent>` plus curated views (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`, `.fullText`) and a `.promise` for the final result |
 | `ctx.events` (`AxlEventBus`) | One specific context (inside the workflow handler) | Observe events **between `ctx.ask()` calls** in a workflow handler, or on ad-hoc contexts from `runtime.createContext()`. Same `AxlEvent` union as `AxlStream`; same curated views (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`). Lazy — zero overhead if no consumer subscribes |
 | `runtime.on('trace', event => …)` | Every execution | Cross-execution observability (background telemetry, cost dashboards, audit logs). Receives every `AxlEvent` from every `execute()` / `stream()` / `createContext()` call |
+| `runtime.recoverIncompleteStreams()` | Post-crash recovery | Reconstructs partial `ExecutionInfo`s for runs whose process died mid-flight, IF `state.persist: 'streaming'` was configured. Wire into process startup AFTER lazy-loading historical state and BEFORE accepting new work. See ["Crash recovery"](#crash-recovery-statepersist-streaming) below |
 | `onToken` / `onToolCall` / `onAgentStart` on `runtime.createContext()` | One ad-hoc context (back-compat) | Tool tests, evals, prototyping. Superseded by `ctx.events` — the callbacks remain for back-compat but the iterable is the unified path forward |
 
 `runtime.execute()` itself is final-result-only by design — it does **not** accept `onToken` or any other event callback. To observe a workflow run from inside the handler, read `ctx.events`; from outside, use `runtime.stream()` (per-execution) or `runtime.on('trace', …)` (cross-execution).
@@ -444,7 +445,8 @@ The filter applies at three layers:
 
 | Route | Scrubbed fields | Preserved |
 |---|---|---|
-| `GET /api/executions` / `:id` | `result`, `error` | `executionId`, `workflow`, `status`, `duration`, `totalCost`, `startedAt`, `completedAt`, `events` (already scrubbed at emit time) |
+| `GET /api/executions` / `:id` | `result`, `error`, `metadata` (replaced with `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces) | `executionId`, `workflow`, `status`, `duration`, `totalCost`, `startedAt`, `completedAt`, `events` (already scrubbed at emit time) |
+| `DELETE /api/executions/:id` | (no content) | (blocked in `readOnly`; also scrubs the WS replay buffer for `execution:{id}` via `ConnectionManager.clearChannelBuffer`) |
 | `GET /api/memory/:scope` / `:key` | `value` | `key` (programmer-chosen identifier, needed for navigation) |
 | `GET /api/sessions/:id` | `message.content`, `message.tool_calls[*].function.arguments`; `message.providerMetadata` is dropped entirely (opaque bag that may carry encoded reasoning / cache keys) | `role`, `name`, `tool_call_id`, `tool_calls[*].id`, `tool_calls[*].type`, `tool_calls[*].function.name`, `handoffHistory` (no content fields to scrub) |
 | `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore` | per-item `input`, `output`, `error`, `annotations`, `scorerErrors`, `scoreDetails[*].metadata` | per-item `scores`, `duration`, `cost`, `scorerCost`, `metadata` (models / tokens / workflows), `traces` (already scrubbed at emit time); result-level `summary`, `metadata`, `totalCost`, `duration`, `timestamp` |
@@ -594,6 +596,42 @@ const PlanGenerator = agent({
 
 This lets you correlate trace output to specific prompt versions, which is especially useful when comparing eval results.
 
+## Crash Recovery: `state.persist: 'streaming'`
+
+Opt-in durability mode that flushes events to the configured `StateStore` throughout a run, so a process crash mid-execution leaves a recoverable trace. Default is `'terminal'` (events written only at workflow end — back-compat, zero overhead).
+
+```ts
+const runtime = new AxlRuntime({
+  state: {
+    store: await RedisStore.create(redisUrl),
+    persist: 'streaming',
+    streamingBatchSize: 100,     // events per flush trigger (default 100)
+    streamingBatchInterval: 1000, // ms (default 1000)
+  },
+});
+
+// On the NEXT process, after a crash:
+await runtime.getExecutions();              // hydrate historical cache first
+const recovered = await runtime.recoverIncompleteStreams();
+console.log(`Recovered ${recovered.length} crashed executions`);
+// Now safe to accept new requests
+```
+
+**Excluded event types** (never flushed, never persisted to `ExecutionInfo.events`): `token`, `partial_object`, `string_delta` — high-volume stream-only events that consumers can reconstruct from `agent_call_end.data.response`. Same exclusion list governs Studio's WebSocket replay buffer.
+
+**Scope.** Only `runtime.execute()` / `runtime.stream()` flush to the buffer. `runtime.createContext()` ad-hoc contexts (Studio playground, tool tests, evals) are deliberately excluded — they have no terminal finalize path, so allowing them to write would leave phantom orphans for `recoverIncompleteStreams()` to mis-recover on every restart.
+
+**Recovered execution shape.** Synthesized `ExecutionInfo` carries `status: 'failed'`, `error: 'process terminated (recovered from streaming buffer)'`, and `workflow: '__axl/recovered'` when the buffer is missing a `workflow_start` event. The events array is bounded by `state.maxEventsPerExecution` (default 50k) — a crashed run with 500k events doesn't resurrect as an unbounded ExecutionInfo. Consumers consuming `getExecutions()` should be aware these can appear; filter on the `__axl/` workflow prefix if you want to exclude recovered runs from dashboards.
+
+**Safety contracts:**
+- Recovery skips ids actively running in the current process (prevents corrupting a live workflow).
+- `saveExecution` failure during recovery preserves the streaming buffer for the next attempt (no data loss on intermittent Redis failures).
+- Recovery is idempotent — re-running it is safe; "canonical exists" branch drops orphan buffers without writing.
+
+**Store coverage:** `RedisStore` implements the streaming methods atomically via MULTI. `MemoryStore` implements them in-process (good for tests; lost on crash by design). `SQLiteStore` does NOT — single-process file storage gets less value from crash-survival, and the runtime emits a one-shot warning when `persist: 'streaming'` is configured against it.
+
+See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#2-statepersist-streaming-for-crash-survival) for the full recovery contract and per-store coverage table.
+
 ## Windowed Aggregates (Studio)
 
 Studio's aggregate views (Cost Dashboard, Eval Runner, Workflow Runner, Trace Explorer) compute time-windowed statistics from persisted execution and eval history. When backed by SQLiteStore or RedisStore, aggregates survive server restarts.
@@ -632,3 +670,11 @@ Each aggregator broadcasts to its own WS channel (`costs`, `eval-trends`, `workf
 - `POST /api/costs/reset` was **removed** in 0.15.0 — any client that was hitting it for a manual reset gets `404`. Use window selection instead; snapshots evict automatically as their window slides.
 - The `CostAggregator` class was replaced by a generic `TraceAggregator<CostData>` configured with a pure `reduceCost` reducer. Behavior is preserved; any external consumer importing `CostAggregator` from `@axlsdk/studio` must switch to `TraceAggregator`.
 - The `costs` WS channel payload changed from `CostData` to `{ snapshots: Record<WindowId, CostData>, updatedAt: number }`. Existing clients that read the old shape must select a window from `snapshots` (typically `snapshots['7d']`).
+
+### Migration from 0.17
+
+- `ExecutionInfo.metadata` is now lifted from `ExecuteOptions.metadata` (control-plane keys `sessionHistory`/`sessionId`/`resumeMode` are stripped). Consumers reading `executionInfo.metadata` that previously saw `undefined` now see real values; narrow accordingly.
+- `DELETE /api/executions/:id` is a new Studio endpoint. It scrubs the WS replay buffer for `execution:{id}` in addition to running `runtime.deleteExecution` — late subscribers can no longer reconstruct events for a deleted run.
+- `runtime.on('execution_deleted', ...)` is a new audit-trail event. Subscribe for compliance logging without wrapping `runtime.deleteExecution`.
+- `state.persist: 'streaming'` is the new opt-in durability mode. Existing deployments default to `'terminal'` (back-compat). See ["Crash Recovery"](#crash-recovery-statepersist-streaming) above.
+- Custom `StateStore` implementers: `deleteExecution`'s contract widened to require a total per-execution sweep (checkpoints + state + pending decisions + streaming buffer + canonical row in one call). Implementations that only delete the canonical row leak PII through the side surfaces.

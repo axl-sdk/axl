@@ -242,6 +242,45 @@ const r2 = await session.send('solve', { question: 'Now multiply that by 3' });
 // Each send() appends to the conversation history, so the agent has full context across turns
 ```
 
+## State Persistence & Recovery
+
+Production-grade state stores with multi-tenant namespacing, TTL-driven retention, and crash survival.
+
+```typescript
+import { AxlRuntime, RedisStore } from '@axlsdk/axl';
+
+const store = await RedisStore.create({
+  url: process.env.REDIS_URL!,
+  keyPrefix: 'axl:prod:',          // namespace for shared-cluster isolation
+  defaultTtl: 60 * 60 * 24 * 30,   // 30-day retention
+  ttls: {
+    streamingEvents: 60 * 60 * 24 * 7,  // safety net for missed recovery
+  },
+});
+
+const runtime = new AxlRuntime({
+  state: { store, persist: 'streaming' },  // flush traces during the run
+});
+
+// Boot sequence: hydrate, recover, accept new work
+await runtime.getExecutions();
+const recovered = await runtime.recoverIncompleteStreams();
+console.log(`Recovered ${recovered.length} crashed executions`);
+```
+
+**Crash survival.** With `state.persist: 'streaming'`, events flush to the store throughout the run. A mid-execution crash leaves a recoverable trace; `runtime.recoverIncompleteStreams()` synthesizes partial `ExecutionInfo`s on the next process.
+
+**GDPR right-to-be-forgotten.** `runtime.deleteExecution(id)` sweeps every per-execution surface (data + indexes + checkpoints + suspended state + streaming buffer + pending decisions) in one atomic call. Emits `execution_deleted` for the audit trail.
+
+```typescript
+runtime.on('execution_deleted', (e) => auditLog.write({ ...e }));
+await runtime.deleteExecution(executionId);
+```
+
+**Queryable per-execution tags.** `ExecutionInfo.metadata` round-trips from `ExecuteOptions.metadata` (`userId`, `tenantId`, correlation ids) — filter via `runtime.getExecutions()`. Studio scrubs metadata under `trace.redact: true`.
+
+See [docs/migration/state-store-durability.md](./docs/migration/state-store-durability.md) for the full design.
+
 ## Providers
 
 Four built-in providers, zero SDK dependencies (raw `fetch`). Set the corresponding env var and use the `provider:model` URI:
@@ -361,7 +400,7 @@ Axl competes primarily with [Mastra](https://mastra.ai) and [LangGraph.js](https
 | **Local dev UI**       | Axl Studio                                           | Mastra Studio                                                       | LangGraph Studio                      |
 | **Deployment**         | Manual                                               | One-command (Vercel, CF, Netlify)                                   | LangGraph Platform                    |
 | **Dependencies**       | Zero (raw `fetch`)                                   | Vercel AI SDK                                                       | `@langchain/core` ecosystem           |
-| **Durable execution**  | `checkpoint` (checkpoint-replay)                     | Workflow suspend/resume                                             | Checkpointers (every superstep)       |
+| **Durable execution**  | `checkpoint` replay + `state.persist: 'streaming'` crash recovery | Workflow suspend/resume                              | Checkpointers (every superstep)       |
 
 **Where Axl shines:** Concurrency primitives, consensus/voting, cost control, testing story, zero dependencies, and imperative workflow style (plain TypeScript, no DSL).
 

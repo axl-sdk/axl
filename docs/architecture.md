@@ -86,7 +86,7 @@ The `StateStore` interface abstracts persistence. Three built-in implementations
 | `SQLiteStore` | File-based persistence (requires `better-sqlite3`) |
 | `RedisStore` | Multi-process deployments (requires `redis`) |
 
-State stores handle workflow execution state (for `checkpoint`/resume), session history, memory entries, pending human decisions, execution history, and eval history.
+State stores handle workflow execution state (for `checkpoint`/resume), session history, memory entries, pending human decisions, execution history, eval history, and — when `state.persist: 'streaming'` is configured — per-execution streaming event buffers for crash-recovery via `runtime.recoverIncompleteStreams()`. All three built-in stores implement the optional `deleteExecution` method as a **total per-execution sweep**: one call removes the canonical row, checkpoints, suspended state, pending decisions, and the streaming buffer atomically (`RedisStore` via MULTI/EXEC, `SQLiteStore` via `db.transaction`, `MemoryStore` via ordered Map deletes).
 
 ```typescript
 // Memory — zero config, no persistence (default)
@@ -103,7 +103,9 @@ const store = await RedisStore.create('redis://localhost:6379');
 const runtime = new AxlRuntime({ state: { store } });
 ```
 
-`RedisStore.create()` is async and connects before returning — wire it up before constructing the runtime. `runtime.shutdown()` closes the connection automatically.
+`RedisStore.create()` is async and connects before returning — wire it up before constructing the runtime. `runtime.shutdown()` closes the connection automatically (after draining in-flight `persistExecution` chains and the streaming flusher so workflows aborted by shutdown don't lose their canonical rows).
+
+For production deployments, see [docs/integration.md](./integration.md) for the multi-tenant `keyPrefix`, TTL configuration, and crash-recovery wiring patterns. The complete state-store design (persistence modes, TTL strategy, GDPR delete contract, `ExecutionInfo.metadata`) is in [docs/migration/state-store-durability.md](./migration/state-store-durability.md).
 
 > **⚠️ Multi-process session writes are NOT serialized.** RedisStore makes session state visible across processes, but the per-session-id lock that protects `Session.send`/`stream`/`end`/`fork` from read-modify-write races is **in-process only**. Two Node workers behind a load balancer concurrently calling `runtime.session('user-123').send(...)` will both read the same Redis snapshot, both append, and the later write will clobber the earlier one — losing an entire user/assistant exchange.
 >

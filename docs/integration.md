@@ -63,6 +63,97 @@ The same pattern works with any Node.js framework (Hono, Fastify, NestJS, Next.j
 
 > **⚠️ Multi-worker deployments need sticky sessions.** `Session.send` is serialized per id within ONE Node process. If you run multiple workers behind a load balancer, you must route requests with the same `sessionId` to the same worker (sticky routing) — otherwise two workers may concurrently `send` on the same session id and the later writer will clobber the earlier one's update. See [API Reference → Sessions → Concurrency](./api-reference.md#concurrency-and-races).
 
+## Production State-Store Deployment
+
+For production deployments — especially multi-process, multi-tenant, or compliance-sensitive — the `StateStore` configuration is load-bearing. The defaults are fine for dev; production needs TTLs, namespace isolation, and (usually) crash-survival.
+
+### RedisStore: keyPrefix, TTLs, and crash recovery
+
+```ts
+import { RedisStore, AxlRuntime } from '@axlsdk/axl';
+
+const store = await RedisStore.create({
+  url: process.env.REDIS_URL!,
+  keyPrefix: `axl:${process.env.TENANT_ID ?? 'prod'}:`,
+  defaultTtl: 60 * 60 * 24 * 30,         // 30 days for everything
+  ttls: {
+    checkpoint:      60 * 60 * 24 * 7,   // 7 days — belongs to a run
+    executionState:  60 * 60 * 24,       // 1 day for suspend/resume state
+    streamingEvents: 60 * 60 * 24 * 7,   // OPT-IN safety net; must exceed max restart-gap
+  },
+});
+
+const runtime = new AxlRuntime({
+  state: { store, persist: 'streaming' },
+});
+```
+
+**Without TTLs, every save accumulates and Redis OOMs.** Pick `defaultTtl` based on your retention policy; override per category as needed. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`) so a generous default doesn't TTL-evict crashed-run buffers before recovery runs. See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#tldr) for the full TTL strategy + window semantics (sliding vs. fixed-creation vs. fixed-refresh).
+
+`keyPrefix` is the storage-layer isolation primitive for shared Redis clusters. Avoid Redis glob metacharacters (`*`, `?`, `[`, `]`) in the prefix; operators running `redis-cli SCAN MATCH` would otherwise have to escape them.
+
+### Boot wiring: recovery before accepting new work
+
+```ts
+// 1. Hydrate the historical cache so recovery's "canonical exists" branch can fire
+await runtime.getExecutions();
+
+// 2. Reconstruct partial ExecutionInfos for crashed runs (if persist: 'streaming')
+const recovered = await runtime.recoverIncompleteStreams();
+console.log(`[boot] recovered ${recovered.length} crashed executions`);
+
+// 3. NOW accept new requests
+app.listen(3000);
+```
+
+Recovery is **idempotent** — re-running it is safe; concurrent recovery on a shared Redis with multiple pods restarting at the same time converges via "canonical exists, drop orphan." But it MUST run BEFORE accepting new work that could share an executionId with a recovery-in-progress (cross-process recovery on a live workflow is not enforced; see [docs/migration/state-store-durability.md](./migration/state-store-durability.md#2-statepersist-streaming-for-crash-survival)).
+
+### Graceful shutdown
+
+```ts
+const server = app.listen(3000);
+
+const shutdown = async () => {
+  server.close();                  // stop accepting new requests FIRST
+  await runtime.shutdown();        // drain in-flight, flush streaming buffer, close store
+  process.exit(0);
+};
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+```
+
+`runtime.shutdown()` aborts in-flight executions, drains the streaming flusher, **awaits all in-flight `persistExecution` chains**, and closes the store connection. Skipping it causes workflows aborted by shutdown to lose their canonical rows (the detached save races the connection close).
+
+### Per-tenant metadata and right-to-be-forgotten
+
+```ts
+app.post('/run', async (req, res) => {
+  const result = await runtime.execute('analyze', req.body.input, {
+    metadata: { userId: req.user.id, tenantId: req.user.tenantId },
+  });
+  res.json(result);
+});
+
+// GDPR delete handler
+app.delete('/users/:id/data', async (req, res) => {
+  const execs = await runtime.getExecutions();
+  const userRuns = execs.filter((e) => e.metadata?.userId === req.params.id);
+  for (const e of userRuns) {
+    await runtime.deleteExecution(e.executionId);
+  }
+  res.json({ deleted: userRuns.length });
+});
+
+// Audit trail
+runtime.on('execution_deleted', (e) => {
+  auditLog.write({ event: 'execution.deleted', operator: req.user.id, ...e });
+});
+```
+
+`runtime.deleteExecution(id)` sweeps every per-execution surface (data + indexes + checkpoints + state + streaming buffer + pending decisions) and emits `execution_deleted` for the audit pipeline. If the execution is still running, it aborts the workflow AND prevents the resulting `workflow_end` from resurrecting the row.
+
+`ExecutionInfo.metadata` strips internal control-plane keys (`sessionHistory`, `sessionId`, `resumeMode`) before persistence so a multi-tenant tag bag stays clean. The snapshot is `structuredClone`'d for isolation from caller mutation.
+
 ## Axl Studio
 
 Axl Studio provides a browser-based development UI for any Axl project.

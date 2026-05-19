@@ -432,6 +432,78 @@ app.post('/api/chat/:sessionId', async (req, res) => {
 });
 ```
 
+## Multi-Tenant Compliance: Per-Tenant Tags + Right-to-be-Forgotten
+
+Multi-tenant SaaS pattern: tag every execution with `tenantId` / `userId`, list by tag, and scrub a specific user's data on a GDPR request — with an audit trail.
+
+```typescript
+import { AxlRuntime, RedisStore } from '@axlsdk/axl';
+
+const store = await RedisStore.create({
+  url: process.env.REDIS_URL!,
+  keyPrefix: 'axl:prod:',          // namespace for shared-cluster isolation
+  defaultTtl: 60 * 60 * 24 * 90,   // 90-day retention
+});
+
+const runtime = new AxlRuntime({ state: { store } });
+
+// Subscribe to the audit signal once at boot
+runtime.on('execution_deleted', (e) => {
+  auditLog.write({
+    event: 'execution.deleted',
+    operator: currentOperator(),
+    timestamp: new Date().toISOString(),
+    ...e,  // { executionId, wasActive, hadPendingDecision, removed }
+  });
+});
+
+// Every workflow execution is tagged with the requesting user/tenant
+app.post('/analyze', async (req, res) => {
+  const result = await runtime.execute('analyze', req.body, {
+    metadata: {
+      userId: req.user.id,
+      tenantId: req.user.tenantId,
+      correlationId: req.headers['x-request-id'],
+    },
+  });
+  res.json(result);
+});
+
+// List a tenant's runs (queryable via runtime.getExecutions())
+app.get('/admin/runs', async (req, res) => {
+  const all = await runtime.getExecutions();
+  const tenant = all.filter((e) => e.metadata?.tenantId === req.user.tenantId);
+  res.json(tenant);
+});
+
+// GDPR right-to-be-forgotten — sweeps every per-execution surface
+app.delete('/users/:id/data', async (req, res) => {
+  const all = await runtime.getExecutions();
+  const userRuns = all.filter((e) => e.metadata?.userId === req.params.id);
+  const results = await Promise.all(
+    userRuns.map((e) => runtime.deleteExecution(e.executionId)),
+  );
+  res.json({ deleted: results.filter(Boolean).length });
+});
+```
+
+**What `deleteExecution` actually removes** (one call, atomic per store):
+
+- Canonical `executionHistory` row + indexes
+- All checkpoints for the id
+- Suspended-state blob + pending-set membership
+- Streaming buffer (when `state.persist: 'streaming'`)
+- Pending `awaitHuman` decision
+- In-memory abort controller, resolver closure, streamable-set membership
+
+If the execution is still in flight, the workflow is **aborted** and marked to skip persist on `workflow_end` — no resurrection. A workflow paused at `ctx.awaitHuman()` correctly wakes (rejects with `AbortError`); previously it would hang forever.
+
+**Internal metadata keys are stripped before persistence.** `sessionHistory`, `sessionId`, and `resumeMode` in `options.metadata` are consumed by the runtime as control-plane channels but filtered out of the persisted `ExecutionInfo.metadata`. So the queryable surface stays a clean tag bag.
+
+**Studio integration:** `DELETE /api/executions/:id` wraps `runtime.deleteExecution` and additionally scrubs the WebSocket replay buffer — late subscribers can't reconstruct a deleted run's events. Blocked in `readOnly` mode.
+
+See [docs/security.md](./security.md#right-to-be-forgotten--execution-deletion) for the security posture and [docs/migration/state-store-durability.md](./migration/state-store-durability.md) for the complete sweep contract.
+
 ## Model Fallback with Race
 
 Try multiple models in parallel, take the first valid response:

@@ -146,6 +146,9 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `POST /api/tools/:name/test` | Test a tool with `{ input: {...} }` |
 | `GET /api/sessions` | List sessions |
 | `GET /api/executions` | List executions |
+| `GET /api/executions/:id` | Execution detail. `?since={step}` filters `events` to those with `step > since` (polling tail) |
+| `POST /api/executions/:id/abort` | Abort a running execution (signal-driven; wakes paused `ctx.awaitHuman`) |
+| `DELETE /api/executions/:id` | Delete an execution from history (GDPR scrub). Calls `runtime.deleteExecution` AND scrubs the WS replay buffer for `execution:{id}`. Returns `{ id, deleted: true }` or 404. Blocked in readOnly |
 | `GET /api/costs?window=24h\|7d\|30d\|all` | Aggregated cost data for a time window (default `7d`). `?windows=all` returns all four windows at once for debugging |
 | `GET /api/eval-trends?window=` | Per-eval score trends (latest, mean, std), cost totals, recent runs with `model`/`duration` |
 | `GET /api/workflow-stats?window=` | Per-workflow totals, completed/failed counts, p50/p95/avg duration, failure rate |
@@ -225,7 +228,7 @@ studio.upgradeWebSocket(server);
 | `serveClient` | `boolean` | `true` | Serve the pre-built SPA |
 | `verifyUpgrade` | `(req) => boolean \| { allowed: boolean, metadata?: unknown } \| Promise<...>` | — | Auth callback for WebSocket upgrades. The object form attaches `metadata` (tenant/user id / role) to the connection, available to `filterTraceEvent` on every outbound broadcast. Bare boolean still works (back-compat) |
 | `filterTraceEvent` | `(event, metadata) => boolean` | — | Per-connection broadcast filter for multi-tenant deployments. Called on every outbound trace event (and on replay buffer events for late subscribers, so historical cross-tenant events can't leak on reconnect). Predicate errors are fail-closed — event is dropped |
-| `readOnly` | `boolean` | `false` | Disable all mutating endpoints. `POST /api/evals/compare` is allowed (pure computation); `POST /api/evals/import`, `POST /api/evals/:name/run`, `POST /api/evals/:name/rescore`, `POST /api/evals/runs/:evalRunId/cancel`, and `DELETE /api/evals/history/:id` are blocked |
+| `readOnly` | `boolean` | `false` | Disable all mutating endpoints. `POST /api/evals/compare` is allowed (pure computation); `POST /api/evals/import`, `POST /api/evals/:name/run`, `POST /api/evals/:name/rescore`, `POST /api/evals/runs/:evalRunId/cancel`, `DELETE /api/evals/history/:id`, and `DELETE /api/executions/:id` are blocked (405 with `error.code: 'READ_ONLY'`) |
 | `evals` | `string \| string[] \| { files, conditions? }` | — | Lazy-load eval files for the Eval Runner panel |
 | `bufferCaps` | `{ maxEventsPerBuffer?, maxBytesPerBuffer?, maxActiveBuffers? }` | `{ 1000, 4 MiB, 256 }` | Override the default WebSocket replay-buffer resource caps for high-churn deployments. Worst-case memory is roughly `maxActiveBuffers × maxBytesPerBuffer` (≈1 GiB at defaults). Terminal `done`/`error` events are always buffered regardless of caps |
 
@@ -450,7 +453,9 @@ const runtime = new AxlRuntime({ trace: { redact: true } });
 const studio = createStudioMiddleware({ runtime });
 ```
 
-Under `redact: true`, the following Studio endpoints scrub user content server-side before responding: `GET /api/executions{,/:id}`, `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser stays navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync); streaming WS broadcasts on `/workflows/:name/execute` with `stream: true`, `/api/playground/chat`, AND the trace channel firehose (`trace:{executionId}`) all scrub `AxlEvent` content before send.
+Under `redact: true`, the following Studio endpoints scrub user content server-side before responding: `GET /api/executions{,/:id}` (also scrubs `ExecutionInfo.metadata` to `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces), `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser stays navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync); streaming WS broadcasts on `/workflows/:name/execute` with `stream: true`, `/api/playground/chat`, AND the trace channel firehose (`trace:{executionId}`) all scrub `AxlEvent` content before send.
+
+**`DELETE /api/executions/:id` is a second cleanup boundary** alongside redaction. Redaction scrubs *content* on read; the delete endpoint removes the *whole row + indexes + checkpoints + suspended state + streaming buffer + pending decisions* AND scrubs the WebSocket replay buffer for `execution:{id}` so late subscribers can't reconstruct events for a deleted run. Audit via `runtime.on('execution_deleted', ...)`.
 
 Studio checks the flag via `runtime.isRedactEnabled(): boolean` — it does **not** reach into the config object directly, because `Readonly<AxlConfig>` is shallow and consumers could mutate the nested `trace.redact` field via sub-object access. `GET /api/health` also reports `readOnly: boolean` so clients can gate mutating UI affordances.
 

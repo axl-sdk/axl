@@ -646,7 +646,51 @@ const store = await RedisStore.create({
 
 The prefix is concatenated as-given — no normalization. Include a trailing colon if you want one. Empty string is rejected.
 
-**TTLs are strongly recommended in production** — without them every `save*` accumulates forever and Redis eventually OOMs. Memory category uses sliding-window semantics (active users keep their data); others use fixed-window. See [api-reference.md](../../docs/api-reference.md#redisstore-options) for full details.
+**TTLs are strongly recommended in production** — without them every `save*` accumulates forever and Redis eventually OOMs. Sliding window: `memory`, `session`, `sessionMeta` (every write refreshes; reads do NOT). Fixed-creation: `checkpoint`, `streamingEvents`. Fixed-refresh: `executionState`, `executionHistory`, `evalHistory`. `streamingEvents` is opt-in only (does NOT fall back to `defaultTtl`). See [api-reference.md](../../docs/api-reference.md#redisstore-options) for the full table.
+
+#### Crash survival: `state.persist: 'streaming'`
+
+Opt-in mode that flushes events to the configured store throughout a run, so a mid-execution crash leaves a recoverable trace.
+
+```typescript
+const runtime = new AxlRuntime({
+  state: {
+    store: await RedisStore.create(redisUrl),
+    persist: 'streaming',          // default 'terminal' (back-compat)
+    streamingBatchSize: 100,       // events per flush trigger
+    streamingBatchInterval: 1000,  // ms
+  },
+});
+
+// Boot sequence: lazy-load THEN recover THEN accept new work
+await runtime.getExecutions();
+const recovered = await runtime.recoverIncompleteStreams();
+console.log(`Recovered ${recovered.length} crashed executions`);
+app.listen(3000);
+```
+
+Excluded events (never flushed): `token`, `partial_object`, `string_delta` — reconstructable from `agent_call_end.data.response`. Scope: `runtime.execute()` and `runtime.stream()` only — `createContext()` flows are deliberately excluded (no terminal finalize path).
+
+Synthesized recovered executions carry `status: 'failed'`, `error: 'process terminated (recovered from streaming buffer)'`, and `workflow: '__axl/recovered'` when no `workflow_start` was captured. Events bounded by `state.maxEventsPerExecution`. SQLite does not implement streaming methods — the runtime warns and falls back to terminal mode.
+
+See [docs/migration/state-store-durability.md](../../docs/migration/state-store-durability.md) for the full design.
+
+#### Execution lifecycle: `runtime.deleteExecution(id)`
+
+GDPR right-to-be-forgotten. One call sweeps every per-execution surface (data + indexes + checkpoints + suspended state + streaming buffer + pending decisions) and emits an `execution_deleted` audit event.
+
+```typescript
+await runtime.deleteExecution(executionId);
+
+runtime.on('execution_deleted', (e) => {
+  // e: { executionId, wasActive, hadPendingDecision, removed }
+  auditLog.write({ event: 'execution.deleted', ...e });
+});
+```
+
+If the execution is still running, the workflow is aborted (and a paused `ctx.awaitHuman()` correctly wakes with `AbortError` — fixed in 0.18.0). The resurrection guard ensures the workflow's eventual `workflow_end` doesn't re-create the row.
+
+`ExecutionInfo.metadata` round-trips from `ExecuteOptions.metadata` (`userId`, `tenantId`, etc.) — queryable via `runtime.getExecutions().filter(...)`. Internal control-plane keys (`sessionHistory`, `sessionId`, `resumeMode`) are stripped before persistence; they remain available via `ctx.metadata` for dynamic selectors.
 
 ### Session Options
 

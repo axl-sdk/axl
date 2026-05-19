@@ -113,6 +113,41 @@ When `onBlock` is `'retry'`, the LLM's blocked output is appended to the convers
 
 For **business rule validation** on the parsed typed object (not raw text), use `validate` (per-call, co-located with the `schema` it validates). This runs after schema parsing and receives the fully typed object, letting you enforce domain constraints (cross-field relationships, referential integrity, etc.). Supported on `ctx.ask()`, `ctx.delegate()`, `ctx.race()`, and `ctx.verify()`. Requires a `schema` — without one, use output guardrails for raw text validation instead. See the [API Reference](api-reference.md#validate) for details.
 
+## Right-to-be-Forgotten / Execution Deletion
+
+Two operator-facing primitives implement the GDPR deletion contract:
+
+**`runtime.deleteExecution(id)`** — total per-execution sweep. Removes from the in-memory caches, the configured `StateStore`, AND every execution-scoped side surface:
+
+- Canonical execution-history row + indexes (legacy SET + sorted-set)
+- All checkpoints for the id
+- Suspended-state row + pending-set membership
+- Streaming-buffer events list + in-flight ids set (when `state.persist: 'streaming'`)
+- Pending `awaitHuman` decision (so it stops surfacing in `runtime.getPendingDecisions()` and the Studio Decisions panel)
+- In-memory resolver closure + abort controller
+
+If the execution is still running, `deleteExecution` aborts it via the registered controller AND adds the id to a `pendingDeletedExecutions` set so the workflow's eventual `workflow_end` does NOT resurrect the row in `persistExecution`. Aborting also correctly wakes a paused `ctx.awaitHuman()` (fixed in 0.18.0 — previously the awaitHuman Promise had no signal listener and hung forever on abort).
+
+```typescript
+await runtime.deleteExecution(executionId);
+
+// Audit trail
+runtime.on('execution_deleted', (e) => {
+  // e: { executionId, wasActive, hadPendingDecision, removed }
+  auditLog.write({ event: 'execution.deleted', operator: currentOperator(), ...e });
+});
+```
+
+The `execution_deleted` event fires on every call — including attempts against unknown ids (`removed: false`) — so compliance pipelines can log attempted deletes too.
+
+**`DELETE /api/executions/:id`** (Studio) — wraps `runtime.deleteExecution` AND scrubs the WebSocket replay buffer for the deleted execution channel via `ConnectionManager.clearChannelBuffer('execution:{id}')`. Without this scrub, late WebSocket subscribers could replay events for a deleted run for up to 30 seconds after stream completion. Blocked in `readOnly` mode (405 with `error.code: 'READ_ONLY'`).
+
+**For bulk eviction by age**, use `RedisStore` TTLs (`defaultTtl` / `ttls.<category>`) instead — the deleteExecution path is for targeted operator-driven scrubs, not retention policy.
+
+See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#1-runtimedeleteexecutionid) for the full delete contract and the per-store sweep table.
+
+**Custom `StateStore` implementers:** `deleteExecution`'s contract requires you to sweep every per-execution surface your store maintains in one call. The runtime delegates the total sweep to your method — it does NOT call separate `deleteCheckpoints` / `finalizeStreamingEvents` after. See the JSDoc on `StateStore.deleteExecution?`.
+
 ## Observability-Boundary Redaction
 
 `config.trace.redact: true` enables a three-layer filter that scrubs user/LLM content everywhere it would otherwise flow to observability consumers, while preserving structural metadata (IDs, keys, agent/tool/workflow names, roles, cost/token metrics, durations, timestamps, `askId`/`parentAskId`/`depth`) so observability stays useful under compliance mode.
@@ -126,10 +161,10 @@ const runtime = new AxlRuntime({
 **The three layers:**
 
 1. **AxlEvents** at emission — `agent_call_end.data.prompt`/`.response`/`.system`/`.thinking`/`.messages`, `ask_start.prompt`, `ask_end.outcome` (`outcome.result` on success, `outcome.error` on failure), gate-event `reason`/`feedbackMessage`, `tool_call_start.data.args`, `tool_call_end.data.args`/`.result`, `tool_approval.data.args`/`.reason`, `handoff_start.data.message` (roundtrip only), `workflow_start.data.input`, `workflow_end.data.result`/`.error`, `done.data.result`, `error.data.message`, string fields on `log` events (one-level walk — nested numeric/boolean fields like `usage.tokens` / `usage.cost` survive so the Cost Dashboard's byEmbedder bucket still works).
-2. **Studio REST route responses** at serialization — `GET /api/executions{,/:id}`, `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser remains navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync).
+2. **Studio REST route responses** at serialization — `GET /api/executions{,/:id}` (also scrubs `ExecutionInfo.metadata` to `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces compliance mode must protect), `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser remains navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync).
 3. **Studio WebSocket broadcasts** — `AxlEvent` content scrubbed on `POST /api/workflows/:name/execute` with `stream: true` and `POST /api/playground/chat` (`token.data`, `tool_call_start.data.args`, `tool_call_end.data.args`/`.result`, `tool_approval.data.args`/`.reason`, `ask_start.prompt`, `ask_end.outcome`, `done.data.result`, `error.data.message`, `handoff_start.data.message`). The **trace firehose channel** (`trace:*`) also applies the same `redactStreamEvent` filter as of 0.16.0 — closing a previous gap where the live trace stream could bypass the per-route scrub.
 
-**What's NOT scrubbed:** Programmatic callers of `runtime.execute()` and direct `StateStore` access still receive raw data — redaction is an observability-boundary filter, **not** a data-at-rest transform. Write endpoints (`PUT /api/memory`, `POST /api/sessions/:id/send`) still accept raw data. Top-level numeric fields (`cost`, `tokens`, `duration`) on every event are never scrubbed — they're load-bearing for `trackExecution` and the cost aggregator. Structural ask-graph metadata (`askId`, `parentAskId`, `depth`, `executionId`, `step`, `timestamp`) is also preserved (random IDs, no PII surface).
+**What's NOT scrubbed:** Programmatic callers of `runtime.execute()` and direct `StateStore` access still receive raw data — redaction is an observability-boundary filter, **not** a data-at-rest transform. For a data-at-rest scrub of a specific execution (GDPR right-to-be-forgotten), use `runtime.deleteExecution(id)` instead. Write endpoints (`PUT /api/memory`, `POST /api/sessions/:id/send`) still accept raw data. Top-level numeric fields (`cost`, `tokens`, `duration`) on every event are never scrubbed — they're load-bearing for `trackExecution` and the cost aggregator. Structural ask-graph metadata (`askId`, `parentAskId`, `depth`, `executionId`, `step`, `timestamp`) is also preserved (random IDs, no PII surface). Caller-supplied `ExecutionInfo.metadata` is scrubbed at the observability boundary when `redact: true` but persists raw in the store — operators wanting the raw values should query `runtime.getExecutions()` programmatically.
 
 Studio consumers should check the flag via `runtime.isRedactEnabled(): boolean` rather than reaching into the config (the full config was intentionally not exposed because `Readonly<T>` is shallow — consumers could mutate `trace.redact` via sub-object access). Separately, `GET /api/health` reports `readOnly: boolean` so a client can gate mutating UI affordances (e.g., the Eval Runner hides its Import / Run buttons in readOnly mode); the redact flag is not surfaced on the health endpoint because it's only consumed server-side at response serialization time.
 
@@ -169,3 +204,5 @@ const studio = createStudioMiddleware({
 The filter runs on every outbound broadcast — including historical replay buffers for late subscribers — so cross-tenant events can't leak even on reconnect. Predicate errors are **fail-closed** (event dropped) so a buggy filter can't accidentally widen visibility. `event` is typed `unknown` because the filter runs across every channel (`trace:*` carries `AxlEvent`, `costs` carries `CostData`, `execution:*` / `eval:*` also carry `AxlEvent`); narrow via the channel-specific union at the call site.
 
 Studio's WebSocket broadcast layer also enforces a 64KB soft frame cap via `truncateIfOversized`. Oversized `agent_call_end.data.messages` snapshots (verbose mode) are replaced with a `{ __truncated: true, originalBytes, maxBytes, hint }` placeholder that preserves `type`/`step`/`agent`/`tool` so the Trace Explorer still renders the row.
+
+**Storage isolation in shared Redis clusters:** `RedisStore.create({ keyPrefix })` namespaces every key the store writes. For multi-tenant SaaS deployments running multiple Axl runtimes against one Redis cluster (e.g., `'axl:tenant-a:'` vs `'axl:tenant-b:'`), the prefix is the storage-layer isolation primitive. The `verifyUpgrade` + `filterTraceEvent` hooks above scope the observability surface; `keyPrefix` scopes the persistence surface. Empty string is rejected to prevent accidental collisions with non-Axl keys. See [api-reference.md `RedisStoreOptions`](./api-reference.md#statestore) for the option table.

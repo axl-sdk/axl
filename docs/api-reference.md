@@ -696,6 +696,8 @@ if (decision.approved) {
 
 **Resolution:** The host app resolves decisions via `runtime.getPendingDecisions()` and `runtime.resolveDecision(executionId, decision)`. See [Security > Approval Gates](./security.md#approval-gates).
 
+**Cancellation:** If the execution is aborted while suspended at `awaitHuman` — via `runtime.abort(id)`, `runtime.deleteExecution(id)`, an external `options.signal`, or a budget hard-stop — the awaitHuman Promise rejects with `AbortError` and the workflow unwinds. The runtime cleans up its own bookkeeping (resolver map + persisted decision row) atomically as part of the delete sweep.
+
 ---
 
 ### `ctx.checkpoint(name, fn)`
@@ -1043,6 +1045,17 @@ runtime.on('session_lock_contended', ({ sessionId }) => {
 ```
 
 Useful when you suspect a session is slow because of queueing (rather than the LLM itself).
+
+#### Runtime events
+
+The `AxlRuntime` extends `EventEmitter`. Subscribe to lifecycle signals:
+
+| Event | Payload | Description |
+|---|---|---|
+| `'trace'` | `AxlEvent` | Fires for every event emitted by every `execute()` / `stream()` / `createContext()` call. The cross-execution observability firehose |
+| `'eval_result'` | `EvalHistoryEntry` | Fires when `saveEvalResult` lands (used by Studio's eval-trends aggregator; available to any consumer) |
+| `'execution_deleted'` | `{ executionId, wasActive, hadPendingDecision, removed }` | Audit signal for `runtime.deleteExecution(id)`. Fires on every call including attempts against unknown ids (`removed: false`). Synchronous — listeners run before `deleteExecution` returns; throwing listeners surface to the caller |
+| `'session_lock_contended'` | `{ sessionId }` | Fires when a `Session.send` / `stream` / `end` / `fork` queues behind an in-flight task on the same id |
 
 > **⚠️ Cross-process locking is NOT provided.** The lock is in-process — multiple Node workers (e.g., a horizontally-scaled web app) all hitting the same Redis-backed `sessionId` will still race. Production deployments behind a load balancer must either:
 >

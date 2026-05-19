@@ -231,7 +231,9 @@ class StreamingFlusher {
     }
     // Chain after any prior in-flight write so order is preserved AND so
     // `finalize` only needs to await the most recent promise to wait on
-    // all pending writes.
+    // all pending writes. The chain's `.finally` evicts ITS OWN entry from
+    // `inflight` so settled-and-not-superseded entries don't accumulate
+    // across an idle runtime (memory leak avoidance).
     const prior = this.inflight.get(executionId) ?? Promise.resolve();
     const next = prior.then(async () => {
       try {
@@ -247,6 +249,13 @@ class StreamingFlusher {
       }
     });
     this.inflight.set(executionId, next);
+    next.finally(() => {
+      // Only evict if WE are still the head — a later flush() may have
+      // overwritten us with a fresh chain, and we mustn't drop that.
+      if (this.inflight.get(executionId) === next) {
+        this.inflight.delete(executionId);
+      }
+    });
     return next;
   }
 
@@ -258,14 +267,12 @@ class StreamingFlusher {
     await this.flush(executionId);
     // Drain any prior in-flight writes BEFORE deleting the store-side buffer.
     // `flush` updated `inflight` to chain after the prior write; awaiting that
-    // promise covers ALL pending writes (they're chained).
+    // promise covers ALL pending writes (they're chained). The chain itself
+    // never rejects — failures inside `appendStreamingEvents` are caught and
+    // logged at the source, so `await pending` here is non-throwing.
     const pending = this.inflight.get(executionId);
     if (pending) {
-      try {
-        await pending;
-      } catch {
-        // Already logged inside flush(). Don't double-log.
-      }
+      await pending;
       this.inflight.delete(executionId);
     }
     // Drop any in-memory state for this execution

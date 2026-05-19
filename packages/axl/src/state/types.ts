@@ -100,10 +100,17 @@ export interface StateStore {
   //
   // All four methods are OPTIONAL. Stores that don't implement them treat
   // `state.persist: 'streaming'` as a soft no-op (no streaming durability,
-  // but the workflow still runs normally). RedisStore implements all four;
-  // MemoryStore and SQLiteStore implement them as in-memory / on-disk
-  // stubs that work for tests but don't survive a process crash (their
-  // raison d'être is in-process / single-process anyway).
+  // but the workflow still runs normally). Coverage in built-ins:
+  //   - RedisStore: implements all four with crash-survival (the intended
+  //     production use case).
+  //   - MemoryStore: implements all four with in-process Map storage —
+  //     good for tests; lost on crash like the rest of MemoryStore state.
+  //   - SQLiteStore: does NOT implement streaming methods. Single-process
+  //     file storage gets less value from crash-survival, and the
+  //     workflow's terminal `saveExecution` already gives full durability.
+  //     Configuring `state.persist: 'streaming'` against SQLite emits a
+  //     one-shot warning at runtime startup and falls back to terminal
+  //     semantics.
 
   /**
    * Append a batch of events to the streaming buffer for an execution.

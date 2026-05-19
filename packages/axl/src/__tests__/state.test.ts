@@ -1777,7 +1777,7 @@ describe('RedisStore', () => {
         expect(mockClient.get).not.toHaveBeenCalled();
       });
 
-      it('listExecutions respects limit via LIMIT clause (not JS slice)', async () => {
+      it('listExecutions respects limit via LIMIT clause (with over-fetch to absorb TTL drift)', async () => {
         const { store, mockClient } = createRedisStoreWithMockClient();
         for (let i = 0; i < 10; i++) await store.saveExecution(makeExec(`e${i}`, i * 100));
 
@@ -1786,13 +1786,33 @@ describe('RedisStore', () => {
 
         expect(result).toHaveLength(3);
         expect(result.map((e) => e.executionId)).toEqual(['e9', 'e8', 'e7']);
-        // Limit was pushed down to the ZSET (not done with a slice in JS)
+        // Limit is pushed down to the ZSET with over-fetch (2x with +5 floor)
+        // so that TTL evictions between ZRANGE and MGET don't silently
+        // under-deliver. With limit=3 we fetch up to 8 candidates and stop
+        // at the first 3 non-null parsed rows.
         expect(mockClient.zRevRangeByScore).toHaveBeenCalledWith(
           'axl:exec-history-z',
           '+inf',
           '-inf',
-          { LIMIT: { offset: 0, count: 3 } },
+          { LIMIT: { offset: 0, count: 8 } },
         );
+      });
+
+      it('listExecutions delivers up to `limit` live entries even when some blobs are TTL-evicted', async () => {
+        const { store, mockClient, data } = createRedisStoreWithMockClient();
+        for (let i = 0; i < 10; i++) await store.saveExecution(makeExec(`e${i}`, i * 100));
+        // Simulate TTL eviction by deleting some data blobs (their ZSET
+        // entries remain — exactly the divergence we want to absorb).
+        data.delete('axl:exec-history:e9');
+        data.delete('axl:exec-history:e8');
+        data.delete('axl:exec-history:e7');
+
+        mockClient.zRevRangeByScore.mockClear();
+        const result = await store.listExecutions(3);
+        // Got 3 live entries from the next-3 surviving (e6,e5,e4) — NOT 0
+        // because all top 3 were evicted.
+        expect(result).toHaveLength(3);
+        expect(result.map((e) => e.executionId)).toEqual(['e6', 'e5', 'e4']);
       });
 
       it('listEvalResults uses ZSET fast path', async () => {
@@ -2105,19 +2125,6 @@ describe('RedisStore', () => {
         expect(ttls.get('axl:checkpoint:e1')).toBe(100);
       });
 
-      it('saveSessionMeta uses EXPIRE NX (does not extend on re-save)', async () => {
-        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
-          sessionMeta: 3600,
-        });
-        await store.saveSessionMeta('s1', 'agentName', 'support');
-        expect(ttls.get('axl:session-meta:s1')).toBe(3600);
-
-        // Shrink and re-save — NX prevents reset
-        ttls.set('axl:session-meta:s1', 50);
-        await store.saveSessionMeta('s1', 'handoffHistory', []);
-        expect(ttls.get('axl:session-meta:s1')).toBe(50);
-      });
-
       it('saveExecution applies TTL via SET ... EX', async () => {
         const { store, ttls } = createRedisStoreWithMockClient(undefined, {
           executionHistory: 60 * 60 * 24 * 30,
@@ -2174,7 +2181,23 @@ describe('RedisStore', () => {
       });
     });
 
-    describe('sliding-window category (memory)', () => {
+    describe('sliding-window categories (memory, sessionMeta)', () => {
+      it('saveSessionMeta uses sliding TTL (extends on re-save, matching the session lifecycle)', async () => {
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          sessionMeta: 3600,
+        });
+        await store.saveSessionMeta('s1', 'agentName', 'support');
+        expect(ttls.get('axl:session-meta:s1')).toBe(3600);
+
+        // Shrink and re-save — sliding TTL DOES reset so meta ages out
+        // together with an active session. Fixed-TTL (NX) would have left
+        // the value at 50, causing handoff history to evict while the
+        // session itself stayed alive.
+        ttls.set('axl:session-meta:s1', 50);
+        await store.saveSessionMeta('s1', 'handoffHistory', []);
+        expect(ttls.get('axl:session-meta:s1')).toBe(3600);
+      });
+
       it('saveMemory uses EXPIRE without NX — every write resets the TTL', async () => {
         const { store, ttls } = createRedisStoreWithMockClient(undefined, {
           memory: 60 * 60 * 24 * 30,
@@ -2187,6 +2210,28 @@ describe('RedisStore', () => {
         ttls.set('axl:memory:session:s1', 100);
         await store.saveMemory('session:s1', 'k2', 'v2');
         expect(ttls.get('axl:memory:session:s1')).toBe(60 * 60 * 24 * 30);
+      });
+
+      it('getMemory legacy migration applies the configured memory TTL', async () => {
+        // Pre-patch (#2), legacy data lived at the sessionMeta location.
+        // Migration on first read sets the canonical hash via HSETNX. Without
+        // a follow-up EXPIRE, the migrated entry was immortal until another
+        // saveMemory call refreshed the sliding window. With the fix, the
+        // migrated entry participates in the same TTL as native writes.
+        const { store, hashData, ttls } = createRedisStoreWithMockClient(undefined, {
+          memory: 60 * 60 * 24, // 1 day
+        });
+
+        // Seed legacy location directly (simulates pre-upgrade data)
+        const legacyKey = 'axl:session-meta:memory:s1:k1';
+        hashData.set(legacyKey, new Map([['value', JSON.stringify('legacy-v1')]]));
+
+        const v = await store.getMemory('s1', 'k1');
+        expect(v).toBe('legacy-v1');
+        // Migrated to canonical hash AND the TTL is applied so it can't be
+        // immortal. EXPIRE is fire-and-forget, so allow a microtask tick.
+        await new Promise((r) => setTimeout(r, 5));
+        expect(ttls.get('axl:memory:s1')).toBe(60 * 60 * 24);
       });
 
       it('memory TTL applies per-scope, not per-key (one TTL per hash)', async () => {

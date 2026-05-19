@@ -140,13 +140,18 @@ export interface RedisStoreOptions {
    * `resolveDecision()` instead.
    *
    * Window semantics:
-   * - `memory` uses **sliding** window — every write resets the TTL, so
-   *   active users keep their data and inactive ones forget. Designed for
-   *   per-user / per-session memory.
-   * - All other categories use **fixed** window — the TTL is set on the
-   *   first write and isn't extended on subsequent writes (via `EXPIRE ... NX`).
-   *   Designed for runtime-controlled lifecycles like executions and
-   *   sessions, where the data should age out on a schedule from creation.
+   * - **Sliding window** (write-only refresh): `memory`, `session`,
+   *   `sessionMeta`. Every write resets the TTL, so active *writers* keep
+   *   their data and inactive ones forget. Reads do NOT refresh the TTL —
+   *   a read-only workload (e.g. agent recalling memories without writing
+   *   new ones) eventually ages out. If you need read-activity to count
+   *   as "active," issue a no-op `ctx.remember` against a sentinel key
+   *   per session turn.
+   * - **Fixed window**: `checkpoint`, `executionState`, `executionHistory`,
+   *   `evalHistory`. The TTL is set on the first write and isn't extended
+   *   on subsequent writes (via `EXPIRE ... NX`). Designed for runtime-
+   *   controlled lifecycles like executions, where the data should age
+   *   out on a schedule from creation.
    */
   ttls?: {
     session?: number | null;
@@ -558,13 +563,17 @@ export class RedisStore implements StateStore {
       await this.client.hSet(this.sessionMetaKey(sessionId), key, JSON.stringify(value));
       return;
     }
-    // Fixed window: only set the TTL when the hash is new. SessionMeta
-    // entries belong to a session and should age out with it; the session
-    // itself has its own TTL via the `session` category.
+    // Sliding window: every write refreshes the TTL. SessionMeta entries
+    // (handoff records, summary caches) belong to a session and must age
+    // out together with it — the session itself uses sliding TTL on
+    // `session`, so meta needs the same semantics or an actively-used
+    // session would see handoff history evict while the conversation
+    // stays alive. Previously used `EXPIRE ... NX` (fixed-from-first-
+    // write), which produced exactly that drift.
     await this.client
       .multi()
       .hSet(this.sessionMetaKey(sessionId), key, JSON.stringify(value))
-      .expire(this.sessionMetaKey(sessionId), ttl, 'NX')
+      .expire(this.sessionMetaKey(sessionId), ttl)
       .exec();
   }
 
@@ -694,6 +703,22 @@ export class RedisStore implements StateStore {
       // HSETNX and the re-read — in which case "deleted" is the freshest
       // truth and we should return null, not the legacy value.
       return null;
+    }
+    // Migrated successfully. If memory has a TTL configured, apply it so
+    // the migrated entry participates in the same sliding-window eviction
+    // as native saveMemory writes. Without this, a legacy entry would be
+    // immortal until another saveMemory call against the same scope hit
+    // the migration timing perfectly. Fire-and-forget — the user's value
+    // is already authoritative; an EXPIRE failure is logged but not
+    // surfaced.
+    const ttl = this.ttlFor('memory');
+    if (ttl !== undefined) {
+      this.client.expire(this.memoryKey(scope), ttl).catch((err: unknown) => {
+        console.error(
+          `[axl] RedisStore: failed to set TTL on migrated memory key ${this.memoryKey(scope)}: ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      });
     }
     return JSON.parse(legacyRaw);
   }
@@ -854,11 +879,20 @@ export class RedisStore implements StateStore {
     // ever had post-#4 writes). Use ZREVRANGEBYSCORE for ordered IDs, then
     // bulk MGET for the data.
     if (zsetSize >= setSize) {
+      // Over-fetch when a limit is requested: TTL can evict data blobs
+      // independent of ZSET entries, so MGET may return nulls. Without
+      // over-fetch, a caller asking for `limit=10` while 3 entries have
+      // been TTL'd between ZREVRANGEBYSCORE and MGET would silently get 7.
+      // 2x with a +5 floor handles a reasonable amount of drift; if more
+      // than half the requested entries are dead pointers, the slow-path
+      // null-filter still applies and the caller gets best-effort up to
+      // `limit`.
+      const fetchCount = limit !== undefined ? Math.max(limit * 2, limit + 5) : undefined;
       const ids = await this.client.zRevRangeByScore(
         zsetKey,
         '+inf',
         '-inf',
-        limit ? { LIMIT: { offset: 0, count: limit } } : undefined,
+        fetchCount !== undefined ? { LIMIT: { offset: 0, count: fetchCount } } : undefined,
       );
       if (ids.length === 0) return [];
       const keys = ids.map(dataKey);
@@ -873,6 +907,7 @@ export class RedisStore implements StateStore {
         } catch {
           // Malformed JSON; skip silently. Same posture as the SET path.
         }
+        if (limit !== undefined && entries.length >= limit) break;
       }
       return entries;
     }

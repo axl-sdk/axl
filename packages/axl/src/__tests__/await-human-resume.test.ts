@@ -208,4 +208,58 @@ describe('awaitHuman suspend/resume', () => {
     expect(state!.status).toBe('waiting');
     expect(state!.workflow).toBe('deploy-flow');
   });
+
+  it('deleteExecution unblocks a workflow awaiting human decision (signal-driven abort)', async () => {
+    // Regression for the C2 gap surfaced by the scenario-verification
+    // review: `runtime.deleteExecution` aborts the controller and cleans
+    // up the runtime's pendingDecisionResolvers map, but pre-fix the
+    // `_awaitHumanImpl` Promise had no signal listener, so the workflow
+    // hung forever waiting for a resolver that was never going to come.
+    const provider = new TestProvider();
+    const approvalWorkflow = workflow({
+      name: 'approval-flow',
+      input: z.object({ action: z.string() }),
+      handler: async (ctx) => {
+        const decision = await ctx.awaitHuman({
+          channel: 'slack',
+          prompt: `Approve action: ${ctx.input.action}?`,
+        });
+        return { approved: decision.approved };
+      },
+    });
+
+    const runtime = new AxlRuntime({ state: { store: 'memory' } });
+    runtime.registerProvider('test', provider);
+    runtime.register(approvalWorkflow);
+
+    const resultPromise = runtime.execute('approval-flow', { action: 'deploy' });
+    // Suppress unhandled rejection — we assert it rejects below
+    resultPromise.catch(() => {});
+
+    // Wait for the workflow to land in awaitHuman
+    const pending = await waitForPendingDecision(runtime);
+    const executionId = pending[0].executionId;
+
+    // Delete the in-flight execution. This must:
+    //   (a) abort the workflow (signal fires inside _awaitHumanImpl),
+    //   (b) clean up pendingDecisionResolvers + the persisted decision,
+    //   (c) NOT resurrect the row after the workflow tears down.
+    const deletePromise = runtime.deleteExecution(executionId);
+
+    // The workflow promise must reject — within a tight timeout so a
+    // future regression (no abort listener, infinite hang) trips this.
+    await expect(
+      Promise.race([
+        resultPromise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), 1000)),
+      ]),
+    ).rejects.toThrow();
+
+    expect(await deletePromise).toBe(true);
+
+    // No resurrected row
+    expect(await runtime.getExecution(executionId)).toBeUndefined();
+    // Decision row cleaned up
+    expect(await runtime.getPendingDecisions()).toHaveLength(0);
+  });
 });

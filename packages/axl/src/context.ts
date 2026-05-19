@@ -3109,8 +3109,47 @@ export class WorkflowContext<TInput = unknown> {
       data: { channel: options.channel, prompt: options.prompt },
     });
 
-    const decision = await new Promise<HumanDecision>((resolve) => {
+    // Honor abort: without a signal listener, an `AbortError`-driven cancel
+    // (e.g., `runtime.deleteExecution` on a mid-flight workflow) cleans up
+    // the runtime's pendingDecisionResolvers map and the persisted decision
+    // row but leaves the workflow Promise hanging forever — the
+    // `pendingDecisions.set(id, resolve)` registration would just sit
+    // there. Race the resolver Promise against the signal and clean up
+    // either path's lingering registration in `finally`.
+    const makeAbortError = (reason: unknown): Error => {
+      // Match the existing AbortError shape used elsewhere in context.ts —
+      // `instanceof DOMException && name === 'AbortError'` is the
+      // detection used by `isAbortError` in runtime.ts and several catch
+      // sites here. Fall back to a tagged Error in environments missing
+      // the global DOMException constructor.
+      if (typeof DOMException !== 'undefined') {
+        return new DOMException(
+          typeof reason === 'string' ? reason : 'awaitHuman aborted',
+          'AbortError',
+        );
+      }
+      const err = new Error(typeof reason === 'string' ? reason : 'awaitHuman aborted');
+      err.name = 'AbortError';
+      return err;
+    };
+
+    const decision = await new Promise<HumanDecision>((resolve, reject) => {
+      // Fast path: already aborted before we even register.
+      if (this.signal?.aborted) {
+        reject(makeAbortError(this.signal.reason));
+        return;
+      }
       this.pendingDecisions!.set(this.executionId, resolve);
+      const onAbort = () => {
+        // Remove our registration ONLY if it's still ours — `resolveDecision`
+        // could have overwritten/cleared between abort and listener firing.
+        const current = this.pendingDecisions!.get(this.executionId);
+        if (current === resolve) {
+          this.pendingDecisions!.delete(this.executionId);
+        }
+        reject(makeAbortError(this.signal?.reason));
+      };
+      this.signal?.addEventListener('abort', onAbort, { once: true });
     });
 
     // Mirror the synchronous-handler path — emit `await_human_resolved` so

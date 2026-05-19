@@ -169,6 +169,21 @@ export interface RedisStoreOptions {
     executionHistory?: number | null;
     evalHistory?: number | null;
     memory?: number | null;
+    /**
+     * TTL for the `state.persist: 'streaming'` per-execution event buffer
+     * (`exec-events:{id}` list). Safety net for the scenario where the
+     * operator forgets to wire `runtime.recoverIncompleteStreams()` into
+     * startup — without this TTL, orphaned buffers from crashed
+     * processes accumulate indefinitely. Default `null` (no TTL —
+     * matches pre-streaming-mode behavior; explicit opt-in for the
+     * safety net so recovery isn't surprised by buffers that aged out).
+     *
+     * **MUST be longer than your recovery cadence.** If you restart
+     * processes every 12h and the buffer TTL is 1h, any crash whose
+     * recovery hasn't fired within the hour loses its events to TTL
+     * eviction. Recommended floor: 24× your max time-between-restarts.
+     */
+    streamingEvents?: number | null;
   };
 }
 
@@ -179,7 +194,8 @@ type TtlCategory =
   | 'executionState'
   | 'executionHistory'
   | 'evalHistory'
-  | 'memory';
+  | 'memory'
+  | 'streamingEvents';
 
 /** Resolved per-category TTL (seconds), or `null` for "no TTL". */
 type ResolvedTtls = Record<TtlCategory, number | null>;
@@ -275,6 +291,16 @@ export class RedisStore implements StateStore {
       // (defaultTtl unset).
       return typeof opts.defaultTtl === 'number' ? opts.defaultTtl : null;
     };
+    // `streamingEvents` is the one category that does NOT fall back to
+    // `defaultTtl` — operators must explicitly opt in. Auto-applying a
+    // 30-day default would silently TTL-evict crashed-run buffers before
+    // recovery had a chance to run; explicit opt-in keeps the safety
+    // net under the operator's control.
+    const resolveStreamingEvents = (override: number | null | undefined): number | null => {
+      if (override === null || override === undefined) return null;
+      if (typeof override === 'number') return override;
+      return null;
+    };
     const effectiveTtls = {
       session: resolveCategory(opts.ttls?.session),
       sessionMeta: resolveCategory(opts.ttls?.sessionMeta),
@@ -283,6 +309,7 @@ export class RedisStore implements StateStore {
       executionHistory: resolveCategory(opts.ttls?.executionHistory),
       evalHistory: resolveCategory(opts.ttls?.evalHistory),
       memory: resolveCategory(opts.ttls?.memory),
+      streamingEvents: resolveStreamingEvents(opts.ttls?.streamingEvents),
     };
 
     const store = new RedisStore(client, keyPrefix, effectiveTtls);
@@ -828,6 +855,9 @@ export class RedisStore implements StateStore {
     //   - exec-events:{id} + streaming-exec-ids membership (the streaming
     //     buffer; recoverIncompleteStreams could resurrect it as a new
     //     ExecutionInfo on next process start)
+    //   - decisions hash field for this id (a pending `awaitHuman` decision
+    //     — the workflow may have been mid-flight when the operator
+    //     deleted; the resolver-side cleanup happens in `runtime.deleteExecution`)
     //
     // del()'s return is the "did it exist" signal for the canonical row —
     // second result in the exec() array (sRem queued first, del second).
@@ -842,6 +872,7 @@ export class RedisStore implements StateStore {
       .sRem(this.pendingExecSetKey(), executionId)
       .del(this.streamingEventsKey(executionId))
       .sRem(this.streamingIdsKey(), executionId)
+      .hDel(this.decisionsKey(), executionId)
       .exec();
     const deleted = typeof deletedCount === 'number' ? deletedCount : 0;
     return deleted > 0;
@@ -980,15 +1011,27 @@ export class RedisStore implements StateStore {
     if (events.length === 0) return;
     // Serialize once; RPUSH multiple values in a single round-trip.
     const serialized = events.map((e) => JSON.stringify(e));
-    // Wrap RPUSH + SADD in a MULTI so the streaming-exec-ids set membership
-    // and the data list stay in sync. A crash between would otherwise leave
-    // events orphaned (in the list but not in the index, so listStreamingExecutions
-    // wouldn't find them on recovery).
-    await this.client
+    // Wrap RPUSH + SADD + (optional) EXPIRE in a MULTI so the streaming-
+    // exec-ids set membership and the data list stay in sync. A crash
+    // between would otherwise leave events orphaned (in the list but not
+    // in the index, so listStreamingExecutions wouldn't find them on
+    // recovery).
+    //
+    // Fixed-from-first-write TTL via `EXPIRE NX`. Safety net for the
+    // scenario where an operator forgets to wire `recoverIncompleteStreams`
+    // into startup — without a TTL, crashed-process buffers accumulate
+    // forever. The window starts at first append so all events for a
+    // single run share one lifetime (vs sliding which would extend
+    // indefinitely for a long-running streaming workflow).
+    const ttl = this.ttlFor('streamingEvents');
+    const tx = this.client
       .multi()
       .rPush(this.streamingEventsKey(executionId), serialized)
-      .sAdd(this.streamingIdsKey(), executionId)
-      .exec();
+      .sAdd(this.streamingIdsKey(), executionId);
+    if (ttl !== undefined) {
+      tx.expire(this.streamingEventsKey(executionId), ttl, 'NX');
+    }
+    await tx.exec();
   }
 
   async finalizeStreamingEvents(executionId: string): Promise<void> {

@@ -360,6 +360,26 @@ function pushEventBounded(execInfo: ExecutionInfo, event: AxlEvent, cap: number)
   }
 }
 
+/** Drop entries from a metadata bag whose values aren't `structuredClone`-
+ *  able. Used as a fallback when `persistExecution` is about to snapshot
+ *  an ExecutionInfo whose metadata `liftPersistedMetadata` had to shallow-
+ *  copy (because the original contained a function or other non-cloneable
+ *  value). The persisted shape stays JSON-clean — no functions reach the
+ *  store, where they'd JSON.stringify to `undefined` and silently corrupt
+ *  the row. Caller-visible bag is untouched. */
+function sanitizeMetadataForPersist(metadata: Record<string, unknown>): Record<string, unknown> {
+  const cleaned: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(metadata)) {
+    try {
+      cleaned[k] = structuredClone(v);
+    } catch {
+      // Non-cloneable; drop silently. Future enhancement: emit a one-shot
+      // console.warn listing the dropped keys so users aren't surprised.
+    }
+  }
+  return cleaned;
+}
+
 /** Bound an array of recovered streaming events to the configured per-
  *  execution cap. When truncation is needed, replaces the cap-th slot with
  *  a `log` sentinel describing the truncation (mirrors `pushEventBounded`).
@@ -776,7 +796,22 @@ export class AxlRuntime extends EventEmitter {
       return;
     }
 
-    const snapshot = structuredClone(execInfo);
+    // Defensive clone. `liftPersistedMetadata` falls back to shallow copy
+    // when metadata contains non-cloneable values (e.g., functions); the
+    // shallow copy then rides through `execInfo.metadata` to here. A naive
+    // `structuredClone(execInfo)` would throw at this point, crashing the
+    // terminal hook. Fall back to a hand-rolled shallow snapshot that
+    // omits the offending metadata so save still proceeds.
+    let snapshot: ExecutionInfo;
+    try {
+      snapshot = structuredClone(execInfo);
+    } catch {
+      snapshot = {
+        ...execInfo,
+        events: [...execInfo.events],
+        metadata: execInfo.metadata ? sanitizeMetadataForPersist(execInfo.metadata) : undefined,
+      };
+    }
 
     if (this.stateStore.saveExecution) {
       // Chain: save canonical executionHistory first, THEN finalize the
@@ -1798,8 +1833,11 @@ export class AxlRuntime extends EventEmitter {
 
   /**
    * Delete an execution from history by id. Removes from the active map (if
-   * still running), the historical cache, and the configured StateStore.
-   * Returns true if an entry was actually removed from any of the three.
+   * still running), the historical cache, the configured StateStore, AND
+   * any execution-scoped side state — pending awaitHuman decisions,
+   * resolver maps, streaming buffer registration, in-flight abort controller.
+   * Returns true if an entry was actually removed from any of the three
+   * primary surfaces (active map, historical cache, store).
    *
    * In-flight handling: if the execution is still running, this method
    * **aborts** it (via the registered abort controller) AND marks the id for
@@ -1808,7 +1846,15 @@ export class AxlRuntime extends EventEmitter {
    * iterating the returned `AxlStream` will see the abort flow through. If
    * you need a hard hand-off (delete completes before the workflow tears
    * down), call `runtime.abort(id)` and `await` the stream/execute promise
-   * before calling this.
+   * before calling this. `streamableExecutionIds` is cleared eagerly so
+   * events emitted during the wind-down don't re-create the streaming
+   * buffer in the store after the deleteExecution-issued DEL.
+   *
+   * Audit trail: emits `execution_deleted` on the runtime's `EventEmitter`
+   * with `{ executionId, wasActive, hadPendingDecision }` so compliance
+   * apps can subscribe via `runtime.on('execution_deleted', ...)` for a
+   * "who deleted what when" log without wrapping this method. Fires
+   * regardless of whether the id was actually present.
    *
    * Use cases: GDPR right-to-be-forgotten, operator-driven cleanup of
    * specific runs (e.g. a workflow that recorded PII the user requested
@@ -1817,6 +1863,7 @@ export class AxlRuntime extends EventEmitter {
    */
   async deleteExecution(id: string): Promise<boolean> {
     const wasActive = this.executions.has(id);
+    const hadPendingDecision = this.pendingDecisionResolvers.has(id);
 
     // Auto-abort: the doc-claimed "doesn't abort" behavior leads to
     // resurrection — the workflow keeps running, hits `persistExecution`,
@@ -1825,10 +1872,25 @@ export class AxlRuntime extends EventEmitter {
     // mid-tool-call.
     if (wasActive) {
       this.pendingDeletedExecutions.add(id);
+      // Eager clear: between this method returning and persistExecution
+      // running, the in-flight workflow's wind-down events would otherwise
+      // re-create the streaming buffer in the store right after the
+      // upcoming `stateStore.deleteExecution` DEL. Clearing the
+      // streamable-set entry prevents those events from being appended.
+      this.streamableExecutionIds.delete(id);
       const controller = this.abortControllers.get(id);
       if (controller) {
         controller.abort();
       }
+    }
+
+    // Resolver-map cleanup: if the workflow was paused on `ctx.awaitHuman`,
+    // the in-memory resolver entry has no other code path that clears it
+    // (resolveDecision normally does). The abort above is what actually
+    // wakes the awaitHuman call (signal.throwIfAborted), so the resolver
+    // becomes unreachable; deleting it bounds map growth.
+    if (hadPendingDecision) {
+      this.pendingDecisionResolvers.delete(id);
     }
 
     // Lazy-load just THIS id from the store (cheaper than the full list).
@@ -1843,6 +1905,18 @@ export class AxlRuntime extends EventEmitter {
     if (this.stateStore.deleteExecution) {
       removedFromStore = await this.stateStore.deleteExecution(id);
     }
+
+    // Audit signal. Emit regardless of whether anything was removed so
+    // compliance consumers see attempted deletes too (useful for "user
+    // tried to delete X but it didn't exist" audit paths). Synchronous
+    // emit so subscribers run before the method returns; throwing
+    // listeners surface to the caller (mirrors EventEmitter defaults).
+    this.emit('execution_deleted', {
+      executionId: id,
+      wasActive,
+      hadPendingDecision,
+      removed: removedFromActive || removedFromHistorical || removedFromStore,
+    });
 
     return removedFromActive || removedFromHistorical || removedFromStore;
   }

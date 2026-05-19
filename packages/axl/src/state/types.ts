@@ -73,6 +73,24 @@ export interface StateStore {
    * Delete an execution from history by ID. Returns `true` if an entry was
    * deleted, `false` if the ID didn't exist. Used for GDPR right-to-be-
    * forgotten and operator-driven cleanup. Symmetric to `deleteEvalResult`.
+   *
+   * **Custom store implementors:** This delete must be **total** —
+   * sweep every per-execution surface your store maintains. The runtime's
+   * `runtime.deleteExecution` does NOT call separate `deleteCheckpoints` /
+   * `deleteExecutionState` / `finalizeStreamingEvents` after this; one
+   * call should clean EVERYTHING owned by the executionId. The built-in
+   * stores remove:
+   *   - the canonical execution-history row and its indexes,
+   *   - all checkpoints for the id,
+   *   - the suspended-state row + its pending-set membership,
+   *   - the streaming-event buffer + its in-flight-ids membership,
+   *   - any pending awaitHuman decision row.
+   * Skipping any of these leaks PII through `recoverIncompleteStreams()`
+   * or `getPendingDecisions()`, breaking the GDPR delete contract.
+   *
+   * For multi-table SQL stores: wrap the deletes in a transaction. For
+   * Redis-style stores: use MULTI/EXEC. Idempotency is required —
+   * deleting an unknown id returns `false` without throwing.
    */
   deleteExecution?(executionId: string): Promise<boolean>;
 

@@ -2793,6 +2793,64 @@ describe('deleteExecution()', () => {
     expect(deleted).toBe(true);
   });
 
+  it('emits execution_deleted with structured metadata on every call', async () => {
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
+    const wf = workflow({
+      name: 'audit-wf',
+      input: z.object({}).strict(),
+      handler: async () => 'ok',
+    });
+    runtime.register(wf);
+    await runtime.execute('audit-wf', {});
+
+    const events: Array<{
+      executionId: string;
+      wasActive: boolean;
+      hadPendingDecision: boolean;
+      removed: boolean;
+    }> = [];
+    runtime.on('execution_deleted', (e) => events.push(e));
+
+    const [exec] = await runtime.getExecutions();
+    await runtime.deleteExecution(exec.executionId);
+    // Also fire a delete on an unknown id — emit should still fire
+    // (compliance consumers want to log attempted deletes too).
+    await runtime.deleteExecution('does-not-exist');
+
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      executionId: exec.executionId,
+      wasActive: false,
+      hadPendingDecision: false,
+      removed: true,
+    });
+    expect(events[1]).toMatchObject({
+      executionId: 'does-not-exist',
+      wasActive: false,
+      hadPendingDecision: false,
+      removed: false,
+    });
+  });
+
+  it('deleteExecution clears pendingDecisionResolvers entry for awaitHuman runs', async () => {
+    const runtime = new AxlRuntime();
+    // Directly seed the resolver map (the integration path is exercised
+    // via Studio's playground / awaitHuman flows; this unit test isolates
+    // the cleanup contract).
+    const resolvers = (runtime as unknown as { pendingDecisionResolvers: Map<string, unknown> })
+      .pendingDecisionResolvers;
+    resolvers.set('exec-awaiting', () => {});
+    expect(resolvers.has('exec-awaiting')).toBe(true);
+
+    const audit: Array<{ executionId: string; hadPendingDecision: boolean }> = [];
+    runtime.on('execution_deleted', (e) => audit.push(e));
+
+    await runtime.deleteExecution('exec-awaiting');
+    expect(resolvers.has('exec-awaiting')).toBe(false);
+    expect(audit[0].hadPendingDecision).toBe(true);
+  });
+
   it('in-flight deleteExecution does not resurrect the row when the workflow eventually completes', async () => {
     // Before the resurrection fix, deleting a still-running execution
     // succeeded but `persistExecution` (called on terminal exit) would
@@ -2882,6 +2940,41 @@ describe('deleteExecution()', () => {
 
     const [exec] = await runtime.getExecutions();
     expect(exec.metadata).toEqual({ userId: 'u-42' });
+  });
+
+  it('ExecutionInfo.metadata gracefully drops non-cloneable values (no workflow crash)', async () => {
+    // structuredClone throws on functions / non-transferable types.
+    // Pipeline:
+    //   1. liftPersistedMetadata structuredClone fails → shallow-copy
+    //      fallback at the lift boundary (includes the function).
+    //   2. persistExecution structuredClone(execInfo) ALSO fails because
+    //      the shallow copy still carries the function. Falls back to a
+    //      hand-rolled snapshot that sanitizes metadata via
+    //      sanitizeMetadataForPersist — drops non-cloneable keys.
+    //   3. Workflow completes; cloneable keys survive; non-cloneable
+    //      keys are silently dropped from the persisted snapshot.
+    // The contract: non-cloneable metadata must NOT crash the workflow.
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
+    const wf = workflow({
+      name: 'meta-nonclone',
+      input: z.object({}).strict(),
+      handler: async () => 'ok',
+    });
+    runtime.register(wf);
+
+    const result = await runtime.execute(
+      'meta-nonclone',
+      {},
+      { metadata: { userId: 'u-1', cb: () => 'opaque' } },
+    );
+    expect(result).toBe('ok');
+
+    const [exec] = await runtime.getExecutions();
+    // Cloneable keys survive
+    expect(exec.metadata?.userId).toBe('u-1');
+    // Non-cloneable key dropped from the persisted snapshot (no crash)
+    expect(exec.metadata?.cb).toBeUndefined();
   });
 
   it('execInfo.metadata is undefined when caller only supplied control-plane keys', async () => {

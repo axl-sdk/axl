@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ```
 
 ### Fixed
+- **`ctx.awaitHuman()` now wakes on signal abort.** Previously the awaitHuman Promise registered a resolver in `pendingDecisions` but had no abort listener — so a workflow paused on awaitHuman would hang forever when its `runtime.execute()` was aborted (including via `runtime.deleteExecution(id)` on the same id, which aborts mid-flight). The Promise now races the signal: if the signal aborts before or during the wait, the resolver is removed from the map and the Promise rejects with `AbortError`. Fast-path check for already-aborted signals before registration; cleanup guarded against `resolveDecision` having already cleared the entry.
+- **`persistExecution` survives non-cloneable values in `ExecutionInfo.metadata`.** `liftPersistedMetadata` falls back to a shallow copy when `structuredClone` throws (e.g., a function in the metadata bag), so the shallow copy then carries the offending value into `persistExecution`'s `structuredClone(execInfo)` — which throws and crashes the terminal hook. Now wraps the snapshot in try/catch with a hand-rolled fallback that drops non-cloneable keys via a new `sanitizeMetadataForPersist` helper. The persisted snapshot stays JSON-clean (Redis blob, SQLite TEXT column, in-memory cache all roundtrip cleanly); non-cloneable keys are silently dropped at the persist boundary. Workflow execution itself is never affected.
+- **`RedisStore.deleteExecution` removes the pending `awaitHuman` decision.** A `runtime.deleteExecution(id)` on a workflow paused at `awaitHuman` used to leave the decision row in `axl:decisions` — `runtime.getPendingDecisions()` and the `decisions` Studio panel kept surfacing the prompt of an execution the operator just "deleted." Now the per-execution sweep includes `hDel(decisionsKey, executionId)`. Symmetric fix on `MemoryStore` (Map delete + persists awaitHuman temp file) and `SQLiteStore` (`DELETE FROM decisions WHERE execution_id`).
+- **`runtime.deleteExecution` clears in-memory `pendingDecisionResolvers` entry.** Without this, a delete on an awaitHuman-paused workflow leaked the resolver closure for the lifetime of the runtime — slow drip in production deployments. Plus the resolver became unreachable but still rooted, which made debugging memory growth harder.
+- **`runtime.deleteExecution` eagerly clears `streamableExecutionIds`.** Without this, events emitted during the aborted workflow's wind-down (between deleteExecution returning and `persistExecution` running) would re-create the streaming buffer in Redis right after the upcoming `stateStore.deleteExecution` DEL — a brief window of resurrection. Now clearing the streamable-set entry alongside the abort short-circuits any post-delete appends.
+
 - **`pushEventBounded` correctly excludes `string_delta` from `ExecutionInfo.events`.** The spec/17 documentation has always classed `string_delta` as stream-only (never persisted to `ExecutionInfo.events`), but the in-memory cap filter listed only `token` and `partial_object`. Long-running schema-streaming workflows would silently accumulate per-character `string_delta` entries in `events`, bloating memory in proportion to character output. The filter now reads from a shared `STREAMING_EXCLUDED_TYPES` set that's documented as the parallel of Studio's WS replay-buffer exclusion list (`UNBUFFERED_EVENT_TYPES`), so future high-volume event types only need to be added in one place.
 - **`StreamingFlusher` no longer leaks settled in-flight promises.** Each per-execution `inflight` Map entry was never evicted after the chained `appendStreamingEvents` resolved — a long-lived runtime running many executions accumulated O(executions) settled promises + closures. Each flush now registers a `.finally` that removes its own entry from the Map (guarded against being replaced by a later flush). Tangentially: the dead `try/catch` around the `await pending` inside `finalize` was removed — `flush()` already catches `appendStreamingEvents` errors at the source, so the awaited promise never rejects and the outer catch was unreachable.
 - **`RedisStore.listExecutions(limit)` / `listEvalResults(limit)` no longer under-deliver under TTL eviction.** Data blobs can TTL-evict independently of their ZSET entries, so a strict `LIMIT` clause silently returned fewer than `limit` live rows when some pointers were dead. The fast path now over-fetches by 2x (with a +5 floor) and slices to `limit` after filtering nulls. Callers asking for the "10 most recent" get up to 10 live entries even when the top of the sorted set has drifted.
@@ -41,6 +47,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`MemoryManager` emits a one-shot `console.warn` when used against a custom `StateStore` that doesn't implement memory methods.** Previously, the sessionMeta-fallback path was completely silent — users on custom stores lost `metadata` and `getAllMemory` enumeration with zero signal. Now they get a single warning per offending store listing the four methods to implement. All three built-in stores implement the methods, so no warning fires for users on `MemoryStore` / `SQLiteStore` / `RedisStore`.
 
 ### Added
+- **`runtime.on('execution_deleted', ...)` audit-trail event.** `runtime.deleteExecution(id)` emits `execution_deleted` with `{ executionId, wasActive, hadPendingDecision, removed }` on every call (including attempts against unknown ids — `removed: false`). Use for SOC2/GDPR audit logging without wrapping the method:
+  ```typescript
+  runtime.on('execution_deleted', (e) => {
+    auditLog.write({ event: 'execution.deleted', user: currentOperator(), ...e });
+  });
+  ```
+
+- **`RedisStore.ttls.streamingEvents` TTL safety net.** New optional per-category TTL for the `state.persist: 'streaming'` per-execution event buffer. Safety net for the scenario where an operator forgets to wire `runtime.recoverIncompleteStreams()` into startup — without this, orphaned buffers from crashed processes accumulate indefinitely. Unlike other TTL categories, `streamingEvents` does NOT fall back to `defaultTtl` — it must be explicitly opted into so a generous default doesn't TTL-evict crashed-run buffers before recovery has a chance to run. Fixed-window via `EXPIRE NX` on first append (so all events for a single run share one lifetime).
+  ```typescript
+  await RedisStore.create({
+    url,
+    defaultTtl: 60 * 60 * 24 * 30, // 30 days
+    ttls: {
+      streamingEvents: 60 * 60 * 24 * 7, // 7 days — must be > your max time-between-restarts
+    },
+  });
+  ```
+
 - **`state.persist: 'streaming'` for in-flight trace durability.** New `StateConfig` options:
   - `persist?: 'terminal' | 'streaming'` — when `'streaming'`, events are batched and flushed to a streaming buffer throughout the run via `StateStore.appendStreamingEvents`. The buffer is finalized when the canonical `executionHistory` blob lands at terminal exit. If the process crashes mid-run, call `runtime.recoverIncompleteStreams()` on the next process to reconstruct a partial `ExecutionInfo` (`status: 'failed'`, `error: 'process terminated (recovered from streaming buffer)'`, `workflow: '__axl/recovered'` when the buffer doesn't include a `workflow_start` event) from the surviving buffer. Default `'terminal'` (back-compat).
   - `streamingBatchSize?: number` — flush every N events. Default `100`. Set to `1` for per-event flush (one Redis round-trip per emit, highest durability at the cost of latency).

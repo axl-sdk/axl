@@ -982,6 +982,7 @@ describe('RedisStore', () => {
       executionHistory: number | null;
       evalHistory: number | null;
       memory: number | null;
+      streamingEvents: number | null;
     }>,
   ) {
     const data = new Map<string, string>();
@@ -1183,6 +1184,7 @@ describe('RedisStore', () => {
       executionHistory: ttlConfig?.executionHistory ?? null,
       evalHistory: ttlConfig?.evalHistory ?? null,
       memory: ttlConfig?.memory ?? null,
+      streamingEvents: ttlConfig?.streamingEvents ?? null,
     };
 
     return { store, mockClient, data, hashData, setData, zsetData, ttls, listData };
@@ -1679,10 +1681,11 @@ describe('RedisStore', () => {
       expect(captured).toHaveLength(1);
       // Per-execution surfaces deleted together: history-set sRem + history
       // blob del + history zRem + checkpoint del + exec-state del +
-      // pending-set sRem + streaming-events del + streaming-ids sRem = 8.
-      // The full sweep prevents resurrection via the streaming buffer and
-      // closes the GDPR right-to-be-forgotten leak path.
-      expect(captured[0]._queueLength()).toBe(8);
+      // pending-exec-set sRem + streaming-events del + streaming-ids sRem +
+      // decisions hash hDel = 9. Full sweep prevents resurrection via the
+      // streaming buffer and closes the GDPR right-to-be-forgotten leak
+      // path (no pending decision left behind for awaitHuman runs).
+      expect(captured[0]._queueLength()).toBe(9);
 
       // No single-op delete commands escaped the MULTI
       expect(mockClient.sRem).not.toHaveBeenCalled();
@@ -1725,6 +1728,27 @@ describe('RedisStore', () => {
       expect(setData.get('axl:streaming-exec-ids')?.has('e1') ?? false).toBe(false);
       const remaining = await store.getStreamingEvents!('e1');
       expect(remaining).toHaveLength(0);
+    });
+
+    it('deleteExecution removes the pending awaitHuman decision (GDPR completeness)', async () => {
+      const { store, hashData } = createRedisStoreWithMockClient();
+      await store.saveExecution(makeExec('e1', 1000));
+      // Seed a pending awaitHuman decision for this execution
+      await store.savePendingDecision('e1', {
+        executionId: 'e1',
+        channel: 'slack',
+        prompt: 'approve refund?',
+        createdAt: '2026-01-01T00:00:00Z',
+      });
+      // Pre: decision row present
+      expect(hashData.get('axl:decisions')?.has('e1')).toBe(true);
+
+      await store.deleteExecution('e1');
+
+      // Post: decision row gone. Without this, `getPendingDecisions()`
+      // would still surface the deleted execution's awaitHuman prompt —
+      // exact PII the GDPR delete is meant to scrub.
+      expect(hashData.get('axl:decisions')?.has('e1') ?? false).toBe(false);
     });
   });
 
@@ -2280,6 +2304,60 @@ describe('RedisStore', () => {
         expect(ttls.get('axl:memory:session:s2')).toBe(3600);
         expect(ttls.get('axl:memory:global')).toBe(3600);
         expect(ttls.size).toBe(3); // exactly three hashes, one TTL each
+      });
+    });
+
+    describe('streamingEvents TTL (safety net for missed recovery)', () => {
+      it('appendStreamingEvents applies EXPIRE NX with the configured streamingEvents TTL', async () => {
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          streamingEvents: 60 * 60 * 24, // 1 day
+        });
+        await store.appendStreamingEvents!('exec-1', [
+          {
+            type: 'log',
+            executionId: 'exec-1',
+            step: 0,
+            timestamp: 1000,
+            data: { msg: 'x' },
+          } as never,
+        ]);
+        expect(ttls.get('axl:exec-events:exec-1')).toBe(60 * 60 * 24);
+
+        // Fixed-from-first-write: a second append shouldn't extend the window.
+        ttls.set('axl:exec-events:exec-1', 100);
+        await store.appendStreamingEvents!('exec-1', [
+          {
+            type: 'log',
+            executionId: 'exec-1',
+            step: 1,
+            timestamp: 1100,
+            data: { msg: 'y' },
+          } as never,
+        ]);
+        expect(ttls.get('axl:exec-events:exec-1')).toBe(100);
+      });
+
+      it('streamingEvents does NOT fall back to defaultTtl (explicit opt-in only)', async () => {
+        // The factory's resolveStreamingEvents intentionally ignores
+        // defaultTtl — auto-applying a 30-day default would silently
+        // evict crashed-run buffers before recovery had a chance to run.
+        // Operators must explicitly opt into the safety net.
+        const { store, ttls } = createRedisStoreWithMockClient(undefined, {
+          // Every other category gets a TTL via the helper, but
+          // streamingEvents must not.
+          executionHistory: 60,
+        });
+        await store.appendStreamingEvents!('exec-1', [
+          {
+            type: 'log',
+            executionId: 'exec-1',
+            step: 0,
+            timestamp: 1000,
+            data: { msg: 'x' },
+          } as never,
+        ]);
+        // No TTL applied — buffer lives until finalize/recovery.
+        expect(ttls.has('axl:exec-events:exec-1')).toBe(false);
       });
     });
 

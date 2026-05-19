@@ -428,15 +428,17 @@ export class SQLiteStore implements StateStore {
   async deleteExecution(executionId: string): Promise<boolean> {
     // Sweep every per-execution side-table inside a transaction so the
     // delete is total. Without this, a GDPR-style "scrub this run" call
-    // leaves PII reachable via lingering checkpoints / suspended state.
-    // SQLite has no streaming-events table (streaming durability is a
-    // RedisStore-only feature), so the buffer-side cleanup is a no-op here.
+    // leaves PII reachable via lingering checkpoints / suspended state /
+    // pending decisions. SQLite has no streaming-events table (streaming
+    // durability is a RedisStore-only feature), so the buffer-side cleanup
+    // is a no-op here.
     const tx = this.db.transaction(() => {
       const result = this.db
         .prepare('DELETE FROM execution_history WHERE execution_id = ?')
         .run(executionId);
       this.db.prepare('DELETE FROM checkpoints WHERE execution_id = ?').run(executionId);
       this.db.prepare('DELETE FROM execution_state WHERE execution_id = ?').run(executionId);
+      this.db.prepare('DELETE FROM decisions WHERE execution_id = ?').run(executionId);
       return result.changes > 0;
     });
     return tx();

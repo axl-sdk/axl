@@ -91,6 +91,14 @@ export interface RedisStoreOptions {
    * trailing colon, include it. Whitespace and unusual characters are
    * accepted as-is. Only the empty string is rejected, to prevent accidental
    * collisions with non-Axl keys.
+   *
+   * Operator note: Redis SCAN/KEYS patterns interpret `*`, `?`, and `[`/`]`
+   * as glob meta-characters. If your prefix contains any of these, the
+   * runtime accepts it (literal SET/HSET/etc. don't use globs and round-
+   * trip cleanly), but operators trying to clean up with
+   * `redis-cli SCAN 0 MATCH '<prefix>*'` will need to escape them. Stick
+   * to alphanumerics, hyphens, underscores, and colons for the best
+   * operator experience.
    */
   keyPrefix?: string;
   /**
@@ -636,7 +644,34 @@ export class RedisStore implements StateStore {
   }
 
   async listPendingExecutions(): Promise<string[]> {
-    return this.client.sMembers(this.pendingExecSetKey());
+    const ids = await this.client.sMembers(this.pendingExecSetKey());
+    if (ids.length === 0) return ids;
+    // Prune stale ids whose state blob TTL'd away. Without this, the
+    // pending-set bloats indefinitely against a TTL'd executionState
+    // category — every awaitHuman-flow workflow that ages out without a
+    // resolve() leaves its id behind. Bulk MGET, filter, fire SREM.
+    const keys = ids.map((id) => this.executionStateKey(id));
+    const raws = await this.client.mGet(keys);
+    const live: string[] = [];
+    const dead: string[] = [];
+    for (let i = 0; i < ids.length; i++) {
+      if (raws[i] != null) {
+        live.push(ids[i]);
+      } else {
+        dead.push(ids[i]);
+      }
+    }
+    if (dead.length > 0) {
+      // Fire-and-forget — listing must not block on cleanup. Pass the
+      // array so node-redis batches it into one SREM round-trip.
+      this.client.sRem(this.pendingExecSetKey(), dead).catch((err: unknown) => {
+        console.error(
+          `[axl] RedisStore: failed to prune ${dead.length} stale pending-exec ids: ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      });
+    }
+    return live;
   }
 
   // ── Memory ──────────────────────────────────────────────────────────

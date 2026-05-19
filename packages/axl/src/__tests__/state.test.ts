@@ -1571,6 +1571,42 @@ describe('RedisStore', () => {
       expect(pending).not.toContain('exec-2');
       expect(pending).toContain('exec-3');
     });
+
+    it('listPendingExecutions prunes stale ids whose state blob TTL-evicted', async () => {
+      // Set the executionState TTL so that we can simulate eviction by
+      // deleting the state blob directly while the membership stays in the
+      // pending set. The next listPendingExecutions call should both filter
+      // the stale id out AND issue a SREM to clean up the set.
+      const { store, mockClient, data, setData } = createRedisStoreWithMockClient(undefined, {
+        executionState: 60,
+      });
+      await store.saveExecutionState('exec-live', {
+        workflow: 'wf',
+        input: null,
+        step: 0,
+        status: 'waiting',
+      });
+      await store.saveExecutionState('exec-stale', {
+        workflow: 'wf',
+        input: null,
+        step: 0,
+        status: 'waiting',
+      });
+
+      // Simulate TTL eviction on exec-stale's state blob (the pending-set
+      // entry remains until we list).
+      data.delete('axl:exec-state:exec-stale');
+      expect(setData.get('axl:pending-executions')?.has('exec-stale')).toBe(true);
+
+      mockClient.sRem.mockClear();
+      const pending = await store.listPendingExecutions();
+      expect(pending).toEqual(['exec-live']);
+      // Fire-and-forget cleanup — yield a microtask then assert the SREM
+      // landed.
+      await new Promise((r) => setTimeout(r, 5));
+      expect(setData.get('axl:pending-executions')?.has('exec-stale') ?? false).toBe(false);
+      expect(mockClient.sRem).toHaveBeenCalledWith('axl:pending-executions', ['exec-stale']);
+    });
   });
 
   describe('execution history', () => {

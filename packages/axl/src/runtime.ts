@@ -1896,7 +1896,10 @@ export class AxlRuntime extends EventEmitter {
     // Lazy-load just THIS id from the store (cheaper than the full list).
     // Without this, a "delete" on something only-in-store leaves a
     // duplicate in memory on the next list call after lazy-load fires.
-    await this.getExecution(id);
+    // Also captures the workflow name BEFORE delete so the audit event
+    // can carry it — compliance pipelines categorize by workflow.
+    const existing = await this.getExecution(id);
+    const workflow = existing?.workflow;
 
     const removedFromActive = this.executions.delete(id);
     const removedFromHistorical = this.historicalExecutions.delete(id);
@@ -1911,8 +1914,10 @@ export class AxlRuntime extends EventEmitter {
     // tried to delete X but it didn't exist" audit paths). Synchronous
     // emit so subscribers run before the method returns; throwing
     // listeners surface to the caller (mirrors EventEmitter defaults).
+    // `workflow` is undefined when the delete was against an unknown id.
     this.emit('execution_deleted', {
       executionId: id,
+      workflow,
       wasActive,
       hadPendingDecision,
       removed: removedFromActive || removedFromHistorical || removedFromStore,
@@ -1927,11 +1932,24 @@ export class AxlRuntime extends EventEmitter {
    *
    * Ensures lazy-loaded history is loaded first so the in-memory cache and
    * the store can't drift apart on the deletion path.
+   *
+   * Emits `eval_deleted` on the runtime's `EventEmitter` with
+   * `{ id, eval, removed }`. Fires on every call — including attempts
+   * against unknown ids (`removed: false`) — symmetric to `execution_deleted`.
+   * Studio's eval-trends aggregator subscribes to this event so deleted
+   * runs don't linger in the trends panel for up to 5 minutes (until the
+   * next periodic rebuild).
    */
   async deleteEvalResult(id: string): Promise<boolean> {
     // Force a lazy-load so the in-memory cache reflects everything in the
     // store before we mutate it.
     await this.getEvalHistory();
+
+    // Capture the eval name from the existing entry BEFORE delete so the
+    // audit event can carry it. `evalName` is undefined when the delete
+    // was against an unknown id.
+    const existing = this.evalHistory.find((e) => e.id === id);
+    const evalName = existing?.eval;
 
     const beforeLength = this.evalHistory.length;
     this.evalHistory = this.evalHistory.filter((e) => e.id !== id);
@@ -1942,7 +1960,19 @@ export class AxlRuntime extends EventEmitter {
       removedFromStore = await this.stateStore.deleteEvalResult(id);
     }
 
-    return removedFromMemory || removedFromStore;
+    const removed = removedFromMemory || removedFromStore;
+
+    // Audit signal — symmetric to `execution_deleted`. Synchronous emit so
+    // subscribers run before the method returns; throwing listeners surface
+    // to the caller (mirrors EventEmitter defaults). Studio aggregators
+    // listen for this to invalidate eval-trends snapshots on delete.
+    this.emit('eval_deleted', {
+      id,
+      eval: evalName,
+      removed,
+    });
+
+    return removed;
   }
 
   /** Get eval result history (most recent first). */

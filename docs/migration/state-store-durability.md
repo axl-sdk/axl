@@ -27,7 +27,13 @@ await runtime.deleteExecution(executionId);
 // Audit trail
 runtime.on('execution_deleted', (e) => {
   auditLog.write({ event: 'execution.deleted', user: operator, ...e });
-  // e: { executionId, wasActive, hadPendingDecision, removed }
+  // e: { executionId, workflow, wasActive, hadPendingDecision, removed }
+});
+
+// Symmetric audit signal for eval history deletion
+runtime.on('eval_deleted', (e) => {
+  auditLog.write({ event: 'eval.deleted', user: operator, ...e });
+  // e: { id, eval, removed }
 });
 ```
 

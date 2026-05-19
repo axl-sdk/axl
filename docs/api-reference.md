@@ -1054,7 +1054,8 @@ The `AxlRuntime` extends `EventEmitter`. Subscribe to lifecycle signals:
 |---|---|---|
 | `'trace'` | `AxlEvent` | Fires for every event emitted by every `execute()` / `stream()` / `createContext()` call. The cross-execution observability firehose |
 | `'eval_result'` | `EvalHistoryEntry` | Fires when `saveEvalResult` lands (used by Studio's eval-trends aggregator; available to any consumer) |
-| `'execution_deleted'` | `{ executionId, wasActive, hadPendingDecision, removed }` | Audit signal for `runtime.deleteExecution(id)`. Fires on every call including attempts against unknown ids (`removed: false`). Synchronous — listeners run before `deleteExecution` returns; throwing listeners surface to the caller |
+| `'execution_deleted'` | `{ executionId, workflow, wasActive, hadPendingDecision, removed }` | Audit signal for `runtime.deleteExecution(id)`. Fires on every call including attempts against unknown ids (`removed: false`, `workflow: undefined`). The `workflow` field is captured BEFORE the delete so compliance pipelines can categorize by workflow without a follow-up lookup. Synchronous — listeners run before `deleteExecution` returns; throwing listeners surface to the caller. Studio's aggregators subscribe to this and rebuild on every delete |
+| `'eval_deleted'` | `{ id, eval, removed }` | Symmetric audit signal for `runtime.deleteEvalResult(id)`. Fires on every call; `eval` captured before delete. Studio's `EvalAggregator` subscribes and rebuilds eval-trends snapshots on delete |
 | `'session_lock_contended'` | `{ sessionId }` | Fires when a `Session.send` / `stream` / `end` / `fork` queues behind an in-flight task on the same id |
 
 > **⚠️ Cross-process locking is NOT provided.** The lock is in-process — multiple Node workers (e.g., a horizontally-scaled web app) all hitting the same Redis-backed `sessionId` will still race. Production deployments behind a load balancer must either:

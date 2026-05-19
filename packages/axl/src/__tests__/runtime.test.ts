@@ -2806,6 +2806,7 @@ describe('deleteExecution()', () => {
 
     const events: Array<{
       executionId: string;
+      workflow?: string;
       wasActive: boolean;
       hadPendingDecision: boolean;
       removed: boolean;
@@ -2821,14 +2822,46 @@ describe('deleteExecution()', () => {
     expect(events).toHaveLength(2);
     expect(events[0]).toMatchObject({
       executionId: exec.executionId,
+      workflow: 'audit-wf', // workflow name carried for compliance categorization
       wasActive: false,
       hadPendingDecision: false,
       removed: true,
     });
     expect(events[1]).toMatchObject({
       executionId: 'does-not-exist',
+      workflow: undefined, // unknown id → no workflow lookup possible
       wasActive: false,
       hadPendingDecision: false,
+      removed: false,
+    });
+  });
+
+  it('emits eval_deleted symmetric to execution_deleted', async () => {
+    const runtime = new AxlRuntime();
+    // Seed an eval result directly via saveEvalResult
+    await runtime.saveEvalResult({
+      id: 'ev-1',
+      eval: 'qa-eval',
+      timestamp: 1000,
+      data: { score: 1 },
+    });
+
+    const events: Array<{ id: string; eval?: string; removed: boolean }> = [];
+    runtime.on('eval_deleted', (e) => events.push(e));
+
+    await runtime.deleteEvalResult('ev-1');
+    // Attempt against unknown id — emit still fires with removed: false
+    await runtime.deleteEvalResult('does-not-exist');
+
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      id: 'ev-1',
+      eval: 'qa-eval',
+      removed: true,
+    });
+    expect(events[1]).toMatchObject({
+      id: 'does-not-exist',
+      eval: undefined,
       removed: false,
     });
   });

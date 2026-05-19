@@ -47,10 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`MemoryManager` emits a one-shot `console.warn` when used against a custom `StateStore` that doesn't implement memory methods.** Previously, the sessionMeta-fallback path was completely silent — users on custom stores lost `metadata` and `getAllMemory` enumeration with zero signal. Now they get a single warning per offending store listing the four methods to implement. All three built-in stores implement the methods, so no warning fires for users on `MemoryStore` / `SQLiteStore` / `RedisStore`.
 
 ### Added
-- **`runtime.on('execution_deleted', ...)` audit-trail event.** `runtime.deleteExecution(id)` emits `execution_deleted` with `{ executionId, wasActive, hadPendingDecision, removed }` on every call (including attempts against unknown ids — `removed: false`). Use for SOC2/GDPR audit logging without wrapping the method:
+- **`runtime.on('execution_deleted', ...)` / `runtime.on('eval_deleted', ...)` audit-trail events.** `runtime.deleteExecution(id)` emits `execution_deleted` with `{ executionId, workflow, wasActive, hadPendingDecision, removed }` on every call (including attempts against unknown ids — `removed: false`, `workflow: undefined`). The `workflow` field is captured BEFORE delete and lets compliance pipelines categorize by workflow without a follow-up lookup. `runtime.deleteEvalResult(id)` symmetrically emits `eval_deleted` with `{ id, eval, removed }`. Studio's aggregators (`TraceAggregator`, `ExecutionAggregator`, `EvalAggregator`) all subscribe to these events and trigger an immediate rebuild — without this, deleted runs would linger in Cost Dashboard / Workflow Stats / Trace Stats / Eval Trends snapshots for up to 5 minutes (until the next periodic rebuild). Use for SOC2/GDPR audit logging without wrapping the methods:
   ```typescript
   runtime.on('execution_deleted', (e) => {
     auditLog.write({ event: 'execution.deleted', user: currentOperator(), ...e });
+  });
+  runtime.on('eval_deleted', (e) => {
+    auditLog.write({ event: 'eval.deleted', user: currentOperator(), ...e });
   });
   ```
 

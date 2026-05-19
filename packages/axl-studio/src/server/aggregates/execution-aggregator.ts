@@ -27,6 +27,7 @@ export class ExecutionAggregator<State> {
   private snaps: AggregateSnapshots<State>;
   private interval?: ReturnType<typeof setInterval>;
   private listener?: (event: AxlEvent) => void;
+  private deleteListener?: () => void;
   private options: ExecutionAggregatorOptions<State>;
   /** Generation counter to prevent stale async fold after rebuild. */
   private generation = 0;
@@ -60,6 +61,16 @@ export class ExecutionAggregator<State> {
         .catch((err) => console.error('[axl-studio] execution fold failed:', err));
     };
     this.options.runtime.on('trace', this.listener);
+    // React to deletes — see TraceAggregator for the full rationale.
+    // Workflow Stats panel showed deleted runs in p50/p95 / failure-rate
+    // until the next periodic rebuild; rebuild on delete closes the
+    // user-visible drift.
+    this.deleteListener = () => {
+      this.rebuild().catch((err) =>
+        console.error('[axl-studio] rebuild on execution_deleted failed:', err),
+      );
+    };
+    this.options.runtime.on('execution_deleted', this.deleteListener);
     this.interval = setInterval(
       () => this.rebuild().catch((err) => console.error('[axl-studio] rebuild failed:', err)),
       REBUILD_INTERVAL_MS,
@@ -95,6 +106,7 @@ export class ExecutionAggregator<State> {
 
   close(): void {
     if (this.listener) this.options.runtime.off('trace', this.listener);
+    if (this.deleteListener) this.options.runtime.off('execution_deleted', this.deleteListener);
     if (this.interval) clearInterval(this.interval);
   }
 }

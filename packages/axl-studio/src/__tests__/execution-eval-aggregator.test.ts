@@ -329,6 +329,47 @@ describe('ExecutionAggregator', () => {
     expect(agg.getSnapshot('all').totalCost).toBeCloseTo(0.04);
     agg.close();
   });
+
+  it('rebuilds on execution_deleted so deleted runs drop from snapshots immediately', async () => {
+    // Without this subscription, a GDPR delete would leave the deleted
+    // run contributing to Cost Dashboard / Workflow Stats for up to 5min
+    // until the next periodic rebuild — user-visible drift.
+    const execs = [
+      makeExecution({ executionId: 'e1', totalCost: 0.01 }),
+      makeExecution({ executionId: 'e2', totalCost: 0.02 }),
+      makeExecution({ executionId: 'e3', totalCost: 0.03 }),
+    ];
+    const runtime = createMockRuntime(execs);
+    const agg = new ExecutionAggregator({
+      runtime: runtime as any,
+      connMgr,
+      channel: 'workflow-stats',
+      reducer: executionReducer,
+      emptyState,
+      windows,
+    });
+    await agg.start();
+    expect(agg.getSnapshot('all').count).toBe(3);
+    expect(agg.getSnapshot('all').totalCost).toBeCloseTo(0.06);
+
+    // Simulate a delete: remove from the mock + emit the event
+    execs.splice(0, 1); // drop e1
+    runtime.emit('execution_deleted', {
+      executionId: 'e1',
+      workflow: 'test-wf',
+      wasActive: false,
+      hadPendingDecision: false,
+      removed: true,
+    });
+
+    // Rebuild is async; flush microtasks
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(agg.getSnapshot('all').count).toBe(2);
+    expect(agg.getSnapshot('all').totalCost).toBeCloseTo(0.05);
+    agg.close();
+  });
 });
 
 // ── EvalAggregator ───────────────────────────────────────────────────
@@ -429,5 +470,35 @@ describe('EvalAggregator', () => {
 
     runtime.emit('eval_result', makeEvalEntry({ id: 'ev-after-close' }));
     expect(agg.getSnapshot('all').count).toBe(0);
+  });
+
+  it('rebuilds on eval_deleted so deleted entries drop from snapshots immediately', async () => {
+    const now = Date.now();
+    const history = [
+      makeEvalEntry({ id: 'ev1', timestamp: now - 1000 }),
+      makeEvalEntry({ id: 'ev2', timestamp: now - 2000 }),
+      makeEvalEntry({ id: 'ev3', timestamp: now - 3000 }),
+    ];
+    const runtime = createMockRuntime([], history);
+    const agg = new EvalAggregator({
+      runtime: runtime as any,
+      connMgr,
+      channel: 'eval-trends',
+      reducer: evalReducer,
+      emptyState,
+      windows,
+    });
+    await agg.start();
+    expect(agg.getSnapshot('all').count).toBe(3);
+
+    // Simulate a delete
+    history.splice(0, 1); // drop ev1
+    runtime.emit('eval_deleted', { id: 'ev1', eval: 'accuracy', removed: true });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(agg.getSnapshot('all').count).toBe(2);
+    agg.close();
   });
 });

@@ -26,6 +26,7 @@ export class EvalAggregator<State> {
   private snaps: AggregateSnapshots<State>;
   private interval?: ReturnType<typeof setInterval>;
   private listener?: (entry: EvalHistoryEntry) => void;
+  private deleteListener?: () => void;
   private options: EvalAggregatorOptions<State>;
 
   constructor(options: EvalAggregatorOptions<State>) {
@@ -45,6 +46,16 @@ export class EvalAggregator<State> {
       this.snaps.fold(entry.timestamp, (prev) => this.options.reducer(prev, entry));
     };
     this.options.runtime.on('eval_result', this.listener);
+    // React to deletes — symmetric to TraceAggregator's execution_deleted
+    // subscription. Without this, an `runtime.deleteEvalResult(id)` leaves
+    // the deleted entry contributing to mean/std/scorer-trend snapshots
+    // until the next periodic rebuild (≤5min).
+    this.deleteListener = () => {
+      this.rebuild().catch((err) =>
+        console.error('[axl-studio] rebuild on eval_deleted failed:', err),
+      );
+    };
+    this.options.runtime.on('eval_deleted', this.deleteListener);
     this.interval = setInterval(
       () => this.rebuild().catch((err) => console.error('[axl-studio] rebuild failed:', err)),
       REBUILD_INTERVAL_MS,
@@ -79,6 +90,7 @@ export class EvalAggregator<State> {
 
   close(): void {
     if (this.listener) this.options.runtime.off('eval_result', this.listener);
+    if (this.deleteListener) this.options.runtime.off('eval_deleted', this.deleteListener);
     if (this.interval) clearInterval(this.interval);
   }
 }

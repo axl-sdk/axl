@@ -26,6 +26,7 @@ export class TraceAggregator<State> {
   private snaps: AggregateSnapshots<State>;
   private interval?: ReturnType<typeof setInterval>;
   private listener?: (event: AxlEvent) => void;
+  private deleteListener?: () => void;
   private options: TraceAggregatorOptions<State>;
 
   constructor(options: TraceAggregatorOptions<State>) {
@@ -45,6 +46,19 @@ export class TraceAggregator<State> {
       this.snaps.fold(event.timestamp, (prev) => this.options.reducer(prev, event));
     };
     this.options.runtime.on('trace', this.listener);
+    // React to deletes: without this, a `runtime.deleteExecution(id)` leaves
+    // the deleted run's contribution in every window snapshot until the next
+    // periodic rebuild (≤5min). User-visible drift on Cost Dashboard / Trace
+    // Stats after a GDPR scrub. A full rebuild is the simple correct fix —
+    // per-execution contribution tracking would be precise but expensive in
+    // memory; rebuild on demand is fine because deletes are rare relative
+    // to live events. Errors logged, not propagated.
+    this.deleteListener = () => {
+      this.rebuild().catch((err) =>
+        console.error('[axl-studio] rebuild on execution_deleted failed:', err),
+      );
+    };
+    this.options.runtime.on('execution_deleted', this.deleteListener);
     this.interval = setInterval(
       () => this.rebuild().catch((err) => console.error('[axl-studio] rebuild failed:', err)),
       REBUILD_INTERVAL_MS,
@@ -81,6 +95,7 @@ export class TraceAggregator<State> {
 
   close(): void {
     if (this.listener) this.options.runtime.off('trace', this.listener);
+    if (this.deleteListener) this.options.runtime.off('execution_deleted', this.deleteListener);
     if (this.interval) clearInterval(this.interval);
   }
 }

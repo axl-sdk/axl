@@ -138,7 +138,7 @@ runtime.on('execution_deleted', (e) => {
 });
 ```
 
-The `execution_deleted` event fires on every call — including attempts against unknown ids (`removed: false`) — so compliance pipelines can log attempted deletes too.
+The `execution_deleted` event fires on every call — including attempts against unknown ids (`removed: false`, `workflow: undefined`) — so compliance pipelines can log attempted deletes too. The `workflow` field is captured before delete and lets the audit log categorize by workflow without a follow-up lookup. `runtime.deleteEvalResult(id)` symmetrically emits `eval_deleted` with `{ id, eval, removed }` — subscribe to both for parity.
 
 **`DELETE /api/executions/:id`** (Studio) — wraps `runtime.deleteExecution` AND scrubs the WebSocket replay buffer for the deleted execution channel via `ConnectionManager.clearChannelBuffer('execution:{id}')`. Without this scrub, late WebSocket subscribers could replay events for a deleted run for up to 30 seconds after stream completion. Blocked in `readOnly` mode (405 with `error.code: 'READ_ONLY'`).
 

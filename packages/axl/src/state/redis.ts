@@ -37,16 +37,22 @@ interface RedisClient {
   rPush(key: string, values: string | string[]): Promise<number>;
   lRange(key: string, start: number, stop: number): Promise<string[]>;
   // Sorted-set ops drive the listExecutions / listEvalResults fast path.
-  // zAdd adds a member with a score; zRevRangeByScore returns members in
-  // descending-score order (optionally limited); zCard counts; zRem deletes.
+  // zAdd adds a member with a score; zRange with BY:'SCORE' + REV:true is the
+  // node-redis v5 form of "ZREVRANGEBYSCORE" (the dedicated method exists in
+  // node-redis v4 but was removed in v5 in favor of the parameterized zRange);
+  // zCard counts; zRem deletes.
   zAdd(key: string, member: { score: number; value: string }): Promise<number>;
   zCard(key: string): Promise<number>;
   zRem(key: string, member: string | string[]): Promise<number>;
-  zRevRangeByScore(
+  zRange(
     key: string,
-    max: number | '+inf',
-    min: number | '-inf',
-    options?: { LIMIT?: { offset: number; count: number } },
+    start: number | string,
+    stop: number | string,
+    options?: {
+      BY?: 'SCORE' | 'LEX';
+      REV?: boolean;
+      LIMIT?: { offset: number; count: number };
+    },
   ): Promise<string[]>;
   // multi() opens a transaction. Queued commands execute atomically on
   // exec() — a crash mid-MULTI leaves none of the queued writes applied,
@@ -954,12 +960,16 @@ export class RedisStore implements StateStore {
       // null-filter still applies and the caller gets best-effort up to
       // `limit`.
       const fetchCount = limit !== undefined ? Math.max(limit * 2, limit + 5) : undefined;
-      const ids = await this.client.zRevRangeByScore(
-        zsetKey,
-        '+inf',
-        '-inf',
-        fetchCount !== undefined ? { LIMIT: { offset: 0, count: fetchCount } } : undefined,
-      );
+      // ZRANGE with BY:'SCORE' + REV:true is the node-redis v5 form of
+      // "ZREVRANGEBYSCORE" (the dedicated method was removed in v5 in favor
+      // of the parameterized zRange). With REV:true the start/stop args are
+      // interpreted in descending order — pass `'+inf'` as start, `'-inf'`
+      // as stop to walk from the highest score downward.
+      const ids = await this.client.zRange(zsetKey, '+inf', '-inf', {
+        BY: 'SCORE',
+        REV: true,
+        ...(fetchCount !== undefined ? { LIMIT: { offset: 0, count: fetchCount } } : {}),
+      });
       if (ids.length === 0) return [];
       const keys = ids.map(dataKey);
       const raws = await this.client.mGet(keys);

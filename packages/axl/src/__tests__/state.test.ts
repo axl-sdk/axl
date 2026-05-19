@@ -1133,25 +1133,54 @@ describe('RedisStore', () => {
         }
         return count;
       }),
-      // ZREVRANGEBYSCORE: returns members in descending-score order.
+      // ZRANGE: the node-redis v5 parameterized form. With
+      // BY:'SCORE' + REV:true this is the "ZREVRANGEBYSCORE" semantic.
       // Production accepts any bounds; this mock only handles the
       // '+inf' / '-inf' pair that our store uses, plus optional LIMIT.
-      zRevRangeByScore: vi.fn(
+      // (The dedicated `zRevRangeByScore` method exists in node-redis v4
+      // but was removed in v5 — caught by the REDIS_URL-gated integration
+      // test suite.)
+      zRange: vi.fn(
         async (
           key: string,
-          max: number | '+inf',
-          min: number | '-inf',
-          options?: { LIMIT?: { offset: number; count: number } },
+          start: number | string,
+          stop: number | string,
+          options?: {
+            BY?: 'SCORE' | 'LEX';
+            REV?: boolean;
+            LIMIT?: { offset: number; count: number };
+          },
         ) => {
           const set = zsetData.get(key);
           if (!set) return [];
           let entries = [...set.entries()];
-          // Filter by score range (mock only really supports +inf/-inf but
-          // gracefully handles numeric bounds too)
-          if (max !== '+inf') entries = entries.filter(([, score]) => score <= max);
-          if (min !== '-inf') entries = entries.filter(([, score]) => score >= min);
-          // Descending by score, with insertion-order stability on ties
-          entries.sort((a, b) => b[1] - a[1]);
+          // BY:SCORE filters by score; REV reverses (start/stop swap meaning).
+          // For our usage (start: '+inf', stop: '-inf', BY: 'SCORE', REV: true),
+          // we want everything in descending score order. Numeric bounds are
+          // also supported for completeness, mirroring real Redis.
+          if (options?.BY === 'SCORE') {
+            if (options.REV) {
+              const max = start;
+              const min = stop;
+              if (max !== '+inf' && typeof max !== 'string')
+                entries = entries.filter(([, score]) => score <= (max as number));
+              if (min !== '-inf' && typeof min !== 'string')
+                entries = entries.filter(([, score]) => score >= (min as number));
+              entries.sort((a, b) => b[1] - a[1]);
+            } else {
+              const min = start;
+              const max = stop;
+              if (min !== '-inf' && typeof min !== 'string')
+                entries = entries.filter(([, score]) => score >= (min as number));
+              if (max !== '+inf' && typeof max !== 'string')
+                entries = entries.filter(([, score]) => score <= (max as number));
+              entries.sort((a, b) => a[1] - b[1]);
+            }
+          } else {
+            // BY undefined → index-based (we don't use this path in production)
+            entries.sort((a, b) => a[1] - b[1]);
+            if (options?.REV) entries.reverse();
+          }
           if (options?.LIMIT) {
             entries = entries.slice(
               options.LIMIT.offset,
@@ -1823,7 +1852,7 @@ describe('RedisStore', () => {
         const { store, mockClient } = createRedisStoreWithMockClient();
         for (let i = 0; i < 5; i++) await store.saveExecution(makeExec(`e${i}`, i * 100));
 
-        mockClient.zRevRangeByScore.mockClear();
+        mockClient.zRange.mockClear();
         mockClient.mGet.mockClear();
         mockClient.get.mockClear();
 
@@ -1831,7 +1860,7 @@ describe('RedisStore', () => {
 
         expect(result.map((e) => e.executionId)).toEqual(['e4', 'e3', 'e2', 'e1', 'e0']);
         // Fast path: exactly ONE zRevRangeByScore + ONE mGet
-        expect(mockClient.zRevRangeByScore).toHaveBeenCalledTimes(1);
+        expect(mockClient.zRange).toHaveBeenCalledTimes(1);
         expect(mockClient.mGet).toHaveBeenCalledTimes(1);
         // And NO per-ID get() — the legacy N+1 path
         expect(mockClient.get).not.toHaveBeenCalled();
@@ -1841,7 +1870,7 @@ describe('RedisStore', () => {
         const { store, mockClient } = createRedisStoreWithMockClient();
         for (let i = 0; i < 10; i++) await store.saveExecution(makeExec(`e${i}`, i * 100));
 
-        mockClient.zRevRangeByScore.mockClear();
+        mockClient.zRange.mockClear();
         const result = await store.listExecutions(3);
 
         expect(result).toHaveLength(3);
@@ -1850,12 +1879,11 @@ describe('RedisStore', () => {
         // so that TTL evictions between ZRANGE and MGET don't silently
         // under-deliver. With limit=3 we fetch up to 8 candidates and stop
         // at the first 3 non-null parsed rows.
-        expect(mockClient.zRevRangeByScore).toHaveBeenCalledWith(
-          'axl:exec-history-z',
-          '+inf',
-          '-inf',
-          { LIMIT: { offset: 0, count: 8 } },
-        );
+        expect(mockClient.zRange).toHaveBeenCalledWith('axl:exec-history-z', '+inf', '-inf', {
+          BY: 'SCORE',
+          REV: true,
+          LIMIT: { offset: 0, count: 8 },
+        });
       });
 
       it('listExecutions delivers up to `limit` live entries even when some blobs are TTL-evicted', async () => {
@@ -1867,7 +1895,7 @@ describe('RedisStore', () => {
         data.delete('axl:exec-history:e8');
         data.delete('axl:exec-history:e7');
 
-        mockClient.zRevRangeByScore.mockClear();
+        mockClient.zRange.mockClear();
         const result = await store.listExecutions(3);
         // Got 3 live entries from the next-3 surviving (e6,e5,e4) — NOT 0
         // because all top 3 were evicted.
@@ -1880,12 +1908,12 @@ describe('RedisStore', () => {
         await store.saveEvalResult({ id: 'ev1', eval: 't', timestamp: 1000, data: {} });
         await store.saveEvalResult({ id: 'ev2', eval: 't', timestamp: 2000, data: {} });
 
-        mockClient.zRevRangeByScore.mockClear();
+        mockClient.zRange.mockClear();
         mockClient.mGet.mockClear();
         const result = await store.listEvalResults();
 
         expect(result.map((e) => e.id)).toEqual(['ev2', 'ev1']);
-        expect(mockClient.zRevRangeByScore).toHaveBeenCalledTimes(1);
+        expect(mockClient.zRange).toHaveBeenCalledTimes(1);
         expect(mockClient.mGet).toHaveBeenCalledTimes(1);
       });
 
@@ -1906,7 +1934,7 @@ describe('RedisStore', () => {
         const result = await store.listExecutions();
         expect(result).toEqual([]);
         // Early-out at the SCARD probe — no need to hit the ZSET or mGet
-        expect(mockClient.zRevRangeByScore).not.toHaveBeenCalled();
+        expect(mockClient.zRange).not.toHaveBeenCalled();
         expect(mockClient.mGet).not.toHaveBeenCalled();
       });
     });
@@ -1925,12 +1953,12 @@ describe('RedisStore', () => {
         data.set('axl:exec-history:legacy-2', JSON.stringify(makeExec('legacy-2', 300)));
         data.set('axl:exec-history:legacy-3', JSON.stringify(makeExec('legacy-3', 200)));
 
-        mockClient.zRevRangeByScore.mockClear();
+        mockClient.zRange.mockClear();
         mockClient.mGet.mockClear();
         const result = await store.listExecutions();
 
         // Fallback used the SET path (N per-key gets + JS sort)
-        expect(mockClient.zRevRangeByScore).not.toHaveBeenCalled();
+        expect(mockClient.zRange).not.toHaveBeenCalled();
         expect(mockClient.mGet).not.toHaveBeenCalled();
         expect(mockClient.get).toHaveBeenCalledTimes(3);
         // Still ordered correctly (JS sort post-fetch)
@@ -1957,7 +1985,7 @@ describe('RedisStore', () => {
 
         const result = await store.listExecutions();
         expect(result).toHaveLength(5); // SET fallback returns all 5
-        expect(mockClient.zRevRangeByScore).not.toHaveBeenCalled();
+        expect(mockClient.zRange).not.toHaveBeenCalled();
       });
 
       it('legacy fallback handles missing data blobs and malformed JSON gracefully', async () => {

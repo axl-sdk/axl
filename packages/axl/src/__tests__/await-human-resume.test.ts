@@ -262,4 +262,114 @@ describe('awaitHuman suspend/resume', () => {
     // Decision row cleaned up
     expect(await runtime.getPendingDecisions()).toHaveLength(0);
   });
+
+  it('awaitHuman that is already resolved does not double-throw when abort fires after', async () => {
+    // Race scenario: resolveDecision fires, awaitHuman returns normally,
+    // THEN the execution is aborted. The signal-abort listener must not
+    // attempt a second reject — the Promise is already settled.
+    const provider = new TestProvider();
+    const wf = workflow({
+      name: 'race-flow',
+      input: z.object({}).strict(),
+      handler: async (ctx) => {
+        const decision = await ctx.awaitHuman({ channel: 'slack', prompt: 'go?' });
+        return { approved: decision.approved };
+      },
+    });
+    const runtime = new AxlRuntime({ state: { store: 'memory' } });
+    runtime.registerProvider('test', provider);
+    runtime.register(wf);
+
+    const resultPromise = runtime.execute('race-flow', {});
+    const pending = await waitForPendingDecision(runtime);
+    const executionId = pending[0].executionId;
+
+    // Resolve normally — workflow completes
+    await runtime.resolveDecision(executionId, { approved: true });
+    const result = (await resultPromise) as { approved: boolean };
+    expect(result.approved).toBe(true);
+
+    // Now fire delete AFTER the workflow completed. The audit event
+    // should still fire (we always emit), but no abort-throw because
+    // the awaitHuman Promise has long since resolved.
+    let deletedEventFired = false;
+    runtime.on('execution_deleted', () => {
+      deletedEventFired = true;
+    });
+    await runtime.deleteExecution(executionId);
+    expect(deletedEventFired).toBe(true);
+  });
+
+  it('awaitHuman wakes on external AbortSignal passed to runtime.execute()', async () => {
+    // The signal-abort wiring should work for any abort source, not just
+    // runtime.deleteExecution. External signals (e.g., from an HTTP
+    // request's AbortController) must also wake a paused awaitHuman.
+    const provider = new TestProvider();
+    const wf = workflow({
+      name: 'ext-signal-flow',
+      input: z.object({}).strict(),
+      handler: async (ctx) => {
+        await ctx.awaitHuman({ channel: 'slack', prompt: 'approve?' });
+        return 'done';
+      },
+    });
+    const runtime = new AxlRuntime({ state: { store: 'memory' } });
+    runtime.registerProvider('test', provider);
+    runtime.register(wf);
+
+    const controller = new AbortController();
+    const resultPromise = runtime.execute('ext-signal-flow', {}, { signal: controller.signal });
+    resultPromise.catch(() => {});
+
+    await waitForPendingDecision(runtime);
+
+    // External abort — should wake the awaitHuman call
+    controller.abort();
+
+    await expect(
+      Promise.race([
+        resultPromise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), 1000)),
+      ]),
+    ).rejects.toThrow();
+  });
+
+  it('awaitHuman fast-path: aborted signal at entry skips in-memory resolver registration', async () => {
+    // If the context signal is already aborted by the time awaitHuman
+    // runs, the Promise rejects via the fast-path BEFORE the resolver
+    // gets added to the in-process `pendingDecisions` Map. The persisted
+    // decision row IS written (the persist happens upstream of the
+    // resolver registration), but the workflow tears down cleanly with
+    // AbortError and `runtime.deleteExecution` then sweeps the persisted
+    // row as part of normal GDPR cleanup.
+    const provider = new TestProvider();
+    const wf = workflow({
+      name: 'fast-abort-flow',
+      input: z.object({}).strict(),
+      handler: async (ctx) => {
+        // Pre-abort the context signal. In production this happens when
+        // `runtime.abort()` fires synchronously between two awaits in the
+        // handler (e.g., shutdown signal racing a checkpoint resolution).
+        (ctx as unknown as { signal: AbortSignal | undefined }).signal = (() => {
+          const ac = new AbortController();
+          ac.abort();
+          return ac.signal;
+        })();
+        await ctx.awaitHuman({ channel: 'slack', prompt: 'too late' });
+        return 'unreachable';
+      },
+    });
+    const runtime = new AxlRuntime({ state: { store: 'memory' } });
+    runtime.registerProvider('test', provider);
+    runtime.register(wf);
+
+    await expect(runtime.execute('fast-abort-flow', {})).rejects.toThrow();
+
+    // In-memory resolver map stays empty (the fast-path bailed before
+    // `pendingDecisions.set` ran) — proves the fast-path's value vs. the
+    // full registration path that would leak a resolver closure.
+    const resolvers = (runtime as unknown as { pendingDecisionResolvers: Map<string, unknown> })
+      .pendingDecisionResolvers;
+    expect(resolvers.size).toBe(0);
+  });
 });

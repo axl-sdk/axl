@@ -2792,6 +2792,116 @@ describe('deleteExecution()', () => {
     const deleted = await runtime.deleteExecution(id);
     expect(deleted).toBe(true);
   });
+
+  it('in-flight deleteExecution does not resurrect the row when the workflow eventually completes', async () => {
+    // Before the resurrection fix, deleting a still-running execution
+    // succeeded but `persistExecution` (called on terminal exit) would
+    // re-create the row in the historical cache + store. GDPR delete
+    // effectively undone seconds later.
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
+    let resolveBlock: (() => void) | undefined;
+    const blocker = new Promise<void>((resolve) => {
+      resolveBlock = resolve;
+    });
+    const wf = workflow({
+      name: 'long-wf',
+      input: z.object({}).strict(),
+      handler: async () => {
+        await blocker;
+        return 'done';
+      },
+    });
+    runtime.register(wf);
+    const inflight = runtime.execute('long-wf', {});
+    await new Promise((r) => setTimeout(r, 10));
+    const [activeId] = (await runtime.getExecutions()).map((e) => e.executionId);
+    expect(activeId).toBeDefined();
+
+    // Delete while still running.
+    const deletedNow = await runtime.deleteExecution(activeId);
+    expect(deletedNow).toBe(true);
+
+    // The workflow's blocking promise resolves; persistExecution would
+    // normally re-create the row. The resurrection guard prevents this.
+    resolveBlock!();
+    await inflight.catch(() => {});
+    // Give the persist chain a tick to settle.
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(await runtime.getExecution(activeId)).toBeUndefined();
+    expect(await runtime.getExecutions()).toHaveLength(0);
+  });
+
+  it('ExecutionInfo.metadata strips control-plane keys (sessionHistory, sessionId, resumeMode)', async () => {
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
+    const wf = workflow({
+      name: 'meta-strip',
+      input: z.object({}).strict(),
+      handler: async () => 'ok',
+    });
+    runtime.register(wf);
+
+    await runtime.execute(
+      'meta-strip',
+      {},
+      {
+        metadata: {
+          userId: 'u-42',
+          tenantId: 't-7',
+          sessionHistory: [
+            { role: 'user', content: 'a much longer message that we don’t want persisted' },
+          ],
+          sessionId: 'sess-internal',
+          resumeMode: true,
+        },
+      },
+    );
+    const [exec] = await runtime.getExecutions();
+    expect(exec.metadata).toEqual({ userId: 'u-42', tenantId: 't-7' });
+    // Internal keys not present
+    expect(exec.metadata?.sessionHistory).toBeUndefined();
+    expect(exec.metadata?.sessionId).toBeUndefined();
+    expect(exec.metadata?.resumeMode).toBeUndefined();
+  });
+
+  it('ExecutionInfo.metadata is isolated from caller mutation post-execute', async () => {
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
+    const wf = workflow({
+      name: 'meta-isolate',
+      input: z.object({}).strict(),
+      handler: async () => 'ok',
+    });
+    runtime.register(wf);
+
+    const metadata: Record<string, unknown> = { userId: 'u-42' };
+    await runtime.execute('meta-isolate', {}, { metadata });
+    metadata.userId = 'mutated-after-the-fact';
+
+    const [exec] = await runtime.getExecutions();
+    expect(exec.metadata).toEqual({ userId: 'u-42' });
+  });
+
+  it('execInfo.metadata is undefined when caller only supplied control-plane keys', async () => {
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
+    const wf = workflow({
+      name: 'meta-only-internal',
+      input: z.object({}).strict(),
+      handler: async () => 'ok',
+    });
+    runtime.register(wf);
+
+    await runtime.execute(
+      'meta-only-internal',
+      {},
+      { metadata: { sessionId: 's', resumeMode: false } },
+    );
+    const [exec] = await runtime.getExecutions();
+    expect(exec.metadata).toBeUndefined();
+  });
 });
 
 describe("state.persist: 'streaming' (#1)", () => {
@@ -2939,27 +3049,101 @@ describe("state.persist: 'streaming' (#1)", () => {
     };
 
     const runtime = new AxlRuntime({
-      state: { store: fakeStore as any, persist: 'streaming', streamingBatchSize: 1 },
+      state: {
+        store: fakeStore as any,
+        persist: 'streaming',
+        streamingBatchSize: 1,
+        streamingBatchInterval: 10,
+      },
     });
 
-    // Manually call the runtime's createContext to get a ctx and emit
-    // various event types into the flusher
-    const ctx = runtime.createContext();
-    (ctx as any).emitEvent({ type: 'token', data: 'x' });
-    (ctx as any).emitEvent({ type: 'partial_object', data: { object: {} } });
-    (ctx as any).emitEvent({ type: 'string_delta', data: { path: '/x', delta: 'a' } });
-    (ctx as any).emitEvent({ type: 'agent_call_start', agent: 'A' });
+    // Use a real workflow execution so the streamableExecutionIds gate is
+    // satisfied — createContext() flows deliberately bypass the flusher
+    // (no terminal finalize path), and that's exercised separately below.
+    const wf = workflow({
+      name: 'wf-excludes',
+      input: z.object({}).strict(),
+      handler: async (ctx) => {
+        (ctx as any).emitEvent({ type: 'token', data: 'x' });
+        (ctx as any).emitEvent({ type: 'partial_object', data: { object: {} } });
+        (ctx as any).emitEvent({ type: 'string_delta', data: { path: '/x', delta: 'a' } });
+        (ctx as any).emitEvent({ type: 'agent_call_start', agent: 'A' });
+        return 'ok';
+      },
+    });
+    runtime.register(wf);
+    await runtime.execute('wf-excludes', {});
 
-    // Wait for the 1s default flush interval (or any pending immediate flushes)
-    await new Promise((r) => setTimeout(r, 1100));
+    // Give the chained finalize a tick to settle
+    await new Promise((r) => setTimeout(r, 50));
 
-    // Only the agent_call_start was kept — the three excluded types were dropped
+    // Only the agent_call_start (and workflow_start/_end emitted by the
+    // runtime itself) were kept — the three excluded types were dropped.
     const allBufferedEvents = [...buffers.values()].flat();
     const types = new Set(allBufferedEvents.map((e) => e.type));
     expect(types.has('token')).toBe(false);
     expect(types.has('partial_object')).toBe(false);
     expect(types.has('string_delta')).toBe(false);
     expect(types.has('agent_call_start')).toBe(true);
+  });
+
+  it('createContext() flows do NOT append to the streaming flusher (no terminal finalize path → would leave phantom orphans)', async () => {
+    const buffers = new Map<string, import('../types.js').AxlEvent[]>();
+    const idsTouched = new Set<string>();
+    const fakeStore = {
+      saveCheckpoint: async () => {},
+      getCheckpoint: async () => null,
+      saveSession: async () => {},
+      getSession: async () => [],
+      deleteSession: async () => {},
+      saveSessionMeta: async () => {},
+      getSessionMeta: async () => null,
+      savePendingDecision: async () => {},
+      getPendingDecisions: async () => [],
+      resolveDecision: async () => {},
+      saveExecutionState: async () => {},
+      getExecutionState: async () => null,
+      listPendingExecutions: async () => [],
+      saveExecution: async () => {},
+      getExecution: async () => null,
+      listExecutions: async () => [],
+      appendStreamingEvents: async (id: string, events: import('../types.js').AxlEvent[]) => {
+        idsTouched.add(id);
+        const existing = buffers.get(id) ?? [];
+        existing.push(...events);
+        buffers.set(id, existing);
+      },
+      finalizeStreamingEvents: async () => {},
+      listStreamingExecutions: async () => [],
+      getStreamingEvents: async () => [],
+    };
+
+    const runtime = new AxlRuntime({
+      state: {
+        store: fakeStore as any,
+        persist: 'streaming',
+        streamingBatchSize: 1,
+        streamingBatchInterval: 10,
+      },
+    });
+
+    const ctx = runtime.createContext();
+    (ctx as any).emitEvent({
+      type: 'log',
+      executionId: 'ad-hoc',
+      step: 0,
+      timestamp: 1000,
+      data: { event: 'pli' },
+    });
+    (ctx as any).emitEvent({ type: 'agent_call_start', agent: 'A' });
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Nothing made it to the flusher because the createContext id was never
+    // registered as a streamable execution. This is the fix for the
+    // phantom-orphan-on-restart bug.
+    expect(idsTouched.size).toBe(0);
+    expect([...buffers.values()].flat()).toHaveLength(0);
   });
 
   it('recoverIncompleteStreams synthesizes ExecutionInfo for orphaned buffers', async () => {
@@ -3047,6 +3231,140 @@ describe("state.persist: 'streaming' (#1)", () => {
     const runtime = new AxlRuntime(); // MemoryStore default; persist not set
     const recovered = await runtime.recoverIncompleteStreams();
     expect(recovered).toEqual([]);
+  });
+
+  it('recoverIncompleteStreams skips ids of executions actively running in this process', async () => {
+    // Recovery races with a live workflow: the buffer is owned by an
+    // in-process execution. Recovery must not synthesize a "failed" record
+    // + delete the live buffer.
+    const runtime = makeRuntime('streaming');
+    let resolveBlock: (() => void) | undefined;
+    const blocker = new Promise<void>((resolve) => {
+      resolveBlock = resolve;
+    });
+    const wf = workflow({
+      name: 'long-stream',
+      input: z.object({}).strict(),
+      handler: async () => {
+        await blocker;
+        return 'done';
+      },
+    });
+    runtime.register(wf);
+    const inflight = runtime.execute('long-stream', {});
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Recovery should NOT touch the live execution.
+    const recovered = await runtime.recoverIncompleteStreams();
+    expect(recovered).toHaveLength(0);
+
+    resolveBlock!();
+    await inflight;
+  });
+
+  it('recoverIncompleteStreams preserves the buffer when saveExecution fails (no data loss)', async () => {
+    const buffers = new Map<string, import('../types.js').AxlEvent[]>();
+    buffers.set('crashed-1', [
+      {
+        type: 'workflow_start',
+        executionId: 'crashed-1',
+        workflow: 'wf-x',
+        step: 0,
+        timestamp: 1000,
+        data: { input: {} },
+      } as unknown as import('../types.js').AxlEvent,
+    ]);
+    const fakeStore = {
+      saveCheckpoint: async () => {},
+      getCheckpoint: async () => null,
+      saveSession: async () => {},
+      getSession: async () => [],
+      deleteSession: async () => {},
+      saveSessionMeta: async () => {},
+      getSessionMeta: async () => null,
+      savePendingDecision: async () => {},
+      getPendingDecisions: async () => [],
+      resolveDecision: async () => {},
+      saveExecutionState: async () => {},
+      getExecutionState: async () => null,
+      listPendingExecutions: async () => [],
+      saveExecution: async () => {
+        throw new Error('save failed (simulated)');
+      },
+      getExecution: async () => null,
+      listExecutions: async () => [],
+      listStreamingExecutions: async () => [...buffers.keys()],
+      getStreamingEvents: async (id: string) => buffers.get(id) ?? [],
+      finalizeStreamingEvents: async (id: string) => {
+        buffers.delete(id);
+      },
+      appendStreamingEvents: async () => {},
+    };
+    const runtime = new AxlRuntime({
+      state: { store: fakeStore as never, persist: 'streaming' },
+    });
+
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const recovered = await runtime.recoverIncompleteStreams();
+    expect(recovered).toHaveLength(0);
+    // Buffer left in place for next attempt — NOT finalized.
+    expect(buffers.has('crashed-1')).toBe(true);
+    errorSpy.mockRestore();
+  });
+
+  it('recoverIncompleteStreams applies maxEventsPerExecution bound to synthesized events', async () => {
+    const cap = 5;
+    const events = Array.from({ length: 50 }, (_, i) => ({
+      type: i === 0 ? 'workflow_start' : 'log',
+      executionId: 'big',
+      workflow: 'huge-wf',
+      step: i,
+      timestamp: 1000 + i,
+      data: i === 0 ? { input: {} } : { n: i },
+    })) as unknown as import('../types.js').AxlEvent[];
+    const buffers = new Map([['big', events]]);
+    const saved: import('../types.js').ExecutionInfo[] = [];
+    const fakeStore = {
+      saveCheckpoint: async () => {},
+      getCheckpoint: async () => null,
+      saveSession: async () => {},
+      getSession: async () => [],
+      deleteSession: async () => {},
+      saveSessionMeta: async () => {},
+      getSessionMeta: async () => null,
+      savePendingDecision: async () => {},
+      getPendingDecisions: async () => [],
+      resolveDecision: async () => {},
+      saveExecutionState: async () => {},
+      getExecutionState: async () => null,
+      listPendingExecutions: async () => [],
+      saveExecution: async (e: import('../types.js').ExecutionInfo) => {
+        saved.push(e);
+      },
+      getExecution: async () => null,
+      listExecutions: async () => [],
+      listStreamingExecutions: async () => [...buffers.keys()],
+      getStreamingEvents: async (id: string) => buffers.get(id) ?? [],
+      finalizeStreamingEvents: async (id: string) => {
+        buffers.delete(id);
+      },
+      appendStreamingEvents: async () => {},
+    };
+    const runtime = new AxlRuntime({
+      state: {
+        store: fakeStore as never,
+        persist: 'streaming',
+        maxEventsPerExecution: cap,
+      },
+    });
+
+    const recovered = await runtime.recoverIncompleteStreams();
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0].events).toHaveLength(cap);
+    // Last entry is the truncation sentinel.
+    const last = recovered[0].events[cap - 1];
+    expect(last.type).toBe('log');
+    expect((last as unknown as { data: { event?: string } }).data.event).toBe('events_truncated');
   });
 
   it('finalize awaits in-flight flush — no orphan buffer when size-flush races with finalize', async () => {
@@ -3173,22 +3491,46 @@ describe("state.persist: 'streaming' (#1)", () => {
       },
     });
 
-    const ctx = runtime.createContext();
-    (ctx as any).emitEvent({
-      type: 'log',
-      executionId: 'manual',
-      step: 0,
-      timestamp: 1000,
-      data: { msg: 'pre-shutdown event' },
+    // Stand up a long-running workflow so we have a real streaming-eligible
+    // execution that emits events into the flusher buffer before shutdown.
+    // (createContext flows don't qualify — see the dedicated test above.)
+    let resolveHandler: (() => void) | undefined;
+    const blocker = new Promise<void>((resolve) => {
+      resolveHandler = resolve;
     });
+    const wf = workflow({
+      name: 'wf-shutdown',
+      input: z.object({}).strict(),
+      handler: async (ctx) => {
+        (ctx as any).emitEvent({
+          type: 'log',
+          executionId: 'manual',
+          step: 0,
+          timestamp: 1000,
+          data: { msg: 'pre-shutdown event' },
+        });
+        await blocker;
+        return 'ok';
+      },
+    });
+    runtime.register(wf);
+    const inflight = runtime.execute('wf-shutdown', {});
+
+    // Yield so the handler runs and the log event lands in the flusher buffer.
+    await new Promise((r) => setTimeout(r, 10));
 
     // Before shutdown — flush hasn't fired (cap not reached, timer not expired)
     expect(saveAttempts).toBe(0);
 
-    // Shutdown should drain
-    await runtime.shutdown();
+    // Shutdown aborts the in-flight workflow AND drains the flusher.
+    const shutdownPromise = runtime.shutdown();
+    resolveHandler!();
+    await shutdownPromise;
+    // Allow the abort-triggered persistExecution chain to settle so
+    // saveAttempts is observed deterministically.
+    await inflight.catch(() => {});
 
-    // Drain happened
+    // Drain happened — the log event we emitted made it through.
     expect(saveAttempts).toBeGreaterThan(0);
   });
 });

@@ -280,6 +280,26 @@ export class ConnectionManager {
     }
   }
 
+  /** Drop the replay buffer for a channel immediately (cancels any pending
+   *  TTL timer). Used by the executions DELETE route to scrub buffered
+   *  events when an operator runs a GDPR delete — otherwise events for the
+   *  deleted execution remain replayable to late subscribers for up to
+   *  `BUFFER_TTL_MS` after stream completion. No-op when no buffer exists.
+   */
+  clearChannelBuffer(channel: string): void {
+    const buffer = this.buffers.get(channel);
+    if (!buffer) return;
+    if (buffer.timer) clearTimeout(buffer.timer);
+    this.buffers.delete(channel);
+  }
+
+  /** @internal Inspection hook for tests — returns whether a replay buffer
+   *  currently exists for `channel`. Not part of the public API; embedders
+   *  should not rely on it. */
+  _hasReplayBuffer(channel: string): boolean {
+    return this.buffers.has(channel);
+  }
+
   /** Unsubscribe a connection from a channel. */
   unsubscribe(ws: BroadcastTarget, channel: string): void {
     this.channels.get(channel)?.delete(ws);

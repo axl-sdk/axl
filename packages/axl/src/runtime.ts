@@ -66,20 +66,83 @@ const DEFAULT_MAX_EVENTS_PER_EXECUTION = 50_000;
 const DEFAULT_STREAMING_BATCH_SIZE = 100;
 const DEFAULT_STREAMING_BATCH_INTERVAL = 1_000; // ms
 
+/** Sentinel workflow name on synthesized ExecutionInfos when the streaming
+ *  buffer doesn't include a `workflow_start` event. The `__axl/` prefix
+ *  marks it as a system-generated value so list-by-workflow consumers can
+ *  filter or group it distinctly from user workflows. */
+const RECOVERED_UNKNOWN_WORKFLOW = '__axl/recovered';
+
 /**
- * Event types excluded from the streaming buffer (high-volume, stream-only
- * by design — already filtered from `ExecutionInfo.events` via
- * `pushEventBounded`). Including these would multiply Redis traffic by
- * 10–100× for no recovery benefit: token streams can be reconstructed from
- * the persisted `agent_call_end.data.response`, and partial objects from
- * `agent_call_end.data` similarly. `string_delta` is incremental UI state
- * with no value post-crash.
+ * High-volume stream-only event types that are NEVER persisted to:
+ *   1. `ExecutionInfo.events` (in-memory canonical array) — filtered by
+ *      `pushEventBounded`.
+ *   2. The streaming-mode Redis buffer — filtered by `StreamingFlusher.append`.
+ *   3. Studio's WS replay buffer (separate constant
+ *      `UNBUFFERED_EVENT_TYPES` in `connection-manager.ts`, kept in sync
+ *      with this list deliberately — the two serve the same purpose at
+ *      different layers).
+ *
+ * Including these would multiply Redis traffic by 10–100× for no recovery
+ * benefit: token streams can be reconstructed from the persisted
+ * `agent_call_end.data.response`, partial objects from `agent_call_end.data`,
+ * and `string_delta` is incremental UI state with no value post-crash.
  */
 const STREAMING_EXCLUDED_TYPES: ReadonlySet<string> = new Set([
   'token',
   'partial_object',
   'string_delta',
 ]);
+
+/**
+ * Keys inside `ExecuteOptions.metadata` that are control-plane fields the
+ * runtime consumes during `execute()` / `stream()` — NOT user tags. We strip
+ * them before lifting `metadata` onto `ExecutionInfo.metadata` so:
+ *   - large session-history buffers don't bloat the persisted blob,
+ *   - `sessionId` doesn't leak into queryable surfaces,
+ *   - the persisted shape is stable user-facing metadata (tags, tenantId,
+ *     correlation ids) rather than a grab-bag of internal options.
+ *
+ * Callers using these keys for control-plane purposes still see them on
+ * `ctx.metadata` and dynamic selector callbacks — only the persisted snapshot
+ * is filtered.
+ */
+const INTERNAL_METADATA_KEYS: ReadonlySet<string> = new Set([
+  'sessionId',
+  'sessionHistory',
+  'resumeMode',
+]);
+
+/**
+ * Filter internal control-plane keys out of `ExecuteOptions.metadata` and
+ * return a fresh object suitable for assignment to `ExecutionInfo.metadata`.
+ *
+ * `structuredClone` isolates the snapshot from caller mutations after
+ * `execute()` / `stream()` returns — otherwise `getExecution(id)` mid-run
+ * would surface live mutations to anyone holding a reference to the original
+ * `options.metadata` object.
+ */
+function liftPersistedMetadata(
+  metadata: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!metadata) return undefined;
+  const filtered: Record<string, unknown> = {};
+  let hasAny = false;
+  for (const [k, v] of Object.entries(metadata)) {
+    if (INTERNAL_METADATA_KEYS.has(k)) continue;
+    filtered[k] = v;
+    hasAny = true;
+  }
+  if (!hasAny) return undefined;
+  try {
+    return structuredClone(filtered);
+  } catch {
+    // Non-cloneable value in metadata (e.g., a function). Fall back to a
+    // shallow copy — the caller's tags are unlikely to contain non-cloneable
+    // data, but we'd rather degrade than crash the workflow on an exotic
+    // entry.
+    return { ...filtered };
+  }
+}
 
 /**
  * Per-execution streaming-event buffer with size-and-time-bounded flushes.
@@ -257,7 +320,7 @@ function isAbortError(err: unknown): boolean {
  *  regular event. The sentinel itself encodes the cap and reason so
  *  consumers know exactly what was lost. */
 function pushEventBounded(execInfo: ExecutionInfo, event: AxlEvent, cap: number): void {
-  if (event.type === 'token' || event.type === 'partial_object') return;
+  if (STREAMING_EXCLUDED_TYPES.has(event.type)) return;
   if (cap === Infinity || execInfo.events.length < cap) {
     execInfo.events.push(event);
     return;
@@ -288,6 +351,38 @@ function pushEventBounded(execInfo: ExecutionInfo, event: AxlEvent, cap: number)
       },
     } as AxlEvent;
   }
+}
+
+/** Bound an array of recovered streaming events to the configured per-
+ *  execution cap. When truncation is needed, replaces the cap-th slot with
+ *  a `log` sentinel describing the truncation (mirrors `pushEventBounded`).
+ *  Idempotent: a buffer that already ends in the sentinel is left alone. */
+function boundRecoveredEvents(events: AxlEvent[], cap: number): AxlEvent[] {
+  if (cap === Infinity || events.length <= cap) return events;
+  const truncated = events.slice(0, cap);
+  const last = truncated[truncated.length - 1];
+  const alreadyTruncated =
+    last?.type === 'log' &&
+    typeof last.data === 'object' &&
+    last.data !== null &&
+    (last.data as { event?: string }).event === 'events_truncated';
+  if (!alreadyTruncated) {
+    truncated[truncated.length - 1] = {
+      type: 'log',
+      executionId: events[0]?.executionId ?? '',
+      step: last?.step ?? 0,
+      timestamp: Date.now(),
+      data: {
+        event: 'events_truncated',
+        cap,
+        message:
+          `Recovered ExecutionInfo.events truncated at ${cap} entries. ` +
+          `Original streaming buffer had ${events.length} events. ` +
+          `Raise via config.state.maxEventsPerExecution.`,
+      },
+    } as AxlEvent;
+  }
+  return truncated;
 }
 
 export type ExecuteOptions = {
@@ -428,6 +523,27 @@ export class AxlRuntime extends EventEmitter {
   /** Streaming-mode flusher. `undefined` when persist === 'terminal'
    *  (back-compat default — no buffering overhead, no batching timer). */
   private streamingFlusher?: StreamingFlusher;
+  /** Execution IDs that are eligible for streaming-buffer durability —
+   *  populated by `execute()` / `stream()`. `createContext()` flows are
+   *  deliberately NOT added: ad-hoc contexts (tool tests, Studio playground,
+   *  evals) have no terminal `persistExecution` path that would finalize the
+   *  streaming buffer, so allowing them to write would leave phantom orphan
+   *  buffers that `recoverIncompleteStreams()` later mis-recovers as failed
+   *  executions. Membership is removed in `persistExecution` once the
+   *  canonical save + finalize chain has been scheduled. */
+  private streamableExecutionIds = new Set<string>();
+  /** Execution IDs deleted by `runtime.deleteExecution()` while still in
+   *  flight. `persistExecution` skips its save + cache write when the
+   *  executionId is in this set — preventing a workflow that completes after
+   *  a delete from resurrecting the (intentionally-removed) row. Entries are
+   *  removed once the would-be persist has been short-circuited. */
+  private pendingDeletedExecutions = new Set<string>();
+  /** In-flight `persistExecution` chains (save → finalize). `shutdown()`
+   *  awaits these before closing the StateStore so a workflow whose abort
+   *  triggers a persist-during-shutdown isn't racing a closed connection.
+   *  The Set is mutated by the chain's own `.finally` so entries clear as
+   *  soon as the work settles. */
+  private persistInflight = new Set<Promise<void>>();
 
   constructor(config?: AxlConfig) {
     super();
@@ -627,10 +743,33 @@ export class AxlRuntime extends EventEmitter {
   /**
    * Persist a completed/failed execution to the state store (fire-and-forget)
    * and move it from the active executions map to the historical cache.
+   *
+   * Resurrection guard: if `runtime.deleteExecution(id)` was called while
+   * this execution was still running, the id will be in
+   * `pendingDeletedExecutions`. In that case we skip the save AND the
+   * historical-cache write, and finalize the streaming buffer (if any) so
+   * the buffer doesn't outlive the delete.
    */
   private persistExecution(execInfo: ExecutionInfo): void {
-    const snapshot = structuredClone(execInfo);
     const id = execInfo.executionId;
+
+    // Always release the streaming-buffer registration — this execution is
+    // terminal in this process regardless of which branch below runs.
+    this.streamableExecutionIds.delete(id);
+
+    if (this.pendingDeletedExecutions.has(id)) {
+      // The user deleted this execution while it was still running. Honor
+      // that intent: skip save, skip cache write, finalize the streaming
+      // buffer so it doesn't outlive the delete.
+      this.pendingDeletedExecutions.delete(id);
+      this.executions.delete(id);
+      if (this.streamingFlusher) {
+        this.streamingFlusher.finalize(id).catch(() => {});
+      }
+      return;
+    }
+
+    const snapshot = structuredClone(execInfo);
 
     if (this.stateStore.saveExecution) {
       // Chain: save canonical executionHistory first, THEN finalize the
@@ -645,24 +784,36 @@ export class AxlRuntime extends EventEmitter {
       //   - saveExecution succeeds → finalize fails → orphan buffer that
       //     the next process's recoverIncompleteStreams will reap via its
       //     "canonical-exists, drop orphan" branch. Best-effort cleanup.
-      this.stateStore
+      //
+      // Track the chain on `persistInflight` so `shutdown()` can await it
+      // before closing the state store. Without this, a workflow that's
+      // aborted by shutdown can race the connection-close: the abort
+      // unwinds → workflow_end emits → persistExecution schedules
+      // saveExecution → shutdown closes the connection → the detached save
+      // fails. The chain is removed from the set in its `.finally`.
+      const chain = this.stateStore
         .saveExecution(snapshot)
         .then(() => {
           // Save succeeded — fire finalize but isolate its failure mode
           // so it doesn't get conflated with save-failure in the outer catch.
-          this.streamingFlusher?.finalize(id).catch(() => {
+          return this.streamingFlusher?.finalize(id).catch(() => {
             // Buffer becomes an orphan; recoverIncompleteStreams cleans up.
           });
         })
         .catch(() => {
           // Save failed; leave buffer in place for next-process recovery.
-        });
+        })
+        .then(() => undefined);
+      this.persistInflight.add(chain);
+      chain.finally(() => this.persistInflight.delete(chain));
     } else if (this.streamingFlusher) {
       // No saveExecution but streaming is enabled (custom store). Drop
       // the streaming buffer anyway — the workflow has completed in this
       // process, and the buffer wasn't going to be load-bearing without
       // a saveExecution path to gate against.
-      this.streamingFlusher.finalize(id).catch(() => {});
+      const chain = this.streamingFlusher.finalize(id).catch(() => {});
+      this.persistInflight.add(chain);
+      chain.finally(() => this.persistInflight.delete(chain));
     }
 
     // Move from active to historical cache to bound active map growth.
@@ -974,7 +1125,11 @@ export class AxlRuntime extends EventEmitter {
       awaitHumanHandler: options?.awaitHumanHandler,
       eventStreamOptions: options?.events,
       onTrace: (event: AxlEvent) => {
-        this.streamingFlusher?.append(executionId, event);
+        // Note: createContext flows do NOT append to streamingFlusher.
+        // Ad-hoc contexts (tool tests, Studio playground, evals) have no
+        // terminal `persistExecution` path that would finalize the
+        // streaming buffer — allowing them to write would leave phantom
+        // orphan buffers that recoverIncompleteStreams() later mis-recovers.
         this.emit('trace', event);
         this.outputAxlEvent(event);
       },
@@ -1022,7 +1177,17 @@ export class AxlRuntime extends EventEmitter {
     // Register with active cost scope for trackCost() attribution
     this.registerWithCostScope(executionId);
 
-    // Create execution info
+    // Register for streaming-buffer durability BEFORE the first event
+    // emission. Only ids registered here get appended to the streaming
+    // flusher — createContext flows are deliberately excluded (no terminal
+    // finalize path).
+    if (this.streamingFlusher) {
+      this.streamableExecutionIds.add(executionId);
+    }
+
+    // Create execution info. Persisted `metadata` strips internal control-
+    // plane keys (sessionHistory, sessionId, resumeMode) and is structurally
+    // cloned to isolate from caller mutation.
     const execInfo: ExecutionInfo = {
       executionId,
       workflow: name,
@@ -1031,11 +1196,13 @@ export class AxlRuntime extends EventEmitter {
       totalCost: 0,
       startedAt: Date.now(),
       duration: 0,
-      metadata: options?.metadata,
+      metadata: liftPersistedMetadata(options?.metadata),
     };
     this.executions.set(executionId, execInfo);
 
-    // Resolve session history from metadata if present
+    // Resolve session history from metadata if present. Note: this reads
+    // from the ORIGINAL options.metadata (control-plane channel), not from
+    // execInfo.metadata (filtered persisted channel).
     const sessionHistory = (options?.metadata?.sessionHistory as ChatMessage[]) ?? undefined;
 
     // Create workflow context
@@ -1061,7 +1228,9 @@ export class AxlRuntime extends EventEmitter {
         // flusher batches events to the store throughout the run, so a
         // mid-run crash leaves a recoverable buffer. No-op when
         // `persist === 'terminal'` (the back-compat default).
-        this.streamingFlusher?.append(executionId, event);
+        if (this.streamableExecutionIds.has(executionId)) {
+          this.streamingFlusher?.append(executionId, event);
+        }
         this.emit('trace', event);
         this.outputAxlEvent(event);
         // Persist handoff records to session metadata. Records land on
@@ -1186,7 +1355,14 @@ export class AxlRuntime extends EventEmitter {
       // Register with active cost scope for trackCost() attribution
       this.registerWithCostScope(executionId);
 
-      // Create execution info for stream executions
+      // Register for streaming-buffer durability BEFORE the first event
+      // emission (mirrors execute()).
+      if (this.streamingFlusher) {
+        this.streamableExecutionIds.add(executionId);
+      }
+
+      // Create execution info for stream executions. Persisted `metadata`
+      // strips internal control-plane keys and is structurally cloned.
       execInfo = {
         executionId,
         workflow: name,
@@ -1195,7 +1371,7 @@ export class AxlRuntime extends EventEmitter {
         totalCost: 0,
         startedAt: Date.now(),
         duration: 0,
-        metadata: options?.metadata,
+        metadata: liftPersistedMetadata(options?.metadata),
       };
       this.executions.set(executionId, execInfo);
 
@@ -1219,7 +1395,9 @@ export class AxlRuntime extends EventEmitter {
           // execute() for full rationale.
           pushEventBounded(execInfo!, event, this.maxEventsPerExecution);
           execInfo!.totalCost += eventCostContribution(event);
-          this.streamingFlusher?.append(executionId, event);
+          if (this.streamableExecutionIds.has(executionId)) {
+            this.streamingFlusher?.append(executionId, event);
+          }
           this.emit('trace', event);
           this.outputAxlEvent(event);
           // Single fan-out: every event flows verbatim to the wire. The
@@ -1419,6 +1597,18 @@ export class AxlRuntime extends EventEmitter {
       await safeClose('streamingFlusher', () => this.streamingFlusher!.flushAll());
     }
 
+    // Drain in-flight `persistExecution` chains. These are detached from
+    // their triggering workflow (fire-and-forget save→finalize), so abort
+    // of in-flight executions schedules saves that the StreamingFlusher
+    // drain above doesn't know about. Without this, the StateStore can
+    // close while the chain's `saveExecution` is mid-flight, losing the
+    // canonical executionHistory row for an aborted workflow.
+    if (this.persistInflight.size > 0) {
+      await safeClose('persistInflight', () =>
+        Promise.allSettled([...this.persistInflight]).then(() => undefined),
+      );
+    }
+
     if (this.mcpManager) await safeClose('mcpManager', () => this.mcpManager!.shutdown());
     if (this.memoryManager) await safeClose('memoryManager', () => this.memoryManager!.close());
     if (this.stateStore.close) await safeClose('stateStore', () => this.stateStore.close!());
@@ -1468,6 +1658,19 @@ export class AxlRuntime extends EventEmitter {
 
     const recovered: ExecutionInfo[] = [];
     for (const id of ids) {
+      // Liveness check: never recover an execution that's actively running
+      // in THIS process. The streaming flusher may have written a batch
+      // before saveExecution lands, so recovery would mistake the live run
+      // for a crashed one — synthesize a `failed` record, delete the live
+      // buffer, and leave the actual workflow about to re-create both.
+      // Cross-process recovery (workflow live in process A, recovery in
+      // process B) requires a Redis-side lease and is out of scope for
+      // this contract: callers must wire recovery into startup BEFORE
+      // accepting new work.
+      if (this.executions.has(id) || this.streamableExecutionIds.has(id)) {
+        continue;
+      }
+
       // If a canonical execution already exists, just drop the orphan buffer.
       const existing = this.historicalExecutions.get(id);
       if (existing) {
@@ -1482,28 +1685,32 @@ export class AxlRuntime extends EventEmitter {
         continue;
       }
 
+      // Bound the synthesized events array to the configured cap so a
+      // crashed run with hundreds of thousands of buffered events can't
+      // resurrect as an unbounded ExecutionInfo. Mirrors `pushEventBounded`'s
+      // sentinel behavior — truncation marker as the last entry.
+      const boundedEvents = boundRecoveredEvents(events, this.maxEventsPerExecution);
+
       // Synthesize a partial ExecutionInfo. We don't have the original
       // input or workflow name on hand, but we can pull them off events
-      // when available (`workflow_start` carries the workflow name in
-      // `data.input` context).
-      const firstEvent = events[0];
-      const lastEvent = events[events.length - 1];
-      const startedAt = firstEvent.timestamp ?? Date.now();
+      // when available — `workflow_start` is the only event type the
+      // emitter auto-stamps with the workflow name, so prefer it. Falling
+      // back to events[0] is fragile because the first ASK-scoped event
+      // (ask_start) may precede workflow_start in unusual scenarios.
+      const workflowStartEvent = boundedEvents.find((e) => e.type === 'workflow_start');
+      const lastEvent = boundedEvents[boundedEvents.length - 1];
+      const startedAt = workflowStartEvent?.timestamp ?? boundedEvents[0]?.timestamp ?? Date.now();
       const completedAt = lastEvent.timestamp ?? startedAt;
-
-      // workflow_start carries `workflow` on the event itself (auto-stamped
-      // by the ctx layer). Fall back to <unknown> if absent.
-      const workflowStartEvent = events.find((e) => e.type === 'workflow_start');
-      const workflowName = workflowStartEvent?.workflow ?? '<unknown>';
+      const workflowName = workflowStartEvent?.workflow ?? RECOVERED_UNKNOWN_WORKFLOW;
 
       // Sum cost from cost-bearing leaf events
-      const totalCost = events.reduce((sum, e) => sum + eventCostContribution(e), 0);
+      const totalCost = boundedEvents.reduce((sum, e) => sum + eventCostContribution(e), 0);
 
       const synthesized: ExecutionInfo = {
         executionId: id,
         workflow: workflowName,
         status: 'failed',
-        events,
+        events: boundedEvents,
         totalCost,
         startedAt,
         completedAt,
@@ -1511,9 +1718,22 @@ export class AxlRuntime extends EventEmitter {
         error: 'process terminated (recovered from streaming buffer)',
       };
 
-      // Persist + register
+      // Persist + register. CRITICAL: only delete the streaming buffer
+      // AFTER saveExecution succeeds. If saveExecution throws (Redis flaky
+      // during recovery), we'd otherwise lose the only on-disk record by
+      // deleting the buffer in the next finalize call. Mirrors the live-
+      // workflow `persistExecution` save→finalize chain.
       if (this.stateStore.saveExecution) {
-        await this.stateStore.saveExecution(synthesized);
+        try {
+          await this.stateStore.saveExecution(synthesized);
+        } catch (err) {
+          console.error(
+            `[axl] recoverIncompleteStreams: failed to save synthesized execution ` +
+              `${id}: ${err instanceof Error ? err.message : String(err)}. ` +
+              `Streaming buffer left in place for next recovery attempt.`,
+          );
+          continue;
+        }
       }
       this.historicalExecutions.set(id, synthesized);
       await this.stateStore.finalizeStreamingEvents?.(id);
@@ -1570,26 +1790,44 @@ export class AxlRuntime extends EventEmitter {
   }
 
   /**
-   * Delete an execution from history by id. Removes from BOTH the active
-   * map (if still running) and the historical cache, and from the
-   * configured StateStore. Returns true if an entry was actually removed
-   * from any of the three.
+   * Delete an execution from history by id. Removes from the active map (if
+   * still running), the historical cache, and the configured StateStore.
+   * Returns true if an entry was actually removed from any of the three.
+   *
+   * In-flight handling: if the execution is still running, this method
+   * **aborts** it (via the registered abort controller) AND marks the id for
+   * skip-on-persist so the workflow's eventual `workflow_end` doesn't
+   * resurrect the row. The workflow itself terminates normally — callers
+   * iterating the returned `AxlStream` will see the abort flow through. If
+   * you need a hard hand-off (delete completes before the workflow tears
+   * down), call `runtime.abort(id)` and `await` the stream/execute promise
+   * before calling this.
    *
    * Use cases: GDPR right-to-be-forgotten, operator-driven cleanup of
    * specific runs (e.g. a workflow that recorded PII the user requested
    * scrubbed). For bulk eviction by age, use a `RedisStore` TTL instead
    * (`defaultTtl` / `ttls.executionHistory`).
-   *
-   * Note: this removes the execution from observability, but does NOT
-   * abort an in-flight execution. To abort first, call `runtime.abort(id)`,
-   * then `deleteExecution(id)` after it finishes.
    */
   async deleteExecution(id: string): Promise<boolean> {
-    // Force a lazy-load so the in-memory historical cache reflects
-    // everything in the store before we mutate it. Otherwise we could
-    // "delete" something only-in-store and leave a duplicate in memory
-    // on the next list call after lazy-load fires.
-    await this.getExecutions();
+    const wasActive = this.executions.has(id);
+
+    // Auto-abort: the doc-claimed "doesn't abort" behavior leads to
+    // resurrection — the workflow keeps running, hits `persistExecution`,
+    // and re-creates the row the caller just deleted. Abort + mark-for-skip
+    // honors the caller's delete intent without leaving the workflow
+    // mid-tool-call.
+    if (wasActive) {
+      this.pendingDeletedExecutions.add(id);
+      const controller = this.abortControllers.get(id);
+      if (controller) {
+        controller.abort();
+      }
+    }
+
+    // Lazy-load just THIS id from the store (cheaper than the full list).
+    // Without this, a "delete" on something only-in-store leaves a
+    // duplicate in memory on the next list call after lazy-load fires.
+    await this.getExecution(id);
 
     const removedFromActive = this.executions.delete(id);
     const removedFromHistorical = this.historicalExecutions.delete(id);

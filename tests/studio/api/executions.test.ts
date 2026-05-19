@@ -192,4 +192,45 @@ describe('Studio API: Executions', () => {
     expect(body.ok).toBe(false);
     expect(body.error.code).toBe('READ_ONLY');
   });
+
+  it('DELETE /api/executions/:id scrubs the WS replay buffer for the deleted execution', async () => {
+    const provider = MockProvider.sequence([{ content: 'done' }]);
+    const { app, connMgr } = createTestServer(provider);
+
+    // Seed a completed execution.
+    await app.request('/api/workflows/test-wf/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: { message: 'hi' } }),
+    });
+    const list = await readJson(await app.request('/api/executions'));
+    const id = list.data[0].executionId;
+
+    // Seed the WS replay buffer for this execution channel — broadcast a
+    // terminal event so the buffer is allocated.
+    const channel = `execution:${id}`;
+    connMgr.broadcast(channel, { type: 'done', data: { result: 'ok' } });
+    expect(connMgr._hasReplayBuffer(channel)).toBe(true);
+
+    // DELETE must drop the buffer immediately (not wait for the 30s TTL).
+    const delRes = await app.request(`/api/executions/${id}`, { method: 'DELETE' });
+    expect(delRes.status).toBe(200);
+    expect(connMgr._hasReplayBuffer(channel)).toBe(false);
+  });
+
+  it('GET /api/executions scrubs metadata when redaction is enabled', async () => {
+    const provider = MockProvider.sequence([{ content: 'done' }]);
+    const { app } = createTestServer(provider, { redact: true });
+
+    await app.request('/api/workflows/test-wf/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input: { message: 'hi' },
+        metadata: { userId: 'u-42', tenantId: 't-7' },
+      }),
+    });
+    const list = await readJson(await app.request('/api/executions'));
+    expect(list.data[0].metadata).toEqual({ redacted: true });
+  });
 });

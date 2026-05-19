@@ -54,7 +54,7 @@ describe('redactExecutionInfo', () => {
     expect(out.error).toBe('[redacted]');
   });
 
-  it('preserves metadata when redact is true', () => {
+  it('preserves structural fields when redact is true', () => {
     const info = makeExecution({
       result: { ssn: '123-45-6789' },
     });
@@ -67,6 +67,23 @@ describe('redactExecutionInfo', () => {
     expect(out.duration).toBe(info.duration);
     expect(out.totalCost).toBe(info.totalCost);
     expect(out.startedAt).toBe(info.startedAt);
+  });
+
+  it('scrubs metadata when redact is true (userId/tenantId/correlation ids are PII surfaces)', () => {
+    const info = makeExecution({
+      metadata: { userId: 'u-42', tenantId: 't-7', correlationId: 'r-x' },
+    });
+    const out = redactExecutionInfo(info, true);
+    // metadata is replaced with a presence marker — keeps the field
+    // serializable while scrubbing every key. Mirrors the
+    // `redactPendingDecision` treatment of `decision.metadata`.
+    expect(out.metadata).toEqual({ redacted: true });
+  });
+
+  it('leaves undefined metadata alone (no synthetic redacted marker)', () => {
+    const info = makeExecution({ metadata: undefined });
+    const out = redactExecutionInfo(info, true);
+    expect(out.metadata).toBeUndefined();
   });
 
   it('does not mutate the input', () => {

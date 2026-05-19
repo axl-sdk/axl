@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { unlinkSync, existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import type { ChatMessage } from '../types.js';
 import { MemoryStore } from '../state/memory.js';
 import { SQLiteStore } from '../state/sqlite.js';
 import { RedisStore } from '../state/redis.js';
@@ -138,11 +139,11 @@ describe('MemoryStore', () => {
 
     it('stores deep copies (mutations do not affect stored data)', async () => {
       const store = new MemoryStore();
-      const history = [{ role: 'user' as const, content: 'hello' }];
+      const history: ChatMessage[] = [{ role: 'user', content: 'hello' }];
       await store.saveSession('session-1', history);
 
       // Mutate original
-      history.push({ role: 'assistant' as const, content: 'hi' });
+      history.push({ role: 'assistant', content: 'hi' });
 
       const loaded = await store.getSession('session-1');
       expect(loaded).toHaveLength(1);
@@ -1626,7 +1627,7 @@ describe('RedisStore', () => {
       expect(setData.get('axl:exec-history-ids')?.has('e1')).toBe(false);
     });
 
-    it('deleteExecution is atomic — sRem + del + zRem queued in one MULTI', async () => {
+    it('deleteExecution is atomic — full per-execution sweep queued in one MULTI', async () => {
       const { store, mockClient } = createRedisStoreWithMockClient();
       await store.saveExecution(makeExec('e1', 1000));
 
@@ -1640,12 +1641,54 @@ describe('RedisStore', () => {
 
       await store.deleteExecution('e1');
       expect(captured).toHaveLength(1);
-      expect(captured[0]._queueLength()).toBe(3); // sRem + del + zRem
+      // Per-execution surfaces deleted together: history-set sRem + history
+      // blob del + history zRem + checkpoint del + exec-state del +
+      // pending-set sRem + streaming-events del + streaming-ids sRem = 8.
+      // The full sweep prevents resurrection via the streaming buffer and
+      // closes the GDPR right-to-be-forgotten leak path.
+      expect(captured[0]._queueLength()).toBe(8);
 
       // No single-op delete commands escaped the MULTI
       expect(mockClient.sRem).not.toHaveBeenCalled();
       expect(mockClient.del).not.toHaveBeenCalled();
       expect(mockClient.zRem).not.toHaveBeenCalled();
+    });
+
+    it('deleteExecution sweeps checkpoint, exec-state, and streaming buffer', async () => {
+      const { store, hashData, setData } = createRedisStoreWithMockClient();
+      const data = (store as unknown as { stateData: Map<string, string> }).stateData; // noop reference for completeness
+      void data;
+      await store.saveExecution(makeExec('e1', 1000));
+      await store.saveCheckpoint('e1', 'step1', { v: 1 });
+      await store.saveExecutionState('e1', {
+        workflow: 'wf',
+        input: {},
+        step: 0,
+        status: 'waiting',
+      });
+      await store.appendStreamingEvents!('e1', [
+        {
+          type: 'log',
+          executionId: 'e1',
+          step: 0,
+          timestamp: 1000,
+          data: { msg: 'x' },
+        } as never,
+      ]);
+
+      // Pre: every surface populated
+      expect(hashData.get('axl:checkpoint:e1')?.size ?? 0).toBeGreaterThan(0);
+      expect(setData.get('axl:pending-executions')?.has('e1')).toBe(true);
+      expect(setData.get('axl:streaming-exec-ids')?.has('e1')).toBe(true);
+
+      await store.deleteExecution('e1');
+
+      // Post: every surface scrubbed
+      expect(hashData.has('axl:checkpoint:e1')).toBe(false);
+      expect(setData.get('axl:pending-executions')?.has('e1') ?? false).toBe(false);
+      expect(setData.get('axl:streaming-exec-ids')?.has('e1') ?? false).toBe(false);
+      const remaining = await store.getStreamingEvents!('e1');
+      expect(remaining).toHaveLength(0);
     });
   });
 

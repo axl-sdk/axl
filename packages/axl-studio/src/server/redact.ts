@@ -114,6 +114,14 @@ export function redactExecutionInfo(info: ExecutionInfo, redact: boolean): Execu
     ...info,
     ...(info.result !== undefined ? { result: REDACTED } : {}),
     ...(info.error !== undefined ? { error: REDACTED } : {}),
+    // `metadata` carries operator-supplied tags (userId/tenantId/correlation
+    // ids per the docs) — exactly the surface trace.redact is supposed to
+    // protect. Without this scrub, REST consumers see the metadata bag
+    // even when redaction is enabled, while events[*].data.* is properly
+    // scrubbed. Use a `{ redacted: true }` marker to keep the field
+    // queryable/serializable rather than dropping it (mirrors
+    // `redactPendingDecision` on `decision.metadata`).
+    ...(info.metadata !== undefined ? { metadata: { redacted: true } } : {}),
     events: info.events.map((e) => redactStreamEvent(e, true)),
   };
 }

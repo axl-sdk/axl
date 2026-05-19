@@ -175,7 +175,16 @@ export class MemoryStore implements StateStore {
   }
 
   async deleteExecution(executionId: string): Promise<boolean> {
-    return this.executionHistory.delete(executionId);
+    // Sweep every per-execution surface so a delete is total — checkpoints,
+    // suspended state, streaming buffer all go together. Otherwise a
+    // GDPR-style "scrub this run" call leaves PII reachable via the
+    // remaining keys (e.g. recoverIncompleteStreams could resurrect the
+    // streaming buffer into a new ExecutionInfo).
+    const removed = this.executionHistory.delete(executionId);
+    this.checkpoints.delete(executionId);
+    this.executionStates.delete(executionId);
+    this.streamingEvents.delete(executionId);
+    return removed;
   }
 
   // ── Eval History ──────────────────────────────────────────────────

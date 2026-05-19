@@ -27,7 +27,7 @@ import {
 import type { WindowId } from './aggregates/aggregate-snapshots.js';
 import { createHealthRoutes } from './routes/health.js';
 import { createWorkflowRoutes } from './routes/workflows.js';
-import executionRoutes from './routes/executions.js';
+import { createExecutionRoutes } from './routes/executions.js';
 import { createSessionRoutes } from './routes/sessions.js';
 import agentRoutes from './routes/agents.js';
 import toolRoutes from './routes/tools.js';
@@ -166,7 +166,7 @@ export function createServer(options: CreateServerOptions) {
   const api = new Hono<StudioEnv>();
   api.route('/', createHealthRoutes(readOnly));
   api.route('/', createWorkflowRoutes(connMgr));
-  api.route('/', executionRoutes);
+  api.route('/', createExecutionRoutes(connMgr));
   api.route('/', createSessionRoutes(connMgr));
   api.route('/', agentRoutes);
   api.route('/', toolRoutes);

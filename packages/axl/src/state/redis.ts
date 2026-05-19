@@ -760,15 +760,28 @@ export class RedisStore implements StateStore {
   }
 
   async deleteExecution(executionId: string): Promise<boolean> {
-    // Atomic: data + legacy SET membership + sorted-set membership all
-    // removed together. del()'s return is the "did it exist" signal —
-    // second result in the exec() array (sRem queued first, del second,
-    // zRem third). Symmetric to deleteEvalResult.
+    // Atomic: data blob + index entries + EVERY per-execution side-key
+    // removed together. Without the side-key sweep, a GDPR delete leaves
+    // PII reachable via:
+    //   - checkpoint:{id} (may contain step inputs/outputs)
+    //   - exec-state:{id} (suspended-state snapshot)
+    //   - exec-events:{id} + streaming-exec-ids membership (the streaming
+    //     buffer; recoverIncompleteStreams could resurrect it as a new
+    //     ExecutionInfo on next process start)
+    //
+    // del()'s return is the "did it exist" signal for the canonical row —
+    // second result in the exec() array (sRem queued first, del second).
+    // Symmetric to deleteEvalResult on the index side.
     const [, deletedCount] = await this.client
       .multi()
       .sRem(this.execHistorySetKey(), executionId)
       .del(this.execHistoryKey(executionId))
       .zRem(this.execHistoryZsetKey(), executionId)
+      .del(this.checkpointKey(executionId))
+      .del(this.executionStateKey(executionId))
+      .sRem(this.pendingExecSetKey(), executionId)
+      .del(this.streamingEventsKey(executionId))
+      .sRem(this.streamingIdsKey(), executionId)
       .exec();
     const deleted = typeof deletedCount === 'number' ? deletedCount : 0;
     return deleted > 0;

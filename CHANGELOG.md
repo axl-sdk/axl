@@ -5,10 +5,117 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.17.7] - 2026-05-20
+
+This release makes Axl's state layer production-grade. Three headline capabilities: **crash-survival** for in-flight traces (`state.persist: 'streaming'` + `recoverIncompleteStreams()`), **GDPR right-to-be-forgotten** (`runtime.deleteExecution` with a total per-execution sweep + audit events), and **`RedisStore` hardening** (per-category TTLs, atomic multi-key writes, O(log N) history reads, multi-tenant `keyPrefix`). Plus `ExecutionInfo.metadata` as a queryable tag surface.
+
+All changes are **additive — existing code runs unchanged**. The new `StateStore` methods are optional; `state.persist` defaults to `'terminal'` (the prior behavior). See the [State Store Durability migration guide](./docs/migration/state-store-durability.md) for the operator-facing walkthrough — most consumers need to do nothing.
+
+### Added
+- **`state.persist: 'streaming'` for in-flight trace durability.** New `StateConfig` options:
+  - `persist?: 'terminal' | 'streaming'` — when `'streaming'`, events are batched and flushed to a streaming buffer throughout the run via `StateStore.appendStreamingEvents`. The buffer is finalized when the canonical `executionHistory` blob lands at terminal exit. If the process crashes mid-run, call `runtime.recoverIncompleteStreams()` on the next process to reconstruct a partial `ExecutionInfo` (`status: 'failed'`, `error: 'process terminated (recovered from streaming buffer)'`, `workflow: '__axl/recovered'` when the buffer doesn't include a `workflow_start` event) from the surviving buffer. Default `'terminal'` (back-compat).
+  - `streamingBatchSize?: number` — flush every N events. Default `100`. Set to `1` for per-event flush (one Redis round-trip per emit, highest durability at the cost of latency).
+  - `streamingBatchInterval?: number` — flush at most every N milliseconds. Default `1000`. The "events lost on crash" window is bounded by `min(batchSize-of-events, interval-of-time)`.
+
+  Excluded from the streaming flush even in `'streaming'` mode: `token`, `partial_object`, `string_delta`. These are high-volume stream-only events already filtered from `ExecutionInfo.events`; tokens/partials can be reconstructed from the persisted `agent_call_end.data.response`.
+
+  Four new optional `StateStore` methods (additive — custom stores can adopt incrementally): `appendStreamingEvents`, `finalizeStreamingEvents`, `listStreamingExecutions`, `getStreamingEvents`. `RedisStore` implements all four atomically (RPUSH + SADD in one MULTI on append; DEL + SREM in one MULTI on finalize). `MemoryStore` implements functional stubs (useful for tests; doesn't survive a process crash by design). `SQLiteStore` does not implement streaming — single-process file storage gets less value from crash-survival; configure `state.persist: 'terminal'` (the default) for SQLite-backed installs.
+
+  Save-order is correct on failure: `persistExecution` saves the canonical `executionHistory` blob FIRST, then finalizes the streaming buffer. If `saveExecution` fails, the buffer stays in place so the next process's `recoverIncompleteStreams()` can still reconstruct the partial ExecutionInfo. `runtime.shutdown()` drains the flusher AND awaits all in-flight `persistExecution` chains before closing the state store — so a workflow whose abort triggers a persist-during-shutdown can't race the connection close and lose its canonical row.
+
+  **Scope: workflow executions only.** `runtime.createContext()` flows (ad-hoc contexts used by tool tests, the Studio playground, and evals) do NOT append to the streaming flusher. Those contexts have no terminal `persistExecution` path that would finalize the buffer, so allowing them to write would leave phantom buffers that `recoverIncompleteStreams()` later mis-recovers as failed executions on every process restart. Only `runtime.execute()` / `runtime.stream()` register an executionId as streamable.
+
+  **`recoverIncompleteStreams()` safety:**
+  - Skips ids of executions actively running in the current process — prevents corruption when recovery is invoked while a workflow is still streaming (would otherwise synthesize a `failed` record and delete the live buffer).
+  - Bounds the synthesized `events` array to `state.maxEventsPerExecution` (default 50k). A crashed run with 500k buffered events no longer resurrects as a 500k-element ExecutionInfo; instead, the array is truncated with the same `events_truncated` log sentinel that `pushEventBounded` writes during live runs.
+  - Preserves the streaming buffer when `saveExecution` throws during recovery — the buffer is the only on-disk record at that point, and deleting it on save-failure would lose data. Mirrors the live-workflow save→finalize ordering.
+
+  ```typescript
+  // Production: stream events to Redis for crash-survival
+  const runtime = new AxlRuntime({
+    state: {
+      store: await RedisStore.create('redis://localhost:6379'),
+      persist: 'streaming',
+    },
+  });
+
+  // On the NEXT process, after the previous one crashed:
+  const recovered = await runtime.recoverIncompleteStreams();
+  console.log(`Recovered ${recovered.length} crashed executions`);
+  ```
+
+- **`runtime.deleteExecution(id)` for on-demand cleanup.** Removes an execution from the in-memory active+historical caches and from the configured `StateStore`. Returns `true` if anything was actually removed, `false` if the id was unknown. Symmetric to `runtime.deleteEvalResult(id)`. Use cases: GDPR right-to-be-forgotten, operator-driven cleanup of runs that captured PII the user asked to scrub. New optional `StateStore.deleteExecution?(id): Promise<boolean>` interface method — all three built-in stores implement it.
+
+  **Total per-execution sweep.** Every per-execution Redis key is removed inside one atomic MULTI: the data blob + both indexes (legacy SET + ZSET), the checkpoint hash, the suspended-state blob + its pending-set membership, the streaming buffer list + its in-flight ids set, and the pending `awaitHuman` decision hash field. `MemoryStore` and `SQLiteStore` apply the equivalent multi-table cleanup (Memory via Map deletes; SQLite wraps the deletes in `db.transaction`). Without this sweep, stranded checkpoints / state / streaming buffers leak PII through `recoverIncompleteStreams()` even after the operator "deleted" the run.
+
+  **In-flight resurrection guard.** Calling `deleteExecution(id)` on an actively-running workflow now (a) auto-aborts the execution via its registered abort controller and (b) marks the id in a `pendingDeletedExecutions` set so the workflow's eventual `workflow_end` short-circuits `persistExecution` — preventing the row from being re-created seconds after the operator deleted it. Earlier behavior would have been a hard footgun for GDPR use cases: delete "succeeded," then the running workflow completed and the row reappeared.
+
+  For bulk eviction by age, use `RedisStore` TTLs instead (see TTL config below).
+- **`DELETE /api/executions/:id` Studio endpoint** wrapping `runtime.deleteExecution`. Returns `{ id, deleted: true }` on success or 404 on unknown id. Blocked in `readOnly` mode (405 with `error.code: 'READ_ONLY'`). The route also scrubs the WebSocket replay buffer for the deleted execution channel via the new `ConnectionManager.clearChannelBuffer` method, so late subscribers can't replay events for a GDPR-deleted run for up to 30 seconds after stream completion.
+- **`runtime.on('execution_deleted', ...)` / `runtime.on('eval_deleted', ...)` audit-trail events.** `runtime.deleteExecution(id)` emits `execution_deleted` with `{ executionId, workflow, wasActive, hadPendingDecision, removed }` on every call (including attempts against unknown ids — `removed: false`, `workflow: undefined`). The `workflow` field is captured BEFORE delete and lets compliance pipelines categorize by workflow without a follow-up lookup. `runtime.deleteEvalResult(id)` symmetrically emits `eval_deleted` with `{ id, eval, removed }`. Studio's aggregators (`TraceAggregator`, `ExecutionAggregator`, `EvalAggregator`) all subscribe to these events and trigger an immediate rebuild — without this, deleted runs would linger in Cost Dashboard / Workflow Stats / Trace Stats / Eval Trends snapshots for up to 5 minutes (until the next periodic rebuild). Use for SOC2/GDPR audit logging without wrapping the methods:
+  ```typescript
+  runtime.on('execution_deleted', (e) => {
+    auditLog.write({ event: 'execution.deleted', user: currentOperator(), ...e });
+  });
+  runtime.on('eval_deleted', (e) => {
+    auditLog.write({ event: 'eval.deleted', user: currentOperator(), ...e });
+  });
+  ```
+- **`ExecutionInfo.metadata`.** Caller-supplied metadata from `ExecuteOptions.metadata` (and `runtime.stream()`'s `options.metadata`) now round-trips through `runtime.getExecution()` / `getExecutions()` as a stable, queryable surface for tags like `userId`, `tenantId`, or correlation ids — no event-parsing required. Persisted by all three built-in stores; `SQLiteStore` adds a `metadata` column in schema v3 (auto-migrated on first open). Additive — existing code is unaffected; the field is `undefined` when no metadata is passed. Filter via `runtime.getExecutions()` + an in-process `.filter()`; secondary indexes are intentionally not provided (`StateStore` is a persistence boundary, not a query engine).
+
+  **Internal control-plane keys are stripped before persistence.** The runtime reads `sessionHistory`, `sessionId`, and `resumeMode` directly from `options.metadata` as control-plane channels — silently persisting them in `ExecutionInfo.metadata` would bloat the canonical row with conversation buffers and leak session correlation ids into queryable surfaces. Those three keys are now filtered out of `execInfo.metadata` at lift time; they remain available on `ctx.metadata` for dynamic selectors and on the original `options.metadata` for the runtime's own consumption. The persisted snapshot is also `structuredClone`'d so caller mutations to `options.metadata` after `execute()`/`stream()` returns don't surface through `getExecution(id)` mid-run.
+
+  **Redacted under `config.trace.redact: true`.** Studio's REST list + detail endpoints now scrub `metadata` to `{ redacted: true }` when redaction is on — `userId`, `tenantId`, and correlation ids are exactly the PII surface compliance mode is meant to protect.
+- **`RedisStore` TTL config: `defaultTtl` + per-category overrides.** Without TTLs, every `save*` accumulates forever and Redis eventually OOMs. New options let operators bound the lifetime of each storage category:
+
+  ```typescript
+  await RedisStore.create({
+    url: 'redis://localhost:6379',
+    defaultTtl: 60 * 60 * 24 * 30, // 30 days for everything
+    ttls: {
+      checkpoint: 60 * 60 * 24 * 7,   // shorter for checkpoints
+      executionState: 60 * 60 * 24,   // 1 day for suspend/resume state
+      sessionMeta: null,              // explicit opt-out, even with defaultTtl
+    },
+  });
+  ```
+
+  Categories: `session`, `sessionMeta`, `checkpoint`, `executionState`, `executionHistory`, `evalHistory`, `memory`, `streamingEvents`. Resolution: per-category override beats `defaultTtl`; `null` in an override explicitly opts that category out; omission falls back to `defaultTtl`; non-positive values are treated as "no TTL" defensively (Redis EXPIRE 0 would immediately delete).
+
+  **Window semantics:**
+  - **Sliding** (`memory`, `session`, `sessionMeta`): every write resets the TTL. Active users keep their data; inactive users forget after the configured idle period. All three are user-activity-driven (chat turns, handoff records, summary caches). `sessionMeta` is sliding so handoff history ages out together with its parent session — fixed-window meta against a sliding session caused premature drop-out for actively-used sessions. **Reads do NOT refresh the TTL** — only writes do. A read-only memory workload eventually ages out unless paired with a no-op `ctx.remember` against a sentinel key. Memory + sessionMeta use `EXPIRE`; session uses `SET ... EX` because of its underlying string storage.
+  - **Fixed-creation** (`checkpoint`, `streamingEvents`): TTL set on first write via `EXPIRE NX`; subsequent writes don't extend the window. Matches the "owned by an execution" lifecycle — checkpoints belong to a specific run and should age out together.
+  - **Fixed-refresh** (`executionState`, `executionHistory`, `evalHistory`): TTL applied via `SET ... EX`, which always refreshes on overwrite. `executionState` refreshes so a long-suspended workflow doesn't disappear mid-flight. Execution / eval history entries are immutable after the first write, so refresh-vs-NX is moot for them in practice.
+
+  **Per-category TTLs are independent.** Setting `session: 3600` and `sessionMeta: 86400` will leave orphaned metadata for a session that has already expired, until the metadata TTL fires. If you want session + meta to age out together, set them to the same value (or rely on the same `defaultTtl`).
+
+  **Legacy memory migration applies the configured TTL.** Pre-patch memory data lived at a synthetic `session-meta` location. The race-safe forward migration on `getMemory` now issues `EXPIRE` after a successful `HSETNX` so the migrated entry participates in the same sliding-window eviction as native writes — without this, a legacy entry would be immortal until another `saveMemory` call against the same scope hit the migration timing perfectly.
+
+  **`listPendingExecutions` self-prunes stale ids.** When `executionState` is TTL-configured, the data blob can expire while its membership in the pending-executions set remains. The list method now bulk-MGETs the state blobs, filters the dead pointers, and fires-and-forgets an `SREM` for the stale ids so the pending set doesn't bloat indefinitely.
+
+  **`pendingDecision` is intentionally NOT configurable.** Pending decisions share a single `axl:decisions` hash; a TTL on that key would expire ALL pending decisions at once. Resolve decisions individually via `resolveDecision()` instead.
+
+  **Index-set growth caveat:** TTLs apply only to data blobs. The legacy ID set + sorted-set indexes (for `executionHistory` / `evalHistory`) have no TTL — they're small (just IDs) and reads filter null mGet results, so correctness is preserved. Indexes grow over time as data ages out; manual `ZREMRANGEBYSCORE` + `SREM` during a maintenance window can prune the bloat. Sweeps are not yet automatic — file an issue if you hit the size where this matters.
+
+- **`RedisStore.ttls.streamingEvents` TTL safety net.** New optional per-category TTL for the `state.persist: 'streaming'` per-execution event buffer. Safety net for the scenario where an operator forgets to wire `runtime.recoverIncompleteStreams()` into startup — without this, orphaned buffers from crashed processes accumulate indefinitely. Unlike other TTL categories, `streamingEvents` does NOT fall back to `defaultTtl` — it must be explicitly opted into so a generous default doesn't TTL-evict crashed-run buffers before recovery has a chance to run. Fixed-window via `EXPIRE NX` on first append (so all events for a single run share one lifetime).
+  ```typescript
+  await RedisStore.create({
+    url,
+    defaultTtl: 60 * 60 * 24 * 30, // 30 days
+    ttls: {
+      streamingEvents: 60 * 60 * 24 * 7, // 7 days — must be > your max time-between-restarts
+    },
+  });
+  ```
+
+- **`RedisStore.create({ keyPrefix })` for shared-cluster deployments.** Pass an options object instead of a URL string to override the default `'axl:'` key prefix. Useful when multiple Axl deployments coexist on one Redis cluster (e.g. `'axl:prod:'` vs `'axl:staging:'`) or when sharing a cluster with other applications. The prefix is concatenated as-given — no normalization — so include a trailing colon if you want one. Empty string is rejected at the factory to prevent accidental collisions with non-Axl keys. The URL-only `RedisStore.create('redis://...')` form is unchanged and remains the recommended shorthand when you just want the default prefix.
+
+  ```typescript
+  await RedisStore.create({ url: 'redis://localhost:6379', keyPrefix: 'axl:prod:' });
+  ```
 
 ### Changed
-- **`RedisStore.listExecutions` / `listEvalResults` are now O(log N) instead of O(N).** Both methods used to `SMEMBERS` the full ID set, issue N independent `GET` round-trips, and JS-sort by timestamp — fine at a few hundred entries, painful at 10k+. Each `saveExecution` / `saveEvalResult` now dual-writes the ID into a Redis sorted set scored by `startedAt` / `timestamp` (inside the same MULTI as the data blob, so atomicity is preserved). Reads use `ZREVRANGEBYSCORE` + a single `MGET` for the data blobs — one indexed range lookup + one pipelined bulk fetch, regardless of total entry count. The legacy ID set is still maintained as a fallback read path; `deleteEvalResult` (and `deleteExecution` once #10 lands) remove from both indexes inside the same atomic MULTI. Public method signatures unchanged.
+- **`RedisStore.listExecutions` / `listEvalResults` are now O(log N) instead of O(N).** Both methods used to `SMEMBERS` the full ID set, issue N independent `GET` round-trips, and JS-sort by timestamp — fine at a few hundred entries, painful at 10k+. Each `saveExecution` / `saveEvalResult` now dual-writes the ID into a Redis sorted set scored by `startedAt` / `timestamp` (inside the same MULTI as the data blob, so atomicity is preserved). Reads use a reverse-ordered `ZRANGE ... BYSCORE` + a single `MGET` for the data blobs — one indexed range lookup + one pipelined bulk fetch, regardless of total entry count. The legacy ID set is still maintained as a fallback read path; `deleteEvalResult` and `deleteExecution` both remove from every index inside the same atomic MULTI. Public method signatures unchanged.
 
   **Upgrade path is automatic.** On `RedisStore.create()`, a one-time lazy backfill scans the legacy ID set in 500-entry chunks and populates the sorted set — one round-trip per chunk plus two probes, cheap when there's nothing to do. The call logs `[axl] RedisStore: backfilled N entries into sorted-set index` on completion. For installs at six-figure execution counts where the startup cost is unacceptable, pass `skipMigration: true` to `RedisStore.create()` and call `await store.backfillExecutionIndex()` / `backfillEvalIndex()` manually during a maintenance window. While the sorted set is behind the ID set (skip-migration installs pre-backfill), `listExecutions` / `listEvalResults` transparently fall back to the legacy SET + N×GET + JS-sort path — slower but correct, no missing data.
 
@@ -42,113 +149,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Studio's Memory Browser and `session.fork()` use `getAllMemory`.** If you have pre-patch memory data on `RedisStore`, it won't appear in Studio's Memory Browser and won't be copied by `session.fork()` until each key has been read once (via `ctx.recall()` or any other `getMemory` call), which auto-migrates it to the new layout. For most users the next `ctx.recall()` happens on the very next turn — the gap closes itself.
 
-  Layout: `{prefix}memory:{scope}` is a hash, fields are user-supplied keys, values are JSON-serialized. Hash-per-scope keeps related entries together (good cohesion for the TTL eviction landing in `[0.18.0]`) and bounds the keyspace to O(scopes) instead of O(scopes × keys).
+  Layout: `{prefix}memory:{scope}` is a hash, fields are user-supplied keys, values are JSON-serialized. Hash-per-scope keeps related entries together (good cohesion for the per-category TTL eviction, also in this release) and bounds the keyspace to O(scopes) instead of O(scopes × keys).
 
 - **`MemoryManager` emits a one-shot `console.warn` when used against a custom `StateStore` that doesn't implement memory methods.** Previously, the sessionMeta-fallback path was completely silent — users on custom stores lost `metadata` and `getAllMemory` enumeration with zero signal. Now they get a single warning per offending store listing the four methods to implement. All three built-in stores implement the methods, so no warning fires for users on `MemoryStore` / `SQLiteStore` / `RedisStore`.
-
-### Added
-- **`runtime.on('execution_deleted', ...)` / `runtime.on('eval_deleted', ...)` audit-trail events.** `runtime.deleteExecution(id)` emits `execution_deleted` with `{ executionId, workflow, wasActive, hadPendingDecision, removed }` on every call (including attempts against unknown ids — `removed: false`, `workflow: undefined`). The `workflow` field is captured BEFORE delete and lets compliance pipelines categorize by workflow without a follow-up lookup. `runtime.deleteEvalResult(id)` symmetrically emits `eval_deleted` with `{ id, eval, removed }`. Studio's aggregators (`TraceAggregator`, `ExecutionAggregator`, `EvalAggregator`) all subscribe to these events and trigger an immediate rebuild — without this, deleted runs would linger in Cost Dashboard / Workflow Stats / Trace Stats / Eval Trends snapshots for up to 5 minutes (until the next periodic rebuild). Use for SOC2/GDPR audit logging without wrapping the methods:
-  ```typescript
-  runtime.on('execution_deleted', (e) => {
-    auditLog.write({ event: 'execution.deleted', user: currentOperator(), ...e });
-  });
-  runtime.on('eval_deleted', (e) => {
-    auditLog.write({ event: 'eval.deleted', user: currentOperator(), ...e });
-  });
-  ```
-
-- **`RedisStore.ttls.streamingEvents` TTL safety net.** New optional per-category TTL for the `state.persist: 'streaming'` per-execution event buffer. Safety net for the scenario where an operator forgets to wire `runtime.recoverIncompleteStreams()` into startup — without this, orphaned buffers from crashed processes accumulate indefinitely. Unlike other TTL categories, `streamingEvents` does NOT fall back to `defaultTtl` — it must be explicitly opted into so a generous default doesn't TTL-evict crashed-run buffers before recovery has a chance to run. Fixed-window via `EXPIRE NX` on first append (so all events for a single run share one lifetime).
-  ```typescript
-  await RedisStore.create({
-    url,
-    defaultTtl: 60 * 60 * 24 * 30, // 30 days
-    ttls: {
-      streamingEvents: 60 * 60 * 24 * 7, // 7 days — must be > your max time-between-restarts
-    },
-  });
-  ```
-
-- **`state.persist: 'streaming'` for in-flight trace durability.** New `StateConfig` options:
-  - `persist?: 'terminal' | 'streaming'` — when `'streaming'`, events are batched and flushed to a streaming buffer throughout the run via `StateStore.appendStreamingEvents`. The buffer is finalized when the canonical `executionHistory` blob lands at terminal exit. If the process crashes mid-run, call `runtime.recoverIncompleteStreams()` on the next process to reconstruct a partial `ExecutionInfo` (`status: 'failed'`, `error: 'process terminated (recovered from streaming buffer)'`, `workflow: '__axl/recovered'` when the buffer doesn't include a `workflow_start` event) from the surviving buffer. Default `'terminal'` (back-compat).
-  - `streamingBatchSize?: number` — flush every N events. Default `100`. Set to `1` for per-event flush (one Redis round-trip per emit, highest durability at the cost of latency).
-  - `streamingBatchInterval?: number` — flush at most every N milliseconds. Default `1000`. The "events lost on crash" window is bounded by `min(batchSize-of-events, interval-of-time)`.
-
-  Excluded from the streaming flush even in `'streaming'` mode: `token`, `partial_object`, `string_delta`. These are high-volume stream-only events already filtered from `ExecutionInfo.events`; tokens/partials can be reconstructed from the persisted `agent_call_end.data.response`.
-
-  Four new optional `StateStore` methods (additive — custom stores can adopt incrementally): `appendStreamingEvents`, `finalizeStreamingEvents`, `listStreamingExecutions`, `getStreamingEvents`. `RedisStore` implements all four atomically (RPUSH + SADD in one MULTI on append; DEL + SREM in one MULTI on finalize). `MemoryStore` implements functional stubs (useful for tests; doesn't survive a process crash by design). `SQLiteStore` does not implement streaming — single-process file storage gets less value from crash-survival; configure `state.persist: 'terminal'` (the default) for SQLite-backed installs.
-
-  Save-order is correct on failure: `persistExecution` saves the canonical `executionHistory` blob FIRST, then finalizes the streaming buffer. If `saveExecution` fails, the buffer stays in place so the next process's `recoverIncompleteStreams()` can still reconstruct the partial ExecutionInfo. `runtime.shutdown()` drains the flusher AND awaits all in-flight `persistExecution` chains before closing the state store — so a workflow whose abort triggers a persist-during-shutdown can't race the connection close and lose its canonical row.
-
-  **Scope: workflow executions only.** `runtime.createContext()` flows (ad-hoc contexts used by tool tests, the Studio playground, and evals) do NOT append to the streaming flusher. Those contexts have no terminal `persistExecution` path that would finalize the buffer, so allowing them to write would leave phantom buffers that `recoverIncompleteStreams()` later mis-recovers as failed executions on every process restart. Only `runtime.execute()` / `runtime.stream()` register an executionId as streamable.
-
-  **`recoverIncompleteStreams()` safety:**
-  - Skips ids of executions actively running in the current process — prevents corruption when recovery is invoked while a workflow is still streaming (would otherwise synthesize a `failed` record and delete the live buffer).
-  - Bounds the synthesized `events` array to `state.maxEventsPerExecution` (default 50k). A crashed run with 500k buffered events no longer resurrects as a 500k-element ExecutionInfo; instead, the array is truncated with the same `events_truncated` log sentinel that `pushEventBounded` writes during live runs.
-  - Preserves the streaming buffer when `saveExecution` throws during recovery — the buffer is the only on-disk record at that point, and deleting it on save-failure would lose data. Mirrors the live-workflow save→finalize ordering.
-
-  ```typescript
-  // Production: stream events to Redis for crash-survival
-  const runtime = new AxlRuntime({
-    state: {
-      store: await RedisStore.create('redis://localhost:6379'),
-      persist: 'streaming',
-    },
-  });
-
-  // On the NEXT process, after the previous one crashed:
-  const recovered = await runtime.recoverIncompleteStreams();
-  console.log(`Recovered ${recovered.length} crashed executions`);
-  ```
-
-- **`RedisStore` TTL config: `defaultTtl` + per-category overrides.** Without TTLs, every `save*` accumulates forever and Redis eventually OOMs. New options let operators bound the lifetime of each storage category:
-
-  ```typescript
-  await RedisStore.create({
-    url: 'redis://localhost:6379',
-    defaultTtl: 60 * 60 * 24 * 30, // 30 days for everything
-    ttls: {
-      checkpoint: 60 * 60 * 24 * 7,   // shorter for checkpoints
-      executionState: 60 * 60 * 24,   // 1 day for suspend/resume state
-      sessionMeta: null,              // explicit opt-out, even with defaultTtl
-    },
-  });
-  ```
-
-  Categories: `session`, `sessionMeta`, `checkpoint`, `executionState`, `executionHistory`, `evalHistory`, `memory`. Resolution: per-category override beats `defaultTtl`; `null` in an override explicitly opts that category out; omission falls back to `defaultTtl`; non-positive values are treated as "no TTL" defensively (Redis EXPIRE 0 would immediately delete).
-
-  **Window semantics:**
-  - **Sliding** (`memory`, `session`, `sessionMeta`): every write resets the TTL. Active users keep their data; inactive users forget after the configured idle period. All three are user-activity-driven (chat turns, handoff records, summary caches). `sessionMeta` is sliding so handoff history ages out together with its parent session — fixed-window meta against a sliding session caused premature drop-out for actively-used sessions. **Reads do NOT refresh the TTL** — only writes do. A read-only memory workload eventually ages out unless paired with a no-op `ctx.remember` against a sentinel key. Memory + sessionMeta use `EXPIRE`; session uses `SET ... EX` because of its underlying string storage.
-  - **Fixed-creation** (`checkpoint`): TTL set on first write via `EXPIRE NX`; subsequent writes don't extend the window. Matches the "owned by an execution" lifecycle — checkpoints belong to a specific run and should age out together.
-  - **Fixed-refresh** (`executionState`, `executionHistory`, `evalHistory`): TTL applied via `SET ... EX`, which always refreshes on overwrite. `executionState` refreshes so a long-suspended workflow doesn't disappear mid-flight. Execution / eval history entries are immutable after the first write, so refresh-vs-NX is moot for them in practice.
-
-  **Per-category TTLs are independent.** Setting `session: 3600` and `sessionMeta: 86400` will leave orphaned metadata for a session that has already expired, until the metadata TTL fires. If you want session + meta to age out together, set them to the same value (or rely on the same `defaultTtl`).
-
-  **Legacy memory migration applies the configured TTL.** Pre-patch memory data lived at a synthetic `session-meta` location. The race-safe forward migration on `getMemory` now issues `EXPIRE` after a successful `HSETNX` so the migrated entry participates in the same sliding-window eviction as native writes — without this, a legacy entry would be immortal until another `saveMemory` call against the same scope hit the migration timing perfectly.
-
-  **`listPendingExecutions` self-prunes stale ids.** When `executionState` is TTL-configured, the data blob can expire while its membership in the pending-executions set remains. The list method now bulk-MGETs the state blobs, filters the dead pointers, and fires-and-forgets an `SREM` for the stale ids so the pending set doesn't bloat indefinitely.
-
-  **`pendingDecision` is intentionally NOT configurable.** Pending decisions share a single `axl:decisions` hash; a TTL on that key would expire ALL pending decisions at once. Resolve decisions individually via `resolveDecision()` instead.
-
-  **Index-set growth caveat:** TTLs apply only to data blobs. The legacy ID set + sorted-set indexes (for `executionHistory` / `evalHistory`) have no TTL — they're small (just IDs) and reads filter null mGet results, so correctness is preserved. Indexes grow over time as data ages out; manual `ZREMRANGEBYSCORE` + `SREM` during a maintenance window can prune the bloat. Sweeps are not yet automatic — file an issue if you hit the size where this matters.
-
-- **`runtime.deleteExecution(id)` for on-demand cleanup.** Removes an execution from the in-memory active+historical caches and from the configured `StateStore`. Returns `true` if anything was actually removed, `false` if the id was unknown. Symmetric to `runtime.deleteEvalResult(id)`. Use cases: GDPR right-to-be-forgotten, operator-driven cleanup of runs that captured PII the user asked to scrub. New optional `StateStore.deleteExecution?(id): Promise<boolean>` interface method — all three built-in stores implement it.
-
-  **Total per-execution sweep.** Every per-execution Redis key is removed inside one atomic MULTI: the data blob + both indexes (legacy SET + ZSET), the checkpoint hash, the suspended-state blob + its pending-set membership, the streaming buffer list + its in-flight ids set. `MemoryStore` and `SQLiteStore` apply the equivalent multi-table cleanup (Memory via Map deletes; SQLite wraps the deletes in `db.transaction`). Without this sweep, stranded checkpoints / state / streaming buffers leak PII through `recoverIncompleteStreams()` even after the operator "deleted" the run.
-
-  **In-flight resurrection guard.** Calling `deleteExecution(id)` on an actively-running workflow now (a) auto-aborts the execution via its registered abort controller and (b) marks the id in a `pendingDeletedExecutions` set so the workflow's eventual `workflow_end` short-circuits `persistExecution` — preventing the row from being re-created seconds after the operator deleted it. Earlier behavior was a hard footgun for GDPR use cases: delete "succeeded," then the running workflow completed and the row reappeared.
-
-  For bulk eviction by age, use `RedisStore` TTLs instead (see TTL config above).
-- **`DELETE /api/executions/:id` Studio endpoint** wrapping `runtime.deleteExecution`. Returns `{ id, deleted: true }` on success or 404 on unknown id. Blocked in `readOnly` mode (405 with `error.code: 'READ_ONLY'`). The route also scrubs the WebSocket replay buffer for the deleted execution channel via the new `ConnectionManager.clearChannelBuffer` method, so late subscribers can't replay events for a GDPR-deleted run for up to 30 seconds after stream completion.
-- **`ExecutionInfo.metadata`.** Caller-supplied metadata from `ExecuteOptions.metadata` (and `runtime.stream()`'s `options.metadata`) now round-trips through `runtime.getExecution()` / `getExecutions()` as a stable, queryable surface for tags like `userId`, `tenantId`, or correlation ids — no event-parsing required. Persisted by all three built-in stores; `SQLiteStore` adds a `metadata` column in schema v3 (auto-migrated on first open). Additive — existing code is unaffected; the field is `undefined` when no metadata is passed. Filter via `runtime.getExecutions()` + an in-process `.filter()`; secondary indexes are intentionally not provided (`StateStore` is a persistence boundary, not a query engine).
-
-  **Internal control-plane keys are stripped before persistence.** The runtime reads `sessionHistory`, `sessionId`, and `resumeMode` directly from `options.metadata` as control-plane channels — silently persisting them in `ExecutionInfo.metadata` would bloat the canonical row with conversation buffers and leak session correlation ids into queryable surfaces. Those three keys are now filtered out of `execInfo.metadata` at lift time; they remain available on `ctx.metadata` for dynamic selectors and on the original `options.metadata` for the runtime's own consumption. The persisted snapshot is also `structuredClone`'d so caller mutations to `options.metadata` after `execute()`/`stream()` returns don't surface through `getExecution(id)` mid-run.
-
-  **Redacted under `config.trace.redact: true`.** Studio's REST list + detail endpoints now scrub `metadata` to `{ redacted: true }` when redaction is on — `userId`, `tenantId`, and correlation ids are exactly the PII surface compliance mode is meant to protect.
-- **`RedisStore.create({ keyPrefix })` for shared-cluster deployments.** Pass an options object instead of a URL string to override the default `'axl:'` key prefix. Useful when multiple Axl deployments coexist on one Redis cluster (e.g. `'axl:prod:'` vs `'axl:staging:'`) or when sharing a cluster with other applications. The prefix is concatenated as-given — no normalization — so include a trailing colon if you want one. Empty string is rejected at the factory to prevent accidental collisions with non-Axl keys. The URL-only `RedisStore.create('redis://...')` form is unchanged and remains the recommended shorthand when you just want the default prefix.
-
-  ```typescript
-  await RedisStore.create({ url: 'redis://localhost:6379', keyPrefix: 'axl:prod:' });
-  ```
 
 ## [0.17.6] - 2026-05-13
 

@@ -688,7 +688,7 @@ runtime.on('execution_deleted', (e) => {
 });
 ```
 
-If the execution is still running, the workflow is aborted (and a paused `ctx.awaitHuman()` correctly wakes with `AbortError` — fixed in 0.18.0). The resurrection guard ensures the workflow's eventual `workflow_end` doesn't re-create the row.
+If the execution is still running, the workflow is aborted (and a paused `ctx.awaitHuman()` correctly wakes with `AbortError` — fixed in 0.17.7). The resurrection guard ensures the workflow's eventual `workflow_end` doesn't re-create the row.
 
 `ExecutionInfo.metadata` round-trips from `ExecuteOptions.metadata` (`userId`, `tenantId`, etc.) — queryable via `runtime.getExecutions().filter(...)`. Internal control-plane keys (`sessionHistory`, `sessionId`, `resumeMode`) are stripped before persistence; they remain available via `ctx.metadata` for dynamic selectors.
 

@@ -1,6 +1,6 @@
 # Migration: State Store Durability & Lifecycle
 
-> **Versions:** 0.17.x → 0.18.0
+> **Versions:** 0.17.6 → 0.17.7
 > **Scope:** Anyone using `RedisStore`, custom `StateStore` implementations, `runtime.deleteExecution`, `ExecuteOptions.metadata`, `ctx.awaitHuman`, or `state.persist`. Operators sizing production deployments. Implementers writing their own `StateStore`.
 
 ## TL;DR

@@ -126,7 +126,7 @@ Two operator-facing primitives implement the GDPR deletion contract:
 - Pending `awaitHuman` decision (so it stops surfacing in `runtime.getPendingDecisions()` and the Studio Decisions panel)
 - In-memory resolver closure + abort controller
 
-If the execution is still running, `deleteExecution` aborts it via the registered controller AND adds the id to a `pendingDeletedExecutions` set so the workflow's eventual `workflow_end` does NOT resurrect the row in `persistExecution`. Aborting also correctly wakes a paused `ctx.awaitHuman()` (fixed in 0.18.0 — previously the awaitHuman Promise had no signal listener and hung forever on abort).
+If the execution is still running, `deleteExecution` aborts it via the registered controller AND adds the id to a `pendingDeletedExecutions` set so the workflow's eventual `workflow_end` does NOT resurrect the row in `persistExecution`. Aborting also correctly wakes a paused `ctx.awaitHuman()` (fixed in 0.17.7 — previously the awaitHuman Promise had no signal listener and hung forever on abort).
 
 ```typescript
 await runtime.deleteExecution(executionId);

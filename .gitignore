@@ -13,6 +13,3 @@ coverage/
 .vscode/
 GEMINI.md
 axl.config.*
-# Customer-ask working docs — internal planning, not part of the published repo
-axl-team-asks.md
-axl-team-asks-review.md

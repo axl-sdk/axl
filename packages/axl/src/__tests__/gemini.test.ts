@@ -191,6 +191,191 @@ describe('GeminiProvider', () => {
       expect(response.tool_calls![0].function.arguments).toBe('{"query":"test"}');
     });
 
+    it('preserves functionCall.id from Gemini 3.x responses (non-streaming)', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [
+                    {
+                      functionCall: {
+                        id: 'fc_abc',
+                        name: 'search',
+                        args: { query: 'test' },
+                      },
+                    },
+                  ],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: { promptTokenCount: 20, candidatesTokenCount: 15, totalTokenCount: 35 },
+          }),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Search' }], {
+        model: 'gemini-3.5-flash',
+      });
+
+      expect(response.tool_calls).toHaveLength(1);
+      expect(response.tool_calls![0].id).toBe('fc_abc');
+      const geminiParts = response.providerMetadata?.geminiParts as Array<{
+        functionCall?: { id?: string };
+      }>;
+      expect(geminiParts?.[0].functionCall?.id).toBe('fc_abc');
+    });
+
+    it('includes id in functionResponse when prior assistant carried a Gemini-native id', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('Done')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat(
+        [
+          { role: 'user', content: 'Search for test' },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'fc_abc',
+                type: 'function' as const,
+                function: { name: 'search', arguments: '{"query":"test"}' },
+              },
+            ],
+            providerMetadata: {
+              geminiParts: [
+                {
+                  functionCall: { id: 'fc_abc', name: 'search', args: { query: 'test' } },
+                },
+              ],
+            },
+          },
+          { role: 'tool', content: '{"hits":3}', tool_call_id: 'fc_abc' },
+        ],
+        { model: 'gemini-3.5-flash' },
+      );
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      const userMsgWithFr = body.contents.find((c: any) =>
+        c.parts.some((p: any) => p.functionResponse),
+      );
+      const frPart = userMsgWithFr.parts.find((p: any) => p.functionResponse);
+      expect(frPart.functionResponse.id).toBe('fc_abc');
+      expect(frPart.functionResponse.name).toBe('search');
+      expect(frPart.functionResponse.response).toEqual({ hits: 3 });
+    });
+
+    it('round-trips parallel functionCall ids — both preserved on incoming and echoed on outbound', async () => {
+      // Turn 1: Gemini returns two parallel functionCalls with native ids.
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [
+                    {
+                      functionCall: { id: 'fc_a', name: 'tool_a', args: { x: 1 } },
+                    },
+                    {
+                      functionCall: { id: 'fc_b', name: 'tool_b', args: { y: 2 } },
+                    },
+                  ],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: { promptTokenCount: 30, candidatesTokenCount: 20, totalTokenCount: 50 },
+          }),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Use both' }], {
+        model: 'gemini-3.5-flash',
+      });
+
+      expect(response.tool_calls).toHaveLength(2);
+      expect(response.tool_calls![0].id).toBe('fc_a');
+      expect(response.tool_calls![1].id).toBe('fc_b');
+
+      // Turn 2: replay the assistant message + both tool results back into Gemini.
+      const turn2Mock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('Done')),
+      });
+
+      await provider.chat(
+        [
+          { role: 'user', content: 'Use both' },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: response.tool_calls!,
+            providerMetadata: response.providerMetadata,
+          },
+          { role: 'tool', content: '{"a":1}', tool_call_id: 'fc_a' },
+          { role: 'tool', content: '{"b":2}', tool_call_id: 'fc_b' },
+        ],
+        { model: 'gemini-3.5-flash' },
+      );
+
+      const body = JSON.parse(turn2Mock.mock.calls[0][1].body);
+      // Tool messages collapse via mergeConsecutiveRoles into one user content with two parts.
+      const userContents = body.contents.filter((c: any) =>
+        c.parts.some((p: any) => p.functionResponse),
+      );
+      const allFrParts = userContents.flatMap((c: any) =>
+        c.parts.filter((p: any) => p.functionResponse),
+      );
+      expect(allFrParts).toHaveLength(2);
+      const byId = new Map<string, any>(allFrParts.map((p: any) => [p.functionResponse.id, p]));
+      expect(byId.get('fc_a')?.functionResponse.name).toBe('tool_a');
+      expect(byId.get('fc_a')?.functionResponse.response).toEqual({ a: 1 });
+      expect(byId.get('fc_b')?.functionResponse.name).toBe('tool_b');
+      expect(byId.get('fc_b')?.functionResponse.response).toEqual({ b: 2 });
+    });
+
+    it('omits id in functionResponse for Gemini 2.x (no native id seen)', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve(makeGeminiResponse('Done')),
+      });
+
+      const provider = new GeminiProvider();
+      await provider.chat(
+        [
+          { role: 'user', content: 'Search for test' },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_0',
+                type: 'function' as const,
+                function: { name: 'search', arguments: '{"query":"test"}' },
+              },
+            ],
+            // No providerMetadata.geminiParts → 2.x case (or first turn without round-trip).
+          },
+          { role: 'tool', content: '{"hits":3}', tool_call_id: 'call_0' },
+        ],
+        { model: 'gemini-2.0-flash' },
+      );
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      const userMsgWithFr = body.contents.find((c: any) =>
+        c.parts.some((p: any) => p.functionResponse),
+      );
+      const frPart = userMsgWithFr.parts.find((p: any) => p.functionResponse);
+      expect(frPart.functionResponse.id).toBeUndefined();
+      expect(frPart.functionResponse.name).toBe('search');
+    });
+
     it('maps tool messages to user messages with functionResponse parts', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('Done')),
@@ -408,6 +593,28 @@ describe('GeminiProvider', () => {
       // NOT gemini-2.5-flash: [0.3e-6, 2.5e-6]
       // Expected: 1000 * 0.1e-6 = 0.0001
       expect(response.cost).toBeCloseTo(0.0001, 8);
+    });
+
+    it('resolves versioned gemini-3.5-flash IDs to the base rate', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve(
+            makeGeminiResponse('Hi', {
+              promptTokenCount: 1000,
+              candidatesTokenCount: 0,
+              totalTokenCount: 1000,
+            }),
+          ),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.5-flash-001',
+      });
+
+      // Should match gemini-3.5-flash: [1.5e-6, 9e-6]
+      // Expected: 1000 * 1.5e-6 = 0.0015
+      expect(response.cost).toBeCloseTo(0.0015, 8);
     });
 
     it('handles API errors gracefully', async () => {
@@ -1674,6 +1881,44 @@ describe('GeminiProvider', () => {
         name: 'search',
         arguments: '{"q":"test"}',
       });
+    });
+
+    it('preserves functionCall.id from Gemini 3.x responses (streaming)', async () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const chunk = {
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [{ functionCall: { id: 'fc_abc', name: 'search', args: { q: 'test' } } }],
+                },
+              },
+            ],
+            usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+          };
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+          controller.close();
+        },
+      });
+
+      mockFetch({ body: stream });
+
+      const provider = new GeminiProvider();
+      const gen = provider.stream([{ role: 'user', content: 'Search' }], {
+        model: 'gemini-3.5-flash',
+      });
+
+      const chunks: any[] = [];
+      for await (const c of gen) {
+        chunks.push(c);
+      }
+
+      const toolDelta = chunks.find((c) => c.type === 'tool_call_delta');
+      expect(toolDelta).toBeDefined();
+      expect(toolDelta.id).toBe('fc_abc');
+      expect(toolDelta.name).toBe('search');
     });
 
     it('yields thinking_delta for thought parts and text_delta for regular parts', async () => {

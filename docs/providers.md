@@ -74,6 +74,7 @@ anthropic:claude-3-haiku        # Legacy
 
 ```
 google:gemini-3.1-pro-preview        # Most capable (preview)
+google:gemini-3.5-flash              # Fast (GA)
 google:gemini-3-flash-preview        # Fast (preview)
 google:gemini-3.1-flash-lite         # Cheapest (GA)
 google:gemini-2.5-pro                # Previous gen (most capable)
@@ -219,7 +220,7 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 - **Anthropic 4.5** (Opus 4.5): Supports `output_config.effort` but not adaptive thinking. Temperature passes through. `effort: 'xhigh'` clamps to `'high'`.
 - **Anthropic older**: Falls back to manual thinking (`budget_tokens`). No `effort` support.
 - **Anthropic + maxTokens**: Auto-bumps `max_tokens` when thinking budget exceeds it (`budget + 1024`).
-- **Gemini 3.x** (gemini-3-*, gemini-3.1-*): Uses `thinkingLevel` string enum. **Cannot fully disable thinking** — `effort: 'none'` maps to the model's minimum level (`'minimal'` for most models, `'low'` for 3.1 Pro). Axl emits a one-time console warning when this happens. `thinkingBudget: N` maps to nearest level (≤1024→low, ≤5000→medium, >5000→high).
+- **Gemini 3.x** (gemini-3-*, gemini-3.1-*, gemini-3.5-*): Uses `thinkingLevel` string enum. **Cannot fully disable thinking** — `effort: 'none'` maps to the model's minimum level (`'minimal'` for most models, `'low'` for 3.1 Pro). Axl emits a one-time console warning when this happens. `thinkingBudget: N` maps to nearest level (≤1024→low, ≤5000→medium, >5000→high).
 - **Gemini 2.x**: Uses integer `thinkingBudget`. Can be set to 0 to disable.
 - **`includeThoughts`**: Returns thought/reasoning summaries. Works on Gemini (`includeThoughts` in `thinkingConfig`) and OpenAI Responses API (`reasoning.summary: 'detailed'`). No-op on Anthropic (thoughts always returned when thinking active) and OpenAI Chat Completions.
 

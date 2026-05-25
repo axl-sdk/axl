@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`google:gemini-3.5-flash` pricing.** Adds the GA identifier to `GEMINI_PRICING` at $1.50 input / $9.00 output per 1M tokens (cached input $0.15/1M — the standard 10% of input rate, no special-casing needed). The 3.x code paths (`isGemini3x` regex `^gemini-3[.-]`, `thinkingLevel` mapping, `minThinkingLevel`) already covered the model — this release adds pricing only. Versioned identifiers (`gemini-3.5-flash-001`-style) resolve to the same rate via the existing longest-prefix matcher.
+
+### Fixed
+- **Gemini provider now round-trips `functionCall.id` end-to-end for Gemini 3.x models.** Per Google's function-calling docs, Gemini 3 always returns a unique `id` on every `functionCall` and requires it back in the matching `functionResponse` so the model can correlate results to calls. Previously Axl generated a synthetic id (`call_N`) on incoming and built `functionResponse` without `id`, which could cause `gemini-3.5-flash` (and other 3.x models) to misattribute results in turns that issued parallel tool calls. The fix is asymmetric — the assistant-side round-trip via `providerMetadata.geminiParts` already preserved the id verbatim; only the incoming-id capture and outbound `functionResponse` build needed updating. Gemini 2.x behavior is unchanged: when no native `functionCall.id` has been observed in the conversation, the outbound `functionResponse` omits the `id` field (bit-for-bit identical payload to before).
+
 ## [0.17.7] - 2026-05-20
 
 This release makes Axl's state layer production-grade. Three headline capabilities: **crash-survival** for in-flight traces (`state.persist: 'streaming'` + `recoverIncompleteStreams()`), **GDPR right-to-be-forgotten** (`runtime.deleteExecution` with a total per-execution sweep + audit events), and **`RedisStore` hardening** (per-category TTLs, atomic multi-key writes, O(log N) history reads, multi-tenant `keyPrefix`). Plus `ExecutionInfo.metadata` as a queryable tag surface.

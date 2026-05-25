@@ -117,6 +117,7 @@ const GEMINI_PRICING: Record<string, [number, number]> = {
   'gemini-3.1-pro-preview': [2e-6, 12e-6],
   'gemini-3.1-flash-lite': [0.25e-6, 1.5e-6],
   'gemini-3.1-flash-lite-preview': [0.25e-6, 1.5e-6],
+  'gemini-3.5-flash': [1.5e-6, 9e-6],
 };
 
 /** Pre-sorted keys (longest first) for prefix matching versioned model names. */
@@ -441,12 +442,25 @@ export class GeminiProvider implements Provider {
    * from assistant messages, then use it when mapping tool result messages.
    */
   private mapMessages(messages: ChatMessage[]): GeminiContent[] {
-    // Pass 1: build tool_call_id -> function name mapping
+    // Pass 1: build tool_call_id -> function name mapping, and collect the set of
+    // ids that originated natively from Gemini (present in a prior assistant
+    // message's providerMetadata.geminiParts). Gemini 3.x requires the id be
+    // echoed back in functionResponse; Gemini 2.x doesn't emit ids, so we must
+    // NOT send one in that case (preserves 2.x behavior bit-for-bit).
     const toolCallIdToName = new Map<string, string>();
+    const geminiNativeIds = new Set<string>();
     for (const msg of messages) {
       if (msg.role === 'assistant' && msg.tool_calls) {
         for (const tc of msg.tool_calls) {
           toolCallIdToName.set(tc.id, tc.function.name);
+        }
+      }
+      if (msg.role === 'assistant') {
+        const rawParts = msg.providerMetadata?.geminiParts as GeminiPart[] | undefined;
+        if (rawParts) {
+          for (const p of rawParts) {
+            if (p.functionCall?.id) geminiNativeIds.add(p.functionCall.id);
+          }
         }
       }
     }
@@ -498,16 +512,23 @@ export class GeminiProvider implements Provider {
         } catch {
           responseData = { result: msg.content };
         }
+        const functionResponse: {
+          id?: string;
+          name: string;
+          response: Record<string, unknown>;
+        } = {
+          name: functionName,
+          response: responseData as Record<string, unknown>,
+        };
+        // Gemini 3.x requires the id from the originating functionCall be echoed
+        // here. Only include it when this id was native to a prior Gemini turn,
+        // so Gemini 2.x payloads stay unchanged.
+        if (msg.tool_call_id && geminiNativeIds.has(msg.tool_call_id)) {
+          functionResponse.id = msg.tool_call_id;
+        }
         result.push({
           role: 'user',
-          parts: [
-            {
-              functionResponse: {
-                name: functionName,
-                response: responseData as Record<string, unknown>,
-              },
-            },
-          ],
+          parts: [{ functionResponse }],
         });
       } else if (msg.role === 'user') {
         result.push({ role: 'user', parts: [{ text: msg.content }] });
@@ -592,8 +613,11 @@ export class GeminiProvider implements Provider {
         } else if (part.text) {
           content += part.text;
         } else if (part.functionCall) {
+          // Gemini 3.x returns a unique `id` on every functionCall and requires it
+          // back in the matching functionResponse. Use it directly when present so
+          // the tool-result echo (handled in mapMessages) can include it.
           toolCalls.push({
-            id: `call_${this.callCounter++}`,
+            id: part.functionCall.id || `call_${this.callCounter++}`,
             type: 'function',
             function: {
               name: part.functionCall.name,
@@ -705,10 +729,12 @@ export class GeminiProvider implements Provider {
               } else if (part.text) {
                 yield { type: 'text_delta', content: part.text };
               } else if (part.functionCall) {
-                // Gemini sends complete functionCall objects (not incremental deltas)
+                // Gemini sends complete functionCall objects (not incremental deltas).
+                // Preserve Gemini 3.x's native `id` so mapMessages can echo it back
+                // in the matching functionResponse on the next turn.
                 yield {
                   type: 'tool_call_delta',
-                  id: `call_${this.callCounter++}`,
+                  id: part.functionCall.id || `call_${this.callCounter++}`,
                   name: part.functionCall.name,
                   arguments: JSON.stringify(part.functionCall.args),
                 };
@@ -751,8 +777,8 @@ export class GeminiProvider implements Provider {
  */
 type GeminiPart = {
   text?: string;
-  functionCall?: { name: string; args: Record<string, unknown> };
-  functionResponse?: { name: string; response: Record<string, unknown> };
+  functionCall?: { id?: string; name: string; args: Record<string, unknown> };
+  functionResponse?: { id?: string; name: string; response: Record<string, unknown> };
   [key: string]: unknown;
 };
 
@@ -768,7 +794,7 @@ type GeminiResponse = {
       parts: Array<{
         text?: string;
         thought?: boolean;
-        functionCall?: { name: string; args: Record<string, unknown> };
+        functionCall?: { id?: string; name: string; args: Record<string, unknown> };
         [key: string]: unknown;
       }>;
     };

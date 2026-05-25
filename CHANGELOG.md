@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.17.8] - 2026-05-25
+
+A small Gemini-focused release: ship pricing for the new `gemini-3.5-flash` GA model, and fix a latent function-call correlation gap that surfaces under parallel tool calls on Gemini 3.x.
 
 ### Added
 - **`google:gemini-3.5-flash` pricing.** Adds the GA identifier to `GEMINI_PRICING` at $1.50 input / $9.00 output per 1M tokens (cached input $0.15/1M — the standard 10% of input rate, no special-casing needed). The 3.x code paths (`isGemini3x` regex `^gemini-3[.-]`, `thinkingLevel` mapping, `minThinkingLevel`) already covered the model — this release adds pricing only. Versioned identifiers (`gemini-3.5-flash-001`-style) resolve to the same rate via the existing longest-prefix matcher.

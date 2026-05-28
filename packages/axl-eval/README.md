@@ -185,6 +185,32 @@ const qualityJudge = llmScorer({ name: 'quality', model: 'openai:gpt-4o', ... })
 const safetyJudge = llmScorer({ name: 'safety', model: 'anthropic:claude-sonnet-4-5-20250514', ... });
 ```
 
+#### Tuning the judge
+
+For reasoning-capable judge models (gpt-5.x, Anthropic Opus/Sonnet 4.5+, Gemini 3.x), `effort` is the highest-leverage knob — judges with reasoning enabled are materially more consistent. The full `ChatOptions` surface is forwarded:
+
+```typescript
+const carefulJudge = llmScorer({
+  name: 'careful',
+  description: 'Reasoning-grade quality judge',
+  model: 'openai-responses:gpt-5',
+  system: 'Rate output quality and explain your reasoning.',
+  effort: 'high',              // huge calibration improvement on reasoning models
+  maxTokens: 1024,             // cap chatty judges to control spend
+  includeThoughts: true,       // surface reasoning summaries — Gemini + openai-responses only
+  // thinkingBudget: 4096,     // precise token budget (advanced)
+  // stop: ['\n###'],          // stop sequences
+  // providerOptions: { ... }, // provider-specific escape hatch
+});
+```
+
+A note on a few of the knobs:
+
+- **`includeThoughts`** is a no-op on Anthropic and the `openai:` (Chat Completions) provider. Use `openai-responses:` or any `google:` model to actually receive reasoning summaries.
+- **`providerOptions`** is merged last into the raw API request, so it can override anything Axl computes — including `responseFormat`. To switch the judge to strict JSON Schema mode on providers that support it (OpenAI Chat Completions, OpenAI Responses, Gemini), pass `providerOptions: { response_format: { type: 'json_schema', json_schema: { name: 'judgment', strict: true, schema: <your-schema-as-json> } } }`. The downstream `extractJson` pipeline handles either shape.
+
+The eval runner also propagates its `AbortSignal` into the judge call, so cancelling a run aborts in-flight LLM calls mid-flight (instead of letting the connection finish and silently completing a doomed item).
+
 ## Running Evals
 
 ### CLI

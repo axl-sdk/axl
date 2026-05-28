@@ -7,6 +7,10 @@ import { randomUUID } from 'node:crypto';
 
 export type RescoreOptions = {
   concurrency?: number;
+  /** Abort signal forwarded into ScorerContext so in-flight LLM scorer calls can
+   *  be cancelled mid-flight. Also checked between items to short-circuit
+   *  remaining work. Mirrors `RunEvalOptions.signal`. */
+  signal?: AbortSignal;
 };
 
 /**
@@ -32,12 +36,28 @@ export async function rescore(
       }
       return runtime.resolveProvider(uri);
     },
+    signal: options?.signal,
   };
 
   const rescored: EvalItem[] = new Array(result.items.length);
   let totalCost = 0;
 
   async function rescoreItem(original: EvalItem, itemIndex: number): Promise<void> {
+    // Short-circuit if the rescore has been cancelled — matches runEval's
+    // between-items signal check (runner.ts) so cancellation behaves the same
+    // in both paths. In-flight LLM scorer calls additionally abort via
+    // scorerContext.signal → provider.chat({ signal }).
+    if (options?.signal?.aborted) {
+      rescored[itemIndex] = {
+        input: original.input,
+        annotations: original.annotations,
+        output: original.output,
+        error: 'cancelled',
+        scores: {},
+      };
+      return;
+    }
+
     // Pass through error items without scoring
     if (original.error) {
       rescored[itemIndex] = {

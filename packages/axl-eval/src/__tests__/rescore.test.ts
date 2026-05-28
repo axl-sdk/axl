@@ -9,9 +9,8 @@ const mockRuntime = {} as AxlRuntime;
 function makeResult(overrides: Partial<EvalResult> = {}): EvalResult {
   return {
     id: 'original-id',
-    workflow: 'test-wf',
     dataset: 'test-ds',
-    metadata: {},
+    metadata: { workflows: ['test-wf'] },
     timestamp: '2024-01-01T00:00:00.000Z',
     totalCost: 0.01,
     duration: 500,
@@ -281,5 +280,64 @@ describe('rescore()', () => {
         expect(item.metadata!.agentCalls).toBe(1);
       }
     }
+  });
+
+  describe('signal propagation', () => {
+    it('forwards signal into ScorerContext so LLM scorers can abort mid-flight', async () => {
+      const result = makeResult();
+      const controller = new AbortController();
+      let capturedSignal: AbortSignal | undefined;
+
+      const signalCapturingScorer: Scorer = {
+        name: 'capture',
+        description: 'captures the signal',
+        isLlm: true,
+        score: (_o, _i, _a, ctx) => {
+          capturedSignal = ctx?.signal;
+          return 1;
+        },
+      };
+
+      await rescore(result, [signalCapturingScorer], mockRuntime, {
+        signal: controller.signal,
+      });
+
+      expect(capturedSignal).toBe(controller.signal);
+    });
+
+    it('omits signal from ScorerContext when none provided', async () => {
+      const result = makeResult();
+      let capturedSignal: AbortSignal | undefined = new AbortController().signal;
+
+      const signalCapturingScorer: Scorer = {
+        name: 'capture',
+        description: 'captures the signal',
+        isLlm: true,
+        score: (_o, _i, _a, ctx) => {
+          capturedSignal = ctx?.signal;
+          return 1;
+        },
+      };
+
+      await rescore(result, [signalCapturingScorer], mockRuntime);
+
+      expect(capturedSignal).toBeUndefined();
+    });
+
+    it('short-circuits remaining items when signal is already aborted', async () => {
+      const result = makeResult();
+      const controller = new AbortController();
+      controller.abort();
+
+      const rescored = await rescore(result, [alwaysOneScorer], mockRuntime, {
+        signal: controller.signal,
+      });
+
+      // Every item should be marked cancelled — none should have been scored.
+      for (const item of rescored.items) {
+        expect(item.error).toBe('cancelled');
+        expect(item.scores['always-one']).toBeUndefined();
+      }
+    });
   });
 });

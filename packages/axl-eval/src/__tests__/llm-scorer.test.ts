@@ -1,17 +1,24 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
+import type { Provider } from '@axlsdk/axl';
 import { llmScorer } from '../llm-scorer.js';
 import type { ScorerContext, ScorerResult } from '../scorer.js';
 
-/** Helper to create a ScorerContext that returns the given mock provider. */
-function mockContext(mockProvider: {
-  chat: (...args: any[]) => Promise<{ content: string; cost?: number }>;
-}): ScorerContext {
+/** Helper to create a ScorerContext that returns the given mock provider.
+ *  The mock only needs `chat`; we cast through `unknown` to satisfy the full
+ *  Provider interface without forcing every test to stub `stream` / `name`. */
+function mockContext(
+  mockProvider: {
+    chat: (...args: any[]) => Promise<{ content: string; cost?: number }>;
+  },
+  options?: { signal?: AbortSignal },
+): ScorerContext {
   return {
     resolveProvider: (uri: string) => ({
-      provider: mockProvider,
+      provider: mockProvider as unknown as Provider,
       model: uri.includes(':') ? uri.split(':').slice(1).join(':') : uri,
     }),
+    signal: options?.signal,
   };
 }
 
@@ -633,5 +640,138 @@ describe('llmScorer()', () => {
     expect(userMessage).toContain('Annotations');
     expect(userMessage).toContain('expectedAnswer');
     expect(userMessage).toContain('42');
+  });
+
+  describe('ChatOptions passthrough', () => {
+    function capturingProvider() {
+      let capturedOptions: any = {};
+      const provider = {
+        async chat(_messages: any[], options: any) {
+          capturedOptions = options;
+          return { content: JSON.stringify({ score: 0.5, reasoning: 'OK' }) };
+        },
+      };
+      return {
+        provider,
+        get captured() {
+          return capturedOptions;
+        },
+      };
+    }
+
+    it('forwards effort to provider.chat', async () => {
+      const harness = capturingProvider();
+      const s = llmScorer({ ...defaultConfig, effort: 'high' });
+      await s.score('o', 'i', undefined, mockContext(harness.provider));
+      expect(harness.captured.effort).toBe('high');
+    });
+
+    it('forwards thinkingBudget to provider.chat', async () => {
+      const harness = capturingProvider();
+      const s = llmScorer({ ...defaultConfig, thinkingBudget: 4096 });
+      await s.score('o', 'i', undefined, mockContext(harness.provider));
+      expect(harness.captured.thinkingBudget).toBe(4096);
+    });
+
+    it('forwards includeThoughts to provider.chat', async () => {
+      const harness = capturingProvider();
+      const s = llmScorer({ ...defaultConfig, includeThoughts: true });
+      await s.score('o', 'i', undefined, mockContext(harness.provider));
+      expect(harness.captured.includeThoughts).toBe(true);
+    });
+
+    it('forwards maxTokens to provider.chat', async () => {
+      const harness = capturingProvider();
+      const s = llmScorer({ ...defaultConfig, maxTokens: 256 });
+      await s.score('o', 'i', undefined, mockContext(harness.provider));
+      expect(harness.captured.maxTokens).toBe(256);
+    });
+
+    it('forwards stop sequences to provider.chat', async () => {
+      const harness = capturingProvider();
+      const s = llmScorer({ ...defaultConfig, stop: ['END', '###'] });
+      await s.score('o', 'i', undefined, mockContext(harness.provider));
+      expect(harness.captured.stop).toEqual(['END', '###']);
+    });
+
+    it('forwards providerOptions to provider.chat', async () => {
+      const harness = capturingProvider();
+      const s = llmScorer({
+        ...defaultConfig,
+        providerOptions: { logprobs: true, seed: 42 },
+      });
+      await s.score('o', 'i', undefined, mockContext(harness.provider));
+      expect(harness.captured.providerOptions).toEqual({ logprobs: true, seed: 42 });
+    });
+
+    it('leaves new fields undefined when not configured (no accidental defaults)', async () => {
+      const harness = capturingProvider();
+      const s = llmScorer(defaultConfig);
+      await s.score('o', 'i', undefined, mockContext(harness.provider));
+      expect(harness.captured.effort).toBeUndefined();
+      expect(harness.captured.thinkingBudget).toBeUndefined();
+      expect(harness.captured.includeThoughts).toBeUndefined();
+      expect(harness.captured.maxTokens).toBeUndefined();
+      expect(harness.captured.stop).toBeUndefined();
+      expect(harness.captured.providerOptions).toBeUndefined();
+    });
+
+    it('forwards signal from ScorerContext to provider.chat', async () => {
+      const harness = capturingProvider();
+      const controller = new AbortController();
+      const s = llmScorer(defaultConfig);
+      await s.score(
+        'o',
+        'i',
+        undefined,
+        mockContext(harness.provider, { signal: controller.signal }),
+      );
+      expect(harness.captured.signal).toBe(controller.signal);
+    });
+
+    it('omits signal when ScorerContext has none', async () => {
+      const harness = capturingProvider();
+      const s = llmScorer(defaultConfig);
+      await s.score('o', 'i', undefined, mockContext(harness.provider));
+      expect(harness.captured.signal).toBeUndefined();
+    });
+
+    it('all new fields coexist with temperature default', async () => {
+      const harness = capturingProvider();
+      const controller = new AbortController();
+      const s = llmScorer({
+        ...defaultConfig,
+        // temperature deliberately omitted — should default to 0.2
+        maxTokens: 512,
+        effort: 'high',
+        thinkingBudget: 2048,
+        includeThoughts: true,
+        stop: ['END'],
+        providerOptions: { seed: 7 },
+      });
+      await s.score(
+        'o',
+        'i',
+        undefined,
+        mockContext(harness.provider, { signal: controller.signal }),
+      );
+      expect(harness.captured.temperature).toBe(0.2);
+      expect(harness.captured.maxTokens).toBe(512);
+      expect(harness.captured.effort).toBe('high');
+      expect(harness.captured.thinkingBudget).toBe(2048);
+      expect(harness.captured.includeThoughts).toBe(true);
+      expect(harness.captured.stop).toEqual(['END']);
+      expect(harness.captured.providerOptions).toEqual({ seed: 7 });
+      expect(harness.captured.signal).toBe(controller.signal);
+      // Hardcoded responseFormat must still be present and unchanged.
+      expect(harness.captured.responseFormat).toEqual({ type: 'json_object' });
+    });
+
+    it('preserves explicit temperature: 0 (does not fall through to default)', async () => {
+      const harness = capturingProvider();
+      const s = llmScorer({ ...defaultConfig, temperature: 0 });
+      await s.score('o', 'i', undefined, mockContext(harness.provider));
+      expect(harness.captured.temperature).toBe(0);
+    });
   });
 });

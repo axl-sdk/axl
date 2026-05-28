@@ -32,6 +32,27 @@ const KNOWN_FLAGS = new Set([
   '--capture-traces',
 ]);
 
+/** Install a SIGINT/SIGTERM handler that aborts an in-flight eval gracefully.
+ *  First signal: aborts the controller so runEval / rescore propagate cancellation
+ *  through ScorerContext.signal into in-flight provider.chat calls. The eval
+ *  unwinds normally and runtime.shutdown() runs in the `finally` block.
+ *  Second signal: hard exit — the user has signalled twice; cleanup is hung
+ *  or taking too long, so we abandon gracefulness rather than appear frozen. */
+function installAbortHandler(controller: AbortController): void {
+  let signalled = false;
+  const onSignal = (sig: NodeJS.Signals) => {
+    if (signalled) {
+      console.error(`\n[axl-eval] Second ${sig} — forcing exit.`);
+      process.exit(130);
+    }
+    signalled = true;
+    console.error(`\n[axl-eval] ${sig} received — cancelling eval (press again to force exit)...`);
+    controller.abort();
+  };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+}
+
 async function main() {
   const args = process.argv.slice(2);
 
@@ -63,16 +84,23 @@ When no config is found, a bare AxlRuntime is created (providers from env vars).
   }
 
   if (args[0] === 'compare') {
+    // `compare` is pure computation — no LLM calls, no AbortSignal plumbing needed.
     await runCompare(args.slice(1));
     return;
   }
 
+  // SIGINT/SIGTERM aborts in-flight LLM calls (eval + rescore) instead of leaving
+  // the process to hard-exit mid-request, which would skip runtime.shutdown() and
+  // leak streaming-buffer state.
+  const controller = new AbortController();
+  installAbortHandler(controller);
+
   if (args[0] === 'rescore') {
-    await runRescore(args.slice(1));
+    await runRescore(args.slice(1), controller.signal);
     return;
   }
 
-  await runEvalCommand(args);
+  await runEvalCommand(args, controller.signal);
 }
 
 function parseThresholdArg(args: string[]): Record<string, number> | number | undefined {
@@ -179,7 +207,7 @@ async function runCompare(args: string[]) {
   }
 }
 
-async function runRescore(args: string[]) {
+async function runRescore(args: string[], signal: AbortSignal) {
   const { outputPath, configArg, conditions, paths } = parseEvalArgs(args);
 
   if (paths.length < 2) {
@@ -209,7 +237,8 @@ async function runRescore(args: string[]) {
 
     const rescored: EvalResult[] = [];
     for (const resultData of results) {
-      rescored.push(await rescore(resultData, evalConfig.scorers, runtime));
+      if (signal.aborted) break;
+      rescored.push(await rescore(resultData, evalConfig.scorers, runtime, { signal }));
     }
 
     for (const r of rescored) {
@@ -490,7 +519,7 @@ function parseEvalArgs(args: string[]): {
 
 // ── Main eval command ──────────────────────────────────────────────
 
-async function runEvalCommand(args: string[]) {
+async function runEvalCommand(args: string[], signal: AbortSignal) {
   const { outputPath, configArg, conditions, runs, captureTraces, paths } = parseEvalArgs(args);
 
   if (paths.length === 0) {
@@ -514,6 +543,9 @@ async function runEvalCommand(args: string[]) {
 
   try {
     for (const filePath of evalFiles) {
+      // Short-circuit if the user aborted between eval files. The in-flight eval
+      // unwinds on its own via runEval({ signal }); this prevents starting the next one.
+      if (signal.aborted) break;
       try {
         const mod = await importModule(path.resolve(filePath), import.meta.url);
         const evalConfig = pickDefault<EvalConfig>(mod);
@@ -616,7 +648,9 @@ async function runEvalCommand(args: string[]) {
         // error). Nested trackExecution scopes walk the AsyncLocalStorage
         // parent chain, so the outer trackExecution above still observes
         // cost/metadata correctly.
-        const runOptions = captureTraces ? { captureTraces: true } : undefined;
+        // Always pass the SIGINT-driven signal so Ctrl+C aborts in-flight
+        // workflows + scorer LLM calls instead of dropping the connection mid-request.
+        const runOptions = { signal, ...(captureTraces ? { captureTraces: true } : {}) };
 
         if (runs > 1) {
           // Multi-run mode. Buffer per-run results locally so we can mark the
@@ -634,6 +668,7 @@ async function runEvalCommand(args: string[]) {
           let runFailure: Error | undefined;
 
           for (let r = 0; r < runs; r++) {
+            if (signal.aborted) break;
             console.error(`[axl-eval] Run ${r + 1}/${runs}...`);
             try {
               const result = await runEval(evalConfig, executeWorkflow, runtime, runOptions);

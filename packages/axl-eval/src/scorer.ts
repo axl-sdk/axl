@@ -1,3 +1,5 @@
+import type { Provider } from '@axlsdk/axl';
+
 /** Result from a scorer that includes metadata beyond the numeric score. */
 export type ScorerResult = {
   score: number;
@@ -13,19 +15,9 @@ export function normalizeScorerResult(result: number | ScorerResult): ScorerResu
 /** Context passed to scorers by the eval runner. */
 export type ScorerContext = {
   /** Resolve a provider:model URI to a provider instance and model name. */
-  resolveProvider: (modelUri: string) => {
-    provider: {
-      chat(
-        messages: { role: string; content: string }[],
-        options: {
-          model: string;
-          temperature?: number;
-          responseFormat?: { type: string; json_schema?: unknown };
-        },
-      ): Promise<{ content: string; cost?: number }>;
-    };
-    model: string;
-  };
+  resolveProvider: (modelUri: string) => { provider: Provider; model: string };
+  /** Abort signal forwarded from the eval runner; scorers should pass it into provider calls. */
+  signal?: AbortSignal;
 };
 
 export type ScorerFn<TOutput, TInput, TAnnotations> = (

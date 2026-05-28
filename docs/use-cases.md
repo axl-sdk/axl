@@ -709,6 +709,7 @@ const planQuality = llmScorer({
   model: 'openai-responses:gpt-5.4',
   system: 'You are an expert fitness coach evaluating workout plans. Rate on a 0-1 scale.',
   schema: z.object({ score: z.number().min(0).max(1), reasoning: z.string() }),
+  effort: 'high',  // reasoning-capable judges score more consistently with effort enabled
 });
 
 export default defineEval({

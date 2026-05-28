@@ -98,6 +98,7 @@ export async function runEval(
       }
       return runtime.resolveProvider(uri);
     },
+    signal: options?.signal,
   };
 
   const evalItems: EvalItem[] = new Array(items.length);

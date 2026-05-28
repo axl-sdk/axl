@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Eval: `llmScorer()` now accepts the full `ChatOptions` surface.** Six new optional fields on `LlmScorerConfig` — `maxTokens`, `effort`, `thinkingBudget`, `includeThoughts`, `stop`, `providerOptions` — are forwarded verbatim to `provider.chat`. The motivating gap: reasoning-capable judges (gpt-5.x, Anthropic Opus 4.5+, Sonnet 4.6+, Gemini 3.x) need `effort: 'high'` to be reliably calibrated, but there was previously no way to set it without abandoning `llmScorer` and reimplementing the schema/cost/error pipeline. `temperature` default (`0.2`) and the hardcoded `responseFormat: { type: 'json_object' }` are unchanged. `providerOptions` is merged last and can override the hardcoded `response_format` for callers who want strict JSON Schema mode (e.g. on OpenAI gpt-4o+ or Gemini) — the downstream `extractJson` pipeline handles either shape.
+- **Eval: `ScorerContext` now propagates `AbortSignal`.** Plumbed end-to-end:
+  - `RunEvalOptions.signal` → `ScorerContext.signal` → `provider.chat({ signal })` inside `llmScorer`.
+  - `RescoreOptions.signal` → same path inside `rescore()`. `rescore()` additionally checks `signal.aborted` between items and short-circuits the remainder of the batch (marking unscored items with `error: 'cancelled'`) — symmetric with the runner's per-item check.
+  - Studio's existing `POST /api/evals/runs/:evalRunId/cancel` route now aborts in-flight judge LLM calls end-to-end (it was already creating an `AbortController` per streaming run; the signal just had nowhere to land beyond the runner's between-item check). Cancel button → mid-flight provider request abort.
+- **Eval CLI: `SIGINT`/`SIGTERM` handler.** `axl-eval` now installs a signal handler that aborts the in-flight eval (or rescore) via the same `AbortSignal` plumbing, instead of letting `process.exit` interrupt a half-completed HTTP request and skip `runtime.shutdown()`. Press once for graceful cancellation; press twice to force-exit (status 130) for the case where cleanup hangs. Without this, the per-scorer signal propagation had no CLI-side trigger; now Ctrl+C is end-to-end.
+
+### Changed
+- **Eval: `ScorerContext.resolveProvider` is now typed against the real `Provider` interface** (imported from `@axlsdk/axl`). The previous inline structural type duplicated a tiny slice of `ChatOptions` and acted as a type-level filter that hid any field not listed there. This is the single source of truth — any future `ChatOptions` field is automatically available to scorers without a corresponding `ScorerContext` widening. Pure type-level change; runtime behavior unchanged. Custom `Scorer` implementations that constructed a mock `ScorerContext` may need to satisfy the wider `Provider` shape (cast through `unknown as Provider` if you only stub `chat`).
+- **Eval: aborted LLM scorers surface as `EvalItem.scorerErrors` entries** with `'aborted'` in the message (e.g. `Scorer "quality" threw: This operation was aborted`). Previously, in-flight scorer calls finished even when the eval was being cancelled, so this category of error was effectively unreachable. Downstream consumers filtering on `scorerErrors` may want to ignore abort-shaped messages to avoid double-reporting cancellation.
+
 ## [0.17.8] - 2026-05-25
 
 A small Gemini-focused release: ship pricing for the new `gemini-3.5-flash` GA model, and fix a latent function-call correlation gap that surfaces under parallel tool calls on Gemini 3.x.

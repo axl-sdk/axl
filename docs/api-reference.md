@@ -1755,6 +1755,12 @@ Configuration for `llmScorer()`.
 | `system` | `string` | required | System prompt for the judge LLM |
 | `schema` | `z.ZodType<{ score: number; ... }>` | `z.object({ score: z.number(), reasoning: z.string() })` | Response schema — converted to JSON Schema and included in the prompt so the LLM knows the exact structure to produce |
 | `temperature` | `number` | `0.2` | Low for scoring consistency |
+| `maxTokens` | `number` | provider default | Cap on response tokens |
+| `effort` | `Effort` | provider default | Unified reasoning/thinking level (`'none' \| 'low' \| 'medium' \| 'high' \| 'xhigh' \| 'max'`). On reasoning-capable judges (gpt-5.x, Anthropic Opus 4.5+, Sonnet 4.6+, Gemini 3.x), `'high'` or `'max'` materially improves calibration. Provider-specific mapping (`xhigh` clamps, `none` semantics, etc.) lives on the [`Effort`](#effort) type — judges follow the same rules as agents |
+| `thinkingBudget` | `number` | — | Precise thinking-token budget override; `0` disables thinking while keeping `effort` for output control (Anthropic). On other providers, simply disables reasoning |
+| `includeThoughts` | `boolean` | provider default | Surface reasoning summaries in the judge's response. Effective on Gemini and the `openai-responses:` provider; no-op on Anthropic and OpenAI Chat Completions (`openai:`). Resolved to `false` if unset |
+| `stop` | `string[]` | — | Stop sequences forwarded to the provider |
+| `providerOptions` | `Record<string, unknown>` | — | Provider-specific escape hatch merged last into the raw API request. Not portable across providers. Can override the hardcoded `responseFormat: { type: 'json_object' }` — pass `providerOptions: { response_format: { type: 'json_schema', ... } }` to switch to strict JSON Schema mode |
 
 ### `ScorerContext`
 
@@ -1762,7 +1768,8 @@ Context passed to scorers by the eval runner.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `resolveProvider` | `(modelUri: string) => { provider, model }` | Resolves a `provider:model` URI to a provider instance and stripped model name. Used by LLM scorers to obtain their provider |
+| `resolveProvider` | `(modelUri: string) => { provider: Provider, model: string }` | Resolves a `provider:model` URI to a `Provider` instance and stripped model name. Used by LLM scorers to obtain their provider |
+| `signal` | `AbortSignal?` | Forwarded from `RunEvalOptions.signal`. Scorers should pass this into provider calls so a long-running judge call gets aborted mid-flight when the eval is cancelled |
 
 ### `EvalComparison`
 

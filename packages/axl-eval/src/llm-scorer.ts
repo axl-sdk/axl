@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { Scorer, ScorerContext, ScorerResult } from './scorer.js';
 import { extractJson, zodToJsonSchema } from '@axlsdk/axl';
+import type { Effort } from '@axlsdk/axl';
 
 export type LlmScorerConfig = {
   name: string;
@@ -8,7 +9,22 @@ export type LlmScorerConfig = {
   model: string;
   system: string;
   schema?: z.ZodType<{ score: number; [key: string]: unknown }>;
+  /** Sampling temperature. Default: 0.2 for deterministic judging. */
   temperature?: number;
+  /** Cap on response tokens. Falls back to provider default if unset. */
+  maxTokens?: number;
+  /** Reasoning effort — `'high'` or `'max'` materially improves judge calibration on
+   *  reasoning-capable models (gpt-5.x, Opus 4.6+, Gemini 3.x). See `Effort` for
+   *  provider-specific mapping. */
+  effort?: Effort;
+  /** Precise thinking-token budget override. See `ChatOptions.thinkingBudget`. */
+  thinkingBudget?: number;
+  /** Surface reasoning summaries in the judge's response (Gemini + OpenAI Responses). */
+  includeThoughts?: boolean;
+  /** Stop sequences forwarded to the provider. */
+  stop?: string[];
+  /** Provider-specific escape hatch — merged last into the raw API request. */
+  providerOptions?: Record<string, unknown>;
 };
 
 export function llmScorer(config: LlmScorerConfig): Scorer {
@@ -53,12 +69,30 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
         schemaJson,
       ].join('\n');
 
+      // Field-by-field forwarding (deliberately NOT spreading `config`):
+      // `LlmScorerConfig` has scorer-specific fields (`name`, `description`,
+      // `schema`, `system`, `model` — the URI, not the chat-options `model`
+      // which is the post-resolveProvider stripped form) that must not leak
+      // into ChatOptions. A spread would silently pass them through to
+      // provider.chat and either be ignored or, worse, override our hardcoded
+      // `responseFormat`. Keep this explicit.
       const response = await provider.chat(
         [
           { role: 'system', content: config.system },
           { role: 'user', content: prompt },
         ],
-        { model, temperature: config.temperature ?? 0.2, responseFormat: { type: 'json_object' } },
+        {
+          model,
+          temperature: config.temperature ?? 0.2,
+          maxTokens: config.maxTokens,
+          effort: config.effort,
+          thinkingBudget: config.thinkingBudget,
+          includeThoughts: config.includeThoughts,
+          stop: config.stop,
+          providerOptions: config.providerOptions,
+          responseFormat: { type: 'json_object' },
+          signal: context.signal,
+        },
       );
 
       const responseCost = response.cost;

@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.17.9] - 2026-05-28
+
+A focused `@axlsdk/eval` release. `llmScorer()` gains the full `ChatOptions` surface so reasoning-capable judges (gpt-5.x, Anthropic Opus 4.5+/Sonnet 4.6+, Gemini 3.x) can be calibrated with `effort: 'high'` without abandoning the helper, and `AbortSignal` now flows end-to-end (runner → scorer context → in-flight `provider.chat`), so Studio's cancel button and a CLI `Ctrl+C` actually abort mid-flight LLM calls instead of letting doomed requests finish.
 
 ### Added
 - **Eval: `llmScorer()` now accepts the full `ChatOptions` surface.** Six new optional fields on `LlmScorerConfig` — `maxTokens`, `effort`, `thinkingBudget`, `includeThoughts`, `stop`, `providerOptions` — are forwarded verbatim to `provider.chat`. The motivating gap: reasoning-capable judges (gpt-5.x, Anthropic Opus 4.5+, Sonnet 4.6+, Gemini 3.x) need `effort: 'high'` to be reliably calibrated, but there was previously no way to set it without abandoning `llmScorer` and reimplementing the schema/cost/error pipeline. `temperature` default (`0.2`) and the hardcoded `responseFormat: { type: 'json_object' }` are unchanged. `providerOptions` is merged last and can override the hardcoded `response_format` for callers who want strict JSON Schema mode (e.g. on OpenAI gpt-4o+ or Gemini) — the downstream `extractJson` pipeline handles either shape.

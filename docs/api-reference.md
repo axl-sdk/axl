@@ -1860,6 +1860,25 @@ Throws if the datasets or scorer names don't match between baseline and candidat
 
 Convenience wrapper that dynamically imports `@axlsdk/eval` and calls `evalCompare()`. Accepts an optional `EvalCompareOptions` third parameter.
 
+### `evaluateScorerErrorRateGate(comparison, maxScorerErrorRate)`
+
+Pure, side-effect-free decision for the gate-side scorer-failure-rate check (what `axl-eval compare --max-scorer-error-rate` runs). Returns a human-readable refusal reason `string`, or `null` to allow. Build your own CI gate on top of `evalCompare()` with it.
+
+- **Type-aware** via the baseline's `metadata.scorerTypes`: a scorer explicitly marked `'deterministic'` tolerates **zero** failures; everything else — including an unknown/missing type on a pre-`scorerTypes` artifact — uses the LLM `maxScorerErrorRate` (the permissive tier, so an old baseline isn't hard-failed on its first flake).
+- Also refuses when a scorer produced **zero scored items** on a side (a mean over an empty sample can't be certified).
+- Reads the per-side `scored`/`failed` counts on `EvalComparison.scorers[name]`, computed over the same truncated pool as the means/CI.
+
+### `evaluateScorerTolerance(scored, failed, type, limit)`
+
+The single shared pure helper backing **both** failure-rate gates (source-side `runEval` and gate-side `evaluateScorerErrorRateGate`). Returns a `ScorerToleranceVerdict`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `attempted` | `number` | `scored + failed` — the rate denominator (excludes cancelled / never-run) |
+| `rate` | `number` | `failed / attempted`, or `0` when nothing was attempted |
+| `exceeds` | `boolean` | Over tolerance AND something was attempted. Deterministic: `failed > 0`; LLM: `rate > limit` (strict) |
+| `zeroSample` | `boolean` | `attempted === 0` — no basis to certify a rate (callers choose their policy) |
+
 ### `BootstrapCIResult`
 
 Result from `pairedBootstrapCI()`.

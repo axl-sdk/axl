@@ -117,6 +117,8 @@ Track spending across agents, models, workflows, and embedders with time-window 
 
 Run evaluations from the UI, watch items stream in, and drill into per-item scores, timing, cost, and LLM-judge reasoning. Compare two runs (baseline vs candidate) with bootstrap-CI significance, a score-distribution chart, and an item-level diff table. The History tab groups multi-run results and tracks mean scores across runs. Toggle **Capture traces** to render each item's events inline. Requires `@axlsdk/eval` as an optional peer dependency.
 
+Amber banners flag runs you shouldn't fully trust — a scorer that failed on too many items, a subset run, or annotations dropped by the dataset schema — so a thinned or misconfigured run can't quietly look clean.
+
 <p align="center">
   <img src="../../docs/assets/studio-eval-runner.gif" alt="Axl Studio eval runner — score and duration trends by scorer and model across runs" width="840">
 </p>

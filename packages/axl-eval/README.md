@@ -255,6 +255,12 @@ export default { workflow: 'qa', dataset: ds, scorers: [judge], failOnScorerErro
 npx axl-eval compare base.json cand.json --fail-on-regression --max-scorer-error-rate 0.05
 ```
 
+Building a custom CI gate? Both decisions are exported as pure functions — `evaluateScorerErrorRateGate` and `evaluateScorerTolerance` (see the [API reference](../../docs/api-reference.md)).
+
+#### Total-workflow-wipeout guard
+
+Separate from the scorer signal above: if **every** item errored in the *workflow* (0 succeeded), the eval produced no scorable output, so `axl-eval` always exits non-zero with `FAILED: … all N item(s) errored in the workflow` — a fully-broken eval (bad provider URI, an exception in every run) can never go green in CI. This is non-configurable (a 0%-success eval is unambiguously broken) and distinct from `failOnScorerErrorRate` (which is about a flaky *scorer* and deliberately ignores a run with no scored items). Partial workflow-failure rates stay visible (`Failures: N/M` in the table) but non-gating.
+
 ### Programmatic
 
 **`runtime.eval()`** — when you have a workflow registered on the runtime. The `workflow` field must match the registered name:

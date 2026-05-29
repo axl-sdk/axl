@@ -15,7 +15,19 @@ export type MultiRunSummary = {
   dataset: string;
   totalCost: number;
   totalDuration: number;
-  scorers: Record<string, { mean: number; std: number; min: number; max: number }>;
+  scorers: Record<
+    string,
+    {
+      mean: number;
+      std: number;
+      min: number;
+      max: number;
+      /** Total valid scores summed across all runs in the group. */
+      scored?: number;
+      /** Total ran-and-failed scorer invocations summed across all runs. */
+      failed?: number;
+    }
+  >;
   timing?: { mean: number; std: number };
 };
 
@@ -63,11 +75,19 @@ export function aggregateRuns(runs: EvalResult[]): MultiRunSummary {
     const minMean = Math.min(...means);
     const maxMean = Math.max(...means);
 
+    // Sum the per-run sample sizes so a multi-run group can surface the same
+    // "thinned sample" signal as a single run (read with `?? 0` — old artifacts
+    // predate these fields). Total attempted across the group = scored + failed.
+    const scored = runs.reduce((sum, r) => sum + (r.summary.scorers[name]?.scored ?? 0), 0);
+    const failed = runs.reduce((sum, r) => sum + (r.summary.scorers[name]?.failed ?? 0), 0);
+
     scorers[name] = {
       mean: round(meanOfMeans),
       std: round(std(means, meanOfMeans)),
       min: round(minMean),
       max: round(maxMean),
+      scored,
+      failed,
     };
   }
 

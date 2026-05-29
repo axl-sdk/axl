@@ -9,8 +9,8 @@ All providers include automatic retry with exponential backoff on `429` (rate li
 The Responses API is the preferred OpenAI integration — it supports prompt caching, native reasoning, and automatic reasoning context round-tripping via `providerMetadata`. All models listed below are available with the `openai-responses:` prefix. Shares the `openai` provider config by default.
 
 ```
-openai-responses:gpt-5.4        # General-purpose, complex reasoning, agentic tasks
-openai-responses:gpt-5.4-pro    # Deeper reasoning for tough problems
+openai-responses:gpt-5.5        # Flagship — most capable general-purpose model
+openai-responses:gpt-5.5-pro    # Deepest reasoning for highest-stakes problems
 openai-responses:gpt-5-mini     # Cost-optimized reasoning and chat
 openai-responses:gpt-5-nano     # High-throughput, straightforward tasks
 openai-responses:o4-mini        # Dedicated reasoning (small)
@@ -23,10 +23,12 @@ openai-responses:o3-pro          # Dedicated reasoning (pro)
 Same models available with the `openai:` prefix. Use this when you need features not yet supported on the Responses API (e.g., stop sequences).
 
 ```
-openai:gpt-5.4                  # General-purpose, complex reasoning, agentic tasks
-openai:gpt-5.4-pro              # Deeper reasoning for tough problems
+openai:gpt-5.5                  # Flagship — most capable general-purpose model
+openai:gpt-5.5-pro              # Deepest reasoning for highest-stakes problems
 openai:gpt-5-mini               # Cost-optimized reasoning and chat
 openai:gpt-5-nano               # High-throughput, straightforward tasks
+openai:gpt-5.4                  # Previous gen
+openai:gpt-5.4-pro              # Previous gen (pro)
 openai:gpt-5.3                  # Previous gen
 openai:gpt-5.2                  # Previous gen
 openai:gpt-5.1                  # Previous gen
@@ -53,7 +55,8 @@ Reasoning model support (o-series): uses `developer` role instead of `system`, s
 ## Anthropic
 
 ```
-anthropic:claude-opus-4-7       # Most capable (supports effort: 'xhigh')
+anthropic:claude-opus-4-8       # Most capable (supports effort: 'xhigh' and 'max')
+anthropic:claude-opus-4-7       # Previous flagship (supports effort: 'xhigh')
 anthropic:claude-opus-4-6       # Previous flagship
 anthropic:claude-sonnet-4-6     # Balanced (latest)
 anthropic:claude-sonnet-4-5     # Balanced
@@ -107,7 +110,7 @@ All model parameters are configurable on `AgentConfig` (agent-level defaults) an
 
 ```typescript
 const creative = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'Write creative stories.',
   temperature: 0.9,   // higher = more creative (0.0–2.0)
   maxTokens: 8192,
@@ -120,7 +123,7 @@ const reasoner = agent({
 });
 
 const precise = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'Extract structured data.',
   temperature: 0.1,   // lower = more deterministic
   toolChoice: 'required',
@@ -143,7 +146,7 @@ const solution = await ctx.ask(reasoner, problem, { effort: 'low' });
 
 ### `effort`
 
-The `effort` parameter provides a unified way to control reasoning depth across all providers. Values: `'none'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`. `'xhigh'` is a first-class tier between `'high'` and `'max'`, supported natively on Anthropic Opus 4.7 and OpenAI gpt-5.2+; it clamps to `'high'` on other models.
+The `effort` parameter provides a unified way to control reasoning depth across all providers. Values: `'none'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`. `'xhigh'` is a first-class tier between `'high'` and `'max'`, supported natively on Anthropic Opus 4.8/4.7 and OpenAI gpt-5.2+; it clamps to `'high'` on other models.
 
 ```typescript
 // Most users — just effort:
@@ -213,8 +216,9 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 #### Provider-specific behavior
 
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
-- **OpenAI GPT-5.x**: Supports `reasoning_effort` like o-series, strips temperature when reasoning active. Uses `system` role (not `developer`). Supports parallel tool calls. Model-specific constraints: `gpt-5-pro` only supports `'high'`; `gpt-5.1+` supports `'none'`; `gpt-5.2+` supports `'xhigh'`.
+- **OpenAI GPT-5.x**: Supports `reasoning_effort` like o-series, strips temperature when reasoning active. Uses `system` role (not `developer`). Supports parallel tool calls. Model-specific constraints: `gpt-5-pro` only supports `'high'`; `gpt-5.1+` supports `'none'`; `gpt-5.2+` (including `gpt-5.5`) supports `'xhigh'`. Latest flagship: `gpt-5.5` ($5/$30 per 1M tokens); `gpt-5.5-pro` ($30/$180).
 - **OpenAI Responses API**: Same effort mapping via `reasoning: { effort }`. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
+- **Anthropic Opus 4.8**: Latest flagship. Same adaptive-thinking behavior as Opus 4.7 — supports `effort: 'xhigh'` and `'max'`, sent as `output_config.effort`. Default `effort` is `'high'`. Same pricing as Opus 4.7 ($5/$25 per 1M tokens).
 - **Anthropic Opus 4.7**: Same adaptive-thinking behavior as 4.6. Additionally supports `effort: 'xhigh'` as a first-class tier between `'high'` and `'max'`, sent as `output_config.effort: 'xhigh'`. Same pricing as Opus 4.6 ($5/$25 per 1M tokens).
 - **Anthropic 4.6** (Opus 4.6, Sonnet 4.6): `effort` enables adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`). Temperature stripped when thinking active. `thinkingBudget: 0` + `effort` sends only `output_config.effort` (no thinking block, temperature allowed). `effort: 'xhigh'` clamps to `'high'` (4.6 doesn't expose a distinct xhigh tier).
 - **Anthropic 4.5** (Opus 4.5): Supports `output_config.effort` but not adaptive thinking. Temperature passes through. `effort: 'xhigh'` clamps to `'high'`.
@@ -295,7 +299,7 @@ Controls whether the model calls tools when tools are available:
 
 ```typescript
 const coder = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You are a coding assistant.',
   tools: [runTests, writeCode],
 });
@@ -322,7 +326,7 @@ Stop sequences tell the model to stop generating when it produces any of the spe
 
 ```typescript
 const agent = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'Generate markdown sections.',
   stop: ['\n---', '\n## '],  // stop at section breaks
 });
@@ -356,7 +360,7 @@ Providers charge less for tokens served from cache. The rates differ by provider
 |-----------|--------|-----------------|
 | gpt-4o / o1 | `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`, `o1-pro` | **50%** of input rate |
 | gpt-4.1 / o3 / o4 | `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `o3`, `o3-mini`, `o3-pro`, `o4-mini` | **25%** of input rate |
-| gpt-5 | `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5.1`–`gpt-5.4`, `gpt-5.4-pro` | **10%** of input rate |
+| gpt-5 | `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5.1`–`gpt-5.5`, `gpt-5.4-pro`, `gpt-5.5-pro` | **10%** of input rate |
 
 Versioned model names (e.g. `gpt-4o-2024-05-13`) are matched by prefix to the base model entry.
 

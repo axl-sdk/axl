@@ -39,9 +39,9 @@ AXL_TRACE_ENABLED=true AXL_TRACE_LEVEL=full node server.js
 
 ```
 [axl] execution:abc-123 | workflow:HandleSupport | started
-[axl] execution:abc-123 | step:1 agent_call_end | agent:SupportBot | model:openai-responses:gpt-5.4 | 1.2s | $0.003
+[axl] execution:abc-123 | step:1 agent_call_end | agent:SupportBot | model:openai-responses:gpt-5.5 | 1.2s | $0.003
 [axl] execution:abc-123 | step:2 tool_call_end  | tool:get_order | args:["ORD-456"] | 45ms
-[axl] execution:abc-123 | step:3 agent_call_end | agent:SupportBot | model:openai-responses:gpt-5.4 | 0.8s | $0.002
+[axl] execution:abc-123 | step:3 agent_call_end | agent:SupportBot | model:openai-responses:gpt-5.5 | 0.8s | $0.002
 [axl] execution:abc-123 | step:4 tool_call_end  | tool:refund_order | args:["ORD-456"] | 120ms
 [axl] execution:abc-123 | workflow:HandleSupport | completed | 2.4s | $0.005
 ```

@@ -1,7 +1,8 @@
 import type { AxlRuntime } from '@axlsdk/axl';
 import type { EvalConfig, EvalResult, EvalItem, EvalSummary, RunEvalOptions } from './types.js';
 import type { ScorerContext } from './scorer.js';
-import { computeStats, mapWithConcurrency } from './utils.js';
+import type { DegradedScorer } from './types.js';
+import { computeStats, mapWithConcurrency, scorerCounts } from './utils.js';
 import { scoreItem } from './score-item.js';
 import { randomUUID } from 'node:crypto';
 
@@ -232,16 +233,48 @@ export async function runEval(
     const scores = evalItems
       .filter((i) => !i.error && i.scores[name] != null)
       .map((i) => i.scores[name] as number);
-    scorerStats[name] = computeStats(scores);
+    const { scored, failed } = scorerCounts(evalItems, name);
+    scorerStats[name] = { ...computeStats(scores), scored, failed };
   }
-
-  const durations = evalItems.filter((i) => !i.error && i.duration != null).map((i) => i.duration!);
-  const timing = durations.length > 0 ? computeStats(durations) : undefined;
 
   const scorerTypes: Record<string, string> = {};
   for (const s of config.scorers) {
     scorerTypes[s.name] = s.isLlm ? 'llm' : 'deterministic';
   }
+
+  // Failure-rate trust signal (opt-in). When `failOnScorerErrorRate` is set, a
+  // scorer is degraded when it's deterministic and failed at all (a failure is
+  // a bug, not noise), OR it's an LLM judge whose failure rate over its
+  // ATTEMPTED items exceeds tolerance. We never throw — the result is still
+  // useful; we flag it and let the CLI/consumer decide the exit code. Invalid
+  // limits are ignored loudly so a typo can't silently disable the gate.
+  let degraded: DegradedScorer[] | undefined;
+  const rawLimit = config.failOnScorerErrorRate;
+  if (rawLimit != null) {
+    if (!Number.isFinite(rawLimit) || rawLimit < 0 || rawLimit > 1) {
+      console.warn(
+        `[axl-eval] Ignoring invalid failOnScorerErrorRate (${rawLimit}); expected a number in [0, 1].`,
+      );
+    } else {
+      for (const name of scorerNames) {
+        const stats = scorerStats[name];
+        const scored = stats.scored ?? 0;
+        const failed = stats.failed ?? 0;
+        const attempted = scored + failed;
+        if (attempted === 0) continue; // nothing ran → nothing to gate on
+        const rate = failed / attempted;
+        const type = scorerTypes[name] === 'llm' ? 'llm' : 'deterministic';
+        const limit = type === 'deterministic' ? 0 : rawLimit;
+        const exceeds = type === 'deterministic' ? failed > 0 : rate > rawLimit;
+        if (exceeds) {
+          (degraded ??= []).push({ scorer: name, rate, limit, type, scored, failed });
+        }
+      }
+    }
+  }
+
+  const durations = evalItems.filter((i) => !i.error && i.duration != null).map((i) => i.duration!);
+  const timing = durations.length > 0 ? computeStats(durations) : undefined;
 
   // Aggregate per-model LLM call counts across all items
   const totalModelCalls = new Map<string, number>();
@@ -325,6 +358,12 @@ export async function runEval(
     totalCost,
     duration: Date.now() - startTime,
     items: evalItems,
-    summary: { count: items.length, failures, scorers: scorerStats, timing },
+    summary: {
+      count: items.length,
+      failures,
+      scorers: scorerStats,
+      timing,
+      ...(degraded ? { degraded } : {}),
+    },
   };
 }

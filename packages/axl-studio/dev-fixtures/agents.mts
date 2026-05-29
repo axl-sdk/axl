@@ -20,21 +20,21 @@ import { lookupTool, calculatorTool, searchTool } from './tools.mjs';
 
 export const qaAgent = agent({
   name: 'qa-agent',
-  model: 'mock:gpt-4o',
+  model: 'openai-responses:gpt-5.5',
   system: 'You are a helpful QA assistant. Answer questions accurately and concisely.',
   tools: [lookupTool],
 });
 
 export const qaAgentUpgraded = agent({
   name: 'qa-agent-upgraded',
-  model: 'mock:claude-sonnet-4-6',
+  model: 'openai-responses:gpt-5.5-pro',
   system: 'You are a helpful QA assistant. Answer questions accurately and concisely.',
   tools: [lookupTool],
 });
 
 export const researchAgent = agent({
   name: 'research-agent',
-  model: 'mock:gpt-4o',
+  model: 'openai-responses:gpt-5.5',
   system:
     'You are a research assistant. Find and synthesize information from multiple sources.',
   tools: [searchTool, lookupTool],
@@ -42,21 +42,21 @@ export const researchAgent = agent({
 
 export const mathAgent = agent({
   name: 'math-agent',
-  model: 'mock:gpt-4o-mini',
+  model: 'openai-responses:gpt-5-mini',
   system: 'You are a math tutor. Solve problems step by step.',
   tools: [calculatorTool],
 });
 
 export const structuredAgent = agent({
   name: 'structured-agent',
-  model: 'mock-json:gpt-4o',
+  model: 'openai:gpt-5.5',
   system:
     'You return structured JSON responses with answer, confidence, sources, and related topics.',
 });
 
 export const schemaRetryAgent = agent({
   name: 'schema-retry-agent',
-  model: 'mock-schema-retry:gpt-4o',
+  model: 'anthropic:claude-sonnet-4-6',
   system: 'Return structured JSON with `answer` (string) and `score` (0-1 number).',
 });
 
@@ -67,7 +67,7 @@ export const schemaRetryAgent = agent({
 
 export const subResearcherAgent = agent({
   name: 'sub-researcher-agent',
-  model: 'mock-tagged:gpt-4o-mini',
+  model: 'google:gemini-2.5-flash',
   system:
     '[#sub-researcher] You are a focused finding sub-researcher. Provide one tight observation per call.',
 });
@@ -87,7 +87,7 @@ export const callSubResearcherTool = tool({
 
 export const orchestratorAgent = agent({
   name: 'orchestrator-agent',
-  model: 'mock-tagged:gpt-4o',
+  model: 'google:gemini-3.1-pro-preview',
   system:
     '[#orchestrator] You delegate complex questions by calling the call-sub-researcher tool, then synthesize the sub-finding into a final answer.',
   tools: [callSubResearcherTool],
@@ -96,7 +96,7 @@ export const orchestratorAgent = agent({
 
 export const alwaysFailAgent = agent({
   name: 'always-fail-agent',
-  model: 'mock-tagged:gpt-4o',
+  model: 'google:gemini-3.1-pro-preview',
   system:
     '[#always-fail] Always returns invalid output so the schema gate exhausts retries.',
   maxTurns: 2,
@@ -104,7 +104,7 @@ export const alwaysFailAgent = agent({
 
 export const streamingStructuredAgent = agent({
   name: 'streaming-structured-agent',
-  model: 'mock-tagged:gpt-4o',
+  model: 'google:gemini-3.1-pro-preview',
   system:
     '[#chunked-structured] Emits JSON in tiny chunks for the partial_object demo.',
   maxTurns: 2,
@@ -112,14 +112,14 @@ export const streamingStructuredAgent = agent({
 
 export const specialistAgent = agent({
   name: 'specialist-agent',
-  model: 'mock-tagged:gpt-4o',
+  model: 'google:gemini-3.1-pro-preview',
   system: '[#specialist] Handoff-target specialist. Answer in detail.',
   maxTurns: 2,
 });
 
 export const generalistAgent = agent({
   name: 'generalist-agent',
-  model: 'mock-tagged:gpt-4o',
+  model: 'google:gemini-3.1-pro-preview',
   system:
     '[#generalist] Hands off complex queries to the specialist via the auto-generated handoff tool.',
   handoffs: [{ agent: specialistAgent, mode: 'oneway' }],
@@ -128,7 +128,7 @@ export const generalistAgent = agent({
 
 export const verboseDemoAgent = agent({
   name: 'verbose-demo-agent',
-  model: 'mock-tagged:gpt-4o',
+  model: 'google:gemini-3.1-pro-preview',
   system: '[#verbose-demo] Acknowledge large payloads tersely.',
   maxTurns: 1,
 });

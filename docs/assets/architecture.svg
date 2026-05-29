@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 420" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#64748b"/>
+    </marker>
+  </defs>
+  <rect width="960" height="420" fill="#0b1220" rx="14"/>
+  <text x="480" y="46" text-anchor="middle" fill="#f8fafc" font-size="22" font-weight="700">Axl architecture</text>
+  <text x="480" y="72" text-anchor="middle" fill="#64748b" font-size="14">Inert definitions compose upward; the runtime executes them.</text>
+
+  <!-- tools -->
+  <rect x="50" y="120" width="150" height="56" rx="10" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+  <text x="125" y="146" text-anchor="middle" fill="#38bdf8" font-size="15" font-weight="600">tool()</text>
+  <text x="125" y="165" text-anchor="middle" fill="#64748b" font-size="11">typed fn + Zod</text>
+  <rect x="50" y="196" width="150" height="56" rx="10" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+  <text x="125" y="222" text-anchor="middle" fill="#38bdf8" font-size="15" font-weight="600">tool()</text>
+  <text x="125" y="241" text-anchor="middle" fill="#64748b" font-size="11">typed fn + Zod</text>
+
+  <!-- agent -->
+  <rect x="300" y="158" width="160" height="60" rx="10" fill="#0f172a" stroke="#818cf8" stroke-width="1.5"/>
+  <text x="380" y="184" text-anchor="middle" fill="#a5b4fc" font-size="15" font-weight="600">agent()</text>
+  <text x="380" y="203" text-anchor="middle" fill="#64748b" font-size="11">model + system + tools</text>
+
+  <!-- workflow -->
+  <rect x="560" y="158" width="160" height="60" rx="10" fill="#0f172a" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="640" y="184" text-anchor="middle" fill="#4ade80" font-size="15" font-weight="600">workflow()</text>
+  <text x="640" y="203" text-anchor="middle" fill="#64748b" font-size="11">async fn (ctx)</text>
+
+  <!-- runtime -->
+  <rect x="800" y="150" width="120" height="76" rx="10" fill="#0f172a" stroke="#e2e8f0" stroke-width="1.5"/>
+  <text x="860" y="183" text-anchor="middle" fill="#f8fafc" font-size="15" font-weight="600">AxlRuntime</text>
+  <text x="860" y="202" text-anchor="middle" fill="#64748b" font-size="11">execute /</text>
+  <text x="860" y="216" text-anchor="middle" fill="#64748b" font-size="11">stream</text>
+
+  <!-- arrows -->
+  <line x1="200" y1="160" x2="296" y2="180" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="200" y1="224" x2="296" y2="196" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="460" y1="188" x2="556" y2="188" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="720" y1="188" x2="796" y2="188" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- ctx surface -->
+  <rect x="300" y="278" width="420" height="92" rx="10" fill="#0f172a" stroke="#1e293b"/>
+  <text x="510" y="304" text-anchor="middle" fill="#94a3b8" font-size="13" font-weight="600">ctx — the workflow surface</text>
+  <text x="510" y="330" text-anchor="middle" fill="#cbd5e1" font-size="13" font-family="ui-monospace, monospace">ask · spawn · vote · verify · race</text>
+  <text x="510" y="352" text-anchor="middle" fill="#cbd5e1" font-size="13" font-family="ui-monospace, monospace">parallel · map · budget · remember · recall</text>
+  <line x1="640" y1="218" x2="560" y2="276" stroke="#334155" stroke-width="1.5" stroke-dasharray="4 4" marker-end="url(#arrow)"/>
+</svg>

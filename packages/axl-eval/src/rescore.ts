@@ -1,7 +1,7 @@
 import type { AxlRuntime } from '@axlsdk/axl';
 import type { EvalResult, EvalItem, EvalSummary } from './types.js';
 import type { Scorer, ScorerContext } from './scorer.js';
-import { computeStats, mapWithConcurrency } from './utils.js';
+import { computeStats, mapWithConcurrency, scorerCounts } from './utils.js';
 import { scoreItem } from './score-item.js';
 import { randomUUID } from 'node:crypto';
 
@@ -114,7 +114,12 @@ export async function rescore(
     const scores = rescored
       .filter((i) => !i.error && i.scores[name] != null)
       .map((i) => i.scores[name] as number);
-    scorerStats[name] = computeStats(scores);
+    // Same scored/failed surfacing as runEval (table + Studio parity). NOTE:
+    // rescore deliberately does NOT support `failOnScorerErrorRate` — it takes
+    // RescoreOptions, not EvalConfig, so there's no degradation gate here. The
+    // counts are informational; gating belongs to the run that produced output.
+    const { scored, failed } = scorerCounts(rescored, name);
+    scorerStats[name] = { ...computeStats(scores), scored, failed };
   }
 
   const scorerTypes: Record<string, string> = {};

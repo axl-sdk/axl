@@ -9,7 +9,29 @@ type Props = {
 };
 
 /** Compact strip chart — each scorer gets a single row with tick marks for each item's score. */
-function ScorerStrip({ name, scores, mean }: { name: string; scores: number[]; mean: number }) {
+function ScorerStrip({
+  name,
+  scores,
+  mean,
+  failed,
+}: {
+  name: string;
+  scores: number[];
+  mean: number;
+  failed: number;
+}) {
+  // Amber "N failed" note when a scorer ran and failed on some items — the mean
+  // (and the ticks) cover only the surviving sample.
+  const failedNote =
+    failed > 0 ? (
+      <span
+        className="ml-1.5 px-1 py-0.5 text-[9px] font-medium rounded bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 align-middle"
+        title={`${failed} of ${scores.length + failed} scorer runs failed — only the ${scores.length} that succeeded are shown.`}
+      >
+        {failed} failed
+      </span>
+    ) : null;
+
   if (scores.length === 0) {
     return (
       <div className="flex items-center gap-3">
@@ -20,6 +42,7 @@ function ScorerStrip({ name, scores, mean }: { name: string; scores: number[]; m
           {name}
         </span>
         <span className="text-xs text-[hsl(var(--muted-foreground))]">No valid scores</span>
+        {failedNote}
       </div>
     );
   }
@@ -28,6 +51,7 @@ function ScorerStrip({ name, scores, mean }: { name: string; scores: number[]; m
     <div className="flex items-center gap-3">
       <span className="w-28 text-xs font-mono truncate" title={name}>
         {name}
+        {failedNote}
       </span>
       <div className="flex-1 h-5 relative bg-[hsl(var(--secondary))] rounded">
         {/* Scale markers */}
@@ -69,14 +93,17 @@ export function ScoreDistribution({ items, scorerNames }: Props) {
   const distributions = useMemo(() => {
     return scorerNames.map((name) => {
       const scores: number[] = [];
+      let failed = 0;
       for (const item of items) {
+        if (item.error) continue;
         const score = item.scores[name];
-        if (score != null && !item.error) {
-          scores.push(score);
-        }
+        if (score != null) scores.push(score);
+        // null score WITH a recorded duration = the scorer ran and failed;
+        // WITHOUT one = skipped by cancellation (counts as neither).
+        else if (item.scoreDetails?.[name]?.duration != null) failed++;
       }
       const mean = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
-      return { name, scores, mean };
+      return { name, scores, mean, failed };
     });
   }, [items, scorerNames]);
 
@@ -103,7 +130,13 @@ export function ScoreDistribution({ items, scorerNames }: Props) {
           <span className="w-12" />
         </div>
         {distributions.map((dist) => (
-          <ScorerStrip key={dist.name} name={dist.name} scores={dist.scores} mean={dist.mean} />
+          <ScorerStrip
+            key={dist.name}
+            name={dist.name}
+            scores={dist.scores}
+            mean={dist.mean}
+            failed={dist.failed}
+          />
         ))}
       </div>
     </div>

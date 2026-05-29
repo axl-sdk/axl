@@ -56,7 +56,7 @@ export const qaWorkflow = workflow({
     return {
       answer,
       metadata: {
-        model: 'mock:test',
+        model: 'openai-responses:gpt-5.5',
         confidence: 0.85,
         sources: [
           { title: 'MDN Web Docs', url: 'https://developer.mozilla.org', relevance: 0.92 },
@@ -77,7 +77,7 @@ export const qaWorkflowUpgraded = workflow({
   input: z.object({ question: z.string() }),
   handler: async (ctx) => {
     const answer = await ctx.ask(qaAgentUpgraded, ctx.input.question);
-    return { answer, metadata: { model: 'mock:claude-sonnet-4-6' } };
+    return { answer, metadata: { model: 'openai-responses:gpt-5.5' } };
   },
 });
 
@@ -323,7 +323,7 @@ export const parallelWorkflow = workflow({
     const branchAgents = ctx.input.topics.map((_, i) =>
       agent({
         name: `branch-${i}-agent`,
-        model: 'mock-tagged:gpt-4o',
+        model: 'google:gemini-3.1-pro-preview',
         system: `[#parallel-branch-${i}] Analyst for branch ${i}.`,
       }),
     );

@@ -285,6 +285,64 @@ describe('OpenAIProvider', () => {
       expect(response.cost).toBeCloseTo(0.00145, 5);
     });
 
+    it('prices gpt-5.5 at $5/$30 per 1M tokens with 10% cached input', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [
+              {
+                message: { content: 'Hi', tool_calls: undefined },
+                finish_reason: 'stop',
+              },
+            ],
+            usage: {
+              prompt_tokens: 1000,
+              completion_tokens: 50,
+              total_tokens: 1050,
+              prompt_tokens_details: { cached_tokens: 800 },
+            },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5.5',
+        maxTokens: 1024,
+      });
+
+      // gpt-5.5: [5e-6, 30e-6, 0.1]
+      // Non-cached input: 200 * 5e-6 = 0.001
+      // Cached input:     800 * 5e-6 * 0.1 = 0.0004
+      // Output:           50 * 30e-6 = 0.0015
+      // Total: 0.0029
+      expect(response.cost).toBeCloseTo(0.0029, 5);
+    });
+
+    it('prices gpt-5.5-pro at $30/$180 via longest-prefix match (not gpt-5.5)', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [
+              {
+                message: { content: 'Hi', tool_calls: undefined },
+                finish_reason: 'stop',
+              },
+            ],
+            usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+          }),
+      });
+
+      const provider = new OpenAIProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5.5-pro',
+        maxTokens: 1024,
+      });
+
+      // gpt-5.5-pro: [30e-6, 180e-6, 0.1]
+      // 100 * 30e-6 + 50 * 180e-6 = 0.003 + 0.009 = 0.012
+      expect(response.cost).toBeCloseTo(0.012, 5);
+    });
+
     it('returns cost: 0 for unknown models (not undefined)', async () => {
       mockFetch({
         json: () =>

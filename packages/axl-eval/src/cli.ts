@@ -22,6 +22,36 @@ import {
 } from './cli-utils.js';
 import { validateEvalConfig } from './cli-validate.js';
 import { parseEvalArgs, envInt } from './cli-args.js';
+import { scorerCounts } from './utils.js';
+
+/**
+ * Refuse to certify a comparison and exit non-zero, with one consistent
+ * message format. Routes both the scorer-filtered guard and the
+ * `--max-scorer-error-rate` failure-rate gate through a single path so the
+ * "why CI failed" line always reads the same.
+ */
+function refuseToGate(reason: string): never {
+  console.error(`[axl-eval] Refusing to gate: ${reason}`);
+  process.exit(1);
+}
+
+/**
+ * Read a scorer's `scored`/`failed` counts from a summary entry, falling back
+ * to recomputing from `items` when the fields are absent (pre-0.17.10
+ * artifacts). `items` is omitted for multi-run summaries that carry no items —
+ * there the fields are authoritative (summed by `aggregateRuns`).
+ */
+function scorerSampleCounts(
+  entry: { scored?: number; failed?: number },
+  name: string,
+  items?: EvalResult['items'],
+): { scored: number; failed: number } {
+  if (entry.scored != null && entry.failed != null) {
+    return { scored: entry.scored, failed: entry.failed };
+  }
+  if (items) return scorerCounts(items, name);
+  return { scored: entry.scored ?? 0, failed: entry.failed ?? 0 };
+}
 
 /** Install a SIGINT/SIGTERM handler that aborts an in-flight eval gracefully.
  *  First signal: aborts the controller so runEval / rescore propagate cancellation
@@ -72,6 +102,12 @@ Usage:
   axl-eval compare <a> <b>                Compare two eval result files
   axl-eval compare <a> <b> --threshold <v>  Set regression threshold (global or per-scorer)
   axl-eval compare <a> <b> --fail-on-regression  Exit 1 if regressions
+  axl-eval compare <a> <b> --max-scorer-error-rate <0..1>  Exit 1 if a scorer's
+                                          failure rate exceeds the limit on
+                                          either side (deterministic scorers
+                                          tolerate zero failures). Always warns
+                                          when either side rests on a thinned
+                                          sample, even without this flag.
 
 Config auto-detection (when --config is not specified):
   ${CONFIG_CANDIDATES.join(' -> ')}
@@ -121,6 +157,28 @@ function parseThresholdArg(args: string[]): Record<string, number> | number | un
 }
 
 /**
+ * Parse `--max-scorer-error-rate <0..1>`. Returns the numeric limit, or
+ * `undefined` when the flag is absent. Exits non-zero on a malformed value
+ * (fail loud — a typo'd gate threshold must not silently disable the gate).
+ */
+function parseMaxScorerErrorRate(args: string[]): number | undefined {
+  const idx = args.indexOf('--max-scorer-error-rate');
+  if (idx === -1) return undefined;
+  if (idx + 1 >= args.length) {
+    console.error('Error: --max-scorer-error-rate requires a value in [0, 1]');
+    process.exit(1);
+  }
+  const n = parseFloat(args[idx + 1]);
+  if (!Number.isFinite(n) || n < 0 || n > 1) {
+    console.error(
+      `Error: --max-scorer-error-rate must be a number in [0, 1], got "${args[idx + 1]}"`,
+    );
+    process.exit(1);
+  }
+  return n;
+}
+
+/**
  * If a raw compare input (single result or multi-run array) was produced by a
  * `--scorers` filtered run, return the scorer names it ran; otherwise undefined.
  * Reads the first run's metadata — a multi-run group shares the same stamp.
@@ -135,8 +193,12 @@ function scorerFilteredScorers(r: EvalResult | EvalResult[]): string[] | undefin
 async function runCompare(args: string[]) {
   const failOnRegression = args.includes('--fail-on-regression');
   const thresholds = parseThresholdArg(args);
+  const maxScorerErrorRate = parseMaxScorerErrorRate(args);
+  // Exclude flags and the values consumed by value-taking flags so neither a
+  // threshold nor an error-rate value is mistaken for a result file path.
+  const valueFlags = new Set(['--threshold', '--max-scorer-error-rate']);
   const files = args.filter(
-    (a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1] === '--threshold'),
+    (a, i) => !a.startsWith('--') && !(i > 0 && valueFlags.has(args[i - 1])),
   );
 
   if (files.length !== 2) {
@@ -170,12 +232,9 @@ async function runCompare(args: string[]) {
     );
   }
   if (failOnRegression && filteredSides.length > 0) {
-    console.error(
-      `[axl-eval] Refusing to gate on a scorer-filtered result (${filteredSides
-        .map(([s]) => s)
-        .join(', ')}); re-run without --scorers.`,
+    refuseToGate(
+      `${filteredSides.map(([s]) => s).join(', ')} was run with --scorers (a scorer subset); re-run without --scorers for a complete baseline.`,
     );
-    process.exit(1);
   }
 
   const compareOptions = thresholds != null ? { thresholds } : undefined;
@@ -234,6 +293,56 @@ async function runCompare(args: string[]) {
   console.log(
     `\n  Regressions: ${comparison.regressions.length} | Improvements: ${comparison.improvements.length} | Stable: ${stable}\n`,
   );
+
+  // Scorer failure-rate signal. Always WARN loudly when either side rests on a
+  // thinned sample (a scorer ran and failed on some items) — a regression check
+  // computed over survivors can look green while half the judges errored. Only
+  // REFUSE to gate when the user opted in with `--max-scorer-error-rate` AND a
+  // scorer is over tolerance (type-aware: deterministic scorers tolerate zero
+  // failures, LLM judges use the flag value), or a scorer produced no scored
+  // items at all on a side (a zero-sample mean can't be certified).
+  const scorerTypes = (comparison.baseline.metadata?.scorerTypes ?? {}) as Record<string, string>;
+  for (const name of scorerNames) {
+    const s = comparison.scorers[name];
+    const bFailed = s.baselineFailed ?? 0;
+    const cFailed = s.candidateFailed ?? 0;
+    if (bFailed > 0 || cFailed > 0) {
+      const bAtt = (s.baselineScored ?? 0) + bFailed;
+      const cAtt = (s.candidateScored ?? 0) + cFailed;
+      console.error(
+        `[axl-eval] WARNING: scorer "${name}" failed on some items ` +
+          `(baseline ${bFailed}/${bAtt}, candidate ${cFailed}/${cAtt}); ` +
+          `the means above are computed over the surviving sample.`,
+      );
+    }
+  }
+
+  if (maxScorerErrorRate != null) {
+    for (const name of scorerNames) {
+      const s = comparison.scorers[name];
+      const type = scorerTypes[name] === 'llm' ? 'llm' : 'deterministic';
+      const limit = type === 'deterministic' ? 0 : maxScorerErrorRate;
+      for (const [side, scored, failed] of [
+        ['baseline', s.baselineScored ?? 0, s.baselineFailed ?? 0],
+        ['candidate', s.candidateScored ?? 0, s.candidateFailed ?? 0],
+      ] as const) {
+        const attempted = scored + failed;
+        if (attempted === 0) {
+          refuseToGate(
+            `scorer "${name}" produced no scored items on ${side} — cannot certify a zero-sample scorer.`,
+          );
+        }
+        const rate = failed / attempted;
+        const exceeds = type === 'deterministic' ? failed > 0 : rate > limit;
+        if (exceeds) {
+          refuseToGate(
+            `scorer "${name}" failed ${(rate * 100).toFixed(1)}% on ${side} ` +
+              `(${failed}/${attempted}), over the ${type === 'deterministic' ? 'deterministic zero-tolerance' : `${(limit * 100).toFixed(1)}%`} limit.`,
+          );
+        }
+      }
+    }
+  }
 
   if (failOnRegression && comparison.regressions.length > 0) {
     // When CI is available, only fail on significant regressions
@@ -373,15 +482,20 @@ function formatTable(result: EvalResult): string {
 
   for (const name of scorerNames) {
     const s = result.summary.scorers[name];
+    const { scored, failed } = scorerSampleCounts(s, name, result.items);
+    // Loud trailing annotation when a scorer ran and failed on some items: the
+    // mean rests on a thinned sample. Shown only when failed > 0 so clean runs
+    // stay uncluttered.
+    const annotation =
+      failed > 0 ? `   (${scored}/${scored + failed} scored, ${failed} failed)` : '';
     // Detect scorers with no valid scores (all items errored → computeStats([]) → all zeros)
-    const validScoreCount = result.items.filter((i) => !i.error && i.scores[name] != null).length;
-    if (validScoreCount === 0) {
+    if (scored === 0) {
       lines.push(
-        `  ${name.padEnd(maxNameLen)}  ${'--'.padStart(colWidth)}  ${'--'.padStart(colWidth)}  ${'--'.padStart(colWidth)}  ${'--'.padStart(colWidth)}  ${'--'.padStart(colWidth)}`,
+        `  ${name.padEnd(maxNameLen)}  ${'--'.padStart(colWidth)}  ${'--'.padStart(colWidth)}  ${'--'.padStart(colWidth)}  ${'--'.padStart(colWidth)}  ${'--'.padStart(colWidth)}${annotation}`,
       );
     } else {
       lines.push(
-        `  ${name.padEnd(maxNameLen)}  ${s.mean.toFixed(2).padStart(colWidth)}  ${s.min.toFixed(2).padStart(colWidth)}  ${s.max.toFixed(2).padStart(colWidth)}  ${s.p50.toFixed(2).padStart(colWidth)}  ${s.p95.toFixed(2).padStart(colWidth)}`,
+        `  ${name.padEnd(maxNameLen)}  ${s.mean.toFixed(2).padStart(colWidth)}  ${s.min.toFixed(2).padStart(colWidth)}  ${s.max.toFixed(2).padStart(colWidth)}  ${s.p50.toFixed(2).padStart(colWidth)}  ${s.p95.toFixed(2).padStart(colWidth)}${annotation}`,
       );
     }
   }
@@ -436,8 +550,13 @@ function formatMultiRunTable(summary: MultiRunSummary): string {
   for (const name of scorerNames) {
     const s = summary.scorers[name];
     const meanStd = `${s.mean.toFixed(3)} \u00b1 ${s.std.toFixed(3)}`;
+    // Multi-run summaries have no items, so the summed scored/failed fields are
+    // authoritative (no fallback recompute possible). Annotate when failed > 0.
+    const { scored, failed } = scorerSampleCounts(s, name);
+    const annotation =
+      failed > 0 ? `   (${scored}/${scored + failed} scored, ${failed} failed)` : '';
     lines.push(
-      `  ${name.padEnd(maxNameLen)}  ${meanStd.padStart(colWidth)}  ${s.min.toFixed(3).padStart(8)}  ${s.max.toFixed(3).padStart(8)}`,
+      `  ${name.padEnd(maxNameLen)}  ${meanStd.padStart(colWidth)}  ${s.min.toFixed(3).padStart(8)}  ${s.max.toFixed(3).padStart(8)}${annotation}`,
     );
   }
 
@@ -453,6 +572,28 @@ function formatMultiRunTable(summary: MultiRunSummary): string {
   lines.push(`  Total Cost: ${costStr} | Total Duration: ${durationStr}s`);
 
   return lines.join('\n');
+}
+
+/**
+ * Print each degraded scorer (set by `runEval` when `failOnScorerErrorRate`
+ * tripped) to stderr and return whether the run was degraded, so the caller can
+ * count the file as failed (→ non-zero exit). Quiet when nothing degraded.
+ */
+function reportDegraded(result: EvalResult, label: string): boolean {
+  const d = result.summary.degraded;
+  if (!d || d.length === 0) return false;
+  for (const x of d) {
+    const attempted = x.scored + x.failed;
+    const limitStr =
+      x.type === 'deterministic'
+        ? 'deterministic zero-tolerance'
+        : `${(x.limit * 100).toFixed(1)}% limit`;
+    console.error(
+      `[axl-eval] DEGRADED: ${label} scorer "${x.scorer}" (${x.type}) failed ` +
+        `${(x.rate * 100).toFixed(1)}% (${x.failed}/${attempted}), over the ${limitStr}.`,
+    );
+  }
+  return true;
 }
 
 // ── Runtime resolution ─────────────────────────────────────────────
@@ -805,12 +946,22 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
           const summary = aggregateRuns(runResults);
           console.log('\n' + formatMultiRunTable(summary) + '\n');
           for (const r of runResults) results.push(r);
+
+          // Failure-rate gate (opt-in via failOnScorerErrorRate in the eval
+          // config). Report every degraded run; count the file as failed unless
+          // it was already counted as a partial batch above (avoids double).
+          let anyDegraded = false;
+          for (const r of runResults) {
+            if (reportDegraded(r, filePath)) anyDegraded = true;
+          }
+          if (anyDegraded && !partial) failedFiles++;
         } else {
           const result = await runEval(evalConfig, executeWorkflow, runtime, runOptions);
           stampFiltered(result);
           results.push(result);
 
           console.log('\n' + formatTable(result) + '\n');
+          if (reportDegraded(result, filePath)) failedFiles++;
         }
       } catch (err) {
         console.error(

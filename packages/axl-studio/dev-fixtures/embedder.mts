@@ -30,7 +30,7 @@ export class MockEmbedder implements Embedder {
       usage: {
         tokens,
         cost,
-        model: 'mock:text-embedding-3-small',
+        model: 'text-embedding-3-small',
       },
     };
   }

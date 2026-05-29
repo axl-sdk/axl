@@ -16,7 +16,43 @@ export type EvalConfig = {
    */
   scorerConcurrency?: number;
   budget?: string;
+  /**
+   * Opt-in source-side trust gate. When set (0–1), `runEval` flags the run as
+   * `summary.degraded` if any scorer's failure rate exceeds tolerance, and the
+   * CLI exits non-zero. Enforcement is **type-aware**: deterministic scorers
+   * tolerate ZERO failures (a deterministic scorer that throws is a bug, not
+   * noise), while LLM scorers use this rate (a flaky judge / rate-limit storm).
+   *
+   * Failure rate = `failed / (scored + failed)` per scorer, where `scored` is
+   * the number of items that produced a valid numeric score and `failed` is the
+   * number whose scorer ran and threw / returned out-of-range. `0` means "any
+   * LLM failure degrades the run". Invalid values (non-finite, <0, >1) are
+   * ignored with a `console.warn`.
+   *
+   * Distinct from the gate-side `--max-scorer-error-rate` compare flag: this one
+   * fires at run/produce time (catch a thinned sample before it's saved), the
+   * other at consume/gate time (refuse to certify a thinned baseline/candidate).
+   */
+  failOnScorerErrorRate?: number;
   metadata?: Record<string, unknown>;
+};
+
+/**
+ * One scorer whose failure rate tripped `EvalConfig.failOnScorerErrorRate`.
+ * Surfaced on `EvalSummary.degraded` so consumers (CLI exit code, Studio
+ * banner) can refuse to trust the mean without re-deriving the rate.
+ */
+export type DegradedScorer = {
+  scorer: string;
+  /** Observed failure rate `failed / (scored + failed)` (0 when nothing ran). */
+  rate: number;
+  /** The tolerance that was exceeded (0 for deterministic scorers). */
+  limit: number;
+  type: 'llm' | 'deterministic';
+  /** Items that produced a valid numeric score. */
+  scored: number;
+  /** Items whose scorer ran and failed (threw / out-of-range). */
+  failed: number;
 };
 
 export type EvalResult = {
@@ -91,6 +127,22 @@ export type EvalSummary = {
       max: number;
       p50: number;
       p95: number;
+      /**
+       * Number of items that produced a valid numeric score — the sample size
+       * the `mean` actually covers. Optional so pre-existing artifacts (and
+       * hand-rolled summaries) stay valid; absent ⇒ recompute from `items`.
+       * Named `scored` (NOT `n`) to avoid collision with
+       * `EvalComparison.scorers[].n` (paired-diff count).
+       */
+      scored?: number;
+      /**
+       * Number of items whose scorer RAN and failed (threw or returned
+       * out-of-range). Distinct from items skipped by cancellation, which land
+       * in neither bucket — so `scored + failed` is the honest "attempted"
+       * denominator and may be `<` the eligible item count. A non-zero `failed`
+       * means the `mean` was computed over a thinned sample.
+       */
+      failed?: number;
     }
   >;
   timing?: {
@@ -100,6 +152,14 @@ export type EvalSummary = {
     p50: number;
     p95: number;
   };
+  /**
+   * Populated by `runEval` ONLY when `EvalConfig.failOnScorerErrorRate` is set
+   * and one or more scorers exceeded tolerance. `runEval` never throws on this
+   * — it returns the (still-useful) result with this flag set, and the CLI /
+   * consumer decides whether to fail. Absent / empty ⇒ no degradation gate
+   * tripped (either not configured or all scorers within tolerance).
+   */
+  degraded?: DegradedScorer[];
 };
 
 /**
@@ -159,6 +219,18 @@ export type EvalComparison = {
       pImprovement?: number;
       /** Number of paired item differences used for CI computation. */
       n?: number;
+      /**
+       * Per-side scorer success/failure counts over the SAME truncated pool the
+       * means and CI are computed from (not a separately-recomputed raw set), so
+       * a gate reads numbers consistent with what the table displays. Raw counts
+       * (consumer divides) keep this truncation-consistent. A non-zero
+       * `*Failed` means that side's mean rests on a thinned sample — the gate-side
+       * `--max-scorer-error-rate` flag refuses to certify when it's over tolerance.
+       */
+      baselineScored?: number;
+      baselineFailed?: number;
+      candidateScored?: number;
+      candidateFailed?: number;
     }
   >;
   timing?: {

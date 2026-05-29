@@ -32,7 +32,7 @@ export async function seedHistorical(runtime: AxlRuntime): Promise<void> {
   const store = runtime.getStateStore();
   const workflows = ['qa-workflow', 'research-workflow', 'rag-workflow', 'unreliable-workflow'];
   const agents = ['qa-agent', 'research-agent', 'qa-agent-upgraded'];
-  const models = ['mock:gpt-4o', 'mock:claude-sonnet-4-6', 'mock:gpt-4o-mini'];
+  const models = ['openai-responses:gpt-5.4', 'openai-responses:gpt-5.5', 'openai-responses:gpt-5-mini'];
   let counter = 0;
   const saves: Array<Promise<unknown>> = [];
 
@@ -244,9 +244,9 @@ export async function seedLive(runtime: AxlRuntime): Promise<void> {
 // and latency shifts). Makes the "By Model" view on Eval Trends
 // immediately useful.
 //
-//   Cohort 1 (mini, days 8-10 ago):    baseline scores, fast, cheap
-//   Cohort 2 (gpt-4o, days 3-5 ago):   +0.06 scores, 1.0× duration, 1.0× cost
-//   Cohort 3 (claude, days 0-2 ago):   +0.13 scores, 1.6× duration, 2.5× cost
+//   Cohort 1 (gpt-5-mini, days 8-10 ago): baseline scores, fast, cheap
+//   Cohort 2 (gpt-5.4, days 3-5 ago):     +0.06 scores, 1.0× duration, 1.0× cost
+//   Cohort 3 (gpt-5.5, days 0-2 ago):     +0.13 scores, 1.6× duration, 2.5× cost
 //
 // Scores are biased post-hoc on the EvalResult: scorer means, per-item
 // scores, duration, cost, and model metadata are overridden so the UI
@@ -264,9 +264,9 @@ type Cohort = {
 };
 
 const COHORTS: Cohort[] = [
-  { label: 'mini era', model: 'mock:gpt-4o-mini', scoreBias: 0, durMult: 0.6, costMult: 0.3, daysAgoStart: 10, daysAgoEnd: 8, runs: 5 },
-  { label: 'gpt-4o upgrade', model: 'mock:gpt-4o', scoreBias: 0.06, durMult: 1.0, costMult: 1.0, daysAgoStart: 5, daysAgoEnd: 3, runs: 4 },
-  { label: 'claude upgrade', model: 'mock:claude-sonnet-4-6', scoreBias: 0.13, durMult: 1.6, costMult: 2.5, daysAgoStart: 2, daysAgoEnd: 0, runs: 4 },
+  { label: 'gpt-5-mini era', model: 'openai-responses:gpt-5-mini', scoreBias: 0, durMult: 0.6, costMult: 0.3, daysAgoStart: 10, daysAgoEnd: 8, runs: 5 },
+  { label: 'gpt-5.4 upgrade', model: 'openai-responses:gpt-5.4', scoreBias: 0.06, durMult: 1.0, costMult: 1.0, daysAgoStart: 5, daysAgoEnd: 3, runs: 4 },
+  { label: 'gpt-5.5 upgrade', model: 'openai-responses:gpt-5.5', scoreBias: 0.13, durMult: 1.6, costMult: 2.5, daysAgoStart: 2, daysAgoEnd: 0, runs: 4 },
 ];
 
 async function seedQaEvalCohorts(runtime: AxlRuntime): Promise<void> {

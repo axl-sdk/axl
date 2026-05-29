@@ -69,10 +69,10 @@ const runtime = new AxlRuntime({
 });
 
 // Providers.
-runtime.registerProvider('mock', realisticEchoProvider);
-runtime.registerProvider('mock-json', jsonProvider);
-runtime.registerProvider('mock-schema-retry', schemaRetryProvider);
-runtime.registerProvider('mock-tagged', mockTaggedProvider);
+runtime.registerProvider('openai-responses', realisticEchoProvider);
+runtime.registerProvider('openai', jsonProvider);
+runtime.registerProvider('anthropic', schemaRetryProvider);
+runtime.registerProvider('google', mockTaggedProvider);
 
 // Workflows + agents + tools.
 for (const wf of allWorkflows) runtime.register(wf);

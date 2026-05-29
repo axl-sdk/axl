@@ -1,16 +1,23 @@
 /**
  * Mock providers for the dev fixtures.
  *
+ * These are `MockProvider`s — no network, no API keys. `index.mts` registers
+ * them under the REAL provider scheme names (so the Studio UI shows production-
+ * realistic `provider:model` labels and a multi-provider cost breakdown), but
+ * the behavior is 100% local. The scheme each is registered under is noted below.
+ *
  * Four providers, each with a clear purpose:
  *
- *   mock              — realistic echo with token + cost telemetry. Used by
- *                       most "ordinary" demo workflows (qa, research, etc).
- *   mock-json         — always returns a structured-output JSON shape.
- *   mock-schema-retry — first turn malformed JSON, second turn valid; used
- *                       by the schema-retry feedback eval.
- *   mock-tagged       — dispatches on a `[#tag]` token at the start of the
- *                       agent's system prompt. Routes to per-scenario
- *                       behaviors (handoffs, partial_object chunks,
+ *   realisticEchoProvider  (scheme: openai-responses) — realistic echo with
+ *                       token + cost telemetry. Used by most "ordinary" demo
+ *                       workflows (qa, research, etc).
+ *   jsonProvider           (scheme: openai) — always returns a structured-
+ *                       output JSON shape.
+ *   schemaRetryProvider    (scheme: anthropic) — first turn malformed JSON,
+ *                       second turn valid; used by the schema-retry feedback eval.
+ *   mockTaggedProvider     (scheme: google) — dispatches on a `[#tag]` token at
+ *                       the start of the agent's system prompt. Routes to per-
+ *                       scenario behaviors (handoffs, partial_object chunks,
  *                       always-fail, parallel branches, etc) without the
  *                       fragile "match a phrase in the system prompt" hack.
  *

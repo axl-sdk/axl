@@ -180,4 +180,37 @@ describe('aggregateRuns()', () => {
   it('throws when given empty runs array', () => {
     expect(() => aggregateRuns([])).toThrow('Cannot aggregate zero runs');
   });
+
+  it('sums scored/failed across runs', () => {
+    const runs = [
+      makeRun({
+        summary: {
+          count: 2,
+          failures: 0,
+          scorers: {
+            accuracy: { mean: 0.7, min: 0.6, max: 0.8, p50: 0.7, p95: 0.8, scored: 8, failed: 2 },
+          },
+        },
+      }),
+      makeRun({
+        summary: {
+          count: 2,
+          failures: 0,
+          scorers: {
+            accuracy: { mean: 0.8, min: 0.7, max: 0.9, p50: 0.8, p95: 0.9, scored: 9, failed: 1 },
+          },
+        },
+      }),
+    ];
+    const summary = aggregateRuns(runs);
+    expect(summary.scorers.accuracy.scored).toBe(17);
+    expect(summary.scorers.accuracy.failed).toBe(3);
+  });
+
+  it('treats missing scored/failed as 0 (pre-0.17.10 artifacts)', () => {
+    // makeRun's default summary has no scored/failed fields.
+    const summary = aggregateRuns([makeRun(), makeRun()]);
+    expect(summary.scorers.accuracy.scored).toBe(0);
+    expect(summary.scorers.accuracy.failed).toBe(0);
+  });
 });

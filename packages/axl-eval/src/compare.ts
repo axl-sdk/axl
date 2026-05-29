@@ -6,6 +6,7 @@ import type {
   EvalImprovement,
 } from './types.js';
 import { pairedBootstrapCI } from './bootstrap.js';
+import { scorerCounts } from './utils.js';
 
 function round(n: number): number {
   return Math.round(n * 1000) / 1000;
@@ -135,11 +136,35 @@ export function evalCompare(
     const deltaPercent = bMeanRaw > 0 ? round((deltaRaw / bMeanRaw) * 100) : 0;
     const threshold = resolveThreshold(name, options, baselineRef.metadata);
 
+    // Per-side scored/failed over the SAME truncated pool the means/CI use, so
+    // a gate (`--max-scorer-error-rate`) reads a sample consistent with the
+    // displayed numbers. Sum across this side's truncated runs (the
+    // `scorerCounts` helper excludes workflow-errored items and counts a
+    // ran-and-failed scorer via its `scoreDetails.duration` discriminator).
+    let baselineScored = 0;
+    let baselineFailed = 0;
+    for (const run of baselineRuns) {
+      const c = scorerCounts(run.items, name);
+      baselineScored += c.scored;
+      baselineFailed += c.failed;
+    }
+    let candidateScored = 0;
+    let candidateFailed = 0;
+    for (const run of candidateRuns) {
+      const c = scorerCounts(run.items, name);
+      candidateScored += c.scored;
+      candidateFailed += c.failed;
+    }
+
     const entry: EvalComparison['scorers'][string] = {
       baselineMean: bMean,
       candidateMean: cMean,
       delta,
       deltaPercent,
+      baselineScored,
+      baselineFailed,
+      candidateScored,
+      candidateFailed,
     };
 
     // Compute bootstrap CI when we have enough paired data

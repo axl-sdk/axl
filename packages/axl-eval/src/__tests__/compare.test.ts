@@ -1273,4 +1273,58 @@ describe('evalCompare()', () => {
       expect(comparison.candidate.metadata.scorerFiltered).toBeUndefined();
     });
   });
+
+  describe('per-side scored/failed counts', () => {
+    // A ran-and-failed scorer = null score WITH a recorded scoreDetails.duration.
+    const failedItem = (q: string) => ({
+      input: { q },
+      output: 'x',
+      scores: { accuracy: null },
+      scoreDetails: { accuracy: { score: null, duration: 5 } },
+    });
+    const okItem = (q: string, s: number) => ({
+      input: { q },
+      output: 'x',
+      scores: { accuracy: s },
+      scoreDetails: { accuracy: { score: s, duration: 5 } },
+    });
+
+    it('reports scored/failed per side over the compared pool', () => {
+      const baseline = makeEvalResult({
+        id: 'b',
+        items: [okItem('1', 0.8), okItem('2', 0.6), failedItem('3')],
+        summary: {
+          count: 3,
+          failures: 0,
+          scorers: { accuracy: { mean: 0.7, min: 0.6, max: 0.8, p50: 0.7, p95: 0.8 } },
+        },
+      });
+      const candidate = makeEvalResult({
+        id: 'c',
+        items: [okItem('1', 0.9), failedItem('2'), failedItem('3')],
+        summary: {
+          count: 3,
+          failures: 0,
+          scorers: { accuracy: { mean: 0.9, min: 0.9, max: 0.9, p50: 0.9, p95: 0.9 } },
+        },
+      });
+
+      const c = evalCompare(baseline, candidate).scorers.accuracy;
+      expect(c.baselineScored).toBe(2);
+      expect(c.baselineFailed).toBe(1);
+      expect(c.candidateScored).toBe(1);
+      expect(c.candidateFailed).toBe(2);
+    });
+
+    it('handles a side with no failures (0/0 fail rate)', () => {
+      const baseline = makeEvalResult({ id: 'b' });
+      const candidate = makeEvalResult({ id: 'c' });
+      const c = evalCompare(baseline, candidate).scorers.accuracy;
+      // makeEvalResult items carry no scoreDetails → counts fall back to score
+      // presence: 2 scored, 0 failed on each side.
+      expect(c.baselineScored).toBe(2);
+      expect(c.baselineFailed).toBe(0);
+      expect(c.candidateFailed).toBe(0);
+    });
+  });
 });

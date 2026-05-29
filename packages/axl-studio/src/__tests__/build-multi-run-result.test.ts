@@ -165,4 +165,30 @@ describe('buildMultiRunResult', () => {
     ]);
     expect(result!._multiRun?.partial).toBeUndefined();
   });
+
+  it('sums scored/failed across runs in the aggregate', () => {
+    const withCounts = (id: string, scored: number, failed: number): EvalResultData => ({
+      id,
+      dataset: 'ds',
+      timestamp: '2026-04-30T00:00:00.000Z',
+      duration: 1000,
+      totalCost: 0.01,
+      items: [],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: { acc: { mean: 0.8, min: 0.8, max: 0.8, p50: 0.8, p95: 0.8, scored, failed } },
+      },
+      metadata: { runGroupId: 'g1' },
+    });
+    const result = buildMultiRunResult([withCounts('r0', 8, 2), withCounts('r1', 9, 1)]);
+    expect(result!._multiRun?.aggregate.scorers.acc.scored).toBe(17);
+    expect(result!._multiRun?.aggregate.scorers.acc.failed).toBe(3);
+  });
+
+  it('treats missing scored/failed as 0 (pre-0.17.10 runs)', () => {
+    const result = buildMultiRunResult([makeRun(0), makeRun(1)]);
+    expect(result!._multiRun?.aggregate.scorers.acc.scored).toBe(0);
+    expect(result!._multiRun?.aggregate.scorers.acc.failed).toBe(0);
+  });
 });

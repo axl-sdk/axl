@@ -25,7 +25,7 @@ const refundOrder = tool({
 });
 
 const SupportBot = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You are a helpful customer support agent. Be concise.',
   tools: [getOrder, refundOrder],
   timeout: '30s',
@@ -53,7 +53,7 @@ const UserProfile = z.object({
 });
 
 const Extractor = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'Extract structured user profile data from the given text.',
   temperature: 0.1,
 });
@@ -229,7 +229,7 @@ const ReviewScore = z.object({
 });
 
 const Reviewer = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'Review the document and provide a score from 1-10 with reasoning.',
   temperature: 0.7,  // some randomness so each call produces a different review
 });
@@ -277,7 +277,7 @@ const PeerReview = workflow({
 Use different models as reviewers to reduce correlated errors:
 
 ```typescript
-const ReviewerGPT = agent({ model: 'openai-responses:gpt-5.4', system: 'Review the document...', temperature: 0.7 });
+const ReviewerGPT = agent({ model: 'openai-responses:gpt-5.5', system: 'Review the document...', temperature: 0.7 });
 const ReviewerClaude = agent({ model: 'anthropic:claude-sonnet-4-6', system: 'Review the document...', temperature: 0.7 });
 const ReviewerGemini = agent({ model: 'google:gemini-3.1-pro-preview', system: 'Review the document...', temperature: 0.7 });
 
@@ -378,7 +378,7 @@ Deep research task that could consume unlimited tokens, capped at a fixed cost. 
 
 ```typescript
 const Researcher = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'Research the given topic thoroughly.',
   tools: [webSearch, readUrl],
   maxTurns: 20,
@@ -410,7 +410,7 @@ A customer chats back and forth with a support agent. Axl maintains conversation
 
 ```typescript
 const SupportBot = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You are a helpful support agent. Be concise and friendly.',
   tools: [getOrder, getCustomer, refundOrder],
   maxTurns: 10,
@@ -530,13 +530,13 @@ A triage agent routes to specialist agents. Each specialist has its own scoped t
 
 ```typescript
 const BillingBot = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You handle billing and payment questions.',
   tools: [getInvoice, processPayment, applyCredit],
 });
 
 const ShippingBot = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You handle shipping and delivery questions.',
   tools: [trackPackage, updateAddress, scheduleRedelivery],
 });
@@ -660,7 +660,7 @@ import { dataset, scorer, llmScorer, defineEval } from '@axlsdk/eval';
 
 // The workflow under evaluation — this is what we're iterating on
 const FitnessCoach = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You are a certified personal trainer. Generate a workout plan for the given profile.',
 });
 
@@ -709,7 +709,7 @@ const structuralValidity = scorer({
 // LLM-as-judge scorer
 const planQuality = llmScorer({
   name: 'plan-quality',
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You are an expert fitness coach evaluating workout plans. Rate on a 0-1 scale.',
   schema: z.object({ score: z.number().min(0).max(1), reasoning: z.string() }),
   effort: 'high',  // reasoning-capable judges score more consistently with effort enabled

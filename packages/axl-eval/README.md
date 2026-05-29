@@ -235,6 +235,26 @@ The CLI resolves a runtime automatically: `--config <path>` > auto-detect `axl.c
 
 **`--scorers <a,b>`** runs only the named scorers (single eval file only) for a fast iteration loop. The result is stamped `metadata.scorerFiltered: true` so `axl-eval compare` warns — and, under `--fail-on-regression`, refuses — to gate on a subset run mistaken for a full baseline.
 
+#### Scorer failure rate — two complementary gates
+
+Concurrent scorers (`concurrency × scorerConcurrency`, up to 25 in-flight by default) can overrun a rate-limited judge model. When a judge call exhausts the provider's retry backoff it throws, the runner records that item's score as `null`, and the mean is computed over the **survivors** — so a thinned sample can still look green. The runner now always reports per-scorer `scored`/`failed` counts (visible in the table as `(18/20 scored, 2 failed)` and in Studio as an amber badge), and two opt-in gates turn that signal into a non-zero exit:
+
+| Gate | Where | When it fires |
+|------|-------|---------------|
+| `failOnScorerErrorRate` (config field) | **Source-side** — at run/produce time | `runEval` flags `summary.degraded` (and the CLI exits non-zero) when a scorer exceeds tolerance, *before* the thinned result is saved. `runEval` never throws — it returns the result with the flag set, preserving multi-run partials and auto-save. |
+| `--max-scorer-error-rate <0..1>` (compare flag) | **Gate-side** — at consume/gate time | `axl-eval compare` refuses (exit 1) to certify a baseline/candidate whose failure rate is over the limit. Always *warns* when either side rests on a thinned sample, even without the flag. |
+
+Both are **type-aware**: deterministic scorers tolerate **zero** failures (a deterministic scorer that throws is a bug, not noise); LLM judges use the configured rate. They're complementary — set `failOnScorerErrorRate` in the eval file to fail fast at run time, and pass `--max-scorer-error-rate` in CI to refuse to gate on an artifact that was already thinned (e.g. an imported result).
+
+```ts
+// eval file — fail this run if the judge errored on >10% of items
+export default { workflow: 'qa', dataset: ds, scorers: [judge], failOnScorerErrorRate: 0.1 };
+```
+
+```bash
+npx axl-eval compare base.json cand.json --fail-on-regression --max-scorer-error-rate 0.05
+```
+
 ### Programmatic
 
 **`runtime.eval()`** — when you have a workflow registered on the runtime. The `workflow` field must match the registered name:
@@ -438,6 +458,7 @@ Compare two runs to detect regressions and improvements. Runs must use the same 
 ```bash
 npx axl-eval compare ./results/v1.json ./results/v2.json
 npx axl-eval compare v1.json v2.json --fail-on-regression  # exit 1 if significant regressions
+npx axl-eval compare v1.json v2.json --max-scorer-error-rate 0.05  # exit 1 if a scorer failed on >5% of items (deterministic scorers: zero tolerance)
 ```
 
 ```

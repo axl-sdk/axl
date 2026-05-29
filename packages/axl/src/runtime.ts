@@ -1053,6 +1053,7 @@ export class AxlRuntime extends EventEmitter {
           concurrency?: number;
           scorerConcurrency?: number;
           budget?: string;
+          failOnScorerErrorRate?: number;
           metadata?: Record<string, unknown>;
         },
         {
@@ -2123,6 +2124,7 @@ export class AxlRuntime extends EventEmitter {
       concurrency?: number;
       scorerConcurrency?: number;
       budget?: string;
+      failOnScorerErrorRate?: number;
       metadata?: Record<string, unknown>;
     },
     options?: {

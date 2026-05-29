@@ -87,6 +87,27 @@ describe('rescore()', () => {
     expect(rescored.summary.scorers['half'].max).toBe(0.5);
   });
 
+  it('surfaces scored/failed counts (but never a degraded gate)', async () => {
+    // Rescore reports the same trust-signal counts as runEval, but takes
+    // RescoreOptions (no failOnScorerErrorRate) — so there is no degradation
+    // gate on this path even when a scorer fails.
+    const flakyScorer: Scorer = {
+      name: 'flaky',
+      description: 'throws on q=2',
+      isLlm: true,
+      score: (_o, input) => {
+        if ((input as { q: string }).q === '2') throw new Error('boom');
+        return 1;
+      },
+    };
+    const rescored = await rescore(makeResult(), [flakyScorer], mockRuntime);
+    const s = rescored.summary.scorers['flaky'];
+    expect(s.scored).toBe(2);
+    expect(s.failed).toBe(1);
+    // No degradation gate exists on the rescore path.
+    expect((rescored.summary as { degraded?: unknown }).degraded).toBeUndefined();
+  });
+
   it('skips scoring for error items and preserves them', async () => {
     const result = makeResult({
       items: [

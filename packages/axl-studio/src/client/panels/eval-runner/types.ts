@@ -29,6 +29,12 @@ export type ScorerStats = {
   max: number;
   p50: number;
   p95: number;
+  /** Items that produced a valid numeric score (the sample size `mean` covers).
+   *  Optional — absent on pre-0.17.10 artifacts; fall back to recomputing from items. */
+  scored?: number;
+  /** Items whose scorer ran and failed (threw / out-of-range). A non-zero value
+   *  means `mean` rests on a thinned sample. */
+  failed?: number;
 };
 
 export type MultiRunAggregate = {
@@ -41,7 +47,10 @@ export type MultiRunAggregate = {
    * heterogeneous groups with multiple.
    */
   workflows?: string[];
-  scorers: Record<string, { mean: number; std: number; min: number; max: number }>;
+  scorers: Record<
+    string,
+    { mean: number; std: number; min: number; max: number; scored?: number; failed?: number }
+  >;
   timing?: { mean: number; std: number };
 };
 
@@ -192,7 +201,7 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
   if (allRuns.length === 0) return null;
   const first = allRuns[0];
   const scorerNames = Object.keys(first.summary?.scorers ?? {});
-  const aggScorers: Record<string, { mean: number; std: number; min: number; max: number }> = {};
+  const aggScorers: MultiRunAggregate['scorers'] = {};
   for (const name of scorerNames) {
     const means = allRuns.map((r) => r.summary?.scorers?.[name]?.mean ?? 0);
     const mean = means.reduce((a, b) => a + b, 0) / means.length;
@@ -200,11 +209,18 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
       means.length > 1
         ? Math.sqrt(means.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (means.length - 1))
         : 0;
+    // Sum per-run sample sizes (parallel to the server's aggregateRuns) so the
+    // multi-run view can surface the same thinned-sample signal. Read with
+    // `?? 0` — pre-0.17.10 runs predate these fields.
+    const scored = allRuns.reduce((s, r) => s + (r.summary?.scorers?.[name]?.scored ?? 0), 0);
+    const failed = allRuns.reduce((s, r) => s + (r.summary?.scorers?.[name]?.failed ?? 0), 0);
     aggScorers[name] = {
       mean: Math.round(mean * 1000) / 1000,
       std: Math.round(std * 1000) / 1000,
       min: Math.round(Math.min(...means) * 1000) / 1000,
       max: Math.round(Math.max(...means) * 1000) / 1000,
+      scored,
+      failed,
     };
   }
   // Union workflows across all runs, first-seen first. Heterogeneous groups
@@ -311,6 +327,36 @@ export function scoreBgTint(score: number): string {
 export function getItemModels(item: EvalItem): string[] {
   if (!Array.isArray(item.metadata?.models)) return [];
   return (item.metadata.models as unknown[]).filter((m): m is string => typeof m === 'string');
+}
+
+/**
+ * Resolve a scorer's `scored`/`failed` sample counts. Prefers the summary
+ * fields (authoritative, set by the runner ≥0.17.10) and falls back to
+ * recomputing from `items` for pre-0.17.10 artifacts — using the same
+ * `scoreDetails.duration` discriminator the server uses (a `null` score WITH a
+ * recorded duration ran-and-failed; WITHOUT one was skipped by cancellation and
+ * counts as neither). `items` is omitted for multi-run aggregates that carry no
+ * items, where the summed fields are authoritative.
+ */
+export function getScorerSampleCounts(
+  stats: { scored?: number; failed?: number },
+  name: string,
+  items?: EvalItem[],
+): { scored: number; failed: number } {
+  if (stats.scored != null && stats.failed != null) {
+    return { scored: stats.scored, failed: stats.failed };
+  }
+  if (items) {
+    let scored = 0;
+    let failed = 0;
+    for (const i of items) {
+      if (i.error) continue;
+      if (i.scores[name] != null) scored++;
+      else if (i.scoreDetails?.[name]?.duration != null) failed++;
+    }
+    return { scored, failed };
+  }
+  return { scored: stats.scored ?? 0, failed: stats.failed ?? 0 };
 }
 
 /** Extract model URIs from an EvalResultData's aggregate metadata (sorted by usage, most-used first). */

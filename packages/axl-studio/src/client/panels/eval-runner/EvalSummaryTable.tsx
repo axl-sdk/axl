@@ -1,5 +1,5 @@
 import { cn, formatCost, formatDuration } from '../../lib/utils';
-import { scoreBarColor, scoreTextColor } from './types';
+import { scoreBarColor, scoreTextColor, getScorerSampleCounts } from './types';
 import type { EvalItem, EvalResultData } from './types';
 
 type Props = {
@@ -38,7 +38,8 @@ export function EvalSummaryTable({ summary, items, totalCost, scorerTypes }: Pro
           </thead>
           <tbody>
             {scorerEntries.map(([scorer, stats]) => {
-              const hasValidScores = items.some((i) => !i.error && i.scores[scorer] != null);
+              const { scored, failed } = getScorerSampleCounts(stats, scorer, items);
+              const hasValidScores = scored > 0;
               return (
                 <tr key={scorer} className="border-b border-[hsl(var(--border))] last:border-b-0">
                   <td className="px-4 py-2.5 font-mono text-[hsl(var(--foreground))]">
@@ -49,6 +50,14 @@ export function EvalSummaryTable({ summary, items, totalCost, scorerTypes }: Pro
                         title="LLM scorer — scores may vary between runs"
                       >
                         LLM
+                      </span>
+                    )}
+                    {failed > 0 && (
+                      <span
+                        className="ml-1.5 px-1 py-0.5 text-[9px] font-medium rounded bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 align-middle"
+                        title={`${failed} of ${scored + failed} scorer runs failed — the mean is computed over the ${scored} that succeeded.`}
+                      >
+                        {scored}/{scored + failed} scored, {failed} failed
                       </span>
                     )}
                   </td>

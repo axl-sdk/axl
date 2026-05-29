@@ -3,15 +3,46 @@
 [![npm version](https://img.shields.io/npm/v/@axlsdk/axl)](https://www.npmjs.com/package/@axlsdk/axl)
 [![npm downloads](https://img.shields.io/npm/dm/@axlsdk/axl)](https://www.npmjs.com/package/@axlsdk/axl)
 [![CI](https://github.com/axl-sdk/axl/actions/workflows/ci.yml/badge.svg)](https://github.com/axl-sdk/axl/actions/workflows/ci.yml)
+[![runtime deps](https://img.shields.io/badge/runtime_deps-0-brightgreen.svg)](#why-axl)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](./LICENSE)
 
 TypeScript SDK for orchestrating agentic systems. Treats concurrency, structured output, uncertainty, and cost as first-class primitives.
+
+<p align="center">
+  <img src="docs/assets/studio-trace-explorer.gif" alt="Axl Studio — live trace explorer waterfall with per-step cost and duration" width="840">
+</p>
+
+> **Status:** Pre-1.0 (0.x). The core SDK is stable and covered by an extensive test suite; APIs may still change between minor versions, so pin a version in production. [Axl Studio](#axl-studio) is under active development.
+
+## A 60-second taste
+
+Most agent frameworks make you hand-roll retries and consensus. In Axl, running the same question through several agents in parallel and taking a majority vote is one call:
+
+```typescript
+const reliableMath = workflow({
+  name: 'reliable-math',
+  input: z.object({ question: z.string() }),
+  handler: async (ctx) => {
+    // Run 5 attempts concurrently...
+    const results = await ctx.spawn(5, () =>
+      ctx.ask(solver, ctx.input.question, { schema: z.object({ answer: z.number() }) }),
+    );
+    // ...then keep the answer that appeared most often.
+    return ctx.vote(results, { strategy: 'majority', key: 'answer' });
+  },
+});
+// `solver` is an agent({ model, system }). Full runnable version: examples/consensus.ts
+```
+
+**No DSL, no graph builder, no compiler — and zero runtime dependencies** (provider calls go through raw `fetch`). Axl is a plain TypeScript library you drop into an existing Node.js backend. [Run the examples →](./examples)
 
 ## Install
 
 ```bash
 npm install @axlsdk/axl zod@^4
 ```
+
+`zod` is a [peer dependency](https://nodejs.org/en/blog/npm/peer-dependencies) — installing it explicitly guarantees your app and Axl share **one** Zod instance (schemas are matched by identity, so a second copy breaks validation). The other packages are optional, installed as you need them: [`@axlsdk/testing`](./packages/axl-testing) (dev), [`@axlsdk/eval`](./packages/axl-eval), and [`@axlsdk/studio`](./packages/axl-studio) (dev).
 
 Set an API key for at least one provider:
 
@@ -35,16 +66,9 @@ Axl has four building blocks. Each is an inert definition until you run it — n
 
 **Runtime** registers workflows and executes them. It manages providers, state, and configuration.
 
-```
-tool() ──┐
-         ├── agent() ──── workflow() ──── AxlRuntime
-tool() ──┘                   │
-                            ctx.ask()
-                            ctx.spawn()
-                            ctx.vote()
-                            ctx.budget()
-                            ...
-```
+<p align="center">
+  <img src="docs/assets/architecture.svg" alt="tool() and agent() compose into workflow(); AxlRuntime executes them; ctx exposes ask, spawn, vote, verify, race, parallel, map, budget, remember, recall" width="820">
+</p>
 
 ## Getting Started
 
@@ -67,8 +91,9 @@ const calculator = tool({
 
 // 2. Define an agent — an LLM with tools and a system prompt
 //    Model format is provider:model. Reads API key from env automatically.
+//    Swap in any supported model (anthropic:claude-sonnet-4-6, google:gemini-3.1-pro-preview, …).
 const mathAgent = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You are a math assistant. Use the calculator for all arithmetic.',
   tools: [calculator],
 });
@@ -188,8 +213,8 @@ const result = await stream.promise; // final output after stream completes
 ```typescript
 const planSchema = z.object({ outline: z.array(z.string()) });
 const draftSchema = z.object({ draft: z.string() });
-const planner = agent({ model: 'openai:gpt-4o', system: 'Plan an outline.' });
-const writer = agent({ model: 'openai:gpt-4o', system: 'Write the draft.' });
+const planner = agent({ model: 'openai-responses:gpt-5.5', system: 'Plan an outline.' });
+const writer = agent({ model: 'openai-responses:gpt-5.5', system: 'Write the draft.' });
 
 const wf = workflow({
   name: 'two-step',
@@ -293,7 +318,7 @@ Four built-in providers, zero SDK dependencies (raw `fetch`). Set the correspond
 | Google Gemini             | `google:`           | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 
 ```typescript
-agent({ model: 'openai-responses:gpt-5.4', ... })
+agent({ model: 'openai-responses:gpt-5.5', ... })
 agent({ model: 'anthropic:claude-sonnet-4-6', ... })
 agent({ model: 'google:gemini-3.1-pro-preview', ... })
 ```
@@ -301,7 +326,7 @@ agent({ model: 'google:gemini-3.1-pro-preview', ... })
 The `effort` parameter controls reasoning depth identically across all providers:
 
 ```typescript
-agent({ model: 'openai-responses:gpt-5.4', effort: 'high', ... })  // OpenAI reasoning effort
+agent({ model: 'openai-responses:gpt-5.5', effort: 'high', ... })  // OpenAI reasoning effort
 agent({ model: 'anthropic:claude-opus-4-6', effort: 'high', ... }) // Anthropic adaptive thinking
 agent({ model: 'google:gemini-3.1-pro-preview', effort: 'high', ... }) // Gemini thinking level
 ```
@@ -322,7 +347,7 @@ import { AxlTestRuntime, MockProvider } from '@axlsdk/testing';
 const runtime = new AxlTestRuntime();
 runtime.register(solve);
 
-// MockProvider returns canned responses in sequence
+// MockProvider returns canned responses in sequence (mock the provider the agent uses)
 runtime.mockProvider(
   'openai-responses',
   MockProvider.sequence([
@@ -356,6 +381,20 @@ Most LLM frameworks treat agents as sequential pipelines. Real agentic systems n
 - **Resource Awareness.** `budget` with hard_stop, finish_and_stop, and warn policies. Cost control is a first-class API, not an afterthought.
 - **Just TypeScript.** Plain async functions, Zod schemas, full IDE support. No DSL, no graph builder, no compiler. Axl is a library that embeds in your existing Node.js backend.
 
+## Axl Studio
+
+A local dev UI for watching agents and workflows run — a waterfall trace explorer, a live cost dashboard, an eval runner with baseline-vs-candidate comparison, and an agent playground. Point it at your runtime and go:
+
+```bash
+npx @axlsdk/studio --open
+```
+
+<p align="center">
+  <img src="docs/assets/studio-cost-dashboard.gif" alt="Axl Studio cost dashboard — spend by agent and model across providers, with time-window filtering" width="840">
+</p>
+
+Studio also embeds as middleware (Express, Fastify, NestJS, raw HTTP) with auth and read-only modes. See the [Studio README](./packages/axl-studio).
+
 ## Packages
 
 | Package                                     | Description                                                                      |
@@ -369,6 +408,7 @@ Most LLM frameworks treat agents as sequential pipelines. Real agentic systems n
 
 | Guide                                    | Description                                                                              |
 | ---------------------------------------- | ---------------------------------------------------------------------------------------- |
+| [Examples](./examples)                   | Runnable, self-contained programs: quickstart, parallel consensus, agent handoffs        |
 | [API Reference](./docs/api-reference.md) | All `ctx.*` primitives, option types, valid values, and defaults                         |
 | [Architecture](./docs/architecture.md)   | System architecture, deployment modes, and execution flow                                |
 | [Providers](./docs/providers.md)         | OpenAI, Anthropic, and Gemini adapters with full model list                              |

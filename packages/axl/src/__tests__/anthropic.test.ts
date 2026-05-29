@@ -271,6 +271,30 @@ describe('AnthropicProvider', () => {
       expect(response.cost).toBeCloseTo(0.00175, 5);
     });
 
+    it('prices claude-opus-4-8 at $5/$25 per 1M tokens (same as 4.7)', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-price-48',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Hi' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 100, output_tokens: 50 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-4-8',
+        maxTokens: 1024,
+      });
+
+      // claude-opus-4-8: [5e-6, 25e-6]
+      // 100 * 5e-6 + 50 * 25e-6 = 0.0005 + 0.00125 = 0.00175
+      expect(response.cost).toBeCloseTo(0.00175, 5);
+    });
+
     it('resolves versioned claude-opus-4-7-YYYYMMDD via prefix match', async () => {
       mockFetch({
         json: () =>
@@ -653,6 +677,56 @@ describe('AnthropicProvider', () => {
       const provider = new AnthropicProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
         model: 'claude-opus-4-7',
+        maxTokens: 4096,
+        effort: 'max',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.thinking).toEqual({ type: 'adaptive' });
+      expect(body.output_config).toEqual({ effort: 'max' });
+    });
+
+    it('maps effort "xhigh" to adaptive mode with effort "xhigh" on Opus 4.8', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th-xhigh-48',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-4-8',
+        maxTokens: 4096,
+        effort: 'xhigh',
+      });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.thinking).toEqual({ type: 'adaptive' });
+      expect(body.output_config).toEqual({ effort: 'xhigh' });
+    });
+
+    it('maps effort "max" to adaptive mode with effort "max" on Opus 4.8', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-th-max-48',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+
+      const provider = new AnthropicProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-4-8',
         maxTokens: 4096,
         effort: 'max',
       });

@@ -85,7 +85,7 @@ import { lookupOrder } from '../tools/db.js';
 
 export const supportAgent = agent({
   name: 'support',
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You are a customer support agent. Use tools to look up order information.',
   tools: [lookupOrder],
 });
@@ -172,7 +172,7 @@ import { agent } from '@axlsdk/axl';
 
 const researcher = agent({
   name: 'researcher',
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You are a research assistant.',
   tools: [calculator],
   effort: 'high',
@@ -189,7 +189,7 @@ Dynamic model and system prompt selection:
 const dynamicAgent = agent({
   model: (ctx) =>
     ctx.metadata?.tier === 'premium'
-      ? 'openai-responses:gpt-5.4'
+      ? 'openai-responses:gpt-5.5'
       : 'openai-responses:gpt-5-nano',
   system: (ctx) => `You are a ${ctx.metadata?.role ?? 'general'} assistant.`,
 });
@@ -548,7 +548,7 @@ const containsPII = (text: string) => /\b\d{3}-\d{2}-\d{4}\b/.test(text);
 const isOffTopic = (text: string) => !text.toLowerCase().includes('support');
 
 const safe = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You are a helpful assistant.',
   guardrails: {
     input: async (prompt, ctx) => {
@@ -739,7 +739,7 @@ import {
 Four built-in providers using the `provider:model` URI scheme:
 
 ```
-openai-responses:gpt-5.4               # OpenAI Responses API (preferred over Chat Completions)
+openai-responses:gpt-5.5               # OpenAI Responses API (preferred over Chat Completions)
 openai:gpt-5.4                         # OpenAI Chat Completions
 anthropic:claude-opus-4-7              # Anthropic (supports effort: 'xhigh')
 google:gemini-3.1-pro-preview          # Google Gemini

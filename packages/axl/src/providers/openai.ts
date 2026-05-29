@@ -44,6 +44,9 @@ export const OPENAI_PRICING: Record<string, [number, number, number]> = {
   'gpt-5.3': [1.75e-6, 14e-6, 0.1],
   'gpt-5.4': [2.5e-6, 15e-6, 0.1],
   'gpt-5.4-pro': [30e-6, 180e-6, 0.1],
+  // gpt-5.5 era (flagship released 2026-04) — cache reads at 10% of input rate
+  'gpt-5.5': [5e-6, 30e-6, 0.1],
+  'gpt-5.5-pro': [30e-6, 180e-6, 0.1],
 };
 
 // Pre-sorted keys for prefix matching (longest first so "gpt-5-mini" matches before "gpt-5")

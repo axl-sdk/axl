@@ -81,7 +81,7 @@ Define an agent with a model, system prompt, tools, and optional handoffs.
 import { agent } from '@axlsdk/axl';
 
 const myAgent = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You are a helpful assistant.',
   tools: [search, calculator],
   temperature: 0.7,
@@ -103,7 +103,7 @@ const myAgent = agent({
 | `mcpTools` | `string[]` | — | Whitelist: only expose these specific MCP tools |
 | `temperature` | `number` | provider default | LLM sampling temperature |
 | `maxTokens` | `number` | `4096` | Maximum tokens in the LLM response |
-| `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'`. Controls reasoning depth across all providers. `'xhigh'` is supported natively on Anthropic Opus 4.7 and OpenAI gpt-5.2+; clamps to `'high'` on other models |
+| `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'`. Controls reasoning depth across all providers. `'xhigh'` is supported natively on Anthropic Opus 4.8/4.7 and OpenAI gpt-5.2+ (including gpt-5.5); clamps to `'high'` on other models |
 | `thinkingBudget` | `number` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. Set to `0` to disable thinking while keeping effort |
 | `includeThoughts` | `boolean` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini |
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool |
@@ -848,7 +848,7 @@ User-defined validation functions that run at the agent boundary, before and aft
 
 ```typescript
 const safe = agent({
-  model: 'openai-responses:gpt-5.4',
+  model: 'openai-responses:gpt-5.5',
   system: 'You are a helpful assistant.',
   guardrails: {
     input: async (prompt, ctx) => {
@@ -1634,6 +1634,7 @@ Configuration for `runEval()` and `runtime.eval()`.
 | `concurrency` | `number` | `5` | Maximum parallel item executions |
 | `scorerConcurrency` | `number` | `5` | Maximum parallel scorers **within a single item**. Worst-case concurrent scorer calls is `concurrency × scorerConcurrency`; set to `1` for a serial judge phase. Cost/timing/ordering are preserved deterministically |
 | `budget` | `string` | — | Cost limit (e.g., `"$10.00"`). Stops processing when exceeded. With concurrent scorers it is a **soft** ceiling — the per-item check runs once before an item's scorers, so overshoot is bounded by `concurrency × scorerConcurrency × max-scorer-cost` |
+| `failOnScorerErrorRate` | `number` (0–1) | — | Opt-in **source-side** trust gate. When set, `runEval` marks the run `summary.degraded` (and the CLI exits non-zero) if a scorer's failure rate exceeds tolerance. **Type-aware**: deterministic scorers tolerate **0** failures (a deterministic scorer that throws is a bug); LLM scorers use this rate. Failure rate = `failed / (scored + failed)`; `0` means "any LLM failure degrades". `runEval` never throws on this — it flags and returns, so the (still-useful) result is persisted and the consumer decides. Invalid values are ignored with a `console.warn`. Catches the silent-thinned-sample trap: a `--fail-on-regression` gate computed over surviving scores can look green when half the judges 429'd. Distinct from the gate-side `axl-eval compare --max-scorer-error-rate` (which refuses to certify an already-thinned baseline/candidate). |
 | `metadata` | `Record<string, unknown>` | — | Arbitrary metadata attached to the result (e.g., model version, prompt variant) |
 
 ### `DatasetConfig`
@@ -1736,8 +1737,10 @@ Aggregate statistics across all items.
 |-------|------|-------------|
 | `count` | `number` | Total items |
 | `failures` | `number` | Items where the workflow threw an error |
-| `scorers` | `Record<string, { mean, min, max, p50, p95 }>` | Per-scorer aggregate stats (all values 0-1) |
+| `scorers` | `Record<string, { mean, min, max, p50, p95, scored?, failed? }>` | Per-scorer aggregate stats (all score values 0-1). `scored` is the number of items that produced a valid numeric score — the sample size `mean` actually covers; `failed` is the number whose scorer **ran and failed** (threw / out-of-range). A scorer skipped by cancellation is in neither bucket, so `scored + failed` is the honest "attempted" count. A non-zero `failed` means `mean` rests on a thinned sample. Both optional (absent on pre-0.17.10 artifacts → recompute from `items`) |
 | `timing` | `{ mean, min, max, p50, p95 }?` | Per-item duration statistics in ms |
+| `degraded` | `DegradedScorer[]?` | Present only when `EvalConfig.failOnScorerErrorRate` is set **and** one or more scorers exceeded tolerance. Each entry is `{ scorer, rate, limit, type, scored, failed }`. `runEval` sets this and returns normally (it never throws); the CLI turns a non-empty `degraded` into a non-zero exit |
+| `DegradedScorer` | `{ scorer: string; rate: number; limit: number; type: 'llm' \| 'deterministic'; scored: number; failed: number }` | One scorer that tripped the failure-rate gate. `rate = failed / (scored + failed)`; `limit` is the tolerance exceeded (`0` for deterministic). Exported from `@axlsdk/eval` |
 
 ### `Scorer`
 
@@ -1786,7 +1789,7 @@ Result from `evalCompare()` comparing a baseline and candidate eval run.
 |-------|------|-------------|
 | `baseline` | `{ id, metadata, runCount, partial? }` | Baseline run identity. `runCount` is the number of runs actually used in mean / regression / timing / cost computation — `evalCompare` truncates both sides to `min(baseline.length, candidate.length)` so the displayed means align with the paired bootstrap CI's sample. `partial` (an `EvalComparisonPartial`) is set when the pooled run count is less than the original batch's planned count |
 | `candidate` | `{ id, metadata, runCount, partial? }` | Candidate run identity. Same shape as `baseline` |
-| `scorers` | `Record<string, { baselineMean, candidateMean, delta, deltaPercent, ci?, significant?, pRegression?, pImprovement?, n? }>` | Per-scorer mean comparison. `ci` is `{ lower: number; upper: number }` (95% bootstrap CI on paired differences). `significant` is `true` when the CI excludes zero and \|delta\| exceeds the threshold. `pRegression`/`pImprovement` are bootstrap probability estimates. `n` is the number of paired differences used for CI |
+| `scorers` | `Record<string, { baselineMean, candidateMean, delta, deltaPercent, ci?, significant?, pRegression?, pImprovement?, n?, baselineScored?, baselineFailed?, candidateScored?, candidateFailed? }>` | Per-scorer mean comparison. `ci` is `{ lower: number; upper: number }` (95% bootstrap CI on paired differences). `significant` is `true` when the CI excludes zero and \|delta\| exceeds the threshold. `pRegression`/`pImprovement` are bootstrap probability estimates. `n` is the number of paired differences used for CI. `{baseline,candidate}{Scored,Failed}` are per-side success/failure counts over the **same truncated pool** the means/CI use (raw counts; consumer divides) — a non-zero `*Failed` means that side's mean rests on a thinned sample, and `axl-eval compare --max-scorer-error-rate` refuses to certify when over tolerance |
 | `timing` | `{ baselineMean, candidateMean, delta, deltaPercent }?` | Per-item duration comparison |
 | `cost` | `{ baselineTotal, candidateTotal, delta, deltaPercent }?` | Total cost comparison |
 | `regressions` | `EvalRegression[]` | Items that got worse |

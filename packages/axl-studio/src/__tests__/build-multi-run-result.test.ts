@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { buildMultiRunResult, type EvalResultData } from '../client/panels/eval-runner/types.js';
+import {
+  buildMultiRunResult,
+  getResultDroppedAnnotationKeys,
+  type EvalResultData,
+} from '../client/panels/eval-runner/types.js';
 
 /**
  * Unit coverage for the partial-batch derivation path. The integration test
@@ -70,6 +74,17 @@ describe('buildMultiRunResult', () => {
     expect(result!._multiRun?.batchCompleted).toBe(2);
     expect(result!._multiRun?.batchAttempted).toBe(5);
     expect(result!._multiRun?.aggregate.runCount).toBe(2);
+  });
+
+  it('carries droppedAnnotationKeys onto the aggregate (read via getResultDroppedAnnotationKeys)', () => {
+    // Dropped keys are dataset-level — identical across runs — so the aggregate
+    // (which spreads `...first`) must expose them for the panel banner to show
+    // in the default multi-run aggregate view, not just per-run.
+    const result = buildMultiRunResult([
+      makeRun(0, { droppedAnnotationKeys: ['expectedTone', 'persona.role'] }),
+      makeRun(1, { droppedAnnotationKeys: ['expectedTone', 'persona.role'] }),
+    ]);
+    expect(getResultDroppedAnnotationKeys(result!)).toEqual(['expectedTone', 'persona.role']);
   });
 
   it('propagates batchFailure from per-run metadata onto _multiRun.batchFailure', () => {

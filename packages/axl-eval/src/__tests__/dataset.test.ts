@@ -223,6 +223,98 @@ describe('dataset() — extra annotation key detection', () => {
     expect(warn.mock.calls[0][0]).toContain('persona.role');
   });
 
+  it('reports dropped keys inside arrays with bracket-notation paths', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ds = dataset({
+      name: 'array-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.object({ tags: z.array(z.object({ label: z.string() })) }),
+      items: [
+        {
+          input: { q: 'Q' },
+          // @ts-expect-error - deliberately undeclared key inside array element
+          annotations: { tags: [{ label: 'a' }, { label: 'b', weight: 5 }] },
+        },
+      ],
+    });
+
+    await ds.getItems();
+    expect(warn.mock.calls[0][0]).toContain('tags[1].weight');
+  });
+
+  it('does NOT warn for a .transform() schema that intentionally reshapes keys', async () => {
+    // A transform reshapes parsed output, so a raw-vs-parsed diff would wrongly
+    // flag the removed key. Detection must skip non-ZodObject schemas entirely.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ds = dataset({
+      name: 'transform-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.object({ a: z.string(), b: z.string() }).transform(({ a }) => ({ a })),
+      // @ts-expect-error - items are typed by the transform's OUTPUT ({a}); we
+      // pass the INPUT shape ({a,b}) the transform actually consumes.
+      items: [{ input: { q: 'Q' }, annotations: { a: 'x', b: 'y' } }],
+    });
+
+    const items = await ds.getItems();
+    expect(items[0].annotations).toEqual({ a: 'x' }); // transform applied
+    expect(warn).not.toHaveBeenCalled(); // but no false "b dropped" warning
+    expect(ds.droppedAnnotationKeys).toEqual([]);
+  });
+
+  it('does NOT warn for a z.record() schema (arbitrary keys are valid)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ds = dataset({
+      name: 'record-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.record(z.string(), z.number()),
+      items: [{ input: { q: 'Q' }, annotations: { anything: 1, goes: 2 } }],
+    });
+
+    await ds.getItems();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('resets droppedAnnotationKeys on a subsequent clean getItems()', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {}); // silence expected first-call warning
+    // Source from a variable (not an inline literal) so TS's excess-property
+    // check doesn't fire — mirrors the variable-sourced datasets the runtime
+    // guard exists for, and lets us mutate between getItems() calls.
+    const items: { input: { q: string }; annotations: { a: string } }[] = [
+      { input: { q: 'Q' }, annotations: { a: 'x', extra: 'y' } as { a: string } },
+    ];
+    const ds = dataset({
+      name: 'reset-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.object({ a: z.string() }),
+      items,
+    });
+    await ds.getItems();
+    expect(ds.droppedAnnotationKeys).toEqual(['extra']);
+
+    // Clean the source and re-load: the getter must reflect the latest run,
+    // not accumulate stale keys from the prior call.
+    items[0] = { input: { q: 'Q' }, annotations: { a: 'x' } };
+    await ds.getItems();
+    expect(ds.droppedAnnotationKeys).toEqual([]);
+  });
+
+  it("getter returns a defensive copy (consumers can't mutate internal state)", async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {}); // silence expected warning
+    const ds = dataset({
+      name: 'copy-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.object({ a: z.string() }),
+      items: [
+        // @ts-expect-error - deliberately undeclared annotation key
+        { input: { q: 'Q' }, annotations: { a: 'x', extra: 'y' } },
+      ],
+    });
+    await ds.getItems();
+    const first = ds.droppedAnnotationKeys as string[];
+    first.push('mutated');
+    expect(ds.droppedAnnotationKeys).toEqual(['extra']); // unaffected
+  });
+
   it("throws under onExtraAnnotationKeys: 'error', listing the dropped keys", async () => {
     const ds = dataset({
       name: 'strict-ann-ds',
@@ -320,6 +412,34 @@ describe('dataset() — extra annotation key detection', () => {
       });
       await ds.getItems();
       expect(warn.mock.calls[0][0]).toContain('unschematized');
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("throws under 'error' policy for a dropped key loaded from a JSON file", async () => {
+    const { writeFile, mkdir, rm } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+
+    const tmpDir = join(tmpdir(), `axl-test-dataset-drop-err-${Date.now()}`);
+    await mkdir(tmpDir, { recursive: true });
+    const filePath = join(tmpDir, 'data.json');
+    await writeFile(
+      filePath,
+      JSON.stringify([{ input: { q: 'Q' }, annotations: { a: 'x', unschematized: true } }]),
+      'utf-8',
+    );
+
+    try {
+      const ds = dataset({
+        name: 'file-err-ds',
+        schema: z.object({ q: z.string() }),
+        annotations: z.object({ a: z.string() }),
+        onExtraAnnotationKeys: 'error',
+        file: filePath,
+      });
+      await expect(ds.getItems()).rejects.toThrow(/unschematized/);
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }

@@ -26,11 +26,11 @@ import {
   getResultModelCounts,
   getResultWorkflows,
   getResultWorkflowCounts,
-  getResultDroppedAnnotationKeys,
   formatModelName,
   getResultTokens,
   buildMultiRunResult,
 } from './types';
+import { DroppedAnnotationKeysBanner } from './DroppedAnnotationKeysBanner';
 import { EvalSummaryTable } from './EvalSummaryTable';
 import { EvalItemList } from './EvalItemList';
 import { EvalItemDetail } from './EvalItemDetail';
@@ -921,6 +921,7 @@ export function EvalRunnerPanel() {
                         Compare with previous...
                       </button>
                     </div>
+                    {currentResult && <DroppedAnnotationKeysBanner result={currentResult} />}
                     <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
                       <StatCard
                         label="Runs"
@@ -1281,35 +1282,7 @@ export function EvalRunnerPanel() {
                         </div>
                       );
                     })()}
-                    {(() => {
-                      const droppedKeys = getResultDroppedAnnotationKeys(displayResult);
-                      if (droppedKeys.length === 0) return null;
-                      return (
-                        <div className="mb-3 rounded-md border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/30 px-3 py-2">
-                          <div className="text-xs text-amber-700 dark:text-amber-300">
-                            <span className="font-medium">
-                              {droppedKeys.length} annotation{' '}
-                              {droppedKeys.length === 1 ? 'key' : 'keys'} dropped by the dataset
-                              schema
-                            </span>{' '}
-                            — stripped before reaching scorers, so any scorer reading{' '}
-                            {droppedKeys.length === 1 ? 'it' : 'them'} silently sees{' '}
-                            <code className="font-mono">undefined</code>. Add to the annotations
-                            schema, or set <code className="font-mono">onExtraAnnotationKeys</code>.
-                            <div className="mt-1 flex flex-wrap gap-1">
-                              {droppedKeys.map((k) => (
-                                <span
-                                  key={k}
-                                  className="px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 text-[10px] font-mono font-medium"
-                                >
-                                  {k}
-                                </span>
-                              ))}
-                            </div>
-                          </div>
-                        </div>
-                      );
-                    })()}
+                    <DroppedAnnotationKeysBanner result={displayResult} />
                     <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
                       <StatCard
                         label="Items"

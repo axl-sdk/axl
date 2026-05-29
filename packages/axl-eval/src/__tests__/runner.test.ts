@@ -1923,7 +1923,14 @@ describe('runEval() — dataset diagnostics', () => {
   it('tolerates a hand-rolled dataset without the droppedAnnotationKeys field', async () => {
     const result = await runEval(
       {
-        dataset: { name: 'bare-ds', getItems: async () => [{ input: { q: 'Q' } }] } as never,
+        // A valid Dataset shape that simply omits the optional
+        // droppedAnnotationKeys field — no cast needed; this is the case the
+        // runner's `?? []` fallback defends.
+        dataset: {
+          name: 'bare-ds',
+          schema: z.object({ q: z.string() }),
+          getItems: async () => [{ input: { q: 'Q' } }],
+        },
         scorers: [exactScorer],
         workflow: 'w',
       },

@@ -52,10 +52,12 @@ export type Dataset<TInput = unknown, TAnnotations = unknown> = {
    * Annotation key paths the schema dropped during the most recent
    * `getItems()` call (empty when none were dropped, or when
    * `onExtraAnnotationKeys: 'ignore'`). Populated as a side effect of
-   * `getItems()` — read it only after awaiting. The eval runner surfaces this
-   * into `EvalResult.metadata.droppedAnnotationKeys` so tooling (e.g. Studio)
-   * can show the warning the same way the CLI logs it. Optional so hand-rolled
-   * `Dataset`-shaped objects (test harnesses) remain valid.
+   * `getItems()` — read it synchronously right after awaiting, on the same
+   * instance; a later `getItems()` overwrites it (calling `getItems()`
+   * concurrently on one shared dataset is unsupported). The eval runner folds
+   * this into `EvalResult.metadata.droppedAnnotationKeys` so any consumer (the
+   * CLI logs it; UIs can render it) sees the same signal. Optional so
+   * hand-rolled `Dataset`-shaped objects (test harnesses) remain valid.
    */
   readonly droppedAnnotationKeys?: readonly string[];
   getItems(): Promise<DatasetItem<TInput, TAnnotations>[]>;
@@ -69,11 +71,35 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * True when `schema` is a `ZodObject` (any unknown-key mode: strip/strict/loose).
+ * Detected via the public `.shape` getter, which only `ZodObject` exposes —
+ * transforms/pipes/preprocess (`.def.type === 'pipe'`), unions, records, arrays,
+ * and wrappers (`.optional()` etc.) all return `undefined`. Uses duck-typing
+ * rather than `instanceof z.ZodObject` so we keep a type-only zod import and
+ * stay robust against duplicate zod copies in a consumer's tree.
+ *
+ * Drop-detection (raw-vs-parsed diff) is only sound when `.parse()` preserves
+ * the input's object shape minus stripped keys. A `.transform()`/`.preprocess()`
+ * that intentionally removes or reshapes keys would otherwise be mis-reported as
+ * "dropped by schema" — so we gate detection on this predicate at the top level.
+ */
+function isObjectSchema(schema: z.ZodType): boolean {
+  const shape = (schema as { shape?: unknown }).shape;
+  return typeof shape === 'object' && shape !== null;
+}
+
+/**
  * Recursively collect key paths present in `raw` but absent from `parsed`
  * (i.e. stripped by the schema). Walks plain objects and arrays; anything else
  * is a leaf. Paths use dot/bracket notation: `persona.tone`, `tags[0].label`.
- * Mode-independent — works whether the schema strips, is strict (which throws
- * before we get here), or is loose (nothing dropped).
+ *
+ * Only called for a top-level `ZodObject` annotations schema (see
+ * `isObjectSchema`). Mode-independent within that scope — works whether the
+ * object strips (detects drops), is strict (`.parse()` throws before we reach
+ * here), or is loose (parsed keeps the keys, so nothing is reported). Known
+ * limitation: a `.transform()` nested inside an object field that removes keys
+ * can still produce a false positive for that sub-path; nested transforms on
+ * annotation data are rare and not worth a full schema walk here.
  */
 function collectDroppedKeys(raw: unknown, parsed: unknown, prefix = ''): string[] {
   if (Array.isArray(raw) && Array.isArray(parsed)) {
@@ -118,7 +144,10 @@ export function dataset<TInput extends z.ZodType, TAnnotations extends z.ZodType
       return { input, annotations: item.annotations };
     }
     const annotations = config.annotations.parse(item.annotations);
-    if (policy !== 'ignore') {
+    // Only diff for plain object schemas: a transform/preprocess/pipe reshapes
+    // output, so a raw-vs-parsed diff would mis-report intentionally-removed
+    // keys as "dropped by schema" (and hard-fail under 'error').
+    if (policy !== 'ignore' && isObjectSchema(config.annotations)) {
       for (const p of collectDroppedKeys(item.annotations, annotations)) droppedAcc.add(p);
     }
     return { input, annotations };
@@ -153,7 +182,10 @@ export function dataset<TInput extends z.ZodType, TAnnotations extends z.ZodType
     schema: config.schema,
     annotationsSchema: config.annotations,
     get droppedAnnotationKeys() {
-      return lastDroppedAnnotationKeys;
+      // Copy so the `readonly string[]` contract holds at runtime — a consumer
+      // can't mutate internal state, and a held reference can't observe a later
+      // getItems() reassignment.
+      return [...lastDroppedAnnotationKeys];
     },
     async getItems() {
       if (config.items && config.file) {
@@ -174,6 +206,9 @@ export function dataset<TInput extends z.ZodType, TAnnotations extends z.ZodType
 
       const dropped = new Set<string>();
       const parsed = rawItems.map((item) => parseItem(item, dropped));
+      // Set before reportDropped: in 'error' mode reportDropped throws, but the
+      // runner only reads the getter after a *successful* getItems(), so the
+      // value behind a rejected call is never observed.
       lastDroppedAnnotationKeys = [...dropped];
       reportDropped(dropped);
       return parsed;

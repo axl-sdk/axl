@@ -689,6 +689,9 @@ const workoutProfiles = dataset({
   }),
   file: './datasets/workout-profiles.json',
 });
+// Heads-up: any annotation key in the JSON that isn't declared above is stripped
+// by Zod before scorers see it. `dataset()` warns about dropped keys by default;
+// set `onExtraAnnotationKeys: 'error'` to fail CI on a schema/data mismatch.
 
 // Deterministic scorer
 const structuralValidity = scorer({

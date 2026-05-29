@@ -31,7 +31,7 @@ export type EvalResult = {
    * - `runGroupId?: string`, `runIndex?: number` for multi-run groups
    * - `droppedAnnotationKeys?: string[]` — annotation key paths the dataset
    *   schema stripped (present only when non-empty). Mirrors the dataset's
-   *   `console.warn`; lets tooling (Studio) surface the same signal.
+   *   `console.warn`; lets any consumer surface the same signal.
    */
   metadata: Record<string, unknown>;
   timestamp: string;

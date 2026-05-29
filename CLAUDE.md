@@ -105,7 +105,8 @@ packages/axl/src/
   redaction.ts       — REDACTION_RULES table + redactEvent() — single source of truth for per-AxlEvent-variant scrubbing, shared with Studio's WS-boundary redactor
   providers/
     types.ts         — Provider interface, ChatOptions, ToolDefinition
-    retry.ts         — fetchWithRetry() — exponential backoff for 429/503/529
+    retry.ts         — fetchWithRetry() — exponential backoff for 429/503/529 + optional governor
+    rate-limiter.ts  — RateLimiter (opt-in counting-semaphore + FIFO governor) + RateLimitConfig
     openai.ts        — OpenAI Chat Completions adapter
     openai-responses.ts — OpenAI Responses API adapter
     anthropic.ts     — Anthropic adapter
@@ -273,7 +274,8 @@ git tag -a vX.Y.Z -m "Release X.Y.Z" && git push origin vX.Y.Z
 - All imports use `.js` extension (ESM convention for TypeScript)
 - tsconfig.base.json uses `"types": ["node"]` for Node.js globals
 - tsup bundles ESM + CJS + DTS for each package
-- Provider adapters use raw `fetch` (no SDK dependencies) with automatic retry on 429/503/529 via `fetchWithRetry` (exponential backoff, 3 total attempts)
+- Provider adapters use raw `fetch` (no SDK dependencies) with automatic retry on 429/503/529 via `fetchWithRetry` (exponential backoff, 3 total attempts). `fetchWithRetry(input, init?, opts?: { maxRetries?, governor? })` — 3rd arg is an options object (was a positional `maxRetries` number pre-0.17.10)
+- Provider rate governor (opt-in, `providers/rate-limiter.ts`): `ProviderConfig.rateLimit?: RateLimitConfig` (`{ maxConcurrent?, minIntervalMs?, acquireTimeoutMs? }`) → each adapter constructs `this.governor = rateLimit ? new RateLimiter(rateLimit) : undefined` and passes `{ governor: this.governor }` at every `fetchWithRetry` site. `RateLimiter` is a dependency-free counting semaphore + FIFO queue: `acquire(signal?)` (pre-aborted → reject no permit; queued-then-aborted → splice no leak; `acquireTimeoutMs` → reject = fail-loud), `release()` (idempotent guard), `observe(res)` (v1 no-op seam for adaptive follow-up). `fetchWithRetry` acquires ONCE before the loop and releases in `finally` gated on a local `acquired` flag, so the whole loop incl. backoff holds one permit (backpressure) and a rejected acquire never over-releases. **Undefined governor ⇒ byte-identical to before (zero-regression).** Permit releases at response headers (streaming gets the `Response` then `yield*`s the body separately) → caps request *concurrency*, NOT token throughput; nesting is safe (permit never held across a nested `ctx.ask`, so `maxConcurrent: 1` doesn't deadlock agent-as-tool). Registry threads `opts.rateLimit` into all 4 factories; `openai-responses` inherits the `openai` block. **Embedder (`embedder-openai.ts`) is OUT of scope in v1** (constructed outside the registry — governs chat only). `maxConcurrent < 2` and invalid (`<1`/non-finite, → no cap) both `console.warn`; first queue `console.warn`s once. Exported `RateLimiter` + `RateLimitConfig` from `@axlsdk/axl`
 - Two OpenAI providers: `openai` (Chat Completions API) and `openai-responses` (Responses API)
 - Reasoning model support: o-series (o1/o3/o4-mini) use developer role, temperature stripping; GPT-5.x also supports reasoning but uses system role. `isOSeriesModel()` detects o-series, `supportsReasoningEffort()` detects o-series + GPT-5.x
 - ChatOptions includes `effort`, `thinkingBudget`, `includeThoughts`, `toolChoice`, `maxTokens`, `stop`, `providerOptions`; all configurable on `AgentConfig` and overridable per-call via `AskOptions` (precedence: AskOptions > AgentConfig > defaults, maxTokens default: 4096). ToolDefinition supports `strict`

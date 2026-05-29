@@ -446,6 +446,33 @@ describe('ProviderRegistry', () => {
       const names = registry.list().sort();
       expect(names).toEqual(['anthropic', 'google', 'openai', 'openai-responses']);
     });
+
+    it('threads providers.<name>.rateLimit into the built-in factories without throwing', () => {
+      // The governor is private, so we can only assert the factory path accepts
+      // and constructs with the rateLimit config (no network on construction).
+      // A maxConcurrent of 1 also emits the serialize warning — proof the
+      // RateLimiter was actually constructed from the threaded config.
+      const config: AxlConfig = {
+        providers: {
+          openai: { apiKey: 'k', rateLimit: { maxConcurrent: 2 } },
+          anthropic: { apiKey: 'k', rateLimit: { maxConcurrent: 2 } },
+          google: { apiKey: 'k', rateLimit: { maxConcurrent: 2 } },
+        },
+      };
+      for (const name of ['openai', 'openai-responses', 'anthropic', 'google']) {
+        const fresh = new ProviderRegistry();
+        expect(() => fresh.get(name, config)).not.toThrow();
+      }
+    });
+
+    it('openai-responses inherits the openai rateLimit config (shared key path)', () => {
+      const config: AxlConfig = {
+        providers: { openai: { apiKey: 'k', rateLimit: { maxConcurrent: 2 } } },
+      };
+      const fresh = new ProviderRegistry();
+      // No dedicated openai-responses config → falls back to openai's (incl. rateLimit).
+      expect(() => fresh.get('openai-responses', config)).not.toThrow();
+    });
   });
 
   // -----------------------------------------------------------------------

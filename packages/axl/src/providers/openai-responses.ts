@@ -10,6 +10,7 @@ import {
 import type { ReasoningEffort } from './openai.js';
 import { resolveThinkingOptions } from './types.js';
 import { fetchWithRetry } from './retry.js';
+import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 
 /**
  * OpenAI Responses API provider using raw fetch (no SDK dependency).
@@ -22,14 +23,16 @@ export class OpenAIResponsesProvider implements Provider {
   readonly name = 'openai-responses';
   private baseUrl: string;
   private apiKey: string;
+  private governor?: RateLimiter;
 
-  constructor(options: { apiKey?: string; baseUrl?: string } = {}) {
+  constructor(options: { apiKey?: string; baseUrl?: string; rateLimit?: RateLimitConfig } = {}) {
     this.apiKey = options.apiKey ?? process.env.OPENAI_API_KEY ?? '';
     this.baseUrl = (
       options.baseUrl ??
       process.env.OPENAI_BASE_URL ??
       'https://api.openai.com/v1'
     ).replace(/\/$/, '');
+    this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
 
     if (!this.apiKey) {
       throw new Error('OpenAI API key is required. Set OPENAI_API_KEY or pass apiKey in options.');
@@ -43,15 +46,19 @@ export class OpenAIResponsesProvider implements Provider {
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
     const body = this.buildRequestBody(messages, options, false);
 
-    const res = await fetchWithRetry(`${this.baseUrl}/responses`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
+    const res = await fetchWithRetry(
+      `${this.baseUrl}/responses`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: options.signal,
       },
-      body: JSON.stringify(body),
-      signal: options.signal,
-    });
+      { governor: this.governor },
+    );
 
     if (!res.ok) {
       const errorBody = await res.text();
@@ -70,15 +77,19 @@ export class OpenAIResponsesProvider implements Provider {
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
     const body = this.buildRequestBody(messages, options, true);
 
-    const res = await fetchWithRetry(`${this.baseUrl}/responses`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
+    const res = await fetchWithRetry(
+      `${this.baseUrl}/responses`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: options.signal,
       },
-      body: JSON.stringify(body),
-      signal: options.signal,
-    });
+      { governor: this.governor },
+    );
 
     if (!res.ok) {
       const errorBody = await res.text();

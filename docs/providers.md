@@ -104,6 +104,73 @@ export default defineConfig({
 });
 ```
 
+### Rate limiting (opt-in)
+
+The automatic 429/503/529 backoff above is **reactive** — it only kicks in after a
+request is rejected. For **proactive** pacing (so you don't storm a provider in the
+first place), set `rateLimit` on a provider config. This is most useful when a large
+fan-out shares one API key — e.g. an eval running `concurrency × scorerConcurrency`
+(up to 25 by default) concurrent judge calls.
+
+```typescript
+export default defineConfig({
+  providers: {
+    openai: {
+      apiKey: process.env.OPENAI_API_KEY,
+      rateLimit: {
+        maxConcurrent: 8,      // ≤ 8 requests in flight at once
+        minIntervalMs: 50,     // ≥ 50ms between request starts (optional)
+        acquireTimeoutMs: 30000, // fail loud if a call waits > 30s in the queue (optional)
+      },
+    },
+  },
+});
+```
+
+`RateLimitConfig` fields (all optional):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `maxConcurrent` | `number` | Max requests in flight for this provider. Must be a finite integer ≥ 1 (invalid values disable the cap with a warning). `1` serializes all requests (a throughput floor, not a deadlock — see below). |
+| `minIntervalMs` | `number` | Minimum ms between successive request *grants* (global spacing, no burst bucket). |
+| `acquireTimeoutMs` | `number` | If set, a call that waits longer than this in the queue rejects (fail loud) instead of hanging on a misconfigured cap. |
+
+**Scope & caveats:**
+
+- **Caps request concurrency, not token throughput (TPM).** A permit is released at
+  response *headers*, so streaming responses don't hold a permit for their whole
+  lifetime. This bounds requests/min pressure, not tokens/min.
+- **Chat calls only.** The governor wraps provider `chat`/`stream` calls. Memory
+  **embedder** calls (e.g. `ctx.remember({ embed: true })`) are constructed outside
+  the provider registry and are **not** governed in this version — they can still
+  count against a shared key's limit.
+- **Per provider instance / process.** Providers are singletons per (runtime,
+  provider type), so one governor covers all chat calls through that adapter — but
+  not other processes or runtimes sharing the same key.
+- **`openai-responses` inherits `openai`'s `rateLimit`** when it has no config of its
+  own (same fallback as `apiKey`/`baseUrl`), so one `openai` block governs both.
+- **No deadlock on nesting.** A permit is held only across a single HTTP call, never
+  across a nested `ctx.ask()` (tool handlers run between provider calls, not during),
+  so an agent-as-tool chain on the same provider under `maxConcurrent: 1` still
+  completes — permits don't stack.
+- **Custom providers** registered via `registerInstance` are not governed unless they
+  wrap `fetchWithRetry({ governor })` themselves.
+
+You can also construct a `RateLimiter` directly (exported from `@axlsdk/axl`) if you
+build a custom provider adapter.
+
+### Retry backoff — worst case
+
+The reactive retry does up to **2 retries (3 attempts total)** on `429`/`503`/`529`.
+Delay per attempt honors a `Retry-After` header when present; otherwise it's
+`1000ms × 2^attempt` (1s, then 2s) with ±25% jitter, and the wait is abort-aware
+(a cancelled signal short-circuits the sleep). Worst case for a single call that
+exhausts retries without `Retry-After`: roughly `1s + 2s ≈ 3s` of backoff plus three
+request round-trips before the final error surfaces. Combined with the governor, the
+whole retry loop runs inside one held permit, so backoff naturally applies
+backpressure to other queued calls rather than letting them pile on a struggling
+provider.
+
 ## Model Parameters
 
 All model parameters are configurable on `AgentConfig` (agent-level defaults) and overridable per-call via `AskOptions`. Precedence: `AskOptions` > `AgentConfig` > internal defaults.

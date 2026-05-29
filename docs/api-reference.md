@@ -1275,6 +1275,26 @@ const runtime3 = new AxlRuntime({
 | `defaultTtl` | `number?` | — | Default TTL in **seconds** applied to every TTL-capable storage category. Without a TTL, every `save*` accumulates forever — strongly recommended in production |
 | `ttls` | `object?` | — | Per-category TTL overrides in seconds (`session`, `sessionMeta`, `checkpoint`, `executionState`, `executionHistory`, `evalHistory`, `memory`, `streamingEvents`). Set a category to `null` to explicitly opt out even when `defaultTtl` is set. `pendingDecision` is intentionally NOT configurable — pending decisions share a hash, so a TTL would expire all of them at once. **Window semantics:** `memory`, `session`, and `sessionMeta` are sliding (every write refreshes TTL — active users keep their data, inactive users forget; reads do NOT refresh); `checkpoint` and `streamingEvents` are fixed-creation (TTL set on first write only); `executionState` / `executionHistory` / `evalHistory` are fixed-refresh (TTL via `SET ... EX`). **`streamingEvents` is opt-in only** — does NOT fall back to `defaultTtl`. Must be longer than your max time-between-restarts or `recoverIncompleteStreams()` will miss crashed-run buffers that aged out before the next process started. Non-positive and non-finite values (`0`, negative, `NaN`, `Infinity`) are defensively treated as no-TTL. Per-category TTLs are independent. Legacy memory entries (pre-`memory-methods` patch) migrate forward on first read with the configured TTL applied. `listPendingExecutions` self-prunes stale ids when their `executionState` blob has TTL-evicted |
 
+### Provider configuration
+
+`config.providers.<name>` (`ProviderConfig`) accepts:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `apiKey` | `string` | env var | API key (falls back to the provider's env var, e.g. `OPENAI_API_KEY`) |
+| `baseUrl` | `string` | provider default | Override the API base URL (proxies, gateways) |
+| `rateLimit` | `RateLimitConfig` | — | Opt-in client-side rate governor for this provider's chat calls. See below. `openai-responses` inherits the `openai` block (incl. `rateLimit`) when it has no config of its own |
+
+**`RateLimitConfig`** — proactive pacing through the shared `fetchWithRetry` chokepoint (complementary to the automatic 429/503/529 backoff). Exported from `@axlsdk/axl` alongside the `RateLimiter` class.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `maxConcurrent` | `number` | Max requests in flight for this provider. Finite integer ≥ 1; invalid values disable the cap (with a `console.warn`). `1` serializes (a throughput floor, not a deadlock — permits aren't held across a nested `ctx.ask()`) |
+| `minIntervalMs` | `number` | Minimum ms between successive request *grants* (global spacing, no burst bucket) |
+| `acquireTimeoutMs` | `number` | If set, a call queued longer than this rejects (fail loud) instead of hanging on a misconfigured cap |
+
+> **Scope:** caps request *concurrency*, not token throughput (TPM) — a permit releases at response headers. Governs **chat calls only** (memory embedder calls are not governed in this version) and is **per provider instance / process** (not shared across processes on the same key). Full caveats in [providers.md → Rate limiting](providers.md#rate-limiting-opt-in).
+
 ### State configuration
 
 `config.state` accepts the following options:

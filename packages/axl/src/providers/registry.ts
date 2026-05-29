@@ -22,19 +22,37 @@ type ProviderFactory = (config: AxlConfig) => Provider;
 const builtinFactories: Record<string, ProviderFactory> = {
   openai: (config) => {
     const opts = config.providers?.openai ?? {};
-    return new OpenAIProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl });
+    return new OpenAIProvider({
+      apiKey: opts.apiKey,
+      baseUrl: opts.baseUrl,
+      rateLimit: opts.rateLimit,
+    });
   },
   'openai-responses': (config) => {
+    // Falls back to the `openai` provider config (incl. its rateLimit) so
+    // configuring `providers.openai.rateLimit` governs the Responses adapter too.
     const opts = config.providers?.['openai-responses'] ?? config.providers?.openai ?? {};
-    return new OpenAIResponsesProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl });
+    return new OpenAIResponsesProvider({
+      apiKey: opts.apiKey,
+      baseUrl: opts.baseUrl,
+      rateLimit: opts.rateLimit,
+    });
   },
   anthropic: (config) => {
     const opts = config.providers?.anthropic ?? {};
-    return new AnthropicProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl });
+    return new AnthropicProvider({
+      apiKey: opts.apiKey,
+      baseUrl: opts.baseUrl,
+      rateLimit: opts.rateLimit,
+    });
   },
   google: (config) => {
     const opts = config.providers?.google ?? {};
-    return new GeminiProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl });
+    return new GeminiProvider({
+      apiKey: opts.apiKey,
+      baseUrl: opts.baseUrl,
+      rateLimit: opts.rateLimit,
+    });
   },
 };
 

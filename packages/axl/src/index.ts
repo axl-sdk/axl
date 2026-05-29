@@ -156,6 +156,8 @@ export { OpenAIResponsesProvider } from './providers/openai-responses.js';
 export { AnthropicProvider } from './providers/anthropic.js';
 export { GeminiProvider } from './providers/gemini.js';
 export { ProviderRegistry } from './providers/registry.js';
+export { RateLimiter } from './providers/rate-limiter.js';
+export type { RateLimitConfig } from './providers/rate-limiter.js';
 export type {
   Provider,
   ProviderAdapter,

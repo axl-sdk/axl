@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { fetchWithRetry } from '../providers/retry.js';
+import { RateLimiter } from '../providers/rate-limiter.js';
+
+const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 const originalFetch = globalThis.fetch;
 
@@ -55,7 +58,7 @@ describe('fetchWithRetry', () => {
     const fail = { ok: false, status: 429, headers: new Headers() };
     globalThis.fetch = vi.fn().mockResolvedValue(fail) as any;
 
-    const res = await fetchWithRetry('https://example.com', undefined, 2);
+    const res = await fetchWithRetry('https://example.com', undefined, { maxRetries: 2 });
     expect(res).toBe(fail);
     // 1 initial + 2 retries = 3 total
     expect(globalThis.fetch).toHaveBeenCalledTimes(3);
@@ -102,5 +105,95 @@ describe('fetchWithRetry', () => {
 
     await fetchWithRetry('https://example.com', init);
     expect(globalThis.fetch).toHaveBeenCalledWith('https://example.com', init);
+  });
+});
+
+describe('fetchWithRetry + governor', () => {
+  it('caps in-flight requests at maxConcurrent across calls', async () => {
+    const rl = new RateLimiter({ maxConcurrent: 2 });
+    let concurrent = 0;
+    let peak = 0;
+    globalThis.fetch = vi.fn(async () => {
+      concurrent++;
+      peak = Math.max(peak, concurrent);
+      await delay(5);
+      concurrent--;
+      return { ok: true, status: 200, headers: new Headers() };
+    }) as any;
+
+    await Promise.all(
+      Array.from({ length: 8 }, () => fetchWithRetry('https://x', undefined, { governor: rl })),
+    );
+    expect(peak).toBe(2);
+  });
+
+  it('holds one permit across a 429 → retry → success for the whole loop', async () => {
+    const rl = new RateLimiter({ maxConcurrent: 1 });
+    let concurrent = 0;
+    let peak = 0;
+    let n = 0;
+    globalThis.fetch = vi.fn(async () => {
+      concurrent++;
+      peak = Math.max(peak, concurrent);
+      await delay(5);
+      concurrent--;
+      n++;
+      // The first caller's first fetch 429s with retry-after:0 (instant retry),
+      // so it does TWO fetches before releasing the permit. The second caller
+      // must not interleave with that retry → peak stays 1.
+      if (n === 1) return { ok: false, status: 429, headers: new Headers({ 'retry-after': '0' }) };
+      return { ok: true, status: 200, headers: new Headers() };
+    }) as any;
+
+    await Promise.all([
+      fetchWithRetry('https://x', undefined, { governor: rl }),
+      fetchWithRetry('https://x', undefined, { governor: rl }),
+    ]);
+    expect(peak).toBe(1);
+    expect(n).toBe(3); // caller A: 429 + ok = 2; caller B: ok = 1
+  });
+
+  it('releases the permit on a thrown fetch (next caller proceeds)', async () => {
+    const rl = new RateLimiter({ maxConcurrent: 1 });
+    let calls = 0;
+    globalThis.fetch = vi.fn(async () => {
+      calls++;
+      if (calls === 1) throw new Error('network down');
+      return { ok: true, status: 200, headers: new Headers() };
+    }) as any;
+
+    await expect(fetchWithRetry('https://x', undefined, { governor: rl })).rejects.toThrow(
+      'network down',
+    );
+    // If the permit had leaked, this second call would hang forever under cap 1.
+    await expect(fetchWithRetry('https://x', undefined, { governor: rl })).resolves.toMatchObject({
+      ok: true,
+    });
+  });
+
+  it('does not deadlock on a nested (sequential) same-governor call under maxConcurrent:1', async () => {
+    // The realistic nesting model: a permit is held only across ONE fetchWithRetry,
+    // released before the agent loop runs a tool whose nested ask makes another
+    // governed call. So sequential same-governor calls under cap 1 must complete.
+    const rl = new RateLimiter({ maxConcurrent: 1 });
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+    })) as any;
+    const outer = async () => {
+      await fetchWithRetry('https://outer', undefined, { governor: rl });
+      await fetchWithRetry('https://nested', undefined, { governor: rl });
+      return 'done';
+    };
+    await expect(outer()).resolves.toBe('done');
+  });
+
+  it('is byte-identical to no-governor when governor is undefined', async () => {
+    const mockRes = { ok: true, status: 200, headers: new Headers() };
+    globalThis.fetch = vi.fn().mockResolvedValue(mockRes) as any;
+    const res = await fetchWithRetry('https://x', undefined, {});
+    expect(res).toBe(mockRes);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
   });
 });

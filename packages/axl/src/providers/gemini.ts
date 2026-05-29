@@ -9,6 +9,7 @@ import type {
 } from './types.js';
 import { resolveThinkingOptions } from './types.js';
 import { fetchWithRetry } from './retry.js';
+import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 
 // ---------------------------------------------------------------------------
 // Schema sanitization for Gemini's tool/responseSchema dialect.
@@ -224,13 +225,15 @@ export class GeminiProvider implements Provider {
   private baseUrl: string;
   private apiKey: string;
   private callCounter = 0;
+  private governor?: RateLimiter;
 
-  constructor(options: { apiKey?: string; baseUrl?: string } = {}) {
+  constructor(options: { apiKey?: string; baseUrl?: string; rateLimit?: RateLimitConfig } = {}) {
     this.apiKey = options.apiKey ?? process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY ?? '';
     this.baseUrl = (options.baseUrl ?? 'https://generativelanguage.googleapis.com/v1beta').replace(
       /\/$/,
       '',
     );
+    this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
 
     if (!this.apiKey) {
       throw new Error('Google API key is required. Set GOOGLE_API_KEY or pass apiKey in options.');
@@ -244,12 +247,16 @@ export class GeminiProvider implements Provider {
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
     const body = this.buildRequestBody(messages, options);
 
-    const res = await fetchWithRetry(`${this.baseUrl}/models/${options.model}:generateContent`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify(body),
-      signal: options.signal,
-    });
+    const res = await fetchWithRetry(
+      `${this.baseUrl}/models/${options.model}:generateContent`,
+      {
+        method: 'POST',
+        headers: this.buildHeaders(),
+        body: JSON.stringify(body),
+        signal: options.signal,
+      },
+      { governor: this.governor },
+    );
 
     if (!res.ok) {
       const errorBody = await res.text();
@@ -276,6 +283,7 @@ export class GeminiProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
+      { governor: this.governor },
     );
 
     if (!res.ok) {

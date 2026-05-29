@@ -1,7 +1,18 @@
+import type { RateLimitConfig } from './providers/rate-limiter.js';
+
 /** Provider configuration */
 export type ProviderConfig = {
   apiKey?: string;
   baseUrl?: string;
+  /**
+   * Opt-in client-side rate governor for this provider's HTTP calls (see
+   * {@link RateLimitConfig}). Bounds in-flight request concurrency (and,
+   * optionally, request spacing) through the shared `fetchWithRetry` chokepoint.
+   * Omitted ⇒ no governor (behavior unchanged). Caveat: governs **chat** calls
+   * through this provider instance only — NOT memory-embedder calls (constructed
+   * outside the registry) and NOT other processes sharing the same API key.
+   */
+  rateLimit?: RateLimitConfig;
 };
 
 /** MCP server configuration */

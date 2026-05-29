@@ -10,6 +10,7 @@ import type {
 } from './types.js';
 import { resolveThinkingOptions } from './types.js';
 import { fetchWithRetry } from './retry.js';
+import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 
 const ANTHROPIC_API_VERSION = '2023-06-01';
 
@@ -163,10 +164,12 @@ export class AnthropicProvider implements Provider {
   private baseUrl: string;
   private apiKey: string;
   private currentModel?: string;
+  private governor?: RateLimiter;
 
-  constructor(options: { apiKey?: string; baseUrl?: string } = {}) {
+  constructor(options: { apiKey?: string; baseUrl?: string; rateLimit?: RateLimitConfig } = {}) {
     this.apiKey = options.apiKey ?? process.env.ANTHROPIC_API_KEY ?? '';
     this.baseUrl = (options.baseUrl ?? 'https://api.anthropic.com/v1').replace(/\/$/, '');
+    this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
 
     if (!this.apiKey) {
       throw new Error(
@@ -183,12 +186,16 @@ export class AnthropicProvider implements Provider {
     this.currentModel = options.model;
     const body = this.buildRequestBody(messages, options, false);
 
-    const res = await fetchWithRetry(`${this.baseUrl}/messages`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify(body),
-      signal: options.signal,
-    });
+    const res = await fetchWithRetry(
+      `${this.baseUrl}/messages`,
+      {
+        method: 'POST',
+        headers: this.buildHeaders(),
+        body: JSON.stringify(body),
+        signal: options.signal,
+      },
+      { governor: this.governor },
+    );
 
     if (!res.ok) {
       const errorBody = await res.text();
@@ -207,12 +214,16 @@ export class AnthropicProvider implements Provider {
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
     const body = this.buildRequestBody(messages, options, true);
 
-    const res = await fetchWithRetry(`${this.baseUrl}/messages`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify(body),
-      signal: options.signal,
-    });
+    const res = await fetchWithRetry(
+      `${this.baseUrl}/messages`,
+      {
+        method: 'POST',
+        headers: this.buildHeaders(),
+        body: JSON.stringify(body),
+        signal: options.signal,
+      },
+      { governor: this.governor },
+    );
 
     if (!res.ok) {
       const errorBody = await res.text();

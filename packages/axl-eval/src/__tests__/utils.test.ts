@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeStats, round } from '../utils.js';
+import { computeStats, round, mapWithConcurrency } from '../utils.js';
 
 describe('computeStats()', () => {
   it('returns zeros for empty array', () => {
@@ -27,5 +27,63 @@ describe('round()', () => {
 
   it('rounds up at midpoint', () => {
     expect(round(0.1235)).toBe(0.124);
+  });
+});
+
+describe('mapWithConcurrency()', () => {
+  it('returns [] for an empty array without hanging', async () => {
+    const result = await mapWithConcurrency([], 5, async () => 1);
+    expect(result).toEqual([]);
+  });
+
+  it('preserves input order regardless of completion order', async () => {
+    // Item 0 resolves last, item 2 first — output must still be [0, 2, 4].
+    const delays = [30, 10, 0];
+    const result = await mapWithConcurrency([0, 1, 2], 3, async (n) => {
+      await new Promise((r) => setTimeout(r, delays[n]));
+      return n * 2;
+    });
+    expect(result).toEqual([0, 2, 4]);
+  });
+
+  it('clamps concurrency <= 0 to one worker (does not hang)', async () => {
+    let maxInFlight = 0;
+    let inFlight = 0;
+    const result = await mapWithConcurrency([1, 2, 3], 0, async (n) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 1));
+      inFlight--;
+      return n;
+    });
+    expect(result).toEqual([1, 2, 3]);
+    expect(maxInFlight).toBe(1);
+  });
+
+  it('bounds concurrency to the requested width', async () => {
+    let maxInFlight = 0;
+    let inFlight = 0;
+    await mapWithConcurrency([1, 2, 3, 4, 5, 6], 2, async (n) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 5));
+      inFlight--;
+      return n;
+    });
+    expect(maxInFlight).toBe(2);
+  });
+
+  it('does not reject the batch when a task handles its own error', async () => {
+    // The helper does not catch — tasks must own try/catch. A task that resolves
+    // (after internally swallowing an error) keeps the pool draining.
+    const result = await mapWithConcurrency([1, 2, 3], 2, async (n) => {
+      try {
+        if (n === 2) throw new Error('boom');
+        return n;
+      } catch {
+        return -1;
+      }
+    });
+    expect(result).toEqual([1, -1, 3]);
   });
 });

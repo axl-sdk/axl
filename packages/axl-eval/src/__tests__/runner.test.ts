@@ -1940,3 +1940,143 @@ describe('runEval() — dataset diagnostics', () => {
     expect(result.metadata.droppedAnnotationKeys).toBeUndefined();
   });
 });
+
+describe('runEval() — concurrent scorers', () => {
+  const oneItem = dataset({
+    name: 'one',
+    schema: z.object({ q: z.string() }),
+    items: [{ input: { q: 'x' } }],
+  });
+  const exec = async () => ({ output: 'out' });
+
+  // The scorer() factory is sync-only (ScorerFn returns no Promise), so async
+  // test scorers are built as plain Scorer literals — same as alwaysOneScorer
+  // in rescore.test.ts. Scorer.score permits a Promise return.
+  const delayScorer = (name: string, delayMs: number, result: number | Error): Scorer => ({
+    name,
+    description: name,
+    isLlm: false,
+    score: async () => {
+      await new Promise((r) => setTimeout(r, delayMs));
+      if (result instanceof Error) throw result;
+      return result;
+    },
+  });
+
+  it('runs an item’s scorers concurrently and captures per-scorer durations', async () => {
+    const slow = delayScorer('slow', 40, 1);
+    const fast = delayScorer('fast', 0, 1);
+
+    const start = Date.now();
+    const result = await runEval(
+      { workflow: 'w', dataset: oneItem, scorers: [slow, fast], scorerConcurrency: 2 },
+      exec,
+      mockRuntime,
+    );
+    const elapsed = Date.now() - start;
+
+    const item = result.items[0];
+    expect(item.scores).toEqual({ slow: 1, fast: 1 });
+    // Wall-clock is bounded by the slow scorer, not slow+fast serial — generous
+    // upper bound to avoid CI flakiness.
+    expect(elapsed).toBeLessThan(200);
+    expect(item.scoreDetails!.slow.duration).toBeGreaterThanOrEqual(
+      item.scoreDetails!.fast.duration!,
+    );
+  });
+
+  it('one throwing scorer does not reject the batch; others still score', async () => {
+    const good = delayScorer('good', 0, 1);
+    const bad = delayScorer('bad', 0, new Error('kaboom'));
+
+    const result = await runEval(
+      { workflow: 'w', dataset: oneItem, scorers: [good, bad], scorerConcurrency: 2 },
+      exec,
+      mockRuntime,
+    );
+
+    const item = result.items[0];
+    expect(item.scores.good).toBe(1);
+    expect(item.scores.bad).toBeNull();
+    expect(item.scorerErrors).toHaveLength(1);
+    expect(item.scorerErrors![0]).toContain('bad');
+    expect(item.scorerErrors![0]).toContain('kaboom');
+  });
+
+  it('accumulates cost across concurrent scorers', async () => {
+    const a: Scorer = {
+      name: 'a',
+      description: 'a',
+      isLlm: false,
+      score: async () => ({ score: 1, cost: 0.02 }),
+    };
+    const b: Scorer = {
+      name: 'b',
+      description: 'b',
+      isLlm: false,
+      score: async () => ({ score: 1, cost: 0.03 }),
+    };
+
+    const result = await runEval(
+      { workflow: 'w', dataset: oneItem, scorers: [a, b], scorerConcurrency: 2 },
+      exec,
+      mockRuntime,
+    );
+
+    expect(result.items[0].scorerCost).toBeCloseTo(0.05, 10);
+    expect(result.totalCost).toBeCloseTo(0.05, 10);
+  });
+
+  it('keeps scores / scoreDetails / scorerErrors in scorer-array order regardless of completion', async () => {
+    // first finishes last, last finishes first — key insertion order must still
+    // follow the scorers array (deterministic JSON / snapshot stability).
+    const scorers = [
+      delayScorer('first', 30, new Error('first-failed')),
+      delayScorer('mid', 15, 1),
+      delayScorer('last', 0, new Error('last-failed')),
+    ];
+
+    const result = await runEval(
+      { workflow: 'w', dataset: oneItem, scorers, scorerConcurrency: 3 },
+      exec,
+      mockRuntime,
+    );
+
+    const item = result.items[0];
+    expect(Object.keys(item.scores)).toEqual(['first', 'mid', 'last']);
+    expect(Object.keys(item.scoreDetails!)).toEqual(['first', 'mid', 'last']);
+    // Errors flattened in scorer-array order, not completion order.
+    expect(item.scorerErrors).toEqual([
+      expect.stringContaining('first'),
+      expect.stringContaining('last'),
+    ]);
+  });
+
+  it('an in-flight scorer aborted mid-run is treated as cancellation, not a phantom error', async () => {
+    const controller = new AbortController();
+    const aborting: Scorer = {
+      name: 'aborting',
+      description: 'a',
+      isLlm: false,
+      score: async () => {
+        controller.abort();
+        // Simulate a provider that rejects with AbortError on signal.
+        const err = new Error('The operation was aborted');
+        err.name = 'AbortError';
+        throw err;
+      },
+    };
+
+    const result = await runEval(
+      { workflow: 'w', dataset: oneItem, scorers: [aborting], scorerConcurrency: 1 },
+      exec,
+      mockRuntime,
+      { signal: controller.signal },
+    );
+
+    const item = result.items[0];
+    // No fabricated "threw" error for an aborted call.
+    expect(item.scorerErrors).toBeUndefined();
+    expect(item.scores.aborting).toBeNull();
+  });
+});

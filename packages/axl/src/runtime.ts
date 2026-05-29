@@ -1048,6 +1048,7 @@ export class AxlRuntime extends EventEmitter {
           dataset: unknown;
           scorers: unknown[];
           concurrency?: number;
+          scorerConcurrency?: number;
           budget?: string;
           metadata?: Record<string, unknown>;
         },
@@ -2117,6 +2118,7 @@ export class AxlRuntime extends EventEmitter {
       dataset: unknown;
       scorers: unknown[];
       concurrency?: number;
+      scorerConcurrency?: number;
       budget?: string;
       metadata?: Record<string, unknown>;
     },

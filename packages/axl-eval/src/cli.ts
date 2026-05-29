@@ -21,16 +21,7 @@ import {
   CONFIG_CANDIDATES,
 } from './cli-utils.js';
 import { validateEvalConfig } from './cli-validate.js';
-
-const KNOWN_FLAGS = new Set([
-  '--output',
-  '--config',
-  '--conditions',
-  '--fail-on-regression',
-  '--threshold',
-  '--runs',
-  '--capture-traces',
-]);
+import { parseEvalArgs, envInt } from './cli-args.js';
 
 /** Install a SIGINT/SIGTERM handler that aborts an in-flight eval gracefully.
  *  First signal: aborts the controller so runEval / rescore propagate cancellation
@@ -64,6 +55,15 @@ Usage:
   axl-eval <path> --output <file>         Save results to JSON
   axl-eval <path> --config <file>         Use config file for runtime
   axl-eval <path> --conditions <list>     Node.js import conditions (comma-separated)
+  axl-eval <path> --concurrency <n>       Override item concurrency (flag > env
+                                          AXL_EVAL_CONCURRENCY > config > 5).
+                                          Max concurrent scorer calls is
+                                          concurrency x scorerConcurrency (the
+                                          per-eval scorerConcurrency defaults to 5).
+  axl-eval <path> --scorers <a,b>         Run only the named scorers (single eval
+                                          file only). Stamps the result as a
+                                          subset so compare won't treat it as a
+                                          full baseline.
   axl-eval <path> --capture-traces        Populate EvalItem.traces on every item
                                           (success + failure). Adds memory
                                           overhead proportional to dataset size
@@ -139,6 +139,27 @@ async function runCompare(args: string[]) {
   const compareOptions = thresholds != null ? { thresholds } : undefined;
   const comparison = evalCompare(baseline, candidate, compareOptions);
 
+  // A scorer-filtered result (CLI `--scorers`) tested only a subset of scorers,
+  // so it isn't a sound baseline/candidate for a full comparison. Warn loudly;
+  // and when the run is being used to GATE CI (`--fail-on-regression`), refuse
+  // outright — a swallowed stderr line wouldn't actually prevent the footgun.
+  const filteredSides = (['baseline', 'candidate'] as const).filter(
+    (side) => comparison[side].metadata?.scorerFiltered === true,
+  );
+  for (const side of filteredSides) {
+    const ran = comparison[side].metadata?.scorersRun;
+    const ranStr = Array.isArray(ran) ? ` (ran: ${(ran as string[]).join(', ')})` : '';
+    console.error(
+      `[axl-eval] WARNING: ${side} was run with a filtered scorer subset${ranStr} — this comparison is incomplete.`,
+    );
+  }
+  if (failOnRegression && filteredSides.length > 0) {
+    console.error(
+      `[axl-eval] Refusing to gate on a scorer-filtered result (${filteredSides.join(', ')}); re-run without --scorers.`,
+    );
+    process.exit(1);
+  }
+
   console.log(
     `\nCompare: baseline (${comparison.baseline.id.slice(0, 8)}) -> candidate (${comparison.candidate.id.slice(0, 8)})\n`,
   );
@@ -208,12 +229,16 @@ async function runCompare(args: string[]) {
 }
 
 async function runRescore(args: string[], signal: AbortSignal) {
-  const { outputPath, configArg, conditions, paths } = parseEvalArgs(args);
+  const { outputPath, configArg, conditions, concurrency, paths } = parseEvalArgs(args);
 
   if (paths.length < 2) {
     console.error('Usage: axl-eval rescore <results.json> <eval-file> [--output <file>]');
     process.exit(1);
   }
+
+  // Honor the same item-concurrency override as the run command (flag > env).
+  // scorerConcurrency keeps its rescore default (5).
+  const itemConcurrency = concurrency ?? envInt('AXL_EVAL_CONCURRENCY');
 
   const [resultsPath, evalFilePath] = paths;
   const raw = JSON.parse(await readFileAsync(resultsPath, 'utf-8'));
@@ -238,7 +263,12 @@ async function runRescore(args: string[], signal: AbortSignal) {
     const rescored: EvalResult[] = [];
     for (const resultData of results) {
       if (signal.aborted) break;
-      rescored.push(await rescore(resultData, evalConfig.scorers, runtime, { signal }));
+      rescored.push(
+        await rescore(resultData, evalConfig.scorers, runtime, {
+          signal,
+          ...(itemConcurrency != null ? { concurrency: itemConcurrency } : {}),
+        }),
+      );
     }
 
     for (const r of rescored) {
@@ -468,59 +498,19 @@ async function getRuntime(configArg?: string, conditions?: string[]): Promise<Ax
   return new AxlRuntime();
 }
 
-// ── Arg parsing ────────────────────────────────────────────────────
-
-function parseEvalArgs(args: string[]): {
-  outputPath?: string;
-  configArg?: string;
-  conditions: string[];
-  runs: number;
-  captureTraces: boolean;
-  paths: string[];
-} {
-  let outputPath: string | undefined;
-  let configArg: string | undefined;
-  let conditions: string[] = [];
-  let runs = 1;
-  let captureTraces = false;
-  const paths: string[] = [];
-
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === '--output' || arg === '--config' || arg === '--conditions' || arg === '--runs') {
-      if (i + 1 >= args.length) {
-        console.error(`Error: ${arg} requires a value`);
-        process.exit(1);
-      }
-      const value = args[++i];
-      if (arg === '--output') outputPath = value;
-      else if (arg === '--config') configArg = value;
-      else if (arg === '--runs') runs = Math.max(1, parseInt(value, 10) || 1);
-      else
-        conditions = value
-          .split(',')
-          .map((c) => c.trim())
-          .filter(Boolean);
-    } else if (arg === '--capture-traces') {
-      // Boolean flag — no value consumed.
-      captureTraces = true;
-    } else if (arg.startsWith('--')) {
-      if (!KNOWN_FLAGS.has(arg)) {
-        console.error(`Unknown flag: ${arg}`);
-        process.exit(1);
-      }
-    } else {
-      paths.push(arg);
-    }
-  }
-
-  return { outputPath, configArg, conditions, runs, captureTraces, paths };
-}
-
 // ── Main eval command ──────────────────────────────────────────────
 
 async function runEvalCommand(args: string[], signal: AbortSignal) {
-  const { outputPath, configArg, conditions, runs, captureTraces, paths } = parseEvalArgs(args);
+  const {
+    outputPath,
+    configArg,
+    conditions,
+    runs,
+    captureTraces,
+    concurrency,
+    scorerNames,
+    paths,
+  } = parseEvalArgs(args);
 
   if (paths.length === 0) {
     console.error('Error: No eval file path provided');
@@ -555,6 +545,38 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
           console.error(`Error: ${filePath} ${validationError}`);
           failedFiles++;
           continue;
+        }
+
+        // Concurrency override precedence: flag > env > config > default.
+        // Mutating evalConfig in place mirrors how this loop already stamps
+        // result.metadata. `concurrency` is pure scheduling — never changes
+        // results — so a per-run override is always safe.
+        evalConfig.concurrency =
+          concurrency ?? envInt('AXL_EVAL_CONCURRENCY') ?? evalConfig.concurrency ?? 5;
+
+        // --scorers: run a subset of scorers for a focused iteration loop.
+        // Single-file only — filtering by name across a glob/dir of evals with
+        // different scorer sets is ambiguous (a name present in one file and
+        // absent in another). Validate-then-filter so the error lists every
+        // available name.
+        if (scorerNames?.length) {
+          if (evalFiles.length > 1) {
+            console.error('Error: --scorers requires a single eval file (got multiple).');
+            process.exit(1);
+          }
+          const available = evalConfig.scorers.map((s) => s.name);
+          const unknown = scorerNames.filter((n) => !available.includes(n));
+          if (unknown.length) {
+            console.error(
+              `Error: --scorers: unknown scorer(s): ${unknown.join(', ')}. Available: ${available.join(', ')}`,
+            );
+            process.exit(1);
+          }
+          evalConfig.scorers = evalConfig.scorers.filter((s) => scorerNames.includes(s.name));
+          if (evalConfig.scorers.length === 0) {
+            console.error('Error: --scorers matched no scorers.');
+            process.exit(1);
+          }
         }
 
         // Resolve executeWorkflow: custom export > registered workflow > error
@@ -652,6 +674,18 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
         // workflows + scorer LLM calls instead of dropping the connection mid-request.
         const runOptions = { signal, ...(captureTraces ? { captureTraces: true } : {}) };
 
+        // Stamp filtered runs so a scorer-subset result can't be silently used
+        // as a full baseline. `compare` warns (and refuses to gate) on it. Must
+        // be applied to EVERY run in a multi-run batch — Studio's multi-run
+        // builder spreads only run[0]'s metadata.
+        const scorersRun = scorerNames?.length ? evalConfig.scorers.map((s) => s.name) : undefined;
+        const stampFiltered = (result: EvalResult) => {
+          if (scorersRun) {
+            result.metadata.scorerFiltered = true;
+            result.metadata.scorersRun = scorersRun;
+          }
+        };
+
         if (runs > 1) {
           // Multi-run mode. Buffer per-run results locally so we can mark the
           // batch correctly before committing to outer `results[]`. The
@@ -674,6 +708,7 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
               const result = await runEval(evalConfig, executeWorkflow, runtime, runOptions);
               result.metadata.runGroupId = runGroupId;
               result.metadata.runIndex = r;
+              stampFiltered(result);
               runResults.push(result);
             } catch (err) {
               runFailure = err instanceof Error ? err : new Error(String(err));
@@ -738,6 +773,7 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
           for (const r of runResults) results.push(r);
         } else {
           const result = await runEval(evalConfig, executeWorkflow, runtime, runOptions);
+          stampFiltered(result);
           results.push(result);
 
           console.log('\n' + formatTable(result) + '\n');

@@ -6,7 +6,15 @@ export type EvalConfig = {
   workflow: string;
   dataset: Dataset<unknown, unknown>;
   scorers: Scorer<unknown, unknown, unknown>[];
+  /** Item-level worker-pool size (how many dataset items run in parallel). Default 5. */
   concurrency?: number;
+  /**
+   * Per-item scorer fan-out — how many of an item's scorers run concurrently.
+   * Default 5 (matches `concurrency`; scorers are parallel-by-default). The
+   * worst-case number of concurrent scorer calls is `concurrency × scorerConcurrency`,
+   * so lower `concurrency` if a rate-limited judge model needs a tighter ceiling.
+   */
+  scorerConcurrency?: number;
   budget?: string;
   metadata?: Record<string, unknown>;
 };
@@ -32,6 +40,10 @@ export type EvalResult = {
    * - `droppedAnnotationKeys?: string[]` — annotation key paths the dataset
    *   schema stripped (present only when non-empty). Mirrors the dataset's
    *   `console.warn`; lets any consumer surface the same signal.
+   * - `scorerFiltered?: boolean` + `scorersRun?: string[]` — set when the CLI
+   *   `--scorers` flag ran a subset of scorers. A guard so a filtered run isn't
+   *   silently used as a full baseline (`compare` warns / refuses to gate on it).
+   *   Distinct from the multi-run "partial" concept (see {@link EvalComparisonPartial}).
    */
   metadata: Record<string, unknown>;
   timestamp: string;

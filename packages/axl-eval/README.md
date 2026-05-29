@@ -225,9 +225,15 @@ npx axl-eval ./evals/                               # run all *.eval.* files in 
 npx axl-eval ./evals/ --output ./results/v1.json    # save results to JSON
 npx axl-eval ./evals/ --config ./axl.config.ts      # use a specific runtime config
 npx axl-eval ./evals/ --conditions development      # add Node.js import conditions (monorepo source exports)
+npx axl-eval ./evals/qa.eval.ts --concurrency 10    # override item concurrency for this run
+npx axl-eval ./evals/qa.eval.ts --scorers accuracy  # run only named scorer(s) (single file)
 ```
 
 The CLI resolves a runtime automatically: `--config <path>` > auto-detect `axl.config.*` > bare `new AxlRuntime()` (providers from env vars). Use `--conditions` when your eval file imports from monorepo packages that use conditional exports (e.g., `"development"` condition for source TypeScript instead of compiled dist).
+
+**`--concurrency <n>` / `AXL_EVAL_CONCURRENCY`** override item concurrency per-invocation (precedence: flag > env > `defineEval` value > default 5). Concurrency is pure scheduling — it never changes results. Note the per-eval `scorerConcurrency` (default 5) is independent, so the worst-case number of simultaneous scorer calls is `concurrency × scorerConcurrency`; lower `--concurrency` if a rate-limited judge model needs a tighter ceiling.
+
+**`--scorers <a,b>`** runs only the named scorers (single eval file only) for a fast iteration loop. The result is stamped `metadata.scorerFiltered: true` so `axl-eval compare` warns — and, under `--fail-on-regression`, refuses — to gate on a subset run mistaken for a full baseline.
 
 ### Programmatic
 
@@ -571,17 +577,20 @@ return { output, cost: ctx.totalCost };
 
 ### Common patterns
 
-**Concurrency** — process items in parallel (default: 5):
+**Concurrency** — process items in parallel (default: 5), and fan out each item's scorers (default: 5):
 
 ```typescript
 export default defineEval({
   workflow: 'qa-eval',
   dataset: ds,
-  scorers: [qualityJudge],
-  concurrency: 10,       // run 10 items in parallel
+  scorers: [qualityJudge, toneJudge, safetyJudge],
+  concurrency: 10,        // run 10 items in parallel
+  scorerConcurrency: 3,   // run up to 3 of an item's scorers at once
   budget: '$5.00',        // stop if total cost exceeds $5
 });
 ```
+
+`scorerConcurrency` parallelizes the per-item judge phase — the dominant cost for evals with several `llmScorer`s. The worst-case number of simultaneous scorer calls is `concurrency × scorerConcurrency`, so a rate-limited judge model may need a lower value (set `scorerConcurrency: 1` for the old serial behavior). Because the per-item `budget` check runs once before an item's scorers, scorer-cost overshoot is bounded by `concurrency × scorerConcurrency × max-scorer-cost`.
 
 **Per-item budget** — cap cost for a single workflow execution:
 
@@ -630,7 +639,8 @@ Programmatically:
 import { rescore } from '@axlsdk/eval';
 
 const rescored = await rescore(originalResult, [updatedScorer, newScorer], runtime, {
-  concurrency: 10,
+  concurrency: 10,        // items rescored in parallel
+  scorerConcurrency: 3,   // scorers per item run in parallel (default 5)
 });
 
 console.log(rescored.metadata.rescored);    // true
@@ -716,7 +726,7 @@ const comparison = evalCompare(baselineRuns, candidateRuns);
 
 | Type | Description |
 |------|-------------|
-| `EvalConfig` | Eval definition (workflow, dataset, scorers, concurrency, budget) |
+| `EvalConfig` | Eval definition (workflow, dataset, scorers, concurrency, scorerConcurrency, budget) |
 | `EvalResult` | Full eval output (items, summary, cost, duration) |
 | `EvalItem` | Per-item result (input, output, scores, scoreDetails, metadata, traces?) |
 | `EvalSummary` | Aggregate statistics (count, failures, scorer stats, timing) |
@@ -726,7 +736,7 @@ const comparison = evalCompare(baselineRuns, candidateRuns);
 | `EvalRegression` / `EvalImprovement` | Per-item change record (itemIndex, scorer, scores, delta) |
 | `ScorerDetail` | Per-scorer detail (score, metadata, duration, cost) |
 | `ScorerResult` | Scorer return type (`{ score, metadata?, cost? }`) |
-| `RescoreOptions` | Options for `rescore()` (`concurrency`) |
+| `RescoreOptions` | Options for `rescore()` (`concurrency`, `scorerConcurrency`, `signal`) |
 | `MultiRunSummary` | Aggregated multi-run output (per-scorer mean/std/min/max) |
 | `BootstrapCIResult` | CI result (`{ lower, upper, mean, pRegression, pImprovement }`) |
 | `RunEvalOptions` | Options for `runEval()` (`onProgress`, `signal`, `captureTraces`) |

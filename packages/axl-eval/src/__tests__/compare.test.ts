@@ -1256,4 +1256,21 @@ describe('evalCompare()', () => {
       expect(comparison.candidate.partial).toBeUndefined();
     });
   });
+
+  describe('scorer-filtered passthrough', () => {
+    it('surfaces metadata.scorerFiltered / scorersRun on each side so the CLI can warn/gate', () => {
+      const baseline = makeEvalResult({
+        id: 'b',
+        metadata: { workflows: ['test'], scorerFiltered: true, scorersRun: ['accuracy'] },
+      });
+      const candidate = makeEvalResult({ id: 'c' });
+
+      const comparison = evalCompare(baseline, candidate);
+
+      expect(comparison.baseline.metadata.scorerFiltered).toBe(true);
+      expect(comparison.baseline.metadata.scorersRun).toEqual(['accuracy']);
+      // The unfiltered candidate carries no such marker.
+      expect(comparison.candidate.metadata.scorerFiltered).toBeUndefined();
+    });
+  });
 });

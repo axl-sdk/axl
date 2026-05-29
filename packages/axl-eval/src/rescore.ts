@@ -2,11 +2,16 @@ import type { AxlRuntime } from '@axlsdk/axl';
 import type { EvalResult, EvalItem, EvalSummary } from './types.js';
 import type { Scorer, ScorerContext } from './scorer.js';
 import { normalizeScorerResult } from './scorer.js';
-import { computeStats, round } from './utils.js';
+import { computeStats, round, mapWithConcurrency } from './utils.js';
 import { randomUUID } from 'node:crypto';
 
 export type RescoreOptions = {
+  /** Item-level worker-pool size (how many saved items rescore in parallel). Default 5. */
   concurrency?: number;
+  /** Per-item scorer fan-out (how many scorers run concurrently within one item).
+   *  Default 5 — matches `EvalConfig.scorerConcurrency`. Worst-case concurrent
+   *  judge calls is `concurrency × scorerConcurrency`. */
+  scorerConcurrency?: number;
   /** Abort signal forwarded into ScorerContext so in-flight LLM scorer calls can
    *  be cancelled mid-flight. Also checked between items to short-circuit
    *  remaining work. Mirrors `RunEvalOptions.signal`. */
@@ -25,6 +30,7 @@ export async function rescore(
 ): Promise<EvalResult> {
   const startTime = Date.now();
   const concurrency = options?.concurrency ?? 5;
+  const scorerConcurrency = options?.scorerConcurrency ?? 5;
 
   const scorerContext: ScorerContext = {
     resolveProvider: (uri: string) => {
@@ -83,9 +89,19 @@ export async function rescore(
       scoreDetails: {},
     };
 
+    // Pre-seed keys in scorer-array order (deterministic JSON order + a
+    // deterministic `null` for any scorer skipped on abort). Same as runEval.
+    for (const s of scorers) {
+      item.scores[s.name] = null;
+      item.scoreDetails![s.name] = { score: null };
+    }
     let itemScorerCost = 0;
+    const scorerErrorsByName: Record<string, string> = {};
 
-    for (const scorer of scorers) {
+    await mapWithConcurrency(scorers, scorerConcurrency, async (scorer) => {
+      // rescore's serial loop had no in-loop abort check; add the same per-task
+      // guard runEval uses so cancellation short-circuits not-yet-started scorers.
+      if (options?.signal?.aborted) return;
       const scorerStart = Date.now();
       try {
         const raw = await scorer.score(item.output, item.input, item.annotations, scorerContext);
@@ -103,10 +119,8 @@ export async function rescore(
           scorerResult.score < 0 ||
           scorerResult.score > 1
         ) {
-          if (!item.scorerErrors) item.scorerErrors = [];
-          item.scorerErrors.push(
-            `Scorer "${scorer.name}" returned out-of-range score ${scorerResult.score} for input ${JSON.stringify(item.input)}`,
-          );
+          scorerErrorsByName[scorer.name] =
+            `Scorer "${scorer.name}" returned out-of-range score ${scorerResult.score} for input ${JSON.stringify(item.input)}`;
           item.scores[scorer.name] = null;
           item.scoreDetails![scorer.name] = {
             score: null,
@@ -124,15 +138,17 @@ export async function rescore(
           };
         }
       } catch (err) {
+        // Aborted mid-flight → cancellation, not a scoring failure (see runEval).
+        if (options?.signal?.aborted || (err as { name?: string })?.name === 'AbortError') {
+          return;
+        }
         const errCost = typeof (err as any)?.cost === 'number' ? (err as any).cost : undefined;
         if (errCost != null) {
           itemScorerCost += errCost;
           totalCost += errCost;
         }
-        if (!item.scorerErrors) item.scorerErrors = [];
-        item.scorerErrors.push(
-          `Scorer "${scorer.name}" threw: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        scorerErrorsByName[scorer.name] =
+          `Scorer "${scorer.name}" threw: ${err instanceof Error ? err.message : String(err)}`;
         item.scores[scorer.name] = null;
         item.scoreDetails![scorer.name] = {
           score: null,
@@ -140,23 +156,19 @@ export async function rescore(
           cost: errCost,
         };
       }
-    }
+    });
+
+    const orderedErrors = scorers
+      .map((s) => scorerErrorsByName[s.name])
+      .filter((e): e is string => e != null);
+    if (orderedErrors.length > 0) item.scorerErrors = orderedErrors;
     item.scorerCost = itemScorerCost > 0 ? itemScorerCost : undefined;
     rescored[itemIndex] = item;
   }
 
-  let index = 0;
-  async function runNext(): Promise<void> {
-    while (index < result.items.length) {
-      const currentIndex = index++;
-      await rescoreItem(result.items[currentIndex], currentIndex);
-    }
-  }
-
-  const workers = Array.from({ length: Math.min(concurrency, result.items.length) }, () =>
-    runNext(),
-  );
-  await Promise.all(workers);
+  // rescoreItem writes into the pre-allocated `rescored` closure array (the
+  // source of truth) and returns void — the pool's returned array is ignored.
+  await mapWithConcurrency(result.items, concurrency, (item, i) => rescoreItem(item, i));
 
   const failures = rescored.filter((i) => i.error).length;
   const scorerNames = scorers.map((s) => s.name);

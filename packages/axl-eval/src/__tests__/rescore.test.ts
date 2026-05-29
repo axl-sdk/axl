@@ -340,4 +340,53 @@ describe('rescore()', () => {
       }
     });
   });
+
+  describe('concurrent scorers', () => {
+    const costScorer = (name: string, cost: number): Scorer => ({
+      name,
+      description: name,
+      isLlm: false,
+      score: async () => ({ score: 1, cost }),
+    });
+
+    it('runs scorers concurrently and accumulates their cost', async () => {
+      const result = makeResult();
+      const rescored = await rescore(
+        result,
+        [costScorer('a', 0.01), costScorer('b', 0.02)],
+        mockRuntime,
+        {
+          scorerConcurrency: 2,
+        },
+      );
+
+      // 3 items × (0.01 + 0.02) = 0.09
+      expect(rescored.totalCost).toBeCloseTo(0.09, 10);
+      for (const item of rescored.items) {
+        expect(item.scores.a).toBe(1);
+        expect(item.scores.b).toBe(1);
+      }
+    });
+
+    it('one throwing scorer does not reject the batch', async () => {
+      const bad: Scorer = {
+        name: 'bad',
+        description: 'b',
+        isLlm: false,
+        score: async () => {
+          throw new Error('kaboom');
+        },
+      };
+      const result = makeResult();
+      const rescored = await rescore(result, [alwaysOneScorer, bad], mockRuntime, {
+        scorerConcurrency: 2,
+      });
+
+      for (const item of rescored.items) {
+        expect(item.scores['always-one']).toBe(1);
+        expect(item.scores.bad).toBeNull();
+        expect(item.scorerErrors![0]).toContain('kaboom');
+      }
+    });
+  });
 });

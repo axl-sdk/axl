@@ -1632,7 +1632,8 @@ Configuration for `runEval()` and `runtime.eval()`.
 | `dataset` | `Dataset` | required | Dataset to evaluate against |
 | `scorers` | `Scorer[]` | required | Scoring functions to apply to each output |
 | `concurrency` | `number` | `5` | Maximum parallel item executions |
-| `budget` | `string` | — | Cost limit (e.g., `"$10.00"`). Stops processing when exceeded |
+| `scorerConcurrency` | `number` | `5` | Maximum parallel scorers **within a single item**. Worst-case concurrent scorer calls is `concurrency × scorerConcurrency`; set to `1` for a serial judge phase. Cost/timing/ordering are preserved deterministically |
+| `budget` | `string` | — | Cost limit (e.g., `"$10.00"`). Stops processing when exceeded. With concurrent scorers it is a **soft** ceiling — the per-item check runs once before an item's scorers, so overshoot is bounded by `concurrency × scorerConcurrency × max-scorer-cost` |
 | `metadata` | `Record<string, unknown>` | — | Arbitrary metadata attached to the result (e.g., model version, prompt variant) |
 
 ### `DatasetConfig`
@@ -1722,6 +1723,8 @@ Full result from an eval run.
 | `fromPartialBatch` | `boolean?` | Set on every successful run from a partial batch — flags "this run came from a batch that did not complete," NOT "this run is partial." Defensive consumers should NOT skip runs based on this flag (they completed and have valid data) |
 | `batchFailure` | `string?` | The error message that stopped a partial batch. Coalesced from `Error.message \|\| String(error)` so it's never blank; omitted when the partial state came from user cancellation rather than a thrown failure |
 | `droppedAnnotationKeys` | `string[]?` | Annotation key paths the dataset's `annotations` schema stripped before items reached scorers (e.g. `expectedTone`, `persona.role`). Present only when non-empty. Mirrors the dataset's `console.warn`; Studio's Eval Runner renders it as a banner. See `DatasetConfig.onExtraAnnotationKeys` |
+| `scorerFiltered` | `boolean?` | Set when the CLI `--scorers` flag ran only a subset of scorers. A guard so a filtered run isn't silently used as a full baseline — `axl-eval compare` warns and refuses to gate (`--fail-on-regression`) on it. Distinct from the multi-run `partial` concept |
+| `scorersRun` | `string[]?` | The scorer names that actually ran, set alongside `scorerFiltered` |
 
 > `EvalResult` used to have a top-level `workflow: string` field. It was removed in 0.14.x because it could not honestly represent multi-workflow runs (nested execution, heterogeneous callbacks). Use `metadata.workflows` instead. `EvalConfig.workflow` (the scheduling input) is unchanged.
 
@@ -1862,7 +1865,9 @@ Options for `rescore()`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `concurrency` | `number` | `5` | Maximum parallel scorer executions |
+| `concurrency` | `number` | `5` | Maximum parallel item rescores |
+| `scorerConcurrency` | `number` | `5` | Maximum parallel scorers within a single item (see `EvalConfig.scorerConcurrency`) |
+| `signal` | `AbortSignal` | — | Cancels in-flight scorer LLM calls and short-circuits remaining items |
 
 ### `rescore(result, scorers, runtime, options?)`
 

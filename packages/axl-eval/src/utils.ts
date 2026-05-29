@@ -18,3 +18,39 @@ export function computeStats(scores: number[]): {
 export function round(n: number): number {
   return Math.round(n * 1000) / 1000;
 }
+
+/**
+ * Run `task` over `items` with a bounded worker pool, preserving input order.
+ *
+ * Results are written to a pre-allocated array at the item's original index, so
+ * `results[i]` always corresponds to `items[i]` regardless of completion order.
+ *
+ * The helper does NOT catch — each `task` must own its try/catch. This is how
+ * callers get `Promise.allSettled` semantics (one failing task never rejects
+ * the whole batch) while still using a simple worker-pool: a task that resolves
+ * (even after internally handling an error) lets the pool continue draining.
+ *
+ * Concurrency is clamped to `[1, items.length]` in exactly one place here.
+ * Callers must NOT pre-clamp with `Math.min(concurrency, items.length)` and
+ * pass the result in — a user/env-supplied `0` would otherwise yield zero
+ * workers while items remain and `Promise.all` would hang forever.
+ */
+export async function mapWithConcurrency<T, R = void>(
+  items: readonly T[],
+  concurrency: number,
+  task: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  const workerCount = items.length === 0 ? 0 : Math.min(Math.max(1, concurrency), items.length);
+
+  let next = 0;
+  async function runNext(): Promise<void> {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await task(items[i], i);
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => runNext()));
+  return results;
+}

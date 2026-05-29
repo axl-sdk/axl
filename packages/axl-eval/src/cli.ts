@@ -588,6 +588,29 @@ function reportDegraded(result: EvalResult, label: string): boolean {
   return true;
 }
 
+/**
+ * A run where EVERY item errored in the workflow (0 succeeded) produced no valid
+ * output to score — the eval is meaningless and must never pass CI green. This
+ * is distinct from (and complementary to) the scorer failure-rate gate: that one
+ * is about a flaky/failing *scorer*, this is about a broken *workflow*. The
+ * scorer gate deliberately ignores a zero-sample scorer (nothing ran), so without
+ * this guard a 100%-workflow-error run exits 0 — a silent-green trap.
+ *
+ * Non-configurable on purpose: a 0%-success eval is unambiguously broken, so this
+ * always fails. (A configurable `failOnItemErrorRate` for PARTIAL workflow-failure
+ * gating is a reasonable future opt-in; the per-item failure count is already shown
+ * loudly in the table either way.) Returns whether the run was a total wipeout.
+ */
+function reportTotalWipeout(result: EvalResult, label: string): boolean {
+  const { count, failures } = result.summary;
+  if (count === 0 || failures < count) return false;
+  console.error(
+    `[axl-eval] FAILED: ${label} — all ${count} item(s) errored in the workflow ` +
+      `(0 succeeded); the eval produced no scorable output.`,
+  );
+  return true;
+}
+
 // ── Runtime resolution ─────────────────────────────────────────────
 
 async function resolveRuntimeFromConfig(configPath: string): Promise<AxlRuntime> {
@@ -939,21 +962,29 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
           console.log('\n' + formatMultiRunTable(summary) + '\n');
           for (const r of runResults) results.push(r);
 
-          // Failure-rate gate (opt-in via failOnScorerErrorRate in the eval
-          // config). Report every degraded run; count the file as failed unless
-          // it was already counted as a partial batch above (avoids double).
-          let anyDegraded = false;
+          // Failure-rate gate (opt-in via failOnScorerErrorRate) + total-wipeout
+          // guard (always). Report every run; count the file as failed unless it
+          // was already counted as a partial batch above (avoids double-count).
+          let anyFailing = false;
           for (const r of runResults) {
-            if (reportDegraded(r, filePath)) anyDegraded = true;
+            // Call both (no short-circuit) so each prints its own diagnostic.
+            const wipeout = reportTotalWipeout(r, filePath);
+            const degraded = reportDegraded(r, filePath);
+            if (wipeout || degraded) anyFailing = true;
           }
-          if (anyDegraded && !partial) failedFiles++;
+          if (anyFailing && !partial) failedFiles++;
         } else {
           const result = await runEval(evalConfig, executeWorkflow, runtime, runOptions);
           stampFiltered(result);
           results.push(result);
 
           console.log('\n' + formatTable(result) + '\n');
-          if (reportDegraded(result, filePath)) failedFiles++;
+          // Total-wipeout guard (always) + scorer failure-rate gate (opt-in). They
+          // are mutually exclusive (a wipeout has no scored items, so no scorer can
+          // be degraded), but report both for clarity; either fails the file.
+          const wipeout = reportTotalWipeout(result, filePath);
+          const degraded = reportDegraded(result, filePath);
+          if (wipeout || degraded) failedFiles++;
         }
       } catch (err) {
         console.error(

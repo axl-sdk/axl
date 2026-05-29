@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
-import type { EvalResult, Scorer } from '@axlsdk/eval';
+import type { DegradedScorer, EvalResult, Scorer } from '@axlsdk/eval';
 import { redactEvalHistoryList, redactEvalResult, redactErrorMessage } from '../redact.js';
 
 export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => Promise<void>) {
@@ -307,8 +307,19 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
         const failureMsg = runFailure
           ? redactErrorMessage(runFailure, redactOn) || String(runFailure) || undefined
           : undefined;
+        // Union scorer degradation across all runs onto the aggregate summary.
+        // Spreading `...first` would surface only run[0]'s `summary.degraded`,
+        // so a gate that trips on a later run would be invisible in the default
+        // aggregate landing view even though the aggregate mean is contaminated.
+        // Mirrors the client's `buildMultiRunResult` so the sync (stream:false)
+        // and streaming (stream:true, client-rebuilt) paths behave identically.
+        const aggDegraded = unionDegradedScorers(results);
         const result = {
           ...first,
+          summary: {
+            ...first.summary,
+            ...(aggDegraded.length > 0 ? { degraded: aggDegraded } : {}),
+          },
           _multiRun: {
             aggregate,
             allRuns: results,
@@ -674,4 +685,32 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
   }
 
   return { app, closeActiveRuns };
+}
+
+/**
+ * Union the per-run `summary.degraded` lists across a multi-run group into a
+ * single list for the aggregate. Merges by scorer name keeping the entry with
+ * the higher `rate` (worst observed) and stamps `runsAffected` with the count
+ * of runs that flagged that scorer. Returns `[]` when no run degraded. The
+ * `runsAffected` field is a client-facing extension (absent on the canonical
+ * `DegradedScorer` shape) consumed by Studio's `DegradedScorersBanner`.
+ */
+function unionDegradedScorers(
+  results: EvalResult[],
+): (DegradedScorer & { runsAffected: number })[] {
+  const byScorer = new Map<string, DegradedScorer & { runsAffected: number }>();
+  for (const run of results) {
+    const degraded = run.summary?.degraded;
+    if (!Array.isArray(degraded)) continue;
+    for (const d of degraded) {
+      const existing = byScorer.get(d.scorer);
+      if (!existing) {
+        byScorer.set(d.scorer, { ...d, runsAffected: 1 });
+      } else {
+        const worse = d.rate > existing.rate ? d : existing;
+        byScorer.set(d.scorer, { ...worse, runsAffected: existing.runsAffected + 1 });
+      }
+    }
+  }
+  return [...byScorer.values()];
 }

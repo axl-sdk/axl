@@ -12,10 +12,18 @@ function degradedLine(d: DegradedScorer): string {
   const total = d.scored + d.failed;
   const pct = (d.rate * 100).toFixed(1);
   const head = `"${d.scorer}" failed ${pct}% (${d.failed}/${total})`;
+  // In a multi-run aggregate, `runsAffected` records how many runs flagged
+  // this scorer (set by `buildMultiRunResult`'s union). Append it so a
+  // degradation that only tripped on later runs reads honestly — single-run
+  // results have no `runsAffected` and so render no suffix.
+  const runsSuffix =
+    d.runsAffected != null && d.runsAffected > 0
+      ? ` (in ${d.runsAffected} run${d.runsAffected === 1 ? '' : 's'})`
+      : '';
   if (d.type === 'deterministic') {
-    return `${head} — deterministic scorers tolerate no failures`;
+    return `${head} — deterministic scorers tolerate no failures${runsSuffix}`;
   }
-  return `${head} — over the ${(d.limit * 100).toFixed(1)}% limit (llm)`;
+  return `${head} — over the ${(d.limit * 100).toFixed(1)}% limit (llm)${runsSuffix}`;
 }
 
 /**

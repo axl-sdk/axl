@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   buildMultiRunResult,
   getResultDroppedAnnotationKeys,
+  getResultDegraded,
+  type DegradedScorer,
   type EvalResultData,
 } from '../client/panels/eval-runner/types.js';
 
@@ -269,5 +271,83 @@ describe('buildMultiRunResult', () => {
     ]);
     const acc = result!._multiRun!.aggregate.scorers.acc;
     expect(acc.mean).toBe(0.4); // (0.8 + 0) / 2 — both runs counted
+  });
+
+  // ── Degraded-scorer union across runs ───────────────────────────
+  //
+  // `summary.degraded` is run-level — the failure-rate gate can trip on a
+  // later run while run[0] is clean. The aggregate (spread `...first`) must
+  // union degradation across ALL runs, else the default aggregate landing
+  // view would hide a contaminated mean.
+
+  function makeRunWithDegraded(
+    runIndex: number,
+    degraded: DegradedScorer[],
+    scorers: Record<string, number> = { acc: 0.8 },
+  ): EvalResultData {
+    const run = makeRun(runIndex, {}, scorers);
+    if (degraded.length > 0) run.summary.degraded = degraded;
+    return run;
+  }
+
+  const degradedEntry = (
+    scorer: string,
+    rate: number,
+    overrides: Partial<DegradedScorer> = {},
+  ): DegradedScorer => ({
+    scorer,
+    rate,
+    limit: 0.1,
+    type: 'llm',
+    scored: 10,
+    failed: Math.round(rate * 10),
+    ...overrides,
+  });
+
+  it('surfaces degraded on the aggregate when only a LATER run degraded', () => {
+    // run[0] is clean; run 2 (index 1) tripped the gate. Spreading `...first`
+    // alone would lose this, so the default aggregate view would show no
+    // banner despite the aggregate mean resting on a thinned sample.
+    const result = buildMultiRunResult([
+      makeRunWithDegraded(0, []),
+      makeRunWithDegraded(1, [degradedEntry('acc', 0.5)]),
+    ]);
+    const degraded = getResultDegraded(result!);
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0].scorer).toBe('acc');
+    expect(degraded[0].rate).toBe(0.5);
+    expect(degraded[0].runsAffected).toBe(1);
+  });
+
+  it('merges a scorer degraded in multiple runs once, keeping the higher rate', () => {
+    const result = buildMultiRunResult([
+      makeRunWithDegraded(0, [degradedEntry('acc', 0.3, { failed: 3 })]),
+      makeRunWithDegraded(1, [degradedEntry('acc', 0.6, { failed: 6 })]),
+      makeRunWithDegraded(2, []), // clean run — must not bump the count
+    ]);
+    const degraded = getResultDegraded(result!);
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0].scorer).toBe('acc');
+    expect(degraded[0].rate).toBe(0.6); // worst observed
+    expect(degraded[0].failed).toBe(6); // entry from the worse run
+    expect(degraded[0].runsAffected).toBe(2); // two runs flagged it
+  });
+
+  it('unions distinct scorers degraded in different runs', () => {
+    const result = buildMultiRunResult([
+      makeRunWithDegraded(0, [degradedEntry('acc', 0.4)]),
+      makeRunWithDegraded(1, [degradedEntry('relevance', 0.7)]),
+    ]);
+    const degraded = getResultDegraded(result!);
+    const byName = Object.fromEntries(degraded.map((d) => [d.scorer, d]));
+    expect(Object.keys(byName).sort()).toEqual(['acc', 'relevance']);
+    expect(byName.acc.runsAffected).toBe(1);
+    expect(byName.relevance.runsAffected).toBe(1);
+  });
+
+  it('leaves degraded absent on a fully-clean group', () => {
+    const result = buildMultiRunResult([makeRunWithDegraded(0, []), makeRunWithDegraded(1, [])]);
+    expect(result!.summary.degraded).toBeUndefined();
+    expect(getResultDegraded(result!)).toEqual([]);
   });
 });

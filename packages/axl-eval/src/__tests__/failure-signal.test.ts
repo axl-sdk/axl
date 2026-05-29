@@ -243,6 +243,28 @@ describe('failure-rate trust signal — degradation gate (opt-in)', () => {
     }
   });
 
+  it('a total workflow wipeout is NOT scorer-degraded (it is zero-sample) — the CLI wipeout guard is the safety net', async () => {
+    // Every item's workflow throws → no scorer ever runs. The scorer failure-rate
+    // gate correctly declines to degrade (zero-sample: no basis to judge the
+    // SCORER), which is precisely why the CLI needs a separate total-wipeout guard
+    // keyed on summary.failures === summary.count. This test pins the invariant
+    // that guard reads.
+    const execute = async () => {
+      throw new Error('workflow broken');
+    };
+    const ok = scorer({ name: 'ok', description: 'ok', score: () => 1 });
+    const result = await runEval(
+      { workflow: 'w', dataset: ds(3), scorers: [ok], failOnScorerErrorRate: 0 },
+      execute,
+      mockRuntime,
+    );
+    expect(result.summary.count).toBe(3);
+    expect(result.summary.failures).toBe(3); // 100% workflow failures
+    expect(result.summary.failures).toBe(result.summary.count); // the wipeout predicate
+    expect(result.summary.degraded).toBeUndefined(); // scorer gate stays silent (zero-sample)
+    expect(result.summary.scorers.ok.scored).toBe(0);
+  });
+
   it('does not gate a scorer that never produced an attempt (0/0)', async () => {
     // All items error in the workflow → the scorer never runs → attempted=0,
     // so the rate gate has nothing to divide and skips it (no false degrade).

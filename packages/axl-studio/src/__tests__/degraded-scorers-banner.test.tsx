@@ -80,6 +80,64 @@ describe('DegradedScorersBanner', () => {
     ).toBeInTheDocument();
   });
 
+  it('appends "(in N runs)" when runsAffected is set (multi-run aggregate)', () => {
+    render(
+      <DegradedScorersBanner
+        result={makeResult([
+          {
+            scorer: 'accuracy',
+            rate: 0.5,
+            limit: 0.1,
+            type: 'llm',
+            scored: 5,
+            failed: 5,
+            runsAffected: 3,
+          },
+        ])}
+      />,
+    );
+    expect(
+      screen.getByText('"accuracy" failed 50.0% (5/10) — over the 10.0% limit (llm) (in 3 runs)'),
+    ).toBeInTheDocument();
+  });
+
+  it('uses singular "run" when runsAffected is 1', () => {
+    render(
+      <DegradedScorersBanner
+        result={makeResult([
+          {
+            scorer: 'exact',
+            rate: 0.25,
+            limit: 0,
+            type: 'deterministic',
+            scored: 3,
+            failed: 1,
+            runsAffected: 1,
+          },
+        ])}
+      />,
+    );
+    expect(
+      screen.getByText(
+        '"exact" failed 25.0% (1/4) — deterministic scorers tolerate no failures (in 1 run)',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('renders no run suffix when runsAffected is absent (single-run)', () => {
+    render(
+      <DegradedScorersBanner
+        result={makeResult([
+          { scorer: 'accuracy', rate: 0.5, limit: 0.1, type: 'llm', scored: 5, failed: 5 },
+        ])}
+      />,
+    );
+    // Exact-match the line — any "(in N run...)" suffix would fail this.
+    expect(
+      screen.getByText('"accuracy" failed 50.0% (5/10) — over the 10.0% limit (llm)'),
+    ).toBeInTheDocument();
+  });
+
   it('caps the line list at 5 and shows a "+N more" affordance', () => {
     const degraded: DegradedScorer[] = Array.from({ length: 8 }, (_, i) => ({
       scorer: `s${i}`,

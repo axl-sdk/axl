@@ -55,6 +55,14 @@ export type DegradedScorer = {
   scored: number;
   /** Items whose scorer ran and failed (threw / out-of-range). */
   failed: number;
+  /**
+   * Client-only extension (absent on the server `DegradedScorer` shape): how
+   * many runs in a multi-run group flagged this scorer as degraded. Populated
+   * by `buildMultiRunResult` when it unions per-run degradation onto the
+   * aggregate so the banner can say "(in N runs)". Absent on single-run
+   * results, where it carries no suffix.
+   */
+  runsAffected?: number;
 };
 
 export type MultiRunAggregate = {
@@ -314,8 +322,20 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
         .map((r) => r.metadata?.batchFailure)
         .find((m): m is string => typeof m === 'string' && m.length > 0)
     : undefined;
+  // Union scorer degradation across ALL runs. `summary.degraded` is run-level:
+  // the failure-rate gate (`EvalConfig.failOnScorerErrorRate`) can trip on run
+  // 3 while run[0] is clean. Spreading `...first` would surface only run[0]'s
+  // degradation, hiding the fact that the aggregate "Mean ± std" is the
+  // contaminated number. We merge by scorer name, keeping the entry with the
+  // higher `rate` (a scorer can degrade in several runs), and count how many
+  // runs flagged it (`runsAffected`) so the banner can say "(in N runs)".
+  const aggDegraded = unionDegraded(allRuns);
   return {
     ...first,
+    summary: {
+      ...first.summary,
+      ...(aggDegraded.length > 0 ? { degraded: aggDegraded } : {}),
+    },
     _multiRun: {
       aggregate,
       allRuns,
@@ -327,6 +347,30 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
       }),
     },
   };
+}
+
+/**
+ * Union the per-run `summary.degraded` lists across a multi-run group into a
+ * single list. Merges by scorer name, keeping the entry with the higher `rate`
+ * (worst observed) and stamping `runsAffected` with the count of runs that
+ * flagged that scorer. Returns `[]` when no run degraded. Defensive — reads
+ * each run through `getResultDegraded` so malformed entries are dropped.
+ */
+function unionDegraded(allRuns: EvalResultData[]): DegradedScorer[] {
+  const byScorer = new Map<string, DegradedScorer & { runsAffected: number }>();
+  for (const run of allRuns) {
+    for (const d of getResultDegraded(run)) {
+      const existing = byScorer.get(d.scorer);
+      if (!existing) {
+        byScorer.set(d.scorer, { ...d, runsAffected: 1 });
+      } else {
+        // Keep the worst (higher rate); always bump the affected-run count.
+        const worse = d.rate > existing.rate ? d : existing;
+        byScorer.set(d.scorer, { ...worse, runsAffected: existing.runsAffected + 1 });
+      }
+    }
+  }
+  return [...byScorer.values()];
 }
 
 // ── Score color utilities ─────────────────────────────────────────

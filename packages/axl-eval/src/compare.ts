@@ -386,7 +386,11 @@ export function evaluateScorerErrorRateGate(
       const failed = (side === 'baseline' ? s.baselineFailed : s.candidateFailed) ?? 0;
       const verdict = evaluateScorerTolerance(scored, failed, type, limit);
       if (verdict.zeroSample) {
-        return `scorer "${name}" produced no scored items on ${side} — cannot certify a zero-sample scorer.`;
+        // attempted === 0 means the scorer produced no valid scores AND recorded
+        // no ran-and-failed attempts on this side — typically every one of its
+        // items errored in the workflow (or was skipped), not necessarily a fault
+        // of the scorer itself. Either way a mean over zero samples can't be certified.
+        return `scorer "${name}" has no scored items on ${side} (its items errored or were skipped) — cannot certify a mean over an empty sample.`;
       }
       if (verdict.exceeds) {
         const limitStr =

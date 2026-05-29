@@ -160,6 +160,13 @@ export default defineConfig({
 - **Custom providers** registered via `registerInstance` are not governed unless they
   wrap `fetchWithRetry({ governor })` themselves.
 
+**Using it with `axl-eval`:** the eval CLI builds its runtime from your config
+(`--config` or an auto-detected `axl.config.*`), so `providers.<name>.rateLimit` is
+honored for judge calls — this is the canonical way to pace eval fan-out on a shared
+key. A *bare* `axl-eval` run with no config (providers from env vars only) has no
+governor; if you need pacing there, add a minimal `axl.config.ts` exporting an
+`AxlRuntime` with the `rateLimit` block. (There is no per-run CLI flag for it today.)
+
 You can also construct a `RateLimiter` directly (exported from `@axlsdk/axl`) if you
 build a custom provider adapter.
 

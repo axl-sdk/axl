@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { cn } from '../../lib/utils';
-import { scoreBarColor } from './types';
+import { scoreBarColor, collectScorerScores } from './types';
 import type { EvalItem } from './types';
 
 type Props = {
@@ -92,16 +92,9 @@ function ScorerStrip({
 export function ScoreDistribution({ items, scorerNames }: Props) {
   const distributions = useMemo(() => {
     return scorerNames.map((name) => {
-      const scores: number[] = [];
-      let failed = 0;
-      for (const item of items) {
-        if (item.error) continue;
-        const score = item.scores[name];
-        if (score != null) scores.push(score);
-        // null score WITH a recorded duration = the scorer ran and failed;
-        // WITHOUT one = skipped by cancellation (counts as neither).
-        else if (item.scoreDetails?.[name]?.duration != null) failed++;
-      }
+      // Single shared discriminator (null score + recorded duration ⇒ failed)
+      // — see collectScorerScores; ScoreDistribution no longer re-implements it.
+      const { scores, failed } = collectScorerScores(items, name);
       const mean = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
       return { name, scores, mean, failed };
     });

@@ -191,4 +191,83 @@ describe('buildMultiRunResult', () => {
     expect(result!._multiRun?.aggregate.scorers.acc.scored).toBe(0);
     expect(result!._multiRun?.aggregate.scorers.acc.failed).toBe(0);
   });
+
+  it('excludes a 100%-failed run from the mean but counts it in failed', () => {
+    // Two runs: the first scored 10 items at mean 0.9; the second scored ZERO
+    // items (all 10 failed) and reports `computeStats([]).mean === 0`. The
+    // mean-of-means must be 0.9 (the contributing run only), NOT 0.45 (which
+    // the old all-runs average produced). The summed `failed`/`scored` still
+    // describe the whole group.
+    const withCounts = (
+      id: string,
+      mean: number,
+      scored: number,
+      failed: number,
+    ): EvalResultData => ({
+      id,
+      dataset: 'ds',
+      timestamp: '2026-04-30T00:00:00.000Z',
+      duration: 1000,
+      totalCost: 0.01,
+      items: [],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: {
+          acc: { mean, min: mean, max: mean, p50: mean, p95: mean, scored, failed },
+        },
+      },
+      metadata: { runGroupId: 'g1' },
+    });
+    const result = buildMultiRunResult([
+      withCounts('r0', 0.9, 10, 0),
+      withCounts('r1', 0, 0, 10), // 100% failed — empty-sample mean of 0
+    ]);
+    const acc = result!._multiRun!.aggregate.scorers.acc;
+    expect(acc.mean).toBe(0.9); // contributing run only
+    expect(acc.std).toBe(0); // single contributing run ⇒ no spread
+    expect(acc.min).toBe(0.9);
+    expect(acc.max).toBe(0.9);
+    // Summed over ALL runs — the whole-group thinning is still reported.
+    expect(acc.scored).toBe(10);
+    expect(acc.failed).toBe(10);
+  });
+
+  it('falls back to all-runs mean when every run scored zero (no divide-by-zero)', () => {
+    // Degenerate case: every run scored nothing. The contributing subset is
+    // empty, so we fall back to the all-runs means (each 0) rather than
+    // dividing by zero. Mean stays 0, the thinning is still summed.
+    const allFailed = (id: string): EvalResultData => ({
+      id,
+      dataset: 'ds',
+      timestamp: '2026-04-30T00:00:00.000Z',
+      duration: 1000,
+      totalCost: 0.01,
+      items: [],
+      summary: {
+        count: 1,
+        failures: 0,
+        scorers: { acc: { mean: 0, min: 0, max: 0, p50: 0, p95: 0, scored: 0, failed: 5 } },
+      },
+      metadata: { runGroupId: 'g1' },
+    });
+    const result = buildMultiRunResult([allFailed('r0'), allFailed('r1')]);
+    const acc = result!._multiRun!.aggregate.scorers.acc;
+    expect(acc.mean).toBe(0);
+    expect(Number.isNaN(acc.mean)).toBe(false);
+    expect(acc.scored).toBe(0);
+    expect(acc.failed).toBe(10);
+  });
+
+  it('keeps a zero-sample run in the mean when scored is absent (pre-0.17.10)', () => {
+    // Without `scored` we can't distinguish a true 0.0 mean from an
+    // empty-sample 0 — keep the old behavior (include the run) so legacy
+    // artifacts render unchanged.
+    const result = buildMultiRunResult([
+      makeRun(0, {}, { acc: 0.8 }),
+      makeRun(1, {}, { acc: 0 }), // no scored/failed fields
+    ]);
+    const acc = result!._multiRun!.aggregate.scorers.acc;
+    expect(acc.mean).toBe(0.4); // (0.8 + 0) / 2 — both runs counted
+  });
 });

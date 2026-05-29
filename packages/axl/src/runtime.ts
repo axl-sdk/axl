@@ -441,6 +441,27 @@ export type EvalProgressEventShape =
   | { type: 'item_done'; itemIndex: number; totalItems: number }
   | { type: 'run_done'; totalItems: number; failures: number };
 
+/**
+ * Structural shape of `@axlsdk/eval`'s `EvalConfig` as seen by the runtime.
+ * `axl` is a peer of `eval` (eval depends on axl, not the reverse), so the core
+ * can't import the real `EvalConfig` type — it forwards `config` to `runEval`
+ * at runtime regardless. This single declaration is the ONE place to keep in
+ * sync with `EvalConfig`'s forwarded fields, so `eval()` and `runRegisteredEval()`
+ * don't drift apart (they previously carried two hand-copied inline shapes).
+ * `dataset`/`scorers` stay `unknown[]`/`unknown` because their real types live in
+ * `@axlsdk/eval`; only the primitive knobs are structurally typed here.
+ */
+export type RuntimeEvalConfigShape = {
+  workflow: string;
+  dataset: unknown;
+  scorers: unknown[];
+  concurrency?: number;
+  scorerConcurrency?: number;
+  budget?: string;
+  failOnScorerErrorRate?: number;
+  metadata?: Record<string, unknown>;
+};
+
 export type CreateContextOptions = {
   metadata?: Record<string, unknown>;
   /** Cost budget for the context (e.g., '$0.50'). Enforced via finish_and_stop policy. */
@@ -1045,23 +1066,11 @@ export class AxlRuntime extends EventEmitter {
       // NOTE: this structural shape must stay in sync with the one on eval()
       // below and with EvalConfig in @axlsdk/eval (core can't import it). When
       // adding an EvalConfig field, update both copies.
-      result = await this.eval(
-        entry.config as {
-          workflow: string;
-          dataset: unknown;
-          scorers: unknown[];
-          concurrency?: number;
-          scorerConcurrency?: number;
-          budget?: string;
-          failOnScorerErrorRate?: number;
-          metadata?: Record<string, unknown>;
-        },
-        {
-          onProgress: options?.onProgress,
-          signal: options?.signal,
-          captureTraces: options?.captureTraces,
-        },
-      );
+      result = await this.eval(entry.config as RuntimeEvalConfigShape, {
+        onProgress: options?.onProgress,
+        signal: options?.signal,
+        captureTraces: options?.captureTraces,
+      });
     }
 
     // Merge extra metadata if provided (e.g., runGroupId for multi-run)
@@ -2117,16 +2126,7 @@ export class AxlRuntime extends EventEmitter {
    * @see Spec Section 13.5
    */
   async eval(
-    config: {
-      workflow: string;
-      dataset: unknown;
-      scorers: unknown[];
-      concurrency?: number;
-      scorerConcurrency?: number;
-      budget?: string;
-      failOnScorerErrorRate?: number;
-      metadata?: Record<string, unknown>;
-    },
+    config: RuntimeEvalConfigShape,
     options?: {
       onProgress?: (event: EvalProgressEventShape) => void;
       signal?: AbortSignal;

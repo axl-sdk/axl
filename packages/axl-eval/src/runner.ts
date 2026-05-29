@@ -2,7 +2,12 @@ import type { AxlRuntime } from '@axlsdk/axl';
 import type { EvalConfig, EvalResult, EvalItem, EvalSummary, RunEvalOptions } from './types.js';
 import type { ScorerContext } from './scorer.js';
 import type { DegradedScorer } from './types.js';
-import { computeStats, mapWithConcurrency, scorerCounts } from './utils.js';
+import {
+  computeStats,
+  mapWithConcurrency,
+  scorerCounts,
+  evaluateScorerTolerance,
+} from './utils.js';
 import { scoreItem } from './score-item.js';
 import { randomUUID } from 'node:crypto';
 
@@ -260,14 +265,14 @@ export async function runEval(
         const stats = scorerStats[name];
         const scored = stats.scored ?? 0;
         const failed = stats.failed ?? 0;
-        const attempted = scored + failed;
-        if (attempted === 0) continue; // nothing ran → nothing to gate on
-        const rate = failed / attempted;
         const type = scorerTypes[name] === 'llm' ? 'llm' : 'deterministic';
         const limit = type === 'deterministic' ? 0 : rawLimit;
-        const exceeds = type === 'deterministic' ? failed > 0 : rate > rawLimit;
-        if (exceeds) {
-          (degraded ??= []).push({ scorer: name, rate, limit, type, scored, failed });
+        const verdict = evaluateScorerTolerance(scored, failed, type, limit);
+        // A scorer that never ran (zeroSample) isn't degraded at the source — the
+        // run produced no basis to judge it. (The compare gate treats zero-sample
+        // differently: it refuses to certify it.)
+        if (verdict.exceeds) {
+          (degraded ??= []).push({ scorer: name, rate: verdict.rate, limit, type, scored, failed });
         }
       }
     }

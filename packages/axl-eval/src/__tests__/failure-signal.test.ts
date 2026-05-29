@@ -5,6 +5,7 @@ import { dataset } from '../dataset.js';
 import { scorer } from '../scorer.js';
 import type { Scorer } from '../scorer.js';
 import { runEval } from '../runner.js';
+import { evaluateScorerTolerance } from '../utils.js';
 
 const mockRuntime = {} as AxlRuntime;
 
@@ -33,6 +34,42 @@ function flakyLlm(name: string, failOn: (q: number) => boolean): Scorer {
     },
   } as Scorer;
 }
+
+describe('evaluateScorerTolerance (shared gate primitive)', () => {
+  it('deterministic: any failure exceeds, regardless of limit', () => {
+    expect(evaluateScorerTolerance(9, 1, 'deterministic', 0.9)).toMatchObject({
+      exceeds: true,
+      zeroSample: false,
+    });
+    expect(evaluateScorerTolerance(10, 0, 'deterministic', 0).exceeds).toBe(false);
+  });
+
+  it('llm: exceeds strictly above the limit (rate == limit passes)', () => {
+    // 1/10 = 0.1; limit 0.1 → not exceeded (strict >).
+    expect(evaluateScorerTolerance(9, 1, 'llm', 0.1).exceeds).toBe(false);
+    // 2/10 = 0.2 > 0.1 → exceeded.
+    expect(evaluateScorerTolerance(8, 2, 'llm', 0.1).exceeds).toBe(true);
+  });
+
+  it('llm: limit 0 means any failure exceeds; limit 1 tolerates all', () => {
+    expect(evaluateScorerTolerance(9, 1, 'llm', 0).exceeds).toBe(true);
+    expect(evaluateScorerTolerance(1, 9, 'llm', 1).exceeds).toBe(false);
+  });
+
+  it('zero-sample: never exceeds, flags zeroSample, rate 0', () => {
+    expect(evaluateScorerTolerance(0, 0, 'deterministic', 0)).toEqual({
+      attempted: 0,
+      rate: 0,
+      exceeds: false,
+      zeroSample: true,
+    });
+    expect(evaluateScorerTolerance(0, 0, 'llm', 0.5).zeroSample).toBe(true);
+  });
+
+  it('computes rate over attempted (scored + failed), not total', () => {
+    expect(evaluateScorerTolerance(6, 2, 'llm', 0.1).rate).toBeCloseTo(0.25, 5);
+  });
+});
 
 describe('failure-rate trust signal — scored/failed counts', () => {
   it('counts valid scores as scored and throws/out-of-range as failed', async () => {

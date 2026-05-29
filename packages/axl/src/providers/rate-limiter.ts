@@ -81,7 +81,12 @@ export class RateLimiter {
   private readonly acquireTimeoutMs?: number;
 
   private active = 0;
-  private lastGrantAt = 0;
+  // `-Infinity` (not 0) so the FIRST grant is always immediate regardless of the
+  // wall clock: `Date.now() - (-Infinity) === Infinity`, which always satisfies
+  // `minIntervalMs`. Initializing to 0 would (only under a mocked/near-zero clock)
+  // wrongly delay the first grant by a full interval, since the limiter has never
+  // actually granted anything yet.
+  private lastGrantAt = Number.NEGATIVE_INFINITY;
   private readonly queue: Waiter[] = [];
   private spacingTimer?: ReturnType<typeof setTimeout>;
   private warnedQueued = false;
@@ -169,9 +174,18 @@ export class RateLimiter {
     });
   }
 
-  /** Release a previously acquired permit and wake the next waiter. Idempotent guard is defense-in-depth. */
+  /** Release a previously acquired permit and wake the next waiter. */
   release(): void {
-    if (this.active === 0) return; // never underflow on a stray double-release
+    if (this.active === 0) {
+      // Never underflow `active` (that would permanently inflate effective
+      // capacity). The one in-tree caller pairs acquire/release via an `acquired`
+      // flag, so reaching here means a genuine double-release bug — surface it
+      // loudly rather than silently corrupting the cap (repo's "fail loud" rule).
+      console.warn(
+        '[axl] RateLimiter.release() called with no active permits — likely a double-release bug.',
+      );
+      return;
+    }
     this.active--;
     this.pump();
   }

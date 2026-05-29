@@ -38,6 +38,13 @@ export type FetchWithRetryOptions = {
    * backpressure to other waiters; the permit is released exactly once in
    * `finally`, gated on whether it was actually acquired. Undefined ⇒ behavior
    * is byte-identical to no governor.
+   *
+   * RE-ENTRANCY INVARIANT: a permit is held only across this single call. Do NOT
+   * invoke another governed `fetchWithRetry` on the same governor while still
+   * inside this one (before it returns/releases) — under `maxConcurrent: 1` that
+   * self-deadlocks. Safe in the SDK today because nested `ctx.ask` calls run in
+   * tool handlers AFTER the provider `chat()` returns and releases, never during
+   * a `fetchWithRetry`.
    */
   governor?: RateLimiter;
 };

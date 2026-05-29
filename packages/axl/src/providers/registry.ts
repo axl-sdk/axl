@@ -28,9 +28,14 @@ const builtinFactories: Record<string, ProviderFactory> = {
       rateLimit: opts.rateLimit,
     });
   },
+  // NB: each adapter builds its OWN RateLimiter from its config — caps are
+  // per-adapter-instance, not pooled. Configuring `openai` AND using both
+  // `openai:` and `openai-responses:` yields two independent governors against
+  // the same key (effective concurrency = the sum). Documented in providers.md.
   'openai-responses': (config) => {
     // Falls back to the `openai` provider config (incl. its rateLimit) so
-    // configuring `providers.openai.rateLimit` governs the Responses adapter too.
+    // `providers.openai.rateLimit` also governs the Responses adapter — but as a
+    // SEPARATE governor instance (see the note above), not a shared counter.
     const opts = config.providers?.['openai-responses'] ?? config.providers?.openai ?? {};
     return new OpenAIResponsesProvider({
       apiKey: opts.apiKey,

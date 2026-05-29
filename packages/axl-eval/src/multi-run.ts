@@ -70,14 +70,25 @@ export function aggregateRuns(runs: EvalResult[]): MultiRunSummary {
   const scorers: MultiRunSummary['scorers'] = {};
 
   for (const name of scorerNames) {
-    const means = runs.map((r) => r.summary.scorers[name]?.mean ?? 0);
+    // A run where this scorer scored ZERO items has an empty-sample mean of 0
+    // (computeStats([]) → 0), which would drag the aggregate mean-of-means toward
+    // 0 as if it were a real 0.0 score. Exclude such runs from the mean/min/max/std
+    // — but only when we can tell: `scored` is absent on pre-0.17.10 artifacts, so
+    // those runs are kept (old behavior). If EVERY run scored nothing, fall back to
+    // all runs so we never divide by zero.
+    const contributing = runs.filter((r) => {
+      const sc = r.summary.scorers[name]?.scored;
+      return sc == null || sc > 0;
+    });
+    const meanSource = contributing.length > 0 ? contributing : runs;
+    const means = meanSource.map((r) => r.summary.scorers[name]?.mean ?? 0);
     const meanOfMeans = means.reduce((a, b) => a + b, 0) / means.length;
     const minMean = Math.min(...means);
     const maxMean = Math.max(...means);
 
-    // Sum the per-run sample sizes so a multi-run group can surface the same
-    // "thinned sample" signal as a single run (read with `?? 0` — old artifacts
-    // predate these fields). Total attempted across the group = scored + failed.
+    // Sum the per-run sample sizes across ALL runs (they describe the whole
+    // group's thinning, independent of which runs contributed to the mean).
+    // Read with `?? 0` — old artifacts predate these fields.
     const scored = runs.reduce((sum, r) => sum + (r.summary.scorers[name]?.scored ?? 0), 0);
     const failed = runs.reduce((sum, r) => sum + (r.summary.scorers[name]?.failed ?? 0), 0);
 

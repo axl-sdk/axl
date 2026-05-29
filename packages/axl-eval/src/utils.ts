@@ -53,6 +53,39 @@ export function scorerCounts(
   return { scored, failed };
 }
 
+/** A scorer's failure-rate verdict against a tolerance — see {@link evaluateScorerTolerance}. */
+export type ScorerToleranceVerdict = {
+  /** `scored + failed` — the attempted denominator (excludes cancelled/never-run). */
+  attempted: number;
+  /** `failed / attempted`, or `0` when nothing was attempted. */
+  rate: number;
+  /** Over tolerance AND something was actually attempted. */
+  exceeds: boolean;
+  /** Nothing was attempted (`attempted === 0`) — no basis to certify a rate. */
+  zeroSample: boolean;
+};
+
+/**
+ * Single source of truth for the type-aware failure-rate decision, shared by the
+ * source-side gate (`runEval` → `summary.degraded`) and the gate-side compare
+ * gate (`evalCompare` consumers). Deterministic scorers tolerate ZERO failures
+ * (a deterministic throw is a bug, not noise); LLM scorers tolerate up to `limit`
+ * (`failed / attempted`). `exceeds` is never true when nothing was attempted —
+ * callers decide their own policy for `zeroSample` (the runner skips it; the
+ * compare gate refuses to certify a zero-sample scorer).
+ */
+export function evaluateScorerTolerance(
+  scored: number,
+  failed: number,
+  type: 'llm' | 'deterministic',
+  limit: number,
+): ScorerToleranceVerdict {
+  const attempted = scored + failed;
+  const rate = attempted === 0 ? 0 : failed / attempted;
+  const exceeds = attempted > 0 && (type === 'deterministic' ? failed > 0 : rate > limit);
+  return { attempted, rate, exceeds, zeroSample: attempted === 0 };
+}
+
 /**
  * Run `task` over `items` with a bounded worker pool, preserving input order.
  *

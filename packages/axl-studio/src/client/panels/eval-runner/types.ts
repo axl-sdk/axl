@@ -37,6 +37,26 @@ export type ScorerStats = {
   failed?: number;
 };
 
+/**
+ * One scorer whose failure rate tripped `EvalConfig.failOnScorerErrorRate`.
+ * Client-side mirror of `@axlsdk/eval`'s `DegradedScorer` (the client mirrors
+ * server types rather than importing them across the package boundary).
+ * Surfaced on `EvalSummary.degraded`; the panel renders `DegradedScorersBanner`
+ * so a thinned/untrustworthy mean can't masquerade as a clean run.
+ */
+export type DegradedScorer = {
+  scorer: string;
+  /** Observed failure rate `failed / (scored + failed)` (0 when nothing ran). */
+  rate: number;
+  /** The tolerance that was exceeded (0 for deterministic scorers). */
+  limit: number;
+  type: 'llm' | 'deterministic';
+  /** Items that produced a valid numeric score. */
+  scored: number;
+  /** Items whose scorer ran and failed (threw / out-of-range). */
+  failed: number;
+};
+
 export type MultiRunAggregate = {
   runGroupId: string;
   runCount: number;
@@ -87,6 +107,12 @@ export type EvalResultData = {
       p50: number;
       p95: number;
     };
+    /**
+     * Scorers whose failure rate exceeded tolerance. Populated by `runEval`
+     * ONLY when `EvalConfig.failOnScorerErrorRate` was set and a scorer
+     * tripped it. Surfaced as `DegradedScorersBanner` via `getResultDegraded`.
+     */
+    degraded?: DegradedScorer[];
   };
   _multiRun?: {
     aggregate: MultiRunAggregate;
@@ -203,15 +229,28 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
   const scorerNames = Object.keys(first.summary?.scorers ?? {});
   const aggScorers: MultiRunAggregate['scorers'] = {};
   for (const name of scorerNames) {
-    const means = allRuns.map((r) => r.summary?.scorers?.[name]?.mean ?? 0);
+    // Mean-of-means must exclude runs where this scorer scored ZERO items: an
+    // empty sample yields `computeStats([]).mean === 0`, which would drag the
+    // aggregate toward 0 even though the summed `scored`/`failed` already report
+    // the thinning. We can only tell a zero-sample run apart when `scored` is
+    // present (≥0.17.10) — when it's absent (pre-0.17.10) we keep the run to
+    // preserve the old behavior. If EVERY run scored nothing (subset empty),
+    // fall back to all-runs means so we never divide by zero.
+    const contributing = allRuns.filter((r) => {
+      const sc = r.summary?.scorers?.[name]?.scored;
+      return sc == null || sc > 0;
+    });
+    const meanSource = contributing.length > 0 ? contributing : allRuns;
+    const means = meanSource.map((r) => r.summary?.scorers?.[name]?.mean ?? 0);
     const mean = means.reduce((a, b) => a + b, 0) / means.length;
     const std =
       means.length > 1
         ? Math.sqrt(means.reduce((sum, v) => sum + (v - mean) ** 2, 0) / (means.length - 1))
         : 0;
     // Sum per-run sample sizes (parallel to the server's aggregateRuns) so the
-    // multi-run view can surface the same thinned-sample signal. Read with
-    // `?? 0` — pre-0.17.10 runs predate these fields.
+    // multi-run view can surface the same thinned-sample signal. Summed over ALL
+    // runs — these describe the whole group, including the thinned ones excluded
+    // from the mean above. Read with `?? 0` — pre-0.17.10 runs predate these.
     const scored = allRuns.reduce((s, r) => s + (r.summary?.scorers?.[name]?.scored ?? 0), 0);
     const failed = allRuns.reduce((s, r) => s + (r.summary?.scorers?.[name]?.failed ?? 0), 0);
     aggScorers[name] = {
@@ -330,13 +369,40 @@ export function getItemModels(item: EvalItem): string[] {
 }
 
 /**
+ * The single client-side discriminator for one scorer's per-item outcomes.
+ * Walks `items` once and classifies each by the same rule the server uses:
+ *   - a non-null score is a surviving sample (collected into `scores`),
+ *   - a `null` score WITH a recorded `scoreDetails.duration` ran-and-failed
+ *     (counted into `failed`),
+ *   - a `null` score WITHOUT a recorded duration was skipped by cancellation
+ *     (counts as neither),
+ *   - items with a top-level `error` are excluded entirely.
+ *
+ * Returns both the surviving `scores[]` (for the strip chart) and the `failed`
+ * count so callers never re-implement the discriminator. `getScorerSampleCounts`
+ * and `ScoreDistribution` both read through this.
+ */
+export function collectScorerScores(
+  items: EvalItem[],
+  name: string,
+): { scores: number[]; failed: number } {
+  const scores: number[] = [];
+  let failed = 0;
+  for (const i of items) {
+    if (i.error) continue;
+    const score = i.scores[name];
+    if (score != null) scores.push(score);
+    else if (i.scoreDetails?.[name]?.duration != null) failed++;
+  }
+  return { scores, failed };
+}
+
+/**
  * Resolve a scorer's `scored`/`failed` sample counts. Prefers the summary
  * fields (authoritative, set by the runner ≥0.17.10) and falls back to
- * recomputing from `items` for pre-0.17.10 artifacts — using the same
- * `scoreDetails.duration` discriminator the server uses (a `null` score WITH a
- * recorded duration ran-and-failed; WITHOUT one was skipped by cancellation and
- * counts as neither). `items` is omitted for multi-run aggregates that carry no
- * items, where the summed fields are authoritative.
+ * recomputing from `items` for pre-0.17.10 artifacts — via the shared
+ * `collectScorerScores` discriminator. `items` is omitted for multi-run
+ * aggregates that carry no items, where the summed fields are authoritative.
  */
 export function getScorerSampleCounts(
   stats: { scored?: number; failed?: number },
@@ -347,14 +413,8 @@ export function getScorerSampleCounts(
     return { scored: stats.scored, failed: stats.failed };
   }
   if (items) {
-    let scored = 0;
-    let failed = 0;
-    for (const i of items) {
-      if (i.error) continue;
-      if (i.scores[name] != null) scored++;
-      else if (i.scoreDetails?.[name]?.duration != null) failed++;
-    }
-    return { scored, failed };
+    const { scores, failed } = collectScorerScores(items, name);
+    return { scored: scores.length, failed };
   }
   return { scored: stats.scored ?? 0, failed: stats.failed ?? 0 };
 }
@@ -390,6 +450,32 @@ export function getResultScorerFiltered(result: EvalResultData): string[] {
   const run = result.metadata?.scorersRun;
   if (!Array.isArray(run)) return [];
   return (run as unknown[]).filter((s): s is string => typeof s === 'string');
+}
+
+/**
+ * Scorers flagged as degraded — failure rate exceeded the configured
+ * tolerance (`EvalConfig.failOnScorerErrorRate`; deterministic scorers tolerate
+ * zero failures). Populated by `runEval` into `summary.degraded` only when the
+ * user opted into the trust signal and a scorer tripped it. Run-level, so it's
+ * identical across the representative run in a multi-run group — reading the
+ * representative result's summary is sufficient, mirroring
+ * `getResultScorerFiltered`. Returns `[]` when no scorer degraded or when the
+ * field is absent. Defensively filters to well-formed entries.
+ */
+export function getResultDegraded(result: EvalResultData): DegradedScorer[] {
+  const degraded = result.summary?.degraded;
+  if (!Array.isArray(degraded)) return [];
+  return (degraded as unknown[]).filter(
+    (d): d is DegradedScorer =>
+      d != null &&
+      typeof d === 'object' &&
+      typeof (d as DegradedScorer).scorer === 'string' &&
+      typeof (d as DegradedScorer).rate === 'number' &&
+      typeof (d as DegradedScorer).limit === 'number' &&
+      ((d as DegradedScorer).type === 'llm' || (d as DegradedScorer).type === 'deterministic') &&
+      typeof (d as DegradedScorer).scored === 'number' &&
+      typeof (d as DegradedScorer).failed === 'number',
+  );
 }
 
 /** Extract per-model LLM call counts from result metadata. */

@@ -189,6 +189,28 @@ describe('fetchWithRetry + governor', () => {
     await expect(outer()).resolves.toBe('done');
   });
 
+  it('releases the permit even if governor.observe() throws (future adaptive seam)', async () => {
+    // observe() is a v1 no-op, but a future header-driven implementation could
+    // throw. It runs inside fetchWithRetry's try, so the finally must still
+    // release the permit — otherwise a throwing observe would wedge the governor.
+    const rl = new RateLimiter({ maxConcurrent: 1 });
+    const observeSpy = vi.spyOn(rl, 'observe').mockImplementation(() => {
+      throw new Error('observe boom');
+    });
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200, headers: new Headers() }) as any;
+
+    await expect(fetchWithRetry('https://x', undefined, { governor: rl })).rejects.toThrow(
+      'observe boom',
+    );
+    // Permit released despite the throw → the next call proceeds (would hang under cap 1 if leaked).
+    observeSpy.mockRestore();
+    await expect(fetchWithRetry('https://x', undefined, { governor: rl })).resolves.toMatchObject({
+      ok: true,
+    });
+  });
+
   it('is byte-identical to no-governor when governor is undefined', async () => {
     const mockRes = { ok: true, status: 200, headers: new Headers() };
     globalThis.fetch = vi.fn().mockResolvedValue(mockRes) as any;

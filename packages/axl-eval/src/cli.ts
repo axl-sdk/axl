@@ -4,7 +4,7 @@ import { readdirSync, statSync } from 'node:fs';
 import { readFile as readFileAsync, writeFile as writeFileAsync, mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
 import type { AxlRuntime, EvalExecuteWorkflow } from '@axlsdk/axl';
-import { evalCompare } from './compare.js';
+import { evalCompare, evaluateScorerErrorRateGate } from './compare.js';
 import { runEval } from './runner.js';
 import { rescore } from './rescore.js';
 import { aggregateRuns } from './multi-run.js';
@@ -168,11 +168,13 @@ function parseMaxScorerErrorRate(args: string[]): number | undefined {
     console.error('Error: --max-scorer-error-rate requires a value in [0, 1]');
     process.exit(1);
   }
-  const n = parseFloat(args[idx + 1]);
+  const raw = args[idx + 1];
+  // Strict numeric parse — `parseFloat('0.5abc')` returns 0.5 and `parseFloat('0,5')`
+  // returns 0, both of which would silently set an unintended gate threshold. Reject
+  // anything that isn't a clean decimal (matches `parseThresholdArg`'s guard).
+  const n = /^\d*\.?\d+$/.test(raw.trim()) ? Number(raw) : NaN;
   if (!Number.isFinite(n) || n < 0 || n > 1) {
-    console.error(
-      `Error: --max-scorer-error-rate must be a number in [0, 1], got "${args[idx + 1]}"`,
-    );
+    console.error(`Error: --max-scorer-error-rate must be a number in [0, 1], got "${raw}"`);
     process.exit(1);
   }
   return n;
@@ -202,7 +204,9 @@ async function runCompare(args: string[]) {
   );
 
   if (files.length !== 2) {
-    console.error('Usage: axl-eval compare <baseline.json> <candidate.json> [--threshold <value>]');
+    console.error(
+      'Usage: axl-eval compare <baseline.json> <candidate.json> [--threshold <value>] [--fail-on-regression] [--max-scorer-error-rate <0..1>]',
+    );
     process.exit(1);
   }
 
@@ -301,12 +305,13 @@ async function runCompare(args: string[]) {
   // scorer is over tolerance (type-aware: deterministic scorers tolerate zero
   // failures, LLM judges use the flag value), or a scorer produced no scored
   // items at all on a side (a zero-sample mean can't be certified).
-  const scorerTypes = (comparison.baseline.metadata?.scorerTypes ?? {}) as Record<string, string>;
+  let sawThinnedSample = false;
   for (const name of scorerNames) {
     const s = comparison.scorers[name];
     const bFailed = s.baselineFailed ?? 0;
     const cFailed = s.candidateFailed ?? 0;
     if (bFailed > 0 || cFailed > 0) {
+      sawThinnedSample = true;
       const bAtt = (s.baselineScored ?? 0) + bFailed;
       const cAtt = (s.candidateScored ?? 0) + cFailed;
       console.error(
@@ -316,32 +321,19 @@ async function runCompare(args: string[]) {
       );
     }
   }
+  // Tell the user how to make the advisory warning blocking (when they haven't).
+  if (sawThinnedSample && maxScorerErrorRate == null) {
+    console.error(
+      `[axl-eval] (advisory — pass --max-scorer-error-rate <0..1> to fail CI on a thinned sample)`,
+    );
+  }
 
+  // Gate-side refusal (opt-in). The decision lives in evaluateScorerErrorRateGate
+  // (pure + unit-tested) so the same type-aware tolerance + zero-sample logic
+  // isn't re-implemented here and at the source-side gate in runEval.
   if (maxScorerErrorRate != null) {
-    for (const name of scorerNames) {
-      const s = comparison.scorers[name];
-      const type = scorerTypes[name] === 'llm' ? 'llm' : 'deterministic';
-      const limit = type === 'deterministic' ? 0 : maxScorerErrorRate;
-      for (const [side, scored, failed] of [
-        ['baseline', s.baselineScored ?? 0, s.baselineFailed ?? 0],
-        ['candidate', s.candidateScored ?? 0, s.candidateFailed ?? 0],
-      ] as const) {
-        const attempted = scored + failed;
-        if (attempted === 0) {
-          refuseToGate(
-            `scorer "${name}" produced no scored items on ${side} — cannot certify a zero-sample scorer.`,
-          );
-        }
-        const rate = failed / attempted;
-        const exceeds = type === 'deterministic' ? failed > 0 : rate > limit;
-        if (exceeds) {
-          refuseToGate(
-            `scorer "${name}" failed ${(rate * 100).toFixed(1)}% on ${side} ` +
-              `(${failed}/${attempted}), over the ${type === 'deterministic' ? 'deterministic zero-tolerance' : `${(limit * 100).toFixed(1)}%`} limit.`,
-          );
-        }
-      }
-    }
+    const reason = evaluateScorerErrorRateGate(comparison, maxScorerErrorRate);
+    if (reason) refuseToGate(reason);
   }
 
   if (failOnRegression && comparison.regressions.length > 0) {

@@ -148,7 +148,11 @@ export default defineConfig({
   provider type), so one governor covers all chat calls through that adapter — but
   not other processes or runtimes sharing the same key.
 - **`openai-responses` inherits `openai`'s `rateLimit`** when it has no config of its
-  own (same fallback as `apiKey`/`baseUrl`), so one `openai` block governs both.
+  own (same fallback as `apiKey`/`baseUrl`). Note this builds a **separate governor
+  instance** per adapter, not a shared counter — if you configure `providers.openai`
+  and use *both* `openai:` and `openai-responses:` models, you get two independent
+  caps against the same key (effective concurrency = the sum). Set `maxConcurrent`
+  with that in mind, or give each adapter its own block.
 - **No deadlock on nesting.** A permit is held only across a single HTTP call, never
   across a nested `ctx.ask()` (tool handlers run between provider calls, not during),
   so an agent-as-tool chain on the same provider under `maxConcurrent: 1` still

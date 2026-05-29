@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { evalCompare } from '../compare.js';
+import { evalCompare, evaluateScorerErrorRateGate } from '../compare.js';
 import type { EvalResult } from '../types.js';
 
 function makeEvalResult(overrides: Partial<EvalResult> = {}): EvalResult {
@@ -1325,6 +1325,93 @@ describe('evalCompare()', () => {
       expect(c.baselineScored).toBe(2);
       expect(c.baselineFailed).toBe(0);
       expect(c.candidateFailed).toBe(0);
+    });
+  });
+
+  describe('evaluateScorerErrorRateGate', () => {
+    const okItem = (q: string, s: number) => ({
+      input: { q },
+      output: 'x',
+      scores: { accuracy: s },
+      scoreDetails: { accuracy: { score: s, duration: 5 } },
+    });
+    const failedItem = (q: string) => ({
+      input: { q },
+      output: 'x',
+      scores: { accuracy: null },
+      scoreDetails: { accuracy: { score: null, duration: 5 } },
+    });
+    // Build a result with N ok items + M failed items for the `accuracy` scorer.
+    const result = (
+      id: string,
+      ok: number,
+      failed: number,
+      metadata: Record<string, unknown> = {},
+    ): EvalResult => {
+      const items = [
+        ...Array.from({ length: ok }, (_, i) => okItem(`ok${i}`, 0.9)),
+        ...Array.from({ length: failed }, (_, i) => failedItem(`f${i}`)),
+      ];
+      return makeEvalResult({
+        id,
+        items,
+        metadata: { workflows: ['t'], ...metadata },
+        summary: {
+          count: items.length,
+          failures: 0,
+          scorers: { accuracy: { mean: 0.9, min: 0.9, max: 0.9, p50: 0.9, p95: 0.9 } },
+        },
+      });
+    };
+
+    it('allows a clean comparison', () => {
+      const cmp = evalCompare(result('b', 10, 0), result('c', 10, 0));
+      expect(evaluateScorerErrorRateGate(cmp, 0.1)).toBeNull();
+    });
+
+    it('refuses when an LLM scorer is over the rate', () => {
+      // candidate: 5 failed of 10 = 50% > 10%. scorerTypes marks accuracy llm.
+      const cmp = evalCompare(
+        result('b', 10, 0, { scorerTypes: { accuracy: 'llm' } }),
+        result('c', 5, 5, { scorerTypes: { accuracy: 'llm' } }),
+      );
+      const reason = evaluateScorerErrorRateGate(cmp, 0.1);
+      expect(reason).toMatch(/scorer "accuracy" failed 50\.0% on candidate/);
+    });
+
+    it('allows an LLM scorer at or under the rate', () => {
+      // 1 failed of 10 = 0.1; limit 0.1 → not over (strict >).
+      const cmp = evalCompare(
+        result('b', 10, 0, { scorerTypes: { accuracy: 'llm' } }),
+        result('c', 9, 1, { scorerTypes: { accuracy: 'llm' } }),
+      );
+      expect(evaluateScorerErrorRateGate(cmp, 0.1)).toBeNull();
+    });
+
+    it('refuses an explicit deterministic scorer on ANY failure regardless of limit', () => {
+      const cmp = evalCompare(
+        result('b', 10, 0, { scorerTypes: { accuracy: 'deterministic' } }),
+        result('c', 9, 1, { scorerTypes: { accuracy: 'deterministic' } }),
+      );
+      expect(evaluateScorerErrorRateGate(cmp, 0.9)).toMatch(/deterministic zero-tolerance/);
+    });
+
+    it('treats a scorer with MISSING scorerTypes as LLM (permissive), not deterministic', () => {
+      // No scorerTypes metadata (old artifact). 1/10 = 0.1 <= 0.2 → must NOT refuse.
+      // The pre-fix bug defaulted unknown types to deterministic zero-tolerance,
+      // which would have hard-failed this on the single flake.
+      const cmp = evalCompare(result('b', 10, 0), result('c', 9, 1));
+      expect(evaluateScorerErrorRateGate(cmp, 0.2)).toBeNull();
+    });
+
+    it('refuses a zero-sample scorer (no scored items on a side)', () => {
+      // candidate scored nothing (all its accuracy runs failed): 0 scored.
+      const cmp = evalCompare(
+        result('b', 10, 0, { scorerTypes: { accuracy: 'llm' } }),
+        result('c', 0, 4, { scorerTypes: { accuracy: 'llm' } }),
+      );
+      // 4/4 = 100% > any rate → refuses (over-rate fires before zero-sample here).
+      expect(evaluateScorerErrorRateGate(cmp, 0.5)).toMatch(/scorer "accuracy"/);
     });
   });
 });

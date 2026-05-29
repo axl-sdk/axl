@@ -107,6 +107,36 @@ describe('RateLimiter', () => {
     expect(times[2]).toBeGreaterThanOrEqual(72);
   });
 
+  it('grants the first request immediately even with minIntervalMs under a low clock', async () => {
+    // Regression guard: lastGrantAt is -Infinity, not 0, so the very first grant
+    // is immediate regardless of the wall clock. With a 0 init and a low/mocked
+    // clock, the first grant would wrongly wait a full interval.
+    vi.useFakeTimers();
+    vi.setSystemTime(5);
+    try {
+      const rl = new RateLimiter({ minIntervalMs: 100 });
+      let resolved = false;
+      void rl.acquire().then(() => {
+        resolved = true;
+      });
+      await Promise.resolve(); // flush the grant's microtask
+      expect(resolved).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('warns (does not silently swallow) a release with no active permits', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const rl = new RateLimiter({ maxConcurrent: 2 });
+      rl.release(); // nothing was acquired → likely a double-release bug
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('double-release'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('warns that maxConcurrent < 2 serializes', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {

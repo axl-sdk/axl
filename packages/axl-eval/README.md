@@ -458,7 +458,7 @@ Compare two runs to detect regressions and improvements. Runs must use the same 
 ```bash
 npx axl-eval compare ./results/v1.json ./results/v2.json
 npx axl-eval compare v1.json v2.json --fail-on-regression  # exit 1 if significant regressions
-npx axl-eval compare v1.json v2.json --max-scorer-error-rate 0.05  # exit 1 if a scorer failed on >5% of items (deterministic scorers: zero tolerance)
+npx axl-eval compare v1.json v2.json --max-scorer-error-rate 0.05  # exit 1 if a scorer failed on >5% of the items it ran against (deterministic scorers: zero tolerance)
 ```
 
 ```

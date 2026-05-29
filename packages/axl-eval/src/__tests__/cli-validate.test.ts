@@ -119,6 +119,29 @@ describe('validateEvalConfig', () => {
     expect(validateEvalConfig({ ...base, concurrency: NaN })).toMatch(/invalid concurrency/);
   });
 
+  it('accepts a valid failOnScorerErrorRate in [0, 1]', () => {
+    const base = { workflow: 'w', dataset: validDataset, scorers: [validScorer] };
+    expect(validateEvalConfig({ ...base, failOnScorerErrorRate: 0 })).toBeUndefined();
+    expect(validateEvalConfig({ ...base, failOnScorerErrorRate: 0.1 })).toBeUndefined();
+    expect(validateEvalConfig({ ...base, failOnScorerErrorRate: 1 })).toBeUndefined();
+  });
+
+  it('rejects an out-of-range or non-numeric failOnScorerErrorRate (fail loud, like the flag)', () => {
+    const base = { workflow: 'w', dataset: validDataset, scorers: [validScorer] };
+    expect(validateEvalConfig({ ...base, failOnScorerErrorRate: 1.5 })).toMatch(
+      /invalid failOnScorerErrorRate/,
+    );
+    expect(validateEvalConfig({ ...base, failOnScorerErrorRate: -0.1 })).toMatch(
+      /invalid failOnScorerErrorRate/,
+    );
+    expect(validateEvalConfig({ ...base, failOnScorerErrorRate: NaN })).toMatch(
+      /invalid failOnScorerErrorRate/,
+    );
+    expect(validateEvalConfig({ ...base, failOnScorerErrorRate: '0.1' })).toMatch(
+      /invalid failOnScorerErrorRate/,
+    );
+  });
+
   it('truncates Got: { ... } hint at 10 keys', () => {
     const cfg: Record<string, unknown> = {};
     for (let i = 0; i < 15; i++) cfg[`k${i}`] = i;

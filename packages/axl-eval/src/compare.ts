@@ -6,11 +6,7 @@ import type {
   EvalImprovement,
 } from './types.js';
 import { pairedBootstrapCI } from './bootstrap.js';
-import { scorerCounts } from './utils.js';
-
-function round(n: number): number {
-  return Math.round(n * 1000) / 1000;
-}
+import { scorerCounts, evaluateScorerTolerance, round } from './utils.js';
 
 const DEFAULT_LLM_THRESHOLD = 0.05;
 const DEFAULT_DETERMINISTIC_THRESHOLD = 0;
@@ -355,4 +351,51 @@ function detectPartial(runs: EvalResult[]): { completed: number; attempted: numb
   if (attempted === undefined) return undefined;
   if (runs.length >= attempted) return undefined;
   return { completed: runs.length, attempted };
+}
+
+/**
+ * Decide whether a comparison should be REFUSED under a gate-side scorer
+ * failure-rate limit (`axl-eval compare --max-scorer-error-rate`). Pure and
+ * testable — returns a human-readable refusal reason, or `null` to allow.
+ *
+ * Type-aware via the baseline's `scorerTypes` metadata: a scorer EXPLICITLY
+ * marked `'deterministic'` tolerates ZERO failures (a deterministic throw is a
+ * bug); everything else — including an unknown/absent type on a pre-`scorerTypes`
+ * artifact — uses the LLM `limit`. Defaulting unknown types to LLM (the
+ * permissive tier) is deliberate: classifying an old artifact's scorers as
+ * deterministic would hard-fail them on the first flake, contradicting the
+ * `--max-scorer-error-rate <n>` the user passed. Scorer NAMES are identical
+ * across sides (enforced by `evalCompare`), so reading types from the baseline
+ * is sufficient.
+ *
+ * Also refuses a scorer that produced ZERO scored items on a side — a mean over
+ * an empty sample can't be certified. Counts come from the same truncated pool
+ * `evalCompare` used for the means/CI (`baseline/candidateScored/Failed`).
+ */
+export function evaluateScorerErrorRateGate(
+  comparison: EvalComparison,
+  maxScorerErrorRate: number,
+): string | null {
+  const scorerTypes = (comparison.baseline.metadata?.scorerTypes ?? {}) as Record<string, string>;
+  for (const name of Object.keys(comparison.scorers)) {
+    const s = comparison.scorers[name];
+    const type = scorerTypes[name] === 'deterministic' ? 'deterministic' : 'llm';
+    const limit = type === 'deterministic' ? 0 : maxScorerErrorRate;
+    for (const side of ['baseline', 'candidate'] as const) {
+      const scored = (side === 'baseline' ? s.baselineScored : s.candidateScored) ?? 0;
+      const failed = (side === 'baseline' ? s.baselineFailed : s.candidateFailed) ?? 0;
+      const verdict = evaluateScorerTolerance(scored, failed, type, limit);
+      if (verdict.zeroSample) {
+        return `scorer "${name}" produced no scored items on ${side} — cannot certify a zero-sample scorer.`;
+      }
+      if (verdict.exceeds) {
+        const limitStr =
+          type === 'deterministic'
+            ? 'deterministic zero-tolerance'
+            : `${(limit * 100).toFixed(1)}%`;
+        return `scorer "${name}" failed ${(verdict.rate * 100).toFixed(1)}% on ${side} (${failed}/${verdict.attempted}), over the ${limitStr} limit.`;
+      }
+    }
+  }
+  return null;
 }

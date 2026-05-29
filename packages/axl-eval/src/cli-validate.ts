@@ -64,5 +64,15 @@ export function validateEvalConfig(cfg: unknown): string | undefined {
       return `exports an invalid ${key} (${typeof v === 'number' ? v : typeof v}) — must be a positive integer.`;
     }
   }
+  // The failure-rate gate must fail loud on a bad value, symmetric with the
+  // `--max-scorer-error-rate` flag. Without this, a typo (e.g. `5` meaning "5%")
+  // only `console.warn`s at runtime and silently disables the gate the user
+  // explicitly opted into — the exact silent-no-op the feature exists to catch.
+  {
+    const v = (c as Record<string, unknown>).failOnScorerErrorRate;
+    if (v !== undefined && (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1)) {
+      return `exports an invalid failOnScorerErrorRate (${typeof v === 'number' ? v : typeof v}) — must be a number between 0 and 1.`;
+    }
+  }
   return undefined;
 }

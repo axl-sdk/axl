@@ -213,4 +213,56 @@ describe('aggregateRuns()', () => {
     expect(summary.scorers.accuracy.scored).toBe(0);
     expect(summary.scorers.accuracy.failed).toBe(0);
   });
+
+  it('excludes a 100%-failed run (scored 0) from the mean but counts it in failed', () => {
+    // Run A scored everything (mean 0.9); run B's scorer failed on every item,
+    // so its summary mean is a meaningless 0 from an empty sample. The aggregate
+    // mean must reflect only the contributing run (0.9), not (0.9+0)/2 = 0.45.
+    const runs = [
+      makeRun({
+        summary: {
+          count: 10,
+          failures: 0,
+          scorers: {
+            accuracy: { mean: 0.9, min: 0.9, max: 0.9, p50: 0.9, p95: 0.9, scored: 10, failed: 0 },
+          },
+        },
+      }),
+      makeRun({
+        summary: {
+          count: 10,
+          failures: 0,
+          scorers: { accuracy: { mean: 0, min: 0, max: 0, p50: 0, p95: 0, scored: 0, failed: 10 } },
+        },
+      }),
+    ];
+    const summary = aggregateRuns(runs);
+    expect(summary.scorers.accuracy.mean).toBe(0.9); // not 0.45
+    expect(summary.scorers.accuracy.min).toBe(0.9);
+    expect(summary.scorers.accuracy.scored).toBe(10);
+    expect(summary.scorers.accuracy.failed).toBe(10); // failed summed across ALL runs
+  });
+
+  it('falls back to all runs when every run scored zero (no divide-by-zero)', () => {
+    const runs = [
+      makeRun({
+        summary: {
+          count: 5,
+          failures: 0,
+          scorers: { accuracy: { mean: 0, min: 0, max: 0, p50: 0, p95: 0, scored: 0, failed: 5 } },
+        },
+      }),
+      makeRun({
+        summary: {
+          count: 5,
+          failures: 0,
+          scorers: { accuracy: { mean: 0, min: 0, max: 0, p50: 0, p95: 0, scored: 0, failed: 5 } },
+        },
+      }),
+    ];
+    const summary = aggregateRuns(runs);
+    expect(summary.scorers.accuracy.mean).toBe(0);
+    expect(Number.isNaN(summary.scorers.accuracy.mean)).toBe(false);
+    expect(summary.scorers.accuracy.failed).toBe(10);
+  });
 });

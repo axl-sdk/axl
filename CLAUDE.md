@@ -227,6 +227,7 @@ pnpm -r test       # Run tests across all packages
 pnpm test:e2e      # E2E scenario tests only (tests/e2e/)
 pnpm test:studio   # Studio API tests only (tests/studio/)
 pnpm test:smoke    # Pack validation smoke tests (tests/smoke/)
+pnpm test:integration  # Live-API tests across packages (pnpm -r test:integration) — needs API keys
 ```
 
 Test infrastructure lives in `tests/` workspace:
@@ -235,7 +236,7 @@ Test infrastructure lives in `tests/` workspace:
 - `tests/smoke/` — Tarball content validation via `pnpm pack`
 - `packages/axl-studio/src/__tests__/` — Inline studio unit tests (server, cost-aggregator, connection-manager, ws-handler, protocol, middleware, aggregates, reducers, redact) plus React Testing Library component tests in `.test.tsx` files (opt-in to jsdom via a per-file `// @vitest-environment jsdom` directive; `setup-dom.ts` loads jest-dom matchers + RTL `cleanup` only when a DOM is present)
 
-All tests use `MockProvider` — no API keys needed.
+All tests use `MockProvider` — no API keys needed. **Exception:** live-API integration tests, gated `describe.skipIf(!process.env.<PROVIDER>_API_KEY)` and run only via `pnpm test:integration` (excluded from the default `vitest run` per-package). They live in `packages/axl/src/__tests__/integration*.test.ts` (providers, workflows, thinking, pricing) and `packages/axl-eval/src/__tests__/integration-scorer-concurrency.test.ts` (concurrent `llmScorer` judges + mid-run abort against a live model). Each package with live tests has its own `vitest.integration.config.ts` that loads the repo-root `.env`. Use the cheapest model (`openai:gpt-4.1-nano`) and tiny payloads.
 
 ## Building
 ```bash

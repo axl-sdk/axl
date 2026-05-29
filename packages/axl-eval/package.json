@@ -29,6 +29,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest watch",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
     "lint": "tsc --noEmit"
   },
   "dependencies": {

@@ -319,6 +319,18 @@ export function getResultModels(result: EvalResultData): string[] {
   return (result.metadata.models as unknown[]).filter((m): m is string => typeof m === 'string');
 }
 
+/**
+ * Annotation key paths the dataset schema dropped (stripped before reaching
+ * scorers). Surfaced by the eval runner into `metadata.droppedAnnotationKeys`.
+ * Dataset-level, so it's identical across runs in a multi-run group — reading
+ * the representative result's metadata is sufficient. Returns `[]` when none.
+ */
+export function getResultDroppedAnnotationKeys(result: EvalResultData): string[] {
+  const dropped = result.metadata?.droppedAnnotationKeys;
+  if (!Array.isArray(dropped)) return [];
+  return (dropped as unknown[]).filter((k): k is string => typeof k === 'string');
+}
+
 /** Extract per-model LLM call counts from result metadata. */
 export function getResultModelCounts(result: EvalResultData): Record<string, number> | null {
   const mc = result.metadata?.modelCounts;

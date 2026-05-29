@@ -101,6 +101,8 @@ const ds = dataset({
 
 You can also load from a file: `dataset({ name: 'large', schema, file: './data.json' })`.
 
+> **Annotation keys must be in the schema.** Zod strips keys it doesn't declare, so an annotation field missing from the `annotations` schema is dropped before it reaches your scorers — and a scorer reading `annotations?.thatField` then silently sees `undefined` and becomes a no-op. By default `dataset()` warns once per dataset listing any dropped keys (`annotation key(s) dropped by schema: ...`). Set `onExtraAnnotationKeys: 'error'` to fail instead (recommended in CI), or `'ignore'` to silence. This is the only guard for `file:` datasets, which aren't type-checked.
+
 ## Scorers
 
 Scorers rate each output on a 0-1 scale. You can mix deterministic and LLM scorers in the same eval.

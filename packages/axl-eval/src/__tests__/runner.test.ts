@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod';
 import type { AxlRuntime } from '@axlsdk/axl';
 import { dataset } from '../dataset.js';
@@ -1880,5 +1880,56 @@ describe('runEval: signal cancellation', () => {
     expect(itemEvents).toHaveLength(3);
     expect(runEvents).toHaveLength(1);
     expect(itemEvents.every((e) => e.totalItems === 3)).toBe(true);
+  });
+});
+
+describe('runEval() — dataset diagnostics', () => {
+  it('surfaces dropped annotation keys on EvalResult.metadata', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ds = dataset({
+      name: 'drop-meta-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.object({ a: z.string() }),
+      onExtraAnnotationKeys: 'warn', // console.warn spied/silenced below
+      items: [
+        // @ts-expect-error - deliberately undeclared annotation key
+        { input: { q: 'Q' }, annotations: { a: 'x', expectedTone: 'formal' } },
+      ],
+    });
+    const result = await runEval(
+      { dataset: ds, scorers: [exactScorer], workflow: 'w' },
+      async () => ({ output: 'x' }),
+      mockRuntime,
+    );
+    expect(result.metadata.droppedAnnotationKeys).toEqual(['expectedTone']);
+    warn.mockRestore();
+  });
+
+  it('omits droppedAnnotationKeys when nothing is dropped', async () => {
+    const ds = dataset({
+      name: 'clean-meta-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.object({ a: z.string() }),
+      items: [{ input: { q: 'Q' }, annotations: { a: 'x' } }],
+    });
+    const result = await runEval(
+      { dataset: ds, scorers: [exactScorer], workflow: 'w' },
+      async () => ({ output: 'x' }),
+      mockRuntime,
+    );
+    expect(result.metadata.droppedAnnotationKeys).toBeUndefined();
+  });
+
+  it('tolerates a hand-rolled dataset without the droppedAnnotationKeys field', async () => {
+    const result = await runEval(
+      {
+        dataset: { name: 'bare-ds', getItems: async () => [{ input: { q: 'Q' } }] } as never,
+        scorers: [exactScorer],
+        workflow: 'w',
+      },
+      async () => ({ output: 'x' }),
+      mockRuntime,
+    );
+    expect(result.metadata.droppedAnnotationKeys).toBeUndefined();
   });
 });

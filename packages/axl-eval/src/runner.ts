@@ -84,6 +84,11 @@ export async function runEval(
   const startTime = Date.now();
   const id = randomUUID();
   const items = await config.dataset.getItems();
+  // Snapshot dataset-load diagnostics (e.g. annotation keys the schema dropped)
+  // so we can surface them on EvalResult.metadata for tooling — mirrors the
+  // console.warn the dataset already emits. Read after getItems(); defensive
+  // against hand-rolled Dataset objects that don't expose the field.
+  const droppedAnnotationKeys = [...(config.dataset.droppedAnnotationKeys ?? [])];
   const concurrency = config.concurrency ?? 5;
   const budgetLimit = config.budget ? parseCost(config.budget) : undefined;
 
@@ -369,6 +374,7 @@ export async function runEval(
       scorerTypes,
       ...modelsMeta,
       ...workflowsMeta,
+      ...(droppedAnnotationKeys.length > 0 ? { droppedAnnotationKeys } : {}),
     },
     timestamp: new Date().toISOString(),
     totalCost,

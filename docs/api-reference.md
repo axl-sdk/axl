@@ -1647,6 +1647,9 @@ Configuration for `dataset()`.
 | `items` | `DatasetItem[]` | — | Inline dataset items (each has `input` and optional `annotations`) |
 | `file` | `string` | — | Path to a JSON file containing items (alternative to inline `items`) |
 | `basePath` | `string` | `cwd` | Base directory for resolving relative `file` paths |
+| `onExtraAnnotationKeys` | `'warn' \| 'error' \| 'ignore'` | `'warn'` | What to do when an item's `annotations` contain keys not declared in the `annotations` schema. Zod strips unknown keys by default, so such fields are silently dropped before reaching scorers (a common cause of no-op scorers). `'warn'` logs one consolidated `console.warn` per dataset listing the dropped key paths; `'error'` throws; `'ignore'` restores the silent-strip behavior. Detection is recursive (reports nested paths like `persona.role`) and covers file-based datasets, which get no compile-time checking. Scoped to `annotations`, not `input`. |
+
+> **Annotation/schema drift.** A scorer that reads `annotations?.someKey` silently returns garbage when `someKey` was stripped because it isn't in the `annotations` schema (e.g. a typo, or a key added to a `file:` dataset but not the schema). TypeScript's excess-property check catches this for *inline* item literals, but not for variable-sourced or file-based items, nor when a `z.ZodType<T>` schema is structurally narrower than `T`. `onExtraAnnotationKeys` (default `'warn'`) is the runtime backstop that catches all of these. Set it to `'error'` in CI to fail the build on drift.
 
 ### `ScorerResult`
 

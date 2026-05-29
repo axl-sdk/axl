@@ -29,6 +29,9 @@ export type EvalResult = {
    *   that need a single "primary" workflow should use `workflows[0]`.
    * - `scorerTypes: Record<string, 'llm' | 'deterministic'>`
    * - `runGroupId?: string`, `runIndex?: number` for multi-run groups
+   * - `droppedAnnotationKeys?: string[]` — annotation key paths the dataset
+   *   schema stripped (present only when non-empty). Mirrors the dataset's
+   *   `console.warn`; lets tooling (Studio) surface the same signal.
    */
   metadata: Record<string, unknown>;
   timestamp: string;

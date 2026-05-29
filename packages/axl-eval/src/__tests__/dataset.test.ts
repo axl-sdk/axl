@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { z } from 'zod';
 import { dataset } from '../dataset.js';
 
@@ -159,5 +159,169 @@ describe('dataset()', () => {
     });
 
     await expect(ds.getItems()).rejects.toThrow();
+  });
+});
+
+describe('dataset() — extra annotation key detection', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('warns by default when an annotation key is dropped by the schema, and strips it', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ds = dataset({
+      name: 'drop-ds',
+      schema: z.object({ question: z.string() }),
+      annotations: z.object({ answer: z.string() }),
+      items: [
+        // expectedTone is not in the annotations schema → silently stripped.
+        // TS's excess-property check catches this for inline literals, but NOT
+        // for variable-sourced or file-based datasets — which is exactly what
+        // the runtime warning exists to cover.
+        // @ts-expect-error - deliberately undeclared annotation key
+        { input: { question: 'Q' }, annotations: { answer: '2', expectedTone: 'formal' } },
+      ],
+    });
+
+    const items = await ds.getItems();
+    // The undeclared key is stripped from what reaches scorers.
+    expect(items[0].annotations).toEqual({ answer: '2' });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('expectedTone');
+    expect(warn.mock.calls[0][0]).toContain('drop-ds');
+  });
+
+  it('emits a single consolidated warning across many items', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ds = dataset({
+      name: 'multi-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.object({ a: z.string() }),
+      items: Array.from({ length: 50 }, (_, i) => ({
+        input: { q: `Q${i}` },
+        annotations: { a: 'x', extra: 'y' },
+      })),
+    });
+
+    await ds.getItems();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports nested dropped key paths', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ds = dataset({
+      name: 'nested-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.object({ persona: z.object({ name: z.string() }) }),
+      items: [
+        // @ts-expect-error - deliberately undeclared nested annotation key
+        { input: { q: 'Q' }, annotations: { persona: { name: 'Ada', role: 'analyst' } } },
+      ],
+    });
+
+    await ds.getItems();
+    expect(warn.mock.calls[0][0]).toContain('persona.role');
+  });
+
+  it("throws under onExtraAnnotationKeys: 'error', listing the dropped keys", async () => {
+    const ds = dataset({
+      name: 'strict-ann-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.object({ a: z.string() }),
+      onExtraAnnotationKeys: 'error',
+      // @ts-expect-error - deliberately undeclared annotation key
+      items: [{ input: { q: 'Q' }, annotations: { a: 'x', typo: 'z' } }],
+    });
+
+    await expect(ds.getItems()).rejects.toThrow(/typo/);
+  });
+
+  it("stays silent under onExtraAnnotationKeys: 'ignore'", async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ds = dataset({
+      name: 'ignore-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.object({ a: z.string() }),
+      onExtraAnnotationKeys: 'ignore',
+      // @ts-expect-error - deliberately undeclared annotation key
+      items: [{ input: { q: 'Q' }, annotations: { a: 'x', extra: 'y' } }],
+    });
+
+    const items = await ds.getItems();
+    expect(items[0].annotations).toEqual({ a: 'x' }); // still stripped
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('does not warn when annotations exactly match the schema', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ds = dataset({
+      name: 'exact-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.object({ a: z.string() }),
+      items: [{ input: { q: 'Q' }, annotations: { a: 'x' } }],
+    });
+
+    await ds.getItems();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('does not warn for a loose annotations schema (nothing is dropped)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ds = dataset({
+      name: 'loose-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.looseObject({ a: z.string() }),
+      items: [{ input: { q: 'Q' }, annotations: { a: 'x', extra: 'y' } }],
+    });
+
+    const items = await ds.getItems();
+    expect(items[0].annotations).toEqual({ a: 'x', extra: 'y' }); // preserved
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('does not warn about extra INPUT keys (detection is scoped to annotations)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const ds = dataset({
+      name: 'input-extra-ds',
+      schema: z.object({ q: z.string() }),
+      annotations: z.object({ a: z.string() }),
+      items: [
+        // input has an undeclared field; annotations are clean
+        // @ts-expect-error - deliberately extra input field
+        { input: { q: 'Q', extra: 'ignored' }, annotations: { a: 'x' } },
+      ],
+    });
+
+    await ds.getItems();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('detects dropped annotation keys loaded from a JSON file', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { writeFile, mkdir, rm } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+
+    const tmpDir = join(tmpdir(), `axl-test-dataset-drop-${Date.now()}`);
+    await mkdir(tmpDir, { recursive: true });
+    const filePath = join(tmpDir, 'data.json');
+    await writeFile(
+      filePath,
+      JSON.stringify([{ input: { q: 'Q' }, annotations: { a: 'x', unschematized: true } }]),
+      'utf-8',
+    );
+
+    try {
+      const ds = dataset({
+        name: 'file-drop-ds',
+        schema: z.object({ q: z.string() }),
+        annotations: z.object({ a: z.string() }),
+        file: filePath,
+      });
+      await ds.getItems();
+      expect(warn.mock.calls[0][0]).toContain('unschematized');
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
   });
 });

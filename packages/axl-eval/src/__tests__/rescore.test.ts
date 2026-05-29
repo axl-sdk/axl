@@ -341,6 +341,22 @@ describe('rescore()', () => {
     });
   });
 
+  it('strips a stale scorerFiltered/scorersRun stamp from the source run', async () => {
+    // A full rescore of a --scorers-filtered run must NOT inherit the filtered
+    // stamp — whether THIS rescore ran a subset is a property of the rescore,
+    // not the source. Otherwise it would falsely trip the compare gate/banner.
+    const result = makeResult({
+      metadata: { workflows: ['test-wf'], scorerFiltered: true, scorersRun: ['old-subset'] },
+    });
+    const rescored = await rescore(result, [alwaysOneScorer, halfScorer], mockRuntime);
+
+    expect(rescored.metadata.scorerFiltered).toBeUndefined();
+    expect(rescored.metadata.scorersRun).toBeUndefined();
+    expect(rescored.metadata.rescored).toBe(true);
+    // Unrelated metadata is preserved.
+    expect(rescored.metadata.workflows).toEqual(['test-wf']);
+  });
+
   describe('concurrent scorers', () => {
     const costScorer = (name: string, cost: number): Scorer => ({
       name,

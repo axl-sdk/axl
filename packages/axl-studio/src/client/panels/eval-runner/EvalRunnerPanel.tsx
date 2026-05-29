@@ -31,6 +31,7 @@ import {
   buildMultiRunResult,
 } from './types';
 import { DroppedAnnotationKeysBanner } from './DroppedAnnotationKeysBanner';
+import { ScorerFilteredBanner } from './ScorerFilteredBanner';
 import { EvalSummaryTable } from './EvalSummaryTable';
 import { EvalItemList } from './EvalItemList';
 import { EvalItemDetail } from './EvalItemDetail';
@@ -922,6 +923,7 @@ export function EvalRunnerPanel() {
                       </button>
                     </div>
                     {currentResult && <DroppedAnnotationKeysBanner result={currentResult} />}
+                    {currentResult && <ScorerFilteredBanner result={currentResult} />}
                     <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
                       <StatCard
                         label="Runs"
@@ -1283,6 +1285,7 @@ export function EvalRunnerPanel() {
                       );
                     })()}
                     <DroppedAnnotationKeysBanner result={displayResult} />
+                    <ScorerFilteredBanner result={displayResult} />
                     <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
                       <StatCard
                         label="Items"

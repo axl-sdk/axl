@@ -631,7 +631,9 @@ npx axl-eval rescore ./results/v1.json ./evals/qa.eval.ts
 npx axl-eval rescore ./results/v1.json ./evals/qa.eval.ts --output ./results/v1-rescored.json
 ```
 
-The rescored result gets a new `id` and has `metadata.rescored: true` and `metadata.originalId` pointing to the source run. `runGroupId` and `runIndex` are stripped from inherited metadata (rescored results are independent evaluations). Only scorer cost is tracked (workflow cost is zero).
+The rescored result gets a new `id` and has `metadata.rescored: true` and `metadata.originalId` pointing to the source run. `runGroupId`, `runIndex`, and any `scorerFiltered`/`scorersRun` stamp are stripped from inherited metadata (rescored results are independent evaluations, and a rescore always runs the eval file's full scorer set). Only scorer cost is tracked (workflow cost is zero).
+
+`--concurrency`/`AXL_EVAL_CONCURRENCY` are honored by `rescore` too (item-level; `scorerConcurrency` keeps its default 5). `--scorers` is **not** supported with `rescore` — it's a run-command-only filter; rescore re-runs whatever scorers the eval file exports (pass a subset there instead).
 
 Programmatically:
 

@@ -1,8 +1,8 @@
 import type { AxlRuntime } from '@axlsdk/axl';
 import type { EvalConfig, EvalResult, EvalItem, EvalSummary, RunEvalOptions } from './types.js';
 import type { ScorerContext } from './scorer.js';
-import { normalizeScorerResult } from './scorer.js';
-import { computeStats, round, mapWithConcurrency } from './utils.js';
+import { computeStats, mapWithConcurrency } from './utils.js';
+import { scoreItem } from './score-item.js';
 import { randomUUID } from 'node:crypto';
 
 function parseCost(cost: string): number {
@@ -204,95 +204,19 @@ export async function runEval(
       budgetExceeded = true;
     }
 
-    // Pre-seed scores/scoreDetails keys in scorer-array order BEFORE the pool.
-    // This fixes JSON key-insertion order (snapshot stability) regardless of
-    // scorer completion order, and makes a never-run scorer (e.g. one skipped
-    // on abort) deterministically `null` rather than absent.
-    evalItem.scoreDetails = {};
-    for (const s of config.scorers) {
-      evalItem.scores[s.name] = null;
-      evalItem.scoreDetails[s.name] = { score: null };
-    }
-    let itemScorerCost = 0;
-    // Collect errors keyed by scorer name, then flatten in scorer-array order
-    // after the pool — `.push()` order would otherwise be completion-ordered
-    // (nondeterministic under concurrency).
-    const scorerErrorsByName: Record<string, string> = {};
-
-    await mapWithConcurrency(config.scorers, scorerConcurrency, async (scorer) => {
-      // Skip scorers not yet started once cancellation has been requested.
-      // In-flight scorers abort via scorerContext.signal → provider.chat.
-      if (options?.signal?.aborted) return;
-      const scorerStart = Date.now();
-      try {
-        const raw = await scorer.score(
-          evalItem.output,
-          item.input,
-          item.annotations,
-          scorerContext,
-        );
-        const scorerResult = normalizeScorerResult(raw);
-
-        if (scorerResult.cost != null) {
-          itemScorerCost += scorerResult.cost;
-          totalCost += scorerResult.cost;
-        }
-
-        const scorerDuration = Date.now() - scorerStart;
-
-        if (
-          !Number.isFinite(scorerResult.score) ||
-          scorerResult.score < 0 ||
-          scorerResult.score > 1
-        ) {
-          scorerErrorsByName[scorer.name] =
-            `Scorer "${scorer.name}" returned out-of-range score ${scorerResult.score} for input ${JSON.stringify(item.input)}`;
-          evalItem.scores[scorer.name] = null;
-          evalItem.scoreDetails![scorer.name] = {
-            score: null,
-            metadata: scorerResult.metadata,
-            duration: scorerDuration,
-            cost: scorerResult.cost,
-          };
-        } else {
-          evalItem.scores[scorer.name] = round(scorerResult.score);
-          evalItem.scoreDetails![scorer.name] = {
-            score: round(scorerResult.score),
-            metadata: scorerResult.metadata,
-            duration: scorerDuration,
-            cost: scorerResult.cost,
-          };
-        }
-      } catch (err) {
-        // A scorer call aborted mid-flight (cancellation) is NOT a scoring
-        // failure — leave its pre-seeded `null` and don't manufacture a
-        // phantom error. Matches the serial loop, which `break`'d before an
-        // in-flight abort could be recorded.
-        if (options?.signal?.aborted || (err as { name?: string })?.name === 'AbortError') {
-          return;
-        }
-        // Capture cost from error (LLM scorer attaches it)
-        const errCost = typeof (err as any)?.cost === 'number' ? (err as any).cost : undefined;
-        if (errCost != null) {
-          itemScorerCost += errCost;
-          totalCost += errCost;
-        }
-        scorerErrorsByName[scorer.name] =
-          `Scorer "${scorer.name}" threw: ${err instanceof Error ? err.message : String(err)}`;
-        evalItem.scores[scorer.name] = null;
-        evalItem.scoreDetails![scorer.name] = {
-          score: null,
-          duration: Date.now() - scorerStart,
-          cost: errCost,
-        };
-      }
-    });
-
-    const orderedErrors = config.scorers
-      .map((s) => scorerErrorsByName[s.name])
-      .filter((e): e is string => e != null);
-    if (orderedErrors.length > 0) evalItem.scorerErrors = orderedErrors;
-    evalItem.scorerCost = itemScorerCost > 0 ? itemScorerCost : undefined;
+    // Score the item's output with all scorers (bounded fan-out). scoreItem
+    // owns the determinism + cancellation + cost logic shared with rescore();
+    // it returns the per-item scorer cost to fold into the running total.
+    // NB: keep the await on its own line — `totalCost += await …` would read
+    // totalCost BEFORE suspending, losing updates across concurrent items.
+    const itemScorerCost = await scoreItem(
+      evalItem,
+      config.scorers,
+      scorerConcurrency,
+      scorerContext,
+      options?.signal,
+    );
+    totalCost += itemScorerCost;
     evalItems[itemIndex] = evalItem;
     options?.onProgress?.({ type: 'item_done', itemIndex, totalItems: items.length });
   }

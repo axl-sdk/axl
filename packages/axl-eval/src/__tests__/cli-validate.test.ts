@@ -95,6 +95,30 @@ describe('validateEvalConfig', () => {
     expect(msg).toMatch(/getItems\(\) method/);
   });
 
+  it('accepts valid positive-integer concurrency / scorerConcurrency', () => {
+    expect(
+      validateEvalConfig({
+        workflow: 'w',
+        dataset: validDataset,
+        scorers: [validScorer],
+        concurrency: 10,
+        scorerConcurrency: 3,
+      }),
+    ).toBeUndefined();
+  });
+
+  it('rejects non-positive or non-integer concurrency knobs', () => {
+    const base = { workflow: 'w', dataset: validDataset, scorers: [validScorer] };
+    expect(validateEvalConfig({ ...base, concurrency: 0 })).toMatch(/invalid concurrency/);
+    expect(validateEvalConfig({ ...base, scorerConcurrency: -1 })).toMatch(
+      /invalid scorerConcurrency/,
+    );
+    expect(validateEvalConfig({ ...base, scorerConcurrency: 2.5 })).toMatch(
+      /invalid scorerConcurrency/,
+    );
+    expect(validateEvalConfig({ ...base, concurrency: NaN })).toMatch(/invalid concurrency/);
+  });
+
   it('truncates Got: { ... } hint at 10 keys', () => {
     const cfg: Record<string, unknown> = {};
     for (let i = 0; i < 15; i++) cfg[`k${i}`] = i;

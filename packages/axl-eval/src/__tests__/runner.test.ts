@@ -2079,4 +2079,31 @@ describe('runEval() — concurrent scorers', () => {
     expect(item.scorerErrors).toBeUndefined();
     expect(item.scores.aborting).toBeNull();
   });
+
+  it('does NOT swallow a genuine scorer bug just because an unrelated abort fired', async () => {
+    // Narrowing the cancellation check to AbortError identity (not the broad
+    // signal.aborted flag) means a real error thrown by another scorer while a
+    // sibling triggered the abort is still reported.
+    const controller = new AbortController();
+    const buggy: Scorer = {
+      name: 'buggy',
+      description: 'b',
+      isLlm: false,
+      score: async () => {
+        controller.abort(); // an abort is now in-flight...
+        throw new TypeError('genuine bug, not a cancellation');
+      },
+    };
+
+    const result = await runEval(
+      { workflow: 'w', dataset: oneItem, scorers: [buggy], scorerConcurrency: 1 },
+      exec,
+      mockRuntime,
+      { signal: controller.signal },
+    );
+
+    const item = result.items[0];
+    expect(item.scores.buggy).toBeNull();
+    expect(item.scorerErrors?.[0]).toContain('genuine bug');
+  });
 });

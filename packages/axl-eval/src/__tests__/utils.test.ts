@@ -46,6 +46,18 @@ describe('mapWithConcurrency()', () => {
     expect(result).toEqual([0, 2, 4]);
   });
 
+  it('coerces non-finite / fractional concurrency instead of running zero workers', async () => {
+    // Regression: Math.max(1, NaN) === NaN → Array.from({length:NaN}) === []
+    // → zero workers → results full of `undefined` holes. Must coerce to 1.
+    for (const bad of [NaN, Infinity, -Infinity]) {
+      const result = await mapWithConcurrency([1, 2, 3], bad as number, async (n) => n * 10);
+      expect(result).toEqual([10, 20, 30]);
+    }
+    // Fractional floors to an integer worker count but still runs every item.
+    const frac = await mapWithConcurrency([1, 2, 3, 4], 2.9, async (n) => n);
+    expect(frac).toEqual([1, 2, 3, 4]);
+  });
+
   it('clamps concurrency <= 0 to one worker (does not hang)', async () => {
     let maxInFlight = 0;
     let inFlight = 0;

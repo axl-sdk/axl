@@ -331,6 +331,21 @@ export function getResultDroppedAnnotationKeys(result: EvalResultData): string[]
   return (dropped as unknown[]).filter((k): k is string => typeof k === 'string');
 }
 
+/**
+ * Scorer names run when the eval was invoked with `--scorers` to filter to a
+ * subset (`metadata.scorerFiltered === true`). Surfaced by the eval CLI into
+ * `metadata.scorersRun`. Run-level, so it's identical across runs in a
+ * multi-run group — reading the representative result's metadata is sufficient,
+ * mirroring `getResultDroppedAnnotationKeys`. Returns `[]` when the run was not
+ * scorer-filtered (i.e. a full-coverage run) or when metadata is absent.
+ */
+export function getResultScorerFiltered(result: EvalResultData): string[] {
+  if (result.metadata?.scorerFiltered !== true) return [];
+  const run = result.metadata?.scorersRun;
+  if (!Array.isArray(run)) return [];
+  return (run as unknown[]).filter((s): s is string => typeof s === 'string');
+}
+
 /** Extract per-model LLM call counts from result metadata. */
 export function getResultModelCounts(result: EvalResultData): Record<string, number> | null {
   const mc = result.metadata?.modelCounts;

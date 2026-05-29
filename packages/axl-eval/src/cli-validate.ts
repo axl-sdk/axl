@@ -54,5 +54,15 @@ export function validateEvalConfig(cfg: unknown): string | undefined {
   if (badScorerIdx !== -1) {
     return `exports a scorers array with a non-scorer entry at index ${badScorerIdx} — each scorer must have a score() method (use the scorer() factory).`;
   }
+  // Concurrency knobs must be positive integers when present. The worker pool
+  // defensively clamps non-positive/non-finite values to 1 at runtime, but a
+  // config that wrote `concurrency: 0` (or NaN via `Number(env)`) almost
+  // certainly has a bug — surface it loudly, matching the `--concurrency` flag.
+  for (const key of ['concurrency', 'scorerConcurrency'] as const) {
+    const v = (c as Record<string, unknown>)[key];
+    if (v !== undefined && (typeof v !== 'number' || !Number.isInteger(v) || v < 1)) {
+      return `exports an invalid ${key} (${typeof v === 'number' ? v : typeof v}) — must be a positive integer.`;
+    }
+  }
   return undefined;
 }

@@ -120,6 +120,18 @@ function parseThresholdArg(args: string[]): Record<string, number> | number | un
   return Object.keys(map).length > 0 ? map : undefined;
 }
 
+/**
+ * If a raw compare input (single result or multi-run array) was produced by a
+ * `--scorers` filtered run, return the scorer names it ran; otherwise undefined.
+ * Reads the first run's metadata — a multi-run group shares the same stamp.
+ */
+function scorerFilteredScorers(r: EvalResult | EvalResult[]): string[] | undefined {
+  const first = Array.isArray(r) ? r[0] : r;
+  const meta = first?.metadata;
+  if (!meta || meta.scorerFiltered !== true) return undefined;
+  return Array.isArray(meta.scorersRun) ? (meta.scorersRun as string[]) : [];
+}
+
 async function runCompare(args: string[]) {
   const failOnRegression = args.includes('--fail-on-regression');
   const thresholds = parseThresholdArg(args);
@@ -136,29 +148,38 @@ async function runCompare(args: string[]) {
   const candidateRaw = JSON.parse(await readFileAsync(files[1], 'utf-8'));
   const baseline: EvalResult | EvalResult[] = baselineRaw;
   const candidate: EvalResult | EvalResult[] = candidateRaw;
-  const compareOptions = thresholds != null ? { thresholds } : undefined;
-  const comparison = evalCompare(baseline, candidate, compareOptions);
 
   // A scorer-filtered result (CLI `--scorers`) tested only a subset of scorers,
-  // so it isn't a sound baseline/candidate for a full comparison. Warn loudly;
-  // and when the run is being used to GATE CI (`--fail-on-regression`), refuse
-  // outright — a swallowed stderr line wouldn't actually prevent the footgun.
-  const filteredSides = (['baseline', 'candidate'] as const).filter(
-    (side) => comparison[side].metadata?.scorerFiltered === true,
-  );
-  for (const side of filteredSides) {
-    const ran = comparison[side].metadata?.scorersRun;
-    const ranStr = Array.isArray(ran) ? ` (ran: ${(ran as string[]).join(', ')})` : '';
+  // so it isn't a sound baseline/candidate for a full comparison. Check this
+  // BEFORE evalCompare(): a subset-vs-full comparison has mismatched scorer sets
+  // and evalCompare() would throw a generic "different scorers" error that never
+  // mentions --scorers. Warn loudly here so the cause is actionable; under
+  // `--fail-on-regression`, refuse outright (a swallowed stderr line wouldn't
+  // actually prevent the footgun).
+  const filteredSides = (
+    [
+      ['baseline', baseline],
+      ['candidate', candidate],
+    ] as const
+  ).filter(([, r]) => scorerFilteredScorers(r) != null);
+  for (const [side, r] of filteredSides) {
+    const ran = scorerFilteredScorers(r);
+    const ranStr = ran && ran.length ? ` (ran: ${ran.join(', ')})` : '';
     console.error(
-      `[axl-eval] WARNING: ${side} was run with a filtered scorer subset${ranStr} — this comparison is incomplete.`,
+      `[axl-eval] WARNING: ${side} was run with --scorers — it tested only a subset${ranStr}, so this comparison is incomplete.`,
     );
   }
   if (failOnRegression && filteredSides.length > 0) {
     console.error(
-      `[axl-eval] Refusing to gate on a scorer-filtered result (${filteredSides.join(', ')}); re-run without --scorers.`,
+      `[axl-eval] Refusing to gate on a scorer-filtered result (${filteredSides
+        .map(([s]) => s)
+        .join(', ')}); re-run without --scorers.`,
     );
     process.exit(1);
   }
+
+  const compareOptions = thresholds != null ? { thresholds } : undefined;
+  const comparison = evalCompare(baseline, candidate, compareOptions);
 
   console.log(
     `\nCompare: baseline (${comparison.baseline.id.slice(0, 8)}) -> candidate (${comparison.candidate.id.slice(0, 8)})\n`,
@@ -229,10 +250,21 @@ async function runCompare(args: string[]) {
 }
 
 async function runRescore(args: string[], signal: AbortSignal) {
-  const { outputPath, configArg, conditions, concurrency, paths } = parseEvalArgs(args);
+  const { outputPath, configArg, conditions, concurrency, scorerNames, paths } =
+    parseEvalArgs(args);
 
   if (paths.length < 2) {
     console.error('Usage: axl-eval rescore <results.json> <eval-file> [--output <file>]');
+    process.exit(1);
+  }
+
+  // --scorers is a run-command-only filter — rescore always re-runs the full
+  // scorer set from the eval file. Fail loudly rather than silently ignoring it
+  // (it parses as a known flag, so it wouldn't trip the unknown-flag guard).
+  if (scorerNames?.length) {
+    console.error(
+      'Error: --scorers is not supported with rescore; pass a scorer subset in the eval file instead.',
+    );
     process.exit(1);
   }
 
@@ -527,6 +559,14 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
     process.exit(1);
   }
 
+  // --scorers is single-file only — filtering by name across a glob/dir of evals
+  // with different scorer sets is ambiguous. Fail fast, before importing any
+  // module, rather than discovering the conflict mid-loop.
+  if (scorerNames?.length && evalFiles.length > 1) {
+    console.error(`Error: --scorers requires a single eval file (matched ${evalFiles.length}).`);
+    process.exit(1);
+  }
+
   const runtime = await getRuntime(configArg, conditions);
   const results: EvalResult[] = [];
   let failedFiles = 0;
@@ -555,15 +595,9 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
           concurrency ?? envInt('AXL_EVAL_CONCURRENCY') ?? evalConfig.concurrency ?? 5;
 
         // --scorers: run a subset of scorers for a focused iteration loop.
-        // Single-file only — filtering by name across a glob/dir of evals with
-        // different scorer sets is ambiguous (a name present in one file and
-        // absent in another). Validate-then-filter so the error lists every
-        // available name.
+        // (The single-file guard already ran before the loop.) Validate-then-
+        // filter so the error lists every available name.
         if (scorerNames?.length) {
-          if (evalFiles.length > 1) {
-            console.error('Error: --scorers requires a single eval file (got multiple).');
-            process.exit(1);
-          }
           const available = evalConfig.scorers.map((s) => s.name);
           const unknown = scorerNames.filter((n) => !available.includes(n));
           if (unknown.length) {

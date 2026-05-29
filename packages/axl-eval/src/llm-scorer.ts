@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { Scorer, ScorerContext, ScorerResult } from './scorer.js';
+import { attachScorerErrorCost } from './scorer.js';
 import { extractJson, zodToJsonSchema } from '@axlsdk/axl';
 import type { Effort } from '@axlsdk/axl';
 
@@ -103,9 +104,7 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
         validated = schema.parse(parsed) as { score: number; [key: string]: unknown };
       } catch (err) {
         // Attach cost to all errors so the runner can capture it even on failure.
-        if (err && typeof err === 'object') {
-          (err as any).cost = responseCost;
-        }
+        attachScorerErrorCost(err, responseCost);
         // Duck-type check instead of instanceof to handle potential dual-instance
         // scenarios where two copies of zod are present in the dependency tree.
         if (
@@ -124,7 +123,7 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
           const error = new Error(
             `LLM scorer "${config.name}" returned an invalid response: ${messages}`,
           );
-          (error as any).cost = responseCost;
+          attachScorerErrorCost(error, responseCost);
           throw error;
         }
         throw err;

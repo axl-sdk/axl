@@ -1041,7 +1041,10 @@ export class AxlRuntime extends EventEmitter {
         captureTraces: options?.captureTraces,
       });
     } else {
-      // Default: use runtime.eval() which creates its own executeWorkflow
+      // Default: use runtime.eval() which creates its own executeWorkflow.
+      // NOTE: this structural shape must stay in sync with the one on eval()
+      // below and with EvalConfig in @axlsdk/eval (core can't import it). When
+      // adding an EvalConfig field, update both copies.
       result = await this.eval(
         entry.config as {
           workflow: string;

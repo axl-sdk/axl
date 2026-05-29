@@ -30,10 +30,13 @@ export function round(n: number): number {
  * the whole batch) while still using a simple worker-pool: a task that resolves
  * (even after internally handling an error) lets the pool continue draining.
  *
- * Concurrency is clamped to `[1, items.length]` in exactly one place here.
- * Callers must NOT pre-clamp with `Math.min(concurrency, items.length)` and
- * pass the result in — a user/env-supplied `0` would otherwise yield zero
- * workers while items remain and `Promise.all` would hang forever.
+ * Concurrency is clamped to `[1, items.length]` in exactly one place here, and
+ * non-finite / fractional values are coerced (NaN/Infinity/`2.5` → a sane
+ * integer). Callers must NOT pre-clamp with `Math.min(concurrency, items.length)`
+ * and pass the result in — a user/env-supplied `0` (or `NaN` from a config like
+ * `Number(process.env.X)`) would otherwise yield zero workers while items
+ * remain, so `Promise.all` resolves immediately leaving the results array full
+ * of holes (and the caller crashes on the `undefined` entries).
  */
 export async function mapWithConcurrency<T, R = void>(
   items: readonly T[],
@@ -41,7 +44,11 @@ export async function mapWithConcurrency<T, R = void>(
   task: (item: T, index: number) => Promise<R>,
 ): Promise<R[]> {
   const results = new Array<R>(items.length);
-  const workerCount = items.length === 0 ? 0 : Math.min(Math.max(1, concurrency), items.length);
+  // Coerce non-finite (NaN/Infinity) to the floor of 1, and floor fractional
+  // values, BEFORE clamping — `Math.max(1, NaN)` is `NaN`, which would make
+  // `Array.from({ length: NaN })` empty and silently run zero workers.
+  const requested = Number.isFinite(concurrency) ? Math.floor(concurrency) : 1;
+  const workerCount = items.length === 0 ? 0 : Math.min(Math.max(1, requested), items.length);
 
   let next = 0;
   async function runNext(): Promise<void> {

@@ -1,8 +1,8 @@
 import type { AxlRuntime } from '@axlsdk/axl';
 import type { EvalResult, EvalItem, EvalSummary } from './types.js';
 import type { Scorer, ScorerContext } from './scorer.js';
-import { normalizeScorerResult } from './scorer.js';
-import { computeStats, round, mapWithConcurrency } from './utils.js';
+import { computeStats, mapWithConcurrency } from './utils.js';
+import { scoreItem } from './score-item.js';
 import { randomUUID } from 'node:crypto';
 
 export type RescoreOptions = {
@@ -89,80 +89,17 @@ export async function rescore(
       scoreDetails: {},
     };
 
-    // Pre-seed keys in scorer-array order (deterministic JSON order + a
-    // deterministic `null` for any scorer skipped on abort). Same as runEval.
-    for (const s of scorers) {
-      item.scores[s.name] = null;
-      item.scoreDetails![s.name] = { score: null };
-    }
-    let itemScorerCost = 0;
-    const scorerErrorsByName: Record<string, string> = {};
-
-    await mapWithConcurrency(scorers, scorerConcurrency, async (scorer) => {
-      // rescore's serial loop had no in-loop abort check; add the same per-task
-      // guard runEval uses so cancellation short-circuits not-yet-started scorers.
-      if (options?.signal?.aborted) return;
-      const scorerStart = Date.now();
-      try {
-        const raw = await scorer.score(item.output, item.input, item.annotations, scorerContext);
-        const scorerResult = normalizeScorerResult(raw);
-
-        if (scorerResult.cost != null) {
-          itemScorerCost += scorerResult.cost;
-          totalCost += scorerResult.cost;
-        }
-
-        const scorerDuration = Date.now() - scorerStart;
-
-        if (
-          !Number.isFinite(scorerResult.score) ||
-          scorerResult.score < 0 ||
-          scorerResult.score > 1
-        ) {
-          scorerErrorsByName[scorer.name] =
-            `Scorer "${scorer.name}" returned out-of-range score ${scorerResult.score} for input ${JSON.stringify(item.input)}`;
-          item.scores[scorer.name] = null;
-          item.scoreDetails![scorer.name] = {
-            score: null,
-            metadata: scorerResult.metadata,
-            duration: scorerDuration,
-            cost: scorerResult.cost,
-          };
-        } else {
-          item.scores[scorer.name] = round(scorerResult.score);
-          item.scoreDetails![scorer.name] = {
-            score: round(scorerResult.score),
-            metadata: scorerResult.metadata,
-            duration: scorerDuration,
-            cost: scorerResult.cost,
-          };
-        }
-      } catch (err) {
-        // Aborted mid-flight → cancellation, not a scoring failure (see runEval).
-        if (options?.signal?.aborted || (err as { name?: string })?.name === 'AbortError') {
-          return;
-        }
-        const errCost = typeof (err as any)?.cost === 'number' ? (err as any).cost : undefined;
-        if (errCost != null) {
-          itemScorerCost += errCost;
-          totalCost += errCost;
-        }
-        scorerErrorsByName[scorer.name] =
-          `Scorer "${scorer.name}" threw: ${err instanceof Error ? err.message : String(err)}`;
-        item.scores[scorer.name] = null;
-        item.scoreDetails![scorer.name] = {
-          score: null,
-          duration: Date.now() - scorerStart,
-          cost: errCost,
-        };
-      }
-    });
-
-    const orderedErrors = scorers
-      .map((s) => scorerErrorsByName[s.name])
-      .filter((e): e is string => e != null);
-    if (orderedErrors.length > 0) item.scorerErrors = orderedErrors;
-    item.scorerCost = itemScorerCost > 0 ? itemScorerCost : undefined;
+    // Same shared scoring path as runEval — determinism, cancellation, and cost
+    // accounting all live in scoreItem. Keep the await off the `+=` line so the
+    // read-modify-write isn't split by suspension across concurrent items.
+    const itemScorerCost = await scoreItem(
+      item,
+      scorers,
+      scorerConcurrency,
+      scorerContext,
+      options?.signal,
+    );
+    totalCost += itemScorerCost;
     rescored[itemIndex] = item;
   }
 
@@ -192,8 +129,17 @@ export async function rescore(
       // Strip run group membership — rescored results are independent evaluations.
       // metadata.workflows is preserved via ...rest so the rescored result keeps
       // the same workflow attribution as the original.
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      const { runGroupId: _, runIndex: __, ...rest } = result.metadata;
+      //
+      // Also strip the scorer-filtered stamp: whether THIS rescore ran a subset
+      // is a property of the rescore invocation, not the source run. A full
+      // rescore of a `--scorers`-filtered run would otherwise inherit a stale
+      // `scorerFiltered: true` + a `scorersRun` listing scorers it didn't even
+      // use — falsely tripping the compare gate and the Studio banner.
+      const rest: Record<string, unknown> = { ...result.metadata };
+      delete rest.runGroupId;
+      delete rest.runIndex;
+      delete rest.scorerFiltered;
+      delete rest.scorersRun;
       const merged: Record<string, unknown> = {
         ...rest,
         rescored: true,

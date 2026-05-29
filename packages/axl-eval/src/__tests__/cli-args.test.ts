@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { parseEvalArgs, envInt, KNOWN_FLAGS } from '../cli-args.js';
+import { parseEvalArgs, envInt, KNOWN_FLAGS, VALUE_FLAGS } from '../cli-args.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -61,6 +61,14 @@ describe('parseEvalArgs()', () => {
   it('lists --concurrency and --scorers among the known flags', () => {
     expect(KNOWN_FLAGS.has('--concurrency')).toBe(true);
     expect(KNOWN_FLAGS.has('--scorers')).toBe(true);
+  });
+
+  it('every VALUE_FLAGS entry is also a KNOWN_FLAG (drift guard)', () => {
+    // A value-flag missing from KNOWN_FLAGS would be rejected as "unknown";
+    // one missing from VALUE_FLAGS would silently swallow its value into paths.
+    for (const f of VALUE_FLAGS) {
+      expect(KNOWN_FLAGS.has(f), `${f} must be in KNOWN_FLAGS`).toBe(true);
+    }
   });
 });
 

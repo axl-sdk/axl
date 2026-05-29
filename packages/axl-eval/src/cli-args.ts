@@ -16,6 +16,23 @@ export const KNOWN_FLAGS = new Set([
   '--scorers',
 ]);
 
+/**
+ * The subset of flags `parseEvalArgs` consumes a following value for. NOT every
+ * value-taking flag in the CLI: `--threshold` takes a value too but is parsed
+ * by `runCompare`'s own parser, not here. Every entry MUST also be in
+ * {@link KNOWN_FLAGS} — a value-flag missing from KNOWN_FLAGS would be rejected
+ * as "unknown", and one missing from VALUE_FLAGS would silently swallow its
+ * value into `paths`. A test asserts `VALUE_FLAGS ⊆ KNOWN_FLAGS`.
+ */
+export const VALUE_FLAGS = new Set([
+  '--output',
+  '--config',
+  '--conditions',
+  '--runs',
+  '--concurrency',
+  '--scorers',
+]);
+
 export type ParsedEvalArgs = {
   outputPath?: string;
   configArg?: string;
@@ -52,15 +69,6 @@ export function parseEvalArgs(args: string[]): ParsedEvalArgs {
   let scorerNames: string[] | undefined;
   const paths: string[] = [];
 
-  const VALUE_FLAGS = new Set([
-    '--output',
-    '--config',
-    '--conditions',
-    '--runs',
-    '--concurrency',
-    '--scorers',
-  ]);
-
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (VALUE_FLAGS.has(arg)) {
@@ -75,6 +83,9 @@ export function parseEvalArgs(args: string[]): ParsedEvalArgs {
       else if (arg === '--concurrency') {
         // Clamp to a floor of 1 with a warning (matches `--runs`' clamp ethos
         // but surfaces the typo). A `0` here would otherwise spawn zero workers.
+        // Note the intentional asymmetry with `envInt` above: an explicit flag
+        // typo is worth a warning, whereas a malformed ambient env var falls
+        // through silently to the next precedence tier.
         const n = parseInt(value, 10);
         if (!Number.isFinite(n) || n <= 0) {
           console.error(`[axl-eval] Ignoring invalid --concurrency "${value}"; using 1.`);

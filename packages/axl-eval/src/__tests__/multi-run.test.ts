@@ -207,7 +207,7 @@ describe('aggregateRuns()', () => {
     expect(summary.scorers.accuracy.failed).toBe(3);
   });
 
-  it('treats missing scored/failed as 0 (pre-0.17.10 artifacts)', () => {
+  it('treats missing scored/failed as 0 (pre-0.18.0 artifacts)', () => {
     // makeRun's default summary has no scored/failed fields.
     const summary = aggregateRuns([makeRun(), makeRun()]);
     expect(summary.scorers.accuracy.scored).toBe(0);

@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.18.0] - 2026-05-30
 
 This release makes the eval pipeline **faster and harder to fool**, and adds **proactive provider rate limiting**. An item's scorers now run concurrently (the dominant cost for LLM-judge evals), and a family of trust signals makes a thinned or broken eval impossible to miss — per-scorer `scored`/`failed` counts, two opt-in failure-rate gates, a total-workflow-wipeout guard, and dataset annotation-key drop detection — each surfaced in both the CLI and Studio. On the provider side, an opt-in client-side rate governor caps in-flight requests at the `fetchWithRetry` chokepoint so a large fan-out on a shared key stops storming the API. Plus the latest OpenAI/Anthropic flagships (`gpt-5.5`, Opus 4.8) and a launch-prep docs + visuals pass.
 

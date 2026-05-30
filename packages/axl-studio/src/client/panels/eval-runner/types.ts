@@ -30,7 +30,7 @@ export type ScorerStats = {
   p50: number;
   p95: number;
   /** Items that produced a valid numeric score (the sample size `mean` covers).
-   *  Optional — absent on pre-0.17.10 artifacts; fall back to recomputing from items. */
+   *  Optional — absent on pre-0.18.0 artifacts; fall back to recomputing from items. */
   scored?: number;
   /** Items whose scorer ran and failed (threw / out-of-range). A non-zero value
    *  means `mean` rests on a thinned sample. */
@@ -241,7 +241,7 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
     // empty sample yields `computeStats([]).mean === 0`, which would drag the
     // aggregate toward 0 even though the summed `scored`/`failed` already report
     // the thinning. We can only tell a zero-sample run apart when `scored` is
-    // present (≥0.17.10) — when it's absent (pre-0.17.10) we keep the run to
+    // present (≥0.18.0) — when it's absent (pre-0.18.0) we keep the run to
     // preserve the old behavior. If EVERY run scored nothing (subset empty),
     // fall back to all-runs means so we never divide by zero.
     const contributing = allRuns.filter((r) => {
@@ -258,7 +258,7 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
     // Sum per-run sample sizes (parallel to the server's aggregateRuns) so the
     // multi-run view can surface the same thinned-sample signal. Summed over ALL
     // runs — these describe the whole group, including the thinned ones excluded
-    // from the mean above. Read with `?? 0` — pre-0.17.10 runs predate these.
+    // from the mean above. Read with `?? 0` — pre-0.18.0 runs predate these.
     const scored = allRuns.reduce((s, r) => s + (r.summary?.scorers?.[name]?.scored ?? 0), 0);
     const failed = allRuns.reduce((s, r) => s + (r.summary?.scorers?.[name]?.failed ?? 0), 0);
     aggScorers[name] = {
@@ -443,8 +443,8 @@ export function collectScorerScores(
 
 /**
  * Resolve a scorer's `scored`/`failed` sample counts. Prefers the summary
- * fields (authoritative, set by the runner ≥0.17.10) and falls back to
- * recomputing from `items` for pre-0.17.10 artifacts — via the shared
+ * fields (authoritative, set by the runner ≥0.18.0) and falls back to
+ * recomputing from `items` for pre-0.18.0 artifacts — via the shared
  * `collectScorerScores` discriminator. `items` is omitted for multi-run
  * aggregates that carry no items, where the summed fields are authoritative.
  */

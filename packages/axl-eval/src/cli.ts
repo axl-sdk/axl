@@ -37,7 +37,7 @@ function refuseToGate(reason: string): never {
 
 /**
  * Read a scorer's `scored`/`failed` counts from a summary entry, falling back
- * to recomputing from `items` when the fields are absent (pre-0.17.10
+ * to recomputing from `items` when the fields are absent (pre-0.18.0
  * artifacts). `items` is omitted for multi-run summaries that carry no items —
  * there the fields are authoritative (summed by `aggregateRuns`).
  */

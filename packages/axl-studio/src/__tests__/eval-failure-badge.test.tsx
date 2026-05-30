@@ -61,7 +61,7 @@ describe('EvalSummaryTable failure badge', () => {
   });
 
   it('falls back to recomputing counts from items when summary fields are absent', () => {
-    // Pre-0.17.10 artifact: no scored/failed on the summary, but scoreDetails
+    // Pre-0.18.0 artifact: no scored/failed on the summary, but scoreDetails
     // still carries the duration discriminator on the items.
     render(
       <EvalSummaryTable

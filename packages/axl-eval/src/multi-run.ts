@@ -73,7 +73,7 @@ export function aggregateRuns(runs: EvalResult[]): MultiRunSummary {
     // A run where this scorer scored ZERO items has an empty-sample mean of 0
     // (computeStats([]) → 0), which would drag the aggregate mean-of-means toward
     // 0 as if it were a real 0.0 score. Exclude such runs from the mean/min/max/std
-    // — but only when we can tell: `scored` is absent on pre-0.17.10 artifacts, so
+    // — but only when we can tell: `scored` is absent on pre-0.18.0 artifacts, so
     // those runs are kept (old behavior). If EVERY run scored nothing, fall back to
     // all runs so we never divide by zero.
     const contributing = runs.filter((r) => {

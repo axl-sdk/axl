@@ -188,7 +188,7 @@ describe('buildMultiRunResult', () => {
     expect(result!._multiRun?.aggregate.scorers.acc.failed).toBe(3);
   });
 
-  it('treats missing scored/failed as 0 (pre-0.17.10 runs)', () => {
+  it('treats missing scored/failed as 0 (pre-0.18.0 runs)', () => {
     const result = buildMultiRunResult([makeRun(0), makeRun(1)]);
     expect(result!._multiRun?.aggregate.scorers.acc.scored).toBe(0);
     expect(result!._multiRun?.aggregate.scorers.acc.failed).toBe(0);
@@ -261,7 +261,7 @@ describe('buildMultiRunResult', () => {
     expect(acc.failed).toBe(10);
   });
 
-  it('keeps a zero-sample run in the mean when scored is absent (pre-0.17.10)', () => {
+  it('keeps a zero-sample run in the mean when scored is absent (pre-0.18.0)', () => {
     // Without `scored` we can't distinguish a true 0.0 mean from an
     // empty-sample 0 — keep the old behavior (include the run) so legacy
     // artifacts render unchanged.

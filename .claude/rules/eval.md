@@ -19,6 +19,14 @@ src/
 ```
 
 ## Conventions & footguns
+- **Function-typed members of `Scorer` use METHOD syntax, never a function-valued property.**
+  `EvalConfig.scorers` erases the generics to `Scorer<unknown, unknown, unknown>[]`, so a
+  concretely-typed scorer must stay assignable to that. Under `strictFunctionTypes`, method
+  params are bivariant (assignable) but property params are contravariant (NOT assignable) —
+  so `applies?(o, i, a): boolean` is correct and `applies?: (o, i, a) => boolean` silently
+  breaks every typed scorer passed to `defineEval` (the 0.18.1 regression). Same rule for any
+  future member on `Scorer`. The `scorer-assignability.test-d.ts` guard locks it in and is
+  compiled by the `typecheck` gate (`.test-d.ts` is *not* excluded by tsconfig; `.test.ts` is).
 - **`scoreItem()` is the single source of truth** for scoring — both `runEval` and
   `rescore` call it. Don't fork the loop.
 - **Cost-folding bug**: write `const c = await scoreItem(...); total += c;` — NEVER

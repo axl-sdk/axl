@@ -92,8 +92,12 @@ export type ScorerConfig<TOutput = unknown, TInput = unknown, TAnnotations = unk
   score: ScorerFn<TOutput, TInput, TAnnotations>;
   /** Optional applicability predicate — see {@link ScorerApplies}. When it
    *  returns `false`, the scorer is skipped for that item (counted as neither
-   *  scored nor failed). Omit to run on every item (the default). */
-  applies?: ScorerApplies<TOutput, TInput, TAnnotations>;
+   *  scored nor failed). Omit to run on every item (the default).
+   *
+   *  Declared with **method syntax** (not a function-valued property) for parity
+   *  with {@link Scorer.applies}, where the syntax is load-bearing: see the note
+   *  there and `__tests__/scorer-assignability.test-d.ts`. */
+  applies?(output: TOutput, input: TInput, annotations?: TAnnotations): boolean;
 };
 
 export type Scorer<TOutput = unknown, TInput = unknown, TAnnotations = unknown> = {
@@ -106,8 +110,17 @@ export type Scorer<TOutput = unknown, TInput = unknown, TAnnotations = unknown> 
     annotations?: TAnnotations,
     context?: ScorerContext,
   ): number | ScorerResult | Promise<number | ScorerResult>;
-  /** See {@link ScorerApplies}. Evaluated by the runner before {@link score}. */
-  applies?: ScorerApplies<TOutput, TInput, TAnnotations>;
+  /** See {@link ScorerApplies}. Evaluated by the runner before {@link score}.
+   *
+   *  Declared with **method syntax** (not a function-valued `ScorerApplies`
+   *  property) so its parameters are checked bivariantly, exactly like
+   *  {@link score}. `EvalConfig.scorers` erases the generics to
+   *  `Scorer<unknown, unknown, unknown>[]`; under `strictFunctionTypes` a
+   *  property would make those params contravariant, so a concretely-typed
+   *  `Scorer<…, TInput, TAnnotations>` would no longer be assignable to that
+   *  array (the 0.18.1 regression). `__tests__/scorer-assignability.test-d.ts`
+   *  locks this in and is compiled by the `typecheck` gate. */
+  applies?(output: TOutput, input: TInput, annotations?: TAnnotations): boolean;
 };
 
 export function scorer<TOutput = unknown, TInput = unknown, TAnnotations = unknown>(

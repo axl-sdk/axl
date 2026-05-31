@@ -396,13 +396,19 @@ export function evaluateScorerErrorRateGate(
     for (const side of ['baseline', 'candidate'] as const) {
       const scored = (side === 'baseline' ? s.baselineScored : s.candidateScored) ?? 0;
       const failed = (side === 'baseline' ? s.baselineFailed : s.candidateFailed) ?? 0;
+      const skipped = (side === 'baseline' ? s.baselineSkipped : s.candidateSkipped) ?? 0;
       const verdict = evaluateScorerTolerance(scored, failed, type, limit);
       if (verdict.zeroSample) {
         // attempted === 0 means the scorer produced no valid scores AND recorded
-        // no ran-and-failed attempts on this side — typically every one of its
-        // items errored in the workflow (or was skipped), not necessarily a fault
-        // of the scorer itself. Either way a mean over zero samples can't be certified.
-        return `scorer "${name}" has no scored items on ${side} (its items errored or were skipped) — cannot certify a mean over an empty sample.`;
+        // no ran-and-failed attempts on this side, so a mean over an empty sample
+        // can't be certified. Distinguish the likely cause: a fully `applies`-
+        // skipped scorer (N/A on every item — a scope/config issue, not a fault)
+        // vs. items that errored in the workflow.
+        const cause =
+          skipped > 0
+            ? `every one of its items was N/A (the \`applies\` predicate skipped all ${skipped})`
+            : `its items errored or produced no score`;
+        return `scorer "${name}" has no scored items on ${side} (${cause}) — cannot certify a mean over an empty sample.`;
       }
       if (verdict.exceeds) {
         const limitStr =

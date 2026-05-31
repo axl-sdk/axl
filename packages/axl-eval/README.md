@@ -295,7 +295,7 @@ Both are **type-aware**: deterministic scorers tolerate **zero** failures (a det
 Because skips are excluded rather than failed, two failure modes are surfaced as **advisories** (stderr, non-fatal) so a conditional scorer can't silently mislead:
 
 - **Fully N/A scorer** — if a scorer ends up applicable to *zero* items (an over-strict predicate, a dataset missing the flagged items, or a predicate that forgot to `return`), its mean is a meaningless empty-sample `0` and the failure-rate gate can't assess it. `axl-eval` prints a `NOTE` (the run still exits 0 — skips are legitimately conditional).
-- **Asymmetric skips in `compare`** — if the baseline and candidate skipped *different* counts of the same scorer, their means cover different applicable subsets, so a delta may be a sample mismatch rather than a real change. `axl-eval compare` prints a `NOTE` alongside the usual thinned-sample warning.
+- **Asymmetric skips in `compare`** — if the baseline and candidate applied a scorer to *different* item subsets (different N/A counts, or the same count of *different* items — detected as fewer items scored on both sides than either scored alone), their per-side means cover different subsets, so a delta may be a sample mismatch rather than a real change. `axl-eval compare` prints a `NOTE` alongside the usual thinned-sample warning. (Studio's compare view shows the same as a "paired n" note.)
 
 ```ts
 // eval file — fail this run if the judge errored on >10% of the items it ran against

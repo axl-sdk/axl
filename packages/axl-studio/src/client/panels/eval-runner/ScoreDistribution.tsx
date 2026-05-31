@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import { cn } from '../../lib/utils';
 import { scoreBarColor, collectScorerScores } from './types';
 import type { EvalItem } from './types';
+import { ScorerSampleChips } from './ScorerSampleChips';
 
 type Props = {
   items: EvalItem[];
@@ -22,29 +23,9 @@ function ScorerStrip({
   failed: number;
   skipped: number;
 }) {
-  // Amber "N failed" note when a scorer ran and failed on some items — the mean
-  // (and the ticks) cover only the surviving sample.
-  const failedNote =
-    failed > 0 ? (
-      <span
-        className="ml-1.5 px-1 py-0.5 text-[9px] font-medium rounded bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 align-middle"
-        title={`${failed} of ${scores.length + failed} scorer runs failed — only the ${scores.length} that succeeded are shown.`}
-      >
-        {failed} failed
-      </span>
-    ) : null;
-
-  // Neutral "N/A" note when a scorer's `applies` predicate skipped some items —
-  // not failures, so a muted/gray tone distinct from the amber failed note.
-  const skippedNote =
-    skipped > 0 ? (
-      <span
-        className="ml-1.5 px-1 py-0.5 text-[9px] font-medium rounded bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] align-middle"
-        title={`${skipped} item(s) not applicable to this scorer (applies predicate returned false) — excluded from the mean and the failure rate`}
-      >
-        N/A: {skipped}
-      </span>
-    ) : null;
+  // Amber "N failed" / muted "N/A" notes — single source of truth in
+  // ScorerSampleChips (simple label form: no `scored` prop ⇒ "{failed} failed").
+  const notes = <ScorerSampleChips failed={failed} skipped={skipped} />;
 
   if (scores.length === 0) {
     return (
@@ -56,8 +37,7 @@ function ScorerStrip({
           {name}
         </span>
         <span className="text-xs text-[hsl(var(--muted-foreground))]">No valid scores</span>
-        {failedNote}
-        {skippedNote}
+        {notes}
       </div>
     );
   }
@@ -66,8 +46,7 @@ function ScorerStrip({
     <div className="flex items-center gap-3">
       <span className="w-28 text-xs font-mono truncate" title={name}>
         {name}
-        {failedNote}
-        {skippedNote}
+        {notes}
       </span>
       <div className="flex-1 h-5 relative bg-[hsl(var(--secondary))] rounded">
         {/* Scale markers */}

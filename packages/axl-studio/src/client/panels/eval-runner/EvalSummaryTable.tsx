@@ -1,6 +1,7 @@
 import { cn, formatCost, formatDuration } from '../../lib/utils';
 import { scoreBarColor, scoreTextColor, getScorerSampleCounts } from './types';
 import type { EvalItem, EvalResultData } from './types';
+import { ScorerSampleChips } from './ScorerSampleChips';
 
 type Props = {
   summary: EvalResultData['summary'];
@@ -52,22 +53,7 @@ export function EvalSummaryTable({ summary, items, totalCost, scorerTypes }: Pro
                         LLM
                       </span>
                     )}
-                    {failed > 0 && (
-                      <span
-                        className="ml-1.5 px-1 py-0.5 text-[9px] font-medium rounded bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 align-middle"
-                        title={`${failed} of ${scored + failed} scorer runs failed — the mean is computed over the ${scored} that succeeded.`}
-                      >
-                        {scored}/{scored + failed} scored, {failed} failed
-                      </span>
-                    )}
-                    {skipped > 0 && (
-                      <span
-                        className="ml-1.5 px-1 py-0.5 text-[9px] font-medium rounded bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] align-middle"
-                        title={`${skipped} item(s) not applicable to this scorer (applies predicate returned false) — excluded from the mean and the failure rate`}
-                      >
-                        N/A: {skipped}
-                      </span>
-                    )}
+                    <ScorerSampleChips failed={failed} skipped={skipped} scored={scored} />
                   </td>
                   {hasValidScores ? (
                     <>

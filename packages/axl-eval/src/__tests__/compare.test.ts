@@ -1474,5 +1474,29 @@ describe('evalCompare()', () => {
       // 4/4 = 100% > any rate → refuses (over-rate fires before zero-sample here).
       expect(evaluateScorerErrorRateGate(cmp, 0.5)).toMatch(/scorer "accuracy"/);
     });
+
+    it('refuses a fully `applies`-skipped side with an N/A-specific message (not "errored")', () => {
+      const skippedItem = (q: string) => ({
+        input: { q },
+        output: 'x',
+        scores: { accuracy: null },
+        scoreDetails: { accuracy: { score: null, skipped: true } },
+      });
+      const baseline = makeEvalResult({
+        id: 'b',
+        items: [okItem('1', 0.9), okItem('2', 0.8)],
+        metadata: { workflows: ['t'], scorerTypes: { accuracy: 'llm' } },
+      });
+      // Candidate skipped accuracy on every item → zeroSample, but as N/A, not error.
+      const candidate = makeEvalResult({
+        id: 'c',
+        items: [skippedItem('1'), skippedItem('2')],
+        metadata: { workflows: ['t'], scorerTypes: { accuracy: 'llm' } },
+      });
+      const reason = evaluateScorerErrorRateGate(evalCompare(baseline, candidate), 0.5);
+      expect(reason).toMatch(/no scored items on candidate/);
+      expect(reason).toMatch(/applies. predicate skipped all 2/);
+      expect(reason).not.toMatch(/errored/);
+    });
   });
 });

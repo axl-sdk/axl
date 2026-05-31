@@ -752,7 +752,13 @@ export function EvalCompareView({
                       <td
                         className={cn(
                           'px-3 py-2.5 text-right font-mono',
-                          scoreTextColor(stats.baselineMean),
+                          // A side that scored zero items (e.g. fully skipped)
+                          // aggregates to mean 0 — render it neutral so it
+                          // doesn't read as a red "scored zero". The
+                          // PairedSampleNote below explains the skip context.
+                          stats.baselineScored === 0
+                            ? 'text-[hsl(var(--muted-foreground))]'
+                            : scoreTextColor(stats.baselineMean),
                         )}
                       >
                         {stats.baselineMean.toFixed(3)}
@@ -760,7 +766,9 @@ export function EvalCompareView({
                       <td
                         className={cn(
                           'px-3 py-2.5 text-right font-mono',
-                          scoreTextColor(stats.candidateMean),
+                          stats.candidateScored === 0
+                            ? 'text-[hsl(var(--muted-foreground))]'
+                            : scoreTextColor(stats.candidateMean),
                         )}
                       >
                         {stats.candidateMean.toFixed(3)}

@@ -11,6 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { EvalSummaryTable } from '../client/panels/eval-runner/EvalSummaryTable';
 import { ScoreDistribution } from '../client/panels/eval-runner/ScoreDistribution';
+import { ScorerSampleChips } from '../client/panels/eval-runner/ScorerSampleChips';
 import { collectScorerScores, getScorerSampleCounts } from '../client/panels/eval-runner/types';
 import type { EvalItem, EvalResultData } from '../client/panels/eval-runner/types';
 
@@ -154,6 +155,20 @@ describe('ScoreDistribution skipped (N/A) note', () => {
       <ScoreDistribution items={[okItem('1', 0.9), okItem('2', 0.9)]} scorerNames={['acc']} />,
     );
     expect(screen.queryByText(/N\/A:/)).not.toBeInTheDocument();
+  });
+});
+
+describe('ScorerSampleChips failed-label form (rich vs simple)', () => {
+  it('renders the rich label when scored is provided', () => {
+    render(<ScorerSampleChips failed={1} scored={2} />);
+    expect(screen.getByText('2/3 scored, 1 failed')).toBeInTheDocument();
+  });
+
+  it('renders the simple label when scored is omitted', () => {
+    render(<ScorerSampleChips failed={2} />);
+    expect(screen.getByText('2 failed')).toBeInTheDocument();
+    // Simple form must not synthesize a "scored" count.
+    expect(screen.queryByText(/scored,/)).not.toBeInTheDocument();
   });
 });
 

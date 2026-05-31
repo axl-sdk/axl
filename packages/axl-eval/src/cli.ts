@@ -325,15 +325,23 @@ async function runCompare(args: string[]) {
       );
     }
     // Conditional scorers (`applies`) skip N/A items. Skips never move the
-    // delta (excluded from both means), but if the two sides skipped DIFFERENT
-    // counts they scored different item subsets — so a delta can reflect a
-    // sample mismatch, not a real change. Note it (advisory only; not a gate).
+    // delta (excluded from both means), but they make the two per-side means
+    // cover different applicable subsets when the sides skipped different COUNTS,
+    // OR the same count of DIFFERENT items — the latter shows up as a paired
+    // shortfall: fewer items scored on BOTH sides (`n`) than either side scored
+    // alone. (`bSkipped !== cSkipped` alone would miss the disjoint-but-equal
+    // case.) Note it (advisory only; not a gate; failures are covered by the
+    // separate WARNING above).
     const bSkipped = s.baselineSkipped ?? 0;
     const cSkipped = s.candidateSkipped ?? 0;
-    if (bSkipped !== cSkipped) {
+    const pairedN = s.n ?? 0;
+    const minScored = Math.min(s.baselineScored ?? 0, s.candidateScored ?? 0);
+    const skipsDiverge =
+      (bSkipped > 0 || cSkipped > 0) && (bSkipped !== cSkipped || pairedN < minScored);
+    if (skipsDiverge) {
       console.error(
-        `[axl-eval] NOTE: scorer "${name}" skipped a different number of items per side ` +
-          `(baseline ${bSkipped} N/A, candidate ${cSkipped} N/A); ` +
+        `[axl-eval] NOTE: scorer "${name}" applies to different subsets per side ` +
+          `(baseline ${bSkipped} N/A, candidate ${cSkipped} N/A; ${pairedN} item(s) scored on both); ` +
           `the two means cover different applicable subsets, so compare the delta with care.`,
       );
     }

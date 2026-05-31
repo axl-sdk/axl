@@ -28,7 +28,13 @@ import { EvalItemDetail } from '../client/panels/eval-runner/EvalItemDetail';
 import { EvalItemList } from '../client/panels/eval-runner/EvalItemList';
 import { EvalCompareItemTable } from '../client/panels/eval-runner/EvalCompareItemTable';
 import { ScorerSampleChips } from '../client/panels/eval-runner/ScorerSampleChips';
-import type { EvalItem, EvalResultData } from '../client/panels/eval-runner/types';
+import { AggregateScorerRow } from '../client/panels/eval-runner/AggregateScorerRow';
+import { EvalCompareView } from '../client/panels/eval-runner/EvalCompareView';
+import type {
+  ComparisonResult,
+  EvalItem,
+  EvalResultData,
+} from '../client/panels/eval-runner/types';
 
 const okItem = (q: string, score: number): EvalItem => ({
   input: { q },
@@ -185,5 +191,130 @@ describe('EvalCompareItemTable — skipped cell is non-comparable', () => {
     // candidate - baseline = 0.6 - 0.8 = -0.200, a genuine drop.
     expect(screen.getByText('-0.200')).toBeInTheDocument();
     expect(screen.queryByText('N/A')).not.toBeInTheDocument();
+  });
+
+  // FINDING 4 — a ran-and-failed null (duration recorded, not skipped) must
+  // carry a "Scorer failed" tooltip on its dash, distinct from a cancelled null
+  // (no tooltip) and a skip ("N/A"). Both sides covered.
+  it('tags a ran-and-failed candidate cell with a "Scorer failed" tooltip (still a dash)', () => {
+    const baseline = makeResult([okItem('q1', 0.8)]);
+    const candidate = makeResult([failedItem('q1')]); // null score WITH duration
+    render(
+      <EvalCompareItemTable baseline={baseline} candidate={candidate} scorerNames={['acc']} />,
+    );
+    expect(screen.getByTitle('Scorer failed')).toBeInTheDocument();
+    // Not a skip — no N/A cell.
+    expect(screen.queryByText('N/A')).not.toBeInTheDocument();
+  });
+
+  it('tags a ran-and-failed baseline cell with a "Scorer failed" tooltip', () => {
+    const baseline = makeResult([failedItem('q1')]);
+    const candidate = makeResult([okItem('q1', 0.8)]);
+    render(
+      <EvalCompareItemTable baseline={baseline} candidate={candidate} scorerNames={['acc']} />,
+    );
+    expect(screen.getByTitle('Scorer failed')).toBeInTheDocument();
+  });
+
+  it('leaves a cancelled null (no duration, not skipped) untitled', () => {
+    const cancelledItem = (q: string): EvalItem => ({
+      input: { q },
+      output: 'x',
+      scores: { acc: null },
+      scoreDetails: { acc: { score: null } }, // no duration, no skipped marker
+    });
+    const baseline = makeResult([okItem('q1', 0.8)]);
+    const candidate = makeResult([cancelledItem('q1')]);
+    render(
+      <EvalCompareItemTable baseline={baseline} candidate={candidate} scorerNames={['acc']} />,
+    );
+    // A cancelled null gets neither "Scorer failed" nor "N/A".
+    expect(screen.queryByTitle('Scorer failed')).not.toBeInTheDocument();
+  });
+});
+
+// FINDING 1 — the multi-run Per-Scorer Aggregate row (extracted to
+// AggregateScorerRow) must not miscolor a fully-skipped scorer (scored 0,
+// mean/min/max = 0) as a red 0.000; it shows "No valid scores" like the
+// single-run summary.
+describe('AggregateScorerRow — fully-skipped scorer parity', () => {
+  const renderRow = (props: Parameters<typeof AggregateScorerRow>[0]) =>
+    render(
+      <table>
+        <tbody>
+          <AggregateScorerRow {...props} />
+        </tbody>
+      </table>,
+    );
+
+  it('renders "No valid scores" when the scorer scored zero items', () => {
+    renderRow({
+      name: 'acc',
+      stats: { mean: 0, std: 0, min: 0, max: 0, scored: 0, failed: 0, skipped: 3 },
+    });
+    expect(screen.getByText('No valid scores')).toBeInTheDocument();
+    // No red 0.000 mean.
+    expect(screen.queryByText('0.000')).not.toBeInTheDocument();
+    // The N/A chip still surfaces the skip count.
+    expect(screen.getByText('N/A: 3')).toBeInTheDocument();
+  });
+
+  it('renders the stat columns normally when the scorer scored at least one item', () => {
+    renderRow({
+      name: 'acc',
+      stats: { mean: 0.9, std: 0.01, min: 0.88, max: 0.92, scored: 3, failed: 0, skipped: 0 },
+    });
+    expect(screen.queryByText('No valid scores')).not.toBeInTheDocument();
+    expect(screen.getByText('0.900')).toBeInTheDocument();
+  });
+});
+
+// FINDING 2 — a per-side mean of 0 from a fully-skipped scorer must NOT render
+// red in the compare summary table; it renders neutral muted.
+describe('EvalCompareView — per-side mean not red when scored 0', () => {
+  const makeSide = (items: EvalItem[]): EvalResultData => ({
+    id: 'r',
+    dataset: 'ds',
+    timestamp: '2026-05-31T00:00:00.000Z',
+    totalCost: 0,
+    duration: 0,
+    items,
+    summary: {
+      count: items.length,
+      failures: 0,
+      scorers: { acc: { mean: 0, min: 0, max: 0, p50: 0, p95: 0 } },
+    },
+  });
+
+  const compareResult: ComparisonResult = {
+    regressions: [],
+    improvements: [],
+    summary: '',
+    scorers: {
+      acc: {
+        baselineMean: 0,
+        candidateMean: 0.9,
+        delta: 0.9,
+        deltaPercent: 0,
+        // Baseline fully skipped this scorer; candidate scored it.
+        baselineScored: 0,
+        candidateScored: 3,
+      },
+    },
+  };
+
+  it('colors a scored-0 side mean neutral (muted), not red', () => {
+    const baseline = makeSide([skippedItem('q1')]);
+    const candidate = makeSide([okItem('q1', 0.9)]);
+    render(
+      <EvalCompareView compareResult={compareResult} baseline={baseline} candidate={candidate} />,
+    );
+    // The baseline 0.000 cell must carry the muted class, not text-red-*.
+    const cells = screen.getAllByText('0.000');
+    const baselineMeanCell = cells.find((el) =>
+      el.className.includes('text-[hsl(var(--muted-foreground))]'),
+    );
+    expect(baselineMeanCell).toBeTruthy();
+    expect(baselineMeanCell!.className).not.toMatch(/text-red/);
   });
 });

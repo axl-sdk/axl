@@ -18,7 +18,7 @@ import type { EvalHistoryEntry } from '../../lib/types';
 import { cn, formatCost, formatDuration, formatTokens, extractLabel } from '../../lib/utils';
 import type { RegisteredEval } from '../../lib/types';
 import type { EvalResultData, ComparisonResult } from './types';
-import { ScorerSampleChips } from './ScorerSampleChips';
+import { AggregateScorerRow } from './AggregateScorerRow';
 import {
   scoreTextColor,
   scoreBgTint,
@@ -583,14 +583,6 @@ export function EvalRunnerPanel() {
     aggSortField === field ? (aggSortDir === 'desc' ? ' \u25BC' : ' \u25B2') : '';
 
   // CV-based color for Std column (lower is better)
-  const stdTextColor = (std: number, mean: number): string => {
-    if (mean === 0) return 'text-[hsl(var(--muted-foreground))]';
-    const cv = std / mean;
-    if (cv < 0.02) return 'text-[hsl(var(--muted-foreground))]';
-    if (cv <= 0.05) return 'text-amber-600 dark:text-amber-400';
-    return 'text-red-600 dark:text-red-400';
-  };
-
   const WORST_ITEMS_LIMIT = 5;
 
   // Worst items by average score across all scorers (from the representative currentResult)
@@ -1021,55 +1013,12 @@ export function EvalRunnerPanel() {
                           </thead>
                           <tbody>
                             {sortedAggScorerEntries.map(([name, s]) => (
-                              <tr
+                              <AggregateScorerRow
                                 key={name}
-                                className="border-b border-[hsl(var(--border))] last:border-b-0"
-                              >
-                                <td className="px-4 py-2.5 font-mono">
-                                  {name}
-                                  {scorerTypes?.[name] === 'llm' && (
-                                    <span
-                                      className="ml-1.5 px-1 py-0.5 text-[9px] font-medium rounded bg-purple-100 text-purple-600 dark:bg-purple-900/30 dark:text-purple-400 align-middle"
-                                      title="LLM scorer — scores may vary between runs"
-                                    >
-                                      LLM
-                                    </span>
-                                  )}
-                                  <ScorerSampleChips failed={s.failed} skipped={s.skipped} />
-                                </td>
-                                <td
-                                  className={cn(
-                                    'px-3 py-2.5 text-right font-mono font-medium',
-                                    scoreTextColor(s.mean),
-                                  )}
-                                >
-                                  {s.mean.toFixed(3)}
-                                </td>
-                                <td
-                                  className={cn(
-                                    'px-3 py-2.5 text-right font-mono',
-                                    stdTextColor(s.std, s.mean),
-                                  )}
-                                >
-                                  {s.std.toFixed(3)}
-                                </td>
-                                <td
-                                  className={cn(
-                                    'px-3 py-2.5 text-right font-mono',
-                                    scoreTextColor(s.min),
-                                  )}
-                                >
-                                  {s.min.toFixed(3)}
-                                </td>
-                                <td
-                                  className={cn(
-                                    'px-3 py-2.5 text-right font-mono',
-                                    scoreTextColor(s.max),
-                                  )}
-                                >
-                                  {s.max.toFixed(3)}
-                                </td>
-                              </tr>
+                                name={name}
+                                stats={s}
+                                isLlm={scorerTypes?.[name] === 'llm'}
+                              />
                             ))}
                           </tbody>
                         </table>

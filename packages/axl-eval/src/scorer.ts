@@ -70,13 +70,15 @@ export type ScorerFn<TOutput, TInput, TAnnotations> = (
  * predicate that THROWS is a bug, not a skip — it's recorded as a scorer
  * failure, never silently swallowed.
  *
- * The verdict is coerced with `!verdict`, so any falsy return (`false`, `0`,
- * `''`, `null`, `undefined`) skips and any truthy return runs — this supports
- * idioms like `(o, i, a) => a.constraints?.length`. For a correctly-typed
- * `boolean` predicate this is exactly `true`=run / `false`=skip. A predicate
- * that accidentally never returns (always `undefined`) therefore skips EVERY
- * item — but that surfaces conspicuously as a non-zero `skipped` count (the
- * Studio "N/A" chip) rather than as a silently green mean.
+ * The contract is `=> boolean`: return `true` to run, `false` to skip. The
+ * runtime is defensively lenient — it coerces with `!verdict`, so a stray falsy
+ * value (a predicate that forgot to `return`) skips rather than crashes — but
+ * authors should return a real boolean. When deriving from a truthy value,
+ * coerce it yourself: `(o, i, a) => !!a.constraints?.length`, not
+ * `=> a.constraints?.length` (which is `number | undefined`, a type error). A
+ * predicate that accidentally never returns therefore skips EVERY item — but
+ * that surfaces conspicuously as a non-zero `skipped` count (the Studio "N/A"
+ * chip), not as a silently green mean.
  */
 export type ScorerApplies<TOutput, TInput, TAnnotations> = (
   output: TOutput,

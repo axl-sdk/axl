@@ -24,6 +24,13 @@ type SortedItem = {
   baselineSkipped: boolean;
   candidateSkipped: boolean;
   /**
+   * A side's null score came from a scorer that RAN and FAILED (threw /
+   * out-of-range) rather than being skipped or cancelled. Discriminated by a
+   * recorded `scoreDetails[name].duration` — same rule as EvalItemList.
+   */
+  baselineFailed: boolean;
+  candidateFailed: boolean;
+  /**
    * True when either side is skipped — the pair is non-comparable, so the delta
    * is meaningless and must not render as a regression/improvement.
    */
@@ -103,8 +110,14 @@ export function EvalCompareItemTable({
     for (let i = 0; i < itemCount; i++) {
       const bScore = baseline.items[i].scores[sortScorer] ?? null;
       const cScore = candidate.items[i].scores[sortScorer] ?? null;
-      const baselineSkipped = baseline.items[i].scoreDetails?.[sortScorer]?.skipped === true;
-      const candidateSkipped = candidate.items[i].scoreDetails?.[sortScorer]?.skipped === true;
+      const bDetail = baseline.items[i].scoreDetails?.[sortScorer];
+      const cDetail = candidate.items[i].scoreDetails?.[sortScorer];
+      const baselineSkipped = bDetail?.skipped === true;
+      const candidateSkipped = cDetail?.skipped === true;
+      // A null score that is NOT a skip but HAS a recorded duration ran-and-failed
+      // (vs. a cancelled null with neither). Same discriminator as EvalItemList.
+      const baselineFailed = bScore == null && !baselineSkipped && bDetail?.duration != null;
+      const candidateFailed = cScore == null && !candidateSkipped && cDetail?.duration != null;
       const nonComparable = baselineSkipped || candidateSkipped;
       // Skipped cells are non-comparable — never synthesize a delta that would
       // read as a regression/improvement. A genuine null on either side already
@@ -135,6 +148,8 @@ export function EvalCompareItemTable({
         delta,
         baselineSkipped,
         candidateSkipped,
+        baselineFailed,
+        candidateFailed,
         nonComparable,
         runDeltas,
       });
@@ -308,7 +323,9 @@ export function EvalCompareItemTable({
                         ) : item.baselineSkipped ? (
                           <span title="Not applicable (N/A)">N/A</span>
                         ) : (
-                          '\u2014'
+                          <span title={item.baselineFailed ? 'Scorer failed' : undefined}>
+                            {'\u2014'}
+                          </span>
                         )}
                       </td>
                       <td
@@ -325,7 +342,9 @@ export function EvalCompareItemTable({
                         ) : item.candidateSkipped ? (
                           <span title="Not applicable (N/A)">N/A</span>
                         ) : (
-                          '\u2014'
+                          <span title={item.candidateFailed ? 'Scorer failed' : undefined}>
+                            {'\u2014'}
+                          </span>
                         )}
                       </td>
                       <td
@@ -337,7 +356,11 @@ export function EvalCompareItemTable({
                       >
                         <div className="font-mono">
                           {item.nonComparable ? (
-                            <span title="Not comparable \u2014 a side was skipped (N/A) for this scorer">
+                            <span
+                              title={
+                                'Not comparable \u2014 a side was skipped (N/A) for this scorer'
+                              }
+                            >
                               N/A
                             </span>
                           ) : item.delta !== 0 ? (

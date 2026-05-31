@@ -5,7 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.18.1] - 2026-05-31
+
+Conditional scorers: scope a scorer to a subset of items with an `applies` predicate, so a judge that doesn't apply to every item no longer pollutes the mean or trips the failure-rate gate — and an `llmScorer` skips the provider call entirely.
 
 ### Added
 - **Conditional scorers (`applies`).** `scorer()` and `llmScorer()` take an optional `applies?: (output, input, annotations?) => boolean` that scopes a scorer to a subset of items (e.g. a refusal judge only for refusal-expected items). When it returns `false` the scorer is skipped — for an `llmScorer`, **no provider call is made** — and the item counts as neither `scored` nor `failed`, so it's excluded from the mean *and* the failure-rate gate denominator (`failOnScorerErrorRate`, `compare --max-scorer-error-rate`). This replaces the old "return `NaN`" hack (see _Deprecated_). Skips render as a neutral "N/A" wherever a score shows — the CLI table and Studio's run / multi-run / compare views — via `ScorerDetail.skipped` and a per-scorer `EvalSummary.scorers[].skipped` count; in `compare`, a "paired n" note flags when the two sides scored different subsets. A throwing predicate is a failure, not a skip. New export: `ScorerApplies`. Purely additive.

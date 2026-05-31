@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.18.2] - 2026-05-31
 
 ### Fixed
 - **Typed scorers compile again under `strict` (regression from 0.18.1).** The `applies?` field added to `Scorer` / `ScorerConfig` in 0.18.1 was declared as a function-valued **property**, whose parameters `strictFunctionTypes` checks contravariantly. That broke assignability of a concretely-typed `Scorer<…, TInput, TAnnotations>` to the `Scorer<unknown, unknown, unknown>[]` element type of `EvalConfig.scorers` — so any scorer built with concrete generics failed to typecheck when passed to `defineEval`, whether or not it used `applies`. `applies` is now declared with **method syntax** (like `score`), which TS checks bivariantly, restoring 0.18.0 assignability. Runtime behavior is unchanged and the public `ScorerApplies` type alias stays (for authoring/documentation). A `*.test-d.ts` guard, compiled by the `typecheck` CI gate, now locks the assignment in. (0.18.1's "Purely additive" note was incorrect for typed scorers under `strict`.)

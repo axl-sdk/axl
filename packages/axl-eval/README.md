@@ -292,6 +292,11 @@ Both are **type-aware**: deterministic scorers tolerate **zero** failures (a det
 
 **Skipped items don't count against either gate.** The failure rate is `failed / (scored + failed)` — items a scorer's `applies` predicate skipped land in neither bucket, so they're excluded from the denominator. This is the supported way to scope a conditional scorer (a refusal judge that only runs on refusal-expected items, say) to its applicable subset without polluting the trust signal. **Do not** return `NaN` for inapplicable items: the gate (correctly) treats a non-finite score as a real failure, so a `NaN`-skipping deterministic scorer trips the zero-tolerance deterministic gate on every skipped item. Use [`applies`](#conditional-scorers-applies) instead.
 
+Because skips are excluded rather than failed, two failure modes are surfaced as **advisories** (stderr, non-fatal) so a conditional scorer can't silently mislead:
+
+- **Fully N/A scorer** — if a scorer ends up applicable to *zero* items (an over-strict predicate, a dataset missing the flagged items, or a predicate that forgot to `return`), its mean is a meaningless empty-sample `0` and the failure-rate gate can't assess it. `axl-eval` prints a `NOTE` (the run still exits 0 — skips are legitimately conditional).
+- **Asymmetric skips in `compare`** — if the baseline and candidate skipped *different* counts of the same scorer, their means cover different applicable subsets, so a delta may be a sample mismatch rather than a real change. `axl-eval compare` prints a `NOTE` alongside the usual thinned-sample warning.
+
 ```ts
 // eval file — fail this run if the judge errored on >10% of the items it ran against
 export default { workflow: 'qa', dataset: ds, scorers: [judge], failOnScorerErrorRate: 0.1 };

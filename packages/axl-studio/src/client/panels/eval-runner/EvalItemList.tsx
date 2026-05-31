@@ -262,14 +262,28 @@ export function EvalItemList({
                     </td>
                     {scorerNames.map((name) => {
                       const score = item.scores[name];
+                      const detail = item.scoreDetails?.[name];
+                      const skipped = detail?.skipped === true;
                       return (
                         <td key={name} className="text-right px-2 py-2 font-mono">
                           {score != null ? (
                             <span className={cn('font-medium tabular-nums', scoreTextColor(score))}>
                               {score.toFixed(2)}
                             </span>
+                          ) : skipped ? (
+                            <span
+                              className="text-[10px] text-[hsl(var(--muted-foreground))]"
+                              title="Not applicable (N/A)"
+                            >
+                              N/A
+                            </span>
                           ) : (
-                            <span className="text-[hsl(var(--muted-foreground))]">—</span>
+                            <span
+                              className="text-[hsl(var(--muted-foreground))]"
+                              title={detail?.duration != null ? 'Scorer failed' : undefined}
+                            >
+                              —
+                            </span>
                           )}
                         </td>
                       );

@@ -150,6 +150,7 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2 py-3 px-4 rounded-xl bg-[hsl(var(--muted))]/50">
           {scorerNames.map((name) => {
             const score = item.scores[name];
+            const skipped = item.scoreDetails?.[name]?.skipped === true;
             return (
               <div key={name} className="flex items-center gap-2">
                 <span className="text-xs text-[hsl(var(--muted-foreground))]">{name}</span>
@@ -171,6 +172,13 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
                       {score.toFixed(2)}
                     </span>
                   </div>
+                ) : skipped ? (
+                  <span
+                    className="text-xs text-[hsl(var(--muted-foreground))] font-mono"
+                    title="Not applicable (N/A)"
+                  >
+                    N/A
+                  </span>
                 ) : (
                   <span className="text-xs text-[hsl(var(--muted-foreground))] font-mono">—</span>
                 )}
@@ -227,6 +235,7 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
             const score = item.scores[name];
             const detail = item.scoreDetails?.[name];
             const scorerError = scorerErrors.find((err) => err.includes(`"${name}"`));
+            const skipped = detail?.skipped === true;
 
             return (
               <div
@@ -246,7 +255,15 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
                       {score.toFixed(3)}
                     </span>
                   )}
-                  {score == null && !scorerError && (
+                  {score == null && skipped && (
+                    <span
+                      className="px-2 py-0.5 rounded-full text-xs font-mono bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))]"
+                      title="Skipped — the scorer's `applies` predicate returned false for this item (excluded from the mean and failure rate)"
+                    >
+                      N/A
+                    </span>
+                  )}
+                  {score == null && !skipped && !scorerError && (
                     <span className="px-2 py-0.5 rounded-full text-xs font-mono bg-[hsl(var(--secondary))] text-[hsl(var(--muted-foreground))]">
                       null
                     </span>
@@ -266,8 +283,16 @@ export function EvalItemDetail({ item, itemIndex, scorerNames, onBack }: Props) 
                 </div>
 
                 {/* Scorer body */}
-                {(detail?.metadata || scorerError) && (
+                {(detail?.metadata || scorerError || skipped) && (
                   <div className="px-4 py-3 space-y-2">
+                    {/* Skipped explanation */}
+                    {skipped && (
+                      <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                        Not applicable — the scorer&rsquo;s <code>applies</code> predicate returned
+                        false for this item, so it was skipped (excluded from the mean and the
+                        failure rate).
+                      </p>
+                    )}
                     {/* Reasoning */}
                     {detail?.metadata &&
                       typeof detail.metadata.reasoning === 'string' &&

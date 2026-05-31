@@ -246,6 +246,16 @@ export type EvalComparison = {
       baselineFailed?: number;
       candidateScored?: number;
       candidateFailed?: number;
+      /**
+       * Per-side `applies`-skipped (N/A) counts over the same truncated pool.
+       * Skips are excluded from both the mean and the failure-rate denominator,
+       * so they never move the delta — but a side that skipped items scored a
+       * different subset than a side that didn't, so surfacing the count lets a
+       * consumer explain a delta that's really a sample mismatch rather than a
+       * regression.
+       */
+      baselineSkipped?: number;
+      candidateSkipped?: number;
     }
   >;
   timing?: {

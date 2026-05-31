@@ -1326,6 +1326,46 @@ describe('evalCompare()', () => {
       expect(c.baselineFailed).toBe(0);
       expect(c.candidateFailed).toBe(0);
     });
+
+    it('reports per-side skipped (N/A) counts and excludes them from scored/failed', () => {
+      // An `applies`-skipped item: null score WITH a `skipped` marker and NO
+      // duration — must count as neither scored nor failed on either side.
+      const skippedItem = (q: string) => ({
+        input: { q },
+        output: 'x',
+        scores: { accuracy: null },
+        scoreDetails: { accuracy: { score: null, skipped: true } },
+      });
+      const baseline = makeEvalResult({
+        id: 'b',
+        items: [okItem('1', 0.8), okItem('2', 0.6), skippedItem('3')],
+        summary: {
+          count: 3,
+          failures: 0,
+          scorers: { accuracy: { mean: 0.7, min: 0.6, max: 0.8, p50: 0.7, p95: 0.8 } },
+        },
+      });
+      // Candidate skips MORE items than baseline — the means then cover different
+      // applicable subsets (the asymmetric-skip case the CLI warns about).
+      const candidate = makeEvalResult({
+        id: 'c',
+        items: [okItem('1', 0.9), skippedItem('2'), skippedItem('3')],
+        summary: {
+          count: 3,
+          failures: 0,
+          scorers: { accuracy: { mean: 0.9, min: 0.9, max: 0.9, p50: 0.9, p95: 0.9 } },
+        },
+      });
+
+      const c = evalCompare(baseline, candidate).scorers.accuracy;
+      expect(c.baselineScored).toBe(2);
+      expect(c.baselineSkipped).toBe(1);
+      expect(c.candidateScored).toBe(1);
+      expect(c.candidateSkipped).toBe(2);
+      // Skips never land in the failure buckets — the gate denominator stays clean.
+      expect(c.baselineFailed).toBe(0);
+      expect(c.candidateFailed).toBe(0);
+    });
   });
 
   describe('evaluateScorerErrorRateGate', () => {

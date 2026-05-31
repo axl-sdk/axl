@@ -20,6 +20,14 @@ type SortedItem = {
   baselineScore: number | null;
   candidateScore: number | null;
   delta: number;
+  /** A side's null score came from a skipped scorer (applies predicate false). */
+  baselineSkipped: boolean;
+  candidateSkipped: boolean;
+  /**
+   * True when either side is skipped — the pair is non-comparable, so the delta
+   * is meaningless and must not render as a regression/improvement.
+   */
+  nonComparable: boolean;
   /** Per-run deltas when pooled (one per run). */
   runDeltas?: number[];
 };
@@ -95,16 +103,27 @@ export function EvalCompareItemTable({
     for (let i = 0; i < itemCount; i++) {
       const bScore = baseline.items[i].scores[sortScorer] ?? null;
       const cScore = candidate.items[i].scores[sortScorer] ?? null;
-      const delta = bScore != null && cScore != null ? cScore - bScore : 0;
+      const baselineSkipped = baseline.items[i].scoreDetails?.[sortScorer]?.skipped === true;
+      const candidateSkipped = candidate.items[i].scoreDetails?.[sortScorer]?.skipped === true;
+      const nonComparable = baselineSkipped || candidateSkipped;
+      // Skipped cells are non-comparable — never synthesize a delta that would
+      // read as a regression/improvement. A genuine null on either side already
+      // yields delta 0 (rendered as a dash, not red).
+      const delta = !nonComparable && bScore != null && cScore != null ? cScore - bScore : 0;
 
       // Compute per-run deltas when pooled
       let runDeltas: number[] | undefined;
       if (runCount > 1) {
         runDeltas = [];
         for (let r = 0; r < runCount; r++) {
-          const bs = baselineRuns![r]?.items[i]?.scores[sortScorer];
-          const cs = candidateRuns![r]?.items[i]?.scores[sortScorer];
-          if (bs != null && cs != null) runDeltas.push(cs - bs);
+          const bItem = baselineRuns![r]?.items[i];
+          const cItem = candidateRuns![r]?.items[i];
+          const bs = bItem?.scores[sortScorer];
+          const cs = cItem?.scores[sortScorer];
+          const skipped =
+            bItem?.scoreDetails?.[sortScorer]?.skipped === true ||
+            cItem?.scoreDetails?.[sortScorer]?.skipped === true;
+          if (!skipped && bs != null && cs != null) runDeltas.push(cs - bs);
         }
       }
 
@@ -114,6 +133,9 @@ export function EvalCompareItemTable({
         baselineScore: bScore,
         candidateScore: cScore,
         delta,
+        baselineSkipped,
+        candidateSkipped,
+        nonComparable,
         runDeltas,
       });
     }
@@ -281,7 +303,13 @@ export function EvalCompareItemTable({
                         )}
                         onClick={() => setExpandedItem(isExpanded ? null : item.index)}
                       >
-                        {item.baselineScore != null ? item.baselineScore.toFixed(3) : '\u2014'}
+                        {item.baselineScore != null ? (
+                          item.baselineScore.toFixed(3)
+                        ) : item.baselineSkipped ? (
+                          <span title="Not applicable (N/A)">N/A</span>
+                        ) : (
+                          '\u2014'
+                        )}
                       </td>
                       <td
                         className={cn(
@@ -292,16 +320,31 @@ export function EvalCompareItemTable({
                         )}
                         onClick={() => setExpandedItem(isExpanded ? null : item.index)}
                       >
-                        {item.candidateScore != null ? item.candidateScore.toFixed(3) : '\u2014'}
+                        {item.candidateScore != null ? (
+                          item.candidateScore.toFixed(3)
+                        ) : item.candidateSkipped ? (
+                          <span title="Not applicable (N/A)">N/A</span>
+                        ) : (
+                          '\u2014'
+                        )}
                       </td>
                       <td
-                        className={cn('px-3 py-2.5 text-right', deltaColor)}
+                        className={cn(
+                          'px-3 py-2.5 text-right',
+                          item.nonComparable ? 'text-[hsl(var(--muted-foreground))]' : deltaColor,
+                        )}
                         onClick={() => setExpandedItem(isExpanded ? null : item.index)}
                       >
                         <div className="font-mono">
-                          {item.delta !== 0
-                            ? `${item.delta > 0 ? '+' : ''}${item.delta.toFixed(3)}`
-                            : '\u2014'}
+                          {item.nonComparable ? (
+                            <span title="Not comparable \u2014 a side was skipped (N/A) for this scorer">
+                              N/A
+                            </span>
+                          ) : item.delta !== 0 ? (
+                            `${item.delta > 0 ? '+' : ''}${item.delta.toFixed(3)}`
+                          ) : (
+                            '\u2014'
+                          )}
                         </div>
                         {item.runDeltas && item.runDeltas.length > 1 && (
                           <div

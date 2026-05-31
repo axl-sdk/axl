@@ -18,6 +18,7 @@ import type { EvalHistoryEntry } from '../../lib/types';
 import { cn, formatCost, formatDuration, formatTokens, extractLabel } from '../../lib/utils';
 import type { RegisteredEval } from '../../lib/types';
 import type { EvalResultData, ComparisonResult } from './types';
+import { ScorerSampleChips } from './ScorerSampleChips';
 import {
   scoreTextColor,
   scoreBgTint,
@@ -1034,6 +1035,7 @@ export function EvalRunnerPanel() {
                                       LLM
                                     </span>
                                   )}
+                                  <ScorerSampleChips failed={s.failed} skipped={s.skipped} />
                                 </td>
                                 <td
                                   className={cn(

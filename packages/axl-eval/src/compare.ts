@@ -139,17 +139,21 @@ export function evalCompare(
     // ran-and-failed scorer via its `scoreDetails.duration` discriminator).
     let baselineScored = 0;
     let baselineFailed = 0;
+    let baselineSkipped = 0;
     for (const run of baselineRuns) {
       const c = scorerCounts(run.items, name);
       baselineScored += c.scored;
       baselineFailed += c.failed;
+      baselineSkipped += c.skipped;
     }
     let candidateScored = 0;
     let candidateFailed = 0;
+    let candidateSkipped = 0;
     for (const run of candidateRuns) {
       const c = scorerCounts(run.items, name);
       candidateScored += c.scored;
       candidateFailed += c.failed;
+      candidateSkipped += c.skipped;
     }
 
     const entry: EvalComparison['scorers'][string] = {
@@ -161,6 +165,8 @@ export function evalCompare(
       baselineFailed,
       candidateScored,
       candidateFailed,
+      baselineSkipped,
+      candidateSkipped,
     };
 
     // Compute bootstrap CI when we have enough paired data

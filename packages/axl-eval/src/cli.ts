@@ -324,6 +324,19 @@ async function runCompare(args: string[]) {
           `the means above are computed over the surviving sample.`,
       );
     }
+    // Conditional scorers (`applies`) skip N/A items. Skips never move the
+    // delta (excluded from both means), but if the two sides skipped DIFFERENT
+    // counts they scored different item subsets — so a delta can reflect a
+    // sample mismatch, not a real change. Note it (advisory only; not a gate).
+    const bSkipped = s.baselineSkipped ?? 0;
+    const cSkipped = s.candidateSkipped ?? 0;
+    if (bSkipped !== cSkipped) {
+      console.error(
+        `[axl-eval] NOTE: scorer "${name}" skipped a different number of items per side ` +
+          `(baseline ${bSkipped} N/A, candidate ${cSkipped} N/A); ` +
+          `the two means cover different applicable subsets, so compare the delta with care.`,
+      );
+    }
   }
   // Tell the user how to make the advisory warning blocking (when they haven't).
   if (sawThinnedSample && maxScorerErrorRate == null) {
@@ -594,6 +607,30 @@ function reportDegraded(result: EvalResult, label: string): boolean {
     );
   }
   return true;
+}
+
+/**
+ * Advisory (non-fatal): a conditional scorer (`applies`) that ended up applicable
+ * to ZERO items — every item was skipped as N/A, nothing scored or failed. Its
+ * mean is a meaningless empty-sample 0 and the failure-rate gate can't assess it
+ * (a zero-sample scorer is never `degraded`). That's almost always a
+ * misconfiguration: an over-strict predicate, a dataset missing the flagged
+ * items, or a predicate that forgot to `return`. The `(N N/A)` table annotation
+ * hints at it, but a fully-skipped GATE scorer would otherwise exit 0 with no
+ * stderr signal — this closes that silent-green hole without changing the exit
+ * code (skips are legitimately conditional; we inform, we don't fail).
+ */
+function reportFullySkippedScorers(result: EvalResult, label: string): void {
+  for (const [name, entry] of Object.entries(result.summary.scorers)) {
+    const { scored, failed, skipped } = scorerSampleCounts(entry, name, result.items);
+    if (skipped > 0 && scored + failed === 0) {
+      console.error(
+        `[axl-eval] NOTE: ${label} scorer "${name}" was not applicable to any item ` +
+          `(${skipped} N/A, 0 scored) — its mean is not meaningful. Check the scorer's ` +
+          `\`applies\` predicate and dataset if you expected it to run.`,
+      );
+    }
+  }
 }
 
 /**
@@ -978,6 +1015,7 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
             // Call both (no short-circuit) so each prints its own diagnostic.
             const wipeout = reportTotalWipeout(r, filePath);
             const degraded = reportDegraded(r, filePath);
+            reportFullySkippedScorers(r, filePath); // advisory only
             if (wipeout || degraded) anyFailing = true;
           }
           if (anyFailing && !partial) failedFiles++;
@@ -992,6 +1030,7 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
           // be degraded), but report both for clarity; either fails the file.
           const wipeout = reportTotalWipeout(result, filePath);
           const degraded = reportDegraded(result, filePath);
+          reportFullySkippedScorers(result, filePath); // advisory only
           if (wipeout || degraded) failedFiles++;
         }
       } catch (err) {

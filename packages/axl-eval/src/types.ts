@@ -232,7 +232,16 @@ export type EvalComparison = {
       significant?: boolean;
       pRegression?: number;
       pImprovement?: number;
-      /** Number of paired item differences used for CI computation. */
+      /**
+       * Paired sample size — the count of items scored on BOTH sides (the only
+       * items a difference exists for). Always set, including `0`/`1`. The CI /
+       * `significant` / `pRegression` / `pImprovement` fields are populated only
+       * when `n >= 2`. NOTE the asymmetry: `delta` is the difference of the two
+       * INDEPENDENT per-side means (each over `{baseline,candidate}Scored`
+       * items), whereas the CI is paired over these `n` — so when `n` is much
+       * smaller than the per-side scored counts (different skips/failures per
+       * side), the delta and the CI rest on different samples.
+       */
       n?: number;
       /**
        * Per-side scorer success/failure counts over the SAME truncated pool the

@@ -179,7 +179,22 @@ export type ComparisonScorerEntry = {
   significant?: boolean;
   pRegression?: number;
   pImprovement?: number;
+  /**
+   * Paired sample size (items scored on BOTH sides). The `delta` is the diff of
+   * the two INDEPENDENT per-side means; the CI is paired over these `n`. When
+   * `n` is much smaller than the per-side scored counts, the two rest on
+   * different samples — see {@link EvalComparison} on the server.
+   */
   n?: number;
+  /** Per-side sample counts over the compared pool — mirror the server's
+   *  `EvalComparison.scorers[]`. Used to label a delta whose two means came from
+   *  different applicable subsets (skips/failures differ per side). */
+  baselineScored?: number;
+  baselineFailed?: number;
+  baselineSkipped?: number;
+  candidateScored?: number;
+  candidateFailed?: number;
+  candidateSkipped?: number;
 };
 
 /**

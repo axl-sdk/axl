@@ -169,14 +169,20 @@ export function evalCompare(
       candidateSkipped,
     };
 
-    // Compute bootstrap CI when we have enough paired data
+    // `n` is the PAIRED sample size — items scored on BOTH sides, the only
+    // items a difference can be computed for. Always set it (even 0/1), because
+    // that's exactly the asymmetric case the labeling needs to surface: the
+    // displayed `delta` is built from each side's INDEPENDENT mean (over that
+    // side's own scored items), while the CI below is paired. When `n` is small
+    // relative to `{baseline,candidate}Scored`, the two rest on different
+    // samples. The CI/significance machinery still requires >= 2 paired diffs.
     const diffs = pairedDiffs[name];
+    entry.n = diffs.length;
     if (diffs.length >= 2) {
       const ci = pairedBootstrapCI(diffs);
       entry.ci = { lower: ci.lower, upper: ci.upper };
       entry.pRegression = ci.pRegression;
       entry.pImprovement = ci.pImprovement;
-      entry.n = diffs.length;
       // Significant when CI excludes zero AND delta exceeds practical threshold
       const ciExcludesZero = ci.lower > 0 || ci.upper < 0;
       entry.significant = ciExcludesZero && Math.abs(ci.mean) >= threshold;

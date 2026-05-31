@@ -1365,6 +1365,27 @@ describe('evalCompare()', () => {
       // Skips never land in the failure buckets — the gate denominator stays clean.
       expect(c.baselineFailed).toBe(0);
       expect(c.candidateFailed).toBe(0);
+      // Only item '1' is scored on BOTH sides → paired n=1. `n` is populated even
+      // below the CI threshold (the labeling needs it exactly in this asymmetric
+      // case), and no CI is computed for a single paired diff.
+      expect(c.n).toBe(1);
+      expect(c.ci).toBeUndefined();
+      expect(c.significant).toBeUndefined();
+    });
+
+    it('always populates paired `n` (the labeling signal), CI only when n >= 2', () => {
+      // Three items scored on both sides → n=3, CI present.
+      const baseline = makeEvalResult({
+        id: 'b',
+        items: [okItem('1', 0.8), okItem('2', 0.6), okItem('3', 0.7)],
+      });
+      const candidate = makeEvalResult({
+        id: 'c',
+        items: [okItem('1', 0.9), okItem('2', 0.7), okItem('3', 0.8)],
+      });
+      const c = evalCompare(baseline, candidate).scorers.accuracy;
+      expect(c.n).toBe(3);
+      expect(c.ci).toBeDefined();
     });
   });
 

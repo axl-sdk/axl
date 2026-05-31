@@ -3,6 +3,7 @@ import { ChevronDown, ChevronUp } from 'lucide-react';
 import { JsonViewer } from '../../components/shared/JsonViewer';
 import { cn, formatCost, formatDuration, extractLabel } from '../../lib/utils';
 import { EvalCompareItemTable } from './EvalCompareItemTable';
+import { PairedSampleNote } from './PairedSampleNote';
 import type { ComparisonResult, EvalResultData } from './types';
 import {
   scoreColorClass,
@@ -705,7 +706,7 @@ export function EvalCompareView({
                     onClick={() => toggleScorerSort('delta')}
                   >
                     {hasCI ? (
-                      <Tooltip text="Score delta with 95% confidence interval via paired bootstrap. If the CI excludes zero and the effect exceeds the practical threshold, the difference is significant (shown with a colored left border).">
+                      <Tooltip text="Score delta with 95% confidence interval via paired bootstrap. If the CI excludes zero and the effect exceeds the practical threshold, the difference is significant (shown with a colored left border). The Baseline and Candidate columns are per-side means (each over that side's own scored items); the CI is paired over items scored on BOTH sides. A per-row 'paired n' note appears when the two samples diverge — different skips (N/A) or failures per side.">
                         Delta{sortIndicator('delta')}
                       </Tooltip>
                     ) : (
@@ -813,6 +814,7 @@ export function EvalCompareView({
                               </div>
                             );
                           })()}
+                        <PairedSampleNote stats={stats} />
                       </td>
                     </tr>
                   );

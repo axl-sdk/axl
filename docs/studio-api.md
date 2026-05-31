@@ -291,6 +291,12 @@ evals: {
 }
 ```
 
+> **`conditions` / `--conditions` is ESM-only.** The custom import conditions are applied
+> through an ESM resolve hook, so they only affect `import`/`await import()` chains.
+> Transitive **CommonJS `require()`** chains bypass the hook — a `development` export that
+> points at a `.ts` source file will silently resolve to the built `.js` instead. Keep the
+> resolved module graph ESM end-to-end if you rely on source-export conditions.
+
 Each file should `export default` a config with `{ workflow, dataset, scorers }` (the result of `defineEval()`). By default, the runtime executes the named workflow for each dataset item. For self-contained evals that don't depend on a registered workflow, export an `executeWorkflow` function — it will be called instead of `runtime.execute()`. See the [`@axlsdk/eval` README](../packages/axl-eval/README.md#defineevalconfig) for details.
 
 Eval names are the file's path relative to the project root (`cwd`), minus the `.eval.*` suffix:

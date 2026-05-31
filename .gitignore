@@ -10,6 +10,7 @@ coverage/
 .internal-notes/
 .claude/*
 !.claude/agents/
+!.claude/rules/
 .vscode/
 GEMINI.md
 axl.config.*

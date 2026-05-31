@@ -724,6 +724,19 @@ export default defineEval({
 });
 ```
 
+> **Conditional scorers.** If a scorer only applies to a subset of items — e.g. a "respects injury constraints" judge that's only meaningful for profiles that declared an injury — give it an `applies` predicate instead of forcing it to return a score for everyone:
+>
+> ```typescript
+> const respectsInjuries = llmScorer({
+>   name: 'respects-injuries',
+>   model: 'openai-responses:gpt-5.5',
+>   system: 'Does the plan avoid exercises contraindicated by the stated injury?',
+>   applies: (_output, _input, annotations) => Boolean(annotations?.injury),
+> });
+> ```
+>
+> When `applies` returns `false` the judge is skipped — no LLM call, and the item counts as neither scored nor failed (so it's excluded from the mean and from the `failOnScorerErrorRate` / `--max-scorer-error-rate` gate). Do **not** return `NaN` for inapplicable items: the failure-rate gate treats a non-finite score as a real failure.
+
 ```bash
 # Run baseline eval
 npx axl-eval ./evals/workout-plan.ts --output results/baseline.json

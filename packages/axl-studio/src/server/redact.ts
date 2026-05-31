@@ -269,7 +269,7 @@ export function redactStreamEvent(event: AxlEvent, redact: boolean): AxlEvent {
  *
  * Preserved fields (structural / metrics):
  *   scores (numeric), duration, cost, scorerCost
- *   scoreDetails[*].{score, duration, cost} (but not metadata)
+ *   scoreDetails[*].{score, duration, cost, skipped} (but not metadata)
  *   metadata (execution metadata: models, tokens, agentCalls, workflows)
  *   traces (trace events — already redacted at emission time)
  */
@@ -291,6 +291,9 @@ function redactEvalItem(item: EvalItem): EvalItem {
         score: detail.score,
         ...(detail.duration !== undefined ? { duration: detail.duration } : {}),
         ...(detail.cost !== undefined ? { cost: detail.cost } : {}),
+        // `skipped` is a structural boolean (the `applies` predicate verdict),
+        // not user/LLM content — preserve it so the client's N/A chip renders.
+        ...(detail.skipped !== undefined ? { skipped: detail.skipped } : {}),
         // metadata deliberately omitted — may contain LLM scorer reasoning
       };
     }

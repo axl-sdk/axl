@@ -118,8 +118,8 @@ export async function rescore(
     // rescore deliberately does NOT support `failOnScorerErrorRate` — it takes
     // RescoreOptions, not EvalConfig, so there's no degradation gate here. The
     // counts are informational; gating belongs to the run that produced output.
-    const { scored, failed } = scorerCounts(rescored, name);
-    scorerStats[name] = { ...computeStats(scores), scored, failed };
+    const { scored, failed, skipped } = scorerCounts(rescored, name);
+    scorerStats[name] = { ...computeStats(scores), scored, failed, skipped };
   }
 
   const scorerTypes: Record<string, string> = {};

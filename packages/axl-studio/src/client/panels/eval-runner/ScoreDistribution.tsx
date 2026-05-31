@@ -14,11 +14,13 @@ function ScorerStrip({
   scores,
   mean,
   failed,
+  skipped,
 }: {
   name: string;
   scores: number[];
   mean: number;
   failed: number;
+  skipped: number;
 }) {
   // Amber "N failed" note when a scorer ran and failed on some items — the mean
   // (and the ticks) cover only the surviving sample.
@@ -29,6 +31,18 @@ function ScorerStrip({
         title={`${failed} of ${scores.length + failed} scorer runs failed — only the ${scores.length} that succeeded are shown.`}
       >
         {failed} failed
+      </span>
+    ) : null;
+
+  // Neutral "N/A" note when a scorer's `applies` predicate skipped some items —
+  // not failures, so a muted/gray tone distinct from the amber failed note.
+  const skippedNote =
+    skipped > 0 ? (
+      <span
+        className="ml-1.5 px-1 py-0.5 text-[9px] font-medium rounded bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] align-middle"
+        title={`${skipped} item(s) not applicable to this scorer (applies predicate returned false) — excluded from the mean and the failure rate`}
+      >
+        N/A: {skipped}
       </span>
     ) : null;
 
@@ -43,6 +57,7 @@ function ScorerStrip({
         </span>
         <span className="text-xs text-[hsl(var(--muted-foreground))]">No valid scores</span>
         {failedNote}
+        {skippedNote}
       </div>
     );
   }
@@ -52,6 +67,7 @@ function ScorerStrip({
       <span className="w-28 text-xs font-mono truncate" title={name}>
         {name}
         {failedNote}
+        {skippedNote}
       </span>
       <div className="flex-1 h-5 relative bg-[hsl(var(--secondary))] rounded">
         {/* Scale markers */}
@@ -94,9 +110,9 @@ export function ScoreDistribution({ items, scorerNames }: Props) {
     return scorerNames.map((name) => {
       // Single shared discriminator (null score + recorded duration ⇒ failed)
       // — see collectScorerScores; ScoreDistribution no longer re-implements it.
-      const { scores, failed } = collectScorerScores(items, name);
+      const { scores, failed, skipped } = collectScorerScores(items, name);
       const mean = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
-      return { name, scores, mean, failed };
+      return { name, scores, mean, failed, skipped };
     });
   }, [items, scorerNames]);
 
@@ -129,6 +145,7 @@ export function ScoreDistribution({ items, scorerNames }: Props) {
             scores={dist.scores}
             mean={dist.mean}
             failed={dist.failed}
+            skipped={dist.skipped}
           />
         ))}
       </div>

@@ -710,6 +710,26 @@ describe('redactEvalResult', () => {
     expect(detail.metadata).toBeUndefined();
   });
 
+  it('preserves scoreDetails[*].skipped (structural boolean, not PII)', () => {
+    const result = makeResult([
+      makeItem({
+        scores: { accuracy: null },
+        scoreDetails: {
+          accuracy: {
+            score: null,
+            skipped: true,
+            metadata: { reason: 'applies predicate returned false' },
+          },
+        },
+      }),
+    ]);
+    const out = redactEvalResult(result, true);
+    const detail = out.items[0].scoreDetails!.accuracy;
+    expect(detail.skipped).toBe(true);
+    // metadata still scrubbed even on a skipped detail.
+    expect(detail.metadata).toBeUndefined();
+  });
+
   it('handles empty items list', () => {
     const result = makeResult([]);
     const out = redactEvalResult(result, true);

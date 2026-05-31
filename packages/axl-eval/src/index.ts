@@ -2,7 +2,14 @@ export { dataset } from './dataset.js';
 export type { Dataset, DatasetConfig, DatasetItem, ExtraKeyPolicy } from './dataset.js';
 
 export { scorer, normalizeScorerResult } from './scorer.js';
-export type { Scorer, ScorerConfig, ScorerContext, ScorerFn, ScorerResult } from './scorer.js';
+export type {
+  Scorer,
+  ScorerApplies,
+  ScorerConfig,
+  ScorerContext,
+  ScorerFn,
+  ScorerResult,
+} from './scorer.js';
 
 export { llmScorer } from './llm-scorer.js';
 export type { LlmScorerConfig } from './llm-scorer.js';

@@ -26,6 +26,9 @@ export type MultiRunSummary = {
       scored?: number;
       /** Total ran-and-failed scorer invocations summed across all runs. */
       failed?: number;
+      /** Total `applies`-skipped (N/A) items summed across all runs. Excluded
+       *  from both the mean and the failure-rate denominator. */
+      skipped?: number;
     }
   >;
   timing?: { mean: number; std: number };
@@ -91,6 +94,7 @@ export function aggregateRuns(runs: EvalResult[]): MultiRunSummary {
     // Read with `?? 0` — old artifacts predate these fields.
     const scored = runs.reduce((sum, r) => sum + (r.summary.scorers[name]?.scored ?? 0), 0);
     const failed = runs.reduce((sum, r) => sum + (r.summary.scorers[name]?.failed ?? 0), 0);
+    const skipped = runs.reduce((sum, r) => sum + (r.summary.scorers[name]?.skipped ?? 0), 0);
 
     scorers[name] = {
       mean: round(meanOfMeans),
@@ -99,6 +103,7 @@ export function aggregateRuns(runs: EvalResult[]): MultiRunSummary {
       max: round(maxMean),
       scored,
       failed,
+      skipped,
     };
   }
 

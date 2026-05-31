@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Conditional scorers (`applies`).** `scorer()` and `llmScorer()` accept an optional `applies?: (output, input, annotations?) => boolean` predicate that scopes a scorer to a subset of items (a refusal judge for refusal-expected items, a constraint judge for constrained items, …). When it returns `false` the scorer is skipped: the body never runs — for an `llmScorer`, **no provider call is made** — and the item counts as neither `scored` nor `failed`, so it's excluded from the mean *and* from the failure-rate denominator (`failOnScorerErrorRate` and `compare --max-scorer-error-rate`). The skip is visible on `ScorerDetail.skipped` and as a new per-scorer `EvalSummary.scorers[].skipped` count (Studio's Eval Runner shows an "N/A" chip). A predicate that throws is recorded as a scorer failure, not a skip. Purely additive — back-compatible.
+
+### Deprecated
+- **The `NaN`-skip workaround for conditional scorers.** Returning a `NaN` / out-of-range sentinel to mean "not applicable" trips the 0.18.0 failure-rate gate (which correctly treats a non-finite score as a real failure — a deterministic conditional scorer returning `NaN` for skipped items showed a ~90% failure rate and permanently tripped the zero-tolerance deterministic gate). Use the `applies` predicate instead. The gate's strictness about `NaN` is intentional and unchanged.
+
 ## [0.18.0] - 2026-05-30
 
 Faster, harder-to-fool evals, plus proactive provider rate limiting and the latest flagship models (`gpt-5.5`, Opus 4.8). Scorers now run concurrently within an item — the dominant cost for LLM-judge evals — and a set of trust signals make a thinned or broken eval impossible to miss.

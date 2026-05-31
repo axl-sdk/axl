@@ -134,6 +134,48 @@ const lengthScore = scorer({
 
 Scorers that return a non-finite value (`NaN` / `Infinity`) or a score outside `[0, 1]` are recorded as `null` with an entry in `item.scorerErrors` — they don't abort the run.
 
+### Conditional scorers (`applies`)
+
+By default every scorer runs against every item. When a scorer only applies to a subset — a refusal judge for refusal-expected items, a constraint judge for constrained items, an asymmetry scorer for asymmetric exercises — declare its scope with an `applies` predicate. It mirrors the `score` signature (`output, input, annotations?`) and returns `true` to run or `false` to skip:
+
+```typescript
+import { scorer } from '@axlsdk/eval';
+
+// Deterministic: only score items the dataset flagged as "constrained"
+const constraintAdherence = scorer({
+  name: 'constraint-adherence',
+  description: 'Output respects the stated constraint',
+  applies: (_output, _input, annotations) => annotations?.constrained === true,
+  score: (output, _input, annotations) =>
+    String(output).includes(String(annotations?.constraint)) ? 1 : 0,
+});
+```
+
+When `applies` returns `false`, the scorer is **skipped** for that item:
+
+- The scorer body never runs — for an `llmScorer`, **no provider call is made**, saving real cost and rate-limit budget (a skipped judge can't 429 you).
+- The item counts as **neither `scored` nor `failed`** — it's excluded from the `mean` *and* from the failure-rate denominator (`failOnScorerErrorRate` and `compare --max-scorer-error-rate`), so a conditional scorer stays honest to both the mean and the trust gate.
+- The skip is visible: `item.scoreDetails[name].skipped === true`, and the run summary carries a per-scorer `skipped` count (alongside `scored` / `failed`). Studio's Eval Runner shows an "N/A" chip.
+
+Applicability usually keys off `input` / `annotations` (a flag or exercise type), but `output` is available too (e.g. "only score outputs that actually refused"). The predicate runs **before** the scorer body, so an inapplicable `llmScorer` never makes its provider call:
+
+```typescript
+import { llmScorer } from '@axlsdk/eval';
+
+// LLM judge: only invoke the (expensive) judge for items where a refusal was expected
+const refusalQuality = llmScorer({
+  name: 'refusal-quality',
+  description: 'Did the model refuse appropriately and explain why?',
+  model: 'openai:gpt-4o',
+  system: 'Rate whether the output is a well-justified refusal.',
+  applies: (_output, _input, annotations) => annotations?.expectRefusal === true,
+});
+```
+
+A predicate that **throws** is treated as a scorer failure (it's a bug), not a skip — the item lands in the `failed` bucket with an entry in `item.scorerErrors`, never silently swallowed.
+
+> **Deprecated: the `NaN`-skip workaround.** Before `applies`, the only way to express "not applicable" was to return a `NaN` / out-of-range sentinel for skipped items. The failure-rate gate (correctly) treats a non-finite score as a real failure, so a deterministic conditional scorer that returned `NaN` for inapplicable items showed a ~90% failure rate and permanently tripped the zero-tolerance deterministic gate. Use `applies` instead. The gate's strictness about `NaN` is intentional and unchanged.
+
 ### LLM scorers
 
 Use an LLM as a judge. The scorer constructs a prompt from the input, output, and annotations, calls the LLM, and validates the response:
@@ -186,6 +228,8 @@ Different LLM scorers can use different providers — each resolves independentl
 const qualityJudge = llmScorer({ name: 'quality', model: 'openai:gpt-4o', ... });
 const safetyJudge = llmScorer({ name: 'safety', model: 'anthropic:claude-sonnet-4-5-20250514', ... });
 ```
+
+LLM scorers also accept the conditional `applies` predicate described in [Conditional scorers](#conditional-scorers-applies) — the most valuable place to use it, since a skipped judge makes no provider call at all.
 
 #### Tuning the judge
 
@@ -246,8 +290,10 @@ Concurrent scorers (`concurrency × scorerConcurrency`, up to 25 in-flight by de
 
 Both are **type-aware**: deterministic scorers tolerate **zero** failures (a deterministic scorer that throws is a bug, not noise); LLM judges use the configured rate. They're complementary — set `failOnScorerErrorRate` in the eval file to fail fast at run time, and pass `--max-scorer-error-rate` in CI to refuse to gate on an artifact that was already thinned (e.g. an imported result).
 
+**Skipped items don't count against either gate.** The failure rate is `failed / (scored + failed)` — items a scorer's `applies` predicate skipped land in neither bucket, so they're excluded from the denominator. This is the supported way to scope a conditional scorer (a refusal judge that only runs on refusal-expected items, say) to its applicable subset without polluting the trust signal. **Do not** return `NaN` for inapplicable items: the gate (correctly) treats a non-finite score as a real failure, so a `NaN`-skipping deterministic scorer trips the zero-tolerance deterministic gate on every skipped item. Use [`applies`](#conditional-scorers-applies) instead.
+
 ```ts
-// eval file — fail this run if the judge errored on >10% of items
+// eval file — fail this run if the judge errored on >10% of the items it ran against
 export default { workflow: 'qa', dataset: ds, scorers: [judge], failOnScorerErrorRate: 0.1 };
 ```
 
@@ -353,8 +399,16 @@ Each eval run returns an `EvalResult` with per-item scores and aggregate statist
 
 Each item has two ways to access scores:
 
-- **`item.scores`** — quick numeric lookup: `Record<string, number | null>`. Use this for simple checks and aggregation. `null` means the scorer failed (see `item.scorerErrors`).
-- **`item.scoreDetails`** — full context: `Record<string, ScorerDetail>`. Each detail has the numeric score plus `metadata` (e.g., LLM reasoning), per-scorer `duration`, and `cost`. Use this when you need to understand *why* a score is what it is.
+- **`item.scores`** — quick numeric lookup: `Record<string, number | null>`. Use this for simple checks and aggregation. `null` means the scorer failed (see `item.scorerErrors`) **or** was skipped by its `applies` predicate — disambiguate with `scoreDetails[name].skipped`.
+- **`item.scoreDetails`** — full context: `Record<string, ScorerDetail>`. Each detail has the numeric score plus `metadata` (e.g., LLM reasoning), per-scorer `duration`, `cost`, and a `skipped` flag. Use this when you need to understand *why* a score is what it is.
+
+A `ScorerDetail` distinguishes three terminal states for a scorer on a given item:
+
+| State | `score` | `skipped` | `duration` |
+|-------|---------|-----------|------------|
+| Scored | `number` | absent | set |
+| Ran-and-failed (threw / out-of-range) | `null` | absent | set |
+| Skipped by `applies` | `null` | `true` | absent |
 
 Summary statistics (mean, p50, p95, etc.) exclude `null` scores. If all scores for a scorer are `null`, the CLI shows `--` instead of misleading `0.00`.
 
@@ -363,6 +417,9 @@ const results = await runtime.eval({ ... });
 
 // ── Aggregate stats ──────────────────────────────────
 console.log(results.summary.scorers['quality'].mean);  // 0.85
+console.log(results.summary.scorers['quality'].scored); // 48 (items that produced a numeric score)
+console.log(results.summary.scorers['quality'].failed); // 2  (scorer ran and threw / out-of-range)
+console.log(results.summary.scorers['quality'].skipped); // 0  (items the applies predicate skipped)
 console.log(results.summary.count);                     // 50 items
 console.log(results.summary.failures);                  // 2 workflow errors
 console.log(results.summary.timing);                    // { mean, min, max, p50, p95 } in ms
@@ -390,14 +447,19 @@ for (const item of results.items) {
   // Rich per-scorer detail — reasoning, timing, cost
   const detail = item.scoreDetails?.['quality'];
   if (detail) {
-    console.log(detail.score);                           // 0.85
-    console.log(detail.metadata?.reasoning);             // "The answer is relevant..."
-    console.log(detail.duration);                        // scorer execution ms
-    console.log(detail.cost);                            // scorer LLM cost
+    if (detail.skipped) {
+      // This scorer's `applies` predicate returned false — not run, not counted
+      console.log('Scorer skipped (not applicable to this item)');
+    } else {
+      console.log(detail.score);                         // 0.85
+      console.log(detail.metadata?.reasoning);           // "The answer is relevant..."
+      console.log(detail.duration);                      // scorer execution ms
+      console.log(detail.cost);                          // scorer LLM cost
+    }
   }
 
-  // Error handling
-  if (item.scores['quality'] === null) {
+  // Error handling — a null score is either a failure OR a skip
+  if (item.scores['quality'] === null && !item.scoreDetails?.['quality']?.skipped) {
     console.log('Scorer failed:', item.scorerErrors);    // ["Scorer "quality" threw: ..."]
   }
 
@@ -741,8 +803,8 @@ const comparison = evalCompare(baselineRuns, candidateRuns);
 | Function | Description |
 |----------|-------------|
 | `dataset(config)` | Create a dataset from inline items or a JSON file |
-| `scorer(config)` | Create a deterministic scorer |
-| `llmScorer(config)` | Create an LLM-as-judge scorer |
+| `scorer(config)` | Create a deterministic scorer (optional `applies` predicate for conditional scoring) |
+| `llmScorer(config)` | Create an LLM-as-judge scorer (optional `applies` predicate — a skipped judge makes no provider call) |
 | `defineEval(config)` | Wrap an eval config for CLI discovery |
 | `runEval(config, executeFn, runtime, options?)` | Run an eval programmatically. `options: RunEvalOptions` accepts `onProgress` / `signal` / `captureTraces` |
 | `evalCompare(baseline, candidate, options?)` | Compare eval results with bootstrap CI |
@@ -758,12 +820,12 @@ const comparison = evalCompare(baselineRuns, candidateRuns);
 | `EvalConfig` | Eval definition (workflow, dataset, scorers, concurrency, scorerConcurrency, budget) |
 | `EvalResult` | Full eval output (items, summary, cost, duration) |
 | `EvalItem` | Per-item result (input, output, scores, scoreDetails, metadata, traces?) |
-| `EvalSummary` | Aggregate statistics (count, failures, scorer stats, timing) |
+| `EvalSummary` | Aggregate statistics (count, failures, per-scorer stats incl. `scored`/`failed`/`skipped`, timing) |
 | `EvalComparison` | Comparison output (scorer deltas, CI, pRegression/pImprovement, n, per-side `runCount` / `partial?`, regressions, improvements). Both sides truncate to `min(baseline.length, candidate.length)` so means align with the paired bootstrap CI's sample |
 | `EvalComparisonPartial` | `{ completed, attempted }` set on a comparison side when the pooled run count is less than the original batch's planned count |
 | `EvalCompareOptions` | Options for `evalCompare()` (`thresholds`) |
 | `EvalRegression` / `EvalImprovement` | Per-item change record (itemIndex, scorer, scores, delta) |
-| `ScorerDetail` | Per-scorer detail (score, metadata, duration, cost) |
+| `ScorerDetail` | Per-scorer detail (score, metadata, duration, cost, `skipped?`) |
 | `ScorerResult` | Scorer return type (`{ score, metadata?, cost? }`) |
 | `RescoreOptions` | Options for `rescore()` (`concurrency`, `scorerConcurrency`, `signal`) |
 | `MultiRunSummary` | Aggregated multi-run output (per-scorer mean/std/min/max) |

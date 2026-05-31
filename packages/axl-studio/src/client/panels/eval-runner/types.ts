@@ -5,6 +5,13 @@ export type ScorerDetail = {
   metadata?: Record<string, unknown>;
   duration?: number;
   cost?: number;
+  /**
+   * `true` when the scorer's `applies` predicate returned `false` for this
+   * item, so the scorer was deliberately skipped (NOT run). Mirrors the server
+   * `ScorerDetail.skipped`. A skipped item is excluded from the mean AND the
+   * failure-rate denominator — counted as neither `scored` nor `failed`.
+   */
+  skipped?: boolean;
 };
 
 export type EvalItem = {
@@ -35,6 +42,10 @@ export type ScorerStats = {
   /** Items whose scorer ran and failed (threw / out-of-range). A non-zero value
    *  means `mean` rests on a thinned sample. */
   failed?: number;
+  /** Items whose scorer's `applies` predicate returned `false` — deliberately
+   *  skipped, NOT run. Counted in neither `scored` nor `failed`. Optional —
+   *  absent on pre-feature artifacts; fall back to recomputing from items. */
+  skipped?: number;
 };
 
 /**
@@ -77,7 +88,15 @@ export type MultiRunAggregate = {
   workflows?: string[];
   scorers: Record<
     string,
-    { mean: number; std: number; min: number; max: number; scored?: number; failed?: number }
+    {
+      mean: number;
+      std: number;
+      min: number;
+      max: number;
+      scored?: number;
+      failed?: number;
+      skipped?: number;
+    }
   >;
   timing?: { mean: number; std: number };
 };
@@ -261,6 +280,7 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
     // from the mean above. Read with `?? 0` — pre-0.18.0 runs predate these.
     const scored = allRuns.reduce((s, r) => s + (r.summary?.scorers?.[name]?.scored ?? 0), 0);
     const failed = allRuns.reduce((s, r) => s + (r.summary?.scorers?.[name]?.failed ?? 0), 0);
+    const skipped = allRuns.reduce((s, r) => s + (r.summary?.scorers?.[name]?.skipped ?? 0), 0);
     aggScorers[name] = {
       mean: Math.round(mean * 1000) / 1000,
       std: Math.round(std * 1000) / 1000,
@@ -268,6 +288,7 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
       max: Math.round(Math.max(...means) * 1000) / 1000,
       scored,
       failed,
+      skipped,
     };
   }
   // Union workflows across all runs, first-seen first. Heterogeneous groups
@@ -414,53 +435,66 @@ export function getItemModels(item: EvalItem): string[] {
 
 /**
  * The single client-side discriminator for one scorer's per-item outcomes.
- * Walks `items` once and classifies each by the same rule the server uses:
+ * Walks `items` once and classifies each by the same precedence the server's
+ * `scorerCounts` uses:
  *   - a non-null score is a surviving sample (collected into `scores`),
- *   - a `null` score WITH a recorded `scoreDetails.duration` ran-and-failed
+ *   - else a `scoreDetails.skipped === true` marker means the scorer's `applies`
+ *     predicate returned `false` — deliberately skipped (counted into `skipped`),
+ *   - else a `null` score WITH a recorded `scoreDetails.duration` ran-and-failed
  *     (counted into `failed`),
- *   - a `null` score WITHOUT a recorded duration was skipped by cancellation
- *     (counts as neither),
+ *   - else a `null` score with neither marker was skipped by cancellation
+ *     (counts as none of the three),
  *   - items with a top-level `error` are excluded entirely.
  *
- * Returns both the surviving `scores[]` (for the strip chart) and the `failed`
- * count so callers never re-implement the discriminator. `getScorerSampleCounts`
- * and `ScoreDistribution` both read through this.
+ * The `skipped` check precedes `duration` so a positive skip marker always wins
+ * over the duration heuristic, matching the server. Returns the surviving
+ * `scores[]` (for the strip chart) plus the `failed` and `skipped` counts so
+ * callers never re-implement the discriminator. `getScorerSampleCounts` and
+ * `ScoreDistribution` both read through this.
  */
 export function collectScorerScores(
   items: EvalItem[],
   name: string,
-): { scores: number[]; failed: number } {
+): { scores: number[]; failed: number; skipped: number } {
   const scores: number[] = [];
   let failed = 0;
+  let skipped = 0;
   for (const i of items) {
     if (i.error) continue;
     const score = i.scores[name];
     if (score != null) scores.push(score);
+    else if (i.scoreDetails?.[name]?.skipped === true) skipped++;
     else if (i.scoreDetails?.[name]?.duration != null) failed++;
   }
-  return { scores, failed };
+  return { scores, failed, skipped };
 }
 
 /**
- * Resolve a scorer's `scored`/`failed` sample counts. Prefers the summary
- * fields (authoritative, set by the runner ≥0.18.0) and falls back to
+ * Resolve a scorer's `scored`/`failed`/`skipped` sample counts. Prefers the
+ * summary fields (authoritative, set by the runner ≥0.18.0) and falls back to
  * recomputing from `items` for pre-0.18.0 artifacts — via the shared
  * `collectScorerScores` discriminator. `items` is omitted for multi-run
  * aggregates that carry no items, where the summed fields are authoritative.
+ *
+ * `skipped` is resolved independently of `scored`/`failed`: it prefers
+ * `stats.skipped` when present, else recomputes from items, else `0`. So a
+ * pre-feature artifact (no `stats.skipped`, no `scoreDetails.skipped` markers)
+ * yields `skipped: 0` whether or not the older `scored`/`failed` fields exist.
  */
 export function getScorerSampleCounts(
-  stats: { scored?: number; failed?: number },
+  stats: { scored?: number; failed?: number; skipped?: number },
   name: string,
   items?: EvalItem[],
-): { scored: number; failed: number } {
+): { scored: number; failed: number; skipped: number } {
+  const recomputed = items ? collectScorerScores(items, name) : undefined;
+  const skipped = stats.skipped ?? recomputed?.skipped ?? 0;
   if (stats.scored != null && stats.failed != null) {
-    return { scored: stats.scored, failed: stats.failed };
+    return { scored: stats.scored, failed: stats.failed, skipped };
   }
-  if (items) {
-    const { scores, failed } = collectScorerScores(items, name);
-    return { scored: scores.length, failed };
+  if (recomputed) {
+    return { scored: recomputed.scores.length, failed: recomputed.failed, skipped };
   }
-  return { scored: stats.scored ?? 0, failed: stats.failed ?? 0 };
+  return { scored: stats.scored ?? 0, failed: stats.failed ?? 0, skipped };
 }
 
 /** Extract model URIs from an EvalResultData's aggregate metadata (sorted by usage, most-used first). */

@@ -38,7 +38,7 @@ export function EvalSummaryTable({ summary, items, totalCost, scorerTypes }: Pro
           </thead>
           <tbody>
             {scorerEntries.map(([scorer, stats]) => {
-              const { scored, failed } = getScorerSampleCounts(stats, scorer, items);
+              const { scored, failed, skipped } = getScorerSampleCounts(stats, scorer, items);
               const hasValidScores = scored > 0;
               return (
                 <tr key={scorer} className="border-b border-[hsl(var(--border))] last:border-b-0">
@@ -58,6 +58,14 @@ export function EvalSummaryTable({ summary, items, totalCost, scorerTypes }: Pro
                         title={`${failed} of ${scored + failed} scorer runs failed — the mean is computed over the ${scored} that succeeded.`}
                       >
                         {scored}/{scored + failed} scored, {failed} failed
+                      </span>
+                    )}
+                    {skipped > 0 && (
+                      <span
+                        className="ml-1.5 px-1 py-0.5 text-[9px] font-medium rounded bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] align-middle"
+                        title={`${skipped} item(s) not applicable to this scorer (applies predicate returned false) — excluded from the mean and the failure rate`}
+                      >
+                        N/A: {skipped}
                       </span>
                     )}
                   </td>

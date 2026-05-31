@@ -94,6 +94,14 @@ export type ScorerDetail = {
   metadata?: Record<string, unknown>;
   duration?: number;
   cost?: number;
+  /**
+   * `true` when the scorer's `applies` predicate returned `false` for this item,
+   * so the scorer was deliberately skipped (NOT run). Distinct from a `null`
+   * score WITH a `duration` (ran-and-failed) and from a `null` score with
+   * neither field (skipped by cancellation). A skipped item is excluded from the
+   * mean AND from the failure-rate denominator — see `scorerCounts`.
+   */
+  skipped?: boolean;
 };
 
 export type EvalItem = {
@@ -143,6 +151,13 @@ export type EvalSummary = {
        * means the `mean` was computed over a thinned sample.
        */
       failed?: number;
+      /**
+       * Number of items for which this scorer's `applies` predicate returned
+       * `false` — deliberately skipped, NOT run. Counted in neither `scored` nor
+       * `failed`, so it never inflates the failure rate. Optional so pre-existing
+       * artifacts stay valid; absent ⇒ recompute from `items` (0 if no skips).
+       */
+      skipped?: number;
     }
   >;
   timing?: {

@@ -238,8 +238,8 @@ export async function runEval(
     const scores = evalItems
       .filter((i) => !i.error && i.scores[name] != null)
       .map((i) => i.scores[name] as number);
-    const { scored, failed } = scorerCounts(evalItems, name);
-    scorerStats[name] = { ...computeStats(scores), scored, failed };
+    const { scored, failed, skipped } = scorerCounts(evalItems, name);
+    scorerStats[name] = { ...computeStats(scores), scored, failed, skipped };
   }
 
   const scorerTypes: Record<string, string> = {};

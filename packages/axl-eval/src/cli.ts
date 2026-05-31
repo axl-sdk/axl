@@ -42,15 +42,19 @@ function refuseToGate(reason: string): never {
  * there the fields are authoritative (summed by `aggregateRuns`).
  */
 function scorerSampleCounts(
-  entry: { scored?: number; failed?: number },
+  entry: { scored?: number; failed?: number; skipped?: number },
   name: string,
   items?: EvalResult['items'],
-): { scored: number; failed: number } {
+): { scored: number; failed: number; skipped: number } {
   if (entry.scored != null && entry.failed != null) {
-    return { scored: entry.scored, failed: entry.failed };
+    // `scored`/`failed` are authoritative; `skipped` was added later, so an
+    // 0.18.0-era artifact may carry the first two without it — recompute that one
+    // field from items when we can, else 0.
+    const skipped = entry.skipped ?? (items ? scorerCounts(items, name).skipped : 0);
+    return { scored: entry.scored, failed: entry.failed, skipped };
   }
   if (items) return scorerCounts(items, name);
-  return { scored: entry.scored ?? 0, failed: entry.failed ?? 0 };
+  return { scored: entry.scored ?? 0, failed: entry.failed ?? 0, skipped: entry.skipped ?? 0 };
 }
 
 /** Install a SIGINT/SIGTERM handler that aborts an in-flight eval gracefully.
@@ -474,12 +478,16 @@ function formatTable(result: EvalResult): string {
 
   for (const name of scorerNames) {
     const s = result.summary.scorers[name];
-    const { scored, failed } = scorerSampleCounts(s, name, result.items);
-    // Loud trailing annotation when a scorer ran and failed on some items: the
-    // mean rests on a thinned sample. Shown only when failed > 0 so clean runs
-    // stay uncluttered.
-    const annotation =
-      failed > 0 ? `   (${scored}/${scored + failed} scored, ${failed} failed)` : '';
+    const { scored, failed, skipped } = scorerSampleCounts(s, name, result.items);
+    // Loud trailing annotation: `failed > 0` means the mean rests on a thinned
+    // sample; `skipped > 0` (an `applies`-conditional scorer) labels items the
+    // scorer deliberately didn't run — crucial so a fully-skipped scorer (all
+    // `--`) reads as "N/A" rather than "broken". Both shown only when non-zero so
+    // clean, unconditional runs stay uncluttered.
+    const annotationParts: string[] = [];
+    if (failed > 0) annotationParts.push(`${scored}/${scored + failed} scored, ${failed} failed`);
+    if (skipped > 0) annotationParts.push(`${skipped} N/A`);
+    const annotation = annotationParts.length > 0 ? `   (${annotationParts.join(', ')})` : '';
     // Detect scorers with no valid scores (all items errored → computeStats([]) → all zeros)
     if (scored === 0) {
       lines.push(

@@ -52,6 +52,19 @@ export async function scoreItem(
     if (signal?.aborted) return;
     const scorerStart = Date.now();
     try {
+      // Applicability gate: a conditional scorer declares which items it applies
+      // to via `applies`. A `false` verdict skips it entirely — no provider call
+      // for an llmScorer — and records it as NEITHER scored nor failed via the
+      // positive `skipped` marker (no `duration`, so the duration heuristic in
+      // `scorerCounts` can't misread it as a failure). A predicate that THROWS is
+      // a bug, not a skip: it falls through to the catch below and is recorded as
+      // a scorer failure (with a duration), never silently swallowed.
+      if (scorer.applies && !scorer.applies(item.output, item.input, item.annotations)) {
+        item.scores[scorer.name] = null;
+        scoreDetails[scorer.name] = { score: null, skipped: true };
+        return;
+      }
+
       const raw = await scorer.score(item.output, item.input, item.annotations, scorerContext);
       const scorerResult = normalizeScorerResult(raw);
 

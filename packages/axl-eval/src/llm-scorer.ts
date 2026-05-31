@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { Scorer, ScorerContext, ScorerResult } from './scorer.js';
+import type { Scorer, ScorerApplies, ScorerContext, ScorerResult } from './scorer.js';
 import { attachScorerErrorCost } from './scorer.js';
 import { extractJson, zodToJsonSchema } from '@axlsdk/axl';
 import type { Effort } from '@axlsdk/axl';
@@ -26,6 +26,11 @@ export type LlmScorerConfig = {
   stop?: string[];
   /** Provider-specific escape hatch — merged last into the raw API request. */
   providerOptions?: Record<string, unknown>;
+  /** Optional applicability predicate — see {@link ScorerApplies}. When it
+   *  returns `false`, the judge is skipped for that item and NO provider call is
+   *  made (the conditional-LLM-judge cost/rate-limit win). The item counts as
+   *  neither scored nor failed. */
+  applies?: ScorerApplies<unknown, unknown, unknown>;
 };
 
 export function llmScorer(config: LlmScorerConfig): Scorer {
@@ -39,6 +44,7 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
     name: config.name,
     description: config.description,
     isLlm: true,
+    applies: config.applies,
     async score(
       output: unknown,
       input: unknown,

@@ -52,10 +52,46 @@ export type ScorerFn<TOutput, TInput, TAnnotations> = (
   annotations?: TAnnotations,
 ) => number | ScorerResult;
 
+/**
+ * Applicability predicate for a conditional scorer. Returns `true` if this
+ * scorer should run for the given item, `false` to skip it.
+ *
+ * The eval runner runs every scorer against every item, so a scorer that only
+ * applies to a subset (a refusal judge for refusal-expected items, a constraint
+ * judge for constrained items, …) declares its scope here. A skipped item is
+ * counted as NEITHER `scored` NOR `failed` — it's excluded from the mean AND
+ * from the failure-rate denominator, so a conditional scorer stays honest to
+ * both. The predicate runs BEFORE the scorer body, so an inapplicable
+ * `llmScorer` never makes its provider call.
+ *
+ * Signature mirrors {@link ScorerFn} (`output, input, annotations`). Applicability
+ * usually keys off `input`/`annotations` (e.g. a flag or exercise type), but
+ * `output` is available too (e.g. "only score outputs that refused"). A
+ * predicate that THROWS is a bug, not a skip — it's recorded as a scorer
+ * failure, never silently swallowed.
+ *
+ * The verdict is coerced with `!verdict`, so any falsy return (`false`, `0`,
+ * `''`, `null`, `undefined`) skips and any truthy return runs — this supports
+ * idioms like `(o, i, a) => a.constraints?.length`. For a correctly-typed
+ * `boolean` predicate this is exactly `true`=run / `false`=skip. A predicate
+ * that accidentally never returns (always `undefined`) therefore skips EVERY
+ * item — but that surfaces conspicuously as a non-zero `skipped` count (the
+ * Studio "N/A" chip) rather than as a silently green mean.
+ */
+export type ScorerApplies<TOutput, TInput, TAnnotations> = (
+  output: TOutput,
+  input: TInput,
+  annotations?: TAnnotations,
+) => boolean;
+
 export type ScorerConfig<TOutput = unknown, TInput = unknown, TAnnotations = unknown> = {
   name: string;
   description: string;
   score: ScorerFn<TOutput, TInput, TAnnotations>;
+  /** Optional applicability predicate — see {@link ScorerApplies}. When it
+   *  returns `false`, the scorer is skipped for that item (counted as neither
+   *  scored nor failed). Omit to run on every item (the default). */
+  applies?: ScorerApplies<TOutput, TInput, TAnnotations>;
 };
 
 export type Scorer<TOutput = unknown, TInput = unknown, TAnnotations = unknown> = {
@@ -68,6 +104,8 @@ export type Scorer<TOutput = unknown, TInput = unknown, TAnnotations = unknown> 
     annotations?: TAnnotations,
     context?: ScorerContext,
   ): number | ScorerResult | Promise<number | ScorerResult>;
+  /** See {@link ScorerApplies}. Evaluated by the runner before {@link score}. */
+  applies?: ScorerApplies<TOutput, TInput, TAnnotations>;
 };
 
 export function scorer<TOutput = unknown, TInput = unknown, TAnnotations = unknown>(
@@ -78,5 +116,6 @@ export function scorer<TOutput = unknown, TInput = unknown, TAnnotations = unkno
     description: config.description,
     isLlm: false,
     score: config.score,
+    applies: config.applies,
   };
 }

@@ -1654,7 +1654,7 @@ Configuration for `runEval()` and `runtime.eval()`.
 | `concurrency` | `number` | `5` | Maximum parallel item executions |
 | `scorerConcurrency` | `number` | `5` | Maximum parallel scorers **within a single item**. Worst-case concurrent scorer calls is `concurrency × scorerConcurrency`; set to `1` for a serial judge phase. Cost/timing/ordering are preserved deterministically |
 | `budget` | `string` | — | Cost limit (e.g., `"$10.00"`). Stops processing when exceeded. With concurrent scorers it is a **soft** ceiling — the per-item check runs once before an item's scorers, so overshoot is bounded by `concurrency × scorerConcurrency × max-scorer-cost` |
-| `failOnScorerErrorRate` | `number` (0–1) | — | Opt-in **source-side** trust gate. When set, `runEval` marks the run `summary.degraded` (and the CLI exits non-zero) if a scorer's failure rate exceeds tolerance. **Type-aware**: deterministic scorers tolerate **0** failures (a deterministic scorer that throws is a bug); LLM scorers use this rate. Failure rate = `failed / (scored + failed)`; `0` means "any LLM failure degrades". `runEval` never throws on this — it flags and returns, so the (still-useful) result is persisted and the consumer decides. An out-of-range value is **rejected at config load** by the CLI (`validateEvalConfig`, fails loud like `--max-scorer-error-rate`); a programmatic `runEval()` caller that bypasses that validation gets a `console.warn` and the gate is skipped. Catches the silent-thinned-sample trap: a `--fail-on-regression` gate computed over surviving scores can look green when half the judges 429'd. Distinct from the gate-side `axl-eval compare --max-scorer-error-rate` (which refuses to certify an already-thinned baseline/candidate). |
+| `failOnScorerErrorRate` | `number` (0–1) | — | Opt-in **source-side** trust gate. When set, `runEval` marks the run `summary.degraded` (and the CLI exits non-zero) if a scorer's failure rate exceeds tolerance. **Type-aware**: deterministic scorers tolerate **0** failures (a deterministic scorer that throws is a bug); LLM scorers use this rate. Failure rate = `failed / (scored + failed)`; `0` means "any LLM failure degrades". Items a scorer's `applies` predicate skipped are in neither `scored` nor `failed`, so they're excluded from the denominator — the supported way to scope a conditional scorer without polluting the gate (do NOT return `NaN` for inapplicable items; the gate treats a non-finite score as a real failure). `runEval` never throws on this — it flags and returns, so the (still-useful) result is persisted and the consumer decides. An out-of-range value is **rejected at config load** by the CLI (`validateEvalConfig`, fails loud like `--max-scorer-error-rate`); a programmatic `runEval()` caller that bypasses that validation gets a `console.warn` and the gate is skipped. Catches the silent-thinned-sample trap: a `--fail-on-regression` gate computed over surviving scores can look green when half the judges 429'd. Distinct from the gate-side `axl-eval compare --max-scorer-error-rate` (which refuses to certify an already-thinned baseline/candidate). |
 | `metadata` | `Record<string, unknown>` | — | Arbitrary metadata attached to the result (e.g., model version, prompt variant) |
 
 ### `DatasetConfig`
@@ -1691,8 +1691,9 @@ Per-scorer data stored on each `EvalItem`, providing richer detail than the `sco
 |-------|------|-------------|
 | `score` | `number \| null` | Score value, or `null` if the scorer failed |
 | `metadata` | `Record<string, unknown>?` | Scorer metadata (e.g., reasoning from LLM scorers) |
-| `duration` | `number?` | Scorer execution time in ms |
+| `duration` | `number?` | Scorer execution time in ms. Absent on a skipped scorer (it never ran) |
 | `cost` | `number?` | LLM cost for this scorer invocation |
+| `skipped` | `boolean?` | `true` when the scorer's `applies` predicate returned `false` for this item, so it was deliberately **not run** (`score` is `null`, no `duration`). Distinct from a ran-and-failed scorer (`null` score WITH a `duration`) and from cancellation (no marker, no duration). A skipped scorer is excluded from the mean AND from the failure-rate denominator — see `EvalSummary.scorers[].skipped` and `failOnScorerErrorRate` |
 
 ### `EvalItem`
 
@@ -1705,7 +1706,7 @@ Per-item result from an eval run. `scores` provides quick numeric access; `score
 | `output` | `unknown` | Workflow output |
 | `error` | `string?` | Workflow-level error message |
 | `scorerErrors` | `string[]?` | Scorer-level error messages (thrown exceptions or out-of-range scores) |
-| `scores` | `Record<string, number \| null>` | Quick numeric access to scores. `null` = scorer error (see `scorerErrors`) |
+| `scores` | `Record<string, number \| null>` | Quick numeric access to scores. `null` = scorer error (see `scorerErrors`) **or** a scorer skipped by its `applies` predicate — disambiguate via `scoreDetails[name].skipped` |
 | `duration` | `number?` | Workflow execution time in ms (set even when workflow errors) |
 | `cost` | `number?` | Workflow LLM cost |
 | `scorerCost` | `number?` | Total scorer cost for this item (sum of all `scoreDetails[*].cost`) |
@@ -1757,7 +1758,7 @@ Aggregate statistics across all items.
 |-------|------|-------------|
 | `count` | `number` | Total items |
 | `failures` | `number` | Items where the workflow threw an error |
-| `scorers` | `Record<string, { mean, min, max, p50, p95, scored?, failed? }>` | Per-scorer aggregate stats (all score values 0-1). `scored` is the number of items that produced a valid numeric score — the sample size `mean` actually covers; `failed` is the number whose scorer **ran and failed** (threw / out-of-range). A scorer skipped by cancellation is in neither bucket, so `scored + failed` is the honest "attempted" count. A non-zero `failed` means `mean` rests on a thinned sample. Both optional (absent on pre-0.18.0 artifacts → recompute from `items`) |
+| `scorers` | `Record<string, { mean, min, max, p50, p95, scored?, failed?, skipped? }>` | Per-scorer aggregate stats (all score values 0-1). `scored` is the number of items that produced a valid numeric score — the sample size `mean` actually covers; `failed` is the number whose scorer **ran and failed** (threw / out-of-range); `skipped` is the number whose `applies` predicate returned `false` (deliberately not run). Neither a skipped nor a cancelled scorer is in `scored`/`failed`, so `scored + failed` is the honest "attempted" count and the failure rate excludes skips. A non-zero `failed` means `mean` rests on a thinned sample. All optional (absent on pre-0.18.0 artifacts → recompute from `items`) |
 | `timing` | `{ mean, min, max, p50, p95 }?` | Per-item duration statistics in ms |
 | `degraded` | `DegradedScorer[]?` | Present only when `EvalConfig.failOnScorerErrorRate` is set **and** one or more scorers exceeded tolerance. Each entry is `{ scorer, rate, limit, type, scored, failed }`. `runEval` sets this and returns normally (it never throws); the CLI turns a non-empty `degraded` into a non-zero exit |
 | `DegradedScorer` | `{ scorer: string; rate: number; limit: number; type: 'llm' \| 'deterministic'; scored: number; failed: number }` | One scorer that tripped the failure-rate gate. `rate = failed / (scored + failed)`; `limit` is the tolerance exceeded (`0` for deterministic). Exported from `@axlsdk/eval` |
@@ -1772,6 +1773,7 @@ A scoring function returned by `scorer()` or `llmScorer()`.
 | `description` | `string` | What this scorer evaluates |
 | `isLlm` | `boolean` | `true` for LLM scorers |
 | `score` | `(output, input, annotations?, context?) => number \| ScorerResult \| Promise<number \| ScorerResult>` | Scoring function (returns 0-1 or a `ScorerResult` with metadata/cost). `context` is a `ScorerContext` passed by the eval runner |
+| `applies` | `(output, input, annotations?) => boolean` (optional) | Conditional-scorer predicate. The runner evaluates it **before** `score`; a `false` verdict skips the scorer for that item — for an `llmScorer`, no provider call is made — and the item counts as neither `scored` nor `failed` (excluded from the mean and the failure-rate denominator). The skip surfaces as `scoreDetails[name].skipped === true`. A predicate that throws is recorded as a scorer failure, not a skip. Omit to run on every item |
 
 ### `LlmScorerConfig`
 
@@ -1791,6 +1793,7 @@ Configuration for `llmScorer()`.
 | `includeThoughts` | `boolean` | provider default | Surface reasoning summaries in the judge's response. Effective on Gemini and the `openai-responses:` provider; no-op on Anthropic and OpenAI Chat Completions (`openai:`). Resolved to `false` if unset |
 | `stop` | `string[]` | — | Stop sequences forwarded to the provider |
 | `providerOptions` | `Record<string, unknown>` | — | Provider-specific escape hatch merged last into the raw API request. Not portable across providers. Can override the hardcoded `responseFormat: { type: 'json_object' }` — pass `providerOptions: { response_format: { type: 'json_schema', ... } }` to switch to strict JSON Schema mode |
+| `applies` | `(output, input, annotations?) => boolean` | — | Conditional-scorer predicate (see `Scorer.applies`). Evaluated before the judge call, so a `false` verdict means **no provider call** is made for that item — the conditional-LLM-judge cost / rate-limit win. The item counts as neither `scored` nor `failed` |
 
 ### `ScorerContext`
 

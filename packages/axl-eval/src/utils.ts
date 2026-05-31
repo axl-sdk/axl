@@ -21,16 +21,25 @@ export function round(n: number): number {
 
 /**
  * Count, for one scorer across a set of items, how many produced a valid score
- * (`scored`) vs ran-and-failed (`failed`). The single source of truth for the
+ * (`scored`), ran-and-failed (`failed`), or were deliberately skipped by the
+ * scorer's `applies` predicate (`skipped`). The single source of truth for the
  * failure-rate trust signal, shared by `runEval`, `rescore`, and `evalCompare`.
  *
- * The discriminator is `scoreDetails[name].duration`: `scoreItem` sets it
- * whenever a scorer actually executes (success, throw, or out-of-range), but a
- * scorer skipped by cancellation keeps its pre-seeded `{ score: null }` with NO
- * duration. So a `null` score WITH a duration is a genuine failure, while a
- * `null` score WITHOUT one was never attempted (cancellation) and belongs in
- * neither bucket — making `scored + failed` the honest "attempted" denominator
- * for a failure rate (it can be `<` the eligible item count).
+ * Three discriminators on the per-scorer `scoreDetails` entry, checked in
+ * precedence order so a positive `skipped` marker always wins over the
+ * duration heuristic:
+ *  - a non-null `scores[name]` ⇒ `scored`;
+ *  - else `skipped === true` (the `applies` predicate returned `false`) ⇒
+ *    `skipped` — deliberately NOT run, so it belongs in neither the mean nor
+ *    the failure-rate denominator;
+ *  - else a `duration` ⇒ `failed` (`scoreItem` stamps it whenever a scorer
+ *    actually executes: success, throw, or out-of-range);
+ *  - else (no score, no marker, no duration) the scorer was skipped by
+ *    cancellation (signal aborted before it started) and belongs in no bucket.
+ *
+ * So `scored + failed` is the honest "attempted" denominator for a failure rate
+ * — it excludes both `applies`-skips and cancellations and can be `<` the
+ * eligible item count.
  *
  * Items whose WORKFLOW errored (`i.error`) are excluded entirely — the scorers
  * never ran for them, so they're not part of the scorer's sample either way.
@@ -39,18 +48,20 @@ export function scorerCounts(
   items: readonly {
     error?: string;
     scores: Record<string, number | null>;
-    scoreDetails?: Record<string, { duration?: number }>;
+    scoreDetails?: Record<string, { duration?: number; skipped?: boolean }>;
   }[],
   name: string,
-): { scored: number; failed: number } {
+): { scored: number; failed: number; skipped: number } {
   let scored = 0;
   let failed = 0;
+  let skipped = 0;
   for (const i of items) {
     if (i.error) continue;
     if (i.scores[name] != null) scored++;
+    else if (i.scoreDetails?.[name]?.skipped === true) skipped++;
     else if (i.scoreDetails?.[name]?.duration != null) failed++;
   }
-  return { scored, failed };
+  return { scored, failed, skipped };
 }
 
 /** A scorer's failure-rate verdict against a tolerance — see {@link evaluateScorerTolerance}. */

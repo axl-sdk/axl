@@ -5,7 +5,6 @@ import type { EvalResult } from '../types.js';
 function makeRun(overrides: Partial<EvalResult> = {}): EvalResult {
   return {
     id: 'run-1',
-    workflow: 'test-wf',
     dataset: 'test-ds',
     metadata: { runGroupId: 'group-1' },
     timestamp: new Date().toISOString(),
@@ -181,14 +180,23 @@ describe('aggregateRuns()', () => {
     expect(() => aggregateRuns([])).toThrow('Cannot aggregate zero runs');
   });
 
-  it('sums scored/failed across runs', () => {
+  it('sums scored/failed/skipped across runs', () => {
     const runs = [
       makeRun({
         summary: {
           count: 2,
           failures: 0,
           scorers: {
-            accuracy: { mean: 0.7, min: 0.6, max: 0.8, p50: 0.7, p95: 0.8, scored: 8, failed: 2 },
+            accuracy: {
+              mean: 0.7,
+              min: 0.6,
+              max: 0.8,
+              p50: 0.7,
+              p95: 0.8,
+              scored: 8,
+              failed: 2,
+              skipped: 5,
+            },
           },
         },
       }),
@@ -197,7 +205,16 @@ describe('aggregateRuns()', () => {
           count: 2,
           failures: 0,
           scorers: {
-            accuracy: { mean: 0.8, min: 0.7, max: 0.9, p50: 0.8, p95: 0.9, scored: 9, failed: 1 },
+            accuracy: {
+              mean: 0.8,
+              min: 0.7,
+              max: 0.9,
+              p50: 0.8,
+              p95: 0.9,
+              scored: 9,
+              failed: 1,
+              skipped: 4,
+            },
           },
         },
       }),
@@ -205,13 +222,17 @@ describe('aggregateRuns()', () => {
     const summary = aggregateRuns(runs);
     expect(summary.scorers.accuracy.scored).toBe(17);
     expect(summary.scorers.accuracy.failed).toBe(3);
+    // `applies`-skips are summed independently of scored/failed and never fold
+    // into the failure-rate denominator.
+    expect(summary.scorers.accuracy.skipped).toBe(9);
   });
 
-  it('treats missing scored/failed as 0 (pre-0.18.0 artifacts)', () => {
-    // makeRun's default summary has no scored/failed fields.
+  it('treats missing scored/failed/skipped as 0 (pre-0.18.0 artifacts)', () => {
+    // makeRun's default summary has no scored/failed/skipped fields.
     const summary = aggregateRuns([makeRun(), makeRun()]);
     expect(summary.scorers.accuracy.scored).toBe(0);
     expect(summary.scorers.accuracy.failed).toBe(0);
+    expect(summary.scorers.accuracy.skipped).toBe(0);
   });
 
   it('excludes a 100%-failed run (scored 0) from the mean but counts it in failed', () => {

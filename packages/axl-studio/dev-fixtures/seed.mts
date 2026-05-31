@@ -17,7 +17,7 @@
  */
 import type { AxlRuntime, AxlEvent } from '@axlsdk/axl';
 import { runEval } from '@axlsdk/eval';
-import type { EvalConfig } from '@axlsdk/eval';
+import type { EvalConfig, EvalResult, EvalItem, EvalSummary } from '@axlsdk/eval';
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -228,6 +228,7 @@ export async function seedLive(runtime: AxlRuntime): Promise<void> {
     await seedQaEvalCohorts(runtime);
     await seedRagEval(runtime);
     await seedPartialBatchEval(runtime);
+    await seedConditionalScorerEval(runtime);
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn(
@@ -453,4 +454,195 @@ async function seedPartialBatchEval(runtime: AxlRuntime): Promise<void> {
       });
     }
   }
+}
+
+// ── Conditional-scorer eval (the `applies` skip / N-A feature) ───────
+//
+// Exercises every Studio surface that renders the "skipped / N/A" scorer
+// state introduced with the `applies` predicate:
+//   - EvalSummaryTable / ScoreDistribution: an "N/A: N" chip on a
+//     partially-skipped scorer, and a "No valid scores" row for a
+//     fully-skipped scorer.
+//   - Per-item detail / list: a neutral "N/A" badge, distinct from a
+//     failed (amber) or low (red) score.
+//   - Multi-run aggregate table (AggregateScorerRow): N/A chips + the
+//     "No valid scores" guard.
+//   - Compare view PairedSampleNote ("paired n=X · per-side B/C") and the
+//     compare item table "N/A" cells — via two runs whose conditional
+//     scorer applies to DIFFERENT item subsets (the asymmetric-skip case,
+//     including equal-count-but-disjoint).
+//
+// Hand-crafted EvalResult rows (no provider/workflow needed) so the skip
+// markers (`scoreDetails[name].skipped`) and the per-scorer
+// scored/failed/skipped counts are fully under our control.
+async function seedConditionalScorerEval(runtime: AxlRuntime): Promise<void> {
+  const { randomUUID } = await import('node:crypto');
+
+  const SCORERS = ['answer-quality', 'constraint-adherence', 'refusal-quality'] as const;
+  const scorerTypes: Record<string, string> = {
+    'answer-quality': 'llm',
+    'constraint-adherence': 'deterministic',
+    'refusal-quality': 'llm',
+  };
+
+  const QUESTIONS = [
+    'What is TypeScript?',
+    'Summarize this in exactly 3 bullet points.',
+    'Explain closures in JavaScript.',
+    'Respond in under 10 words: what is HTTP?',
+    'How do React hooks work?',
+    'List 5 sorting algorithms, one per line.',
+    'What is the capital of France?',
+    'Describe the JavaScript event loop.',
+  ];
+  // answer-quality runs on every item; constraint score used when an item is
+  // "constrained". refusal-quality is never applicable here (fully N/A).
+  const QUALITY = [0.92, 0.81, 0.88, 0.73, 0.95, 0.79, 0.99, 0.85];
+  const CONSTRAINT = [0.9, 0.6, 0.75, 0.5, 0.8, 0.65, 1.0, 0.7];
+
+  const r3 = (n: number) => Math.round(n * 1000) / 1000;
+
+  const makeItem = (idx: number, constrained: boolean, qualityBias: number): EvalItem => {
+    const scores: Record<string, number | null> = {};
+    const scoreDetails: NonNullable<EvalItem['scoreDetails']> = {};
+
+    const q = r3(Math.min(1, Math.max(0, QUALITY[idx] + qualityBias)));
+    scores['answer-quality'] = q;
+    scoreDetails['answer-quality'] = {
+      score: q,
+      duration: 120 + ((idx * 17) % 80),
+      cost: 0.0006,
+      metadata: { reasoning: 'Rated the answer for accuracy and completeness against the question.' },
+    };
+
+    if (constrained) {
+      const c = CONSTRAINT[idx];
+      scores['constraint-adherence'] = c;
+      scoreDetails['constraint-adherence'] = { score: c, duration: 2 };
+    } else {
+      // Skipped: null score + positive `skipped` marker, NO duration.
+      scores['constraint-adherence'] = null;
+      scoreDetails['constraint-adherence'] = { score: null, skipped: true };
+    }
+
+    // No refusal-expected items in this dataset → fully N/A.
+    scores['refusal-quality'] = null;
+    scoreDetails['refusal-quality'] = { score: null, skipped: true };
+
+    return {
+      input: { question: QUESTIONS[idx], constrained },
+      annotations: { constrained, expectRefusal: false },
+      output: `A thorough answer to: ${QUESTIONS[idx]}`,
+      scores,
+      scoreDetails,
+      duration: 700 + ((idx * 131) % 900),
+      cost: 0.002 + ((idx * 7) % 5) / 1000,
+      scorerCost: 0.0006,
+    };
+  };
+
+  const summarize = (items: EvalItem[]): EvalSummary => {
+    const scorers: EvalSummary['scorers'] = {};
+    for (const name of SCORERS) {
+      const vals = items
+        .map((i) => i.scores[name])
+        .filter((v): v is number => typeof v === 'number')
+        .sort((a, b) => a - b);
+      const skipped = items.filter((i) => i.scoreDetails?.[name]?.skipped === true).length;
+      const failed = items.filter(
+        (i) =>
+          i.scores[name] == null &&
+          i.scoreDetails?.[name]?.skipped !== true &&
+          i.scoreDetails?.[name]?.duration != null,
+      ).length;
+      const stat = vals.length
+        ? {
+            mean: r3(vals.reduce((s, v) => s + v, 0) / vals.length),
+            min: vals[0],
+            max: vals[vals.length - 1],
+            p50: vals[Math.floor((vals.length - 1) * 0.5)],
+            p95: vals[Math.floor((vals.length - 1) * 0.95)],
+          }
+        : { mean: 0, min: 0, max: 0, p50: 0, p95: 0 };
+      scorers[name] = { ...stat, scored: vals.length, failed, skipped };
+    }
+    const durs = items
+      .map((i) => i.duration)
+      .filter((d): d is number => typeof d === 'number')
+      .sort((a, b) => a - b);
+    const timing = durs.length
+      ? {
+          mean: r3(durs.reduce((s, d) => s + d, 0) / durs.length),
+          min: durs[0],
+          max: durs[durs.length - 1],
+          p50: durs[Math.floor((durs.length - 1) * 0.5)],
+          p95: durs[Math.floor((durs.length - 1) * 0.95)],
+        }
+      : undefined;
+    return { count: items.length, failures: 0, scorers, timing };
+  };
+
+  const makeResult = (
+    items: EvalItem[],
+    extraMeta: Record<string, unknown> = {},
+  ): EvalResult => ({
+    id: randomUUID(),
+    dataset: 'conditional-demo-dataset',
+    metadata: {
+      workflows: ['conditional-demo-workflow'],
+      models: ['openai-responses:gpt-5.5'],
+      modelCounts: { 'openai-responses:gpt-5.5': items.length },
+      scorerTypes,
+      ...extraMeta,
+    },
+    timestamp: new Date().toISOString(),
+    totalCost: r3(items.reduce((s, it) => s + (it.cost ?? 0) + (it.scorerCost ?? 0), 0)),
+    duration: items.reduce((s, it) => s + (it.duration ?? 0), 0),
+    items,
+    summary: summarize(items),
+  });
+
+  const itemsFor = (constrainedIdx: number[], qualityBias = 0): EvalItem[] => {
+    const set = new Set(constrainedIdx);
+    return QUESTIONS.map((_q, i) => makeItem(i, set.has(i), qualityBias));
+  };
+
+  // 1) Multi-run group (3 runs): constraint applies to items 0-2 → scored 3,
+  //    N/A 5; refusal-quality fully N/A. Drives the run-detail N/A chips AND
+  //    the multi-run aggregate table (N/A chips + "No valid scores").
+  const groupId = randomUUID();
+  for (let i = 0; i < 3; i++) {
+    const result = makeResult(itemsFor([0, 1, 2], (i - 1) * 0.02), {
+      runGroupId: groupId,
+      runIndex: i,
+    });
+    await runtime.saveEvalResult({
+      id: result.id,
+      eval: 'conditional-demo',
+      timestamp: Date.now() - 30 * 60 * 1000 + i * 1000,
+      data: result,
+    });
+  }
+
+  // 2) Compare pair — same eval/dataset/scorers, but the conditional scorer
+  //    applies to DIFFERENT (and equal-count-but-disjoint) subsets:
+  //    baseline constrains {0,1,2}, candidate constrains {2,3,4}. Overlap is
+  //    only item 2 → paired n=1 for constraint while each side scored 3, and
+  //    both skip 5 (equal counts, disjoint) → PairedSampleNote + the CLI's
+  //    equal-but-disjoint NOTE. answer-quality is biased down so there's also
+  //    a real delta on the always-applicable scorer.
+  const baseline = makeResult(itemsFor([0, 1, 2], 0));
+  const candidate = makeResult(itemsFor([2, 3, 4], -0.05));
+  await runtime.saveEvalResult({
+    id: baseline.id,
+    eval: 'conditional-demo',
+    timestamp: Date.now() - 20 * 60 * 1000,
+    data: baseline,
+  });
+  await runtime.saveEvalResult({
+    id: candidate.id,
+    eval: 'conditional-demo',
+    timestamp: Date.now() - 19 * 60 * 1000,
+    data: candidate,
+  });
 }

@@ -457,6 +457,7 @@ describe('ProviderRegistry', () => {
           'deepseek',
           'mistral',
           'groq',
+          'bedrock',
           'ollama',
           'vllm',
           'lmstudio',

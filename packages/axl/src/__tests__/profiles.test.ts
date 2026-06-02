@@ -8,6 +8,7 @@ import {
   DEEPSEEK_PROFILE,
   MISTRAL_PROFILE,
   GROQ_PROFILE,
+  BEDROCK_PROFILE,
   OLLAMA_PROFILE,
   BUILTIN_PROFILES,
 } from '../providers/profiles/index.js';
@@ -61,6 +62,9 @@ function provider(profile: ProviderProfile, apiKey: string | undefined = 'k', ba
 
 const AZURE_BASE = 'https://my-resource.openai.azure.com/openai/v1';
 const azure = () => provider(AZURE_PROFILE, 'k', AZURE_BASE);
+
+const BEDROCK_BASE = 'https://bedrock-mantle.us-east-1.api.aws/v1';
+const bedrock = () => provider(BEDROCK_PROFILE, 'tok', BEDROCK_BASE);
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
@@ -292,6 +296,46 @@ describe('Groq preset', () => {
       await provider(GROQ_PROFILE).chat(user, { model, effort: 'medium' });
       expect(req(fetchMock).body, model).not.toHaveProperty('reasoning_effort');
     }
+  });
+});
+
+// ===========================================================================
+// AWS Bedrock
+// ===========================================================================
+
+describe('Bedrock preset', () => {
+  it('throws if no base URL is provided (region-specific, no default)', () => {
+    expect(() => provider(BEDROCK_PROFILE, 'tok')).toThrow(/AWS Bedrock requires a base URL/);
+  });
+
+  it('uses bearer auth against the configured region endpoint', async () => {
+    const fetchMock = mockFetch(ok());
+    await bedrock().chat(user, { model: 'openai.gpt-oss-120b-1:0' });
+    const r = req(fetchMock);
+    expect(r.url).toBe(`${BEDROCK_BASE}/chat/completions`);
+    expect(r.headers.Authorization).toBe('Bearer tok');
+  });
+
+  it('emits reasoning_effort for gpt-oss (clamping max→high)', async () => {
+    let fetchMock = mockFetch(ok());
+    await bedrock().chat(user, { model: 'openai.gpt-oss-120b-1:0', effort: 'medium' });
+    expect(req(fetchMock).body.reasoning_effort).toBe('medium');
+
+    fetchMock = mockFetch(ok());
+    await bedrock().chat(user, { model: 'openai.gpt-oss-20b-1:0', effort: 'max' });
+    expect(req(fetchMock).body.reasoning_effort).toBe('high');
+  });
+
+  it('omits reasoning_effort for non-gpt-oss models', async () => {
+    const fetchMock = mockFetch(ok());
+    await bedrock().chat(user, { model: 'anthropic.claude-sonnet-4-6', effort: 'high' });
+    expect(req(fetchMock).body).not.toHaveProperty('reasoning_effort');
+  });
+
+  it('reports unknown cost (Bedrock returns no usage.cost)', async () => {
+    mockFetch(ok());
+    const r = await bedrock().chat(user, { model: 'openai.gpt-oss-120b-1:0' });
+    expect(r.cost).toBeUndefined();
   });
 });
 

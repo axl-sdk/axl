@@ -104,6 +104,7 @@ xai:grok-4
 deepseek:deepseek-reasoner
 mistral:mistral-large-latest
 groq:openai/gpt-oss-120b               # fastest inference; open-weight only
+bedrock:openai.gpt-oss-120b-1:0        # AWS Bedrock (gpt-oss); region base URL + bearer token
 ollama:llama3                          # local — no key, $0
 vllm:meta-llama/Llama-3.3-70B-Instruct
 lmstudio:<model>  ·  llamacpp:<model>  ·  sglang:<model>
@@ -121,6 +122,7 @@ on its env vars. Each preset reads `<PRESET>_API_KEY` and `<PRESET>_BASE_URL`
 | `deepseek` | `https://api.deepseek.com/v1` | Bearer | captures `reasoning_content`, round-trips on tool turns; no `json_schema` | unknown |
 | `mistral` | `https://api.mistral.ai/v1` | Bearer | `reasoning_effort` (active→`high`; `magistral-*` omit) | unknown |
 | `groq` | `https://api.groq.com/openai/v1` | Bearer | `reasoning_effort` on reasoning families only | unknown |
+| `bedrock` | *your region* (`BEDROCK_BASE_URL`) | Bearer (`AWS_BEARER_TOKEN_BEDROCK`) | `reasoning_effort` for gpt-oss | unknown |
 | `ollama` | `http://localhost:11434/v1` | none | inline `<think>` | **$0** |
 | `vllm` | `http://localhost:8000/v1` | optional | inline `<think>` | **$0** |
 | `lmstudio` | `http://localhost:1234/v1` | none | inline `<think>` | **$0** |
@@ -143,7 +145,15 @@ Notes & caveats:
   tool-calling depends on server launch flags + per-model parsers.
 - **Azure (v1 API):** set the base URL to `https://{resource}.openai.azure.com/openai/v1`;
   the deployment name goes in the model slot. API-key auth uses the `api-key` header; Entra
-  token auth (async key callback) is on the roadmap, not yet wired.
+  token auth uses the async-key callback (set `apiKey` to a function — see below).
+- **AWS Bedrock:** scoped to **gpt-oss** for now (Claude-on-Bedrock is a later native-adapter
+  mode). Set a region base URL (prefer the `bedrock-mantle` endpoint) and a bearer token
+  (`AWS_BEARER_TOKEN_BEDROCK`); model ids carry a version suffix (`openai.gpt-oss-120b-1:0`).
+  Cost is unknown (Bedrock returns no per-call cost). No SigV4 — short-term tokens can use the
+  async-key callback.
+- **Expiring credentials (Azure-Entra, Bedrock short-term, Databricks/IBM OAuth):** set a
+  provider's `apiKey` to a function `() => string | Promise<string>` — Axl resolves it per
+  request, so your callback owns refresh. A plain string is the common case.
 
 Build your own preset by cloning a `ProviderProfile` (see [Custom Providers](#custom-providers)).
 
@@ -341,6 +351,7 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 | **DeepSeek** | model-driven⊕ | model-driven⊕ | model-driven⊕ | model-driven⊕ | model-driven⊕ | model-driven⊕ | no-op◆ |
 | **Mistral** (small/medium) | omit | `reasoning_effort: 'high'`¶ | `'high'` | `'high'` | `'high'` | `'high'` | no-op◆ |
 | **Groq** (gpt-oss) | omit | `reasoning_effort: 'low'` | `'medium'` | `'high'` | `'high'` | `'high'` | no-op◆ |
+| **Bedrock** (gpt-oss) | omit | `reasoning_effort: 'low'` | `'medium'` | `'high'` | `'high'` | `'high'` | no-op◆ |
 | **Self-hosted** (ollama/vllm/…) | deploy-time⊗ | deploy-time⊗ | deploy-time⊗ | deploy-time⊗ | deploy-time⊗ | deploy-time⊗ | no-op◆ |
 
 ¶ The provider's `reasoning_effort` vocabulary is narrower than Axl's, so multiple levels collapse (xAI grok-3-mini exposes only `low`/`high`; Mistral maps any active effort to `'high'`). Models/families not listed (xAI grok-4, Mistral `magistral-*` and `large`/`ministral`/etc., Groq qwen3/llama) **omit** `reasoning_effort` — `effort` is a documented no-op there, never an error.

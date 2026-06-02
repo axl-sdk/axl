@@ -1281,7 +1281,7 @@ const runtime3 = new AxlRuntime({
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `apiKey` | `string` | env var | API key (falls back to the provider's env var, e.g. `OPENAI_API_KEY`) |
+| `apiKey` | `string \| (() => string \| Promise<string>)` | env var | API key, or a function (`ApiKeySource`) resolved **per request** for expiring credentials (Azure-Entra, Bedrock short-term, Databricks/IBM OAuth) — your callback owns refresh/caching. Falls back to the provider's env var (e.g. `OPENAI_API_KEY`) |
 | `baseUrl` | `string` | provider default | Override the API base URL (proxies, gateways) |
 | `rateLimit` | `RateLimitConfig` | — | Opt-in client-side rate governor for this provider's chat calls. See below. `openai-responses` inherits the `openai` block (incl. `rateLimit`) when it has no config of its own — but as a **separate governor instance**, not a shared counter (using both adapters ⇒ effective concurrency is the sum) |
 

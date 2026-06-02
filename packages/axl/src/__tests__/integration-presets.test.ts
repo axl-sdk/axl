@@ -7,6 +7,7 @@ import {
   MISTRAL_PROFILE,
   GROQ_PROFILE,
   AZURE_PROFILE,
+  BEDROCK_PROFILE,
   OLLAMA_PROFILE,
 } from '../providers/profiles/index.js';
 import type { ChatMessage, ChatOptions } from '../providers/types.js';
@@ -186,6 +187,26 @@ describe.skipIf(
     expect(res.usage?.total_tokens).toBeGreaterThan(0);
   });
 });
+
+// ── AWS Bedrock (gpt-oss via the OpenAI-compatible endpoint) ────────────────
+
+describe.skipIf(!process.env.AWS_BEARER_TOKEN_BEDROCK || !process.env.BEDROCK_BASE_URL)(
+  'preset: AWS Bedrock',
+  () => {
+    const provider = () => new OpenAICompatibleProvider({ profile: BEDROCK_PROFILE });
+    const model = process.env.BEDROCK_MODEL ?? 'openai.gpt-oss-20b-1:0';
+
+    it('accepts a gpt-oss chat call via bearer auth', async () => {
+      const res = await smoke(provider(), model);
+      expect(typeof res.content).toBe('string');
+      expect(res.usage?.total_tokens).toBeGreaterThan(0);
+    });
+
+    it('does not 4xx with reasoning_effort set on gpt-oss', async () => {
+      await expect(smoke(provider(), model, { effort: 'low' })).resolves.toBeDefined();
+    });
+  },
+);
 
 // ── Self-hosted (opt-in: requires a running local server) ───────────────────
 // Gate on OLLAMA_BASE_URL so this only runs when a user points at their server.

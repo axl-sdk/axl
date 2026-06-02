@@ -74,7 +74,12 @@ pnpm -F axl test -- agent
 source .env && pnpm -F axl test -- integration-advanced --reporter=verbose
 ```
 
-Integration tests require `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY` in a `.env` file. They are automatically skipped when keys are not present.
+Integration tests read provider API keys from a `.env` file at the repo root. Copy
+`.env.example` to `.env` and fill in the providers you want to exercise — it lists every
+supported key (OpenAI, Anthropic, Gemini, plus the OpenAI-compatible presets: OpenRouter,
+xAI, DeepSeek, Mistral, Groq, Azure, and local runtimes) and where to obtain each. Each
+provider's tests are gated on its own key and **auto-skip when the key is absent**, so a
+partial `.env` is fine. Run the whole live suite with `pnpm test:integration`.
 
 ## Code Conventions
 

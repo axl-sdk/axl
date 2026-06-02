@@ -61,6 +61,8 @@ export {
   eventCostContribution,
   isCostBearingLeaf,
   isRootLevel,
+  hasPositiveTokens,
+  isUsableCost,
   COST_BEARING_LEAF_TYPES,
 } from './event-utils.js';
 

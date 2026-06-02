@@ -28,6 +28,34 @@ export const COST_BEARING_LEAF_TYPES = [
 const COST_LEAF_SET: ReadonlySet<string> = new Set(COST_BEARING_LEAF_TYPES);
 
 /**
+ * True when an event reports a POSITIVE token count — i.e. it did measurable,
+ * billable work. This is the discriminator the unpriced-cost signal (T2.5) uses:
+ * a cost-bearing leaf with positive tokens but no usable cost is an unpriced
+ * model / pricing-table miss, whereas a failed call (no usage) or a no-usage
+ * streamed `done` (zero tokens) is NOT "unpriced". Used by the core ask-cost
+ * rollup AND the Studio aggregators, so the per-ask flag and the dashboard count
+ * stay in lockstep.
+ */
+export function hasPositiveTokens(event: {
+  tokens?: { input?: number; output?: number; reasoning?: number } | null;
+}): boolean {
+  const t = event.tokens;
+  if (!t) return false;
+  return (t.input ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0) > 0;
+}
+
+/**
+ * True when a cost value is usable for accounting: a finite, non-negative
+ * number. A NON-usable cost (`undefined`, `NaN`, `Infinity`, negative) on a
+ * work-bearing leaf is what marks it "unpriced / unknown". Shared by the core
+ * ask-cost rollup and the Studio aggregators so their unpriced detection stays
+ * exactly in lockstep (incl. the non-finite edge).
+ */
+export function isUsableCost(cost: unknown): cost is number {
+  return typeof cost === 'number' && Number.isFinite(cost) && cost >= 0;
+}
+
+/**
  * Cost contribution of `event` to a running total.
  *
  * Returns the event's `cost` if it's a cost-bearing leaf; 0 otherwise.

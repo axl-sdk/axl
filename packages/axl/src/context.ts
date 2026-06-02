@@ -37,7 +37,7 @@ import {
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
 import { StreamingWalker } from './streaming-walker.js';
-import { COST_BEARING_LEAF_TYPES } from './event-utils.js';
+import { COST_BEARING_LEAF_TYPES, hasPositiveTokens, isUsableCost } from './event-utils.js';
 import { AxlEventBus, EventStreamOverflowError, type EventStreamOptions } from './event-stream.js';
 import { redactEvent } from './redaction.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
@@ -1300,10 +1300,12 @@ export class WorkflowContext<TInput = unknown> {
             });
           }
 
-          response ??= {
-            content,
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-          };
+          // Parity with the non-streaming path: only attach usage if the
+          // provider actually reported it (via the `done` chunk above). A
+          // fabricated zero-usage object would make a no-usage streamed call
+          // look like it "did measurable work" and falsely trip the unpriced
+          // signal (T2.5) for $0 local providers and usage-omitting gateways.
+          response ??= { content };
           if (toolCalls.length > 0) {
             response.tool_calls = toolCalls;
           }
@@ -3712,14 +3714,19 @@ export class WorkflowContext<TInput = unknown> {
     // inside an ask.
     const cost = (partial as { cost?: number }).cost;
     if (frame && (COST_BEARING_LEAF_TYPES as readonly string[]).includes(partial.type as string)) {
-      if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) {
+      if (isUsableCost(cost)) {
         frame.askCost.value += cost;
-      } else if ((partial as { tokens?: unknown }).tokens != null) {
-        // A cost-bearing leaf that did measurable work (returned usage/tokens)
+      } else if (
+        hasPositiveTokens(
+          partial as { tokens?: { input?: number; output?: number; reasoning?: number } },
+        )
+      ) {
+        // A cost-bearing leaf that did measurable work (a POSITIVE token count)
         // but produced no usable cost = an unpriced model / pricing-table miss.
-        // `tokens` is the "did work" signal that distinguishes this from a failed
-        // call (error emits carry neither cost nor tokens), so `ask_end.cost`
-        // (which omits the unknown component) can be flagged as a lower bound.
+        // The positive-token signal distinguishes this from a failed call (no
+        // tokens) AND from a no-usage streamed call (zero tokens) — so
+        // `ask_end.cost` (which omits the unknown component) is flagged as a
+        // lower bound only when real work was actually billed.
         frame.askUnpriced = true;
       }
     }

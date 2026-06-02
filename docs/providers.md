@@ -104,7 +104,7 @@ xai:grok-4
 deepseek:deepseek-reasoner
 mistral:mistral-large-latest
 groq:openai/gpt-oss-120b               # fastest inference; open-weight only
-bedrock:openai.gpt-oss-120b-1:0        # AWS Bedrock (gpt-oss); region base URL + bearer token
+bedrock:openai.gpt-oss-120b            # AWS Bedrock (gpt-oss); region base URL + bearer token
 ollama:llama3                          # local — no key, $0
 vllm:meta-llama/Llama-3.3-70B-Instruct
 lmstudio:<model>  ·  llamacpp:<model>  ·  sglang:<model>
@@ -147,13 +147,15 @@ Notes & caveats:
   the deployment name goes in the model slot. API-key auth uses the `api-key` header; Entra
   token auth uses the async-key callback (set `apiKey` to a function — see below).
 - **AWS Bedrock:** scoped to **gpt-oss** for now (Claude-on-Bedrock is a later native-adapter
-  mode). Set a region base URL (prefer the `bedrock-mantle` endpoint) and a bearer token
-  (`AWS_BEARER_TOKEN_BEDROCK`); model ids carry a version suffix (`openai.gpt-oss-120b-1:0`).
-  Cost is unknown (Bedrock returns no per-call cost). No SigV4 — short-term tokens can use the
-  async-key callback.
+  mode). Set a region base URL and a bearer token (`AWS_BEARER_TOKEN_BEDROCK`). Match the model
+  id to the endpoint: the preferred `bedrock-mantle` endpoint uses **unsuffixed** ids
+  (`openai.gpt-oss-120b`); the alternative `bedrock-runtime` endpoint uses the version-suffixed
+  form (`openai.gpt-oss-120b-1:0`). Cost is unknown (Bedrock returns no per-call cost). No
+  SigV4 — short-term tokens can use the async-key callback.
 - **Expiring credentials (Azure-Entra, Bedrock short-term, Databricks/IBM OAuth):** set a
   provider's `apiKey` to a function `() => string | Promise<string>` — Axl resolves it per
-  request, so your callback owns refresh. A plain string is the common case.
+  request, so your callback owns refresh. A plain string is the common case. (The callback
+  covers the four chat adapters; the semantic-memory embedder still takes a static key.)
 
 Build your own preset by cloning a `ProviderProfile` (see [Custom Providers](#custom-providers)).
 

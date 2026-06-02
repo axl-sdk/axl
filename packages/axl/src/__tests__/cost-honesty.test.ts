@@ -32,6 +32,38 @@ function seqProvider(responses: ProviderResponse[]): Provider {
   };
 }
 
+/** A streaming provider: yields a text delta then a `done` chunk that carries
+ *  usage/cost only when provided (mirrors a real provider — no fabricated usage). */
+function streamProvider(opts: {
+  content?: string;
+  usage?: ProviderResponse['usage'];
+  cost?: number;
+}): Provider {
+  const content = opts.content ?? 'ok';
+  return {
+    name: 'mock',
+    async chat() {
+      return { content, usage: opts.usage, cost: opts.cost };
+    },
+    async *stream(): AsyncGenerator<StreamChunk> {
+      yield { type: 'text_delta', content };
+      yield {
+        type: 'done',
+        ...(opts.usage
+          ? {
+              usage: {
+                prompt_tokens: opts.usage.prompt_tokens,
+                completion_tokens: opts.usage.completion_tokens,
+                total_tokens: opts.usage.total_tokens,
+              },
+            }
+          : {}),
+        ...(opts.cost !== undefined ? { cost: opts.cost } : {}),
+      };
+    },
+  };
+}
+
 function throwingProvider(): Provider {
   return {
     name: 'mock',
@@ -128,6 +160,28 @@ describe('ask_end.unpriced (T2.5)', () => {
     await ctx.ask(plain(), 'hi');
     const redacted = redactEvent(askEnd(traces)!) as { unpriced?: boolean };
     expect(redacted.unpriced).toBe(true);
+  });
+
+  // ── Streaming parity (regression guard for the fabricated-zero-usage bug) ──
+  it('STREAMING: a done chunk with NO usage does NOT flag unpriced (parity with chat)', async () => {
+    // The bug: the streaming branch fabricated {0,0,0} usage, so a no-usage
+    // streamed call (every $0 local provider that omits the usage chunk) was
+    // wrongly flagged as unpriced. It must behave exactly like non-streaming.
+    const { ctx, traces } = createTestCtx({
+      provider: streamProvider({ content: 'hi' }), // no usage
+      onToken: () => {}, // enables the streaming path
+    });
+    await ctx.ask(plain(), 'hi');
+    expect(askEnd(traces)?.unpriced).toBeFalsy();
+  });
+
+  it('STREAMING: a done chunk WITH usage but no cost DOES flag unpriced', async () => {
+    const { ctx, traces } = createTestCtx({
+      provider: streamProvider({ content: 'hi', usage }), // usage, no cost
+      onToken: () => {},
+    });
+    await ctx.ask(plain(), 'hi');
+    expect(askEnd(traces)?.unpriced).toBe(true);
   });
 
   it('emits unpriced on the handoff-roundtrip target ask_end (not just the main loop)', async () => {

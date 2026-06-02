@@ -3,7 +3,7 @@
  * Each reducer is a pure (state, source) => state function — no I/O, no mutation.
  */
 import type { AxlEvent, ExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
-import { eventCostContribution } from '@axlsdk/axl';
+import { eventCostContribution, hasPositiveTokens, isUsableCost } from '@axlsdk/axl';
 import type { CostData } from '../types.js';
 
 // ── Shared helpers ────────────────────────────────────────────────────
@@ -72,12 +72,13 @@ export function reduceCost(acc: CostData, event: AxlEvent): CostData {
   const tokens = event.tokens ?? {};
 
   // Unpriced leaf: a cost-bearing LLM/embedder call that did measurable work
-  // (it passed the cost-null+no-tokens guard above, so it has tokens) but had no
-  // usable cost. Counting these lets the dashboard flag totalCost as a lower
-  // bound. tool_call_end has no tokens (excluded by the guard); ask_end is
-  // already returned above and always carries a numeric cost.
+  // (POSITIVE tokens) but had no usable cost. Counting these lets the dashboard
+  // flag totalCost as a lower bound. The explicit hasPositiveTokens check keeps
+  // this self-contained and in lockstep with the core's ask_end.unpriced
+  // discriminator (so a no-usage/zero-token streamed call isn't miscounted).
   const isUnpricedLeaf =
-    event.cost == null &&
+    !isUsableCost(event.cost) &&
+    hasPositiveTokens(event) &&
     (event.type === 'agent_call_end' ||
       event.type === 'memory_remember' ||
       event.type === 'memory_recall');

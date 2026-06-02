@@ -1,3 +1,4 @@
+import { hasPositiveTokens, isUsableCost } from '@axlsdk/axl';
 import type { CostData } from './types.js';
 import type { ConnectionManager } from './ws/connection-manager.js';
 
@@ -64,10 +65,12 @@ export class CostAggregator {
     const tokens = event.tokens ?? {};
 
     // Unpriced leaf (parity with reduceCost): a cost-bearing LLM/embedder call
-    // that did measurable work but had no usable cost. ask_end always carries a
-    // numeric cost, so it's excluded; tool_call_end has no tokens (filtered above).
+    // that did measurable work (POSITIVE tokens) but had no usable cost. ask_end
+    // always carries a numeric cost, so it's excluded; tool_call_end has no
+    // tokens. The hasPositiveTokens check matches the core discriminator.
     if (
-      event.cost == null &&
+      !isUsableCost(event.cost) &&
+      hasPositiveTokens(event) &&
       (event.type === 'agent_call_end' ||
         event.type === 'memory_remember' ||
         event.type === 'memory_recall')

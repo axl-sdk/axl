@@ -500,6 +500,8 @@ if (result.budgetExceeded) {
 
 Read-only getter returning the total cost accumulated by agent calls in this context. Inside a `ctx.budget()` block, returns only that block's accumulated cost; after the block completes, the nested cost is rolled up into the parent total.
 
+> **Unpriced models → lower bound.** A call to an unpriced model (pricing-table miss / a provider that reports no per-call cost) contributes `undefined` cost, which counts as nothing — so `ctx.totalCost` (and `ExecutionInfo.totalCost`, `ctx.budget()` accounting) **understate** total spend when unpriced models run. The owning `ask_end` carries `unpriced: true` and the Studio Cost Dashboard surfaces `CostData.unpricedCalls`; use those to detect when the number is a lower bound rather than exact.
+
 ```typescript
 const ctx = runtime.createContext();
 await ctx.ask(agent, 'hello');

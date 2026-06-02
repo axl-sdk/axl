@@ -490,7 +490,9 @@ export type AxlEventBase = {
    *   - **Leaf cost** (`agent_call_end`, `tool_call_end`, `memory_remember`,
    *     `memory_recall`): the authoritative charge for this single
    *     provider call / tool invocation / embedder call. Summing these
-   *     across an execution gives the true spend.
+   *     across an execution gives the spend — a LOWER BOUND when any call
+   *     used an unpriced model (its `cost` is `undefined` and contributes
+   *     nothing; the owning `ask_end` sets `unpriced: true`).
    *
    *   - **Per-ask rollup** (`ask_end`): the SUM of leaf costs emitted
    *     within this ask's frame, EXCLUDING nested asks (which roll up
@@ -837,6 +839,9 @@ export type ExecutionInfo = {
    *  here (stream-only); aggregate `tokens: { input, output, reasoning? }`
    *  on `agent_call_end` is the persisted token representation. */
   events: AxlEvent[];
+  /** Total spend for the execution. A LOWER BOUND when an unpriced model ran
+   *  (those calls contribute nothing) — check for any `ask_end.unpriced` /
+   *  `agent_call_end.cost === undefined` to know whether it's exact. */
   totalCost: number;
   startedAt: number;
   completedAt?: number;

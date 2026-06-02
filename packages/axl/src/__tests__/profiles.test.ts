@@ -406,6 +406,20 @@ describe('registry wiring', () => {
     expect(p.name).toBe('openrouter');
   });
 
+  it('preserves a colon WITHIN the model id (Bedrock runtime -1:0 suffix)', () => {
+    const reg = new ProviderRegistry();
+    const { provider: p, model } = reg.resolve('bedrock:openai.gpt-oss-120b-1:0', {
+      providers: {
+        bedrock: {
+          apiKey: 'tok',
+          baseUrl: 'https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1',
+        },
+      },
+    });
+    expect(model).toBe('openai.gpt-oss-120b-1:0'); // split on the FIRST colon only
+    expect(p.name).toBe('bedrock');
+  });
+
   it('does NOT override the native big-3 adapters with presets', () => {
     const reg = new ProviderRegistry();
     const openai = reg.get('openai', { providers: { openai: { apiKey: 'k' } } });

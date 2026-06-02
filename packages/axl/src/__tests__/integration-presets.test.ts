@@ -194,7 +194,7 @@ describe.skipIf(!process.env.AWS_BEARER_TOKEN_BEDROCK || !process.env.BEDROCK_BA
   'preset: AWS Bedrock',
   () => {
     const provider = () => new OpenAICompatibleProvider({ profile: BEDROCK_PROFILE });
-    const model = process.env.BEDROCK_MODEL ?? 'openai.gpt-oss-20b-1:0';
+    const model = process.env.BEDROCK_MODEL ?? 'openai.gpt-oss-20b';
 
     it('accepts a gpt-oss chat call via bearer auth', async () => {
       const res = await smoke(provider(), model);

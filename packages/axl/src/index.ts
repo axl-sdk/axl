@@ -151,10 +151,31 @@ export {
 } from './errors.js';
 
 // Provider
-export { OpenAIProvider } from './providers/openai.js';
+export { OpenAIProvider, OPENAI_PRICING, estimateOpenAICost } from './providers/openai.js';
 export { OpenAIResponsesProvider } from './providers/openai-responses.js';
 export { AnthropicProvider } from './providers/anthropic.js';
 export { GeminiProvider } from './providers/gemini.js';
+// Generic OpenAI-compatible engine + profile types (build a custom provider preset).
+export {
+  OpenAICompatibleProvider,
+  priceFromTable,
+  resolvePerModel,
+  ThinkTagScanner,
+  extractThinkTags,
+} from './providers/openai-compatible.js';
+export type {
+  ProviderProfile,
+  CapabilityFlags,
+  PricingSource,
+  PricingTable,
+  ReasoningProfile,
+  ReasoningCapture,
+  ReasoningRoundTrip,
+  ReasoningEmit,
+  AuthHeader,
+  PerModel,
+  OpenAICompatibleOptions,
+} from './providers/openai-compatible.js';
 export { ProviderRegistry } from './providers/registry.js';
 export { RateLimiter } from './providers/rate-limiter.js';
 export type { RateLimitConfig } from './providers/rate-limiter.js';

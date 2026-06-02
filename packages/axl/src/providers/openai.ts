@@ -1,14 +1,12 @@
-import type {
-  Provider,
-  ChatOptions,
-  ChatMessage,
-  ProviderResponse,
-  StreamChunk,
-  Effort,
-} from './types.js';
-import { resolveThinkingOptions } from './types.js';
-import { fetchWithRetry } from './retry.js';
-import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
+import type { Effort } from './types.js';
+import type { RateLimitConfig } from './rate-limiter.js';
+import {
+  OpenAICompatibleProvider,
+  priceFromTable,
+  type ProviderProfile,
+  type PricingTable,
+  type ReasoningEmit,
+} from './openai-compatible.js';
 
 // ---------------------------------------------------------------------------
 // Approximate per-token pricing (USD) for common OpenAI models.
@@ -18,7 +16,7 @@ import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 // Actual pricing may differ; check OpenAI's pricing page for current rates.
 // ---------------------------------------------------------------------------
 
-export const OPENAI_PRICING: Record<string, [number, number, number]> = {
+export const OPENAI_PRICING: PricingTable = {
   // gpt-4o era — cache reads at 50% of input rate
   'gpt-4o': [2.5e-6, 10e-6, 0.5],
   'gpt-4o-mini': [0.15e-6, 0.6e-6, 0.5],
@@ -50,31 +48,21 @@ export const OPENAI_PRICING: Record<string, [number, number, number]> = {
   'gpt-5.5-pro': [30e-6, 180e-6, 0.1],
 };
 
-// Pre-sorted keys for prefix matching (longest first so "gpt-5-mini" matches before "gpt-5")
-const PRICING_KEYS_BY_LENGTH = Object.keys(OPENAI_PRICING).sort((a, b) => b.length - a.length);
-
+/**
+ * Estimate OpenAI call cost from token usage. Exact match first, then
+ * longest-prefix match for versioned models (e.g. `gpt-4o-2024-05-13`).
+ *
+ * Returns `undefined` when the model is not in the table — callers must treat
+ * that as "unknown cost", never as free (a silent `0` would break
+ * `ctx.budget()` and mislead cost dashboards). See spec §6.
+ */
 export function estimateOpenAICost(
   model: string,
   promptTokens: number,
   completionTokens: number,
   cachedTokens?: number,
-): number {
-  // Try exact match first, then longest-prefix match for versioned models (e.g. gpt-4o-2024-05-13)
-  let pricing = OPENAI_PRICING[model];
-  if (!pricing) {
-    for (const key of PRICING_KEYS_BY_LENGTH) {
-      if (model.startsWith(key)) {
-        pricing = OPENAI_PRICING[key];
-        break;
-      }
-    }
-  }
-  if (!pricing) return 0;
-
-  const [inputRate, outputRate, cacheMultiplier] = pricing;
-  const cached = cachedTokens ?? 0;
-  const inputCost = (promptTokens - cached) * inputRate + cached * inputRate * cacheMultiplier;
-  return inputCost + completionTokens * outputRate;
+): number | undefined {
+  return priceFromTable(OPENAI_PRICING, model, promptTokens, completionTokens, cachedTokens);
 }
 
 /** Returns true for o-series models (o1, o3, o4-mini) that always reason. */
@@ -139,404 +127,57 @@ export function budgetToReasoningEffort(budget: number): ReasoningEffort {
 }
 
 /**
- * OpenAI-compatible provider using raw fetch (no SDK dependency).
- *
- * Supports:
- * - Chat completions
- * - Tool calling
- * - Streaming via SSE
- * - Structured output via response_format (JSON mode / JSON schema)
- * - Reasoning models (o1/o3/o4-mini) with developer role and reasoning_effort
+ * OpenAI Chat Completions reasoning emit. Computes `reasoning_effort` for
+ * o-series / GPT-5.x models from the unified effort/thinkingBudget knobs and
+ * signals when to strip `temperature` (always for o-series; for GPT-5.x only
+ * when reasoning is active). Non-reasoning models get neither.
  */
-export class OpenAIProvider implements Provider {
-  readonly name = 'openai';
-  private baseUrl: string;
-  private apiKey: string;
-  private governor?: RateLimiter;
+export const openaiReasoningEmit: ReasoningEmit = (body, resolved, model) => {
+  const oSeries = isOSeriesModel(model);
+  const reasoningCapable = supportsReasoningEffort(model);
+  const { thinkingBudget, thinkingDisabled, activeEffort, hasBudgetOverride } = resolved;
 
+  let wireEffort: ReasoningEffort | undefined;
+  if (reasoningCapable) {
+    if (hasBudgetOverride) {
+      // Explicit budget always takes precedence (consistent with Anthropic/Gemini)
+      wireEffort = clampReasoningEffort(model, budgetToReasoningEffort(thinkingBudget!));
+    } else if (!thinkingDisabled && activeEffort) {
+      wireEffort = clampReasoningEffort(model, effortToReasoningEffort(activeEffort));
+    } else if (thinkingDisabled) {
+      // Disable reasoning: covers both effort='none' and thinkingBudget=0
+      wireEffort = clampReasoningEffort(model, 'none');
+    }
+  }
+
+  if (wireEffort) body.reasoning_effort = wireEffort;
+
+  return { stripTemperature: oSeries || (reasoningCapable && wireEffort !== undefined) };
+};
+
+/** Canonical OpenAI Chat Completions profile. */
+export const OPENAI_PROFILE: ProviderProfile = {
+  name: 'openai',
+  label: 'OpenAI',
+  defaultBaseUrl: 'https://api.openai.com/v1',
+  envApiKey: 'OPENAI_API_KEY',
+  envBaseUrl: 'OPENAI_BASE_URL',
+  pricing: { kind: 'table', table: OPENAI_PRICING },
+  reasoning: { emit: openaiReasoningEmit, capture: 'none' },
+  roleFor: (role, model) => (role === 'system' && isOSeriesModel(model) ? 'developer' : role),
+  maxTokensField: 'max_completion_tokens',
+  parallelToolCalls: (model) => !isOSeriesModel(model),
+};
+
+/**
+ * OpenAI provider (Chat Completions) — the canonical {@link OpenAICompatibleProvider}
+ * profile. Preserved as a named export with its original constructor signature.
+ *
+ * Supports chat, tool calling, SSE streaming, structured output, and reasoning
+ * models (o1/o3/o4-mini + GPT-5.x) via `reasoning_effort`.
+ */
+export class OpenAIProvider extends OpenAICompatibleProvider {
   constructor(options: { apiKey?: string; baseUrl?: string; rateLimit?: RateLimitConfig } = {}) {
-    this.apiKey = options.apiKey ?? process.env.OPENAI_API_KEY ?? '';
-    this.baseUrl = (
-      options.baseUrl ??
-      process.env.OPENAI_BASE_URL ??
-      'https://api.openai.com/v1'
-    ).replace(/\/$/, '');
-    this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
-
-    if (!this.apiKey) {
-      throw new Error('OpenAI API key is required. Set OPENAI_API_KEY or pass apiKey in options.');
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // chat - non-streaming completion
-  // ---------------------------------------------------------------------------
-
-  async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
-    const body = this.buildRequestBody(messages, options, false);
-
-    const res = await fetchWithRetry(
-      `${this.baseUrl}/chat/completions`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify(body),
-        signal: options.signal,
-      },
-      { governor: this.governor },
-    );
-
-    if (!res.ok) {
-      const errorBody = await res.text();
-      const message = this.extractErrorMessage(errorBody, res.status);
-      throw new Error(message);
-    }
-
-    const json = (await res.json()) as OpenAIChatResponse;
-    const choice = json.choices[0];
-
-    const usage = json.usage
-      ? {
-          prompt_tokens: json.usage.prompt_tokens,
-          completion_tokens: json.usage.completion_tokens,
-          total_tokens: json.usage.total_tokens,
-          reasoning_tokens: json.usage.completion_tokens_details?.reasoning_tokens,
-          cached_tokens: json.usage.prompt_tokens_details?.cached_tokens,
-        }
-      : undefined;
-
-    const cost = usage
-      ? estimateOpenAICost(
-          options.model,
-          usage.prompt_tokens,
-          usage.completion_tokens,
-          usage.cached_tokens,
-        )
-      : undefined;
-
-    return {
-      content: choice.message.content ?? '',
-      tool_calls: choice.message.tool_calls?.map((tc) => ({
-        id: tc.id,
-        type: 'function' as const,
-        function: {
-          name: tc.function.name,
-          arguments: tc.function.arguments,
-        },
-      })),
-      usage,
-      cost,
-    };
-  }
-
-  // ---------------------------------------------------------------------------
-  // stream - SSE streaming completion
-  // ---------------------------------------------------------------------------
-
-  async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
-    const body = this.buildRequestBody(messages, options, true);
-
-    const res = await fetchWithRetry(
-      `${this.baseUrl}/chat/completions`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify(body),
-        signal: options.signal,
-      },
-      { governor: this.governor },
-    );
-
-    if (!res.ok) {
-      const errorBody = await res.text();
-      const message = this.extractErrorMessage(errorBody, res.status);
-      throw new Error(message);
-    }
-
-    if (!res.body) {
-      throw new Error('OpenAI stream response has no body');
-    }
-
-    yield* this.parseSSEStream(res.body, options.model);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Internal helpers
-  // ---------------------------------------------------------------------------
-
-  private buildRequestBody(
-    messages: ChatMessage[],
-    options: ChatOptions,
-    stream: boolean,
-  ): Record<string, unknown> {
-    const oSeries = isOSeriesModel(options.model);
-    const reasoningCapable = supportsReasoningEffort(options.model);
-    const { thinkingBudget, thinkingDisabled, activeEffort, hasBudgetOverride } =
-      resolveThinkingOptions(options);
-
-    // Compute effective reasoning effort for OpenAI wire format
-    let wireEffort: ReasoningEffort | undefined;
-    if (reasoningCapable) {
-      if (hasBudgetOverride) {
-        // Explicit budget always takes precedence (consistent with Anthropic/Gemini)
-        wireEffort = clampReasoningEffort(options.model, budgetToReasoningEffort(thinkingBudget!));
-      } else if (!thinkingDisabled && activeEffort) {
-        wireEffort = clampReasoningEffort(options.model, effortToReasoningEffort(activeEffort));
-      } else if (thinkingDisabled) {
-        // Disable reasoning: covers both effort='none' and thinkingBudget=0
-        wireEffort = clampReasoningEffort(options.model, 'none');
-      }
-    }
-
-    // Temperature: always strip for o-series; for GPT-5.x, strip only when reasoning active
-    const stripTemp = oSeries || (reasoningCapable && wireEffort !== undefined);
-
-    const body: Record<string, unknown> = {
-      model: options.model,
-      messages: messages.map((m) => this.formatMessage(m, oSeries)),
-      stream,
-    };
-
-    if (options.temperature !== undefined && !stripTemp) {
-      body.temperature = options.temperature;
-    }
-
-    // Use max_completion_tokens instead of deprecated max_tokens
-    if (options.maxTokens !== undefined) {
-      body.max_completion_tokens = options.maxTokens;
-    }
-
-    if (options.stop) body.stop = options.stop;
-
-    if (options.tools && options.tools.length > 0) {
-      body.tools = options.tools;
-      // o-series models don't support parallel_tool_calls; GPT-5.x and others do
-      if (!oSeries) {
-        body.parallel_tool_calls = true;
-      }
-    }
-
-    if (options.toolChoice !== undefined) {
-      body.tool_choice = options.toolChoice;
-    }
-
-    if (options.responseFormat) {
-      body.response_format = options.responseFormat;
-    }
-
-    if (wireEffort) body.reasoning_effort = wireEffort;
-
-    if (stream) {
-      body.stream_options = { include_usage: true };
-    }
-
-    if (options.providerOptions) {
-      Object.assign(body, options.providerOptions);
-    }
-
-    return body;
-  }
-
-  /** Extract a human-readable message from an API error response body. */
-  private extractErrorMessage(body: string, status: number): string {
-    try {
-      const json = JSON.parse(body) as { error?: { message?: string; type?: string } };
-      if (json.error?.message) {
-        return `OpenAI API error (${status}): ${json.error.message}`;
-      }
-    } catch {
-      // Not JSON, use raw body
-    }
-    return `OpenAI API error (${status}): ${body}`;
-  }
-
-  private formatMessage(msg: ChatMessage, oSeries: boolean): Record<string, unknown> {
-    const out: Record<string, unknown> = {
-      role: msg.role === 'system' && oSeries ? 'developer' : msg.role,
-      content: msg.content,
-    };
-    if (msg.name) out.name = msg.name;
-    if (msg.tool_calls) out.tool_calls = msg.tool_calls;
-    if (msg.tool_call_id) out.tool_call_id = msg.tool_call_id;
-    return out;
-  }
-
-  private async *parseSSEStream(
-    body: ReadableStream<Uint8Array>,
-    model: string,
-  ): AsyncGenerator<StreamChunk> {
-    const reader = body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let usageData:
-      | {
-          prompt_tokens: number;
-          completion_tokens: number;
-          total_tokens: number;
-          reasoning_tokens?: number;
-          cached_tokens?: number;
-        }
-      | undefined;
-
-    // Map tool call index -> id, so we can associate streamed deltas that
-    // arrive before the id field with the correct tool call once the id appears.
-    const indexToId = new Map<number, string>();
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        // Keep the last potentially-incomplete line in the buffer
-        buffer = lines.pop() ?? '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith(':')) continue;
-
-          if (trimmed === 'data: [DONE]') {
-            yield {
-              type: 'done',
-              usage: usageData,
-              cost: usageData
-                ? estimateOpenAICost(
-                    model,
-                    usageData.prompt_tokens,
-                    usageData.completion_tokens,
-                    usageData.cached_tokens,
-                  )
-                : undefined,
-            };
-            return;
-          }
-
-          if (trimmed.startsWith('data: ')) {
-            const jsonStr = trimmed.slice(6);
-            let parsed: OpenAIStreamChunk;
-            try {
-              parsed = JSON.parse(jsonStr) as OpenAIStreamChunk;
-            } catch {
-              continue; // Skip malformed JSON
-            }
-
-            // Capture usage from the final chunk if present
-            if (parsed.usage) {
-              usageData = {
-                prompt_tokens: parsed.usage.prompt_tokens,
-                completion_tokens: parsed.usage.completion_tokens,
-                total_tokens: parsed.usage.total_tokens,
-                reasoning_tokens: parsed.usage.completion_tokens_details?.reasoning_tokens,
-                cached_tokens: parsed.usage.prompt_tokens_details?.cached_tokens,
-              };
-              continue;
-            }
-
-            const delta = parsed.choices?.[0]?.delta;
-            if (!delta) continue;
-
-            // Text content
-            if (delta.content) {
-              yield { type: 'text_delta', content: delta.content };
-            }
-
-            // Tool call deltas
-            if (delta.tool_calls) {
-              for (const tc of delta.tool_calls) {
-                // Track id by index so subsequent deltas without an id
-                // map to the correct tool call
-                if (tc.id) {
-                  indexToId.set(tc.index, tc.id);
-                }
-                const id = indexToId.get(tc.index) ?? `__pending_${tc.index}`;
-                yield {
-                  type: 'tool_call_delta',
-                  id,
-                  name: tc.function?.name,
-                  arguments: tc.function?.arguments,
-                };
-              }
-            }
-          }
-        }
-      }
-
-      // If we exit the loop without a [DONE], still emit done with whatever usage we have
-      yield {
-        type: 'done',
-        usage: usageData,
-        cost: usageData
-          ? estimateOpenAICost(
-              model,
-              usageData.prompt_tokens,
-              usageData.completion_tokens,
-              usageData.cached_tokens,
-            )
-          : undefined,
-      };
-    } finally {
-      reader.releaseLock();
-    }
+    super({ profile: OPENAI_PROFILE, ...options });
   }
 }
-
-// ---------------------------------------------------------------------------
-// OpenAI API response types (internal)
-// ---------------------------------------------------------------------------
-
-type OpenAIChatResponse = {
-  choices: Array<{
-    message: {
-      content: string | null;
-      tool_calls?: Array<{
-        id: string;
-        type: 'function';
-        function: { name: string; arguments: string };
-      }>;
-    };
-    finish_reason: string;
-  }>;
-  usage?: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-    completion_tokens_details?: {
-      reasoning_tokens?: number;
-    };
-    prompt_tokens_details?: {
-      cached_tokens?: number;
-    };
-  };
-};
-
-type OpenAIStreamChunk = {
-  choices?: Array<{
-    delta: {
-      content?: string;
-      tool_calls?: Array<{
-        index: number;
-        id?: string;
-        function?: { name?: string; arguments?: string };
-      }>;
-    };
-    finish_reason: string | null;
-  }>;
-  usage?: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-    completion_tokens_details?: {
-      reasoning_tokens?: number;
-    };
-    prompt_tokens_details?: {
-      cached_tokens?: number;
-    };
-  };
-};

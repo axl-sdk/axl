@@ -343,7 +343,10 @@ describe('OpenAIProvider', () => {
       expect(response.cost).toBeCloseTo(0.012, 5);
     });
 
-    it('returns cost: 0 for unknown models (not undefined)', async () => {
+    it('returns cost: undefined for unknown models (unmeasured, not a misleading $0)', async () => {
+      // A pricing-table miss surfaces as `undefined` ("unknown cost"), never a
+      // silent 0 — a fake $0 would mislead cost dashboards and let ctx.budget()
+      // treat paid models as free. See spec §6.
       mockFetch({
         json: () =>
           Promise.resolve({
@@ -363,8 +366,7 @@ describe('OpenAIProvider', () => {
         maxTokens: 1024,
       });
 
-      expect(response.cost).toBe(0);
-      expect(response.cost).not.toBeUndefined();
+      expect(response.cost).toBeUndefined();
     });
 
     it('handles API errors gracefully', async () => {

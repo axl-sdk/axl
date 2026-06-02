@@ -30,6 +30,7 @@ function emptyRetry(): CostData['retry'] {
 export function emptyCostData(): CostData {
   return {
     totalCost: 0,
+    unpricedCalls: 0,
     totalTokens: { input: 0, output: 0, reasoning: 0 },
     byAgent: {},
     byModel: {},
@@ -69,6 +70,17 @@ export function reduceCost(acc: CostData, event: AxlEvent): CostData {
   const cost = eventCostContribution(event);
   if (event.type === 'ask_end') return acc;
   const tokens = event.tokens ?? {};
+
+  // Unpriced leaf: a cost-bearing LLM/embedder call that did measurable work
+  // (it passed the cost-null+no-tokens guard above, so it has tokens) but had no
+  // usable cost. Counting these lets the dashboard flag totalCost as a lower
+  // bound. tool_call_end has no tokens (excluded by the guard); ask_end is
+  // already returned above and always carries a numeric cost.
+  const isUnpricedLeaf =
+    event.cost == null &&
+    (event.type === 'agent_call_end' ||
+      event.type === 'memory_remember' ||
+      event.type === 'memory_recall');
 
   // Only count tokens from agent_call_end events — embedder tokens are
   // bucketed separately into byEmbedder.tokens.
@@ -153,6 +165,7 @@ export function reduceCost(acc: CostData, event: AxlEvent): CostData {
 
   return {
     totalCost: acc.totalCost + cost,
+    unpricedCalls: acc.unpricedCalls + (isUnpricedLeaf ? 1 : 0),
     totalTokens,
     byAgent,
     byModel,

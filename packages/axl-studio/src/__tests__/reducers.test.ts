@@ -123,6 +123,7 @@ describe('reduceCost', () => {
       expect(newData.byAgent).toEqual(oldData.byAgent);
       expect(newData.byModel).toEqual(oldData.byModel);
       expect(newData.byWorkflow).toEqual(oldData.byWorkflow);
+      expect(newData.unpricedCalls).toBe(oldData.unpricedCalls);
     });
 
     it('matches on events with no cost or tokens (skip path)', () => {
@@ -242,6 +243,56 @@ describe('reduceCost', () => {
       expect(result.totalCost).toBe(0);
       expect(result.byAgent['a'].cost).toBe(0);
       expect(result.byModel['gpt-4'].cost).toBe(0);
+    });
+  });
+
+  describe('unpriced calls (T2.5)', () => {
+    it('counts an agent_call_end with tokens but no cost (totalCost unchanged)', () => {
+      const out = reduceCost(
+        emptyCostData(),
+        makeEvent({
+          type: 'agent_call_end',
+          agent: 'a',
+          model: 'm',
+          tokens: { input: 10, output: 5 },
+        }),
+      );
+      expect(out.unpricedCalls).toBe(1);
+      expect(out.totalCost).toBe(0);
+    });
+
+    it('does NOT count a priced call', () => {
+      const out = reduceCost(
+        emptyCostData(),
+        makeEvent({ type: 'agent_call_end', cost: 0.002, tokens: { input: 10 } }),
+      );
+      expect(out.unpricedCalls).toBe(0);
+      expect(out.totalCost).toBeCloseTo(0.002, 6);
+    });
+
+    it('does NOT count a failed call (no cost, no tokens → skip path)', () => {
+      const out = reduceCost(
+        emptyCostData(),
+        makeEvent({ type: 'agent_call_end', data: { error: 'boom' } }),
+      );
+      expect(out.unpricedCalls).toBe(0);
+    });
+
+    it('counts an unpriced memory_recall', () => {
+      const out = reduceCost(
+        emptyCostData(),
+        makeEvent({ type: 'memory_recall', tokens: { input: 8 }, data: {} }),
+      );
+      expect(out.unpricedCalls).toBe(1);
+    });
+
+    it('stays in parity with CostAggregator on the unpriced count', () => {
+      const ev = makeEvent({ type: 'agent_call_end', model: 'm', tokens: { input: 10 } });
+      const reduced = reduceCost(emptyCostData(), ev);
+      const agg = new CostAggregator(new ConnectionManager());
+      agg.onTrace(ev);
+      expect(agg.getData().unpricedCalls).toBe(reduced.unpricedCalls);
+      expect(reduced.unpricedCalls).toBe(1);
     });
   });
 });

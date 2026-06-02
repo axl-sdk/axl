@@ -23,6 +23,7 @@ function emptyRetry(): CostData['retry'] {
 export class CostAggregator {
   private data: CostData = {
     totalCost: 0,
+    unpricedCalls: 0,
     totalTokens: { input: 0, output: 0, reasoning: 0 },
     byAgent: {},
     byModel: {},
@@ -61,6 +62,18 @@ export class CostAggregator {
 
     const cost = Number.isFinite(event.cost) ? event.cost! : 0;
     const tokens = event.tokens ?? {};
+
+    // Unpriced leaf (parity with reduceCost): a cost-bearing LLM/embedder call
+    // that did measurable work but had no usable cost. ask_end always carries a
+    // numeric cost, so it's excluded; tool_call_end has no tokens (filtered above).
+    if (
+      event.cost == null &&
+      (event.type === 'agent_call_end' ||
+        event.type === 'memory_remember' ||
+        event.type === 'memory_recall')
+    ) {
+      this.data.unpricedCalls += 1;
+    }
 
     this.data.totalCost += cost;
     // totalTokens represents agent prompt/completion/reasoning tokens —
@@ -159,6 +172,7 @@ export class CostAggregator {
   reset(): void {
     this.data = {
       totalCost: 0,
+      unpricedCalls: 0,
       totalTokens: { input: 0, output: 0, reasoning: 0 },
       byAgent: {},
       byModel: {},

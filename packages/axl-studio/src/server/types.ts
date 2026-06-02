@@ -45,6 +45,13 @@ export type AgentSummary = {
 /** Cost aggregation data */
 export type CostData = {
   totalCost: number;
+  /**
+   * Count of cost-bearing leaf calls (`agent_call_end` / `memory_*`) that did
+   * measurable work but had no usable cost (unpriced model / pricing-table miss).
+   * When > 0, `totalCost` is a LOWER BOUND — the unknown component is not
+   * included — so the dashboard can flag it instead of implying an exact figure.
+   */
+  unpricedCalls: number;
   totalTokens: { input: number; output: number; reasoning: number };
   byAgent: Record<string, { cost: number; calls: number }>;
   byModel: Record<

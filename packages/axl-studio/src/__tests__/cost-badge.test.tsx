@@ -54,4 +54,21 @@ describe('CostBadge', () => {
     render(<CostBadge cost={0.0000123} />);
     expect(screen.getByText('$1.23e-5')).toBeInTheDocument();
   });
+
+  // ── Unpriced lower-bound rendering (T2.5) ──────────────────────────────
+  it('prefixes "≥" and adds a tooltip when the ask used an unpriced model', () => {
+    render(<CostBadge cost={0.002} unpriced />);
+    const el = screen.getByText('≥ $0.002000');
+    expect(el).toBeInTheDocument();
+    expect(el).toHaveAttribute('title', expect.stringContaining('unpriced'));
+  });
+
+  it('keeps a real $0.00 (known-free) distinct from an unknown lower bound', () => {
+    const { rerender } = render(<CostBadge cost={0} />);
+    expect(screen.getByText('$0.00')).toBeInTheDocument();
+    expect(screen.queryByText('≥ $0.00')).not.toBeInTheDocument();
+
+    rerender(<CostBadge cost={0} unpriced />);
+    expect(screen.getByText('≥ $0.00')).toBeInTheDocument();
+  });
 });

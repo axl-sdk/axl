@@ -52,12 +52,13 @@ export function AskDetails(props: AskDetailsProps): ReactElement {
       filtered.find((e): e is typeof e & { agent: string } => 'agent' in e && !!e.agent)?.agent;
     const prompt = start?.prompt;
     const cost = end?.cost;
+    const unpriced = end?.unpriced === true;
     const duration =
       start && end && typeof start.timestamp === 'number' && typeof end.timestamp === 'number'
         ? end.timestamp - start.timestamp
         : undefined;
     const outcome = end?.outcome;
-    return { filtered, summary: { agent, prompt, cost, duration, outcome } };
+    return { filtered, summary: { agent, prompt, cost, unpriced, duration, outcome } };
   }, [events, askId]);
 
   return (
@@ -89,7 +90,9 @@ export function AskDetails(props: AskDetailsProps): ReactElement {
       </div>
       <div className="px-4 py-2 border-b border-slate-200 dark:border-slate-700 flex items-center gap-3 text-xs">
         {summary.duration !== undefined && <DurationBadge ms={summary.duration} />}
-        {typeof summary.cost === 'number' && <CostBadge cost={summary.cost} />}
+        {typeof summary.cost === 'number' && (
+          <CostBadge cost={summary.cost} unpriced={summary.unpriced} />
+        )}
         {summary.outcome && (
           <span
             className={cn(

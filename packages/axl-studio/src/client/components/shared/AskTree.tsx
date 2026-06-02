@@ -47,6 +47,8 @@ type AskNode = {
   startedAt?: number;
   endedAt?: number;
   cost: number;
+  /** True when this ask used an unpriced model — `cost` is a lower bound. */
+  unpriced?: boolean;
   status: AskStatus;
   outcomeResult?: unknown;
   outcomeError?: string;
@@ -148,6 +150,8 @@ function buildAskTree(events: AxlEvent[]): AskNode[] {
         node.endedAt = ev.timestamp;
         // ask_end.cost is the authoritative per-ask rollup (decision 10).
         if (typeof ev.cost === 'number') node.cost = ev.cost;
+        // When an unpriced model ran, ask_end.cost is a lower bound.
+        if (ev.unpriced) node.unpriced = true;
         // Defense-in-depth: the strict union mandates `outcome` on ask_end,
         // but a malformed wire payload (older runtime, redaction edge case)
         // could omit it. Treat missing outcome as "still running" rather
@@ -337,7 +341,7 @@ function AskNodeRow(props: {
             />
           )}
           {duration !== undefined && <DurationBadge ms={duration} />}
-          <CostBadge cost={node.cost} />
+          <CostBadge cost={node.cost} unpriced={node.unpriced} />
         </span>
       </div>
       {node.handoffsOut.length > 0 && (

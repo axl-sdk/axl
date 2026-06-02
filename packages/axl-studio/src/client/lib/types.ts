@@ -170,6 +170,9 @@ export type ExecutionInfo = {
 /** Cost data */
 export type CostData = {
   totalCost: number;
+  /** Count of cost-bearing calls that did work but had no usable cost (unpriced
+   *  model). When > 0, `totalCost` is a lower bound. */
+  unpricedCalls: number;
   totalTokens: { input: number; output: number; reasoning: number };
   byAgent: Record<string, { cost: number; calls: number }>;
   byModel: Record<

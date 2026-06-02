@@ -113,7 +113,19 @@ export function CostDashboardPanel() {
           showReasoning ? 'lg:grid-cols-4' : 'lg:grid-cols-3',
         )}
       >
-        <StatCard label="Total Cost" value={formatCost(costs.totalCost)} subtitle={window} />
+        <StatCard
+          label="Total Cost"
+          value={
+            costs.unpricedCalls > 0
+              ? `≥ ${formatCost(costs.totalCost)}`
+              : formatCost(costs.totalCost)
+          }
+          subtitle={
+            costs.unpricedCalls > 0
+              ? `${window} · lower bound (${costs.unpricedCalls} unpriced call${costs.unpricedCalls !== 1 ? 's' : ''})`
+              : window
+          }
+        />
         <StatCard
           label="Input Tokens"
           value={formatTokens(costs.totalTokens.input)}

@@ -582,6 +582,12 @@ export type AxlEvent =
         /** Sum of `agent_call_end.cost` + `tool_call_end.cost` WITHIN THIS ASK,
          *  excluding nested asks. Nested asks contribute to their own ask_end. */
         cost: number;
+        /** True when a cost-bearing leaf in this ask did measurable work but had
+         *  no usable cost (unpriced model / pricing-table miss). When set, `cost`
+         *  is a LOWER BOUND — the unknown component is not included. Absent ⇒
+         *  `cost` is exact. Surfaced so dashboards don't render a misleading
+         *  exact `$0.00` for an ask that used an unpriced model. */
+        unpriced?: boolean;
         duration: number;
       })
 
@@ -601,8 +607,9 @@ export type AxlEvent =
         type: 'agent_call_end';
         agent: string;
         model: string;
-        /** Authoritative turn-level cost. */
-        cost: number;
+        /** Authoritative turn-level cost. `undefined` for an unpriced model
+         *  (pricing-table miss) and absent on the error path (no usage). */
+        cost?: number;
         duration: number;
         tokens?: { input?: number; output?: number; reasoning?: number };
         /** Response-side payload — response text, thinking. */

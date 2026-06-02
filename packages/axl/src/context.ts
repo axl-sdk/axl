@@ -84,6 +84,14 @@ type AskFrame = {
    * by `ask_end` to populate `cost` per spec decision 10.
    */
   askCost: { value: number };
+  /**
+   * True when a cost-bearing leaf in THIS frame did measurable work (returned
+   * usage/tokens) but had no usable cost (unpriced model / pricing-table miss).
+   * Set in `emitEvent` alongside the cost rollup. Read by `ask_end` to surface
+   * `unpriced`, so an ask's `cost` (which silently omits the unknown component)
+   * is shown as a lower bound rather than a misleading exact figure.
+   */
+  askUnpriced: boolean;
 };
 const askStorage = new AsyncLocalStorage<AskFrame>();
 
@@ -651,6 +659,7 @@ export class WorkflowContext<TInput = unknown> {
           agent: agent._name,
           stepRef,
           askCost: { value: 0 },
+          askUnpriced: false,
         };
 
         return askStorage.run(frame, async () => {
@@ -796,6 +805,7 @@ export class WorkflowContext<TInput = unknown> {
                     error: 'ask_end emitted without outcome — internal bug',
                   } as const),
                 cost: frame.askCost.value,
+                ...(frame.askUnpriced ? { unpriced: true } : {}),
                 duration: Date.now() - askStart,
               });
             } catch (emitErr) {
@@ -1415,6 +1425,7 @@ export class WorkflowContext<TInput = unknown> {
                 agent: descriptor.agent._name,
                 stepRef: sourceFrame?.stepRef ?? this.stepRefRoot,
                 askCost: { value: 0 },
+                askUnpriced: false,
               };
 
               // Pass accumulated messages so the target agent can see the source agent's work.
@@ -1450,6 +1461,7 @@ export class WorkflowContext<TInput = unknown> {
                       type: 'ask_end',
                       outcome: { ok: true, result },
                       cost: targetFrame.askCost.value,
+                      ...(targetFrame.askUnpriced ? { unpriced: true } : {}),
                       duration: Date.now() - targetAskStart,
                     });
                     return result;
@@ -1461,6 +1473,7 @@ export class WorkflowContext<TInput = unknown> {
                         error: err instanceof Error ? err.message : String(err),
                       },
                       cost: targetFrame.askCost.value,
+                      ...(targetFrame.askUnpriced ? { unpriced: true } : {}),
                       duration: Date.now() - targetAskStart,
                     });
                     throw err;
@@ -3698,14 +3711,17 @@ export class WorkflowContext<TInput = unknown> {
     // `memory_recall`) from the per-ask rollup when `ctx.recall()` ran
     // inside an ask.
     const cost = (partial as { cost?: number }).cost;
-    if (
-      frame &&
-      typeof cost === 'number' &&
-      Number.isFinite(cost) &&
-      cost >= 0 &&
-      (COST_BEARING_LEAF_TYPES as readonly string[]).includes(partial.type as string)
-    ) {
-      frame.askCost.value += cost;
+    if (frame && (COST_BEARING_LEAF_TYPES as readonly string[]).includes(partial.type as string)) {
+      if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) {
+        frame.askCost.value += cost;
+      } else if ((partial as { tokens?: unknown }).tokens != null) {
+        // A cost-bearing leaf that did measurable work (returned usage/tokens)
+        // but produced no usable cost = an unpriced model / pricing-table miss.
+        // `tokens` is the "did work" signal that distinguishes this from a failed
+        // call (error emits carry neither cost nor tokens), so `ask_end.cost`
+        // (which omits the unknown component) can be flagged as a lower bound.
+        frame.askUnpriced = true;
+      }
     }
     const event = {
       executionId: this.executionId,

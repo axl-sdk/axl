@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Broad provider expansion: the OpenAI adapter is now a generic OpenAI-compatible engine, and Axl ships first-class presets for the providers and self-hosted runtimes that speak the OpenAI Chat Completions wire format — keeping cross-provider `effort` and cost-as-a-primitive working where compatible endpoints normally lose them.
+
+### Added
+- **Generic `OpenAICompatibleProvider` + `ProviderProfile`.** One engine (raw `fetch`, zero deps) serves any OpenAI-compatible endpoint, parameterized by a profile. `OpenAIProvider` is now a thin subclass with the canonical OpenAI profile; behavior is unchanged except the cost-on-miss fix below. Exported: `OpenAICompatibleProvider`, `ProviderProfile`, `CapabilityFlags`, `PricingSource`/`PricingTable`, `ReasoningProfile`/`ReasoningCapture`/`ReasoningRoundTrip`/`ReasoningEmit`, `AuthHeader`, `PerModel`, plus helpers `priceFromTable`, `resolvePerModel`, `reasoningEffortEmit`, `reasoningObjectEmit`, `ThinkTagScanner`, `extractThinkTags`, and `OPENAI_PROFILE` / `openaiReasoningEmit`.
+- **Built-in presets** (registered under their `provider:` name): `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, and the self-hosted bundle `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. Each reads `<PRESET>_API_KEY` / `<PRESET>_BASE_URL`. Exported as `*_PROFILE` constants + `BUILTIN_PROFILES` for cloning. See `docs/providers.md`.
+- **Cross-provider reasoning that actually fires.** The unified `effort` knob is decoupled from OpenAI model-name regexes — it now maps to each provider's reasoning mechanism (`reasoning_effort`, OpenRouter's `reasoning` object, etc.) and is omitted where a provider/model rejects it (no silent 400). Reasoning traces are captured (`reasoning_content` / `reasoning` / `reasoning_details` / inline `<think>`) into `thinking_content` + `thinking_delta`, with a turn-aware round-trip for DeepSeek/OpenRouter tool loops.
+- **Profile knobs:** `authHeader` (`bearer` | `api-key` | custom — Azure uses `api-key`), `allowMissingApiKey` (keyless local servers), per-profile pricing source, `forbiddenParams` / `supportsJsonSchema` capability flags (with `PerModel` overrides), and `requestDefaults`.
+
+### Changed
+- **Cost on a pricing-table miss is now `undefined` ("unknown"), not `0`.** A fake `$0` let `ctx.budget()` treat unpriced models as free and showed misleading `$0.00` in dashboards; `undefined` is unmeasured and contributes nothing to budget totals (the budget rail already handled this). `estimateOpenAICost` now returns `number | undefined`. **Caveat for consumers:** code that sums `response.cost` without a null-guard will see `NaN` where it saw `0` — use the exported `eventCostContribution()` (which already treats non-finite/missing as `0`) as the safe reducer. `ProviderResponse.cost` / `StreamChunk.done.cost` were already optional, so no type change.
+
 ## [0.18.2] - 2026-05-31
 
 ### Fixed

@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: May 2026
+> Last updated: June 2026
 
 ## Guiding Principles
 
@@ -74,15 +74,24 @@ Currently: `InMemoryVectorStore` (testing) and `SqliteVectorStore` (production).
 
 #### Provider Ecosystem Expansion
 
-| Provider | URI | Priority |
-|----------|-----|----------|
-| Ollama (local models) | `ollama:llama3` | High |
-| AWS Bedrock | `bedrock:anthropic.claude-sonnet-4-6` | Medium |
-| Azure OpenAI | `azure:gpt-4o` | Medium |
-| Groq | `groq:llama3-70b` | Low |
-| Mistral | `mistral:mistral-large` | Low |
+The OpenAI `/v1/chat/completions` + Bearer wire format is the de-facto standard — aggregators, the non-Big-3 labs, every self-hosted runtime, and (now) the enterprise clouds all speak it. The `OpenAIProvider` already accepts a custom `baseUrl`, so basic chat/tools/streaming works against these today. Rather than hand-write one ~500-line adapter per provider, the plan generalizes the existing adapter into a **generic `OpenAICompatibleProvider` parameterized by a `ProviderProfile`**, and ships breadth as **registry presets** — turning a coverage problem into a configuration problem (the shape Vercel's `@ai-sdk/openai-compatible` and LiteLLM converged on). The native `anthropic`/`gemini` adapters stay native to preserve thinking/effort fidelity, and the zero-dependency raw-`fetch` guarantee is preserved.
 
-Each adapter follows the existing pattern: raw `fetch`, implements the `Provider` interface, registered via `ProviderRegistry`.
+The generalization fixes three OpenAI-specific behaviors that currently misfire on other providers: the unified `effort` knob is gated to OpenAI model names (silent no-op elsewhere), unpriced models report a misleading `$0` instead of "unknown" cost, and reasoning traces from non-OpenAI providers are dropped. A profile carries per-preset pricing, reasoning emit/capture, auth-header shape, and capability flags (with per-model overrides where providers diverge).
+
+**Tier 1 — the generic engine + highest-leverage breadth:**
+
+| Preset | URI example | Notes |
+|--------|-------------|-------|
+| OpenRouter | `openrouter:vendor/model` | One key → 300+ models; unified reasoning + provider-reported cost |
+| Azure OpenAI (v1) | `azure:<deployment>` | Deployment-name-as-model; `api-key` header auth |
+| xAI Grok · DeepSeek · Mistral · Groq | `xai:…` `deepseek:…` `mistral:…` `groq:…` | Each a profile + small quirk set |
+| Self-hosted (Ollama, vLLM, LM Studio, llama.cpp, SGLang) | `ollama:…` `vllm:…` … | First-class local presets — keyless, zero-cost, correct default ports |
+
+**Tier 2 — enterprise reach:** AWS Bedrock (`openai.gpt-oss-*` via its bearer-key OpenAI-compatible endpoint; Claude-on-Bedrock routes through native `anthropic`), an async `apiKey` callback for expiring tokens (unblocks Vertex / Azure-Entra / Databricks / watsonx), and data-platform presets (Snowflake Cortex, Databricks, OCI).
+
+**Tier 3 — fidelity & long tail:** Vertex auth modes on the native adapters; additional frontier-lab and aggregator presets (mostly reachable via OpenRouter already).
+
+All presets follow the existing pattern: raw `fetch`, the `Provider` interface, registered via `ProviderRegistry`. Embeddings remain OpenAI-only until a parallel `OpenAICompatibleEmbedder` lands (tracked separately).
 
 #### Example Recipes
 

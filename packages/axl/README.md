@@ -58,6 +58,17 @@ export const config = defineConfig({
 
 Provider API keys are also read automatically from environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`/`GEMINI_API_KEY`), so for local development you can skip the `providers` block entirely.
 
+**Beyond the big three**, Axl ships presets for any OpenAI-compatible endpoint — pick a model with `preset:model` and set the matching env var:
+
+```typescript
+agent({ model: 'openrouter:anthropic/claude-opus-4.7' }); // OPENROUTER_API_KEY — 300+ models, one key
+agent({ model: 'groq:openai/gpt-oss-120b' });             // GROQ_API_KEY — fastest inference
+agent({ model: 'deepseek:deepseek-reasoner' });           // DEEPSEEK_API_KEY
+agent({ model: 'ollama:llama3' });                        // local — no key, $0
+```
+
+Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, and self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them. Build your own by cloning a `ProviderProfile`. See [docs/providers.md](../../docs/providers.md#openai-compatible-providers--presets).
+
 Each provider also accepts an opt-in `rateLimit` (`{ maxConcurrent?, minIntervalMs?, acquireTimeoutMs? }`) for proactive client-side pacing on top of the automatic 429/503/529 backoff — useful when a large fan-out (e.g. an eval) shares one API key. It caps in-flight request concurrency (not token throughput) for that provider's chat calls. See [Providers → Rate limiting](../../docs/providers.md#rate-limiting-opt-in).
 
 State store options: `'memory'` (default), `'sqlite'` (requires `better-sqlite3`), or a `RedisStore` instance for multi-process deployments. See [State Stores](#state-stores).

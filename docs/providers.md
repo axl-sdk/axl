@@ -89,6 +89,64 @@ google:gemini-3-pro-preview          # Deprecated (shut down March 9, 2026)
 google:gemini-3.1-flash-lite-preview # Deprecated (shuts down May 25, 2026)
 ```
 
+## OpenAI-compatible providers & presets
+
+The OpenAI `/v1/chat/completions` wire format is the de-facto standard, so one generic
+engine — `OpenAICompatibleProvider`, parameterized by a `ProviderProfile` — serves every
+endpoint that speaks it. Axl ships built-in **presets** registered under their own
+`provider:` name; pick a model with `preset:model`:
+
+```
+openrouter:anthropic/claude-opus-4.7   # 300+ models behind one key (vendor/model slug)
+openrouter:openai/gpt-5.5
+azure:my-deployment                    # deployment name is the "model"
+xai:grok-4
+deepseek:deepseek-reasoner
+mistral:mistral-large-latest
+groq:openai/gpt-oss-120b               # fastest inference; open-weight only
+ollama:llama3                          # local — no key, $0
+vllm:meta-llama/Llama-3.3-70B-Instruct
+lmstudio:<model>  ·  llamacpp:<model>  ·  sglang:<model>
+```
+
+Configure each like any provider (`apiKey` / `baseUrl` / `rateLimit` under its name), or rely
+on its env vars. Each preset reads `<PRESET>_API_KEY` and `<PRESET>_BASE_URL`
+(e.g. `OPENROUTER_API_KEY`, `XAI_API_KEY`, `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_BASE_URL`).
+
+| Preset | Default base URL | Auth | Reasoning | Pricing |
+|---|---|---|---|---|
+| `openrouter` | `https://openrouter.ai/api/v1` | Bearer | `reasoning` object (effort/budget); captures `reasoning_details` | **provider-reported** (`usage.cost`, USD) |
+| `azure` | *your resource* (`AZURE_OPENAI_BASE_URL`) | `api-key` header | reuses OpenAI (o-series/GPT-5) | OpenAI table when deployment is model-named, else unknown |
+| `xai` | `https://api.x.ai/v1` | Bearer | `reasoning_effort` (`max`→`high`) | unknown |
+| `deepseek` | `https://api.deepseek.com/v1` | Bearer | captures `reasoning_content`, round-trips on tool turns; no `json_schema` | unknown |
+| `mistral` | `https://api.mistral.ai/v1` | Bearer | `reasoning_effort` (active→`high`; `magistral-*` omit) | unknown |
+| `groq` | `https://api.groq.com/openai/v1` | Bearer | `reasoning_effort` on reasoning families only | unknown |
+| `ollama` | `http://localhost:11434/v1` | none | inline `<think>` | **$0** |
+| `vllm` | `http://localhost:8000/v1` | optional | inline `<think>` | **$0** |
+| `lmstudio` | `http://localhost:1234/v1` | none | inline `<think>` | **$0** |
+| `llamacpp` | `http://localhost:8080/v1` | none | inline `<think>` | **$0** |
+| `sglang` | `http://localhost:30000/v1` | none | inline `<think>` | **$0** |
+
+Notes & caveats:
+- **`effort` works across reasoning models**, not just OpenAI — each preset maps the unified
+  knob to its provider's mechanism (and omits it where the provider/model rejects it, so it's
+  never a silent 400).
+- **Cost where competitors drop it.** OpenRouter returns per-call cost, which Axl surfaces
+  directly; local presets are an explicit `$0`. Where a provider's per-token prices aren't
+  tracked, cost is `undefined` (**unknown**, never a misleading `$0`).
+- **Capability is per-model on marketplaces** (OpenRouter/Together/Groq): one model supports
+  strict `json_schema` and the next doesn't. Profile flags are sensible defaults; use
+  [`providerOptions`](#provideroptions) for per-call overrides.
+- **Self-hosted** is keyless by default; pass a key only if your server enforces one. Server
+  caveats (not Axl bugs): Ollama's `/v1` drops streaming `tool_calls` deltas and lacks
+  `tool_choice` (use its native `/api/chat` for heavy tool use); vLLM/SGLang/LM Studio
+  tool-calling depends on server launch flags + per-model parsers.
+- **Azure (v1 API):** set the base URL to `https://{resource}.openai.azure.com/openai/v1`;
+  the deployment name goes in the model slot. API-key auth uses the `api-key` header; Entra
+  token auth (async key callback) is on the roadmap, not yet wired.
+
+Build your own preset by cloning a `ProviderProfile` (see [Custom Providers](#custom-providers)).
+
 ## Configuration
 
 ```typescript
@@ -276,6 +334,22 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 | **Anthropic** (older) | disabled | `budget_tokens: 1024` | `budget_tokens: 5000` | `budget_tokens: 10000` | `budget_tokens: 10000`◊ | `budget_tokens: 30000` | exact budget |
 | **Gemini** (3.x) | model minimum‡ | `thinkingLevel: 'low'` | `thinkingLevel: 'medium'` | `thinkingLevel: 'high'` | `thinkingLevel: 'high'`◊ | `thinkingLevel: 'high'` | nearest `thinkingLevel` |
 | **Gemini** (2.x) | `thinkingBudget: 0` | `thinkingBudget: 1024` | `thinkingBudget: 5000` | `thinkingBudget: 10000` | `thinkingBudget: 16384` | `thinkingBudget: 24576`§ | exact budget |
+| **OpenRouter** | `reasoning: {enabled:false}` | `reasoning: {effort:'low'}` | `'medium'` | `'high'` | clamped to `'high'` | clamped to `'high'` | `reasoning: {max_tokens: N}` ✓ |
+| **Azure OpenAI** | same as OpenAI (per deployment's underlying model) | | | | | | nearest effort* |
+| **xAI** (grok-3-mini) | omit | `reasoning_effort: 'low'` | `'high'`¶ | `'high'` | `'high'` | `'high'` | no-op◆ |
+| **xAI** (grok-4*) | omit | omit (auto-reasons) | omit | omit | omit | omit | no-op◆ |
+| **DeepSeek** | model-driven⊕ | model-driven⊕ | model-driven⊕ | model-driven⊕ | model-driven⊕ | model-driven⊕ | no-op◆ |
+| **Mistral** (small/medium) | omit | `reasoning_effort: 'high'`¶ | `'high'` | `'high'` | `'high'` | `'high'` | no-op◆ |
+| **Groq** (gpt-oss) | omit | `reasoning_effort: 'low'` | `'medium'` | `'high'` | `'high'` | `'high'` | no-op◆ |
+| **Self-hosted** (ollama/vllm/…) | deploy-time⊗ | deploy-time⊗ | deploy-time⊗ | deploy-time⊗ | deploy-time⊗ | deploy-time⊗ | no-op◆ |
+
+¶ The provider's `reasoning_effort` vocabulary is narrower than Axl's, so multiple levels collapse (xAI grok-3-mini exposes only `low`/`high`; Mistral maps any active effort to `'high'`). Models/families not listed (xAI grok-4, Mistral `magistral-*` and `large`/`ministral`/etc., Groq qwen3/llama) **omit** `reasoning_effort` — `effort` is a documented no-op there, never an error.
+
+◆ These presets don't accept an explicit token budget, and (unlike OpenAI) Axl does **not** translate `thinkingBudget` to a nearest effort for them — it is a no-op. Use `effort`, or `providerOptions` for provider-native budget params.
+
+⊕ DeepSeek reasoning is determined by model choice (`deepseek-reasoner`/V4-thinking always reason; `deepseek-chat` doesn't); `effort` is a no-op. Captured reasoning round-trips on tool-call turns.
+
+⊗ Reasoning on self-hosted runtimes is configured at the server (launch flags / `chat_template_kwargs`), so `effort` is generally a no-op; inline `<think>` output is captured.
 
 † Anthropic `effort: 'max'` only supported on Opus 4.7 and Opus 4.6. On Sonnet 4.6 and Opus 4.5, capped to `'high'`.
 
@@ -335,6 +409,13 @@ const agent = agent({
 ```
 
 `providerOptions` is spread **last** into the request body, so it can override any computed field. This is not portable across providers — use `effort`/`thinkingBudget`/`includeThoughts` for cross-provider behavior. Available on `AgentConfig` (agent-level default) and `AskOptions` (per-call override).
+
+> **OpenAI-compatible presets — `forbiddenParams` precedence.** Some presets strip request
+> params their provider rejects (e.g. `stop` on Grok-4 reasoning models). Stripping runs
+> **after** the `providerOptions` merge but **exempts any key you set explicitly in
+> `providerOptions`** — it only removes Axl's *computed* value. So re-introducing a forbidden
+> param via `providerOptions` is honored ("you asked for it"), and may produce a provider
+> error — that's on you, by design.
 
 > **Warning: shallow merge.** `providerOptions` is applied via `Object.assign(body, providerOptions)`, which is a **shallow merge**. Nested objects in `providerOptions` will **replace** the corresponding top-level key entirely, not deep-merge with it.
 >
@@ -426,7 +507,7 @@ cost = (non_cached_input_tokens × input_rate)
      + (output_tokens × output_rate)
 ```
 
-If a model is not in the pricing table (including all versioned snapshots not explicitly listed), cost is returned as `0` rather than an incorrect estimate.
+If a model is not in the pricing table (including all versioned snapshots not explicitly listed), cost is returned as `undefined` — **"unknown", never a misleading `0`**. A fake `$0` would let `ctx.budget()` treat a paid model as free and would show `$0.00` in cost dashboards; `undefined` is unmeasured and contributes nothing to budget totals. (OpenAI-compatible presets choose their pricing per provider: provider-reported, `undefined`, or an explicit `0` for local runtimes — see [presets](#openai-compatible-providers--presets).)
 
 ### Prompt caching rates
 
@@ -494,3 +575,34 @@ const runtime = new AxlRuntime(defineConfig({
 runtime.registerProvider('my-provider', new MyProvider());
 // Now use: 'my-provider:model-name'
 ```
+
+### Custom OpenAI-compatible preset (recommended for compatible endpoints)
+
+If your endpoint speaks the OpenAI Chat Completions format, you don't need a hand-written
+adapter — clone a `ProviderProfile` and let the generic engine do the work:
+
+```typescript
+import { OpenAICompatibleProvider, reasoningEffortEmit, type ProviderProfile } from '@axlsdk/axl';
+
+const MY_PROFILE: ProviderProfile = {
+  name: 'acme',
+  label: 'Acme',
+  defaultBaseUrl: 'https://api.acme.ai/v1',
+  envApiKey: 'ACME_API_KEY',
+  pricing: { kind: 'from-response' },        // or { kind: 'table', table }, 'zero', 'unknown'
+  reasoning: {
+    emit: reasoningEffortEmit((r) => r.activeEffort),
+    capture: 'reasoning_content',             // 'reasoning' | 'reasoning_details' | 'think_tags' | 'none'
+  },
+  capabilities: { supportsJsonSchema: false },
+};
+
+runtime.registerProvider('acme', new OpenAICompatibleProvider({ profile: MY_PROFILE }));
+// Now use: 'acme:some-model'
+```
+
+Profile fields cover auth header shape (`authHeader`), per-model quirks (`PerModel<T>` for
+`forbiddenParams` / `supportsJsonSchema` / the reasoning emit), `allowMissingApiKey` (local
+servers), `maxTokensField`, `parallelToolCalls`, and `requestDefaults`. See the built-in
+presets in `packages/axl/src/providers/profiles/` for worked examples, and the
+[API reference](./api-reference.md#provider-profiles) for the full type.

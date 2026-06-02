@@ -1295,6 +1295,43 @@ const runtime3 = new AxlRuntime({
 
 > **Scope:** caps request *concurrency*, not token throughput (TPM) — a permit releases at response headers. Governs **chat calls only** (memory embedder calls are not governed in this version) and is **per provider instance / process** (not shared across processes on the same key). Full caveats in [providers.md → Rate limiting](providers.md#rate-limiting-opt-in).
 
+### Provider profiles
+
+The generic `OpenAICompatibleProvider` is parameterized by a `ProviderProfile`. Built-in
+presets (OpenRouter, Azure, xAI, DeepSeek, Mistral, Groq, ollama/vllm/lmstudio/llamacpp/sglang)
+are profiles; build your own by cloning one. Guide: [providers.md → presets](providers.md#openai-compatible-providers--presets).
+
+**`ProviderProfile`**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | `string` | — | Machine name = `Provider.name` and the `provider:` URI key |
+| `label` | `string` | `name` | Human label used in error messages |
+| `defaultBaseUrl` | `string` | — | Base URL when neither config `baseUrl` nor `envBaseUrl` is set |
+| `envBaseUrl` | `string` | — | Env var consulted for the base URL |
+| `envApiKey` | `string` | — | Env var consulted for the API key |
+| `authHeader` | `AuthHeader` | `'bearer'` | `'bearer'` (`Authorization: Bearer`), `'api-key'` (Azure), or `{ header, scheme? }` |
+| `headers` | `Record<string,string>` | — | Static headers merged into every request |
+| `allowMissingApiKey` | `boolean` | `false` | Allow an empty key (local servers) → no auth header sent |
+| `pricing` | `PricingSource` | — | How per-call cost is derived |
+| `reasoning` | `ReasoningProfile` | — | Effort emission + reasoning capture/round-trip |
+| `capabilities` | `CapabilityFlags` | — | Wire-quirk flags |
+| `roleFor` | `(role, model) => string` | identity | Map a message role to the wire role (OpenAI: `system`→`developer` on o-series) |
+| `maxTokensField` | `'max_completion_tokens' \| 'max_tokens'` | `'max_completion_tokens'` | Output-token field name |
+| `parallelToolCalls` | `PerModel<boolean>` | off | Send `parallel_tool_calls: true` when tools are present |
+| `requestDefaults` | `Record<string,unknown>` | — | Static body fields merged before `providerOptions` |
+
+**`PricingSource`** — `{ kind: 'table'; table: PricingTable }` · `{ kind: 'from-response' }` (provider returns `usage.cost`) · `{ kind: 'zero' }` (local) · `{ kind: 'unknown' }`. A `'table'` miss yields `cost: undefined`, never `0`.
+
+**`ReasoningProfile`** — `{ emit: ReasoningEmit; capture: ReasoningCapture; roundTrip?: ReasoningRoundTrip }`.
+- `capture`: `'none'` · `'reasoning_content'` · `'reasoning'` · `'reasoning_details'` · `'think_tags'` (inline `<think>`).
+- `roundTrip`: `'none'` (default) · `'on-tool-call-turns'` (echo captured reasoning only on assistant turns that carried `tool_calls`).
+- Helpers: `reasoningEffortEmit(map)` writes top-level `reasoning_effort`; `reasoningObjectEmit(mapEffort)` writes OpenRouter's `reasoning` object (effort XOR `max_tokens`).
+
+**`CapabilityFlags`** — `emitsMessageName?` (default `true`) · `forbiddenParams?: PerModel<string[]>` (strip engine-computed values, preserve user `providerOptions`) · `supportsJsonSchema?: PerModel<boolean>` (default `true`; falls back to `json_object`) · `supportsStreamUsage?` (default `true`).
+
+**`PerModel<T>`** = `T | ((model: string) => T)` — a value, or a function resolved per call against the model id (for providers whose constraints differ by model).
+
 ### State configuration
 
 `config.state` accepts the following options:

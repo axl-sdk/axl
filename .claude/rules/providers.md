@@ -5,9 +5,25 @@ paths:
 
 # Provider adapters
 
-One adapter per provider, all implementing the `Provider` interface in
-`providers/types.ts`. **Zero SDK dependencies — raw `fetch` only.** New providers register
-through the factory in `registry.ts`.
+Two kinds of adapter, both implementing the `Provider` interface in `providers/types.ts`,
+both **zero SDK dependencies — raw `fetch` only**:
+- **Native adapters** for providers with their own wire format: `openai` (Chat Completions),
+  `openai-responses`, `anthropic`, `gemini`.
+- **One generic engine** — `OpenAICompatibleProvider` (`providers/openai-compatible.ts`) —
+  for everything that speaks the OpenAI Chat Completions format. It's parameterized by a
+  `ProviderProfile`; presets live in `providers/profiles/*.ts` and register from
+  `BUILTIN_PROFILES` in `registry.ts`. **`OpenAIProvider` is itself a thin subclass** of the
+  engine carrying the canonical OpenAI profile. To add an OpenAI-compatible provider, add a
+  profile — NOT a new adapter. New native (non-compatible) providers still register a factory
+  in `registry.ts`.
+
+**Profiles are data + small strategy fns** — `pricing` (`table`/`from-response`/`zero`/`unknown`;
+a table miss is `undefined`, never `0`), `reasoning` (`emit` + `capture` + turn-aware
+`roundTrip`), `capabilities` (`emitsMessageName`/`forbiddenParams`/`supportsJsonSchema`,
+`PerModel<T>` where a provider's rules differ by model), `authHeader`, `allowMissingApiKey`,
+`maxTokensField`, `parallelToolCalls`, `requestDefaults`. `forbiddenParams` strips
+engine-computed values but preserves the user's explicit `providerOptions`. Keep
+per-provider quirks in the profile (allowed to rot), not in the engine.
 
 - **Two OpenAI adapters**: `openai` (Chat Completions) and `openai-responses` (Responses
   API). They share config but build *separate* instances — using both means effective

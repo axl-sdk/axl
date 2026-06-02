@@ -7,7 +7,12 @@ import type {
   Effort,
 } from './types.js';
 import type { ChatRole } from '../types.js';
-import { resolveThinkingOptions, type ResolvedThinkingOptions } from './types.js';
+import {
+  resolveThinkingOptions,
+  resolveApiKey,
+  type ResolvedThinkingOptions,
+  type ApiKeySource,
+} from './types.js';
 import { fetchWithRetry } from './retry.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 
@@ -355,7 +360,8 @@ function isRoundTripField(field: unknown): field is RoundTripField {
 
 export type OpenAICompatibleOptions = {
   profile: ProviderProfile;
-  apiKey?: string;
+  /** API key or a per-request resolver (expiring tokens). See {@link ApiKeySource}. */
+  apiKey?: ApiKeySource;
   baseUrl?: string;
   rateLimit?: RateLimitConfig;
 };
@@ -368,14 +374,16 @@ export class OpenAICompatibleProvider implements Provider {
   readonly name: string;
   protected readonly profile: ProviderProfile;
   protected readonly baseUrl: string;
-  protected readonly apiKey: string;
+  /** A key string, or a resolver invoked per request (expiring tokens). */
+  protected readonly apiKeySource: ApiKeySource;
   protected readonly governor?: RateLimiter;
 
   constructor(options: OpenAICompatibleOptions) {
     const p = options.profile;
     this.profile = p;
     this.name = p.name;
-    this.apiKey = options.apiKey ?? (p.envApiKey ? process.env[p.envApiKey] : undefined) ?? '';
+    this.apiKeySource =
+      options.apiKey ?? (p.envApiKey ? process.env[p.envApiKey] : undefined) ?? '';
     const envBase = p.envBaseUrl ? process.env[p.envBaseUrl] : undefined;
     const explicitBase = options.baseUrl ?? envBase;
     this.baseUrl = (explicitBase ?? p.defaultBaseUrl).replace(/\/$/, '');
@@ -389,20 +397,37 @@ export class OpenAICompatibleProvider implements Provider {
           `(it is resource-specific and has no default).`,
       );
     }
-    if (!this.apiKey && !p.allowMissingApiKey) {
+    // Eager validation for the STRING case (fail fast at construction). A
+    // function source can't be awaited here — it's validated per request in
+    // resolveKey().
+    if (typeof this.apiKeySource === 'string' && !this.apiKeySource && !p.allowMissingApiKey) {
       const env = p.envApiKey ?? 'the API key env var';
       throw new Error(`${label} API key is required. Set ${env} or pass apiKey in options.`);
     }
   }
 
+  /** Resolve the API key for one request, validating against allowMissingApiKey. */
+  protected async resolveKey(): Promise<string> {
+    const key = await resolveApiKey(this.apiKeySource);
+    if (!key && !this.profile.allowMissingApiKey) {
+      const label = this.profile.label ?? this.profile.name;
+      const env = this.profile.envApiKey ?? 'the API key env var';
+      throw new Error(`${label} API key is required. Set ${env} or pass apiKey in options.`);
+    }
+    return key;
+  }
+
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
+    // Resolve the key BEFORE entering fetchWithRetry so a slow token refresh
+    // doesn't hold a rate-limiter permit.
+    const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, false);
 
     const res = await fetchWithRetry(
       `${this.baseUrl}/chat/completions`,
       {
         method: 'POST',
-        headers: this.buildHeaders(),
+        headers,
         body: JSON.stringify(body),
         signal: options.signal,
       },
@@ -418,13 +443,14 @@ export class OpenAICompatibleProvider implements Provider {
   }
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
+    const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, true);
 
     const res = await fetchWithRetry(
       `${this.baseUrl}/chat/completions`,
       {
         method: 'POST',
-        headers: this.buildHeaders(),
+        headers,
         body: JSON.stringify(body),
         signal: options.signal,
       },
@@ -445,16 +471,16 @@ export class OpenAICompatibleProvider implements Provider {
   // Request building
   // ---------------------------------------------------------------------------
 
-  protected buildHeaders(): Record<string, string> {
+  protected buildHeaders(apiKey: string): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       ...(this.profile.headers ?? {}),
     };
-    if (this.apiKey) {
+    if (apiKey) {
       const auth = this.profile.authHeader ?? 'bearer';
-      if (auth === 'bearer') headers.Authorization = `Bearer ${this.apiKey}`;
-      else if (auth === 'api-key') headers['api-key'] = this.apiKey;
-      else headers[auth.header] = auth.scheme ? `${auth.scheme} ${this.apiKey}` : this.apiKey;
+      if (auth === 'bearer') headers.Authorization = `Bearer ${apiKey}`;
+      else if (auth === 'api-key') headers['api-key'] = apiKey;
+      else headers[auth.header] = auth.scheme ? `${auth.scheme} ${apiKey}` : apiKey;
     }
     return headers;
   }

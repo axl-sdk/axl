@@ -208,7 +208,12 @@ export type {
   Effort,
   ToolChoice,
 } from './providers/types.js';
-export { resolveThinkingOptions, type ResolvedThinkingOptions } from './providers/types.js';
+export {
+  resolveThinkingOptions,
+  resolveApiKey,
+  type ResolvedThinkingOptions,
+  type ApiKeySource,
+} from './providers/types.js';
 
 // MCP
 export { McpManager } from './mcp/manager.js';

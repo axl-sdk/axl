@@ -169,3 +169,17 @@ export function resolveThinkingOptions(
     hasBudgetOverride,
   };
 }
+
+/**
+ * An API key, or a function that produces one per request. The function form
+ * supports expiring credentials (Azure-Entra, Databricks/IBM OAuth, Bedrock
+ * short-term tokens): the caller's callback owns refresh/caching; Axl invokes it
+ * once per request and does not memoize. See `docs/providers.md`.
+ */
+export type ApiKeySource = string | (() => string | Promise<string>);
+
+/** Resolve an {@link ApiKeySource} to a concrete key for a single request. */
+export async function resolveApiKey(source: ApiKeySource | undefined): Promise<string> {
+  if (typeof source === 'function') return (await source()) ?? '';
+  return source ?? '';
+}

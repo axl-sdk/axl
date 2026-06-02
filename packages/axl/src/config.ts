@@ -1,8 +1,12 @@
 import type { RateLimitConfig } from './providers/rate-limiter.js';
+import type { ApiKeySource } from './providers/types.js';
 
 /** Provider configuration */
 export type ProviderConfig = {
-  apiKey?: string;
+  /** API key, or a function resolving one per request (for expiring tokens —
+   *  Azure-Entra, Databricks/IBM OAuth, Bedrock short-term). A plain string is
+   *  the common case. See {@link ApiKeySource}. */
+  apiKey?: ApiKeySource;
   baseUrl?: string;
   /**
    * Opt-in client-side rate governor for this provider's HTTP calls (see

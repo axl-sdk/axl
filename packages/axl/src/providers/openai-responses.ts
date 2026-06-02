@@ -8,7 +8,7 @@ import {
   clampReasoningEffort,
 } from './openai.js';
 import type { ReasoningEffort } from './openai.js';
-import { resolveThinkingOptions } from './types.js';
+import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 
@@ -22,11 +22,13 @@ import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 export class OpenAIResponsesProvider implements Provider {
   readonly name = 'openai-responses';
   private baseUrl: string;
-  private apiKey: string;
+  private apiKeySource: ApiKeySource;
   private governor?: RateLimiter;
 
-  constructor(options: { apiKey?: string; baseUrl?: string; rateLimit?: RateLimitConfig } = {}) {
-    this.apiKey = options.apiKey ?? process.env.OPENAI_API_KEY ?? '';
+  constructor(
+    options: { apiKey?: ApiKeySource; baseUrl?: string; rateLimit?: RateLimitConfig } = {},
+  ) {
+    this.apiKeySource = options.apiKey ?? process.env.OPENAI_API_KEY ?? '';
     this.baseUrl = (
       options.baseUrl ??
       process.env.OPENAI_BASE_URL ??
@@ -34,9 +36,25 @@ export class OpenAIResponsesProvider implements Provider {
     ).replace(/\/$/, '');
     this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
 
-    if (!this.apiKey) {
+    // Eager validation for the string case; a function source is validated per
+    // request in resolveKey().
+    if (typeof this.apiKeySource === 'string' && !this.apiKeySource) {
       throw new Error('OpenAI API key is required. Set OPENAI_API_KEY or pass apiKey in options.');
     }
+  }
+
+  /** Resolve the API key for one request (supports an expiring-token callback). */
+  private async resolveKey(): Promise<string> {
+    const key = await resolveApiKey(this.apiKeySource);
+    if (!key) {
+      throw new Error('OpenAI API key is required. Set OPENAI_API_KEY or pass apiKey in options.');
+    }
+    return key;
+  }
+
+  /** Build request headers from a resolved key (used by both chat and stream). */
+  private buildHeaders(apiKey: string): Record<string, string> {
+    return { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
   }
 
   // ---------------------------------------------------------------------------
@@ -44,16 +62,14 @@ export class OpenAIResponsesProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
+    const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, false);
 
     const res = await fetchWithRetry(
       `${this.baseUrl}/responses`,
       {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
-        },
+        headers,
         body: JSON.stringify(body),
         signal: options.signal,
       },
@@ -75,16 +91,14 @@ export class OpenAIResponsesProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
+    const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, true);
 
     const res = await fetchWithRetry(
       `${this.baseUrl}/responses`,
       {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
-        },
+        headers,
         body: JSON.stringify(body),
         signal: options.signal,
       },

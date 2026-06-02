@@ -8,7 +8,7 @@ import type {
   ToolDefinition,
   ToolCallMessage,
 } from './types.js';
-import { resolveThinkingOptions } from './types.js';
+import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 
@@ -162,20 +162,35 @@ function clampAnthropicEffort(
 export class AnthropicProvider implements Provider {
   readonly name = 'anthropic';
   private baseUrl: string;
-  private apiKey: string;
+  private apiKeySource: ApiKeySource;
   private currentModel?: string;
   private governor?: RateLimiter;
 
-  constructor(options: { apiKey?: string; baseUrl?: string; rateLimit?: RateLimitConfig } = {}) {
-    this.apiKey = options.apiKey ?? process.env.ANTHROPIC_API_KEY ?? '';
+  constructor(
+    options: { apiKey?: ApiKeySource; baseUrl?: string; rateLimit?: RateLimitConfig } = {},
+  ) {
+    this.apiKeySource = options.apiKey ?? process.env.ANTHROPIC_API_KEY ?? '';
     this.baseUrl = (options.baseUrl ?? 'https://api.anthropic.com/v1').replace(/\/$/, '');
     this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
 
-    if (!this.apiKey) {
+    // Eager validation for the string case; a function source is validated per
+    // request in resolveKey().
+    if (typeof this.apiKeySource === 'string' && !this.apiKeySource) {
       throw new Error(
         'Anthropic API key is required. Set ANTHROPIC_API_KEY or pass apiKey in options.',
       );
     }
+  }
+
+  /** Resolve the API key for one request (supports an expiring-token callback). */
+  private async resolveKey(): Promise<string> {
+    const key = await resolveApiKey(this.apiKeySource);
+    if (!key) {
+      throw new Error(
+        'Anthropic API key is required. Set ANTHROPIC_API_KEY or pass apiKey in options.',
+      );
+    }
+    return key;
   }
 
   // ---------------------------------------------------------------------------
@@ -184,13 +199,14 @@ export class AnthropicProvider implements Provider {
 
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
     this.currentModel = options.model;
+    const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, false);
 
     const res = await fetchWithRetry(
       `${this.baseUrl}/messages`,
       {
         method: 'POST',
-        headers: this.buildHeaders(),
+        headers,
         body: JSON.stringify(body),
         signal: options.signal,
       },
@@ -212,13 +228,14 @@ export class AnthropicProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
+    const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, true);
 
     const res = await fetchWithRetry(
       `${this.baseUrl}/messages`,
       {
         method: 'POST',
-        headers: this.buildHeaders(),
+        headers,
         body: JSON.stringify(body),
         signal: options.signal,
       },
@@ -242,10 +259,10 @@ export class AnthropicProvider implements Provider {
   // Internal: request building
   // ---------------------------------------------------------------------------
 
-  private buildHeaders(): Record<string, string> {
+  private buildHeaders(apiKey: string): Record<string, string> {
     return {
       'Content-Type': 'application/json',
-      'x-api-key': this.apiKey,
+      'x-api-key': apiKey,
       'anthropic-version': ANTHROPIC_API_VERSION,
     };
   }

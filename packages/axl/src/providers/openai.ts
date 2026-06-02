@@ -1,4 +1,4 @@
-import type { Effort } from './types.js';
+import type { Effort, ApiKeySource } from './types.js';
 import type { RateLimitConfig } from './rate-limiter.js';
 import {
   OpenAICompatibleProvider,
@@ -177,7 +177,9 @@ export const OPENAI_PROFILE: ProviderProfile = {
  * models (o1/o3/o4-mini + GPT-5.x) via `reasoning_effort`.
  */
 export class OpenAIProvider extends OpenAICompatibleProvider {
-  constructor(options: { apiKey?: string; baseUrl?: string; rateLimit?: RateLimitConfig } = {}) {
+  constructor(
+    options: { apiKey?: ApiKeySource; baseUrl?: string; rateLimit?: RateLimitConfig } = {},
+  ) {
     super({ profile: OPENAI_PROFILE, ...options });
   }
 }

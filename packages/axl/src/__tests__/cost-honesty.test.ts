@@ -129,4 +129,40 @@ describe('ask_end.unpriced (T2.5)', () => {
     const redacted = redactEvent(askEnd(traces)!) as { unpriced?: boolean };
     expect(redacted.unpriced).toBe(true);
   });
+
+  it('emits unpriced on the handoff-roundtrip target ask_end (not just the main loop)', async () => {
+    // The target ask_end is emitted at a DIFFERENT code site than the main loop;
+    // verify the signal rides it. Source turns are priced; only the target is not.
+    const target = agent({ name: 'target', model: 'mock:test', system: 'specialist' });
+    const source = agent({
+      name: 'source',
+      model: 'mock:test',
+      system: 'coordinator',
+      handoffs: [{ agent: target, mode: 'roundtrip' }],
+    });
+    const provider = seqProvider([
+      {
+        content: '',
+        tool_calls: [
+          {
+            id: 'h1',
+            type: 'function',
+            function: { name: 'handoff_to_target', arguments: '{"message":"go"}' },
+          },
+        ],
+        usage,
+        cost: 0.001,
+      },
+      { content: 'specialist answer', usage }, // target turn — UNPRICED
+      { content: 'final', usage, cost: 0.001 }, // source resumes — priced
+    ]);
+    const { ctx, traces } = createTestCtx({ provider });
+    await ctx.ask(source, 'coordinate');
+
+    const ends = traces.filter((t) => t.type === 'ask_end') as AskEnd[];
+    const targetEnd = ends.find((e) => e.agent === 'target');
+    const sourceEnd = ends.find((e) => e.agent === 'source');
+    expect(targetEnd?.unpriced).toBe(true); // the unpriced target turn flags its own ask
+    expect(sourceEnd?.unpriced).toBeFalsy(); // source turns were all priced
+  });
 });

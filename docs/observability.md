@@ -66,7 +66,7 @@ All events share the `AxlEventBase` shape; `data` and other variant-specific fie
 | Type | When emitted | Key `data` fields |
 |------|-------------|-------------------|
 | `workflow_start` / `workflow_end` | Workflow lifecycle | `input` / `status`, `duration`, `result?`, `error?`, `aborted?` |
-| `ask_start` / `ask_end` | Bound every `ctx.ask()` call (one pair per invocation, including nested). | `prompt` on start; `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration` on end |
+| `ask_start` / `ask_end` | Bound every `ctx.ask()` call (one pair per invocation, including nested). | `prompt` on start; `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration`, and `unpriced?: boolean` on end |
 | `agent_call_start` / `agent_call_end` | Per LLM call (every loop turn of `ctx.ask()`). `_start` fires before the request; `_end` after the response. | `_start`: `agent`, `model`, `turn`. `_end` `data`: `prompt`, `response`, `system`, `thinking?`, `params`, `turn`, `retryReason?`, `messages?` (verbose only) |
 | `token` | Streaming text chunk (stream-only, never persisted to `ExecutionInfo.events`) | `data: string` |
 | `tool_call_start` / `tool_call_end` | Tool invocation lifecycle | `_start` `data`: `args`. `_end` `data`: `args`, `result`, `callId` |
@@ -124,7 +124,9 @@ for (const event of info.events) {
 
 `ask_end.cost` is the **per-ask rollup** of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). If you sum `event.cost` across every event you observe, you'll double-count.
 
-Use the exported helper `eventCostContribution(event)` — it returns `0` for `ask_end` rollups and for non-finite values, and the event's cost otherwise. This is the single source of truth Axl's internals use; third-party accumulators should match:
+**Unknown cost (`ask_end.unpriced`).** When an ask used a model with no usable per-call price (a pricing-table miss, or a provider that doesn't report cost), the unpriced call's `cost` is `undefined` — it contributes nothing to the rollup, so `ask_end.cost` becomes a **lower bound** and `ask_end.unpriced` is `true`. A *failed* call (which carries no usage) is NOT flagged. Treat `unpriced` asks as "at least `cost`", not exact (Studio renders them `≥ $X`). `agent_call_end.cost` is `number | undefined` for the same reason.
+
+Use the exported helper `eventCostContribution(event)` — it returns `0` for `ask_end` rollups, for non-finite values, and for an undefined (unpriced) cost, and the event's cost otherwise. This is the single source of truth Axl's internals use; third-party accumulators should match:
 
 ```typescript
 import { eventCostContribution } from '@axlsdk/axl';

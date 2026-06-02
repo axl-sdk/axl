@@ -1,18 +1,23 @@
 import { reasoningEffortEmit, type ProviderProfile } from '../openai-compatible.js';
 
-// Groq serves both reasoning (gpt-oss, qwen3, deepseek-r1 distills, qwq) and
-// plain open-weight models. reasoning_effort 400s on the non-reasoning ones, so
-// emit it only for reasoning families. (Model-prefix heuristic; lives in the
-// adapter where rot is acceptable, and is overridable via providerOptions.)
-const isReasoningModel = (model: string) => /gpt-oss|qwen3|deepseek-r1|qwq/i.test(model);
+// `reasoning_effort` is per-FAMILY on Groq, not just per-reasoning-model:
+//  - gpt-oss accepts low | medium | high.
+//  - qwen3 / qwq / deepseek-r1 distills accept only none | default — passing
+//    low/medium/high 400s ("reasoning_effort must be one of none or default").
+// So map the unified effort to a wire value ONLY for gpt-oss; for the other
+// reasoning families, omit the field and let the model default (effort is a
+// documented no-op there). Plain open-weight models also 400 on the field, so
+// they're omitted too. (Model-prefix heuristic; lives in the adapter where rot
+// is acceptable, overridable via providerOptions.)
+const isGptOss = (model: string) => /gpt-oss/i.test(model);
 
 /**
  * Groq — fastest inference (LPU), OpenAI-compatible at
  * `https://api.groq.com/openai/v1`. Open-weight models only.
  *
  * - 400s on `messages[].name` → not emitted.
- * - `reasoning_effort` only for reasoning families (above); `xhigh`/`max` clamp
- *   to `high`.
+ * - `reasoning_effort` (low/medium/high; `xhigh`/`max`→`high`) for gpt-oss only;
+ *   a no-op on other models (whose vocab differs / who reject the field).
  * - Reasoning text comes back in `message.reasoning` (gpt-oss).
  */
 export const GROQ_PROFILE: ProviderProfile = {
@@ -24,7 +29,7 @@ export const GROQ_PROFILE: ProviderProfile = {
   pricing: { kind: 'unknown' },
   reasoning: {
     emit: reasoningEffortEmit((resolved, model) => {
-      if (!isReasoningModel(model) || resolved.thinkingDisabled || !resolved.activeEffort) {
+      if (!isGptOss(model) || resolved.thinkingDisabled || !resolved.activeEffort) {
         return undefined;
       }
       const e = resolved.activeEffort;

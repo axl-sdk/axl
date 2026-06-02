@@ -1,6 +1,9 @@
 import type { ProviderProfile, ReasoningEmit } from '../openai-compatible.js';
 
-const isReasoner = (model: string) => /reasoner/i.test(model);
+// Thinking models: the classic `deepseek-reasoner` (retires 2026-07-24) and the
+// V4 thinking families. They reason automatically and reject/ignore sampling
+// params; non-thinking `deepseek-chat` keeps them.
+const isReasoner = (model: string) => /reasoner|v4/i.test(model);
 
 /**
  * DeepSeek thinking models (`deepseek-reasoner`) reason automatically — there is

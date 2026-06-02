@@ -507,6 +507,8 @@ describe('reasoning capture (chat)', () => {
     const r = await reasoning('reasoning_content', 'on-tool-call-turns').chat(userMsg, {
       model: 'm',
     });
+    // Capture still surfaces thinking AND the round-trip bag is attached.
+    expect(r.thinking_content).toBe('x');
     expect(r.providerMetadata).toEqual({
       openaiCompatReasoning: { field: 'reasoning_content', value: 'x' },
     });
@@ -689,5 +691,214 @@ describe('streaming', () => {
     });
     await collect(makeProvider({ capabilities: { supportsStreamUsage: false } }));
     expect(lastRequest(fetchMock).body).not.toHaveProperty('stream_options');
+  });
+});
+
+// ===========================================================================
+// Tool calls — streaming reassembly + non-streaming round-trip + mapping
+// ===========================================================================
+
+describe('tool calls', () => {
+  async function collectStream(p: OpenAICompatibleProvider) {
+    const chunks: any[] = [];
+    for await (const c of p.stream(userMsg, { model: 'm' })) chunks.push(c);
+    return chunks;
+  }
+
+  // Simulate the downstream accumulator (context.ts keys deltas by id).
+  function assemble(chunks: any[]) {
+    const byId = new Map<string, { name?: string; arguments: string }>();
+    for (const c of chunks) {
+      if (c.type !== 'tool_call_delta') continue;
+      const cur = byId.get(c.id) ?? { arguments: '' };
+      if (c.name) cur.name = c.name;
+      if (c.arguments) cur.arguments += c.arguments;
+      byId.set(c.id, cur);
+    }
+    return byId;
+  }
+
+  it('reassembles a tool call when id+name are on the first delta (OpenAI shape)', async () => {
+    mockFetch({
+      body: sseStream([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{\\"a\\":"}}]},"finish_reason":null}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":null}]}',
+        'data: [DONE]',
+      ]),
+    });
+    const calls = assemble(await collectStream(makeProvider()));
+    expect([...calls.keys()]).toEqual(['call_1']);
+    expect(calls.get('call_1')).toEqual({ name: 'f', arguments: '{"a":1}' });
+  });
+
+  it('reassembles a SINGLE tool call when the id arrives on a LATER delta', async () => {
+    // Some providers stream name/args first, id later. Must not split into two.
+    mockFetch({
+      body: sseStream([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":"{\\"a\\":"}}]},"finish_reason":null}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"arguments":"1}"}}]},"finish_reason":null}]}',
+        'data: [DONE]',
+      ]),
+    });
+    const calls = assemble(await collectStream(makeProvider()));
+    expect([...calls.keys()]).toEqual(['call_9']);
+    expect(calls.get('call_9')).toEqual({ name: 'f', arguments: '{"a":1}' });
+  });
+
+  it('flushes a buffered tool call under a synthetic id if the id never arrives', async () => {
+    mockFetch({
+      body: sseStream([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f","arguments":"{}"}}]},"finish_reason":null}]}',
+        'data: [DONE]',
+      ]),
+    });
+    const calls = assemble(await collectStream(makeProvider()));
+    // Not dropped — emitted once under a stable per-index synthetic id.
+    expect([...calls.values()]).toEqual([{ name: 'f', arguments: '{}' }]);
+  });
+
+  it('round-trips assistant tool_calls + tool result onto the wire (non-streaming)', async () => {
+    const fetchMock = mockFetch(okJson());
+    const history: ChatMessage[] = [
+      { role: 'user', content: 'q' },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{ id: 't1', type: 'function', function: { name: 'f', arguments: '{}' } }],
+      },
+      { role: 'tool', content: '42', tool_call_id: 't1' },
+    ];
+    await makeProvider().chat(history, { model: 'm' });
+    const msgs = lastRequest(fetchMock).body.messages as Array<Record<string, any>>;
+    expect(msgs[1].tool_calls[0].id).toBe('t1');
+    expect(msgs[1].content).toBe('');
+    expect(msgs[2].role).toBe('tool');
+    expect(msgs[2].tool_call_id).toBe('t1');
+  });
+
+  it('maps response.message.tool_calls into ProviderResponse.tool_calls', async () => {
+    mockFetch(
+      okJson(
+        {},
+        {
+          content: null,
+          tool_calls: [
+            { id: 'c1', type: 'function', function: { name: 'lookup', arguments: '{"x":1}' } },
+          ],
+        },
+      ),
+    );
+    const r = await makeProvider().chat(userMsg, { model: 'm' });
+    expect(r.tool_calls).toEqual([
+      { id: 'c1', type: 'function', function: { name: 'lookup', arguments: '{"x":1}' } },
+    ]);
+  });
+});
+
+// ===========================================================================
+// Round-trip field validation (security: closed allowlist for the echo key)
+// ===========================================================================
+
+describe('round-trip field allowlist', () => {
+  it('refuses to echo a non-allowlisted field from providerMetadata', async () => {
+    const fetchMock = mockFetch(okJson());
+    const hostile: ChatMessage = {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 't1', type: 'function', function: { name: 'f', arguments: '{}' } }],
+      // A malformed/hostile history entry trying to overwrite the model field.
+      providerMetadata: { openaiCompatReasoning: { field: 'model', value: 'evil-model' } },
+    };
+    await makeProvider({
+      reasoning: { emit: () => {}, capture: 'reasoning_content', roundTrip: 'on-tool-call-turns' },
+    }).chat([hostile], { model: 'real-model' });
+    const body = lastRequest(fetchMock).body;
+    expect(body.model).toBe('real-model'); // not overwritten
+    const msgs = body.messages as Array<Record<string, unknown>>;
+    expect(msgs[0]).not.toHaveProperty('model');
+  });
+});
+
+// ===========================================================================
+// computeCost robustness
+// ===========================================================================
+
+describe('computeCost NaN guard', () => {
+  it('returns undefined (not NaN) when a table-priced provider omits token counts', async () => {
+    // Malformed usage: cost would compute as NaN without the finite guard.
+    mockFetch({
+      json: () =>
+        Promise.resolve({
+          choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }],
+          usage: { completion_tokens: 5, total_tokens: 5 }, // prompt_tokens missing
+        }),
+    });
+    const r = await makeProvider({
+      pricing: { kind: 'table', table: { m: [1e-6, 1e-6, 1] } },
+    }).chat(userMsg, { model: 'm' });
+    expect(r.cost).toBeUndefined();
+  });
+});
+
+// ===========================================================================
+// More streaming edge cases
+// ===========================================================================
+
+describe('streaming edge cases', () => {
+  async function collect(p: OpenAICompatibleProvider) {
+    const chunks: any[] = [];
+    for await (const c of p.stream(userMsg, { model: 'm' })) chunks.push(c);
+    return chunks;
+  }
+
+  it('accumulates reasoning_details across deltas for round-trip on tool turns', async () => {
+    mockFetch({
+      body: sseStream([
+        'data: {"choices":[{"delta":{"reasoning":"a","reasoning_details":[{"i":1}]},"finish_reason":null}]}',
+        'data: {"choices":[{"delta":{"reasoning":"b","reasoning_details":[{"i":2}]},"finish_reason":null}]}',
+        'data: [DONE]',
+      ]),
+    });
+    const chunks = await collect(
+      makeProvider({
+        reasoning: {
+          emit: () => {},
+          capture: 'reasoning_details',
+          roundTrip: 'on-tool-call-turns',
+        },
+      }),
+    );
+    expect(chunks.find((c) => c.type === 'done').providerMetadata).toEqual({
+      openaiCompatReasoning: { field: 'reasoning_details', value: [{ i: 1 }, { i: 2 }] },
+    });
+  });
+
+  it('still emits a done chunk + flushes think tags when the stream ends without [DONE]', async () => {
+    mockFetch({
+      body: sseStream([
+        'data: {"choices":[{"delta":{"content":"visible<think>hidden"},"finish_reason":null}]}',
+        // no "data: [DONE]" — abrupt close
+      ]),
+    });
+    const chunks = await collect(
+      makeProvider({ reasoning: { emit: () => {}, capture: 'think_tags' } }),
+    );
+    expect(chunks.some((c) => c.type === 'done')).toBe(true);
+    const thinking = chunks
+      .filter((c) => c.type === 'thinking_delta')
+      .map((c) => c.content)
+      .join('');
+    expect(thinking).toBe('hidden'); // unterminated block flushed as thinking
+  });
+});
+
+// ===========================================================================
+// think_tags malformed-input contract
+// ===========================================================================
+
+describe('think_tags malformed input', () => {
+  it('treats a stray </think> with no opening tag as ordinary text', () => {
+    // No <think> ever opened → nothing to close → the literal stays visible.
+    expect(extractThinkTags('a</think>b')).toEqual({ content: 'a</think>b', thinking: '' });
   });
 });

@@ -6,9 +6,9 @@ import type { ProviderProfile } from '../openai-compatible.js';
  *
  * The mid-2026 v1 surface drops the old `/deployments/{id}/` path and
  * `api-version` query param: the deployment name goes in the `model` field and
- * the base URL is `https://{resource}.openai.azure.com/openai/v1`. Set it via
- * the `azure` provider's `baseUrl` config or `AZURE_OPENAI_BASE_URL` — the
- * placeholder default below fails loudly if neither is provided.
+ * the base URL is `https://{resource}.openai.azure.com/openai/v1`. It is
+ * resource-specific, so `requireExplicitBaseUrl` makes the constructor throw if
+ * neither `providers.azure.baseUrl` nor `AZURE_OPENAI_BASE_URL` is set.
  *
  * Auth: API-key auth uses the `api-key` header (NOT `Authorization: Bearer`).
  * Entra/AAD bearer-token auth needs the async key callback (Tier 2) and is not
@@ -22,8 +22,9 @@ import type { ProviderProfile } from '../openai-compatible.js';
 export const AZURE_PROFILE: ProviderProfile = {
   name: 'azure',
   label: 'Azure OpenAI',
-  // Intentionally a placeholder — Azure base URLs are resource-specific.
+  // Never actually used — requireExplicitBaseUrl forces a real value first.
   defaultBaseUrl: 'https://YOUR-RESOURCE.openai.azure.com/openai/v1',
+  requireExplicitBaseUrl: true,
   envApiKey: 'AZURE_OPENAI_API_KEY',
   envBaseUrl: 'AZURE_OPENAI_BASE_URL',
   authHeader: 'api-key',

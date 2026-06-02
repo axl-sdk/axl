@@ -144,6 +144,12 @@ export type ProviderProfile = {
   label?: string;
   /** Base URL used when neither a constructor arg nor env var is set. */
   defaultBaseUrl: string;
+  /**
+   * Require an explicit base URL (config `baseUrl` or `envBaseUrl`) — throw at
+   * construction if neither is set. For providers like Azure whose base URL is
+   * account/resource-specific and has no usable default.
+   */
+  requireExplicitBaseUrl?: boolean;
   /** Env var consulted for the base URL (after the constructor arg). */
   envBaseUrl?: string;
   /** Env var consulted for the API key (after the constructor arg). */
@@ -301,12 +307,10 @@ export function extractThinkTags(content: string): { content: string; thinking: 
  */
 export function reasoningEffortEmit(
   map: (resolved: ResolvedThinkingOptions, model: string) => string | undefined,
-  opts: { stripTemperatureWhenActive?: boolean } = {},
 ): ReasoningEmit {
   return (body, resolved, model) => {
     const value = map(resolved, model);
     if (value) body.reasoning_effort = value;
-    return { stripTemperature: opts.stripTemperatureWhenActive ? value !== undefined : false };
   };
 }
 
@@ -335,7 +339,19 @@ export function reasoningObjectEmit(
 // ---------------------------------------------------------------------------
 
 /** Round-trip payload stashed in `providerMetadata` for reasoning echo. */
-type RoundTripReasoning = { field: string; value: unknown };
+/**
+ * The wire fields we will echo back on a tool-call turn. A CLOSED union: the
+ * round-trip key comes from `providerMetadata` (externally settable via
+ * `Session.send`), and is used as a dynamic body key, so it must never be
+ * allowed to inject/overwrite an arbitrary field like `model` or `messages`.
+ */
+const ROUND_TRIP_FIELDS = ['reasoning_content', 'reasoning', 'reasoning_details'] as const;
+type RoundTripField = (typeof ROUND_TRIP_FIELDS)[number];
+type RoundTripReasoning = { field: RoundTripField; value: unknown };
+
+function isRoundTripField(field: unknown): field is RoundTripField {
+  return typeof field === 'string' && (ROUND_TRIP_FIELDS as readonly string[]).includes(field);
+}
 
 export type OpenAICompatibleOptions = {
   profile: ProviderProfile;
@@ -361,11 +377,19 @@ export class OpenAICompatibleProvider implements Provider {
     this.name = p.name;
     this.apiKey = options.apiKey ?? (p.envApiKey ? process.env[p.envApiKey] : undefined) ?? '';
     const envBase = p.envBaseUrl ? process.env[p.envBaseUrl] : undefined;
-    this.baseUrl = (options.baseUrl ?? envBase ?? p.defaultBaseUrl).replace(/\/$/, '');
+    const explicitBase = options.baseUrl ?? envBase;
+    this.baseUrl = (explicitBase ?? p.defaultBaseUrl).replace(/\/$/, '');
     this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
 
+    const label = p.label ?? p.name;
+    if (p.requireExplicitBaseUrl && explicitBase === undefined) {
+      const env = p.envBaseUrl ? ` or ${p.envBaseUrl}` : '';
+      throw new Error(
+        `${label} requires a base URL. Set providers.${p.name}.baseUrl${env} ` +
+          `(it is resource-specific and has no default).`,
+      );
+    }
     if (!this.apiKey && !p.allowMissingApiKey) {
-      const label = p.label ?? p.name;
       const env = p.envApiKey ?? 'the API key env var';
       throw new Error(`${label} API key is required. Set ${env} or pass apiKey in options.`);
     }
@@ -519,8 +543,15 @@ export class OpenAICompatibleProvider implements Provider {
       msg.tool_calls &&
       msg.tool_calls.length > 0
     ) {
-      const rt = msg.providerMetadata?.openaiCompatReasoning as RoundTripReasoning | undefined;
-      if (rt && rt.value !== undefined && rt.value !== null) out[rt.field] = rt.value;
+      const rt = msg.providerMetadata?.openaiCompatReasoning as
+        | { field?: unknown; value?: unknown }
+        | undefined;
+      // Validate the field against the closed allowlist before using it as a
+      // dynamic body key — a malformed/hostile history entry must not be able to
+      // overwrite `model`, `messages`, etc.
+      if (rt && isRoundTripField(rt.field) && rt.value !== undefined && rt.value !== null) {
+        out[rt.field] = rt.value;
+      }
     }
 
     return out;
@@ -573,14 +604,24 @@ export class OpenAICompatibleProvider implements Provider {
         return typeof reportedCost === 'number' && Number.isFinite(reportedCost)
           ? reportedCost
           : undefined;
-      case 'table':
-        return priceFromTable(
+      case 'table': {
+        // Guard against NaN from a provider that reports malformed token counts —
+        // a NaN cost would poison budget totals and the axl.agent.cost span.
+        const c = priceFromTable(
           p.table,
           model,
           usage.prompt_tokens,
           usage.completion_tokens,
           usage.cached_tokens,
         );
+        return c !== undefined && Number.isFinite(c) ? c : undefined;
+      }
+      default: {
+        // Exhaustiveness: a new PricingSource variant must be wired here, not
+        // silently fall through to an "unknown"-looking undefined.
+        const _exhaustive: never = p;
+        throw new Error(`Unhandled pricing source: ${JSON.stringify(_exhaustive)}`);
+      }
     }
   }
 
@@ -617,6 +658,10 @@ export class OpenAICompatibleProvider implements Provider {
       }
       case 'none':
         break;
+      default: {
+        const _exhaustive: never = this.profile.reasoning.capture;
+        throw new Error(`Unhandled reasoning capture: ${String(_exhaustive)}`);
+      }
     }
 
     const usage = this.toUsage(json.usage);
@@ -669,6 +714,27 @@ export class OpenAICompatibleProvider implements Provider {
     const reasoningDetails: unknown[] = [];
 
     const indexToId = new Map<number, string>();
+    // Deltas that arrived before the tool call's `id` is known are buffered by
+    // index, then flushed under the real id once it appears — emitting a
+    // synthetic `__pending_` id and later switching to the real id would make
+    // the downstream accumulator (which keys on id) treat one call as two.
+    const pendingToolCalls = new Map<number, { name?: string; arguments: string }>();
+
+    // Flush any tool-call buffers whose id never arrived (malformed provider) so
+    // the call isn't silently dropped — under a stable synthetic id per index.
+    const flushPendingToolCalls = (): StreamChunk[] => {
+      const out: StreamChunk[] = [];
+      for (const [index, buf] of pendingToolCalls) {
+        out.push({
+          type: 'tool_call_delta',
+          id: `__toolcall_${index}`,
+          name: buf.name,
+          arguments: buf.arguments,
+        });
+      }
+      pendingToolCalls.clear();
+      return out;
+    };
 
     const makeDone = (): StreamChunk => {
       const usage = this.toUsage(usageData);
@@ -711,6 +777,7 @@ export class OpenAICompatibleProvider implements Provider {
               if (flushed.text) yield { type: 'text_delta', content: flushed.text };
               if (flushed.thinking) yield { type: 'thinking_delta', content: flushed.thinking };
             }
+            yield* flushPendingToolCalls();
             yield makeDone();
             return;
           }
@@ -759,16 +826,37 @@ export class OpenAICompatibleProvider implements Provider {
             }
           }
 
-          // Tool-call deltas.
+          // Tool-call deltas. Emit under the real id; buffer until it's known.
           if (delta.tool_calls) {
             for (const tc of delta.tool_calls) {
               if (tc.id) indexToId.set(tc.index, tc.id);
-              yield {
-                type: 'tool_call_delta',
-                id: indexToId.get(tc.index) ?? `__pending_${tc.index}`,
-                name: tc.function?.name,
-                arguments: tc.function?.arguments,
-              };
+              const id = indexToId.get(tc.index);
+              if (id === undefined) {
+                // Id not seen yet — accumulate name/arguments for this index.
+                const buf = pendingToolCalls.get(tc.index) ?? { arguments: '' };
+                if (tc.function?.name) buf.name = tc.function.name;
+                if (tc.function?.arguments) buf.arguments += tc.function.arguments;
+                pendingToolCalls.set(tc.index, buf);
+                continue;
+              }
+              // Id known: flush any buffered prefix merged into this delta, once.
+              const buf = pendingToolCalls.get(tc.index);
+              if (buf) {
+                pendingToolCalls.delete(tc.index);
+                yield {
+                  type: 'tool_call_delta',
+                  id,
+                  name: buf.name ?? tc.function?.name,
+                  arguments: buf.arguments + (tc.function?.arguments ?? ''),
+                };
+              } else {
+                yield {
+                  type: 'tool_call_delta',
+                  id,
+                  name: tc.function?.name,
+                  arguments: tc.function?.arguments,
+                };
+              }
             }
           }
         }
@@ -780,6 +868,7 @@ export class OpenAICompatibleProvider implements Provider {
         if (flushed.text) yield { type: 'text_delta', content: flushed.text };
         if (flushed.thinking) yield { type: 'thinking_delta', content: flushed.thinking };
       }
+      yield* flushPendingToolCalls();
       yield makeDone();
     } finally {
       reader.releaseLock();

@@ -55,9 +55,12 @@ function ok(extra: Record<string, unknown> = {}, message: Record<string, unknown
 
 const user: ChatMessage[] = [{ role: 'user', content: 'Hello' }];
 
-function provider(profile: ProviderProfile, apiKey = 'k') {
-  return new OpenAICompatibleProvider({ profile, apiKey });
+function provider(profile: ProviderProfile, apiKey: string | undefined = 'k', baseUrl?: string) {
+  return new OpenAICompatibleProvider({ profile, apiKey, baseUrl });
 }
+
+const AZURE_BASE = 'https://my-resource.openai.azure.com/openai/v1';
+const azure = () => provider(AZURE_PROFILE, 'k', AZURE_BASE);
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
@@ -112,26 +115,36 @@ describe('OpenRouter preset', () => {
 // ===========================================================================
 
 describe('Azure preset', () => {
+  it('throws if no base URL is provided (resource-specific, no default)', () => {
+    expect(() => provider(AZURE_PROFILE)).toThrow(/Azure OpenAI requires a base URL/);
+  });
+
+  it('targets the configured resource base URL', async () => {
+    const fetchMock = mockFetch(ok());
+    await azure().chat(user, { model: 'my-deployment' });
+    expect(req(fetchMock).url).toBe(`${AZURE_BASE}/chat/completions`);
+  });
+
   it('authenticates with the api-key header (not Bearer)', async () => {
     const fetchMock = mockFetch(ok());
-    await provider(AZURE_PROFILE).chat(user, { model: 'my-deployment' });
+    await azure().chat(user, { model: 'my-deployment' });
     expect(req(fetchMock).headers['api-key']).toBe('k');
     expect(req(fetchMock).headers.Authorization).toBeUndefined();
   });
 
   it('prices when the deployment is named after a known model, undefined otherwise', async () => {
     mockFetch(ok());
-    const named = await provider(AZURE_PROFILE).chat(user, { model: 'gpt-4o' });
+    const named = await azure().chat(user, { model: 'gpt-4o' });
     expect(named.cost).toBeGreaterThan(0);
 
     mockFetch(ok());
-    const arbitrary = await provider(AZURE_PROFILE).chat(user, { model: 'prod-deploy-7' });
+    const arbitrary = await azure().chat(user, { model: 'prod-deploy-7' });
     expect(arbitrary.cost).toBeUndefined();
   });
 
   it('reuses OpenAI reasoning: system→developer + reasoning_effort on o-series', async () => {
     const fetchMock = mockFetch(ok());
-    await provider(AZURE_PROFILE).chat(
+    await azure().chat(
       [
         { role: 'system', content: 's' },
         { role: 'user', content: 'u' },
@@ -149,22 +162,33 @@ describe('Azure preset', () => {
 // ===========================================================================
 
 describe('xAI preset', () => {
-  it('maps effort to reasoning_effort, clamping max→high', async () => {
+  it('emits reasoning_effort for grok-3-mini (low|high), clamping the rest to high', async () => {
     let fetchMock = mockFetch(ok());
     await provider(XAI_PROFILE).chat(user, { model: 'grok-3-mini', effort: 'max' });
     expect(req(fetchMock).body.reasoning_effort).toBe('high');
+
+    fetchMock = mockFetch(ok());
+    await provider(XAI_PROFILE).chat(user, { model: 'grok-3-mini', effort: 'medium' });
+    expect(req(fetchMock).body.reasoning_effort).toBe('high'); // grok-3-mini has no 'medium'
 
     fetchMock = mockFetch(ok());
     await provider(XAI_PROFILE).chat(user, { model: 'grok-3-mini', effort: 'low' });
     expect(req(fetchMock).body.reasoning_effort).toBe('low');
   });
 
-  it('strips stop on grok-4 reasoning models but keeps it on chat variants', async () => {
-    let fetchMock = mockFetch(ok());
-    await provider(XAI_PROFILE).chat(user, { model: 'grok-4', stop: ['END'] });
-    expect(req(fetchMock).body).not.toHaveProperty('stop');
+  it('does NOT send reasoning_effort to grok-4 (auto-reasons, would 400)', async () => {
+    const fetchMock = mockFetch(ok());
+    await provider(XAI_PROFILE).chat(user, { model: 'grok-4', effort: 'high' });
+    expect(req(fetchMock).body).not.toHaveProperty('reasoning_effort');
+  });
 
-    fetchMock = mockFetch(ok());
+  it('strips stop on reasoning models (grok-3-mini, grok-4) but keeps it on chat variants', async () => {
+    for (const model of ['grok-4', 'grok-3-mini']) {
+      const fetchMock = mockFetch(ok());
+      await provider(XAI_PROFILE).chat(user, { model, stop: ['END'] });
+      expect(req(fetchMock).body, model).not.toHaveProperty('stop');
+    }
+    const fetchMock = mockFetch(ok());
     await provider(XAI_PROFILE).chat(user, { model: 'grok-3', stop: ['END'] });
     expect(req(fetchMock).body.stop).toEqual(['END']);
   });
@@ -212,18 +236,28 @@ describe('DeepSeek preset', () => {
 // ===========================================================================
 
 describe('Mistral preset', () => {
-  it('maps any active effort to high (narrow vocabulary)', async () => {
+  it('emits reasoning_effort=high only for the small/medium families', async () => {
     let fetchMock = mockFetch(ok());
-    await provider(MISTRAL_PROFILE).chat(user, { model: 'magistral-medium', effort: 'low' });
-    // magistral rejects reasoning_effort entirely
-    expect(req(fetchMock).body).not.toHaveProperty('reasoning_effort');
+    await provider(MISTRAL_PROFILE).chat(user, { model: 'mistral-small-latest', effort: 'low' });
+    expect(req(fetchMock).body.reasoning_effort).toBe('high'); // narrow vocab → high
 
     fetchMock = mockFetch(ok());
-    await provider(MISTRAL_PROFILE).chat(user, { model: 'mistral-large', effort: 'low' });
+    await provider(MISTRAL_PROFILE).chat(user, { model: 'mistral-medium-latest', effort: 'max' });
     expect(req(fetchMock).body.reasoning_effort).toBe('high');
+  });
 
-    fetchMock = mockFetch(ok());
-    await provider(MISTRAL_PROFILE).chat(user, { model: 'mistral-large', effort: 'none' });
+  it('omits reasoning_effort for models that reject it (would 422)', async () => {
+    // mistral-large / ministral / pixtral / codestral do not accept the field
+    for (const model of ['mistral-large-latest', 'ministral-8b', 'magistral-medium']) {
+      const fetchMock = mockFetch(ok());
+      await provider(MISTRAL_PROFILE).chat(user, { model, effort: 'high' });
+      expect(req(fetchMock).body, model).not.toHaveProperty('reasoning_effort');
+    }
+  });
+
+  it('omits reasoning_effort when reasoning is disabled', async () => {
+    const fetchMock = mockFetch(ok());
+    await provider(MISTRAL_PROFILE).chat(user, { model: 'mistral-small-latest', effort: 'none' });
     expect(req(fetchMock).body).not.toHaveProperty('reasoning_effort');
   });
 });
@@ -241,14 +275,23 @@ describe('Groq preset', () => {
     expect((req(fetchMock).body.messages as any[])[0]).not.toHaveProperty('name');
   });
 
-  it('emits reasoning_effort only for reasoning families', async () => {
+  it('emits reasoning_effort (low/medium/high) only for gpt-oss', async () => {
     let fetchMock = mockFetch(ok());
     await provider(GROQ_PROFILE).chat(user, { model: 'openai/gpt-oss-120b', effort: 'medium' });
     expect(req(fetchMock).body.reasoning_effort).toBe('medium');
 
     fetchMock = mockFetch(ok());
-    await provider(GROQ_PROFILE).chat(user, { model: 'llama-3.3-70b', effort: 'medium' });
-    expect(req(fetchMock).body).not.toHaveProperty('reasoning_effort');
+    await provider(GROQ_PROFILE).chat(user, { model: 'openai/gpt-oss-120b', effort: 'max' });
+    expect(req(fetchMock).body.reasoning_effort).toBe('high'); // clamp
+  });
+
+  it('does NOT send low/medium/high to qwen3 or plain models (they 400 on it)', async () => {
+    // qwen3 accepts only none|default; llama rejects the field entirely.
+    for (const model of ['qwen/qwen3-32b', 'llama-3.3-70b', 'deepseek-r1-distill-llama-70b']) {
+      const fetchMock = mockFetch(ok());
+      await provider(GROQ_PROFILE).chat(user, { model, effort: 'medium' });
+      expect(req(fetchMock).body, model).not.toHaveProperty('reasoning_effort');
+    }
   });
 });
 

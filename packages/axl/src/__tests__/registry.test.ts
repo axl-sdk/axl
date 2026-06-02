@@ -442,9 +442,28 @@ describe('ProviderRegistry', () => {
       expect(registry.has('anthropic')).toBe(true);
     });
 
-    it('lists exactly openai, openai-responses, anthropic, and google for a fresh registry', () => {
+    it('lists the native big-3 adapters plus the OpenAI-compatible presets', () => {
       const names = registry.list().sort();
-      expect(names).toEqual(['anthropic', 'google', 'openai', 'openai-responses']);
+      // Native adapters (own wire format) ...
+      expect(names).toEqual(
+        expect.arrayContaining(['anthropic', 'google', 'openai', 'openai-responses']),
+      );
+      // ... plus the generic-engine presets registered from BUILTIN_PROFILES.
+      expect(names).toEqual(
+        expect.arrayContaining([
+          'openrouter',
+          'azure',
+          'xai',
+          'deepseek',
+          'mistral',
+          'groq',
+          'ollama',
+          'vllm',
+          'lmstudio',
+          'llamacpp',
+          'sglang',
+        ]),
+      );
     });
 
     it('threads providers.<name>.rateLimit into the built-in factories without throwing', () => {

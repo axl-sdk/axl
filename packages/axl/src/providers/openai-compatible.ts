@@ -1,4 +1,11 @@
-import type { Provider, ChatOptions, ChatMessage, ProviderResponse, StreamChunk } from './types.js';
+import type {
+  Provider,
+  ChatOptions,
+  ChatMessage,
+  ProviderResponse,
+  StreamChunk,
+  Effort,
+} from './types.js';
 import type { ChatRole } from '../types.js';
 import { resolveThinkingOptions, type ResolvedThinkingOptions } from './types.js';
 import { fetchWithRetry } from './retry.js';
@@ -280,6 +287,47 @@ export function extractThinkTags(content: string): { content: string; thinking: 
   const a = scanner.push(content);
   const b = scanner.flush();
   return { content: a.text + b.text, thinking: a.thinking + b.thinking };
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning emit builders (shared by presets).
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a {@link ReasoningEmit} that writes a top-level `reasoning_effort`
+ * string (OpenAI-style; used by xAI, Groq, Mistral). `map` returns the wire
+ * value for the resolved options + model, or `undefined` to emit nothing
+ * (e.g. reasoning disabled, or a model that rejects the field).
+ */
+export function reasoningEffortEmit(
+  map: (resolved: ResolvedThinkingOptions, model: string) => string | undefined,
+  opts: { stripTemperatureWhenActive?: boolean } = {},
+): ReasoningEmit {
+  return (body, resolved, model) => {
+    const value = map(resolved, model);
+    if (value) body.reasoning_effort = value;
+    return { stripTemperature: opts.stripTemperatureWhenActive ? value !== undefined : false };
+  };
+}
+
+/**
+ * Build a {@link ReasoningEmit} that writes OpenRouter/Vercel's nested
+ * `reasoning` object. effort and max_tokens are MUTUALLY EXCLUSIVE there, so a
+ * positive `thinkingBudget` emits `{ max_tokens }`, an active effort emits
+ * `{ effort }`, and disabled reasoning emits `{ enabled: false }`.
+ */
+export function reasoningObjectEmit(
+  mapEffort: (effort: Exclude<Effort, 'none'>, model: string) => string,
+): ReasoningEmit {
+  return (body, resolved, model) => {
+    if (resolved.hasBudgetOverride) {
+      body.reasoning = { max_tokens: resolved.thinkingBudget };
+    } else if (resolved.activeEffort) {
+      body.reasoning = { effort: mapEffort(resolved.activeEffort, model) };
+    } else if (resolved.thinkingDisabled) {
+      body.reasoning = { enabled: false };
+    }
+  };
 }
 
 // ---------------------------------------------------------------------------

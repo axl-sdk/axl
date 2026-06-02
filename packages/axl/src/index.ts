@@ -160,9 +160,27 @@ export {
   OpenAICompatibleProvider,
   priceFromTable,
   resolvePerModel,
+  reasoningEffortEmit,
+  reasoningObjectEmit,
   ThinkTagScanner,
   extractThinkTags,
 } from './providers/openai-compatible.js';
+export { OPENAI_PROFILE, openaiReasoningEmit } from './providers/openai.js';
+// Built-in OpenAI-compatible presets (clone + tweak for a custom provider).
+export {
+  BUILTIN_PROFILES,
+  OPENROUTER_PROFILE,
+  AZURE_PROFILE,
+  XAI_PROFILE,
+  DEEPSEEK_PROFILE,
+  MISTRAL_PROFILE,
+  GROQ_PROFILE,
+  OLLAMA_PROFILE,
+  VLLM_PROFILE,
+  LMSTUDIO_PROFILE,
+  LLAMACPP_PROFILE,
+  SGLANG_PROFILE,
+} from './providers/profiles/index.js';
 export type {
   ProviderProfile,
   CapabilityFlags,

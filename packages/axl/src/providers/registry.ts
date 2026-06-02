@@ -3,6 +3,8 @@ import { OpenAIProvider } from './openai.js';
 import { OpenAIResponsesProvider } from './openai-responses.js';
 import { AnthropicProvider } from './anthropic.js';
 import { GeminiProvider } from './gemini.js';
+import { OpenAICompatibleProvider, type ProviderProfile } from './openai-compatible.js';
+import { BUILTIN_PROFILES } from './profiles/index.js';
 import type { AxlConfig } from '../config.js';
 
 /**
@@ -60,6 +62,32 @@ const builtinFactories: Record<string, ProviderFactory> = {
     });
   },
 };
+
+/**
+ * Factory for an OpenAI-compatible preset: the generic engine + a profile,
+ * reading per-provider config under the profile's name. The key/baseURL fall
+ * back to the profile's env vars inside the engine when config omits them.
+ */
+function presetFactory(profile: ProviderProfile): ProviderFactory {
+  return (config) => {
+    const opts = config.providers?.[profile.name] ?? {};
+    return new OpenAICompatibleProvider({
+      profile,
+      apiKey: opts.apiKey,
+      baseUrl: opts.baseUrl,
+      rateLimit: opts.rateLimit,
+    });
+  };
+}
+
+// OpenAI-compatible presets (openrouter, azure, xai, deepseek, mistral, groq,
+// ollama, vllm, lmstudio, llamacpp, sglang). Registered under each profile name.
+for (const profile of BUILTIN_PROFILES) {
+  // Built-in adapters above take precedence over a same-named preset.
+  if (!(profile.name in builtinFactories)) {
+    builtinFactories[profile.name] = presetFactory(profile);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Provider Registry

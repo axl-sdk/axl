@@ -5,10 +5,27 @@
  */
 
 import type { RateLimiter } from './rate-limiter.js';
+import { buildProviderError, parseRetryAfter } from './errors.js';
 
-const RETRYABLE_STATUS_CODES = new Set([429, 503, 529]);
+/**
+ * TRANSPORT auto-retry set. Deliberately NARROW ({429, 503, 529}) — these are
+ * the statuses we auto-retry on the same provider with backoff. This is a
+ * SEPARATE concept from `ProviderError.retryable` (the broader semantic
+ * failover hint in `errors.ts` via `isRetryableStatus`): widening this set
+ * would silently change auto-retry behavior for every provider. The subset
+ * invariant (every member here is retryable per `isRetryableStatus`) is
+ * asserted in tests. See the cross-link comment in `errors.ts`.
+ */
+export const RETRYABLE_STATUS_CODES = new Set([429, 503, 529]);
 const MAX_RETRIES = 2; // 3 total attempts
 const BASE_DELAY_MS = 1000;
+/** Cap an in-loop backoff sleep so a hostile/huge Retry-After can't stall us. */
+const MAX_BACKOFF_MS = 60_000;
+
+/** Apply +/-25% jitter to a backoff delay. */
+function jitter(ms: number): number {
+  return ms * (0.75 + Math.random() * 0.5);
+}
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -47,7 +64,29 @@ export type FetchWithRetryOptions = {
    * a `fetchWithRetry`.
    */
   governor?: RateLimiter;
+  /**
+   * Provider/adapter name used ONLY to label a normalized network error. When
+   * `fetch` itself throws (DNS, connection reset, TLS, socket hangup) and
+   * retries are exhausted, this becomes the `provider` field of the
+   * `ProviderError{ status: 0 }` thrown. Defaults to `'unknown'`.
+   */
+  provider?: string;
 };
+
+/**
+ * Distinguish a user/budget abort (which must propagate verbatim) from a real
+ * transport failure (which we retry/normalize). A pre-aborted signal counts as
+ * an abort even when the thrown error isn't a recognizable `AbortError`.
+ */
+function isAbortError(err: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true;
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    'name' in err &&
+    (err as { name?: unknown }).name === 'AbortError'
+  );
+}
 
 /**
  * Wrapper around fetch that retries on rate-limit and transient server errors
@@ -66,6 +105,7 @@ export async function fetchWithRetry(
 ): Promise<Response> {
   const maxRetries = opts?.maxRetries ?? MAX_RETRIES;
   const governor = opts?.governor;
+  const provider = opts?.provider ?? 'unknown';
 
   let acquired = false;
   if (governor) {
@@ -77,7 +117,27 @@ export async function fetchWithRetry(
 
   try {
     for (let attempt = 0; ; attempt++) {
-      const res = await fetch(input, init);
+      let res: Response;
+      try {
+        res = await fetch(input, init);
+      } catch (err) {
+        // Network / non-HTTP failure (DNS, connection reset, TLS, socket
+        // hangup). A user/budget abort must NEVER become a ProviderError —
+        // propagate it verbatim.
+        if (isAbortError(err, init?.signal ?? undefined)) throw err;
+        // Otherwise treat as a retryable transport failure: retry with the same
+        // backoff path as 429/503/529, and on exhaustion normalize to a
+        // ProviderError{ status: 0 } (retryable via isRetryableStatus).
+        if (attempt >= maxRetries) {
+          throw buildProviderError({
+            provider,
+            status: 0,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+        await sleep(jitter(BASE_DELAY_MS * 2 ** attempt), init?.signal ?? undefined);
+        continue;
+      }
       governor?.observe(res);
 
       // Return immediately if OK, non-retryable, or out of retries
@@ -90,18 +150,17 @@ export async function fetchWithRetry(
         return res;
       }
 
-      // Calculate delay: respect Retry-After header, else exponential backoff
-      const retryAfter = res.headers.get('retry-after');
-      let delay: number;
-      if (retryAfter && !isNaN(Number(retryAfter))) {
-        delay = Number(retryAfter) * 1000;
-      } else {
-        delay = BASE_DELAY_MS * 2 ** attempt;
-      }
-      // Jitter: +/-25%
-      delay *= 0.75 + Math.random() * 0.5;
+      // Calculate delay: respect Retry-After header (shared parser, single
+      // source of truth in errors.ts), else exponential backoff. Clamp the
+      // in-loop sleep so a hostile/huge header can't stall the loop —
+      // `ProviderError.retryAfterMs` still carries the RAW value.
+      const retryAfterMs = parseRetryAfter(res.headers);
+      const baseDelay =
+        retryAfterMs !== undefined
+          ? Math.min(retryAfterMs, MAX_BACKOFF_MS)
+          : BASE_DELAY_MS * 2 ** attempt;
 
-      await sleep(delay, init?.signal ?? undefined);
+      await sleep(jitter(baseDelay), init?.signal ?? undefined);
     }
   } finally {
     if (acquired) governor!.release();

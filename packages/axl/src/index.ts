@@ -151,6 +151,7 @@ export {
   GuardrailError,
   ValidationError,
 } from './errors.js';
+export { ProviderError, isRetryableStatus } from './providers/errors.js';
 
 // Provider
 export { OpenAIProvider, OPENAI_PRICING, estimateOpenAICost } from './providers/openai.js';

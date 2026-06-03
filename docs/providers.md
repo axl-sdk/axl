@@ -252,6 +252,56 @@ whole retry loop runs inside one held permit, so backoff naturally applies
 backpressure to other queued calls rather than letting them pile on a struggling
 provider.
 
+### Typed provider errors
+
+Every adapter throws a `ProviderError` (extends `AxlError`, `code: 'PROVIDER_ERROR'`)
+on a non-2xx HTTP response, and `fetchWithRetry` normalizes a thrown network failure
+(DNS, connection reset, TLS, socket hangup) into a `ProviderError` with `status: 0`.
+The `.message` is the provider's own error text, **verbatim** (no added prefix), so
+existing message assertions keep working — only the thrown *type* changed.
+
+```typescript
+import { ProviderError } from '@axlsdk/axl';
+
+try {
+  await ctx.ask(agent, 'hi');
+} catch (err) {
+  if (err instanceof ProviderError) {
+    err.provider;     // 'openai' | 'anthropic' | 'google' | 'openai-responses' | preset name
+    err.status;       // HTTP status; 0 for network failures
+    err.retryable;    // semantic failover hint (see below)
+    err.retryAfterMs; // parsed Retry-After, raw/unclamped (when header present)
+    err.requestId;    // provider request id (when a standard header is present)
+    err.body;         // raw provider error body (NOT placed on the event stream)
+  }
+}
+```
+
+**Two separate retry concepts — do not conflate them:**
+
+- **Transport auto-retry** (`429`/`503`/`529`) is what `fetchWithRetry` retries on the
+  *same* provider with backoff. This set is deliberately narrow.
+- **`ProviderError.retryable`** is a *broader semantic failover hint* for higher layers
+  (e.g. "should I fail over to a different model/provider?"). Exported helper
+  `isRetryableStatus(status)` returns the same classification:
+
+  | status | `retryable` |
+  |---|---|
+  | `408`, `429`, `500`, `502`, `503`, `504`, `529` | `true` |
+  | `0` (network) | `true` |
+  | `400`, `401`, `403`, `404`, `409`, `413`, `422`, `425`, other 4xx | `false` |
+
+  `404` (model/catalog miss) and `409` (conflict) are intentionally **not** retryable:
+  cross-provider catalog-miss failover is a higher-layer *policy* decision, not a
+  transport-level hint. Unmapped codes default to `false` (conservative).
+
+**Retry-After** is surfaced on the thrown error (`retryAfterMs`, raw/unclamped) in both
+numeric-seconds and HTTP-date forms. The in-loop transport sleep clamps to 60s so a
+hostile/huge header can't stall the loop; the raw value still rides on the error.
+
+`ProviderError.body` carries the raw provider response — see `docs/security.md` for why
+it stays on the error and is never emitted on the event stream.
+
 ## Model Parameters
 
 All model parameters are configurable on `AgentConfig` (agent-level defaults) and overridable per-call via `AskOptions`. Precedence: `AskOptions` > `AgentConfig` > internal defaults.

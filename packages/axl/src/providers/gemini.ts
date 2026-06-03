@@ -9,6 +9,7 @@ import type {
 } from './types.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
+import { buildProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 
 // ---------------------------------------------------------------------------
@@ -270,13 +271,19 @@ export class GeminiProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor },
+      { governor: this.governor, provider: this.name },
     );
 
     if (!res.ok) {
       const errorBody = await res.text();
       const message = this.extractErrorMessage(errorBody, res.status);
-      throw new Error(message);
+      throw buildProviderError({
+        provider: this.name,
+        status: res.status,
+        headers: res.headers,
+        message,
+        body: errorBody,
+      });
     }
 
     const json = (await res.json()) as GeminiResponse;
@@ -299,13 +306,19 @@ export class GeminiProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor },
+      { governor: this.governor, provider: this.name },
     );
 
     if (!res.ok) {
       const errorBody = await res.text();
       const message = this.extractErrorMessage(errorBody, res.status);
-      throw new Error(message);
+      throw buildProviderError({
+        provider: this.name,
+        status: res.status,
+        headers: res.headers,
+        message,
+        body: errorBody,
+      });
     }
 
     if (!res.body) {

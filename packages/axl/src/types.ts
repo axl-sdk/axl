@@ -9,6 +9,14 @@ export type BudgetResult<T> = {
   value: T | null;
   budgetExceeded: boolean;
   totalCost: number;
+  /**
+   * True when the block ran a model with no usable cost (unpriced / pricing-table
+   * miss) that did measurable work. `totalCost` is then a LOWER BOUND — the unknown
+   * component is omitted. NOTE: this is observability only; cost limits / `hard_stop`
+   * are NOT enforced on unpriced spend (the enforcement rail never sees it). Token
+   * budgets are the future fix for governing unpriced models.
+   */
+  unpriced: boolean;
 };
 
 /** Human decision from awaitHuman */
@@ -262,6 +270,13 @@ export type AgentCallEndData = {
    *  abort, etc). Mutually exclusive with `response` content. Subject to
    *  `config.trace.redact` (vendor errors can echo prompt text). */
   error?: string;
+  /** HTTP status when the thrown error was a `ProviderError` (`0` for network
+   *  failures). Omitted for non-provider errors. The raw error body is
+   *  intentionally NOT placed on the event (it's redaction-eligible). */
+  status?: number;
+  /** Semantic failover hint from a thrown `ProviderError` (see
+   *  `ProviderError.retryable`). Omitted for non-provider errors. */
+  retryable?: boolean;
 };
 
 /** Data shape for `tool_call_end` events. */

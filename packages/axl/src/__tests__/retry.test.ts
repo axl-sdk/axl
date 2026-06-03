@@ -153,18 +153,20 @@ describe('fetchWithRetry + governor', () => {
     expect(n).toBe(3); // caller A: 429 + ok = 2; caller B: ok = 1
   });
 
-  it('releases the permit on a thrown fetch (next caller proceeds)', async () => {
+  it('releases the permit on an exhausted network failure (next caller proceeds)', async () => {
     const rl = new RateLimiter({ maxConcurrent: 1 });
     let calls = 0;
     globalThis.fetch = vi.fn(async () => {
       calls++;
-      if (calls === 1) throw new Error('network down');
+      if (calls === 1) throw new TypeError('network down');
       return { ok: true, status: 200, headers: new Headers() };
     }) as any;
 
-    await expect(fetchWithRetry('https://x', undefined, { governor: rl })).rejects.toThrow(
-      'network down',
-    );
+    // maxRetries:0 ⇒ no retry: the network throw is normalized to a
+    // ProviderError{status:0} (the message is preserved verbatim).
+    await expect(
+      fetchWithRetry('https://x', undefined, { governor: rl, maxRetries: 0 }),
+    ).rejects.toThrow('network down');
     // If the permit had leaked, this second call would hang forever under cap 1.
     await expect(fetchWithRetry('https://x', undefined, { governor: rl })).resolves.toMatchObject({
       ok: true,

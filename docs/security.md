@@ -170,6 +170,18 @@ Studio consumers should check the flag via `runtime.isRedactEnabled(): boolean` 
 
 See [observability.md](./observability.md#pii-and-redaction) for the complete per-route scrubbed/preserved field table.
 
+### `ProviderError.body` is intentionally off the event stream
+
+When a provider returns a non-2xx response, the adapter throws a `ProviderError`
+carrying the **raw provider error body** on `.body`. Provider error bodies can echo
+prompt text (vendors often reflect part of the offending request), so `.body` is
+**redaction-eligible** content. It lives **only on the thrown error object** and is
+**never** placed on the event stream: the `agent_call_end` error event carries the
+error *message* (`data.error`, already subject to `trace.redact`) plus the structural
+`data.status` / `data.retryable`, but not `body`. This keeps the redaction surface
+unchanged — operators who need the raw body must inspect the caught `ProviderError`
+programmatically. See [providers.md](./providers.md#typed-provider-errors).
+
 ## Multi-Tenant Deployments (Studio Middleware)
 
 When `@axlsdk/studio/middleware` is mounted inside a multi-tenant application, two hooks scope what each connection can see:

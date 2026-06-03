@@ -29,7 +29,16 @@ per-provider quirks in the profile (allowed to rot), not in the engine.
   API). They share config but build *separate* instances — using both means effective
   concurrency/limits are the sum, not a shared counter.
 - **Retry**: every network call goes through `fetchWithRetry` (exponential backoff on
-  429/503/529). Its 3rd arg is an options object `{ maxRetries?, governor? }`.
+  429/503/529). Its 3rd arg is an options object `{ maxRetries?, governor?, provider? }`.
+- **Typed errors**: every `!res.ok` site throws a `ProviderError` (extends `AxlError`,
+  `code: 'PROVIDER_ERROR'`, message verbatim from each adapter's own
+  `extractErrorMessage`) built via `buildProviderError` in `providers/errors.ts`;
+  `fetchWithRetry` normalizes a thrown network failure to `ProviderError{ status: 0 }`
+  (aborts propagate verbatim). `ProviderError.retryable` (via `isRetryableStatus`) is a
+  **broader semantic failover hint** — kept SEPARATE from the narrow transport-retry set
+  (`429`/`503`/`529`) in `retry.ts`. `parseRetryAfter` (numeric-seconds + HTTP-date) is
+  the single source of truth, shared by both. Full table + rationale: `docs/providers.md`
+  (typed provider errors) and `docs/api-reference.md`.
 - **Rate limiting** (opt-in): `ProviderConfig.rateLimit` builds a `RateLimiter`
   (dependency-free counting semaphore + FIFO queue) threaded in as the `governor`. An
   undefined governor ⇒ behavior byte-identical to no limiter. It caps request

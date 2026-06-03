@@ -1,5 +1,6 @@
 import type { Embedder, EmbedResult } from './types.js';
 import { fetchWithRetry } from '../providers/retry.js';
+import { buildProviderError } from '../providers/errors.js';
 
 /**
  * Per-million-token USD pricing for OpenAI embedding models.
@@ -64,23 +65,35 @@ export class OpenAIEmbedder implements Embedder {
     // support. Without this, a rate-limited embed() call tanked the parent
     // `ctx.remember({embed:true})` and cost attribution silently lost the
     // call from observability.
-    const response = await fetchWithRetry(`${this.baseUrl}/v1/embeddings`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
+    const response = await fetchWithRetry(
+      `${this.baseUrl}/v1/embeddings`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          input: texts,
+          dimensions: this.dimensions,
+        }),
+        signal,
       },
-      body: JSON.stringify({
-        model: this.model,
-        input: texts,
-        dimensions: this.dimensions,
-      }),
-      signal,
-    });
+      // Participate in the same typed-error contract as the provider adapters: a
+      // thrown network failure normalizes to ProviderError{status:0,provider:'openai'}.
+      { provider: 'openai' },
+    );
 
     if (!response.ok) {
       const body = await response.text();
-      throw new Error(`OpenAI embeddings API error (${response.status}): ${body}`);
+      throw buildProviderError({
+        provider: 'openai',
+        status: response.status,
+        headers: response.headers,
+        message: `OpenAI embeddings API error (${response.status}): ${body}`,
+        body,
+      });
     }
 
     const json = (await response.json()) as {

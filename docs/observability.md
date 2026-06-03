@@ -67,7 +67,7 @@ All events share the `AxlEventBase` shape; `data` and other variant-specific fie
 |------|-------------|-------------------|
 | `workflow_start` / `workflow_end` | Workflow lifecycle | `input` / `status`, `duration`, `result?`, `error?`, `aborted?` |
 | `ask_start` / `ask_end` | Bound every `ctx.ask()` call (one pair per invocation, including nested). | `prompt` on start; `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration`, and `unpriced?: boolean` on end |
-| `agent_call_start` / `agent_call_end` | Per LLM call (every loop turn of `ctx.ask()`). `_start` fires before the request; `_end` after the response. | `_start`: `agent`, `model`, `turn`. `_end` `data`: `prompt`, `response`, `system`, `thinking?`, `params`, `turn`, `retryReason?`, `messages?` (verbose only) |
+| `agent_call_start` / `agent_call_end` | Per LLM call (every loop turn of `ctx.ask()`). `_start` fires before the request; `_end` after the response. | `_start`: `agent`, `model`, `turn`. `_end` `data`: `prompt`, `response`, `system`, `thinking?`, `params`, `turn`, `retryReason?`, `messages?` (verbose only). On the error path: `error` (message), plus `status` + `retryable` when the thrown error was a `ProviderError` (the raw `ProviderError.body` is intentionally **not** emitted — see [security.md](./security.md)) |
 | `token` | Streaming text chunk (stream-only, never persisted to `ExecutionInfo.events`) | `data: string` |
 | `tool_call_start` / `tool_call_end` | Tool invocation lifecycle | `_start` `data`: `args`. `_end` `data`: `args`, `result`, `callId` |
 | `tool_approval` | `requireApproval` gate fires — **both** approve and deny | `approved`, `args`, `reason?` |
@@ -138,6 +138,12 @@ for (const event of info.events) {
 ```
 
 The whole-execution total is `ExecutionInfo.totalCost`. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, Studio's cost aggregator, and `AxlTestRuntime.totalCost()` all apply this guard via `eventCostContribution` internally.
+
+### Budget honesty
+
+The same unpriced condition is surfaced on the budget rail. A [`ctx.budget()`](api-reference.md#ctxbudgetoptions-fn) block whose calls ran an unpriced model returns `BudgetResult.unpriced === true` (and `ctx.getBudgetStatus().unpriced` is `true` mid-block); inner budgets propagate the flag to their parent. When this happens Axl logs a **one-time `console.warn` per budget block**.
+
+⚠️ **Honesty, not enforcement.** `unpriced` reports that `totalCost` is a lower bound — it does **not** make the limit enforceable. The enforcement rail only ever sees *measured* cost, so a cost limit (including `hard_stop`) **cannot trip on unpriced spend** (e.g. unpriced/self-hosted/Bedrock models). A `hard_stop` budget pointed at an unpriced model will run unbounded by dollars. Token-denominated budgets are the planned mechanism for governing unpriced models; until then, treat `unpriced: true` as "the limit could not be enforced for part of this block." To restore enforceable cost limits, register pricing for the model so calls carry a usable cost.
 
 ### Failure surfacing — `ask_end` vs. `error`
 

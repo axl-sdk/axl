@@ -14,6 +14,7 @@ import {
   type ApiKeySource,
 } from './types.js';
 import { fetchWithRetry } from './retry.js';
+import { buildProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 
 // ===========================================================================
@@ -431,11 +432,18 @@ export class OpenAICompatibleProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor },
+      { governor: this.governor, provider: this.name },
     );
 
     if (!res.ok) {
-      throw new Error(this.extractErrorMessage(await res.text(), res.status));
+      const errorBody = await res.text();
+      throw buildProviderError({
+        provider: this.name,
+        status: res.status,
+        headers: res.headers,
+        message: this.extractErrorMessage(errorBody, res.status),
+        body: errorBody,
+      });
     }
 
     const json = (await res.json()) as OpenAIChatResponse;
@@ -454,11 +462,18 @@ export class OpenAICompatibleProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor },
+      { governor: this.governor, provider: this.name },
     );
 
     if (!res.ok) {
-      throw new Error(this.extractErrorMessage(await res.text(), res.status));
+      const errorBody = await res.text();
+      throw buildProviderError({
+        provider: this.name,
+        status: res.status,
+        headers: res.headers,
+        message: this.extractErrorMessage(errorBody, res.status),
+        body: errorBody,
+      });
     }
     if (!res.body) {
       throw new Error(`${this.profile.label ?? this.profile.name} stream response has no body`);

@@ -492,15 +492,22 @@ if (result.budgetExceeded) {
 | `'hard_stop'` | Abort immediately via `AbortController`. The current LLM call is cancelled mid-flight. Returns `{ value: null, budgetExceeded: true }` |
 | `'warn'` | Log a warning but allow execution to continue past the budget |
 
-**Returns:** `BudgetResult<T>`: `{ value: T | null, budgetExceeded: boolean, totalCost: number }`
+**Returns:** `BudgetResult<T>`: `{ value: T | null, budgetExceeded: boolean, totalCost: number, unpriced: boolean }`
 
-**Nesting:** Budget blocks can be nested. Inner budgets roll their costs up to the parent.
+- **`unpriced`** — `true` when the block ran a model with no usable per-call cost (unpriced model / pricing-table miss) that did measurable work. `totalCost` is then a **lower bound** (the unknown component is omitted). The same condition is readable mid-block via [`ctx.getBudgetStatus().unpriced`](#ctxgetbudgetstatus), and Axl logs a one-time `console.warn` per budget block when it happens.
+- ⚠️ **`unpriced` is observability only — cost limits / `hard_stop` are NOT enforced on unpriced spend.** The enforcement rail never sees the unknown cost, so a `hard_stop` budget does **not** govern unpriced models (e.g. Bedrock, self-hosted). Token-denominated budgets are the planned fix for governing unpriced spend. Until then, treat `unpriced: true` as "this limit could not be enforced for part of this block."
+
+**Nesting:** Budget blocks can be nested. Inner budgets roll their costs — **and their `unpriced` lower-bound flag** — up to the parent.
+
+#### `ctx.getBudgetStatus()`
+
+Returns the live status of the active budget block, or `null` outside any block: `{ spent: number, limit: number, remaining: number, unpriced: boolean }`. `unpriced` mirrors `BudgetResult.unpriced`; when `true`, `spent` is a lower bound and `remaining` an upper bound (see the enforcement caveat above).
 
 ### `ctx.totalCost`
 
 Read-only getter returning the total cost accumulated by agent calls in this context. Inside a `ctx.budget()` block, returns only that block's accumulated cost; after the block completes, the nested cost is rolled up into the parent total.
 
-> **Unpriced models → lower bound.** A call to an unpriced model (pricing-table miss / a provider that reports no per-call cost) contributes `undefined` cost, which counts as nothing — so `ctx.totalCost` (and `ExecutionInfo.totalCost`, `ctx.budget()` accounting) **understate** total spend when unpriced models run. The owning `ask_end` carries `unpriced: true` and the Studio Cost Dashboard surfaces `CostData.unpricedCalls`; use those to detect when the number is a lower bound rather than exact.
+> **Unpriced models → lower bound.** A call to an unpriced model (pricing-table miss / a provider that reports no per-call cost) contributes `undefined` cost, which counts as nothing — so `ctx.totalCost` (and `ExecutionInfo.totalCost`, `ctx.budget()` accounting) **understate** total spend when unpriced models run. Detect it via: the owning `ask_end.unpriced`, `BudgetResult.unpriced` / `ctx.getBudgetStatus().unpriced` for a `ctx.budget()` block, and the Studio Cost Dashboard's `CostData.unpricedCalls`. Because the unknown component is invisible to the budget rail, a `ctx.budget()` cost limit / `hard_stop` **cannot enforce on unpriced spend** — it only reports it.
 
 ```typescript
 const ctx = runtime.createContext();
@@ -1674,6 +1681,29 @@ All errors extend `AxlError`.
 | `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy. Includes `.limit`, `.spent`, `.policy` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
 | `ToolDenied` | `ctx.ask()` | Agent attempted to call a tool not in its ACL. Includes `.toolName`, `.agentName` |
+| `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`. Message is the provider's text verbatim (no prefix). |
+
+### `ProviderError` fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `provider` | `string` | Adapter / preset name: `'openai'`, `'anthropic'`, `'google'`, `'openai-responses'`, or a compatible-preset name |
+| `status` | `number` | HTTP status; `0` for non-HTTP (network) failures |
+| `retryable` | `boolean` | Semantic failover hint (see table below). **Distinct** from the transport auto-retry set (`429`/`503`/`529`) |
+| `retryAfterMs` | `number \| undefined` | Parsed `Retry-After` (raw/unclamped) when the header was present; supports numeric-seconds and HTTP-date |
+| `requestId` | `string \| undefined` | Provider request id (`x-request-id` / `request-id`) when present |
+| `body` | `string \| undefined` | Raw provider error body. Lives only on the error — never on the event stream (redaction-eligible) |
+
+**`retryable` classification** (also exposed as the exported helper `isRetryableStatus(status: number): boolean`):
+
+| status | `retryable` |
+|---|---|
+| `408`, `429`, `500`, `502`, `503`, `504`, `529` | `true` |
+| `0` (network) | `true` |
+| `400`, `401`, `403`, `404`, `409`, `413`, `422`, `425`, other 4xx | `false` (conservative default) |
+
+`agent_call_end` events on a provider error also carry `data.status` and `data.retryable`
+(message in `data.error`); the raw `body` is never emitted. See `docs/observability.md`.
 
 ---
 

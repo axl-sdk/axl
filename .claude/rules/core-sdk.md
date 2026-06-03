@@ -34,7 +34,10 @@ runs sessions, and owns execution history + cost tracking.
   result to the source). Routing is static or a function of `ctx.metadata`.
 - **Cost** flows through one budget rail: `ctx.budget()` enforces across agent calls *and*
   semantic memory. Per-ask cost excludes nested asks (they roll up to their own ask) —
-  don't double-count `ask_end`.
+  don't double-count `ask_end`. The rail is **honest but not omniscient about unpriced
+  spend**: an unpriced model (pricing-table miss) sets `BudgetResult.unpriced` /
+  `getBudgetStatus().unpriced` and makes `totalCost` a lower bound, but the limit /
+  `hard_stop` **cannot enforce** on it (the enforcement path never sees the unknown cost).
 - New cross-provider model params go on `ChatOptions` (configurable on `AgentConfig`,
   overridable per-call on `AskOptions`; precedence AskOptions > AgentConfig > defaults).
   `docs/api-reference.md` is authoritative for the exact defaults.

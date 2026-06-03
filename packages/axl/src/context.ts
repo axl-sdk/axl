@@ -41,6 +41,7 @@ import { COST_BEARING_LEAF_TYPES, hasPositiveTokens, isUsableCost } from './even
 import { AxlEventBus, EventStreamOverflowError, type EventStreamOptions } from './event-stream.js';
 import { redactEvent } from './redaction.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
+import { ProviderError } from './providers/errors.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import type { AxlConfig } from './config.js';
 import { parseDuration, parseCost } from './config.js';
@@ -239,6 +240,8 @@ export type WorkflowContextInit = {
     exceeded: boolean;
     policy: string;
     abortController?: AbortController;
+    unpriced: boolean;
+    unpricedWarned: boolean;
   };
   stateStore?: StateStore;
   signal?: AbortSignal;
@@ -322,6 +325,17 @@ export class WorkflowContext<TInput = unknown> {
     exceeded: boolean;
     policy: string;
     abortController?: AbortController;
+    /**
+     * Set true when a cost-bearing leaf inside this budget did measurable work
+     * (positive tokens) but produced no usable cost (unpriced model / pricing-table
+     * miss). `totalCost` then UNDERSTATES real spend — it's a lower bound. The budget
+     * rail REPORTS this (via {@link BudgetResult.unpriced} / {@link getBudgetStatus})
+     * but does NOT enforce on it: `_accumulateBudgetCost` never sees the unknown
+     * component, so a cost limit / hard_stop cannot trip on unpriced spend.
+     */
+    unpriced: boolean;
+    /** Dedup guard so the unpriced warning fires at most once per budget block. */
+    unpricedWarned: boolean;
   };
   private stateStore?: StateStore;
   /** Root step counter for this execution. Inherited by every ctx.ask()
@@ -1333,6 +1347,12 @@ export class WorkflowContext<TInput = unknown> {
             turn: turns,
             ...(retryReason ? { retryReason } : {}),
             error: err instanceof Error ? err.message : String(err),
+            // Enrich with typed-error metadata when available. `body` is
+            // deliberately NOT emitted — it's redaction-eligible (see
+            // docs/security.md). `data.error` already carries the message.
+            ...(err instanceof ProviderError
+              ? { status: err.status, retryable: err.retryable }
+              : {}),
           },
         });
         throw err;
@@ -2778,6 +2798,8 @@ export class WorkflowContext<TInput = unknown> {
       exceeded: false,
       policy,
       abortController: controller,
+      unpriced: false,
+      unpricedWarned: false,
     };
 
     const executeBudget = async (): Promise<BudgetResult<T>> => {
@@ -2786,18 +2808,34 @@ export class WorkflowContext<TInput = unknown> {
         const value = budgetSignal ? await signalStorage.run(budgetSignal, fn) : await fn();
         const totalCost = this.budgetContext!.totalCost;
         const exceeded = this.budgetContext!.exceeded;
-        return { value, budgetExceeded: exceeded, totalCost };
+        const unpriced = this.budgetContext!.unpriced;
+        return { value, budgetExceeded: exceeded, totalCost, unpriced };
       } catch (err) {
         if (this.budgetContext!.exceeded) {
-          return { value: null, budgetExceeded: true, totalCost: this.budgetContext!.totalCost };
+          return {
+            value: null,
+            budgetExceeded: true,
+            totalCost: this.budgetContext!.totalCost,
+            unpriced: this.budgetContext!.unpriced,
+          };
         }
         // AbortError from hard_stop should count as budget exceeded
         if (err instanceof DOMException && err.name === 'AbortError' && controller) {
-          return { value: null, budgetExceeded: true, totalCost: this.budgetContext!.totalCost };
+          return {
+            value: null,
+            budgetExceeded: true,
+            totalCost: this.budgetContext!.totalCost,
+            unpriced: this.budgetContext!.unpriced,
+          };
         }
         throw err;
       } finally {
-        if (parentBudget) parentBudget.totalCost += this.budgetContext!.totalCost;
+        // Roll nested spend AND the unpriced lower-bound flag up to the parent budget:
+        // if an inner block spent unmeasured money, the parent's total is a lower bound too.
+        if (parentBudget) {
+          parentBudget.totalCost += this.budgetContext!.totalCost;
+          if (this.budgetContext!.unpriced) parentBudget.unpriced = true;
+        }
         this.budgetContext = parentBudget;
       }
     };
@@ -2821,13 +2859,25 @@ export class WorkflowContext<TInput = unknown> {
     return executeBudget();
   }
 
-  /** Get the current budget status, or null if not inside a budget block. */
-  getBudgetStatus(): { spent: number; limit: number; remaining: number } | null {
+  /**
+   * Get the current budget status, or null if not inside a budget block.
+   *
+   * `unpriced` is true when this block ran a model with no usable cost (unpriced /
+   * pricing-table miss): `spent` is then a LOWER BOUND and `remaining` an upper bound —
+   * the limit cannot be enforced on the unmeasured spend. See {@link BudgetResult.unpriced}.
+   */
+  getBudgetStatus(): {
+    spent: number;
+    limit: number;
+    remaining: number;
+    unpriced: boolean;
+  } | null {
     if (!this.budgetContext) return null;
     return {
       spent: this.budgetContext.totalCost,
       limit: this.budgetContext.limit,
       remaining: Math.max(0, this.budgetContext.limit - this.budgetContext.totalCost),
+      unpriced: this.budgetContext.unpriced,
     };
   }
 
@@ -3713,21 +3763,46 @@ export class WorkflowContext<TInput = unknown> {
     // `memory_recall`) from the per-ask rollup when `ctx.recall()` ran
     // inside an ask.
     const cost = (partial as { cost?: number }).cost;
-    if (frame && (COST_BEARING_LEAF_TYPES as readonly string[]).includes(partial.type as string)) {
-      if (isUsableCost(cost)) {
-        frame.askCost.value += cost;
-      } else if (
+    if ((COST_BEARING_LEAF_TYPES as readonly string[]).includes(partial.type as string)) {
+      // Classify the leaf ONCE, then feed two independent accumulators: the per-ask
+      // frame rollup (ALS-scoped) AND the budget rail (instance-scoped). A
+      // cost-bearing leaf that did measurable work (POSITIVE token count) but
+      // produced no usable cost = an unpriced model / pricing-table miss. The
+      // positive-token signal distinguishes this from a failed call (no tokens) AND
+      // from a no-usage streamed call (zero tokens). Budget detection is NOT gated on
+      // `frame`: a direct `ctx.budget(() => ctx.recall(...))` emits a cost-bearing
+      // leaf with no ask frame, and the budget must still see it.
+      const usable = isUsableCost(cost);
+      const unpriced =
+        !usable &&
         hasPositiveTokens(
           partial as { tokens?: { input?: number; output?: number; reasoning?: number } },
-        )
-      ) {
-        // A cost-bearing leaf that did measurable work (a POSITIVE token count)
-        // but produced no usable cost = an unpriced model / pricing-table miss.
-        // The positive-token signal distinguishes this from a failed call (no
-        // tokens) AND from a no-usage streamed call (zero tokens) — so
-        // `ask_end.cost` (which omits the unknown component) is flagged as a
-        // lower bound only when real work was actually billed.
-        frame.askUnpriced = true;
+        );
+      if (frame) {
+        if (usable) frame.askCost.value += cost;
+        else if (unpriced) frame.askUnpriced = true;
+      }
+      if (unpriced && this.budgetContext) {
+        // REPORT (not enforce): mark the budget's total as a lower bound. The
+        // enforcement rail (`_accumulateBudgetCost`) never receives the unknown
+        // component, so a cost limit / hard_stop still cannot trip on this spend.
+        this.budgetContext.unpriced = true;
+        // Warn only when there's an ENFORCEABLE (finite) cost limit the user might
+        // wrongly trust — the runtime installs an ambient `Infinity` budget on every
+        // execution, and warning "your cost limit is a lower bound" there is a lie
+        // (no limit was set). The `unpriced` flag above is still recorded so
+        // `ctx.totalCost` / `getBudgetStatus()` stay honest under the ambient budget.
+        if (!this.budgetContext.unpricedWarned && Number.isFinite(this.budgetContext.limit)) {
+          // Fail loud, once per block: a budget with a cost limit is silently
+          // blind to unpriced spend. Synchronous check-and-set (no await) ⇒ no
+          // interleaving under JS's cooperative single-threaded model.
+          this.budgetContext.unpricedWarned = true;
+          console.warn(
+            "Budget honesty: unpriced work detected — this budget's cost limit is a " +
+              'lower bound and is NOT enforced on unpriced models. ' +
+              'See docs/observability.md#budget-honesty.',
+          );
+        }
       }
     }
     const event = {

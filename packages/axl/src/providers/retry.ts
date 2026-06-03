@@ -15,8 +15,12 @@ import { buildProviderError, parseRetryAfter } from './errors.js';
  * would silently change auto-retry behavior for every provider. The subset
  * invariant (every member here is retryable per `isRetryableStatus`) is
  * asserted in tests. See the cross-link comment in `errors.ts`.
+ *
+ * `ReadonlySet` so in-package code can't mutate the invariant; intentionally NOT
+ * barrel-exported — consumers use `ProviderError.retryable` / `isRetryableStatus`,
+ * not this transport set.
  */
-export const RETRYABLE_STATUS_CODES = new Set([429, 503, 529]);
+export const RETRYABLE_STATUS_CODES: ReadonlySet<number> = new Set([429, 503, 529]);
 const MAX_RETRIES = 2; // 3 total attempts
 const BASE_DELAY_MS = 1000;
 /** Cap an in-loop backoff sleep so a hostile/huge Retry-After can't stall us. */
@@ -62,6 +66,10 @@ export type FetchWithRetryOptions = {
    * self-deadlocks. Safe in the SDK today because nested `ctx.ask` calls run in
    * tool handlers AFTER the provider `chat()` returns and releases, never during
    * a `fetchWithRetry`.
+   *
+   * NOTE: a rejection from `governor.acquire()` (pre-aborted signal /
+   * `acquireTimeoutMs`) propagates VERBATIM — it is raised before the fetch loop,
+   * so it is never normalized into a `ProviderError`. Aborts must stay aborts.
    */
   governor?: RateLimiter;
   /**

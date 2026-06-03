@@ -87,11 +87,21 @@ export class OpenAIEmbedder implements Embedder {
 
     if (!response.ok) {
       const body = await response.text();
+      // Extract the nested error message (parity with the provider adapters'
+      // `extractErrorMessage`) so `.message` is human-readable, not a raw JSON
+      // blob; the raw body is still preserved on `ProviderError.body`.
+      let detail = body;
+      try {
+        const json = JSON.parse(body) as { error?: { message?: string }; message?: string };
+        detail = json.error?.message ?? json.message ?? body;
+      } catch {
+        // Not JSON — keep the raw body.
+      }
       throw buildProviderError({
         provider: 'openai',
         status: response.status,
         headers: response.headers,
-        message: `OpenAI embeddings API error (${response.status}): ${body}`,
+        message: `OpenAI embeddings API error (${response.status}): ${detail}`,
         body,
       });
     }

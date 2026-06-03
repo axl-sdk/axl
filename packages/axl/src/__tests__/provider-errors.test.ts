@@ -456,7 +456,10 @@ describe('OpenAIEmbedder throws ProviderError', () => {
       expect(pe.provider).toBe('openai');
       expect(pe.status).toBe(400);
       expect(pe.retryable).toBe(false);
-      expect(pe.message).toBe(`OpenAI embeddings API error (400): ${body}`);
+      // Message extracts the nested error.message (parity with adapters)…
+      expect(pe.message).toBe('OpenAI embeddings API error (400): invalid input');
+      // …while the raw body is still preserved on the error.
+      expect(pe.body).toBe(body);
     }
   });
 

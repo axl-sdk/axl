@@ -219,6 +219,29 @@ function estimateMessagesTokens(messages: ChatMessage[]): number {
   return total;
 }
 
+/**
+ * Active `ctx.budget()` accounting state. One mutable object per budget block,
+ * shared by reference across the block's async branches (spawn/race/map).
+ */
+type BudgetContextState = {
+  totalCost: number;
+  limit: number;
+  exceeded: boolean;
+  policy: string;
+  abortController?: AbortController;
+  /**
+   * Set true when a cost-bearing leaf inside this budget did measurable work
+   * (positive tokens) but produced no usable cost (unpriced model / pricing-table
+   * miss). `totalCost` then UNDERSTATES real spend — it's a lower bound. The budget
+   * rail REPORTS this (via {@link BudgetResult.unpriced} / `getBudgetStatus`) but
+   * does NOT enforce on it: `_accumulateBudgetCost` never receives the unknown
+   * component, so a cost limit / hard_stop cannot trip on unpriced spend.
+   */
+  unpriced: boolean;
+  /** Dedup guard so the unpriced warning fires at most once per budget block. */
+  unpricedWarned: boolean;
+};
+
 export type WorkflowContextInit = {
   input: unknown;
   executionId: string;
@@ -234,15 +257,7 @@ export type WorkflowContextInit = {
   /** Pre-execution tool-call callback. `meta` carries the ask correlation. */
   onToolCall?: (call: { name: string; args: unknown; callId?: string }, meta: CallbackMeta) => void;
   pendingDecisions?: Map<string, (d: HumanDecision) => void>;
-  budgetContext?: {
-    totalCost: number;
-    limit: number;
-    exceeded: boolean;
-    policy: string;
-    abortController?: AbortController;
-    unpriced: boolean;
-    unpricedWarned: boolean;
-  };
+  budgetContext?: BudgetContextState;
   stateStore?: StateStore;
   signal?: AbortSignal;
   workflowName?: string;
@@ -319,24 +334,7 @@ export class WorkflowContext<TInput = unknown> {
     meta: CallbackMeta,
   ) => void;
   private pendingDecisions?: Map<string, (d: HumanDecision) => void>;
-  private budgetContext?: {
-    totalCost: number;
-    limit: number;
-    exceeded: boolean;
-    policy: string;
-    abortController?: AbortController;
-    /**
-     * Set true when a cost-bearing leaf inside this budget did measurable work
-     * (positive tokens) but produced no usable cost (unpriced model / pricing-table
-     * miss). `totalCost` then UNDERSTATES real spend — it's a lower bound. The budget
-     * rail REPORTS this (via {@link BudgetResult.unpriced} / {@link getBudgetStatus})
-     * but does NOT enforce on it: `_accumulateBudgetCost` never sees the unknown
-     * component, so a cost limit / hard_stop cannot trip on unpriced spend.
-     */
-    unpriced: boolean;
-    /** Dedup guard so the unpriced warning fires at most once per budget block. */
-    unpricedWarned: boolean;
-  };
+  private budgetContext?: BudgetContextState;
   private stateStore?: StateStore;
   /** Root step counter for this execution. Inherited by every ctx.ask()
    *  frame so all events from this WorkflowContext (root + nested) share
@@ -2860,7 +2858,9 @@ export class WorkflowContext<TInput = unknown> {
   }
 
   /**
-   * Get the current budget status, or null if not inside a budget block.
+   * Get the current budget status, or null if not inside a budget block. Inside
+   * nested budgets this reflects the **innermost active** block (the nested block's
+   * `finally` restores the parent before control returns to it).
    *
    * `unpriced` is true when this block ran a model with no usable cost (unpriced /
    * pricing-table miss): `spent` is then a LOWER BOUND and `remaining` an upper bound —

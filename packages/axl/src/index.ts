@@ -152,6 +152,8 @@ export {
   ValidationError,
 } from './errors.js';
 export { ProviderError, isRetryableStatus } from './providers/errors.js';
+// NOTE: `RETRYABLE_STATUS_CODES` (retry.ts) is intentionally NOT exported — it's the
+// narrow transport-retry set; consumers use `ProviderError.retryable` / `isRetryableStatus`.
 
 // Provider
 export { OpenAIProvider, OPENAI_PRICING, estimateOpenAICost } from './providers/openai.js';

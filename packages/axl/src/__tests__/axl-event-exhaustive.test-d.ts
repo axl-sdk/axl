@@ -26,8 +26,15 @@ function assertExhaustive(ev: AxlEvent): string {
       return ev.outcome.ok ? 'ok' : ev.outcome.error;
     case 'agent_call_start':
       return ev.model;
-    case 'agent_call_end':
+    case 'agent_call_end': {
+      // Type-level guard for the typed-error enrichment (spec 21): these optional
+      // fields exist with exactly these types on the error path.
+      const status: number | undefined = ev.data.status;
+      const retryable: boolean | undefined = ev.data.retryable;
+      void status;
+      void retryable;
       return ev.data.response;
+    }
     case 'token':
       return ev.data;
     case 'tool_call_start':

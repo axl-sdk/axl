@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-08
+
 Two themes. **Broad provider expansion:** the OpenAI adapter now powers
 first-class presets for OpenAI-compatible hosted providers and local runtimes
 while preserving Axl's cross-provider `effort`, tool-calling, and cost surfaces.

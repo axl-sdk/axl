@@ -855,9 +855,16 @@ export type ExecutionInfo = {
    *  on `agent_call_end` is the persisted token representation. */
   events: AxlEvent[];
   /** Total spend for the execution. A LOWER BOUND when an unpriced model ran
-   *  (those calls contribute nothing) — check for any `ask_end.unpriced` /
-   *  `agent_call_end.cost === undefined` to know whether it's exact. */
+   *  (those calls contribute nothing) — read {@link ExecutionInfo.unpriced} to
+   *  know whether it's exact, rather than scanning the event timeline. */
   totalCost: number;
+  /** True when any cost-bearing leaf in this execution did billable work but had
+   *  no usable cost (unpriced model / pricing-table miss): `totalCost` is then a
+   *  LOWER BOUND, not exact. `false` means every cost-bearing call was priced.
+   *  The aggregate counterpart of `ask_end.unpriced` / `BudgetResult.unpriced`,
+   *  computed via `isUnpricedLeaf`. `undefined` only on executions recorded
+   *  before this field existed (back-compat). */
+  unpriced?: boolean;
   startedAt: number;
   completedAt?: number;
   duration: number;

@@ -308,7 +308,7 @@ See [docs/migration/state-store-durability.md](./docs/migration/state-store-dura
 
 ## Providers
 
-Four built-in providers, zero SDK dependencies (raw `fetch`). Set the corresponding env var and use the `provider:model` URI:
+Four native adapters, zero SDK dependencies (raw `fetch`). Set the corresponding env var and use the `provider:model` URI:
 
 | Provider                  | URI prefix          | Env var                              |
 | ------------------------- | ------------------- | ------------------------------------ |
@@ -322,6 +322,16 @@ agent({ model: 'openai-responses:gpt-5.5', ... })
 agent({ model: 'anthropic:claude-sonnet-4-6', ... })
 agent({ model: 'google:gemini-3.1-pro-preview', ... })
 ```
+
+Beyond the four, a generic OpenAI-compatible engine ships presets for any endpoint that speaks the OpenAI Chat Completions format — pick a model with `preset:model` and set the matching env var:
+
+```typescript
+agent({ model: 'openrouter:anthropic/claude-opus-4.7', ... }) // 300+ models, one key
+agent({ model: 'groq:openai/gpt-oss-120b', ... })             // fastest inference
+agent({ model: 'ollama:llama3', ... })                        // local — no key, $0
+```
+
+Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, plus self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them; build your own by cloning a `ProviderProfile`.
 
 The `effort` parameter controls reasoning depth identically across all providers:
 
@@ -411,7 +421,7 @@ Studio also embeds as middleware (Express, Fastify, NestJS, raw HTTP) with auth 
 | [Examples](./examples)                   | Runnable, self-contained programs: quickstart, parallel consensus, agent handoffs        |
 | [API Reference](./docs/api-reference.md) | All `ctx.*` primitives, option types, valid values, and defaults                         |
 | [Architecture](./docs/architecture.md)   | System architecture, deployment modes, and execution flow                                |
-| [Providers](./docs/providers.md)         | OpenAI, Anthropic, and Gemini adapters with full model list                              |
+| [Providers](./docs/providers.md)         | Native OpenAI/Anthropic/Gemini adapters + OpenAI-compatible presets, effort mapping, typed errors |
 | [Use Cases](./docs/use-cases.md)         | Real-world examples: support bots, consensus, budget control, handoffs, batch processing |
 | [Testing](./docs/testing.md)             | MockProvider, AxlTestRuntime, snapshot testing, assertion helpers                        |
 | [Observability](./docs/observability.md) | Trace modes, OpenTelemetry integration, cost-per-span attribution                        |

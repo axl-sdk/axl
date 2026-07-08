@@ -107,7 +107,7 @@ Waterfall visualization of execution traces. Filter by type, agent, or tool; see
 
 ### Cost Dashboard
 
-Track spending across agents, models, workflows, and embedders with time-window filtering (24h/7d/30d/all). Sortable breakdown tables, a **Retry Overhead** section that decomposes cost by `retryReason` when retries happen, and a **Memory (Embedder)** section bucketed by embedder model. Sub-cent values use tiered precision so embedder costs don't collapse to `$0.0000`.
+Track spending across agents, models, workflows, and embedders with time-window filtering (24h/7d/30d/all). Sortable breakdown tables, a **Retry Overhead** section that decomposes cost by `retryReason` when retries happen, and a **Memory (Embedder)** section bucketed by embedder model. Sub-cent values use tiered precision so embedder costs don't collapse to `$0.0000`. Calls to unpriced models (a pricing-table miss, or a provider that reports no per-call cost) render as `≥ $X` with an "N unpriced calls" note, so the total reads as an honest lower bound rather than a misleading exact figure.
 
 <p align="center">
   <img src="../../docs/assets/studio-cost-dashboard.gif" alt="Axl Studio cost dashboard — spend by agent, model, and workflow with time-window filtering" width="840">

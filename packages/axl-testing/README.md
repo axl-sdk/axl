@@ -130,6 +130,7 @@ const result = await runtime.execute('my-workflow', { question: 'What is 2+2?' }
 expect(runtime.agentCalls()).toHaveLength(1);
 expect(runtime.toolCalls()).toHaveLength(1);
 expect(runtime.totalCost()).toBe(0);
+expect(runtime.unpriced()).toBe(false); // true if any call used an unpriced model → totalCost() is a lower bound
 ```
 
 For testing human-in-the-loop flows:
@@ -188,6 +189,7 @@ runtime.mockProvider('openai', provider);
 runtime.agentCalls();   // All recorded agent invocations
 runtime.toolCalls();    // All recorded tool invocations
 runtime.totalCost();    // Cumulative cost
+runtime.unpriced();     // true if any call was unpriced (totalCost() is then a lower bound)
 runtime.steps();        // All recorded steps (agents + tools)
 runtime.traceLog();     // All trace events
 ```

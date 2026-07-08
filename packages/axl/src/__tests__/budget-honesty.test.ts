@@ -174,6 +174,27 @@ describe('budget honesty — BudgetResult.unpriced (Part A)', () => {
     expect(calls).toBe(5);
   });
 
+  it("a 'warn' policy budget over unpriced spend: never exceeds, still reports unpriced + warns once", async () => {
+    // The `warn` policy only logs once the PRICED total crosses the limit. Under
+    // a purely-unpriced run nothing crosses, so `budgetExceeded` stays false —
+    // but honesty is independent of policy: `unpriced` is reported and the
+    // one-time budget-honesty warning still fires (finite limit was set).
+    const { ctx } = createTestCtx({ provider: seqProvider([{ content: 'ok', usage }]) });
+    const r = await ctx.budget({ cost: '$0.01', onExceed: 'warn' }, async () => {
+      await ctx.ask(plain(), 'one');
+      await ctx.ask(plain(), 'two');
+      return 'ran';
+    });
+    expect(r.value).toBe('ran');
+    expect(r.budgetExceeded).toBe(false);
+    expect(r.unpriced).toBe(true);
+    // Exactly one budget-honesty warning across both unpriced calls.
+    const honestyWarnings = warnSpy.mock.calls.filter((c) =>
+      String(c[0]).includes('Budget honesty'),
+    );
+    expect(honestyWarnings).toHaveLength(1);
+  });
+
   it('flags a FRAMELESS cost-bearing leaf — ctx.remember(embed) under budget, no ask frame', async () => {
     // Proves A1's de-gating: budget detection is NOT gated on an ask frame. A direct
     // semantic memory op emits a cost-bearing leaf with no ALS frame; the budget must

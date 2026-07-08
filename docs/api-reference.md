@@ -221,7 +221,7 @@ const ctx = runtime.createContext({
 
 ### `runtime.trackExecution(fn, options?)`
 
-Track cost and execution metadata across any runtime operations within `fn`. Returns `{ result, cost, metadata, traces? }` where `metadata` includes `models` (unique model URIs), `modelCallCounts`, `tokens` (input/output/reasoning sums — agent calls only, not embedder tokens), `agentCalls` count, `workflows` (insertion-ordered unique names), and `workflowCallCounts`. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
+Track cost and execution metadata across any runtime operations within `fn`. Returns `{ result, cost, unpriced, metadata, traces? }` where `unpriced` is `true` when any tracked call was unpriced (making `cost` a **lower bound** — the aggregate counterpart of `ExecutionInfo.unpriced`), and `metadata` includes `models` (unique model URIs), `modelCallCounts`, `tokens` (input/output/reasoning sums — agent calls only, not embedder tokens), `agentCalls` count, `workflows` (insertion-ordered unique names), and `workflowCallCounts`. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
 
 **Note on `metadata.tokens`:** narrowly scoped to agent prompt/completion/reasoning tokens. Embedder tokens from semantic memory ops are deliberately not summed in (different pricing, different model). Consumers who want embedder token counts should subscribe to `runtime.on('trace', ...)` and read `data.usage.tokens` on `memory_remember` / `memory_recall` events.
 
@@ -246,7 +246,7 @@ console.log(`${traces.length} trace events captured`);
 
 ### `runtime.trackCost(fn)`
 
-Convenience wrapper around `trackExecution()` that returns only `{ result, cost }`. Use when you don't need metadata.
+Convenience wrapper around `trackExecution()` that returns only `{ result, cost, unpriced }` (`unpriced` makes `cost` a lower bound — see `trackExecution`). Use when you don't need metadata.
 
 ```typescript
 const { result, cost } = await runtime.trackCost(async () => {
@@ -507,7 +507,7 @@ Returns the live status of the active budget block, or `null` outside any block:
 
 Read-only getter returning the total cost accumulated by agent calls in this context. Inside a `ctx.budget()` block, returns only that block's accumulated cost; after the block completes, the nested cost is rolled up into the parent total.
 
-> **Unpriced models → lower bound.** A call to an unpriced model (pricing-table miss / a provider that reports no per-call cost) contributes `undefined` cost, which counts as nothing — so `ctx.totalCost` (and `ExecutionInfo.totalCost`, `ctx.budget()` accounting) **understate** total spend when unpriced models run. Detect it via: the owning `ask_end.unpriced`, `BudgetResult.unpriced` / `ctx.getBudgetStatus().unpriced` for a `ctx.budget()` block, and the Studio Cost Dashboard's `CostData.unpricedCalls`. Because the unknown component is invisible to the budget rail, a `ctx.budget()` cost limit / `hard_stop` **cannot enforce on unpriced spend** — it only reports it.
+> **Unpriced models → lower bound.** A call to an unpriced model (pricing-table miss / a provider that reports no per-call cost) contributes `undefined` cost, which counts as nothing — so `ctx.totalCost` (and `ExecutionInfo.totalCost`, `ctx.budget()` accounting) **understate** total spend when unpriced models run. Detect it via: `ExecutionInfo.unpriced` (the execution-level aggregate from `runtime.execute()` / `getExecutions()`), `runtime.trackExecution().unpriced`, the owning `ask_end.unpriced`, `BudgetResult.unpriced` / `ctx.getBudgetStatus().unpriced` for a `ctx.budget()` block, and the Studio Cost Dashboard's `CostData.unpricedCalls`. Because the unknown component is invisible to the budget rail, a `ctx.budget()` cost limit / `hard_stop` **cannot enforce on unpriced spend** — it only reports it.
 
 ```typescript
 const ctx = runtime.createContext();
@@ -1184,7 +1184,8 @@ Completed and failed executions are automatically persisted to the state store (
 | `workflow` | `string` | Workflow name |
 | `status` | `'running' \| 'completed' \| 'failed' \| 'waiting'` | Current status |
 | `events` | `AxlEvent[]` | All events for this execution. Renamed from `steps` in 0.16.0; `SQLiteStore` auto-migrates the `execution_history.steps` column to `events` on first open |
-| `totalCost` | `number` | Accumulated cost in USD |
+| `totalCost` | `number` | Accumulated cost in USD. A **lower bound** when `unpriced` is `true` |
+| `unpriced` | `boolean \| undefined` | `true` when any cost-bearing call in the execution did billable work but had no usable cost (unpriced model / pricing-table miss) — `totalCost` is then a lower bound. `false` when every call was priced. The aggregate counterpart of `ask_end.unpriced` / `BudgetResult.unpriced` — read this instead of scanning `events`. `undefined` only on executions recorded before this field existed |
 | `startedAt` | `number` | Start timestamp (ms) |
 | `completedAt` | `number \| undefined` | Completion timestamp (ms) |
 | `duration` | `number` | Duration in ms |
@@ -1530,7 +1531,7 @@ import { eventCostContribution } from '@axlsdk/axl';
 const total = info.events.reduce((sum, e) => sum + eventCostContribution(e), 0);
 ```
 
-Also exported: `isCostBearingLeaf(event: AxlEvent): boolean` (takes an event, checks its `type` against the leaf set — pass the event, not the type string), `COST_BEARING_LEAF_TYPES` (the canonical `as const` tuple: `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall`), and `isRootLevel(event: AxlEvent): boolean` (true when `depth === 0` or undefined — used for root-only token filtering).
+Also exported: `isCostBearingLeaf(event: AxlEvent): boolean` (takes an event, checks its `type` against the leaf set — pass the event, not the type string), `isUnpricedLeaf(event): boolean` (the single source of truth for the unpriced signal — `true` when a cost-bearing leaf did billable work but had no usable cost; drives `ExecutionInfo.unpriced` / `trackExecution().unpriced` / Studio's `unpricedCalls`), `COST_BEARING_LEAF_TYPES` (the canonical `as const` tuple: `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall`), and `isRootLevel(event: AxlEvent): boolean` (true when `depth === 0` or undefined — used for root-only token filtering).
 
 **`parsePartialJson(text: string): unknown`** — tolerant JSON parser used internally for `partial_object` streaming. Recovers from truncated input (unclosed strings/objects/arrays) and is hardened against deeply-nested input via a 256-depth cap (returns `null` on overflow). Exported from `@axlsdk/axl` for consumers building their own progressive-render pipelines that need to share Axl's truncation-recovery and stack-overflow guard rails. Zero dependencies.
 
@@ -1563,6 +1564,8 @@ Populated when the provider returns (success or recoverable failure). Pair invar
 | `turn` | `number` | 1-indexed iteration of the tool-calling loop. Mirrors the matching `agent_call_start.data.turn` |
 | `retryReason` | `'schema' \| 'validate' \| 'guardrail'?` | Mirrors `agent_call_start.data.retryReason` so cost-attribution consumers reading `agent_call_end` (where `cost` lives) can bucket without joining |
 | `error` | `string?` | Provider error message when the call threw (network failure, 4xx/5xx, abort, etc). Mutually exclusive with `response` content. Subject to `config.trace.redact` |
+| `status` | `number?` | HTTP status when the throw was a `ProviderError` (`0` for network failures). Mirrors `ProviderError.status`; omitted for non-provider errors. The raw error `body` is **not** on the event (redaction-eligible) |
+| `retryable` | `boolean?` | Semantic failover hint when the throw was a `ProviderError` (mirrors `ProviderError.retryable`). Omitted for non-provider errors |
 
 `AgentCallParams` is also exported from `@axlsdk/axl` for consumers needing to type the resolved parameters object directly.
 

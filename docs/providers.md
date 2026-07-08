@@ -390,7 +390,7 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 | **OpenAI** (GPT-5.1+) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | capped to `'high'`⁂ | capped to `'high'`⁂ | nearest effort level* |
 | **OpenAI** (GPT-5.2+) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | `reasoning_effort: 'xhigh'` | nearest effort level* |
 | **OpenAI Responses** | same clamping as above | `reasoning.effort: 'low'` | `reasoning.effort: 'medium'` | `reasoning.effort: 'high'` | same clamping | same clamping | nearest effort level* |
-| **Anthropic** (Opus 4.7) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | manual `budget_tokens` |
+| **Anthropic** (Opus 4.8 / 4.7) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | manual `budget_tokens` |
 | **Anthropic** (4.6) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | capped to `'high'`◊ | adaptive + `effort: 'max'`† | manual `budget_tokens` |
 | **Anthropic** (4.5) | disabled | `output_config.effort: 'low'` | `output_config.effort: 'medium'` | `output_config.effort: 'high'` | capped to `'high'`◊ | capped to `'high'` | manual `budget_tokens` |
 | **Anthropic** (older) | disabled | `budget_tokens: 1024` | `budget_tokens: 5000` | `budget_tokens: 10000` | `budget_tokens: 10000`◊ | `budget_tokens: 30000` | exact budget |
@@ -414,9 +414,9 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 
 ⊗ Reasoning on self-hosted runtimes is configured at the server (launch flags / `chat_template_kwargs`), so `effort` is generally a no-op; inline `<think>` output is captured.
 
-† Anthropic `effort: 'max'` only supported on Opus 4.7 and Opus 4.6. On Sonnet 4.6 and Opus 4.5, capped to `'high'`.
+† Anthropic `effort: 'max'` only supported on Opus 4.8, 4.7, and 4.6. On Sonnet 4.6 and Opus 4.5, capped to `'high'`.
 
-◊ Anthropic `effort: 'xhigh'` is only supported on Opus 4.7 (positioned between `'high'` and `'max'`). On other Anthropic models and on Gemini 3.x, it clamps to `'high'`.
+◊ Anthropic `effort: 'xhigh'` is only supported on Opus 4.8 and 4.7 (positioned between `'high'` and `'max'`). On other Anthropic models and on Gemini 3.x, it clamps to `'high'`.
 
 ⁑ OpenAI pre-gpt-5.1 models (o-series, gpt-5, gpt-5-mini, gpt-5-nano) do not support `reasoning_effort: 'none'`. Axl clamps to `'minimal'` — the lowest supported value.
 
@@ -433,7 +433,7 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
 - **OpenAI GPT-5.x**: Supports `reasoning_effort` like o-series, strips temperature when reasoning active. Uses `system` role (not `developer`). Supports parallel tool calls. Model-specific constraints: `gpt-5-pro` only supports `'high'`; `gpt-5.1+` supports `'none'`; `gpt-5.2+` (including `gpt-5.5`) supports `'xhigh'`. Latest flagship: `gpt-5.5` ($5/$30 per 1M tokens); `gpt-5.5-pro` ($30/$180).
 - **OpenAI Responses API**: Same effort mapping via `reasoning: { effort }`. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
-- **Anthropic Opus 4.8**: Latest flagship. Same adaptive-thinking behavior as Opus 4.7 — supports `effort: 'xhigh'` and `'max'`, sent as `output_config.effort`. Default `effort` is `'high'`. Same pricing as Opus 4.7 ($5/$25 per 1M tokens).
+- **Anthropic Opus 4.8**: Latest flagship. Same adaptive-thinking behavior as Opus 4.7 — supports `effort: 'xhigh'` and `'max'`, sent as `output_config.effort`. Default `effort` is `'high'`.
 - **Anthropic Opus 4.7**: Same adaptive-thinking behavior as 4.6. Additionally supports `effort: 'xhigh'` as a first-class tier between `'high'` and `'max'`, sent as `output_config.effort: 'xhigh'`. Same pricing as Opus 4.6 ($5/$25 per 1M tokens).
 - **Anthropic 4.6** (Opus 4.6, Sonnet 4.6): `effort` enables adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`). Temperature stripped when thinking active. `thinkingBudget: 0` + `effort` sends only `output_config.effort` (no thinking block, temperature allowed). `effort: 'xhigh'` clamps to `'high'` (4.6 doesn't expose a distinct xhigh tier).
 - **Anthropic 4.5** (Opus 4.5): Supports `output_config.effort` but not adaptive thinking. Temperature passes through. `effort: 'xhigh'` clamps to `'high'`.

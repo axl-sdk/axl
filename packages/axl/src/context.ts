@@ -3772,6 +3772,12 @@ export class WorkflowContext<TInput = unknown> {
       // from a no-usage streamed call (zero tokens). Budget detection is NOT gated on
       // `frame`: a direct `ctx.budget(() => ctx.recall(...))` emits a cost-bearing
       // leaf with no ask frame, and the budget must still see it.
+      // This is the canonical inline form of `isUnpricedLeaf` (event-utils):
+      // it splits the two terms because the priced branch ALSO needs `usable`
+      // to add to the rollup. The `isCostBearingLeaf` gate is the enclosing
+      // `if`. Keep this in lockstep with `isUnpricedLeaf` — the runtime + Studio
+      // aggregate via that helper, so a divergence here would desync the per-ask
+      // flag from `ExecutionInfo.unpriced`.
       const usable = isUsableCost(cost);
       const unpriced =
         !usable &&

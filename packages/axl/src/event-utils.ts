@@ -109,6 +109,38 @@ export function isCostBearingLeaf(event: AxlEvent): boolean {
 }
 
 /**
+ * True when the event is the "unpriced lower-bound" signal: a cost-bearing leaf
+ * that did measurable, billable work (POSITIVE tokens) but produced no usable
+ * cost (an unpriced model / pricing-table miss). This is the SINGLE source of
+ * truth for that discriminator — the core ask-cost rollup, the runtime's
+ * `ExecutionInfo.unpriced` / `trackExecution().unpriced` aggregation, and
+ * Studio's `unpricedCalls` count + cost reducer ALL route through it, so they
+ * cannot drift.
+ *
+ * It is the conjunction of the three primitives:
+ *   `isCostBearingLeaf` ∧ `!isUsableCost(cost)` ∧ `hasPositiveTokens`.
+ * The positive-token term is what distinguishes an unpriced model from a FAILED
+ * call (no usage) or a no-usage streamed `done` (zero tokens) — neither is
+ * "unpriced". An `ask_end` rollup carries a numeric cost, and `tool_call_end`
+ * carries no tokens, so both are naturally excluded.
+ *
+ * Structural param (like {@link hasPositiveTokens} / {@link isUsableCost}) so
+ * Studio's pre-typed trace-event shapes can pass through without casting.
+ */
+export function isUnpricedLeaf(event: {
+  type?: string;
+  cost?: unknown;
+  tokens?: { input?: number; output?: number; reasoning?: number } | null;
+}): boolean {
+  return (
+    event.type !== undefined &&
+    COST_LEAF_SET.has(event.type) &&
+    !isUsableCost(event.cost) &&
+    hasPositiveTokens(event)
+  );
+}
+
+/**
  * True when the event originates from the root ask (`depth === 0`)
  * or has no ask correlation at all (workflow / done / error / log).
  *

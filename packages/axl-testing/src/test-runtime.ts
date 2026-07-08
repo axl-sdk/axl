@@ -9,7 +9,13 @@ import type {
   AxlConfig,
   AnyWorkflow,
 } from '@axlsdk/axl';
-import { WorkflowContext, MemoryStore, ProviderRegistry, eventCostContribution } from '@axlsdk/axl';
+import {
+  WorkflowContext,
+  MemoryStore,
+  ProviderRegistry,
+  eventCostContribution,
+  isUnpricedLeaf,
+} from '@axlsdk/axl';
 import type { EventStreamOptions, WorkflowContextInit } from '@axlsdk/axl';
 
 // `AnyWorkflow` is a re-exported alias for `Workflow<any, any>` — see
@@ -44,6 +50,7 @@ export class AxlTestRuntime {
   private _steps: RecordedStep[] = [];
   private _traceLog: AxlEvent[] = [];
   private _totalCost = 0;
+  private _unpriced = false;
   private _stepCounter = 0;
   private recordPath?: string;
   private recorded: ProviderResponse[] = [];
@@ -89,6 +96,7 @@ export class AxlTestRuntime {
     this._steps = [];
     this._traceLog = [];
     this._totalCost = 0;
+    this._unpriced = false;
     this._stepCounter = 0;
     this.recorded = [];
     this._executionId = generateExecutionId();
@@ -167,6 +175,8 @@ export class AxlTestRuntime {
         // Single-source-of-truth cost accumulator. Skips ask_end
         // rollups (decision 10) and guards NaN/Infinity.
         this._totalCost += eventCostContribution(event);
+        // Honest aggregate: one unpriced leaf makes `totalCost()` a lower bound.
+        if (isUnpricedLeaf(event)) this._unpriced = true;
 
         // Track provider responses for recording
         if (event.type === 'agent_call_end' && event.data) {
@@ -242,6 +252,11 @@ export class AxlTestRuntime {
 
   totalCost(): number {
     return this._totalCost;
+  }
+  /** True when any cost-bearing call was unpriced — `totalCost()` is then a
+   *  LOWER BOUND. Mirrors `ExecutionInfo.unpriced` / `BudgetResult.unpriced`. */
+  unpriced(): boolean {
+    return this._unpriced;
   }
   steps(): RecordedStep[] {
     return this._steps;

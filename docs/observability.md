@@ -126,6 +126,8 @@ for (const event of info.events) {
 
 **Unknown cost (`ask_end.unpriced`).** When an ask used a model with no usable per-call price (a pricing-table miss, or a provider that doesn't report cost), the unpriced call's `cost` is `undefined` — it contributes nothing to the rollup, so `ask_end.cost` becomes a **lower bound** and `ask_end.unpriced` is `true`. A *failed* call (which carries no usage) is NOT flagged. Treat `unpriced` asks as "at least `cost`", not exact (Studio renders them `≥ $X`). `agent_call_end.cost` is `number | undefined` for the same reason.
 
+**Execution-level aggregate (`ExecutionInfo.unpriced`).** To answer "is this execution's `totalCost` exact?" without scanning the timeline, read `ExecutionInfo.unpriced` (from `runtime.execute()` / `getExecutions()` / recovered streams) — `true` when any cost-bearing call was unpriced. The same flag is on `runtime.trackExecution().unpriced` and `AxlTestRuntime.unpriced()`. All three derive from the exported `isUnpricedLeaf(event)` discriminator (the single source of truth shared with the per-ask rollup and Studio's `CostData.unpricedCalls`).
+
 Use the exported helper `eventCostContribution(event)` — it returns `0` for `ask_end` rollups, for non-finite values, and for an undefined (unpriced) cost, and the event's cost otherwise. This is the single source of truth Axl's internals use; third-party accumulators should match:
 
 ```typescript

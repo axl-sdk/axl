@@ -60,6 +60,7 @@ export { stringStreamFromEvents } from './string-stream-from-events.js';
 export {
   eventCostContribution,
   isCostBearingLeaf,
+  isUnpricedLeaf,
   isRootLevel,
   hasPositiveTokens,
   isUsableCost,

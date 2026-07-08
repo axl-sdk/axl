@@ -1,4 +1,4 @@
-import { hasPositiveTokens, isUsableCost } from '@axlsdk/axl';
+import { isUnpricedLeaf } from '@axlsdk/axl';
 import type { CostData } from './types.js';
 import type { ConnectionManager } from './ws/connection-manager.js';
 
@@ -64,17 +64,12 @@ export class CostAggregator {
     const cost = Number.isFinite(event.cost) ? event.cost! : 0;
     const tokens = event.tokens ?? {};
 
-    // Unpriced leaf (parity with reduceCost): a cost-bearing LLM/embedder call
-    // that did measurable work (POSITIVE tokens) but had no usable cost. ask_end
-    // always carries a numeric cost, so it's excluded; tool_call_end has no
-    // tokens. The hasPositiveTokens check matches the core discriminator.
-    if (
-      !isUsableCost(event.cost) &&
-      hasPositiveTokens(event) &&
-      (event.type === 'agent_call_end' ||
-        event.type === 'memory_remember' ||
-        event.type === 'memory_recall')
-    ) {
+    // Unpriced leaf: a cost-bearing LLM/embedder call that did measurable work
+    // (POSITIVE tokens) but had no usable cost. Uses the core `isUnpricedLeaf`
+    // discriminator so the dashboard count stays in lockstep with the SDK's
+    // `ExecutionInfo.unpriced` / `ask_end.unpriced` (ask_end carries a numeric
+    // cost and tool_call_end has no tokens, so both are excluded).
+    if (isUnpricedLeaf(event)) {
       this.data.unpricedCalls += 1;
     }
 

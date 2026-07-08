@@ -4,6 +4,7 @@ import {
   eventCostContribution,
   isCostBearingLeaf,
   isRootLevel,
+  isUnpricedLeaf,
 } from '../event-utils.js';
 import type { AxlEvent } from '../types.js';
 
@@ -171,5 +172,57 @@ describe('COST_BEARING_LEAF_TYPES', () => {
     // returns the specific literal type, not `string`.
     const first: 'agent_call_end' = COST_BEARING_LEAF_TYPES[0];
     expect(first).toBe('agent_call_end');
+  });
+});
+
+describe('isUnpricedLeaf', () => {
+  const tokens = { input: 10, output: 5 };
+
+  it('is TRUE for a cost-bearing leaf with positive tokens and no usable cost', () => {
+    // The canonical unpriced signal: did billable work, no measurable cost.
+    expect(isUnpricedLeaf(ev({ type: 'agent_call_end', tokens }))).toBe(true);
+    expect(isUnpricedLeaf(ev({ type: 'memory_recall', tokens }))).toBe(true);
+    expect(isUnpricedLeaf(ev({ type: 'memory_remember', tokens }))).toBe(true);
+  });
+
+  it('is FALSE when the cost is usable (priced call) — including a real $0', () => {
+    expect(isUnpricedLeaf(ev({ type: 'agent_call_end', tokens, cost: 0.002 }))).toBe(false);
+    // cost: 0 is a KNOWN zero (free/cached/local), not "unknown" — not unpriced.
+    expect(isUnpricedLeaf(ev({ type: 'agent_call_end', tokens, cost: 0 }))).toBe(false);
+  });
+
+  it('is FALSE for a failed call (no tokens) — distinguishes failure from unpriced', () => {
+    expect(isUnpricedLeaf(ev({ type: 'agent_call_end' }))).toBe(false);
+    expect(isUnpricedLeaf(ev({ type: 'agent_call_end', tokens: { input: 0, output: 0 } }))).toBe(
+      false,
+    );
+  });
+
+  it('is FALSE for a non-usable cost (NaN/Infinity/negative) with NO tokens', () => {
+    // Non-finite cost alone is not enough — without positive tokens it is a
+    // failed/empty call, not unpriced work.
+    expect(isUnpricedLeaf(ev({ type: 'agent_call_end', cost: NaN }))).toBe(false);
+    expect(isUnpricedLeaf(ev({ type: 'agent_call_end', cost: Infinity }))).toBe(false);
+  });
+
+  it('treats a non-finite cost WITH positive tokens as unpriced (NaN/Infinity/negative)', () => {
+    // A malformed pricing table yielding NaN/Infinity is "unknown cost", so a
+    // work-bearing leaf with such a value is unpriced — same as a missing cost.
+    expect(isUnpricedLeaf(ev({ type: 'agent_call_end', tokens, cost: NaN }))).toBe(true);
+    expect(isUnpricedLeaf(ev({ type: 'agent_call_end', tokens, cost: -1 }))).toBe(true);
+  });
+
+  it('is FALSE for tool_call_end (a leaf, but carries no tokens)', () => {
+    expect(isUnpricedLeaf(ev({ type: 'tool_call_end', tool: 't' }))).toBe(false);
+  });
+
+  it('is FALSE for ask_end even with tokens (a rollup, not a leaf)', () => {
+    expect(
+      isUnpricedLeaf(ev({ type: 'ask_end', tokens, outcome: { ok: true, result: 'x' } })),
+    ).toBe(false);
+  });
+
+  it('counts reasoning-only tokens as billable work', () => {
+    expect(isUnpricedLeaf(ev({ type: 'agent_call_end', tokens: { reasoning: 7 } }))).toBe(true);
   });
 });

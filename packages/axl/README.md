@@ -67,7 +67,7 @@ agent({ model: 'deepseek:deepseek-reasoner' });           // DEEPSEEK_API_KEY
 agent({ model: 'ollama:llama3' });                        // local — no key, $0
 ```
 
-Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, and self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them. Build your own by cloning a `ProviderProfile`. See [docs/providers.md](../../docs/providers.md#openai-compatible-providers--presets).
+Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, and self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them. Build your own by cloning a `ProviderProfile`. See [docs/providers.md](../../docs/providers.md#openai-compatible-providers--presets).
 
 Each provider also accepts an opt-in `rateLimit` (`{ maxConcurrent?, minIntervalMs?, acquireTimeoutMs? }`) for proactive client-side pacing on top of the automatic 429/503/529 backoff — useful when a large fan-out (e.g. an eval) shares one API key. It caps in-flight request concurrency (not token throughput) for that provider's chat calls. See [Providers → Rate limiting](../../docs/providers.md#rate-limiting-opt-in).
 
@@ -749,12 +749,12 @@ import {
 
 ### Provider URIs
 
-Four built-in providers using the `provider:model` URI scheme:
+Four native adapters using the `provider:model` URI scheme (plus the OpenAI-compatible presets above):
 
 ```
 openai-responses:gpt-5.5               # OpenAI Responses API (preferred over Chat Completions)
 openai:gpt-5.4                         # OpenAI Chat Completions
-anthropic:claude-opus-4-7              # Anthropic (supports effort: 'xhigh')
+anthropic:claude-opus-4-8              # Anthropic (supports effort: 'xhigh' and 'max')
 google:gemini-3.1-pro-preview          # Google Gemini
 ```
 

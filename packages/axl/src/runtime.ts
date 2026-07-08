@@ -28,7 +28,7 @@ import type {
   ChatMessage,
   HandoffRecord,
 } from './types.js';
-import { eventCostContribution } from './event-utils.js';
+import { eventCostContribution, isUnpricedLeaf } from './event-utils.js';
 import { NoopSpanManager } from './telemetry/noop.js';
 import { createSpanManager } from './telemetry/index.js';
 import type { SpanManager, SpanHandle } from './telemetry/types.js';
@@ -1252,6 +1252,7 @@ export class AxlRuntime extends EventEmitter {
       status: 'running',
       events: [],
       totalCost: 0,
+      unpriced: false,
       startedAt: Date.now(),
       duration: 0,
       metadata: liftPersistedMetadata(options?.metadata),
@@ -1282,6 +1283,8 @@ export class AxlRuntime extends EventEmitter {
         // every event; only the in-memory array is bounded.
         pushEventBounded(execInfo, event, this.maxEventsPerExecution);
         execInfo.totalCost += eventCostContribution(event);
+        // Honest aggregate: one unpriced leaf makes `totalCost` a lower bound.
+        if (isUnpricedLeaf(event)) execInfo.unpriced = true;
         // Streaming durability: in `state.persist: 'streaming'` mode the
         // flusher batches events to the store throughout the run, so a
         // mid-run crash leaves a recoverable buffer. No-op when
@@ -1429,6 +1432,7 @@ export class AxlRuntime extends EventEmitter {
         status: 'running',
         events: [],
         totalCost: 0,
+        unpriced: false,
         startedAt: Date.now(),
         duration: 0,
         metadata: liftPersistedMetadata(options?.metadata),
@@ -1455,6 +1459,7 @@ export class AxlRuntime extends EventEmitter {
           // execute() for full rationale.
           pushEventBounded(execInfo!, event, this.maxEventsPerExecution);
           execInfo!.totalCost += eventCostContribution(event);
+          if (isUnpricedLeaf(event)) execInfo!.unpriced = true;
           if (this.streamableExecutionIds.has(executionId)) {
             this.streamingFlusher?.append(executionId, event);
           }
@@ -1765,8 +1770,10 @@ export class AxlRuntime extends EventEmitter {
       const completedAt = lastEvent.timestamp ?? startedAt;
       const workflowName = workflowStartEvent?.workflow ?? RECOVERED_UNKNOWN_WORKFLOW;
 
-      // Sum cost from cost-bearing leaf events
+      // Sum cost from cost-bearing leaf events; flag if any was unpriced so the
+      // recovered `totalCost` carries the same lower-bound signal as a live run.
       const totalCost = boundedEvents.reduce((sum, e) => sum + eventCostContribution(e), 0);
+      const unpriced = boundedEvents.some(isUnpricedLeaf);
 
       const synthesized: ExecutionInfo = {
         executionId: id,
@@ -1774,6 +1781,7 @@ export class AxlRuntime extends EventEmitter {
         status: 'failed',
         events: boundedEvents,
         totalCost,
+        unpriced,
         startedAt,
         completedAt,
         duration: completedAt - startedAt,
@@ -2200,9 +2208,11 @@ export class AxlRuntime extends EventEmitter {
    *
    * Works with both `createContext()` and `execute()` calls inside `fn`.
    */
-  async trackCost<T>(fn: () => Promise<T>): Promise<{ result: T; cost: number }> {
-    const { result, cost } = await this.trackExecution(fn);
-    return { result, cost };
+  async trackCost<T>(
+    fn: () => Promise<T>,
+  ): Promise<{ result: T; cost: number; unpriced: boolean }> {
+    const { result, cost, unpriced } = await this.trackExecution(fn);
+    return { result, cost, unpriced };
   }
 
   /**
@@ -2243,6 +2253,9 @@ export class AxlRuntime extends EventEmitter {
   ): Promise<{
     result: T;
     cost: number;
+    /** True when any tracked call was unpriced — `cost` is then a LOWER BOUND.
+     *  Aggregate counterpart of `ExecutionInfo.unpriced`, via `isUnpricedLeaf`. */
+    unpriced: boolean;
     traces?: AxlEvent[];
     metadata: {
       models: string[];
@@ -2278,6 +2291,7 @@ export class AxlRuntime extends EventEmitter {
     const workflowCalls = new Map<string, number>();
     const tokens = { input: 0, output: 0, reasoning: 0 };
     let agentCalls = 0;
+    let unpriced = false;
     const capturedTraces: AxlEvent[] | undefined = options?.captureTraces ? [] : undefined;
 
     const listener = (event: AxlEvent) => {
@@ -2285,6 +2299,8 @@ export class AxlRuntime extends EventEmitter {
       // Cost rollup via shared helper — one source of truth for the
       // "skip ask_end, finite-check, leaf-only" invariant (spec §10).
       scope.totalCost += eventCostContribution(event);
+      // Honest aggregate: one unpriced leaf makes `cost` a lower bound.
+      if (isUnpricedLeaf(event)) unpriced = true;
       if (event.type === 'agent_call_end') {
         if (event.model) modelCalls.set(event.model, (modelCalls.get(event.model) ?? 0) + 1);
         agentCalls++;
@@ -2347,6 +2363,7 @@ export class AxlRuntime extends EventEmitter {
       return {
         result,
         cost: scope.totalCost,
+        unpriced,
         ...(capturedTraces ? { traces: capturedTraces } : {}),
         metadata: {
           models: [...modelCalls.keys()],

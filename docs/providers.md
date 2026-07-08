@@ -496,15 +496,27 @@ portable across every provider and degrades gracefully. Two knobs tune it (spec
 
   | Provider | Native `json_schema` support | On opt-in |
   |---|---|---|
-  | OpenAI Chat / Responses | ✅ constrained decoding | used as-is |
+  | OpenAI Chat / Responses | ✅ accepts `json_schema` | used as-is (non-strict — see note) |
   | OpenAI-compatible | ✅ when the profile's `supportsJsonSchema` is true | else **downgraded** to `json_object` |
   | Google Gemini | ⚠️ accepted but sanitized (`$ref`/`$defs`/… stripped) | **lossy** |
   | Anthropic | ❌ ignored structurally (system-prompt JSON instruction) | **unsupported** |
+
+  The derived provider schema is rendered from the Zod schema's **input** side
+  (what the model must emit — consistent with the prompt rendering), so
+  `.transform()` schemas stay non-empty and `.default()`/`.optional()` fields
+  aren't spuriously marked required.
 
   When the resolved provider can't fully honor it (downgraded / lossy /
   unsupported), Axl emits a `native_output_unsupported` `schema_diagnostic` and a
   one-time warning, then **proceeds** — the prompt text remains the parse contract
   (see [observability.md#schema-diagnostics](./observability.md#schema-diagnostics)).
+
+  > **Note — non-strict on OpenAI.** Axl currently sends `json_schema` **without**
+  > `strict: true`, so on OpenAI the schema is guidance rather than hard
+  > constrained decoding. True strict mode requires transforming the schema into
+  > OpenAI's strict subset (every property `required`, `additionalProperties:false`
+  > everywhere) and is a planned follow-up. Client-side Zod validation is the
+  > enforcement boundary either way.
 
 **Why prompt-guided is the default (not native).** Native constrained decoding
 caps schema depth and can degrade output quality on complex schemas (e.g. large

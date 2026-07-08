@@ -171,6 +171,31 @@ function estimateInlineSchemaTokens(schema: z.ZodType): number {
 }
 
 /**
+ * Memoized provider schema for the NATIVE structured-output path
+ * (`nativeStructuredOutput`), keyed by schema identity.
+ *
+ * Rendered with `io: 'input'` — the same side the prompt uses — because native
+ * structured output constrains the model's OUTPUT, which then becomes the
+ * `.parse` INPUT. Deriving from the output side (as the tool-def converter does)
+ * would (a) collapse a `.transform()`/`.pipe()` schema to an empty `{}` on the
+ * wire and (b) contradict the prompt for `.default()`ed / `.optional()` fields
+ * (output marks them required, input doesn't). Inline (no `$ref`) to stay safe
+ * on Gemini's sanitizer, matching the tool-def rendering.
+ */
+const nativeSchemaCache = new WeakMap<z.ZodType, Record<string, unknown>>();
+function deriveNativeSchema(schema: z.ZodType): Record<string, unknown> {
+  const cached = nativeSchemaCache.get(schema);
+  if (cached !== undefined) return cached;
+  const json = z.toJSONSchema(schema, { unrepresentable: 'any', io: 'input' }) as Record<
+    string,
+    unknown
+  >;
+  delete json.$schema;
+  nativeSchemaCache.set(schema, json);
+  return json;
+}
+
+/**
  * Render a Zod schema as compact JSON-Schema TEXT for the prompt guidance path
  * ONLY (`Respond with valid JSON matching this schema: …`). Private by design.
  *
@@ -1262,7 +1287,10 @@ export class WorkflowContext<TInput = unknown> {
               type: 'json_schema',
               json_schema: {
                 name: 'response',
-                schema: zodToJsonSchema(options.schema as z.ZodType),
+                // Input-side rendering — see `deriveNativeSchema`. Keeps the
+                // native schema consistent with the prompt and non-empty for
+                // `.transform()` schemas.
+                schema: deriveNativeSchema(options.schema as z.ZodType),
               },
             }
           : { type: 'json_object' };
@@ -1607,9 +1635,15 @@ export class WorkflowContext<TInput = unknown> {
 
               // Pass accumulated messages so the target agent can see the source agent's work.
               // Forward schema/retries/validate/metadata — the target agent uses its own model params.
+              // schemaPrompt/nativeStructuredOutput must travel too: on the
+              // multi-candidate `delegate` path the handoff TARGET (not the
+              // router) produces the structured reply, so these controls only
+              // take effect if forwarded here (spec 22 R11).
               const handoffOptions = options
                 ? {
                     schema: options.schema,
+                    schemaPrompt: options.schemaPrompt,
+                    nativeStructuredOutput: options.nativeStructuredOutput,
                     retries: options.retries,
                     metadata: options.metadata,
                     validate: options.validate,

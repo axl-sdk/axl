@@ -63,8 +63,14 @@ cross-provider `effort`, tool-calling, and cost surfaces.
   (ignores), Gemini (lossy sanitize), OpenAI-compatible profiles with
   `supportsJsonSchema: false` (downgrade to `json_object`) — emit a
   `native_output_unsupported` diagnostic and proceed. Adds an optional
-  `Provider.nativeStructuredOutputSupport(model)` capability method. Forwarded
-  through `ctx.delegate`. See `docs/providers.md`.
+  `Provider.nativeStructuredOutputSupport(model)` capability method. The derived
+  provider schema is rendered from the Zod schema's **input** side (consistent
+  with the prompt), so `.transform()` schemas stay non-empty and
+  `.default()`/`.optional()` fields aren't spuriously marked required. Forwarded
+  through `ctx.delegate` to the terminal agent on both the single- and
+  multi-candidate (handoff) paths. On OpenAI the `json_schema` is sent non-strict
+  (schema-as-guidance); true strict-mode constrained decoding is a follow-up.
+  See `docs/providers.md`.
 
 - **Structured-output prompts render the schema's INPUT shape.** The appended
   guidance now uses `z.toJSONSchema`'s `io: 'input'` mode, so a `.transform()` /

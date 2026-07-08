@@ -191,6 +191,69 @@ describe('delegate forwards schemaPrompt / nativeStructuredOutput (R11)', () => 
     await ctx.delegate([a], 'go', { schema: S, nativeStructuredOutput: true }).catch(() => {});
     expect(p.calls[0].options.responseFormat?.type).toBe('json_schema');
   });
+
+  it('MULTI-candidate delegate forwards both fields to the handoff TARGET (not just the router)', async () => {
+    // Sequence provider: call 0 = router picks handoff_to_beta; call 1 = target beta.
+    class SeqProvider {
+      readonly name = 'test';
+      calls: Array<{ messages: ChatMessage[]; options: ChatOptions }> = [];
+      nativeStructuredOutputSupport() {
+        return 'schema' as const;
+      }
+      async chat(messages: ChatMessage[], options: ChatOptions) {
+        this.calls.push({ messages, options });
+        if (this.calls.length === 1) {
+          return {
+            content: '',
+
+            tool_calls: [
+              {
+                id: 't1',
+                type: 'function',
+                function: { name: 'handoff_to_beta', arguments: '{}' },
+              },
+            ] as any,
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+            cost: 0,
+          };
+        }
+        return {
+          content: '{"ok":true}',
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+          cost: 0,
+        };
+      }
+      async *stream(messages: ChatMessage[], options: ChatOptions) {
+        const r = await this.chat(messages, options);
+        yield { type: 'text_delta' as const, content: r.content };
+        yield { type: 'done' as const, usage: r.usage };
+      }
+    }
+    const p = new SeqProvider();
+    const registry = new ProviderRegistry();
+    registry.registerInstance('test', p as never);
+    const ctx = new WorkflowContext({
+      input: 'x',
+      executionId: 'exec-deleg',
+      config: { defaultProvider: 'test' },
+      providerRegistry: registry,
+    });
+    const alpha = agent({ name: 'alpha', model: 'test:m', system: 'alpha' });
+    const beta = agent({ name: 'beta', model: 'test:m', system: 'beta' });
+    await ctx
+      .delegate([alpha, beta], 'go', {
+        schema: S,
+        schemaPrompt: { render: 'DELEGATED_TARGET' },
+        nativeStructuredOutput: true,
+      })
+      .catch(() => {});
+    // The TARGET call (index 1) must carry the custom prompt AND the native format.
+    const targetCall = p.calls[1];
+    expect(targetCall).toBeDefined();
+    const userMsg = [...targetCall.messages].reverse().find((m) => m.role === 'user');
+    expect(userMsg?.content as string).toContain('DELEGATED_TARGET');
+    expect(targetCall.options.responseFormat?.type).toBe('json_schema');
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -209,6 +272,36 @@ describe('nativeStructuredOutput', () => {
       expect(rf.json_schema.schema).toEqual(
         expect.objectContaining({ type: 'object', properties: { ok: { type: 'boolean' } } }),
       );
+    }
+  });
+
+  it('derives the native schema from the INPUT side — a .transform() stays non-empty', async () => {
+    const p = new RecordingProvider('{"raw":"x"}', 'schema');
+    const { ctx } = makeCtx(p);
+    const a = agent({ name: 'tnat', model: 'test:m', system: 's' });
+    const T = z.object({ raw: z.string() }).transform((o) => ({ parsed: o.raw }));
+    await runAsk(ctx, a, 'go', { schema: T, nativeStructuredOutput: true });
+    const rf = p.calls[0].options.responseFormat;
+    expect(rf?.type).toBe('json_schema');
+    if (rf?.type === 'json_schema') {
+      const s = rf.json_schema.schema as { type?: string; properties?: Record<string, unknown> };
+      // Output mode would have collapsed the transform to `{}`; input mode keeps `raw`.
+      expect(s.type).toBe('object');
+      expect(s.properties).toHaveProperty('raw');
+      expect(s.properties).not.toHaveProperty('parsed'); // post-transform field, model doesn't emit it
+    }
+  });
+
+  it('native schema does not spuriously mark a .default() field required (input side)', async () => {
+    const p = new RecordingProvider('{"name":"x"}', 'schema');
+    const { ctx } = makeCtx(p);
+    const a = agent({ name: 'tdef', model: 'test:m', system: 's' });
+    const D = z.object({ name: z.string(), age: z.number().default(5) });
+    await runAsk(ctx, a, 'go', { schema: D, nativeStructuredOutput: true });
+    const rf = p.calls[0].options.responseFormat;
+    if (rf?.type === 'json_schema') {
+      const s = rf.json_schema.schema as { required?: string[] };
+      expect(s.required).toEqual(['name']); // age is defaulted → not required, matches the prompt
     }
   });
 

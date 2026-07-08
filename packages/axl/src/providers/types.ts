@@ -134,7 +134,11 @@ export interface Provider {
    * still run). Optional: an adapter that omits it is assumed to honor the schema
    * fully (`'schema'`), so unknown adapters simply opt out of the warning.
    *
-   *  - `'schema'` — native constrained decoding against the schema (e.g. OpenAI).
+   *  - `'schema'` — accepts a `json_schema` response format for this model (the
+   *    strongest tier; e.g. OpenAI/Responses). Note: Axl currently sends
+   *    NON-strict `json_schema` (it does not set `strict: true`), so on OpenAI
+   *    this is schema-as-guidance, not hard constrained decoding — true strict
+   *    mode needs an OpenAI-strict-subset schema transform and is a follow-up.
    *  - `'downgraded'` — accepted but downgraded to plain `json_object`; the schema
    *    shape is NOT enforced structurally (e.g. an OpenAI-compatible profile with
    *    `supportsJsonSchema: false`).

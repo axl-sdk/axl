@@ -64,6 +64,7 @@ Run from the repo root. Per-area detail: `.claude/rules/testing.md` and the pack
 - `eval.md` — `axl-eval` scorers, runner, CLI
 - `studio.md` — Studio server / middleware / client
 - `testing.md` — test conventions
+- `parallel-agents.md` — concurrent-agent worktree/stash discipline (always loaded)
 - `releasing.md` — version bump + publish
 
 ## Repo-specific conventions

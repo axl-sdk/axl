@@ -128,6 +128,33 @@ describe('detectDroppedRefinements', () => {
     expect(detectDroppedRefinements(schema).count).toBe(1);
   });
 
+  it('flags z.custom() / z.instanceof() (renders to a typeless {}) — the worst cliff', () => {
+    // A custom-type node carries the validator on the def itself (no `checks`)
+    // and z.toJSONSchema renders it to `{}` — zero shape guidance for the model.
+    const custom = detectDroppedRefinements(
+      z.object({ id: z.custom<string>((v) => typeof v === 'string' && v.length > 0) }),
+    );
+    expect(custom.count).toBe(1);
+    expect(custom.paths).toEqual(['id']);
+
+    const inst = detectDroppedRefinements(z.object({ when: z.instanceof(Date) }));
+    expect(inst.count).toBe(1);
+    expect(inst.paths).toEqual(['when']);
+  });
+
+  it('flags a refinement on a record KEY type (rendered as propertyNames, dropped)', () => {
+    const schema = z.record(
+      z.string().refine((s) => s.startsWith('x'), 'prefixed'),
+      z.number(),
+    );
+    expect(detectDroppedRefinements(schema).count).toBe(1);
+  });
+
+  it('flags a refinement inside an object catchall', () => {
+    const schema = z.object({ a: z.string() }).catchall(z.number().refine((n) => n > 0));
+    expect(detectDroppedRefinements(schema).count).toBe(1);
+  });
+
   it('does not blow the stack on a recursive schema', () => {
     type Node = { value: number; children: Node[] };
     const Node: z.ZodType<Node> = z.lazy(() =>
@@ -174,8 +201,23 @@ describe('schema_diagnostic emit sites', () => {
     expect(warnSpy).toHaveBeenCalledTimes(1);
   });
 
-  it('streaming_disabled: union root fires cause:non-object + warns', async () => {
+  it('streaming_disabled: only fires when streaming is active (observer present)', async () => {
+    // No observer → the gate is moot, so no noise on a plain execute().
     const { ctx, events } = makeCtx();
+    const a = agent({ name: 'nostream', model: 'test:m', system: 's' });
+    await runAsk(ctx, a, 'go', {
+      schema: z.discriminatedUnion('k', [
+        z.object({ k: z.literal('a'), a: z.string() }),
+        z.object({ k: z.literal('b'), b: z.number() }),
+      ]),
+    });
+    expect(diagnostics(events).filter((e) => e.data.kind === 'streaming_disabled')).toHaveLength(0);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('streaming_disabled: union root fires cause:non-object + warns (streaming active)', async () => {
+    const { ctx, events } = makeCtx();
+    void ctx.events; // allocate the event bus → streaming active (J5's situation)
     const a = agent({ name: 'union', model: 'test:m', system: 's' });
     const schema = z.discriminatedUnion('k', [
       z.object({ k: z.literal('a'), a: z.string() }),
@@ -190,6 +232,7 @@ describe('schema_diagnostic emit sites', () => {
 
   it('streaming_disabled: object root + a tool fires cause:tools, event-only (no warn)', async () => {
     const { ctx, events } = makeCtx();
+    void ctx.events; // streaming active
     const t = tool({
       name: 'noop',
       description: 'noop',

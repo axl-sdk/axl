@@ -12,6 +12,7 @@ import type {
   VerifyOptions,
   AwaitHumanOptions,
   AskOptions,
+  SchemaPromptOption,
   DelegateOptions,
   RaceOptions,
   AxlEvent,
@@ -122,17 +123,27 @@ const inlineSchemaCache = new WeakMap<z.ZodType, Record<string, unknown>>();
  *  Wraps Zod v4's built-in `z.toJSONSchema()`, stripping the `$schema` key
  *  since tool parameter schemas are embedded objects, not standalone documents.
  *
- *  **Inline** rendering: shared subschemas are duplicated in place, NOT hoisted
- *  into `$defs`/`$ref`. This is the safe rendering for provider tool definitions
- *  on every provider — notably Gemini's `sanitizeSchemaForGemini` strips
- *  `$ref`/`$defs`, which would silently reduce a hoisted schema to a typeless
- *  `{}`. The `$ref`-compact rendering lives in the private `renderSchemaForPrompt`
- *  and is scoped to prompt text, where `$ref` is opaque bytes on the wire. */
+ *  **Inline** rendering: shared subschemas are duplicated in place rather than
+ *  hoisted into `$defs`/`$ref`. This is the safe rendering for provider tool
+ *  definitions — notably Gemini's `sanitizeSchemaForGemini` strips `$ref`/`$defs`,
+ *  which would silently reduce a hoisted schema to a typeless `{}`. (Note: a
+ *  genuinely RECURSIVE schema still emits `$ref`/`$defs` even inline — recursion
+ *  can't be inlined — so such tool schemas remain lossy on Gemini regardless;
+ *  that's a pre-existing provider limitation, independent of this rendering.)
+ *  The extra `reused:'ref'` compaction lives in the private
+ *  `renderSchemaForPrompt` and is scoped to prompt text, where `$ref` is opaque
+ *  bytes on the wire. */
 export function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
   const cached = inlineSchemaCache.get(schema);
   if (cached !== undefined) return cached;
   const result = z.toJSONSchema(schema, { unrepresentable: 'any' }) as Record<string, unknown>;
   delete result.$schema;
+  // Shallow-freeze the cached object so an accidental top-level mutation by a
+  // consumer (this is a public barrel export) fails loudly in strict mode
+  // rather than silently poisoning the shared cache. Audited callers are all
+  // read-only; nested objects stay mutable (shallow), which is enough to catch
+  // the realistic footguns (adding/deleting a top-level key).
+  Object.freeze(result);
   inlineSchemaCache.set(schema, result);
   return result;
 }
@@ -142,6 +153,22 @@ export function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
  * best-effort caching rationale as `inlineSchemaCache`, for the prompt path.
  */
 const promptSchemaCache = new WeakMap<z.ZodType, string>();
+
+/**
+ * Memoized estimated token count of a schema's INLINE JSON-Schema serialization,
+ * keyed by schema identity. Used by the tool-def oversized diagnostic, which
+ * runs once per ask on stable `tool.inputSchema` values — without this the
+ * `JSON.stringify` would re-run every ask even though the result is a static
+ * property of the schema (AC-J7 "no measurable cost").
+ */
+const inlineSchemaTokenCache = new WeakMap<z.ZodType, number>();
+function estimateInlineSchemaTokens(schema: z.ZodType): number {
+  const cached = inlineSchemaTokenCache.get(schema);
+  if (cached !== undefined) return cached;
+  const tokens = estimateTokens(JSON.stringify(zodToJsonSchema(schema)));
+  inlineSchemaTokenCache.set(schema, tokens);
+  return tokens;
+}
 
 /**
  * Render a Zod schema as compact JSON-Schema TEXT for the prompt guidance path
@@ -1016,22 +1043,48 @@ export class WorkflowContext<TInput = unknown> {
       }
     }
 
-    // Build user prompt
+    // Build user prompt. `schemaPrompt` controls the model-facing rendering
+    // (spec 22, Problem B); the `.parse` gate downstream is unaffected — the Zod
+    // schema still validates the reply whichever rendering is chosen.
+    // Precedence: AskOptions > AgentConfig > default ('json-schema').
+    const schemaPromptMode: SchemaPromptOption =
+      options?.schemaPrompt ?? agent._config.schemaPrompt ?? 'json-schema';
     let userContent = prompt;
+    let appendedSchemaText: string | undefined;
     if (options?.schema) {
-      // Prompt-only rendering: `$ref`-hoisted + compact (see `renderSchemaForPrompt`).
-      // This is TEXT the model reads, not a structural schema on the wire, so the
-      // Gemini `$ref` cliff does not apply here (it only bites tool-def schemas).
-      const schemaText = renderSchemaForPrompt(options.schema as z.ZodType);
-      userContent += `\n\nRespond with valid JSON matching this schema:\n${schemaText}`;
+      const schema = options.schema as z.ZodType;
+      if (schemaPromptMode === 'none') {
+        // Zero prompt text — the schema is the parse gate only. R7 diagnostic
+        // fires from emitSchemaDiagnostics (the model gets no shape guidance).
+      } else if (schemaPromptMode === 'json-schema') {
+        // Prompt-only rendering: `$ref`-hoisted + compact (see
+        // `renderSchemaForPrompt`). This is TEXT the model reads, not a
+        // structural schema on the wire, so the Gemini `$ref` cliff does not
+        // apply here (it only bites tool-def schemas).
+        appendedSchemaText = renderSchemaForPrompt(schema);
+        userContent += `\n\nRespond with valid JSON matching this schema:\n${appendedSchemaText}`;
+      } else {
+        // Custom rendering: append exactly what the author supplies (string or
+        // function of the schema). No wrapper phrasing — they own the guidance.
+        appendedSchemaText =
+          typeof schemaPromptMode.render === 'function'
+            ? schemaPromptMode.render(schema)
+            : schemaPromptMode.render;
+        userContent += `\n\n${appendedSchemaText}`;
+      }
     }
 
     messages.push({ role: 'user', content: userContent });
 
-    // Schema-capability diagnostics (spec 22, Problem E). Once per ask — the
+    // Schema-capability diagnostics (spec 22, Problems B + E). Once per ask — the
     // prompt schema and tool-def schemas are both known here, before the
     // tool-calling turn loop begins.
-    this.emitSchemaDiagnostics(agent, options, toolDefs);
+    this.emitSchemaDiagnostics(agent, options, toolDefs, {
+      mode: schemaPromptMode,
+      appendedSchemaText,
+      provider,
+      model,
+    });
 
     // If this agent was reached via handoff, include the source agent's conversation
     if (handoffMessages && handoffMessages.length > 0) {
@@ -1187,9 +1240,24 @@ export class WorkflowContext<TInput = unknown> {
         signal: this.currentSignal,
       };
 
-      // If schema requested and no tools, use JSON mode
+      // If schema requested and no tools, use JSON mode. With
+      // `nativeStructuredOutput`, derive the provider schema from the SAME Zod
+      // schema (never a second, contradictable one) and take the native
+      // `json_schema` path; each adapter maps or downgrades it per its
+      // capabilities (a `native_output_unsupported` diagnostic already warned if
+      // it can't be honored). Otherwise fall back to plain `json_object`.
       if (options?.schema && toolDefs.length === 0) {
-        chatOptions.responseFormat = { type: 'json_object' };
+        const nativeOut =
+          options?.nativeStructuredOutput ?? agent._config.nativeStructuredOutput ?? false;
+        chatOptions.responseFormat = nativeOut
+          ? {
+              type: 'json_schema',
+              json_schema: {
+                name: 'response',
+                schema: zodToJsonSchema(options.schema as z.ZodType),
+              },
+            }
+          : { type: 'json_object' };
       }
 
       const callbackMeta = this.currentCallbackMeta(agent._name);
@@ -2241,10 +2309,12 @@ export class WorkflowContext<TInput = unknown> {
 
   /**
    * Emit `schema_diagnostic` events for the silent structured-output cliffs
-   * (spec 22, Problem E). Called once per ask. Covers three sites:
-   *  - the appended **prompt** schema (oversized, dropped refinements),
+   * (spec 22, Problems B + E). Called once per ask. Covers:
+   *  - the appended **prompt** schema (oversized; dropped refinements; or the
+   *    zero-guidance `schemaPrompt:'none'` footgun),
    *  - each user **tool-def** schema (oversized, dropped refinements),
-   *  - the **streaming** gate (disabled by a non-object root or by tools).
+   *  - the **streaming** gate (disabled by a non-object root or by tools),
+   *  - **native structured output** the resolved provider can't honor (R10).
    *
    * The structured event always fires (persisted + streamed). For the genuinely
    * surprising, low-frequency cliffs it ALSO fires a one-time deduped
@@ -2257,6 +2327,13 @@ export class WorkflowContext<TInput = unknown> {
     agent: Agent,
     options: AskOptions<unknown> | undefined,
     toolDefs: ToolDefinition[],
+    ctx: {
+      mode: SchemaPromptOption;
+      /** The text actually appended to the prompt (`undefined` for `'none'`). */
+      appendedSchemaText: string | undefined;
+      provider: Provider;
+      model: string;
+    },
   ): void {
     const silent = this.config.diagnostics?.silent;
     const threshold =
@@ -2265,47 +2342,103 @@ export class WorkflowContext<TInput = unknown> {
 
     // ── Prompt schema ──────────────────────────────────────────────────────
     if (schema) {
-      const promptTokens = estimateTokens(renderSchemaForPrompt(schema));
-      if (promptTokens > threshold) {
+      if (ctx.mode === 'none') {
+        // Zero model-facing guidance (R7) — the schema is the parse gate only,
+        // so the model is likely to loop on parse failures. This is the surprise;
+        // warn once. Skip oversized/dropped-refinement (nothing was appended).
         this.emitEvent({
           type: 'schema_diagnostic',
           agent: agent._name,
-          data: {
-            kind: 'prompt_schema_oversized',
-            estimatedTokens: promptTokens,
-            threshold,
-            site: 'prompt',
-          },
-        });
-      }
-
-      const dropped = detectDroppedRefinements(schema);
-      if (dropped.count > 0) {
-        this.emitEvent({
-          type: 'schema_diagnostic',
-          agent: agent._name,
-          data: {
-            kind: 'dropped_refinements',
-            count: dropped.count,
-            paths: dropped.paths,
-            site: 'prompt',
-          },
+          data: { kind: 'schema_prompt_none_no_guidance' },
         });
         warnSchemaDiagnosticOnce(
-          `${agent._name}\0dropped_refinements\0prompt\0${dropped.paths.join(',')}`,
-          `${dropped.count} refinement(s) on the output schema for agent '${agent._name}' ` +
-            `(at ${dropped.paths.join(', ')}) are dropped from the model-facing JSON Schema — ` +
-            `the model is never told the rule, then parsing rejects it. Surface it in the prompt ` +
-            `(schemaPrompt) or repair with ctx.verify.`,
+          `${agent._name}\0schema_prompt_none`,
+          `schemaPrompt:'none' is set on agent '${agent._name}' with an output schema and no ` +
+            `custom guidance — the model receives zero shape hints while the reply is still ` +
+            `parsed against the schema, which invites a parse-failure retry loop. Provide a ` +
+            `custom { render } or drop 'none'.`,
           silent,
         );
+      } else {
+        // 'json-schema' or custom { render }: the appended text is a recurring
+        // input cost — check its size. (For custom text, we measure exactly what
+        // the author appended.)
+        const promptTokens = estimateTokens(ctx.appendedSchemaText ?? '');
+        if (promptTokens > threshold) {
+          this.emitEvent({
+            type: 'schema_diagnostic',
+            agent: agent._name,
+            data: {
+              kind: 'prompt_schema_oversized',
+              estimatedTokens: promptTokens,
+              threshold,
+              site: 'prompt',
+            },
+          });
+        }
+
+        // Dropped refinements are only meaningful for the DEFAULT rendering,
+        // which provably omits them. With a custom renderer the author owns the
+        // guidance text (they may well describe the rule), so we don't claim it.
+        if (ctx.mode === 'json-schema') {
+          const dropped = detectDroppedRefinements(schema);
+          if (dropped.count > 0) {
+            this.emitEvent({
+              type: 'schema_diagnostic',
+              agent: agent._name,
+              data: {
+                kind: 'dropped_refinements',
+                count: dropped.count,
+                paths: dropped.paths,
+                site: 'prompt',
+              },
+            });
+            warnSchemaDiagnosticOnce(
+              `${agent._name}\0dropped_refinements\0prompt\0${dropped.count}\0${dropped.paths.join(',')}`,
+              `${dropped.count} refinement(s) on the output schema for agent '${agent._name}' ` +
+                `(at ${dropped.paths.join(', ')}) are dropped from the model-facing JSON Schema — ` +
+                `the model is never told the rule, then parsing rejects it. Surface it in the prompt ` +
+                `(schemaPrompt) or repair with ctx.verify.`,
+              silent,
+            );
+          }
+        }
+      }
+
+      // ── Native structured output the provider can't honor (R10) ────────────
+      const nativeOut = options?.nativeStructuredOutput ?? agent._config.nativeStructuredOutput;
+      if (nativeOut && toolDefs.length === 0) {
+        const support = ctx.provider.nativeStructuredOutputSupport?.(ctx.model) ?? 'schema';
+        if (support !== 'schema') {
+          this.emitEvent({
+            type: 'schema_diagnostic',
+            agent: agent._name,
+            data: {
+              kind: 'native_output_unsupported',
+              ...(ctx.provider.name ? { provider: ctx.provider.name } : {}),
+              support,
+            },
+          });
+          warnSchemaDiagnosticOnce(
+            `${agent._name}\0native_output_unsupported\0${ctx.provider.name ?? ctx.model}`,
+            `nativeStructuredOutput is set on agent '${agent._name}' but provider ` +
+              `'${ctx.provider.name ?? ctx.model}' ${support === 'downgraded' ? 'downgrades it to plain JSON mode' : support === 'lossy' ? 'sanitizes the schema lossily' : 'ignores it structurally'} — ` +
+              `the schema shape is not natively enforced. The prompt text remains the parse ` +
+              `contract; the call proceeds.`,
+            silent,
+          );
+        }
       }
 
       // ── Streaming gate — mirrors the gate at the stream site: progressive
-      //    `partial_object` requires a `ZodObject` root and no tools. ──────────
+      //    `partial_object` requires a `ZodObject` root and no tools. Only
+      //    surface it when streaming is actually active (an observer is
+      //    present); telling a non-streaming caller that streaming is "disabled"
+      //    is pure noise and would fire on every plain `execute()`. This is
+      //    exactly J5's situation (they subscribe to `ctx.events`/`AxlStream`). ─
       const rootIsObject = schema instanceof z.ZodObject;
       const hasTools = toolDefs.length > 0;
-      if (!rootIsObject || hasTools) {
+      if (this._streamingEnabled && (!rootIsObject || hasTools)) {
         // Prefer the more actionable cause when both hold: a non-object root is
         // the surprising one J5 hits (`z.discriminatedUnion` looks streamable);
         // `tools` is expected. Only the non-object cause earns a console.warn.
@@ -2330,7 +2463,7 @@ export class WorkflowContext<TInput = unknown> {
 
     // ── Tool-def schemas ───────────────────────────────────────────────────
     for (const tool of agent._config.tools ?? []) {
-      const toolTokens = estimateTokens(JSON.stringify(zodToJsonSchema(tool.inputSchema)));
+      const toolTokens = estimateInlineSchemaTokens(tool.inputSchema);
       if (toolTokens > threshold) {
         this.emitEvent({
           type: 'schema_diagnostic',
@@ -2359,7 +2492,7 @@ export class WorkflowContext<TInput = unknown> {
           },
         });
         warnSchemaDiagnosticOnce(
-          `${agent._name}\0dropped_refinements\0tool\0${tool.name}`,
+          `${agent._name}\0dropped_refinements\0tool\0${tool.name}\0${droppedTool.count}`,
           `${droppedTool.count} refinement(s) on tool '${tool.name}' input schema ` +
             `(at ${droppedTool.paths.join(', ')}) are dropped from the tool definition — the ` +
             `model is never told the constraint. Validate inside the tool handler instead.`,
@@ -3835,6 +3968,8 @@ export class WorkflowContext<TInput = unknown> {
       });
       return this.ask(agents[0], prompt, {
         schema: options?.schema,
+        schemaPrompt: options?.schemaPrompt,
+        nativeStructuredOutput: options?.nativeStructuredOutput,
         retries: options?.retries,
         metadata: options?.metadata,
         validate: options?.validate,
@@ -3895,6 +4030,8 @@ export class WorkflowContext<TInput = unknown> {
 
     return this.ask(routerAgent, prompt, {
       schema: options?.schema,
+      schemaPrompt: options?.schemaPrompt,
+      nativeStructuredOutput: options?.nativeStructuredOutput,
       retries: options?.retries,
       metadata: options?.metadata,
       validate: options?.validate,

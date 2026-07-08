@@ -473,8 +473,9 @@ or a missing progressive UI. Axl surfaces these as `schema_diagnostic` events
 |---|---|---|
 | `prompt_schema_oversized` | The appended prompt schema — or a tool-def schema — exceeds the token threshold (`data.site: 'prompt' \| 'tool'`, `data.tool?`) | No (event-only) |
 | `dropped_refinements` | The schema carries `.refine()`/`.superRefine()` rules that `z.toJSONSchema` drops, so the model never sees them and `.parse` may reject (`data.count`, `data.paths`, `data.site`, `data.tool?`) | Yes |
-| `streaming_disabled` | Progressive `partial_object` streaming is off because the schema root isn't a `ZodObject` (`cause: 'non-object'`) or tools are present (`cause: 'tools'`) | Only for `non-object` (the `tools` cause is expected) |
+| `streaming_disabled` | Progressive `partial_object` streaming is off because the schema root isn't a `ZodObject` (`cause: 'non-object'`) or tools are present (`cause: 'tools'`). Only fires when streaming is actually active (an observer is present) — a plain non-streaming `execute()` never emits it | Only for `non-object` (the `tools` cause is expected) |
 | `schema_prompt_none_no_guidance` | `schemaPrompt: 'none'` was set with a schema and no override, so the model gets zero shape guidance | Yes |
+| `native_output_unsupported` | `nativeStructuredOutput` was requested but the resolved provider can't honor the derived schema — it `downgraded` it to plain JSON mode, sanitized it `lossy`, or left it `unsupported` (prompt-only). The call proceeds regardless | Yes |
 
 **Why the `console.warn`.** The trace console is off by default and the median
 consumer never wires up `ctx.events`, so an event alone would re-bury the pain.

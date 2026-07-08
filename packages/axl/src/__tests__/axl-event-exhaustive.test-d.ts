@@ -82,6 +82,8 @@ function assertExhaustive(ev: AxlEvent): string {
           return ev.data.cause;
         case 'schema_prompt_none_no_guidance':
           return ev.data.kind;
+        case 'native_output_unsupported':
+          return ev.data.support;
         default: {
           const _exhaustiveDiag: never = ev.data;
           return _exhaustiveDiag;

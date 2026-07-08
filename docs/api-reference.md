@@ -279,6 +279,8 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `schema` | `ZodType<T>` | — | Validates and parses the response as structured output. On validation failure, retries with accumulating context |
+| `schemaPrompt` | `'json-schema' \| 'none' \| { render: string \| (schema) => string }` | `'json-schema'` | How `schema` is rendered into the model-facing prompt. `'none'` appends nothing (schema stays the parse gate; fires a `schema_prompt_none_no_guidance` diagnostic); `{ render }` appends exactly your string/function output. Does NOT affect the `.parse` gate. See [providers.md](providers.md#structured-output-prompt-guided-default-vs-native) |
+| `nativeStructuredOutput` | `boolean` | `false` | Opt into the provider's native `json_schema` path, deriving the provider schema from the same `schema` (no second, contradictable schema). Only when a `schema` is set and no tools. Providers that can't honor it downgrade/ignore it and a `native_output_unsupported` diagnostic warns; the call proceeds. See [providers.md](providers.md#structured-output-prompt-guided-default-vs-native) |
 | `retries` | `number` | `3` | Number of schema validation retries |
 | `validate` | `OutputValidator<T>` | — | Post-schema business rule validation. Receives the parsed typed object. Only runs when `schema` is set. See [Validate](#validate) |
 | `validateRetries` | `number` | `2` | Maximum retries for `validate` failures |

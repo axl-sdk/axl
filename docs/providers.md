@@ -478,6 +478,41 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 | `stop` | ✅ | ❌ silently ignored | ✅ | ✅ |
 | `providerOptions` | ✅ | ✅ | ✅ | ✅ |
 
+### Structured output: prompt-guided (default) vs. native
+
+By default `ctx.ask({ schema })` is **prompt-guided**: Axl appends a JSON-Schema
+description to the prompt and validates the reply client-side with Zod. This is
+portable across every provider and degrades gracefully. Two knobs tune it (spec
+22, `docs/api-reference.md`):
+
+- **`schemaPrompt`** — controls the model-facing rendering only (the Zod schema
+  is still the parse gate): `'json-schema'` (default), `'none'` (append nothing —
+  parse gate only), or `{ render }` (custom string/function). Use `'none'` +
+  hand-tuned system guidance when you want the schema to contribute zero prompt
+  tokens.
+- **`nativeStructuredOutput: true`** — opt into the provider's *native*
+  `json_schema` path. Axl derives the provider schema from the **same** Zod
+  schema (you never supply a second, drift-prone JSON Schema). Support varies:
+
+  | Provider | Native `json_schema` support | On opt-in |
+  |---|---|---|
+  | OpenAI Chat / Responses | ✅ constrained decoding | used as-is |
+  | OpenAI-compatible | ✅ when the profile's `supportsJsonSchema` is true | else **downgraded** to `json_object` |
+  | Google Gemini | ⚠️ accepted but sanitized (`$ref`/`$defs`/… stripped) | **lossy** |
+  | Anthropic | ❌ ignored structurally (system-prompt JSON instruction) | **unsupported** |
+
+  When the resolved provider can't fully honor it (downgraded / lossy /
+  unsupported), Axl emits a `native_output_unsupported` `schema_diagnostic` and a
+  one-time warning, then **proceeds** — the prompt text remains the parse contract
+  (see [observability.md#schema-diagnostics](./observability.md#schema-diagnostics)).
+
+**Why prompt-guided is the default (not native).** Native constrained decoding
+caps schema depth and can degrade output quality on complex schemas (e.g. large
+discriminated unions), and behavior differs sharply per provider. Prompt-guided
++ client-side Zod validation is the portable, predictable default; reach for
+`nativeStructuredOutput` on simple, flat schemas where a provider you control
+enforces it well.
+
 ### `providerOptions`
 
 Provider-specific options merged directly into the raw API request body. Use this as an escape hatch for provider features that don't fit the unified API.

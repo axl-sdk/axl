@@ -22,6 +22,12 @@ import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
  */
 export class OpenAIResponsesProvider implements Provider {
   readonly name = 'openai-responses';
+
+  /** The Responses API honors `json_schema` (structured outputs) natively. */
+  nativeStructuredOutputSupport(): 'schema' {
+    return 'schema';
+  }
+
   private baseUrl: string;
   private apiKeySource: ApiKeySource;
   private governor?: RateLimiter;

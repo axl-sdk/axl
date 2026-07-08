@@ -162,6 +162,13 @@ function clampAnthropicEffort(
  */
 export class AnthropicProvider implements Provider {
   readonly name = 'anthropic';
+
+  /** Anthropic ignores native `json_schema` structurally — Axl uses a system
+   *  prompt JSON instruction + client-side Zod validation (see buildRequest). */
+  nativeStructuredOutputSupport(): 'unsupported' {
+    return 'unsupported';
+  }
+
   private baseUrl: string;
   private apiKeySource: ApiKeySource;
   private governor?: RateLimiter;

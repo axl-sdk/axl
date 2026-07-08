@@ -87,9 +87,36 @@ export type AwaitHumanOptions = {
   metadata?: Record<string, unknown>;
 };
 
+/**
+ * Controls how the output `schema` is rendered into the MODEL-FACING prompt
+ * (spec 22, Problem B). Independent of the `.parse` gate — whichever mode you
+ * pick, the full Zod `schema` still validates the reply.
+ *
+ *  - `'json-schema'` (default) — append the compact, `$ref`-hoisted JSON-Schema
+ *    guidance (`Respond with valid JSON matching this schema: …`).
+ *  - `'none'` — append NOTHING; the schema is the parse gate only. Fires a
+ *    `schema_prompt_none_no_guidance` diagnostic (the model gets zero shape hint).
+ *  - `{ render }` — append exactly this string, or the string your function
+ *    returns from the schema. Object form (not a bare string) so custom text can
+ *    never collide with the `'none'` / `'json-schema'` sentinels.
+ */
+export type SchemaPromptOption =
+  | 'json-schema'
+  | 'none'
+  | { render: string | ((schema: z.ZodType<unknown>) => string) };
+
 /** Ask options */
 export type AskOptions<T = unknown> = {
   schema?: z.ZodType<T>;
+  /** How the `schema` is rendered into the model-facing prompt. Default
+   *  `'json-schema'`. Does not affect the `.parse` gate. See `SchemaPromptOption`. */
+  schemaPrompt?: SchemaPromptOption;
+  /** Opt into the provider's NATIVE structured-output path (`json_schema`),
+   *  deriving the provider schema from `schema` (no second, contradictable
+   *  schema). Providers that can't honor it downgrade/ignore it and a
+   *  `schema_diagnostic` warns; the call still proceeds. Only takes effect when
+   *  a `schema` is set and no tools are registered. Default `false`. */
+  nativeStructuredOutput?: boolean;
   retries?: number;
   /** Post-schema business rule validation. Receives the parsed typed object after schema
    *  validation succeeds. Only runs when `schema` is set. Retries with accumulating context
@@ -121,6 +148,12 @@ export type AskOptions<T = unknown> = {
 export type DelegateOptions<T = unknown> = {
   /** Zod schema for structured output from the selected agent. */
   schema?: z.ZodType<T>;
+  /** How the `schema` is rendered into the selected agent's prompt. Forwarded to
+   *  the terminal `ctx.ask()`. See `SchemaPromptOption`. */
+  schemaPrompt?: SchemaPromptOption;
+  /** Opt the terminal `ctx.ask()` into the provider's native structured-output
+   *  path. Forwarded to the selected agent's ask. */
+  nativeStructuredOutput?: boolean;
   /** Model URI for the internal router agent (default: first candidate's model). */
   routerModel?: string;
   /** Additional metadata passed to the router and selected agent. */
@@ -415,7 +448,17 @@ export type SchemaDiagnosticData =
       tool?: string;
     }
   | { kind: 'streaming_disabled'; rootType: string; cause: 'non-object' | 'tools' }
-  | { kind: 'schema_prompt_none_no_guidance' };
+  | { kind: 'schema_prompt_none_no_guidance' }
+  | {
+      /** `nativeStructuredOutput` was requested but the resolved provider can't
+       *  honor the derived schema — it downgrades it to plain JSON mode
+       *  (`downgraded`), sanitizes it lossily (`lossy`, e.g. Gemini strips
+       *  keywords), or ignores it structurally and relies on the prompt
+       *  (`unsupported`, e.g. Anthropic). The call proceeds regardless (O5). */
+      kind: 'native_output_unsupported';
+      provider?: string;
+      support: 'downgraded' | 'lossy' | 'unsupported';
+    };
 
 /** Data shape for legacy `guardrail` events. Replaced by `pipeline` in PR 2. */
 export type GuardrailData = {

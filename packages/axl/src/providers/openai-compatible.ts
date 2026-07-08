@@ -391,6 +391,20 @@ export type OpenAICompatibleOptions = {
  */
 export class OpenAICompatibleProvider implements Provider {
   readonly name: string;
+
+  /** `json_schema` is honored natively when the profile's `supportsJsonSchema`
+   *  capability is true for this model (the default); otherwise the engine
+   *  downgrades the request to plain `json_object` (see `buildRequestBody`),
+   *  which does NOT enforce the schema shape. */
+  nativeStructuredOutputSupport(model: string): 'schema' | 'downgraded' {
+    const supportsSchema = resolvePerModel(
+      this.profile.capabilities?.supportsJsonSchema,
+      model,
+      true,
+    );
+    return supportsSchema ? 'schema' : 'downgraded';
+  }
+
   protected readonly profile: ProviderProfile;
   protected readonly baseUrl: string;
   /** A key string, or a resolver invoked per request (expiring tokens). */

@@ -117,6 +117,7 @@ export type {
   ValidateData,
   StringDeltaData,
   AskOptions,
+  SchemaPromptOption,
   DelegateOptions,
   RaceOptions,
   VoteOptions,

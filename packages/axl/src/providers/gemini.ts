@@ -223,6 +223,14 @@ function warnGemini3xEffortNone(model: string): void {
  */
 export class GeminiProvider implements Provider {
   readonly name = 'google';
+
+  /** Gemini accepts a `responseSchema` but `sanitizeSchemaForGemini` strips
+   *  keywords it doesn't support (`$ref`/`$defs`/`additionalProperties`/…), so a
+   *  derived schema can lose constraints — lossy, not faithful. */
+  nativeStructuredOutputSupport(): 'lossy' {
+    return 'lossy';
+  }
+
   private baseUrl: string;
   private apiKeySource: ApiKeySource;
   private callCounter = 0;

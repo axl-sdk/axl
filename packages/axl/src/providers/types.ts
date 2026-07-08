@@ -125,6 +125,25 @@ export interface Provider {
    * Stream a chat completion, yielding chunks as they arrive.
    */
   stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk>;
+
+  /**
+   * How this provider honors a `responseFormat: { type: 'json_schema' }` derived
+   * from the caller's Zod schema, for `model` (spec 22, Problem B / R10). Used by
+   * the runtime to warn — via a `schema_diagnostic` — when `nativeStructuredOutput`
+   * can't be honored, WITHOUT failing the call (portable multi-provider code must
+   * still run). Optional: an adapter that omits it is assumed to honor the schema
+   * fully (`'schema'`), so unknown adapters simply opt out of the warning.
+   *
+   *  - `'schema'` — native constrained decoding against the schema (e.g. OpenAI).
+   *  - `'downgraded'` — accepted but downgraded to plain `json_object`; the schema
+   *    shape is NOT enforced structurally (e.g. an OpenAI-compatible profile with
+   *    `supportsJsonSchema: false`).
+   *  - `'lossy'` — accepted but the schema is sanitized and may lose keywords
+   *    (e.g. Gemini strips `$ref`/`$defs`/`additionalProperties`).
+   *  - `'unsupported'` — ignored structurally; the provider relies on the prompt
+   *    JSON instruction instead (e.g. Anthropic).
+   */
+  nativeStructuredOutputSupport?(model: string): 'schema' | 'downgraded' | 'lossy' | 'unsupported';
 }
 
 /**

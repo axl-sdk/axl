@@ -59,16 +59,28 @@ export function detectDroppedRefinements(schema: z.ZodType): DroppedRefinements 
     const def = (node as { _zod?: { def?: Record<string, unknown> } })._zod?.def;
     if (!def) return;
 
-    // 1. Custom checks on THIS node = dropped refinements.
+    const here = () => paths.add(path === '' ? '<root>' : path);
+
+    // 1a. `.refine()`/`.superRefine()` attach a `custom` CHECK to an otherwise
+    //     normal node (e.g. a ZodObject with `checks: [{ check: 'custom' }]`).
     const checks = def.checks;
     if (Array.isArray(checks)) {
       for (const check of checks) {
         const kind = (check as { _zod?: { def?: { check?: string } } })?._zod?.def?.check;
         if (kind === 'custom') {
           count += 1;
-          paths.add(path === '' ? '<root>' : path);
+          here();
         }
       }
+    }
+    // 1b. `z.custom()` / `z.instanceof()` are custom-TYPE nodes: the validator
+    //     lives directly on the def (`def.type === 'custom'`, `def.check ===
+    //     'custom'`, no `checks` array) and `z.toJSONSchema` renders them to a
+    //     literally empty `{}` — the most opaque cliff, worse than a dropped
+    //     `.refine()` (which at least renders the base type). Count it once.
+    if (def.check === 'custom') {
+      count += 1;
+      here();
     }
 
     // 2. Recurse into children by container shape.
@@ -92,7 +104,11 @@ export function detectDroppedRefinements(schema: z.ZodType): DroppedRefinements 
       def.items.forEach((item, i) => walk(item, `${path}[${i}]`));
     }
     if ('rest' in def && def.rest) walk(def.rest, `${path}[]`);
-    // record / map: { keyType, valueType }
+    // object catchall: { catchall } — the value schema for extra keys.
+    if ('catchall' in def && def.catchall) walk(def.catchall, `${path}[*]`);
+    // record / map: { keyType, valueType } — refinements can live on the KEY too
+    // (rendered as `propertyNames`, and a `.refine()` there is dropped).
+    if ('keyType' in def) walk(def.keyType, `${path}[key]`);
     if ('valueType' in def) walk(def.valueType, `${path}[*]`);
     // pipe / transform: { in, out } — refinements can live on either side.
     if ('in' in def) walk(def.in, path);
@@ -119,6 +135,11 @@ export function detectDroppedRefinements(schema: z.ZodType): DroppedRefinements 
 // ── One-time deduped console.warn (R8) ───────────────────────────────────────
 
 const DOCS_URL = 'docs/observability.md#schema-diagnostics';
+/** Cap so a process that mints dynamic agent names (e.g. `agent-<uuid>` per
+ *  request/tenant) can't grow this Set without bound. On overflow we clear it —
+ *  at worst a warning repeats after thousands of distinct cliffs, which is far
+ *  better than an unbounded leak. */
+const MAX_WARNED_KEYS = 2048;
 const warnedDiagnosticKeys = new Set<string>();
 
 /**
@@ -135,6 +156,7 @@ const warnedDiagnosticKeys = new Set<string>();
 export function warnSchemaDiagnosticOnce(key: string, message: string, silent?: boolean): void {
   if (silent || process.env.AXL_DIAGNOSTICS_SILENT === 'true') return;
   if (warnedDiagnosticKeys.has(key)) return;
+  if (warnedDiagnosticKeys.size >= MAX_WARNED_KEYS) warnedDiagnosticKeys.clear();
   warnedDiagnosticKeys.add(key);
   console.warn(`[axl] ${message} See ${DOCS_URL}.`);
 }

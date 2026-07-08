@@ -1,5 +1,5 @@
 import type { Tool } from './tool.js';
-import type { AskOptions, GuardrailsConfig } from './types.js';
+import type { AskOptions, GuardrailsConfig, SchemaPromptOption } from './types.js';
 import type { Effort, ToolChoice } from './providers/types.js';
 import { ProviderRegistry } from './providers/registry.js';
 import { WorkflowContext } from './context.js';
@@ -34,6 +34,12 @@ export type AgentConfig = {
   stop?: string[];
   /** Provider-specific options merged into API requests. Not portable across providers. */
   providerOptions?: Record<string, unknown>;
+  /** Default rendering of a `ctx.ask` output schema into this agent's prompt.
+   *  Overridable per-call via `AskOptions.schemaPrompt`. See `SchemaPromptOption`. */
+  schemaPrompt?: SchemaPromptOption;
+  /** Default opt-in to the provider's native structured-output path for this
+   *  agent. Overridable per-call via `AskOptions.nativeStructuredOutput`. */
+  nativeStructuredOutput?: boolean;
   maxTurns?: number;
   timeout?: string;
   maxContext?: number;

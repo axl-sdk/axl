@@ -49,6 +49,22 @@ cross-provider `effort`, tool-calling, and cost surfaces.
   the oversized threshold is configurable via
   `AxlConfig.diagnostics.schemaOversizedTokens` (default 4000). See
   `docs/observability.md#schema-diagnostics`.
+- **`schemaPrompt` — decouple the prompt contract from the parse schema.** A new
+  `AskOptions`/`AgentConfig` option controls how a `ctx.ask` output schema is
+  rendered into the model-facing prompt, independently of the Zod `.parse` gate:
+  `'json-schema'` (default), `'none'` (append nothing — schema stays the parse
+  gate only; fires a `schema_prompt_none_no_guidance` diagnostic), or
+  `{ render: string | (schema) => string }` for fully custom guidance. Forwarded
+  through `ctx.delegate`.
+- **`nativeStructuredOutput` — provider-neutral native structured output.** A new
+  `AskOptions`/`AgentConfig` boolean opts into the provider's native `json_schema`
+  path, deriving the provider schema from the **same** Zod schema (no second,
+  contradictable JSON Schema). Providers that can't honor it — Anthropic
+  (ignores), Gemini (lossy sanitize), OpenAI-compatible profiles with
+  `supportsJsonSchema: false` (downgrade to `json_object`) — emit a
+  `native_output_unsupported` diagnostic and proceed. Adds an optional
+  `Provider.nativeStructuredOutputSupport(model)` capability method. Forwarded
+  through `ctx.delegate`. See `docs/providers.md`.
 
 ### Changed
 - **Unknown model cost is now `undefined`, not `0`.** Pricing-table misses no

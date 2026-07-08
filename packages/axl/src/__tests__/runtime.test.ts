@@ -3325,6 +3325,19 @@ describe("state.persist: 'streaming' (#1)", () => {
         depth: 0,
         data: {},
       } as any,
+      {
+        executionId: 'orphan-1',
+        step: 2,
+        type: 'agent_call_end',
+        agent: 'B',
+        model: 'unpriced-model',
+        tokens: { input: 10, output: 5 },
+        duration: 25,
+        timestamp: 1150,
+        askId: 'b',
+        depth: 0,
+        data: {},
+      } as any,
     ]);
 
     const runtime = new AxlRuntime({
@@ -3339,8 +3352,9 @@ describe("state.persist: 'streaming' (#1)", () => {
     expect(recovered[0].workflow).toBe('my-workflow');
     // totalCost summed from cost-bearing events
     expect(recovered[0].totalCost).toBeCloseTo(0.05);
+    expect(recovered[0].unpriced).toBe(true);
     // Events preserved
-    expect(recovered[0].events).toHaveLength(2);
+    expect(recovered[0].events).toHaveLength(3);
 
     // Saved to store + buffer finalized
     expect(saved).toHaveLength(1);

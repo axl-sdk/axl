@@ -53,7 +53,7 @@ export function reduceCost(acc: CostData, event: AxlEvent): CostData {
   // They carry no meaningful cost — any cost/token fields are incidental.
   if (isWorkflowStart && event.workflow) {
     const byWorkflow = { ...acc.byWorkflow };
-    const prev = byWorkflow[event.workflow] ?? { cost: 0, executions: 0 };
+    const prev = byWorkflow[event.workflow] ?? { cost: 0, executions: 0, unpricedCalls: 0 };
     byWorkflow[event.workflow] = { ...prev, executions: prev.executions + 1 };
     return { ...acc, byWorkflow };
   }
@@ -91,16 +91,26 @@ export function reduceCost(acc: CostData, event: AxlEvent): CostData {
 
   const byAgent = { ...acc.byAgent };
   if (event.agent) {
-    const prev = byAgent[event.agent] ?? { cost: 0, calls: 0 };
-    byAgent[event.agent] = { cost: prev.cost + cost, calls: prev.calls + 1 };
+    const prev = byAgent[event.agent] ?? { cost: 0, calls: 0, unpricedCalls: 0 };
+    byAgent[event.agent] = {
+      cost: prev.cost + cost,
+      calls: prev.calls + 1,
+      unpricedCalls: prev.unpricedCalls + (unpricedLeaf ? 1 : 0),
+    };
   }
 
   const byModel = { ...acc.byModel };
   if (event.model) {
-    const prev = byModel[event.model] ?? { cost: 0, calls: 0, tokens: { input: 0, output: 0 } };
+    const prev = byModel[event.model] ?? {
+      cost: 0,
+      calls: 0,
+      unpricedCalls: 0,
+      tokens: { input: 0, output: 0 },
+    };
     byModel[event.model] = {
       cost: prev.cost + cost,
       calls: prev.calls + 1,
+      unpricedCalls: prev.unpricedCalls + (unpricedLeaf ? 1 : 0),
       tokens: {
         input: prev.tokens.input + finite(tokens.input),
         output: prev.tokens.output + finite(tokens.output),
@@ -110,10 +120,11 @@ export function reduceCost(acc: CostData, event: AxlEvent): CostData {
 
   const byWorkflow = { ...acc.byWorkflow };
   if (event.workflow) {
-    const prev = byWorkflow[event.workflow] ?? { cost: 0, executions: 0 };
+    const prev = byWorkflow[event.workflow] ?? { cost: 0, executions: 0, unpricedCalls: 0 };
     byWorkflow[event.workflow] = {
       cost: prev.cost + cost,
       executions: prev.executions + (isWorkflowStart ? 1 : 0),
+      unpricedCalls: prev.unpricedCalls + (unpricedLeaf ? 1 : 0),
     };
   }
 
@@ -151,10 +162,11 @@ export function reduceCost(acc: CostData, event: AxlEvent): CostData {
     byEmbedder = { ...acc.byEmbedder };
     const modelKey = usage?.model ?? 'unknown';
     const embedTokens = typeof usage?.tokens === 'number' ? finite(usage.tokens) : 0;
-    const prev = byEmbedder[modelKey] ?? { cost: 0, calls: 0, tokens: 0 };
+    const prev = byEmbedder[modelKey] ?? { cost: 0, calls: 0, unpricedCalls: 0, tokens: 0 };
     byEmbedder[modelKey] = {
       cost: prev.cost + cost,
       calls: prev.calls + 1,
+      unpricedCalls: prev.unpricedCalls + (unpricedLeaf ? 1 : 0),
       tokens: prev.tokens + embedTokens,
     };
   }

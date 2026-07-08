@@ -253,12 +253,16 @@ describe('reduceCost', () => {
         makeEvent({
           type: 'agent_call_end',
           agent: 'a',
+          workflow: 'wf',
           model: 'm',
           tokens: { input: 10, output: 5 },
         }),
       );
       expect(out.unpricedCalls).toBe(1);
       expect(out.totalCost).toBe(0);
+      expect(out.byAgent.a.unpricedCalls).toBe(1);
+      expect(out.byModel.m.unpricedCalls).toBe(1);
+      expect(out.byWorkflow.wf.unpricedCalls).toBe(1);
     });
 
     it('does NOT count a priced call', () => {
@@ -281,17 +285,31 @@ describe('reduceCost', () => {
     it('counts an unpriced memory_recall', () => {
       const out = reduceCost(
         emptyCostData(),
-        makeEvent({ type: 'memory_recall', tokens: { input: 8 }, data: {} }),
+        makeEvent({
+          type: 'memory_recall',
+          tokens: { input: 8 },
+          data: { usage: { model: 'embedder', tokens: 8 } },
+        }),
       );
       expect(out.unpricedCalls).toBe(1);
+      expect(out.byEmbedder.embedder.unpricedCalls).toBe(1);
     });
 
     it('stays in parity with CostAggregator on the unpriced count', () => {
-      const ev = makeEvent({ type: 'agent_call_end', model: 'm', tokens: { input: 10 } });
+      const ev = makeEvent({
+        type: 'agent_call_end',
+        agent: 'a',
+        workflow: 'wf',
+        model: 'm',
+        tokens: { input: 10 },
+      });
       const reduced = reduceCost(emptyCostData(), ev);
       const agg = new CostAggregator(new ConnectionManager());
       agg.onTrace(ev);
       expect(agg.getData().unpricedCalls).toBe(reduced.unpricedCalls);
+      expect(agg.getData().byAgent.a.unpricedCalls).toBe(reduced.byAgent.a.unpricedCalls);
+      expect(agg.getData().byModel.m.unpricedCalls).toBe(reduced.byModel.m.unpricedCalls);
+      expect(agg.getData().byWorkflow.wf.unpricedCalls).toBe(reduced.byWorkflow.wf.unpricedCalls);
       expect(reduced.unpricedCalls).toBe(1);
     });
   });

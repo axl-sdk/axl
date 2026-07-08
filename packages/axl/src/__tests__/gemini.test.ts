@@ -549,7 +549,7 @@ describe('GeminiProvider', () => {
       expect(response.cost).toBeCloseTo(0.0001, 8);
     });
 
-    it('returns cost: 0 for unknown models (not undefined)', async () => {
+    it('returns undefined cost for unknown models (honest lower-bound signal)', async () => {
       mockFetch({
         json: () =>
           Promise.resolve(
@@ -566,8 +566,7 @@ describe('GeminiProvider', () => {
         model: 'gemini-unknown-model-9000',
       });
 
-      expect(response.cost).toBe(0);
-      expect(response.cost).not.toBeUndefined();
+      expect(response.cost).toBeUndefined();
     });
 
     it('prefers longer prefix matches for versioned model names', async () => {

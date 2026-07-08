@@ -1195,6 +1195,7 @@ export class AxlRuntime extends EventEmitter {
         exceeded: false,
         policy: 'finish_and_stop',
         unpriced: false,
+        unpricedCount: 0,
         unpricedWarned: false,
       },
     });
@@ -1352,6 +1353,7 @@ export class AxlRuntime extends EventEmitter {
         exceeded: false,
         policy: 'finish_and_stop',
         unpriced: false,
+        unpricedCount: 0,
         unpricedWarned: false,
       },
     });
@@ -1517,6 +1519,7 @@ export class AxlRuntime extends EventEmitter {
           exceeded: false,
           policy: 'finish_and_stop',
           unpriced: false,
+          unpricedCount: 0,
           unpricedWarned: false,
         },
       });

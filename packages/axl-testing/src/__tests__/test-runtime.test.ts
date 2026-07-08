@@ -227,6 +227,39 @@ describe('AxlTestRuntime', () => {
     });
   });
 
+  describe('unpriced()', () => {
+    it('reports true when a replayed response has usage but no cost', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.replay([
+        {
+          content: 'unpriced response',
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        },
+      ]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('HandleSupport', { msg: 'hello' });
+
+      expect(runtime.totalCost()).toBe(0);
+      expect(runtime.unpriced()).toBe(true);
+    });
+
+    it('reports false for a known-free response', async () => {
+      const runtime = new AxlTestRuntime();
+      const provider = MockProvider.sequence([{ content: 'free response', cost: 0 }]);
+
+      runtime.register(HandleSupport);
+      runtime.mockProvider('openai', provider);
+
+      await runtime.execute('HandleSupport', { msg: 'hello' });
+
+      expect(runtime.totalCost()).toBe(0);
+      expect(runtime.unpriced()).toBe(false);
+    });
+  });
+
   describe('steps()', () => {
     it('returns workflow_start and workflow_end steps', async () => {
       const runtime = new AxlTestRuntime();

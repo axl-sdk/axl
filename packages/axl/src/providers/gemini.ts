@@ -132,7 +132,7 @@ function estimateGeminiCost(
   inputTokens: number,
   outputTokens: number,
   cachedTokens?: number,
-): number {
+): number | undefined {
   let pricing = GEMINI_PRICING[model];
   if (!pricing) {
     for (const key of GEMINI_PRICING_KEYS_BY_LENGTH) {
@@ -142,7 +142,7 @@ function estimateGeminiCost(
       }
     }
   }
-  if (!pricing) return 0;
+  if (!pricing) return undefined;
 
   const [inputRate, outputRate] = pricing;
   const cached = cachedTokens ?? 0;

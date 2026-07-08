@@ -54,8 +54,8 @@ describe('CostAggregator', () => {
     });
 
     const data = aggregator.getData();
-    expect(data.byAgent['agent-a']).toEqual({ cost: 0.01, calls: 1 });
-    expect(data.byAgent['agent-b']).toEqual({ cost: 0.02, calls: 1 });
+    expect(data.byAgent['agent-a']).toEqual({ cost: 0.01, calls: 1, unpricedCalls: 0 });
+    expect(data.byAgent['agent-b']).toEqual({ cost: 0.02, calls: 1, unpricedCalls: 0 });
     expect(data.byModel['model-x'].cost).toBe(0.01);
     expect(data.byModel['model-y'].cost).toBe(0.02);
     expect(data.byWorkflow['wf-1']).toBeDefined();
@@ -82,7 +82,11 @@ describe('CostAggregator', () => {
     });
 
     const data = aggregator.getData();
-    expect(data.byWorkflow['wf-exec']).toEqual({ cost: 0.05, executions: 3 });
+    expect(data.byWorkflow['wf-exec']).toEqual({
+      cost: 0.05,
+      executions: 3,
+      unpricedCalls: 0,
+    });
   });
 
   it('reset zeroes all counters', () => {
@@ -290,12 +294,14 @@ describe('CostAggregator', () => {
       expect(data.byEmbedder['text-embedding-3-small']).toEqual({
         cost: 0.000005 + 0.000003,
         calls: 2,
+        unpricedCalls: 0,
         tokens: 16,
       });
       // Large model: 1 call
       expect(data.byEmbedder['text-embedding-3-large']).toEqual({
         cost: 0.0001,
         calls: 1,
+        unpricedCalls: 0,
         tokens: 100,
       });
       // Total cost still includes embedder cost (rides the same rail)
@@ -331,6 +337,7 @@ describe('CostAggregator', () => {
       expect(data.byEmbedder['local-embedder']).toEqual({
         cost: 0,
         calls: 1,
+        unpricedCalls: 1,
         tokens: 50,
       });
       // CRITICAL: memory tokens must NOT conflate with agent prompt tokens
@@ -355,6 +362,7 @@ describe('CostAggregator', () => {
       expect(data.byEmbedder['unknown']).toEqual({
         cost: 0.000002,
         calls: 1,
+        unpricedCalls: 0,
         tokens: 4,
       });
     });

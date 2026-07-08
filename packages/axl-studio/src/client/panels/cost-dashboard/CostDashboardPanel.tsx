@@ -81,6 +81,10 @@ export function CostDashboardPanel() {
   const embedderEntries = Object.entries(byEmbedder);
   const embedderTotalCost = embedderEntries.reduce((sum, [, d]) => sum + d.cost, 0);
   const embedderTotalCalls = embedderEntries.reduce((sum, [, d]) => sum + d.calls, 0);
+  const embedderTotalUnpriced = embedderEntries.reduce(
+    (sum, [, d]) => sum + (d.unpricedCalls ?? 0),
+    0,
+  );
   const embedderTotalTokens = embedderEntries.reduce((sum, [, d]) => sum + d.tokens, 0);
   const embedderPercent = costs.totalCost > 0 ? (embedderTotalCost / costs.totalCost) * 100 : 0;
 
@@ -152,7 +156,7 @@ export function CostDashboardPanel() {
           {Object.keys(costs.byAgent).length === 0 ? (
             <p className="text-xs text-[hsl(var(--muted-foreground))]">No agent data</p>
           ) : (
-            <CostTable<{ agent: string; cost: number; calls: number }>
+            <CostTable<{ agent: string; cost: number; calls: number; unpricedCalls: number }>
               columns={[
                 {
                   label: 'Agent',
@@ -167,13 +171,14 @@ export function CostDashboardPanel() {
                 {
                   label: 'Cost',
                   sortKey: (row) => row.cost,
-                  render: (row) => <CostBadge cost={row.cost} />,
+                  render: (row) => <CostBadge cost={row.cost} unpriced={row.unpricedCalls > 0} />,
                 },
               ]}
               rows={Object.entries(costs.byAgent).map(([agent, data]) => ({
                 agent,
                 cost: data.cost,
                 calls: data.calls,
+                unpricedCalls: data.unpricedCalls ?? 0,
               }))}
               rowKey={(row) => row.agent}
               defaultSort={{ index: 2, dir: 'desc' }}
@@ -188,7 +193,13 @@ export function CostDashboardPanel() {
           {Object.keys(costs.byModel).length === 0 ? (
             <p className="text-xs text-[hsl(var(--muted-foreground))]">No model data</p>
           ) : (
-            <CostTable<{ model: string; calls: number; tokens: number; cost: number }>
+            <CostTable<{
+              model: string;
+              calls: number;
+              tokens: number;
+              cost: number;
+              unpricedCalls: number;
+            }>
               columns={[
                 {
                   label: 'Model',
@@ -208,7 +219,7 @@ export function CostDashboardPanel() {
                 {
                   label: 'Cost',
                   sortKey: (row) => row.cost,
-                  render: (row) => <CostBadge cost={row.cost} />,
+                  render: (row) => <CostBadge cost={row.cost} unpriced={row.unpricedCalls > 0} />,
                 },
               ]}
               rows={Object.entries(costs.byModel).map(([model, data]) => ({
@@ -216,6 +227,7 @@ export function CostDashboardPanel() {
                 calls: data.calls,
                 tokens: data.tokens.input + data.tokens.output,
                 cost: data.cost,
+                unpricedCalls: data.unpricedCalls ?? 0,
               }))}
               rowKey={(row) => row.model}
               defaultSort={{ index: 3, dir: 'desc' }}
@@ -235,6 +247,7 @@ export function CostDashboardPanel() {
               executions: number;
               cost: number;
               avgCost: number;
+              unpricedCalls: number;
             }>
               columns={[
                 {
@@ -250,12 +263,14 @@ export function CostDashboardPanel() {
                 {
                   label: 'Total Cost',
                   sortKey: (row) => row.cost,
-                  render: (row) => <CostBadge cost={row.cost} />,
+                  render: (row) => <CostBadge cost={row.cost} unpriced={row.unpricedCalls > 0} />,
                 },
                 {
                   label: 'Avg Cost',
                   sortKey: (row) => row.avgCost,
-                  render: (row) => <CostBadge cost={row.avgCost} />,
+                  render: (row) => (
+                    <CostBadge cost={row.avgCost} unpriced={row.unpricedCalls > 0} />
+                  ),
                 },
               ]}
               rows={Object.entries(costs.byWorkflow).map(([wf, data]) => ({
@@ -263,6 +278,7 @@ export function CostDashboardPanel() {
                 executions: data.executions,
                 cost: data.cost,
                 avgCost: data.executions > 0 ? data.cost / data.executions : 0,
+                unpricedCalls: data.unpricedCalls ?? 0,
               }))}
               rowKey={(row) => row.workflow}
               defaultSort={{ index: 2, dir: 'desc' }}
@@ -279,7 +295,10 @@ export function CostDashboardPanel() {
             <div className="flex items-baseline justify-between mb-3">
               <h3 className="text-sm font-medium">Memory (Embedder)</h3>
               <span className="text-xs text-[hsl(var(--muted-foreground))]">
-                {formatCost(embedderTotalCost)} across {embedderTotalCalls} call
+                {embedderTotalUnpriced > 0
+                  ? `≥ ${formatCost(embedderTotalCost)}`
+                  : formatCost(embedderTotalCost)}{' '}
+                across {embedderTotalCalls} call
                 {embedderTotalCalls !== 1 ? 's' : ''}
                 <span className="opacity-40 mx-1.5">·</span>
                 {formatTokens(embedderTotalTokens)} tokens
@@ -291,7 +310,13 @@ export function CostDashboardPanel() {
                 )}
               </span>
             </div>
-            <CostTable<{ model: string; calls: number; tokens: number; cost: number }>
+            <CostTable<{
+              model: string;
+              calls: number;
+              tokens: number;
+              cost: number;
+              unpricedCalls: number;
+            }>
               columns={[
                 {
                   label: 'Embedder Model',
@@ -311,7 +336,7 @@ export function CostDashboardPanel() {
                 {
                   label: 'Cost',
                   sortKey: (row) => row.cost,
-                  render: (row) => <CostBadge cost={row.cost} />,
+                  render: (row) => <CostBadge cost={row.cost} unpriced={row.unpricedCalls > 0} />,
                 },
               ]}
               rows={embedderEntries.map(([model, data]) => ({
@@ -319,6 +344,7 @@ export function CostDashboardPanel() {
                 calls: data.calls,
                 tokens: data.tokens,
                 cost: data.cost,
+                unpricedCalls: data.unpricedCalls ?? 0,
               }))}
               rowKey={(row) => row.model}
               defaultSort={{ index: 3, dir: 'desc' }}

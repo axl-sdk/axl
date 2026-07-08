@@ -151,3 +151,23 @@ describe('trackExecution().unpriced', () => {
     expect(tracked.cost).toBeCloseTo(0.002, 6);
   });
 });
+
+describe('trackCost().unpriced', () => {
+  it('is TRUE when a tracked call was unpriced; cost is a lower bound', async () => {
+    const runtime = makeRuntime(seqProvider([{ content: 'ok', usage }]));
+    runtime.register(askWorkflow);
+
+    const tracked = await runtime.trackCost(() => runtime.execute('ask-wf', 'go'));
+    expect(tracked.unpriced).toBe(true);
+    expect(tracked.cost).toBe(0);
+  });
+
+  it('is FALSE when every tracked call was priced', async () => {
+    const runtime = makeRuntime(seqProvider([{ content: 'ok', usage, cost: 0.002 }]));
+    runtime.register(askWorkflow);
+
+    const tracked = await runtime.trackCost(() => runtime.execute('ask-wf', 'go'));
+    expect(tracked.unpriced).toBe(false);
+    expect(tracked.cost).toBeCloseTo(0.002, 6);
+  });
+});

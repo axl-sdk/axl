@@ -109,7 +109,7 @@ describe('OpenRouter preset', () => {
     const r = await provider(OPENROUTER_PROFILE).chat(user, { model: 'm' });
     expect(r.thinking_content).toBe('because');
     expect(r.providerMetadata).toEqual({
-      openaiCompatReasoning: { field: 'reasoning_details', value: details },
+      openaiCompatReasoning: { provider: 'openrouter', field: 'reasoning_details', value: details },
     });
   });
 });
@@ -134,6 +134,18 @@ describe('Azure preset', () => {
     await azure().chat(user, { model: 'my-deployment' });
     expect(req(fetchMock).headers['api-key']).toBe('k');
     expect(req(fetchMock).headers.Authorization).toBeUndefined();
+  });
+
+  it('can override authHeader for Entra bearer-token callbacks', async () => {
+    const fetchMock = mockFetch(ok());
+    await new OpenAICompatibleProvider({
+      profile: AZURE_PROFILE,
+      baseUrl: AZURE_BASE,
+      apiKey: async () => 'entra-token',
+      authHeader: 'bearer',
+    }).chat(user, { model: 'my-deployment' });
+    expect(req(fetchMock).headers.Authorization).toBe('Bearer entra-token');
+    expect(req(fetchMock).headers['api-key']).toBeUndefined();
   });
 
   it('prices when the deployment is named after a known model, undefined otherwise', async () => {
@@ -208,7 +220,7 @@ describe('DeepSeek preset', () => {
     const r = await provider(DEEPSEEK_PROFILE).chat(user, { model: 'deepseek-reasoner' });
     expect(r.thinking_content).toBe('chain');
     expect(r.providerMetadata).toEqual({
-      openaiCompatReasoning: { field: 'reasoning_content', value: 'chain' },
+      openaiCompatReasoning: { provider: 'deepseek', field: 'reasoning_content', value: 'chain' },
     });
   });
 

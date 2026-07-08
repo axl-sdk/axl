@@ -318,7 +318,7 @@ describe('AnthropicProvider', () => {
       expect(response.cost).toBeCloseTo(0.00175, 5);
     });
 
-    it('returns cost: 0 for unknown models (not undefined)', async () => {
+    it('returns undefined cost for unknown models (honest lower-bound signal)', async () => {
       mockFetch({
         json: () =>
           Promise.resolve({
@@ -337,8 +337,7 @@ describe('AnthropicProvider', () => {
         maxTokens: 1024,
       });
 
-      expect(response.cost).toBe(0);
-      expect(response.cost).not.toBeUndefined();
+      expect(response.cost).toBeUndefined();
     });
 
     it('handles API errors gracefully', async () => {

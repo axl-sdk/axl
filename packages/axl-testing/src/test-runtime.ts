@@ -184,8 +184,20 @@ export class AxlTestRuntime {
           if (response !== undefined) {
             this.recorded.push({
               content: response,
-              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-              cost: event.cost ?? 0,
+              usage: event.tokens
+                ? {
+                    prompt_tokens: event.tokens.input ?? 0,
+                    completion_tokens: event.tokens.output ?? 0,
+                    total_tokens:
+                      (event.tokens.input ?? 0) +
+                      (event.tokens.output ?? 0) +
+                      (event.tokens.reasoning ?? 0),
+                    ...(event.tokens.reasoning !== undefined
+                      ? { reasoning_tokens: event.tokens.reasoning }
+                      : {}),
+                  }
+                : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+              ...(event.cost !== undefined ? { cost: event.cost } : {}),
             });
           }
         }

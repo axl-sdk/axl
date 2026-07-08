@@ -160,12 +160,22 @@ export type ExecutionInfo = {
   status: 'running' | 'completed' | 'failed';
   events: AxlEvent[];
   totalCost: number;
+  /** True when `totalCost` is a lower bound because at least one leaf call was unpriced. */
+  unpriced?: boolean;
   startedAt: number;
   completedAt?: number;
   duration: number;
   result?: unknown;
   error?: string;
 };
+
+type CostBucket = { cost: number; calls: number; unpricedCalls: number };
+
+type TokenCostBucket = CostBucket & { tokens: { input: number; output: number } };
+
+type WorkflowCostBucket = { cost: number; executions: number; unpricedCalls: number };
+
+type EmbedderCostBucket = CostBucket & { tokens: number };
 
 /** Cost data */
 export type CostData = {
@@ -174,12 +184,9 @@ export type CostData = {
    *  model). When > 0, `totalCost` is a lower bound. */
   unpricedCalls: number;
   totalTokens: { input: number; output: number; reasoning: number };
-  byAgent: Record<string, { cost: number; calls: number }>;
-  byModel: Record<
-    string,
-    { cost: number; calls: number; tokens: { input: number; output: number } }
-  >;
-  byWorkflow: Record<string, { cost: number; executions: number }>;
+  byAgent: Record<string, CostBucket>;
+  byModel: Record<string, TokenCostBucket>;
+  byWorkflow: Record<string, WorkflowCostBucket>;
   /** Cost decomposition by retry reason. `primary` is first-attempt calls;
    *  `schema`/`validate`/`guardrail` are retry-attempt costs bucketed by
    *  which gate triggered the retry. Optional because a client may be talking
@@ -200,7 +207,7 @@ export type CostData = {
    *  `ctx.recall({query})`). Keyed by embedder model; `tokens` is a flat
    *  count (embeddings APIs don't split input/output). Optional for the
    *  same back-compat reason as `retry` — older servers won't emit it. */
-  byEmbedder?: Record<string, { cost: number; calls: number; tokens: number }>;
+  byEmbedder?: Record<string, EmbedderCostBucket>;
 };
 
 /** Session summary */

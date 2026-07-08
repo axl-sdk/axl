@@ -32,7 +32,11 @@ describe('ApiKeySource union (T2.2)', () => {
 
   it('AxlConfig.providers carries the union through', () => {
     const cfg: AxlConfig = {
-      providers: { openrouter: { apiKey: async () => 'tok' }, openai: { apiKey: 'sk' } },
+      providers: {
+        openrouter: { apiKey: async () => 'tok' },
+        openai: { apiKey: 'sk' },
+        azure: { apiKey: async () => 'entra-token', authHeader: 'bearer' },
+      },
     };
     void cfg;
   });

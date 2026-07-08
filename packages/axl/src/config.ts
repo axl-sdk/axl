@@ -1,5 +1,6 @@
 import type { RateLimitConfig } from './providers/rate-limiter.js';
 import type { ApiKeySource } from './providers/types.js';
+import type { AuthHeader } from './providers/openai-compatible.js';
 
 /** Provider configuration */
 export type ProviderConfig = {
@@ -8,6 +9,8 @@ export type ProviderConfig = {
    *  the common case. See {@link ApiKeySource}. */
   apiKey?: ApiKeySource;
   baseUrl?: string;
+  /** OpenAI-compatible presets only: override the profile auth header shape. */
+  authHeader?: AuthHeader;
   /**
    * Opt-in client-side rate governor for this provider's HTTP calls (see
    * {@link RateLimitConfig}). Bounds in-flight request concurrency (and,

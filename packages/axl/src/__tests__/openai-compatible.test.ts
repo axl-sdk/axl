@@ -192,6 +192,33 @@ describe('priceFromTable', () => {
   });
 });
 
+describe('zero pricing', () => {
+  it('returns cost 0 for a known-free provider even when usage is omitted', async () => {
+    mockFetch(okJson({ usage: undefined }));
+    const r = await makeProvider({ pricing: { kind: 'zero' } }).chat(userMsg, { model: 'm' });
+    expect(r.usage).toBeUndefined();
+    expect(r.cost).toBe(0);
+  });
+
+  it('streams cost 0 for a known-free provider even when usage is omitted', async () => {
+    mockFetch({
+      body: sseStream([
+        'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}',
+        'data: [DONE]',
+      ]),
+    });
+    const chunks: any[] = [];
+    for await (const c of makeProvider({ pricing: { kind: 'zero' } }).stream(userMsg, {
+      model: 'm',
+    })) {
+      chunks.push(c);
+    }
+    const done = chunks.find((c) => c.type === 'done');
+    expect(done.usage).toBeUndefined();
+    expect(done.cost).toBe(0);
+  });
+});
+
 describe('resolvePerModel', () => {
   it('resolves plain values, functions, and the fallback', () => {
     expect(resolvePerModel(['a'], 'm', [])).toEqual(['a']);
@@ -510,7 +537,7 @@ describe('reasoning capture (chat)', () => {
     // Capture still surfaces thinking AND the round-trip bag is attached.
     expect(r.thinking_content).toBe('x');
     expect(r.providerMetadata).toEqual({
-      openaiCompatReasoning: { field: 'reasoning_content', value: 'x' },
+      openaiCompatReasoning: { provider: 'test', field: 'reasoning_content', value: 'x' },
     });
   });
 });
@@ -524,12 +551,16 @@ describe('reasoning round-trip echo (on-tool-call-turns)', () => {
     role: 'assistant',
     content: '',
     tool_calls: [{ id: 't1', type: 'function', function: { name: 'f', arguments: '{}' } }],
-    providerMetadata: { openaiCompatReasoning: { field: 'reasoning_content', value: 'echoed' } },
+    providerMetadata: {
+      openaiCompatReasoning: { provider: 'test', field: 'reasoning_content', value: 'echoed' },
+    },
   };
   const assistantPlain: ChatMessage = {
     role: 'assistant',
     content: 'just text',
-    providerMetadata: { openaiCompatReasoning: { field: 'reasoning_content', value: 'nope' } },
+    providerMetadata: {
+      openaiCompatReasoning: { provider: 'test', field: 'reasoning_content', value: 'nope' },
+    },
   };
 
   it('echoes reasoning on an assistant turn that carried tool_calls', async () => {
@@ -539,6 +570,29 @@ describe('reasoning round-trip echo (on-tool-call-turns)', () => {
     }).chat([assistantWithToolCall], { model: 'm' });
     const msgs = lastRequest(fetchMock).body.messages as Array<Record<string, unknown>>;
     expect(msgs[0].reasoning_content).toBe('echoed');
+  });
+
+  it('does NOT echo reasoning metadata captured by a different compatible provider', async () => {
+    const fetchMock = mockFetch(okJson());
+    const foreign: ChatMessage = {
+      ...assistantWithToolCall,
+      providerMetadata: {
+        openaiCompatReasoning: {
+          provider: 'openrouter',
+          field: 'reasoning_details',
+          value: [{ type: 'reasoning.text' }],
+        },
+      },
+    };
+    await makeProvider({
+      name: 'deepseek',
+      reasoning: { emit: () => {}, capture: 'reasoning_content', roundTrip: 'on-tool-call-turns' },
+    }).chat([foreign], { model: 'm' });
+
+    const msgs = lastRequest(fetchMock).body.messages as Array<Record<string, unknown>>;
+    expect(msgs[0]).not.toHaveProperty('reasoning_content');
+    expect(msgs[0]).not.toHaveProperty('reasoning');
+    expect(msgs[0]).not.toHaveProperty('reasoning_details');
   });
 
   it('does NOT echo reasoning on a plain assistant turn', async () => {
@@ -678,7 +732,7 @@ describe('streaming', () => {
       }),
     );
     expect(chunks.find((c) => c.type === 'done').providerMetadata).toEqual({
-      openaiCompatReasoning: { field: 'reasoning_content', value: 'r1r2' },
+      openaiCompatReasoning: { provider: 'test', field: 'reasoning_content', value: 'r1r2' },
     });
   });
 
@@ -807,7 +861,9 @@ describe('round-trip field allowlist', () => {
       content: '',
       tool_calls: [{ id: 't1', type: 'function', function: { name: 'f', arguments: '{}' } }],
       // A malformed/hostile history entry trying to overwrite the model field.
-      providerMetadata: { openaiCompatReasoning: { field: 'model', value: 'evil-model' } },
+      providerMetadata: {
+        openaiCompatReasoning: { provider: 'test', field: 'model', value: 'evil-model' },
+      },
     };
     await makeProvider({
       reasoning: { emit: () => {}, capture: 'reasoning_content', roundTrip: 'on-tool-call-turns' },
@@ -869,21 +925,51 @@ describe('streaming edge cases', () => {
       }),
     );
     expect(chunks.find((c) => c.type === 'done').providerMetadata).toEqual({
-      openaiCompatReasoning: { field: 'reasoning_details', value: [{ i: 1 }, { i: 2 }] },
+      openaiCompatReasoning: {
+        provider: 'test',
+        field: 'reasoning_details',
+        value: [{ i: 1 }, { i: 2 }],
+      },
     });
   });
 
-  it('still emits a done chunk + flushes think tags when the stream ends without [DONE]', async () => {
+  it('throws ProviderError on an in-band SSE error payload', async () => {
+    mockFetch({
+      body: sseStream(['data: {"error":{"message":"stream failed","type":"server_error"}}']),
+    });
+
+    await expect(collect(makeProvider())).rejects.toMatchObject({
+      name: 'ProviderError',
+      provider: 'test',
+      status: 0,
+      retryable: false,
+      message: 'stream failed',
+    });
+  });
+
+  it('flushes think tags then throws when the stream ends without [DONE]', async () => {
     mockFetch({
       body: sseStream([
         'data: {"choices":[{"delta":{"content":"visible<think>hidden"},"finish_reason":null}]}',
         // no "data: [DONE]" — abrupt close
       ]),
     });
-    const chunks = await collect(
-      makeProvider({ reasoning: { emit: () => {}, capture: 'think_tags' } }),
-    );
-    expect(chunks.some((c) => c.type === 'done')).toBe(true);
+    const chunks: any[] = [];
+    const p = (async () => {
+      for await (const c of makeProvider({
+        reasoning: { emit: () => {}, capture: 'think_tags' },
+      }).stream(userMsg, { model: 'm' })) {
+        chunks.push(c);
+      }
+    })();
+    await expect(p).rejects.toMatchObject({
+      name: 'ProviderError',
+      provider: 'test',
+      status: 0,
+      retryable: true,
+      message: 'Test stream ended before [DONE]',
+    });
+    expect(chunks.some((c) => c.type === 'done')).toBe(false);
     const thinking = chunks
       .filter((c) => c.type === 'thinking_delta')
       .map((c) => c.content)

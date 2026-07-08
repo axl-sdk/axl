@@ -1643,7 +1643,7 @@ describe('runEval: onProgress callback', () => {
 describe('runEval: captureTraces', () => {
   // A tiny in-process workflow that triggers a real agent_call trace event
   // so we can assert the per-item trace capture end-to-end.
-  async function buildTracingRuntime() {
+  async function buildTracingRuntime(options: { omitCost?: boolean } = {}) {
     const { AxlRuntime, agent, workflow } = await import('@axlsdk/axl');
     const runtime = new AxlRuntime({ defaultProvider: 'mock' });
     const provider = {
@@ -1651,14 +1651,14 @@ describe('runEval: captureTraces', () => {
       chat: async () => ({
         content: 'answer',
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-        cost: 0.002,
+        ...(options.omitCost ? {} : { cost: 0.002 }),
       }),
       stream: async function* () {
         yield { type: 'text_delta' as const, content: 'answer' };
         yield {
           type: 'done' as const,
           usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-          cost: 0.002,
+          ...(options.omitCost ? {} : { cost: 0.002 }),
         };
       },
     };
@@ -1704,6 +1704,26 @@ describe('runEval: captureTraces', () => {
     // Trace cost should match item cost
     for (const item of result.items) {
       expect(item.cost).toBeGreaterThan(0);
+    }
+  });
+
+  it('preserves lower-bound cost flags from trackExecution in eval artifacts', async () => {
+    const { runtime } = await buildTracingRuntime({ omitCost: true });
+    const result = await runEval(
+      { workflow: 'ask', dataset: testDataset, scorers: [] },
+      async (input, rt) => {
+        const output = await rt.execute('ask', input);
+        return { output };
+      },
+      runtime,
+      { captureTraces: true },
+    );
+
+    expect(result.totalCost).toBe(0);
+    expect(result.unpriced).toBe(true);
+    for (const item of result.items) {
+      expect(item.cost).toBe(0);
+      expect(item.unpriced).toBe(true);
     }
   });
 

@@ -1335,14 +1335,22 @@ describe('OpenAIResponsesProvider', () => {
 
       const provider = new OpenAIResponsesProvider();
       const chunks: unknown[] = [];
-      await expect(async () => {
+      const p = (async () => {
         for await (const chunk of provider.stream([{ role: 'user', content: 'Hi' }], {
           model: 'gpt-4o',
           maxTokens: 1024,
         })) {
           chunks.push(chunk);
         }
-      }).rejects.toThrow('OpenAI Responses API error: Context length exceeded');
+      })();
+      await expect(p).rejects.toMatchObject({
+        name: 'ProviderError',
+        provider: 'openai-responses',
+        status: 0,
+        retryable: false,
+        message: 'OpenAI Responses API error: Context length exceeded',
+      });
+      expect(chunks).toEqual([]);
     });
   });
 });

@@ -104,29 +104,26 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('preset: DeepSeek', () => {
         model: 'deepseek-reasoner',
         maxTokens: 64,
         tools,
+        toolChoice: { type: 'function', function: { name: 'get_time' } },
       },
     );
-    // If it asked for the tool, echo the reasoning back on the tool-call turn
-    // (the per-turn rule we must not 400 on).
-    if (first.tool_calls?.length) {
-      const followup = await provider().chat(
-        [
-          { role: 'user', content: 'What time is it? Use the tool.' },
-          {
-            role: 'assistant',
-            content: first.content,
-            tool_calls: first.tool_calls,
-            providerMetadata: first.providerMetadata,
-          },
-          { role: 'tool', content: '12:00', tool_call_id: first.tool_calls[0].id },
-        ],
-        { model: 'deepseek-reasoner', maxTokens: 64, tools },
-      );
-      expect(typeof followup.content).toBe('string');
-    } else {
-      // Even without a tool call, reasoning_content should have been captured.
-      expect(typeof first.content).toBe('string');
-    }
+    expect(first.tool_calls?.length).toBeGreaterThan(0);
+    expect(first.providerMetadata).toBeDefined();
+
+    const followup = await provider().chat(
+      [
+        { role: 'user', content: 'What time is it? Use the tool.' },
+        {
+          role: 'assistant',
+          content: first.content,
+          tool_calls: first.tool_calls,
+          providerMetadata: first.providerMetadata,
+        },
+        { role: 'tool', content: '12:00', tool_call_id: first.tool_calls![0].id },
+      ],
+      { model: 'deepseek-reasoner', maxTokens: 64, tools },
+    );
+    expect(typeof followup.content).toBe('string');
   });
 });
 

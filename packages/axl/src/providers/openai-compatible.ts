@@ -14,7 +14,7 @@ import {
   type ApiKeySource,
 } from './types.js';
 import { fetchWithRetry } from './retry.js';
-import { buildProviderError } from './errors.js';
+import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 
 // ===========================================================================
@@ -353,7 +353,7 @@ export function reasoningObjectEmit(
  */
 const ROUND_TRIP_FIELDS = ['reasoning_content', 'reasoning', 'reasoning_details'] as const;
 type RoundTripField = (typeof ROUND_TRIP_FIELDS)[number];
-type RoundTripReasoning = { field: RoundTripField; value: unknown };
+type RoundTripReasoning = { provider: string; field: RoundTripField; value: unknown };
 
 function isRoundTripField(field: unknown): field is RoundTripField {
   return typeof field === 'string' && (ROUND_TRIP_FIELDS as readonly string[]).includes(field);
@@ -364,6 +364,8 @@ export type OpenAICompatibleOptions = {
   /** API key or a per-request resolver (expiring tokens). See {@link ApiKeySource}. */
   apiKey?: ApiKeySource;
   baseUrl?: string;
+  /** Override the profile's auth header shape (e.g. Azure Entra bearer tokens). */
+  authHeader?: AuthHeader;
   rateLimit?: RateLimitConfig;
 };
 
@@ -377,6 +379,7 @@ export class OpenAICompatibleProvider implements Provider {
   protected readonly baseUrl: string;
   /** A key string, or a resolver invoked per request (expiring tokens). */
   protected readonly apiKeySource: ApiKeySource;
+  protected readonly authHeader?: AuthHeader;
   protected readonly governor?: RateLimiter;
 
   constructor(options: OpenAICompatibleOptions) {
@@ -385,6 +388,7 @@ export class OpenAICompatibleProvider implements Provider {
     this.name = p.name;
     this.apiKeySource =
       options.apiKey ?? (p.envApiKey ? process.env[p.envApiKey] : undefined) ?? '';
+    this.authHeader = options.authHeader;
     const envBase = p.envBaseUrl ? process.env[p.envBaseUrl] : undefined;
     const explicitBase = options.baseUrl ?? envBase;
     this.baseUrl = (explicitBase ?? p.defaultBaseUrl).replace(/\/$/, '');
@@ -492,7 +496,7 @@ export class OpenAICompatibleProvider implements Provider {
       ...(this.profile.headers ?? {}),
     };
     if (apiKey) {
-      const auth = this.profile.authHeader ?? 'bearer';
+      const auth = this.authHeader ?? this.profile.authHeader ?? 'bearer';
       if (auth === 'bearer') headers.Authorization = `Bearer ${apiKey}`;
       else if (auth === 'api-key') headers['api-key'] = apiKey;
       else headers[auth.header] = auth.scheme ? `${auth.scheme} ${apiKey}` : apiKey;
@@ -585,12 +589,20 @@ export class OpenAICompatibleProvider implements Provider {
       msg.tool_calls.length > 0
     ) {
       const rt = msg.providerMetadata?.openaiCompatReasoning as
-        | { field?: unknown; value?: unknown }
+        | { provider?: unknown; field?: unknown; value?: unknown }
         | undefined;
       // Validate the field against the closed allowlist before using it as a
       // dynamic body key — a malformed/hostile history entry must not be able to
-      // overwrite `model`, `messages`, etc.
-      if (rt && isRoundTripField(rt.field) && rt.value !== undefined && rt.value !== null) {
+      // overwrite `model`, `messages`, etc. The provider/profile check prevents
+      // one OpenAI-compatible backend's opaque reasoning payload from being
+      // echoed to another backend when a session switches providers.
+      if (
+        rt &&
+        rt.provider === this.name &&
+        isRoundTripField(rt.field) &&
+        rt.value !== undefined &&
+        rt.value !== null
+      ) {
         out[rt.field] = rt.value;
       }
     }
@@ -634,11 +646,10 @@ export class OpenAICompatibleProvider implements Provider {
     usage: ProviderResponse['usage'],
     reportedCost: number | undefined,
   ): number | undefined {
-    if (!usage) return undefined;
     const p = this.profile.pricing;
+    if (p.kind === 'zero') return 0;
+    if (!usage) return undefined;
     switch (p.kind) {
-      case 'zero':
-        return 0;
       case 'unknown':
         return undefined;
       case 'from-response':
@@ -676,19 +687,27 @@ export class OpenAICompatibleProvider implements Provider {
       case 'reasoning_content':
         if (typeof message.reasoning_content === 'string') {
           thinking = message.reasoning_content;
-          roundTrip = { field: 'reasoning_content', value: message.reasoning_content };
+          roundTrip = {
+            provider: this.name,
+            field: 'reasoning_content',
+            value: message.reasoning_content,
+          };
         }
         break;
       case 'reasoning':
         if (typeof message.reasoning === 'string') {
           thinking = message.reasoning;
-          roundTrip = { field: 'reasoning', value: message.reasoning };
+          roundTrip = { provider: this.name, field: 'reasoning', value: message.reasoning };
         }
         break;
       case 'reasoning_details':
         if (typeof message.reasoning === 'string') thinking = message.reasoning;
         if (message.reasoning_details !== undefined) {
-          roundTrip = { field: 'reasoning_details', value: message.reasoning_details };
+          roundTrip = {
+            provider: this.name,
+            field: 'reasoning_details',
+            value: message.reasoning_details,
+          };
         }
         break;
       case 'think_tags': {
@@ -783,11 +802,15 @@ export class OpenAICompatibleProvider implements Provider {
       if (this.profile.reasoning.roundTrip === 'on-tool-call-turns') {
         if (capture === 'reasoning_details' && reasoningDetails.length > 0) {
           providerMetadata = {
-            openaiCompatReasoning: { field: 'reasoning_details', value: reasoningDetails },
+            openaiCompatReasoning: {
+              provider: this.name,
+              field: 'reasoning_details',
+              value: reasoningDetails,
+            },
           };
         } else if ((capture === 'reasoning_content' || capture === 'reasoning') && reasoningText) {
           providerMetadata = {
-            openaiCompatReasoning: { field: capture, value: reasoningText },
+            openaiCompatReasoning: { provider: this.name, field: capture, value: reasoningText },
           };
         }
       }
@@ -830,6 +853,20 @@ export class OpenAICompatibleProvider implements Provider {
             parsed = JSON.parse(trimmed.slice(6)) as OpenAIStreamChunk;
           } catch {
             continue;
+          }
+
+          if (parsed.error) {
+            const message =
+              typeof parsed.error.message === 'string'
+                ? parsed.error.message
+                : `${this.profile.label ?? this.profile.name} stream error`;
+            throw new ProviderError({
+              provider: this.name,
+              status: 0,
+              retryable: false,
+              message,
+              body: JSON.stringify(parsed.error),
+            });
           }
 
           if (parsed.usage) {
@@ -910,7 +947,12 @@ export class OpenAICompatibleProvider implements Provider {
         if (flushed.thinking) yield { type: 'thinking_delta', content: flushed.thinking };
       }
       yield* flushPendingToolCalls();
-      yield makeDone();
+      throw new ProviderError({
+        provider: this.name,
+        status: 0,
+        retryable: true,
+        message: `${this.profile.label ?? this.profile.name} stream ended before [DONE]`,
+      });
     } finally {
       reader.releaseLock();
     }
@@ -950,6 +992,7 @@ type OpenAIChatResponse = {
 };
 
 type OpenAIStreamChunk = {
+  error?: { message?: string; [key: string]: unknown };
   choices?: Array<{
     delta: {
       content?: string;

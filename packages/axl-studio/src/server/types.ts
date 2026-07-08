@@ -42,6 +42,14 @@ export type AgentSummary = {
   stop?: string[];
 };
 
+type CostBucket = { cost: number; calls: number; unpricedCalls: number };
+
+type TokenCostBucket = CostBucket & { tokens: { input: number; output: number } };
+
+type WorkflowCostBucket = { cost: number; executions: number; unpricedCalls: number };
+
+type EmbedderCostBucket = CostBucket & { tokens: number };
+
 /** Cost aggregation data */
 export type CostData = {
   totalCost: number;
@@ -53,12 +61,9 @@ export type CostData = {
    */
   unpricedCalls: number;
   totalTokens: { input: number; output: number; reasoning: number };
-  byAgent: Record<string, { cost: number; calls: number }>;
-  byModel: Record<
-    string,
-    { cost: number; calls: number; tokens: { input: number; output: number } }
-  >;
-  byWorkflow: Record<string, { cost: number; executions: number }>;
+  byAgent: Record<string, CostBucket>;
+  byModel: Record<string, TokenCostBucket>;
+  byWorkflow: Record<string, WorkflowCostBucket>;
   /**
    * Cost decomposition by retry reason. `primary` accumulates cost from
    * `agent_call` events WITHOUT a `retryReason` (first-attempt calls).
@@ -92,7 +97,7 @@ export type CostData = {
    * and byAgent/byModel/byWorkflow buckets will always sum to ≤
    * totalCost; the difference is the embedder spend.
    */
-  byEmbedder: Record<string, { cost: number; calls: number; tokens: number }>;
+  byEmbedder: Record<string, EmbedderCostBucket>;
 };
 
 /** Session summary */

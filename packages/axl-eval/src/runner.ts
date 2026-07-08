@@ -171,6 +171,7 @@ export async function runEval(
         // non-object metadata (e.g. an array or scalar) doesn't silently
         // corrupt downstream math or shape expectations.
         evalItem.cost = extractUserCost(tracked.result) ?? tracked.cost;
+        if (tracked.unpriced) evalItem.unpriced = true;
         evalItem.metadata = extractUserMetadata(tracked.result) ?? tracked.metadata;
         if (tracked.traces && tracked.traces.length > 0) {
           evalItem.traces = tracked.traces;
@@ -361,6 +362,7 @@ export async function runEval(
     },
     timestamp: new Date().toISOString(),
     totalCost,
+    ...(evalItems.some((item) => item.unpriced) ? { unpriced: true } : {}),
     duration: Date.now() - startTime,
     items: evalItems,
     summary: {

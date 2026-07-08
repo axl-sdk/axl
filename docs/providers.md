@@ -145,7 +145,7 @@ Notes & caveats:
   tool-calling depends on server launch flags + per-model parsers.
 - **Azure (v1 API):** set the base URL to `https://{resource}.openai.azure.com/openai/v1`;
   the deployment name goes in the model slot. API-key auth uses the `api-key` header; Entra
-  token auth uses the async-key callback (set `apiKey` to a function — see below).
+  token auth uses the async-key callback plus `authHeader: 'bearer'` (see below).
 - **AWS Bedrock:** scoped to **gpt-oss** for now (Claude-on-Bedrock is a later native-adapter
   mode). Set a region base URL and a bearer token (`AWS_BEARER_TOKEN_BEDROCK`). Match the model
   id to the endpoint: the preferred `bedrock-mantle` endpoint uses **unsuffixed** ids
@@ -154,8 +154,9 @@ Notes & caveats:
   SigV4 — short-term tokens can use the async-key callback.
 - **Expiring credentials (Azure-Entra, Bedrock short-term, Databricks/IBM OAuth):** set a
   provider's `apiKey` to a function `() => string | Promise<string>` — Axl resolves it per
-  request, so your callback owns refresh. A plain string is the common case. (The callback
-  covers the four chat adapters; the semantic-memory embedder still takes a static key.)
+  request, so your callback owns refresh. Azure Entra also needs `authHeader: 'bearer'` because
+  the Azure preset defaults to `api-key` header auth. A plain string is the common case. (The
+  callback covers the four chat adapters; the semantic-memory embedder still takes a static key.)
 
 Build your own preset by cloning a `ProviderProfile` (see [Custom Providers](#custom-providers)).
 

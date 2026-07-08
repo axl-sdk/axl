@@ -75,6 +75,7 @@ function presetFactory(profile: ProviderProfile): ProviderFactory {
       profile,
       apiKey: opts.apiKey,
       baseUrl: opts.baseUrl,
+      authHeader: opts.authHeader,
       rateLimit: opts.rateLimit,
     });
   };

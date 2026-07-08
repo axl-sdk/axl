@@ -267,7 +267,9 @@ export function TraceExplorerPanel() {
                     <span className="text-[hsl(var(--muted-foreground))] truncate">
                       {exec.executionId.slice(0, 8)}… | {exec.events.length} events
                     </span>
-                    {exec.totalCost > 0 && <CostBadge cost={exec.totalCost} />}
+                    {(exec.totalCost > 0 || exec.unpriced) && (
+                      <CostBadge cost={exec.totalCost} unpriced={exec.unpriced} />
+                    )}
                   </div>
                   <div className="flex items-center gap-2 mt-1 text-[10px] text-[hsl(var(--muted-foreground))]">
                     <span>{formatTimestamp(exec.startedAt)}</span>

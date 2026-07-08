@@ -84,6 +84,8 @@ export type EvalResult = {
   metadata: Record<string, unknown>;
   timestamp: string;
   totalCost: number;
+  /** True when `totalCost` is a lower bound because at least one item used unpriced work. */
+  unpriced?: boolean;
   duration: number;
   items: EvalItem[];
   summary: EvalSummary;
@@ -113,6 +115,8 @@ export type EvalItem = {
   scores: Record<string, number | null>;
   duration?: number;
   cost?: number;
+  /** True when `cost` is a lower bound because this item used unpriced work. */
+  unpriced?: boolean;
   scorerCost?: number;
   scoreDetails?: Record<string, ScorerDetail>;
   /** Execution metadata forwarded from the runtime (models, tokens, agentCalls, etc). */

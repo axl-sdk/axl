@@ -238,6 +238,8 @@ type BudgetContextState = {
    * component, so a cost limit / hard_stop cannot trip on unpriced spend.
    */
   unpriced: boolean;
+  /** Monotonic count of unpriced leaves observed in this budget scope. */
+  unpricedCount: number;
   /** Dedup guard so the unpriced warning fires at most once per budget block. */
   unpricedWarned: boolean;
 };
@@ -683,6 +685,7 @@ export class WorkflowContext<TInput = unknown> {
           // whole-tree spend). `frame.askCost` is the spec-correct, this-ask-only
           // figure used on `ask_end` (decision 10).
           const costBefore = this.budgetContext?.totalCost ?? 0;
+          const unpricedCountBefore = this.budgetContext?.unpricedCount ?? 0;
           const resolveCtx = options?.metadata
             ? { metadata: { ...this.metadata, ...options.metadata } }
             : { metadata: this.metadata };
@@ -760,6 +763,7 @@ export class WorkflowContext<TInput = unknown> {
             // so reliability dashboards keyed off ask_end.outcome aren't
             // poisoned by hook bugs.
             const costAfter = this.budgetContext?.totalCost ?? 0;
+            const unpricedCountAfter = this.budgetContext?.unpricedCount ?? 0;
             if (this.onAgentCallComplete) {
               try {
                 this.onAgentCallComplete({
@@ -768,6 +772,7 @@ export class WorkflowContext<TInput = unknown> {
                   response: typeof result === 'string' ? result : JSON.stringify(result),
                   model: agent.resolveModel(resolveCtx),
                   cost: costAfter - costBefore,
+                  unpriced: frame.askUnpriced || unpricedCountAfter > unpricedCountBefore,
                   duration: Date.now() - askStart,
                   promptVersion: agent._config.version,
                   temperature: options?.temperature ?? agent._config.temperature,
@@ -2797,6 +2802,7 @@ export class WorkflowContext<TInput = unknown> {
       policy,
       abortController: controller,
       unpriced: false,
+      unpricedCount: 0,
       unpricedWarned: false,
     };
 
@@ -2832,7 +2838,10 @@ export class WorkflowContext<TInput = unknown> {
         // if an inner block spent unmeasured money, the parent's total is a lower bound too.
         if (parentBudget) {
           parentBudget.totalCost += this.budgetContext!.totalCost;
-          if (this.budgetContext!.unpriced) parentBudget.unpriced = true;
+          if (this.budgetContext!.unpriced) {
+            parentBudget.unpriced = true;
+            parentBudget.unpricedCount += this.budgetContext!.unpricedCount;
+          }
         }
         this.budgetContext = parentBudget;
       }
@@ -3793,6 +3802,7 @@ export class WorkflowContext<TInput = unknown> {
         // enforcement rail (`_accumulateBudgetCost`) never receives the unknown
         // component, so a cost limit / hard_stop still cannot trip on this spend.
         this.budgetContext.unpriced = true;
+        this.budgetContext.unpricedCount += 1;
         // Warn only when there's an ENFORCEABLE (finite) cost limit the user might
         // wrongly trust — the runtime installs an ambient `Infinity` budget on every
         // execution, and warning "your cost limit is a lower bound" there is a lie

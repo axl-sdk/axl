@@ -51,7 +51,7 @@ function estimateAnthropicCost(
   outputTokens: number,
   cacheReadTokens?: number,
   cacheWriteTokens?: number,
-): number {
+): number | undefined {
   // Try exact match first, then prefix match for versioned models
   let pricing = ANTHROPIC_PRICING[model];
   if (!pricing) {
@@ -62,7 +62,7 @@ function estimateAnthropicCost(
       }
     }
   }
-  if (!pricing) return 0;
+  if (!pricing) return undefined;
 
   const [inputRate, outputRate] = pricing;
   const cacheRead = cacheReadTokens ?? 0;
@@ -164,7 +164,6 @@ export class AnthropicProvider implements Provider {
   readonly name = 'anthropic';
   private baseUrl: string;
   private apiKeySource: ApiKeySource;
-  private currentModel?: string;
   private governor?: RateLimiter;
 
   constructor(
@@ -199,7 +198,6 @@ export class AnthropicProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
-    this.currentModel = options.model;
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, false);
 
@@ -227,7 +225,7 @@ export class AnthropicProvider implements Provider {
     }
 
     const json = (await res.json()) as AnthropicMessageResponse;
-    return this.parseResponse(json);
+    return this.parseResponse(json, options.model);
   }
 
   // ---------------------------------------------------------------------------
@@ -522,7 +520,7 @@ export class AnthropicProvider implements Provider {
   // Internal: response parsing
   // ---------------------------------------------------------------------------
 
-  private parseResponse(json: AnthropicMessageResponse): ProviderResponse {
+  private parseResponse(json: AnthropicMessageResponse, model: string): ProviderResponse {
     let content = '';
     let thinkingContent = '';
     const toolCalls: ToolCallMessage[] = [];
@@ -559,13 +557,7 @@ export class AnthropicProvider implements Provider {
       : undefined;
 
     const cost = json.usage
-      ? estimateAnthropicCost(
-          this.currentModel ?? '',
-          totalInput,
-          json.usage.output_tokens,
-          cacheRead,
-          cacheWrite,
-        )
+      ? estimateAnthropicCost(model, totalInput, json.usage.output_tokens, cacheRead, cacheWrite)
       : undefined;
 
     return {

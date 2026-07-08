@@ -13,6 +13,8 @@ import { AnthropicProvider } from '../providers/anthropic.js';
 import { GeminiProvider } from '../providers/gemini.js';
 import { OpenAIEmbedder } from '../memory/embedder-openai.js';
 import type { ChatMessage, ChatOptions } from '../providers/types.js';
+import { agent } from '../agent.js';
+import { createTestCtx } from './helpers.js';
 
 const originalFetch = globalThis.fetch;
 
@@ -158,6 +160,41 @@ describe('ProviderError backward-compat', () => {
     for (const status of RETRYABLE_STATUS_CODES) {
       expect(isRetryableStatus(status)).toBe(true);
     }
+  });
+});
+
+describe('ProviderError trace enrichment', () => {
+  it('copies status/retryable to agent_call_end and omits raw body', async () => {
+    const body = '{"error":{"message":"secret prompt echo"}}';
+    const provider = {
+      name: 'mock',
+      async chat() {
+        throw new ProviderError({
+          provider: 'mock',
+          status: 429,
+          retryable: true,
+          message: 'rate limited',
+          body,
+        });
+      },
+      async *stream() {
+        yield { type: 'done' as const };
+      },
+    };
+    const { ctx, traces } = createTestCtx({ provider });
+    const a = agent({ name: 'a', model: 'mock:m', system: 's' });
+
+    await expect(ctx.ask(a, 'hi')).rejects.toThrow('rate limited');
+
+    const end = traces.find((e) => e.type === 'agent_call_end');
+    expect(end).toBeDefined();
+    expect(end!.data).toMatchObject({
+      error: 'rate limited',
+      status: 429,
+      retryable: true,
+    });
+    expect(end!.data).not.toHaveProperty('body');
+    expect(JSON.stringify(end)).not.toContain(body);
   });
 });
 

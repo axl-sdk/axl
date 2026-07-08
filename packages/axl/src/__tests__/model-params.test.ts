@@ -9,11 +9,11 @@ import type { AxlEvent } from '../types.js';
 
 class TestProvider {
   readonly name = 'test';
-  private responses: Array<{ content: string }>;
+  private responses: Array<{ content: string; omitCost?: boolean }>;
   private callIndex = 0;
   calls: any[] = [];
 
-  constructor(responses: Array<{ content: string }>) {
+  constructor(responses: Array<{ content: string; omitCost?: boolean }>) {
     this.responses = responses;
   }
 
@@ -24,7 +24,7 @@ class TestProvider {
     return {
       content: resp.content,
       usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
-      cost: 0.001,
+      ...(resp.omitCost ? {} : { cost: 0.001 }),
     };
   }
 
@@ -187,6 +187,39 @@ describe('Configurable Model Parameters', () => {
       expect(captured.maxTokens).toBe(4096);
       expect(captured.temperature).toBeUndefined();
       expect(captured.effort).toBeUndefined();
+    });
+
+    it('reports when callback cost is a lower bound because the call was unpriced', async () => {
+      const provider = new TestProvider([{ content: 'hello', omitCost: true }]);
+      const a = agent({ model: 'test:m', system: 'sys' });
+
+      let captured: any;
+      const ctx = createTestContext(provider, {
+        onAgentCallComplete: (call) => {
+          captured = call;
+        },
+      });
+
+      await ctx.ask(a, 'hi');
+
+      expect(captured.cost).toBe(0);
+      expect(captured.unpriced).toBe(true);
+    });
+
+    it('reports callback cost as exact when the call was priced', async () => {
+      const provider = new TestProvider([{ content: 'hello' }]);
+      const a = agent({ model: 'test:m', system: 'sys' });
+
+      let captured: any;
+      const ctx = createTestContext(provider, {
+        onAgentCallComplete: (call) => {
+          captured = call;
+        },
+      });
+
+      await ctx.ask(a, 'hi');
+
+      expect(captured.unpriced).toBe(false);
     });
 
     it('hook throw does NOT corrupt ask_end.outcome.ok (post-success observability is isolated)', async () => {

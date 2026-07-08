@@ -52,7 +52,11 @@ export class CostAggregator {
     // Workflow" section displayed executions: 0 for every workflow in
     // production. Handle it first, then continue to the cost-bearing path.
     if (event.type === 'workflow_start' && event.workflow) {
-      const entry = this.data.byWorkflow[event.workflow] ?? { cost: 0, executions: 0 };
+      const entry = this.data.byWorkflow[event.workflow] ?? {
+        cost: 0,
+        executions: 0,
+        unpricedCalls: 0,
+      };
       entry.executions += 1;
       this.data.byWorkflow[event.workflow] = entry;
       this.connMgr.broadcast('costs', this.data);
@@ -69,7 +73,8 @@ export class CostAggregator {
     // discriminator so the dashboard count stays in lockstep with the SDK's
     // `ExecutionInfo.unpriced` / `ask_end.unpriced` (ask_end carries a numeric
     // cost and tool_call_end has no tokens, so both are excluded).
-    if (isUnpricedLeaf(event)) {
+    const unpricedLeaf = isUnpricedLeaf(event);
+    if (unpricedLeaf) {
       this.data.unpricedCalls += 1;
     }
 
@@ -87,9 +92,10 @@ export class CostAggregator {
     }
 
     if (event.agent) {
-      const entry = this.data.byAgent[event.agent] ?? { cost: 0, calls: 0 };
+      const entry = this.data.byAgent[event.agent] ?? { cost: 0, calls: 0, unpricedCalls: 0 };
       entry.cost += cost;
       entry.calls += 1;
+      if (unpricedLeaf) entry.unpricedCalls += 1;
       this.data.byAgent[event.agent] = entry;
     }
 
@@ -97,10 +103,12 @@ export class CostAggregator {
       const entry = this.data.byModel[event.model] ?? {
         cost: 0,
         calls: 0,
+        unpricedCalls: 0,
         tokens: { input: 0, output: 0 },
       };
       entry.cost += cost;
       entry.calls += 1;
+      if (unpricedLeaf) entry.unpricedCalls += 1;
       entry.tokens.input += tokens.input ?? 0;
       entry.tokens.output += tokens.output ?? 0;
       this.data.byModel[event.model] = entry;
@@ -111,8 +119,13 @@ export class CostAggregator {
       // above; here we only accumulate cost from agent_call / memory /
       // tool events that were emitted inside the workflow (all of which
       // now carry `event.workflow` via `emitTrace`'s auto-stamp).
-      const entry = this.data.byWorkflow[event.workflow] ?? { cost: 0, executions: 0 };
+      const entry = this.data.byWorkflow[event.workflow] ?? {
+        cost: 0,
+        executions: 0,
+        unpricedCalls: 0,
+      };
       entry.cost += cost;
+      if (unpricedLeaf) entry.unpricedCalls += 1;
       this.data.byWorkflow[event.workflow] = entry;
     }
 
@@ -150,9 +163,15 @@ export class CostAggregator {
       const d = (event.data ?? {}) as { usage?: { model?: string; tokens?: number } };
       const modelKey = d.usage?.model ?? 'unknown';
       const embedTokens = typeof d.usage?.tokens === 'number' ? d.usage.tokens : 0;
-      const entry = this.data.byEmbedder[modelKey] ?? { cost: 0, calls: 0, tokens: 0 };
+      const entry = this.data.byEmbedder[modelKey] ?? {
+        cost: 0,
+        calls: 0,
+        unpricedCalls: 0,
+        tokens: 0,
+      };
       entry.cost += cost;
       entry.calls += 1;
+      if (unpricedLeaf) entry.unpricedCalls += 1;
       entry.tokens += embedTokens;
       this.data.byEmbedder[modelKey] = entry;
     }

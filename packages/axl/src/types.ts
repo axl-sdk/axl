@@ -909,6 +909,8 @@ export type AgentCallInfo = {
   response: string;
   model: string;
   cost: number;
+  /** True when `cost` is a lower bound because the call tree included unpriced work. */
+  unpriced: boolean;
   duration: number;
   promptVersion?: string;
   temperature?: number;

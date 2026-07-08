@@ -10,7 +10,7 @@ import {
 import type { ReasoningEffort } from './openai.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
-import { buildProviderError } from './errors.js';
+import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 
 /**
@@ -508,7 +508,12 @@ export class OpenAIResponsesProvider implements Provider {
           data.response?.error?.message ??
           data.response?.status_details?.error?.message ??
           'Unknown error';
-        throw new Error(`OpenAI Responses API error: ${errorMsg}`);
+        throw new ProviderError({
+          provider: this.name,
+          status: 0,
+          retryable: false,
+          message: `OpenAI Responses API error: ${errorMsg}`,
+        });
       }
 
       default:

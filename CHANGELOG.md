@@ -7,9 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Broad provider expansion: the OpenAI adapter now powers first-class presets for
-OpenAI-compatible hosted providers and local runtimes while preserving Axl's
-cross-provider `effort`, tool-calling, and cost surfaces.
+Two themes. **Broad provider expansion:** the OpenAI adapter now powers
+first-class presets for OpenAI-compatible hosted providers and local runtimes
+while preserving Axl's cross-provider `effort`, tool-calling, and cost surfaces.
+**Structured-output & `ctx.ask` pipeline control:** cheaper, more accurate
+schema prompts by default; `schemaPrompt` and `nativeStructuredOutput` to steer
+the model-facing contract independently of the Zod parse gate; and a
+`schema_diagnostic` event that surfaces the previously-silent structured-output
+cliffs.
 
 ### Added
 - **OpenAI-compatible provider profiles.** New generic `OpenAICompatibleProvider`
@@ -28,15 +33,21 @@ cross-provider `effort`, tool-calling, and cost surfaces.
 - **Unpriced-cost honesty.** `ask_end`, `ExecutionInfo`, `runtime.trackExecution`,
   `AxlTestRuntime`, budget status, and Studio now flag lower-bound totals when a
   model reports usage but no usable cost.
-- **Cheaper structured-output prompts.** When `ctx.ask({ schema })` appends the
-  JSON-Schema guidance, subschemas shared across (e.g.) discriminated-union arms
-  are now hoisted into `$defs`/`$ref` once instead of duplicated inline, and the
-  JSON is emitted compact (no pretty-print indentation). For large unions with
-  shared sub-objects this cuts the appended schema tokens by an order of magnitude
-  with no code change. The exported `zodToJsonSchema` (used for provider tool
-  definitions) is unchanged — it stays inline, which is required for Gemini, whose
-  schema sanitizer strips `$ref`/`$defs`. Zod→JSON-Schema conversions are also
-  memoized by schema identity, benefiting the per-turn tool-definition path.
+- **Cheaper, more accurate structured-output prompts.** When `ctx.ask({ schema })`
+  appends the JSON-Schema guidance, subschemas shared across (e.g.)
+  discriminated-union arms are now hoisted into `$defs`/`$ref` once instead of
+  duplicated inline, and the JSON is emitted compact (no pretty-print
+  indentation) — an order-of-magnitude token cut for large unions with shared
+  sub-objects, with no code change. The guidance is also rendered from the
+  schema's **input** side (`z.toJSONSchema`'s `io: 'input'`), so a `.transform()`/
+  `.pipe()` schema shows the model the pre-transform fields it must produce
+  instead of collapsing to an empty `{}` (the default `'output'` mode's behavior
+  for transforms); plain schemas are unchanged except non-strict objects
+  correctly omit `additionalProperties: false` while `.strict()` keeps it. The
+  exported `zodToJsonSchema` (used for provider tool definitions) stays inline,
+  which is required for Gemini, whose schema sanitizer strips `$ref`/`$defs`;
+  Zod→JSON-Schema conversions are memoized by schema identity, benefiting the
+  per-turn tool-definition path.
 - **`schema_diagnostic` events for silent structured-output cliffs.** A new
   `AskScoped` event (surfaced in `ctx.events` / `AxlStream` and `.lifecycle`)
   fires — once per ask — when: an appended prompt schema or a tool-def schema
@@ -70,15 +81,11 @@ cross-provider `effort`, tool-calling, and cost surfaces.
   through `ctx.delegate` to the terminal agent on both the single- and
   multi-candidate (handoff) paths. On OpenAI the `json_schema` is sent non-strict
   (schema-as-guidance); true strict-mode constrained decoding is a follow-up.
-  See `docs/providers.md`.
-
-- **Structured-output prompts render the schema's INPUT shape.** The appended
-  guidance now uses `z.toJSONSchema`'s `io: 'input'` mode, so a `.transform()` /
-  `.pipe()` output schema shows the model the pre-transform fields it must
-  produce instead of collapsing to an empty `{}` (the default `'output'` mode's
-  behavior for transforms). Plain schemas are unchanged except non-strict objects
-  correctly omit `additionalProperties: false` (they accept extra keys); `.strict()`
-  keeps it. This makes the documented `.transform()` repair recipe work.
+  See `docs/api-reference.md#structured-output` and `docs/providers.md`.
+- **Repair recipes for recoverable output.** Documented first-class support for
+  repairing structurally-off output without a reject-and-retry: a Zod
+  `.transform()`/`.pipe()` in the schema (pure, runs inside `.parse`, no extra
+  LLM turn) and `ctx.verify` (LLM-in-the-loop). See `docs/use-cases.md`.
 
 ### Fixed
 - **Groq `json_schema` support is now per-model.** `nativeStructuredOutput` on

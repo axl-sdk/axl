@@ -66,6 +66,14 @@ cross-provider `effort`, tool-calling, and cost surfaces.
   `Provider.nativeStructuredOutputSupport(model)` capability method. Forwarded
   through `ctx.delegate`. See `docs/providers.md`.
 
+- **Structured-output prompts render the schema's INPUT shape.** The appended
+  guidance now uses `z.toJSONSchema`'s `io: 'input'` mode, so a `.transform()` /
+  `.pipe()` output schema shows the model the pre-transform fields it must
+  produce instead of collapsing to an empty `{}` (the default `'output'` mode's
+  behavior for transforms). Plain schemas are unchanged except non-strict objects
+  correctly omit `additionalProperties: false` (they accept extra keys); `.strict()`
+  keeps it. This makes the documented `.transform()` repair recipe work.
+
 ### Changed
 - **Unknown model cost is now `undefined`, not `0`.** Pricing-table misses no
   longer look free in budgets or dashboards. Consumers that sum costs should use

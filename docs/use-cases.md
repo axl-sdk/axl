@@ -107,6 +107,35 @@ const order = await ctx.ask(extractAgent, 'Extract the order from this email', {
 
 If the LLM produces `{ items: [{productId: "A1", quantity: 2, unitPrice: 10}], total: 25, currency: "USD" }`, validate rejects it with "Total 25 doesn't match computed 20." The LLM sees this feedback with all previous attempts and can self-correct.
 
+### Repair in place with `.transform()` (no extra LLM turn)
+
+When the model's output is *structurally recoverable* — a stray whitespace, a missing derivable field, a value that just needs normalizing — you don't need a retry or a second LLM call. Put the repair **inside the Zod schema** with `.transform()` (or `.pipe()`). It runs as part of `schema.parse` on the `ctx.ask()` reply, so the repaired value is what flows downstream — no extra turn, no new API:
+
+```typescript
+const ContactSchema = z
+  .object({
+    name: z.string(),
+    email: z.string(),
+    tags: z.array(z.string()).optional(),
+  })
+  .transform((c) => ({
+    ...c,
+    email: c.email.trim().toLowerCase(), // normalize
+    tags: c.tags ?? [],                   // fill a derivable default
+    domain: c.email.trim().toLowerCase().split('@')[1] ?? '', // compute a field
+  }));
+
+// `contact` is the POST-transform shape: normalized email, guaranteed tags, added domain.
+const contact = await ctx.ask(extractAgent, 'Extract the contact', { schema: ContactSchema });
+```
+
+Two things to know:
+
+- **The prompt shows the pre-transform (input) shape.** `z.toJSONSchema` renders a transform's *input* side, so the model is told to produce `{ name, email, tags? }` — it never sees `domain`. That's correct: the model produces raw data, the transform derives the rest.
+- **Re-validation is by construction.** The transform's output *is* the parsed value; there's no second `parse()` and no double-application of the transform. Combine with `validate` for business rules the transform can't guarantee.
+
+Use `.transform()` for deterministic, pure repair. When repair needs a fallback data source or the model genuinely has to try again, use `ctx.verify` (below).
+
 ### Verify: retrying a non-LLM data source
 
 When the data comes from an API instead of an LLM, use `ctx.verify()`. The `retry.parsed` field lets you distinguish schema failures (malformed response) from validate failures (structurally valid but business-invalid), and repair the data programmatically:

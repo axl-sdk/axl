@@ -190,10 +190,18 @@ function estimateInlineSchemaTokens(schema: z.ZodType): number {
 function renderSchemaForPrompt(schema: z.ZodType): string {
   const cached = promptSchemaCache.get(schema);
   if (cached !== undefined) return cached;
-  const json = z.toJSONSchema(schema, { unrepresentable: 'any', reused: 'ref' }) as Record<
-    string,
-    unknown
-  >;
+  // `io: 'input'` renders the shape the model must PRODUCE — the schema's INPUT.
+  // This matters for `.transform()`/`.pipe()` schemas: the default ('output')
+  // mode renders the post-transform type, which for a transform is opaque and
+  // collapses to `{}` — a schema-in-prompt with zero guidance. Input mode shows
+  // the pre-transform fields the model actually supplies. For plain schemas it's
+  // identical except non-strict objects correctly omit `additionalProperties:
+  // false` (they DO accept extra keys), while `.strict()` keeps it.
+  const json = z.toJSONSchema(schema, {
+    unrepresentable: 'any',
+    io: 'input',
+    reused: 'ref',
+  }) as Record<string, unknown>;
   delete json.$schema;
   const rendered = JSON.stringify(json);
   promptSchemaCache.set(schema, rendered);

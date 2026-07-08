@@ -186,6 +186,24 @@ describe('Phase 1 — parity (AC-J1b)', () => {
     expect(zodToJsonSchema(s1)).not.toBe(zodToJsonSchema(s2));
     expect(zodToJsonSchema(s1)).toEqual(zodToJsonSchema(s2));
   });
+
+  it('a .transform() schema renders its INPUT shape (not an empty {}) — the J3 repair recipe', async () => {
+    // Default ('output') rendering collapses a transform to `{}` — zero guidance.
+    // The prompt must show the pre-transform fields the model actually produces.
+    const Contact = z
+      .object({ name: z.string(), email: z.string() })
+      .transform((c) => ({ ...c, domain: c.email.split('@')[1] ?? '' }));
+    const provider = new RecordingProvider(JSON.stringify({ name: 'A', email: 'a@b.co' }));
+    const ctx = createCtx(provider);
+    await ctx.ask(testAgent, 'go', { schema: Contact });
+    const rendered = appendedSchemaText(
+      [...provider.calls[0].messages].reverse().find((m) => m.role === 'user')!.content,
+    );
+    const parsed = JSON.parse(rendered) as { properties?: Record<string, unknown> };
+    expect(Object.keys(parsed.properties ?? {})).toEqual(expect.arrayContaining(['name', 'email']));
+    // The computed post-transform field must NOT be in the prompt (model doesn't produce it).
+    expect(parsed.properties ?? {}).not.toHaveProperty('domain');
+  });
 });
 
 // ── AC-Gemini-noregress: the tool-def path stays inline (no $ref/$defs) ───────

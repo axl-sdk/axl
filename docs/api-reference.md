@@ -933,6 +933,13 @@ const result = await ctx.ask(agent, prompt, {
 
 **Supported on:** `ctx.ask()`, `ctx.delegate()`, `ctx.race()`, and `ctx.verify()`. On delegate and handoffs, validate is forwarded to the final agent call. On race, results that fail validate are discarded (same as schema failures).
 
+### Repairing output (vs. rejecting it)
+
+`validate` is a boolean gate — it rejects and retries, it doesn't repair. When output is *recoverable*, two mechanisms repair it in place, no new `ctx.ask` API needed:
+
+- **Pure, deterministic repair → put a `.transform()` in the schema.** `z.object({...}).transform(repair)` runs *inside* `schema.parse`, so the repaired value is what flows downstream — no extra LLM turn. The prompt is rendered from the transform's **input** side, so the model is told the pre-transform shape it must produce (not the computed fields the transform adds). See [In-schema repair with `.transform()`](use-cases.md#repair-in-place-with-transform-no-extra-llm-turn).
+- **LLM-in-the-loop / parse-failure repair → `ctx.verify`.** Wrap `ctx.ask` in `ctx.verify`; on retry, `retry.parsed` is the typed object ("safe to modify and return") for programmatic repair. See [LLM-first with repair fallback](use-cases.md#advanced-llm-first-with-programmatic-repair-fallback).
+
 See [Validated Data Extraction](use-cases.md#validated-data-extraction) for complete examples.
 
 ### `OutputValidator`

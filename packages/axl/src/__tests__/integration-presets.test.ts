@@ -103,12 +103,11 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('preset: DeepSeek', () => {
       },
     ];
     const first = await provider().chat(
-      [{ role: 'user', content: 'What time is it? Use the tool.' }],
+      [{ role: 'user', content: 'Call the get_time function now. Do not answer directly.' }],
       {
         model: 'deepseek-reasoner',
         maxTokens: 64,
         tools,
-        toolChoice: { type: 'function', function: { name: 'get_time' } },
       },
     );
     expect(first.tool_calls?.length).toBeGreaterThan(0);
@@ -116,7 +115,7 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('preset: DeepSeek', () => {
 
     const followup = await provider().chat(
       [
-        { role: 'user', content: 'What time is it? Use the tool.' },
+        { role: 'user', content: 'Call the get_time function now. Do not answer directly.' },
         {
           role: 'assistant',
           content: first.content,
@@ -249,8 +248,19 @@ const localPresetCases = [
   },
 ] as const;
 
+function hasUsableBaseUrl(envName: string): boolean {
+  const value = process.env[envName];
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 for (const c of localPresetCases) {
-  describe.skipIf(!process.env[c.baseUrlEnv])(`preset: ${c.label} (local)`, () => {
+  describe.skipIf(!hasUsableBaseUrl(c.baseUrlEnv))(`preset: ${c.label} (local)`, () => {
     it('reaches a local server with no key and reports cost 0', async () => {
       const provider = new OpenAICompatibleProvider({ profile: c.profile });
       const model = process.env[c.modelEnv] ?? c.defaultModel;

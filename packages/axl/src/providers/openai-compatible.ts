@@ -359,6 +359,22 @@ function isRoundTripField(field: unknown): field is RoundTripField {
   return typeof field === 'string' && (ROUND_TRIP_FIELDS as readonly string[]).includes(field);
 }
 
+function normalizeMessageContent(content: OpenAIChatMessage['content']): string {
+  if (typeof content === 'string') return content;
+  if (content == null) return '';
+  if (!Array.isArray(content)) return '';
+
+  return content
+    .map((part) => {
+      if (typeof part === 'string') return part;
+      if (!part || typeof part !== 'object') return '';
+      if (typeof part.text === 'string') return part.text;
+      if (typeof part.content === 'string') return part.content;
+      return '';
+    })
+    .join('');
+}
+
 export type OpenAICompatibleOptions = {
   profile: ProviderProfile;
   /** API key or a per-request resolver (expiring tokens). See {@link ApiKeySource}. */
@@ -679,7 +695,7 @@ export class OpenAICompatibleProvider implements Provider {
 
   protected parseResponse(json: OpenAIChatResponse, model: string): ProviderResponse {
     const message = json.choices?.[0]?.message ?? {};
-    let content = message.content ?? '';
+    let content = normalizeMessageContent(message.content);
     let thinking: string | undefined;
     let roundTrip: RoundTripReasoning | undefined;
 
@@ -975,7 +991,7 @@ type OpenAIUsage = {
 };
 
 type OpenAIChatMessage = {
-  content: string | null;
+  content: string | null | Array<string | { text?: string; content?: string }>;
   reasoning_content?: string;
   reasoning?: string;
   reasoning_details?: unknown;

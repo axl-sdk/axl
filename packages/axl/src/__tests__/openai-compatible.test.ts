@@ -523,6 +523,12 @@ describe('reasoning capture (chat)', () => {
     expect(r.thinking_content).toBe('hidden');
   });
 
+  it('normalizes content block arrays to the ProviderResponse string contract', async () => {
+    mockFetch(okJson({}, { content: [{ type: 'text', text: 'hi' }, { content: ' there' }] }));
+    const r = await reasoning('none').chat(userMsg, { model: 'm' });
+    expect(r.content).toBe('hi there');
+  });
+
   it('does NOT attach round-trip metadata when roundTrip is none', async () => {
     mockFetch(okJson({}, { reasoning_content: 'x' }));
     const r = await reasoning('reasoning_content').chat(userMsg, { model: 'm' });

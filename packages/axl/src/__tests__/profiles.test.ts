@@ -68,6 +68,7 @@ const bedrock = () => provider(BEDROCK_PROFILE, 'tok', BEDROCK_BASE);
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  vi.unstubAllEnvs();
 });
 
 // ===========================================================================
@@ -120,7 +121,9 @@ describe('OpenRouter preset', () => {
 
 describe('Azure preset', () => {
   it('throws if no base URL is provided (resource-specific, no default)', () => {
-    expect(() => provider(AZURE_PROFILE)).toThrow(/Azure OpenAI requires a base URL/);
+    expect(() => provider({ ...AZURE_PROFILE, envBaseUrl: undefined })).toThrow(
+      /Azure OpenAI requires a base URL/,
+    );
   });
 
   it('targets the configured resource base URL', async () => {
@@ -358,7 +361,10 @@ describe('Bedrock preset', () => {
 describe('Local presets', () => {
   it('constructs with no API key and sends no auth header', async () => {
     const fetchMock = mockFetch(ok());
-    const p = new OpenAICompatibleProvider({ profile: OLLAMA_PROFILE }); // no apiKey
+    const p = new OpenAICompatibleProvider({
+      profile: OLLAMA_PROFILE,
+      baseUrl: 'http://localhost:11434/v1',
+    }); // no apiKey
     await p.chat(user, { model: 'llama3' });
     const r = req(fetchMock);
     expect(r.url).toBe('http://localhost:11434/v1/chat/completions');

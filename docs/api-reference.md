@@ -279,8 +279,8 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `schema` | `ZodType<T>` | — | Validates and parses the response as structured output. On validation failure, retries with accumulating context |
-| `schemaPrompt` | `'json-schema' \| 'none' \| { render: string \| (schema) => string }` | `'json-schema'` | How `schema` is rendered into the model-facing prompt. `'none'` appends nothing (schema stays the parse gate; fires a `schema_prompt_none_no_guidance` diagnostic); `{ render }` appends exactly your string/function output. Does NOT affect the `.parse` gate. See [providers.md](providers.md#structured-output-prompt-guided-default-vs-native) |
-| `nativeStructuredOutput` | `boolean` | `false` | Opt into the provider's native `json_schema` path, deriving the provider schema from the same `schema` (no second, contradictable schema). Only when a `schema` is set and no tools. Providers that can't honor it downgrade/ignore it and a `native_output_unsupported` diagnostic warns; the call proceeds. See [providers.md](providers.md#structured-output-prompt-guided-default-vs-native) |
+| `schemaPrompt` | `'json-schema' \| 'none' \| { render: string \| (schema) => string }` | `'json-schema'` | How `schema` is rendered into the model-facing prompt. `'none'` appends nothing (schema stays the parse gate; fires a `schema_prompt_none_no_guidance` diagnostic); `{ render }` appends exactly your string/function output. Does NOT affect the `.parse` gate. See [Structured Output](#structured-output) |
+| `nativeStructuredOutput` | `boolean` | `false` | Opt into the provider's native `json_schema` path, deriving the provider schema from the same `schema` (no second, contradictable schema). Only when a `schema` is set and no tools. Providers that can't honor it downgrade/ignore it and a `native_output_unsupported` diagnostic warns; the call proceeds. See [Structured Output](#structured-output) |
 | `retries` | `number` | `3` | Number of schema validation retries |
 | `validate` | `OutputValidator<T>` | — | Post-schema business rule validation. Receives the parsed typed object. Only runs when `schema` is set. See [Validate](#validate) |
 | `validateRetries` | `number` | `2` | Maximum retries for `validate` failures |
@@ -984,6 +984,69 @@ LLM response (raw string)
 Retry counts refer to **retries only** — the initial LLM call does not count. With the defaults (guardrail: 2, schema: 3, validate: 2), the worst case is `1 + 2 + 3 + 2 = 8` total LLM calls: 1 initial call plus up to 7 retries across all gates.
 
 Retries are **additive, not multiplicative** — each gate has its own counter that only increments when *that gate* fails. A response that passes gate 1 but fails gate 2 only increments the gate 2 counter. Counters are persistent across the entire `ctx.ask()` call and do not reset when a different gate fails. The `maxTurns` limit (default 25) provides a hard ceiling on total LLM calls regardless of gate failures.
+
+---
+
+## Structured Output
+
+Passing a `schema` to `ctx.ask()` (or `delegate`/`race`/`verify`) makes the reply a parsed, typed object instead of a string. Two things happen, and you control them independently:
+
+1. **What the model is told** — the model-facing prompt (`schemaPrompt`).
+2. **How the reply is enforced** — the Zod `schema` always runs as the parse gate (Gate 2 of the [Output Pipeline](#output-pipeline)), with self-correcting retries.
+
+### Default: prompt-guided + client-side validation
+
+By default Axl appends a JSON-Schema description of your schema to the prompt and sends `responseFormat: { type: 'json_object' }` — the provider is told "reply with JSON," and your Zod schema is what actually enforces the shape (with retries). This is portable across every provider and degrades gracefully; it's the recommended path for anything non-trivial. Client-side Zod validation is the enforcement boundary in **every** mode below.
+
+> Native constrained decoding is **not** the default: it caps schema depth, degrades on complex schemas (large discriminated unions especially), and behaves differently per provider. Prompt-guided + Zod is predictable everywhere. See [providers.md](providers.md#structured-output-prompt-guided-default-vs-native).
+
+### `schemaPrompt` — the model-facing rendering
+
+Controls only the prompt text; the `.parse` gate is unaffected.
+
+| `schemaPrompt` | Prompt behavior | Notes |
+|---|---|---|
+| `'json-schema'` **(default)** | Appends the compact, `$ref`-hoisted JSON Schema | Rendered from the schema's **input** side (`z.toJSONSchema(..., { io: 'input' })`), so a `.transform()` shows its pre-transform fields, not an empty `{}` |
+| `'none'` | Appends nothing | Schema is the parse gate only; pair with your own system-prompt guidance. Fires a `schema_prompt_none_no_guidance` [diagnostic](observability.md#schema-diagnostics) |
+| `{ render: string }` | Appends exactly that string | You own the guidance text |
+| `{ render: (schema) => string }` | Appends your function's output | Receives the Zod schema |
+
+The `'json-schema'` renderer also hoists sub-schemas shared across (e.g.) discriminated-union arms into `$defs`/`$ref` once and drops pretty-print whitespace — an order-of-magnitude token cut for large unions, with no code change ([prompt cost](observability.md#structured-output-prompt-cost)).
+
+### `nativeStructuredOutput` — the provider's native path (default `false`)
+
+Set `true` to opt into the provider's native `json_schema` response format. Axl derives the provider schema from the **same** Zod schema (input side — no second, contradictable JSON Schema) and sends `responseFormat: { type: 'json_schema', json_schema: { name, schema } }`. Only takes effect when a `schema` is set and **no tools** are registered (JSON mode is disabled when tools are present).
+
+Providers can't all honor it. Each adapter reports a tier via the optional `Provider.nativeStructuredOutputSupport(model)`; when it isn't fully honored Axl emits a `native_output_unsupported` [diagnostic](observability.md#schema-diagnostics), **warns once, and proceeds** (the prompt text remains the parse contract):
+
+| Tier | Meaning | Examples |
+|---|---|---|
+| `schema` | Native `json_schema` accepted | OpenAI, OpenAI Responses, Mistral, OpenRouter, xAI, Groq `openai/gpt-oss-*` |
+| `downgraded` | Accepted but downgraded to `json_object` (shape not enforced) | DeepSeek, Groq `llama`/`gemma`/… |
+| `lossy` | Accepted but the schema is sanitized (keywords stripped) | Gemini |
+| `unsupported` | Ignored structurally; uses a system-prompt JSON instruction | Anthropic |
+
+> On OpenAI the `json_schema` is currently sent **non-strict** (schema-as-guidance, not hard constrained decoding). True strict mode needs an OpenAI-strict-subset transform and is a follow-up; client-side Zod is the guarantee. Full per-provider detail: [providers.md](providers.md#structured-output-prompt-guided-default-vs-native).
+
+### Wire summary
+
+| Situation | `responseFormat` sent |
+|---|---|
+| `schema`, no tools, default | `{ type: 'json_object' }` |
+| `schema`, no tools, `nativeStructuredOutput: true` | `{ type: 'json_schema', json_schema: {…} }` |
+| `schema` **with tools** | none — JSON mode is gated off; the schema still parses client-side |
+
+### Precedence & forwarding
+
+`schemaPrompt` and `nativeStructuredOutput` live on both `AskOptions` (per-call) and `AgentConfig` (agent default): **AskOptions > AgentConfig > default**. Both are forwarded through `ctx.delegate` to the terminal agent (single- and multi-candidate/handoff paths).
+
+### Repairing recoverable output
+
+See [Repairing output](#repairing-output-vs-rejecting-it) — a `.transform()` in the schema (pure, no extra LLM turn) or `ctx.verify` (LLM-in-the-loop). Because the prompt renders the transform's input side, the model produces the raw shape and the transform derives the rest.
+
+### Related diagnostics
+
+Silent structured-output cliffs surface as `schema_diagnostic` events — oversized appended/tool schema, dropped `.refine()`s, streaming disabled, zero-guidance `'none'`, and `native_output_unsupported`. See [observability.md#schema-diagnostics](observability.md#schema-diagnostics).
 
 ---
 

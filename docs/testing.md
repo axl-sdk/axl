@@ -180,6 +180,20 @@ expect(seen.find((s) => s.attempt === 1)).toBeUndefined();
 expect(seen.some((s) => s.attempt === 2 && s.v === 2)).toBe(true);
 ```
 
+### Schema diagnostics & `nativeStructuredOutput`
+
+`schema_diagnostic` events (oversized schema, dropped `.refine()`s, streaming disabled, `schemaPrompt:'none'`, `native_output_unsupported`) are ordinary `AxlEvent`s — capture them off `ctx.events` / `onTrace` and filter by `type`/`data.kind`:
+
+```typescript
+const diags = seen.filter((e) => e.type === 'schema_diagnostic');
+expect(diags.some((e) => e.data.kind === 'dropped_refinements')).toBe(true);
+```
+
+Two behaviors to test around, both driven purely by MockProvider:
+
+- **`streaming_disabled` is observer-gated** — it only fires when streaming is active (allocate `ctx.events` *before* the ask). A plain `runtime.execute()` with no observer emits nothing.
+- **`native_output_unsupported` depends on the provider's capability tier.** `MockProvider` does **not** implement `nativeStructuredOutputSupport`, so the runtime treats it as `'schema'` (fully supported) — meaning the diagnostic will **not** fire under a plain mock even with `nativeStructuredOutput: true`. To test the `downgraded`/`lossy`/`unsupported` paths, give your mock the method: `Object.assign(provider, { nativeStructuredOutputSupport: () => 'unsupported' })`. The real per-provider tiers are exercised in the live tier (`pnpm test:integration`, `integration-structured-output.test.ts`) — a green MockProvider run does **not** prove a real provider honors `json_schema`.
+
 ## AxlTestRuntime
 
 `AxlTestRuntime` supports the **full `ctx.*` primitive set** — `ask`, `spawn`, `vote`, `verify`, `budget`, `race`, `parallel`, `map`, `awaitHuman`, `checkpoint`, and `log` — so that workflows under test exercise the same code paths as production.

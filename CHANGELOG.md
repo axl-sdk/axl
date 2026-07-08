@@ -37,6 +37,18 @@ cross-provider `effort`, tool-calling, and cost surfaces.
   definitions) is unchanged — it stays inline, which is required for Gemini, whose
   schema sanitizer strips `$ref`/`$defs`. Zod→JSON-Schema conversions are also
   memoized by schema identity, benefiting the per-turn tool-definition path.
+- **`schema_diagnostic` events for silent structured-output cliffs.** A new
+  `AskScoped` event (surfaced in `ctx.events` / `AxlStream` and `.lifecycle`)
+  fires — once per ask — when: an appended prompt schema or a tool-def schema
+  exceeds a token threshold (`prompt_schema_oversized`); a schema carries
+  `.refine()`/`.superRefine()` rules that `z.toJSONSchema` silently drops
+  (`dropped_refinements`); or progressive `partial_object` streaming is disabled
+  by a non-object schema root or by tools (`streaming_disabled`). The
+  genuinely-surprising cliffs also emit a one-time deduped `console.warn`
+  (silenceable via `AxlConfig.diagnostics.silent` or `AXL_DIAGNOSTICS_SILENT=true`);
+  the oversized threshold is configurable via
+  `AxlConfig.diagnostics.schemaOversizedTokens` (default 4000). See
+  `docs/observability.md#schema-diagnostics`.
 
 ### Changed
 - **Unknown model cost is now `undefined`, not `0`.** Pricing-table misses no

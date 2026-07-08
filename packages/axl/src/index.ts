@@ -113,6 +113,7 @@ export type {
   AwaitHumanResolvedData,
   GuardrailData,
   SchemaCheckData,
+  SchemaDiagnosticData,
   ValidateData,
   StringDeltaData,
   AskOptions,

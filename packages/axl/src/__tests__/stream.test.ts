@@ -874,6 +874,9 @@ describe('AxlStream', () => {
       handoff_return: 'lifecycle',
       pipeline: 'lifecycle',
       verify: 'lifecycle',
+      // Schema capability diagnostics — low-frequency, structural (once per ask),
+      // and the whole point (J7) is that they were invisible; surface them.
+      schema_diagnostic: 'lifecycle',
       // Durable-execution checkpoints — structural points in the timeline.
       checkpoint_save: 'lifecycle',
       checkpoint_replay: 'lifecycle',
@@ -998,6 +1001,11 @@ describe('AxlStream', () => {
           ...ASK_,
         },
         verify: { type: 'verify', data: { attempts: 1, passed: true }, ...ASK_ },
+        schema_diagnostic: {
+          type: 'schema_diagnostic',
+          data: { kind: 'streaming_disabled', rootType: 'ZodUnion', cause: 'non-object' },
+          ...ASK_,
+        },
         log: { type: 'log', data: { event: 'x' } },
         memory_remember: { type: 'memory_remember', data: { scope: 'global' } },
         memory_recall: { type: 'memory_recall', data: { scope: 'global' } },

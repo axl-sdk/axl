@@ -460,6 +460,54 @@ If a schema's appended text is still large, that's usually inherent schema size
 (many fields, deep nesting, per-field `.describe()` text) rather than rendering
 overhead — measure with `data.prompt` before adding hand-tuned guidance.
 
+### Schema diagnostics
+
+Some structured-output problems fail *silently* — the model is never told about
+a rule, or streaming quietly turns off — so you only notice via wasted retries
+or a missing progressive UI. Axl surfaces these as `schema_diagnostic` events
+(one per ask, per cliff) and, for the genuinely surprising ones, a one-time
+`console.warn`. The event is `AskScoped` and carries a `kind`-discriminated
+`data`:
+
+| `data.kind` | Fires when | `console.warn`? |
+|---|---|---|
+| `prompt_schema_oversized` | The appended prompt schema — or a tool-def schema — exceeds the token threshold (`data.site: 'prompt' \| 'tool'`, `data.tool?`) | No (event-only) |
+| `dropped_refinements` | The schema carries `.refine()`/`.superRefine()` rules that `z.toJSONSchema` drops, so the model never sees them and `.parse` may reject (`data.count`, `data.paths`, `data.site`, `data.tool?`) | Yes |
+| `streaming_disabled` | Progressive `partial_object` streaming is off because the schema root isn't a `ZodObject` (`cause: 'non-object'`) or tools are present (`cause: 'tools'`) | Only for `non-object` (the `tools` cause is expected) |
+| `schema_prompt_none_no_guidance` | `schemaPrompt: 'none'` was set with a schema and no override, so the model gets zero shape guidance | Yes |
+
+**Why the `console.warn`.** The trace console is off by default and the median
+consumer never wires up `ctx.events`, so an event alone would re-bury the pain.
+The warn mirrors the budget-honesty precedent: **process-level, deduped once per
+`agent + kind + schema`**, pointing here. `prompt_schema_oversized` and the
+`tools` streaming cause are event-only because they're tunable/expected, not
+surprising.
+
+**Acting on each:**
+- `dropped_refinements` → surface the rule into the prompt (`schemaPrompt`) or
+  enforce it after parsing with `ctx.verify` / a Zod `.transform()`. Plain
+  constraints (`.min()`, `.email()`, `.regex()`) are *not* reported — they
+  render into JSON Schema fine.
+- `streaming_disabled` (`non-object`) → wrap the schema:
+  `z.object({ result: <yourSchema> })` re-enables `partial_object` streaming.
+- `prompt_schema_oversized` → see [Structured-output prompt cost](#structured-output-prompt-cost);
+  Phase-1 compaction already removes most bloat, so a remaining oversized signal
+  usually means genuinely large schema content.
+
+**Configuration** (`AxlConfig.diagnostics`):
+
+```ts
+defineConfig({
+  diagnostics: {
+    schemaOversizedTokens: 4000, // token threshold for `prompt_schema_oversized` (default 4000)
+    silent: true,                // suppress the console.warn (events still fire)
+  },
+});
+```
+
+Set `AXL_DIAGNOSTICS_SILENT=true` to silence the warns process-wide without a
+config change. The structured events always fire regardless.
+
 ### PII and redaction
 
 `config.trace.redact` is an **observability-boundary filter** that scrubs user/LLM content everywhere it would otherwise flow to observability consumers. The mental model: "what can the observability layer see?". Under `redact: true`, structural metadata (workflow names, agent names, tool names, cost/token metrics, durations, status, roles, keys, IDs, `askId`/`parentAskId`/`depth`) stays visible — but any field that carries prompt/response/user/LLM content is replaced with `'[redacted]'`.

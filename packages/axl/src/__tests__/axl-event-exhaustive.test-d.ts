@@ -71,6 +71,22 @@ function assertExhaustive(ev: AxlEvent): string {
       return ev.data.path + ':' + ev.data.delta;
     case 'verify':
       return String(ev.data.passed);
+    case 'schema_diagnostic':
+      // Narrow on the discriminated `kind` to verify the two-level union shape.
+      switch (ev.data.kind) {
+        case 'prompt_schema_oversized':
+          return ev.data.site;
+        case 'dropped_refinements':
+          return String(ev.data.count);
+        case 'streaming_disabled':
+          return ev.data.cause;
+        case 'schema_prompt_none_no_guidance':
+          return ev.data.kind;
+        default: {
+          const _exhaustiveDiag: never = ev.data;
+          return _exhaustiveDiag;
+        }
+      }
     case 'log':
       return 'log';
     case 'memory_remember':

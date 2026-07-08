@@ -40,6 +40,11 @@ import { StreamingWalker } from './streaming-walker.js';
 import { COST_BEARING_LEAF_TYPES, hasPositiveTokens, isUsableCost } from './event-utils.js';
 import { AxlEventBus, EventStreamOverflowError, type EventStreamOptions } from './event-stream.js';
 import { redactEvent } from './redaction.js';
+import {
+  detectDroppedRefinements,
+  warnSchemaDiagnosticOnce,
+  DEFAULT_SCHEMA_OVERSIZED_TOKENS,
+} from './schema-diagnostics.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
 import { ProviderError } from './providers/errors.js';
 import type { ProviderRegistry } from './providers/registry.js';
@@ -1022,6 +1027,11 @@ export class WorkflowContext<TInput = unknown> {
     }
 
     messages.push({ role: 'user', content: userContent });
+
+    // Schema-capability diagnostics (spec 22, Problem E). Once per ask — the
+    // prompt schema and tool-def schemas are both known here, before the
+    // tool-calling turn loop begins.
+    this.emitSchemaDiagnostics(agent, options, toolDefs);
 
     // If this agent was reached via handoff, include the source agent's conversation
     if (handoffMessages && handoffMessages.length > 0) {
@@ -2227,6 +2237,136 @@ export class WorkflowContext<TInput = unknown> {
       agent: agentName,
       ...(providerMetadata ? { providerMetadata } : {}),
     });
+  }
+
+  /**
+   * Emit `schema_diagnostic` events for the silent structured-output cliffs
+   * (spec 22, Problem E). Called once per ask. Covers three sites:
+   *  - the appended **prompt** schema (oversized, dropped refinements),
+   *  - each user **tool-def** schema (oversized, dropped refinements),
+   *  - the **streaming** gate (disabled by a non-object root or by tools).
+   *
+   * The structured event always fires (persisted + streamed). For the genuinely
+   * surprising, low-frequency cliffs it ALSO fires a one-time deduped
+   * `console.warn` so the median consumer — who never wires up `ctx.events` and
+   * runs with the trace console off — still sees it. `oversized` is event-only
+   * (O3: it's tunable/noisy); the `tools` streaming cause is event-only too
+   * (expected behavior for any tool-using agent, not a surprise).
+   */
+  private emitSchemaDiagnostics(
+    agent: Agent,
+    options: AskOptions<unknown> | undefined,
+    toolDefs: ToolDefinition[],
+  ): void {
+    const silent = this.config.diagnostics?.silent;
+    const threshold =
+      this.config.diagnostics?.schemaOversizedTokens ?? DEFAULT_SCHEMA_OVERSIZED_TOKENS;
+    const schema = options?.schema as z.ZodType | undefined;
+
+    // ── Prompt schema ──────────────────────────────────────────────────────
+    if (schema) {
+      const promptTokens = estimateTokens(renderSchemaForPrompt(schema));
+      if (promptTokens > threshold) {
+        this.emitEvent({
+          type: 'schema_diagnostic',
+          agent: agent._name,
+          data: {
+            kind: 'prompt_schema_oversized',
+            estimatedTokens: promptTokens,
+            threshold,
+            site: 'prompt',
+          },
+        });
+      }
+
+      const dropped = detectDroppedRefinements(schema);
+      if (dropped.count > 0) {
+        this.emitEvent({
+          type: 'schema_diagnostic',
+          agent: agent._name,
+          data: {
+            kind: 'dropped_refinements',
+            count: dropped.count,
+            paths: dropped.paths,
+            site: 'prompt',
+          },
+        });
+        warnSchemaDiagnosticOnce(
+          `${agent._name}\0dropped_refinements\0prompt\0${dropped.paths.join(',')}`,
+          `${dropped.count} refinement(s) on the output schema for agent '${agent._name}' ` +
+            `(at ${dropped.paths.join(', ')}) are dropped from the model-facing JSON Schema — ` +
+            `the model is never told the rule, then parsing rejects it. Surface it in the prompt ` +
+            `(schemaPrompt) or repair with ctx.verify.`,
+          silent,
+        );
+      }
+
+      // ── Streaming gate — mirrors the gate at the stream site: progressive
+      //    `partial_object` requires a `ZodObject` root and no tools. ──────────
+      const rootIsObject = schema instanceof z.ZodObject;
+      const hasTools = toolDefs.length > 0;
+      if (!rootIsObject || hasTools) {
+        // Prefer the more actionable cause when both hold: a non-object root is
+        // the surprising one J5 hits (`z.discriminatedUnion` looks streamable);
+        // `tools` is expected. Only the non-object cause earns a console.warn.
+        const cause: 'non-object' | 'tools' = !rootIsObject ? 'non-object' : 'tools';
+        const rootType = schema.constructor?.name ?? 'unknown';
+        this.emitEvent({
+          type: 'schema_diagnostic',
+          agent: agent._name,
+          data: { kind: 'streaming_disabled', rootType, cause },
+        });
+        if (cause === 'non-object') {
+          warnSchemaDiagnosticOnce(
+            `${agent._name}\0streaming_disabled\0${rootType}`,
+            `Progressive object streaming is disabled for agent '${agent._name}' because the ` +
+              `output schema root is ${rootType}, not a ZodObject. Wrap it — ` +
+              `z.object({ result: <yourSchema> }) — to re-enable partial_object streaming.`,
+            silent,
+          );
+        }
+      }
+    }
+
+    // ── Tool-def schemas ───────────────────────────────────────────────────
+    for (const tool of agent._config.tools ?? []) {
+      const toolTokens = estimateTokens(JSON.stringify(zodToJsonSchema(tool.inputSchema)));
+      if (toolTokens > threshold) {
+        this.emitEvent({
+          type: 'schema_diagnostic',
+          agent: agent._name,
+          data: {
+            kind: 'prompt_schema_oversized',
+            estimatedTokens: toolTokens,
+            threshold,
+            site: 'tool',
+            tool: tool.name,
+          },
+        });
+      }
+
+      const droppedTool = detectDroppedRefinements(tool.inputSchema);
+      if (droppedTool.count > 0) {
+        this.emitEvent({
+          type: 'schema_diagnostic',
+          agent: agent._name,
+          data: {
+            kind: 'dropped_refinements',
+            count: droppedTool.count,
+            paths: droppedTool.paths,
+            site: 'tool',
+            tool: tool.name,
+          },
+        });
+        warnSchemaDiagnosticOnce(
+          `${agent._name}\0dropped_refinements\0tool\0${tool.name}`,
+          `${droppedTool.count} refinement(s) on tool '${tool.name}' input schema ` +
+            `(at ${droppedTool.paths.join(', ')}) are dropped from the tool definition — the ` +
+            `model is never told the constraint. Validate inside the tool handler instead.`,
+          silent,
+        );
+      }
+    }
   }
 
   private buildToolDefs(

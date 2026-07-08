@@ -119,6 +119,23 @@ export type ContextManagementConfig = {
   reserveTokens?: number;
 };
 
+/** Schema-capability diagnostics configuration (spec 22, Problem E). */
+export type DiagnosticsConfig = {
+  /**
+   * Token threshold above which an appended prompt schema — or a provider
+   * tool-definition schema — emits a `prompt_schema_oversized`
+   * `schema_diagnostic`. Measured with the same ~4-chars/token estimator used
+   * for context management. Default `4000`.
+   */
+  schemaOversizedTokens?: number;
+  /**
+   * Silence the one-time `console.warn` diagnostics (the structured
+   * `schema_diagnostic` events still fire). Also silenceable process-wide via
+   * `AXL_DIAGNOSTICS_SILENT=true`.
+   */
+  silent?: boolean;
+};
+
 import type { TelemetryConfig } from './telemetry/types.js';
 import type { MemoryConfig } from './memory/types.js';
 
@@ -134,6 +151,7 @@ export type AxlConfig = {
   trace?: TraceConfig;
   defaults?: DefaultsConfig;
   contextManagement?: ContextManagementConfig;
+  diagnostics?: DiagnosticsConfig;
   memory?: MemoryConfig;
   telemetry?: TelemetryConfig;
 };

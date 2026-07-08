@@ -188,6 +188,10 @@ export const AXL_EVENT_TYPES = [
   'string_delta',
   // Verification
   'verify',
+  // Schema capability diagnostics (spec 22, Problem E) — surface the silent
+  // structured-output cliffs (oversized appended schema, dropped refinements,
+  // streaming disabled, zero-guidance `schemaPrompt:'none'`).
+  'schema_diagnostic',
   // Observability
   'log',
   'memory_remember',
@@ -377,6 +381,41 @@ export type StringDeltaData = {
    */
   delta: string;
 };
+
+/**
+ * Data for the `schema_diagnostic` event (spec 22, Problem E) — a `kind`-
+ * discriminated payload mirroring `pipeline`'s two-level union. Each variant
+ * surfaces one silent structured-output cliff:
+ *
+ *  - `prompt_schema_oversized` — an appended prompt schema (or a tool-def
+ *    schema) exceeds the token threshold; the schema is a recurring input cost.
+ *  - `dropped_refinements` — the schema carries `.refine()`/`.superRefine()`
+ *    rules `z.toJSONSchema` drops, so the model is never told and `.parse` may
+ *    reject → wasted retries. `paths` are structural field paths (not PII).
+ *  - `streaming_disabled` — progressive `partial_object` streaming is off
+ *    because the schema root isn't a `ZodObject` (`non-object`) or tools are
+ *    present (`tools`).
+ *  - `schema_prompt_none_no_guidance` — `schemaPrompt:'none'` was set with a
+ *    schema and no override, so the model gets zero shape guidance (parse gate
+ *    only). Emitted from the Problem-B path (spec 22 §5.3).
+ */
+export type SchemaDiagnosticData =
+  | {
+      kind: 'prompt_schema_oversized';
+      estimatedTokens: number;
+      threshold: number;
+      site: 'prompt' | 'tool';
+      tool?: string;
+    }
+  | {
+      kind: 'dropped_refinements';
+      count: number;
+      paths?: string[];
+      site: 'prompt' | 'tool';
+      tool?: string;
+    }
+  | { kind: 'streaming_disabled'; rootType: string; cause: 'non-object' | 'tools' }
+  | { kind: 'schema_prompt_none_no_guidance' };
 
 /** Data shape for legacy `guardrail` events. Replaced by `pipeline` in PR 2. */
 export type GuardrailData = {
@@ -754,6 +793,9 @@ export type AxlEvent =
 
   // ── Verification ────────────────────────────────────────────────────────
   | (AxlEventBase & AskScoped & { type: 'verify'; data: VerifyData })
+
+  // ── Schema capability diagnostics (spec 22, Problem E) ──────────────────
+  | (AxlEventBase & AskScoped & { type: 'schema_diagnostic'; data: SchemaDiagnosticData })
 
   // ── Legacy gate events (collapsed into `pipeline` in PR 2) ──────────────
   | (AxlEventBase & Partial<AskScoped> & { type: 'guardrail'; data?: GuardrailData })

@@ -43,6 +43,7 @@ const LIFECYCLE_TYPES: ReadonlySet<AxlEventType> = new Set<AxlEventType>([
   'delegate',
   'pipeline',
   'verify',
+  'schema_diagnostic',
   'workflow_start',
   'workflow_end',
   'checkpoint_save',

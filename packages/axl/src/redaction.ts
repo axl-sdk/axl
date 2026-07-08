@@ -193,6 +193,11 @@ export const REDACTION_RULES: { [K in AxlEventType]: RuleFor<K> } = {
   string_delta: (e) => ({ ...e, data: { ...e.data, delta: REDACTED } }),
   verify: (e) =>
     e.data.lastError !== undefined ? { ...e, data: { ...e.data, lastError: REDACTED } } : e,
+  // `schema_diagnostic` carries only structural schema metadata — token counts,
+  // thresholds, JSON-Schema field paths, a root type name, a tool name — none of
+  // which is user content or PII (field paths are schema-shape, preserved like
+  // `string_delta.path`). Passthrough, as an explicit reviewed decision.
+  schema_diagnostic: passthrough as unknown as RuleFor<'schema_diagnostic'>,
   log: (e) => {
     if (!e.data || typeof e.data !== 'object' || Array.isArray(e.data)) return e;
     return { ...e, data: walkObjectOneLevel(e.data as Record<string, unknown>, LOG_PRESERVE_KEYS) };

@@ -80,6 +80,16 @@ cross-provider `effort`, tool-calling, and cost surfaces.
   correctly omit `additionalProperties: false` (they accept extra keys); `.strict()`
   keeps it. This makes the documented `.transform()` repair recipe work.
 
+### Fixed
+- **Groq `json_schema` support is now per-model.** `nativeStructuredOutput` on
+  Groq's `llama`/`gemma`/etc models used to send a `response_format: json_schema`
+  those models reject with a 400; only the `openai/gpt-oss-*` family supports it.
+  The `groq` profile now advertises `supportsJsonSchema` per-model so the request
+  downgrades cleanly to `json_object` (with a `native_output_unsupported`
+  diagnostic) on unsupported models and uses the native path on `gpt-oss`.
+  Verified against the live Groq API. (Surfaced by the new native-output path;
+  no prior code sent `json_schema` through the OpenAI-compatible engine.)
+
 ### Changed
 - **Unknown model cost is now `undefined`, not `0`.** Pricing-table misses no
   longer look free in budgets or dashboards. Consumers that sum costs should use

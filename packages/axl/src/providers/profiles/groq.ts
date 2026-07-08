@@ -39,5 +39,11 @@ export const GROQ_PROFILE: ProviderProfile = {
   },
   capabilities: {
     emitsMessageName: false,
+    // Groq's `response_format: json_schema` is supported only on a subset of
+    // models — the `openai/gpt-oss-*` family accepts it; llama/gemma/etc 400
+    // with "This model does not support response format `json_schema`".
+    // Per-model so `nativeStructuredOutput` engages the native path only where
+    // it works and otherwise downgrades cleanly to `json_object` (verified live).
+    supportsJsonSchema: isGptOss,
   },
 };

@@ -15,6 +15,7 @@ import { OpenAIResponsesProvider } from '../providers/openai-responses.js';
 import { OpenAIProvider } from '../providers/openai.js';
 import { OpenAICompatibleProvider } from '../providers/openai-compatible.js';
 import { DEEPSEEK_PROFILE } from '../providers/profiles/deepseek.js';
+import { GROQ_PROFILE } from '../providers/profiles/groq.js';
 
 // ── Harness ──────────────────────────────────────────────────────────────────
 
@@ -374,5 +375,10 @@ describe('nativeStructuredOutputSupport() adapter mapping', () => {
   it('DeepSeek profile (supportsJsonSchema:false) → downgraded', () => {
     const p = new OpenAICompatibleProvider({ apiKey: 'k', profile: DEEPSEEK_PROFILE });
     expect(p.nativeStructuredOutputSupport('deepseek-chat')).toBe('downgraded');
+  });
+  it('Groq is per-model: openai/gpt-oss-* → schema, llama/etc → downgraded (live-verified)', () => {
+    const p = new OpenAICompatibleProvider({ apiKey: 'k', profile: GROQ_PROFILE });
+    expect(p.nativeStructuredOutputSupport('openai/gpt-oss-20b')).toBe('schema');
+    expect(p.nativeStructuredOutputSupport('llama-3.1-8b-instant')).toBe('downgraded');
   });
 });

@@ -497,7 +497,7 @@ portable across every provider and degrades gracefully. Two knobs tune it (spec
   | Provider | Native `json_schema` support | On opt-in |
   |---|---|---|
   | OpenAI Chat / Responses | ✅ accepts `json_schema` | used as-is (non-strict — see note) |
-  | OpenAI-compatible | ✅ when the profile's `supportsJsonSchema` is true | else **downgraded** to `json_object` |
+  | OpenAI-compatible | ✅ when the profile's `supportsJsonSchema` is true (may be **per-model** — e.g. Groq only `openai/gpt-oss-*`) | else **downgraded** to `json_object` |
   | Google Gemini | ⚠️ accepted but sanitized (`$ref`/`$defs`/… stripped) | **lossy** |
   | Anthropic | ❌ ignored structurally (system-prompt JSON instruction) | **unsupported** |
 

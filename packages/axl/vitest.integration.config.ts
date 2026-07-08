@@ -29,5 +29,8 @@ export default defineConfig({
     environment: 'node',
     env: loadDotEnv(root),
     include: ['src/__tests__/integration*.test.ts'],
+    // Live API calls — reasoning models, schema-retry loops, and slow providers
+    // routinely exceed Vitest's 5s default. Give each test room.
+    testTimeout: 60_000,
   },
 });

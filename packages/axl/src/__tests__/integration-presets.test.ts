@@ -9,6 +9,10 @@ import {
   AZURE_PROFILE,
   BEDROCK_PROFILE,
   OLLAMA_PROFILE,
+  VLLM_PROFILE,
+  LMSTUDIO_PROFILE,
+  LLAMACPP_PROFILE,
+  SGLANG_PROFILE,
 } from '../providers/profiles/index.js';
 import type { ChatMessage, ChatOptions } from '../providers/types.js';
 
@@ -206,14 +210,53 @@ describe.skipIf(!process.env.AWS_BEARER_TOKEN_BEDROCK || !process.env.BEDROCK_BA
 );
 
 // ── Self-hosted (opt-in: requires a running local server) ───────────────────
-// Gate on OLLAMA_BASE_URL so this only runs when a user points at their server.
 
-describe.skipIf(!process.env.OLLAMA_BASE_URL)('preset: Ollama (local)', () => {
-  it('reaches a local server with no key and reports cost 0', async () => {
-    const provider = new OpenAICompatibleProvider({ profile: OLLAMA_PROFILE });
-    const model = process.env.OLLAMA_MODEL ?? 'llama3';
-    const res = await smoke(provider, model);
-    expect(typeof res.content).toBe('string');
-    expect(res.cost).toBe(0); // local pricing is an explicit zero
+const localPresetCases = [
+  {
+    label: 'Ollama',
+    profile: OLLAMA_PROFILE,
+    baseUrlEnv: 'OLLAMA_BASE_URL',
+    modelEnv: 'OLLAMA_MODEL',
+    defaultModel: 'llama3',
+  },
+  {
+    label: 'vLLM',
+    profile: VLLM_PROFILE,
+    baseUrlEnv: 'VLLM_BASE_URL',
+    modelEnv: 'VLLM_MODEL',
+    defaultModel: 'meta-llama/Llama-3.3-70B-Instruct',
+  },
+  {
+    label: 'LM Studio',
+    profile: LMSTUDIO_PROFILE,
+    baseUrlEnv: 'LMSTUDIO_BASE_URL',
+    modelEnv: 'LMSTUDIO_MODEL',
+    defaultModel: 'local-model',
+  },
+  {
+    label: 'llama.cpp',
+    profile: LLAMACPP_PROFILE,
+    baseUrlEnv: 'LLAMACPP_BASE_URL',
+    modelEnv: 'LLAMACPP_MODEL',
+    defaultModel: 'local-model',
+  },
+  {
+    label: 'SGLang',
+    profile: SGLANG_PROFILE,
+    baseUrlEnv: 'SGLANG_BASE_URL',
+    modelEnv: 'SGLANG_MODEL',
+    defaultModel: 'local-model',
+  },
+] as const;
+
+for (const c of localPresetCases) {
+  describe.skipIf(!process.env[c.baseUrlEnv])(`preset: ${c.label} (local)`, () => {
+    it('reaches a local server with no key and reports cost 0', async () => {
+      const provider = new OpenAICompatibleProvider({ profile: c.profile });
+      const model = process.env[c.modelEnv] ?? c.defaultModel;
+      const res = await smoke(provider, model);
+      expect(typeof res.content).toBe('string');
+      expect(res.cost).toBe(0); // local pricing is an explicit zero
+    });
   });
-});
+}

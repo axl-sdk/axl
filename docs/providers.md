@@ -110,9 +110,11 @@ vllm:meta-llama/Llama-3.3-70B-Instruct
 lmstudio:<model>  ·  llamacpp:<model>  ·  sglang:<model>
 ```
 
-Configure each like any provider (`apiKey` / `baseUrl` / `rateLimit` under its name), or rely
-on its env vars. Each preset reads `<PRESET>_API_KEY` and `<PRESET>_BASE_URL`
-(e.g. `OPENROUTER_API_KEY`, `XAI_API_KEY`, `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_BASE_URL`).
+Configure each like any provider (`apiKey` / `baseUrl` / `authHeader` / `rateLimit` under its
+name), or rely on its env vars. Most presets read `<PRESET>_API_KEY` and
+`<PRESET>_BASE_URL` (for example `OPENROUTER_API_KEY`, `XAI_API_KEY`); Azure uses
+`AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_BASE_URL`, and Bedrock uses
+`AWS_BEARER_TOKEN_BEDROCK` + `BEDROCK_BASE_URL`.
 
 | Preset | Default base URL | Auth | Reasoning | Pricing |
 |---|---|---|---|---|
@@ -136,7 +138,7 @@ Notes & caveats:
 - **Cost where competitors drop it.** OpenRouter returns per-call cost, which Axl surfaces
   directly; local presets are an explicit `$0`. Where a provider's per-token prices aren't
   tracked, cost is `undefined` (**unknown**, never a misleading `$0`).
-- **Capability is per-model on marketplaces** (OpenRouter/Together/Groq): one model supports
+- **Capability is per-model on marketplaces** (OpenRouter/Groq): one model supports
   strict `json_schema` and the next doesn't. Profile flags are sensible defaults; use
   [`providerOptions`](#provideroptions) for per-call overrides.
 - **Self-hosted** is keyless by default; pass a key only if your server enforces one. Server

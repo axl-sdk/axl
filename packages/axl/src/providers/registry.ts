@@ -82,7 +82,8 @@ function presetFactory(profile: ProviderProfile): ProviderFactory {
 }
 
 // OpenAI-compatible presets (openrouter, azure, xai, deepseek, mistral, groq,
-// ollama, vllm, lmstudio, llamacpp, sglang). Registered under each profile name.
+// bedrock, ollama, vllm, lmstudio, llamacpp, sglang). Registered under each
+// profile name.
 for (const profile of BUILTIN_PROFILES) {
   // Built-in adapters above take precedence over a same-named preset.
   if (!(profile.name in builtinFactories)) {

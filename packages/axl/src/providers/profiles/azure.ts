@@ -11,8 +11,8 @@ import type { ProviderProfile } from '../openai-compatible.js';
  * neither `providers.azure.baseUrl` nor `AZURE_OPENAI_BASE_URL` is set.
  *
  * Auth: API-key auth uses the `api-key` header (NOT `Authorization: Bearer`).
- * Entra/AAD bearer-token auth needs the async key callback (Tier 2) and is not
- * wired here.
+ * Entra/AAD bearer-token auth uses the async key callback plus an `authHeader:
+ * 'bearer'` override.
  *
  * Azure serves OpenAI models, so the OpenAI reasoning logic and pricing table
  * are reused. Caveat: deployment names are arbitrary, so o-series/GPT-5

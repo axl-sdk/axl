@@ -1309,8 +1309,9 @@ const runtime3 = new AxlRuntime({
 ### Provider profiles
 
 The generic `OpenAICompatibleProvider` is parameterized by a `ProviderProfile`. Built-in
-presets (OpenRouter, Azure, xAI, DeepSeek, Mistral, Groq, ollama/vllm/lmstudio/llamacpp/sglang)
-are profiles; build your own by cloning one. Guide: [providers.md → presets](providers.md#openai-compatible-providers--presets).
+presets (OpenRouter, Azure, xAI, DeepSeek, Mistral, Groq, Bedrock,
+ollama/vllm/lmstudio/llamacpp/sglang) are profiles; build your own by cloning one. Guide:
+[providers.md → presets](providers.md#openai-compatible-providers--presets).
 
 **`ProviderProfile`**
 

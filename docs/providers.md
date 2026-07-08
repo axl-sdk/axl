@@ -89,6 +89,25 @@ google:gemini-3-pro-preview          # Deprecated (shut down March 9, 2026)
 google:gemini-3.1-flash-lite-preview # Deprecated (shuts down May 25, 2026)
 ```
 
+### Structured output & schema handling on Gemini
+
+Gemini's schema sanitizer (`sanitizeSchemaForGemini`) strips a set of JSON-Schema
+keywords it doesn't support — including `$ref` and `$defs`. This has two
+consequences worth knowing:
+
+- **Tool-definition schemas must stay inline.** Axl renders provider tool
+  definitions with the inline (`$ref`-free) converter for exactly this reason. A
+  `$ref`-hoisted tool schema would be sanitized down to a typeless `{}` on Gemini
+  (with no 400 error — a silent type loss). This is why the appended-prompt schema
+  compaction (which *does* use `$ref`) is scoped to prompt text only, where `$ref`
+  is opaque bytes the model reads rather than a structural schema on the wire.
+- **On the default JSON mode, the prompt text is the schema contract.** When a
+  schema is requested without native structured output, Axl sends
+  `responseMimeType: 'application/json'` with **no** `responseSchema` on Gemini
+  (and a generic "respond with JSON" system line on Anthropic — schema never
+  transmitted structurally). On those providers the appended prompt schema is the
+  *entire* schema signal, so its content matters more than on OpenAI.
+
 ## OpenAI-compatible providers & presets
 
 The OpenAI `/v1/chat/completions` wire format is the de-facto standard, so one generic

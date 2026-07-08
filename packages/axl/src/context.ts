@@ -96,13 +96,76 @@ type AskFrame = {
 };
 const askStorage = new AsyncLocalStorage<AskFrame>();
 
+/**
+ * Memoized inline JSON-Schema conversions, keyed by Zod schema identity.
+ *
+ * The conversion (`z.toJSONSchema`) walks the entire schema tree; the tool-def
+ * hot path (`buildToolDefs`) re-derives the same schema on every turn from a
+ * stable `tool.inputSchema`, and const / agent-config prompt schemas are also
+ * stable. A `WeakMap` on schema identity turns those into cache hits while
+ * inline per-call schemas (a fresh object each call) miss cleanly and are GC'd
+ * with no leak. Best-effort: correctness never depends on a hit.
+ *
+ * The cached object is shared by reference — callers MUST treat it as read-only.
+ * Audited consumers (`buildToolDefs` wrapping, Gemini `sanitizeSchemaForGemini`
+ * which clones, Studio introspection which serializes, prompt stringify) never
+ * mutate it.
+ */
+const inlineSchemaCache = new WeakMap<z.ZodType, Record<string, unknown>>();
+
 /** Convert a Zod schema to JSON Schema. Exported for Studio tool introspection.
  *  Wraps Zod v4's built-in `z.toJSONSchema()`, stripping the `$schema` key
- *  since tool parameter schemas are embedded objects, not standalone documents. */
+ *  since tool parameter schemas are embedded objects, not standalone documents.
+ *
+ *  **Inline** rendering: shared subschemas are duplicated in place, NOT hoisted
+ *  into `$defs`/`$ref`. This is the safe rendering for provider tool definitions
+ *  on every provider — notably Gemini's `sanitizeSchemaForGemini` strips
+ *  `$ref`/`$defs`, which would silently reduce a hoisted schema to a typeless
+ *  `{}`. The `$ref`-compact rendering lives in the private `renderSchemaForPrompt`
+ *  and is scoped to prompt text, where `$ref` is opaque bytes on the wire. */
 export function zodToJsonSchema(schema: z.ZodType): Record<string, unknown> {
+  const cached = inlineSchemaCache.get(schema);
+  if (cached !== undefined) return cached;
   const result = z.toJSONSchema(schema, { unrepresentable: 'any' }) as Record<string, unknown>;
   delete result.$schema;
+  inlineSchemaCache.set(schema, result);
   return result;
+}
+
+/**
+ * Memoized compact prompt renderings, keyed by Zod schema identity. Same
+ * best-effort caching rationale as `inlineSchemaCache`, for the prompt path.
+ */
+const promptSchemaCache = new WeakMap<z.ZodType, string>();
+
+/**
+ * Render a Zod schema as compact JSON-Schema TEXT for the prompt guidance path
+ * ONLY (`Respond with valid JSON matching this schema: …`). Private by design.
+ *
+ * Two divergences from the exported `zodToJsonSchema`:
+ *  - `reused: 'ref'` hoists subschemas shared across (e.g.) discriminated-union
+ *    arms into `$defs`/`$ref` once instead of duplicating them inline — the big
+ *    token win for large unions.
+ *  - `JSON.stringify` WITHOUT `null, 2` — drops pretty-print indentation.
+ *
+ * Both are safe here because this string is pure prompt text: `$ref` is opaque
+ * bytes to every provider on the prompt path (no provider parses prompt JSON
+ * structurally), so the Gemini `$ref`-stripping cliff — which only bites the
+ * structural tool-def / responseSchema paths — does not apply. Keeping this
+ * rendering physically separate from the exported converter makes the Gemini
+ * footgun unrepresentable rather than an easy-to-miss flag on a shared symbol.
+ */
+function renderSchemaForPrompt(schema: z.ZodType): string {
+  const cached = promptSchemaCache.get(schema);
+  if (cached !== undefined) return cached;
+  const json = z.toJSONSchema(schema, { unrepresentable: 'any', reused: 'ref' }) as Record<
+    string,
+    unknown
+  >;
+  delete json.$schema;
+  const rendered = JSON.stringify(json);
+  promptSchemaCache.set(schema, rendered);
+  return rendered;
 }
 
 /** Simple token estimator: ~4 chars per token. Good enough for context management. */
@@ -951,8 +1014,11 @@ export class WorkflowContext<TInput = unknown> {
     // Build user prompt
     let userContent = prompt;
     if (options?.schema) {
-      const jsonSchema = zodToJsonSchema(options.schema as z.ZodType);
-      userContent += `\n\nRespond with valid JSON matching this schema:\n${JSON.stringify(jsonSchema, null, 2)}`;
+      // Prompt-only rendering: `$ref`-hoisted + compact (see `renderSchemaForPrompt`).
+      // This is TEXT the model reads, not a structural schema on the wire, so the
+      // Gemini `$ref` cliff does not apply here (it only bites tool-def schemas).
+      const schemaText = renderSchemaForPrompt(options.schema as z.ZodType);
+      userContent += `\n\nRespond with valid JSON matching this schema:\n${schemaText}`;
     }
 
     messages.push({ role: 'user', content: userContent });

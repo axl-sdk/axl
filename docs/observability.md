@@ -433,6 +433,33 @@ Three common symptoms and what to look for in traces:
 
 **"Why did my agent respond that way?"** Enable `trace.level: 'full'` and check the `data.messages` array on the relevant `agent_call_end` — it has the exact conversation (system prompt, history, tool results, retry feedback) as the model saw it. `system`, `params`, `thinking`, and `retryReason` are visible in default mode without needing verbose.
 
+### Structured-output prompt cost
+
+When you call `ctx.ask(prompt, { schema })`, Axl appends a JSON-Schema rendering
+of the schema to the user prompt (`Respond with valid JSON matching this
+schema: …`). This text is part of the input tokens on every attempt, so a large
+schema is a recurring cost.
+
+Two things keep that text small automatically, with no code change:
+
+- **Shared subschemas are hoisted.** Subschemas reused across the schema — the
+  classic case is a `z.discriminatedUnion` whose arms share the same sub-objects —
+  are emitted once under `$defs` and referenced via `$ref`, rather than duplicated
+  inline at every occurrence. For large unions this is an order-of-magnitude
+  reduction in the appended tokens.
+- **The JSON is compact.** No pretty-print indentation is added to the prompt
+  rendering.
+
+This applies only to the **prompt** rendering. Provider **tool definitions** still
+use the inline (`$ref`-free) rendering, which is required for Gemini (its schema
+sanitizer strips `$ref`/`$defs`). To read the exact appended text, enable
+`trace.level: 'full'` and inspect the last user message in `agent_call_start`'s
+`data.messages`.
+
+If a schema's appended text is still large, that's usually inherent schema size
+(many fields, deep nesting, per-field `.describe()` text) rather than rendering
+overhead — measure with `data.prompt` before adding hand-tuned guidance.
+
 ### PII and redaction
 
 `config.trace.redact` is an **observability-boundary filter** that scrubs user/LLM content everywhere it would otherwise flow to observability consumers. The mental model: "what can the observability layer see?". Under `redact: true`, structural metadata (workflow names, agent names, tool names, cost/token metrics, durations, status, roles, keys, IDs, `askId`/`parentAskId`/`depth`) stays visible — but any field that carries prompt/response/user/LLM content is replaced with `'[redacted]'`.

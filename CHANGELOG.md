@@ -28,6 +28,15 @@ cross-provider `effort`, tool-calling, and cost surfaces.
 - **Unpriced-cost honesty.** `ask_end`, `ExecutionInfo`, `runtime.trackExecution`,
   `AxlTestRuntime`, budget status, and Studio now flag lower-bound totals when a
   model reports usage but no usable cost.
+- **Cheaper structured-output prompts.** When `ctx.ask({ schema })` appends the
+  JSON-Schema guidance, subschemas shared across (e.g.) discriminated-union arms
+  are now hoisted into `$defs`/`$ref` once instead of duplicated inline, and the
+  JSON is emitted compact (no pretty-print indentation). For large unions with
+  shared sub-objects this cuts the appended schema tokens by an order of magnitude
+  with no code change. The exported `zodToJsonSchema` (used for provider tool
+  definitions) is unchanged — it stays inline, which is required for Gemini, whose
+  schema sanitizer strips `$ref`/`$defs`. Zod→JSON-Schema conversions are also
+  memoized by schema identity, benefiting the per-turn tool-definition path.
 
 ### Changed
 - **Unknown model cost is now `undefined`, not `0`.** Pricing-table misses no

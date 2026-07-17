@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Model-facing tool output projection.** Local tools can define a synchronous `toModelOutput` allowlist that keeps the complete post-hook result on the host-facing `tool_call_end` event while sending only validated, purpose-built content to the model. Adds exported `ToolModelOutput` and fail-closed `ToolModelOutputError`; existing tools, direct invocation, MCP, and handoffs retain their prior behavior.
+
+### Changed
+
+- **Configured tool mocks honor model-output policy.** `AxlTestRuntime.mockTool()` still bypasses the configured handler, schema, approval, retry, and hooks, but a matching configured local tool now deliberately supplies its `sensitive` and `toModelOutput` policy so tests shape model context the same way as production. Unconfigured overrides retain legacy serialization.
+
 ## [0.19.0] - 2026-07-08
 
 Two themes. **Broad provider expansion:** the OpenAI adapter now powers

@@ -1,6 +1,6 @@
 // Core API
 export { tool } from './tool.js';
-export type { Tool, ToolConfig, ToolHooks, RetryPolicy } from './tool.js';
+export type { Tool, ToolConfig, ToolHooks, ToolModelOutput, RetryPolicy } from './tool.js';
 
 export { agent } from './agent.js';
 export type { Agent, AgentConfig, HandoffDescriptor } from './agent.js';
@@ -153,6 +153,7 @@ export {
   BudgetExceededError,
   GuardrailError,
   ValidationError,
+  ToolModelOutputError,
 } from './errors.js';
 export { ProviderError, isRetryableStatus } from './providers/errors.js';
 // NOTE: `RETRYABLE_STATUS_CODES` (retry.ts) is intentionally NOT exported — it's the

@@ -1,7 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod';
-import { workflow, agent, tool } from '@axlsdk/axl';
-import type { AxlEvent } from '@axlsdk/axl';
+import { workflow, agent, tool, ToolModelOutputError } from '@axlsdk/axl';
+import type { AxlEvent, Tool } from '@axlsdk/axl';
 import { AxlTestRuntime, MockProvider } from '../index.js';
 
 // ── Test Fixtures ────────────────────────────────────────────────────────────
@@ -28,6 +28,45 @@ const HandleSupport = workflow({
     return response;
   },
 });
+
+function toolCallResponse(name: string, id = `call-${name}`) {
+  return {
+    content: '',
+    tool_calls: [
+      {
+        id,
+        type: 'function' as const,
+        function: { name, arguments: '{}' },
+      },
+    ],
+  };
+}
+
+function createToolWorkflow(
+  name: string,
+  tools: Tool<any, any>[],
+  options: { streaming?: boolean } = {},
+) {
+  const testAgent = agent({
+    name: `${name}-agent`,
+    model: 'openai:gpt-4o-mini',
+    system: 'Use the requested tool.',
+    tools,
+  });
+
+  return workflow({
+    name,
+    input: z.object({}),
+    handler: async (ctx) => {
+      if (options.streaming) void ctx.events;
+      return ctx.ask(testAgent, 'Run the tool.');
+    },
+  });
+}
+
+function recordedToolContent(provider: MockProvider): string | undefined {
+  return provider.calls[1]?.messages.find((message) => message.role === 'tool')?.content;
+}
 
 // A workflow with output schema for output validation tests
 const StrictWorkflow = workflow({
@@ -446,6 +485,298 @@ describe('AxlTestRuntime', () => {
       expect(runtime.toolCalls()).toHaveLength(1);
       expect(runtime.toolCalls()[0].name).toBe('get_order');
       expect(runtime.toolCalls()[0].result).toEqual({ mocked: true });
+    });
+
+    it('applies configured projection policy while retaining the complete mock result for hosts', async () => {
+      const projectedTool = tool({
+        name: 'projected_mock',
+        description: 'Return a rich result',
+        input: z.object({}),
+        handler: () => ({ humanMessage: 'real', internalId: 'real-id', payload: [1] }),
+        toModelOutput: (output) => ({ message: output.humanMessage }),
+      });
+      const projectedWorkflow = createToolWorkflow('ProjectedMock', [projectedTool]);
+      const provider = MockProvider.sequence([
+        toolCallResponse('projected_mock'),
+        { content: 'done' },
+      ]);
+      const completeMockResult = {
+        humanMessage: 'ready',
+        internalId: 'host-only-id',
+        payload: [1, 2, 3],
+      };
+      const runtime = new AxlTestRuntime();
+      runtime.register(projectedWorkflow);
+      runtime.mockProvider('openai', provider);
+      runtime.mockTool('projected_mock', () => completeMockResult);
+
+      await runtime.execute('ProjectedMock', {});
+
+      expect(runtime.toolCalls('projected_mock')).toEqual([
+        { name: 'projected_mock', args: {}, result: completeMockResult },
+      ]);
+      const toolEnd = runtime
+        .traceLog()
+        .find((event) => event.type === 'tool_call_end' && event.tool === 'projected_mock');
+      expect(toolEnd?.data.result).toEqual(completeMockResult);
+      expect(recordedToolContent(provider)).toBe('{"message":"ready"}');
+      expect(recordedToolContent(provider)).not.toContain('host-only-id');
+    });
+
+    it('lets configured sensitive policy win and skips projection for a mock result', async () => {
+      const mapper = vi.fn(() => 'must not be sent');
+      const sensitiveTool = tool({
+        name: 'sensitive_mock',
+        description: 'Return sensitive data',
+        input: z.object({}),
+        sensitive: true,
+        handler: () => ({ secret: 'real' }),
+        toModelOutput: mapper,
+      });
+      const sensitiveWorkflow = createToolWorkflow('SensitiveMock', [sensitiveTool]);
+      const provider = MockProvider.sequence([
+        toolCallResponse('sensitive_mock'),
+        { content: 'done' },
+      ]);
+      const runtime = new AxlTestRuntime();
+      runtime.register(sensitiveWorkflow);
+      runtime.mockProvider('openai', provider);
+      runtime.mockTool('sensitive_mock', () => ({ secret: 'mock-secret' }));
+
+      await runtime.execute('SensitiveMock', {});
+
+      expect(mapper).not.toHaveBeenCalled();
+      expect(runtime.toolCalls('sensitive_mock')[0].result).toEqual({ secret: 'mock-secret' });
+      expect(recordedToolContent(provider)).toBe('[REDACTED - sensitive tool output]');
+
+      const failureProvider = MockProvider.sequence([
+        toolCallResponse('sensitive_mock', 'call-sensitive-failure'),
+        { content: 'recovered' },
+      ]);
+      const failureRuntime = new AxlTestRuntime();
+      failureRuntime.register(sensitiveWorkflow);
+      failureRuntime.mockProvider('openai', failureProvider);
+      failureRuntime.mockTool('sensitive_mock', () => {
+        throw new Error('sensitive mock failed');
+      });
+
+      await failureRuntime.execute('SensitiveMock', {});
+
+      expect(mapper).not.toHaveBeenCalled();
+      expect(failureRuntime.toolCalls('sensitive_mock')[0].result).toEqual({
+        error: 'sensitive mock failed',
+      });
+      expect(recordedToolContent(failureProvider)).toBe('[REDACTED - sensitive tool output]');
+    });
+
+    it('bypasses configured projection when the mock throws', async () => {
+      const mapper = vi.fn(() => 'must not run');
+      const configuredTool = tool({
+        name: 'throwing_mock',
+        description: 'Throw from a mock',
+        input: z.object({}),
+        handler: () => ({ ok: true }),
+        toModelOutput: mapper,
+      });
+      const throwingWorkflow = createToolWorkflow('ThrowingMock', [configuredTool]);
+      const provider = MockProvider.sequence([
+        toolCallResponse('throwing_mock'),
+        { content: 'recovered' },
+      ]);
+      const runtime = new AxlTestRuntime();
+      runtime.register(throwingWorkflow);
+      runtime.mockProvider('openai', provider);
+      runtime.mockTool('throwing_mock', () => {
+        throw new Error('mock exploded');
+      });
+
+      await runtime.execute('ThrowingMock', {});
+
+      expect(mapper).not.toHaveBeenCalled();
+      expect(runtime.toolCalls('throwing_mock')[0].result).toEqual({ error: 'mock exploded' });
+      expect(recordedToolContent(provider)).toBe('{"error":"mock exploded"}');
+    });
+
+    it('projects a normally returned error-shaped mock result', async () => {
+      const configuredTool = tool({
+        name: 'returned_error_mock',
+        description: 'Return an error-shaped result',
+        input: z.object({}),
+        handler: () => ({ error: 'real error', internal: 'real-only' }),
+        toModelOutput: (output) => ({ message: output.error }),
+      });
+      const returnedErrorWorkflow = createToolWorkflow('ReturnedErrorMock', [configuredTool]);
+      const provider = MockProvider.sequence([
+        toolCallResponse('returned_error_mock'),
+        { content: 'done' },
+      ]);
+      const runtime = new AxlTestRuntime();
+      runtime.register(returnedErrorWorkflow);
+      runtime.mockProvider('openai', provider);
+      runtime.mockTool('returned_error_mock', () => ({
+        error: 'mock declined',
+        internal: 'host-only',
+      }));
+
+      await runtime.execute('ReturnedErrorMock', {});
+
+      expect(runtime.toolCalls('returned_error_mock')[0].result).toEqual({
+        error: 'mock declined',
+        internal: 'host-only',
+      });
+      expect(recordedToolContent(provider)).toBe('{"message":"mock declined"}');
+    });
+
+    it('preserves legacy serialization for an override without a configured tool', async () => {
+      const unconfiguredWorkflow = createToolWorkflow('UnconfiguredMock', []);
+      const provider = MockProvider.sequence([
+        toolCallResponse('unconfigured_override'),
+        { content: 'done' },
+      ]);
+      const runtime = new AxlTestRuntime();
+      runtime.register(unconfiguredWorkflow);
+      runtime.mockProvider('openai', provider);
+      runtime.mockTool('unconfigured_override', () => 'legacy string');
+
+      await runtime.execute('UnconfiguredMock', {});
+
+      expect(runtime.toolCalls('unconfigured_override')[0].result).toBe('legacy string');
+      expect(recordedToolContent(provider)).toBe('"legacy string"');
+    });
+
+    it('sends identical projected mock content in streaming and non-streaming asks', async () => {
+      const projectedTool = tool({
+        name: 'parity_mock',
+        description: 'Project the mock result',
+        input: z.object({}),
+        handler: () => ({ visible: 'real', hidden: 'real-only' }),
+        toModelOutput: (output) => output.visible,
+      });
+      const nonStreamingWorkflow = createToolWorkflow('NonStreamingProjection', [projectedTool]);
+      const streamingWorkflow = createToolWorkflow('StreamingProjection', [projectedTool], {
+        streaming: true,
+      });
+      const nonStreamingProvider = MockProvider.sequence([
+        toolCallResponse('parity_mock'),
+        { content: 'done' },
+      ]);
+      const streamingProvider = MockProvider.sequence([
+        toolCallResponse('parity_mock'),
+        { content: 'done' },
+      ]);
+      const nonStreamingRuntime = new AxlTestRuntime();
+      nonStreamingRuntime.register(nonStreamingWorkflow);
+      nonStreamingRuntime.mockProvider('openai', nonStreamingProvider);
+      nonStreamingRuntime.mockTool('parity_mock', () => ({
+        visible: 'projected text',
+        hidden: 'host-only',
+      }));
+      const streamingRuntime = new AxlTestRuntime();
+      streamingRuntime.register(streamingWorkflow);
+      streamingRuntime.mockProvider('openai', streamingProvider);
+      streamingRuntime.mockTool('parity_mock', () => ({
+        visible: 'projected text',
+        hidden: 'host-only',
+      }));
+
+      await nonStreamingRuntime.execute('NonStreamingProjection', {});
+      await streamingRuntime.execute('StreamingProjection', {});
+
+      expect(recordedToolContent(nonStreamingProvider)).toBe('projected text');
+      expect(recordedToolContent(streamingProvider)).toBe(
+        recordedToolContent(nonStreamingProvider),
+      );
+    });
+
+    it('includes projected mock content in the next full-trace request snapshot', async () => {
+      const projectedTool = tool({
+        name: 'full_trace_mock',
+        description: 'Project the mock result',
+        input: z.object({}),
+        handler: () => ({ visible: 'real', hidden: 'real-only' }),
+        toModelOutput: (output) => ({ visible: output.visible }),
+      });
+      const fullTraceWorkflow = createToolWorkflow('FullTraceProjection', [projectedTool]);
+      const provider = MockProvider.sequence([
+        toolCallResponse('full_trace_mock'),
+        { content: 'done' },
+      ]);
+      const runtime = new AxlTestRuntime({ config: { trace: { level: 'full' } } });
+      runtime.register(fullTraceWorkflow);
+      runtime.mockProvider('openai', provider);
+      runtime.mockTool('full_trace_mock', () => ({
+        visible: 'model-visible',
+        hidden: 'host-only',
+      }));
+
+      await runtime.execute('FullTraceProjection', {});
+
+      const starts = runtime.traceLog().filter((event) => event.type === 'agent_call_start');
+      expect(starts).toHaveLength(2);
+      const messages = (starts[1].data as Record<string, unknown>).messages as Array<
+        Record<string, unknown>
+      >;
+      expect(messages).toContainEqual(
+        expect.objectContaining({
+          role: 'tool',
+          content: '{"visible":"model-visible"}',
+        }),
+      );
+      expect(JSON.stringify(messages)).not.toContain('host-only');
+    });
+
+    it('fails closed after recording the complete mock result when projection fails', async () => {
+      const mapper = vi.fn(() => {
+        throw new Error('mapper-secret');
+      });
+      const configuredTool = tool({
+        name: 'invalid_projection_mock',
+        description: 'Return an invalid projection',
+        input: z.object({}),
+        handler: () => ({ raw: 'real' }),
+        toModelOutput: mapper,
+      });
+      const failureWorkflow = createToolWorkflow('InvalidProjectionMock', [configuredTool]);
+      const provider = MockProvider.sequence([
+        toolCallResponse('invalid_projection_mock'),
+        { content: 'must not be called' },
+      ]);
+      const runtime = new AxlTestRuntime();
+      runtime.register(failureWorkflow);
+      runtime.mockProvider('openai', provider);
+      runtime.mockTool('invalid_projection_mock', () => ({ raw: 'host-only' }));
+
+      await expect(runtime.execute('InvalidProjectionMock', {})).rejects.toBeInstanceOf(
+        ToolModelOutputError,
+      );
+
+      expect(mapper).toHaveBeenCalledOnce();
+      expect(provider.calls).toHaveLength(1);
+      expect(runtime.toolCalls('invalid_projection_mock')).toEqual([
+        {
+          name: 'invalid_projection_mock',
+          args: {},
+          result: { raw: 'host-only' },
+        },
+      ]);
+      expect(
+        runtime
+          .traceLog()
+          .filter(
+            (event) => event.type === 'tool_call_end' && event.tool === 'invalid_projection_mock',
+          ),
+      ).toHaveLength(1);
+      expect(runtime.traceLog().find((event) => event.type === 'ask_end')?.outcome).toEqual({
+        ok: false,
+        error: 'Failed to prepare model output for tool "invalid_projection_mock"',
+      });
+      const workflowEnd = runtime.traceLog().find((event) => event.type === 'workflow_end');
+      expect(workflowEnd?.data).toMatchObject({
+        status: 'failed',
+        error: 'Failed to prepare model output for tool "invalid_projection_mock"',
+      });
+      expect(JSON.stringify(workflowEnd)).not.toContain('mapper-secret');
+      expect(JSON.stringify(workflowEnd)).not.toContain('host-only');
     });
   });
 

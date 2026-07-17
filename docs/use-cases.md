@@ -41,6 +41,32 @@ const HandleSupport = workflow({
 
 25 lines for a production-ready support agent with tool access, type safety, and streaming.
 
+## Rich application results with compact model context
+
+A tool can return actions and bulky host data for UI rendering without copying all of it into the next model request. `toModelOutput` is an explicit allowlist over the successful post-hook result:
+
+```typescript
+const searchCatalog = tool({
+  name: 'search_catalog',
+  description: 'Search products and prepare application cards',
+  input: z.object({ query: z.string() }),
+  handler: async ({ query }) => {
+    const products = await catalog.search(query);
+    return {
+      humanMessage: `Found ${products.length} products.`,
+      actions: products.map((product) => ({
+        label: `Open ${product.name}`,
+        internalId: product.id,
+      })),
+      payload: products,
+    };
+  },
+  toModelOutput: (result) => ({ message: result.humanMessage }),
+});
+```
+
+An unredacted `tool_call_end` retains `humanMessage`, `actions`, and `payload` for the application. The model receives only `{"message":"…"}`. Keep critical writes and side effects inside the handler or workflow; events remain a bounded, optionally redacted observation channel rather than a durable delivery queue.
+
 ## Structured Data Extraction
 
 Extract entities with strict type validation and self-correcting retry.

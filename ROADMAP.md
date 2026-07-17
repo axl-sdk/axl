@@ -18,6 +18,7 @@
 - **Agent Guardrails** — Input/output validation at the agent boundary with retry, throw, or custom policies
 - **Session Options** — Configurable history limits, summarization, and persistence
 - **Tool Middleware** — Approval gates (`requireApproval`) and lifecycle hooks (`before`/`after`)
+- **Model-Facing Tool Output Projection** — Opt-in synchronous `toModelOutput` allowlists the successful post-hook tool result sent to the model while preserving the complete host-observable result. Strict JSON-compatible validation fails closed, `sensitive` takes precedence, configured `AxlTestRuntime.mockTool()` overrides inherit projection policy, and direct/MCP/handoff paths remain unchanged.
 - **Agent Handoffs** — Oneway and roundtrip modes with descriptions, OTel spans, and session history
 - **Unified Event Model** — Single `AxlEvent` discriminated union (replaces the 0.15 `StreamEvent` + `TraceEvent` split). Wire format = trace format. Adds `ask_start`/`ask_end`, `agent_call_start`, `tool_call_start`, ask-graph correlation (`askId`/`parentAskId`/`depth`). `AxlStream.lifecycle` filtered iterable. See [migration guide](docs/migration/unified-event-model.md)
 - **Axl Studio** — Local development UI with 8 panels (Playground, Workflows, Traces, Costs, Memory, Sessions, Tools, Evals)

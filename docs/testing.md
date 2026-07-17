@@ -218,6 +218,36 @@ axl.mockTool('get_order', async ({ orderId }) => ({ id: orderId, status: 'delive
 const result = await axl.execute('HandleSupport', { msg: 'Refund please' });
 ```
 
+When the mocked name matches a configured local tool, the mock still bypasses the configured schema, approval, retry, hooks, and real handler. The configured tool contributes only its model-output policy: `sensitive` and `toModelOutput`. This lets a test return the same complete application artifact the host would render while asserting the smaller tool message the provider receives:
+
+```typescript
+const provider = MockProvider.sequence([
+  { content: '', tool_calls: [{
+    id: 'call-1',
+    type: 'function',
+    function: { name: 'get_order', arguments: '{"orderId":"123"}' },
+  }] },
+  { content: 'Done.' },
+]);
+
+runtime.mockProvider('openai', provider);
+runtime.mockTool('get_order', () => ({
+  humanMessage: 'Ready for pickup',
+  internalId: 'host-only-123',
+}));
+
+await runtime.execute('HandleSupport', { msg: 'Check order 123' });
+
+expect(runtime.toolCalls('get_order')[0].result).toEqual({
+  humanMessage: 'Ready for pickup',
+  internalId: 'host-only-123',
+});
+expect(provider.calls[1].messages.find((m) => m.role === 'tool')?.content)
+  .toBe('{"message":"Ready for pickup"}');
+```
+
+A thrown mock bypasses projection; a normally returned error-shaped value may be projected. A configured sensitive mock always sends the fixed redaction marker and never invokes its mapper. An override whose name is not in the agent's configured tools keeps legacy serialization. Use `config: { trace: { level: 'full' } }` when asserting that the next `agent_call_start.data.messages` snapshot contains the projected content.
+
 This design means you never need a separate "test mode" for individual primitives. If your workflow uses `ctx.budget()` wrapping `ctx.spawn()` with `ctx.vote()`, all of that runs as-is in tests — only the LLM and tool I/O are mocked.
 
 ## Testing vs. Evaluation

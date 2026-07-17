@@ -46,6 +46,37 @@ describe('tool()', () => {
     expect(sensitiveTool.sensitive).toBe(true);
   });
 
+  it('only exposes toModelOutput when configured', () => {
+    expect(Object.keys(basicTool)).not.toContain('toModelOutput');
+
+    const projectedTool = tool({
+      name: 'projected',
+      description: 'Project a result',
+      input: z.object({}),
+      handler: () => ({ private: 'host', public: 'model' }),
+      toModelOutput: (output) => output.public,
+    });
+
+    expect(projectedTool.toModelOutput).toBeTypeOf('function');
+    expect(Object.keys(projectedTool)).toContain('toModelOutput');
+  });
+
+  it('does not project direct run() or _execute() results', async () => {
+    const project = vi.fn(() => 'model-only');
+    const t = tool({
+      name: 'direct-result',
+      description: 'Return a full result directly',
+      input: z.object({}),
+      handler: () => ({ complete: true }),
+      toModelOutput: project,
+    });
+    const ctx = { log: vi.fn() } as never;
+
+    await expect(t._execute({})).resolves.toEqual({ complete: true });
+    await expect(t.run(ctx, {})).resolves.toEqual({ complete: true });
+    expect(project).not.toHaveBeenCalled();
+  });
+
   it('exposes retry policy with defaults', () => {
     expect(basicTool.retry).toEqual({
       attempts: 1,

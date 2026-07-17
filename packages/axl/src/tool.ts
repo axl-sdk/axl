@@ -16,6 +16,15 @@ export type ToolHooks<TInput = unknown, TOutput = unknown> = {
   after?(output: TOutput, ctx: WorkflowContext): TOutput | Promise<TOutput>;
 };
 
+/** JSON-compatible content that a tool may explicitly expose to the model. */
+export type ToolModelOutput =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly ToolModelOutput[]
+  | { readonly [key: string]: ToolModelOutput | undefined };
+
 /** Tool configuration */
 export type ToolConfig<TInput extends z.ZodType, TOutput = unknown> = {
   name: string;
@@ -30,6 +39,8 @@ export type ToolConfig<TInput extends z.ZodType, TOutput = unknown> = {
   requireApproval?: boolean;
   /** Lifecycle hooks: before/after the handler. */
   hooks?: ToolHooks<z.infer<TInput>, TOutput>;
+  /** Select the subset of a successful result that is sent back to the model. */
+  toModelOutput?(output: Readonly<TOutput>): ToolModelOutput;
 };
 
 /** A defined tool instance */
@@ -41,6 +52,8 @@ export type Tool<TInput extends z.ZodType = z.ZodType, TOutput = unknown> = {
   readonly retry: RetryPolicy;
   readonly requireApproval: boolean;
   readonly hooks?: ToolHooks<z.infer<TInput>, TOutput>;
+  /** Select the subset of a successful result that is sent back to the model. */
+  toModelOutput?(output: Readonly<TOutput>): ToolModelOutput;
   /** Run the tool directly from workflow code */
   run(ctx: WorkflowContext, input: z.infer<TInput>): Promise<TOutput>;
   /** Execute the handler (internal use — includes retry logic) */
@@ -149,6 +162,7 @@ export function tool<TInput extends z.ZodType, TOutput = unknown>(
     retry: retryPolicy,
     requireApproval: config.requireApproval ?? false,
     hooks: config.hooks,
+    ...(config.toModelOutput !== undefined ? { toModelOutput: config.toModelOutput } : {}),
 
     async run(ctx: WorkflowContext, input: z.infer<TInput>): Promise<TOutput> {
       const startTime = Date.now();

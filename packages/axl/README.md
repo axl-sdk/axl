@@ -162,8 +162,13 @@ const calculator = tool({
   // handler also accepts (input, ctx) for nested agent invocations — see below
   retry: { attempts: 3, backoff: 'exponential' },
   sensitive: false,
+  // Keep the complete handler result for the host while sending only this
+  // allowlisted projection back to the model:
+  toModelOutput: (result) => ({ answer: result.result }),
 });
 ```
+
+`toModelOutput` is an opt-in, synchronous mapper for successful agent-invoked local tools. Strings are sent verbatim; JSON-compatible values are strictly validated and serialized once. The full post-hook result stays on `tool_call_end.data.result` for host rendering (subject to `trace.redact`). `sensitive: true` and thrown handler/hook/mock failures skip projection, and projection errors fail closed with `ToolModelOutputError`—there is no raw fallback. Direct `tool.run()`/`_execute()`, MCP tools, and handoffs are unchanged. See the [API reference](../../docs/api-reference.md#model-facing-tool-output) for the exact type, validation, mock, and delivery contract.
 
 Tool handlers receive a second parameter `ctx: WorkflowContext` (a child context), enabling the "agent-as-tool" composition pattern:
 

@@ -36,6 +36,7 @@ const search = tool({
 | `maxStringLength` | `number` | `10000` | Max length for any string argument. Set to `0` to disable |
 | `requireApproval` | `boolean` | `false` | When `true`, agent-initiated calls trigger `ctx.awaitHuman()` before execution. Skipped for direct `tool.run()` calls |
 | `hooks` | `ToolHooks` | — | Lifecycle hooks (see below) |
+| `toModelOutput` | `(output: Readonly<TOutput>) => ToolModelOutput` | — | Synchronously allowlist the successful, post-`after` result sent to the model. The complete result remains available to the host on `tool_call_end` unless trace redaction is enabled |
 
 #### `RetryPolicy`
 
@@ -53,6 +54,41 @@ const search = tool({
 | `after` | `(output: TOutput, ctx: WorkflowContext) => TOutput \| Promise<TOutput>` | Transform output after handler runs |
 
 Execution order for agent-initiated calls: approval gate → `hooks.before` → handler → `hooks.after`. For direct `tool.run()` calls: `hooks.before` → handler → `hooks.after` (no approval gate).
+
+#### Model-facing tool output
+
+`toModelOutput` separates the complete application result from the compact content sent back to the model on the next turn:
+
+```typescript
+const findOrder = tool({
+  name: 'find_order',
+  description: 'Find an order and return application actions',
+  input: z.object({ orderId: z.string() }),
+  handler: async ({ orderId }) => ({
+    humanMessage: 'Order is ready for pickup.',
+    action: { label: 'Open order', internalId: orderId },
+    payload: await loadLargeOrderPayload(orderId),
+  }),
+  toModelOutput: (result) => ({ message: result.humanMessage }),
+});
+```
+
+The mapper is synchronous and receives the same result reference after a successful `hooks.after`. `Readonly<TOutput>` is shallow and is an authoring contract: Axl does not clone or freeze the result. Treat the mapper as pure; mutating the value is unsupported and can also mutate the object retained by the host event.
+
+`ToolModelOutput` supports strings, finite numbers, booleans, `null`, dense arrays, and plain or null-prototype records recursively. An `undefined` object property is omitted. A top-level `undefined`, array hole/`undefined`, bigint, function, symbol, non-finite number, cycle, accessor, callable custom `toJSON`, enumerable symbol key, or non-plain object fails with exported `ToolModelOutputError`. Shared non-cyclic references are valid. Projected strings become verbatim tool-message content; every other value is validated and JSON-encoded once. Without a mapper, legacy `JSON.stringify` behavior is unchanged, including quoted string results.
+
+Configured local tools use this precedence:
+
+1. `sensitive: true` sends `[REDACTED - sensitive tool output]` and never runs the mapper.
+2. A thrown handler, `after` hook, or configured mock failure keeps the existing JSON error result and never runs the mapper.
+3. A normally returned value runs `toModelOutput` when configured. This includes a normally returned object with an `error` property; that object still keeps the legacy after-hook and span classification.
+4. Otherwise Axl uses legacy serialization.
+
+Projection runs only for configured local tools invoked by an agent, including the agent-as-tool pattern. `tool.run()` and `_execute()` always return the complete value without projecting. MCP tools and handoff pseudo-tools are unchanged. A matching `AxlTestRuntime.mockTool()` bypasses the real handler, validation, approval, retry, and hooks as before, but inherits the configured tool's `sensitive` and `toModelOutput` policy. An override with no configured tool keeps legacy behavior.
+
+If mapping or validation fails, Axl emits the complete `tool_call_end` first and then throws `ToolModelOutputError` with code `TOOL_MODEL_OUTPUT_ERROR`, `toolName`, and a generic message. It never falls back to the raw result, appends no tool message, and makes no next provider call. The host-only `.cause` may contain mapper-supplied details; do not export it without applying your own redaction policy. `tool_call_end.duration` and the `axl.tool.call` span cover handler/hook work only, not projection.
+
+This is a model/provider-facing data-minimization boundary, not a host-event security or delivery boundary. `tool_call_end.data.result` remains complete subject to `trace.redact`; it does not gain a projected field. Critical side effects must happen in the handler or workflow logic, not solely in an event listener: `ctx.events`, `AxlStream`, and trace listeners retain their existing redaction, bounded-queue, overflow, and persistence behavior.
 
 #### Child Context in Tool Handlers
 

@@ -47,6 +47,14 @@ Prompt injection is an inherent risk in any system where untrusted text is passe
 - API keys configured in `axl.config.ts` or environment variables are **never** included in LLM prompts or logged in traces.
 - Tools marked with `sensitive: true` have their return values redacted from LLM context in subsequent calls.
 
+### Minimize tool results sent to the model
+
+For a rich application result that is not wholly sensitive, configure `toModelOutput` as an explicit allowlist. The host continues to observe the complete result through `tool_call_end.data.result` while the next provider request receives only the projection. A projection failure is fail-closed: Axl never falls back to the raw result. `sensitive: true` has higher precedence and skips projection entirely.
+
+This boundary minimizes **model/provider-facing** data; it does not scrub host observability. `trace.redact` remains the control for event content, and a full trace can show the successfully projected tool message in the next `agent_call_start.data.messages`. `ToolModelOutputError.message` is generic, but its host-only `.cause` may contain an exception thrown by application mapper code. Do not serialize or export `.cause` blindly.
+
+Events are observation, not a durable application-command bus. Critical actions and persistence belong in the tool handler or workflow. A renderer or artifact harvester consuming `ctx.events`, `AxlStream`, or trace listeners must retain the existing redaction, queue-overflow, and state-persistence considerations; projection adds no delivery guarantee.
+
 ## Approval Gates
 
 Tools with `requireApproval: true` trigger a human approval step before execution. When an agent tries to call the tool, the workflow **suspends** — the pending decision is saved to the state store and the execution waits until a human approves or denies.

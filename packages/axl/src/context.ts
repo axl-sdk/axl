@@ -34,6 +34,7 @@ import {
   BudgetExceededError,
   GuardrailError,
   ValidationError,
+  ToolModelOutputError,
 } from './errors.js';
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
@@ -56,6 +57,7 @@ import type { McpManager } from './mcp/manager.js';
 import type { SpanManager } from './telemetry/types.js';
 import type { MemoryManager } from './memory/manager.js';
 import type { RememberOptions, RecallOptions, VectorResult } from './memory/types.js';
+import { serializeToolModelOutput } from './tool-model-output.js';
 
 /**
  * AsyncLocalStorage for per-branch abort signals.
@@ -63,6 +65,24 @@ import type { RememberOptions, RecallOptions, VectorResult } from './memory/type
  * without mutating shared state on the WorkflowContext instance.
  */
 const signalStorage = new AsyncLocalStorage<AbortSignal>();
+
+type ToolExecutionOutcome =
+  | { kind: 'returned'; value: unknown }
+  | { kind: 'thrown'; value: { error: string } };
+
+function isErrorShaped(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && 'error' in value;
+}
+
+function prepareToolModelOutput(toolName: string, project: () => unknown): string {
+  let output: unknown;
+  try {
+    output = project();
+  } catch (cause) {
+    throw new ToolModelOutputError(toolName, cause);
+  }
+  return serializeToolModelOutput(toolName, output);
+}
 
 /**
  * Per-ask frame propagated via AsyncLocalStorage.
@@ -1802,6 +1822,12 @@ export class WorkflowContext<TInput = unknown> {
             }
           }
 
+          // Resolve configured metadata even when a test override wins. Overrides still
+          // bypass validation, approval, hooks, retries, and the real handler; the matching
+          // configured tool contributes only sensitive/model-output policy.
+          const tool = agent._config.tools?.find((candidate) => candidate.name === toolName);
+          const isMcpTool = !tool && this.mcpManager?.isMcpTool(toolName);
+
           // Check toolOverrides first (for mock tool interception)
           const toolOverride = this.toolOverrides?.get(toolName);
           if (toolOverride) {
@@ -1828,17 +1854,18 @@ export class WorkflowContext<TInput = unknown> {
             );
             const toolStart = Date.now();
 
-            const executeOverride = async () => {
-              let toolResult: unknown;
+            const executeOverride = async (): Promise<ToolExecutionOutcome> => {
               try {
-                toolResult = await toolOverride(toolArgs);
+                return { kind: 'returned', value: await toolOverride(toolArgs) };
               } catch (err) {
-                toolResult = { error: err instanceof Error ? err.message : String(err) };
+                return {
+                  kind: 'thrown',
+                  value: { error: err instanceof Error ? err.message : String(err) },
+                };
               }
-              return toolResult;
             };
 
-            const toolResult = this.spanManager
+            const outcome = this.spanManager
               ? await this.spanManager.withSpanAsync(
                   'axl.tool.call',
                   {
@@ -1846,26 +1873,49 @@ export class WorkflowContext<TInput = unknown> {
                     'axl.agent.name': agent._name,
                   },
                   async (span) => {
-                    const r = await executeOverride();
+                    const result = await executeOverride();
                     span.setAttribute('axl.tool.duration', Date.now() - toolStart);
-                    const isError =
-                      r && typeof r === 'object' && 'error' in (r as Record<string, unknown>);
+                    const isError = isErrorShaped(result.value);
                     span.setAttribute('axl.tool.success', !isError);
-                    if (isError)
-                      span.setStatus('error', (r as Record<string, unknown>).error as string);
-                    return r;
+                    if (isErrorShaped(result.value))
+                      span.setStatus('error', result.value.error as string);
+                    return result;
                   },
                 )
               : await executeOverride();
 
-            const resultContent = JSON.stringify(toolResult);
-            this.emitEvent({
-              type: 'tool_call_end',
-              agent: agent._name,
-              tool: toolName,
-              duration: Date.now() - toolStart,
-              data: { args: toolArgs, result: toolResult, callId: toolCall.id },
-            });
+            const toolResult = outcome.value;
+            const toolDuration = Date.now() - toolStart;
+            const projectionEligible =
+              tool !== undefined &&
+              !tool.sensitive &&
+              outcome.kind === 'returned' &&
+              tool.toModelOutput !== undefined;
+            let resultContent: string;
+
+            if (projectionEligible) {
+              this.emitEvent({
+                type: 'tool_call_end',
+                agent: agent._name,
+                tool: toolName,
+                duration: toolDuration,
+                data: { args: toolArgs, result: toolResult, callId: toolCall.id },
+              });
+              resultContent = prepareToolModelOutput(toolName, () =>
+                tool.toModelOutput!(toolResult as never),
+              );
+            } else {
+              resultContent = tool?.sensitive
+                ? '[REDACTED - sensitive tool output]'
+                : JSON.stringify(toolResult);
+              this.emitEvent({
+                type: 'tool_call_end',
+                agent: agent._name,
+                tool: toolName,
+                duration: toolDuration,
+                data: { args: toolArgs, result: toolResult, callId: toolCall.id },
+              });
+            }
             currentMessages.push({
               role: 'tool',
               content: resultContent,
@@ -1873,10 +1923,6 @@ export class WorkflowContext<TInput = unknown> {
             });
             continue;
           }
-
-          // Find the tool (check local tools first, then MCP tools)
-          const tool = agent._config.tools?.find((t) => t.name === toolName);
-          const isMcpTool = !tool && this.mcpManager?.isMcpTool(toolName);
 
           if (!tool && !isMcpTool) {
             // Tool denied
@@ -1982,15 +2028,18 @@ export class WorkflowContext<TInput = unknown> {
             }
           }
 
-          const executeTool = async (): Promise<{ toolResult: unknown; resultContent: string }> => {
-            let toolResult: unknown;
-            let resultContent: string;
+          const executeTool = async (): Promise<{
+            outcome: ToolExecutionOutcome;
+            resultContent?: string;
+          }> => {
+            let outcome: ToolExecutionOutcome;
+            let resultContent: string | undefined;
 
             if (isMcpTool && this.mcpManager) {
               // Execute MCP tool
               try {
                 const mcpResult = await this.mcpManager.callTool(toolName, toolArgs);
-                toolResult = mcpResult;
+                outcome = { kind: 'returned', value: mcpResult };
                 // Extract text content from MCP result
                 resultContent = mcpResult.content
                   .map((c: { type: string; text?: string }) =>
@@ -2001,8 +2050,11 @@ export class WorkflowContext<TInput = unknown> {
                   resultContent = `Error: ${resultContent}`;
                 }
               } catch (err) {
-                toolResult = { error: err instanceof Error ? err.message : String(err) };
-                resultContent = JSON.stringify(toolResult);
+                outcome = {
+                  kind: 'thrown',
+                  value: { error: err instanceof Error ? err.message : String(err) },
+                };
+                resultContent = JSON.stringify(outcome.value);
               }
             } else if (tool) {
               // Execute local tool with a child context for nested agent
@@ -2012,39 +2064,46 @@ export class WorkflowContext<TInput = unknown> {
               // anything explicitly.
               const childCtx = this.createChildContext();
               try {
-                toolResult = await tool._execute(toolArgs, childCtx);
+                outcome = { kind: 'returned', value: await tool._execute(toolArgs, childCtx) };
               } catch (err) {
-                toolResult = { error: err instanceof Error ? err.message : String(err) };
+                outcome = {
+                  kind: 'thrown',
+                  value: { error: err instanceof Error ? err.message : String(err) },
+                };
               }
 
               // After hook: transform output after execution (only on success)
               if (
+                outcome.kind === 'returned' &&
                 tool.hooks?.after &&
-                !(
-                  toolResult &&
-                  typeof toolResult === 'object' &&
-                  'error' in (toolResult as Record<string, unknown>)
-                )
+                !isErrorShaped(outcome.value)
               ) {
                 try {
-                  toolResult = await tool.hooks.after(toolResult, this);
+                  outcome = {
+                    kind: 'returned',
+                    value: await tool.hooks.after(outcome.value, this),
+                  };
                 } catch (err) {
-                  toolResult = {
-                    error: `After hook error: ${err instanceof Error ? err.message : String(err)}`,
+                  outcome = {
+                    kind: 'thrown',
+                    value: {
+                      error: `After hook error: ${err instanceof Error ? err.message : String(err)}`,
+                    },
                   };
                 }
               }
 
-              // Redact sensitive tool results
-              resultContent = tool.sensitive
-                ? '[REDACTED - sensitive tool output]'
-                : JSON.stringify(toolResult);
+              if (tool.sensitive) {
+                resultContent = '[REDACTED - sensitive tool output]';
+              } else if (outcome.kind === 'thrown' || tool.toModelOutput === undefined) {
+                resultContent = JSON.stringify(outcome.value);
+              }
             } else {
-              toolResult = undefined;
+              outcome = { kind: 'returned', value: undefined };
               resultContent = 'Tool execution error';
             }
 
-            return { toolResult, resultContent };
+            return { outcome, resultContent };
           };
 
           // Use qualified "server:tool_name" for MCP tools in traces
@@ -2053,7 +2112,7 @@ export class WorkflowContext<TInput = unknown> {
               ? (this.mcpManager.getQualifiedName(toolName) ?? toolName)
               : toolName;
 
-          const { toolResult, resultContent } = this.spanManager
+          const execution = this.spanManager
             ? await this.spanManager.withSpanAsync(
                 'axl.tool.call',
                 {
@@ -2063,28 +2122,45 @@ export class WorkflowContext<TInput = unknown> {
                 async (span) => {
                   const r = await executeTool();
                   span.setAttribute('axl.tool.duration', Date.now() - toolStart);
-                  const isError =
-                    r.toolResult &&
-                    typeof r.toolResult === 'object' &&
-                    'error' in (r.toolResult as Record<string, unknown>);
+                  const isError = isErrorShaped(r.outcome.value);
                   span.setAttribute('axl.tool.success', !isError);
-                  if (isError)
-                    span.setStatus(
-                      'error',
-                      (r.toolResult as Record<string, unknown>).error as string,
-                    );
+                  if (isErrorShaped(r.outcome.value))
+                    span.setStatus('error', r.outcome.value.error as string);
                   return r;
                 },
               )
             : await executeTool();
 
-          this.emitEvent({
-            type: 'tool_call_end',
-            agent: agent._name,
-            tool: traceName,
-            duration: Date.now() - toolStart,
-            data: { args: toolArgs, result: toolResult, callId: toolCall.id },
-          });
+          const toolResult = execution.outcome.value;
+          const toolDuration = Date.now() - toolStart;
+          const projectionEligible =
+            tool !== undefined &&
+            !tool.sensitive &&
+            execution.outcome.kind === 'returned' &&
+            tool.toModelOutput !== undefined;
+          let resultContent: string;
+
+          if (projectionEligible) {
+            this.emitEvent({
+              type: 'tool_call_end',
+              agent: agent._name,
+              tool: traceName,
+              duration: toolDuration,
+              data: { args: toolArgs, result: toolResult, callId: toolCall.id },
+            });
+            resultContent = prepareToolModelOutput(toolName, () =>
+              tool.toModelOutput!(toolResult as never),
+            );
+          } else {
+            resultContent = execution.resultContent!;
+            this.emitEvent({
+              type: 'tool_call_end',
+              agent: agent._name,
+              tool: traceName,
+              duration: toolDuration,
+              data: { args: toolArgs, result: toolResult, callId: toolCall.id },
+            });
+          }
 
           currentMessages.push({
             role: 'tool',

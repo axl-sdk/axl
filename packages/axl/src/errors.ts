@@ -12,6 +12,19 @@ export class AxlError extends Error {
   }
 }
 
+/** Thrown when a tool's model-facing output cannot be projected safely. */
+export class ToolModelOutputError extends AxlError {
+  readonly toolName: string;
+  readonly cause: unknown;
+
+  constructor(toolName: string, cause: unknown) {
+    super('TOOL_MODEL_OUTPUT_ERROR', `Failed to prepare model output for tool "${toolName}"`);
+    this.name = 'ToolModelOutputError';
+    this.toolName = toolName;
+    this.cause = cause;
+  }
+}
+
 /** Thrown when schema validation fails after all retries exhausted */
 export class VerifyError extends AxlError {
   readonly lastOutput: unknown;

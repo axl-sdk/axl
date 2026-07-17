@@ -1,9 +1,9 @@
-import type { AxlRuntime, AxlEvent, ExecutionInfo } from '@axlsdk/axl';
+import type { AxlRuntime, AxlEvent, HistoricalExecutionInfo } from '@axlsdk/axl';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import { AggregateSnapshots, REBUILD_INTERVAL_MS, withinWindow } from './aggregate-snapshots.js';
 import type { WindowId } from './aggregate-snapshots.js';
 
-export type ExecutionReducer<State> = (acc: State, execution: ExecutionInfo) => State;
+export type ExecutionReducer<State> = (acc: State, execution: HistoricalExecutionInfo) => State;
 
 export type ExecutionAggregatorOptions<State> = {
   runtime: AxlRuntime;
@@ -79,7 +79,7 @@ export class ExecutionAggregator<State> {
 
   async rebuild(): Promise<void> {
     this.generation++;
-    const executions: ExecutionInfo[] = await this.options.runtime.getExecutions();
+    const executions: HistoricalExecutionInfo[] = await this.options.runtime.getExecutions();
     const cap = this.options.executionCap ?? 2000;
     const capped = executions.slice(0, cap);
     const now = Date.now();

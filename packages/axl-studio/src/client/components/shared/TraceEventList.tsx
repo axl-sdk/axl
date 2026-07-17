@@ -19,7 +19,7 @@ import { cn, formatCost } from '../../lib/utils';
 import { CostBadge } from './CostBadge';
 import { DurationBadge } from './DurationBadge';
 import { JsonViewer } from './JsonViewer';
-import type { AxlEvent } from '../../lib/types';
+import type { HistoricalAxlEvent } from '../../lib/types';
 import {
   getEventColor,
   getDepth,
@@ -142,7 +142,7 @@ function ParamPill({ label, value }: { label: string; value: unknown }) {
 }
 
 /** Rendered body for an expanded agent_call_start event (request side). */
-export function AgentCallStartBody({ event }: { event: AxlEvent }) {
+export function AgentCallStartBody({ event }: { event: HistoricalAxlEvent }) {
   const d = getAgentCallStartData(event);
   if (!d) return null;
   return (
@@ -183,7 +183,7 @@ export function AgentCallStartBody({ event }: { event: AxlEvent }) {
 }
 
 /** Rendered body for an expanded agent_call_end event (response side). */
-export function AgentCallEndBody({ event }: { event: AxlEvent }) {
+export function AgentCallEndBody({ event }: { event: HistoricalAxlEvent }) {
   const d = getAgentCallEndData(event);
   if (!d) return null;
   return (
@@ -217,7 +217,7 @@ export function AgentCallEndBody({ event }: { event: AxlEvent }) {
 }
 
 /** Rendered body for an expanded tool_approval event. */
-export function ToolApprovalBody({ event }: { event: AxlEvent }) {
+export function ToolApprovalBody({ event }: { event: HistoricalAxlEvent }) {
   const d = getToolApprovalData(event);
   if (!d) return null;
   return (
@@ -252,7 +252,7 @@ export function ToolApprovalBody({ event }: { event: AxlEvent }) {
 }
 
 /** Rendered body for an expanded gate event (guardrail / schema_check / validate). */
-export function GateCheckBody({ event }: { event: AxlEvent }) {
+export function GateCheckBody({ event }: { event: HistoricalAxlEvent }) {
   const d = getGateData(event);
   if (!d) return null;
   const failed = d.valid === false || d.blocked === true;
@@ -297,7 +297,7 @@ export function GateCheckBody({ event }: { event: AxlEvent }) {
 
 /** `ask_start` body — renders the user prompt at the top level of the
  *  event (not inside `event.data`, which is absent on this variant). */
-function AskStartBody({ event }: { event: AxlEvent }) {
+function AskStartBody({ event }: { event: HistoricalAxlEvent }) {
   if (event.type !== 'ask_start') return null;
   // `prompt` is required on the `ask_start` variant.
   const { prompt } = event;
@@ -314,7 +314,7 @@ function AskStartBody({ event }: { event: AxlEvent }) {
 
 /** `ask_end` body — renders outcome (narrowed on outcome.ok), plus the
  *  per-ask cost and duration from the top level of the event. */
-function AskEndBody({ event }: { event: AxlEvent }) {
+function AskEndBody({ event }: { event: HistoricalAxlEvent }) {
   if (event.type !== 'ask_end') return null;
   // `outcome`, `cost`, `duration` are all required on `ask_end`.
   const { outcome, cost, duration } = event;
@@ -356,7 +356,7 @@ function AskEndBody({ event }: { event: AxlEvent }) {
 
 /** `pipeline` body — renders status/stage/attempt progression and the
  *  failure reason (only populated on `status: 'failed'`). */
-function PipelineBody({ event }: { event: AxlEvent }) {
+function PipelineBody({ event }: { event: HistoricalAxlEvent }) {
   if (event.type !== 'pipeline') return null;
   // `status`, `stage`, `attempt`, `maxAttempts` are required across all
   // three pipeline variants. `reason` exists only on the `failed` branch
@@ -375,7 +375,7 @@ function PipelineBody({ event }: { event: AxlEvent }) {
 
 /** `handoff_start` / `handoff_return` body — shows source→target and
  *  (for roundtrip start) the message passed to the target. */
-function HandoffBody({ event }: { event: AxlEvent }) {
+function HandoffBody({ event }: { event: HistoricalAxlEvent }) {
   // Both handoff variants are required to carry `data`; the strict
   // discriminated union narrows directly on `event.type`. `message` lives
   // only on `handoff_start.data`; `duration` only on `handoff_return.data`.
@@ -414,7 +414,7 @@ function HandoffBody({ event }: { event: AxlEvent }) {
 }
 
 /** Generic fallback body for event types without a dedicated renderer. */
-function GenericBody({ event }: { event: AxlEvent }) {
+function GenericBody({ event }: { event: HistoricalAxlEvent }) {
   // Most variants carry `data` (sometimes `unknown`, sometimes a strict
   // shape); a few (`ask_start`, `token`) don't. Read defensively via
   // `'data' in event` so the strict union doesn't reject the access.
@@ -456,7 +456,7 @@ function TraceEventRow({
   maxDuration,
   baseDepth,
 }: {
-  event: AxlEvent;
+  event: HistoricalAxlEvent;
   index: number;
   isExpanded: boolean;
   onToggle: () => void;
@@ -589,7 +589,7 @@ export function TraceEventList({
   showToolbar = true,
   header,
 }: {
-  events: AxlEvent[];
+  events: HistoricalAxlEvent[];
   maxDuration?: number;
   showToolbar?: boolean;
   header?: ReactNode;

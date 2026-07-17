@@ -2,7 +2,7 @@
  * Pure reducer functions for each aggregate panel.
  * Each reducer is a pure (state, source) => state function — no I/O, no mutation.
  */
-import type { AxlEvent, ExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
+import type { HistoricalAxlEvent, HistoricalExecutionInfo, EvalHistoryEntry } from '@axlsdk/axl';
 import { eventCostContribution, isUnpricedLeaf } from '@axlsdk/axl';
 import type { CostData } from '../types.js';
 
@@ -46,7 +46,7 @@ export function emptyCostData(): CostData {
  * detection (both production log-form and test runtime shapes), and
  * NaN/Infinity guards on all numeric accumulations.
  */
-export function reduceCost(acc: CostData, event: AxlEvent): CostData {
+export function reduceCost(acc: CostData, event: HistoricalAxlEvent): CostData {
   const isWorkflowStart = event.type === 'workflow_start';
 
   // workflow_start events increment per-workflow executions and return early.
@@ -416,7 +416,7 @@ function percentile(sorted: number[], p: number): number {
 
 export function reduceWorkflowStats(
   acc: WorkflowStatsData,
-  execution: ExecutionInfo,
+  execution: HistoricalExecutionInfo,
 ): WorkflowStatsData {
   const byWorkflow = { ...acc.byWorkflow };
   const prev = byWorkflow[execution.workflow] ?? {
@@ -522,7 +522,7 @@ export function emptyTraceStatsData(): TraceStatsData {
   };
 }
 
-export function reduceTraceStats(acc: TraceStatsData, event: AxlEvent): TraceStatsData {
+export function reduceTraceStats(acc: TraceStatsData, event: HistoricalAxlEvent): TraceStatsData {
   const eventTypeCounts = { ...acc.eventTypeCounts };
   eventTypeCounts[event.type] = (eventTypeCounts[event.type] ?? 0) + 1;
 
@@ -537,17 +537,23 @@ export function reduceTraceStats(acc: TraceStatsData, event: AxlEvent): TraceSta
     // tool_denied: legacy event for "tool not available" path. data.approved
     // distinguishes approvals (true) from denials (absent/false).
     // tool_approval: distinct event from the approval gate with data.approved.
-    const isDeniedEvent = event.type === 'tool_denied';
+    const isDeniedEvent =
+      event.type === 'tool_denied' ||
+      (event.type === 'tool_call_end' &&
+        event.schemaVersion === 2 &&
+        event.data.outcome.status === 'denied');
     const isApprovalEvent = event.type === 'tool_approval';
     const eventData =
-      isDeniedEvent || isApprovalEvent
+      event.type === 'tool_denied' || isApprovalEvent
         ? (event.data as { approved?: boolean } | undefined)
         : undefined;
     const isApproved =
-      (isDeniedEvent && eventData?.approved === true) ||
+      (event.type === 'tool_denied' && eventData?.approved === true) ||
       (isApprovalEvent && eventData?.approved === true);
     const isDenied =
-      (isDeniedEvent && !eventData?.approved) || (isApprovalEvent && eventData?.approved === false);
+      (event.type === 'tool_denied' && !eventData?.approved) ||
+      (event.type === 'tool_call_end' && isDeniedEvent) ||
+      (isApprovalEvent && eventData?.approved === false);
     byTool[toolName] = {
       calls: prev.calls + (event.type === 'tool_call_end' ? 1 : 0),
       denied: prev.denied + (isDenied ? 1 : 0),

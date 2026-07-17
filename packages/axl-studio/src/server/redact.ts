@@ -29,13 +29,13 @@
  * configure their own StateStore to store scrubbed values.
  */
 import type {
-  ExecutionInfo,
+  HistoricalExecutionInfo,
   ChatMessage,
   PendingDecision,
-  AxlEvent,
+  HistoricalAxlEvent,
   EvalHistoryEntry,
 } from '@axlsdk/axl';
-import { redactEvent } from '@axlsdk/axl';
+import { redactHistoricalEvent } from '@axlsdk/axl';
 import type { EvalResult, EvalItem, ScorerDetail } from '@axlsdk/eval';
 
 // Stream events on the wire are `AxlEvent` — the translation layer was
@@ -108,7 +108,10 @@ export function redactValue(value: unknown, redact: boolean): unknown {
  * serialization boundary is the last line before PII leaves the
  * observability envelope.
  */
-export function redactExecutionInfo(info: ExecutionInfo, redact: boolean): ExecutionInfo {
+export function redactExecutionInfo(
+  info: HistoricalExecutionInfo,
+  redact: boolean,
+): HistoricalExecutionInfo {
   if (!redact) return info;
   return {
     ...info,
@@ -123,11 +126,14 @@ export function redactExecutionInfo(info: ExecutionInfo, redact: boolean): Execu
     // `redactPendingDecision` on `decision.metadata`).
     ...(info.metadata !== undefined ? { metadata: { redacted: true } } : {}),
     events: info.events.map((e) => redactStreamEvent(e, true)),
-  };
+  } as HistoricalExecutionInfo;
 }
 
 /** List variant: maps each entry through the single-item redactor. */
-export function redactExecutionList(infos: ExecutionInfo[], redact: boolean): ExecutionInfo[] {
+export function redactExecutionList(
+  infos: HistoricalExecutionInfo[],
+  redact: boolean,
+): HistoricalExecutionInfo[] {
   if (!redact) return infos;
   return infos.map((info) => redactExecutionInfo(info, redact));
 }
@@ -250,9 +256,9 @@ export function redactSessionHistory(history: ChatMessage[], redact: boolean): C
  * reads still receive raw events — redaction is an observability-boundary
  * filter, not a data-at-rest transform.
  */
-export function redactStreamEvent(event: AxlEvent, redact: boolean): AxlEvent {
+export function redactStreamEvent(event: HistoricalAxlEvent, redact: boolean): HistoricalAxlEvent {
   if (!redact) return event;
-  return redactEvent(event);
+  return redactHistoricalEvent(event);
 }
 
 // ── Eval results ─────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import { redactExecutionInfo, redactExecutionList } from '../redact.js';
+import type { HistoricalExecutionInfo } from '@axlsdk/axl';
 
 export function createExecutionRoutes(connMgr?: ConnectionManager): Hono<StudioEnv> {
   const app = new Hono<StudioEnv>();
@@ -66,7 +67,7 @@ export function createExecutionRoutes(connMgr?: ConnectionManager): Hono<StudioE
       paged = {
         ...execution,
         events: execution.events.filter((e) => e.step > since),
-      };
+      } as HistoricalExecutionInfo;
     }
 
     return c.json({

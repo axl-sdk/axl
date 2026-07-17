@@ -1,5 +1,5 @@
 import type {
-  AxlEvent,
+  HistoricalAxlEvent,
   AxlEventOf,
   AgentCallStartData,
   AgentCallEndData,
@@ -7,7 +7,13 @@ import type {
   SchemaCheckData,
   ValidateData,
   ToolApprovalData,
+  ExecutionInfo,
 } from './types';
+
+/** Select the trace reducer/renderer without scanning or reinterpreting events. */
+export function executionEventSchemaVersion(execution: ExecutionInfo): 1 | 2 {
+  return execution.eventSchemaVersion ?? 1;
+}
 
 /**
  * Per-event-type bar/dot color. Organized by family — start/end pairs share
@@ -38,6 +44,7 @@ export const EVENT_COLORS: Record<string, string> = {
   // ── Tool activity ──────────────────────────────────────────────────
   tool_call_start: 'bg-purple-500',
   tool_call_end: 'bg-purple-500',
+  tool_call_rejected: 'bg-red-400',
   // tool_approval is a sub-event of the tool lifecycle; lighter shade
   // distinguishes it without leaving the family. Denial overrides to red
   // via `isFailureEvent`.
@@ -111,10 +118,14 @@ const UNKNOWN_EVENT_COLOR = 'bg-pink-400';
  * tool, aborted workflow, or `log` event carrying an `error` field (the
  * memory-audit events emit `error` on the failure path).
  */
-export function isFailureEvent(event: AxlEvent): boolean {
+export function isFailureEvent(event: HistoricalAxlEvent): boolean {
   switch (event.type) {
     case 'tool_denied':
       return true;
+    case 'tool_call_rejected':
+      return true;
+    case 'tool_call_end':
+      return event.schemaVersion === 2 && event.data.outcome.status !== 'succeeded';
     case 'guardrail':
       // GuardrailData uses `blocked: boolean`. Input/output guardrails both
       // share this shape; either one being blocked means failure.
@@ -162,7 +173,7 @@ export function getBarColor(type: string): string {
  * events render red when their payload indicates failure so the user can
  * spot failure clusters in the trace waterfall without expanding every row.
  */
-export function getEventColor(event: AxlEvent): string {
+export function getEventColor(event: HistoricalAxlEvent): string {
   if (isFailureEvent(event)) return 'bg-red-500';
   return getBarColor(event.type);
 }
@@ -176,7 +187,7 @@ export function getEventColor(event: AxlEvent): string {
  * separately because it spans two asks). For those, we fall back to 0 so
  * the waterfall renders them at the root indent level.
  */
-export function getDepth(event: AxlEvent): number {
+export function getDepth(event: HistoricalAxlEvent): number {
   // `'depth' in event` narrows out variants where `depth` isn't declared
   // (workflow_*, handoff_*, done). For variants where depth is on
   // `Partial<AskScoped>` (log/memory_*/checkpoint_*/await_human/error/
@@ -213,17 +224,17 @@ export type GateCheckData = {
   feedbackMessage?: string;
 };
 
-export function getAgentCallStartData(event: AxlEvent): AgentCallStartData | null {
+export function getAgentCallStartData(event: HistoricalAxlEvent): AgentCallStartData | null {
   if (event.type !== 'agent_call_start') return null;
   return event.data ?? null;
 }
 
-export function getAgentCallEndData(event: AxlEvent): AgentCallEndData | null {
+export function getAgentCallEndData(event: HistoricalAxlEvent): AgentCallEndData | null {
   if (event.type !== 'agent_call_end') return null;
   return event.data ?? null;
 }
 
-export function getGateData(event: AxlEvent): GateCheckData | null {
+export function getGateData(event: HistoricalAxlEvent): GateCheckData | null {
   // Three variants share a normalized read shape — `guardrail` carries
   // `blocked` while `schema_check`/`validate` carry `valid`. Combining
   // them via the shared `GateCheckData` lets the renderer treat all three
@@ -243,13 +254,13 @@ export function getGateData(event: AxlEvent): GateCheckData | null {
   return null;
 }
 
-export function getToolApprovalData(event: AxlEvent): ToolApprovalData | null {
+export function getToolApprovalData(event: HistoricalAxlEvent): ToolApprovalData | null {
   if (event.type !== 'tool_approval') return null;
   return event.data ?? null;
 }
 
 /** Returns true if this agent_call (start or end) is a retry triggered by a failed gate. */
-export function isRetryCall(event: AxlEvent): boolean {
+export function isRetryCall(event: HistoricalAxlEvent): boolean {
   if (event.type === 'agent_call_start') return !!event.data?.retryReason;
   if (event.type === 'agent_call_end') return !!event.data?.retryReason;
   return false;

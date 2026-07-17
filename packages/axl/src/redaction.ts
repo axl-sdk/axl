@@ -30,7 +30,18 @@
  * preserve these by spreading `{ ...event }` and only overriding the
  * specific user-content field(s) for that variant.
  */
-import type { AxlEvent, AxlEventOf, AxlEventType } from './types.js';
+import type {
+  AxlEvent,
+  AxlEventOf,
+  AxlEventType,
+  AxlEventV2,
+  HistoricalAxlEvent,
+  LegacyAxlEventV1,
+  ToolCallOutcome,
+  ToolCallRejectedData,
+  ToolLifecycleEventV2,
+} from './types.js';
+import { getEventSchemaVersion } from './event-schema.js';
 
 export const REDACTED = '[redacted]';
 
@@ -239,4 +250,97 @@ export const REDACTION_RULES: { [K in AxlEventType]: RuleFor<K> } = {
 export function redactEvent(event: AxlEvent): AxlEvent {
   const rule = REDACTION_RULES[event.type] as RuleFor<typeof event.type>;
   return rule(event as never);
+}
+
+function redactV2Outcome(outcome: ToolCallOutcome): ToolCallOutcome {
+  switch (outcome.status) {
+    case 'succeeded':
+      return { ...outcome, result: REDACTED };
+    case 'denied':
+      return outcome.reason === undefined ? outcome : { ...outcome, reason: REDACTED };
+    case 'cancelled':
+      return {
+        ...outcome,
+        cancellation: {
+          ...outcome.cancellation,
+          ...('result' in outcome.cancellation ? { result: REDACTED } : {}),
+          ...(outcome.cancellation.reason !== undefined ? { reason: REDACTED } : {}),
+        },
+      };
+    case 'failed': {
+      const failure = outcome.failure;
+      return {
+        ...outcome,
+        failure: {
+          ...failure,
+          ...('result' in failure ? { result: REDACTED } : {}),
+          error: {
+            ...failure.error,
+            message: REDACTED,
+            ...(failure.error.cause !== undefined ? { cause: REDACTED } : {}),
+          },
+        } as typeof failure,
+      };
+    }
+  }
+}
+
+function redactV2Rejection(data: ToolCallRejectedData): ToolCallRejectedData {
+  switch (data.reason) {
+    case 'unavailable':
+      return data;
+    case 'invalid_json':
+      return { ...data, message: REDACTED };
+    case 'invalid_arguments':
+      return {
+        ...data,
+        args: REDACTED,
+        issues: data.issues.map((issue) => ({
+          ...issue,
+          ...(issue.message !== undefined ? { message: REDACTED } : {}),
+        })),
+      };
+  }
+}
+
+type V2ToolEventType = ToolLifecycleEventV2['type'];
+type V2ToolRule<T extends V2ToolEventType> = (
+  event: Extract<ToolLifecycleEventV2, { type: T }>,
+) => Extract<ToolLifecycleEventV2, { type: T }>;
+
+/** Exhaustive v2 tool redaction table, installed before the v2 writer switch. */
+const V2_TOOL_REDACTION_RULES: { [K in V2ToolEventType]: V2ToolRule<K> } = {
+  tool_call_start: (event) => ({
+    ...event,
+    data: { ...event.data, args: REDACTED },
+  }),
+  tool_call_end: (event) => ({
+    ...event,
+    data: {
+      ...event.data,
+      args: REDACTED,
+      outcome: redactV2Outcome(event.data.outcome),
+    },
+  }),
+  tool_call_rejected: (event) => ({
+    ...event,
+    data: redactV2Rejection(event.data),
+  }),
+};
+
+/** Redact either persisted schema without reinterpreting its lifecycle. */
+export function redactHistoricalEvent(event: HistoricalAxlEvent): HistoricalAxlEvent {
+  if (getEventSchemaVersion(event) === 1) return redactEvent(event as LegacyAxlEventV1);
+
+  const v2Event = event as AxlEventV2;
+  switch (v2Event.type) {
+    case 'tool_call_start':
+      return V2_TOOL_REDACTION_RULES.tool_call_start(v2Event);
+    case 'tool_call_end':
+      return V2_TOOL_REDACTION_RULES.tool_call_end(v2Event);
+    case 'tool_call_rejected':
+      return V2_TOOL_REDACTION_RULES.tool_call_rejected(v2Event);
+  }
+
+  return redactEvent(v2Event as unknown as LegacyAxlEventV1) as unknown as AxlEventV2;
 }

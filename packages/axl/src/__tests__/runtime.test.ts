@@ -3561,6 +3561,127 @@ describe("state.persist: 'streaming' (#1)", () => {
     expect(buffers.has('orphan-1')).toBe(false);
   });
 
+  it('recoverIncompleteStreams preserves v2 schema metadata through truncation', async () => {
+    const events = Array.from({ length: 3 }, (_, step) => ({
+      schemaVersion: 2 as const,
+      type: step === 0 ? ('workflow_start' as const) : ('log' as const),
+      executionId: 'orphan-v2',
+      workflow: 'v2-workflow',
+      step,
+      timestamp: 1000 + step,
+      data: step === 0 ? { input: {} } : { step },
+    })) as import('../types.js').AxlEventV2[];
+    const buffers = new Map<string, import('../types.js').HistoricalAxlEvent[]>([
+      ['orphan-v2', events],
+    ]);
+    const saved: import('../types.js').HistoricalExecutionInfo[] = [];
+    const fakeStore = {
+      saveCheckpoint: async () => {},
+      getCheckpoint: async () => null,
+      saveSession: async () => {},
+      getSession: async () => [],
+      deleteSession: async () => {},
+      saveSessionMeta: async () => {},
+      getSessionMeta: async () => null,
+      savePendingDecision: async () => {},
+      getPendingDecisions: async () => [],
+      resolveDecision: async () => {},
+      saveExecutionState: async () => {},
+      getExecutionState: async () => null,
+      listPendingExecutions: async () => [],
+      saveExecution: async (execution: import('../types.js').HistoricalExecutionInfo) => {
+        saved.push(execution);
+      },
+      getExecution: async () => null,
+      listExecutions: async () => [],
+      appendStreamingEvents: async () => {},
+      finalizeStreamingEvents: async (id: string) => {
+        buffers.delete(id);
+      },
+      listStreamingExecutions: async () => [...buffers.keys()],
+      getStreamingEvents: async (id: string) => buffers.get(id) ?? [],
+    };
+    const runtime = new AxlRuntime({
+      state: {
+        store: fakeStore as never,
+        persist: 'streaming',
+        maxEventsPerExecution: 2,
+      },
+    });
+
+    const recovered = await runtime.recoverIncompleteStreams();
+
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0].eventSchemaVersion).toBe(2);
+    expect(recovered[0].events).toHaveLength(2);
+    expect(recovered[0].events.every((event) => event.schemaVersion === 2)).toBe(true);
+    expect(recovered[0].events[1]).toMatchObject({
+      schemaVersion: 2,
+      type: 'log',
+      data: { event: 'events_truncated' },
+    });
+    expect(saved).toEqual(recovered);
+    expect(buffers.has('orphan-v2')).toBe(false);
+  });
+
+  it('recoverIncompleteStreams rejects mixed-version buffers without deleting them', async () => {
+    const events = [
+      {
+        type: 'workflow_start' as const,
+        executionId: 'mixed',
+        workflow: 'workflow',
+        step: 0,
+        timestamp: 1000,
+        data: { input: {} },
+      },
+      {
+        schemaVersion: 2 as const,
+        type: 'log' as const,
+        executionId: 'mixed',
+        step: 1,
+        timestamp: 1001,
+        data: { event: 'mixed' },
+      },
+    ] as import('../types.js').HistoricalAxlEvent[];
+    const buffers = new Map([['mixed', events]]);
+    let saved = false;
+    const fakeStore = {
+      saveCheckpoint: async () => {},
+      getCheckpoint: async () => null,
+      saveSession: async () => {},
+      getSession: async () => [],
+      deleteSession: async () => {},
+      saveSessionMeta: async () => {},
+      getSessionMeta: async () => null,
+      savePendingDecision: async () => {},
+      getPendingDecisions: async () => [],
+      resolveDecision: async () => {},
+      saveExecutionState: async () => {},
+      getExecutionState: async () => null,
+      listPendingExecutions: async () => [],
+      saveExecution: async () => {
+        saved = true;
+      },
+      getExecution: async () => null,
+      listExecutions: async () => [],
+      appendStreamingEvents: async () => {},
+      finalizeStreamingEvents: async (id: string) => {
+        buffers.delete(id);
+      },
+      listStreamingExecutions: async () => [...buffers.keys()],
+      getStreamingEvents: async (id: string) => buffers.get(id) ?? [],
+    };
+    const runtime = new AxlRuntime({
+      state: { store: fakeStore as never, persist: 'streaming' },
+    });
+
+    await expect(runtime.recoverIncompleteStreams()).rejects.toThrow(
+      'Streaming buffer mixed contains mixed event schema versions',
+    );
+    expect(saved).toBe(false);
+    expect(buffers.has('mixed')).toBe(true);
+  });
+
   it('recoverIncompleteStreams is a no-op when no orphans exist', async () => {
     const runtime = makeRuntime('streaming');
     const recovered = await runtime.recoverIncompleteStreams();

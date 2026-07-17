@@ -11,6 +11,44 @@ import { RedisStore } from '../state/redis.js';
 // Clean up the MemoryStore temp file between tests to prevent state leaking
 const AWAIT_HUMAN_TEMP_FILE = join(tmpdir(), 'axl-memory-store', 'await-human-state.json');
 
+function makeV2Execution(id: string): import('../types.js').ExecutionInfoV2 {
+  return {
+    executionId: id,
+    workflow: 'v2-workflow',
+    status: 'completed',
+    eventSchemaVersion: 2,
+    events: [
+      {
+        schemaVersion: 2,
+        executionId: id,
+        step: 0,
+        type: 'log',
+        timestamp: 1000,
+        data: { event: 'v2' },
+      },
+    ],
+    totalCost: 0,
+    startedAt: 1000,
+    completedAt: 1001,
+    duration: 1,
+  };
+}
+
+function makeMixedExecution(id: string): import('../types.js').HistoricalExecutionInfo {
+  return {
+    ...makeV2Execution(id),
+    events: [
+      {
+        executionId: id,
+        step: 0,
+        type: 'log',
+        timestamp: 1000,
+        data: { event: 'legacy' },
+      },
+    ],
+  } as import('../types.js').HistoricalExecutionInfo;
+}
+
 describe('MemoryStore', () => {
   beforeEach(() => {
     try {
@@ -273,7 +311,19 @@ describe('MemoryStore', () => {
       await store.saveExecution(exec);
 
       const loaded = await store.getExecution('e1');
-      expect(loaded).toEqual(exec);
+      expect(loaded).toEqual({ ...exec, eventSchemaVersion: 1 });
+    });
+
+    it('round-trips v2 metadata and rejects mixed traces before writing', async () => {
+      const store = new MemoryStore();
+      const execution = makeV2Execution('v2-memory');
+
+      await store.saveExecution(execution);
+      expect(await store.getExecution(execution.executionId)).toEqual(execution);
+      await expect(store.saveExecution(makeMixedExecution('mixed-memory'))).rejects.toThrow(
+        'declares event schema v2 but contains a v1 event',
+      );
+      expect(await store.getExecution('mixed-memory')).toBeNull();
     });
 
     it('getExecution returns null for unknown id', async () => {
@@ -666,7 +716,20 @@ describe('SQLiteStore', () => {
       await store.saveExecution(exec);
 
       const loaded = await store.getExecution('e1');
-      expect(loaded).toEqual(exec);
+      expect(loaded).toEqual({ ...exec, eventSchemaVersion: 1 });
+      store.close();
+    });
+
+    it('round-trips v2 metadata and rejects mixed traces before writing', async () => {
+      const store = createStore();
+      const execution = makeV2Execution('v2-sqlite');
+
+      await store.saveExecution(execution);
+      expect(await store.getExecution(execution.executionId)).toEqual(execution);
+      await expect(store.saveExecution(makeMixedExecution('mixed-sqlite'))).rejects.toThrow(
+        'declares event schema v2 but contains a v1 event',
+      );
+      expect(await store.getExecution('mixed-sqlite')).toBeNull();
       store.close();
     });
 
@@ -694,7 +757,7 @@ describe('SQLiteStore', () => {
 
       const store2 = new SQLiteStore(dbPath);
       const loaded = await store2.getExecution('e1');
-      expect(loaded).toEqual(makeExec('e1', 1000));
+      expect(loaded).toEqual({ ...makeExec('e1', 1000), eventSchemaVersion: 1 });
       store2.close();
     });
 
@@ -719,7 +782,7 @@ describe('SQLiteStore', () => {
       await store.saveExecution(exec);
 
       const loaded = await store.getExecution('e1');
-      expect(loaded).toEqual(exec);
+      expect(loaded).toEqual({ ...exec, eventSchemaVersion: 1 });
       // Defense against silent `metadata: undefined` keys that would break
       // strict equality with `{ ...exec }` round-trip checks.
       expect('metadata' in (loaded as object)).toBe(false);
@@ -1650,6 +1713,18 @@ describe('RedisStore', () => {
       startedAt,
       completedAt: startedAt + 100,
       duration: 100,
+    });
+
+    it('round-trips v2 metadata and rejects mixed traces before writing', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      const execution = makeV2Execution('v2-redis');
+
+      await store.saveExecution(execution);
+      expect(await store.getExecution(execution.executionId)).toEqual(execution);
+      await expect(store.saveExecution(makeMixedExecution('mixed-redis'))).rejects.toThrow(
+        'declares event schema v2 but contains a v1 event',
+      );
+      expect(await store.getExecution('mixed-redis')).toBeNull();
     });
 
     it('metadata round-trips through saveExecution/getExecution (JSON serialization)', async () => {
@@ -2770,7 +2845,7 @@ describe('RedisStore', () => {
       expect(await store.getStreamingEvents('unknown')).toEqual([]);
     });
 
-    it('getStreamingEvents skips malformed JSON without crashing recovery', async () => {
+    it('getStreamingEvents fails loudly on malformed JSON without returning a partial trace', async () => {
       const { store, listData } = createRedisStoreWithMockClient();
       listData.set('axl:exec-events:e1', [
         JSON.stringify(sampleEvent(0)),
@@ -2778,10 +2853,9 @@ describe('RedisStore', () => {
         JSON.stringify(sampleEvent(2)),
       ]);
 
-      const recovered = await store.getStreamingEvents('e1');
-      expect(recovered).toHaveLength(2);
-      expect((recovered[0] as { step: number }).step).toBe(0);
-      expect((recovered[1] as { step: number }).step).toBe(2);
+      await expect(store.getStreamingEvents('e1')).rejects.toThrow(
+        'Streaming buffer e1 contains invalid JSON at index 1',
+      );
     });
 
     it('uses the configured keyPrefix for both the events list and the in-flight set', async () => {

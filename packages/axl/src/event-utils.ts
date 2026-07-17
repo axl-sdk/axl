@@ -6,7 +6,7 @@
  * core runtime, AxlTestRuntime, and Studio's cost reducer ALL use these —
  * keeping one source of truth for each invariant.
  */
-import type { AxlEvent } from './types.js';
+import type { HistoricalAxlEvent } from './types.js';
 
 /**
  * Variants that directly carry an authoritative cost charge from the
@@ -71,7 +71,7 @@ export function isUsableCost(cost: unknown): cost is number {
  * `ask_end.cost` directly — that field is populated whether or not
  * the leaf events were summed separately. Spec decision 10.
  */
-export function eventCostContribution(event: AxlEvent): number {
+export function eventCostContribution(event: HistoricalAxlEvent): number {
   // `ask_end` explicitly excluded (rollup). Other variants that carry
   // a top-level `cost` (e.g., `agent_call_end`, `tool_call_end`,
   // `memory_*`) contribute their charge directly. Unknown future
@@ -104,7 +104,7 @@ export function eventCostContribution(event: AxlEvent): number {
  * with `cost: 0` is still a leaf (produced by a free / cached turn),
  * just one that happens to contribute zero.
  */
-export function isCostBearingLeaf(event: AxlEvent): boolean {
+export function isCostBearingLeaf(event: HistoricalAxlEvent): boolean {
   return COST_LEAF_SET.has(event.type);
 }
 
@@ -151,7 +151,7 @@ export function isUnpricedLeaf(event: {
  * (out-of-ask lifecycle events, synthesized terminals) are treated
  * as root-level — they're never at depth ≥ 1.
  */
-export function isRootLevel(event: AxlEvent): boolean {
+export function isRootLevel(event: HistoricalAxlEvent): boolean {
   // `AskScoped` variants carry `depth`; out-of-ask lifecycle events
   // (workflow_*, done, error, handoff without askId) don't. Treat
   // missing `depth` as root-level — those events are never at

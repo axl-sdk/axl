@@ -15,6 +15,7 @@ import { cn, formatCost, formatDuration } from '../../lib/utils';
 import type { ExecutionInfo, AxlEvent } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
 import { ResizableSplit } from '../../components/shared/ResizableSplit';
+import { executionEventSchemaVersion } from '../../lib/trace-utils';
 
 type FilterOption = { value: string; label: string };
 
@@ -259,9 +260,19 @@ export function TraceExplorerPanel() {
                       : 'border-[hsl(var(--border))] hover:bg-[hsl(var(--accent))]',
                   )}
                 >
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-2">
                     <span className="font-medium truncate">{exec.workflow}</span>
-                    <StatusBadge status={exec.status} />
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {executionEventSchemaVersion(exec) === 1 && (
+                        <span
+                          className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-medium text-amber-600 dark:text-amber-400"
+                          title="Legacy v1 lifecycle semantics"
+                        >
+                          legacy v1
+                        </span>
+                      )}
+                      <StatusBadge status={exec.status} />
+                    </div>
                   </div>
                   <div className="flex items-center justify-between mt-1">
                     <span className="text-[hsl(var(--muted-foreground))] truncate">
@@ -305,6 +316,13 @@ export function TraceExplorerPanel() {
                       stats.models.length > 1 ? `+${stats.models.length - 1} more` : undefined
                     }
                   />
+                </div>
+              )}
+
+              {selectedExecution && executionEventSchemaVersion(selectedExecution) === 1 && (
+                <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                  Legacy v1 lifecycle: tool outcomes retain their historical semantics and may
+                  contain unmatched starts.
                 </div>
               )}
 

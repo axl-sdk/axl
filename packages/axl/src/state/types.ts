@@ -1,4 +1,10 @@
-import type { AxlEvent, ChatMessage, ExecutionInfo, HumanDecision } from '../types.js';
+import type {
+  AxlEvent,
+  ChatMessage,
+  HistoricalAxlEvent,
+  HistoricalExecutionInfo,
+  HumanDecision,
+} from '../types.js';
 
 /** A pending human decision awaiting resolution. */
 export type PendingDecision = {
@@ -64,11 +70,11 @@ export interface StateStore {
 
   // Execution history
   /** Save a completed/failed execution to history. */
-  saveExecution?(execution: ExecutionInfo): Promise<void>;
+  saveExecution?(execution: HistoricalExecutionInfo): Promise<void>;
   /** Get a specific execution by ID from history. */
-  getExecution?(executionId: string): Promise<ExecutionInfo | null>;
+  getExecution?(executionId: string): Promise<HistoricalExecutionInfo | null>;
   /** List recent executions (most recent first). */
-  listExecutions?(limit?: number): Promise<ExecutionInfo[]>;
+  listExecutions?(limit?: number): Promise<HistoricalExecutionInfo[]>;
   /**
    * Delete an execution from history by ID. Returns `true` if an entry was
    * deleted, `false` if the ID didn't exist. Used for GDPR right-to-be-
@@ -154,7 +160,7 @@ export interface StateStore {
    * Read the events accumulated in the streaming buffer for an execution.
    * Returns `[]` if no buffer exists.
    */
-  getStreamingEvents?(executionId: string): Promise<AxlEvent[]>;
+  getStreamingEvents?(executionId: string): Promise<HistoricalAxlEvent[]>;
 
   // Lifecycle
   close?(): Promise<void>;

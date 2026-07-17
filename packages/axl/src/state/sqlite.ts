@@ -1,4 +1,10 @@
-import type { ChatMessage, ExecutionInfo, HumanDecision } from '../types.js';
+import type {
+  ChatMessage,
+  HistoricalAxlEvent,
+  HistoricalExecutionInfo,
+  HumanDecision,
+} from '../types.js';
+import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
 import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } from './types.js';
 
 // Lazy-loaded better-sqlite3 types
@@ -25,20 +31,22 @@ type ExecutionHistoryRow = {
   error: string | null;
   events: string;
   metadata: string | null;
+  event_schema_version: number | null;
 };
 
-function rowToExecutionInfo(row: ExecutionHistoryRow): ExecutionInfo {
-  const info: ExecutionInfo = {
+function rowToExecutionInfo(row: ExecutionHistoryRow): HistoricalExecutionInfo {
+  const info = {
     executionId: row.execution_id,
     workflow: row.workflow,
-    status: row.status as ExecutionInfo['status'],
+    status: row.status as HistoricalExecutionInfo['status'],
     totalCost: row.total_cost,
     startedAt: row.started_at,
     completedAt: row.completed_at ?? undefined,
     duration: row.duration,
-    error: row.error ?? undefined,
-    events: (safeJsonParse(row.events) as ExecutionInfo['events']) ?? [],
-  };
+    events: (safeJsonParse(row.events) as HistoricalAxlEvent[]) ?? [],
+    ...(row.event_schema_version != null ? { eventSchemaVersion: row.event_schema_version } : {}),
+  } as HistoricalExecutionInfo;
+  if (row.error != null) info.error = row.error;
   // `metadata` is optional on the type so only attach when present —
   // keeps `.toEqual()` round-trip checks tight (no spurious `undefined`
   // keys) and matches `MemoryStore`'s `structuredClone` semantics.
@@ -48,7 +56,7 @@ function rowToExecutionInfo(row: ExecutionHistoryRow): ExecutionInfo {
       info.metadata = parsed as Record<string, unknown>;
     }
   }
-  return info;
+  return normalizeStoredExecution(info);
 }
 
 /**
@@ -101,6 +109,8 @@ export class SQLiteStore implements StateStore {
    *   column (TEXT, nullable, JSON-serialized) so caller-supplied
    *   `ExecuteOptions.metadata` round-trips through history. Existing
    *   rows get `NULL`, deserialized as `metadata: undefined`.
+   * - v4 (event schema): add `execution_history.event_schema_version`.
+   *   Existing rows remain `NULL`, the documented v1 sentinel.
    *
    * Applied BEFORE `initTables()` so the subsequent `CREATE TABLE
    * IF NOT EXISTS` runs against the post-migration column name. Fresh
@@ -118,7 +128,7 @@ export class SQLiteStore implements StateStore {
    * transactional re-read costs nothing.
    */
   private migrate(): void {
-    const TARGET_VERSION = 3;
+    const TARGET_VERSION = 4;
     const current = this.db.pragma('user_version', { simple: true }) as number;
     if (current >= TARGET_VERSION) return;
 
@@ -166,6 +176,12 @@ export class SQLiteStore implements StateStore {
         const cols = this.db.pragma('table_info(execution_history)') as Array<{ name: string }>;
         if (cols.length > 0 && !cols.some((c) => c.name === 'metadata')) {
           this.db.exec('ALTER TABLE execution_history ADD COLUMN metadata TEXT');
+        }
+      }
+      if (committed < 4) {
+        const cols = this.db.pragma('table_info(execution_history)') as Array<{ name: string }>;
+        if (cols.length > 0 && !cols.some((c) => c.name === 'event_schema_version')) {
+          this.db.exec('ALTER TABLE execution_history ADD COLUMN event_schema_version INTEGER');
         }
       }
       this.db.pragma(`user_version = ${TARGET_VERSION}`);
@@ -232,7 +248,8 @@ export class SQLiteStore implements StateStore {
         duration INTEGER NOT NULL DEFAULT 0,
         error TEXT,
         events TEXT NOT NULL,
-        metadata TEXT
+        metadata TEXT,
+        event_schema_version INTEGER
       );
 
       CREATE TABLE IF NOT EXISTS eval_history (
@@ -389,33 +406,38 @@ export class SQLiteStore implements StateStore {
 
   // ── Execution History ────────────────────────────────────────────────────
 
-  async saveExecution(execution: ExecutionInfo): Promise<void> {
+  async saveExecution(execution: HistoricalExecutionInfo): Promise<void> {
+    const normalized = normalizeStoredExecution({
+      ...execution,
+      eventSchemaVersion: getExecutionEventSchemaVersion(execution),
+    } as HistoricalExecutionInfo);
     this.db
       .prepare(
-        'INSERT OR REPLACE INTO execution_history (execution_id, workflow, status, total_cost, started_at, completed_at, duration, error, events, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT OR REPLACE INTO execution_history (execution_id, workflow, status, total_cost, started_at, completed_at, duration, error, events, metadata, event_schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
-        execution.executionId,
-        execution.workflow,
-        execution.status,
-        execution.totalCost,
-        execution.startedAt,
-        execution.completedAt ?? null,
-        execution.duration,
-        execution.error ?? null,
-        JSON.stringify(execution.events),
-        execution.metadata !== undefined ? JSON.stringify(execution.metadata) : null,
+        normalized.executionId,
+        normalized.workflow,
+        normalized.status,
+        normalized.totalCost,
+        normalized.startedAt,
+        normalized.completedAt ?? null,
+        normalized.duration,
+        normalized.error ?? null,
+        JSON.stringify(normalized.events),
+        normalized.metadata !== undefined ? JSON.stringify(normalized.metadata) : null,
+        normalized.eventSchemaVersion,
       );
   }
 
-  async getExecution(executionId: string): Promise<ExecutionInfo | null> {
+  async getExecution(executionId: string): Promise<HistoricalExecutionInfo | null> {
     const row = this.db
       .prepare('SELECT * FROM execution_history WHERE execution_id = ?')
       .get(executionId) as ExecutionHistoryRow | undefined;
     return row ? rowToExecutionInfo(row) : null;
   }
 
-  async listExecutions(limit?: number): Promise<ExecutionInfo[]> {
+  async listExecutions(limit?: number): Promise<HistoricalExecutionInfo[]> {
     const sql = limit
       ? 'SELECT * FROM execution_history ORDER BY started_at DESC LIMIT ?'
       : 'SELECT * FROM execution_history ORDER BY started_at DESC';

@@ -12,6 +12,8 @@
 // Value imports remain banned — see `lib/event-utils.ts` for the pattern.
 import type {
   AxlEvent,
+  AxlEventV2,
+  HistoricalAxlEvent,
   AxlEventBase,
   AxlEventType,
   AxlEventOf,
@@ -41,6 +43,8 @@ import type {
 
 export type {
   AxlEvent,
+  AxlEventV2,
+  HistoricalAxlEvent,
   AxlEventBase,
   AxlEventType,
   AxlEventOf,
@@ -158,7 +162,9 @@ export type ExecutionInfo = {
   executionId: string;
   workflow: string;
   status: 'running' | 'completed' | 'failed';
-  events: AxlEvent[];
+  /** Missing on historical rows written before schema versioning; missing = v1. */
+  eventSchemaVersion?: 1 | 2;
+  events: HistoricalAxlEvent[];
   totalCost: number;
   /** True when `totalCost` is a lower bound because at least one leaf call was unpriced. */
   unpriced?: boolean;

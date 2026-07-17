@@ -1,5 +1,12 @@
-import type { AxlEvent, ChatMessage, ExecutionInfo, HumanDecision } from '../types.js';
+import type {
+  AxlEvent,
+  ChatMessage,
+  HistoricalAxlEvent,
+  HistoricalExecutionInfo,
+  HumanDecision,
+} from '../types.js';
 import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } from './types.js';
+import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
 
 // Minimal interface for the node-redis client methods we use.
 // Avoids a hard compile-time dependency on the redis package.
@@ -344,7 +351,7 @@ export class RedisStore implements StateStore {
       this.execHistoryZsetKey(),
       (id) => this.execHistoryKey(id),
       (raw) => {
-        const exec = JSON.parse(raw) as ExecutionInfo;
+        const exec = JSON.parse(raw) as HistoricalExecutionInfo;
         return typeof exec.startedAt === 'number'
           ? { score: exec.startedAt, value: exec.executionId }
           : null;
@@ -810,7 +817,7 @@ export class RedisStore implements StateStore {
 
   // ── Execution History ────────────────────────────────────────────────
 
-  async saveExecution(execution: ExecutionInfo): Promise<void> {
+  async saveExecution(execution: HistoricalExecutionInfo): Promise<void> {
     // Atomic: index-set membership + data blob + sorted-set score commit
     // together. Before MULTI/EXEC, a crash between writes left
     // `listExecutions` returning IDs whose data was absent — graceful skip
@@ -826,10 +833,14 @@ export class RedisStore implements StateStore {
     // listExecutions stays correct regardless.
     const ttl = this.ttlFor('executionHistory');
     const setOptions = ttl !== undefined ? { EX: ttl } : undefined;
+    const storedExecution = normalizeStoredExecution({
+      ...execution,
+      eventSchemaVersion: getExecutionEventSchemaVersion(execution),
+    } as HistoricalExecutionInfo);
     await this.client
       .multi()
       .sAdd(this.execHistorySetKey(), execution.executionId)
-      .set(this.execHistoryKey(execution.executionId), JSON.stringify(execution), setOptions)
+      .set(this.execHistoryKey(execution.executionId), JSON.stringify(storedExecution), setOptions)
       .zAdd(this.execHistoryZsetKey(), {
         score: execution.startedAt,
         value: execution.executionId,
@@ -837,19 +848,20 @@ export class RedisStore implements StateStore {
       .exec();
   }
 
-  async getExecution(executionId: string): Promise<ExecutionInfo | null> {
+  async getExecution(executionId: string): Promise<HistoricalExecutionInfo | null> {
     const raw = await this.client.get(this.execHistoryKey(executionId));
-    return raw ? JSON.parse(raw) : null;
+    return raw ? normalizeStoredExecution(JSON.parse(raw) as HistoricalExecutionInfo) : null;
   }
 
-  async listExecutions(limit?: number): Promise<ExecutionInfo[]> {
-    return this.listHistoryByZset(
+  async listExecutions(limit?: number): Promise<HistoricalExecutionInfo[]> {
+    const executions = await this.listHistoryByZset<HistoricalExecutionInfo>(
       this.execHistorySetKey(),
       this.execHistoryZsetKey(),
       (id) => this.execHistoryKey(id),
       (a, b) => b.startedAt - a.startedAt,
       limit,
     );
+    return executions.map(normalizeStoredExecution);
   }
 
   async deleteExecution(executionId: string): Promise<boolean> {
@@ -1060,19 +1072,18 @@ export class RedisStore implements StateStore {
     return this.client.sMembers(this.streamingIdsKey());
   }
 
-  async getStreamingEvents(executionId: string): Promise<AxlEvent[]> {
+  async getStreamingEvents(executionId: string): Promise<HistoricalAxlEvent[]> {
     const raws = await this.client.lRange(this.streamingEventsKey(executionId), 0, -1);
     if (raws.length === 0) return [];
-    const events: AxlEvent[] = [];
-    for (const raw of raws) {
+    return raws.map((raw, index) => {
       try {
-        events.push(JSON.parse(raw) as AxlEvent);
-      } catch {
-        // Skip malformed entries — same posture as the listExecutions
-        // slow-path fallback. A corrupt event shouldn't crash recovery.
+        return JSON.parse(raw) as HistoricalAxlEvent;
+      } catch (error) {
+        throw new Error(`Streaming buffer ${executionId} contains invalid JSON at index ${index}`, {
+          cause: error,
+        });
       }
-    }
-    return events;
+    });
   }
 
   /** Close the Redis connection. */

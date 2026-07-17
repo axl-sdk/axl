@@ -14,11 +14,13 @@ const require_ = createRequire(import.meta.url);
  * - v1 → v2: `checkpoints.step` (INTEGER) → `checkpoints.name` (TEXT).
  * - v2 → v3: add `execution_history.metadata` (TEXT, nullable) so
  *            `ExecutionInfo.metadata` round-trips through history.
+ * - v3 → v4: add `execution_history.event_schema_version` (INTEGER,
+ *            nullable); missing remains the v1 sentinel.
  * The SQLiteStore constructor runs `migrate()` before `initTables()` and
  * tracks version via PRAGMA `user_version`. Idempotent, transactional,
  * rolls back on failure.
  */
-describe('SQLiteStore — schema migration v0 → v3', () => {
+describe('SQLiteStore — schema migration v0 → v4', () => {
   const tmps: string[] = [];
 
   afterEach(() => {
@@ -34,7 +36,7 @@ describe('SQLiteStore — schema migration v0 → v3', () => {
     return join(dir, 'state.sqlite');
   }
 
-  it('fresh install: creates table with `events` + `metadata` columns and sets user_version=3', () => {
+  it('fresh install: creates versioned execution history and sets user_version=4', () => {
     const path = makeTmpFile();
     const store = new SQLiteStore(path);
     const Database = require_('better-sqlite3');
@@ -45,7 +47,8 @@ describe('SQLiteStore — schema migration v0 → v3', () => {
       expect(names).toContain('events');
       expect(names).not.toContain('steps');
       expect(names).toContain('metadata');
-      expect(db.pragma('user_version', { simple: true })).toBe(3);
+      expect(names).toContain('event_schema_version');
+      expect(db.pragma('user_version', { simple: true })).toBe(4);
     } finally {
       db.close();
       void store; // silence unused-locals
@@ -104,7 +107,7 @@ describe('SQLiteStore — schema migration v0 → v3', () => {
     new SQLiteStore(path);
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(3);
+      expect(db.pragma('user_version', { simple: true })).toBe(4);
       const cols = db.pragma('table_info(execution_history)') as Array<{ name: string }>;
       const names = cols.map((c) => c.name);
       expect(names).toContain('events');
@@ -147,7 +150,7 @@ describe('SQLiteStore — schema migration v0 → v3', () => {
 
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(3);
+      expect(db.pragma('user_version', { simple: true })).toBe(4);
       const cols = db.pragma('table_info(execution_history)') as Array<{ name: string }>;
       expect(cols.map((c) => c.name)).toContain('events');
     } finally {
@@ -193,7 +196,7 @@ describe('SQLiteStore — schema migration v0 → v3', () => {
     // Verify column rename + version bump.
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(3);
+      expect(db.pragma('user_version', { simple: true })).toBe(4);
       const cols = db.pragma('table_info(checkpoints)') as Array<{ name: string }>;
       const names = cols.map((c) => c.name);
       expect(names).toContain('name');
@@ -251,7 +254,7 @@ describe('SQLiteStore — schema migration v0 → v3', () => {
 
     const db = new Database(path, { readonly: true });
     try {
-      expect(db.pragma('user_version', { simple: true })).toBe(3);
+      expect(db.pragma('user_version', { simple: true })).toBe(4);
       const cols = db.pragma('table_info(execution_history)') as Array<{ name: string }>;
       expect(cols.map((c) => c.name)).toContain('metadata');
     } finally {
@@ -279,6 +282,71 @@ describe('SQLiteStore — schema migration v0 → v3', () => {
     });
     const got2 = await store.getExecution!('exec-v3');
     expect(got2!.metadata).toEqual({ userId: 'u1' });
+  });
+
+  it('v3 → v4: adds event schema carrier without rewriting legacy events', async () => {
+    const path = makeTmpFile();
+    const Database = require_('better-sqlite3');
+    const legacyEvents = [
+      {
+        type: 'tool_denied',
+        executionId: 'exec-v3',
+        step: 1,
+        timestamp: 1000,
+        tool: 'missing',
+        data: {},
+      },
+    ];
+    const seed = new Database(path);
+    seed.exec(`
+      CREATE TABLE execution_history (
+        execution_id TEXT PRIMARY KEY,
+        workflow TEXT NOT NULL,
+        status TEXT NOT NULL,
+        total_cost REAL NOT NULL DEFAULT 0,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        duration INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        events TEXT NOT NULL,
+        metadata TEXT
+      );
+      PRAGMA user_version = 3;
+    `);
+    seed
+      .prepare('INSERT INTO execution_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(
+        'exec-v3',
+        'wf',
+        'completed',
+        0,
+        1000,
+        1000,
+        0,
+        null,
+        JSON.stringify(legacyEvents),
+        null,
+      );
+    seed.close();
+
+    const store = new SQLiteStore(path);
+    const db = new Database(path, { readonly: true });
+    try {
+      expect(db.pragma('user_version', { simple: true })).toBe(4);
+      const row = db
+        .prepare(
+          'SELECT events, event_schema_version FROM execution_history WHERE execution_id = ?',
+        )
+        .get('exec-v3') as { events: string; event_schema_version: number | null };
+      expect(row.event_schema_version).toBeNull();
+      expect(row.events).toBe(JSON.stringify(legacyEvents));
+    } finally {
+      db.close();
+    }
+
+    const got = await store.getExecution!('exec-v3');
+    expect(got?.eventSchemaVersion).toBe(1);
+    expect(got?.events).toEqual(legacyEvents);
   });
 
   it('round-trip: saveExecution writes via new column name; getExecution reads back', async () => {
@@ -309,5 +377,6 @@ describe('SQLiteStore — schema migration v0 → v3', () => {
     expect(got!.events).toHaveLength(1);
     expect(got!.events[0].type).toBe('workflow_start');
     expect(got!.totalCost).toBe(0.5);
+    expect(got!.eventSchemaVersion).toBe(1);
   });
 });

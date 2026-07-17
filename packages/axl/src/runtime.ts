@@ -21,13 +21,21 @@ import { McpManager } from './mcp/manager.js';
 import { MemoryManager } from './memory/manager.js';
 import type {
   AxlEvent,
+  AxlEventV2,
   CallbackMeta,
   ExecutionInfo,
+  HistoricalAxlEvent,
+  HistoricalExecutionInfo,
+  LegacyAxlEventV1,
   HumanDecision,
   AwaitHumanOptions,
   ChatMessage,
   HandoffRecord,
 } from './types.js';
+import {
+  getEventSchemaVersion,
+  normalizeStoredExecution as normalizeHistoricalExecution,
+} from './event-schema.js';
 import { eventCostContribution, isUnpricedLeaf } from './event-utils.js';
 import { NoopSpanManager } from './telemetry/noop.js';
 import { createSpanManager } from './telemetry/index.js';
@@ -384,7 +392,7 @@ function sanitizeMetadataForPersist(metadata: Record<string, unknown>): Record<s
  *  execution cap. When truncation is needed, replaces the cap-th slot with
  *  a `log` sentinel describing the truncation (mirrors `pushEventBounded`).
  *  Idempotent: a buffer that already ends in the sentinel is left alone. */
-function boundRecoveredEvents(events: AxlEvent[], cap: number): AxlEvent[] {
+function boundRecoveredEvents(events: HistoricalAxlEvent[], cap: number): HistoricalAxlEvent[] {
   if (cap === Infinity || events.length <= cap) return events;
   const truncated = events.slice(0, cap);
   const last = truncated[truncated.length - 1];
@@ -394,7 +402,9 @@ function boundRecoveredEvents(events: AxlEvent[], cap: number): AxlEvent[] {
     last.data !== null &&
     (last.data as { event?: string }).event === 'events_truncated';
   if (!alreadyTruncated) {
+    const version = getEventSchemaVersion(events[0] ?? {});
     truncated[truncated.length - 1] = {
+      ...(version === 2 ? { schemaVersion: 2 as const } : {}),
       type: 'log',
       executionId: events[0]?.executionId ?? '',
       step: last?.step ?? 0,
@@ -407,7 +417,7 @@ function boundRecoveredEvents(events: AxlEvent[], cap: number): AxlEvent[] {
           `Original streaming buffer had ${events.length} events. ` +
           `Raise via config.state.maxEventsPerExecution.`,
       },
-    } as AxlEvent;
+    } as HistoricalAxlEvent;
   }
   return truncated;
 }
@@ -552,7 +562,7 @@ export class AxlRuntime extends EventEmitter {
   private mcpManager?: McpManager;
   private memoryManager?: MemoryManager;
   private spanManager: SpanManager = new NoopSpanManager();
-  private historicalExecutions = new Map<string, ExecutionInfo>();
+  private historicalExecutions = new Map<string, HistoricalExecutionInfo>();
   private historicalExecutionsLoadPromise: Promise<void> | null = null;
   /** Per-session in-process serialization. Each entry is a chain of pending
    *  work for that session id — `Session.send` / `Session.stream` await the
@@ -778,7 +788,7 @@ export class AxlRuntime extends EventEmitter {
       execInfo.duration = execInfo.completedAt - execInfo.startedAt;
       execInfo.error = err instanceof Error ? err.message : String(err);
       ctx._emitWorkflowEnd({
-        status: 'failed',
+        status: 'failed' as const,
         duration: execInfo.duration,
         error: execInfo.error,
         ...(aborted ? { aborted: true } : {}),
@@ -1101,14 +1111,14 @@ export class AxlRuntime extends EventEmitter {
   }
 
   /** Get all execution info (running + completed + historical). */
-  /** Normalize an `ExecutionInfo` loaded from a `StateStore` so the
-   *  `events: AxlEvent[]` type contract holds for downstream consumers
+  /** Normalize an execution loaded from a `StateStore` so the
+   *  historical event union holds for downstream consumers
    *  (Studio aggregators, REST routes, redaction). Custom or legacy stores
    *  may persist rows without `events` (or with a non-array value) — without
    *  this guard, a single malformed row crashes every iterator over
-   *  `exec.events` and takes down dependent features. Mutates the row
-   *  in place; logs at most one warning per `executionId`. */
-  private normalizeStoredExecution(exec: ExecutionInfo): ExecutionInfo {
+   *  `exec.events` and takes down dependent features. Returns a normalized
+   *  copy; logs at most one warning per `executionId`. */
+  private normalizeStoredExecution(exec: HistoricalExecutionInfo): HistoricalExecutionInfo {
     if (!Array.isArray(exec.events)) {
       if (!this.warnedMalformedExecutions.has(exec.executionId)) {
         this.warnedMalformedExecutions.add(exec.executionId);
@@ -1117,12 +1127,12 @@ export class AxlRuntime extends EventEmitter {
             `(got ${exec.events === null ? 'null' : typeof exec.events}); coercing to []`,
         );
       }
-      exec.events = [];
+      return normalizeHistoricalExecution({ ...exec, events: [] } as HistoricalExecutionInfo);
     }
-    return exec;
+    return normalizeHistoricalExecution(exec);
   }
 
-  async getExecutions(): Promise<ExecutionInfo[]> {
+  async getExecutions(): Promise<HistoricalExecutionInfo[]> {
     // Lazy-load historical executions from store on first access (once-guard)
     if (!this.historicalExecutionsLoadPromise && this.stateStore.listExecutions) {
       this.historicalExecutionsLoadPromise = this.stateStore
@@ -1137,9 +1147,10 @@ export class AxlRuntime extends EventEmitter {
             }
           }
         })
-        .catch(() => {
+        .catch((error) => {
           // Failed to load — reset so next call retries
           this.historicalExecutionsLoadPromise = null;
+          throw error;
         });
     }
     if (this.historicalExecutionsLoadPromise) {
@@ -1711,7 +1722,7 @@ export class AxlRuntime extends EventEmitter {
    * finalize. The implementation checks the historical store before
    * synthesizing, so a re-run is safe.
    */
-  async recoverIncompleteStreams(): Promise<ExecutionInfo[]> {
+  async recoverIncompleteStreams(): Promise<HistoricalExecutionInfo[]> {
     if (!this.stateStore.listStreamingExecutions || !this.stateStore.getStreamingEvents) {
       // Store doesn't support streaming — nothing to recover.
       return [];
@@ -1727,7 +1738,7 @@ export class AxlRuntime extends EventEmitter {
     // check.)
     await this.getExecutions();
 
-    const recovered: ExecutionInfo[] = [];
+    const recovered: HistoricalExecutionInfo[] = [];
     for (const id of ids) {
       // Liveness check: never recover an execution that's actively running
       // in THIS process. The streaming flusher may have written a batch
@@ -1756,6 +1767,13 @@ export class AxlRuntime extends EventEmitter {
         continue;
       }
 
+      const eventSchemaVersion = getEventSchemaVersion(events[0]);
+      for (const event of events) {
+        if (getEventSchemaVersion(event) !== eventSchemaVersion) {
+          throw new Error(`Streaming buffer ${id} contains mixed event schema versions`);
+        }
+      }
+
       // Bound the synthesized events array to the configured cap so a
       // crashed run with hundreds of thousands of buffered events can't
       // resurrect as an unbounded ExecutionInfo. Mirrors `pushEventBounded`'s
@@ -1779,10 +1797,10 @@ export class AxlRuntime extends EventEmitter {
       const totalCost = boundedEvents.reduce((sum, e) => sum + eventCostContribution(e), 0);
       const unpriced = boundedEvents.some(isUnpricedLeaf);
 
-      const synthesized: ExecutionInfo = {
+      const executionBase = {
         executionId: id,
         workflow: workflowName,
-        status: 'failed',
+        status: 'failed' as const,
         events: boundedEvents,
         totalCost,
         unpriced,
@@ -1791,6 +1809,18 @@ export class AxlRuntime extends EventEmitter {
         duration: completedAt - startedAt,
         error: 'process terminated (recovered from streaming buffer)',
       };
+      const synthesized: HistoricalExecutionInfo =
+        eventSchemaVersion === 2
+          ? {
+              ...executionBase,
+              eventSchemaVersion: 2,
+              events: boundedEvents as AxlEventV2[],
+            }
+          : {
+              ...executionBase,
+              eventSchemaVersion: 1,
+              events: boundedEvents as LegacyAxlEventV1[],
+            };
 
       // Persist + register. CRITICAL: only delete the streaming buffer
       // AFTER saveExecution succeeds. If saveExecution throws (Redis flaky
@@ -1827,7 +1857,7 @@ export class AxlRuntime extends EventEmitter {
   }
 
   /** Get execution details by ID. */
-  async getExecution(executionId: string): Promise<ExecutionInfo | undefined> {
+  async getExecution(executionId: string): Promise<HistoricalExecutionInfo | undefined> {
     // Check active in-memory executions first
     const inMemory = this.executions.get(executionId);
     if (inMemory) return inMemory;

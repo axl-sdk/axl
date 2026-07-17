@@ -73,6 +73,14 @@ export {
 // we ship with the SDK.
 export { parsePartialJson } from './partial-json.js';
 
+// Persisted event-schema compatibility helpers.
+export {
+  getEventSchemaVersion,
+  getExecutionEventSchemaVersion,
+  normalizeStoredExecution,
+  UnsupportedEventSchemaVersionError,
+} from './event-schema.js';
+
 // Session
 export { Session } from './session.js';
 export type { SessionOptions } from './session.js';
@@ -159,8 +167,8 @@ export type {
   HandoffRecord,
   AgentCallInfo,
 } from './types.js';
-export { AXL_EVENT_TYPES } from './types.js';
-export { REDACTED, REDACTION_RULES, redactEvent } from './redaction.js';
+export { AXL_EVENT_TYPES, AXL_EVENT_TYPES_V2, AXL_TOOL_LIFECYCLE_TYPES_V2 } from './types.js';
+export { REDACTED, REDACTION_RULES, redactEvent, redactHistoricalEvent } from './redaction.js';
 
 // Errors
 export {

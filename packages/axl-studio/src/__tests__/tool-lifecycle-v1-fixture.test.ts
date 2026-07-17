@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { STUDIO_TOOL_LIFECYCLE_V1_FIXTURE } from './fixtures/tool-lifecycle-v1.js';
+import { executionEventSchemaVersion } from '../client/lib/trace-utils.js';
 
 describe('legacy tool lifecycle fixture', () => {
   it('locks the unversioned shapes Studio must continue to interpret as v1', () => {
@@ -71,5 +72,18 @@ describe('legacy tool lifecycle fixture', () => {
         ],
       }
     `);
+  });
+
+  it('routes an absent execution carrier to the legacy renderer', () => {
+    type StudioExecution = Parameters<typeof executionEventSchemaVersion>[0];
+    expect(executionEventSchemaVersion(STUDIO_TOOL_LIFECYCLE_V1_FIXTURE as StudioExecution)).toBe(
+      1,
+    );
+    expect(
+      executionEventSchemaVersion({
+        ...STUDIO_TOOL_LIFECYCLE_V1_FIXTURE,
+        eventSchemaVersion: 2,
+      } as StudioExecution),
+    ).toBe(2);
   });
 });

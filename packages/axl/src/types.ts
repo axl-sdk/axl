@@ -249,6 +249,20 @@ export const AXL_EVENT_TYPES = [
 /** Discriminator union derived from `AXL_EVENT_TYPES`. */
 export type AxlEventType = (typeof AXL_EVENT_TYPES)[number];
 
+/** Canonical discriminator list for the v2 writer. Kept additive while the
+ * compatible runtime still emits v1 so readers can become exhaustive first. */
+export const AXL_EVENT_TYPES_V2 = [
+  ...AXL_EVENT_TYPES.filter((type) => type !== 'tool_denied'),
+  'tool_call_rejected',
+] as const;
+
+/** Accepted/rejected tool lifecycle discriminators in event schema v2. */
+export const AXL_TOOL_LIFECYCLE_TYPES_V2 = [
+  'tool_call_start',
+  'tool_call_end',
+  'tool_call_rejected',
+] as const;
+
 /** Resolved model parameters sent to the provider for an LLM call. */
 export type AgentCallParams = {
   temperature?: number;

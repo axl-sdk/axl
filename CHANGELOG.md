@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-07-17
+
 ### Added
 
 - **Model-facing tool output projection.** Local tools can define a synchronous `toModelOutput` allowlist that keeps the complete post-hook result on the host-facing `tool_call_end` event while sending only validated, purpose-built content to the model. Adds exported `ToolModelOutput` and fail-closed `ToolModelOutputError`; existing tools, direct invocation, MCP, and handoffs retain their prior behavior.
@@ -921,7 +923,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.19.1...HEAD
+[0.19.1]: https://github.com/axl-sdk/axl/compare/v0.19.0...v0.19.1
 [0.15.0]: https://github.com/axl-sdk/axl/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/axl-sdk/axl/compare/v0.13.8...v0.14.0
 [0.13.8]: https://github.com/axl-sdk/axl/compare/v0.13.7...v0.13.8

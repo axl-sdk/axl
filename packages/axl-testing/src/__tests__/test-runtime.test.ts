@@ -619,6 +619,7 @@ describe('AxlTestRuntime', () => {
         name: 'throwing_mock',
         description: 'Throw from a mock',
         input: z.object({}),
+        retry: { attempts: 3 },
         handler: () => ({ ok: true }),
         toModelOutput: mapper,
       });
@@ -630,13 +631,15 @@ describe('AxlTestRuntime', () => {
       const runtime = new AxlTestRuntime();
       runtime.register(throwingWorkflow);
       runtime.mockProvider('openai', provider);
-      runtime.mockTool('throwing_mock', () => {
+      const throwingMock = vi.fn(() => {
         throw new Error('mock exploded');
       });
+      runtime.mockTool('throwing_mock', throwingMock);
 
       await runtime.execute('ThrowingMock', {});
 
       expect(mapper).not.toHaveBeenCalled();
+      expect(throwingMock).toHaveBeenCalledOnce();
       expect(runtime.toolCalls('throwing_mock')[0].result).toEqual({ error: 'mock exploded' });
       expect(recordedToolContent(provider)).toBe('{"error":"mock exploded"}');
     });

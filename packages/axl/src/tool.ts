@@ -40,7 +40,7 @@ export type ToolConfig<TInput extends z.ZodType, TOutput = unknown> = {
   /** Lifecycle hooks: before/after the handler. */
   hooks?: ToolHooks<z.infer<TInput>, TOutput>;
   /** Select the subset of a successful result that is sent back to the model. */
-  toModelOutput?(output: Readonly<TOutput>): ToolModelOutput;
+  toModelOutput?(this: void, output: Readonly<TOutput>): ToolModelOutput;
 };
 
 /** A defined tool instance */
@@ -53,7 +53,7 @@ export type Tool<TInput extends z.ZodType = z.ZodType, TOutput = unknown> = {
   readonly requireApproval: boolean;
   readonly hooks?: ToolHooks<z.infer<TInput>, TOutput>;
   /** Select the subset of a successful result that is sent back to the model. */
-  toModelOutput?(output: Readonly<TOutput>): ToolModelOutput;
+  toModelOutput?(this: void, output: Readonly<TOutput>): ToolModelOutput;
   /** Run the tool directly from workflow code */
   run(ctx: WorkflowContext, input: z.infer<TInput>): Promise<TOutput>;
   /** Execute the handler (internal use — includes retry logic) */

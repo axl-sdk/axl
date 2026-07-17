@@ -54,7 +54,7 @@ import type { AxlConfig } from './config.js';
 import { parseDuration, parseCost } from './config.js';
 import type { StateStore } from './state/types.js';
 import type { McpManager } from './mcp/manager.js';
-import type { SpanManager } from './telemetry/types.js';
+import type { SpanHandle, SpanManager } from './telemetry/types.js';
 import type { MemoryManager } from './memory/manager.js';
 import type { RememberOptions, RecallOptions, VectorResult } from './memory/types.js';
 import { serializeToolModelOutput } from './tool-model-output.js';
@@ -72,6 +72,48 @@ type ToolExecutionOutcome =
 
 function isErrorShaped(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && 'error' in value;
+}
+
+function isErrorShapedSafely(value: unknown): value is Record<string, unknown> {
+  try {
+    return isErrorShaped(value);
+  } catch {
+    return false;
+  }
+}
+
+function recordToolSpanResult(
+  span: SpanHandle,
+  value: unknown,
+  suppressInspectionErrors: boolean,
+): void {
+  let isError = false;
+  let errorMessage: unknown;
+  const inspect = () => {
+    if (isErrorShaped(value)) {
+      isError = true;
+      errorMessage = value.error;
+    } else {
+      isError = false;
+    }
+  };
+
+  if (suppressInspectionErrors) {
+    try {
+      inspect();
+    } catch {
+      // The legacy error-property sentinel is observability metadata, not part
+      // of projection eligibility. A hostile proxy must not bypass a configured
+      // sensitive/projection policy or leak its trap error into ask events.
+      isError = false;
+      errorMessage = undefined;
+    }
+  } else {
+    inspect();
+  }
+
+  span.setAttribute('axl.tool.success', !isError);
+  if (isError) span.setStatus('error', errorMessage as string);
 }
 
 function prepareToolModelOutput(toolName: string, project: () => unknown): string {
@@ -1853,6 +1895,8 @@ export class WorkflowContext<TInput = unknown> {
               callbackMeta,
             );
             const toolStart = Date.now();
+            const suppressErrorShapeInspection =
+              tool?.sensitive === true || tool?.toModelOutput !== undefined;
 
             const executeOverride = async (): Promise<ToolExecutionOutcome> => {
               try {
@@ -1875,17 +1919,13 @@ export class WorkflowContext<TInput = unknown> {
                   async (span) => {
                     const result = await executeOverride();
                     span.setAttribute('axl.tool.duration', Date.now() - toolStart);
-                    const isError = isErrorShaped(result.value);
-                    span.setAttribute('axl.tool.success', !isError);
-                    if (isErrorShaped(result.value))
-                      span.setStatus('error', result.value.error as string);
+                    recordToolSpanResult(span, result.value, suppressErrorShapeInspection);
                     return result;
                   },
                 )
               : await executeOverride();
 
             const toolResult = outcome.value;
-            const toolDuration = Date.now() - toolStart;
             const projectionEligible =
               tool !== undefined &&
               !tool.sensitive &&
@@ -1894,6 +1934,7 @@ export class WorkflowContext<TInput = unknown> {
             let resultContent: string;
 
             if (projectionEligible) {
+              const toolDuration = Date.now() - toolStart;
               this.emitEvent({
                 type: 'tool_call_end',
                 agent: agent._name,
@@ -1901,13 +1942,13 @@ export class WorkflowContext<TInput = unknown> {
                 duration: toolDuration,
                 data: { args: toolArgs, result: toolResult, callId: toolCall.id },
               });
-              resultContent = prepareToolModelOutput(toolName, () =>
-                tool.toModelOutput!(toolResult as never),
-              );
+              const project = tool.toModelOutput!;
+              resultContent = prepareToolModelOutput(toolName, () => project(toolResult as never));
             } else {
               resultContent = tool?.sensitive
                 ? '[REDACTED - sensitive tool output]'
                 : JSON.stringify(toolResult);
+              const toolDuration = Date.now() - toolStart;
               this.emitEvent({
                 type: 'tool_call_end',
                 agent: agent._name,
@@ -1957,6 +1998,8 @@ export class WorkflowContext<TInput = unknown> {
           this.onToolCall?.({ name: toolName, args: toolArgs, callId: toolCall.id }, callbackMeta);
 
           const toolStart = Date.now();
+          const suppressErrorShapeInspection =
+            tool?.sensitive === true || tool?.toModelOutput !== undefined;
 
           // Approval gate: if tool requires approval, ask the human first.
           // Note: MCP tools have no `tool` object here (isMcpTool is true instead),
@@ -2076,7 +2119,9 @@ export class WorkflowContext<TInput = unknown> {
               if (
                 outcome.kind === 'returned' &&
                 tool.hooks?.after &&
-                !isErrorShaped(outcome.value)
+                !(suppressErrorShapeInspection
+                  ? isErrorShapedSafely(outcome.value)
+                  : isErrorShaped(outcome.value))
               ) {
                 try {
                   outcome = {
@@ -2122,10 +2167,7 @@ export class WorkflowContext<TInput = unknown> {
                 async (span) => {
                   const r = await executeTool();
                   span.setAttribute('axl.tool.duration', Date.now() - toolStart);
-                  const isError = isErrorShaped(r.outcome.value);
-                  span.setAttribute('axl.tool.success', !isError);
-                  if (isErrorShaped(r.outcome.value))
-                    span.setStatus('error', r.outcome.value.error as string);
+                  recordToolSpanResult(span, r.outcome.value, suppressErrorShapeInspection);
                   return r;
                 },
               )
@@ -2148,9 +2190,8 @@ export class WorkflowContext<TInput = unknown> {
               duration: toolDuration,
               data: { args: toolArgs, result: toolResult, callId: toolCall.id },
             });
-            resultContent = prepareToolModelOutput(toolName, () =>
-              tool.toModelOutput!(toolResult as never),
-            );
+            const project = tool.toModelOutput!;
+            resultContent = prepareToolModelOutput(toolName, () => project(toolResult as never));
           } else {
             resultContent = execution.resultContent!;
             this.emitEvent({

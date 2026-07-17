@@ -221,6 +221,33 @@ const result = await axl.execute('HandleSupport', { msg: 'Refund please' });
 When the mocked name matches a configured local tool, the mock still bypasses the configured schema, approval, retry, hooks, and real handler. The configured tool contributes only its model-output policy: `sensitive` and `toModelOutput`. This lets a test return the same complete application artifact the host would render while asserting the smaller tool message the provider receives:
 
 ```typescript
+import { agent, tool, workflow } from '@axlsdk/axl';
+import { AxlTestRuntime, MockProvider } from '@axlsdk/testing';
+import { z } from 'zod';
+
+const getOrder = tool({
+  name: 'get_order',
+  description: 'Look up an order',
+  input: z.object({ orderId: z.string() }),
+  handler: async ({ orderId }) => ({
+    humanMessage: `Order ${orderId} is ready`,
+    internalId: `host-only-${orderId}`,
+  }),
+  toModelOutput: (result) => ({ message: result.humanMessage }),
+});
+
+const supportAgent = agent({
+  model: 'openai:test',
+  system: 'Use the order tool.',
+  tools: [getOrder],
+});
+
+const ProjectedSupport = workflow({
+  name: 'ProjectedSupport',
+  input: z.object({ msg: z.string() }),
+  handler: (ctx) => ctx.ask(supportAgent, ctx.input.msg),
+});
+
 const provider = MockProvider.sequence([
   { content: '', tool_calls: [{
     id: 'call-1',
@@ -230,15 +257,17 @@ const provider = MockProvider.sequence([
   { content: 'Done.' },
 ]);
 
-runtime.mockProvider('openai', provider);
-runtime.mockTool('get_order', () => ({
+const axl = new AxlTestRuntime();
+axl.register(ProjectedSupport);
+axl.mockProvider('openai', provider);
+axl.mockTool('get_order', () => ({
   humanMessage: 'Ready for pickup',
   internalId: 'host-only-123',
 }));
 
-await runtime.execute('HandleSupport', { msg: 'Check order 123' });
+await axl.execute('ProjectedSupport', { msg: 'Check order 123' });
 
-expect(runtime.toolCalls('get_order')[0].result).toEqual({
+expect(axl.toolCalls('get_order')[0].result).toEqual({
   humanMessage: 'Ready for pickup',
   internalId: 'host-only-123',
 });

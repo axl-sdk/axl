@@ -1,3 +1,4 @@
+import { types as nodeTypes } from 'node:util';
 import { ToolModelOutputError } from './errors.js';
 import type { ToolModelOutput } from './tool.js';
 
@@ -37,6 +38,10 @@ function normalize(value: unknown, path: string, stack: WeakSet<object>): ToolMo
   try {
     prototype = Object.getPrototypeOf(value);
     descriptors = Object.getOwnPropertyDescriptors(value);
+    // Descriptor maps are ordinary objects. Remove their prototype before any
+    // keyed lookup so ambient Object.prototype pollution cannot masquerade as
+    // an own array element or trigger an inherited accessor.
+    Object.setPrototypeOf(descriptors, null);
   } catch (cause) {
     throw invalid(
       path,
@@ -129,6 +134,12 @@ function normalize(value: unknown, path: string, stack: WeakSet<object>): ToolMo
 /** Validate and render an explicit model-facing tool result. */
 export function serializeToolModelOutput(toolName: string, output: unknown): string {
   try {
+    if (nodeTypes.isPromise(output)) {
+      // Async projectors are unsupported, but a rejected Promise must still be
+      // observed or Node may emit an unhandled rejection after we fail closed.
+      // Call the intrinsic directly so Promise subclasses cannot override it.
+      void Promise.prototype.then.call(output, undefined, () => undefined);
+    }
     if (typeof output === 'string') return output;
     return JSON.stringify(normalize(output, '$', new WeakSet<object>()));
   } catch (cause) {

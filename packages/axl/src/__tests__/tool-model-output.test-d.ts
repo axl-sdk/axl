@@ -58,6 +58,18 @@ describe('ToolModelOutput types', () => {
     expectTypeOf(unprojectedTool._execute).returns.toEqualTypeOf<
       Promise<{ complete: true; count: number }>
     >();
+
+    tool({
+      name: 'result-only',
+      description: 'result-only',
+      input: z.object({}),
+      handler: () => ({ value: 1 }),
+      toModelOutput(output) {
+        // @ts-expect-error projectors have no implicit ToolConfig receiver
+        void this.name;
+        return output.value;
+      },
+    });
   });
 
   it('accepts the supported recursive output surface', () => {

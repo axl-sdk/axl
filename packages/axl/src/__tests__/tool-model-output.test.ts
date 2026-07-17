@@ -164,6 +164,23 @@ describe('model-facing tool output projection', () => {
     expect(toolMessage(harness.provider.calls[1].messages).content).toBe(expected);
   });
 
+  it('invokes projection without an implicit receiver', async () => {
+    const projected = tool({
+      name: 'detached_projection',
+      description: 'Invoke projection as a result-only callback',
+      input: z.object({}),
+      handler: () => ({ raw: true }),
+      toModelOutput: function (this: unknown) {
+        return this === undefined ? 'detached' : 'bound';
+      } as never,
+    });
+    const harness = setup([projected]);
+
+    await harness.ctx.ask(harness.testAgent, 'go');
+
+    expect(toolMessage(harness.provider.calls[1].messages).content).toBe('detached');
+  });
+
   it.each([
     ['string', 'plain text', '"plain text"'],
     ['record', { answer: 42, omitted: undefined }, '{"answer":42}'],
@@ -308,6 +325,37 @@ describe('model-facing tool output projection', () => {
     );
   });
 
+  it('observes a rejected Promise from an unsupported async projector', async () => {
+    const secret = 'async-projector-secret';
+    const unhandled = vi.fn();
+    process.on('unhandledRejection', unhandled);
+    const projected = tool({
+      name: 'async_rejection',
+      description: 'Reject asynchronously despite the synchronous contract',
+      input: z.object({}),
+      handler: () => ({ raw: 'host-only' }),
+      toModelOutput: (async () => {
+        throw new Error(secret);
+      }) as never,
+    });
+    const harness = setup([projected]);
+
+    try {
+      await expect(harness.ctx.ask(harness.testAgent, 'go')).rejects.toMatchObject({
+        name: 'ToolModelOutputError',
+        toolName: 'async_rejection',
+        message: 'Failed to prepare model output for tool "async_rejection"',
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    } finally {
+      process.off('unhandledRejection', unhandled);
+    }
+
+    expect(unhandled).not.toHaveBeenCalled();
+    expect(JSON.stringify(harness.traces)).not.toContain(secret);
+    expect(harness.provider.calls).toHaveLength(1);
+  });
+
   it('accepts null-prototype records and preserves a literal __proto__ key', async () => {
     const record = Object.create(null) as Record<string, unknown>;
     Object.defineProperty(record, '__proto__', {
@@ -375,6 +423,33 @@ describe('model-facing tool output projection', () => {
     } finally {
       if (original) Object.defineProperty(Array.prototype, 'toJSON', original);
       else delete (Array.prototype as { toJSON?: unknown }).toJSON;
+    }
+  });
+
+  it('rejects sparse arrays despite Object.prototype descriptor pollution', async () => {
+    const original = Object.getOwnPropertyDescriptor(Object.prototype, '0');
+    Object.defineProperty(Object.prototype, '0', {
+      configurable: true,
+      writable: true,
+      value: { enumerable: true, value: 'injected' },
+    });
+    try {
+      const projected = tool({
+        name: 'polluted_descriptor_map',
+        description: 'Reject a sparse array under prototype pollution',
+        input: z.object({}),
+        handler: () => 'complete',
+        toModelOutput: () => new Array(1) as never,
+      });
+      const harness = setup([projected]);
+
+      await expect(harness.ctx.ask(harness.testAgent, 'go')).rejects.toBeInstanceOf(
+        ToolModelOutputError,
+      );
+      expect(harness.provider.calls).toHaveLength(1);
+    } finally {
+      if (original) Object.defineProperty(Object.prototype, '0', original);
+      else delete (Object.prototype as Record<string, unknown>)['0'];
     }
   });
 
@@ -537,6 +612,45 @@ describe('model-facing tool output projection', () => {
 
     expect(after).not.toHaveBeenCalled();
     expect(toolMessage(harness.provider.calls[1].messages).content).toBe('{"message":"declined"}');
+  });
+
+  it('does not let legacy error-shape proxy traps bypass configured projection', async () => {
+    const secret = 'error-sentinel-secret';
+    const rawResult = new Proxy(
+      {},
+      {
+        has: (_target, key) => {
+          if (key === 'error') throw new Error(secret);
+          return false;
+        },
+      },
+    );
+    const after = vi.fn((output) => output);
+    const mapper = vi.fn(() => 'safe projection');
+    const spans = new RecordingSpanManager();
+    const projected = tool({
+      name: 'proxy_sentinel',
+      description: 'Project despite a hostile legacy error sentinel',
+      input: z.object({}),
+      handler: () => rawResult,
+      hooks: { after },
+      toModelOutput: mapper,
+    });
+    const harness = setup([projected], undefined, { spanManager: spans });
+
+    await harness.ctx.ask(harness.testAgent, 'go');
+
+    expect(after).toHaveBeenCalledOnce();
+    expect(mapper).toHaveBeenCalledWith(rawResult);
+    expect(harness.traces.find((event) => event.type === 'tool_call_end')?.data.result).toBe(
+      rawResult,
+    );
+    expect(toolMessage(harness.provider.calls[1].messages).content).toBe('safe projection');
+    expect(spans.spans.find((span) => span.name === 'axl.tool.call')).toMatchObject({
+      attributes: { 'axl.tool.success': true },
+      status: { code: 'ok' },
+    });
+    expect(JSON.stringify(harness.traces)).not.toContain(secret);
   });
 
   it('redacts the authoritative host event without changing projected model content', async () => {
@@ -752,6 +866,42 @@ describe('model-facing tool output projection', () => {
     expect(harness.traces.find((event) => event.type === 'tool_call_end')?.duration).toBe(0);
     expect(JSON.stringify(spans.spans)).not.toContain('override-mapper-secret');
     expect(JSON.stringify(spans.spans)).not.toContain('host-only');
+  });
+
+  it('preserves legacy override event duration through result serialization', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(0);
+    const spans = new RecordingSpanManager();
+    const legacyTool = tool({
+      name: 'legacy_override_duration',
+      description: 'Retain legacy override duration semantics',
+      input: z.object({}),
+      handler: () => ({ real: true }),
+    });
+    const overrideResult = {
+      toJSON: () => {
+        clock.mockReturnValue(1_000);
+        return { mocked: true };
+      },
+    };
+    const overrides = new Map<string, (args: unknown) => Promise<unknown>>([
+      ['legacy_override_duration', async () => overrideResult],
+    ]);
+    const harness = setup([legacyTool], undefined, {
+      toolOverrides: overrides,
+      spanManager: spans,
+    });
+
+    try {
+      await harness.ctx.ask(harness.testAgent, 'go');
+    } finally {
+      clock.mockRestore();
+    }
+
+    expect(toolMessage(harness.provider.calls[1].messages).content).toBe('{"mocked":true}');
+    expect(harness.traces.find((event) => event.type === 'tool_call_end')?.duration).toBe(1_000);
+    expect(spans.spans.find((span) => span.name === 'axl.tool.call')).toMatchObject({
+      attributes: { 'axl.tool.duration': 0 },
+    });
   });
 
   it('projects an agent-as-tool result while retaining its complete nested result', async () => {

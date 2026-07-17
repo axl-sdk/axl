@@ -1,0 +1,4 @@
+interface:
+  display_name: 'Live API Verification'
+  short_description: 'Close real-provider verification gaps safely'
+  default_prompt: 'Use $live-api-verification to run and document the outstanding live-provider acceptance checks.'

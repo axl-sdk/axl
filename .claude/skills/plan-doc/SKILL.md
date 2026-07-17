@@ -6,6 +6,11 @@ disable-model-invocation: true
 
 Create a living plan doc for the work described in the user's request.
 
+The root/orchestrating lead owns final synthesis because it holds the product
+conversation and decision context. Delegate bounded code discovery when useful,
+but do not delegate authorship of product decisions, architecture choices,
+acceptance criteria, or the final plan.
+
 Default location: `.internal/spec/<name>-plan.md` (the gitignored internal-spec staging area; the public `docs/` tree is flat reference guides, not a home for working plans, and must never accrue changelog-style plan docs). For a large multi-increment program, give the durable architecture its own numbered `.internal/spec/` doc and make this a thinner per-increment plan that references it. **Never `git add -f` anything under `.internal/`.**
 
 ## What the doc must contain, in this flow
@@ -34,4 +39,9 @@ Resolve everything you can by digging into the code or research — do that firs
 
 ## Plan-mode behavior
 
-If invoked in plan mode, do all the research, code-grounding, and derivation as normal, then present the **full doc content as the proposed plan** via `ExitPlanMode` and write it to its `.internal/spec/` home **on approval** (plan mode gates the file write, not the thinking). Lean into the extra upfront rigor plan mode affords — chase open questions in the code, deepen the architecture grounding — so the approval gate reviews a richer doc. In normal mode, write the doc directly.
+If invoked in a product surface with plan mode, do all research, code-grounding,
+and derivation normally, then present the **full doc content as the proposed
+plan** through that surface's approval mechanism. In Claude Code this is
+`ExitPlanMode`; in Codex use the available plan approval workflow. Write the doc
+to `.internal/spec/` only after approval. Plan mode gates the file write, not the
+thinking. In normal mode, write the doc directly.

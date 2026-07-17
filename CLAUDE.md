@@ -75,5 +75,21 @@ Run from the repo root. Per-area detail: `.claude/rules/testing.md` and the pack
 - **Never commit gitignored paths** (`.internal/**`); no `git add -f`.
 - **Never commit, push, or tag without explicit approval.**
 
-> Note: `GEMINI.md` is a symlink to this file. `.claude/rules/` is Claude-Code-specific; the
-> `docs/` and source pointers above are what keep this index useful for any tool.
+## Workflow skills
+
+These are explicit-invoke skills (`disable-model-invocation: true`). They live
+in `.claude/skills/` and are exposed to Codex through the tracked
+`.agents/skills` symlink, so one Axl-specific skill body serves both tools.
+
+- `/plan-doc` — create a living journeys-to-architecture plan under
+  `.internal/spec/`.
+- `/tackle-plan` — implement, test, independently review, and commit a named
+  plan to completion.
+- `/session-review` — adversarial white-box review of a concrete net diff.
+- `/scenario-review` — black-box scenario derivation before implementation
+  inspection, followed by evidence-based gap closure.
+- `/live-api-verification` — close the canonical provider-gated checklist with
+  bounded paid integration tests and explicit provider/model evidence.
+
+> `AGENTS.md` is the agent-neutral entrypoint that routes Codex and other tools
+> through this index and the applicable shared `.claude/rules/` files.

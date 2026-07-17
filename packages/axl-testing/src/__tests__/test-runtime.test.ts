@@ -523,6 +523,50 @@ describe('AxlTestRuntime', () => {
       expect(recordedToolContent(provider)).not.toContain('host-only-id');
     });
 
+    it('inherits only projection policy from a configured tool when a mock wins', async () => {
+      const handler = vi.fn(() => ({ visible: 'real', hidden: 'real-only' }));
+      const before = vi.fn((input) => input);
+      const after = vi.fn((output) => output);
+      const configuredTool = tool({
+        name: 'policy_only_mock',
+        description: 'Exercise the exact configured mock boundary',
+        input: z.object({ required: z.string() }),
+        requireApproval: true,
+        retry: { attempts: 3 },
+        hooks: { before, after },
+        handler,
+        toModelOutput: (output) => output.visible,
+      });
+      const configuredWorkflow = createToolWorkflow('PolicyOnlyMock', [configuredTool]);
+      const provider = MockProvider.sequence([
+        toolCallResponse('policy_only_mock'),
+        { content: 'done' },
+      ]);
+      const runtime = new AxlTestRuntime({
+        humanDecisions: () => {
+          throw new Error('approval must remain bypassed');
+        },
+      });
+      runtime.register(configuredWorkflow);
+      runtime.mockProvider('openai', provider);
+      runtime.mockTool('policy_only_mock', () => ({
+        visible: 'mock projection',
+        hidden: 'host-only',
+      }));
+
+      await runtime.execute('PolicyOnlyMock', {});
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(before).not.toHaveBeenCalled();
+      expect(after).not.toHaveBeenCalled();
+      expect(runtime.toolCalls('policy_only_mock')[0].args).toEqual({});
+      expect(runtime.toolCalls('policy_only_mock')[0].result).toEqual({
+        visible: 'mock projection',
+        hidden: 'host-only',
+      });
+      expect(recordedToolContent(provider)).toBe('mock projection');
+    });
+
     it('lets configured sensitive policy win and skips projection for a mock result', async () => {
       const mapper = vi.fn(() => 'must not be sent');
       const sensitiveTool = tool({

@@ -43,8 +43,21 @@ describe('ToolModelOutput types', () => {
       Promise<{ value: number; secret: string }>
     >();
 
-    const concreteTools: Tool<any, any>[] = [syncTool, asyncTool];
+    const concreteTools: Tool[] = [syncTool, asyncTool];
     agent({ model: 'mock:model', system: 'test', tools: concreteTools });
+
+    const unprojectedTool = tool({
+      name: 'unprojected',
+      description: 'unprojected',
+      input: z.object({}),
+      handler: () => ({ complete: true as const, count: 1 }),
+    });
+    expectTypeOf(unprojectedTool.run).returns.toEqualTypeOf<
+      Promise<{ complete: true; count: number }>
+    >();
+    expectTypeOf(unprojectedTool._execute).returns.toEqualTypeOf<
+      Promise<{ complete: true; count: number }>
+    >();
   });
 
   it('accepts the supported recursive output surface', () => {

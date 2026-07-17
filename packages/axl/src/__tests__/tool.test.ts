@@ -47,7 +47,17 @@ describe('tool()', () => {
   });
 
   it('only exposes toModelOutput when configured', () => {
-    expect(Object.keys(basicTool)).not.toContain('toModelOutput');
+    expect(Object.keys(basicTool)).toEqual([
+      'name',
+      'description',
+      'inputSchema',
+      'sensitive',
+      'retry',
+      'requireApproval',
+      'hooks',
+      'run',
+      '_execute',
+    ]);
 
     const projectedTool = tool({
       name: 'projected',

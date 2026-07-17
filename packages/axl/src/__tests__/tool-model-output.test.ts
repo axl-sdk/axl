@@ -105,6 +105,7 @@ describe('model-facing tool output projection', () => {
   it('projects the post-after-hook value while retaining the complete host result', async () => {
     const tracesSeenByMapper: AxlEvent[] = [];
     let traces: AxlEvent[] = tracesSeenByMapper;
+    let mapperOutput: unknown;
     const projected = tool({
       name: 'rich_result',
       description: 'Return a rich application result',
@@ -119,6 +120,7 @@ describe('model-facing tool output projection', () => {
       },
       toModelOutput(output) {
         expect(traces.some((event) => event.type === 'tool_call_end')).toBe(true);
+        mapperOutput = output;
         return { message: output.humanMessage };
       },
     });
@@ -133,6 +135,8 @@ describe('model-facing tool output projection', () => {
       humanMessage: 'Ready for the user',
       payload: { rows: [1, 2, 3] },
     });
+    expect(end?.data.result).toBe(mapperOutput);
+    expect(Object.keys(end?.data ?? {})).toEqual(['args', 'result', 'callId']);
     expect(toolMessage(harness.provider.calls[1].messages).content).toBe(
       '{"message":"Ready for the user"}',
     );
@@ -160,18 +164,43 @@ describe('model-facing tool output projection', () => {
     expect(toolMessage(harness.provider.calls[1].messages).content).toBe(expected);
   });
 
-  it('preserves legacy serialization when no mapper is configured', async () => {
-    const legacyString = tool({
-      name: 'legacy_string',
-      description: 'Return a string',
+  it.each([
+    ['string', 'plain text', '"plain text"'],
+    ['record', { answer: 42, omitted: undefined }, '{"answer":42}'],
+    ['array', [1, 'two', false, null], '[1,"two",false,null]'],
+    ['number', 42, '42'],
+    ['boolean', false, 'false'],
+    ['null', null, 'null'],
+  ])(
+    'preserves legacy %s serialization when no mapper is configured',
+    async (_label, raw, expected) => {
+      const legacyTool = tool({
+        name: 'legacy_result',
+        description: 'Return a legacy result',
+        input: z.object({}),
+        handler: () => raw,
+      });
+      const harness = setup([legacyTool]);
+
+      await harness.ctx.ask(harness.testAgent, 'go');
+
+      expect(toolMessage(harness.provider.calls[1].messages).content).toBe(expected);
+    },
+  );
+
+  it('preserves legacy unserializable-result failure and event ordering', async () => {
+    const legacyTool = tool({
+      name: 'legacy_unserializable',
+      description: 'Return a legacy unserializable result',
       input: z.object({}),
-      handler: () => 'plain text',
+      handler: () => 1n,
     });
-    const harness = setup([legacyString]);
+    const harness = setup([legacyTool]);
 
-    await harness.ctx.ask(harness.testAgent, 'go');
+    await expect(harness.ctx.ask(harness.testAgent, 'go')).rejects.toBeInstanceOf(TypeError);
 
-    expect(toolMessage(harness.provider.calls[1].messages).content).toBe('"plain text"');
+    expect(harness.provider.calls).toHaveLength(1);
+    expect(harness.traces.filter((event) => event.type === 'tool_call_end')).toHaveLength(0);
   });
 
   it.each([
@@ -193,6 +222,14 @@ describe('model-facing tool output projection', () => {
     ],
     ['custom toJSON', () => ({ toJSON: () => ({ leaked: true }) })],
     ['accessor', () => Object.defineProperty({}, 'secret', { enumerable: true, get: () => 'x' })],
+    [
+      'non-enumerable accessor',
+      () => Object.defineProperty({}, 'secret', { enumerable: false, get: () => 'x' }),
+    ],
+    [
+      'symbol accessor',
+      () => Object.defineProperty({}, Symbol('secret'), { enumerable: false, get: () => 'x' }),
+    ],
     ['Date', () => new Date()],
     ['Map', () => new Map([['secret', 'value']])],
     ['Set', () => new Set(['secret'])],
@@ -620,6 +657,101 @@ describe('model-facing tool output projection', () => {
       attributes: { 'axl.tool.success': false },
       status: { code: 'error', message: 'declined' },
     });
+  });
+
+  it('preserves legacy returned error-shaped output, hook treatment, and span classification', async () => {
+    const spans = new RecordingSpanManager();
+    const after = vi.fn((output) => output);
+    const legacyTool = tool({
+      name: 'legacy_error_span',
+      description: 'Return an error-shaped result without projection',
+      input: z.object({}),
+      handler: () => ({ error: 'declined', internal: 'host-only' }),
+      hooks: { after },
+    });
+    const harness = setup([legacyTool], undefined, { spanManager: spans });
+
+    await harness.ctx.ask(harness.testAgent, 'go');
+
+    expect(after).not.toHaveBeenCalled();
+    expect(toolMessage(harness.provider.calls[1].messages).content).toBe(
+      '{"error":"declined","internal":"host-only"}',
+    );
+    expect(spans.spans.find((span) => span.name === 'axl.tool.call')).toMatchObject({
+      attributes: { 'axl.tool.success': false },
+      status: { code: 'error', message: 'declined' },
+    });
+  });
+
+  it('keeps legacy failed-span classification for a projected returned error-shaped override', async () => {
+    const spans = new RecordingSpanManager();
+    const configured = tool({
+      name: 'error_override_span',
+      description: 'Project an override result',
+      input: z.object({}),
+      handler: () => ({ error: 'real', internal: 'real-only' }),
+      toModelOutput: (output) => output.error,
+    });
+    const overrides = new Map<string, (args: unknown) => Promise<unknown>>([
+      ['error_override_span', async () => ({ error: 'mock declined', internal: 'host-only' })],
+    ]);
+    const harness = setup([configured], undefined, {
+      toolOverrides: overrides,
+      spanManager: spans,
+    });
+
+    await harness.ctx.ask(harness.testAgent, 'go');
+
+    expect(toolMessage(harness.provider.calls[1].messages).content).toBe('mock declined');
+    expect(harness.traces.find((event) => event.type === 'tool_call_end')?.data.result).toEqual({
+      error: 'mock declined',
+      internal: 'host-only',
+    });
+    expect(spans.spans.find((span) => span.name === 'axl.tool.call')).toMatchObject({
+      attributes: { 'axl.tool.success': false },
+      status: { code: 'error', message: 'mock declined' },
+    });
+  });
+
+  it('closes override telemetry before a configured projection failure', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(0);
+    const spans = new RecordingSpanManager();
+    const configured = tool({
+      name: 'failing_override_projection',
+      description: 'Fail after an override returns',
+      input: z.object({}),
+      handler: () => ({ raw: 'real' }),
+      toModelOutput: () => {
+        clock.mockReturnValue(1_000);
+        throw new Error('override-mapper-secret');
+      },
+    });
+    const overrides = new Map<string, (args: unknown) => Promise<unknown>>([
+      ['failing_override_projection', async () => ({ raw: 'host-only' })],
+    ]);
+    const harness = setup([configured], undefined, {
+      toolOverrides: overrides,
+      spanManager: spans,
+    });
+
+    try {
+      await expect(harness.ctx.ask(harness.testAgent, 'go')).rejects.toBeInstanceOf(
+        ToolModelOutputError,
+      );
+    } finally {
+      clock.mockRestore();
+    }
+
+    expect(spans.spans.find((span) => span.name === 'axl.tool.call')).toMatchObject({
+      attributes: {
+        'axl.tool.duration': 0,
+        'axl.tool.success': true,
+      },
+      status: { code: 'ok' },
+    });
+    expect(harness.traces.find((event) => event.type === 'tool_call_end')?.duration).toBe(0);
+    expect(JSON.stringify(spans.spans)).not.toContain('override-mapper-secret');
+    expect(JSON.stringify(spans.spans)).not.toContain('host-only');
   });
 
   it('projects an agent-as-tool result while retaining its complete nested result', async () => {

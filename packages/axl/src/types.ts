@@ -352,7 +352,8 @@ export type ToolApprovalData = {
   reason?: string;
 };
 
-/** Data shape for `tool_denied` events. Emitted when the LLM names a tool the agent doesn't expose. */
+/** Historical v1 data shape for `tool_denied` events. V2 writers emit
+ * `tool_call_rejected` for unavailable provider requests instead. */
 export type ToolDeniedData = {
   args?: unknown;
   reason?: string;

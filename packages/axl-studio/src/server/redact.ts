@@ -102,7 +102,7 @@ export function redactValue(value: unknown, redact: boolean): unknown {
  * `redactStreamEvent` to catch per-variant payloads that emit-time
  * redaction may have missed (e.g., `partial_object.data.object`,
  * `verify.data.lastError`, `pipeline.reason`, terminal `done`/`error`,
- * `tool_call_start.data.args`, `tool_denied.data.*`). Defense in depth —
+ * `tool_call_start.data.args`, historical v1 `tool_denied.data.*`). Defense in depth —
  * core `emitEvent` scrubs most variants at emission, but the REST
  * serialization boundary is the last line before PII leaves the
  * observability envelope.

@@ -3474,16 +3474,47 @@ describe("state.persist: 'streaming' (#1)", () => {
     expect(buffers.has('orphan-1')).toBe(false);
   });
 
-  it('recoverIncompleteStreams preserves v2 schema metadata through truncation', async () => {
-    const events = Array.from({ length: 3 }, (_, step) => ({
-      schemaVersion: 2 as const,
-      type: step === 0 ? ('workflow_start' as const) : ('log' as const),
-      executionId: 'orphan-v2',
-      workflow: 'v2-workflow',
-      step,
-      timestamp: 1000 + step,
-      data: step === 0 ? { input: {} } : { step },
-    })) as import('../types.js').AxlEventV2[];
+  it('recoverIncompleteStreams preserves an orphan v2 tool start without inventing an end', async () => {
+    const events = [
+      {
+        schemaVersion: 2 as const,
+        type: 'workflow_start' as const,
+        executionId: 'orphan-v2',
+        workflow: 'v2-workflow',
+        step: 0,
+        timestamp: 1000,
+        data: { input: {} },
+      },
+      {
+        schemaVersion: 2 as const,
+        type: 'tool_call_start' as const,
+        executionId: 'orphan-v2',
+        askId: 'ask-v2',
+        depth: 0,
+        agent: 'agent-v2',
+        tool: 'lookup',
+        callId: 'orphan-call',
+        step: 1,
+        timestamp: 1001,
+        data: { args: { id: 1 } },
+      },
+      {
+        schemaVersion: 2 as const,
+        type: 'log' as const,
+        executionId: 'orphan-v2',
+        step: 2,
+        timestamp: 1002,
+        data: { event: 'before-crash' },
+      },
+      {
+        schemaVersion: 2 as const,
+        type: 'log' as const,
+        executionId: 'orphan-v2',
+        step: 3,
+        timestamp: 1003,
+        data: { event: 'crash' },
+      },
+    ] satisfies import('../types.js').AxlEventV2[];
     const buffers = new Map<string, import('../types.js').HistoricalAxlEvent[]>([
       ['orphan-v2', events],
     ]);
@@ -3518,7 +3549,7 @@ describe("state.persist: 'streaming' (#1)", () => {
       state: {
         store: fakeStore as never,
         persist: 'streaming',
-        maxEventsPerExecution: 2,
+        maxEventsPerExecution: 3,
       },
     });
 
@@ -3526,13 +3557,24 @@ describe("state.persist: 'streaming' (#1)", () => {
 
     expect(recovered).toHaveLength(1);
     expect(recovered[0].eventSchemaVersion).toBe(2);
-    expect(recovered[0].events).toHaveLength(2);
+    expect(recovered[0].events).toHaveLength(3);
     expect(recovered[0].events.every((event) => event.schemaVersion === 2)).toBe(true);
     expect(recovered[0].events[1]).toMatchObject({
+      schemaVersion: 2,
+      type: 'tool_call_start',
+      callId: 'orphan-call',
+      data: { args: { id: 1 } },
+    });
+    expect(recovered[0].events[2]).toMatchObject({
       schemaVersion: 2,
       type: 'log',
       data: { event: 'events_truncated' },
     });
+    expect(
+      recovered[0].events.some(
+        (event) => event.type === 'tool_call_end' && event.callId === 'orphan-call',
+      ),
+    ).toBe(false);
     expect(saved).toEqual(recovered);
     expect(buffers.has('orphan-v2')).toBe(false);
   });

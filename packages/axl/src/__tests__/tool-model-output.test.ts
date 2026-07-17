@@ -17,6 +17,10 @@ import type { SequenceProvider } from './helpers.js';
 type RecordedSpan = {
   name: string;
   attributes: Record<string, string | number | boolean>;
+  events: Array<{
+    name: string;
+    attributes?: Record<string, string | number | boolean>;
+  }>;
   status?: { code: 'ok' | 'error'; message?: string };
 };
 
@@ -28,13 +32,18 @@ class RecordingSpanManager implements SpanManager {
     attributes: Record<string, string | number | boolean>,
     fn: (span: SpanHandle) => Promise<T>,
   ): Promise<T> {
-    const record: RecordedSpan = { name, attributes: { ...attributes } };
+    const record: RecordedSpan = { name, attributes: { ...attributes }, events: [] };
     this.spans.push(record);
     const span: SpanHandle = {
       setAttribute: (key, value) => {
         record.attributes[key] = value;
       },
-      addEvent: () => undefined,
+      addEvent: (eventName, eventAttributes) => {
+        record.events.push({
+          name: eventName,
+          ...(eventAttributes === undefined ? {} : { attributes: { ...eventAttributes } }),
+        });
+      },
       setStatus: (code, message) => {
         record.status = { code, ...(message === undefined ? {} : { message }) };
       },
@@ -54,11 +63,11 @@ class RecordingSpanManager implements SpanManager {
   async shutdown(): Promise<void> {}
 }
 
-function call(name: string, id = `call-${name}`): ToolCallMessage {
+function call(name: string, id = `call-${name}`, args = '{}'): ToolCallMessage {
   return {
     id,
     type: 'function',
-    function: { name, arguments: '{}' },
+    function: { name, arguments: args },
   };
 }
 
@@ -148,7 +157,9 @@ describe('model-facing tool output projection', () => {
 
     await harness.ctx.ask(harness.testAgent, 'go');
 
-    const end = harness.traces.find((event) => event.type === 'tool_call_end');
+    const ends = harness.traces.filter((event) => event.type === 'tool_call_end');
+    expect(ends).toHaveLength(1);
+    const end = ends[0];
     expect(terminalResult(end)).toEqual({
       action: { label: 'Open', internalId: 'action-1' },
       humanMessage: 'Ready for the user',
@@ -159,6 +170,11 @@ describe('model-facing tool output projection', () => {
     expect(toolMessage(harness.provider.calls[1].messages).content).toBe(
       '{"message":"Ready for the user"}',
     );
+    expect(
+      harness.traces
+        .filter((event) => event.type === 'tool_call_start' || event.type === 'tool_call_end')
+        .map((event) => event.type),
+    ).toEqual(['tool_call_start', 'tool_call_end']);
   });
 
   it.each([
@@ -229,17 +245,28 @@ describe('model-facing tool output projection', () => {
   );
 
   it('emits a serialization failure before aborting without provider continuation', async () => {
+    const laterHandler = vi.fn();
     const legacyTool = tool({
       name: 'legacy_unserializable',
       description: 'Return a legacy unserializable result',
       input: z.object({}),
       handler: () => 1n,
     });
-    const harness = setup([legacyTool]);
+    const later = tool({
+      name: 'after_serialization_failure',
+      description: 'must not execute',
+      input: z.object({}),
+      handler: laterHandler,
+    });
+    const harness = setup(
+      [legacyTool, later],
+      [call(legacyTool.name, 'serialization-failure'), call(later.name, 'later-serialization')],
+    );
 
     await expect(harness.ctx.ask(harness.testAgent, 'go')).rejects.toBeInstanceOf(TypeError);
 
     expect(harness.provider.calls).toHaveLength(1);
+    expect(laterHandler).not.toHaveBeenCalled();
     expect(harness.traces.filter((event) => event.type === 'tool_call_end')).toHaveLength(1);
     expect(harness.traces.find((event) => event.type === 'tool_call_end')).toMatchObject({
       data: {
@@ -249,6 +276,14 @@ describe('model-facing tool output projection', () => {
         },
       },
     });
+    expect(
+      harness.traces
+        .filter((event) => event.type === 'tool_call_start' || event.type === 'tool_call_end')
+        .map((event) => [event.type, event.callId]),
+    ).toEqual([
+      ['tool_call_start', 'serialization-failure'],
+      ['tool_call_end', 'serialization-failure'],
+    ]);
   });
 
   it.each([
@@ -333,6 +368,19 @@ describe('model-facing tool output projection', () => {
     expect(harness.provider.calls).toHaveLength(1);
     const ends = harness.traces.filter((event) => event.type === 'tool_call_end');
     expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({
+      data: {
+        outcome: {
+          status: 'failed',
+          failure: {
+            phase: 'projection',
+            kind: 'output',
+            disposition: 'abort',
+            result: { rawSecret: 'host-only' },
+          },
+        },
+      },
+    });
     expect(terminalResult(ends[0])).toEqual({ rawSecret: 'host-only' });
     const askEnd = harness.traces.find((event) => event.type === 'ask_end');
     expect(askEnd?.outcome).toEqual({
@@ -340,6 +388,11 @@ describe('model-facing tool output projection', () => {
       error: 'Failed to prepare model output for tool "invalid_projection"',
     });
     expect(JSON.stringify(harness.traces)).not.toContain('leaked');
+    expect(
+      harness.traces
+        .filter((event) => event.type === 'tool_call_start' || event.type === 'tool_call_end')
+        .map((event) => event.type),
+    ).toEqual(['tool_call_start', 'tool_call_end']);
   });
 
   it('accepts shared references that are not cyclic', async () => {
@@ -538,6 +591,27 @@ describe('model-facing tool output projection', () => {
     const serialized = JSON.stringify(harness.traces);
     expect(serialized).not.toContain('mapper-secret-value');
     expect(serialized).toContain('raw-value');
+    expect(harness.provider.calls).toHaveLength(1);
+    const ends = harness.traces.filter((event) => event.type === 'tool_call_end');
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({
+      data: {
+        outcome: {
+          status: 'failed',
+          failure: {
+            phase: 'projection',
+            kind: 'output',
+            disposition: 'abort',
+            result: { rawSecret: 'raw-value' },
+          },
+        },
+      },
+    });
+    expect(
+      harness.traces
+        .filter((event) => event.type === 'tool_call_start' || event.type === 'tool_call_end')
+        .map((event) => event.type),
+    ).toEqual(['tool_call_start', 'tool_call_end']);
   });
 
   it('keeps the host-visible cause out of ordinary error serialization', () => {
@@ -571,6 +645,7 @@ describe('model-facing tool output projection', () => {
 
   it('lets sensitive policy win over projection on success and failure', async () => {
     const mapper = vi.fn(() => 'should not run');
+    const successSpans = new RecordingSpanManager();
     const sensitiveSuccess = tool({
       name: 'sensitive_success',
       description: 'Sensitive success',
@@ -579,30 +654,85 @@ describe('model-facing tool output projection', () => {
       handler: () => ({ secret: 'complete' }),
       toModelOutput: mapper,
     });
-    const success = setup([sensitiveSuccess]);
+    const success = setup([sensitiveSuccess], undefined, { spanManager: successSpans });
     await success.ctx.ask(success.testAgent, 'go');
     expect(toolMessage(success.provider.calls[1].messages).content).toBe(
       '[REDACTED - sensitive tool output]',
     );
-
-    const sensitiveFailure = tool({
-      name: 'sensitive_failure',
-      description: 'Sensitive failure',
-      input: z.object({}),
-      sensitive: true,
-      handler: () => {
-        throw new ToolFailure({
-          message: 'handler-secret',
-          modelMessage: 'model-safe-but-sensitive',
-        });
+    const sensitiveSuccessSpan = successSpans.spans.find((span) => span.name === 'axl.tool.call');
+    expect(sensitiveSuccessSpan).toMatchObject({
+      attributes: {
+        'axl.tool.name': 'sensitive_success',
+        'axl.tool.outcome': 'succeeded',
+        'axl.tool.success': true,
       },
-      toModelOutput: mapper,
+      events: [],
+      status: { code: 'ok' },
     });
-    const failure = setup([sensitiveFailure]);
-    await failure.ctx.ask(failure.testAgent, 'go');
-    expect(toolMessage(failure.provider.calls[1].messages).content).toBe(
-      '[REDACTED - sensitive tool failure]',
-    );
+    expect(
+      JSON.stringify({
+        attributes: sensitiveSuccessSpan?.attributes,
+        events: sensitiveSuccessSpan?.events,
+      }),
+    ).not.toContain('complete');
+
+    const sensitiveFailures = [
+      tool({
+        name: 'sensitive_before_failure',
+        description: 'Sensitive before-hook failure',
+        input: z.object({}),
+        sensitive: true,
+        hooks: {
+          before: () => {
+            throw new ToolFailure({
+              message: 'before-secret',
+              modelMessage: 'before-model-safe-but-sensitive',
+            });
+          },
+        },
+        handler: () => ({ secret: 'must not run' }),
+        toModelOutput: mapper,
+      }),
+      tool({
+        name: 'sensitive_handler_failure',
+        description: 'Sensitive handler failure',
+        input: z.object({}),
+        sensitive: true,
+        handler: () => {
+          throw new ToolFailure({
+            message: 'handler-secret',
+            modelMessage: 'handler-model-safe-but-sensitive',
+          });
+        },
+        toModelOutput: mapper,
+      }),
+      tool({
+        name: 'sensitive_after_failure',
+        description: 'Sensitive after-hook failure',
+        input: z.object({}),
+        sensitive: true,
+        handler: () => ({ secret: 'raw-result' }),
+        hooks: {
+          after: () => {
+            throw new ToolFailure({
+              message: 'after-secret',
+              modelMessage: 'after-model-safe-but-sensitive',
+            });
+          },
+        },
+        toModelOutput: mapper,
+      }),
+    ];
+
+    for (const sensitiveFailure of sensitiveFailures) {
+      const failure = setup([sensitiveFailure]);
+      await failure.ctx.ask(failure.testAgent, 'go');
+      expect(toolMessage(failure.provider.calls[1].messages).content).toBe(
+        '[REDACTED - sensitive tool failure]',
+      );
+      expect(JSON.stringify(failure.provider.calls[1].messages)).not.toContain('secret');
+      expect(JSON.stringify(failure.provider.calls[1].messages)).not.toContain('model-safe');
+    }
     expect(mapper).not.toHaveBeenCalled();
   });
 
@@ -798,6 +928,40 @@ describe('model-facing tool output projection', () => {
     ]);
   });
 
+  it('pairs repeated same-name siblings by call identity rather than tool name', async () => {
+    const repeated = tool({
+      name: 'repeated_name',
+      description: 'Return the invocation input',
+      input: z.object({ value: z.string() }),
+      handler: ({ value }) => ({ value }),
+    });
+    const harness = setup(
+      [repeated],
+      [
+        call('repeated_name', 'repeat-1', '{"value":"first"}'),
+        call('repeated_name', 'repeat-2', '{"value":"second"}'),
+      ],
+    );
+
+    await harness.ctx.ask(harness.testAgent, 'go');
+
+    expect(
+      harness.traces
+        .filter(
+          (event): event is Extract<AxlEvent, { type: 'tool_call_end' }> =>
+            event.type === 'tool_call_end',
+        )
+        .map((event) => ({
+          callId: event.callId,
+          args: event.data.args,
+          result: terminalResult(event),
+        })),
+    ).toEqual([
+      { callId: 'repeat-1', args: { value: 'first' }, result: { value: 'first' } },
+      { callId: 'repeat-2', args: { value: 'second' }, result: { value: 'second' } },
+    ]);
+  });
+
   it('keeps serialized projections isolated through later turns and source mutation', async () => {
     const firstProjection = { visible: 'first' };
     const provider = createSequenceProvider([
@@ -923,6 +1087,16 @@ describe('model-facing tool output projection', () => {
     expect(toolMessage(nonStreaming.provider.calls[1].messages).content).toBe('safe');
     expect(toolMessage(streaming.provider.calls[1].messages).content).toBe('safe');
     expect(JSON.stringify(streaming.provider.calls[1].messages)).not.toContain('host-only');
+    const lifecycleShape = (events: AxlEvent[]) =>
+      events
+        .filter((event) => event.type === 'tool_call_start' || event.type === 'tool_call_end')
+        .map((event) => ({
+          type: event.type,
+          tool: event.tool,
+          callId: event.callId,
+          data: event.data,
+        }));
+    expect(lifecycleShape(streaming.traces)).toEqual(lifecycleShape(nonStreaming.traces));
   });
 
   it('does not continue to the provider after a tool aborts the ask signal', async () => {

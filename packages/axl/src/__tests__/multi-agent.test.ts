@@ -4,6 +4,49 @@ import { tool } from '../tool.js';
 import { z } from 'zod';
 import { createSequenceProvider, createTestCtx } from './helpers.js';
 import type { Provider } from '../providers/types.js';
+import type { SpanHandle, SpanManager } from '../telemetry/types.js';
+
+type RecordedSpan = {
+  name: string;
+  attributes: Record<string, string | number | boolean>;
+  parent?: RecordedSpan;
+};
+
+class NestingSpanManager implements SpanManager {
+  readonly spans: RecordedSpan[] = [];
+  private active?: RecordedSpan;
+
+  async withSpanAsync<T>(
+    name: string,
+    attributes: Record<string, string | number | boolean>,
+    fn: (span: SpanHandle) => Promise<T>,
+  ): Promise<T> {
+    const parent = this.active;
+    const record: RecordedSpan = {
+      name,
+      attributes: { ...attributes },
+      ...(parent ? { parent } : {}),
+    };
+    this.spans.push(record);
+    this.active = record;
+    const span: SpanHandle = {
+      setAttribute: (key, value) => {
+        record.attributes[key] = value;
+      },
+      addEvent: () => undefined,
+      setStatus: () => undefined,
+      end: () => undefined,
+    };
+    try {
+      return await fn(span);
+    } finally {
+      this.active = parent;
+    }
+  }
+
+  addEventToActiveSpan(): void {}
+  async shutdown(): Promise<void> {}
+}
 
 describe('child context', () => {
   it('createChildContext() isolates session history', async () => {
@@ -179,36 +222,119 @@ describe('child context', () => {
       'Final result: specialist answer',
     ]);
 
-    const { ctx, traces } = createTestCtx({ provider });
+    const spanManager = new NestingSpanManager();
+    const { ctx, traces } = createTestCtx({ provider, spanManager });
     const result = await ctx.ask(outerAgent, 'Coordinate this task');
 
     expect(result).toBe('Final result: specialist answer');
-    const toolStart = traces.find(
-      (event) => event.type === 'tool_call_start' && event.callId === 'tc1',
-    );
-    const toolEnd = traces.find(
-      (event) => event.type === 'tool_call_end' && event.callId === 'tc1',
-    );
-    const outerAsk = traces.find(
+    expect(traces.filter((event) => event.type === 'ask_start')).toHaveLength(2);
+    expect(traces.filter((event) => event.type === 'ask_end')).toHaveLength(2);
+    expect(traces.filter((event) => event.type === 'tool_call_start')).toHaveLength(1);
+    expect(traces.filter((event) => event.type === 'tool_call_end')).toHaveLength(1);
+    expect(traces.filter((event) => event.type === 'tool_call_rejected')).toHaveLength(0);
+    const outerAskStarts = traces.filter(
       (event) => event.type === 'ask_start' && event.agent === 'outer_agent',
     );
-    const innerAsk = traces.find(
+    const innerAskStarts = traces.filter(
       (event) => event.type === 'ask_start' && event.agent === 'sub_agent',
     );
+    expect(outerAskStarts).toHaveLength(1);
+    expect(innerAskStarts).toHaveLength(1);
+    const [outerAsk] = outerAskStarts;
+    const [innerAsk] = innerAskStarts;
+    expect(outerAsk).toMatchObject({ depth: 0, agent: 'outer_agent' });
+    expect(outerAsk?.parentAskId).toBeUndefined();
+    expect(innerAsk).toMatchObject({
+      parentAskId: outerAsk?.askId,
+      depth: 1,
+      agent: 'sub_agent',
+    });
+    expect(innerAsk?.askId).not.toBe(outerAsk?.askId);
+    expect(innerAsk?.executionId).toBe(outerAsk?.executionId);
+
+    const outerAskEnds = traces.filter(
+      (event) => event.type === 'ask_end' && event.askId === outerAsk?.askId,
+    );
+    const innerAskEnds = traces.filter(
+      (event) => event.type === 'ask_end' && event.askId === innerAsk?.askId,
+    );
+    expect(outerAskEnds).toHaveLength(1);
+    expect(innerAskEnds).toHaveLength(1);
+    const [outerAskEnd] = outerAskEnds;
+    const [innerAskEnd] = innerAskEnds;
+    expect(outerAskEnd).toMatchObject({
+      executionId: outerAsk?.executionId,
+      askId: outerAsk?.askId,
+      depth: 0,
+      agent: 'outer_agent',
+      outcome: { ok: true, result: 'Final result: specialist answer' },
+    });
+    expect(outerAskEnd?.parentAskId).toBeUndefined();
+    expect(innerAskEnd).toMatchObject({
+      executionId: innerAsk?.executionId,
+      askId: innerAsk?.askId,
+      parentAskId: outerAsk?.askId,
+      depth: 1,
+      agent: 'sub_agent',
+      outcome: { ok: true, result: 'specialist answer' },
+    });
+
+    const toolStarts = traces.filter(
+      (event) => event.type === 'tool_call_start' && event.callId === 'tc1',
+    );
+    const toolEnds = traces.filter(
+      (event) => event.type === 'tool_call_end' && event.callId === 'tc1',
+    );
+    expect(toolStarts).toHaveLength(1);
+    expect(toolEnds).toHaveLength(1);
+    const [toolStart] = toolStarts;
+    const [toolEnd] = toolEnds;
     expect(toolStart).toMatchObject({
       schemaVersion: 2,
+      executionId: outerAsk?.executionId,
       tool: 'ask_specialist',
       askId: outerAsk?.askId,
+      depth: 0,
+      agent: 'outer_agent',
       callId: 'tc1',
     });
     expect(toolEnd).toMatchObject({
       schemaVersion: 2,
+      executionId: outerAsk?.executionId,
       tool: 'ask_specialist',
       askId: outerAsk?.askId,
+      depth: 0,
+      agent: 'outer_agent',
       callId: 'tc1',
       data: { outcome: { status: 'succeeded', result: 'specialist answer' } },
     });
-    expect(innerAsk).toMatchObject({ parentAskId: outerAsk?.askId, depth: 1 });
+    expect(toolStart?.parentAskId).toBeUndefined();
+    expect(toolEnd?.parentAskId).toBeUndefined();
+    expect(toolEnd?.duration).toBeGreaterThanOrEqual(innerAskEnd?.duration ?? 0);
+    expect(outerAskEnd?.duration).toBeGreaterThanOrEqual(toolEnd?.duration ?? 0);
+
+    expect(outerAsk?.step).toBeLessThan(toolStart?.step ?? 0);
+    expect(toolStart?.step).toBeLessThan(innerAsk?.step ?? 0);
+    expect(innerAsk?.step).toBeLessThan(innerAskEnd?.step ?? 0);
+    expect(innerAskEnd?.step).toBeLessThan(toolEnd?.step ?? 0);
+    expect(toolEnd?.step).toBeLessThan(outerAskEnd?.step ?? 0);
+
+    const outerAskSpan = spanManager.spans.find(
+      (span) =>
+        span.name === 'axl.agent.ask' && span.attributes['axl.agent.name'] === 'outer_agent',
+    );
+    const toolSpan = spanManager.spans.find(
+      (span) =>
+        span.name === 'axl.tool.call' && span.attributes['axl.tool.name'] === 'ask_specialist',
+    );
+    const innerAskSpan = spanManager.spans.find(
+      (span) => span.name === 'axl.agent.ask' && span.attributes['axl.agent.name'] === 'sub_agent',
+    );
+    expect(outerAskSpan).toBeDefined();
+    expect(toolSpan).toBeDefined();
+    expect(innerAskSpan).toBeDefined();
+    expect(toolSpan!.parent).toBe(outerAskSpan);
+    expect(innerAskSpan!.parent).toBe(toolSpan);
   });
 
   it('agent-as-tool propagates cancellation through the inner and outer lifecycle', async () => {
@@ -232,10 +358,7 @@ describe('child context', () => {
           };
         }
         controller.abort('cancel nested ask');
-        return {
-          content: 'must not continue',
-          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-        };
+        throw new DOMException('cancel nested ask', 'AbortError');
       },
       stream: async function* () {
         yield { type: 'done' as const };
@@ -254,20 +377,128 @@ describe('child context', () => {
       system: 'outer',
       tools: [outerTool],
     });
-    const { ctx, traces } = createTestCtx({ provider, signal: controller.signal });
+    const spanManager = new NestingSpanManager();
+    const { ctx, traces } = createTestCtx({
+      provider,
+      signal: controller.signal,
+      spanManager,
+    });
 
     await expect(ctx.ask(outer, 'go')).rejects.toMatchObject({ name: 'AbortError' });
     expect(calls).toBe(2);
-    expect(
-      traces.find((event) => event.type === 'tool_call_end' && event.callId === 'outer-call'),
-    ).toMatchObject({ data: { outcome: { status: 'cancelled' } } });
-    const innerAsk = traces.find(
-      (event) => event.type === 'ask_start' && event.agent === 'inner_cancel',
-    );
-    const outerAsk = traces.find(
+    expect(controller.signal).toMatchObject({ aborted: true, reason: 'cancel nested ask' });
+    expect(traces.filter((event) => event.type === 'ask_start')).toHaveLength(2);
+    expect(traces.filter((event) => event.type === 'ask_end')).toHaveLength(2);
+    expect(traces.filter((event) => event.type === 'tool_call_start')).toHaveLength(1);
+    expect(traces.filter((event) => event.type === 'tool_call_end')).toHaveLength(1);
+    expect(traces.filter((event) => event.type === 'tool_call_rejected')).toHaveLength(0);
+
+    const outerAskStarts = traces.filter(
       (event) => event.type === 'ask_start' && event.agent === 'outer_cancel',
     );
-    expect(innerAsk?.parentAskId).toBe(outerAsk?.askId);
+    const innerAskStarts = traces.filter(
+      (event) => event.type === 'ask_start' && event.agent === 'inner_cancel',
+    );
+    expect(outerAskStarts).toHaveLength(1);
+    expect(innerAskStarts).toHaveLength(1);
+    const [outerAsk] = outerAskStarts;
+    const [innerAsk] = innerAskStarts;
+    expect(outerAsk).toMatchObject({ depth: 0, agent: 'outer_cancel' });
+    expect(outerAsk?.parentAskId).toBeUndefined();
+    expect(innerAsk).toMatchObject({
+      parentAskId: outerAsk?.askId,
+      depth: 1,
+      agent: 'inner_cancel',
+    });
+    expect(innerAsk?.askId).not.toBe(outerAsk?.askId);
+    expect(innerAsk?.executionId).toBe(outerAsk?.executionId);
+
+    const outerAskEnds = traces.filter(
+      (event) => event.type === 'ask_end' && event.askId === outerAsk?.askId,
+    );
+    const innerAskEnds = traces.filter(
+      (event) => event.type === 'ask_end' && event.askId === innerAsk?.askId,
+    );
+    expect(outerAskEnds).toHaveLength(1);
+    expect(innerAskEnds).toHaveLength(1);
+    const [outerAskEnd] = outerAskEnds;
+    const [innerAskEnd] = innerAskEnds;
+    expect(outerAskEnd).toMatchObject({
+      executionId: outerAsk?.executionId,
+      askId: outerAsk?.askId,
+      depth: 0,
+      agent: 'outer_cancel',
+      outcome: { ok: false },
+    });
+    expect(outerAskEnd?.parentAskId).toBeUndefined();
+    expect(innerAskEnd).toMatchObject({
+      executionId: innerAsk?.executionId,
+      askId: innerAsk?.askId,
+      parentAskId: outerAsk?.askId,
+      depth: 1,
+      agent: 'inner_cancel',
+      outcome: { ok: false },
+    });
+
+    const toolStarts = traces.filter(
+      (event) => event.type === 'tool_call_start' && event.callId === 'outer-call',
+    );
+    const toolEnds = traces.filter(
+      (event) => event.type === 'tool_call_end' && event.callId === 'outer-call',
+    );
+    expect(toolStarts).toHaveLength(1);
+    expect(toolEnds).toHaveLength(1);
+    const [toolStart] = toolStarts;
+    const [toolEnd] = toolEnds;
+    expect(toolStart).toMatchObject({
+      schemaVersion: 2,
+      executionId: outerAsk?.executionId,
+      askId: outerAsk?.askId,
+      depth: 0,
+      agent: 'outer_cancel',
+      tool: 'ask_inner_cancel',
+      callId: 'outer-call',
+    });
+    expect(toolEnd).toMatchObject({
+      schemaVersion: 2,
+      executionId: outerAsk?.executionId,
+      askId: outerAsk?.askId,
+      depth: 0,
+      agent: 'outer_cancel',
+      tool: 'ask_inner_cancel',
+      callId: 'outer-call',
+      data: {
+        outcome: { status: 'cancelled', cancellation: { phase: 'handler' } },
+      },
+    });
+    expect(toolStart?.parentAskId).toBeUndefined();
+    expect(toolEnd?.parentAskId).toBeUndefined();
+    expect(toolEnd?.duration).toBeGreaterThanOrEqual(innerAskEnd?.duration ?? 0);
+    expect(outerAskEnd?.duration).toBeGreaterThanOrEqual(toolEnd?.duration ?? 0);
+
+    expect(outerAsk?.step).toBeLessThan(toolStart?.step ?? 0);
+    expect(toolStart?.step).toBeLessThan(innerAsk?.step ?? 0);
+    expect(innerAsk?.step).toBeLessThan(innerAskEnd?.step ?? 0);
+    expect(innerAskEnd?.step).toBeLessThan(toolEnd?.step ?? 0);
+    expect(toolEnd?.step).toBeLessThan(outerAskEnd?.step ?? 0);
+
+    const outerAskSpan = spanManager.spans.find(
+      (span) =>
+        span.name === 'axl.agent.ask' && span.attributes['axl.agent.name'] === 'outer_cancel',
+    );
+    const toolSpan = spanManager.spans.find(
+      (span) =>
+        span.name === 'axl.tool.call' && span.attributes['axl.tool.name'] === 'ask_inner_cancel',
+    );
+    const innerAskSpan = spanManager.spans.find(
+      (span) =>
+        span.name === 'axl.agent.ask' && span.attributes['axl.agent.name'] === 'inner_cancel',
+    );
+    expect(outerAskSpan).toBeDefined();
+    expect(toolSpan).toBeDefined();
+    expect(innerAskSpan).toBeDefined();
+    expect(toolSpan!.parent).toBe(outerAskSpan);
+    expect(innerAskSpan!.parent).toBe(toolSpan);
   });
 
   it('token events carry depth 0 for root asks and >= 1 for nested asks', async () => {

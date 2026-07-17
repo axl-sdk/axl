@@ -1,10 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
+import { z } from 'zod';
 import { McpManager } from '../mcp/manager.js';
 import type { McpServer, McpToolDefinition, McpToolResult } from '../mcp/types.js';
 import { WorkflowContext } from '../context.js';
+import type { AxlEvent } from '../types.js';
 
 import { ProviderRegistry } from '../providers/registry.js';
 import { agent } from '../agent.js';
+import { tool } from '../tool.js';
+import { ToolFailure } from '../errors.js';
 
 // ── Mock MCP Server ──────────────────────────────────────────────────────
 
@@ -517,6 +521,67 @@ describe('MCP integration with WorkflowContext', () => {
     });
   });
 
+  it('records an MCP transport throw as failed/handler and aborts without continuation', async () => {
+    const { manager, mocks } = createMockManager([
+      {
+        name: 'fs-server',
+        tools: [{ name: 'read_file', description: 'Read a file', inputSchema: { type: 'object' } }],
+      },
+    ]);
+    const transportError = new Error('MCP transport unavailable');
+    mocks[0].callTool = vi.fn(async () => {
+      throw transportError;
+    });
+    const provider = new TestProvider([
+      {
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_mcp_transport',
+            type: 'function',
+            function: { name: 'read_file', arguments: '{}' },
+          },
+        ],
+      },
+      { content: 'must not continue' },
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerInstance('test', provider as any);
+    const traces: AxlEvent[] = [];
+    const ctx = new WorkflowContext({
+      input: 'test',
+      executionId: 'mcp-transport-failure',
+      config: { defaultProvider: 'test' },
+      providerRegistry: registry,
+      onTrace: (event) => traces.push(event),
+      mcpManager: manager,
+    });
+    const agentWithMcp = agent({
+      model: 'test:test-model',
+      system: 'You are a test agent',
+      mcp: ['fs-server'],
+    });
+
+    await expect(ctx.ask(agentWithMcp, 'Read a file')).rejects.toBe(transportError);
+
+    expect(provider.calls).toHaveLength(1);
+    expect(traces.filter((event) => event.type === 'tool_call_start')).toHaveLength(1);
+    expect(traces.filter((event) => event.type === 'tool_call_end')).toHaveLength(1);
+    expect(traces.find((event) => event.type === 'tool_call_end')).toMatchObject({
+      data: {
+        outcome: {
+          status: 'failed',
+          failure: {
+            phase: 'handler',
+            kind: 'unexpected',
+            disposition: 'abort',
+            attempts: 1,
+          },
+        },
+      },
+    });
+  });
+
   it('continues after MCP isError with a typed failed terminal outcome', async () => {
     const { manager, mocks } = createMockManager([
       {
@@ -569,6 +634,128 @@ describe('MCP integration with WorkflowContext', () => {
         },
       },
     });
+  });
+
+  it('settles mixed success, denial, ToolFailure, and MCP error siblings sequentially', async () => {
+    const order: string[] = [];
+    const success = tool({
+      name: 'local_success',
+      description: 'succeeds',
+      input: z.object({}),
+      handler: () => {
+        order.push('success');
+        return { ok: true };
+      },
+    });
+    const denied = tool({
+      name: 'local_denied',
+      description: 'requires approval',
+      input: z.object({}),
+      requireApproval: true,
+      handler: () => {
+        order.push('denied-handler');
+        return 'must not run';
+      },
+    });
+    const recoverable = tool({
+      name: 'local_recoverable',
+      description: 'fails safely',
+      input: z.object({}),
+      handler: () => {
+        order.push('recoverable');
+        throw new ToolFailure({ message: 'host diagnostic', modelMessage: 'safe recovery' });
+      },
+    });
+    const { manager, mocks } = createMockManager([
+      {
+        name: 'fs-server',
+        tools: [{ name: 'read_file', description: 'Read a file', inputSchema: { type: 'object' } }],
+      },
+    ]);
+    mocks[0].callTool = vi.fn(async () => {
+      order.push('mcp');
+      return { content: [{ type: 'text', text: 'remote failure' }], isError: true };
+    });
+    const provider = new TestProvider([
+      {
+        content: '',
+        tool_calls: [
+          {
+            id: 'mixed-success',
+            type: 'function',
+            function: { name: success.name, arguments: '{}' },
+          },
+          {
+            id: 'mixed-denied',
+            type: 'function',
+            function: { name: denied.name, arguments: '{}' },
+          },
+          {
+            id: 'mixed-recoverable',
+            type: 'function',
+            function: { name: recoverable.name, arguments: '{}' },
+          },
+          {
+            id: 'mixed-mcp',
+            type: 'function',
+            function: { name: 'read_file', arguments: '{}' },
+          },
+        ],
+      },
+      { content: 'all siblings settled' },
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerInstance('test', provider as any);
+    const traces: AxlEvent[] = [];
+    const ctx = new WorkflowContext({
+      input: 'test',
+      executionId: 'mixed-siblings',
+      config: { defaultProvider: 'test' },
+      providerRegistry: registry,
+      onTrace: (event) => traces.push(event),
+      awaitHumanHandler: async () => ({ approved: false, reason: 'operator denied' }),
+      mcpManager: manager,
+    });
+    const mixedAgent = agent({
+      model: 'test:test-model',
+      system: 'You are a test agent',
+      tools: [success, denied, recoverable],
+      mcp: ['fs-server'],
+    });
+
+    await expect(ctx.ask(mixedAgent, 'run all tools')).resolves.toBe('all siblings settled');
+
+    expect(order).toEqual(['success', 'recoverable', 'mcp']);
+    expect(provider.calls).toHaveLength(2);
+    const lifecycle = traces.filter(
+      (event) => event.type === 'tool_call_start' || event.type === 'tool_call_end',
+    );
+    expect(lifecycle.map((event) => [event.type, event.callId])).toEqual([
+      ['tool_call_start', 'mixed-success'],
+      ['tool_call_end', 'mixed-success'],
+      ['tool_call_start', 'mixed-denied'],
+      ['tool_call_end', 'mixed-denied'],
+      ['tool_call_start', 'mixed-recoverable'],
+      ['tool_call_end', 'mixed-recoverable'],
+      ['tool_call_start', 'mixed-mcp'],
+      ['tool_call_end', 'mixed-mcp'],
+    ]);
+    expect(
+      lifecycle
+        .filter(
+          (event): event is Extract<AxlEvent, { type: 'tool_call_end' }> =>
+            event.type === 'tool_call_end',
+        )
+        .map((event) => event.data.outcome),
+    ).toMatchObject([
+      { status: 'succeeded' },
+      { status: 'denied' },
+      { status: 'failed', failure: { kind: 'tool_failure', disposition: 'continue' } },
+      { status: 'failed', failure: { kind: 'mcp_error', disposition: 'continue' } },
+    ]);
+    expect(
+      provider.calls[1].messages.filter((message: any) => message.role === 'tool'),
+    ).toHaveLength(4);
   });
 
   it('mcpTools restriction limits available tools', async () => {

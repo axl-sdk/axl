@@ -10,7 +10,7 @@ import {
 } from '../tool-invocation.js';
 import { tool } from '../tool.js';
 import type { WorkflowContext } from '../context.js';
-import type { ToolCallMessage } from '../types.js';
+import type { ToolCallMessage, ToolCallOutcome } from '../types.js';
 
 const context = {} as WorkflowContext;
 const createChildContext = () => context;
@@ -249,29 +249,110 @@ describe('v2 tool invocation seams', () => {
     expect(projectionSettlement.providerContent).toBeUndefined();
   });
 
-  it('maps terminal outcomes to structural span attributes only', () => {
-    const span = {
-      setAttribute: vi.fn(),
-      setStatus: vi.fn(),
-      addEvent: vi.fn(),
-      end: vi.fn(),
-    };
-    recordToolSpanOutcome(span, {
-      status: 'failed',
-      failure: {
-        phase: 'handler',
-        kind: 'unexpected',
-        disposition: 'abort',
-        attempts: 1,
-        error: { name: 'Error', message: 'must not reach telemetry' },
+  it.each([
+    {
+      phase: 'approval',
+      kind: 'infrastructure',
+      disposition: 'abort',
+      error: { name: 'Error', message: 'private approval', cause: 'private cause' },
+    },
+    {
+      phase: 'before_hook',
+      kind: 'tool_failure',
+      disposition: 'continue',
+      error: { name: 'ToolFailure', message: 'private before', cause: 'private cause' },
+    },
+    {
+      phase: 'before_hook',
+      kind: 'unexpected',
+      disposition: 'abort',
+      error: { name: 'Error', message: 'private before', cause: 'private cause' },
+    },
+    {
+      phase: 'handler',
+      kind: 'tool_failure',
+      disposition: 'continue',
+      attempts: 1,
+      error: { name: 'ToolFailure', message: 'private handler', cause: 'private cause' },
+    },
+    {
+      phase: 'handler',
+      kind: 'mcp_error',
+      disposition: 'continue',
+      attempts: 1,
+      error: { name: 'McpToolError', message: 'private remote', cause: 'private cause' },
+    },
+    {
+      phase: 'handler',
+      kind: 'unexpected',
+      disposition: 'abort',
+      attempts: 3,
+      error: { name: 'Error', message: 'private handler', cause: 'private cause' },
+    },
+    {
+      phase: 'after_hook',
+      kind: 'tool_failure',
+      disposition: 'continue',
+      result: { private: 'result' },
+      error: { name: 'ToolFailure', message: 'private after', cause: 'private cause' },
+    },
+    {
+      phase: 'after_hook',
+      kind: 'unexpected',
+      disposition: 'abort',
+      result: { private: 'result' },
+      error: { name: 'Error', message: 'private after', cause: 'private cause' },
+    },
+    {
+      phase: 'projection',
+      kind: 'output',
+      disposition: 'abort',
+      result: { private: 'result' },
+      error: {
+        name: 'ToolModelOutputError',
+        message: 'private projection',
+        cause: 'private cause',
       },
-    });
+    },
+    {
+      phase: 'serialization',
+      kind: 'output',
+      disposition: 'abort',
+      result: { private: 'result' },
+      error: { name: 'TypeError', message: 'private serialization', cause: 'private cause' },
+    },
+  ] as const)(
+    'maps $phase/$kind failures to structural span attributes without disclosure',
+    (failure) => {
+      const span = {
+        setAttribute: vi.fn(),
+        setStatus: vi.fn(),
+        addEvent: vi.fn(),
+        end: vi.fn(),
+      };
+      const outcome = { status: 'failed', failure } as ToolCallOutcome;
 
-    expect(span.setAttribute).toHaveBeenCalledWith('axl.tool.outcome', 'failed');
-    expect(span.setAttribute).toHaveBeenCalledWith('axl.tool.phase', 'handler');
-    expect(span.setStatus).toHaveBeenCalledWith('error');
-    expect(JSON.stringify(span.setAttribute.mock.calls)).not.toContain('must not reach telemetry');
-  });
+      recordToolSpanOutcome(span, outcome);
+
+      expect(span.setAttribute).toHaveBeenCalledWith('axl.tool.outcome', 'failed');
+      expect(span.setAttribute).toHaveBeenCalledWith('axl.tool.success', false);
+      expect(span.setAttribute).toHaveBeenCalledWith('axl.tool.phase', failure.phase);
+      expect(span.setStatus).toHaveBeenCalledWith('error');
+      expect(span.setAttribute.mock.calls).toEqual([
+        ['axl.tool.outcome', 'failed'],
+        ['axl.tool.success', false],
+        ['axl.tool.phase', failure.phase],
+      ]);
+      expect(span.addEvent.mock.calls).toEqual([]);
+      expect(
+        JSON.stringify({
+          attributes: span.setAttribute.mock.calls,
+          status: span.setStatus.mock.calls,
+          events: span.addEvent.mock.calls,
+        }),
+      ).not.toContain('private');
+    },
+  );
 
   it.each([
     'approval',

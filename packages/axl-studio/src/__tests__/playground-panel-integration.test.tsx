@@ -27,6 +27,7 @@ import type { ReactNode } from 'react';
 
 // ── Mock the WS singleton: capture subscribe callback per channel ─────
 const subscribers = new Map<string, (data: unknown) => void>();
+const connectionSubscribers = new Set<(connected: boolean) => void>();
 const wsSubscribeMock = vi.fn((channel: string, cb: (data: unknown) => void) => {
   subscribers.set(channel, cb);
   return () => {
@@ -37,6 +38,10 @@ const wsSubscribeMock = vi.fn((channel: string, cb: (data: unknown) => void) => 
 vi.mock('../client/lib/ws', () => ({
   wsClient: {
     subscribe: (channel: string, cb: (data: unknown) => void) => wsSubscribeMock(channel, cb),
+    subscribeConnection: (cb: (connected: boolean) => void) => {
+      connectionSubscribers.add(cb);
+      return () => connectionSubscribers.delete(cb);
+    },
   },
 }));
 
@@ -63,6 +68,7 @@ beforeEach(() => {
 
 afterEach(() => {
   subscribers.clear();
+  connectionSubscribers.clear();
   wsSubscribeMock.mockClear();
   playgroundChatMock.mockReset();
   fetchAgentsMock.mockReset();
@@ -100,6 +106,12 @@ function pushEvent(event: AxlEvent, channel = 'execution:exec-1'): void {
   if (!cb) throw new Error(`No subscriber for ${channel}; have: ${[...subscribers.keys()]}`);
   act(() => {
     cb(event);
+  });
+}
+
+function disconnect(): void {
+  act(() => {
+    for (const callback of connectionSubscribers) callback(false);
   });
 }
 
@@ -246,6 +258,93 @@ describe('PlaygroundPanel integration', () => {
     expect(screen.getAllByText('rejected').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/Failed in handler: Error/)).toBeInTheDocument();
     expect(screen.getByText(/Rejected before execution: unavailable/)).toBeInTheDocument();
+  });
+
+  it('renders denied and cancelled tool invocations as terminal rows', async () => {
+    renderWithQuery(<PlaygroundPanel />);
+    await submitMessage('exercise policy terminals');
+    pushEvent(ev({ type: 'token', askId: 'a', depth: 0, agent: 'chat', data: 'Working...' }));
+
+    for (const callId of ['denied-call', 'cancelled-call']) {
+      pushEvent(
+        ev({
+          type: 'tool_call_start',
+          askId: 'a',
+          depth: 0,
+          agent: 'chat',
+          tool: 'lookup',
+          callId,
+          data: { args: { callId } },
+        }),
+      );
+    }
+    pushEvent(
+      ev({
+        type: 'tool_call_end',
+        askId: 'a',
+        depth: 0,
+        agent: 'chat',
+        tool: 'lookup',
+        callId: 'denied-call',
+        duration: 1,
+        data: {
+          args: { callId: 'denied-call' },
+          outcome: { status: 'denied', reason: 'operator denied' },
+        },
+      }),
+    );
+    pushEvent(
+      ev({
+        type: 'tool_call_end',
+        askId: 'a',
+        depth: 0,
+        agent: 'chat',
+        tool: 'lookup',
+        callId: 'cancelled-call',
+        duration: 1,
+        data: {
+          args: { callId: 'cancelled-call' },
+          outcome: {
+            status: 'cancelled',
+            cancellation: {
+              phase: 'after_handler',
+              reason: 'execution stopped',
+              result: { retained: true },
+            },
+          },
+        },
+      }),
+    );
+
+    expect(screen.getAllByText('denied').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('cancelled').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('Reason: operator denied')).toBeInTheDocument();
+    expect(screen.getByText(/Cancelled in after_handler: execution stopped/)).toBeInTheDocument();
+    expect(screen.getByText('Output before cancellation:')).toBeInTheDocument();
+  });
+
+  it('marks an unmatched running tool incomplete when the socket disconnects', async () => {
+    renderWithQuery(<PlaygroundPanel />);
+    await submitMessage('interrupt the tool');
+    pushEvent(ev({ type: 'token', askId: 'a', depth: 0, agent: 'chat', data: 'Working...' }));
+    pushEvent(
+      ev({
+        type: 'tool_call_start',
+        askId: 'a',
+        depth: 0,
+        agent: 'chat',
+        tool: 'lookup',
+        callId: 'interrupted-call',
+        data: { args: {} },
+      }),
+    );
+
+    disconnect();
+
+    expect(screen.getAllByText('incomplete').length).toBeGreaterThanOrEqual(1);
+    expect(
+      screen.getByText('Trace ended before a matching tool terminal was observed.'),
+    ).toBeInTheDocument();
   });
 
   it('renders retained results and orphan terminals honestly', async () => {

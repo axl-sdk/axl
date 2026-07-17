@@ -12,7 +12,13 @@ import {
   redactPendingDecision,
   redactPendingDecisionList,
 } from '../server/redact.js';
-import type { ExecutionInfo, ChatMessage, PendingDecision, AxlEvent } from '@axlsdk/axl';
+import type {
+  ExecutionInfo,
+  ChatMessage,
+  PendingDecision,
+  AxlEvent,
+  ToolCallFailure,
+} from '@axlsdk/axl';
 import type { EvalResult } from '@axlsdk/eval';
 
 // AxlEvent fixture helper — supplies the base fields every event needs so
@@ -335,6 +341,126 @@ describe('redactStreamEvent', () => {
     expect(out.data.args).toBe('[redacted]');
     expect(out.data.result).toBe('[redacted]');
   });
+
+  it.each([
+    {
+      phase: 'approval',
+      kind: 'infrastructure',
+      disposition: 'abort',
+      error: { name: 'Error', message: 'private approval', cause: 'private cause' },
+    },
+    {
+      phase: 'before_hook',
+      kind: 'tool_failure',
+      disposition: 'continue',
+      error: { name: 'ToolFailure', message: 'private before', cause: 'private cause' },
+    },
+    {
+      phase: 'before_hook',
+      kind: 'unexpected',
+      disposition: 'abort',
+      error: { name: 'Error', message: 'private before', cause: 'private cause' },
+    },
+    {
+      phase: 'handler',
+      kind: 'tool_failure',
+      disposition: 'continue',
+      attempts: 2,
+      error: { name: 'ToolFailure', message: 'private handler', cause: 'private cause' },
+    },
+    {
+      phase: 'handler',
+      kind: 'mcp_error',
+      disposition: 'continue',
+      attempts: 1,
+      error: { name: 'McpToolError', message: 'private remote', cause: 'private cause' },
+    },
+    {
+      phase: 'handler',
+      kind: 'unexpected',
+      disposition: 'abort',
+      attempts: 3,
+      error: { name: 'Error', message: 'private handler', cause: 'private cause' },
+    },
+    {
+      phase: 'after_hook',
+      kind: 'tool_failure',
+      disposition: 'continue',
+      result: { private: 'result' },
+      error: { name: 'ToolFailure', message: 'private after', cause: 'private cause' },
+    },
+    {
+      phase: 'after_hook',
+      kind: 'unexpected',
+      disposition: 'abort',
+      result: { private: 'result' },
+      error: { name: 'Error', message: 'private after', cause: 'private cause' },
+    },
+    {
+      phase: 'projection',
+      kind: 'output',
+      disposition: 'abort',
+      result: { private: 'result' },
+      error: {
+        name: 'ToolModelOutputError',
+        message: 'private projection',
+        cause: 'private cause',
+      },
+    },
+    {
+      phase: 'serialization',
+      kind: 'output',
+      disposition: 'abort',
+      result: { private: 'result' },
+      error: { name: 'TypeError', message: 'private serialization', cause: 'private cause' },
+    },
+  ] as const)(
+    'scrubs Studio $phase/$kind failure fields while retaining lifecycle structure',
+    (failure) => {
+      const event: AxlEvent = {
+        ...baseEvent(),
+        ...askScoped(),
+        schemaVersion: 2,
+        type: 'tool_call_end',
+        tool: 'lookup',
+        callId: 'call-failure',
+        duration: 37,
+        data: {
+          args: { private: 'args' },
+          outcome: { status: 'failed', failure: failure as ToolCallFailure },
+        },
+      };
+
+      const out = redactStreamEvent(event, true) as Extract<AxlEvent, { type: 'tool_call_end' }>;
+
+      expect(out).toMatchObject({
+        schemaVersion: 2,
+        executionId: 'test',
+        askId: 'a1',
+        depth: 0,
+        step: 0,
+        timestamp: 0,
+        tool: 'lookup',
+        callId: 'call-failure',
+        duration: 37,
+        data: {
+          args: '[redacted]',
+          outcome: {
+            status: 'failed',
+            failure: {
+              phase: failure.phase,
+              kind: failure.kind,
+              disposition: failure.disposition,
+              error: { name: failure.error.name, message: '[redacted]', cause: '[redacted]' },
+              ...('attempts' in failure ? { attempts: failure.attempts } : {}),
+              ...('result' in failure ? { result: '[redacted]' } : {}),
+            },
+          },
+        },
+      });
+      expect(JSON.stringify(out)).not.toContain('private');
+    },
+  );
 
   it('scrubs tool_approval.data.args and .data.reason', () => {
     const event: AxlEvent = {

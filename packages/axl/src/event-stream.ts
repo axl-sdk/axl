@@ -235,10 +235,6 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
   private readonly maxQueued: number;
   private readonly onOverflow: NonNullable<EventStreamOptions['onOverflow']>;
   private overflowWarned = false;
-  /** Pair bookkeeping for the lossy iterator queue. Listener delivery is
-   * independent and never participates in this policy. */
-  private readonly consumedToolStarts = new Set<string>();
-  private readonly droppedToolStarts = new Set<string>();
   /** Callbacks fired exactly once when `_finish()` is called. Used by
    *  curated views (e.g., `partialObjects`) that are listener-based and
    *  need a termination signal independent of any synthetic `done` event. */
@@ -403,9 +399,7 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     return {
       next: (): Promise<IteratorResult<AxlEvent>> => {
         if (self.eventQueue.length > 0) {
-          const event = self.eventQueue.shift()!;
-          self.noteIteratorDelivery(event);
-          return Promise.resolve({ value: event, done: false });
+          return Promise.resolve({ value: self.eventQueue.shift()!, done: false });
         }
         if (self.finished && self.eventQueue.length === 0) {
           return Promise.resolve({ value: undefined as unknown as AxlEvent, done: true });
@@ -987,37 +981,13 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
         err instanceof Error ? err.message : String(err),
       );
     }
-    const pairKey = this.toolPairKey(event);
-    if (event.type === 'tool_call_end' && pairKey && this.droppedToolStarts.delete(pairKey)) {
-      return;
-    }
     const waiter = this.waiters.shift();
     if (waiter) {
-      this.noteIteratorDelivery(event);
       waiter({ value: event, done: false });
       return;
     }
     // No active waiter — queue. Enforce the soft cap on non-terminal events.
     if (this.eventQueue.length >= this.maxQueued && !TERMINAL_TYPES.has(event.type)) {
-      if (
-        this.onOverflow === 'drop-oldest-non-terminal' &&
-        event.type === 'tool_call_end' &&
-        pairKey
-      ) {
-        if (this.consumedToolStarts.has(pairKey)) {
-          this.warnOverflow('preserving a tool end whose start was already consumed past the cap');
-          this.eventQueue.push(event);
-          return;
-        }
-        const queuedStart = this.eventQueue.findIndex(
-          (queued) => queued.type === 'tool_call_start' && this.toolPairKey(queued) === pairKey,
-        );
-        if (queuedStart >= 0) {
-          this.warnOverflow('dropping a closed tool start/end pair together');
-          this.eventQueue.splice(queuedStart, 1);
-          return;
-        }
-      }
       this.handleOverflow(event);
       return;
     }
@@ -1039,12 +1009,7 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     let droppedIdx = -1;
     for (let i = 0; i < this.eventQueue.length; i++) {
       const candidate = this.eventQueue[i];
-      const candidateKey = this.toolPairKey(candidate);
-      const protectedConsumedEnd =
-        candidate.type === 'tool_call_end' &&
-        candidateKey !== undefined &&
-        this.consumedToolStarts.has(candidateKey);
-      if (!TERMINAL_TYPES.has(candidate.type) && !protectedConsumedEnd) {
+      if (!TERMINAL_TYPES.has(candidate.type)) {
         droppedIdx = i;
         break;
       }
@@ -1061,29 +1026,9 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
         : 'queue contains only protected terminal events; preserving them past the cap',
     );
     if (droppedIdx >= 0) {
-      const [dropped] = this.eventQueue.splice(droppedIdx, 1);
-      const droppedKey = this.toolPairKey(dropped);
-      if (dropped.type === 'tool_call_start' && droppedKey) {
-        const matchingEnd = this.eventQueue.findIndex(
-          (queued) => queued.type === 'tool_call_end' && this.toolPairKey(queued) === droppedKey,
-        );
-        if (matchingEnd >= 0) this.eventQueue.splice(matchingEnd, 1);
-        else this.droppedToolStarts.add(droppedKey);
-      }
+      this.eventQueue.splice(droppedIdx, 1);
     }
     this.eventQueue.push(event);
-  }
-
-  private toolPairKey(event: AxlEvent): string | undefined {
-    if (event.type !== 'tool_call_start' && event.type !== 'tool_call_end') return undefined;
-    return `${event.executionId}\u0000${event.askId}\u0000${event.callId}`;
-  }
-
-  private noteIteratorDelivery(event: AxlEvent): void {
-    const key = this.toolPairKey(event);
-    if (!key) return;
-    if (event.type === 'tool_call_start') this.consumedToolStarts.add(key);
-    else this.consumedToolStarts.delete(key);
   }
 
   private warnOverflow(detail: string): void {
@@ -1116,8 +1061,6 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
       w({ value: undefined as unknown as AxlEvent, done: true });
     }
     this.waiters.length = 0;
-    this.consumedToolStarts.clear();
-    this.droppedToolStarts.clear();
     // Drain finish callbacks. Snapshot first so the iteration is over a
     // fixed list — callbacks registered DURING this loop go through
     // `_onFinish`'s `finished === true` branch and fire synchronously

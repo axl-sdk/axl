@@ -61,11 +61,9 @@ export function createWorkflowRoutes(connMgr: ConnectionManager) {
 
     if (body.stream) {
       // Streaming execution — pipe events to WS channel. Under
-      // `trace.redact`, scrub each StreamEvent before broadcast so
+      // `trace.redact`, scrub each AxlEvent before broadcast so
       // token deltas, tool args/results, and the final `done.data`
       // don't leak raw LLM/user content to WS subscribers.
-      // TODO(PR-3-spec-16): the wire emits AxlEvent directly after PR 3 and
-      // `redactStreamEvent` is replaced with an AxlEvent-aware scrubber.
       const stream = runtime.stream(name, body.input ?? {}, { metadata: body.metadata });
       const executionId = `stream-${Date.now()}`;
       const redactOn = runtime.isRedactEnabled();

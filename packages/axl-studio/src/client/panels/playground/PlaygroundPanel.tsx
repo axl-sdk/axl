@@ -417,7 +417,7 @@ export function PlaygroundPanel() {
       }
     }
 
-    if (stream.done) {
+    if (stream.done || stream.interrupted) {
       for (const [key, toolCall] of toolCalls) {
         if (toolCall.status === 'running')
           toolCalls.set(key, { ...toolCall, status: 'incomplete' });
@@ -445,7 +445,7 @@ export function PlaygroundPanel() {
         return prev;
       });
     }
-  }, [stream.events, stream.done]);
+  }, [stream.events, stream.done, stream.interrupted]);
 
   // Track cost and tokens from stream events incrementally
   useEffect(() => {

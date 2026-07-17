@@ -806,6 +806,97 @@ describe('AxlTestRuntime', () => {
       });
     });
 
+    it('maps configured mock cancellation to one correlated terminal event and aborts the ask', async () => {
+      const realHandler = vi.fn(() => ({ source: 'real' }));
+      const cancelledTool = tool({
+        name: 'cancelled_mock',
+        description: 'Cancel from the configured mock override',
+        input: z.object({}),
+        handler: realHandler,
+      });
+      const laterHandler = vi.fn(() => ({ shouldNotRun: true }));
+      const laterTool = tool({
+        name: 'after_cancelled_mock',
+        description: 'Must not run after cancellation',
+        input: z.object({}),
+        handler: laterHandler,
+      });
+      const cancelledWorkflow = createToolWorkflow('CancelledMock', [cancelledTool, laterTool]);
+      const provider = MockProvider.sequence([
+        {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call-cancelled-mock',
+              type: 'function',
+              function: { name: cancelledTool.name, arguments: '{}' },
+            },
+            {
+              id: 'call-after-cancelled-mock',
+              type: 'function',
+              function: { name: laterTool.name, arguments: '{}' },
+            },
+          ],
+        },
+        { content: 'must not be called' },
+      ]);
+      const runtime = new AxlTestRuntime();
+      runtime.register(cancelledWorkflow);
+      runtime.mockProvider('openai', provider);
+      const cancelledMock = vi.fn(() => {
+        throw new DOMException('mock cancelled', 'AbortError');
+      });
+      runtime.mockTool(cancelledTool.name, cancelledMock);
+
+      await expect(runtime.execute('CancelledMock', {})).rejects.toMatchObject({
+        name: 'AbortError',
+        message: 'mock cancelled',
+      });
+
+      expect(cancelledMock).toHaveBeenCalledOnce();
+      expect(realHandler).not.toHaveBeenCalled();
+      expect(laterHandler).not.toHaveBeenCalled();
+      expect(provider.calls).toHaveLength(1);
+
+      const [recorded] = runtime.toolCalls(cancelledTool.name);
+      expect(recorded).toMatchObject({
+        name: cancelledTool.name,
+        callId: 'call-cancelled-mock',
+        args: {},
+        outcome: {
+          status: 'cancelled',
+          cancellation: { phase: 'handler', reason: 'mock cancelled' },
+        },
+      });
+      const lifecycle = runtime
+        .traceLog()
+        .filter((event) => event.type === 'tool_call_start' || event.type === 'tool_call_end');
+      expect(lifecycle).toHaveLength(2);
+      expect(lifecycle.map((event) => [event.type, event.tool, event.callId])).toEqual([
+        ['tool_call_start', cancelledTool.name, 'call-cancelled-mock'],
+        ['tool_call_end', cancelledTool.name, 'call-cancelled-mock'],
+      ]);
+      expect(lifecycle[0]).toMatchObject({
+        executionId: recorded.executionId,
+        askId: recorded.askId,
+        callId: recorded.callId,
+        data: { args: {} },
+      });
+      expect(lifecycle[1]).toMatchObject({
+        executionId: recorded.executionId,
+        askId: recorded.askId,
+        callId: recorded.callId,
+        data: { args: {}, outcome: recorded.outcome },
+      });
+      expect(runtime.traceLog().find((event) => event.type === 'ask_end')).toMatchObject({
+        askId: recorded.askId,
+        outcome: { ok: false, error: 'mock cancelled' },
+      });
+      expect(runtime.traceLog().find((event) => event.type === 'workflow_end')).toMatchObject({
+        data: { status: 'failed', error: 'mock cancelled', aborted: true },
+      });
+    });
+
     it('projects a normally returned error-shaped mock result', async () => {
       const configuredTool = tool({
         name: 'returned_error_mock',
@@ -851,6 +942,83 @@ describe('AxlTestRuntime', () => {
 
       expect(succeededResult(runtime.toolCalls('unconfigured_override')[0])).toBe('legacy string');
       expect(recordedToolContent(provider)).toBe('"legacy string"');
+    });
+
+    it('maps unconfigured override serialization failure and aborts before later siblings', async () => {
+      const unconfiguredWorkflow = createToolWorkflow('UnconfiguredSerializationFailure', []);
+      const provider = MockProvider.sequence([
+        {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call-unconfigured-unserializable',
+              type: 'function',
+              function: { name: 'unconfigured_unserializable', arguments: '{}' },
+            },
+            {
+              id: 'call-after-unconfigured-unserializable',
+              type: 'function',
+              function: { name: 'after_unconfigured_unserializable', arguments: '{}' },
+            },
+          ],
+        },
+        { content: 'must not be called' },
+      ]);
+      const runtime = new AxlTestRuntime();
+      runtime.register(unconfiguredWorkflow);
+      runtime.mockProvider('openai', provider);
+      const laterMock = vi.fn(() => ({ shouldNotRun: true }));
+      runtime.mockTool('unconfigured_unserializable', () => 1n);
+      runtime.mockTool('after_unconfigured_unserializable', laterMock);
+
+      await expect(runtime.execute('UnconfiguredSerializationFailure', {})).rejects.toBeInstanceOf(
+        TypeError,
+      );
+
+      expect(provider.calls).toHaveLength(1);
+      expect(laterMock).not.toHaveBeenCalled();
+      const [recorded] = runtime.toolCalls('unconfigured_unserializable');
+      expect(recorded).toMatchObject({
+        name: 'unconfigured_unserializable',
+        callId: 'call-unconfigured-unserializable',
+        args: {},
+        outcome: {
+          status: 'failed',
+          failure: {
+            phase: 'serialization',
+            kind: 'output',
+            disposition: 'abort',
+            result: 1n,
+          },
+        },
+      });
+      const lifecycle = runtime
+        .traceLog()
+        .filter((event) => event.type === 'tool_call_start' || event.type === 'tool_call_end');
+      expect(lifecycle).toHaveLength(2);
+      expect(lifecycle.map((event) => [event.type, event.tool, event.callId])).toEqual([
+        ['tool_call_start', 'unconfigured_unserializable', 'call-unconfigured-unserializable'],
+        ['tool_call_end', 'unconfigured_unserializable', 'call-unconfigured-unserializable'],
+      ]);
+      expect(lifecycle[0]).toMatchObject({
+        executionId: recorded.executionId,
+        askId: recorded.askId,
+        callId: recorded.callId,
+        data: { args: {} },
+      });
+      expect(lifecycle[1]).toMatchObject({
+        executionId: recorded.executionId,
+        askId: recorded.askId,
+        callId: recorded.callId,
+        data: { args: {}, outcome: recorded.outcome },
+      });
+      expect(runtime.traceLog().find((event) => event.type === 'ask_end')).toMatchObject({
+        askId: recorded.askId,
+        outcome: { ok: false },
+      });
+      expect(runtime.traceLog().find((event) => event.type === 'workflow_end')).toMatchObject({
+        data: { status: 'failed' },
+      });
     });
 
     it('sends identical projected mock content in streaming and non-streaming asks', async () => {

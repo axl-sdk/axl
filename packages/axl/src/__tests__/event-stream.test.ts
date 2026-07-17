@@ -199,7 +199,7 @@ describe('AxlEventBus — overflow safety net', () => {
     expect(seen).toEqual(['workflow_end', 'b', 'c']);
   });
 
-  it('retains an end past the cap when its start was already consumed', async () => {
+  it('keeps lifecycle delivery independent from pairing when the queue overflows', async () => {
     const bus = new AxlEventBus({ maxQueued: 1 });
     const iterator = bus[Symbol.asyncIterator]();
     const pendingStart = iterator.next();
@@ -210,22 +210,12 @@ describe('AxlEventBus — overflow safety net', () => {
     bus._push(toolEnd());
     bus._finish();
 
-    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'token' } });
     await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'tool_call_end' } });
+    await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+    expect(warnSpy).toHaveBeenCalledOnce();
   });
 
-  it('drops a queued closed tool pair together when the end crosses the cap', async () => {
-    const bus = new AxlEventBus({ maxQueued: 1 });
-    bus._push(toolStart());
-    bus._push(toolEnd());
-    bus._finish();
-
-    const seen: AxlEvent[] = [];
-    for await (const event of bus) seen.push(event);
-    expect(seen).toEqual([]);
-  });
-
-  it('drops a later end when overflow already evicted its queued start', async () => {
+  it('allows an explicitly incomplete lifecycle view without exceeding maxQueued', async () => {
     const bus = new AxlEventBus({ maxQueued: 1 });
     bus._push(toolStart());
     bus._push(ev({ type: 'token', data: 'replacement', ...ASK }));
@@ -234,21 +224,29 @@ describe('AxlEventBus — overflow safety net', () => {
 
     const seen: AxlEvent[] = [];
     for await (const event of bus) seen.push(event);
-    expect(seen.map((event) => event.type)).toEqual(['token']);
+    expect(seen.map((event) => event.type)).toEqual(['tool_call_end']);
+    expect(warnSpy).toHaveBeenCalledOnce();
   });
 
-  it('suppresses an evicted start end even when an iterator is waiting', async () => {
-    const bus = new AxlEventBus({ maxQueued: 1 });
-    const iterator = bus[Symbol.asyncIterator]();
-    bus._push(toolStart());
-    bus._push(ev({ type: 'token', data: 'replacement', ...ASK }));
+  it('keeps a stalled lifecycle queue bounded without pair-tracking state', () => {
+    const maxQueued = 3;
+    const bus = new AxlEventBus({ maxQueued });
 
-    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'token' } });
-    const waiting = iterator.next();
-    bus._push(toolEnd());
-    bus._finish();
+    for (let index = 0; index < 1_000; index++) {
+      const callId = `call-${index}`;
+      bus._push(toolStart(callId));
+      expect((bus as unknown as { eventQueue: unknown[] }).eventQueue.length).toBeLessThanOrEqual(
+        maxQueued,
+      );
+      bus._push(toolEnd(callId));
+      expect((bus as unknown as { eventQueue: unknown[] }).eventQueue.length).toBeLessThanOrEqual(
+        maxQueued,
+      );
+    }
 
-    await expect(waiting).resolves.toEqual({ value: undefined, done: true });
+    expect(Object.keys(bus)).not.toEqual(
+      expect.arrayContaining(['consumedToolStarts', 'droppedToolStarts']),
+    );
   });
 });
 

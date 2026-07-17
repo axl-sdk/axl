@@ -478,49 +478,159 @@ describe('ctx.events — Session and AxlTestRuntime events plumbing', () => {
 });
 
 describe('ctx.events — error isolation between onTrace and bus', () => {
-  it('a throwing onTrace handler does not block the ctx.events bus from receiving events', async () => {
-    // The runtime wires its own onTrace into WorkflowContext (for cost
-    // accumulation, broadcast, etc.). If a third-party trace listener
-    // throws, ctx.events must still receive the event — the try/catch
-    // around `onTrace` runs BEFORE the bus push.
-    const provider = MockProvider.sequence([{ content: 'hi' }]);
+  it('a throwing ctx.events tool listener cannot alter a successful tool outcome', async () => {
+    const provider = MockProvider.sequence([
+      {
+        content: '',
+        tool_calls: [
+          {
+            id: 'ctx-listener-call',
+            type: 'function',
+            function: { name: 'stable_ctx_tool', arguments: '{}' },
+          },
+        ],
+      },
+      { content: 'done' },
+    ]);
     const runtime = buildRuntime(provider);
-    const a = agent({ name: 'a', model: 'mock:test', system: 's' });
+    const handler = vi.fn(() => ({ ok: true }));
+    const stableTool = tool({
+      name: 'stable_ctx_tool',
+      description: 'remain successful when an observer throws',
+      input: z.object({}),
+      handler,
+    });
+    const a = agent({ name: 'a', model: 'mock:test', system: 's', tools: [stableTool] });
+    runtime.register(
+      workflow({
+        name: 'ctx-listener-isolation',
+        input: z.object({}),
+        handler: async (ctx) => {
+          ctx.events.on('tool_call_end', () => {
+            throw new Error('ctx.events observer failed');
+          });
+          return ctx.ask(a, 'go');
+        },
+      }),
+    );
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    // Subscribe a throwing trace listener at the runtime level.
-    runtime.on('trace', () => {
-      throw new Error('synthetic onTrace failure');
+    await expect(runtime.execute('ctx-listener-isolation', {})).resolves.toBe('done');
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(provider.calls).toHaveLength(2);
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining('listener for "tool_call_end" threw'),
+      'ctx.events observer failed',
+    );
+    error.mockRestore();
+  });
+
+  it('a throwing AxlStream tool listener cannot alter a successful tool outcome', async () => {
+    const provider = MockProvider.sequence([
+      {
+        content: '',
+        tool_calls: [
+          {
+            id: 'stream-listener-call',
+            type: 'function',
+            function: { name: 'stable_stream_tool', arguments: '{}' },
+          },
+        ],
+      },
+      { content: 'done' },
+    ]);
+    const runtime = buildRuntime(provider);
+    const handler = vi.fn(() => ({ ok: true }));
+    const stableTool = tool({
+      name: 'stable_stream_tool',
+      description: 'remain successful when a stream observer throws',
+      input: z.object({}),
+      handler,
+    });
+    const a = agent({ name: 'a', model: 'mock:test', system: 's', tools: [stableTool] });
+    runtime.register(
+      workflow({
+        name: 'stream-listener-isolation',
+        input: z.object({}),
+        handler: (ctx) => ctx.ask(a, 'go'),
+      }),
+    );
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const stream = runtime.stream('stream-listener-isolation', {});
+    stream.on('tool_call_end', () => {
+      throw new Error('AxlStream observer failed');
+    });
+
+    await expect(stream.promise).resolves.toBe('done');
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(provider.calls).toHaveLength(2);
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining('listener for "tool_call_end" threw'),
+      'AxlStream observer failed',
+    );
+    error.mockRestore();
+  });
+
+  it('a throwing runtime trace listener cannot alter a successful tool lifecycle', async () => {
+    const provider = MockProvider.sequence([
+      {
+        content: '',
+        tool_calls: [
+          {
+            id: 'runtime-listener-call',
+            type: 'function',
+            function: { name: 'stable_runtime_tool', arguments: '{}' },
+          },
+        ],
+      },
+      { content: 'done' },
+    ]);
+    const runtime = buildRuntime(provider);
+    const handler = vi.fn(() => ({ ok: true }));
+    const stableTool = tool({
+      name: 'stable_runtime_tool',
+      description: 'remain successful when a runtime observer throws',
+      input: z.object({}),
+      handler,
+    });
+    const a = agent({ name: 'a', model: 'mock:test', system: 's', tools: [stableTool] });
+    const observed: AxlEvent[] = [];
+    runtime.on('trace', (event) => observed.push(event));
+    runtime.on('trace', (event) => {
+      if (event.type === 'tool_call_start' || event.type === 'tool_call_end') {
+        throw new Error(`synthetic ${event.type} listener failure`);
+      }
     });
 
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const types: string[] = [];
     const wf = workflow({
-      name: 'onTrace-throws',
+      name: 'runtime-trace-listener-isolation',
       input: z.object({}),
-      handler: async (ctx) => {
-        void (async () => {
-          for await (const e of ctx.events) types.push(e.type);
-        })();
-        await ctx.ask(a, 'go');
-        return null;
-      },
+      handler: (ctx) => ctx.ask(a, 'go'),
     });
     runtime.register(wf);
 
-    // Workflow must complete despite the throwing onTrace.
-    await runtime.execute('onTrace-throws', {});
-    await new Promise((r) => setImmediate(r));
+    await expect(runtime.execute('runtime-trace-listener-isolation', {})).resolves.toBe('done');
 
-    // ctx.events received the events — the bus push is independent of
-    // the trace listener failure.
-    expect(types.length).toBeGreaterThan(0);
-    expect(types).toContain('agent_call_end');
-    // Trace listener errors are logged via console.error (the documented
-    // isolation behavior). Note: runtime.on('trace', ...) is NOT wrapped
-    // by the same try/catch as `init.onTrace` — the Node EventEmitter
-    // behavior may surface this differently. The point of this test is
-    // the BUS still sees events; whether the throw is logged is a
-    // separate listener-isolation concern.
+    expect(handler).toHaveBeenCalledOnce();
+    expect(provider.calls).toHaveLength(2);
+    expect(observed.filter((event) => event.type === 'tool_call_start')).toHaveLength(1);
+    expect(observed.filter((event) => event.type === 'tool_call_end')).toEqual([
+      expect.objectContaining({
+        callId: 'runtime-listener-call',
+        data: { args: {}, outcome: { status: 'succeeded', result: { ok: true } } },
+      }),
+    ]);
+    expect(errSpy).toHaveBeenCalledWith(
+      '[axl] onTrace handler threw; trace event dropped:',
+      'synthetic tool_call_start listener failure',
+    );
+    expect(errSpy).toHaveBeenCalledWith(
+      '[axl] onTrace handler threw; trace event dropped:',
+      'synthetic tool_call_end listener failure',
+    );
     errSpy.mockRestore();
   });
 });

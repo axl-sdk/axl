@@ -21,9 +21,9 @@ export function executionEventSchemaVersion(execution: ExecutionInfo): 1 | 2 {
  * top via `getEventColor` → `isFailureEvent` (always wins, returns red-500).
  *
  * Design rules:
- *   - Red is reserved for failure (set on the leaf `tool_denied` and applied
- *     dynamically by `isFailureEvent` to gate/verify/ask_end/workflow_end
- *     payload-encoded failures across the union).
+ *   - Red is reserved for failure (including historical v1 `tool_denied`) and
+ *     applied dynamically by `isFailureEvent` to payload-encoded failures
+ *     across the live and historical unions.
  *   - Cool hues are rationed to avoid blue ≈ sky ≈ violet ≈ teal at dot size.
  *   - Streaming and diagnostic events (`token`, `partial_object`, `log`) use
  *     muted slate to recede behind structural events.

@@ -789,6 +789,7 @@ export type AskScoped = {
  * before agent resolution (e.g., `ask_start` is fired before the
  * dynamic agent selector runs) can land without it.
  */
+/** @deprecated Observe typed `AxlEvent` values instead. */
 export type CallbackMeta = {
   askId: string;
   parentAskId?: string;

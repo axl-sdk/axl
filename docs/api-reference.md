@@ -105,7 +105,14 @@ const researchTool = tool({
 });
 ```
 
-The child context shares budget tracking, abort signals, trace emission, and streaming callbacks (`onToken` / `onToolCall` / `onAgentStart`) with the parent — nested-ask events propagate to the same callbacks. Session history is isolated. Created internally via `WorkflowContext.createChildContext()`. Consumers wanting root-only callback behavior filter on `meta.depth === 0` at the callback site.
+The child context shares budget tracking, abort signals, trace emission, the
+`ctx.events` bus, and explicit streaming mode with the parent. Nested-ask
+events propagate to the same bus; consumers wanting root-only behavior filter
+on `event.depth === 0`, while per-ask consumers route by `askId`. Session
+history is isolated. Created internally via
+`WorkflowContext.createChildContext()`. The legacy callbacks inherit too, but
+they are deprecated; see the
+[stream-first migration guide](migration/stream-first-observation.md).
 
 ---
 
@@ -225,13 +232,18 @@ console.log(ctx.totalCost); // accumulated cost from all agent calls
 | `budget` | `string` | — | Cost budget (e.g., `'$0.50'`). Enforced via `finish_and_stop` policy |
 | `signal` | `AbortSignal` | — | Abort signal for cancellation/timeouts |
 | `sessionHistory` | `ChatMessage[]` | — | Prior conversation history for multi-turn testing |
-| `onToken` | `(token: string, meta: CallbackMeta) => void` | — | Token streaming callback. `meta` carries `{ askId, parentAskId?, depth, agent }` so consumers can route per-ask. Filter on `meta.depth === 0` for root-only behavior |
-| `onToolCall` | `(call: { name, args, callId? }, meta: CallbackMeta) => void` | — | Fires when an agent invokes a tool. Same `meta` shape as `onToken` |
-| `onAgentStart` | `(info: { agent, model }, meta: CallbackMeta) => void` | — | Fires when an agent begins processing. Same `meta` shape as `onToken` |
+| `onToken` | `(token: string, meta: CallbackMeta) => void` | — | **Deprecated.** Token callback. Warns once per process; migrate to `ctx.events` before the next breaking release |
+| `onToolCall` | `(call: { name, args, callId? }, meta: CallbackMeta) => void` | — | **Deprecated.** Tool-start callback. Warns once per process; migrate to `ctx.events` |
+| `onAgentStart` | `(info: { agent, model }, meta: CallbackMeta) => void` | — | **Deprecated.** Agent-start callback. Warns once per process; migrate to `ctx.events` |
 | `awaitHumanHandler` | `(options) => Promise<HumanDecision>` | — | Handler for tool approval requests. Required when the agent uses tools with `requireApproval` — without it, the call throws a clear error |
 | `events` | `EventStreamOptions` | `{ maxQueued: 10_000, onOverflow: 'drop-oldest-non-terminal' }` | Configures the iterator-queue cap and overflow policy on the lazy `ctx.events` bus. See [`EventStreamOptions`](#eventstreamoptions) |
 
-> **`onToken` / `onToolCall` / `onAgentStart` are superseded by `ctx.events`.** The callbacks remain for back-compat. New code should iterate `ctx.events` (an `AxlEventBus` — same `AsyncIterable<AxlEvent>` + `EventEmitter` shape as `AxlStream`). See [`ctx.events`](#ctxevents) below.
+> **`onToken` / `onToolCall` / `onAgentStart` are deprecated.** They remain
+> operational for this release, but their first use warns once per process and
+> they will be removed in the next breaking release. New code should iterate
+> `ctx.events` (an `AxlEventBus` — same `AsyncIterable<AxlEvent>` +
+> `EventEmitter` shape as `AxlStream`). See [`ctx.events`](#ctxevents) below and
+> the [migration guide](migration/stream-first-observation.md).
 
 **When to use vs. workflows:** Use `createContext()` when you want to call agents without registering a workflow — eval files, one-off scripts, tests, API endpoints. Use `runtime.execute()` when you want execution lifecycle tracking (status, duration, history in Studio's executions panel).
 
@@ -1271,7 +1283,7 @@ const runtime = new AxlRuntime({
 | `signal` | `AbortSignal` | — | External abort signal. Cancels the workflow exactly as `runtime.abort(executionId)` would. Lets callers use the standard JS pattern without having to track the execution id |
 | `events` | `EventStreamOptions` | `{ maxQueued: 10_000, onOverflow: 'drop-oldest-non-terminal' }` | Configures the iterator-queue cap and overflow policy on `ctx.events` (and on the `AxlStream` returned by `runtime.stream()`). See [`EventStreamOptions`](#eventstreamoptions) |
 
-> **No `onToken` here.** `runtime.execute()` is final-result-only by design. To observe tokens, tool calls, or any other event from inside the workflow handler, read `ctx.events` (see [`ctx.events`](#ctxevents)). To observe from outside, use `runtime.stream()` and consume the returned `AxlStream`. Per-execution callbacks (`onToken` / `onToolCall` / `onAgentStart`) only exist on `runtime.createContext()`, where they remain for back-compat (the iterable surface on `ctx.events` is the unified path forward).
+> **No `onToken` here.** `runtime.execute()` is final-result-only by design. To observe tokens, tool calls, or any other event from inside the workflow handler, read `ctx.events` (see [`ctx.events`](#ctxevents)). To observe from outside, use `runtime.stream()` and consume the returned `AxlStream`. The legacy callback options only exist on `runtime.createContext()`, where they are deprecated and warn once per process.
 
 ### Execution History
 
@@ -1566,7 +1578,7 @@ const runtime = new AxlRuntime({ state: { store: new MyStore() } });
 Every agent call, tool invocation, handoff, and system event emits an `AxlEvent`. These accumulate in `ExecutionInfo.events` and are broadcast via WebSocket in Studio. The wire format (streaming) and trace format (persisted) are the same shape — no translation layer.
 
 ```typescript
-import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped, CallbackMeta } from '@axlsdk/axl';
+import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl';
 ```
 
 > Renamed from `TraceEvent`/`StreamEvent` in 0.16.0. See the [migration guide](./migration/unified-event-model.md) for the full diff.
@@ -1759,7 +1771,12 @@ Emitted AFTER control returns to the source agent. **Roundtrip mode only** — o
 | `error` | `string?` | Error message (when `status === 'failed'`). Subject to `config.trace.redact` |
 | `aborted` | `boolean?` | `true` when the execution ended via `AbortSignal` (user cancel, budget `hard_stop`, parent-scope abort). Lets consumers distinguish cancellation from genuine error |
 
-### `CallbackMeta` (passed to `onToken` / `onToolCall` / `onAgentStart`)
+### `CallbackMeta` (deprecated)
+
+Legacy metadata passed to the deprecated `onToken` / `onToolCall` /
+`onAgentStart` callbacks. New code should inspect the correlated fields on
+`AxlEvent` instead. See the
+[stream-first migration guide](migration/stream-first-observation.md).
 
 ```typescript
 type CallbackMeta = {

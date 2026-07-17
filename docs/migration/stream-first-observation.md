@@ -1,20 +1,29 @@
 # Migration: Stream-First Observation
 
-> **Versions:** 0.16.x → next
-> **Scope:** Anyone iterating `AxlStream`, calling `runtime.execute()` / `runtime.stream()` / `runtime.createContext()`, using `Session.send` / `Session.stream`, or wanting to observe events from inside a workflow handler.
+> **Versions:** 0.16.x → next major
+> **Scope:** Anyone iterating `AxlStream`, calling `runtime.execute()` / `runtime.stream()` / `runtime.createContext()`, using `Session.send` / `Session.stream`, observing events from inside a workflow handler, or using the legacy `onToken` / `onToolCall` / `onAgentStart` callbacks.
 
 ## What changed
 
-Phase 1 of the Stream-First Observation API ships:
+The first two phases of the Stream-First Observation API ship:
 
 1. **`ctx.events`** — a lazy `AxlEventBus` accessible from every `WorkflowContext`. Iterate `AxlEvent` from inside a workflow handler — including between `ctx.ask()` calls — without standing up a `runtime.stream()` consumer outside.
 2. **Coalescing `partialObjects` view** on both `AxlStream` and `ctx.events`. Yields the latest `partial_object` payload per `askId` with the 1-indexed `attempt`. Designed for streaming-structured-output UIs that render the current state, not every intermediate snapshot.
 3. **Bounded queue + overflow policy** on every `AxlEventBus`. Default cap of `10_000` events, overflow drops the oldest non-terminal. Strict mode (`'throw'`) raises a typed `EventStreamOverflowError`.
 4. **`events: EventStreamOptions`** plumbed through every entry point: `runtime.execute()`, `runtime.stream()`, `runtime.createContext()`, `Session.send`, `Session.stream`, `AxlTestRuntime.execute`.
+5. **Legacy callback deprecation.** `onToken`, `onToolCall`, and `onAgentStart`
+   on `runtime.createContext()` still work, but are type-deprecated and warn
+   once per process. They will be removed in the next breaking release.
+6. **Explicit wire streaming mode.** `runtime.stream()` selects the provider's
+   streaming path directly; it no longer installs an internal callback
+   sentinel or allocates `ctx.events` behind the consumer's back. Child
+   contexts inherit that mode.
 
 ## TL;DR
 
-For most consumers there is **nothing to do** — defaults preserve existing behavior in all but two narrow cases (see "Behavior changes" below). If you want to use the new feature, subscribe to `ctx.events` at the top of your workflow handler.
+If you do not use the deprecated callbacks, defaults preserve existing behavior
+apart from the narrow cases below. Callback consumers should migrate now;
+subscribe to `ctx.events` before the first `ctx.ask()` on an ad-hoc context.
 
 ## New API at a glance
 
@@ -74,7 +83,7 @@ This restores pre-release behavior.
 
 ### 2. `runtime.execute()` can now stream tokens — under one condition
 
-Before this release, `runtime.execute()` always took the non-streaming `provider.chat` code path. After this release, the streaming path activates whenever an observer is present at the time `ctx.ask()` starts — either the legacy `onToken` callback OR an allocated `ctx.events`. If your workflow handler does **not** access `ctx.events`, behavior is unchanged.
+Before this release, `runtime.execute()` always took the non-streaming `provider.chat` code path. After this release, the streaming path activates when the workflow handler has allocated `ctx.events` before `ctx.ask()` starts. (`onToken` can also activate streaming on an ad-hoc context created with `runtime.createContext()`, but it is deprecated and is not an `ExecuteOptions` field.) If your workflow handler does **not** access `ctx.events`, behavior is unchanged.
 
 If your handler does access `ctx.events`, individual `ctx.ask()` calls now go through `provider.stream` instead of `provider.chat`. The final `ProviderResponse` is the same shape; the difference is per-token streaming events fire alongside it.
 
@@ -120,6 +129,121 @@ try {
 | Test a tool in isolation | `runtime.createContext()` + `tool.run(ctx, input)`; iterate `ctx.events` if you want event-level assertions |
 
 The four channels are **alternatives**, not additive — accumulating cost from `ctx.events` AND `runtime.on('trace', …)` would double-count.
+
+## Migrating legacy callbacks
+
+Create the context first, attach an event observer, and only then start the
+ask. The bus is lazy, so this ordering also makes the provider's streaming path
+explicit.
+
+### Tokens and root-only filtering
+
+```typescript
+// Before
+const ctx = runtime.createContext({
+  onToken: (token, meta) => {
+    if (meta.depth === 0) display(token);
+  },
+});
+
+// After
+const ctx = runtime.createContext();
+ctx.events.on('token', (event) => {
+  if (event.depth === 0) display(event.data);
+});
+```
+
+If you only need text, use the string-only curated view:
+
+```typescript
+void (async () => {
+  for await (const token of ctx.events.text) display(token);
+})();
+```
+
+The `.text` view intentionally yields only strings. Use the typed `token`
+event listener above when you need `depth`, `askId`, or agent correlation.
+
+### Tool and agent starts
+
+```typescript
+ctx.events.on('tool_call_start', (event) => {
+  recordToolStart({
+    name: event.tool,
+    args: event.data.args,
+    callId: event.callId,
+    askId: event.askId,
+    depth: event.depth,
+    agent: event.agent,
+  });
+});
+
+ctx.events.on('agent_call_start', (event) => {
+  recordAgentStart({
+    agent: event.agent,
+    model: event.model,
+    askId: event.askId,
+    depth: event.depth,
+  });
+});
+```
+
+Unlike the old callbacks, the event union also exposes correlated terminal
+events. Match `tool_call_end` to its start with `askId` + `callId`, not tool
+name.
+
+### Nested asks
+
+Use `event.depth === 0` for the old root-only display. To retain nested output,
+route by `askId`, or consume the built-in grouped view:
+
+```typescript
+void (async () => {
+  for await (const chunk of ctx.events.textByAsk) {
+    appendToMessage(chunk.askId, chunk.text, {
+      agent: chunk.agent,
+    });
+  }
+})();
+```
+
+### Cross-execution and cross-suspension observation
+
+An ad-hoc context's bus covers that context only. Use the runtime trace emitter
+for telemetry spanning many executions or an `awaitHuman` suspension/resume:
+
+```typescript
+runtime.on('trace', (event) => persistTelemetry(event));
+```
+
+Use `runtime.stream()` when the observer owns one wire execution. It selects
+streaming mode directly and returns both the event iterable and final-result
+promise; it does not need a hidden callback sentinel.
+
+### Ad-hoc context cleanup
+
+Prefer a signal so cancellation disposes the event bus and any active ask:
+
+```typescript
+const controller = new AbortController();
+const ctx = runtime.createContext({ signal: controller.signal });
+const events = ctx.events;
+
+try {
+  return await tool.run(ctx, input);
+} finally {
+  controller.abort();
+  // If no signal is available, call ctx.disposeEvents() instead.
+}
+```
+
+### Callback throws no longer control the workflow
+
+Legacy callbacks ran synchronously, so a throw could accidentally interrupt
+the ask. Event listeners are observation boundaries: listener exceptions are
+isolated and logged so telemetry or UI code cannot crash the workflow. Use an
+`AbortController`, a tool approval policy, or explicit workflow logic when the
+observer must affect control flow.
 
 ## Lifecycle gotchas
 

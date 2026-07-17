@@ -349,8 +349,8 @@ describe('trace events — streaming path captures thinking', () => {
       config: {},
       providerRegistry: registry,
       onTrace: (e) => traces.push(e),
-      onToken: (tok) => tokens.push(tok),
     });
+    ctx.events.on('token', (event) => tokens.push(event.data));
     const a = agent({ name: 'streamer', model: 'mock:test', system: 'sys' });
     await ctx.ask(a, 'hi');
 

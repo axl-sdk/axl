@@ -73,8 +73,7 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
     const redactOn = runtime.isRedactEnabled();
 
     // Create context — its auto-generated executionId becomes the WS channel name.
-    // Token events flow through emitEvent → runtime.emit('trace') → our listener below,
-    // so no manual onToken needed.
+    // Token events flow through emitEvent → runtime.emit('trace') → our listener below.
     const ctx = runtime.createContext({ sessionHistory: history });
     const executionId = ctx.executionId;
     // Touch `ctx.events` to allocate the bus — this activates the

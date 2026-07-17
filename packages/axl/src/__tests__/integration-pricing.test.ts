@@ -514,8 +514,8 @@ describe.skipIf(!hasGoogle)('Pricing Integration: Gemini', () => {
 // contributing to ctx.budget() because cost was never set on the response
 // built from the stream's done chunk.
 //
-// The workflow is run via runtime.stream() so the context uses the streaming
-// path (onToken set), not the chat() path.
+// The workflow is run via runtime.stream() so the context uses the explicit
+// streaming transport mode, not the chat() path.
 // ---------------------------------------------------------------------------
 
 describe.skipIf(!hasOpenAI)('Budget tracking: streaming accumulates cost [OpenAI]', () => {

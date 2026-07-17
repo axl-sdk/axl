@@ -26,7 +26,7 @@ function createMockProvider(responses: string[]): Provider {
     },
     stream: async function* () {
       // Mirror the same response sequence on the streaming path so tests
-      // exercising onToken can rely on `responses` being delivered. Without
+      // observing ctx.events can rely on `responses` being delivered. Without
       // this, the streaming branch would emit empty content and gates that
       // expect a JSON payload would always fail.
       const content = responses[streamCallIndex] ?? responses[responses.length - 1];
@@ -140,7 +140,7 @@ describe('validate (post-schema business rule validation)', () => {
 
     it('runs validate against the buffered response when streaming is enabled', async () => {
       // The unified-event-model migration (spec/16, §4.1) drops the old
-      // hard error: validate + onToken now coexist. Tokens stream as they
+      // hard error: validate + stream observation now coexist. Tokens stream as they
       // arrive; the validate callback runs against the fully-buffered,
       // schema-parsed response. With the pipeline events landing in PR 2,
       // consumers see retry boundaries and `AxlStream.fullText` only
@@ -148,10 +148,8 @@ describe('validate (post-schema business rule validation)', () => {
       const a = agent({ model: 'mock:test', system: 'Return JSON.' });
       const tokens: string[] = [];
       let validateCalled = false;
-      const { ctx } = createCtx({
-        responses: [JSON.stringify({ value: 7 })],
-        onToken: (t: string) => tokens.push(t),
-      });
+      const { ctx } = createCtx({ responses: [JSON.stringify({ value: 7 })] });
+      ctx.events.on('token', (event) => tokens.push(event.data));
       const result = await ctx.ask(a, 'Hello', {
         schema: ValueSchema,
         validate: (out) => {

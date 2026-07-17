@@ -106,21 +106,11 @@ describe('child context', () => {
     expect(agentCallTraces.some((t) => t.agent === 'traced_child')).toBe(true);
   });
 
-  it('createChildContext() inherits streaming callbacks (callback meta carries depth)', async () => {
-    // Spec/16 §3.2: callbacks now propagate into nested asks because every
-    // invocation carries `meta.askId`/`meta.depth` so consumers can filter
-    // root-only behavior with `meta.depth === 0` instead of relying on
-    // runtime isolation.
-    const tokenInvocations: { token: string; depth: number }[] = [];
+  it('createChildContext() shares stream-first agent events', async () => {
+    const { ctx } = createTestCtx();
     const agentStartInvocations: { agent: string; depth: number }[] = [];
-
-    const { ctx } = createTestCtx({
-      onToken: (token: string, meta: { depth: number }) => {
-        tokenInvocations.push({ token, depth: meta.depth });
-      },
-      onAgentStart: (info: { agent: string }, meta: { depth: number }) => {
-        agentStartInvocations.push({ agent: info.agent, depth: meta.depth });
-      },
+    ctx.events.on('agent_call_start', (event) => {
+      agentStartInvocations.push({ agent: event.agent, depth: event.depth });
     });
 
     const child = ctx.createChildContext();
@@ -133,8 +123,7 @@ describe('child context', () => {
 
     await child.ask(childAgent, 'hello');
 
-    // Parent's streaming callbacks DO fire — the new contract is that
-    // consumers filter on `meta.depth` if they want root-only.
+    // The parent observer sees the child ask and can filter by depth.
     expect(agentStartInvocations.length).toBeGreaterThan(0);
     expect(agentStartInvocations[0].agent).toBe('streaming_child');
     // Depth is 0 because the child ctx is invoked outside any parent ask;
@@ -196,11 +185,7 @@ describe('child context', () => {
     expect(result).toBe('Final result: specialist answer');
   });
 
-  it('onToken meta.depth: 0 for root-ask tokens, >= 1 for nested-ask tokens', async () => {
-    // Pin spec/16 §3.2: callbacks now propagate into nested asks via the
-    // CallbackMeta `depth` field. Root-ask tokens carry meta.depth === 0;
-    // nested-ask tokens carry meta.depth >= 1. Consumers wanting
-    // root-only behavior filter on `meta.depth === 0`.
+  it('token events carry depth 0 for root asks and >= 1 for nested asks', async () => {
     const subAgent = agent({
       name: 'inner',
       model: 'mock:test',
@@ -276,14 +261,11 @@ describe('child context', () => {
       },
     };
 
-    // Capture tokens with their depth metadata.
     const tokens: Array<{ token: string; depth: number; agent?: string }> = [];
 
-    const { ctx } = createTestCtx({
-      provider,
-      onToken: (token: string, meta: { depth: number; agent?: string }) => {
-        tokens.push({ token, depth: meta.depth, agent: meta.agent });
-      },
+    const { ctx } = createTestCtx({ provider });
+    ctx.events.on('token', (event) => {
+      tokens.push({ token: event.data, depth: event.depth, agent: event.agent });
     });
     await ctx.ask(outerAgent, 'start');
 

@@ -60,6 +60,22 @@ import type { MemoryManager } from './memory/manager.js';
 import type { RememberOptions, RecallOptions, VectorResult } from './memory/types.js';
 import { serializeToolModelOutput } from './tool-model-output.js';
 
+const LEGACY_OBSERVATION_WARNING_KEY = Symbol.for(
+  '@axlsdk/axl/legacy-observation-callback-warning',
+);
+
+function warnForLegacyObservationCallbacks(init: WorkflowContextInit): void {
+  if (!init.onToken && !init.onToolCall && !init.onAgentStart) return;
+  const processState = globalThis as typeof globalThis & Record<PropertyKey, unknown>;
+  if (processState[LEGACY_OBSERVATION_WARNING_KEY]) return;
+  processState[LEGACY_OBSERVATION_WARNING_KEY] = true;
+  console.warn(
+    '[axl] onToken, onToolCall, and onAgentStart are deprecated and will be removed in the next breaking release. ' +
+      'Use ctx.events, runtime.stream(), or runtime trace listeners instead. ' +
+      'See docs/migration/stream-first-observation.md.',
+  );
+}
+
 /**
  * AsyncLocalStorage for per-branch abort signals.
  * Used by race/spawn/map/budget to thread signals through async contexts
@@ -477,11 +493,13 @@ export type WorkflowContextInit = {
   providerRegistry: ProviderRegistry;
   sessionHistory?: ChatMessage[];
   onTrace?: (event: AxlEvent) => void;
-  /** Per-token streaming callback. `meta` carries `askId`/`parentAskId`/
+  /** @deprecated Use `ctx.events` or `runtime.stream()`.
+   * Per-token streaming callback. `meta` carries `askId`/`parentAskId`/
    *  `depth`/`agent` so consumers can route or filter (e.g., `meta.depth === 0`
    *  for root-only chat UIs). */
   onToken?: (token: string, meta: CallbackMeta) => void;
-  /** Pre-execution tool-call callback. `meta` carries the ask correlation. */
+  /** @deprecated Use `ctx.events` and observe `tool_call_start`.
+   * Pre-execution tool-call callback. `meta` carries the ask correlation. */
   onToolCall?: (call: { name: string; args: unknown; callId?: string }, meta: CallbackMeta) => void;
   pendingDecisions?: Map<string, (d: HumanDecision) => void>;
   budgetContext?: BudgetContextState;
@@ -499,7 +517,8 @@ export type WorkflowContextInit = {
   toolOverrides?: Map<string, (args: unknown) => Promise<unknown>>;
   /** Handler for awaitHuman — when set, returns immediately instead of waiting for pendingDecisions. */
   awaitHumanHandler?: (options: AwaitHumanOptions) => HumanDecision | Promise<HumanDecision>;
-  /** Callback fired when an agent LLM call is about to start. */
+  /** @deprecated Use `ctx.events` and observe `agent_call_start`.
+   * Callback fired when an agent LLM call is about to start. */
   onAgentStart?: (info: { agent: string; model: string }, meta: CallbackMeta) => void;
   /** Callback fired after each ctx.ask() completes (once per ask invocation). */
   onAgentCallComplete?: (call: AgentCallInfo) => void;
@@ -714,6 +733,7 @@ export class WorkflowContext<TInput = unknown> {
   }
 
   constructor(init: WorkflowContextInit) {
+    warnForLegacyObservationCallbacks(init);
     this.input = init.input as TInput;
     this.executionId = init.executionId;
     this.metadata = init.metadata ?? {};

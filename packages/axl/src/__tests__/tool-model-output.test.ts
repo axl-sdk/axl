@@ -69,11 +69,11 @@ function setup(
   tools: Tool<any, any>[],
   toolCalls: ToolCallMessage[] = [call(tools[0].name)],
   options: {
-    onAgentStart?: () => void;
     redact?: boolean;
     provider?: SequenceProvider;
     signal?: AbortSignal;
     streaming?: boolean;
+    observeTrace?: (event: AxlEvent) => void;
     toolOverrides?: Map<string, (args: unknown) => Promise<unknown>>;
     spanManager?: SpanManager;
   } = {},
@@ -86,12 +86,14 @@ function setup(
     input: 'test',
     executionId: randomUUID(),
     config: { trace: { level: 'full', redact: options.redact } },
-    onAgentStart: options.onAgentStart,
     providerRegistry: registry,
     signal: options.signal,
     toolOverrides: options.toolOverrides,
     spanManager: options.spanManager,
-    onTrace: (event) => traces.push(event),
+    onTrace: (event) => {
+      traces.push(event);
+      options.observeTrace?.(event);
+    },
   });
   if (options.streaming) void ctx.events;
   const testAgent = agent({
@@ -935,7 +937,7 @@ describe('model-facing tool output projection', () => {
     });
   });
 
-  it('rechecks cancellation after start callbacks before provider continuation', async () => {
+  it('rechecks cancellation after start observers before provider continuation', async () => {
     const controller = new AbortController();
     let starts = 0;
     const projected = tool({
@@ -947,7 +949,8 @@ describe('model-facing tool output projection', () => {
     });
     const harness = setup([projected], undefined, {
       signal: controller.signal,
-      onAgentStart: () => {
+      observeTrace: (event) => {
+        if (event.type !== 'agent_call_start') return;
         starts++;
         if (starts === 2) controller.abort();
       },

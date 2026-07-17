@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+
+- **`runtime.createContext()` observation callbacks.** `onToken`, `onToolCall`,
+  and `onAgentStart` remain operational for this release, but are
+  type-deprecated and warn once per process. Migrate to `ctx.events` for
+  ad-hoc contexts, `runtime.stream()` for one wire execution, or the runtime
+  trace emitter for cross-execution observation. The callbacks will be removed
+  in the next breaking release. See the
+  [stream-first migration guide](docs/migration/stream-first-observation.md).
+
+### Changed
+
+- **`runtime.stream()` now selects streaming mode explicitly.** It no longer
+  installs an internal `onToken` sentinel or allocates `ctx.events` solely to
+  choose `provider.stream`; child contexts inherit the explicit mode.
+
 ## [0.19.1] - 2026-07-17
 
 ### Added

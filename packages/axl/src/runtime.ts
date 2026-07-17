@@ -470,14 +470,17 @@ export type CreateContextOptions = {
   signal?: AbortSignal;
   /** Prior conversation history for multi-turn eval testing. */
   sessionHistory?: ChatMessage[];
-  /** Token streaming callback. `meta` carries `askId`/`parentAskId`/`depth`/`agent`
+  /** @deprecated Use `ctx.events` or `runtime.stream()`.
+   * Token streaming callback. `meta` carries `askId`/`parentAskId`/`depth`/`agent`
    *  so consumers can route or filter by ask correlation (e.g.,
    *  `meta.depth === 0` for root-only chat UIs). */
   onToken?: (token: string, meta: CallbackMeta) => void;
-  /** Fires when an agent invokes a tool. `meta` carries the same ask
+  /** @deprecated Use `ctx.events` and observe `tool_call_start`.
+   * Fires when an agent invokes a tool. `meta` carries the same ask
    *  correlation shape as `onToken`. */
   onToolCall?: (call: { name: string; args: unknown; callId?: string }, meta: CallbackMeta) => void;
-  /** Fires when an agent begins processing a turn. `meta` carries the
+  /** @deprecated Use `ctx.events` and observe `agent_call_start`.
+   * Fires when an agent begins processing a turn. `meta` carries the
    *  same ask correlation shape as `onToken`. */
   onAgentStart?: (info: { agent: string; model?: string }, meta: CallbackMeta) => void;
   /** Handler for tool approval requests. Called when an agent invokes a tool with requireApproval. */

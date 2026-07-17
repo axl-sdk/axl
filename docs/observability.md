@@ -183,7 +183,7 @@ Unknown models report `tokens` but no `cost`. The Studio Cost Dashboard renders 
 
 ### Observation paths
 
-Five ways to observe what happens during a workflow run. Pick by scope:
+Four ways to observe what happens during a workflow run. Pick by scope:
 
 | Path | Scope | When to use |
 |------|-------|-------------|
@@ -191,9 +191,12 @@ Five ways to observe what happens during a workflow run. Pick by scope:
 | `ctx.events` (`AxlEventBus`) | One specific context (inside the workflow handler) | Observe events **between `ctx.ask()` calls** in a workflow handler, or on ad-hoc contexts from `runtime.createContext()`. Same `AxlEvent` union as `AxlStream`; same curated views (`.text`, `.lifecycle`, `.textByAsk`, `.partialObjects`). Lazy — zero overhead if no consumer subscribes |
 | `runtime.on('trace', event => …)` | Every execution | Cross-execution observability (background telemetry, cost dashboards, audit logs). Receives every `AxlEvent` from every `execute()` / `stream()` / `createContext()` call |
 | `runtime.recoverIncompleteStreams()` | Post-crash recovery | Reconstructs partial `ExecutionInfo`s for runs whose process died mid-flight, IF `state.persist: 'streaming'` was configured. Wire into process startup AFTER lazy-loading historical state and BEFORE accepting new work. See ["Crash recovery"](#crash-recovery-statepersist-streaming) below |
-| `onToken` / `onToolCall` / `onAgentStart` on `runtime.createContext()` | One ad-hoc context (back-compat) | Tool tests, evals, prototyping. Superseded by `ctx.events` — the callbacks remain for back-compat but the iterable is the unified path forward |
 
 `runtime.execute()` itself is final-result-only by design — it does **not** accept `onToken` or any other event callback. To observe a workflow run from inside the handler, read `ctx.events`; from outside, use `runtime.stream()` (per-execution) or `runtime.on('trace', …)` (cross-execution).
+
+The legacy `onToken` / `onToolCall` / `onAgentStart` options on
+`runtime.createContext()` are deprecated and warn once per process. Migrate to
+`ctx.events`; see the [stream-first migration guide](migration/stream-first-observation.md).
 
 #### `ctx.events` — observing between `ctx.ask()` calls
 
@@ -398,30 +401,21 @@ runtime.execute('my-workflow', input, {
 
 Existing 0.x consumers gain the cap automatically with this release. If your workflow somehow relied on unbounded queueing, opt out with `events: { maxQueued: Infinity }`. See the full upgrade notes in [docs/migration/stream-first-observation.md](migration/stream-first-observation.md).
 
-### Streaming callbacks: `meta` parameter
+### Migrating streaming callbacks
 
-The `onToken` / `onToolCall` / `onAgentStart` callbacks on `runtime.createContext()` receive a second `meta: CallbackMeta` parameter:
+The `onToken` / `onToolCall` / `onAgentStart` options on
+`runtime.createContext()` are deprecated. They remain operational for this
+release, but their first use warns once per process and they will be removed in
+the next breaking release. Use `ctx.events` for an ad-hoc context, `AxlStream`
+for a wire consumer, or the runtime trace emitter for cross-execution
+observation. Filter events with `event.depth === 0` to preserve root-only
+behavior, or route nested output by `askId` with `.textByAsk`.
 
-```typescript
-type CallbackMeta = {
-  askId: string;
-  parentAskId?: string;
-  depth: number;
-  agent: string;
-};
-```
-
-`createChildContext` no longer isolates these callbacks — nested asks (e.g., agent-as-tool handlers calling `ctx.ask()`) propagate to the same outer callbacks. To preserve the old root-only behavior, filter on `meta.depth === 0`:
-
-```typescript
-const ctx = runtime.createContext({
-  onToken: (token, meta) => {
-    if (meta.depth === 0) display(token); // root-only chat UI
-  },
-});
-```
-
-Drop the `depth === 0` filter to display tokens from nested asks too. The same filtering pattern is available on `runtime.stream()` via `event.depth` on each `AxlEvent` (or use the prebuilt `.text` / `.textByAsk` views).
+The [stream-first migration guide](migration/stream-first-observation.md)
+contains equivalent recipes and the callback-throw behavior change. The
+[unified event-model guide](migration/unified-event-model.md) preserves the
+historical callback contract for consumers migrating through older 0.x
+releases.
 
 ### Debugging retries
 

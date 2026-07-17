@@ -17,6 +17,53 @@ function buildRuntime(provider: MockProvider): AxlRuntime {
 }
 
 describe('ctx.events — workflow handler observation', () => {
+  it('replaces onToolCall with a fully correlated tool_call_start listener', async () => {
+    const provider = MockProvider.sequence([
+      {
+        content: '',
+        tool_calls: [
+          {
+            id: 'call-lookup',
+            type: 'function',
+            function: { name: 'lookup', arguments: '{"id":"case-1"}' },
+          },
+        ],
+      },
+      { content: 'done' },
+    ]);
+    const runtime = buildRuntime(provider);
+    const lookup = tool({
+      name: 'lookup',
+      description: 'Look up a case',
+      input: z.object({ id: z.string() }),
+      handler: ({ id }) => ({ id }),
+    });
+    const a = agent({ name: 'a', model: 'mock:test', system: 'a', tools: [lookup] });
+    let observed: Extract<AxlEvent, { type: 'tool_call_start' }> | undefined;
+    const wf = workflow({
+      name: 'observe-tool-start',
+      input: z.object({}),
+      handler: async (ctx) => {
+        ctx.events.on('tool_call_start', (event) => {
+          observed = event;
+        });
+        return ctx.ask(a, 'look it up');
+      },
+    });
+    runtime.register(wf);
+
+    await runtime.execute('observe-tool-start', {});
+
+    expect(observed).toMatchObject({
+      tool: 'lookup',
+      callId: 'call-lookup',
+      askId: expect.any(String),
+      depth: 0,
+      agent: 'a',
+      data: { args: { id: 'case-1' } },
+    });
+  });
+
   it('iterates events emitted between two ctx.ask() calls', async () => {
     const provider = MockProvider.sequence([{ content: 'first' }, { content: 'second' }]);
     const runtime = buildRuntime(provider);

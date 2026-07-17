@@ -1,5 +1,5 @@
 import type { ZodError } from 'zod';
-import type { Result } from './types.js';
+import type { Result, ToolFailureOptions } from './types.js';
 
 /** Base error class for all Axl errors */
 export class AxlError extends Error {
@@ -11,6 +11,27 @@ export class AxlError extends Error {
     this.code = code;
   }
 }
+
+/** A known tool failure whose author-provided model message is safe to expose. */
+export class ToolFailure extends AxlError {
+  readonly modelMessage: string;
+  declare readonly cause?: unknown;
+
+  constructor(options: ToolFailureOptions) {
+    super(options.code ?? 'TOOL_FAILURE', options.message);
+    this.name = 'ToolFailure';
+    this.modelMessage = options.modelMessage;
+    if (options.cause !== undefined) {
+      Object.defineProperty(this, 'cause', {
+        configurable: true,
+        enumerable: false,
+        value: options.cause,
+      });
+    }
+  }
+}
+
+export type ToolFailureConstructor = typeof ToolFailure;
 
 /** Thrown when a tool's model-facing output cannot be projected safely. */
 export class ToolModelOutputError extends AxlError {
@@ -169,21 +190,5 @@ export class ValidationError extends AxlError {
     this.lastOutput = lastOutput;
     this.reason = reason;
     this.retries = retries;
-  }
-}
-
-/** Internal: thrown when an agent tries to call a tool not in its ACL */
-export class ToolDenied extends AxlError {
-  readonly toolName: string;
-  readonly agentName: string;
-
-  constructor(toolName: string, agentName: string) {
-    super(
-      'TOOL_DENIED',
-      `Agent "${agentName}" attempted to call tool "${toolName}" which is not in its ACL`,
-    );
-    this.name = 'ToolDenied';
-    this.toolName = toolName;
-    this.agentName = agentName;
   }
 }

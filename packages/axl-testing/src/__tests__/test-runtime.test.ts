@@ -1,8 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod';
-import { workflow, agent, tool, ToolModelOutputError } from '@axlsdk/axl';
+import { workflow, agent, tool, ToolFailure, ToolModelOutputError } from '@axlsdk/axl';
 import type { AxlEvent, Tool } from '@axlsdk/axl';
 import { AxlTestRuntime, MockProvider } from '../index.js';
+import type { RecordedToolCall } from '../index.js';
 
 // ── Test Fixtures ────────────────────────────────────────────────────────────
 
@@ -66,6 +67,14 @@ function createToolWorkflow(
 
 function recordedToolContent(provider: MockProvider): string | undefined {
   return provider.calls[1]?.messages.find((message) => message.role === 'tool')?.content;
+}
+
+function succeededResult(call: RecordedToolCall): unknown {
+  expect(call.outcome.status).toBe('succeeded');
+  if (call.outcome.status !== 'succeeded') {
+    throw new Error(`Expected a succeeded tool call, received ${call.outcome.status}`);
+  }
+  return call.outcome.result;
 }
 
 // A workflow with output schema for output validation tests
@@ -163,7 +172,12 @@ describe('AxlTestRuntime', () => {
       expect(toolCalls).toHaveLength(1);
       expect(toolCalls[0].name).toBe('get_order');
       expect(toolCalls[0].args).toEqual({ orderId: '123' });
-      expect(toolCalls[0].result).toEqual({
+      expect(toolCalls[0]).toMatchObject({
+        executionId: expect.stringMatching(/^test-/),
+        askId: expect.any(String),
+        callId: 'call-1',
+      });
+      expect(succeededResult(toolCalls[0])).toEqual({
         id: '123',
         status: 'delivered',
         amount: 49.99,
@@ -194,6 +208,39 @@ describe('AxlTestRuntime', () => {
 
       expect(runtime.toolCalls('get_order')).toHaveLength(1);
       expect(runtime.toolCalls('non_existent_tool')).toHaveLength(0);
+    });
+
+    it('records denied calls without inventing a successful result', async () => {
+      const handler = vi.fn(() => ({ shouldNotRun: true }));
+      const approvalTool = tool({
+        name: 'approval_required',
+        description: 'Require an explicit approval decision',
+        input: z.object({}),
+        requireApproval: true,
+        handler,
+      });
+      const approvalWorkflow = createToolWorkflow('ApprovalDenied', [approvalTool]);
+      const provider = MockProvider.sequence([
+        toolCallResponse('approval_required', 'call-denied'),
+        { content: 'understood' },
+      ]);
+      const runtime = new AxlTestRuntime({
+        humanDecisions: () => ({ approved: false, reason: 'not in this test' }),
+      });
+      runtime.register(approvalWorkflow);
+      runtime.mockProvider('openai', provider);
+
+      await expect(runtime.execute('ApprovalDenied', {})).resolves.toBe('understood');
+
+      expect(handler).not.toHaveBeenCalled();
+      expect(runtime.toolCalls('approval_required')).toEqual([
+        expect.objectContaining({
+          name: 'approval_required',
+          callId: 'call-denied',
+          args: {},
+          outcome: { status: 'denied', reason: 'not in this test' },
+        }),
+      ]);
     });
   });
 
@@ -452,7 +499,7 @@ describe('AxlTestRuntime', () => {
 
       const toolCalls = runtime.toolCalls('get_order');
       expect(toolCalls).toHaveLength(1);
-      expect(toolCalls[0].result).toEqual({
+      expect(succeededResult(toolCalls[0])).toEqual({
         id: '999',
         status: 'pending',
         amount: 0,
@@ -484,7 +531,7 @@ describe('AxlTestRuntime', () => {
 
       expect(runtime.toolCalls()).toHaveLength(1);
       expect(runtime.toolCalls()[0].name).toBe('get_order');
-      expect(runtime.toolCalls()[0].result).toEqual({ mocked: true });
+      expect(succeededResult(runtime.toolCalls()[0])).toEqual({ mocked: true });
     });
 
     it('applies configured projection policy while retaining the complete mock result for hosts', async () => {
@@ -512,13 +559,16 @@ describe('AxlTestRuntime', () => {
 
       await runtime.execute('ProjectedMock', {});
 
-      expect(runtime.toolCalls('projected_mock')).toEqual([
-        { name: 'projected_mock', args: {}, result: completeMockResult },
-      ]);
+      const recordedCall = runtime.toolCalls('projected_mock')[0];
+      expect(recordedCall).toMatchObject({
+        name: 'projected_mock',
+        args: {},
+        outcome: { status: 'succeeded', result: completeMockResult },
+      });
       const toolEnd = runtime
         .traceLog()
         .find((event) => event.type === 'tool_call_end' && event.tool === 'projected_mock');
-      expect(toolEnd?.data.result).toEqual(completeMockResult);
+      expect(toolEnd?.data.outcome).toEqual({ status: 'succeeded', result: completeMockResult });
       expect(recordedToolContent(provider)).toBe('{"message":"ready"}');
       expect(recordedToolContent(provider)).not.toContain('host-only-id');
     });
@@ -560,11 +610,54 @@ describe('AxlTestRuntime', () => {
       expect(before).not.toHaveBeenCalled();
       expect(after).not.toHaveBeenCalled();
       expect(runtime.toolCalls('policy_only_mock')[0].args).toEqual({});
-      expect(runtime.toolCalls('policy_only_mock')[0].result).toEqual({
+      expect(succeededResult(runtime.toolCalls('policy_only_mock')[0])).toEqual({
         visible: 'mock projection',
         hidden: 'host-only',
       });
       expect(recordedToolContent(provider)).toBe('mock projection');
+    });
+
+    it('keeps JSON parsing at the agent-call boundary before invoking a configured mock', async () => {
+      const configuredTool = tool({
+        name: 'json_boundary_mock',
+        description: 'Reject malformed provider arguments before the override',
+        input: z.object({ required: z.string() }),
+        handler: () => ({ real: true }),
+      });
+      const configuredWorkflow = createToolWorkflow('JsonBoundaryMock', [configuredTool]);
+      const provider = MockProvider.sequence([
+        {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call-invalid-json',
+              type: 'function',
+              function: { name: 'json_boundary_mock', arguments: '{not-json' },
+            },
+          ],
+        },
+        { content: 'corrected' },
+      ]);
+      const runtime = new AxlTestRuntime();
+      runtime.register(configuredWorkflow);
+      runtime.mockProvider('openai', provider);
+      const mock = vi.fn(() => ({ mocked: true }));
+      runtime.mockTool('json_boundary_mock', mock);
+
+      await expect(runtime.execute('JsonBoundaryMock', {})).resolves.toBe('corrected');
+
+      expect(mock).not.toHaveBeenCalled();
+      expect(runtime.toolCalls('json_boundary_mock')).toEqual([]);
+      expect(
+        runtime
+          .traceLog()
+          .find(
+            (event) => event.type === 'tool_call_rejected' && event.tool === 'json_boundary_mock',
+          ),
+      ).toMatchObject({
+        callId: 'call-invalid-json',
+        data: { reason: 'invalid_json', requestedTool: 'json_boundary_mock' },
+      });
     });
 
     it('lets configured sensitive policy win and skips projection for a mock result', async () => {
@@ -590,7 +683,9 @@ describe('AxlTestRuntime', () => {
       await runtime.execute('SensitiveMock', {});
 
       expect(mapper).not.toHaveBeenCalled();
-      expect(runtime.toolCalls('sensitive_mock')[0].result).toEqual({ secret: 'mock-secret' });
+      expect(succeededResult(runtime.toolCalls('sensitive_mock')[0])).toEqual({
+        secret: 'mock-secret',
+      });
       expect(recordedToolContent(provider)).toBe('[REDACTED - sensitive tool output]');
 
       const failureProvider = MockProvider.sequence([
@@ -601,19 +696,28 @@ describe('AxlTestRuntime', () => {
       failureRuntime.register(sensitiveWorkflow);
       failureRuntime.mockProvider('openai', failureProvider);
       failureRuntime.mockTool('sensitive_mock', () => {
-        throw new Error('sensitive mock failed');
+        throw new ToolFailure({
+          message: 'host-only sensitive failure',
+          modelMessage: 'model-safe but still hidden by sensitive policy',
+        });
       });
 
-      await failureRuntime.execute('SensitiveMock', {});
+      await expect(failureRuntime.execute('SensitiveMock', {})).resolves.toBe('recovered');
 
       expect(mapper).not.toHaveBeenCalled();
-      expect(failureRuntime.toolCalls('sensitive_mock')[0].result).toEqual({
-        error: 'sensitive mock failed',
+      expect(failureRuntime.toolCalls('sensitive_mock')[0].outcome).toMatchObject({
+        status: 'failed',
+        failure: {
+          phase: 'handler',
+          kind: 'tool_failure',
+          disposition: 'continue',
+        },
       });
-      expect(recordedToolContent(failureProvider)).toBe('[REDACTED - sensitive tool output]');
+      expect(recordedToolContent(failureProvider)).toBe('[REDACTED - sensitive tool failure]');
+      expect(recordedToolContent(failureProvider)).not.toContain('model-safe');
     });
 
-    it('bypasses configured projection when the mock throws', async () => {
+    it('records an unexpected mock throw as failed/handler and aborts the ask', async () => {
       const mapper = vi.fn(() => 'must not run');
       const configuredTool = tool({
         name: 'throwing_mock',
@@ -636,12 +740,70 @@ describe('AxlTestRuntime', () => {
       });
       runtime.mockTool('throwing_mock', throwingMock);
 
-      await runtime.execute('ThrowingMock', {});
+      await expect(runtime.execute('ThrowingMock', {})).rejects.toThrow('mock exploded');
 
       expect(mapper).not.toHaveBeenCalled();
       expect(throwingMock).toHaveBeenCalledOnce();
-      expect(runtime.toolCalls('throwing_mock')[0].result).toEqual({ error: 'mock exploded' });
-      expect(recordedToolContent(provider)).toBe('{"error":"mock exploded"}');
+      expect(provider.calls).toHaveLength(1);
+      expect(runtime.toolCalls('throwing_mock')[0].outcome).toMatchObject({
+        status: 'failed',
+        failure: {
+          phase: 'handler',
+          kind: 'unexpected',
+          disposition: 'abort',
+          attempts: 1,
+          error: { name: 'Error', message: 'mock exploded' },
+        },
+      });
+    });
+
+    it('records ToolFailure from a mock as failed/handler and continues with model-safe text', async () => {
+      const configuredTool = tool({
+        name: 'recoverable_mock',
+        description: 'Return a recoverable mock failure',
+        input: z.object({ required: z.string() }),
+        retry: { attempts: 3 },
+        handler: () => ({ ok: true }),
+        toModelOutput: () => {
+          throw new Error('projection must remain bypassed');
+        },
+      });
+      const recoverableWorkflow = createToolWorkflow('RecoverableMock', [configuredTool]);
+      const provider = MockProvider.sequence([
+        toolCallResponse('recoverable_mock'),
+        { content: 'recovered' },
+      ]);
+      const runtime = new AxlTestRuntime();
+      runtime.register(recoverableWorkflow);
+      runtime.mockProvider('openai', provider);
+      const recoverableMock = vi.fn(() => {
+        throw new ToolFailure({
+          message: 'host-only failure detail',
+          modelMessage: 'Please choose another input.',
+          code: 'MOCK_REJECTED',
+        });
+      });
+      runtime.mockTool('recoverable_mock', recoverableMock);
+
+      await expect(runtime.execute('RecoverableMock', {})).resolves.toBe('recovered');
+
+      expect(recoverableMock).toHaveBeenCalledOnce();
+      expect(provider.calls).toHaveLength(2);
+      expect(recordedToolContent(provider)).toBe('Please choose another input.');
+      expect(runtime.toolCalls('recoverable_mock')[0].outcome).toMatchObject({
+        status: 'failed',
+        failure: {
+          phase: 'handler',
+          kind: 'tool_failure',
+          disposition: 'continue',
+          attempts: 1,
+          error: {
+            name: 'ToolFailure',
+            message: 'host-only failure detail',
+            code: 'MOCK_REJECTED',
+          },
+        },
+      });
     });
 
     it('projects a normally returned error-shaped mock result', async () => {
@@ -667,7 +829,7 @@ describe('AxlTestRuntime', () => {
 
       await runtime.execute('ReturnedErrorMock', {});
 
-      expect(runtime.toolCalls('returned_error_mock')[0].result).toEqual({
+      expect(succeededResult(runtime.toolCalls('returned_error_mock')[0])).toEqual({
         error: 'mock declined',
         internal: 'host-only',
       });
@@ -687,7 +849,7 @@ describe('AxlTestRuntime', () => {
 
       await runtime.execute('UnconfiguredMock', {});
 
-      expect(runtime.toolCalls('unconfigured_override')[0].result).toBe('legacy string');
+      expect(succeededResult(runtime.toolCalls('unconfigured_override')[0])).toBe('legacy string');
       expect(recordedToolContent(provider)).toBe('"legacy string"');
     });
 
@@ -799,13 +961,20 @@ describe('AxlTestRuntime', () => {
 
       expect(mapper).toHaveBeenCalledOnce();
       expect(provider.calls).toHaveLength(1);
-      expect(runtime.toolCalls('invalid_projection_mock')).toEqual([
-        {
-          name: 'invalid_projection_mock',
-          args: {},
-          result: { raw: 'host-only' },
+      expect(runtime.toolCalls('invalid_projection_mock')).toHaveLength(1);
+      expect(runtime.toolCalls('invalid_projection_mock')[0]).toMatchObject({
+        name: 'invalid_projection_mock',
+        args: {},
+        outcome: {
+          status: 'failed',
+          failure: {
+            phase: 'projection',
+            kind: 'output',
+            disposition: 'abort',
+            result: { raw: 'host-only' },
+          },
         },
-      ]);
+      });
       expect(
         runtime
           .traceLog()

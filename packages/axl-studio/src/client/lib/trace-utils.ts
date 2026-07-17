@@ -125,7 +125,10 @@ export function isFailureEvent(event: HistoricalAxlEvent): boolean {
     case 'tool_call_rejected':
       return true;
     case 'tool_call_end':
-      return event.schemaVersion === 2 && event.data.outcome.status !== 'succeeded';
+      return (
+        event.schemaVersion === 2 &&
+        (event.data.outcome.status === 'failed' || event.data.outcome.status === 'denied')
+      );
     case 'guardrail':
       // GuardrailData uses `blocked: boolean`. Input/output guardrails both
       // share this shape; either one being blocked means failure.
@@ -174,6 +177,13 @@ export function getBarColor(type: string): string {
  * spot failure clusters in the trace waterfall without expanding every row.
  */
 export function getEventColor(event: HistoricalAxlEvent): string {
+  if (
+    event.type === 'tool_call_end' &&
+    event.schemaVersion === 2 &&
+    event.data.outcome.status === 'cancelled'
+  ) {
+    return 'bg-amber-500';
+  }
   if (isFailureEvent(event)) return 'bg-red-500';
   return getBarColor(event.type);
 }

@@ -508,7 +508,20 @@ export function enrichWorkflowStats(data: WorkflowStatsData) {
 
 export type TraceStatsData = {
   eventTypeCounts: Record<string, number>;
-  byTool: Record<string, { calls: number; denied: number; approved: number }>;
+  byTool: Record<
+    string,
+    {
+      accepted: number;
+      succeeded: number;
+      failed: number;
+      failedByPhase: Record<string, number>;
+      denied: number;
+      cancelled: number;
+      rejected: number;
+      approved: number;
+      legacy: { calls: number; denied: number; approved: number };
+    }
+  >;
   retryByAgent: Record<string, { schema: number; validate: number; guardrail: number }>;
   totalEvents: number;
 };
@@ -528,37 +541,65 @@ export function reduceTraceStats(acc: TraceStatsData, event: HistoricalAxlEvent)
 
   const byTool = { ...acc.byTool };
   if (
+    event.type === 'tool_call_start' ||
     event.type === 'tool_call_end' ||
+    event.type === 'tool_call_rejected' ||
     event.type === 'tool_denied' ||
     event.type === 'tool_approval'
   ) {
     const toolName = event.tool;
-    const prev = byTool[toolName] ?? { calls: 0, denied: 0, approved: 0 };
-    // tool_denied: legacy event for "tool not available" path. data.approved
-    // distinguishes approvals (true) from denials (absent/false).
-    // tool_approval: distinct event from the approval gate with data.approved.
-    const isDeniedEvent =
-      event.type === 'tool_denied' ||
-      (event.type === 'tool_call_end' &&
-        event.schemaVersion === 2 &&
-        event.data.outcome.status === 'denied');
-    const isApprovalEvent = event.type === 'tool_approval';
-    const eventData =
-      event.type === 'tool_denied' || isApprovalEvent
-        ? (event.data as { approved?: boolean } | undefined)
-        : undefined;
-    const isApproved =
-      (event.type === 'tool_denied' && eventData?.approved === true) ||
-      (isApprovalEvent && eventData?.approved === true);
-    const isDenied =
-      (event.type === 'tool_denied' && !eventData?.approved) ||
-      (event.type === 'tool_call_end' && isDeniedEvent) ||
-      (isApprovalEvent && eventData?.approved === false);
-    byTool[toolName] = {
-      calls: prev.calls + (event.type === 'tool_call_end' ? 1 : 0),
-      denied: prev.denied + (isDenied ? 1 : 0),
-      approved: prev.approved + (isApproved ? 1 : 0),
+    const prev = byTool[toolName] ?? {
+      accepted: 0,
+      succeeded: 0,
+      failed: 0,
+      failedByPhase: {},
+      denied: 0,
+      cancelled: 0,
+      rejected: 0,
+      approved: 0,
+      legacy: { calls: 0, denied: 0, approved: 0 },
     };
+    const next = {
+      ...prev,
+      failedByPhase: { ...prev.failedByPhase },
+      legacy: { ...prev.legacy },
+    };
+
+    if (event.schemaVersion === 2) {
+      if (event.type === 'tool_call_start') next.accepted++;
+      if (event.type === 'tool_call_rejected') next.rejected++;
+      if (event.type === 'tool_approval' && event.data?.approved) next.approved++;
+      if (event.type === 'tool_call_end') {
+        switch (event.data.outcome.status) {
+          case 'succeeded':
+            next.succeeded++;
+            break;
+          case 'failed': {
+            next.failed++;
+            const phase = event.data.outcome.failure.phase;
+            next.failedByPhase[phase] = (next.failedByPhase[phase] ?? 0) + 1;
+            break;
+          }
+          case 'denied':
+            next.denied++;
+            break;
+          case 'cancelled':
+            next.cancelled++;
+            break;
+        }
+      }
+    } else if (event.type === 'tool_call_end') {
+      next.legacy.calls++;
+    } else if (event.type === 'tool_denied') {
+      const approved = (event.data as { approved?: boolean } | undefined)?.approved === true;
+      if (approved) next.legacy.approved++;
+      else next.legacy.denied++;
+    } else if (event.type === 'tool_approval') {
+      if (event.data?.approved === true) next.legacy.approved++;
+      else if (event.data?.approved === false) next.legacy.denied++;
+    }
+
+    byTool[toolName] = next;
   }
 
   const retryByAgent = { ...acc.retryByAgent };

@@ -14,6 +14,31 @@ function ev(partial: Record<string, unknown>): AxlEvent {
 
 const ASK = { askId: 'a', depth: 0 } as const;
 
+function toolStart(callId = 'c1'): AxlEvent {
+  return ev({
+    schemaVersion: 2,
+    type: 'tool_call_start',
+    agent: 'agent',
+    tool: 'lookup',
+    callId,
+    data: { args: {} },
+    ...ASK,
+  });
+}
+
+function toolEnd(callId = 'c1'): AxlEvent {
+  return ev({
+    schemaVersion: 2,
+    type: 'tool_call_end',
+    agent: 'agent',
+    tool: 'lookup',
+    callId,
+    duration: 1,
+    data: { args: {}, outcome: { status: 'succeeded', result: 'ok' } },
+    ...ASK,
+  });
+}
+
 describe('AxlEventBus — overflow safety net', () => {
   let warnSpy: ReturnType<typeof vi.spyOn>;
 
@@ -172,6 +197,58 @@ describe('AxlEventBus — overflow safety net', () => {
       seen.push(e.type === 'token' ? (e as { data: string }).data : e.type);
     }
     expect(seen).toEqual(['workflow_end', 'b', 'c']);
+  });
+
+  it('retains an end past the cap when its start was already consumed', async () => {
+    const bus = new AxlEventBus({ maxQueued: 1 });
+    const iterator = bus[Symbol.asyncIterator]();
+    const pendingStart = iterator.next();
+    bus._push(toolStart());
+    await expect(pendingStart).resolves.toMatchObject({ value: { type: 'tool_call_start' } });
+
+    bus._push(ev({ type: 'token', data: 'queued', ...ASK }));
+    bus._push(toolEnd());
+    bus._finish();
+
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'token' } });
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'tool_call_end' } });
+  });
+
+  it('drops a queued closed tool pair together when the end crosses the cap', async () => {
+    const bus = new AxlEventBus({ maxQueued: 1 });
+    bus._push(toolStart());
+    bus._push(toolEnd());
+    bus._finish();
+
+    const seen: AxlEvent[] = [];
+    for await (const event of bus) seen.push(event);
+    expect(seen).toEqual([]);
+  });
+
+  it('drops a later end when overflow already evicted its queued start', async () => {
+    const bus = new AxlEventBus({ maxQueued: 1 });
+    bus._push(toolStart());
+    bus._push(ev({ type: 'token', data: 'replacement', ...ASK }));
+    bus._push(toolEnd());
+    bus._finish();
+
+    const seen: AxlEvent[] = [];
+    for await (const event of bus) seen.push(event);
+    expect(seen.map((event) => event.type)).toEqual(['token']);
+  });
+
+  it('suppresses an evicted start end even when an iterator is waiting', async () => {
+    const bus = new AxlEventBus({ maxQueued: 1 });
+    const iterator = bus[Symbol.asyncIterator]();
+    bus._push(toolStart());
+    bus._push(ev({ type: 'token', data: 'replacement', ...ASK }));
+
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'token' } });
+    const waiting = iterator.next();
+    bus._push(toolEnd());
+    bus._finish();
+
+    await expect(waiting).resolves.toEqual({ value: undefined, done: true });
   });
 });
 

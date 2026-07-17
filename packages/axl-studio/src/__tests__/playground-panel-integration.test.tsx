@@ -47,6 +47,7 @@ const fetchAgentsMock = vi.fn();
 vi.mock('../client/lib/api', async () => {
   const actual = await vi.importActual<typeof import('../client/lib/api')>('../client/lib/api');
   return {
+    schemaVersion: 2,
     ...actual,
     fetchAgents: () => fetchAgentsMock(),
     playgroundChat: (msg: string, sid?: string, agent?: string) =>
@@ -177,13 +178,109 @@ describe('PlaygroundPanel integration', () => {
         depth: 0,
         tool: 'getWeather',
         callId: 'c1',
-        data: { args: { city: 'SF' }, result: { tempF: 65 } },
+        data: {
+          args: { city: 'SF' },
+          outcome: { status: 'succeeded', result: { tempF: 65 } },
+        },
       }),
     );
     // Result section appears after tool_call_end.
     expect(screen.getByText('Output:')).toBeInTheDocument();
 
     pushEvent(ev({ type: 'done', data: { result: 'It is 65°F in SF' } }));
+  });
+
+  it('renders failed and rejected tool invocations as terminal rows', async () => {
+    renderWithQuery(<PlaygroundPanel />);
+    await submitMessage('exercise terminal tools');
+    pushEvent(ev({ type: 'token', askId: 'a', depth: 0, agent: 'chat', data: 'Working...' }));
+
+    pushEvent(
+      ev({
+        type: 'tool_call_start',
+        askId: 'a',
+        depth: 0,
+        agent: 'chat',
+        tool: 'lookup',
+        callId: 'failed-call',
+        data: { args: { id: 1 } },
+      }),
+    );
+    pushEvent(
+      ev({
+        type: 'tool_call_end',
+        askId: 'a',
+        depth: 0,
+        agent: 'chat',
+        tool: 'lookup',
+        callId: 'failed-call',
+        duration: 1,
+        data: {
+          args: { id: 1 },
+          outcome: {
+            status: 'failed',
+            failure: {
+              phase: 'handler',
+              kind: 'unexpected',
+              disposition: 'abort',
+              attempts: 1,
+              error: { name: 'Error', message: 'host failure' },
+            },
+          },
+        },
+      }),
+    );
+    pushEvent(
+      ev({
+        type: 'tool_call_rejected',
+        askId: 'a',
+        depth: 0,
+        agent: 'chat',
+        tool: 'missing',
+        callId: 'rejected-call',
+        data: { reason: 'unavailable', requestedTool: 'missing', availableTools: ['lookup'] },
+      }),
+    );
+
+    expect(screen.getAllByText('failed').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('rejected').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText(/Failed in handler: Error/)).toBeInTheDocument();
+    expect(screen.getByText(/Rejected before execution: unavailable/)).toBeInTheDocument();
+  });
+
+  it('renders retained results and orphan terminals honestly', async () => {
+    renderWithQuery(<PlaygroundPanel />);
+    await submitMessage('exercise replay gaps');
+    pushEvent(ev({ type: 'token', askId: 'a', depth: 0, agent: 'chat', data: 'Working...' }));
+
+    pushEvent(
+      ev({
+        type: 'tool_call_end',
+        askId: 'a',
+        depth: 0,
+        agent: 'chat',
+        tool: 'lookup',
+        callId: 'orphan-end',
+        duration: 1,
+        data: {
+          args: { id: 1 },
+          outcome: {
+            status: 'failed',
+            failure: {
+              phase: 'projection',
+              kind: 'output',
+              disposition: 'abort',
+              error: { name: 'Error', message: 'projection failed' },
+              result: { retained: true },
+            },
+          },
+        },
+      }),
+    );
+
+    expect(screen.getByText(/Terminal observed without its matching start/)).toBeInTheDocument();
+    expect(screen.getByText('Output before failure:')).toBeInTheDocument();
+    expect(screen.getByText('"retained"')).toBeInTheDocument();
   });
 
   it('renders handoff source → target after a handoff event', async () => {

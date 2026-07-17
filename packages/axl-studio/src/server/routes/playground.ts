@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import { redactStreamEvent } from '../redact.js';
-import type { AxlEvent } from '@axlsdk/axl';
+import type { AxlEventV2 as AxlEvent } from '@axlsdk/axl';
 
 // Demo schemas keyed by agent name. When the playground UI selects an agent
 // in this map, the chat-bubble render path exercises the spec/17
@@ -98,6 +98,7 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
     (async () => {
       let stepCounter = Number.MAX_SAFE_INTEGER - 1;
       const terminalFields = () => ({
+        schemaVersion: 2 as const,
         executionId,
         step: stepCounter++,
         timestamp: Date.now(),

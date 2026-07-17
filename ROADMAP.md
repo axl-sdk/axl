@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: June 2026
+> Last updated: July 2026
 
 ## Guiding Principles
 
@@ -20,7 +20,7 @@
 - **Tool Middleware** — Approval gates (`requireApproval`) and lifecycle hooks (`before`/`after`)
 - **Model-Facing Tool Output Projection** — Opt-in synchronous `toModelOutput` allowlists the successful post-hook tool result sent to the model while preserving the complete host-observable result. Strict JSON-compatible validation fails closed, `sensitive` takes precedence, configured `AxlTestRuntime.mockTool()` overrides inherit projection policy, and direct/MCP/handoff paths remain unchanged.
 - **Agent Handoffs** — Oneway and roundtrip modes with descriptions, OTel spans, and session history
-- **Unified Event Model** — Single `AxlEvent` discriminated union (replaces the 0.15 `StreamEvent` + `TraceEvent` split). Wire format = trace format. Adds `ask_start`/`ask_end`, `agent_call_start`, `tool_call_start`, ask-graph correlation (`askId`/`parentAskId`/`depth`). `AxlStream.lifecycle` filtered iterable. See [migration guide](docs/migration/unified-event-model.md)
+- **Unified Event Model and v2 Tool Lifecycle** — Single live `AxlEvent` discriminated union with required `schemaVersion: 2`; `ExecutionInfo.eventSchemaVersion` selects the reducer without scanning events, while `HistoricalExecutionInfo` keeps v1 history honest. Provider-issued tools use pre-start `tool_call_rejected` plus one four-state terminal outcome (`succeeded`, `failed`, `denied`, `cancelled`) for accepted calls. Normal returns succeed regardless of an `error` property; explicit `ToolFailure` permits author-declared model-safe recovery. See the [stream-first and tool-lifecycle migration guide](docs/migration/stream-first-observation.md).
 - **Axl Studio** — Local development UI with 8 panels (Playground, Workflows, Traces, Costs, Memory, Sessions, Tools, Evals)
 - **Evaluation Framework** — `dataset()`, `scorer()`, `llmScorer()`, `evalCompare()`, `rescore()`, `aggregateRuns()`, CLI with `compare`, `rescore` subcommands, `--runs` multi-run support
 - **Configurable Model Parameters** — `temperature`, `maxTokens`, `effort`, `thinkingBudget`, `includeThoughts`, `toolChoice`, `stop` on `AgentConfig` and per-call via `AskOptions`
@@ -28,30 +28,9 @@
 - **State Durability & Lifecycle (0.17.7)** — `state.persist: 'streaming'` flushes events during the run via the `StreamingFlusher`; `runtime.recoverIncompleteStreams()` reconstructs partial `ExecutionInfo`s after a crash (live-execution-skip guard, event-cap bound, save-failure preserves buffer, `__axl/recovered` sentinel). `runtime.deleteExecution(id)` is the GDPR right-to-be-forgotten sweep (data + indexes + checkpoints + suspended state + streaming buffer + pending decisions; in-flight resurrection guard; signal-abort propagates to paused `ctx.awaitHuman`). `execution_deleted` runtime event for audit trails. Studio: `DELETE /api/executions/:id` + WS replay buffer scrub. `ExecutionInfo.metadata` lifts caller-supplied tags (`userId`/`tenantId`) into a queryable surface with control-plane key stripping + isolation. `runtime.shutdown()` drains the streaming flusher AND in-flight `persistExecution` chains. See [migration guide](docs/migration/state-store-durability.md).
 - **Redis Production Hardening (0.17.7)** — `RedisStore.create({ keyPrefix, defaultTtl, ttls, skipMigration })` with per-category TTL config (`memory`/`session`/`sessionMeta` sliding, `checkpoint`/`streamingEvents` fixed-creation, `executionHistory`/`evalHistory`/`executionState` fixed-refresh). Every multi-key write atomic via `MULTI/EXEC`. `listExecutions`/`listEvalResults` use sorted-set fast path (reverse `ZRANGE ... BYSCORE` + `MGET`, O(log N), 2× over-fetch for TTL drift). Lazy backfill from legacy SET on startup. `RedisStore` now implements memory methods (race-safe legacy migration). `listPendingExecutions` self-prunes stale ids.
 - **Structured-Output & `ctx.ask` Pipeline Control** — Prompt-guided structured output stays the portable default; the appended JSON Schema is now `$ref`-hoisted + compact + rendered from the schema's input side (order-of-magnitude token cut on large unions, correct for `.transform()`). `schemaPrompt` (`'json-schema'` | `'none'` | `{ render }`) decouples the model-facing prompt from the parse gate; `nativeStructuredOutput` opts into the provider's native `json_schema` (derived from the same Zod schema) with a per-adapter capability tier (`Provider.nativeStructuredOutputSupport`) that warns-and-proceeds when unsupported. Silent cliffs surface as a new `schema_diagnostic` event (oversized / dropped-refinements / streaming-disabled / no-guidance / native-unsupported) plus a bounded one-time `console.warn`. Repair via Zod `.transform()` / `ctx.verify`. Verified live across 8 providers. See [api-reference.md#structured-output](docs/api-reference.md#structured-output).
-- **Stream-First Observation API (Phases 1–2, complete)** — `ctx.events` on every `WorkflowContext` exposes the same `AxlEvent` iterable + curated views as `AxlStream` (`.text`, `.lifecycle`, `.textByAsk`, plus the new `.partialObjects` coalescing view). Observe events between `ctx.ask()` calls inside a workflow handler. Bounded-queue safety net (`maxQueued` + `onOverflow`) shipped on both `AxlStream` and `ctx.events`. `partialObjects` is schema-retry-aware (drops pending on `pipeline(failed)`, surfaces `attempt` to consumers) and recovers latest snapshot for late subscribers via the per-bus `latestPartialByAsk` map. `EventStreamOverflowError` (typed) propagates from strict-mode runs to BOTH the wire-side `AxlStream` bus and the in-handler `ctx.events` bus before the workflow fails. `events: EventStreamOptions` plumbed through `runtime.execute` / `runtime.stream` / `runtime.createContext` / `Session.send` / `Session.stream` / `AxlTestRuntime.execute`. `ctx.events` auto-disposes on signal abort. AbortSignal listeners on long-lived signals are cleaned up on workflow completion. Iterator early-break is a clean `return()`; throwing user listeners are isolated from the workflow. Explicit streaming mode replaces the internal callback sentinel and is inherited by child contexts. The legacy callbacks remain operational for this release but are type-deprecated and warn once per process. See [migration guide](docs/migration/stream-first-observation.md).
+- **Stream-First Observation API (Phases 1–3, complete)** — `ctx.events` on every `WorkflowContext` exposes the same `AxlEvent` iterable + curated views as `AxlStream` (`.text`, `.lifecycle`, `.textByAsk`, plus `.partialObjects`). Bounded queues, strict overflow, explicit streaming mode, signal cleanup, retry-aware views, and event options span every execution surface. The obsolete `onToken`, `onToolCall`, and `onAgentStart` context callbacks are removed; `ctx.events`, `runtime.stream()`, and runtime trace listeners cover context, wire-execution, and cross-execution observation without listener exceptions acting as control flow. See [migration guide](docs/migration/stream-first-observation.md).
 
 ### Planned
-
-#### Tool lifecycle semantics (next major)
-
-Tool execution still carries two inherited ambiguities that should be removed deliberately,
-not patched piecemeal: a normally returned object with an `error` property is treated as a
-failure for after-hook and span purposes, while invalid arguments emit no tool-call pair and
-approval denial or a failing before-hook emit a start without a matching end. Before the next
-major, design an explicit returned-versus-thrown outcome contract and terminal event semantics,
-publish migration guidance, and update tool execution as one coherent breaking change. Until
-then, the current behavior remains compatibility-locked.
-
-#### Stream-First Observation API — Phase 3
-
-Phases 1–2 (above) shipped `ctx.events`, the bounded-queue safety net, explicit
-streaming mode, and callback deprecation. Remaining work:
-
-- **Phase 3.** Remove the callback options at the next major. Audit
-  `packages/axl-studio/src/server/routes/playground.ts` and `tools.ts` for any
-  embed paths that read the callbacks before removing them.
-
-Out of scope (decided): adding `onToken` to `runtime.execute()` / `ExecuteOptions`. That would entrench the callback model in a third place. `runtime.execute()` stays final-result-only by design — observation belongs on `ctx.events` (inside the handler), `stream()` (per-execution), or the runtime trace emitter (cross-execution).
 
 #### Strict-mode native structured output
 

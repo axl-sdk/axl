@@ -65,7 +65,11 @@ const searchCatalog = tool({
 });
 ```
 
-An unredacted `tool_call_end` retains `humanMessage`, `actions`, and `payload` for the application. The model receives only `{"message":"…"}`. Keep critical writes and side effects inside the handler or workflow; events remain a bounded, optionally redacted observation channel rather than a durable delivery queue.
+An unredacted succeeded `tool_call_end.data.outcome.result` retains
+`humanMessage`, `actions`, and `payload` for the application. The model receives
+only `{"message":"…"}`. Keep critical writes and side effects inside the handler
+or workflow; events remain a bounded, optionally redacted observation channel
+rather than a durable delivery queue.
 
 ## Structured Data Extraction
 

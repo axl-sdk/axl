@@ -61,7 +61,10 @@ runtime.on('trace', (event) => {
 
 ### Event types
 
-All events share the `AxlEventBase` shape; `data` and other variant-specific fields are narrowed by `type`. See [api-reference.md](./api-reference.md#axlevent) for the full per-type schemas. The full set of types:
+All live events share the v2 `AxlEventBase` shape, including required
+`schemaVersion: 2`; `data` and other variant-specific fields are narrowed by
+`type`. See [api-reference.md](./api-reference.md#axlevent) for the full per-type
+schemas. The full set of types:
 
 | Type | When emitted | Key `data` fields |
 |------|-------------|-------------------|
@@ -69,9 +72,9 @@ All events share the `AxlEventBase` shape; `data` and other variant-specific fie
 | `ask_start` / `ask_end` | Bound every `ctx.ask()` call (one pair per invocation, including nested). | `prompt` on start; `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration`, and `unpriced?: boolean` on end |
 | `agent_call_start` / `agent_call_end` | Per LLM call (every loop turn of `ctx.ask()`). `_start` fires before the request; `_end` after the response. | `_start` `data`: `prompt`, `system?`, `params`, `turn`, `retryReason?`, `toolNames?`, and `messages?` (full trace only). `_end` `data`: `response`, `thinking?`, `turn`, `retryReason?`. On the error path, `_end` also carries `error` (message), plus `status` + `retryable` when the thrown error was a `ProviderError` (the raw `ProviderError.body` is intentionally **not** emitted — see [security.md](./security.md)) |
 | `token` | Streaming text chunk (stream-only, never persisted to `ExecutionInfo.events`) | `data: string` |
-| `tool_call_start` / `tool_call_end` | Tool invocation lifecycle | `_start` `data`: `args`. `_end` `data`: `args`, `result`, `callId` |
+| `tool_call_rejected` | Unavailable tool, invalid JSON, or invalid local arguments before execution starts; no start/end pair | `reason`, `requestedTool`, plus `availableTools`, generic `message`, or structural `issues` by reason |
+| `tool_call_start` / `tool_call_end` | Accepted tool invocation lifecycle | `_start` `data`: validated `args`, `requestedTool?`. `_end` `data`: same `args`, `requestedTool?`, and discriminated `outcome` (`succeeded`, `failed`, `denied`, `cancelled`) |
 | `tool_approval` | `requireApproval` gate fires — **both** approve and deny | `approved`, `args`, `reason?` |
-| `tool_denied` | Agent tried to call a tool that doesn't exist | `reason`, `args` |
 | `guardrail` | Input or output guardrail runs — pass or fail | `guardrailType`, `blocked`, `reason?`, `attempt?`, `maxAttempts?`, `feedbackMessage?` (output only, on retry) |
 | `schema_check` | Every schema parse on a structured-output call — pass or fail | `valid`, `reason?`, `attempt`, `maxAttempts`, `feedbackMessage?` (on retry) |
 | `validate` | Post-schema business rule validator runs — pass or fail | `valid`, `reason?`, `attempt`, `maxAttempts`, `feedbackMessage?` (on retry) |
@@ -90,6 +93,48 @@ All events share the `AxlEventBase` shape; `data` and other variant-specific fie
 | `done` / `error` | Terminal workflow markers (wrap their payload under `data` — `done.data = { result }`, `error.data = { message, name?, code? }`) | see signatures |
 
 `AxlStream.fullText` commits on `pipeline(committed)` and discards the in-progress buffer on `pipeline(failed)` or `ask_end({ok: false})`, so retried attempts' tokens never leak into the committed text.
+
+### Tool lifecycle outcomes and trace completeness
+
+Tool lifecycle status follows control flow, not user-owned result fields. A
+normally returned `{ error: ... }` is `succeeded`; an explicit `ToolFailure` is
+`failed` with `kind: 'tool_failure'` and `disposition: 'continue'`; an ordinary
+throw is `failed` with `kind: 'unexpected'` and `disposition: 'abort'`. MCP
+`isError` and approval denial also continue the agent loop, while cancellation
+and approval/output infrastructure failures abort it.
+
+`tool_call_end.data.outcome` is the authoritative terminal:
+
+- `succeeded` carries the post-`after` complete host result;
+- `failed.failure` identifies `phase`, `kind`, `disposition`, structured error,
+  and result/attempt count only where one exists;
+- `denied` carries an optional reason and means no hook or handler ran;
+- `cancelled.cancellation` identifies the cancellation phase and retains a raw
+  result only when execution had already produced one.
+
+Failure event details are host observability data, never an implicit provider
+message. Only `ToolFailure.modelMessage`, bounded MCP protocol error content,
+and denial content cross the provider boundary. `trace.redact` scrubs host
+arguments, results, reasons, error messages, and error causes.
+
+For v2 events, pair an accepted call with
+`(executionId, askId, callId)`. Every complete, untruncated trace has one end per
+start with the same canonical tool name. This is not a transactional delivery
+promise: queue overflow, persistence caps, disconnected clients, strict
+listener failure, or process death may omit a terminal from one consumer view.
+Treat an orphan start in such a view as an incomplete trace, not a synthesized
+tool failure.
+
+### Event schema versions and historical traces
+
+All new live `AxlEvent`s have `schemaVersion: 2`, and all new live
+`ExecutionInfo` records have `eventSchemaVersion: 2`. History APIs return
+`HistoricalExecutionInfo`; absent execution/event version metadata is the v1
+sentinel. New writers emit v2 only, while built-in stores and Studio retain a
+dedicated v1 reader for legacy `tool_call_end.data.result`, `tool_denied`, and
+orphan-start semantics. Consumers reading history must narrow the execution
+version before applying a v2 reducer and must not infer v2 outcomes from v1
+shapes.
 
 **`workflow_start` / `workflow_end` are first-class event types as of 0.15.0** — previously emitted as `log` events with `data.event === 'workflow_start'` / `'workflow_end'`. Consumers filtering on the old log-form shape must switch to `event.type === 'workflow_start'` / `'workflow_end'`; `event.workflow` is now top-level, `data` carries `WorkflowStartData { input }` / `WorkflowEndData { status, duration, result?, error?, aborted? }`. `runtime.stream()` now also emits `workflow_start` (was silently omitted). Aborted workflows emit `workflow_end` with `data.aborted: true` so consumers can distinguish cancellation / budget hard-stop from genuine errors without a separate event subscription.
 
@@ -194,9 +239,10 @@ Four ways to observe what happens during a workflow run. Pick by scope:
 
 `runtime.execute()` itself is final-result-only by design — it does **not** accept `onToken` or any other event callback. To observe a workflow run from inside the handler, read `ctx.events`; from outside, use `runtime.stream()` (per-execution) or `runtime.on('trace', …)` (cross-execution).
 
-The legacy `onToken` / `onToolCall` / `onAgentStart` options on
-`runtime.createContext()` are deprecated and warn once per process. Migrate to
-`ctx.events`; see the [stream-first migration guide](migration/stream-first-observation.md).
+The legacy `onToken` / `onToolCall` / `onAgentStart` options have been removed
+from `runtime.createContext()`. Untyped callers receive a targeted migration
+error and the values are never invoked. See the
+[stream-first migration guide](migration/stream-first-observation.md).
 
 #### `ctx.events` — observing between `ctx.ask()` calls
 
@@ -401,15 +447,13 @@ runtime.execute('my-workflow', input, {
 
 Existing 0.x consumers gain the cap automatically with this release. If your workflow somehow relied on unbounded queueing, opt out with `events: { maxQueued: Infinity }`. See the full upgrade notes in [docs/migration/stream-first-observation.md](migration/stream-first-observation.md).
 
-### Migrating streaming callbacks
+### Migrating removed streaming callbacks
 
 The `onToken` / `onToolCall` / `onAgentStart` options on
-`runtime.createContext()` are deprecated. They remain operational for this
-release, but their first use warns once per process and they will be removed in
-the next breaking release. Use `ctx.events` for an ad-hoc context, `AxlStream`
-for a wire consumer, or the runtime trace emitter for cross-execution
-observation. Filter events with `event.depth === 0` to preserve root-only
-behavior, or route nested output by `askId` with `.textByAsk`.
+`runtime.createContext()` no longer exist. Use `ctx.events` for an ad-hoc
+context, `AxlStream` for a wire consumer, or the runtime trace emitter for
+cross-execution observation. Filter events with `event.depth === 0` to preserve
+root-only behavior, or route nested output by `askId` with `.textByAsk`.
 
 The [stream-first migration guide](migration/stream-first-observation.md)
 contains equivalent recipes and the callback-throw behavior change. The
@@ -515,7 +559,8 @@ The filter applies at three layers:
 - `agent_call_end.data`: `response`, `thinking`, `error`
 - `ask_start.prompt` and `ask_end.outcome` (`outcome.result` on success, `outcome.error` on failure)
 - `guardrail` / `schema_check` / `validate`: `reason`, `feedbackMessage`
-- `tool_call_start.data.args`, `tool_call_end.data`: `args`, `result`
+- `tool_call_rejected.data`: rejected `args`, issue `message`, and invalid-JSON `message`
+- `tool_call_start.data.args`; `tool_call_end.data`: `args`, every outcome `result`, denial/cancellation `reason`, and failure `error.message`/`error.cause`
 - `tool_approval.data`: `args`, `reason`
 - `handoff_start.data.message` (roundtrip handoffs only — `handoff_return` carries no user/LLM content)
 - `workflow_start.data.input`, `workflow_end.data.result`/`error`
@@ -538,7 +583,8 @@ The filter applies at three layers:
 **3. Studio WebSocket broadcasts** — for streaming endpoints (playground, workflow execute with `stream: true`) **and** the trace firehose (`trace:*` channels). Scrubs the new `AxlEvent` variants directly via `redactStreamEvent`:
 
 - `token.data` — streaming LLM output
-- `tool_call_start.data.args`, `tool_call_end.data.args`/`result`
+- `tool_call_rejected.data.args`/diagnostic messages
+- `tool_call_start.data.args`; `tool_call_end.data.args`, outcome results/reasons, and failure error details
 - `tool_approval.data.args`/`.reason`
 - `ask_start.prompt`, `ask_end.outcome`
 - `done.data.result`, `error.data.message`
@@ -617,7 +663,7 @@ Every `ctx.*` primitive emits a span. Spans nest naturally: a workflow span cont
 |-----------|------------|
 | `axl.workflow.execute` | `axl.workflow.name`, `axl.workflow.duration`, `axl.workflow.cost` |
 | `axl.agent.ask` | `axl.agent.name`, `axl.agent.model`, `axl.agent.prompt_tokens`, `axl.agent.completion_tokens`, `axl.agent.cost` |
-| `axl.tool.call` | `axl.tool.name`, `axl.tool.duration`, `axl.tool.success` |
+| `axl.tool.call` | `axl.tool.name`, `axl.tool.duration`, `axl.tool.outcome`, `axl.tool.success`, `axl.tool.phase` (failed/cancelled) |
 | `axl.ctx.spawn` | `axl.spawn.count`, `axl.spawn.quorum`, `axl.spawn.completed` |
 | `axl.ctx.race` | `axl.race.participants`, `axl.race.winner` |
 | `axl.ctx.vote` | `axl.vote.strategy`, `axl.vote.result` |
@@ -625,6 +671,14 @@ Every `ctx.*` primitive emits a span. Spans nest naturally: a workflow span cont
 | `axl.ctx.awaitHuman` | `axl.awaitHuman.channel`, `axl.awaitHuman.wait_duration` |
 | `axl.tool.approval` | `axl.tool.name`, `axl.tool.approval.approved` |
 | `axl.agent.handoff` | `axl.handoff.source`, `axl.handoff.target`, `axl.handoff.mode` |
+
+Tool span status derives from the terminal control-flow outcome: `succeeded` is
+OTel `OK`; `failed` and `cancelled` are `ERROR`; `denied` is `UNSET` with
+`axl.tool.outcome = 'denied'`. Pre-start rejections do not create a dedicated
+tool span. Raw arguments, results, denial reasons, and error messages are never
+span attributes. Axl-generated span status descriptions are also intentionally
+empty on errors; use the host error channel or redacted lifecycle event for
+diagnostics rather than exporting exception text through OTel.
 
 ### Cost-Per-Span
 
@@ -702,7 +756,16 @@ console.log(`Recovered ${recovered.length} crashed executions`);
 
 **Scope.** Only `runtime.execute()` / `runtime.stream()` flush to the buffer. `runtime.createContext()` ad-hoc contexts (Studio playground, tool tests, evals) are deliberately excluded — they have no terminal finalize path, so allowing them to write would leave phantom orphans for `recoverIncompleteStreams()` to mis-recover on every restart.
 
-**Recovered execution shape.** Synthesized `ExecutionInfo` carries `status: 'failed'`, `error: 'process terminated (recovered from streaming buffer)'`, and `workflow: '__axl/recovered'` when the buffer is missing a `workflow_start` event. The events array is bounded by `state.maxEventsPerExecution` (default 50k) — a crashed run with 500k events doesn't resurrect as an unbounded ExecutionInfo. Consumers consuming `getExecutions()` should be aware these can appear; filter on the `__axl/` workflow prefix if you want to exclude recovered runs from dashboards.
+**Recovered execution shape.** The synthesized `HistoricalExecutionInfo` keeps
+the streaming buffer's event schema version; it does not upgrade v1 events or
+invent missing tool terminals. It carries `status: 'failed'`,
+`error: 'process terminated (recovered from streaming buffer)'`, and
+`workflow: '__axl/recovered'` when the buffer is missing a `workflow_start`
+event. The events array is bounded by `state.maxEventsPerExecution` (default
+50k) — a crashed run with 500k events doesn't resurrect as an unbounded
+execution. Consumers reading `getExecutions()` should narrow
+`eventSchemaVersion` and can filter on the `__axl/` workflow prefix to exclude
+recovered runs from dashboards.
 
 **Safety contracts:**
 - Recovery skips ids actively running in the current process (prevents corrupting a live workflow).

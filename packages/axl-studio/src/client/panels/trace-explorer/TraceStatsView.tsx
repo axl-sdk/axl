@@ -18,6 +18,7 @@ const RETRY_COLORS = {
 const EVENT_TYPE_COLORS: Record<string, string> = {
   agent_call: '#3b82f6', // blue
   tool_call: '#10b981', // emerald
+  tool_call_rejected: '#ef4444', // red
   tool_approval: '#14b8a6', // teal
   tool_denied: '#ef4444', // red
   workflow_start: '#8b5cf6', // violet
@@ -54,7 +55,9 @@ export function TraceStatsView() {
   }
 
   const eventTypes = Object.entries(stats.eventTypeCounts).sort(([, a], [, b]) => b - a);
-  const tools = Object.entries(stats.byTool).sort(([, a], [, b]) => b.calls - a.calls);
+  const tools = Object.entries(stats.byTool).sort(
+    ([, a], [, b]) => b.accepted + b.legacy.calls - (a.accepted + a.legacy.calls),
+  );
   const retries = Object.entries(stats.retryByAgent).filter(
     ([, r]) => r.schema + r.validate + r.guardrail > 0,
   );
@@ -67,10 +70,12 @@ export function TraceStatsView() {
   }));
 
   // Top-N tool calls bar chart
-  const toolBars = tools.map(([name, data]) => ({
-    label: name,
-    value: data.calls,
-  }));
+  const toolBars = tools
+    .filter(([, data]) => data.accepted > 0)
+    .map(([name, data]) => ({
+      label: name,
+      value: data.accepted,
+    }));
 
   // Retry-by-agent stacked bar
   const retryStacks = retries.map(([agent, r]) => ({
@@ -110,19 +115,65 @@ export function TraceStatsView() {
         {/* Top tools */}
         <div className="rounded-xl border border-[hsl(var(--border))] p-4">
           <h4 className="text-sm font-medium mb-3">
-            Tool Calls{' '}
-            {tools.length > 10 && (
+            Accepted Tool Calls{' '}
+            {toolBars.length > 10 && (
               <span className="text-[10px] text-[hsl(var(--muted-foreground))]">(top 10)</span>
             )}
           </h4>
-          {tools.length === 0 ? (
+          {toolBars.length === 0 ? (
             <p className="text-xs text-[hsl(var(--muted-foreground))]">
-              No tool activity in window
+              No accepted v2 tool calls in window
             </p>
           ) : (
             <BarChart data={toolBars} maxBars={10} />
           )}
         </div>
+
+        {tools.some(
+          ([, d]) => d.succeeded + d.failed + d.denied + d.cancelled + d.rejected > 0,
+        ) && (
+          <div className="lg:col-span-2 rounded-xl border border-[hsl(var(--border))] p-4">
+            <h4 className="text-sm font-medium mb-3">Tool Lifecycle Outcomes (v2)</h4>
+            <StackedBarChart
+              data={tools
+                .filter(([, d]) => d.succeeded + d.failed + d.denied + d.cancelled + d.rejected > 0)
+                .map(([name, d]) => ({
+                  label: name,
+                  segments: [
+                    { name: 'succeeded', value: d.succeeded, color: '#10b981' },
+                    { name: 'failed', value: d.failed, color: '#ef4444' },
+                    { name: 'denied', value: d.denied, color: '#dc2626' },
+                    { name: 'cancelled', value: d.cancelled, color: '#f59e0b' },
+                    { name: 'rejected', value: d.rejected, color: '#be123c' },
+                  ].filter((segment) => segment.value > 0),
+                }))}
+              formatValue={(value) => value.toString()}
+            />
+          </div>
+        )}
+
+        {tools.some(([, d]) => d.legacy.calls + d.legacy.approved + d.legacy.denied > 0) && (
+          <div className="lg:col-span-2 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
+            <h4 className="text-sm font-medium mb-1">Legacy Tool Lifecycle (v1)</h4>
+            <p className="text-xs text-[hsl(var(--muted-foreground))] mb-3">
+              Historical call, approval, and denial counts are kept separate because v1 did not
+              record the v2 terminal outcome union.
+            </p>
+            <StackedBarChart
+              data={tools
+                .filter(([, d]) => d.legacy.calls + d.legacy.approved + d.legacy.denied > 0)
+                .map(([name, d]) => ({
+                  label: name,
+                  segments: [
+                    { name: 'legacy calls', value: d.legacy.calls, color: '#64748b' },
+                    { name: 'legacy approved', value: d.legacy.approved, color: '#059669' },
+                    { name: 'legacy denied', value: d.legacy.denied, color: '#b91c1c' },
+                  ].filter((segment) => segment.value > 0),
+                }))}
+              formatValue={(value) => value.toString()}
+            />
+          </div>
+        )}
 
         {/* Retry breakdown */}
         {retries.length > 0 && (

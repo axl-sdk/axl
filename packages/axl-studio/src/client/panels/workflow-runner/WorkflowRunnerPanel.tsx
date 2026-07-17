@@ -406,7 +406,11 @@ export function WorkflowRunnerPanel() {
                           )}
                         </div>
                       ) : (
-                        <TraceEventList events={timelineEvents} maxDuration={maxDuration} />
+                        <TraceEventList
+                          events={timelineEvents}
+                          maxDuration={maxDuration}
+                          traceComplete={stream.done || stream.interrupted}
+                        />
                       )}
                     </div>
                   )}

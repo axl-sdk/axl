@@ -45,7 +45,9 @@ import { getEventSchemaVersion } from './event-schema.js';
 
 export const REDACTED = '[redacted]';
 
-/** Type-safe rule signature: takes a specific event variant, returns the same variant. */
+type LegacyEventType = LegacyAxlEventV1['type'];
+type LegacyEventOf<T extends LegacyEventType> = Extract<LegacyAxlEventV1, { type: T }>;
+type LegacyRuleFor<T extends LegacyEventType> = (event: LegacyEventOf<T>) => LegacyEventOf<T>;
 type RuleFor<T extends AxlEventType> = (event: AxlEventOf<T>) => AxlEventOf<T>;
 
 /**
@@ -93,8 +95,8 @@ const MEMORY_PRESERVE_KEYS: ReadonlySet<string> = new Set(['scope']);
 
 /** Shared rule for the legacy gate events (`guardrail` / `schema_check` / `validate`). */
 function redactGate<T extends 'guardrail' | 'schema_check' | 'validate'>(
-  event: AxlEventOf<T>,
-): AxlEventOf<T> {
+  event: LegacyEventOf<T>,
+): LegacyEventOf<T> {
   const d = (event as { data?: { reason?: string; feedbackMessage?: string } }).data;
   if (!d) return event;
   if (d.reason === undefined && d.feedbackMessage === undefined) return event;
@@ -105,23 +107,23 @@ function redactGate<T extends 'guardrail' | 'schema_check' | 'validate'>(
       ...(d.reason !== undefined ? { reason: REDACTED } : {}),
       ...(d.feedbackMessage !== undefined ? { feedbackMessage: REDACTED } : {}),
     },
-  } as AxlEventOf<T>;
+  } as LegacyEventOf<T>;
 }
 
 /** Shared rule for the three `memory_*` events. */
 function redactMemory<T extends 'memory_remember' | 'memory_recall' | 'memory_forget'>(
-  event: AxlEventOf<T>,
-): AxlEventOf<T> {
+  event: LegacyEventOf<T>,
+): LegacyEventOf<T> {
   const d = (event as { data?: Record<string, unknown> }).data;
   if (!d || typeof d !== 'object') return event;
   return {
     ...event,
     data: walkObjectOneLevel(d, MEMORY_PRESERVE_KEYS),
-  } as AxlEventOf<T>;
+  } as LegacyEventOf<T>;
 }
 
 /** Identity helper — used for variants that carry no user content. */
-const passthrough = <T extends AxlEventType>(e: AxlEventOf<T>): AxlEventOf<T> => e;
+const passthrough = <T extends LegacyEventType>(e: LegacyEventOf<T>): LegacyEventOf<T> => e;
 
 /**
  * Per-variant rule table. Adding a new variant to `AXL_EVENT_TYPES`
@@ -133,7 +135,7 @@ const passthrough = <T extends AxlEventType>(e: AxlEventOf<T>): AxlEventOf<T> =>
  * that's still an explicit, reviewed decision rather than a
  * silent omission.
  */
-export const REDACTION_RULES: { [K in AxlEventType]: RuleFor<K> } = {
+const LEGACY_REDACTION_RULES: { [K in LegacyEventType]: LegacyRuleFor<K> } = {
   workflow_start: (e) =>
     e.data.input !== undefined ? { ...e, data: { ...e.data, input: REDACTED } } : e,
   workflow_end: (e) => {
@@ -193,10 +195,10 @@ export const REDACTION_RULES: { [K in AxlEventType]: RuleFor<K> } = {
       },
     };
   },
-  delegate: passthrough as unknown as RuleFor<'delegate'>,
+  delegate: passthrough as unknown as LegacyRuleFor<'delegate'>,
   handoff_start: (e) =>
     e.data.message !== undefined ? { ...e, data: { ...e.data, message: REDACTED } } : e,
-  handoff_return: passthrough as unknown as RuleFor<'handoff_return'>,
+  handoff_return: passthrough as unknown as LegacyRuleFor<'handoff_return'>,
   pipeline: (e) => (e.status === 'failed' ? { ...e, reason: REDACTED } : e),
   partial_object: (e) => ({ ...e, data: { ...e.data, object: REDACTED } }),
   // `path` is structural (schema-shape, no PII); `delta` is user content.
@@ -208,16 +210,16 @@ export const REDACTION_RULES: { [K in AxlEventType]: RuleFor<K> } = {
   // thresholds, JSON-Schema field paths, a root type name, a tool name — none of
   // which is user content or PII (field paths are schema-shape, preserved like
   // `string_delta.path`). Passthrough, as an explicit reviewed decision.
-  schema_diagnostic: passthrough as unknown as RuleFor<'schema_diagnostic'>,
+  schema_diagnostic: passthrough as unknown as LegacyRuleFor<'schema_diagnostic'>,
   log: (e) => {
     if (!e.data || typeof e.data !== 'object' || Array.isArray(e.data)) return e;
     return { ...e, data: walkObjectOneLevel(e.data as Record<string, unknown>, LOG_PRESERVE_KEYS) };
   },
-  memory_remember: redactMemory as unknown as RuleFor<'memory_remember'>,
-  memory_recall: redactMemory as unknown as RuleFor<'memory_recall'>,
-  memory_forget: redactMemory as unknown as RuleFor<'memory_forget'>,
-  checkpoint_save: passthrough as unknown as RuleFor<'checkpoint_save'>,
-  checkpoint_replay: passthrough as unknown as RuleFor<'checkpoint_replay'>,
+  memory_remember: redactMemory as unknown as LegacyRuleFor<'memory_remember'>,
+  memory_recall: redactMemory as unknown as LegacyRuleFor<'memory_recall'>,
+  memory_forget: redactMemory as unknown as LegacyRuleFor<'memory_forget'>,
+  checkpoint_save: passthrough as unknown as LegacyRuleFor<'checkpoint_save'>,
+  checkpoint_replay: passthrough as unknown as LegacyRuleFor<'checkpoint_replay'>,
   await_human: (e) =>
     e.data.prompt !== undefined ? { ...e, data: { ...e.data, prompt: REDACTED } } : e,
   await_human_resolved: (e) => {
@@ -231,9 +233,9 @@ export const REDACTION_RULES: { [K in AxlEventType]: RuleFor<K> } = {
     if (hasReason) (scrubbed as { reason?: string }).reason = REDACTED;
     return { ...e, data: { ...e.data, decision: scrubbed } };
   },
-  guardrail: redactGate as unknown as RuleFor<'guardrail'>,
-  schema_check: redactGate as unknown as RuleFor<'schema_check'>,
-  validate: redactGate as unknown as RuleFor<'validate'>,
+  guardrail: redactGate as unknown as LegacyRuleFor<'guardrail'>,
+  schema_check: redactGate as unknown as LegacyRuleFor<'schema_check'>,
+  validate: redactGate as unknown as LegacyRuleFor<'validate'>,
   done: (e) => ({ ...e, data: { result: REDACTED } }),
   error: (e) => ({ ...e, data: { ...e.data, message: REDACTED } }),
 };
@@ -247,8 +249,8 @@ export const REDACTION_RULES: { [K in AxlEventType]: RuleFor<K> } = {
  * `WorkflowContext.emitEvent` (core) and `redactStreamEvent` (Studio)
  * check the flag before calling this function.
  */
-export function redactEvent(event: AxlEvent): AxlEvent {
-  const rule = REDACTION_RULES[event.type] as RuleFor<typeof event.type>;
+function redactLegacyEvent(event: LegacyAxlEventV1): LegacyAxlEventV1 {
+  const rule = LEGACY_REDACTION_RULES[event.type] as LegacyRuleFor<typeof event.type>;
   return rule(event as never);
 }
 
@@ -328,19 +330,60 @@ const V2_TOOL_REDACTION_RULES: { [K in V2ToolEventType]: V2ToolRule<K> } = {
   }),
 };
 
+type CommonV2EventType = Exclude<AxlEventType, V2ToolEventType>;
+
+function reuseLegacyRule<T extends CommonV2EventType>(type: T): RuleFor<T> {
+  return LEGACY_REDACTION_RULES[type as LegacyEventType] as unknown as RuleFor<T>;
+}
+
+const COMMON_V2_REDACTION_RULES = {
+  workflow_start: reuseLegacyRule('workflow_start'),
+  workflow_end: reuseLegacyRule('workflow_end'),
+  ask_start: reuseLegacyRule('ask_start'),
+  ask_end: reuseLegacyRule('ask_end'),
+  agent_call_start: reuseLegacyRule('agent_call_start'),
+  agent_call_end: reuseLegacyRule('agent_call_end'),
+  token: reuseLegacyRule('token'),
+  tool_approval: reuseLegacyRule('tool_approval'),
+  delegate: reuseLegacyRule('delegate'),
+  handoff_start: reuseLegacyRule('handoff_start'),
+  handoff_return: reuseLegacyRule('handoff_return'),
+  pipeline: reuseLegacyRule('pipeline'),
+  partial_object: reuseLegacyRule('partial_object'),
+  string_delta: reuseLegacyRule('string_delta'),
+  verify: reuseLegacyRule('verify'),
+  schema_diagnostic: reuseLegacyRule('schema_diagnostic'),
+  log: reuseLegacyRule('log'),
+  memory_remember: reuseLegacyRule('memory_remember'),
+  memory_recall: reuseLegacyRule('memory_recall'),
+  memory_forget: reuseLegacyRule('memory_forget'),
+  checkpoint_save: reuseLegacyRule('checkpoint_save'),
+  checkpoint_replay: reuseLegacyRule('checkpoint_replay'),
+  await_human: reuseLegacyRule('await_human'),
+  await_human_resolved: reuseLegacyRule('await_human_resolved'),
+  guardrail: reuseLegacyRule('guardrail'),
+  schema_check: reuseLegacyRule('schema_check'),
+  validate: reuseLegacyRule('validate'),
+  done: reuseLegacyRule('done'),
+  error: reuseLegacyRule('error'),
+} satisfies { [K in CommonV2EventType]: RuleFor<K> };
+
+/** Current-writer redaction rules. The mapped type makes every live event
+ * discriminator an explicit compile-time redaction decision. */
+export const REDACTION_RULES = {
+  ...COMMON_V2_REDACTION_RULES,
+  ...V2_TOOL_REDACTION_RULES,
+} satisfies { [K in AxlEventType]: RuleFor<K> };
+
+export function redactEvent(event: AxlEvent): AxlEvent {
+  const rule = REDACTION_RULES[event.type] as RuleFor<typeof event.type>;
+  return rule(event as never);
+}
+
 /** Redact either persisted schema without reinterpreting its lifecycle. */
 export function redactHistoricalEvent(event: HistoricalAxlEvent): HistoricalAxlEvent {
-  if (getEventSchemaVersion(event) === 1) return redactEvent(event as LegacyAxlEventV1);
-
-  const v2Event = event as AxlEventV2;
-  switch (v2Event.type) {
-    case 'tool_call_start':
-      return V2_TOOL_REDACTION_RULES.tool_call_start(v2Event);
-    case 'tool_call_end':
-      return V2_TOOL_REDACTION_RULES.tool_call_end(v2Event);
-    case 'tool_call_rejected':
-      return V2_TOOL_REDACTION_RULES.tool_call_rejected(v2Event);
+  if (getEventSchemaVersion(event) === 1) {
+    return redactLegacyEvent(event as LegacyAxlEventV1);
   }
-
-  return redactEvent(v2Event as unknown as LegacyAxlEventV1) as unknown as AxlEventV2;
+  return redactEvent(event as AxlEventV2);
 }

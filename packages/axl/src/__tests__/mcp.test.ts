@@ -457,7 +457,7 @@ describe('MCP integration with WorkflowContext', () => {
     expect(toolMsg.content).toContain('Result from read_file');
   });
 
-  it('converts malformed resolved MCP content into the legacy continued error outcome', async () => {
+  it('records malformed resolved MCP content as an unexpected failure and aborts', async () => {
     const { manager, mocks } = createMockManager([
       {
         name: 'fs-server',
@@ -502,12 +502,73 @@ describe('MCP integration with WorkflowContext', () => {
       mcp: ['fs-server'],
     });
 
-    await expect(ctx.ask(agentWithMcp, 'Read a file')).resolves.toBe('recovered');
+    await expect(ctx.ask(agentWithMcp, 'Read a file')).rejects.toThrow('malformed MCP content');
 
-    const toolMessage = provider.calls[1].messages.find((message: any) => message.role === 'tool');
-    expect(toolMessage.content).toBe('{"error":"malformed MCP content"}');
+    expect(provider.calls).toHaveLength(1);
     expect(traces.filter((event) => event.type === 'tool_call_start')).toHaveLength(1);
     expect(traces.filter((event) => event.type === 'tool_call_end')).toHaveLength(1);
+    expect(traces.find((event) => event.type === 'tool_call_end')).toMatchObject({
+      data: {
+        outcome: {
+          status: 'failed',
+          failure: { phase: 'serialization', kind: 'output', disposition: 'abort' },
+        },
+      },
+    });
+  });
+
+  it('continues after MCP isError with a typed failed terminal outcome', async () => {
+    const { manager, mocks } = createMockManager([
+      {
+        name: 'fs-server',
+        tools: [{ name: 'read_file', description: 'Read a file', inputSchema: { type: 'object' } }],
+      },
+    ]);
+    mocks[0].callTool = vi.fn(async () => ({
+      content: [{ type: 'text', text: 'permission denied' }],
+      isError: true,
+    }));
+    const provider = new TestProvider([
+      {
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_mcp_error',
+            type: 'function',
+            function: { name: 'read_file', arguments: '{}' },
+          },
+        ],
+      },
+      { content: 'recovered' },
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerInstance('test', provider as any);
+    const traces: any[] = [];
+    const ctx = new WorkflowContext({
+      input: 'test',
+      executionId: 'mcp-error-result',
+      config: { defaultProvider: 'test' },
+      providerRegistry: registry,
+      onTrace: (event) => traces.push(event),
+      mcpManager: manager,
+    });
+    const agentWithMcp = agent({
+      model: 'test:test-model',
+      system: 'You are a test agent',
+      mcp: ['fs-server'],
+    });
+
+    await expect(ctx.ask(agentWithMcp, 'Read a file')).resolves.toBe('recovered');
+    const toolMessage = provider.calls[1].messages.find((message: any) => message.role === 'tool');
+    expect(toolMessage.content).toBe('MCP tool error: permission denied');
+    expect(traces.find((event) => event.type === 'tool_call_end')).toMatchObject({
+      data: {
+        outcome: {
+          status: 'failed',
+          failure: { phase: 'handler', kind: 'mcp_error', disposition: 'continue' },
+        },
+      },
+    });
   });
 
   it('mcpTools restriction limits available tools', async () => {

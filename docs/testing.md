@@ -103,7 +103,7 @@ axl.mockProvider('openai', MockProvider.replay('./snapshots/support.json'));
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `.toolCalls(name?)` | `ToolCall[]` | All tool calls made, optionally filtered by tool name. |
+| `.toolCalls(name?)` | `RecordedToolCall[]` | Accepted tool calls recorded from their terminal v2 events, optionally filtered by canonical tool name. |
 | `.agentCalls(name?)` | `AgentCall[]` | All LLM calls made, optionally filtered by agent name. |
 | `.totalCost()` | `number` | Total cost incurred (0 if mocked). |
 | `.steps()` | `RecordedStep[]` | All workflow steps in execution order (test-runtime-internal recording). |
@@ -115,6 +115,34 @@ Filter `traceLog()` results with the unified event tag names:
 const agentCalls = runtime.traceLog().filter((e) => e.type === 'agent_call_end');
 const toolCalls = runtime.traceLog().filter((e) => e.type === 'tool_call_end');
 ```
+
+`RecordedToolCall` carries `name`, `args`, `outcome`, and the complete
+`(executionId, askId, callId)` correlation key. Narrow the discriminated outcome
+before reading status-specific fields; failed, denied, and pre-result cancelled
+calls do not invent a `result`:
+
+```typescript
+const [call] = runtime.toolCalls('get_order');
+
+if (call.outcome.status === 'succeeded') {
+  expect(call.outcome.result).toEqual({ id: '123', status: 'delivered' });
+} else {
+  throw new Error(`Expected get_order to succeed, got ${call.outcome.status}`);
+}
+```
+
+Pre-start rejections are not accepted calls, so inspect `.traceLog()` for them:
+
+```typescript
+const rejected = runtime
+  .traceLog()
+  .filter((event) => event.type === 'tool_call_rejected');
+expect(rejected[0]?.data.reason).toBe('invalid_arguments');
+```
+
+In a complete, non-overflowed test trace, assert one end per start by the full
+correlation key rather than by tool name. Deliberately capped or interrupted
+streams may be incomplete and should not manufacture a terminal outcome.
 
 ## Testing observability — `ctx.events`, `partialObjects`, overflow
 
@@ -218,7 +246,7 @@ axl.mockTool('get_order', async ({ orderId }) => ({ id: orderId, status: 'delive
 const result = await axl.execute('HandleSupport', { msg: 'Refund please' });
 ```
 
-When the mocked name matches a configured local tool, the mock still bypasses the configured schema, approval, retry, hooks, and real handler. The configured tool contributes only its model-output policy: `sensitive` and `toModelOutput`. This lets a test return the same complete application artifact the host would render while asserting the smaller tool message the provider receives:
+When the mocked name matches a configured local tool, the mock still bypasses the configured schema, approval, retry, hooks, and real handler. Provider arguments must still be valid JSON because parsing belongs to the agent-call boundary, before the mock is selected. The configured tool contributes only its model-output policy: `sensitive` and `toModelOutput`. This lets a test return the same complete application artifact the host would render while asserting the smaller tool message the provider receives:
 
 ```typescript
 import { agent, tool, workflow } from '@axlsdk/axl';
@@ -267,15 +295,27 @@ axl.mockTool('get_order', () => ({
 
 await axl.execute('ProjectedSupport', { msg: 'Check order 123' });
 
-expect(axl.toolCalls('get_order')[0].result).toEqual({
-  humanMessage: 'Ready for pickup',
-  internalId: 'host-only-123',
+const [call] = axl.toolCalls('get_order');
+expect(call.outcome).toEqual({
+  status: 'succeeded',
+  result: {
+    humanMessage: 'Ready for pickup',
+    internalId: 'host-only-123',
+  },
 });
 expect(provider.calls[1].messages.find((m) => m.role === 'tool')?.content)
   .toBe('{"message":"Ready for pickup"}');
 ```
 
-A thrown mock bypasses projection; a normally returned error-shaped value may be projected. A configured sensitive mock always sends the fixed redaction marker and never invokes its mapper. An override whose name is not in the agent's configured tools keeps legacy serialization. Use `config: { trace: { level: 'full' } }` when asserting that the next `agent_call_start.data.messages` snapshot contains the projected content.
+A normally returned error-shaped value is a successful result and may be
+projected. A thrown `ToolFailure` bypasses projection, records
+`failed / handler / tool_failure`, and continues with its model-safe message; an
+ordinary throw records `failed / handler / unexpected` and aborts the ask. A
+configured sensitive mock always sends the fixed redaction marker on success
+and never invokes its mapper. An override whose name is not in the agent's
+configured tools keeps normal JSON serialization. Use
+`config: { trace: { level: 'full' } }` when asserting that the next
+`agent_call_start.data.messages` snapshot contains the projected content.
 
 This design means you never need a separate "test mode" for individual primitives. If your workflow uses `ctx.budget()` wrapping `ctx.spawn()` with `ctx.vote()`, all of that runs as-is in tests — only the LLM and tool I/O are mocked.
 

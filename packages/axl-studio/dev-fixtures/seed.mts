@@ -15,7 +15,7 @@
  *                              memory, creates sessions, runs the qa-eval
  *                              cohort story (3 model upgrades over 10 days).
  */
-import type { AxlRuntime, AxlEvent } from '@axlsdk/axl';
+import type { AxlRuntime, AxlEvent, HistoricalExecutionInfo } from '@axlsdk/axl';
 import { runEval } from '@axlsdk/eval';
 import type { EvalConfig, EvalResult, EvalItem, EvalSummary } from '@axlsdk/eval';
 
@@ -32,7 +32,11 @@ export async function seedHistorical(runtime: AxlRuntime): Promise<void> {
   const store = runtime.getStateStore();
   const workflows = ['qa-workflow', 'research-workflow', 'rag-workflow', 'unreliable-workflow'];
   const agents = ['qa-agent', 'research-agent', 'qa-agent-upgraded'];
-  const models = ['openai-responses:gpt-5.4', 'openai-responses:gpt-5.5', 'openai-responses:gpt-5-mini'];
+  const models = [
+    'openai-responses:gpt-5.4',
+    'openai-responses:gpt-5.5',
+    'openai-responses:gpt-5-mini',
+  ];
   let counter = 0;
   const saves: Array<Promise<unknown>> = [];
 
@@ -65,6 +69,7 @@ export async function seedHistorical(runtime: AxlRuntime): Promise<void> {
 
       const events = [
         {
+          schemaVersion: 2 as const,
           type: 'workflow_start' as const,
           executionId: execId,
           step: 0,
@@ -73,6 +78,7 @@ export async function seedHistorical(runtime: AxlRuntime): Promise<void> {
           data: { input: {} },
         },
         {
+          schemaVersion: 2 as const,
           type: 'agent_call_end' as const,
           executionId: execId,
           step: 1,
@@ -93,6 +99,7 @@ export async function seedHistorical(runtime: AxlRuntime): Promise<void> {
           },
         },
         {
+          schemaVersion: 2 as const,
           type: 'workflow_end' as const,
           executionId: execId,
           step: 2,
@@ -107,6 +114,7 @@ export async function seedHistorical(runtime: AxlRuntime): Promise<void> {
 
       const saved = store.saveExecution?.({
         executionId: execId,
+        eventSchemaVersion: 2,
         workflow,
         status,
         events: events as unknown as AxlEvent[],
@@ -120,27 +128,224 @@ export async function seedHistorical(runtime: AxlRuntime): Promise<void> {
     }
   }
 
+  const lifecycleStartedAt = Date.now() - 60_000;
+  const v2Base = {
+    schemaVersion: 2 as const,
+    executionId: 'tool-lifecycle-v2-demo',
+    timestamp: lifecycleStartedAt,
+    workflow: 'tool-lifecycle-v2-demo',
+    askId: 'tool-lifecycle-v2-ask',
+    depth: 0,
+    agent: 'tool-lifecycle-demo-agent',
+  };
+  const v2Events: AxlEvent[] = [
+    {
+      schemaVersion: 2,
+      executionId: v2Base.executionId,
+      step: 0,
+      timestamp: lifecycleStartedAt,
+      workflow: v2Base.workflow,
+      type: 'workflow_start',
+      data: { input: {} },
+    },
+    ...(
+      [
+        {
+          callId: 'demo-succeeded',
+          outcome: { status: 'succeeded', result: { answer: 42 } },
+        },
+        {
+          callId: 'demo-failed',
+          outcome: {
+            status: 'failed',
+            failure: {
+              phase: 'projection',
+              kind: 'output',
+              disposition: 'abort',
+              error: { name: 'ToolModelOutputError', message: 'Projection failed' },
+              result: { hostOnly: true },
+            },
+          },
+        },
+        { callId: 'demo-denied', outcome: { status: 'denied', reason: 'Operator denied' } },
+        {
+          callId: 'demo-cancelled',
+          outcome: {
+            status: 'cancelled',
+            cancellation: {
+              phase: 'after_handler',
+              reason: 'Execution cancelled',
+              result: { completedBeforeCancel: true },
+            },
+          },
+        },
+      ] as const
+    ).flatMap(({ callId, outcome }, index) => [
+      {
+        ...v2Base,
+        step: index * 2 + 1,
+        timestamp: lifecycleStartedAt + index * 20 + 1,
+        type: 'tool_call_start' as const,
+        tool: 'demo_tool',
+        callId,
+        data: { args: { scenario: outcome.status } },
+      },
+      {
+        ...v2Base,
+        step: index * 2 + 2,
+        timestamp: lifecycleStartedAt + index * 20 + 2,
+        type: 'tool_call_end' as const,
+        tool: 'demo_tool',
+        callId,
+        duration: 1,
+        data: { args: { scenario: outcome.status }, outcome },
+      },
+    ]),
+    {
+      ...v2Base,
+      step: 9,
+      timestamp: lifecycleStartedAt + 90,
+      type: 'tool_call_rejected',
+      tool: 'missing_tool',
+      callId: 'demo-rejected',
+      data: {
+        reason: 'unavailable',
+        requestedTool: 'missing_tool',
+        availableTools: ['demo_tool'],
+      },
+    },
+    {
+      schemaVersion: 2,
+      executionId: v2Base.executionId,
+      step: 10,
+      timestamp: lifecycleStartedAt + 100,
+      workflow: v2Base.workflow,
+      type: 'workflow_end',
+      data: { status: 'completed', duration: 100, result: 'seeded lifecycle outcomes' },
+    },
+  ];
+  const lifecycleExecutions: HistoricalExecutionInfo[] = [
+    {
+      executionId: v2Base.executionId,
+      eventSchemaVersion: 2,
+      workflow: v2Base.workflow,
+      status: 'completed',
+      events: v2Events,
+      totalCost: 0,
+      startedAt: lifecycleStartedAt,
+      completedAt: lifecycleStartedAt + 100,
+      duration: 100,
+      result: 'seeded lifecycle outcomes',
+    },
+    {
+      executionId: 'tool-lifecycle-v1-demo',
+      workflow: 'tool-lifecycle-v1-demo',
+      status: 'completed',
+      totalCost: 0,
+      startedAt: lifecycleStartedAt - 1_000,
+      completedAt: lifecycleStartedAt - 900,
+      duration: 100,
+      events: [
+        {
+          executionId: 'tool-lifecycle-v1-demo',
+          step: 1,
+          timestamp: lifecycleStartedAt - 990,
+          type: 'tool_call_start',
+          askId: 'legacy-ask',
+          depth: 0,
+          agent: 'legacy-agent',
+          tool: 'legacy_tool',
+          callId: 'legacy-complete',
+          data: { args: { value: 1 } },
+        },
+        {
+          executionId: 'tool-lifecycle-v1-demo',
+          step: 2,
+          timestamp: lifecycleStartedAt - 980,
+          type: 'tool_call_end',
+          askId: 'legacy-ask',
+          depth: 0,
+          agent: 'legacy-agent',
+          tool: 'legacy_tool',
+          callId: 'legacy-complete',
+          duration: 10,
+          data: {
+            args: { value: 1 },
+            result: { error: null, value: 1 },
+            callId: 'legacy-complete',
+          },
+        },
+        {
+          executionId: 'tool-lifecycle-v1-demo',
+          step: 3,
+          timestamp: lifecycleStartedAt - 970,
+          type: 'tool_call_start',
+          askId: 'legacy-ask',
+          depth: 0,
+          agent: 'legacy-agent',
+          tool: 'legacy_incomplete_tool',
+          callId: 'legacy-incomplete',
+          data: { args: {} },
+        },
+      ],
+    },
+  ];
+  for (const execution of lifecycleExecutions) {
+    const saved = store.saveExecution?.(execution);
+    if (saved) saves.push(saved);
+  }
+
   await Promise.all(saves);
 
   // eslint-disable-next-line no-console
   console.log(
-    `[axl-studio dev] Seeded ${counter} historical executions across the last 12 days`,
+    `[axl-studio dev] Seeded ${counter + lifecycleExecutions.length} historical executions across the last 12 days`,
   );
 }
 
 // ── Live seed ────────────────────────────────────────────────────────
 
 const FACTS: Array<[string, string]> = [
-  ['fact:typescript', 'TypeScript is a typed superset of JavaScript that compiles to plain JavaScript and catches type errors at compile time.'],
-  ['fact:react-hooks', 'React Hooks are functions that let you use state and other React features without writing class components. Common hooks include useState, useEffect, useMemo, and useCallback.'],
-  ['fact:closures', 'A closure is a function that remembers variables from the scope in which it was defined, even after that outer scope has finished executing.'],
-  ['fact:event-loop', 'The JavaScript event loop continuously checks the call stack and task queue, enabling non-blocking I/O through asynchronous callbacks.'],
-  ['fact:promises', 'A Promise represents the eventual completion or failure of an asynchronous operation and supports chained .then/.catch handlers.'],
-  ['fact:docker', 'Docker packages applications into lightweight containers that include code, runtime, libraries, and dependencies for consistent deployment across environments.'],
-  ['fact:kubernetes', 'Kubernetes is an open-source orchestration system for automating deployment, scaling, and management of containerized applications.'],
-  ['fact:rest', 'REST (Representational State Transfer) is an architectural style for building stateless web APIs using standard HTTP verbs.'],
-  ['fact:websockets', 'WebSockets provide full-duplex communication over a single TCP connection, enabling real-time bidirectional data exchange between client and server.'],
-  ['fact:microservices', 'Microservices architecture decomposes an application into small, independently deployable services that communicate over well-defined APIs.'],
+  [
+    'fact:typescript',
+    'TypeScript is a typed superset of JavaScript that compiles to plain JavaScript and catches type errors at compile time.',
+  ],
+  [
+    'fact:react-hooks',
+    'React Hooks are functions that let you use state and other React features without writing class components. Common hooks include useState, useEffect, useMemo, and useCallback.',
+  ],
+  [
+    'fact:closures',
+    'A closure is a function that remembers variables from the scope in which it was defined, even after that outer scope has finished executing.',
+  ],
+  [
+    'fact:event-loop',
+    'The JavaScript event loop continuously checks the call stack and task queue, enabling non-blocking I/O through asynchronous callbacks.',
+  ],
+  [
+    'fact:promises',
+    'A Promise represents the eventual completion or failure of an asynchronous operation and supports chained .then/.catch handlers.',
+  ],
+  [
+    'fact:docker',
+    'Docker packages applications into lightweight containers that include code, runtime, libraries, and dependencies for consistent deployment across environments.',
+  ],
+  [
+    'fact:kubernetes',
+    'Kubernetes is an open-source orchestration system for automating deployment, scaling, and management of containerized applications.',
+  ],
+  [
+    'fact:rest',
+    'REST (Representational State Transfer) is an architectural style for building stateless web APIs using standard HTTP verbs.',
+  ],
+  [
+    'fact:websockets',
+    'WebSockets provide full-duplex communication over a single TCP connection, enabling real-time bidirectional data exchange between client and server.',
+  ],
+  [
+    'fact:microservices',
+    'Microservices architecture decomposes an application into small, independently deployable services that communicate over well-defined APIs.',
+  ],
 ];
 
 export async function seedLive(runtime: AxlRuntime): Promise<void> {
@@ -157,13 +362,20 @@ export async function seedLive(runtime: AxlRuntime): Promise<void> {
     await runtime.execute('qa-workflow', { question: 'Explain closures in JavaScript' });
     await runtime.execute('research-workflow', { topic: 'WebAssembly performance', depth: 'deep' });
     await runtime.execute('qa-workflow', { question: 'How do React hooks work?' });
-    await runtime.execute('research-workflow', { topic: 'Edge computing trends', depth: 'shallow' });
+    await runtime.execute('research-workflow', {
+      topic: 'Edge computing trends',
+      depth: 'shallow',
+    });
 
     // RAG: each call does semantic recall (1 embedder call) + agent ask.
-    await runtime.execute('rag-workflow', { question: 'Tell me about TypeScript and its benefits' });
+    await runtime.execute('rag-workflow', {
+      question: 'Tell me about TypeScript and its benefits',
+    });
     await runtime.execute('rag-workflow', { question: 'How do React hooks work in practice?' });
     await runtime.execute('rag-workflow', { question: 'Explain the JavaScript event loop' });
-    await runtime.execute('rag-workflow', { question: 'What are the differences between Docker and Kubernetes?' });
+    await runtime.execute('rag-workflow', {
+      question: 'What are the differences between Docker and Kubernetes?',
+    });
 
     // Memory-heavy: 3 recalls + 1 write per run.
     await runtime.execute('memory-heavy-workflow', { topic: 'TypeScript' });
@@ -184,10 +396,16 @@ export async function seedLive(runtime: AxlRuntime): Promise<void> {
     // Spec/16 unified-event-model seeds — at least one execution of each
     // so history has the new event shapes ready to inspect.
     await runtime.execute('nested-asks-workflow', { topic: 'unified event model' }).catch(() => {});
-    await runtime.execute('handoff-workflow', { query: 'review of architecture trade-offs' }).catch(() => {});
+    await runtime
+      .execute('handoff-workflow', { query: 'review of architecture trade-offs' })
+      .catch(() => {});
     await runtime.execute('schema-retry-workflow', { question: 'rate the spec' }).catch(() => {});
-    await runtime.execute('parallel-workflow', { topics: ['observability', 'streaming', 'state'] }).catch(() => {});
-    await runtime.execute('streaming-structured-workflow', { subject: 'event-model migration' }).catch(() => {});
+    await runtime
+      .execute('parallel-workflow', { topics: ['observability', 'streaming', 'state'] })
+      .catch(() => {});
+    await runtime
+      .execute('streaming-structured-workflow', { subject: 'event-model migration' })
+      .catch(() => {});
     await runtime.execute('ask-failure-workflow', { question: 'force a failure' }).catch(() => {});
     await runtime.execute('always-fail-workflow', { message: 'expected to fail' }).catch(() => {});
 
@@ -199,7 +417,9 @@ export async function seedLive(runtime: AxlRuntime): Promise<void> {
 
     const session2 = runtime.session('session-react-deep-dive');
     await session2.send('qa-workflow', { question: 'Explain React hooks' });
-    await session2.send('qa-workflow', { question: 'What is the difference between useState and useReducer?' });
+    await session2.send('qa-workflow', {
+      question: 'What is the difference between useState and useReducer?',
+    });
     await session2.send('qa-workflow', { question: 'When should I use useMemo vs useCallback?' });
     await session2.send('qa-workflow', { question: 'How do custom hooks work?' });
     await session2.send('qa-workflow', { question: 'Explain the rules of hooks' });
@@ -231,10 +451,7 @@ export async function seedLive(runtime: AxlRuntime): Promise<void> {
     await seedConditionalScorerEval(runtime);
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.warn(
-      '[axl-studio dev] seed failed:',
-      err instanceof Error ? err.message : String(err),
-    );
+    console.warn('[axl-studio dev] seed failed:', err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -265,9 +482,36 @@ type Cohort = {
 };
 
 const COHORTS: Cohort[] = [
-  { label: 'gpt-5-mini era', model: 'openai-responses:gpt-5-mini', scoreBias: 0, durMult: 0.6, costMult: 0.3, daysAgoStart: 10, daysAgoEnd: 8, runs: 5 },
-  { label: 'gpt-5.4 upgrade', model: 'openai-responses:gpt-5.4', scoreBias: 0.06, durMult: 1.0, costMult: 1.0, daysAgoStart: 5, daysAgoEnd: 3, runs: 4 },
-  { label: 'gpt-5.5 upgrade', model: 'openai-responses:gpt-5.5', scoreBias: 0.13, durMult: 1.6, costMult: 2.5, daysAgoStart: 2, daysAgoEnd: 0, runs: 4 },
+  {
+    label: 'gpt-5-mini era',
+    model: 'openai-responses:gpt-5-mini',
+    scoreBias: 0,
+    durMult: 0.6,
+    costMult: 0.3,
+    daysAgoStart: 10,
+    daysAgoEnd: 8,
+    runs: 5,
+  },
+  {
+    label: 'gpt-5.4 upgrade',
+    model: 'openai-responses:gpt-5.4',
+    scoreBias: 0.06,
+    durMult: 1.0,
+    costMult: 1.0,
+    daysAgoStart: 5,
+    daysAgoEnd: 3,
+    runs: 4,
+  },
+  {
+    label: 'gpt-5.5 upgrade',
+    model: 'openai-responses:gpt-5.5',
+    scoreBias: 0.13,
+    durMult: 1.6,
+    costMult: 2.5,
+    daysAgoStart: 2,
+    daysAgoEnd: 0,
+    runs: 4,
+  },
 ];
 
 async function seedQaEvalCohorts(runtime: AxlRuntime): Promise<void> {
@@ -343,9 +587,7 @@ async function seedQaEvalCohorts(runtime: AxlRuntime): Promise<void> {
       // Spread runs evenly across the cohort's time window.
       const span = cohort.daysAgoStart - cohort.daysAgoEnd;
       const offsetDays =
-        cohort.runs > 1
-          ? cohort.daysAgoStart - (span * i) / (cohort.runs - 1)
-          : cohort.daysAgoEnd;
+        cohort.runs > 1 ? cohort.daysAgoStart - (span * i) / (cohort.runs - 1) : cohort.daysAgoEnd;
       const timestamp = Date.now() - offsetDays * DAY;
 
       await runtime.saveEvalResult({
@@ -512,7 +754,9 @@ async function seedConditionalScorerEval(runtime: AxlRuntime): Promise<void> {
       score: q,
       duration: 120 + ((idx * 17) % 80),
       cost: 0.0006,
-      metadata: { reasoning: 'Rated the answer for accuracy and completeness against the question.' },
+      metadata: {
+        reasoning: 'Rated the answer for accuracy and completeness against the question.',
+      },
     };
 
     if (constrained) {
@@ -582,10 +826,7 @@ async function seedConditionalScorerEval(runtime: AxlRuntime): Promise<void> {
     return { count: items.length, failures: 0, scorers, timing };
   };
 
-  const makeResult = (
-    items: EvalItem[],
-    extraMeta: Record<string, unknown> = {},
-  ): EvalResult => ({
+  const makeResult = (items: EvalItem[], extraMeta: Record<string, unknown> = {}): EvalResult => ({
     id: randomUUID(),
     dataset: 'conditional-demo-dataset',
     metadata: {

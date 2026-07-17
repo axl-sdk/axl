@@ -256,6 +256,7 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
     // to `Number.MAX_SAFE_INTEGER` as a sentinel meaning "after all
     // numbered events" — consumers ordering by step still see `done` last.
     const doneEvent: AxlEvent = {
+      schemaVersion: 2,
       type: 'done',
       executionId,
       step: Number.MAX_SAFE_INTEGER,
@@ -275,6 +276,7 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
   _error(error: Error, executionId: string): void {
     if (this.events.isFinished) return;
     const errorEvent: AxlEvent = {
+      schemaVersion: 2,
       type: 'error',
       executionId,
       step: Number.MAX_SAFE_INTEGER,

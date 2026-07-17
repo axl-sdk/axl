@@ -1,6 +1,8 @@
 /** Compile-only lock for the next-major tool lifecycle and history contracts. */
 import type {
   AxlEventV2,
+  AxlEvent,
+  AxlRuntime,
   AxlEventV2Of,
   ExecutionInfoV2,
   HistoricalAxlEvent,
@@ -17,6 +19,14 @@ import type {
   LegacyAxlEventV1,
   RetryPolicy,
 } from '../index.js';
+
+declare const runtime: AxlRuntime;
+// @ts-expect-error callback observation was removed in favor of ctx.events/runtime.stream
+runtime.createContext({ onToken: () => {} });
+// @ts-expect-error callback observation was removed in favor of ctx.events
+runtime.createContext({ onToolCall: () => {} });
+// @ts-expect-error callback observation was removed in favor of typed events
+runtime.createContext({ onAgentStart: () => {} });
 
 const error = { name: 'Error', message: 'host diagnostic' } as const;
 declare const ToolFailurePrototype: ToolFailureConstructor;
@@ -124,6 +134,8 @@ const endEvent = {
   duration: 2,
   data: endData,
 } satisfies AxlEventV2Of<'tool_call_end'>;
+
+const liveEndEvent: AxlEvent = endEvent;
 
 const rejectionEvent: ToolCallRejectedEvent = {
   schemaVersion: 2,
@@ -416,6 +428,7 @@ export {
   throwable,
   toolFailure,
   typedToolFailure,
+  liveEndEvent,
   retryPredicate,
   readHistoricalEventVersion,
   unversionedV2Event,

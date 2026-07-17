@@ -16,7 +16,6 @@ import type {
   DelegateOptions,
   RaceOptions,
   AxlEvent,
-  CallbackMeta,
   ChatMessage,
   ToolCallMessage,
   ProviderResponse,
@@ -40,7 +39,7 @@ import { parsePartialJson } from './partial-json.js';
 import { StreamingWalker } from './streaming-walker.js';
 import { COST_BEARING_LEAF_TYPES, hasPositiveTokens, isUsableCost } from './event-utils.js';
 import { AxlEventBus, EventStreamOverflowError, type EventStreamOptions } from './event-stream.js';
-import { redactEvent } from './redaction.js';
+import { redactHistoricalEvent } from './redaction.js';
 import {
   detectDroppedRefinements,
   warnSchemaDiagnosticOnce,
@@ -57,27 +56,11 @@ import type { SpanManager } from './telemetry/types.js';
 import type { MemoryManager } from './memory/manager.js';
 import type { RememberOptions, RecallOptions, VectorResult } from './memory/types.js';
 import {
-  executeAcceptedToolV1,
-  finalizeLegacyToolResult,
-  parseToolInvocationV1,
-  recordLegacyToolSpanResult,
+  parseToolInvocation,
+  cloneToolArguments,
+  recordToolSpanOutcome,
+  settleAcceptedTool,
 } from './tool-invocation.js';
-
-const LEGACY_OBSERVATION_WARNING_KEY = Symbol.for(
-  '@axlsdk/axl/legacy-observation-callback-warning',
-);
-
-function warnForLegacyObservationCallbacks(init: WorkflowContextInit): void {
-  if (!init.onToken && !init.onToolCall && !init.onAgentStart) return;
-  const processState = globalThis as typeof globalThis & Record<PropertyKey, unknown>;
-  if (processState[LEGACY_OBSERVATION_WARNING_KEY]) return;
-  processState[LEGACY_OBSERVATION_WARNING_KEY] = true;
-  console.warn(
-    '[axl] onToken, onToolCall, and onAgentStart are deprecated and will be removed in the next breaking release. ' +
-      'Use ctx.events, runtime.stream(), or runtime trace listeners instead. ' +
-      'See docs/migration/stream-first-observation.md.',
-  );
-}
 
 /**
  * AsyncLocalStorage for per-branch abort signals.
@@ -402,14 +385,6 @@ export type WorkflowContextInit = {
   providerRegistry: ProviderRegistry;
   sessionHistory?: ChatMessage[];
   onTrace?: (event: AxlEvent) => void;
-  /** @deprecated Use `ctx.events` or `runtime.stream()`.
-   * Per-token streaming callback. `meta` carries `askId`/`parentAskId`/
-   *  `depth`/`agent` so consumers can route or filter (e.g., `meta.depth === 0`
-   *  for root-only chat UIs). */
-  onToken?: (token: string, meta: CallbackMeta) => void;
-  /** @deprecated Use `ctx.events` and observe `tool_call_start`.
-   * Pre-execution tool-call callback. `meta` carries the ask correlation. */
-  onToolCall?: (call: { name: string; args: unknown; callId?: string }, meta: CallbackMeta) => void;
   pendingDecisions?: Map<string, (d: HumanDecision) => void>;
   budgetContext?: BudgetContextState;
   stateStore?: StateStore;
@@ -426,9 +401,6 @@ export type WorkflowContextInit = {
   toolOverrides?: Map<string, (args: unknown) => Promise<unknown>>;
   /** Handler for awaitHuman — when set, returns immediately instead of waiting for pendingDecisions. */
   awaitHumanHandler?: (options: AwaitHumanOptions) => HumanDecision | Promise<HumanDecision>;
-  /** @deprecated Use `ctx.events` and observe `agent_call_start`.
-   * Callback fired when an agent LLM call is about to start. */
-  onAgentStart?: (info: { agent: string; model: string }, meta: CallbackMeta) => void;
   /** Callback fired after each ctx.ask() completes (once per ask invocation). */
   onAgentCallComplete?: (call: AgentCallInfo) => void;
   /** Options for the lazy `ctx.events` `AxlEventBus`. Forwarded by
@@ -445,8 +417,8 @@ export type WorkflowContextInit = {
    *  visible to those children, and child allocation is visible to the
    *  parent. Direct callers should not pass this. */
   _busRef?: { current: AxlEventBus | undefined };
-  /** Internal: force provider streaming for runtime.stream() without using a
-   * legacy callback as transport control. Inherited by child contexts. */
+  /** Internal: force provider streaming for runtime.stream(). Inherited by
+   * child contexts. */
   _forceStreaming?: boolean;
   /** Internal: shared auto-checkpoint counters. Set by `createChildContext`
    *  so parent + child share the same number space, preventing checkpoint
@@ -486,11 +458,6 @@ export class WorkflowContext<TInput = unknown> {
   private providerRegistry: ProviderRegistry;
   private sessionHistory: ChatMessage[];
   private onTrace?: (event: AxlEvent) => void;
-  private onToken?: (token: string, meta: CallbackMeta) => void;
-  private onToolCall?: (
-    call: { name: string; args: unknown; callId?: string },
-    meta: CallbackMeta,
-  ) => void;
   private pendingDecisions?: Map<string, (d: HumanDecision) => void>;
   private budgetContext?: BudgetContextState;
   private stateStore?: StateStore;
@@ -533,7 +500,6 @@ export class WorkflowContext<TInput = unknown> {
   private awaitHumanHandler?: (
     options: AwaitHumanOptions,
   ) => HumanDecision | Promise<HumanDecision>;
-  private onAgentStart?: (info: { agent: string; model: string }, meta: CallbackMeta) => void;
   private onAgentCallComplete?: (call: AgentCallInfo) => void;
 
   /** Shared mutable slot for the lazy `AxlEventBus`. The slot is shared
@@ -565,8 +531,7 @@ export class WorkflowContext<TInput = unknown> {
    *    *between* asks. `ctx.events.partialObjects` is the coalescing view
    *    designed for streaming-structured-output UIs.
    *  - **Ad-hoc contexts** from `runtime.createContext()`: the same
-   *    iterable replaces the legacy `onToken` / `onToolCall` /
-   *    `onAgentStart` callbacks.
+   *    iterable provides typed per-context observation.
    *  - **Cross-execution**: prefer `runtime.on('trace', …)` instead — that
    *    fans out across all executions, while `ctx.events` is per-context.
    *
@@ -582,8 +547,8 @@ export class WorkflowContext<TInput = unknown> {
    * **Subscribe before the first `ctx.ask()`.** The streaming code
    * path inside `ctx.ask()` activates only when an observer is
    * present at the time the ask starts (`_streamingEnabled` — an explicit
-   * runtime streaming mode, the legacy `onToken` callback, or allocated
-   * `ctx.events`). If you allocate `ctx.events` AFTER a `ctx.ask()` has
+   * runtime streaming mode or allocated `ctx.events`). If you allocate
+   * `ctx.events` AFTER a `ctx.ask()` has
    * begun, that in-flight ask will not stream `token` /
    * `partial_object` events at all (the agent loop went through
    * `provider.chat` instead of `provider.stream`). Subsequent asks
@@ -630,19 +595,18 @@ export class WorkflowContext<TInput = unknown> {
   }
 
   /** True when asks should use provider streaming: `runtime.stream()` set an
-   *  explicit internal mode, the legacy `onToken` callback is present, or
-   *  `ctx.events` has been allocated. `ctx.ask` reads this to decide whether to enter the
+   *  explicit internal mode or `ctx.events` has been allocated. `ctx.ask`
+   *  reads this to decide whether to enter the
    *  streaming code path; the gate is re-checked per ask, so a
    *  consumer subscribing AFTER the first ask started still gets
    *  streaming on the next one. The check `_busRef.current !== undefined`
    *  is a one-way flag — `_finish` does not unset the reference, so
    *  once an observer was present, every subsequent ask streams. */
   private get _streamingEnabled(): boolean {
-    return this._forceStreaming || this.onToken !== undefined || this._busRef.current !== undefined;
+    return this._forceStreaming || this._busRef.current !== undefined;
   }
 
   constructor(init: WorkflowContextInit) {
-    warnForLegacyObservationCallbacks(init);
     this.input = init.input as TInput;
     this.executionId = init.executionId;
     this.metadata = init.metadata ?? {};
@@ -650,8 +614,6 @@ export class WorkflowContext<TInput = unknown> {
     this.providerRegistry = init.providerRegistry;
     this.sessionHistory = init.sessionHistory ?? [];
     this.onTrace = init.onTrace;
-    this.onToken = init.onToken;
-    this.onToolCall = init.onToolCall;
     this.pendingDecisions = init.pendingDecisions;
     this.budgetContext = init.budgetContext;
     this.stateStore = init.stateStore;
@@ -663,7 +625,6 @@ export class WorkflowContext<TInput = unknown> {
     this.resumeMode = init.resumeMode ?? false;
     this.toolOverrides = init.toolOverrides;
     this.awaitHumanHandler = init.awaitHumanHandler;
-    this.onAgentStart = init.onAgentStart;
     this.onAgentCallComplete = init.onAgentCallComplete;
     // The bus slot is shared mutable state across parent + children so a
     // late allocation in either is visible to all of them. Root contexts
@@ -719,15 +680,8 @@ export class WorkflowContext<TInput = unknown> {
    * Create a child context for nested agent invocations (e.g., agent-as-tool).
    * Shares: budget tracking, abort signals, trace emission, provider registry,
    *         state store, span manager, memory manager, MCP manager, config,
-   *         awaitHuman handler, pending decisions, tool overrides, AND the
-   *         streaming callbacks (onToken / onAgentStart / onToolCall).
+   *         awaitHuman handler, pending decisions, tool overrides, and event bus.
    * Isolates: session history.
-   *
-   * Streaming callbacks now propagate into nested asks because every callback
-   * invocation carries `meta.askId`/`meta.parentAskId`/`meta.depth` so
-   * consumers that want root-only behavior can filter on `meta.depth === 0`
-   * instead of relying on the runtime to drop nested events. This is the
-   * "nested ask visibility" fix from spec §3.2.
    *
    * The shared step counter lives in `askStorage` (ALS), so there is no
    * per-context counter to pass through anymore. Nested events are
@@ -749,9 +703,6 @@ export class WorkflowContext<TInput = unknown> {
       spanManager: this.spanManager,
       memoryManager: this.memoryManager,
       onTrace: this.onTrace,
-      onToken: this.onToken,
-      onToolCall: this.onToolCall,
-      onAgentStart: this.onAgentStart,
       onAgentCallComplete: this.onAgentCallComplete,
       awaitHumanHandler: this.awaitHumanHandler,
       pendingDecisions: this.pendingDecisions,
@@ -783,98 +734,83 @@ export class WorkflowContext<TInput = unknown> {
     return signalStorage.getStore() ?? this.signal;
   }
 
-  /**
-   * Build a `CallbackMeta` for the current ask frame. Used at every
-   * `onToken`/`onToolCall`/`onAgentStart` call site so consumers can
-   * route or filter by ask correlation (`meta.depth === 0` for root
-   * chat UIs, etc.).
-   *
-   * If the call is somehow outside an ask frame (e.g., a programmatic
-   * `tool.run()` test harness), falls back to a synthetic meta keyed off
-   * `executionId` so the type contract holds — consumers see `depth: 0`
-   * and can ignore those events.
-   */
-  private currentCallbackMeta(agentName: string): CallbackMeta {
-    const frame = askStorage.getStore();
-    if (frame) {
-      return {
-        askId: frame.askId,
-        ...(frame.parentAskId ? { parentAskId: frame.parentAskId } : {}),
-        depth: frame.depth,
-        agent: agentName,
-      };
-    }
-    return { askId: this.executionId, depth: 0, agent: agentName };
-  }
-
-  /** Execute and observe one non-handoff tool request using the compatibility
-   * v1 lifecycle. Resolution/execution/message preparation live behind typed
-   * seams; this method is the sole start/end/span/message coordinator. */
-  private async observeLegacyToolInvocation(
+  /** Resolve, execute, and observe one non-handoff tool request. Rejections
+   * never start. Every accepted request emits one terminal event before a
+   * continuation message or abort escapes this coordinator. */
+  private async observeToolInvocation(
     agent: Agent,
     toolCall: ToolCallMessage,
     currentMessages: ChatMessage[],
-    callbackMeta: CallbackMeta,
+    availableTools: string[],
   ): Promise<void> {
+    const signal = this.currentSignal;
+    signal?.throwIfAborted();
     const requestedTool = toolCall.function.name;
     const configuredTool = agent._config.tools?.find(
       (candidate) => candidate.name === requestedTool,
     );
     const override = this.toolOverrides?.get(requestedTool);
     const mcpManager = this.mcpManager;
-    const isMcpTool = !configuredTool && mcpManager?.isMcpTool(requestedTool);
-    const parsed = parseToolInvocationV1({
+    const mcpMatch = !configuredTool
+      ? mcpManager
+          ?.getToolsForAgent(agent._config.mcp, agent._config.mcpTools)
+          .find(({ tool }) => tool.name === requestedTool)
+      : undefined;
+    const parsed = parseToolInvocation({
       toolCall,
       configuredTool,
       override,
-      ...(isMcpTool && mcpManager
+      ...(mcpMatch && mcpManager
         ? {
-            mcpCall: (args: unknown) => mcpManager.callTool(requestedTool, args),
-            mcpTraceName: mcpManager.getQualifiedName(requestedTool) ?? requestedTool,
+            mcpCall: (args: unknown) => mcpManager.callTool(requestedTool, args, mcpMatch.server),
+            mcpTraceName: `${mcpMatch.server}:${requestedTool}`,
           }
         : {}),
-      availableTools: agent._config.tools?.map((candidate) => candidate.name) ?? [],
+      availableTools,
     });
+    signal?.throwIfAborted();
 
     if ('kind' in parsed) {
-      if (parsed.kind === 'unavailable') {
-        this.emitEvent({ type: 'tool_denied', agent: agent._name, tool: requestedTool });
-        const available = agent._config.tools ? parsed.availableTools.join(', ') : 'none';
-        currentMessages.push({
-          role: 'tool',
-          content: `Tool "${requestedTool}" is not available. Available tools: ${available}`,
-          tool_call_id: toolCall.id,
-        });
-      } else {
-        currentMessages.push({
-          role: 'tool',
-          content: parsed.modelMessage,
-          tool_call_id: toolCall.id,
-        });
-      }
+      this.emitEvent({
+        type: 'tool_call_rejected',
+        agent: agent._name,
+        tool: parsed.toolName,
+        callId: parsed.callId,
+        data: parsed.data,
+      });
+      currentMessages.push({
+        role: 'tool',
+        content: parsed.modelMessage,
+        tool_call_id: parsed.callId,
+      });
       return;
     }
 
+    // Events and approval handlers receive snapshots so synchronous observers
+    // cannot mutate the execution-owned arguments retained by the coordinator.
+    const startArgs = cloneToolArguments(parsed.args);
+
     this.emitEvent({
       type: 'tool_call_start',
-      tool: requestedTool,
+      agent: agent._name,
+      tool: parsed.toolName,
       callId: parsed.callId,
-      data: { args: parsed.args },
+      data: {
+        args: startArgs,
+        ...(parsed.requestedTool !== parsed.toolName
+          ? { requestedTool: parsed.requestedTool }
+          : {}),
+      },
     });
-    this.onToolCall?.(
-      { name: requestedTool, args: parsed.args, callId: parsed.callId },
-      callbackMeta,
-    );
-    const toolStart = Date.now();
-    const suppressErrorShapeInspection =
-      configuredTool?.sensitive === true || configuredTool?.toModelOutput !== undefined;
+    const startedAt = Date.now();
 
     const requestApproval = async (): Promise<{ approved: boolean; reason?: string }> => {
       const approve = async (): Promise<{ approved: boolean; reason?: string }> => {
+        const approvalArgs = cloneToolArguments(parsed.args);
         const decision = await this.awaitHuman({
           channel: 'tool_approval',
-          prompt: `Tool "${requestedTool}" wants to execute with args: ${JSON.stringify(parsed.args)}`,
-          metadata: { toolName: requestedTool, args: parsed.args, agent: agent._name },
+          prompt: `Tool "${parsed.toolName}" wants to execute with args: ${JSON.stringify(parsed.args)}`,
+          metadata: { toolName: parsed.toolName, args: approvalArgs, agent: agent._name },
         });
         return decision.approved
           ? { approved: true }
@@ -884,7 +820,7 @@ export class WorkflowContext<TInput = unknown> {
       const approval = this.spanManager
         ? await this.spanManager.withSpanAsync(
             'axl.tool.approval',
-            { 'axl.tool.name': requestedTool, 'axl.agent.name': agent._name },
+            { 'axl.tool.name': parsed.toolName, 'axl.agent.name': agent._name },
             async (span) => {
               const value = await approve();
               span.setAttribute('axl.tool.approval.approved', value.approved);
@@ -896,85 +832,66 @@ export class WorkflowContext<TInput = unknown> {
       this.emitEvent({
         type: 'tool_approval',
         agent: agent._name,
-        tool: requestedTool,
+        tool: parsed.toolName,
+        callId: parsed.callId,
         data: {
           approved: approval.approved,
-          args: parsed.args,
+          args: cloneToolArguments(parsed.args),
           ...(approval.reason ? { reason: approval.reason } : {}),
         },
       });
       return approval;
     };
 
-    const result = await executeAcceptedToolV1({
-      invocation: parsed,
-      context: this,
-      requestApproval,
-      createChildContext: () => this.createChildContext(),
-      observeExecution: async (execute) =>
-        this.spanManager
-          ? this.spanManager.withSpanAsync(
-              'axl.tool.call',
-              { 'axl.tool.name': parsed.traceName, 'axl.agent.name': agent._name },
-              async (span) => {
-                const execution = await execute();
-                span.setAttribute('axl.tool.duration', Date.now() - toolStart);
-                recordLegacyToolSpanResult(
-                  span,
-                  execution.outcome.value,
-                  suppressErrorShapeInspection,
-                );
-                return execution;
-              },
-            )
-          : execute(),
-    });
+    let terminalEmitted = false;
+    const executeAndObserve = async (span?: Parameters<typeof recordToolSpanOutcome>[0]) => {
+      const settlement = await settleAcceptedTool({
+        invocation: parsed,
+        context: this,
+        signal,
+        requestApproval,
+        createChildContext: () => this.createChildContext(),
+      });
+      const duration = Date.now() - startedAt;
+      span?.setAttribute('axl.tool.duration', duration);
+      if (span) recordToolSpanOutcome(span, settlement.outcome);
+      if (terminalEmitted) {
+        throw new Error(`Tool invocation ${parsed.callId} emitted more than one terminal event`);
+      }
+      terminalEmitted = true;
+      this.emitEvent({
+        type: 'tool_call_end',
+        agent: agent._name,
+        tool: parsed.toolName,
+        callId: parsed.callId,
+        duration,
+        data: {
+          args: cloneToolArguments(parsed.args),
+          ...(parsed.requestedTool !== parsed.toolName
+            ? { requestedTool: parsed.requestedTool }
+            : {}),
+          outcome: settlement.outcome,
+        },
+      });
+      return settlement;
+    };
 
-    if (result.kind === 'denied') {
+    const settlement = this.spanManager
+      ? await this.spanManager.withSpanAsync(
+          'axl.tool.call',
+          { 'axl.tool.name': parsed.toolName, 'axl.agent.name': agent._name },
+          executeAndObserve,
+        )
+      : await executeAndObserve();
+
+    if (settlement.providerContent !== undefined) {
       currentMessages.push({
         role: 'tool',
-        content: JSON.stringify({ error: `Tool denied by human: ${result.reason}` }),
+        content: settlement.providerContent,
         tool_call_id: parsed.callId,
       });
-      return;
     }
-    if (result.kind === 'before_hook_failed') {
-      currentMessages.push({
-        role: 'tool',
-        content: JSON.stringify({ error: `Before hook error: ${result.message}` }),
-        tool_call_id: parsed.callId,
-      });
-      return;
-    }
-
-    const toolResult = result.execution.outcome.value;
-    const resultContent = finalizeLegacyToolResult({
-      toolName: requestedTool,
-      configuredTool,
-      outcome: result.execution.outcome,
-      legacyContent: () =>
-        parsed.source.kind === 'override' && configuredTool?.sensitive
-          ? '[REDACTED - sensitive tool output]'
-          : parsed.source.kind === 'override'
-            ? JSON.stringify(toolResult)
-            : result.execution.resultContent!,
-      emitEnd: () => {
-        this.emitEvent({
-          type: 'tool_call_end',
-          agent: agent._name,
-          tool: parsed.traceName,
-          duration: Date.now() - toolStart,
-          data: { args: result.effectiveArgs, result: toolResult, callId: parsed.callId },
-        });
-      },
-      beforeProjection: () => this.currentSignal?.throwIfAborted(),
-    });
-
-    currentMessages.push({
-      role: 'tool',
-      content: resultContent,
-      tool_call_id: parsed.callId,
-    });
+    if (settlement.abortError !== undefined) throw settlement.abortError;
   }
 
   // ── ctx.ask() ─────────────────────────────────────────────────────────
@@ -1501,8 +1418,6 @@ export class WorkflowContext<TInput = unknown> {
           : { type: 'json_object' };
       }
 
-      const callbackMeta = this.currentCallbackMeta(agent._name);
-
       // Build the request-side payload BEFORE the call. Everything here is
       // known at dispatch time, so consumers see "what's being asked" the
       // moment the call leaves the runtime — they don't have to wait for a
@@ -1557,7 +1472,6 @@ export class WorkflowContext<TInput = unknown> {
           ...(messagesSnapshot ? { messages: messagesSnapshot } : {}),
         },
       });
-      this.onAgentStart?.({ agent: agent._name, model: modelUri }, callbackMeta);
 
       let response: ProviderResponse;
 
@@ -1577,9 +1491,8 @@ export class WorkflowContext<TInput = unknown> {
         // the aborted signal passed in ChatOptions.
         this.currentSignal?.throwIfAborted();
 
-        // Activate the streaming code path when ANY observer is interested:
+        // Activate the streaming code path when an event observer is interested:
         // - runtime.stream() set the explicit internal transport mode
-        // - `onToken` is set (legacy callback path)
         // - `ctx.events` has been allocated (a workflow-handler consumer
         //   subscribed via `for await (const p of ctx.events.partialObjects)`
         //   or similar). Without this branch, runtime.execute() would skip
@@ -1639,9 +1552,6 @@ export class WorkflowContext<TInput = unknown> {
               // trace listeners both see it. Stream-only — `runtime.execute`'s
               // onTrace skips persisting tokens to ExecutionInfo.events.
               this.emitEvent({ type: 'token', data: chunk.content });
-              // `onToken` is optional — the streaming branch can also be
-              // entered solely because `ctx.events` is being observed.
-              this.onToken?.(chunk.content, callbackMeta);
               if (walker) {
                 // Walker drives both `string_delta` (via the onStringDelta
                 // callback above) and structural-boundary detection (via
@@ -2013,7 +1923,12 @@ export class WorkflowContext<TInput = unknown> {
             }
           }
 
-          await this.observeLegacyToolInvocation(agent, toolCall, currentMessages, callbackMeta);
+          await this.observeToolInvocation(
+            agent,
+            toolCall,
+            currentMessages,
+            toolDefs.map((tool) => tool.function.name),
+          );
         }
 
         continue; // Next turn
@@ -4130,6 +4045,7 @@ export class WorkflowContext<TInput = unknown> {
       }
     }
     const event = {
+      schemaVersion: 2,
       executionId: this.executionId,
       step,
       timestamp: Date.now(),
@@ -4157,7 +4073,9 @@ export class WorkflowContext<TInput = unknown> {
     // AFTER the event is constructed so cost-rail accumulation (above)
     // sees the unscrubbed numeric fields. Top-level numerics (`cost`,
     // `tokens`, `duration`) are preserved by every rule.
-    const finalEvent = this.config.trace?.redact ? redactEvent(event) : event;
+    const finalEvent = this.config.trace?.redact
+      ? (redactHistoricalEvent(event) as AxlEvent)
+      : event;
     // Isolate consumer bugs: a buggy onTrace handler must not crash the
     // workflow. Swallow and forward to console.error so the caller sees
     // the failure in ops but the workflow keeps running.

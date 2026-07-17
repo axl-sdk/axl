@@ -116,9 +116,22 @@ const runtime = new AxlTestRuntime();
 runtime.register(myWorkflow);
 
 // Mock the LLM
-runtime.mockProvider('openai', MockProvider.sequence([
-  { content: '42' },
-]));
+runtime.mockProvider(
+  'openai',
+  MockProvider.sequence([
+    {
+      content: '',
+      tool_calls: [
+        {
+          id: 'call-calculator',
+          type: 'function',
+          function: { name: 'calculator', arguments: '{"expression":"2+2"}' },
+        },
+      ],
+    },
+    { content: '42' },
+  ]),
+);
 
 // Mock tools
 runtime.mockTool('calculator', async ({ expression }) => ({ result: 4 }));
@@ -126,12 +139,22 @@ runtime.mockTool('calculator', async ({ expression }) => ({ result: 4 }));
 // Execute
 const result = await runtime.execute('my-workflow', { question: 'What is 2+2?' });
 
-// Inspect recorded calls
-expect(runtime.agentCalls()).toHaveLength(1);
-expect(runtime.toolCalls()).toHaveLength(1);
+// Inspect recorded calls. Every accepted call has a terminal v2 outcome.
+expect(runtime.agentCalls()).toHaveLength(2); // tool request + final provider turn
+const [call] = runtime.toolCalls('calculator');
+if (call.outcome.status !== 'succeeded') {
+  throw new Error(`Expected calculator to succeed, got ${call.outcome.status}`);
+}
+expect(call.outcome.result).toEqual({ result: 4 });
 expect(runtime.totalCost()).toBe(0);
 expect(runtime.unpriced()).toBe(false); // true if any call used an unpriced model → totalCost() is a lower bound
 ```
+
+Recorded tool calls also carry `executionId`, `askId`, and `callId` for exact
+correlation. Failed, denied, and pre-result cancelled outcomes intentionally do
+not expose a top-level `result`; narrow `outcome.status` first. Configured mocks
+bypass the local schema, approval, retry, hooks, and real handler, while still
+using the configured tool's `sensitive` and `toModelOutput` policies.
 
 For testing human-in-the-loop flows:
 

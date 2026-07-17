@@ -5,7 +5,7 @@ import { agent } from '../agent.js';
 import { workflow } from '../workflow.js';
 import { AxlRuntime } from '../runtime.js';
 import type { AxlEvent } from '../types.js';
-import { TimeoutError, MaxTurnsError, QuorumNotMet, VerifyError } from '../errors.js';
+import { TimeoutError, MaxTurnsError, QuorumNotMet, VerifyError, ToolFailure } from '../errors.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -54,10 +54,13 @@ const calculatorTool = tool({
 
 const failingTool = tool({
   name: 'failing_tool',
-  description: 'A tool that always fails. Used for testing error recovery.',
+  description: 'A tool that reports a known, model-safe failure for recovery testing.',
   input: z.object({}),
   handler: () => {
-    throw new Error('This tool intentionally fails');
+    throw new ToolFailure({
+      message: 'This tool intentionally fails',
+      modelMessage: 'The requested calculation backend is unavailable. Try another tool.',
+    });
   },
 });
 
@@ -988,9 +991,9 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
 
   // ── Group 8: Edge Cases ───────────────────────────────────────────
 
-  // ── 23. Tool error recovery — agent handles tool failure gracefully ─
+  // ── 23. Explicit ToolFailure recovery ─────────────────────────────
 
-  forEachProvider('tool error recovery — agent handles tool failure gracefully', async (model) => {
+  forEachProvider('explicit ToolFailure lets the agent recover safely', async (model) => {
     const recoveryAgent = agent({
       model,
       system:
@@ -1021,6 +1024,11 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
     const toolNames = toolCalls.map((t) => t.tool);
     expect(toolNames).toContain('failing_tool');
     expect(toolNames).toContain('calculator');
+    const failedCall = toolCalls.find((event) => event.tool === 'failing_tool');
+    expect(failedCall?.data.outcome).toMatchObject({
+      status: 'failed',
+      failure: { phase: 'handler', kind: 'tool_failure', disposition: 'continue' },
+    });
   });
 
   // ── 24. Multi-level handoff (A→B→C) ───────────────────────────────

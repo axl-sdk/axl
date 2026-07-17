@@ -1,29 +1,43 @@
 # Migration: Stream-First Observation
 
-> **Versions:** 0.16.x → next major
+> **Versions:** 0.19.x → next breaking release
 > **Scope:** Anyone iterating `AxlStream`, calling `runtime.execute()` / `runtime.stream()` / `runtime.createContext()`, using `Session.send` / `Session.stream`, observing events from inside a workflow handler, or using the legacy `onToken` / `onToolCall` / `onAgentStart` callbacks.
 
 ## What changed
 
-The first two phases of the Stream-First Observation API ship:
+The Stream-First Observation API and the v2 tool lifecycle now ship as one
+coherent contract:
 
 1. **`ctx.events`** — a lazy `AxlEventBus` accessible from every `WorkflowContext`. Iterate `AxlEvent` from inside a workflow handler — including between `ctx.ask()` calls — without standing up a `runtime.stream()` consumer outside.
 2. **Coalescing `partialObjects` view** on both `AxlStream` and `ctx.events`. Yields the latest `partial_object` payload per `askId` with the 1-indexed `attempt`. Designed for streaming-structured-output UIs that render the current state, not every intermediate snapshot.
 3. **Bounded queue + overflow policy** on every `AxlEventBus`. Default cap of `10_000` events, overflow drops the oldest non-terminal. Strict mode (`'throw'`) raises a typed `EventStreamOverflowError`.
 4. **`events: EventStreamOptions`** plumbed through every entry point: `runtime.execute()`, `runtime.stream()`, `runtime.createContext()`, `Session.send`, `Session.stream`, `AxlTestRuntime.execute`.
-5. **Legacy callback deprecation.** `onToken`, `onToolCall`, and `onAgentStart`
-   on `runtime.createContext()` still work, but are type-deprecated and warn
-   once per process. They will be removed in the next breaking release.
+5. **Legacy callback removal.** `onToken`, `onToolCall`, and `onAgentStart` are
+   no longer accepted by `runtime.createContext()`. TypeScript rejects them;
+   JavaScript or cast-through-`unknown` callers receive a targeted runtime error
+   pointing to this guide. The values are never invoked.
 6. **Explicit wire streaming mode.** `runtime.stream()` selects the provider's
    streaming path directly; it no longer installs an internal callback
    sentinel or allocates `ctx.events` behind the consumer's back. Child
    contexts inherit that mode.
+7. **Tool lifecycle event schema v2.** Live events carry
+   `schemaVersion: 2`, live `ExecutionInfo` carries `eventSchemaVersion: 2`,
+   pre-start failures emit `tool_call_rejected`, and every accepted tool call
+   closes with one `tool_call_end.data.outcome` status: `succeeded`, `failed`,
+   `denied`, or `cancelled`.
+8. **Return means success.** A normally returned tool value succeeds regardless
+   of property names. A returned `{ error: ... }` is ordinary application data;
+   use the exported `ToolFailure` when a known failure is safe to explain to the
+   model, or throw an ordinary error to abort the ask.
 
 ## TL;DR
 
-If you do not use the deprecated callbacks, defaults preserve existing behavior
-apart from the narrow cases below. Callback consumers should migrate now;
-subscribe to `ctx.events` before the first `ctx.ask()` on an ad-hoc context.
+Remove all three callback options before upgrading. Subscribe to `ctx.events`
+before the first `ctx.ask()` on an ad-hoc context, use `runtime.stream()` for one
+wire execution, or use `runtime.on('trace', ...)` for cross-execution
+observation. Audit tools that both return an object with an `error` field and
+define `hooks.after`: that hook now runs because normal return control flow is
+always success.
 
 ## New API at a glance
 
@@ -83,7 +97,11 @@ This restores pre-release behavior.
 
 ### 2. `runtime.execute()` can now stream tokens — under one condition
 
-Before this release, `runtime.execute()` always took the non-streaming `provider.chat` code path. After this release, the streaming path activates when the workflow handler has allocated `ctx.events` before `ctx.ask()` starts. (`onToken` can also activate streaming on an ad-hoc context created with `runtime.createContext()`, but it is deprecated and is not an `ExecuteOptions` field.) If your workflow handler does **not** access `ctx.events`, behavior is unchanged.
+Before the stream-first preparation release, `runtime.execute()` always took
+the non-streaming `provider.chat` code path. Now the streaming path activates
+when the workflow handler has allocated `ctx.events` before `ctx.ask()` starts.
+The removed callbacks are not streaming gates. If your workflow handler does
+**not** access `ctx.events`, behavior is unchanged.
 
 If your handler does access `ctx.events`, individual `ctx.ask()` calls now go through `provider.stream` instead of `provider.chat`. The final `ProviderResponse` is the same shape; the difference is per-token streaming events fire alongside it.
 
@@ -118,6 +136,94 @@ try {
 
 > **Note:** on `runtime.execute()` (no `AxlStream`), `'throw'` only fires if the workflow handler allocated `ctx.events` and that bus saturates. On `runtime.stream()`, the wire-side `AxlStream` bus always applies the policy.
 
+### 5. Tool return values are no longer inspected for an `error` property
+
+Previously, a normally returned object with an `error` property could be
+classified as a tool failure. That heuristic is gone. Inherited, accessor,
+proxy-backed, nested, and truthy `error` properties do not affect handler
+classification; normal hook and output-preparation behavior still applies:
+
+```typescript
+const lookup = tool({
+  name: 'lookup',
+  description: 'Look up a case',
+  input: z.object({ id: z.string() }),
+  handler: async ({ id }) => ({ id, error: null, status: 'open' }),
+  hooks: {
+    after: async (result) => ({ ...result, observed: true }),
+  },
+});
+```
+
+The `after` hook now runs after every normal handler return. If an older tool
+returned `{ error: ... }` and relied on Axl skipping `after`, audit that hook for
+newly-triggered side effects before upgrading.
+
+Known failures that are safe for model recovery must be explicit:
+
+```typescript
+import { ToolFailure } from '@axlsdk/axl';
+
+throw new ToolFailure({
+  message: 'Case service rejected the transition', // host diagnostic
+  modelMessage: 'The case cannot be updated in its current state.',
+  code: 'CASE_STATE_CONFLICT',
+  cause,
+});
+```
+
+A handler-thrown `ToolFailure` is retried according to the existing `retry`
+policy; hooks retain their existing no-retry behavior. If the failure remains
+terminal, its author-declared `modelMessage` is sent to the model and the agent
+loop continues. An ordinary hook/handler throw is host-diagnostic only, closes
+the call as failed, and aborts the ask without a tool message. Denial and MCP
+`isError` also continue; cancellation and approval/projection/serialization
+failures abort.
+
+### 6. Tool lifecycle events use the v2 terminal union
+
+Invalid JSON, invalid local arguments, and unavailable tools now emit
+`tool_call_rejected` without a `tool_call_start`. `tool_denied` is removed.
+Accepted calls emit `tool_call_start`, then exactly one correlated
+`tool_call_end` in a complete trace. Narrow the terminal result before reading
+variant fields:
+
+```typescript
+ctx.events.on('tool_call_end', (event) => {
+  const { outcome } = event.data;
+  switch (outcome.status) {
+    case 'succeeded':
+      renderResult(outcome.result);
+      break;
+    case 'failed':
+      reportFailure(outcome.failure.phase, outcome.failure.error);
+      break;
+    case 'denied':
+      renderDenied(outcome.reason);
+      break;
+    case 'cancelled':
+      renderCancelled(outcome.cancellation.phase);
+      break;
+  }
+});
+```
+
+Pair v2 calls by `(executionId, askId, callId)`, never by tool name or globally
+by `callId`. Duration covers wall time from start through the terminal decision,
+including approval wait, hooks, retries, handler work, and output preparation.
+Queue overflow, capped persistence, disconnection, and process death can still
+produce an incomplete consumer view; do not synthesize a failure for an orphan
+start.
+
+### 7. Persisted event history is dual-read, single-write
+
+New live events have `schemaVersion: 2`; new live executions have
+`eventSchemaVersion: 2`. History APIs return `HistoricalExecutionInfo`, a union
+of v2 executions and legacy v1 executions. Missing version metadata means v1.
+New writers produce only v2, while built-in stores and Studio continue to read
+v1 without guessing a v2 outcome from legacy `data.result` or `tool_denied`
+events. Narrow on `eventSchemaVersion === 2` before using v2-only event shapes.
+
 ## When to use which observation surface
 
 | You want to … | Use |
@@ -129,6 +235,12 @@ try {
 | Test a tool in isolation | `runtime.createContext()` + `tool.run(ctx, input)`; iterate `ctx.events` if you want event-level assertions |
 
 The four channels are **alternatives**, not additive — accumulating cost from `ctx.events` AND `runtime.on('trace', …)` would double-count.
+
+Allocating `ctx.events` selects the provider streaming transport for subsequent
+asks. The removed `onAgentStart`/`onToolCall`-only path did not. If you need only
+structural events and must keep a custom provider on its non-streaming transport,
+use `runtime.on('trace', ...)` filtered by `executionId` instead of allocating
+the context bus.
 
 ## Migrating legacy callbacks
 
@@ -167,6 +279,15 @@ event listener above when you need `depth`, `askId`, or agent correlation.
 ### Tool and agent starts
 
 ```typescript
+// Before (0.19.x)
+const ctx = runtime.createContext({
+  onAgentStart: ({ agent, model }, meta) =>
+    recordAgentStart({ agent, model, askId: meta.askId, depth: meta.depth }),
+  onToolCall: ({ name, args, callId }, meta) =>
+    recordToolStart({ name, args, callId, askId: meta.askId, depth: meta.depth }),
+});
+
+// After
 ctx.events.on('tool_call_start', (event) => {
   recordToolStart({
     name: event.tool,
@@ -176,6 +297,12 @@ ctx.events.on('tool_call_start', (event) => {
     depth: event.depth,
     agent: event.agent,
   });
+});
+ctx.events.on('tool_call_end', (event) => {
+  recordToolEnd(event.askId, event.callId, event.data.outcome);
+});
+ctx.events.on('tool_call_rejected', (event) => {
+  recordToolRejection(event.askId, event.callId, event.data);
 });
 
 ctx.events.on('agent_call_start', (event) => {
@@ -188,9 +315,67 @@ ctx.events.on('agent_call_start', (event) => {
 });
 ```
 
+For a staged application migration, a userland adapter can preserve
+callback-shaped consumers without restoring callback control flow:
+
+```typescript
+import type { AxlEventBus, AxlEventOf } from '@axlsdk/axl';
+
+type ObserverMeta = {
+  askId: string;
+  parentAskId?: string;
+  depth: number;
+  agent?: string;
+};
+
+function meta(
+  event: AxlEventOf<'token' | 'agent_call_start' | 'tool_call_start'>,
+): ObserverMeta {
+  return {
+    askId: event.askId,
+    ...(event.parentAskId ? { parentAskId: event.parentAskId } : {}),
+    depth: event.depth,
+    ...(event.agent ? { agent: event.agent } : {}),
+  };
+}
+
+export function attachLegacyObservers(
+  events: AxlEventBus,
+  observers: {
+    token?: (value: string, meta: ObserverMeta) => void;
+    agentStart?: (value: { agent: string; model: string }, meta: ObserverMeta) => void;
+    toolStart?: (
+      value: { name: string; args: unknown; callId: string },
+      meta: ObserverMeta,
+    ) => void;
+  },
+): () => void {
+  const onToken = (event: AxlEventOf<'token'>) => observers.token?.(event.data, meta(event));
+  const onAgent = (event: AxlEventOf<'agent_call_start'>) =>
+    observers.agentStart?.({ agent: event.agent, model: event.model }, meta(event));
+  const onTool = (event: AxlEventOf<'tool_call_start'>) =>
+    observers.toolStart?.(
+      { name: event.tool, args: event.data.args, callId: event.callId },
+      meta(event),
+    );
+
+  events.on('token', onToken);
+  events.on('agent_call_start', onAgent);
+  events.on('tool_call_start', onTool);
+  return () => {
+    events.off('token', onToken);
+    events.off('agent_call_start', onAgent);
+    events.off('tool_call_start', onTool);
+  };
+}
+```
+
+This adapter is not exported by Axl. Listener exceptions remain isolated and
+cannot reproduce the removed callbacks' accidental control-flow behavior.
+
 Unlike the old callbacks, the event union also exposes correlated terminal
-events. Match `tool_call_end` to its start with `askId` + `callId`, not tool
-name.
+events. Match `tool_call_end` to its start with
+`(executionId, askId, callId)`, not tool name.
 
 ### Nested asks
 
@@ -244,6 +429,85 @@ the ask. Event listeners are observation boundaries: listener exceptions are
 isolated and logged so telemetry or UI code cannot crash the workflow. Use an
 `AbortController`, a tool approval policy, or explicit workflow logic when the
 observer must affect control flow.
+
+```typescript
+const controller = new AbortController();
+const listener = (event: AxlEvent) => {
+  if (event.executionId === executionId && shouldCancel(event)) {
+    controller.abort('cancelled by application policy');
+  }
+};
+
+runtime.on('trace', listener);
+try {
+  await runtime.execute('workflow', input, { signal: controller.signal });
+} finally {
+  runtime.off('trace', listener);
+}
+```
+
+If an untyped caller still supplies any removed callback key to
+`runtime.createContext()`, context creation throws immediately with an
+`INVALID_CONFIG` migration error. Presence is rejected even when the property
+value is `undefined`; the runtime does not read or invoke the value. Remove the
+key rather than disabling its value.
+
+## Migrating tests and configured tool mocks
+
+`AxlTestRuntime.toolCalls()` now returns correlated records with the typed v2
+`outcome`; it no longer assumes every end is `{ args, result }`. Narrow the
+status before reading a result:
+
+```typescript
+const [call] = runtime.toolCalls('lookup');
+expect(call.callId).toBeTruthy();
+if (call.outcome.status !== 'succeeded') {
+  throw new Error(`Expected success, got ${call.outcome.status}`);
+}
+expect(call.outcome.result).toEqual({ found: true });
+```
+
+Configured `mockTool()` handlers intentionally still bypass the configured
+local schema, approval, retry, hooks, and real handler. Provider argument JSON
+parsing still happens before mock selection. The configured tool contributes
+only its `sensitive` and `toModelOutput` policy. A mock return, including
+`{ error: ... }`, succeeds; an ordinary mock throw aborts; a `ToolFailure`
+continues with only its explicit model-safe text.
+
+## Studio, counters, cost, and OpenTelemetry
+
+Studio dual-reads history. Missing version metadata is v1 and stays labeled
+legacy; v2 is rendered from the terminal union. Trace aggregates no longer use
+one ambiguous `calls/approved/denied` bucket. V2 counts are
+`accepted/succeeded/failed/failedByPhase/denied/cancelled/rejected/approved`,
+and v1 `calls/approved/denied` remain under a separate `legacy` bucket.
+
+The new lifecycle adds observable starts, rejections, and terminal ends, so
+event totals and accepted-call counts can increase relative to v1. It does not
+add provider work or billing. Continue calculating spend from cost-bearing
+model/embedder events (or `eventCostContribution`), never by counting tool
+events.
+
+Tool spans expose only structural status: `succeeded` maps to OTel `OK`,
+`failed` and `cancelled` map to `ERROR`, and `denied` maps to `UNSET`.
+`axl.tool.outcome`, `axl.tool.phase`, and duration remain available. Raw
+handler/hook/approval messages, results, and provider-safe tool text are not
+placed in span attributes or status descriptions.
+
+## Rollback and mixed-version deployments
+
+The breaking runtime is single-write v2 and dual-read v1/v2. A rollback to a
+0.19.x runtime is unsafe after any v2 execution has been persisted because the
+older reader does not understand `tool_call_rejected` or the terminal union.
+Before deploying, verify every service that reads execution history and every
+Studio instance understands v2. During a rolling upgrade, upgrade readers
+first, then writers. Do not rewrite old rows or strip version metadata.
+
+If rollback is required after v2 writes begin, stop new executions and restore
+the previous application together with a database snapshot taken before the
+first v2 write, or keep the new dual-read runtime in place while reverting only
+unrelated application code. Downgrading just the package against mixed history
+is not supported.
 
 ## Lifecycle gotchas
 

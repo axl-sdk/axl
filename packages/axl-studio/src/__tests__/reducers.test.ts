@@ -534,8 +534,8 @@ describe('reduceTraceStats', () => {
     state = reduceTraceStats(state, makeEvent({ type: 'tool_call_end', tool: 'search' }));
     state = reduceTraceStats(state, makeEvent({ type: 'tool_denied', tool: 'search' }));
 
-    expect(state.byTool['search'].calls).toBe(2);
-    expect(state.byTool['search'].denied).toBe(1);
+    expect(state.byTool['search'].legacy.calls).toBe(2);
+    expect(state.byTool['search'].legacy.denied).toBe(1);
   });
 
   it('tracks retry reasons by agent', () => {
@@ -622,8 +622,8 @@ describe('reduceTraceStats', () => {
       }),
     );
 
-    expect(state.byTool['dangerous-tool'].approved).toBe(1);
-    expect(state.byTool['dangerous-tool'].denied).toBe(0);
-    expect(state.byTool['dangerous-tool'].calls).toBe(0);
+    expect(state.byTool['dangerous-tool'].legacy.approved).toBe(1);
+    expect(state.byTool['dangerous-tool'].legacy.denied).toBe(0);
+    expect(state.byTool['dangerous-tool'].legacy.calls).toBe(0);
   });
 });

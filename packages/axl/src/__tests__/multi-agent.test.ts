@@ -179,10 +179,95 @@ describe('child context', () => {
       'Final result: specialist answer',
     ]);
 
-    const { ctx } = createTestCtx({ provider });
+    const { ctx, traces } = createTestCtx({ provider });
     const result = await ctx.ask(outerAgent, 'Coordinate this task');
 
     expect(result).toBe('Final result: specialist answer');
+    const toolStart = traces.find(
+      (event) => event.type === 'tool_call_start' && event.callId === 'tc1',
+    );
+    const toolEnd = traces.find(
+      (event) => event.type === 'tool_call_end' && event.callId === 'tc1',
+    );
+    const outerAsk = traces.find(
+      (event) => event.type === 'ask_start' && event.agent === 'outer_agent',
+    );
+    const innerAsk = traces.find(
+      (event) => event.type === 'ask_start' && event.agent === 'sub_agent',
+    );
+    expect(toolStart).toMatchObject({
+      schemaVersion: 2,
+      tool: 'ask_specialist',
+      askId: outerAsk?.askId,
+      callId: 'tc1',
+    });
+    expect(toolEnd).toMatchObject({
+      schemaVersion: 2,
+      tool: 'ask_specialist',
+      askId: outerAsk?.askId,
+      callId: 'tc1',
+      data: { outcome: { status: 'succeeded', result: 'specialist answer' } },
+    });
+    expect(innerAsk).toMatchObject({ parentAskId: outerAsk?.askId, depth: 1 });
+  });
+
+  it('agent-as-tool propagates cancellation through the inner and outer lifecycle', async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const provider: Provider = {
+      name: 'mock',
+      chat: async () => {
+        calls++;
+        if (calls === 1) {
+          return {
+            content: '',
+            tool_calls: [
+              {
+                id: 'outer-call',
+                type: 'function',
+                function: { name: 'ask_inner_cancel', arguments: '{"question":"go"}' },
+              },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          };
+        }
+        controller.abort('cancel nested ask');
+        return {
+          content: 'must not continue',
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        };
+      },
+      stream: async function* () {
+        yield { type: 'done' as const };
+      },
+    };
+    const inner = agent({ name: 'inner_cancel', model: 'mock:test', system: 'inner' });
+    const outerTool = tool({
+      name: 'ask_inner_cancel',
+      description: 'invoke cancellable inner agent',
+      input: z.object({ question: z.string() }),
+      handler: ({ question }, ctx) => ctx.ask(inner, question),
+    });
+    const outer = agent({
+      name: 'outer_cancel',
+      model: 'mock:test',
+      system: 'outer',
+      tools: [outerTool],
+    });
+    const { ctx, traces } = createTestCtx({ provider, signal: controller.signal });
+
+    await expect(ctx.ask(outer, 'go')).rejects.toMatchObject({ name: 'AbortError' });
+    expect(calls).toBe(2);
+    expect(
+      traces.find((event) => event.type === 'tool_call_end' && event.callId === 'outer-call'),
+    ).toMatchObject({ data: { outcome: { status: 'cancelled' } } });
+    const innerAsk = traces.find(
+      (event) => event.type === 'ask_start' && event.agent === 'inner_cancel',
+    );
+    const outerAsk = traces.find(
+      (event) => event.type === 'ask_start' && event.agent === 'outer_cancel',
+    );
+    expect(innerAsk?.parentAskId).toBe(outerAsk?.askId);
   });
 
   it('token events carry depth 0 for root asks and >= 1 for nested asks', async () => {
@@ -640,12 +725,13 @@ describe('dynamic handoffs', () => {
 
 describe('edge cases', () => {
   it('tool handler error propagates correctly through child context', async () => {
+    const handlerError = new Error('tool handler exploded');
     const failingTool = tool({
       name: 'failing_tool',
       description: 'A tool that always fails',
       input: z.object({ x: z.string() }),
       handler: async () => {
-        throw new Error('tool handler exploded');
+        throw handlerError;
       },
     });
 
@@ -656,7 +742,7 @@ describe('edge cases', () => {
       tools: [failingTool],
     });
 
-    // Provider: agent calls the failing tool, then gets error in tool result and responds
+    // Provider advertises a continuation that must never run after an unexpected failure.
     const provider = createSequenceProvider([
       {
         tool_calls: [
@@ -671,10 +757,8 @@ describe('edge cases', () => {
     ]);
 
     const { ctx } = createTestCtx({ provider });
-    const result = await ctx.ask(outerAgent, 'Try the tool');
-
-    // Error is caught and fed back as tool result, agent continues
-    expect(result).toBe('Handled the error gracefully');
+    await expect(ctx.ask(outerAgent, 'Try the tool')).rejects.toBe(handlerError);
+    expect(provider.calls).toHaveLength(1);
   });
 
   it('existing tool handlers without ctx parameter still work', async () => {
@@ -821,15 +905,14 @@ describe('edge cases', () => {
 
     expect(result).toBe('outer done');
 
-    // Verify the mock was used (not the real handler). Type predicate
-    // narrows to the strict `tool_call_end` variant so `data.result` is
-    // typed without a cast.
+    // Verify the mock was used (not the real handler). The strict v2 end
+    // variant exposes the discriminated outcome without a cast.
     const innerToolTraces = traces.filter(
       (t): t is Extract<typeof t, { type: 'tool_call_end' }> =>
         t.type === 'tool_call_end' && t.tool === 'inner_tool',
     );
     expect(innerToolTraces).toHaveLength(1);
-    expect(innerToolTraces[0].data.result).toBe('MOCKED');
+    expect(innerToolTraces[0].data.outcome).toEqual({ status: 'succeeded', result: 'MOCKED' });
   });
 
   it('dynamic handoff function that throws is handled gracefully', async () => {

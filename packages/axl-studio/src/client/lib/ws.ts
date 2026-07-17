@@ -1,4 +1,5 @@
 type WsCallback = (data: unknown) => void;
+type WsConnectionCallback = (connected: boolean) => void;
 
 /**
  * Singleton WebSocket client with channel subscription support.
@@ -6,6 +7,7 @@ type WsCallback = (data: unknown) => void;
 class WsClient {
   private ws: WebSocket | null = null;
   private listeners = new Map<string, Set<WsCallback>>();
+  private connectionListeners = new Set<WsConnectionCallback>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private url: string;
 
@@ -21,6 +23,7 @@ class WsClient {
     this.ws = new WebSocket(this.url);
 
     this.ws.onopen = () => {
+      for (const listener of this.connectionListeners) listener(true);
       // Re-subscribe to all active channels
       for (const channel of this.listeners.keys()) {
         this.send({ type: 'subscribe', channel });
@@ -52,6 +55,7 @@ class WsClient {
     };
 
     this.ws.onclose = () => {
+      for (const listener of this.connectionListeners) listener(false);
       this.scheduleReconnect();
     };
 
@@ -91,6 +95,11 @@ class WsClient {
         this.send({ type: 'unsubscribe', channel });
       }
     };
+  }
+
+  subscribeConnection(callback: WsConnectionCallback): () => void {
+    this.connectionListeners.add(callback);
+    return () => this.connectionListeners.delete(callback);
   }
 
   disconnect(): void {

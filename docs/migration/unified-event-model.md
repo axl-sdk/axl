@@ -3,6 +3,11 @@
 > **Versions:** 0.15.x → 0.16.0
 > **Scope:** Anyone consuming `TraceEvent`, `StreamEvent`, `ExecutionInfo.steps`, `AxlStream.steps`, or the `onToken` / `onToolCall` / `onAgentStart` callbacks. Also covers the `ctx.checkpoint()` named-checkpoint migration and the `parentToolCallId` removal that finalize in 0.16.0.
 
+> **Historical guide:** This page documents the 0.15 → 0.16 transition. The
+> callbacks described below were removed in the later breaking release. After
+> completing this historical rename, follow the
+> [stream-first observation and tool-lifecycle guide](./stream-first-observation.md).
+
 ## What changed
 
 Axl had two parallel event models that duplicated each other:

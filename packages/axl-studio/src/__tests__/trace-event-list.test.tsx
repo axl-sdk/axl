@@ -31,6 +31,7 @@ import type { AxlEvent } from '../client/lib/types';
  */
 function makeEvent(overrides: Record<string, unknown>): AxlEvent {
   return {
+    schemaVersion: 2,
     executionId: 'exec-1',
     step: 0,
     type: 'agent_call_end',
@@ -149,5 +150,115 @@ describe('TraceEventList', () => {
     expect(screen.queryByRole('button', { name: /expand/i })).not.toBeInTheDocument();
     // No rows.
     expect(within(container).queryByText(/^#\d/)).not.toBeInTheDocument();
+  });
+
+  it('renders v2 terminal status and failure phase details', async () => {
+    const event = makeEvent({
+      type: 'tool_call_end',
+      tool: 'lookup',
+      callId: 'call-1',
+      duration: 4,
+      data: {
+        args: { id: 1 },
+        outcome: {
+          status: 'failed',
+          failure: {
+            phase: 'projection',
+            kind: 'output',
+            disposition: 'abort',
+            error: { name: 'Error', message: 'projection failed' },
+            result: { id: 1 },
+          },
+        },
+      },
+    });
+    render(<TraceEventList events={[event]} />);
+
+    expect(screen.getByText('failed')).toBeInTheDocument();
+    await userEvent.click(screen.getByText('#0').closest('button')!);
+    expect(screen.getByText(/projection · output · abort/)).toBeInTheDocument();
+    expect(screen.getByText(/Error: projection failed/)).toBeInTheDocument();
+    expect(screen.getByText('Result before failure')).toBeInTheDocument();
+    expect(screen.getAllByText('"id"')).toHaveLength(2);
+  });
+
+  it('labels unmatched v2 and legacy starts honestly after a trace completes', () => {
+    const v2Start = makeEvent({
+      step: 1,
+      type: 'tool_call_start',
+      tool: 'lookup',
+      callId: 'v2-call',
+      data: { args: {} },
+    });
+    const legacyStart = {
+      ...v2Start,
+      schemaVersion: undefined,
+      step: 2,
+      callId: 'legacy-call',
+    } as unknown as AxlEvent;
+
+    render(<TraceEventList events={[v2Start, legacyStart]} traceComplete />);
+
+    expect(screen.getByText('incomplete trace')).toBeInTheDocument();
+    expect(screen.getByText('legacy incomplete')).toBeInTheDocument();
+  });
+
+  it('does not pair legacy same-name calls when their call IDs differ', () => {
+    const start = {
+      ...makeEvent({
+        type: 'tool_call_start',
+        tool: 'lookup',
+        callId: 'start-id',
+        data: { args: {} },
+      }),
+      schemaVersion: undefined,
+    } as unknown as AxlEvent;
+    const end = {
+      ...makeEvent({
+        step: 1,
+        type: 'tool_call_end',
+        tool: 'lookup',
+        callId: 'different-id',
+        data: { args: {}, result: { ok: true }, callId: 'different-id' },
+      }),
+      schemaVersion: undefined,
+    } as unknown as AxlEvent;
+
+    render(<TraceEventList events={[start, end]} traceComplete />);
+
+    expect(screen.getByText('legacy incomplete')).toBeInTheDocument();
+  });
+
+  it('labels unmatched starts incomplete when history is truncated', () => {
+    const start = makeEvent({
+      type: 'tool_call_start',
+      tool: 'lookup',
+      callId: 'truncated-call',
+      data: { args: {} },
+    });
+    const truncated = makeEvent({
+      step: 2,
+      type: 'log',
+      data: { event: 'events_truncated' },
+    });
+
+    render(<TraceEventList events={[start, truncated]} />);
+
+    expect(screen.getByText('incomplete trace')).toBeInTheDocument();
+  });
+
+  it('renders a rejected request as a completed row with its reason', async () => {
+    const event = makeEvent({
+      type: 'tool_call_rejected',
+      tool: 'missing',
+      callId: 'call-rejected',
+      data: { reason: 'unavailable', requestedTool: 'missing', availableTools: ['lookup'] },
+    });
+    render(<TraceEventList events={[event]} />);
+
+    expect(screen.getByText('rejected')).toBeInTheDocument();
+    await userEvent.click(screen.getByText('#0').closest('button')!);
+    expect(screen.getByText('unavailable')).toBeInTheDocument();
+    expect(screen.getByText('lookup')).toBeInTheDocument();
   });
 });

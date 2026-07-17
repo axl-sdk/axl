@@ -25,6 +25,7 @@ import { act, renderHook } from '@testing-library/react';
 
 // Capture the callback registered by useWs so tests can push events.
 let wsCallback: ((data: unknown) => void) | null = null;
+let connectionCallback: ((connected: boolean) => void) | null = null;
 const subscribeMock = vi.fn((_channel: string, cb: (data: unknown) => void) => {
   wsCallback = cb;
   return () => {
@@ -35,6 +36,12 @@ const subscribeMock = vi.fn((_channel: string, cb: (data: unknown) => void) => {
 vi.mock('../client/lib/ws', () => ({
   wsClient: {
     subscribe: (channel: string, cb: (data: unknown) => void) => subscribeMock(channel, cb),
+    subscribeConnection: (cb: (connected: boolean) => void) => {
+      connectionCallback = cb;
+      return () => {
+        connectionCallback = null;
+      };
+    },
   },
 }));
 
@@ -61,6 +68,7 @@ function pushEvent(event: AxlEvent): void {
 
 beforeEach(() => {
   wsCallback = null;
+  connectionCallback = null;
   subscribeMock.mockClear();
   _step = 0;
 });
@@ -72,6 +80,7 @@ describe('useWsStream — initial state', () => {
       tokens: '',
       events: [],
       done: false,
+      interrupted: false,
       error: null,
       result: null,
     });
@@ -226,9 +235,16 @@ describe('useWsStream — executionId transitions', () => {
       tokens: '',
       events: [],
       done: false,
+      interrupted: false,
       error: null,
       result: null,
     });
+  });
+
+  it('marks an unfinished stream incomplete when the socket disconnects', () => {
+    const { result } = renderHook(() => useWsStream('interrupted-run'));
+    act(() => connectionCallback?.(false));
+    expect(result.current.interrupted).toBe(true);
   });
 
   it('id → null: keeps tokens/events visible but clears the done/result/error gate', () => {

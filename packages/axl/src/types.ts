@@ -197,9 +197,9 @@ export const AXL_EVENT_TYPES = [
   // Tool invocation lifecycle
   'tool_call_start',
   'tool_call_end',
+  'tool_call_rejected',
   // Single-point tool events
   'tool_approval',
-  'tool_denied',
   // Delegation
   'delegate',
   // Handoff (spans two asks; not AskScoped).
@@ -249,12 +249,8 @@ export const AXL_EVENT_TYPES = [
 /** Discriminator union derived from `AXL_EVENT_TYPES`. */
 export type AxlEventType = (typeof AXL_EVENT_TYPES)[number];
 
-/** Canonical discriminator list for the v2 writer. Kept additive while the
- * compatible runtime still emits v1 so readers can become exhaustive first. */
-export const AXL_EVENT_TYPES_V2 = [
-  ...AXL_EVENT_TYPES.filter((type) => type !== 'tool_denied'),
-  'tool_call_rejected',
-] as const;
+/** Backward-compatible name for the canonical v2 writer discriminator list. */
+export const AXL_EVENT_TYPES_V2 = AXL_EVENT_TYPES;
 
 /** Accepted/rejected tool lifecycle discriminators in event schema v2. */
 export const AXL_TOOL_LIFECYCLE_TYPES_V2 = [
@@ -410,18 +406,6 @@ export type ToolFailureOptions = {
   code?: string;
   cause?: unknown;
 };
-
-/** Compile-only Phase 0 shape for the next-major `ToolFailure` class.
- * The runtime value is introduced atomically with recognition in the v2 tool
- * coordinator so a compatible runtime can never mis-handle it. */
-export type ToolFailure = Error & {
-  readonly code: string;
-  readonly modelMessage: string;
-  readonly cause?: unknown;
-};
-
-/** Compile-only constructor contract for `ToolFailure`. */
-export type ToolFailureConstructor = new (options: ToolFailureOptions) => ToolFailure;
 
 /** Failure details for an accepted v2 tool invocation. */
 export type ToolCallFailure =
@@ -794,24 +778,6 @@ export type AskScoped = {
 };
 
 /**
- * Meta carried alongside callback invocations (`onToken`, `onAgentStart`,
- * `onToolCall`) so consumers can group/route by ask.
- *
- * Note: `agent` is **required** here (the callback is always invoked
- * inside an ALS frame that has the agent name already resolved). On the
- * event side (`AskScoped.agent`) the field is optional — events emitted
- * before agent resolution (e.g., `ask_start` is fired before the
- * dynamic agent selector runs) can land without it.
- */
-/** @deprecated Observe typed `AxlEvent` values instead. */
-export type CallbackMeta = {
-  askId: string;
-  parentAskId?: string;
-  depth: number;
-  agent: string;
-};
-
-/**
  * Unified event union. Replaces the old `TraceEvent` (rich, persisted) and
  * `StreamEvent` (lean, wire) by emitting a single rich event from one site
  * and consuming the same shape on both rails.
@@ -1098,9 +1064,8 @@ export type AxlEventV2 =
       schemaVersion: 2;
     });
 
-/** Current live event alias. The breaking writer switch moves this alias to
- * `AxlEventV2` without changing the frozen historical contract above. */
-export type AxlEvent = LegacyAxlEventV1;
+/** Current live event contract. Every emitted event is explicitly v2. */
+export type AxlEvent = AxlEventV2;
 
 /** Event returned by state-store and recovery readers during the migration. */
 export type HistoricalAxlEvent = LegacyAxlEventV1 | AxlEventV2;
@@ -1193,10 +1158,6 @@ export type ExecutionInfoV1 = {
   metadata?: Record<string, unknown>;
 };
 
-/** Current live execution alias. The breaking writer switch moves this alias
- * to `ExecutionInfoV2` while historical reads retain their explicit union. */
-export type ExecutionInfo = ExecutionInfoV1;
-
 /** Stored execution written before explicit event schema versioning. */
 export type LegacyExecutionInfoV1 = ExecutionInfoV1 & {
   eventSchemaVersion?: 1;
@@ -1207,6 +1168,9 @@ export type ExecutionInfoV2 = Omit<ExecutionInfoV1, 'events'> & {
   eventSchemaVersion: 2;
   events: AxlEventV2[];
 };
+
+/** Current live execution contract. Historical reads retain their explicit union. */
+export type ExecutionInfo = ExecutionInfoV2;
 
 /** Honest state-store read contract: missing version metadata means v1. */
 export type HistoricalExecutionInfo = LegacyExecutionInfoV1 | ExecutionInfoV2;

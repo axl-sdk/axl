@@ -867,8 +867,8 @@ describe('AxlStream', () => {
       agent_call_end: 'lifecycle',
       tool_call_start: 'lifecycle',
       tool_call_end: 'lifecycle',
+      tool_call_rejected: 'lifecycle',
       tool_approval: 'lifecycle',
-      tool_denied: 'lifecycle',
       delegate: 'lifecycle',
       handoff_start: 'lifecycle',
       handoff_return: 'lifecycle',
@@ -954,7 +954,14 @@ describe('AxlStream', () => {
           tool: 't',
           callId: 'c1',
           duration: 1,
-          data: { args: {}, result: 'r' },
+          data: { args: {}, outcome: { status: 'succeeded', result: 'r' } },
+          ...ASK_,
+        },
+        tool_call_rejected: {
+          type: 'tool_call_rejected',
+          tool: 't',
+          callId: 'c2',
+          data: { reason: 'unavailable', requestedTool: 't', availableTools: [] },
           ...ASK_,
         },
         tool_approval: {
@@ -963,7 +970,6 @@ describe('AxlStream', () => {
           data: { approved: true, args: {} },
           ...ASK_,
         },
-        tool_denied: { type: 'tool_denied', tool: 't', ...ASK_ },
         delegate: {
           type: 'delegate',
           data: { candidates: ['a'], reason: 'single_candidate' },

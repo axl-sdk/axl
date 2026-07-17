@@ -1,5 +1,6 @@
-import type { z } from 'zod';
+import { ZodError, type z } from 'zod';
 import type { WorkflowContext } from './context.js';
+import type { ToolArgumentIssue } from './types.js';
 
 /** Retry policy for tool handlers */
 export type RetryPolicy = {
@@ -66,26 +67,130 @@ const DEFAULT_MAX_STRING_LENGTH = 10_000;
  * Recursively validate string lengths in parsed tool arguments.
  * Throws if any string exceeds the configured max length.
  */
-function validateStringLengths(value: unknown, maxLen: number, path = ''): void {
+class ToolStringLengthError extends Error {
+  constructor(
+    readonly path: readonly (string | number)[],
+    readonly actual: number,
+    readonly maximum: number,
+  ) {
+    const renderedPath = path.reduce<string>(
+      (current, part) =>
+        typeof part === 'number' ? `${current}[${part}]` : current ? `${current}.${part}` : part,
+      '',
+    );
+    super(
+      `String argument${renderedPath ? ` at "${renderedPath}"` : ''} exceeds maximum length (${actual} > ${maximum})`,
+    );
+    this.name = 'ToolStringLengthError';
+  }
+}
+
+function validateStringLengths(
+  value: unknown,
+  maxLen: number,
+  path: readonly (string | number)[] = [],
+): void {
   if (typeof value === 'string') {
     if (value.length > maxLen) {
-      throw new Error(
-        `String argument${path ? ` at "${path}"` : ''} exceeds maximum length (${value.length} > ${maxLen})`,
-      );
+      throw new ToolStringLengthError(path, value.length, maxLen);
     }
   } else if (Array.isArray(value)) {
     for (let i = 0; i < value.length; i++) {
-      validateStringLengths(value[i], maxLen, path ? `${path}[${i}]` : `[${i}]`);
+      validateStringLengths(value[i], maxLen, [...path, i]);
     }
   } else if (value !== null && typeof value === 'object') {
     for (const [key, val] of Object.entries(value)) {
-      validateStringLengths(val, maxLen, path ? `${path}.${key}` : key);
+      validateStringLengths(val, maxLen, [...path, key]);
     }
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timeout);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function isAbortError(error: unknown): boolean {
+  try {
+    return (
+      (error instanceof DOMException && error.name === 'AbortError') ||
+      (error instanceof Error && error.name === 'AbortError')
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Convert local input failures to provider-corrective structural issues. */
+export function toolArgumentIssues(error: unknown): ToolArgumentIssue[] {
+  if (error instanceof ZodError) {
+    return error.issues.map((issue) => ({
+      path: issue.path.map((part) => (typeof part === 'symbol' ? String(part) : part)),
+      code: issue.code,
+      message: issue.message,
+    }));
+  }
+  if (error instanceof ToolStringLengthError) {
+    return [
+      {
+        path: error.path,
+        code: 'too_big',
+        message: error.message,
+      },
+    ];
+  }
+  return [{ path: [], code: 'invalid_arguments', message: 'Tool arguments are invalid.' }];
+}
+
+type ToolExecutionOptions = {
+  signal?: AbortSignal;
+  onAttempt?: (attempt: number) => void;
+  /** Lifecycle coordinator classifies a returned value followed by abort as
+   * `after_handler`; direct `_execute()` retains its historical abort check. */
+  checkAfterHandlerAbort?: boolean;
+};
+
+type ToolInternals = {
+  prepareInput(input: unknown): unknown;
+  executePrepared(
+    input: unknown,
+    ctx?: WorkflowContext,
+    options?: ToolExecutionOptions,
+  ): Promise<unknown>;
+};
+
+const TOOL_INTERNALS = new WeakMap<object, ToolInternals>();
+
+function getToolInternals(tool: Tool): ToolInternals {
+  const internals = TOOL_INTERNALS.get(tool as object);
+  if (!internals) throw new Error(`Tool "${tool.name}" was not created by tool()`);
+  return internals;
+}
+
+/** Internal agent-call seam: validate once before lifecycle acceptance. */
+export function prepareToolInput(tool: Tool, input: unknown): unknown {
+  return getToolInternals(tool).prepareInput(input);
+}
+
+/** Internal agent-call seam: execute previously validated input. */
+export function executePreparedTool(
+  tool: Tool,
+  input: unknown,
+  ctx: WorkflowContext,
+  options?: ToolExecutionOptions,
+): Promise<unknown> {
+  return getToolInternals(tool).executePrepared(input, ctx, options);
 }
 
 function getBackoffMs(attempt: number, strategy: 'none' | 'linear' | 'exponential'): number {
@@ -115,25 +220,35 @@ export function tool<TInput extends z.ZodType, TOutput = unknown>(
 
   const maxStringLen = config.maxStringLength ?? DEFAULT_MAX_STRING_LENGTH;
 
-  const execute = async (input: z.infer<TInput>, ctx?: WorkflowContext): Promise<TOutput> => {
-    // Validate input against schema
+  const prepareInput = (input: unknown): z.infer<TInput> => {
     const parsed = config.input.parse(input);
-
-    // Enforce string length limits
     if (maxStringLen > 0) {
       validateStringLengths(parsed, maxStringLen);
     }
+    return parsed;
+  };
 
+  const executePrepared = async (
+    parsed: z.infer<TInput>,
+    ctx?: WorkflowContext,
+    options?: ToolExecutionOptions,
+  ): Promise<TOutput> => {
     const maxAttempts = retryPolicy.attempts ?? 1;
 
     let lastError: Error | undefined;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      options?.signal?.throwIfAborted();
+      options?.onAttempt?.(attempt);
       try {
         // ctx is optional on _execute but required on handler. In practice, all runtime
         // call sites (agent tool loop, tool.run) always provide ctx. The undefined case
         // only occurs when _execute is called directly in tests or internal code.
-        return await config.handler(parsed, ctx as WorkflowContext);
+        const result = await config.handler(parsed, ctx as WorkflowContext);
+        if (options?.checkAfterHandlerAbort !== false) options?.signal?.throwIfAborted();
+        return result;
       } catch (err) {
+        if (options?.signal?.aborted) options.signal.throwIfAborted();
+        if (isAbortError(err)) throw err;
         lastError = err instanceof Error ? err : new Error(String(err));
 
         if (attempt === maxAttempts) break;
@@ -146,7 +261,7 @@ export function tool<TInput extends z.ZodType, TOutput = unknown>(
         // Apply backoff
         const backoffMs = getBackoffMs(attempt, retryPolicy.backoff ?? 'exponential');
         if (backoffMs > 0) {
-          await sleep(backoffMs);
+          await sleep(backoffMs, options?.signal);
         }
       }
     }
@@ -154,7 +269,10 @@ export function tool<TInput extends z.ZodType, TOutput = unknown>(
     throw lastError;
   };
 
-  return {
+  const execute = async (input: z.infer<TInput>, ctx?: WorkflowContext): Promise<TOutput> =>
+    executePrepared(prepareInput(input), ctx);
+
+  const instance: Tool<TInput, TOutput> = {
     name: config.name,
     description: config.description,
     inputSchema: config.input,
@@ -197,4 +315,9 @@ export function tool<TInput extends z.ZodType, TOutput = unknown>(
 
     _execute: execute,
   };
+  TOOL_INTERNALS.set(instance, {
+    prepareInput,
+    executePrepared: executePrepared as ToolInternals['executePrepared'],
+  });
+  return instance;
 }

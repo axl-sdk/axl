@@ -1118,7 +1118,7 @@ describe('trace events — redaction', () => {
     expect(toolCallEvents).toHaveLength(1);
     const data = toolCallEvents[0].data as Record<string, unknown>;
     expect(data.args).toBe('[redacted]');
-    expect(data.result).toBe('[redacted]');
+    expect(data.outcome).toEqual({ status: 'succeeded', result: '[redacted]' });
   });
 
   it('redacts tool_approval args when trace.redact is true', async () => {

@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Send, ArrowRight, ShieldCheck, MessageSquarePlus, Activity } from 'lucide-react';
 import { eventCostContribution } from '../../lib/event-utils';
-import type { AxlEvent } from '../../lib/types';
+import type { AxlEvent, ToolCallOutcome, ToolCallRejectedData } from '../../lib/types';
 import { PanelHeader } from '../../components/layout/PanelHeader';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { StreamingText } from '../../components/shared/StreamingText';
@@ -15,7 +15,35 @@ import { fetchAgents, playgroundChat } from '../../lib/api';
 import { useWsStream } from '../../hooks/use-ws-stream';
 import { cn, formatCost, formatTokens } from '../../lib/utils';
 
-type ToolCall = { name: string; args: unknown; result?: unknown; callId?: string };
+type ToolCallBase = {
+  name: string;
+  args: unknown;
+  callId: string;
+  executionId: string;
+  askId: string;
+  /** False when replay/transport loss delivered a terminal without its start. */
+  startObserved: boolean;
+};
+type ToolCall =
+  | (ToolCallBase & { status: 'running' | 'incomplete' })
+  | (ToolCallBase & { status: 'succeeded'; result: unknown })
+  | (ToolCallBase & {
+      status: 'failed';
+      failure: Extract<ToolCallOutcome, { status: 'failed' }>['failure'];
+    })
+  | (ToolCallBase & { status: 'denied'; reason?: string })
+  | (ToolCallBase & {
+      status: 'cancelled';
+      cancellation: Extract<ToolCallOutcome, { status: 'cancelled' }>['cancellation'];
+    })
+  | {
+      name: string;
+      callId: string;
+      executionId: string;
+      askId: string;
+      status: 'rejected';
+      rejection: ToolCallRejectedData;
+    };
 type Handoff = { source: string; target: string; mode: string };
 
 type Message = {
@@ -26,11 +54,26 @@ type Message = {
   approvals?: Array<{ tool: string; approved: boolean }>;
 };
 
+function ToolCallStatusBadge({ status }: { status: ToolCall['status'] }) {
+  const tone =
+    status === 'succeeded'
+      ? 'bg-green-100 text-green-800 dark:bg-green-950/40 dark:text-green-300'
+      : status === 'running'
+        ? 'bg-blue-100 text-blue-800 dark:bg-blue-950/40 dark:text-blue-300'
+        : status === 'incomplete' || status === 'cancelled'
+          ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300'
+          : 'bg-red-100 text-red-800 dark:bg-red-950/40 dark:text-red-300';
+  return (
+    <span className={cn('px-1.5 py-0.5 text-[9px] font-medium rounded-full', tone)}>{status}</span>
+  );
+}
+
 // Stable Set hoisted out of render — re-creating per render means the
 // auto-open effect's dependency identity churns and triggers an extra
 // rescan on every render of the component.
 const ACTIVITY_TRIGGERS: ReadonlySet<string> = new Set([
   'tool_call_start',
+  'tool_call_rejected',
   'handoff_start',
   'tool_approval',
 ]);
@@ -287,7 +330,8 @@ export function PlaygroundPanel() {
 
   // Collect tool calls, handoffs, and approvals from stream events
   useEffect(() => {
-    const toolCalls: ToolCall[] = [];
+    const toolCalls = new Map<string, ToolCall>();
+    const toolCallOrder: string[] = [];
     const handoffs: Handoff[] = [];
     const approvals: Array<{ tool: string; approved: boolean }> = [];
 
@@ -302,18 +346,63 @@ export function PlaygroundPanel() {
     // SPA — degrade to undefined rendering instead.
     for (const event of stream.events) {
       if (event.type === 'tool_call_start') {
-        toolCalls.push({
+        const key = `${event.executionId}\u0000${event.askId}\u0000${event.callId}`;
+        toolCalls.set(key, {
           name: event.tool,
           args: event.data?.args,
           callId: event.callId,
+          executionId: event.executionId,
+          askId: event.askId,
+          startObserved: true,
+          status: 'running',
         });
+        toolCallOrder.push(key);
       } else if (event.type === 'tool_call_end') {
-        // Prefer callId match; the top-level `tool` is the fallback
-        // for legacy events that didn't stamp callId.
-        const existing = event.callId
-          ? toolCalls.find((tc) => tc.callId === event.callId)
-          : toolCalls.find((tc) => tc.name === event.tool && !tc.result);
-        if (existing) existing.result = event.data?.result;
+        // Live Playground events are v2: pair only by the full invocation
+        // identity. Name-only matching can attach an end to the wrong nested ask.
+        const key = `${event.executionId}\u0000${event.askId}\u0000${event.callId}`;
+        const existing = toolCalls.get(key);
+        if (!existing || existing.status !== 'rejected') {
+          const base: ToolCallBase = {
+            name: event.tool,
+            args: event.data.args,
+            callId: event.callId,
+            executionId: event.executionId,
+            askId: event.askId,
+            startObserved: existing != null,
+          };
+          const outcome = event.data.outcome;
+          switch (outcome.status) {
+            case 'succeeded':
+              toolCalls.set(key, { ...base, status: 'succeeded', result: outcome.result });
+              break;
+            case 'failed':
+              toolCalls.set(key, { ...base, status: 'failed', failure: outcome.failure });
+              break;
+            case 'denied':
+              toolCalls.set(key, { ...base, status: 'denied', reason: outcome.reason });
+              break;
+            case 'cancelled':
+              toolCalls.set(key, {
+                ...base,
+                status: 'cancelled',
+                cancellation: outcome.cancellation,
+              });
+              break;
+          }
+          if (!existing) toolCallOrder.push(key);
+        }
+      } else if (event.type === 'tool_call_rejected') {
+        const key = `${event.executionId}\u0000${event.askId}\u0000${event.callId}`;
+        toolCalls.set(key, {
+          name: event.tool,
+          callId: event.callId,
+          executionId: event.executionId,
+          askId: event.askId,
+          status: 'rejected',
+          rejection: event.data,
+        });
+        toolCallOrder.push(key);
       } else if (event.type === 'handoff_start') {
         // `handoff_start` carries the transition metadata (source, target,
         // mode). `handoff_return` (roundtrip only) is a structural marker —
@@ -328,7 +417,18 @@ export function PlaygroundPanel() {
       }
     }
 
-    if (toolCalls.length > 0 || handoffs.length > 0 || approvals.length > 0) {
+    if (stream.done) {
+      for (const [key, toolCall] of toolCalls) {
+        if (toolCall.status === 'running')
+          toolCalls.set(key, { ...toolCall, status: 'incomplete' });
+      }
+    }
+    const orderedToolCalls = toolCallOrder.flatMap((key) => {
+      const toolCall = toolCalls.get(key);
+      return toolCall ? [toolCall] : [];
+    });
+
+    if (orderedToolCalls.length > 0 || handoffs.length > 0 || approvals.length > 0) {
       setMessages((prev) => {
         const last = prev[prev.length - 1];
         if (last?.role === 'assistant') {
@@ -336,7 +436,7 @@ export function PlaygroundPanel() {
             ...prev.slice(0, -1),
             {
               ...last,
-              toolCalls: toolCalls.length > 0 ? toolCalls : last.toolCalls,
+              toolCalls: orderedToolCalls.length > 0 ? orderedToolCalls : last.toolCalls,
               handoffs: handoffs.length > 0 ? handoffs : last.handoffs,
               approvals: approvals.length > 0 ? approvals : last.approvals,
             },
@@ -345,7 +445,7 @@ export function PlaygroundPanel() {
         return prev;
       });
     }
-  }, [stream.events]);
+  }, [stream.events, stream.done]);
 
   // Track cost and tokens from stream events incrementally
   useEffect(() => {
@@ -558,14 +658,79 @@ export function PlaygroundPanel() {
                 <div className="mt-2 space-y-2 border-t border-[hsl(var(--border))] pt-2">
                   {msg.toolCalls.map((tc, j) => (
                     <div key={j} className="text-xs">
-                      <div className="font-medium mb-1">Tool: {tc.name}</div>
+                      <div className="flex items-center gap-2 font-medium mb-1">
+                        <span>Tool: {tc.name}</span>
+                        <ToolCallStatusBadge status={tc.status} />
+                      </div>
                       <div className="space-y-1">
-                        <div className="text-[hsl(var(--muted-foreground))]">Input:</div>
-                        <JsonViewer data={tc.args} collapsed />
-                        {tc.result !== undefined && (
+                        {tc.status !== 'rejected' && (
+                          <>
+                            <div className="text-[hsl(var(--muted-foreground))]">Input:</div>
+                            <JsonViewer data={tc.args} collapsed />
+                          </>
+                        )}
+                        {tc.status !== 'rejected' && !tc.startObserved && (
+                          <div className="text-amber-600 dark:text-amber-400">
+                            Terminal observed without its matching start; the trace is incomplete.
+                          </div>
+                        )}
+                        {tc.status === 'succeeded' && (
                           <>
                             <div className="text-[hsl(var(--muted-foreground))]">Output:</div>
                             <JsonViewer data={tc.result} collapsed />
+                          </>
+                        )}
+                        {tc.status === 'failed' && (
+                          <>
+                            <div className="text-red-600 dark:text-red-400">
+                              Failed in {tc.failure.phase}: {tc.failure.error.name} —{' '}
+                              {tc.failure.error.message}
+                            </div>
+                            {'result' in tc.failure && (
+                              <>
+                                <div className="text-[hsl(var(--muted-foreground))]">
+                                  Output before failure:
+                                </div>
+                                <JsonViewer data={tc.failure.result} collapsed />
+                              </>
+                            )}
+                          </>
+                        )}
+                        {tc.status === 'denied' && tc.reason && (
+                          <div className="text-red-600 dark:text-red-400">Reason: {tc.reason}</div>
+                        )}
+                        {tc.status === 'cancelled' && (
+                          <>
+                            <div className="text-amber-600 dark:text-amber-400">
+                              Cancelled in {tc.cancellation.phase}
+                              {tc.cancellation.reason ? `: ${tc.cancellation.reason}` : ''}
+                            </div>
+                            {'result' in tc.cancellation && (
+                              <>
+                                <div className="text-[hsl(var(--muted-foreground))]">
+                                  Output before cancellation:
+                                </div>
+                                <JsonViewer data={tc.cancellation.result} collapsed />
+                              </>
+                            )}
+                          </>
+                        )}
+                        {tc.status === 'incomplete' && (
+                          <div className="text-amber-600 dark:text-amber-400">
+                            Trace ended before a matching tool terminal was observed.
+                          </div>
+                        )}
+                        {tc.status === 'rejected' && (
+                          <>
+                            <div className="text-red-600 dark:text-red-400">
+                              Rejected before execution: {tc.rejection.reason}
+                            </div>
+                            {tc.rejection.reason === 'invalid_arguments' && (
+                              <JsonViewer
+                                data={{ args: tc.rejection.args, issues: tc.rejection.issues }}
+                                collapsed
+                              />
+                            )}
                           </>
                         )}
                       </div>
@@ -752,7 +917,12 @@ export function PlaygroundPanel() {
               </h3>
               <AskTree events={stream.events} />
               {activityEvents.length > 0 ? (
-                <TraceEventList events={activityEvents} showToolbar={false} />
+                <TraceEventList
+                  events={activityEvents}
+                  lifecycleEvents={stream.events}
+                  traceComplete={stream.done || stream.interrupted}
+                  showToolbar={false}
+                />
               ) : (
                 <p className="text-xs text-[hsl(var(--muted-foreground))]">
                   Events will appear here as the agent executes.

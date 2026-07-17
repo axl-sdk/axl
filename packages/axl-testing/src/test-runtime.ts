@@ -8,6 +8,7 @@ import type {
   AgentCallInfo,
   AxlConfig,
   AnyWorkflow,
+  ToolCallOutcome,
 } from '@axlsdk/axl';
 import {
   WorkflowContext,
@@ -23,7 +24,20 @@ import type { EventStreamOptions, WorkflowContextInit } from '@axlsdk/axl';
 // `any` is load-bearing for satisfying narrowly-typed handlers (e.g., a
 // `Workflow<TInput=MsgType>` whose handler takes `WorkflowContext<MsgType>`).
 
-export type RecordedToolCall = { name: string; args: unknown; result: unknown };
+/** One accepted provider-issued tool invocation, recorded from its terminal v2 event.
+ *
+ * Narrow `outcome.status` before reading status-specific fields. Correlation uses
+ * `(executionId, askId, callId)`; `name` is the canonical tool name.
+ */
+export type RecordedToolCall = {
+  name: string;
+  executionId: string;
+  askId: string;
+  callId: string;
+  args: unknown;
+  requestedTool?: string;
+  outcome: ToolCallOutcome;
+};
 export type RecordedAgentCall = Partial<AgentCallInfo> &
   Pick<AgentCallInfo, 'agent' | 'prompt' | 'response'>;
 export type RecordedStep = { step: number; type: string; data: unknown };
@@ -166,10 +180,17 @@ export class AxlTestRuntime {
           data: (event as { data?: unknown }).data,
         });
 
-        if (event.type === 'tool_call_end' && event.data) {
-          const { args, result } = event.data as { args: unknown; result: unknown };
-          // `tool: string` is required on `tool_call_end`; narrowing makes it non-null.
-          this._toolCalls.push({ name: event.tool, args, result });
+        if (event.type === 'tool_call_end') {
+          const { args, requestedTool, outcome } = event.data;
+          this._toolCalls.push({
+            name: event.tool,
+            executionId: event.executionId,
+            askId: event.askId,
+            callId: event.callId,
+            args,
+            ...(requestedTool !== undefined ? { requestedTool } : {}),
+            outcome,
+          });
         }
 
         // Single-source-of-truth cost accumulator. Skips ask_end

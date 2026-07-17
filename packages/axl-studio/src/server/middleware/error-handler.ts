@@ -36,7 +36,7 @@ export async function errorHandler(c: Context<StudioEnv>, next: Next) {
     // (ValidationError includes the failing reason, provider errors often
     // quote the request body, GuardrailError includes the trigger reason).
     // `redactErrorMessage` lets structural errors (Budget/Timeout/MaxTurns/
-    // Quorum/NoConsensus/ToolDenied) pass through and scrubs the rest.
+    // Quorum/NoConsensus) pass through and scrubs the rest.
     const runtime = c.get('runtime');
     const redactOn = runtime?.isRedactEnabled?.() ?? false;
 

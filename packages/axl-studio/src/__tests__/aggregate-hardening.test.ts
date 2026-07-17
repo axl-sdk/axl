@@ -319,9 +319,9 @@ describe('reduceTraceStats tool_approval regression', () => {
       }),
     );
 
-    expect(state.byTool['dangerous-tool'].approved).toBe(1);
-    expect(state.byTool['dangerous-tool'].denied).toBe(0);
-    expect(state.byTool['dangerous-tool'].calls).toBe(0);
+    expect(state.byTool['dangerous-tool'].legacy.approved).toBe(1);
+    expect(state.byTool['dangerous-tool'].legacy.denied).toBe(0);
+    expect(state.byTool['dangerous-tool'].legacy.calls).toBe(0);
   });
 
   it('tool_approval with data.approved=false increments denied counter', () => {
@@ -335,8 +335,8 @@ describe('reduceTraceStats tool_approval regression', () => {
       }),
     );
 
-    expect(state.byTool['dangerous-tool'].denied).toBe(1);
-    expect(state.byTool['dangerous-tool'].approved).toBe(0);
+    expect(state.byTool['dangerous-tool'].legacy.denied).toBe(1);
+    expect(state.byTool['dangerous-tool'].legacy.approved).toBe(0);
   });
 
   it('tool_approval with no data increments neither approved nor denied', () => {
@@ -353,8 +353,8 @@ describe('reduceTraceStats tool_approval regression', () => {
     // With no data, approved is undefined (not true, not false).
     // isDenied requires eventData?.approved === false (strict), so undefined doesn't match.
     // isApproved requires eventData?.approved === true, so undefined doesn't match.
-    expect(state.byTool['dangerous-tool'].approved).toBe(0);
-    expect(state.byTool['dangerous-tool'].denied).toBe(0);
+    expect(state.byTool['dangerous-tool'].legacy.approved).toBe(0);
+    expect(state.byTool['dangerous-tool'].legacy.denied).toBe(0);
   });
 
   it('mixed tool events accumulate correctly', () => {
@@ -387,9 +387,9 @@ describe('reduceTraceStats tool_approval regression', () => {
       makeEvent({ type: 'tool_denied', tool, data: { approved: true } }),
     );
 
-    expect(state.byTool[tool].calls).toBe(3);
-    expect(state.byTool[tool].approved).toBe(3); // 2 from tool_approval + 1 from tool_denied
-    expect(state.byTool[tool].denied).toBe(2); // 1 from tool_approval + 1 from tool_denied
+    expect(state.byTool[tool].legacy.calls).toBe(3);
+    expect(state.byTool[tool].legacy.approved).toBe(3); // 2 from tool_approval + 1 from tool_denied
+    expect(state.byTool[tool].legacy.denied).toBe(2); // 1 from tool_approval + 1 from tool_denied
   });
 });
 

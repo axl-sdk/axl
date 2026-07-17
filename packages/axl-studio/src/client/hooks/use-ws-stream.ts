@@ -13,6 +13,8 @@ type StreamState = {
   tokens: string;
   events: AxlEvent[];
   done: boolean;
+  /** True once transport interruption makes lifecycle pairing incomplete. */
+  interrupted: boolean;
   error: string | null;
   result: unknown;
 };
@@ -21,6 +23,7 @@ const INITIAL_STATE: StreamState = {
   tokens: '',
   events: [],
   done: false,
+  interrupted: false,
   error: null,
   result: null,
 };
@@ -112,7 +115,11 @@ export function useWsStream(executionId: string | null): StreamState {
     });
   }, []);
 
-  useWs(executionId ? `execution:${executionId}` : null, handleEvent);
+  const handleDisconnect = useCallback(() => {
+    setState((prev) => (prev.done ? prev : { ...prev, interrupted: true }));
+  }, []);
+
+  useWs(executionId ? `execution:${executionId}` : null, handleEvent, handleDisconnect);
 
   return state;
 }

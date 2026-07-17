@@ -62,7 +62,6 @@ const SAFE_ERROR_NAMES = new Set([
   'TimeoutError',
   'MaxTurnsError',
   'BudgetExceededError',
-  'ToolDenied',
 ]);
 
 /**

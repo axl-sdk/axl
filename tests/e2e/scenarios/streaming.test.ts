@@ -92,7 +92,7 @@ describe('Streaming E2E', () => {
     expect(types).toContain('done');
   });
 
-  it('streams tokens from BOTH outer and sub-agent (consumers filter via meta.depth — spec/16 §3.2)', async () => {
+  it('streams tokens from BOTH outer and sub-agent (consumers filter via event.depth)', async () => {
     const researcher = agent({
       name: 'researcher',
       model: 'mock:researcher',
@@ -183,7 +183,10 @@ describe('Streaming E2E', () => {
     expect(toolCallEndEvents.length).toBeGreaterThanOrEqual(1);
     const researchResult = toolCallEndEvents.find((e) => e.tool === 'research');
     expect(researchResult).toBeDefined();
-    expect(researchResult!.data.result).toBe('research findings about topic X');
+    expect(researchResult!.data.outcome).toEqual({
+      status: 'succeeded',
+      result: 'research findings about topic X',
+    });
 
     // Stream should complete with a done event
     const doneEvents = allEvents.filter((e) => e.type === 'done');
@@ -260,12 +263,18 @@ describe('Streaming E2E', () => {
       (e): e is Extract<AxlEvent, { type: 'tool_call_end' }> => e.type === 'tool_call_end',
     );
     expect(toolCallEndEvents).toHaveLength(2);
-    expect(toolCallEndEvents[0].data.callId).toBe('call_aaa');
-    expect(toolCallEndEvents[1].data.callId).toBe('call_bbb');
+    expect(toolCallEndEvents[0].callId).toBe('call_aaa');
+    expect(toolCallEndEvents[1].callId).toBe('call_bbb');
 
-    // Results should be correctly attributed (carried on tool_call_end.data.result)
-    expect(toolCallEndEvents[0].data.result).toBe('Result for: cats');
-    expect(toolCallEndEvents[1].data.result).toBe('Result for: dogs');
+    // Results should be correctly attributed through the v2 terminal outcome.
+    expect(toolCallEndEvents[0].data.outcome).toEqual({
+      status: 'succeeded',
+      result: 'Result for: cats',
+    });
+    expect(toolCallEndEvents[1].data.outcome).toEqual({
+      status: 'succeeded',
+      result: 'Result for: dogs',
+    });
   });
 
   it('stream rejects with error when workflow throws', async () => {

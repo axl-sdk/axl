@@ -22,7 +22,6 @@ import { MemoryManager } from './memory/manager.js';
 import type {
   AxlEvent,
   AxlEventV2,
-  CallbackMeta,
   ExecutionInfo,
   HistoricalAxlEvent,
   HistoricalExecutionInfo,
@@ -32,6 +31,7 @@ import type {
   ChatMessage,
   HandoffRecord,
 } from './types.js';
+import { AxlError } from './errors.js';
 import {
   getEventSchemaVersion,
   normalizeStoredExecution as normalizeHistoricalExecution,
@@ -351,6 +351,7 @@ function pushEventBounded(execInfo: ExecutionInfo, event: AxlEvent, cap: number)
     (last.data as { event?: string }).event === 'events_truncated';
   if (!alreadyTruncated) {
     execInfo.events[execInfo.events.length - 1] = {
+      schemaVersion: 2,
       type: 'log',
       executionId: event.executionId,
       step: event.step,
@@ -364,7 +365,7 @@ function pushEventBounded(execInfo: ExecutionInfo, event: AxlEvent, cap: number)
           `and the WS broadcast — only the in-memory array is bounded. ` +
           `Raise via config.state.maxEventsPerExecution.`,
       },
-    } as AxlEvent;
+    };
   }
 }
 
@@ -480,19 +481,6 @@ export type CreateContextOptions = {
   signal?: AbortSignal;
   /** Prior conversation history for multi-turn eval testing. */
   sessionHistory?: ChatMessage[];
-  /** @deprecated Use `ctx.events` or `runtime.stream()`.
-   * Token streaming callback. `meta` carries `askId`/`parentAskId`/`depth`/`agent`
-   *  so consumers can route or filter by ask correlation (e.g.,
-   *  `meta.depth === 0` for root-only chat UIs). */
-  onToken?: (token: string, meta: CallbackMeta) => void;
-  /** @deprecated Use `ctx.events` and observe `tool_call_start`.
-   * Fires when an agent invokes a tool. `meta` carries the same ask
-   *  correlation shape as `onToken`. */
-  onToolCall?: (call: { name: string; args: unknown; callId?: string }, meta: CallbackMeta) => void;
-  /** @deprecated Use `ctx.events` and observe `agent_call_start`.
-   * Fires when an agent begins processing a turn. `meta` carries the
-   *  same ask correlation shape as `onToken`. */
-  onAgentStart?: (info: { agent: string; model?: string }, meta: CallbackMeta) => void;
   /** Handler for tool approval requests. Called when an agent invokes a tool with requireApproval. */
   awaitHumanHandler?: (options: AwaitHumanOptions) => Promise<HumanDecision>;
   /** Configuration for the lazy `ctx.events` bus on the returned context.
@@ -500,6 +488,21 @@ export type CreateContextOptions = {
    *  'drop-oldest-non-terminal'`. */
   events?: EventStreamOptions;
 };
+
+const REMOVED_OBSERVATION_CALLBACKS = ['onToken', 'onToolCall', 'onAgentStart'] as const;
+
+function assertNoRemovedObservationCallbacks(options: unknown): void {
+  if (options === null || typeof options !== 'object') return;
+  const removed = REMOVED_OBSERVATION_CALLBACKS.filter((key) => Object.hasOwn(options, key));
+  if (removed.length === 0) return;
+
+  throw new AxlError(
+    'INVALID_CONFIG',
+    `runtime.createContext() no longer accepts ${removed.join(', ')}. ` +
+      'Observe ctx.events or use runtime.stream() instead. ' +
+      'See docs/migration/stream-first-observation.md.',
+  );
+}
 
 /** Cost scope for tracking cost across async boundaries via AsyncLocalStorage. */
 type CostScope = {
@@ -1171,6 +1174,7 @@ export class AxlRuntime extends EventEmitter {
    * and automatically emits trace events and tracks cost.
    */
   createContext(options?: CreateContextOptions): WorkflowContext {
+    assertNoRemovedObservationCallbacks(options);
     const executionId = randomUUID();
     const budgetLimit = options?.budget ? parseCost(options.budget) : Infinity;
 
@@ -1189,9 +1193,6 @@ export class AxlRuntime extends EventEmitter {
       memoryManager: this.memoryManager,
       sessionHistory: options?.sessionHistory,
       signal: options?.signal,
-      onToken: options?.onToken,
-      onToolCall: options?.onToolCall,
-      onAgentStart: options?.onAgentStart,
       awaitHumanHandler: options?.awaitHumanHandler,
       eventStreamOptions: options?.events,
       onTrace: (event: AxlEvent) => {
@@ -1265,6 +1266,7 @@ export class AxlRuntime extends EventEmitter {
       executionId,
       workflow: name,
       status: 'running',
+      eventSchemaVersion: 2,
       events: [],
       totalCost: 0,
       unpriced: false,
@@ -1446,6 +1448,7 @@ export class AxlRuntime extends EventEmitter {
         executionId,
         workflow: name,
         status: 'running',
+        eventSchemaVersion: 2,
         events: [],
         totalCost: 0,
         unpriced: false,

@@ -4,6 +4,7 @@ import { tool } from '../tool.js';
 import { agent } from '../agent.js';
 import { WorkflowContext } from '../context.js';
 import { ProviderRegistry } from '../providers/registry.js';
+import { ToolFailure } from '../errors.js';
 import { randomUUID } from 'node:crypto';
 import type { AxlEvent, AwaitHumanOptions, HumanDecision } from '../types.js';
 import type { Provider, ProviderResponse, ToolCallMessage } from '../providers/types.js';
@@ -265,7 +266,7 @@ describe('tool middleware & approval gates', () => {
   });
 
   describe('hook error handling', () => {
-    it('before hook throws → LLM gets error message, agent loop continues', async () => {
+    it('before hook ToolFailure gives the LLM its safe message and continues', async () => {
       const myTool = tool({
         name: 'failing_before',
         description: 'Tool with failing before hook',
@@ -273,7 +274,10 @@ describe('tool middleware & approval gates', () => {
         handler: (input) => `result:${input.v}`,
         hooks: {
           before: () => {
-            throw new Error('before hook exploded');
+            throw new ToolFailure({
+              message: 'before hook exploded',
+              modelMessage: 'before hook recovery',
+            });
           },
         },
       });
@@ -321,11 +325,10 @@ describe('tool middleware & approval gates', () => {
 
       const result = await ctx.ask(a, 'Do it');
       expect(result).toBe('Handled error gracefully');
-      expect(capturedToolMsg).toContain('Before hook error');
-      expect(capturedToolMsg).toContain('before hook exploded');
+      expect(capturedToolMsg).toBe('before hook recovery');
     });
 
-    it('after hook throws → LLM gets error message, agent loop continues', async () => {
+    it('after hook ToolFailure gives the LLM its safe message and continues', async () => {
       const myTool = tool({
         name: 'failing_after',
         description: 'Tool with failing after hook',
@@ -333,7 +336,10 @@ describe('tool middleware & approval gates', () => {
         handler: (input) => `result:${input.v}`,
         hooks: {
           after: () => {
-            throw new Error('after hook exploded');
+            throw new ToolFailure({
+              message: 'after hook exploded',
+              modelMessage: 'after hook recovery',
+            });
           },
         },
       });
@@ -381,8 +387,7 @@ describe('tool middleware & approval gates', () => {
 
       const result = await ctx.ask(a, 'Do it');
       expect(result).toBe('Handled after error');
-      expect(capturedToolMsg).toContain('After hook error');
-      expect(capturedToolMsg).toContain('after hook exploded');
+      expect(capturedToolMsg).toBe('after hook recovery');
     });
   });
 

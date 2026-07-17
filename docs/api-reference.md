@@ -55,6 +55,42 @@ const search = tool({
 
 Execution order for agent-initiated calls: approval gate → `hooks.before` → handler → `hooks.after`. For direct `tool.run()` calls: `hooks.before` → handler → `hooks.after` (no approval gate).
 
+A normally returned value is successful regardless of its fields. Axl never
+interprets an `error` property as lifecycle control. `hooks.after` therefore
+runs exactly once after every normal handler return and never after a handler
+throw.
+
+#### Model-safe tool failures
+
+Throw `ToolFailure` only when a known failure is safe for the model to act on:
+
+```typescript
+import { ToolFailure } from '@axlsdk/axl';
+
+throw new ToolFailure({
+  message: 'Inventory reservation conflicted',
+  modelMessage: 'That item is no longer available; offer another item.',
+  code: 'OUT_OF_STOCK',
+  cause,
+});
+```
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `message` | `string` | **required** | Host diagnostic retained on the terminal event subject to redaction |
+| `modelMessage` | `string` | **required** | Author-declared provider-safe content used for agent-loop continuation |
+| `code` | `string` | `'TOOL_FAILURE'` | Stable application code |
+| `cause` | `unknown` | — | Non-enumerable host-only cause |
+
+A handler-thrown `ToolFailure` follows the existing `RetryPolicy`; hook failures
+are not retried. A terminal `ToolFailure` from `before`, the handler, or `after`
+closes the call as `failed` with `disposition: 'continue'`; the model receives
+only `modelMessage` (or the fixed marker for a sensitive tool). An ordinary
+throw closes the call as `failed` with `disposition: 'abort'`, emits no provider
+tool content, and aborts the ask. Direct `tool.run()` and `_execute()` propagate
+both kinds of throw to their caller and emit no provider-issued `tool_call_*`
+lifecycle.
+
 #### Model-facing tool output
 
 `toModelOutput` separates the complete application result from the compact content sent back to the model on the next turn:
@@ -73,22 +109,35 @@ const findOrder = tool({
 });
 ```
 
-The mapper is synchronous, runs inline once per completed agent-invoked tool call that can continue to the provider, and receives the same result reference after a successful `hooks.after`. If the ask is already cancelled after the complete `tool_call_end` is emitted, Axl skips projection because no tool message can be sent. `Readonly<TOutput>` is shallow and is an authoring contract: Axl does not clone or freeze the result. Treat the mapper as pure; mutating the value is unsupported and can also mutate the object retained by the host event. A slow mapper blocks the ask once it starts. If a later workflow run re-executes the tool call, it evaluates the mapper again; a checkpoint replay that skips the call also skips mapping. Provider transport retries reuse the already-serialized tool message rather than rerunning the mapper or tool.
+The mapper is synchronous, runs inline once per accepted agent-invoked tool call that has completed `hooks.after` and can continue to the provider, and receives the same result reference retained for the terminal host event. Axl rechecks cancellation before and after projection; cancellation closes the call as `cancelled` and sends no tool message. `Readonly<TOutput>` is shallow and is an authoring contract: Axl does not clone or freeze the result. Treat the mapper as pure; mutating the value is unsupported and can also mutate the object retained by the host event. A slow mapper blocks the ask once it starts. If a later workflow run re-executes the tool call, it evaluates the mapper again; a checkpoint replay that skips the call also skips mapping. Provider transport retries reuse the already-serialized tool message rather than rerunning the mapper or tool.
 
 `ToolModelOutput` supports strings, finite numbers, booleans, `null`, dense arrays, and plain or null-prototype records recursively. An `undefined` object property is omitted. A top-level `undefined`, array hole/`undefined`, bigint, function, symbol, non-finite number, cycle, Promise/thenable, accessor, callable custom `toJSON`, enumerable symbol key, or non-plain object fails with exported `ToolModelOutputError`. Shared non-cyclic references are valid. Projected strings become verbatim canonical tool-message content; every other value is validated and JSON-encoded once. Prefer record projections when the distinction between JSON-looking text and structured data must survive every provider's native tool-result envelope. Without a mapper, legacy `JSON.stringify` behavior is unchanged, including quoted string results.
 
 Configured local tools use this precedence:
 
 1. `sensitive: true` sends `[REDACTED - sensitive tool output]` and never runs the mapper.
-2. A thrown handler, `after` hook, or configured mock failure keeps the existing JSON error result and never runs the mapper.
-3. A normally returned value runs `toModelOutput` when configured. This includes a normally returned object with an `error` property; that object still keeps the legacy after-hook and span classification.
-4. Otherwise Axl uses legacy serialization.
+2. An explicit `ToolFailure` from `before`, the handler, `after`, or a configured mock sends only its author-declared `modelMessage` and never runs the mapper.
+3. An ordinary thrown handler, hook, or mock error aborts the ask without provider tool content and never runs the mapper.
+4. A normally returned value runs `hooks.after` exactly once and then runs `toModelOutput` when configured. This includes any value with an `error` property: property names have no lifecycle meaning.
+5. Otherwise Axl uses legacy serialization.
 
 Projection runs only for configured local tools invoked by an agent, including the agent-as-tool pattern. `tool.run()` and `_execute()` always return the complete value without projecting. MCP tools and handoff pseudo-tools are unchanged. A matching `AxlTestRuntime.mockTool()` bypasses the real handler, validation, approval, retry, and hooks as before, but inherits the configured tool's `sensitive` and `toModelOutput` policy. An override with no configured tool keeps legacy behavior.
 
-If mapping or validation fails, Axl emits the complete `tool_call_end` first and then throws `ToolModelOutputError` with code `TOOL_MODEL_OUTPUT_ERROR`, `toolName`, and a generic message. It never falls back to the raw result, appends no tool message, and makes no next provider call. At that point the handler and successful `after` hook have already completed; retrying the surrounding workflow can therefore repeat their effects unless the application uses its normal idempotency/checkpoint strategy. The host-only `.cause` may contain mapper-supplied details. It is non-enumerable so ordinary `JSON.stringify(error)` does not include it, but serializers that inspect non-enumerable properties still can; do not export it without applying your own redaction policy. `tool_call_end.duration` and the `axl.tool.call` span cover handler/hook work only, not projection.
+If mapping or validation fails, Axl closes the accepted call as `failed` /
+`projection` and then throws `ToolModelOutputError` with code
+`TOOL_MODEL_OUTPUT_ERROR`, `toolName`, and a generic message. It never falls
+back to the raw result, appends no tool message, and makes no next provider
+call. The terminal outcome retains the complete post-`after` result for trusted
+host observation. At that point the handler and successful `after` hook have
+already completed; retrying the surrounding workflow can therefore repeat
+their effects unless the application uses its normal idempotency/checkpoint
+strategy. The host-only `.cause` may contain mapper-supplied details. It is
+non-enumerable so ordinary `JSON.stringify(error)` does not include it, but
+serializers that inspect non-enumerable properties still can; do not export it
+without applying your own redaction policy. `tool_call_end.duration` and the
+`axl.tool.call` span cover total wall time through output preparation.
 
-This is a model/provider-facing data-minimization boundary, not a host-event security or delivery boundary. Projection is an allowlist, not a size or token budget: it may be larger than the complete result, and Axl does not truncate it automatically. `tool_call_end.data.result` remains complete subject to `trace.redact`; it does not gain a projected field. Critical side effects must happen in the handler or workflow logic, not solely in an event listener: `ctx.events`, `AxlStream`, and trace listeners retain their existing redaction, bounded-queue, overflow, and persistence behavior.
+This is a model/provider-facing data-minimization boundary, not a host-event security or delivery boundary. Projection is an allowlist, not a size or token budget: it may be larger than the complete result, and Axl does not truncate it automatically. `tool_call_end.data.outcome.result` remains complete on result-bearing variants subject to `trace.redact`; it does not gain a projected field. Critical side effects must happen in the handler or workflow logic, not solely in an event listener: `ctx.events`, `AxlStream`, and trace listeners retain their existing redaction, bounded-queue, overflow, and persistence behavior.
 
 #### Child Context in Tool Handlers
 
@@ -110,9 +159,7 @@ The child context shares budget tracking, abort signals, trace emission, the
 events propagate to the same bus; consumers wanting root-only behavior filter
 on `event.depth === 0`, while per-ask consumers route by `askId`. Session
 history is isolated. Created internally via
-`WorkflowContext.createChildContext()`. The legacy callbacks inherit too, but
-they are deprecated; see the
-[stream-first migration guide](migration/stream-first-observation.md).
+`WorkflowContext.createChildContext()`.
 
 ---
 
@@ -232,18 +279,16 @@ console.log(ctx.totalCost); // accumulated cost from all agent calls
 | `budget` | `string` | — | Cost budget (e.g., `'$0.50'`). Enforced via `finish_and_stop` policy |
 | `signal` | `AbortSignal` | — | Abort signal for cancellation/timeouts |
 | `sessionHistory` | `ChatMessage[]` | — | Prior conversation history for multi-turn testing |
-| `onToken` | `(token: string, meta: CallbackMeta) => void` | — | **Deprecated.** Token callback. Warns once per process; migrate to `ctx.events` before the next breaking release |
-| `onToolCall` | `(call: { name, args, callId? }, meta: CallbackMeta) => void` | — | **Deprecated.** Tool-start callback. Warns once per process; migrate to `ctx.events` |
-| `onAgentStart` | `(info: { agent, model }, meta: CallbackMeta) => void` | — | **Deprecated.** Agent-start callback. Warns once per process; migrate to `ctx.events` |
 | `awaitHumanHandler` | `(options) => Promise<HumanDecision>` | — | Handler for tool approval requests. Required when the agent uses tools with `requireApproval` — without it, the call throws a clear error |
 | `events` | `EventStreamOptions` | `{ maxQueued: 10_000, onOverflow: 'drop-oldest-non-terminal' }` | Configures the iterator-queue cap and overflow policy on the lazy `ctx.events` bus. See [`EventStreamOptions`](#eventstreamoptions) |
 
-> **`onToken` / `onToolCall` / `onAgentStart` are deprecated.** They remain
-> operational for this release, but their first use warns once per process and
-> they will be removed in the next breaking release. New code should iterate
-> `ctx.events` (an `AxlEventBus` — same `AsyncIterable<AxlEvent>` +
-> `EventEmitter` shape as `AxlStream`). See [`ctx.events`](#ctxevents) below and
-> the [migration guide](migration/stream-first-observation.md).
+> **Removed callback options.** `onToken`, `onToolCall`, and `onAgentStart` are
+> no longer part of `CreateContextOptions`. An untyped object containing any of
+> those keys throws `INVALID_CONFIG` immediately, even if the value is
+> `undefined`; the value is neither read nor invoked. Iterate `ctx.events` (an
+> `AxlEventBus` — the same `AsyncIterable<AxlEvent>` + `EventEmitter` shape as
+> `AxlStream`) or use another observation surface from the
+> [migration guide](migration/stream-first-observation.md).
 
 **When to use vs. workflows:** Use `createContext()` when you want to call agents without registering a workflow — eval files, one-off scripts, tests, API endpoints. Use `runtime.execute()` when you want execution lifecycle tracking (status, duration, history in Studio's executions panel).
 
@@ -616,7 +661,7 @@ const wf = workflow({
 |--------|------|-------------|
 | `[Symbol.asyncIterator]` | `AsyncIterator<AxlEvent>` | Iterate every event in emission order via `for await` |
 | `.text` | `AsyncIterable<string>` | Root-only token chunks (chat-bubble view) |
-| `.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only — `ask_*`, `agent_call_*`, `tool_call_*`, `tool_approval`, `tool_denied`, `handoff_start`, `handoff_return`, `delegate`, `pipeline`, `verify`, `schema_diagnostic`, `workflow_*`, `checkpoint_save`, `checkpoint_replay`, `await_human`, `await_human_resolved`. Skips per-token chatter and progressive `partial_object` emissions. Identical to `AxlStream.lifecycle` (single source of truth: `LIFECYCLE_TYPES` in `event-stream.ts`) |
+| `.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only — `ask_*`, `agent_call_*`, `tool_call_*` (including `tool_call_rejected`), `tool_approval`, `handoff_start`, `handoff_return`, `delegate`, `pipeline`, `verify`, `schema_diagnostic`, `workflow_*`, `checkpoint_save`, `checkpoint_replay`, `await_human`, `await_human_resolved`. Skips per-token chatter and progressive `partial_object` emissions. Identical to `AxlStream.lifecycle` (single source of truth: `LIFECYCLE_TYPES` in `event-stream.ts`) |
 | `.textByAsk` | `AsyncIterable<{ askId, agent?, text }>` | Per-ask token chunks for split-pane UIs |
 | `.partialObjects` | `AsyncIterable<CoalescedPartialObject>` (`{ askId, agent?, object, attempt }`) | **Coalescing view** — yields the latest `partial_object` payload per `askId`. `attempt` is the 1-indexed attempt number; on schema/validate/guardrail retry, the runtime emits `pipeline(failed)` and the view drops any undrained pending value for the affected ask, so attempt-N snapshots cannot leak across the retry boundary. Listener-based: does NOT race with the main iterator; running both concurrently each receive every event. Memory bounded by `O(active asks)`, not `O(events emitted)` |
 | `.stringStream(opts?)` | `AsyncIterable<StringStreamEvent>` (`{ askId, agent?, path, delta, accumulated, attempt }`) | **Streaming view** over `string_delta` events with optional `{ path?, askId? }` filters. Yields `delta` (new chars from this chunk) and `accumulated` (running text-so-far for that ask + path). Late subscribers are seeded with one synthetic event per matching `(askId, path)` carrying `delta === accumulated === <full text-so-far>`, so a UI binding to `/summary` mid-stream renders the field's current state immediately. Listener-based: does NOT race with the main iterator. Per-ask accumulator cleared on `pipeline(failed)` (discarded attempt) and on `ask_end` (memory hygiene). Designed for chat-style typewriter rendering of long string fields |
@@ -1217,7 +1262,9 @@ import type { AxlEvent } from '@axlsdk/axl';
 const stream = runtime.stream('MyWorkflow', input);
 for await (const event of stream) {
   if (event.type === 'token') process.stdout.write(event.data);
-  if (event.type === 'tool_call_end') console.log('tool result:', event.tool, event.data.result);
+  if (event.type === 'tool_call_end' && event.data.outcome.status === 'succeeded') {
+    console.log('tool result:', event.tool, event.data.outcome.result);
+  }
   if (event.type === 'error') console.error('error:', event.data.message);
   if (event.type === 'done') console.log('result:', event.data.result);
 }
@@ -1226,7 +1273,7 @@ for await (const event of stream) {
 | Accessor | Type | Description |
 |---|---|---|
 | `for await ... of stream` | `AsyncIterable<AxlEvent>` | Every `AxlEvent`, in the order emitted |
-| `stream.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only — `ask_*`, `agent_call_*`, `tool_call_*`, `tool_approval`, `tool_denied`, `handoff_start`, `handoff_return`, `delegate`, `pipeline`, `verify`, `workflow_*`, `checkpoint_save`, `checkpoint_replay`, `await_human`, `await_human_resolved`. Skips token chatter |
+| `stream.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only — `ask_*`, `agent_call_*`, `tool_call_*` (including `tool_call_rejected`), `tool_approval`, `handoff_start`, `handoff_return`, `delegate`, `pipeline`, `verify`, `workflow_*`, `checkpoint_save`, `checkpoint_replay`, `await_human`, `await_human_resolved`. Skips token chatter |
 | `stream.text` | `AsyncIterable<string>` | Root-only token stream (`depth === 0`). Nested-ask tokens (agent-as-tool handlers, `delegate`, `race` branches) are omitted — use `stream.textByAsk` or filter the raw stream on `event.depth >= 1` to see them |
 | `stream.textByAsk` | `AsyncIterable<{ askId, agent?, text }>` | **Every** token tagged with the producing ask frame. Complements `.text` — use for split-pane UIs that render each sub-agent's output in its own lane, grouped by `askId` |
 | `stream.partialObjects` | `AsyncIterable<CoalescedPartialObject>` (`{ askId, agent?, object, attempt }`) | **Coalescing view** — yields the latest `partial_object` payload per `askId`. `attempt` is the 1-indexed attempt number; the view drops pending snapshots on `pipeline(failed)` so attempt-N values never leak after a schema/validate/guardrail retry begins. Listener-based: does NOT race with the main iterator. Memory bounded by `O(active asks)`, not `O(events)`. The right shape for streaming-structured-output UIs |
@@ -1283,7 +1330,12 @@ const runtime = new AxlRuntime({
 | `signal` | `AbortSignal` | — | External abort signal. Cancels the workflow exactly as `runtime.abort(executionId)` would. Lets callers use the standard JS pattern without having to track the execution id |
 | `events` | `EventStreamOptions` | `{ maxQueued: 10_000, onOverflow: 'drop-oldest-non-terminal' }` | Configures the iterator-queue cap and overflow policy on `ctx.events` (and on the `AxlStream` returned by `runtime.stream()`). See [`EventStreamOptions`](#eventstreamoptions) |
 
-> **No `onToken` here.** `runtime.execute()` is final-result-only by design. To observe tokens, tool calls, or any other event from inside the workflow handler, read `ctx.events` (see [`ctx.events`](#ctxevents)). To observe from outside, use `runtime.stream()` and consume the returned `AxlStream`. The legacy callback options only exist on `runtime.createContext()`, where they are deprecated and warn once per process.
+> **No observation callbacks here or on `runtime.createContext()`.**
+> `runtime.execute()` is final-result-only by design. To observe tokens, tool
+> calls, or any other event from inside the workflow handler, read `ctx.events`
+> (see [`ctx.events`](#ctxevents)). To observe from outside, use
+> `runtime.stream()` and consume the returned `AxlStream`, or use the runtime
+> trace listener for cross-execution observation.
 
 ### Execution History
 
@@ -1291,10 +1343,10 @@ Completed and failed executions are automatically persisted to the state store (
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `getExecutions()` | `Promise<ExecutionInfo[]>` | All executions (active + historical), sorted by `startedAt` descending. Merges in-memory active executions with historical data from the state store |
-| `getExecution(id)` | `Promise<ExecutionInfo \| undefined>` | Look up a specific execution. Checks in-memory first, then falls through to the state store |
+| `getExecutions()` | `Promise<HistoricalExecutionInfo[]>` | All executions (active + historical), sorted by `startedAt` descending. New/live entries are v2; stored v1 entries remain explicitly typed as legacy |
+| `getExecution(id)` | `Promise<HistoricalExecutionInfo \| undefined>` | Look up a specific execution. Checks in-memory first, then falls through to the state store |
 | `deleteExecution(id)` | `Promise<boolean>` | Remove an execution from in-memory caches and the state store. Returns `true` if anything was removed. Used for GDPR right-to-be-forgotten and operator cleanup. Sweeps every per-execution surface: data blob + indexes, checkpoints, suspended-state, streaming buffer, pending awaitHuman decision, in-memory resolver map. If the execution is still running, auto-aborts the workflow (which now correctly wakes a paused `ctx.awaitHuman()`) AND marks the id for skip-on-persist so the row can't resurrect after the operator-initiated delete. Emits `execution_deleted` on the runtime's `EventEmitter` (audit trail). Studio's `DELETE /api/executions/:id` route additionally scrubs the WS replay buffer for the deleted execution channel |
-| `recoverIncompleteStreams()` | `Promise<ExecutionInfo[]>` | Synthesize partial `ExecutionInfo`s for executions whose process died while `state.persist: 'streaming'` was configured. Reads from `StateStore.listStreamingExecutions` + `getStreamingEvents`, synthesizes with `status: 'failed'` and `error: 'process terminated'`, persists via `saveExecution`, and finalizes the streaming buffer. Skips ids of executions actively running in the current process (prevents corrupting a live workflow). Bounds the synthesized `events` array to `state.maxEventsPerExecution`. Preserves the streaming buffer on `saveExecution` failure so the next attempt can still recover. Synthesized executions whose buffer is missing a `workflow_start` event use the sentinel workflow name `__axl/recovered`. Idempotent and safe to re-run. Wire into your process startup AFTER lazy-loading historical state and BEFORE accepting new work. Returns `[]` when the configured store doesn't implement streaming methods |
+| `recoverIncompleteStreams()` | `Promise<HistoricalExecutionInfo[]>` | Synthesize partial execution records for executions whose process died while `state.persist: 'streaming'` was configured. The recovered record keeps the streaming buffer's event schema version and never invents missing tool terminals. Reads from `StateStore.listStreamingExecutions` + `getStreamingEvents`, synthesizes with `status: 'failed'` and `error: 'process terminated'`, persists via `saveExecution`, and finalizes the streaming buffer. Skips ids of executions actively running in the current process, bounds `events` to `state.maxEventsPerExecution`, and preserves the buffer on save failure. Idempotent; run after lazy-loading history and before accepting work. |
 
 `ExecutionInfo`:
 
@@ -1303,6 +1355,7 @@ Completed and failed executions are automatically persisted to the state store (
 | `executionId` | `string` | Unique execution ID |
 | `workflow` | `string` | Workflow name |
 | `status` | `'running' \| 'completed' \| 'failed' \| 'waiting'` | Current status |
+| `eventSchemaVersion` | `2` | Required on live/current `ExecutionInfo`; selects the v2 event reducer without scanning `events` |
 | `events` | `AxlEvent[]` | All events for this execution. Renamed from `steps` in 0.16.0; `SQLiteStore` auto-migrates the `execution_history.steps` column to `events` on first open |
 | `totalCost` | `number` | Accumulated cost in USD. A **lower bound** when `unpriced` is `true` |
 | `unpriced` | `boolean \| undefined` | `true` when any cost-bearing call in the execution did billable work but had no usable cost (unpriced model / pricing-table miss) — `totalCost` is then a lower bound. `false` when every call was priced. The aggregate counterpart of `ask_end.unpriced` / `BudgetResult.unpriced` — read this instead of scanning `events`. `undefined` only on executions recorded before this field existed |
@@ -1312,6 +1365,12 @@ Completed and failed executions are automatically persisted to the state store (
 | `result` | `unknown \| undefined` | Workflow return value (when `status === 'completed'`) |
 | `error` | `string \| undefined` | Error message (when `status === 'failed'`) |
 | `metadata` | `Record<string, unknown> \| undefined` | Caller-supplied metadata lifted from `ExecuteOptions.metadata` (or `runtime.stream()`'s `options.metadata`). Stable, queryable surface for tags like `userId`, `tenantId`, or correlation ids — filter via `runtime.getExecutions()` + an in-process `.filter()`. Persisted by all three built-in stores (`MemoryStore`/`SQLiteStore`/`RedisStore`); `SQLiteStore` adds a `metadata` column in schema v3 (auto-migrated on first open). The internal control-plane keys `sessionHistory`, `sessionId`, and `resumeMode` are stripped before persistence — they remain readable on `ctx.metadata` for dynamic selectors but don't bloat the queryable surface. The snapshot is `structuredClone`'d so caller mutations to the original `options.metadata` after `execute()`/`stream()` returns don't surface mid-run. Scrubbed to `{ redacted: true }` by Studio's REST endpoints when `config.trace.redact: true`. Secondary indexes are intentionally not provided — `StateStore` is a persistence boundary, not a query engine |
+
+History readers return `HistoricalExecutionInfo = LegacyExecutionInfoV1 |
+ExecutionInfoV2`. Missing `eventSchemaVersion` is the v1 sentinel. New writers
+emit only v2; built-in stores preserve v1 payloads and do not infer v2 tool
+outcomes from legacy event shapes. Narrow on `eventSchemaVersion === 2` before
+using `AxlEventV2`-only fields such as `tool_call_end.data.outcome`.
 
 ### Eval History
 
@@ -1575,7 +1634,12 @@ const runtime = new AxlRuntime({ state: { store: new MyStore() } });
 
 ## AxlEvent
 
-Every agent call, tool invocation, handoff, and system event emits an `AxlEvent`. These accumulate in `ExecutionInfo.events` and are broadcast via WebSocket in Studio. The wire format (streaming) and trace format (persisted) are the same shape — no translation layer.
+Every agent call, tool invocation, handoff, and system event emits an `AxlEvent`.
+`AxlEvent` is the live v2 contract and always carries `schemaVersion: 2`.
+These events accumulate in `ExecutionInfo.events` and are broadcast via
+WebSocket in Studio. The wire format (streaming) and trace format (persisted)
+are the same shape — no translation layer. Stored readers use
+`HistoricalAxlEvent` for the v1/v2 union.
 
 ```typescript
 import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl';
@@ -1587,6 +1651,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `schemaVersion` | `2` | Required event-schema discriminator on every live v2 event |
 | `executionId` | `string` | Execution this event belongs to |
 | `step` | `number` | Monotonic per-execution step counter, shared across nested asks via `AsyncLocalStorage` |
 | `type` | `AxlEventType` | See `AXL_EVENT_TYPES` below |
@@ -1624,10 +1689,10 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number`, `data: AgentCallStartData` | Before each LLM call (one per loop turn) |
 | `agent_call_end` | `AskScoped` | `agent: string`, `model: string`, `cost: number`, `duration: number`, `data: AgentCallEndData` | After each LLM call returns |
 | `token` | `AskScoped` | `data: string` | Streaming text chunk. **Stream-only** — never persisted to `ExecutionInfo.events` |
-| `tool_call_start` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallStartData` | Before tool handler runs |
-| `tool_call_end` | `AskScoped` | `tool: string`, `callId: string`, `duration: number`, `cost?`, `data: ToolCallData` | After tool handler returns |
+| `tool_call_rejected` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallRejectedData` | Provider request rejected before execution starts; no start/end pair |
+| `tool_call_start` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallStartDataV2` | After availability, JSON, and local argument validation succeeds |
+| `tool_call_end` | `AskScoped` | `tool: string`, `callId: string`, `duration: number`, `cost?`, `data: ToolCallEndData` | Exactly one terminal outcome for an accepted call in a complete trace |
 | `tool_approval` | `AskScoped` | `tool: string`, `callId?`, `data: ToolApprovalData` | `requireApproval` gate fires (both approve and deny) |
-| `tool_denied` | `AskScoped` | `tool: string`, `callId?`, `data?: ToolDeniedData` | LLM names a tool the agent doesn't expose |
 | `delegate` | `AskScoped` | `data: DelegateData` | `ctx.delegate()` routes (including single-agent short-circuit) |
 | `handoff_start` | — (spans two asks) | `fromAskId`, `toAskId`, `sourceDepth`, `targetDepth`, `data: HandoffStartData` | Fires BEFORE the target ask begins. Emitted on EVERY handoff (both oneway and roundtrip). Orders ahead of the target's `ask_start` in step-sorted timelines |
 | `handoff_return` | — (spans two asks) | `fromAskId`, `toAskId`, `sourceDepth`, `targetDepth`, `data: HandoffReturnData` | Fires AFTER control returns to the source agent. **Roundtrip mode only** — oneway handoffs are terminal at the target and emit no return event |
@@ -1645,7 +1710,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `done` | — | `data: { result: unknown }` | Terminal — workflow completed |
 | `error` | `Partial<AskScoped>` | `data: { message: string, name?, code? }` | Terminal — non-ask-internal error (top-level workflow throws, infra/abort errors) |
 
-Per-variant data shape exports from `@axlsdk/axl`: `AgentCallStartData`, `AgentCallEndData`, `AgentCallParams`, `ToolCallData`, `ToolCallStartData`, `ToolApprovalData`, `ToolDeniedData`, `HandoffStartData`, `HandoffReturnData`, `DelegateData`, `VerifyData`, `WorkflowStartData`, `WorkflowEndData`, `MemoryEventData`, `CheckpointEventData`, `AwaitHumanData`, `AwaitHumanResolvedData`, `GuardrailData`, `SchemaCheckData`, `ValidateData`, `StringDeltaData`. View-helper event types: `CoalescedPartialObject`, `StringStreamEvent`, `StringStreamFilter`. The constant tuple `AXL_EVENT_TYPES` is the single source of truth for the discriminator.
+Per-variant data shape exports from `@axlsdk/axl`: `AgentCallStartData`, `AgentCallEndData`, `AgentCallParams`, `ToolCallStartDataV2`, `ToolCallRejectedData`, `ToolArgumentIssue`, `ToolCallEndData`, `ToolCallOutcome`, `ToolCallFailure`, `ToolCallCancellation`, `ToolEventError`, `ToolApprovalData`, `HandoffStartData`, `HandoffReturnData`, `DelegateData`, `VerifyData`, `WorkflowStartData`, `WorkflowEndData`, `MemoryEventData`, `CheckpointEventData`, `AwaitHumanData`, `AwaitHumanResolvedData`, `GuardrailData`, `SchemaCheckData`, `ValidateData`, `StringDeltaData`. Versioned exports include `AxlEventV2`, `HistoricalAxlEvent`, `ExecutionInfoV2`, `LegacyExecutionInfoV1`, and `HistoricalExecutionInfo`. View-helper event types: `CoalescedPartialObject`, `StringStreamEvent`, `StringStreamFilter`. The constant tuple `AXL_EVENT_TYPES` is the single source of truth for the live discriminator.
 
 **Cost double-counting guard:** `ask_end.cost` is the per-ask rollup of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). Use the exported helper `eventCostContribution(event)` — returns `0` on `ask_end` and on non-finite values, `event.cost` otherwise. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, Studio's cost aggregator, and `AxlTestRuntime.totalCost()` all use this helper internally:
 
@@ -1711,11 +1776,53 @@ Populated when the provider returns (success or recoverable failure). Pair invar
 | `args` | `unknown` | Tool arguments that were pending approval |
 | `reason` | `string?` | Denial reason (set only when `approved: false`) |
 
-### `ToolCallStartData` / `ToolCallData` (`tool_call_start` / `tool_call_end`)
+### Tool lifecycle data
 
-`ToolCallStartData`: `{ args: unknown }` — the args the LLM provided.
+`ToolCallStartDataV2` is `{ args: unknown; requestedTool?: string }`. `args` is
+the validated logical input before any `before`-hook transform.
+`requestedTool` is present when the provider-visible name differs from the
+canonical trace name.
 
-`ToolCallData` (on `tool_call_end`): `{ args, result, callId? }` — args, return value, and provider correlation id.
+`ToolCallRejectedData` is a pre-start union:
+
+- `{ reason: 'unavailable', requestedTool, availableTools }`
+- `{ reason: 'invalid_json', requestedTool, message }`
+- `{ reason: 'invalid_arguments', requestedTool, args, issues }`
+
+An issue is `{ path: readonly (string | number)[]; code: string; message? }` and
+contains no rejected values. Rejections never emit `tool_call_start` or
+`tool_call_end`.
+
+`ToolCallEndData` is `{ args, requestedTool?, outcome }`. `callId` stays
+top-level on the event. End args exactly match start args. The outcome union is:
+
+```typescript
+type ToolCallOutcome =
+  | { status: 'succeeded'; result: unknown }
+  | { status: 'failed'; failure: ToolCallFailure }
+  | { status: 'denied'; reason?: string }
+  | { status: 'cancelled'; cancellation: ToolCallCancellation };
+```
+
+`ToolCallFailure` discriminates `phase`, `kind`, and `disposition`:
+
+- approval infrastructure failures: `approval` / `infrastructure` / `abort`;
+- hook failures: `before_hook` or `after_hook`, with `tool_failure` /
+  `continue` or `unexpected` / `abort`;
+- handler failures: `tool_failure` or `mcp_error` / `continue`, or
+  `unexpected` / `abort`, plus `attempts`;
+- output failures: `projection` or `serialization` / `output` / `abort`.
+
+After-hook and output failures retain the available raw or post-hook `result`.
+Handler throws, approval failure, denial, and pre-result cancellation do not
+invent one. `ToolCallCancellation.phase` is `approval`, `before_hook`,
+`handler`, `after_handler`, `after_hook`, `projection`, or `serialization`;
+post-result phases retain `result`.
+
+Every accepted call settles at most once. In a complete v2 trace, pair start and
+end by `(executionId, askId, callId)`. Lossy queues, capped persistence,
+disconnection, or process death may yield an explicitly incomplete consumer
+view; never synthesize a terminal outcome for an orphan start.
 
 ### `HandoffStartData` (data on `handoff_start` events)
 
@@ -1771,24 +1878,6 @@ Emitted AFTER control returns to the source agent. **Roundtrip mode only** — o
 | `error` | `string?` | Error message (when `status === 'failed'`). Subject to `config.trace.redact` |
 | `aborted` | `boolean?` | `true` when the execution ended via `AbortSignal` (user cancel, budget `hard_stop`, parent-scope abort). Lets consumers distinguish cancellation from genuine error |
 
-### `CallbackMeta` (deprecated)
-
-Legacy metadata passed to the deprecated `onToken` / `onToolCall` /
-`onAgentStart` callbacks. New code should inspect the correlated fields on
-`AxlEvent` instead. See the
-[stream-first migration guide](migration/stream-first-observation.md).
-
-```typescript
-type CallbackMeta = {
-  askId: string;
-  parentAskId?: string;
-  depth: number;
-  agent: string;
-};
-```
-
-Streaming callbacks now propagate to nested asks (child contexts inherit them). Filter on `meta.depth === 0` for root-only behavior. See [observability.md](./observability.md#streaming-callbacks-meta-parameter) for examples.
-
 ### Verbose trace mode and redaction
 
 - **`config.trace.level === 'full'`** opts into verbose mode: `agent_call_start.data.messages` is populated with the full `ChatMessage[]` about to be sent to the provider on each turn. This grows with tool results and retry feedback across turns, so it's off by default
@@ -1803,6 +1892,7 @@ All errors extend `AxlError`.
 
 | Error | Thrown by | Description |
 |-------|----------|-------------|
+| `ToolFailure` | tool authors | Explicit model-safe tool failure. Constructor takes `{ message, modelMessage, code?, cause? }`; terminal agent-invoked calls may continue with `modelMessage`, while direct calls still throw |
 | `VerifyError` | `ctx.ask()`, `ctx.verify()` | Schema validation failed after all retries. Includes `.lastOutput`, `.zodError`, `.retries` |
 | `ValidationError` | `ctx.ask()`, `ctx.verify()` | Post-schema business rule validation failed after all retries. Includes `.lastOutput`, `.reason`, `.retries` |
 | `QuorumNotMet` | `ctx.spawn()`, `ctx.map()` | Fewer tasks succeeded than the required quorum. Includes `.results` |
@@ -1811,7 +1901,6 @@ All errors extend `AxlError`.
 | `MaxTurnsError` | `ctx.ask()` | Agent exceeded its configured `maxTurns` |
 | `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy. Includes `.limit`, `.spent`, `.policy` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
-| `ToolDenied` | `ctx.ask()` | Agent attempted to call a tool not in its ACL. Includes `.toolName`, `.agentName` |
 | `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`. Message is the provider's text verbatim (no prefix). |
 
 ### `ProviderError` fields

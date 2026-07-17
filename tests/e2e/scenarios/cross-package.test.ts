@@ -109,7 +109,7 @@ describe('Cross-Package E2E', () => {
     const toolCalls = testRuntime.toolCalls();
     expect(toolCalls.length).toBe(1);
     expect(toolCalls[0].name).toBe('greet');
-    expect(toolCalls[0].result).toBe('Hello, Test!');
+    expect(toolCalls[0].outcome).toEqual({ status: 'succeeded', result: 'Hello, Test!' });
 
     const agentCalls = testRuntime.agentCalls();
     expect(agentCalls.length).toBeGreaterThanOrEqual(1);
@@ -163,6 +163,6 @@ describe('Cross-Package E2E', () => {
 
     const toolCalls = testRuntime.toolCalls();
     expect(toolCalls.length).toBe(1);
-    expect(toolCalls[0].result).toBe('Mocked greeting!');
+    expect(toolCalls[0].outcome).toEqual({ status: 'succeeded', result: 'Mocked greeting!' });
   });
 });

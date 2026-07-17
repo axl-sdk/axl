@@ -11,19 +11,18 @@
 // enforces that only `import type` / `export type` reach into core.
 // Value imports remain banned — see `lib/event-utils.ts` for the pattern.
 import type {
-  AxlEvent,
   AxlEventV2,
   HistoricalAxlEvent,
   AxlEventBase,
-  AxlEventType,
-  AxlEventOf,
   AskScoped,
-  CallbackMeta,
   AgentCallStartData,
   AgentCallEndData,
   AgentCallParams,
   ToolCallData,
   ToolCallStartData,
+  ToolCallEndData,
+  ToolCallRejectedData,
+  ToolCallOutcome,
   ToolApprovalData,
   ToolDeniedData,
   HandoffStartData,
@@ -41,20 +40,25 @@ import type {
   ValidateData,
 } from '@axlsdk/axl';
 
+/** Current live and WS event contract. Historical readers use
+ * `HistoricalAxlEvent` below. */
+export type AxlEvent = AxlEventV2;
+export type AxlEventType = AxlEvent['type'];
+export type AxlEventOf<T extends AxlEvent['type']> = Extract<AxlEvent, { type: T }>;
+
 export type {
-  AxlEvent,
   AxlEventV2,
   HistoricalAxlEvent,
   AxlEventBase,
-  AxlEventType,
-  AxlEventOf,
   AskScoped,
-  CallbackMeta,
   AgentCallStartData,
   AgentCallEndData,
   AgentCallParams,
   ToolCallData,
   ToolCallStartData,
+  ToolCallEndData,
+  ToolCallRejectedData,
+  ToolCallOutcome,
   ToolApprovalData,
   ToolDeniedData,
   HandoffStartData,
@@ -371,7 +375,20 @@ export type WorkflowStatsResponse = {
 /** Trace stats from GET /api/trace-stats */
 export type TraceStatsData = {
   eventTypeCounts: Record<string, number>;
-  byTool: Record<string, { calls: number; denied: number; approved: number }>;
+  byTool: Record<
+    string,
+    {
+      accepted: number;
+      succeeded: number;
+      failed: number;
+      failedByPhase: Record<string, number>;
+      denied: number;
+      cancelled: number;
+      rejected: number;
+      approved: number;
+      legacy: { calls: number; denied: number; approved: number };
+    }
+  >;
   retryByAgent: Record<string, { schema: number; validate: number; guardrail: number }>;
   totalEvents: number;
 };

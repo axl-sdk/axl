@@ -25,7 +25,7 @@ interface OTelTracerProvider {
 
 /** Minimal interface for the @opentelemetry/api module. */
 interface OTelApi {
-  SpanStatusCode: { OK: unknown; ERROR: unknown };
+  SpanStatusCode: { UNSET: unknown; OK: unknown; ERROR: unknown };
   trace: {
     getTracerProvider(): OTelTracerProvider;
     getActiveSpan?(): OTelSpan | undefined;
@@ -74,6 +74,7 @@ export class OTelSpanManager implements SpanManager {
     const otelApi = this.otelApi;
 
     return this.tracer.startActiveSpan(name, { attributes }, async (otelSpan: OTelSpan) => {
+      let statusWasSet = false;
       const handle: SpanHandle = {
         setAttribute(key: string, value: string | number | boolean) {
           otelSpan.setAttribute(key, value);
@@ -81,9 +82,14 @@ export class OTelSpanManager implements SpanManager {
         addEvent(eventName: string, attrs?: Record<string, string | number | boolean>) {
           otelSpan.addEvent(eventName, attrs);
         },
-        setStatus(code: 'ok' | 'error', message?: string) {
+        setStatus(code: 'unset' | 'ok' | 'error', message?: string) {
+          statusWasSet = true;
           const statusCode =
-            code === 'ok' ? otelApi.SpanStatusCode.OK : otelApi.SpanStatusCode.ERROR;
+            code === 'ok'
+              ? otelApi.SpanStatusCode.OK
+              : code === 'error'
+                ? otelApi.SpanStatusCode.ERROR
+                : otelApi.SpanStatusCode.UNSET;
           otelSpan.setStatus({ code: statusCode, message });
         },
         end() {
@@ -93,10 +99,13 @@ export class OTelSpanManager implements SpanManager {
 
       try {
         const result = await fn(handle);
-        handle.setStatus('ok');
+        if (!statusWasSet) handle.setStatus('ok');
         return result;
       } catch (err) {
-        handle.setStatus('error', err instanceof Error ? err.message : String(err));
+        // Error text can contain provider, prompt, or sensitive tool data.
+        // Keep exported status structural; host diagnostics remain in Axl's
+        // own error and redacted event channels.
+        handle.setStatus('error');
         throw err;
       } finally {
         handle.end();

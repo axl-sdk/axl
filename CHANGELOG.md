@@ -7,18 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Deprecated
+### Added
+
+- **Tool lifecycle event schema v2.** Every new live event carries
+  `schemaVersion: 2` and every new live `ExecutionInfo` carries
+  `eventSchemaVersion: 2`. Provider-issued tool requests rejected before
+  execution emit `tool_call_rejected`; accepted calls close with one
+  `tool_call_end.data.outcome` status: `succeeded`, `failed`, `denied`, or
+  `cancelled`. `HistoricalExecutionInfo` and `HistoricalAxlEvent` preserve an
+  explicit v1/v2 read union; missing version metadata is v1, and new writers
+  emit only v2.
+- **Model-safe `ToolFailure`.** Tool authors can throw exported `ToolFailure`
+  with separate host `message` and provider-safe `modelMessage`. Existing
+  handler retry policy still applies; a terminal `ToolFailure` records a
+  structured failed outcome and permits agent-loop continuation without
+  exposing an ordinary exception message.
+
+### Removed
 
 - **`runtime.createContext()` observation callbacks.** `onToken`, `onToolCall`,
-  and `onAgentStart` remain operational for this release, but are
-  type-deprecated and warn once per process. Migrate to `ctx.events` for
-  ad-hoc contexts, `runtime.stream()` for one wire execution, or the runtime
-  trace emitter for cross-execution observation. The callbacks will be removed
-  in the next breaking release. See the
-  [stream-first migration guide](docs/migration/stream-first-observation.md).
+  and `onAgentStart` are removed from the public type and runtime. Untyped
+  callers receive a targeted migration error and the values are never invoked.
+  Use `ctx.events` for an ad-hoc context, `runtime.stream()` for one wire
+  execution, or the runtime trace emitter for cross-execution observation. See
+  the [stream-first migration guide](docs/migration/stream-first-observation.md).
+- **Legacy `tool_denied` live event.** Unavailable tools are now pre-start
+  `tool_call_rejected` events with `reason: 'unavailable'`.
+- **Dead `ToolDenied` error export.** Unavailable provider requests are
+  recoverable rejections, not thrown ACL errors. Historical `tool_denied`
+  event data remains readable through the v1 history union.
 
 ### Changed
 
+- **Normal tool returns always succeed.** Axl no longer inspects an `error`
+  property on user-owned return values. `hooks.after` runs exactly once after
+  every normal local-handler return; code that previously returned
+  `{ error: ... }` and relied on skipping `after` must be audited for newly
+  triggered side effects. Ordinary hook/handler throws abort the ask without a
+  provider tool message; denial, MCP `isError`, and explicit `ToolFailure`
+  outcomes may continue.
+- **Tool observation is terminal and phase-aware.** Failure and cancellation
+  phases are represented in the terminal union; output preparation happens
+  before the end event; duration includes approval wait, hooks, retry/backoff,
+  handler work, and projection/serialization. Complete v2 traces pair starts
+  and ends by `(executionId, askId, callId)`, while lossy/interrupted views stay
+  explicitly incomplete rather than synthesizing outcomes.
 - **`runtime.stream()` now selects streaming mode explicitly.** It no longer
   installs an internal `onToken` sentinel or allocates `ctx.events` solely to
   choose `provider.stream`; child contexts inherit the explicit mode.

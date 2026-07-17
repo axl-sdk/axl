@@ -102,7 +102,6 @@ export type {
   AxlEventBase,
   AxlEventOf,
   AskScoped,
-  CallbackMeta,
   // Per-type data shapes — consumers narrowing via `event.type` get
   // statically-typed access to `data`. Kept in the same export block as
   // `AxlEvent` so the discriminated union and its parts move together.
@@ -115,8 +114,6 @@ export type {
   ToolCallRejectedData,
   ToolCallRejectedEvent,
   ToolEventError,
-  ToolFailure,
-  ToolFailureConstructor,
   ToolFailureOptions,
   ToolCallFailure,
   ToolCallCancellation,
@@ -178,12 +175,13 @@ export {
   NoConsensus,
   TimeoutError,
   MaxTurnsError,
-  ToolDenied,
   BudgetExceededError,
   GuardrailError,
   ValidationError,
   ToolModelOutputError,
+  ToolFailure,
 } from './errors.js';
+export type { ToolFailureConstructor } from './errors.js';
 export { ProviderError, isRetryableStatus } from './providers/errors.js';
 // NOTE: `RETRYABLE_STATUS_CODES` (retry.ts) is intentionally NOT exported — it's the
 // narrow transport-retry set; consumers use `ProviderError.retryable` / `isRetryableStatus`.

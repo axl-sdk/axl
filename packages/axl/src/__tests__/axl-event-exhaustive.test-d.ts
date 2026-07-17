@@ -41,9 +41,9 @@ function assertExhaustive(ev: AxlEvent): string {
       return ev.tool;
     case 'tool_call_end':
       return ev.tool;
+    case 'tool_call_rejected':
+      return ev.data.reason;
     case 'tool_approval':
-      return ev.tool;
-    case 'tool_denied':
       return ev.tool;
     case 'delegate':
       return ev.data.reason;

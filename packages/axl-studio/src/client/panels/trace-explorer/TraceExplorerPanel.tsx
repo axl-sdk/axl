@@ -347,7 +347,14 @@ export function TraceExplorerPanel() {
                    toolbar, expand/collapse state, and TraceExpandContext so
                    "Expand" cascades into nested TextBlocks (system prompt,
                    prompt, response) and embedded JSON dumps. */
-                <TraceEventList events={filteredEvents} maxDuration={maxDuration} />
+                <TraceEventList
+                  events={filteredEvents}
+                  lifecycleEvents={allEvents}
+                  traceComplete={
+                    selectedExecution ? selectedExecution.status !== 'running' : undefined
+                  }
+                  maxDuration={maxDuration}
+                />
               )}
             </div>
           }

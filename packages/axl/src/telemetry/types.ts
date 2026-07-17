@@ -12,7 +12,7 @@ export type TelemetryConfig = {
 export interface SpanHandle {
   setAttribute(key: string, value: string | number | boolean): void;
   addEvent(name: string, attributes?: Record<string, string | number | boolean>): void;
-  setStatus(code: 'ok' | 'error', message?: string): void;
+  setStatus(code: 'unset' | 'ok' | 'error', message?: string): void;
   end(): void;
 }
 

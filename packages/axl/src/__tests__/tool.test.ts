@@ -333,6 +333,30 @@ describe('tool()', () => {
     );
   });
 
+  it('run() treats returned error-shaped data as success and runs the after hook', async () => {
+    const logFn = vi.fn();
+    const after = vi.fn((result: { error: string }) => ({ ...result, observed: true }));
+    const ctx = { log: logFn } as any;
+    const returnedError = tool({
+      name: 'returned-error',
+      description: 'Returns business data',
+      input: z.object({}),
+      handler: () => ({ error: 'declined' }),
+      hooks: { after },
+    });
+
+    await expect(returnedError._execute({})).resolves.toEqual({ error: 'declined' });
+    await expect(returnedError.run(ctx, {})).resolves.toEqual({
+      error: 'declined',
+      observed: true,
+    });
+    expect(after).toHaveBeenCalledOnce();
+    expect(logFn).toHaveBeenCalledWith(
+      'tool_call_complete',
+      expect.objectContaining({ tool: 'returned-error' }),
+    );
+  });
+
   it('run() logs error trace and rethrows when handler fails', async () => {
     const logFn = vi.fn();
     const ctx = { log: logFn } as any;

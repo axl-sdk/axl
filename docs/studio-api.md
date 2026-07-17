@@ -27,7 +27,7 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `GET /api/costs?window=24h\|7d\|30d\|all` | Aggregated cost data for a time window (default `7d`). `?windows=all` returns all four windows at once for debugging |
 | `GET /api/eval-trends?window=` | Per-eval score trends (latest, mean, std), cost totals, recent runs with `model`/`duration` |
 | `GET /api/workflow-stats?window=` | Per-workflow totals, completed/failed counts, p50/p95/avg duration, failure rate |
-| `GET /api/trace-stats?window=` | Event-type distribution, tool call counts (calls/approved/denied), retry breakdown by agent |
+| `GET /api/trace-stats?window=` | Event-type distribution, version-separated tool lifecycle counts, and retry breakdown by agent |
 | `GET /api/memory/:scope/:key` | Read memory entry |
 | `PUT /api/memory/:scope/:key` | Save memory entry |
 | `DELETE /api/memory/:scope/:key` | Delete memory entry |
@@ -45,6 +45,44 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 
 All endpoints return `{ ok: true, data: {...} }` on success or `{ ok: false, error: { code, message } }` on error.
 
+### Versioned execution history and tool aggregates
+
+`GET /api/executions/:id` returns historical execution data without rewriting
+it. New rows carry `eventSchemaVersion: 2`, and every new event carries
+`schemaVersion: 2`. A missing execution/event version identifies legacy v1
+history. Studio renders that history with a legacy badge and preserves its
+`tool_call_end.data.result` / `tool_denied` semantics; it never guesses a v2
+terminal outcome. An unmatched v1 start is `legacy incomplete`, while an
+unmatched v2 start after completion, truncation, or connection interruption is
+`incomplete trace`.
+
+Current live `execution:*` and `trace:*` channels carry the v2 lifecycle
+directly. Pre-start rejection is `tool_call_rejected`. An accepted call closes
+with `tool_call_end.data.outcome`, narrowed by `status` to `succeeded`,
+`failed`, `denied`, or `cancelled`. Pair accepted calls only by the full
+`(executionId, askId, callId)` identity.
+
+Each `trace-stats.byTool[tool]` bucket has this shape:
+
+```typescript
+{
+  accepted: number;       // v2 tool_call_start
+  succeeded: number;      // v2 successful terminal
+  failed: number;         // v2 failed terminal
+  failedByPhase: Record<string, number>;
+  denied: number;         // v2 denied terminal
+  cancelled: number;      // v2 cancelled terminal
+  rejected: number;       // v2 pre-start rejection
+  approved: number;       // v2 approved tool_approval
+  legacy: { calls: number; approved: number; denied: number };
+}
+```
+
+The v1 bucket stays separate because a legacy end does not encode the v2
+terminal status. Additional v2 starts, rejections, and terminal events change
+trace counts only. Cost and billing still fold cost-bearing model/embedder
+events, so the expanded tool lifecycle does not add spend.
+
 ## WebSocket
 
 Single endpoint at `ws://localhost:4400/ws` with channel multiplexing:
@@ -55,6 +93,10 @@ Single endpoint at `ws://localhost:4400/ws` with channel multiplexing:
 ```
 
 Channels: `execution:{id}`, `trace:{id}`, `trace:*`, `eval:{id}`, `eval:{evalRunId}`, `eval:*`, `costs`, `eval-trends`, `workflow-stats`, `trace-stats`, `decisions`. Execution and eval channels have replay buffering — late subscribers receive the full event history (capped at 1000 events by default; tunable via `bufferCaps`, see below). Buffers are cleaned up 30s after the stream completes. Aggregate channels (`costs`, `eval-trends`, `workflow-stats`, `trace-stats`) broadcast `{ snapshots: Record<WindowId, State>, updatedAt }` on every fold or rebuild.
+
+Replay caps and socket interruption can produce an incomplete view. The client
+labels unmatched accepted starts as incomplete after a cap/truncation marker or
+disconnect; it does not synthesize a terminal outcome.
 
 **Outbound frame budget.** The WS broadcast layer enforces a 64KB soft cap via `truncateIfOversized`. Oversized verbose-mode `agent_call_start.data.messages` request snapshots are replaced with a `{ __truncated: true, originalBytes, maxBytes, hint }` placeholder that preserves the event's `type`/`step`/`agent`/`tool` so the Trace Explorer still renders the row. The 64KB threshold matches the inbound message reject limit in the WS protocol (shared constant).
 

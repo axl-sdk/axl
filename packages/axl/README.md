@@ -168,7 +168,16 @@ const calculator = tool({
 });
 ```
 
-`toModelOutput` is an opt-in, synchronous mapper for successful agent-invoked local tools. Strings are sent verbatim; JSON-compatible values are strictly validated and serialized once. The full post-hook result stays on `tool_call_end.data.result` for host rendering (subject to `trace.redact`). `sensitive: true` and thrown handler/hook/mock failures skip projection, and projection errors fail closed with `ToolModelOutputError`—there is no raw fallback. Direct `tool.run()`/`_execute()`, MCP tools, and handoffs are unchanged. See the [API reference](../../docs/api-reference.md#model-facing-tool-output) for the exact type, validation, mock, and delivery contract.
+`toModelOutput` is an opt-in, synchronous mapper for successful agent-invoked local tools. Strings are sent verbatim; JSON-compatible values are strictly validated and serialized once. The full post-hook result stays on the succeeded `tool_call_end.data.outcome.result` for host rendering (subject to `trace.redact`). `sensitive: true` and thrown handler/hook/mock failures skip projection, and projection errors close the call as `failed` / `projection` with no raw fallback. Direct `tool.run()`/`_execute()`, MCP tools, and handoffs are unchanged. See the [API reference](../../docs/api-reference.md#model-facing-tool-output) for the exact type, validation, mock, and delivery contract.
+
+A normally returned value succeeds even when it contains an `error` property,
+and `hooks.after` runs after every normal handler return. Throw `ToolFailure`
+when a known failure has an author-declared message that is safe for model
+recovery; ordinary throws abort the ask without provider tool content. Live
+events use schema v2: pre-start rejection is `tool_call_rejected`, while every
+accepted call closes with a `succeeded`, `failed`, `denied`, or `cancelled`
+outcome. See the
+[migration guide](../../docs/migration/stream-first-observation.md).
 
 Tool handlers receive a second parameter `ctx: WorkflowContext` (a child context), enabling the "agent-as-tool" composition pattern:
 
@@ -400,6 +409,11 @@ const wf = workflow({
 ```
 
 Subscribe before the first `ctx.ask()` — the streaming code path inside `ctx.ask()` only activates when an observer is present at the time the ask starts. The bus auto-terminates on `workflow_end` / `error` (and on signal abort, for ad-hoc `runtime.createContext({ signal })` flows). Configure the iterator-queue cap and overflow policy via `runtime.execute(..., { events: { maxQueued, onOverflow } })` — defaults (`maxQueued: 10_000`, `onOverflow: 'drop-oldest-non-terminal'`) are a default-on safety net against slow consumers. See [`docs/observability.md`](../../docs/observability.md#observation-paths) for the full Observation paths comparison, [`docs/api-reference.md`](../../docs/api-reference.md#ctxevents) for the type table, and [`docs/migration/stream-first-observation.md`](../../docs/migration/stream-first-observation.md) for upgrade notes.
+
+The former `onToken`, `onToolCall`, and `onAgentStart` options on
+`runtime.createContext()` are removed. Use `ctx.events`, `runtime.stream()`, or
+the runtime trace listener according to observation scope; untyped callers that
+still pass a removed key receive a targeted migration error.
 
 ### Context Primitives
 
@@ -748,7 +762,6 @@ import {
   BudgetExceededError, // Budget limit exceeded
   GuardrailError, // Guardrail blocked input or output
   ValidationError, // Post-schema business rule validation failed after retries
-  ToolDenied, // Agent tried to call unauthorized tool
 } from '@axlsdk/axl';
 ```
 

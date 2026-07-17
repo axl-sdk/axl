@@ -13,8 +13,10 @@ const SupportBot = agent({
 ```
 
 If an LLM attempts to invoke a tool not in the agent's `tools` list (including MCP tools), the runtime:
+
 1. Blocks the call.
-2. Logs a `tool_denied` event (visible in traces).
+2. Emits `tool_call_rejected` with `reason: 'unavailable'` and no
+   `tool_call_start` (visible in traces).
 3. Sends a correction to the LLM: "Tool X is not available. Available tools: [...]"
 4. The LLM continues with available tools.
 
@@ -49,7 +51,14 @@ Prompt injection is an inherent risk in any system where untrusted text is passe
 
 ### Minimize tool results sent to the model
 
-For a rich application result that is not wholly sensitive, configure `toModelOutput` as an explicit allowlist. The host continues to observe the complete result through `tool_call_end.data.result` while the next provider request receives only the projection. A projection failure is fail-closed: Axl never falls back to the raw result. `sensitive: true` has higher precedence and skips projection entirely.
+For a rich application result that is not wholly sensitive, configure `toModelOutput` as an explicit allowlist. The host continues to observe the complete result through the result-bearing `tool_call_end.data.outcome` variant while the next provider request receives only the projection. A projection failure is fail-closed: Axl records `failed` / `projection` and never falls back to the raw result. `sensitive: true` has higher precedence and skips projection entirely.
+
+Ordinary thrown hook/handler messages are never provider content. When a known
+failure is safe for model recovery, tool authors must opt in by throwing
+`ToolFailure` with a separate `modelMessage`; only that author-declared content
+is sent, unless `sensitive: true` replaces it with the fixed sensitive-failure
+marker. A normal return always means success, even if the application value has
+an `error` property.
 
 This boundary minimizes **model/provider-facing** data; it does not scrub host observability. `trace.redact` remains the control for event content, and a full trace can show the successfully projected tool message in the next `agent_call_start.data.messages`. `ToolModelOutputError.message` is generic, but its host-only `.cause` may contain an exception thrown by application mapper code. The cause is non-enumerable to keep it out of ordinary `JSON.stringify(error)` output; serializers that inspect non-enumerable properties can still expose it, so do not export `.cause` blindly.
 
@@ -88,7 +97,11 @@ This works across restarts — if the process restarts while waiting, the decisi
 
 **Axl Studio** provides a Decisions panel (`GET /api/decisions`, `POST /api/decisions/:id/resolve`) that renders pending approvals in a web UI, useful during development.
 
-On denial, the runtime emits a `tool_denied` trace event and sends the denial reason back to the LLM as a tool response, giving the agent an opportunity to try a different approach.
+On denial, the runtime emits `tool_approval` with `approved: false`, then closes
+the accepted call with `tool_call_end.data.outcome.status === 'denied'`. Safe
+denial content is sent to the LLM, giving the agent an opportunity to try a
+different approach. Denial is distinct from `tool_call_rejected`, which occurs
+before execution can start.
 
 ## Agent Guardrails
 
@@ -168,9 +181,9 @@ const runtime = new AxlRuntime({
 
 **The three layers:**
 
-1. **AxlEvents** at emission — `agent_call_start.data.prompt`/`.system`/`.messages`, `agent_call_end.data.response`/`.thinking`/`.error`, `ask_start.prompt`, `ask_end.outcome` (`outcome.result` on success, `outcome.error` on failure), gate-event `reason`/`feedbackMessage`, `tool_call_start.data.args`, `tool_call_end.data.args`/`.result`, `tool_approval.data.args`/`.reason`, `handoff_start.data.message` (roundtrip only), `workflow_start.data.input`, `workflow_end.data.result`/`.error`, `done.data.result`, `error.data.message`, string fields on `log` events (one-level walk — nested numeric/boolean fields like `usage.tokens` / `usage.cost` survive so the Cost Dashboard's byEmbedder bucket still works).
+1. **AxlEvents** at emission — `agent_call_start.data.prompt`/`.system`/`.messages`, `agent_call_end.data.response`/`.thinking`/`.error`, `ask_start.prompt`, `ask_end.outcome` (`outcome.result` on success, `outcome.error` on failure), gate-event `reason`/`feedbackMessage`, rejected-tool args/messages, `tool_call_start.data.args`, tool-end args/results/reasons/error details, `tool_approval.data.args`/`.reason`, `handoff_start.data.message` (roundtrip only), `workflow_start.data.input`, `workflow_end.data.result`/`.error`, `done.data.result`, `error.data.message`, string fields on `log` events (one-level walk — nested numeric/boolean fields like `usage.tokens` / `usage.cost` survive so the Cost Dashboard's byEmbedder bucket still works).
 2. **Studio REST route responses** at serialization — `GET /api/executions{,/:id}` (also scrubs `ExecutionInfo.metadata` to `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces compliance mode must protect), `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser remains navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync).
-3. **Studio WebSocket broadcasts** — `AxlEvent` content scrubbed on `POST /api/workflows/:name/execute` with `stream: true` and `POST /api/playground/chat` (`token.data`, `tool_call_start.data.args`, `tool_call_end.data.args`/`.result`, `tool_approval.data.args`/`.reason`, `ask_start.prompt`, `ask_end.outcome`, `done.data.result`, `error.data.message`, `handoff_start.data.message`). The **trace firehose channel** (`trace:*`) also applies the same `redactStreamEvent` filter as of 0.16.0 — closing a previous gap where the live trace stream could bypass the per-route scrub.
+3. **Studio WebSocket broadcasts** — `AxlEvent` content scrubbed on `POST /api/workflows/:name/execute` with `stream: true` and `POST /api/playground/chat` (`token.data`, rejected-tool args/messages, `tool_call_start.data.args`, tool-end args/results/reasons/error details, `tool_approval.data.args`/`.reason`, `ask_start.prompt`, `ask_end.outcome`, `done.data.result`, `error.data.message`, `handoff_start.data.message`). The **trace firehose channel** (`trace:*`) applies the same event redaction filter, so it cannot bypass the per-route scrub.
 
 **What's NOT scrubbed:** Programmatic callers of `runtime.execute()` and direct `StateStore` access still receive raw data — redaction is an observability-boundary filter, **not** a data-at-rest transform. For a data-at-rest scrub of a specific execution (GDPR right-to-be-forgotten), use `runtime.deleteExecution(id)` instead. Write endpoints (`PUT /api/memory`, `POST /api/sessions/:id/send`) still accept raw data. Top-level numeric fields (`cost`, `tokens`, `duration`) on every event are never scrubbed — they're load-bearing for `trackExecution` and the cost aggregator. Structural ask-graph metadata (`askId`, `parentAskId`, `depth`, `executionId`, `step`, `timestamp`) is also preserved (random IDs, no PII surface). Caller-supplied `ExecutionInfo.metadata` is scrubbed at the observability boundary when `redact: true` but persists raw in the store — operators wanting the raw values should query `runtime.getExecutions()` programmatically.
 

@@ -19,7 +19,7 @@ import { cn, formatCost } from '../../lib/utils';
 import { CostBadge } from './CostBadge';
 import { DurationBadge } from './DurationBadge';
 import { JsonViewer } from './JsonViewer';
-import type { HistoricalAxlEvent } from '../../lib/types';
+import type { HistoricalAxlEvent, ToolCallOutcome } from '../../lib/types';
 import {
   getEventColor,
   getDepth,
@@ -251,6 +251,117 @@ export function ToolApprovalBody({ event }: { event: HistoricalAxlEvent }) {
   );
 }
 
+function OutcomeBadge({ status }: { status: ToolCallOutcome['status'] | 'rejected' }) {
+  const tone =
+    status === 'succeeded'
+      ? 'bg-green-100 text-green-800 dark:bg-green-950/40 dark:text-green-300'
+      : status === 'cancelled'
+        ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300'
+        : 'bg-red-100 text-red-800 dark:bg-red-950/40 dark:text-red-300';
+  return (
+    <span className={cn('px-2 py-0.5 rounded-full text-[10px] font-medium', tone)}>
+      {status.toUpperCase()}
+    </span>
+  );
+}
+
+/** Rendered body for a v2 accepted tool invocation terminal. */
+export function ToolCallEndBody({ event }: { event: HistoricalAxlEvent }) {
+  if (event.type !== 'tool_call_end' || event.schemaVersion !== 2) return null;
+  const { outcome } = event.data;
+  return (
+    <>
+      <div className="flex items-center gap-2 mb-2 text-xs">
+        <OutcomeBadge status={outcome.status} />
+        {outcome.status === 'failed' && (
+          <span className="text-[hsl(var(--muted-foreground))]">
+            {outcome.failure.phase} · {outcome.failure.kind} · {outcome.failure.disposition}
+          </span>
+        )}
+        {outcome.status === 'cancelled' && (
+          <span className="text-[hsl(var(--muted-foreground))]">{outcome.cancellation.phase}</span>
+        )}
+      </div>
+      {event.data.requestedTool && event.data.requestedTool !== event.tool && (
+        <p className="text-xs mb-2">
+          <strong>Requested as:</strong> {event.data.requestedTool}
+        </p>
+      )}
+      <p className="text-[11px] font-medium uppercase tracking-wider opacity-70 mb-1">Arguments</p>
+      <TraceJsonViewer data={event.data.args as Record<string, unknown>} />
+      {outcome.status === 'succeeded' && (
+        <>
+          <p className="text-[11px] font-medium uppercase tracking-wider opacity-70 mt-2 mb-1">
+            Result
+          </p>
+          <TraceJsonViewer data={outcome.result as Record<string, unknown>} />
+        </>
+      )}
+      {outcome.status === 'failed' && 'result' in outcome.failure && (
+        <>
+          <p className="text-[11px] font-medium uppercase tracking-wider opacity-70 mt-2 mb-1">
+            Result before failure
+          </p>
+          <TraceJsonViewer data={outcome.failure.result as Record<string, unknown>} />
+        </>
+      )}
+      {outcome.status === 'failed' && (
+        <TextBlock
+          label="Host failure"
+          content={`${outcome.failure.error.name}: ${outcome.failure.error.message}`}
+          tone="warning"
+          defaultOpen
+        />
+      )}
+      {outcome.status === 'denied' && outcome.reason && (
+        <p className="text-xs mt-2">
+          <strong>Reason:</strong> {outcome.reason}
+        </p>
+      )}
+      {outcome.status === 'cancelled' && outcome.cancellation.reason && (
+        <p className="text-xs mt-2">
+          <strong>Reason:</strong> {outcome.cancellation.reason}
+        </p>
+      )}
+      {outcome.status === 'cancelled' && 'result' in outcome.cancellation && (
+        <>
+          <p className="text-[11px] font-medium uppercase tracking-wider opacity-70 mt-2 mb-1">
+            Result before cancellation
+          </p>
+          <TraceJsonViewer data={outcome.cancellation.result as Record<string, unknown>} />
+        </>
+      )}
+    </>
+  );
+}
+
+/** Rendered body for a provider request rejected before tool execution began. */
+export function ToolCallRejectedBody({ event }: { event: HistoricalAxlEvent }) {
+  if (event.type !== 'tool_call_rejected') return null;
+  return (
+    <>
+      <div className="flex items-center gap-2 mb-2 text-xs">
+        <OutcomeBadge status="rejected" />
+        <span className="text-[hsl(var(--muted-foreground))]">{event.data.reason}</span>
+      </div>
+      <p className="text-xs mb-2">
+        <strong>Requested tool:</strong> {event.data.requestedTool}
+      </p>
+      {event.data.reason === 'unavailable' && (
+        <p className="text-xs mb-2">
+          <strong>Available tools:</strong> {event.data.availableTools.join(', ') || 'none'}
+        </p>
+      )}
+      {event.data.reason === 'invalid_arguments' && (
+        <TraceJsonViewer data={{ args: event.data.args, issues: event.data.issues }} />
+      )}
+      {event.data.reason === 'invalid_json' && (
+        <TextBlock label="Parse error" content={event.data.message} tone="warning" defaultOpen />
+      )}
+    </>
+  );
+}
+
 /** Rendered body for an expanded gate event (guardrail / schema_check / validate). */
 export function GateCheckBody({ event }: { event: HistoricalAxlEvent }) {
   const d = getGateData(event);
@@ -455,6 +566,7 @@ function TraceEventRow({
   onToggle,
   maxDuration,
   baseDepth,
+  lifecycleBadge,
 }: {
   event: HistoricalAxlEvent;
   index: number;
@@ -462,6 +574,7 @@ function TraceEventRow({
   onToggle: () => void;
   maxDuration: number;
   baseDepth: number;
+  lifecycleBadge?: string;
 }) {
   const depth = Math.max(0, getDepth(event) - baseDepth);
   const isRetry = isRetryCall(event);
@@ -497,6 +610,25 @@ function TraceEventRow({
         </span>
         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${getEventColor(event)}`} />
         <span className="font-medium w-28 truncate">{event.type}</span>
+        {lifecycleBadge && (
+          <span
+            className={cn(
+              'px-1.5 py-0.5 text-[9px] font-medium rounded-full whitespace-nowrap',
+              lifecycleBadge === 'succeeded' || lifecycleBadge === 'approved'
+                ? 'bg-green-100 text-green-800 dark:bg-green-950/40 dark:text-green-300'
+                : lifecycleBadge === 'running' ||
+                    lifecycleBadge === 'accepted' ||
+                    lifecycleBadge === 'legacy result' ||
+                    lifecycleBadge === 'legacy'
+                  ? 'bg-slate-200 text-slate-800 dark:bg-slate-800 dark:text-slate-200'
+                  : lifecycleBadge.includes('incomplete') || lifecycleBadge === 'cancelled'
+                    ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300'
+                    : 'bg-red-100 text-red-800 dark:bg-red-950/40 dark:text-red-300',
+            )}
+          >
+            {lifecycleBadge}
+          </span>
+        )}
         {isRetry && (
           <span
             className="inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[9px] font-medium rounded-full bg-amber-200 text-amber-900 dark:bg-amber-800 dark:text-amber-100"
@@ -517,8 +649,8 @@ function TraceEventRow({
         {event.agent && (
           <span className="text-blue-600 dark:text-blue-400 w-28 truncate">{event.agent}</span>
         )}
-        {/* `tool` lives on the four tool-* variants (tool_call_start/end,
-            tool_approval, tool_denied) — narrow via `'tool' in event` so
+        {/* `tool` lives on the tool lifecycle variants (including v2
+            `tool_call_rejected` and legacy `tool_denied`) — narrow via `'tool' in event` so
             the strict union admits the access on those rows only. */}
         {'tool' in event && event.tool && (
           <span className="text-purple-600 dark:text-purple-400 w-28 truncate">{event.tool}</span>
@@ -550,6 +682,10 @@ function TraceEventRow({
             <GateCheckBody event={event} />
           ) : event.type === 'tool_approval' ? (
             <ToolApprovalBody event={event} />
+          ) : event.type === 'tool_call_end' && event.schemaVersion === 2 ? (
+            <ToolCallEndBody event={event} />
+          ) : event.type === 'tool_call_rejected' ? (
+            <ToolCallRejectedBody event={event} />
           ) : event.type === 'ask_start' ? (
             <AskStartBody event={event} />
           ) : event.type === 'ask_end' ? (
@@ -585,11 +721,17 @@ function TraceEventRow({
  */
 export function TraceEventList({
   events,
+  lifecycleEvents = events,
+  traceComplete,
   maxDuration: maxDurationOverride,
   showToolbar = true,
   header,
 }: {
   events: HistoricalAxlEvent[];
+  /** Full unfiltered trace used for lifecycle pairing when `events` is filtered. */
+  lifecycleEvents?: HistoricalAxlEvent[];
+  /** Whether an unmatched accepted start is terminally incomplete. */
+  traceComplete?: boolean;
   maxDuration?: number;
   showToolbar?: boolean;
   header?: ReactNode;
@@ -602,6 +744,61 @@ export function TraceEventList({
     if (maxDurationOverride != null) return maxDurationOverride;
     return Math.max(...events.map((e) => e.duration ?? 0), 1);
   }, [events, maxDurationOverride]);
+
+  const lifecycleBadges = useMemo(() => {
+    const badges = new Map<HistoricalAxlEvent, string>();
+    const isComplete =
+      (traceComplete ?? false) ||
+      lifecycleEvents.some(
+        (event) =>
+          event.type === 'done' ||
+          event.type === 'error' ||
+          event.type === 'workflow_end' ||
+          (event.type === 'log' &&
+            typeof event.data === 'object' &&
+            event.data !== null &&
+            'event' in event.data &&
+            event.data.event === 'events_truncated'),
+      );
+    const v2Ends = new Set(
+      lifecycleEvents
+        .filter((event) => event.type === 'tool_call_end' && event.schemaVersion === 2)
+        .map((event) => `${event.executionId}\u0000${event.askId}\u0000${event.callId}`),
+    );
+    const legacyEnds = lifecycleEvents.filter(
+      (event) => event.type === 'tool_call_end' && event.schemaVersion !== 2,
+    );
+
+    for (const event of lifecycleEvents) {
+      if (event.type === 'tool_call_start') {
+        if (event.schemaVersion === 2) {
+          const key = `${event.executionId}\u0000${event.askId}\u0000${event.callId}`;
+          badges.set(
+            event,
+            v2Ends.has(key) ? 'accepted' : isComplete ? 'incomplete trace' : 'running',
+          );
+        } else {
+          const paired = legacyEnds.some((end) => {
+            const startCallId = 'callId' in event ? event.callId : undefined;
+            const endCallId = 'callId' in end ? end.callId : undefined;
+            return startCallId != null && endCallId != null
+              ? startCallId === endCallId
+              : end.tool === event.tool;
+          });
+          badges.set(event, paired ? 'legacy' : isComplete ? 'legacy incomplete' : 'legacy');
+        }
+      } else if (event.type === 'tool_call_end') {
+        badges.set(event, event.schemaVersion === 2 ? event.data.outcome.status : 'legacy result');
+      } else if (event.type === 'tool_call_rejected') {
+        badges.set(event, 'rejected');
+      } else if (event.type === 'tool_denied') {
+        badges.set(event, 'legacy denied');
+      } else if (event.type === 'tool_approval') {
+        badges.set(event, event.data.approved ? 'approved' : 'denied');
+      }
+    }
+    return badges;
+  }, [lifecycleEvents, traceComplete]);
 
   // Base depth for indent rendering. When drilled into a single ask, all
   // rows share a depth (e.g. 2 for a grandchild), which would push every
@@ -684,6 +881,7 @@ export function TraceEventList({
                 onToggle={() => toggleEvent(eventKey)}
                 maxDuration={maxDuration}
                 baseDepth={baseDepth}
+                lifecycleBadge={lifecycleBadges.get(event)}
               />
             );
           })}

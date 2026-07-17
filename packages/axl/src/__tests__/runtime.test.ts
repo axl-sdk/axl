@@ -72,16 +72,6 @@ function createTransportProbeProvider() {
   };
 }
 
-const LEGACY_OBSERVATION_WARNING_KEY = Symbol.for(
-  '@axlsdk/axl/legacy-observation-callback-warning',
-);
-
-function resetLegacyObservationWarning(): void {
-  delete (globalThis as typeof globalThis & Record<PropertyKey, unknown>)[
-    LEGACY_OBSERVATION_WARNING_KEY
-  ];
-}
-
 // ═════════════════════════════════════════════════════════════════════════
 // register() and execute()
 // ═════════════════════════════════════════════════════════════════════════
@@ -268,8 +258,6 @@ describe('stream()', () => {
   });
 
   it('uses provider.stream without installing a callback or allocating ctx.events', async () => {
-    resetLegacyObservationWarning();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const probe = createTransportProbeProvider();
     const runtime = new AxlRuntime({ defaultProvider: 'test' });
     runtime.registerProvider('test', probe.provider as any);
@@ -288,8 +276,6 @@ describe('stream()', () => {
     expect(result).toBe('stream response');
     expect(probe.stream).toHaveBeenCalledTimes(1);
     expect(probe.chat).not.toHaveBeenCalled();
-    expect(warn).not.toHaveBeenCalled();
-    warn.mockRestore();
   });
 
   it('keeps runtime.execute on provider.chat when no events observer is allocated', async () => {
@@ -1920,113 +1906,40 @@ describe('createContext()', () => {
     expect(provider.calls[0].messages.some((m: any) => m.content === 'prior question')).toBe(true);
   });
 
-  it('keeps legacy onToken as a compatible provider-stream activation path', async () => {
-    resetLegacyObservationWarning();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  it('uses ctx.events as the ad-hoc provider-stream activation path', async () => {
     const probe = createTransportProbeProvider();
     const runtime = new AxlRuntime({ defaultProvider: 'test' });
     runtime.registerProvider('test', probe.provider as any);
-    const onToken = vi.fn();
     const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
-    const ctx = runtime.createContext({ onToken });
+    const ctx = runtime.createContext();
+    void ctx.events;
 
     const result = await ctx.ask(testAgent, 'hello');
 
     expect(result).toBe('stream response');
     expect(probe.stream).toHaveBeenCalledTimes(1);
     expect(probe.chat).not.toHaveBeenCalled();
-    expect(onToken).toHaveBeenCalledWith(
-      'stream response',
-      expect.objectContaining({ agent: 'test', depth: 0 }),
-    );
-    expect(warn).toHaveBeenCalledOnce();
-    expect(warn.mock.calls[0][0]).toContain('docs/migration/stream-first-observation.md');
-    warn.mockRestore();
-    resetLegacyObservationWarning();
   });
 
-  it('keeps every legacy observation callback operational with correlated metadata', async () => {
-    resetLegacyObservationWarning();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    let callIndex = 0;
-    const runtime = new AxlRuntime({ defaultProvider: 'test' });
-    runtime.registerProvider('test', {
-      name: 'test',
-      chat: vi.fn(async () => {
-        throw new Error('legacy onToken compatibility must select provider.stream');
-      }),
-      stream: async function* () {
-        callIndex++;
-        if (callIndex === 1) {
-          yield {
-            type: 'tool_call_delta' as const,
-            id: 'legacy-call-1',
-            name: 'legacy_tool',
-            arguments: '{"value":7}',
-          };
-        } else {
-          yield { type: 'text_delta' as const, content: 'done' };
-        }
-        yield {
-          type: 'done' as const,
-          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-        };
-      },
-    });
-    const legacyTool = tool({
-      name: 'legacy_tool',
-      description: 'Compatibility fixture',
-      input: z.object({ value: z.number() }),
-      handler: ({ value }) => ({ value }),
-    });
-    const testAgent = agent({
-      name: 'legacy-agent',
-      model: 'test:default',
-      system: 'test',
-      tools: [legacyTool],
-    });
-    const onToken = vi.fn();
-    const onToolCall = vi.fn();
-    const onAgentStart = vi.fn();
-    const ctx = runtime.createContext({ onToken, onToolCall, onAgentStart });
-
-    await expect(ctx.ask(testAgent, 'hello')).resolves.toBe('done');
-
-    expect(onToken).toHaveBeenCalledWith(
-      'done',
-      expect.objectContaining({ agent: 'legacy-agent', depth: 0 }),
-    );
-    expect(onToolCall).toHaveBeenCalledWith(
-      { name: 'legacy_tool', args: { value: 7 }, callId: 'legacy-call-1' },
-      expect.objectContaining({ agent: 'legacy-agent', depth: 0 }),
-    );
-    expect(onAgentStart).toHaveBeenCalledTimes(2);
-    const firstMeta = onAgentStart.mock.calls[0][1];
-    expect(firstMeta).toEqual(
-      expect.objectContaining({ askId: expect.any(String), agent: 'legacy-agent', depth: 0 }),
-    );
-    expect(onAgentStart.mock.calls[1][1]).toEqual(firstMeta);
-    expect(warn).toHaveBeenCalledOnce();
-    warn.mockRestore();
-    resetLegacyObservationWarning();
-  });
-
-  it('warns once per process only when legacy observation callbacks are supplied', () => {
-    resetLegacyObservationWarning();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  it('rejects removed observation callback keys without reading or invoking their values', () => {
     const { runtime } = createRuntime();
+    const options = Object.defineProperties(
+      {},
+      {
+        onToken: {
+          enumerable: true,
+          get: () => {
+            throw new Error('must not read');
+          },
+        },
+        onToolCall: { enumerable: true, value: vi.fn() },
+        onAgentStart: { enumerable: true, value: vi.fn() },
+      },
+    );
 
-    runtime.createContext();
-    expect(warn).not.toHaveBeenCalled();
-
-    runtime.createContext({ onToken: () => {} });
-    runtime.createContext({ onToolCall: () => {} });
-    runtime.createContext({ onAgentStart: () => {} });
-
-    expect(warn).toHaveBeenCalledOnce();
-    expect(warn.mock.calls[0][0]).toContain('onToken, onToolCall, and onAgentStart');
-    warn.mockRestore();
-    resetLegacyObservationWarning();
+    expect(() => runtime.createContext(options as never)).toThrowError(
+      /onToken, onToolCall, onAgentStart.*docs\/migration\/stream-first-observation\.md/,
+    );
   });
 
   it('passes awaitHumanHandler to the context', async () => {

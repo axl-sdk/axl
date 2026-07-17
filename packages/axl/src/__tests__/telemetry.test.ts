@@ -11,6 +11,13 @@ import {
 } from '@opentelemetry/sdk-trace-base';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { context, trace } from '@opentelemetry/api';
+import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
+import { agent } from '../agent.js';
+import { WorkflowContext } from '../context.js';
+import { ProviderRegistry } from '../providers/registry.js';
+import { tool } from '../tool.js';
+import { createSequenceProvider } from './helpers.js';
 
 describe('telemetry', () => {
   describe('NoopSpanManager', () => {
@@ -119,7 +126,7 @@ describe('OTelSpanManager', () => {
     expect(spans).toHaveLength(1);
     // OTel SpanStatusCode.ERROR = 2
     expect(spans[0].status.code).toBe(2);
-    expect(spans[0].status.message).toBe('test error');
+    expect(spans[0].status.message).toBeUndefined();
   });
 
   it('sets ok status on success', async () => {
@@ -149,6 +156,60 @@ describe('OTelSpanManager', () => {
     expect(parent).toBeDefined();
     // Child's parent span ID should match parent's span ID
     expect(child.parentSpanContext?.spanId).toBe(parent.spanContext().spanId);
+  });
+
+  it('parents an agent-as-tool inner ask under the outer tool span', async () => {
+    const inner = agent({ name: 'otel-inner', model: 'mock:test', system: 'inner' });
+    const agentTool = tool({
+      name: 'ask_otel_inner',
+      description: 'invoke an inner agent',
+      input: z.object({ question: z.string() }),
+      handler: ({ question }, ctx) => ctx.ask(inner, question),
+    });
+    const outer = agent({
+      name: 'otel-outer',
+      model: 'mock:test',
+      system: 'outer',
+      tools: [agentTool],
+    });
+    const mock = createSequenceProvider([
+      {
+        tool_calls: [
+          {
+            id: 'otel-tool-call',
+            type: 'function',
+            function: { name: 'ask_otel_inner', arguments: '{"question":"go"}' },
+          },
+        ],
+      },
+      'inner answer',
+      'outer answer',
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerInstance('mock', mock);
+    const ctx = new WorkflowContext({
+      input: 'test',
+      executionId: randomUUID(),
+      config: {},
+      providerRegistry: registry,
+      spanManager: manager,
+    });
+
+    await expect(ctx.ask(outer, 'go')).resolves.toBe('outer answer');
+
+    const spans = exporter.getFinishedSpans();
+    const outerAsk = spans.find(
+      (span) => span.name === 'axl.agent.ask' && span.attributes['axl.agent.name'] === 'otel-outer',
+    );
+    const toolSpan = spans.find(
+      (span) =>
+        span.name === 'axl.tool.call' && span.attributes['axl.tool.name'] === 'ask_otel_inner',
+    );
+    const innerAsk = spans.find(
+      (span) => span.name === 'axl.agent.ask' && span.attributes['axl.agent.name'] === 'otel-inner',
+    );
+    expect(toolSpan?.parentSpanContext?.spanId).toBe(outerAsk?.spanContext().spanId);
+    expect(innerAsk?.parentSpanContext?.spanId).toBe(toolSpan?.spanContext().spanId);
   });
 
   it('setAttribute adds attributes after creation', async () => {

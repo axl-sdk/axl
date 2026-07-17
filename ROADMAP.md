@@ -32,6 +32,16 @@
 
 ### Planned
 
+#### Tool lifecycle semantics (next major)
+
+Tool execution still carries two inherited ambiguities that should be removed deliberately,
+not patched piecemeal: a normally returned object with an `error` property is treated as a
+failure for after-hook and span purposes, while invalid arguments emit no tool-call pair and
+approval denial or a failing before-hook emit a start without a matching end. Before the next
+major, design an explicit returned-versus-thrown outcome contract and terminal event semantics,
+publish migration guidance, and update tool execution as one coherent breaking change. Until
+then, the current behavior remains compatibility-locked.
+
 #### Stream-First Observation API — Phases 2 & 3
 
 Phase 1 (above) shipped `ctx.events` and the bounded-queue safety net. Remaining work:

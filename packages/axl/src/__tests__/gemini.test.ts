@@ -417,6 +417,7 @@ describe('GeminiProvider', () => {
       ['null', 'null', { result: null }],
       ['array', '[1,"two"]', { result: [1, 'two'] }],
       ['JSON string', '"plain"', { result: 'plain' }],
+      ['non-JSON text', 'plain', { result: 'plain' }],
     ])(
       "wraps a parsed %s tool result in Gemini's required object envelope",
       async (_label, content, expected) => {

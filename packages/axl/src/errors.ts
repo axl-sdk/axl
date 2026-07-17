@@ -22,6 +22,10 @@ export class ToolModelOutputError extends AxlError {
     this.name = 'ToolModelOutputError';
     this.toolName = toolName;
     this.cause = cause;
+    // Mapper errors may contain application data. Keep the cause directly
+    // inspectable by trusted host code without exposing it through ordinary
+    // Object.keys()/JSON.stringify() error serialization.
+    Object.defineProperty(this, 'cause', { enumerable: false });
   }
 }
 

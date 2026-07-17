@@ -522,6 +522,15 @@ describe('model-facing tool output projection', () => {
     expect(serialized).toContain('raw-value');
   });
 
+  it('keeps the host-visible cause out of ordinary error serialization', () => {
+    const cause = new Error('mapper-secret-value');
+    const error = new ToolModelOutputError('projected_tool', cause);
+
+    expect(error.cause).toBe(cause);
+    expect(Object.keys(error)).not.toContain('cause');
+    expect(JSON.stringify(error)).not.toContain('mapper-secret-value');
+  });
+
   it('rewraps a ToolModelOutputError thrown by the mapper for the current tool', async () => {
     const nested = new ToolModelOutputError('spoofed_tool', new Error('nested'));
     const projected = tool({
@@ -901,6 +910,7 @@ describe('model-facing tool output projection', () => {
 
   it('does not continue to the provider after a tool aborts the ask signal', async () => {
     const controller = new AbortController();
+    const mapper = vi.fn(() => 'safe projection');
     const projected = tool({
       name: 'abort_after_execution',
       description: 'Abort after completing a local side effect',
@@ -909,7 +919,7 @@ describe('model-facing tool output projection', () => {
         controller.abort();
         return { raw: 'host-only' };
       },
-      toModelOutput: () => 'safe projection',
+      toModelOutput: mapper,
     });
     const harness = setup([projected], undefined, { signal: controller.signal });
 
@@ -918,6 +928,7 @@ describe('model-facing tool output projection', () => {
     });
 
     expect(harness.provider.calls).toHaveLength(1);
+    expect(mapper).not.toHaveBeenCalled();
     expect(harness.traces.filter((event) => event.type === 'tool_call_end')).toHaveLength(1);
     expect(harness.traces.find((event) => event.type === 'ask_end')?.outcome).toMatchObject({
       ok: false,

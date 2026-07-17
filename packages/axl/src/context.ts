@@ -37,6 +37,7 @@ import {
   ToolModelOutputError,
 } from './errors.js';
 import type { Agent } from './agent.js';
+import type { Tool } from './tool.js';
 import { parsePartialJson } from './partial-json.js';
 import { StreamingWalker } from './streaming-walker.js';
 import { COST_BEARING_LEAF_TYPES, hasPositiveTokens, isUsableCost } from './event-utils.js';
@@ -124,6 +125,40 @@ function prepareToolModelOutput(toolName: string, project: () => unknown): strin
     throw new ToolModelOutputError(toolName, cause);
   }
   return serializeToolModelOutput(toolName, output);
+}
+
+function finalizeToolResult(options: {
+  toolName: string;
+  configuredTool: Tool | undefined;
+  outcome: ToolExecutionOutcome;
+  legacyContent: () => string;
+  emitEnd: () => void;
+  beforeProjection: () => void;
+}): string {
+  const { toolName, configuredTool, outcome, legacyContent, emitEnd, beforeProjection } = options;
+  const projectionEligible =
+    configuredTool !== undefined &&
+    !configuredTool.sensitive &&
+    outcome.kind === 'returned' &&
+    configuredTool.toModelOutput !== undefined;
+
+  if (projectionEligible) {
+    // The complete host result is authoritative and observable even when the
+    // subsequent projection fails. Never move projection ahead of this event.
+    emitEnd();
+    // A completed tool or synchronous end-event listener may cancel the ask.
+    // Projection is pure provider preparation, so do not run it when there can
+    // be no continuation (or let its failure mask the cancellation).
+    beforeProjection();
+    const project = configuredTool.toModelOutput!;
+    return prepareToolModelOutput(toolName, () => project(outcome.value as never));
+  }
+
+  // Preserve legacy ordering: serialization happens before tool_call_end when
+  // no projector is eligible.
+  const content = legacyContent();
+  emitEnd();
+  return content;
 }
 
 /**
@@ -1937,37 +1972,24 @@ export class WorkflowContext<TInput = unknown> {
               : await executeOverride();
 
             const toolResult = outcome.value;
-            const projectionEligible =
-              tool !== undefined &&
-              !tool.sensitive &&
-              outcome.kind === 'returned' &&
-              tool.toModelOutput !== undefined;
-            let resultContent: string;
-
-            if (projectionEligible) {
-              const toolDuration = Date.now() - toolStart;
-              this.emitEvent({
-                type: 'tool_call_end',
-                agent: agent._name,
-                tool: toolName,
-                duration: toolDuration,
-                data: { args: toolArgs, result: toolResult, callId: toolCall.id },
-              });
-              const project = tool.toModelOutput!;
-              resultContent = prepareToolModelOutput(toolName, () => project(toolResult as never));
-            } else {
-              resultContent = tool?.sensitive
-                ? '[REDACTED - sensitive tool output]'
-                : JSON.stringify(toolResult);
-              const toolDuration = Date.now() - toolStart;
-              this.emitEvent({
-                type: 'tool_call_end',
-                agent: agent._name,
-                tool: toolName,
-                duration: toolDuration,
-                data: { args: toolArgs, result: toolResult, callId: toolCall.id },
-              });
-            }
+            const resultContent = finalizeToolResult({
+              toolName,
+              configuredTool: tool,
+              outcome,
+              legacyContent: () =>
+                tool?.sensitive ? '[REDACTED - sensitive tool output]' : JSON.stringify(toolResult),
+              emitEnd: () => {
+                const toolDuration = Date.now() - toolStart;
+                this.emitEvent({
+                  type: 'tool_call_end',
+                  agent: agent._name,
+                  tool: toolName,
+                  duration: toolDuration,
+                  data: { args: toolArgs, result: toolResult, callId: toolCall.id },
+                });
+              },
+              beforeProjection: () => this.currentSignal?.throwIfAborted(),
+            });
             currentMessages.push({
               role: 'tool',
               content: resultContent,
@@ -2186,33 +2208,22 @@ export class WorkflowContext<TInput = unknown> {
 
           const toolResult = execution.outcome.value;
           const toolDuration = Date.now() - toolStart;
-          const projectionEligible =
-            tool !== undefined &&
-            !tool.sensitive &&
-            execution.outcome.kind === 'returned' &&
-            tool.toModelOutput !== undefined;
-          let resultContent: string;
-
-          if (projectionEligible) {
-            this.emitEvent({
-              type: 'tool_call_end',
-              agent: agent._name,
-              tool: traceName,
-              duration: toolDuration,
-              data: { args: toolArgs, result: toolResult, callId: toolCall.id },
-            });
-            const project = tool.toModelOutput!;
-            resultContent = prepareToolModelOutput(toolName, () => project(toolResult as never));
-          } else {
-            resultContent = execution.resultContent!;
-            this.emitEvent({
-              type: 'tool_call_end',
-              agent: agent._name,
-              tool: traceName,
-              duration: toolDuration,
-              data: { args: toolArgs, result: toolResult, callId: toolCall.id },
-            });
-          }
+          const resultContent = finalizeToolResult({
+            toolName,
+            configuredTool: tool,
+            outcome: execution.outcome,
+            legacyContent: () => execution.resultContent!,
+            emitEnd: () => {
+              this.emitEvent({
+                type: 'tool_call_end',
+                agent: agent._name,
+                tool: traceName,
+                duration: toolDuration,
+                data: { args: toolArgs, result: toolResult, callId: toolCall.id },
+              });
+            },
+            beforeProjection: () => this.currentSignal?.throwIfAborted(),
+          });
 
           currentMessages.push({
             role: 'tool',

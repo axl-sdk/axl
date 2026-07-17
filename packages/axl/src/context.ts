@@ -517,6 +517,9 @@ export type WorkflowContextInit = {
    *  visible to those children, and child allocation is visible to the
    *  parent. Direct callers should not pass this. */
   _busRef?: { current: AxlEventBus | undefined };
+  /** Internal: force provider streaming for runtime.stream() without using a
+   * legacy callback as transport control. Inherited by child contexts. */
+  _forceStreaming?: boolean;
   /** Internal: shared auto-checkpoint counters. Set by `createChildContext`
    *  so parent + child share the same number space, preventing checkpoint
    *  store key collisions across nested `WorkflowContext` instances.
@@ -613,6 +616,7 @@ export class WorkflowContext<TInput = unknown> {
    *  contexts that never observe). */
   private readonly _busRef: { current: AxlEventBus | undefined };
   private readonly _eventStreamOptions?: EventStreamOptions;
+  private readonly _forceStreaming: boolean;
   /** Removes the constructor-registered `'abort'` listener from
    *  `this.signal` so a long-lived signal (e.g., a request-scoped or
    *  process-wide signal reused across many `runtime.createContext()` /
@@ -649,9 +653,9 @@ export class WorkflowContext<TInput = unknown> {
    *
    * **Subscribe before the first `ctx.ask()`.** The streaming code
    * path inside `ctx.ask()` activates only when an observer is
-   * present at the time the ask starts (`_streamingEnabled` — either
-   * the legacy `onToken` callback is set or `ctx.events` has been
-   * allocated). If you allocate `ctx.events` AFTER a `ctx.ask()` has
+   * present at the time the ask starts (`_streamingEnabled` — an explicit
+   * runtime streaming mode, the legacy `onToken` callback, or allocated
+   * `ctx.events`). If you allocate `ctx.events` AFTER a `ctx.ask()` has
    * begun, that in-flight ask will not stream `token` /
    * `partial_object` events at all (the agent loop went through
    * `provider.chat` instead of `provider.stream`). Subsequent asks
@@ -697,18 +701,16 @@ export class WorkflowContext<TInput = unknown> {
     this.abortListenerCleanup?.();
   }
 
-  /** True if any observer wants per-token streaming for asks started
-   *  from this context: either the legacy `onToken` callback is set
-   *  (e.g., `runtime.stream()` plumbs a sentinel) OR `ctx.events` has
-   *  been allocated (a workflow-handler consumer subscribed before
-   *  the ask). `ctx.ask` reads this to decide whether to enter the
+  /** True when asks should use provider streaming: `runtime.stream()` set an
+   *  explicit internal mode, the legacy `onToken` callback is present, or
+   *  `ctx.events` has been allocated. `ctx.ask` reads this to decide whether to enter the
    *  streaming code path; the gate is re-checked per ask, so a
    *  consumer subscribing AFTER the first ask started still gets
    *  streaming on the next one. The check `_busRef.current !== undefined`
    *  is a one-way flag — `_finish` does not unset the reference, so
    *  once an observer was present, every subsequent ask streams. */
   private get _streamingEnabled(): boolean {
-    return this.onToken !== undefined || this._busRef.current !== undefined;
+    return this._forceStreaming || this.onToken !== undefined || this._busRef.current !== undefined;
   }
 
   constructor(init: WorkflowContextInit) {
@@ -742,6 +744,7 @@ export class WorkflowContext<TInput = unknown> {
     // constructed.
     this._busRef = init._busRef ?? { current: undefined };
     this._eventStreamOptions = init.eventStreamOptions;
+    this._forceStreaming = init._forceStreaming ?? false;
     // Auto-dispose the events bus when this context's signal aborts.
     // The leak this prevents: a `runtime.createContext({ signal })` flow
     // that iterates `ctx.events` and never emits a `workflow_end` /
@@ -836,6 +839,7 @@ export class WorkflowContext<TInput = unknown> {
       // the parent's iterator with `parentAskId`/`depth` correlation
       // intact.
       _busRef: this._busRef,
+      _forceStreaming: this._forceStreaming,
       eventStreamOptions: this._eventStreamOptions,
       // Isolated: sessionHistory (empty)
     });
@@ -1475,8 +1479,8 @@ export class WorkflowContext<TInput = unknown> {
         this.currentSignal?.throwIfAborted();
 
         // Activate the streaming code path when ANY observer is interested:
-        // - `onToken` is set (legacy callback path; runtime.stream() sets a
-        //   sentinel `() => {}` to enable streaming without any consumer)
+        // - runtime.stream() set the explicit internal transport mode
+        // - `onToken` is set (legacy callback path)
         // - `ctx.events` has been allocated (a workflow-handler consumer
         //   subscribed via `for await (const p of ctx.events.partialObjects)`
         //   or similar). Without this branch, runtime.execute() would skip

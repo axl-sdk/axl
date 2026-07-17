@@ -169,8 +169,8 @@ describe('ask_end.unpriced (T2.5)', () => {
     // wrongly flagged as unpriced. It must behave exactly like non-streaming.
     const { ctx, traces } = createTestCtx({
       provider: streamProvider({ content: 'hi' }), // no usage
-      onToken: () => {}, // enables the streaming path
     });
+    void ctx.events;
     await ctx.ask(plain(), 'hi');
     expect(askEnd(traces)?.unpriced).toBeFalsy();
   });
@@ -178,8 +178,8 @@ describe('ask_end.unpriced (T2.5)', () => {
   it('STREAMING: a done chunk WITH usage but no cost DOES flag unpriced', async () => {
     const { ctx, traces } = createTestCtx({
       provider: streamProvider({ content: 'hi', usage }), // usage, no cost
-      onToken: () => {},
     });
+    void ctx.events;
     await ctx.ask(plain(), 'hi');
     expect(askEnd(traces)?.unpriced).toBe(true);
   });

@@ -48,6 +48,30 @@ function createRuntime(provider?: TestProvider): { runtime: AxlRuntime; provider
   return { runtime, provider: p };
 }
 
+function createTransportProbeProvider() {
+  const chat = vi.fn(async () => ({
+    content: 'chat response',
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    cost: 0,
+  }));
+  const stream = vi.fn(() =>
+    (async function* () {
+      yield { type: 'text_delta' as const, content: 'stream response' };
+      yield {
+        type: 'done' as const,
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        cost: 0,
+      };
+    })(),
+  );
+
+  return {
+    provider: { name: 'test', chat, stream },
+    chat,
+    stream,
+  };
+}
+
 // ═════════════════════════════════════════════════════════════════════════
 // register() and execute()
 // ═════════════════════════════════════════════════════════════════════════
@@ -231,6 +255,67 @@ describe('stream()', () => {
     const stream = runtime.stream('stream-result', { x: 21 });
     const result = await stream.promise;
     expect(result).toBe(42);
+  });
+
+  it('uses provider.stream without installing a callback or allocating ctx.events', async () => {
+    const probe = createTransportProbeProvider();
+    const runtime = new AxlRuntime({ defaultProvider: 'test' });
+    runtime.registerProvider('test', probe.provider as any);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+
+    runtime.register(
+      workflow({
+        name: 'stream-transport-selection',
+        input: z.object({}),
+        handler: (ctx) => ctx.ask(testAgent, 'hello'),
+      }),
+    );
+
+    const result = await runtime.stream('stream-transport-selection', {}).promise;
+
+    expect(result).toBe('stream response');
+    expect(probe.stream).toHaveBeenCalledTimes(1);
+    expect(probe.chat).not.toHaveBeenCalled();
+  });
+
+  it('keeps runtime.execute on provider.chat when no events observer is allocated', async () => {
+    const probe = createTransportProbeProvider();
+    const runtime = new AxlRuntime({ defaultProvider: 'test' });
+    runtime.registerProvider('test', probe.provider as any);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+    runtime.register(
+      workflow({
+        name: 'execute-transport-selection',
+        input: z.object({}),
+        handler: (ctx) => ctx.ask(testAgent, 'hello'),
+      }),
+    );
+
+    const result = await runtime.execute('execute-transport-selection', {});
+
+    expect(result).toBe('chat response');
+    expect(probe.chat).toHaveBeenCalledTimes(1);
+    expect(probe.stream).not.toHaveBeenCalled();
+  });
+
+  it('inherits runtime.stream transport mode in child contexts', async () => {
+    const probe = createTransportProbeProvider();
+    const runtime = new AxlRuntime({ defaultProvider: 'test' });
+    runtime.registerProvider('test', probe.provider as any);
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+    runtime.register(
+      workflow({
+        name: 'child-stream-transport-selection',
+        input: z.object({}),
+        handler: (ctx) => ctx.createChildContext().ask(testAgent, 'hello from child'),
+      }),
+    );
+
+    const result = await runtime.stream('child-stream-transport-selection', {}).promise;
+
+    expect(result).toBe('stream response');
+    expect(probe.stream).toHaveBeenCalledTimes(1);
+    expect(probe.chat).not.toHaveBeenCalled();
   });
 
   it('emits log events via the stream (unified event model — formerly wrapped as `step`)', async () => {
@@ -1821,13 +1906,23 @@ describe('createContext()', () => {
     expect(provider.calls[0].messages.some((m: any) => m.content === 'prior question')).toBe(true);
   });
 
-  it('accepts onToken option without error', async () => {
-    const { runtime } = createRuntime();
+  it('keeps legacy onToken as a compatible provider-stream activation path', async () => {
+    const probe = createTransportProbeProvider();
+    const runtime = new AxlRuntime({ defaultProvider: 'test' });
+    runtime.registerProvider('test', probe.provider as any);
+    const onToken = vi.fn();
+    const testAgent = agent({ name: 'test', model: 'test:default', system: 'test' });
+    const ctx = runtime.createContext({ onToken });
 
-    const ctx = runtime.createContext({
-      onToken: () => {},
-    });
-    expect(ctx).toBeDefined();
+    const result = await ctx.ask(testAgent, 'hello');
+
+    expect(result).toBe('stream response');
+    expect(probe.stream).toHaveBeenCalledTimes(1);
+    expect(probe.chat).not.toHaveBeenCalled();
+    expect(onToken).toHaveBeenCalledWith(
+      'stream response',
+      expect.objectContaining({ agent: 'test', depth: 0 }),
+    );
   });
 
   it('passes awaitHumanHandler to the context', async () => {
@@ -2150,7 +2245,8 @@ describe('trackExecution()', () => {
 
     const { traces } = await runtime.trackExecution(
       async () => {
-        const ctx = runtime.createContext({ onToken: () => {} });
+        const ctx = runtime.createContext();
+        void ctx.events;
         return ctx.ask(testAgent, 'hi');
       },
       { captureTraces: true },

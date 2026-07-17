@@ -481,9 +481,8 @@ describe('ctx.events — error isolation between onTrace and bus', () => {
 describe('ctx.events — partialObjects from a streaming workflow', () => {
   it('streaming code path activates when ctx.events is observed (even on runtime.execute)', async () => {
     // Without this, the customer's runtime.execute() flow would never
-    // emit token / partial_object events because streaming is gated on
-    // `onToken`. The fix in context.ts also enables streaming when
-    // `_busRef.current` is set.
+    // emit token / partial_object events unless the event bus itself activates
+    // streaming before the ask starts.
     const provider = MockProvider.sequence([{ content: '{"v":1}', chunks: ['{"v":', '1', '}'] }]);
     const runtime = buildRuntime(provider);
     const a = agent({ name: 'a', model: 'mock:test', system: 'a' });

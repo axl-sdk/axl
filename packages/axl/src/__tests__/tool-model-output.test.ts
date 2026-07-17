@@ -87,13 +87,13 @@ function setup(
     executionId: randomUUID(),
     config: { trace: { level: 'full', redact: options.redact } },
     onAgentStart: options.onAgentStart,
-    onToken: options.streaming ? () => undefined : undefined,
     providerRegistry: registry,
     signal: options.signal,
     toolOverrides: options.toolOverrides,
     spanManager: options.spanManager,
     onTrace: (event) => traces.push(event),
   });
+  if (options.streaming) void ctx.events;
   const testAgent = agent({
     name: 'projection-test',
     model: 'mock:model',

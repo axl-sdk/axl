@@ -34,8 +34,8 @@ function makeCtx(provider: MockProvider) {
     config: {},
     providerRegistry: registry,
     onTrace: (e) => traces.push(e),
-    onToken: () => {},
   });
+  void ctx.events;
   return { ctx, traces };
 }
 

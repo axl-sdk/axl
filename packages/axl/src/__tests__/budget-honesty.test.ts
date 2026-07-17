@@ -251,8 +251,8 @@ describe('budget honesty — BudgetResult.unpriced (Part A)', () => {
   it('STREAMING: a done chunk with NO usage does NOT flag the budget unpriced', async () => {
     const { ctx } = createTestCtx({
       provider: streamProvider({ content: 'hi' }), // no usage
-      onToken: () => {}, // enables the streaming path
     });
+    void ctx.events;
     const r = await ctx.budget({ cost: '$5' }, () => ctx.ask(plain(), 'hi'));
     expect(r.unpriced).toBe(false);
   });
@@ -260,8 +260,8 @@ describe('budget honesty — BudgetResult.unpriced (Part A)', () => {
   it('STREAMING: a done chunk WITH positive tokens but no cost DOES flag unpriced', async () => {
     const { ctx } = createTestCtx({
       provider: streamProvider({ content: 'hi', usage }), // usage, no cost
-      onToken: () => {},
     });
+    void ctx.events;
     const r = await ctx.budget({ cost: '$5' }, () => ctx.ask(plain(), 'hi'));
     expect(r.unpriced).toBe(true);
   });

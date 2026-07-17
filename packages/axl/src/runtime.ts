@@ -1450,11 +1450,9 @@ export class AxlRuntime extends EventEmitter {
         sessionHistory,
         signal: controller.signal,
         eventStreamOptions: options?.events,
-        // Sentinel `onToken` so the streaming code path in WorkflowContext
-        // is entered (it's gated on `this.onToken` being defined). The
-        // actual `token` AxlEvents are emitted via `emitEvent` and reach
-        // the wire through `onTrace` — this callback is just the gate.
-        onToken: () => {},
+        // Transport mode is explicit internal state. It is inherited by child
+        // contexts and does not allocate an unconsumed ctx.events queue.
+        _forceStreaming: true,
         onTrace: (event: AxlEvent) => {
           // High-volume stream-only events never persist; remaining
           // structural events are bounded by maxEventsPerExecution. See

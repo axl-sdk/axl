@@ -159,10 +159,8 @@ describe('Streaming E2E', () => {
     // events to the wire so subagent activity is observable. Consumers that
     // want root-only behavior filter on `depth === 0`.
     //
-    // Token-content assertions are deferred to the follow-up that wires
-    // `runtime.stream()`'s default `onToken` (currently gated by the streaming
-    // path in WorkflowContext). The depth-tagged ask events are the wire-level
-    // invariant that PR 1 commit 4 lands.
+    // runtime.stream() selects the provider streaming path explicitly. The
+    // depth-tagged ask events remain the wire-level nested-observation invariant.
     const askStarts = allEvents.filter(
       (e): e is Extract<AxlEvent, { type: 'ask_start' }> => e.type === 'ask_start',
     );

@@ -13,16 +13,15 @@ function makeCtx(provider: MockProvider) {
   const registry = new ProviderRegistry();
   registry.registerInstance('mock', provider);
   const traces: AxlEvent[] = [];
-  const tokens: string[] = [];
   const ctx = new WorkflowContext({
     input: 'test',
     executionId: randomUUID(),
     config: {},
     providerRegistry: registry,
     onTrace: (e) => traces.push(e),
-    onToken: (t) => tokens.push(t),
   });
-  return { ctx, traces, tokens };
+  void ctx.events;
+  return { ctx, traces };
 }
 
 function partialObjectEvents(traces: AxlEvent[]) {

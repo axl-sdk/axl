@@ -328,6 +328,13 @@ export type ToolCallStartData = {
   args: unknown;
 };
 
+/** Data shape for a v2 tool start. The event's `tool` is canonical; this field
+ * retains the provider-visible request name only when it differs. */
+export type ToolCallStartDataV2 = {
+  args: unknown;
+  requestedTool?: string;
+};
+
 /** Data shape for `tool_approval` events. Emitted by the approval gate on both outcomes. */
 export type ToolApprovalData = {
   approved: boolean;
@@ -340,6 +347,148 @@ export type ToolDeniedData = {
   args?: unknown;
   reason?: string;
   callId?: string;
+};
+
+/** A validation issue for a provider-issued tool invocation.
+ *
+ * Values are deliberately omitted: paths and validator codes are sufficient
+ * for correction without copying application data into diagnostic channels.
+ */
+export type ToolArgumentIssue = {
+  path: readonly (string | number)[];
+  code: string;
+  message?: string;
+};
+
+/** Data shape for a v2 tool request rejected before execution starts. */
+export type ToolCallRejectedData =
+  | {
+      reason: 'unavailable';
+      requestedTool: string;
+      availableTools: string[];
+    }
+  | {
+      reason: 'invalid_json';
+      requestedTool: string;
+      message: string;
+    }
+  | {
+      reason: 'invalid_arguments';
+      requestedTool: string;
+      args: unknown;
+      issues: readonly ToolArgumentIssue[];
+    };
+
+/** Host-observable error details for a terminal tool outcome. */
+export type ToolEventError = {
+  name: string;
+  message: string;
+  code?: string;
+  /** Optional host-only diagnostic cause. Redaction removes this at every
+   * untrusted observation boundary. */
+  cause?: unknown;
+};
+
+/** Constructor input for the next-major model-safe thrown tool failure. */
+export type ToolFailureOptions = {
+  message: string;
+  modelMessage: string;
+  code?: string;
+  cause?: unknown;
+};
+
+/** Compile-only Phase 0 shape for the next-major `ToolFailure` class.
+ * The runtime value is introduced atomically with recognition in the v2 tool
+ * coordinator so a compatible runtime can never mis-handle it. */
+export type ToolFailure = Error & {
+  readonly code: string;
+  readonly modelMessage: string;
+  readonly cause?: unknown;
+};
+
+/** Compile-only constructor contract for `ToolFailure`. */
+export type ToolFailureConstructor = new (options: ToolFailureOptions) => ToolFailure;
+
+/** Failure details for an accepted v2 tool invocation. */
+export type ToolCallFailure =
+  | {
+      phase: 'approval';
+      kind: 'infrastructure';
+      disposition: 'abort';
+      error: ToolEventError;
+    }
+  | {
+      phase: 'before_hook';
+      kind: 'tool_failure';
+      disposition: 'continue';
+      error: ToolEventError;
+    }
+  | {
+      phase: 'before_hook';
+      kind: 'unexpected';
+      disposition: 'abort';
+      error: ToolEventError;
+    }
+  | {
+      phase: 'handler';
+      kind: 'tool_failure' | 'mcp_error';
+      disposition: 'continue';
+      error: ToolEventError;
+      attempts: number;
+    }
+  | {
+      phase: 'handler';
+      kind: 'unexpected';
+      disposition: 'abort';
+      error: ToolEventError;
+      attempts: number;
+    }
+  | {
+      phase: 'after_hook';
+      kind: 'tool_failure';
+      disposition: 'continue';
+      error: ToolEventError;
+      result: unknown;
+    }
+  | {
+      phase: 'after_hook';
+      kind: 'unexpected';
+      disposition: 'abort';
+      error: ToolEventError;
+      result: unknown;
+    }
+  | {
+      phase: 'projection' | 'serialization';
+      kind: 'output';
+      disposition: 'abort';
+      error: ToolEventError;
+      result: unknown;
+    };
+
+/** Cancellation details for an accepted v2 tool invocation. */
+export type ToolCallCancellation =
+  | {
+      phase: 'approval' | 'before_hook' | 'handler';
+      reason?: string;
+    }
+  | {
+      phase: 'after_handler' | 'after_hook' | 'projection' | 'serialization';
+      result: unknown;
+      reason?: string;
+    };
+
+/** Terminal state of an accepted v2 tool invocation. */
+export type ToolCallOutcome =
+  | { status: 'succeeded'; result: unknown }
+  | { status: 'failed'; failure: ToolCallFailure }
+  | { status: 'denied'; reason?: string }
+  | { status: 'cancelled'; cancellation: ToolCallCancellation };
+
+/** Data shape for a v2 `tool_call_end` event. */
+export type ToolCallEndData = {
+  args: unknown;
+  requestedTool?: string;
+  outcome: ToolCallOutcome;
 };
 
 /** Data shape for `handoff_start` events (always emitted, pre-transition). */
@@ -665,7 +814,7 @@ export type CallbackMeta = {
  * exhaustiveness fixture in `__tests__/axl-event-exhaustive.test-d.ts` will
  * also fail until the new case is handled.
  */
-export type AxlEvent =
+type LegacyAxlEventPayloadV1 =
   // ── Execution lifecycle ─────────────────────────────────────────────────
   | (AxlEventBase & { type: 'workflow_start'; workflow: string; data: WorkflowStartData })
   | (AxlEventBase & { type: 'workflow_end'; workflow: string; data: WorkflowEndData })
@@ -880,6 +1029,70 @@ export type AxlEvent =
         data: { message: string; name?: string; code?: string };
       });
 
+/** Tool lifecycle variants written by the v2 event schema. */
+export type ToolLifecycleEventV2 =
+  | (AxlEventBase &
+      AskScoped & {
+        schemaVersion: 2;
+        type: 'tool_call_start';
+        agent: string;
+        tool: string;
+        callId: string;
+        data: ToolCallStartDataV2;
+      })
+  | (AxlEventBase &
+      AskScoped & {
+        schemaVersion: 2;
+        type: 'tool_call_end';
+        agent: string;
+        tool: string;
+        callId: string;
+        duration: number;
+        cost?: number;
+        data: ToolCallEndData;
+      })
+  | (AxlEventBase &
+      AskScoped & {
+        schemaVersion: 2;
+        type: 'tool_call_rejected';
+        agent: string;
+        tool: string;
+        callId: string;
+        data: ToolCallRejectedData;
+      });
+
+/** Event persisted by the legacy unversioned writer. Readers may normalize the
+ * absent marker to an explicit `1` without reinterpreting its payload. */
+export type LegacyAxlEventV1 = LegacyAxlEventPayloadV1 & { schemaVersion?: 1 };
+
+/** Named v2 rejection event for consumers that do not need the full union. */
+export type ToolCallRejectedEvent = Extract<ToolLifecycleEventV2, { type: 'tool_call_rejected' }>;
+
+/** Event contract written by the next breaking runtime.
+ *
+ * This additive prototype lets consumers and type tests lock the schema before
+ * the runtime writer switches. Every v2 event carries the version directly;
+ * `tool_denied` and the v1 tool end shape cannot be represented.
+ */
+export type AxlEventV2 =
+  | ToolLifecycleEventV2
+  | (Exclude<
+      LegacyAxlEventPayloadV1,
+      { type: 'tool_call_start' | 'tool_call_end' | 'tool_denied' }
+    > & {
+      schemaVersion: 2;
+    });
+
+/** Current live event alias. The breaking writer switch moves this alias to
+ * `AxlEventV2` without changing the frozen historical contract above. */
+export type AxlEvent = LegacyAxlEventV1;
+
+/** Event returned by state-store and recovery readers during the migration. */
+export type HistoricalAxlEvent = LegacyAxlEventV1 | AxlEventV2;
+
+/** Convenience: extract a v2 union member by discriminator. */
+export type AxlEventV2Of<T extends AxlEventV2['type']> = Extract<AxlEventV2, { type: T }>;
+
 /** Convenience: extract the union member matching a given `type` discriminator. */
 export type AxlEventOf<T extends AxlEventType> = Extract<AxlEvent, { type: T }>;
 
@@ -931,14 +1144,14 @@ export type OutputValidator<T = unknown> = (
 ) => ValidateResult | Promise<ValidateResult>;
 
 /** Execution info */
-export type ExecutionInfo = {
+export type ExecutionInfoV1 = {
   executionId: string;
   workflow: string;
   status: ExecutionStatus;
   /** Full event timeline. Tokens and `partial_object` events are NOT persisted
    *  here (stream-only); aggregate `tokens: { input, output, reasoning? }`
    *  on `agent_call_end` is the persisted token representation. */
-  events: AxlEvent[];
+  events: LegacyAxlEventV1[];
   /** Total spend for the execution. A LOWER BOUND when an unpriced model ran
    *  (those calls contribute nothing) — read {@link ExecutionInfo.unpriced} to
    *  know whether it's exact, rather than scanning the event timeline. */
@@ -964,6 +1177,24 @@ export type ExecutionInfo = {
    *  provided — `StateStore` is a persistence boundary, not a query engine. */
   metadata?: Record<string, unknown>;
 };
+
+/** Current live execution alias. The breaking writer switch moves this alias
+ * to `ExecutionInfoV2` while historical reads retain their explicit union. */
+export type ExecutionInfo = ExecutionInfoV1;
+
+/** Stored execution written before explicit event schema versioning. */
+export type LegacyExecutionInfoV1 = ExecutionInfoV1 & {
+  eventSchemaVersion?: 1;
+};
+
+/** Stored or live execution written by the v2 event writer. */
+export type ExecutionInfoV2 = Omit<ExecutionInfoV1, 'events'> & {
+  eventSchemaVersion: 2;
+  events: AxlEventV2[];
+};
+
+/** Honest state-store read contract: missing version metadata means v1. */
+export type HistoricalExecutionInfo = LegacyExecutionInfoV1 | ExecutionInfoV2;
 
 /** Record of an agent handoff event (persisted in session metadata).
  *

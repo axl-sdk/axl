@@ -381,7 +381,7 @@ export const alwaysFailWorkflow = workflow({
 });
 
 // 80KB prompt → with AXL_DEV_VERBOSE=1 (trace.level: 'full'), the
-// captured agent_call_end.data.messages snapshot exceeds the 64KB WS
+// captured agent_call_start.data.messages request snapshot exceeds the 64KB WS
 // soft cap and gets replaced by the truncation placeholder in the
 // Trace Explorer.
 export const verboseDemoWorkflow = workflow({

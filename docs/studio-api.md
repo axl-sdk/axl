@@ -56,7 +56,7 @@ Single endpoint at `ws://localhost:4400/ws` with channel multiplexing:
 
 Channels: `execution:{id}`, `trace:{id}`, `trace:*`, `eval:{id}`, `eval:{evalRunId}`, `eval:*`, `costs`, `eval-trends`, `workflow-stats`, `trace-stats`, `decisions`. Execution and eval channels have replay buffering — late subscribers receive the full event history (capped at 1000 events by default; tunable via `bufferCaps`, see below). Buffers are cleaned up 30s after the stream completes. Aggregate channels (`costs`, `eval-trends`, `workflow-stats`, `trace-stats`) broadcast `{ snapshots: Record<WindowId, State>, updatedAt }` on every fold or rebuild.
 
-**Outbound frame budget.** The WS broadcast layer enforces a 64KB soft cap via `truncateIfOversized`. Oversized verbose-mode `agent_call_end.data.messages` snapshots are replaced with a `{ __truncated: true, originalBytes, maxBytes, hint }` placeholder that preserves the event's `type`/`step`/`agent`/`tool` so the Trace Explorer still renders the row. The 64KB threshold matches the inbound message reject limit in the WS protocol (shared constant).
+**Outbound frame budget.** The WS broadcast layer enforces a 64KB soft cap via `truncateIfOversized`. Oversized verbose-mode `agent_call_start.data.messages` request snapshots are replaced with a `{ __truncated: true, originalBytes, maxBytes, hint }` placeholder that preserves the event's `type`/`step`/`agent`/`tool` so the Trace Explorer still renders the row. The 64KB threshold matches the inbound message reject limit in the WS protocol (shared constant).
 
 ### Migrating from 0.14
 

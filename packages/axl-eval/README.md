@@ -480,7 +480,7 @@ for (const item of results.items) {
 }
 ```
 
-`captureTraces` strips verbose-mode `agent_call_end.data.messages` snapshots and high-volume events (`token`, `partial_object`) from the captured array to keep memory bounded. The structural events you'd want for debugging — `agent_call_start`/`agent_call_end`, `tool_call_*`, gate events, `pipeline`, `verify`, `handoff_*` — are all retained.
+`captureTraces` strips verbose-mode `agent_call_start.data.messages` request snapshots and high-volume events (`token`, `partial_object`) from the captured array to keep memory bounded. The structural events you'd want for debugging — `agent_call_start`/`agent_call_end`, `tool_call_*`, gate events, `pipeline`, `verify`, `handoff_*` — are all retained.
 
 #### Per-item live observation with `ctx.events`
 

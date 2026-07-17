@@ -263,7 +263,7 @@ Track cost and execution metadata across any runtime operations within `fn`. Ret
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `captureTraces` | `boolean` | `false` | When `true`, collects every `AxlEvent` observed during `fn` and returns it on `result.traces`. On failure, the captured traces are attached to the thrown error as a non-enumerable `axlCapturedTraces` property (eval runners read this side-channel to populate `EvalItem.traces` on failed items). Verbose-mode `agent_call_end.data.messages` snapshots are stripped from captured traces to keep memory bounded |
+| `captureTraces` | `boolean` | `false` | When `true`, collects every `AxlEvent` observed during `fn` and returns it on `result.traces`. On failure, the captured traces are attached to the thrown error as a non-enumerable `axlCapturedTraces` property (eval runners read this side-channel to populate `EvalItem.traces` on failed items). Verbose-mode `agent_call_start.data.messages` snapshots are stripped from captured traces to keep memory bounded |
 
 ```typescript
 const { result, cost, metadata } = await runtime.trackExecution(async () => {
@@ -1774,7 +1774,7 @@ Streaming callbacks now propagate to nested asks (child contexts inherit them). 
 
 ### Verbose trace mode and redaction
 
-- **`config.trace.level === 'full'`** opts into verbose mode: `agent_call_end.data.messages` is populated with the full `ChatMessage[]` sent to the provider on each turn. This grows with tool results and retry feedback across turns, so it's off by default
+- **`config.trace.level === 'full'`** opts into verbose mode: `agent_call_start.data.messages` is populated with the full `ChatMessage[]` about to be sent to the provider on each turn. This grows with tool results and retry feedback across turns, so it's off by default
 - **`config.trace.redact === true`** is an **observability-boundary filter** — scrubs user/LLM content everywhere it would otherwise flow to observability consumers (events, Studio REST route responses, Studio WebSocket broadcasts). Structural metadata (workflow names, agent names, tool names, cost/token metrics, durations, roles, IDs, attempt counters, scorer scores, ask-graph fields like `askId`/`parentAskId`/`depth`) stays visible so the Trace Explorer, Memory Browser, Session Manager, Cost Dashboard, and Eval Runner all remain usable under compliance mode. See [`observability.md`](./observability.md#pii-and-redaction) for the complete per-route scrubbed/preserved table. Programmatic callers of `runtime.execute()` and direct `StateStore` access still receive raw values — redaction is an observability filter, not a data-at-rest transform. Access the flag from Studio consumers via `runtime.isRedactEnabled(): boolean`
 - **Per-variant scrub rules are exported.** `REDACTED`, `REDACTION_RULES: Record<AxlEventType, RuleFor<...>>`, and `redactEvent(event)` from `@axlsdk/axl` are the single source of truth for which fields scrub on which event variants. Both core's emit-time path and Studio's WS-boundary path consult the same table — adding a new variant to `AXL_EVENT_TYPES` without a corresponding rule is a typecheck error. Custom observability sinks that re-export events to third-party platforms can apply `redactEvent(event)` to inherit the same per-variant contract
 

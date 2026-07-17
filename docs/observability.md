@@ -32,8 +32,8 @@ AXL_TRACE_ENABLED=true AXL_TRACE_LEVEL=full node server.js
 | Level | What's logged |
 |-------|--------------|
 | `off` | Nothing. |
-| `steps` | One line per workflow step: agent calls, tool calls, verify results, budget usage. Includes cost and duration. **Default.** `agent_call_end` events already carry the resolved system prompt, resolved model params, reasoning/thinking content, turn counter, and retry reason — none of those depend on `full` mode |
-| `full` | Everything in `steps`, plus: a complete `ChatMessage[]` snapshot on every `agent_call_end` event (under `data.messages`) so you can reconstruct exactly what the model saw on any given turn, including tool results and retry feedback accumulated across loop iterations. This grows with conversation depth, so it's off by default — enable when debugging |
+| `steps` | One line per workflow step: agent calls, tool calls, verify results, budget usage. Includes cost and duration. **Default.** Request-side `agent_call_start` events already carry the resolved system prompt and model params; response-side `agent_call_end` events carry reasoning/thinking content. Both carry the turn counter and retry reason — none of those fields depend on `full` mode |
+| `full` | Everything in `steps`, plus: a complete `ChatMessage[]` request snapshot on every `agent_call_start` event (under `data.messages`) so you can reconstruct exactly what the model was about to see on that turn, including tool results and retry feedback accumulated across loop iterations. This grows with conversation depth, so it's off by default — enable when debugging |
 
 ### Example Output (`steps` level)
 
@@ -67,7 +67,7 @@ All events share the `AxlEventBase` shape; `data` and other variant-specific fie
 |------|-------------|-------------------|
 | `workflow_start` / `workflow_end` | Workflow lifecycle | `input` / `status`, `duration`, `result?`, `error?`, `aborted?` |
 | `ask_start` / `ask_end` | Bound every `ctx.ask()` call (one pair per invocation, including nested). | `prompt` on start; `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration`, and `unpriced?: boolean` on end |
-| `agent_call_start` / `agent_call_end` | Per LLM call (every loop turn of `ctx.ask()`). `_start` fires before the request; `_end` after the response. | `_start`: `agent`, `model`, `turn`. `_end` `data`: `prompt`, `response`, `system`, `thinking?`, `params`, `turn`, `retryReason?`, `messages?` (verbose only). On the error path: `error` (message), plus `status` + `retryable` when the thrown error was a `ProviderError` (the raw `ProviderError.body` is intentionally **not** emitted — see [security.md](./security.md)) |
+| `agent_call_start` / `agent_call_end` | Per LLM call (every loop turn of `ctx.ask()`). `_start` fires before the request; `_end` after the response. | `_start` `data`: `prompt`, `system?`, `params`, `turn`, `retryReason?`, `toolNames?`, and `messages?` (full trace only). `_end` `data`: `response`, `thinking?`, `turn`, `retryReason?`. On the error path, `_end` also carries `error` (message), plus `status` + `retryable` when the thrown error was a `ProviderError` (the raw `ProviderError.body` is intentionally **not** emitted — see [security.md](./security.md)) |
 | `token` | Streaming text chunk (stream-only, never persisted to `ExecutionInfo.events`) | `data: string` |
 | `tool_call_start` / `tool_call_end` | Tool invocation lifecycle | `_start` `data`: `args`. `_end` `data`: `args`, `result`, `callId` |
 | `tool_approval` | `requireApproval` gate fires — **both** approve and deny | `approved`, `args`, `reason?` |
@@ -431,7 +431,7 @@ Three common symptoms and what to look for in traces:
 
 **"My structured output keeps failing."** Filter for `schema_check` events with `valid: false`. The `reason` field has the Zod parse error; the `feedbackMessage` is the exact message the model saw on its next attempt. If the feedback isn't clear enough to help the model correct itself, that's a prompt/schema design problem, not a retry-count problem.
 
-**"Why did my agent respond that way?"** Enable `trace.level: 'full'` and check the `data.messages` array on the relevant `agent_call_end` — it has the exact conversation (system prompt, history, tool results, retry feedback) as the model saw it. `system`, `params`, `thinking`, and `retryReason` are visible in default mode without needing verbose.
+**"Why did my agent respond that way?"** Enable `trace.level: 'full'` and check the `data.messages` array on the relevant `agent_call_start` — it has the exact request conversation (system prompt, history, tool results, retry feedback) immediately before the provider call. Request-side `system` and `params`, plus response-side `thinking`, are visible in default mode without needing verbose; `retryReason` is mirrored on both start and end.
 
 ### Structured-output prompt cost
 
@@ -517,7 +517,8 @@ The filter applies at three layers:
 
 **1. AxlEvents** — at `emitEvent()` emission time. Scrubs:
 
-- `agent_call_end.data`: `prompt`, `response`, `system`, `thinking`, `messages` (replaced with a single placeholder message preserving the count)
+- `agent_call_start.data`: `prompt`, `system`, `messages` (replaced with a single placeholder message preserving the count)
+- `agent_call_end.data`: `response`, `thinking`, `error`
 - `ask_start.prompt` and `ask_end.outcome` (`outcome.result` on success, `outcome.error` on failure)
 - `guardrail` / `schema_check` / `validate`: `reason`, `feedbackMessage`
 - `tool_call_start.data.args`, `tool_call_end.data`: `args`, `result`

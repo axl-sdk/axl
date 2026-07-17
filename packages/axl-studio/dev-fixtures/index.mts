@@ -13,7 +13,7 @@
  *                      Explorer, REST envelopes, WS broadcasts)
  *
  *   AXL_DEV_VERBOSE=1  turn on `trace.level: 'full'` (verbose
- *                      agent_call_end.data.messages snapshots — required
+ *                      agent_call_start.data.messages request snapshots — required
  *                      for the >64KB truncation-placeholder smoke check
  *                      on the verbose-demo-workflow)
  *

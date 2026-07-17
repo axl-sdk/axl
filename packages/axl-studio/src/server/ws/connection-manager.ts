@@ -42,8 +42,8 @@ const DEFAULT_MAX_BUFFER_EVENTS = 1000;
 
 /** Default per-buffer byte budget. 1000 events × 64KB max each would
  *  peak at ~64MB per stream; the real-world distribution is bimodal
- *  (hundreds of small structural events + a few verbose `agent_call_end`
- *  snapshots), so 4MB per buffer is generous. When exceeded, new non-
+ *  (hundreds of small structural events + a few verbose `agent_call_start`
+ *  request snapshots), so 4MB per buffer is generous. When exceeded, new non-
  *  terminal events are dropped (terminal `done`/`error` always
  *  buffered). Review B-4. Override via
  *  `bufferCaps.maxBytesPerBuffer`. */
@@ -106,7 +106,7 @@ function isBufferedChannel(channel: string): boolean {
 
 /**
  * Guard against outbound frames that exceed the WS size budget. Verbose-mode
- * `agent_call` events with a full `messages[]` snapshot can balloon past 64KB
+ * `agent_call_start` events with a full request-side `messages[]` snapshot can balloon past 64KB
  * on long conversations; browsers/ws libraries behave inconsistently when this
  * happens (silent drop, connection close, errors). Instead of hoping the
  * underlying stack handles it, we serialize once, check size, and fall back to

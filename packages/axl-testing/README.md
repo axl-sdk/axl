@@ -146,7 +146,7 @@ const runtime = new AxlTestRuntime({
 ```typescript
 import { AxlTestRuntime } from '@axlsdk/testing';
 
-// Verbose trace mode — populates agent_call_end.data.messages
+// Verbose trace mode — populates agent_call_start.data.messages
 const runtime = new AxlTestRuntime({
   config: { trace: { level: 'full' } },
 });

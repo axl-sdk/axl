@@ -89,6 +89,13 @@ google:gemini-3-pro-preview          # Deprecated (shut down March 9, 2026)
 google:gemini-3.1-flash-lite-preview # Deprecated (shuts down May 25, 2026)
 ```
 
+Gemini [requires every `functionResponse.response` to be a JSON
+object](https://ai.google.dev/api/generate-content#FunctionResponse). Axl keeps object
+tool results unchanged and wraps canonical primitive, `null`, array, and text
+tool-message content as `{ result: value }` when building the Gemini wire request.
+This provider-envelope normalization does not change the canonical
+`ChatMessage.content` seen by Axl or other providers.
+
 ### Structured output & schema handling on Gemini
 
 Gemini's schema sanitizer (`sanitizeSchemaForGemini`) strips a set of JSON-Schema

@@ -102,6 +102,19 @@ function sanitizeSchemaForGemini(schema: unknown): unknown {
   return out;
 }
 
+function parseGeminiFunctionResponse(content: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return { result: content };
+  }
+
+  return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : { result: parsed };
+}
+
 // ---------------------------------------------------------------------------
 // Approximate per-token pricing (USD) for common Gemini models.
 // Format: [inputCostPerToken, outputCostPerToken]
@@ -551,19 +564,13 @@ export class GeminiProvider implements Provider {
         }
       } else if (msg.role === 'tool') {
         const functionName = toolCallIdToName.get(msg.tool_call_id!) ?? 'unknown';
-        let responseData: unknown;
-        try {
-          responseData = JSON.parse(msg.content);
-        } catch {
-          responseData = { result: msg.content };
-        }
         const functionResponse: {
           id?: string;
           name: string;
           response: Record<string, unknown>;
         } = {
           name: functionName,
-          response: responseData as Record<string, unknown>,
+          response: parseGeminiFunctionResponse(msg.content),
         };
         // Gemini 3.x requires the id from the originating functionCall be echoed
         // here. Only include it when this id was native to a prior Gemini turn,

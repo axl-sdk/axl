@@ -1277,6 +1277,11 @@ export class WorkflowContext<TInput = unknown> {
     let lastStartMaxAttempts = 1;
 
     while (turns < maxTurns) {
+      // Do not rely on providers to honor an already-aborted signal. In
+      // particular, a tool may complete (and project) after aborting the ask;
+      // the continuation must stop before another provider invocation.
+      this.currentSignal?.throwIfAborted();
+
       // Timeout check
       if (Date.now() - startTime > timeoutMs) {
         throw new TimeoutError('ctx.ask()', timeoutMs);
@@ -1428,6 +1433,12 @@ export class WorkflowContext<TInput = unknown> {
       // ask-loop error handling (ask_end({ok:false}), MaxTurnsError, etc.) is
       // unchanged.
       try {
+        // Start-event consumers and callbacks run synchronously above and may
+        // cancel the ask. Recheck immediately before dispatch so a custom
+        // provider cannot receive a continuation merely because it ignores
+        // the aborted signal passed in ChatOptions.
+        this.currentSignal?.throwIfAborted();
+
         // Activate the streaming code path when ANY observer is interested:
         // - `onToken` is set (legacy callback path; runtime.stream() sets a
         //   sentinel `() => {}` to enable streaming without any consumer)

@@ -10,7 +10,9 @@ import type { Tool } from '../tool.js';
 import { tool } from '../tool.js';
 import type { AxlEvent, ToolCallMessage } from '../types.js';
 import type { SpanHandle, SpanManager } from '../telemetry/types.js';
+import { MockProvider } from '../../../axl-testing/src/mock-provider.js';
 import { createSequenceProvider } from './helpers.js';
+import type { SequenceProvider } from './helpers.js';
 
 type RecordedSpan = {
   name: string;
@@ -67,12 +69,16 @@ function setup(
   tools: Tool<any, any>[],
   toolCalls: ToolCallMessage[] = [call(tools[0].name)],
   options: {
+    onAgentStart?: () => void;
     redact?: boolean;
+    provider?: SequenceProvider;
+    signal?: AbortSignal;
+    streaming?: boolean;
     toolOverrides?: Map<string, (args: unknown) => Promise<unknown>>;
     spanManager?: SpanManager;
   } = {},
 ) {
-  const provider = createSequenceProvider([{ tool_calls: toolCalls }, 'done']);
+  const provider = options.provider ?? createSequenceProvider([{ tool_calls: toolCalls }, 'done']);
   const registry = new ProviderRegistry();
   registry.registerInstance('mock', provider);
   const traces: AxlEvent[] = [];
@@ -80,7 +86,10 @@ function setup(
     input: 'test',
     executionId: randomUUID(),
     config: { trace: { level: 'full', redact: options.redact } },
+    onAgentStart: options.onAgentStart,
+    onToken: options.streaming ? () => undefined : undefined,
     providerRegistry: registry,
+    signal: options.signal,
     toolOverrides: options.toolOverrides,
     spanManager: options.spanManager,
     onTrace: (event) => traces.push(event),
@@ -144,9 +153,13 @@ describe('model-facing tool output projection', () => {
 
   it.each([
     ['string', 'plain text', 'plain text'],
+    ['empty string', '', ''],
     ['record', { answer: 42, omitted: undefined }, '{"answer":42}'],
+    ['empty record', {}, '{}'],
     ['array', [1, 'two', false, null], '[1,"two",false,null]'],
+    ['empty array', [], '[]'],
     ['number', 42, '42'],
+    ['zero', 0, '0'],
     ['boolean', false, 'false'],
     ['null', null, 'null'],
   ])('renders projected %s output exactly once', async (_label, projection, expected) => {
@@ -251,6 +264,10 @@ describe('model-facing tool output projection', () => {
     ['Map', () => new Map([['secret', 'value']])],
     ['Set', () => new Set(['secret'])],
     ['Promise', () => Promise.resolve('secret')],
+    [
+      'non-enumerable thenable',
+      () => Object.defineProperty({}, 'then', { value: () => undefined }),
+    ],
     [
       'throwing proxy',
       () =>
@@ -712,6 +729,231 @@ describe('model-facing tool output projection', () => {
     expect(harness.provider.calls).toHaveLength(1);
   });
 
+  it('keeps projection policy and call IDs isolated in a successful mixed batch', async () => {
+    const projected = tool({
+      name: 'projected_batch',
+      description: 'Project one result in a mixed batch',
+      input: z.object({}),
+      handler: () => ({ visible: 'projected', secret: 'projected-host-only' }),
+      toModelOutput: (output) => output.visible,
+    });
+    const legacy = tool({
+      name: 'legacy_batch',
+      description: 'Keep one result on the legacy path',
+      input: z.object({}),
+      handler: () => 'legacy',
+    });
+    const harness = setup(
+      [projected, legacy],
+      [call('projected_batch', 'call-projected'), call('legacy_batch', 'call-legacy')],
+    );
+
+    await harness.ctx.ask(harness.testAgent, 'go');
+
+    expect(
+      harness.provider.calls[1].messages.filter((message: any) => message.role === 'tool'),
+    ).toEqual([
+      expect.objectContaining({
+        content: 'projected',
+        tool_call_id: 'call-projected',
+      }),
+      expect.objectContaining({
+        content: '"legacy"',
+        tool_call_id: 'call-legacy',
+      }),
+    ]);
+    expect(
+      harness.traces
+        .filter((event) => event.type === 'tool_call_end')
+        .map((event) => [event.data.callId, event.data.result]),
+    ).toEqual([
+      ['call-projected', { visible: 'projected', secret: 'projected-host-only' }],
+      ['call-legacy', 'legacy'],
+    ]);
+  });
+
+  it('keeps serialized projections isolated through later turns and source mutation', async () => {
+    const firstProjection = { visible: 'first' };
+    const provider = createSequenceProvider([
+      { tool_calls: [call('repeated_projection', 'call-first')] },
+      { tool_calls: [call('repeated_projection', 'call-second')] },
+      'done',
+    ]);
+    const originalChat = provider.chat.bind(provider);
+    provider.chat = async (messages, options) => {
+      if (provider.calls.length === 1) firstProjection.visible = 'mutated-after-serialization';
+      return originalChat(messages, options);
+    };
+    let execution = 0;
+    const projected = tool({
+      name: 'repeated_projection',
+      description: 'Project repeated results independently',
+      input: z.object({}),
+      handler: () => {
+        execution++;
+        return { visible: execution === 1 ? 'first' : 'second', secret: `host-only-${execution}` };
+      },
+      toModelOutput: (output) =>
+        output.visible === 'first' ? firstProjection : { visible: 'second' },
+    });
+    const harness = setup([projected], undefined, { provider });
+
+    await harness.ctx.ask(harness.testAgent, 'go');
+
+    expect(
+      harness.provider.calls[2].messages.filter((message: any) => message.role === 'tool'),
+    ).toEqual([
+      expect.objectContaining({ content: '{"visible":"first"}', tool_call_id: 'call-first' }),
+      expect.objectContaining({ content: '{"visible":"second"}', tool_call_id: 'call-second' }),
+    ]);
+    expect(JSON.stringify(harness.provider.calls[2].messages)).not.toContain('host-only');
+  });
+
+  it('propagates provider rejection without retrying with the complete result', async () => {
+    const calls: SequenceProvider['calls'] = [];
+    const provider: SequenceProvider = {
+      name: 'mock',
+      calls,
+      chat: async (messages, options) => {
+        calls.push({ messages, options });
+        if (calls.length === 1) {
+          return { content: '', tool_calls: [call('provider_rejection')] };
+        }
+        throw new Error('provider rejected projected content');
+      },
+      stream: async function* () {
+        yield { type: 'done' as const };
+      },
+    };
+    const handler = vi.fn(() => ({ visible: 'safe', secret: 'host-only' }));
+    const mapper = vi.fn((output: { visible: string }) => output.visible);
+    const projected = tool({
+      name: 'provider_rejection',
+      description: 'Keep provider rejection fail-closed',
+      input: z.object({}),
+      handler,
+      toModelOutput: mapper,
+    });
+    const harness = setup([projected], undefined, { provider });
+
+    await expect(harness.ctx.ask(harness.testAgent, 'go')).rejects.toThrow(
+      'provider rejected projected content',
+    );
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(mapper).toHaveBeenCalledOnce();
+    expect(calls).toHaveLength(2);
+    expect(toolMessage(calls[1].messages).content).toBe('safe');
+    expect(JSON.stringify(calls[1].messages)).not.toContain('host-only');
+  });
+
+  it('projects once after a handler retry succeeds', async () => {
+    const handler = vi
+      .fn<() => { visible: string; secret: string }>()
+      .mockImplementationOnce(() => {
+        throw new Error('retry me');
+      })
+      .mockReturnValue({ visible: 'safe', secret: 'host-only' });
+    const mapper = vi.fn((output: { visible: string }) => output.visible);
+    const projected = tool({
+      name: 'retried_handler',
+      description: 'Project only the successful handler result',
+      input: z.object({}),
+      retry: { attempts: 2, backoff: 'none' },
+      handler,
+      toModelOutput: mapper,
+    });
+    const harness = setup([projected]);
+
+    await harness.ctx.ask(harness.testAgent, 'go');
+
+    expect(handler).toHaveBeenCalledTimes(2);
+    expect(mapper).toHaveBeenCalledOnce();
+    expect(toolMessage(harness.provider.calls[1].messages).content).toBe('safe');
+  });
+
+  it('keeps real-tool projection equivalent in streaming and non-streaming asks', async () => {
+    const projected = tool({
+      name: 'streaming_projection',
+      description: 'Project the same real result in both modes',
+      input: z.object({}),
+      handler: () => ({ visible: 'safe', secret: 'host-only' }),
+      toModelOutput: (output) => output.visible,
+    });
+    const makeProvider = () =>
+      MockProvider.sequence([
+        { content: '', tool_calls: [call('streaming_projection')] },
+        { content: 'done' },
+      ]) as SequenceProvider;
+    const nonStreaming = setup([projected], undefined, { provider: makeProvider() });
+    const streaming = setup([projected], undefined, {
+      provider: makeProvider(),
+      streaming: true,
+    });
+
+    await nonStreaming.ctx.ask(nonStreaming.testAgent, 'go');
+    await streaming.ctx.ask(streaming.testAgent, 'go');
+
+    expect(toolMessage(nonStreaming.provider.calls[1].messages).content).toBe('safe');
+    expect(toolMessage(streaming.provider.calls[1].messages).content).toBe('safe');
+    expect(JSON.stringify(streaming.provider.calls[1].messages)).not.toContain('host-only');
+  });
+
+  it('does not continue to the provider after a tool aborts the ask signal', async () => {
+    const controller = new AbortController();
+    const projected = tool({
+      name: 'abort_after_execution',
+      description: 'Abort after completing a local side effect',
+      input: z.object({}),
+      handler: () => {
+        controller.abort();
+        return { raw: 'host-only' };
+      },
+      toModelOutput: () => 'safe projection',
+    });
+    const harness = setup([projected], undefined, { signal: controller.signal });
+
+    await expect(harness.ctx.ask(harness.testAgent, 'go')).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+
+    expect(harness.provider.calls).toHaveLength(1);
+    expect(harness.traces.filter((event) => event.type === 'tool_call_end')).toHaveLength(1);
+    expect(harness.traces.find((event) => event.type === 'ask_end')?.outcome).toMatchObject({
+      ok: false,
+    });
+  });
+
+  it('rechecks cancellation after start callbacks before provider continuation', async () => {
+    const controller = new AbortController();
+    let starts = 0;
+    const projected = tool({
+      name: 'abort_from_start_callback',
+      description: 'Abort from the continuation start callback',
+      input: z.object({}),
+      handler: () => ({ raw: 'host-only' }),
+      toModelOutput: () => 'safe projection',
+    });
+    const harness = setup([projected], undefined, {
+      signal: controller.signal,
+      onAgentStart: () => {
+        starts++;
+        if (starts === 2) controller.abort();
+      },
+    });
+
+    await expect(harness.ctx.ask(harness.testAgent, 'go')).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+
+    expect(harness.provider.calls).toHaveLength(1);
+    expect(harness.traces.filter((event) => event.type === 'agent_call_start')).toHaveLength(2);
+    expect(harness.traces.filter((event) => event.type === 'agent_call_end')).toHaveLength(2);
+    expect(harness.traces.find((event) => event.type === 'ask_end')?.outcome).toMatchObject({
+      ok: false,
+    });
+  });
+
   it('closes tool telemetry before projection and keeps a failed projection span successful', async () => {
     const clock = vi.spyOn(Date, 'now').mockReturnValue(0);
     const spans = new RecordingSpanManager();
@@ -946,4 +1188,76 @@ describe('model-facing tool output projection', () => {
     expect(end?.data.result).toEqual({ answer: 'specialist answer', internalId: 'host-only' });
     expect(toolMessage(provider.calls[2].messages).content).toBe('specialist answer');
   });
+
+  it.each([
+    ['projected outer boundary', true, 'inner answer'],
+    ['legacy outer boundary', false, '{"answer":"inner answer","outerSecret":"outer-host-only"}'],
+  ])(
+    'keeps nested inner projection independent with a %s',
+    async (_label, projectOuter, expectedOuterContent) => {
+      const provider = createSequenceProvider([
+        { tool_calls: [call('ask_nested_specialist', 'call-outer')] },
+        { tool_calls: [call('inner_lookup', 'call-inner')] },
+        'inner answer',
+        'outer done',
+      ]);
+      const registry = new ProviderRegistry();
+      registry.registerInstance('mock', provider);
+      const traces: AxlEvent[] = [];
+      const ctx = new WorkflowContext({
+        input: 'test',
+        executionId: randomUUID(),
+        config: { trace: { level: 'full' } },
+        providerRegistry: registry,
+        onTrace: (event) => traces.push(event),
+      });
+      const innerLookup = tool({
+        name: 'inner_lookup',
+        description: 'Return rich inner data',
+        input: z.object({}),
+        handler: () => ({ visible: 'inner-visible', secret: 'inner-host-only' }),
+        toModelOutput: (output) => output.visible,
+      });
+      const specialist = agent({
+        name: 'nested-specialist',
+        model: 'mock:model',
+        system: 'specialist',
+        tools: [innerLookup],
+      });
+      const outerConfig = {
+        name: 'ask_nested_specialist',
+        description: 'Ask a specialist that uses another tool',
+        input: z.object({}),
+        handler: async (_input: unknown, childCtx: WorkflowContext) => ({
+          answer: await childCtx.ask(specialist, 'question'),
+          outerSecret: 'outer-host-only',
+        }),
+      };
+      const agentTool = projectOuter
+        ? tool({ ...outerConfig, toModelOutput: (output) => output.answer })
+        : tool(outerConfig);
+      const outer = agent({
+        name: 'nested-outer',
+        model: 'mock:model',
+        system: 'outer',
+        tools: [agentTool],
+      });
+
+      await ctx.ask(outer, 'go');
+
+      expect(toolMessage(provider.calls[2].messages).content).toBe('inner-visible');
+      expect(JSON.stringify(provider.calls[2].messages)).not.toContain('inner-host-only');
+      expect(toolMessage(provider.calls[3].messages).content).toBe(expectedOuterContent);
+      expect(JSON.stringify(provider.calls[3].messages)).not.toContain('inner-host-only');
+      expect(
+        traces.find((event) => event.type === 'tool_call_end' && event.tool === 'inner_lookup')
+          ?.data.result,
+      ).toEqual({ visible: 'inner-visible', secret: 'inner-host-only' });
+      expect(
+        traces.find(
+          (event) => event.type === 'tool_call_end' && event.tool === 'ask_nested_specialist',
+        )?.data.result,
+      ).toEqual({ answer: 'inner answer', outerSecret: 'outer-host-only' });
+    },
+  );
 });

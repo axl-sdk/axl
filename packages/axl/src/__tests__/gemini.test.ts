@@ -411,6 +411,47 @@ describe('GeminiProvider', () => {
       expect(frPart.functionResponse.response).toEqual({ result: 'data' });
     });
 
+    it.each([
+      ['number', '42', { result: 42 }],
+      ['boolean', 'false', { result: false }],
+      ['null', 'null', { result: null }],
+      ['array', '[1,"two"]', { result: [1, 'two'] }],
+      ['JSON string', '"plain"', { result: 'plain' }],
+    ])(
+      "wraps a parsed %s tool result in Gemini's required object envelope",
+      async (_label, content, expected) => {
+        const fetchMock = mockFetch({
+          json: () => Promise.resolve(makeGeminiResponse('Done')),
+        });
+
+        const provider = new GeminiProvider();
+        await provider.chat(
+          [
+            { role: 'user', content: 'Run the tool' },
+            {
+              role: 'assistant',
+              content: '',
+              tool_calls: [
+                {
+                  id: 'tc_primitive',
+                  type: 'function' as const,
+                  function: { name: 'get_value', arguments: '{}' },
+                },
+              ],
+            },
+            { role: 'tool', content, tool_call_id: 'tc_primitive' },
+          ],
+          { model: 'gemini-2.0-flash' },
+        );
+
+        const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+        const functionResponse = body.contents
+          .flatMap((item: any) => item.parts)
+          .find((part: any) => part.functionResponse)?.functionResponse;
+        expect(functionResponse.response).toEqual(expected);
+      },
+    );
+
     it('maps json_object response format to responseMimeType', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('{"key":"value"}')),

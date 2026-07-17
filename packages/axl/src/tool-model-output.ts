@@ -79,6 +79,17 @@ function normalize(value: unknown, path: string, stack: WeakSet<object>): ToolMo
   if (typeof inheritedToJSON?.value === 'function') {
     throw invalid(propertyPath(path, 'toJSON'), 'inherited custom toJSON is not supported');
   }
+  const inheritedThen =
+    prototype === Array.prototype || prototype === Object.prototype
+      ? Object.getOwnPropertyDescriptor(prototype, 'then')
+      : undefined;
+  if (
+    typeof descriptors.then?.value === 'function' ||
+    (inheritedThen !== undefined &&
+      (!('value' in inheritedThen) || typeof inheritedThen.value === 'function'))
+  ) {
+    throw invalid(path, 'thenable output is not supported');
+  }
 
   stack.add(value);
   try {

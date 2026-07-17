@@ -457,6 +457,59 @@ describe('MCP integration with WorkflowContext', () => {
     expect(toolMsg.content).toContain('Result from read_file');
   });
 
+  it('converts malformed resolved MCP content into the legacy continued error outcome', async () => {
+    const { manager, mocks } = createMockManager([
+      {
+        name: 'fs-server',
+        tools: [{ name: 'read_file', description: 'Read a file', inputSchema: { type: 'object' } }],
+      },
+    ]);
+    mocks[0].callTool = vi.fn(async () =>
+      Object.defineProperty({}, 'content', {
+        get: () => {
+          throw new Error('malformed MCP content');
+        },
+      }),
+    ) as unknown as MockMcpServer['callTool'];
+
+    const provider = new TestProvider([
+      {
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_mcp_malformed',
+            type: 'function',
+            function: { name: 'read_file', arguments: '{}' },
+          },
+        ],
+      },
+      { content: 'recovered' },
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerInstance('test', provider as any);
+    const traces: any[] = [];
+    const ctx = new WorkflowContext({
+      input: 'test',
+      executionId: 'mcp-malformed-result',
+      config: { defaultProvider: 'test' },
+      providerRegistry: registry,
+      onTrace: (event) => traces.push(event),
+      mcpManager: manager,
+    });
+    const agentWithMcp = agent({
+      model: 'test:test-model',
+      system: 'You are a test agent',
+      mcp: ['fs-server'],
+    });
+
+    await expect(ctx.ask(agentWithMcp, 'Read a file')).resolves.toBe('recovered');
+
+    const toolMessage = provider.calls[1].messages.find((message: any) => message.role === 'tool');
+    expect(toolMessage.content).toBe('{"error":"malformed MCP content"}');
+    expect(traces.filter((event) => event.type === 'tool_call_start')).toHaveLength(1);
+    expect(traces.filter((event) => event.type === 'tool_call_end')).toHaveLength(1);
+  });
+
   it('mcpTools restriction limits available tools', async () => {
     const { manager } = createMockManager([
       {

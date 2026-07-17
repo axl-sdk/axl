@@ -34,10 +34,8 @@ import {
   BudgetExceededError,
   GuardrailError,
   ValidationError,
-  ToolModelOutputError,
 } from './errors.js';
 import type { Agent } from './agent.js';
-import type { Tool } from './tool.js';
 import { parsePartialJson } from './partial-json.js';
 import { StreamingWalker } from './streaming-walker.js';
 import { COST_BEARING_LEAF_TYPES, hasPositiveTokens, isUsableCost } from './event-utils.js';
@@ -55,10 +53,15 @@ import type { AxlConfig } from './config.js';
 import { parseDuration, parseCost } from './config.js';
 import type { StateStore } from './state/types.js';
 import type { McpManager } from './mcp/manager.js';
-import type { SpanHandle, SpanManager } from './telemetry/types.js';
+import type { SpanManager } from './telemetry/types.js';
 import type { MemoryManager } from './memory/manager.js';
 import type { RememberOptions, RecallOptions, VectorResult } from './memory/types.js';
-import { serializeToolModelOutput } from './tool-model-output.js';
+import {
+  executeAcceptedToolV1,
+  finalizeLegacyToolResult,
+  parseToolInvocationV1,
+  recordLegacyToolSpanResult,
+} from './tool-invocation.js';
 
 const LEGACY_OBSERVATION_WARNING_KEY = Symbol.for(
   '@axlsdk/axl/legacy-observation-callback-warning',
@@ -82,100 +85,6 @@ function warnForLegacyObservationCallbacks(init: WorkflowContextInit): void {
  * without mutating shared state on the WorkflowContext instance.
  */
 const signalStorage = new AsyncLocalStorage<AbortSignal>();
-
-type ToolExecutionOutcome =
-  | { kind: 'returned'; value: unknown }
-  | { kind: 'thrown'; value: { error: string } };
-
-function isErrorShaped(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && 'error' in value;
-}
-
-function isErrorShapedSafely(value: unknown): value is Record<string, unknown> {
-  try {
-    return isErrorShaped(value);
-  } catch {
-    return false;
-  }
-}
-
-function recordToolSpanResult(
-  span: SpanHandle,
-  value: unknown,
-  suppressInspectionErrors: boolean,
-): void {
-  let isError = false;
-  let errorMessage: unknown;
-  const inspect = () => {
-    if (isErrorShaped(value)) {
-      isError = true;
-      errorMessage = value.error;
-    } else {
-      isError = false;
-    }
-  };
-
-  if (suppressInspectionErrors) {
-    try {
-      inspect();
-    } catch {
-      // The legacy error-property sentinel is observability metadata, not part
-      // of projection eligibility. A hostile proxy must not bypass a configured
-      // sensitive/projection policy or leak its trap error into ask events.
-      isError = false;
-      errorMessage = undefined;
-    }
-  } else {
-    inspect();
-  }
-
-  span.setAttribute('axl.tool.success', !isError);
-  if (isError) span.setStatus('error', errorMessage as string);
-}
-
-function prepareToolModelOutput(toolName: string, project: () => unknown): string {
-  let output: unknown;
-  try {
-    output = project();
-  } catch (cause) {
-    throw new ToolModelOutputError(toolName, cause);
-  }
-  return serializeToolModelOutput(toolName, output);
-}
-
-function finalizeToolResult(options: {
-  toolName: string;
-  configuredTool: Tool | undefined;
-  outcome: ToolExecutionOutcome;
-  legacyContent: () => string;
-  emitEnd: () => void;
-  beforeProjection: () => void;
-}): string {
-  const { toolName, configuredTool, outcome, legacyContent, emitEnd, beforeProjection } = options;
-  const projectionEligible =
-    configuredTool !== undefined &&
-    !configuredTool.sensitive &&
-    outcome.kind === 'returned' &&
-    configuredTool.toModelOutput !== undefined;
-
-  if (projectionEligible) {
-    // The complete host result is authoritative and observable even when the
-    // subsequent projection fails. Never move projection ahead of this event.
-    emitEnd();
-    // A completed tool or synchronous end-event listener may cancel the ask.
-    // Projection is pure provider preparation, so do not run it when there can
-    // be no continuation (or let its failure mask the cancellation).
-    beforeProjection();
-    const project = configuredTool.toModelOutput!;
-    return prepareToolModelOutput(toolName, () => project(outcome.value as never));
-  }
-
-  // Preserve legacy ordering: serialization happens before tool_call_end when
-  // no projector is eligible.
-  const content = legacyContent();
-  emitEnd();
-  return content;
-}
 
 /**
  * Per-ask frame propagated via AsyncLocalStorage.
@@ -896,6 +805,176 @@ export class WorkflowContext<TInput = unknown> {
       };
     }
     return { askId: this.executionId, depth: 0, agent: agentName };
+  }
+
+  /** Execute and observe one non-handoff tool request using the compatibility
+   * v1 lifecycle. Resolution/execution/message preparation live behind typed
+   * seams; this method is the sole start/end/span/message coordinator. */
+  private async observeLegacyToolInvocation(
+    agent: Agent,
+    toolCall: ToolCallMessage,
+    currentMessages: ChatMessage[],
+    callbackMeta: CallbackMeta,
+  ): Promise<void> {
+    const requestedTool = toolCall.function.name;
+    const configuredTool = agent._config.tools?.find(
+      (candidate) => candidate.name === requestedTool,
+    );
+    const override = this.toolOverrides?.get(requestedTool);
+    const mcpManager = this.mcpManager;
+    const isMcpTool = !configuredTool && mcpManager?.isMcpTool(requestedTool);
+    const parsed = parseToolInvocationV1({
+      toolCall,
+      configuredTool,
+      override,
+      ...(isMcpTool && mcpManager
+        ? {
+            mcpCall: (args: unknown) => mcpManager.callTool(requestedTool, args),
+            mcpTraceName: mcpManager.getQualifiedName(requestedTool) ?? requestedTool,
+          }
+        : {}),
+      availableTools: agent._config.tools?.map((candidate) => candidate.name) ?? [],
+    });
+
+    if ('kind' in parsed) {
+      if (parsed.kind === 'unavailable') {
+        this.emitEvent({ type: 'tool_denied', agent: agent._name, tool: requestedTool });
+        const available = agent._config.tools ? parsed.availableTools.join(', ') : 'none';
+        currentMessages.push({
+          role: 'tool',
+          content: `Tool "${requestedTool}" is not available. Available tools: ${available}`,
+          tool_call_id: toolCall.id,
+        });
+      } else {
+        currentMessages.push({
+          role: 'tool',
+          content: parsed.modelMessage,
+          tool_call_id: toolCall.id,
+        });
+      }
+      return;
+    }
+
+    this.emitEvent({
+      type: 'tool_call_start',
+      tool: requestedTool,
+      callId: parsed.callId,
+      data: { args: parsed.args },
+    });
+    this.onToolCall?.(
+      { name: requestedTool, args: parsed.args, callId: parsed.callId },
+      callbackMeta,
+    );
+    const toolStart = Date.now();
+    const suppressErrorShapeInspection =
+      configuredTool?.sensitive === true || configuredTool?.toModelOutput !== undefined;
+
+    const requestApproval = async (): Promise<{ approved: boolean; reason?: string }> => {
+      const approve = async (): Promise<{ approved: boolean; reason?: string }> => {
+        const decision = await this.awaitHuman({
+          channel: 'tool_approval',
+          prompt: `Tool "${requestedTool}" wants to execute with args: ${JSON.stringify(parsed.args)}`,
+          metadata: { toolName: requestedTool, args: parsed.args, agent: agent._name },
+        });
+        return decision.approved
+          ? { approved: true }
+          : { approved: false, reason: decision.reason ?? 'Denied by human' };
+      };
+
+      const approval = this.spanManager
+        ? await this.spanManager.withSpanAsync(
+            'axl.tool.approval',
+            { 'axl.tool.name': requestedTool, 'axl.agent.name': agent._name },
+            async (span) => {
+              const value = await approve();
+              span.setAttribute('axl.tool.approval.approved', value.approved);
+              return value;
+            },
+          )
+        : await approve();
+
+      this.emitEvent({
+        type: 'tool_approval',
+        agent: agent._name,
+        tool: requestedTool,
+        data: {
+          approved: approval.approved,
+          args: parsed.args,
+          ...(approval.reason ? { reason: approval.reason } : {}),
+        },
+      });
+      return approval;
+    };
+
+    const result = await executeAcceptedToolV1({
+      invocation: parsed,
+      context: this,
+      requestApproval,
+      createChildContext: () => this.createChildContext(),
+      observeExecution: async (execute) =>
+        this.spanManager
+          ? this.spanManager.withSpanAsync(
+              'axl.tool.call',
+              { 'axl.tool.name': parsed.traceName, 'axl.agent.name': agent._name },
+              async (span) => {
+                const execution = await execute();
+                span.setAttribute('axl.tool.duration', Date.now() - toolStart);
+                recordLegacyToolSpanResult(
+                  span,
+                  execution.outcome.value,
+                  suppressErrorShapeInspection,
+                );
+                return execution;
+              },
+            )
+          : execute(),
+    });
+
+    if (result.kind === 'denied') {
+      currentMessages.push({
+        role: 'tool',
+        content: JSON.stringify({ error: `Tool denied by human: ${result.reason}` }),
+        tool_call_id: parsed.callId,
+      });
+      return;
+    }
+    if (result.kind === 'before_hook_failed') {
+      currentMessages.push({
+        role: 'tool',
+        content: JSON.stringify({ error: `Before hook error: ${result.message}` }),
+        tool_call_id: parsed.callId,
+      });
+      return;
+    }
+
+    const toolResult = result.execution.outcome.value;
+    const resultContent = finalizeLegacyToolResult({
+      toolName: requestedTool,
+      configuredTool,
+      outcome: result.execution.outcome,
+      legacyContent: () =>
+        parsed.source.kind === 'override' && configuredTool?.sensitive
+          ? '[REDACTED - sensitive tool output]'
+          : parsed.source.kind === 'override'
+            ? JSON.stringify(toolResult)
+            : result.execution.resultContent!,
+      emitEnd: () => {
+        this.emitEvent({
+          type: 'tool_call_end',
+          agent: agent._name,
+          tool: parsed.traceName,
+          duration: Date.now() - toolStart,
+          data: { args: result.effectiveArgs, result: toolResult, callId: parsed.callId },
+        });
+      },
+      beforeProjection: () => this.currentSignal?.throwIfAborted(),
+    });
+
+    currentMessages.push({
+      role: 'tool',
+      content: resultContent,
+      tool_call_id: parsed.callId,
+    });
   }
 
   // ── ctx.ask() ─────────────────────────────────────────────────────────
@@ -1934,326 +2013,7 @@ export class WorkflowContext<TInput = unknown> {
             }
           }
 
-          // Resolve configured metadata even when a test override wins. Overrides still
-          // bypass validation, approval, hooks, retries, and the real handler; the matching
-          // configured tool contributes only sensitive/model-output policy.
-          const tool = agent._config.tools?.find((candidate) => candidate.name === toolName);
-          const isMcpTool = !tool && this.mcpManager?.isMcpTool(toolName);
-
-          // Check toolOverrides first (for mock tool interception)
-          const toolOverride = this.toolOverrides?.get(toolName);
-          if (toolOverride) {
-            let toolArgs: unknown;
-            try {
-              toolArgs = JSON.parse(toolCall.function.arguments);
-            } catch {
-              currentMessages.push({
-                role: 'tool',
-                content: `Error: Invalid JSON in tool arguments. Please provide valid JSON.`,
-                tool_call_id: toolCall.id,
-              });
-              continue;
-            }
-            this.emitEvent({
-              type: 'tool_call_start',
-              tool: toolName,
-              callId: toolCall.id,
-              data: { args: toolArgs },
-            });
-            this.onToolCall?.(
-              { name: toolName, args: toolArgs, callId: toolCall.id },
-              callbackMeta,
-            );
-            const toolStart = Date.now();
-            const suppressErrorShapeInspection =
-              tool?.sensitive === true || tool?.toModelOutput !== undefined;
-
-            const executeOverride = async (): Promise<ToolExecutionOutcome> => {
-              try {
-                return { kind: 'returned', value: await toolOverride(toolArgs) };
-              } catch (err) {
-                return {
-                  kind: 'thrown',
-                  value: { error: err instanceof Error ? err.message : String(err) },
-                };
-              }
-            };
-
-            const outcome = this.spanManager
-              ? await this.spanManager.withSpanAsync(
-                  'axl.tool.call',
-                  {
-                    'axl.tool.name': toolName,
-                    'axl.agent.name': agent._name,
-                  },
-                  async (span) => {
-                    const result = await executeOverride();
-                    span.setAttribute('axl.tool.duration', Date.now() - toolStart);
-                    recordToolSpanResult(span, result.value, suppressErrorShapeInspection);
-                    return result;
-                  },
-                )
-              : await executeOverride();
-
-            const toolResult = outcome.value;
-            const resultContent = finalizeToolResult({
-              toolName,
-              configuredTool: tool,
-              outcome,
-              legacyContent: () =>
-                tool?.sensitive ? '[REDACTED - sensitive tool output]' : JSON.stringify(toolResult),
-              emitEnd: () => {
-                const toolDuration = Date.now() - toolStart;
-                this.emitEvent({
-                  type: 'tool_call_end',
-                  agent: agent._name,
-                  tool: toolName,
-                  duration: toolDuration,
-                  data: { args: toolArgs, result: toolResult, callId: toolCall.id },
-                });
-              },
-              beforeProjection: () => this.currentSignal?.throwIfAborted(),
-            });
-            currentMessages.push({
-              role: 'tool',
-              content: resultContent,
-              tool_call_id: toolCall.id,
-            });
-            continue;
-          }
-
-          if (!tool && !isMcpTool) {
-            // Tool denied
-            this.emitEvent({ type: 'tool_denied', agent: agent._name, tool: toolName });
-            currentMessages.push({
-              role: 'tool',
-              content: `Tool "${toolName}" is not available. Available tools: ${agent._config.tools?.map((t) => t.name).join(', ') ?? 'none'}`,
-              tool_call_id: toolCall.id,
-            });
-            continue;
-          }
-
-          // Parse tool arguments
-          let toolArgs: unknown;
-          try {
-            toolArgs = JSON.parse(toolCall.function.arguments);
-          } catch {
-            currentMessages.push({
-              role: 'tool',
-              content: `Error: Invalid JSON in tool arguments. Please provide valid JSON.`,
-              tool_call_id: toolCall.id,
-            });
-            continue;
-          }
-
-          this.emitEvent({
-            type: 'tool_call_start',
-            tool: toolName,
-            callId: toolCall.id,
-            data: { args: toolArgs },
-          });
-          this.onToolCall?.({ name: toolName, args: toolArgs, callId: toolCall.id }, callbackMeta);
-
-          const toolStart = Date.now();
-          const suppressErrorShapeInspection =
-            tool?.sensitive === true || tool?.toModelOutput !== undefined;
-
-          // Approval gate: if tool requires approval, ask the human first.
-          // Note: MCP tools have no `tool` object here (isMcpTool is true instead),
-          // so they bypass the approval gate entirely. This is intentional — MCP tools
-          // are externally managed and don't carry requireApproval config.
-          if (tool && tool.requireApproval) {
-            const approvalFn = async (): Promise<{ approved: boolean; reason?: string }> => {
-              const decision = await this.awaitHuman({
-                channel: 'tool_approval',
-                prompt: `Tool "${toolName}" wants to execute with args: ${JSON.stringify(toolArgs)}`,
-                metadata: { toolName, args: toolArgs, agent: agent._name },
-              });
-              if (!decision.approved) {
-                const reason = decision.reason ?? 'Denied by human';
-                currentMessages.push({
-                  role: 'tool',
-                  content: JSON.stringify({ error: `Tool denied by human: ${reason}` }),
-                  tool_call_id: toolCall.id,
-                });
-                return { approved: false, reason };
-              }
-              return { approved: true };
-            };
-
-            let approvalOutcome: { approved: boolean; reason?: string };
-            if (this.spanManager) {
-              approvalOutcome = await this.spanManager.withSpanAsync(
-                'axl.tool.approval',
-                {
-                  'axl.tool.name': toolName,
-                  'axl.agent.name': agent._name,
-                },
-                async (span) => {
-                  const result = await approvalFn();
-                  span.setAttribute('axl.tool.approval.approved', result.approved);
-                  return result;
-                },
-              );
-            } else {
-              approvalOutcome = await approvalFn();
-            }
-
-            this.emitEvent({
-              type: 'tool_approval',
-              agent: agent._name,
-              tool: toolName,
-              data: {
-                approved: approvalOutcome.approved,
-                args: toolArgs,
-                ...(approvalOutcome.reason ? { reason: approvalOutcome.reason } : {}),
-              },
-            });
-
-            if (!approvalOutcome.approved) continue;
-          }
-
-          // Before hook: transform input before execution
-          if (tool && tool.hooks?.before) {
-            try {
-              toolArgs = await tool.hooks.before(toolArgs, this);
-            } catch (err) {
-              const errorMsg = err instanceof Error ? err.message : String(err);
-              currentMessages.push({
-                role: 'tool',
-                content: JSON.stringify({ error: `Before hook error: ${errorMsg}` }),
-                tool_call_id: toolCall.id,
-              });
-              continue;
-            }
-          }
-
-          const executeTool = async (): Promise<{
-            outcome: ToolExecutionOutcome;
-            resultContent?: string;
-          }> => {
-            let outcome: ToolExecutionOutcome;
-            let resultContent: string | undefined;
-
-            if (isMcpTool && this.mcpManager) {
-              // Execute MCP tool
-              try {
-                const mcpResult = await this.mcpManager.callTool(toolName, toolArgs);
-                outcome = { kind: 'returned', value: mcpResult };
-                // Extract text content from MCP result
-                resultContent = mcpResult.content
-                  .map((c: { type: string; text?: string }) =>
-                    c.type === 'text' ? c.text : `[${c.type}]`,
-                  )
-                  .join('\n');
-                if (mcpResult.isError) {
-                  resultContent = `Error: ${resultContent}`;
-                }
-              } catch (err) {
-                outcome = {
-                  kind: 'thrown',
-                  value: { error: err instanceof Error ? err.message : String(err) },
-                };
-                resultContent = JSON.stringify(outcome.value);
-              }
-            } else if (tool) {
-              // Execute local tool with a child context for nested agent
-              // invocations (agent-as-tool pattern). Nested events are
-              // correlated to the outer ask via `parentAskId` from the
-              // ALS frame, so the child context doesn't need to thread
-              // anything explicitly.
-              const childCtx = this.createChildContext();
-              try {
-                outcome = { kind: 'returned', value: await tool._execute(toolArgs, childCtx) };
-              } catch (err) {
-                outcome = {
-                  kind: 'thrown',
-                  value: { error: err instanceof Error ? err.message : String(err) },
-                };
-              }
-
-              // After hook: transform output after execution (only on success)
-              if (
-                outcome.kind === 'returned' &&
-                tool.hooks?.after &&
-                !(suppressErrorShapeInspection
-                  ? isErrorShapedSafely(outcome.value)
-                  : isErrorShaped(outcome.value))
-              ) {
-                try {
-                  outcome = {
-                    kind: 'returned',
-                    value: await tool.hooks.after(outcome.value, this),
-                  };
-                } catch (err) {
-                  outcome = {
-                    kind: 'thrown',
-                    value: {
-                      error: `After hook error: ${err instanceof Error ? err.message : String(err)}`,
-                    },
-                  };
-                }
-              }
-
-              if (tool.sensitive) {
-                resultContent = '[REDACTED - sensitive tool output]';
-              } else if (outcome.kind === 'thrown' || tool.toModelOutput === undefined) {
-                resultContent = JSON.stringify(outcome.value);
-              }
-            } else {
-              outcome = { kind: 'returned', value: undefined };
-              resultContent = 'Tool execution error';
-            }
-
-            return { outcome, resultContent };
-          };
-
-          // Use qualified "server:tool_name" for MCP tools in traces
-          const traceName =
-            isMcpTool && this.mcpManager
-              ? (this.mcpManager.getQualifiedName(toolName) ?? toolName)
-              : toolName;
-
-          const execution = this.spanManager
-            ? await this.spanManager.withSpanAsync(
-                'axl.tool.call',
-                {
-                  'axl.tool.name': traceName,
-                  'axl.agent.name': agent._name,
-                },
-                async (span) => {
-                  const r = await executeTool();
-                  span.setAttribute('axl.tool.duration', Date.now() - toolStart);
-                  recordToolSpanResult(span, r.outcome.value, suppressErrorShapeInspection);
-                  return r;
-                },
-              )
-            : await executeTool();
-
-          const toolResult = execution.outcome.value;
-          const toolDuration = Date.now() - toolStart;
-          const resultContent = finalizeToolResult({
-            toolName,
-            configuredTool: tool,
-            outcome: execution.outcome,
-            legacyContent: () => execution.resultContent!,
-            emitEnd: () => {
-              this.emitEvent({
-                type: 'tool_call_end',
-                agent: agent._name,
-                tool: traceName,
-                duration: toolDuration,
-                data: { args: toolArgs, result: toolResult, callId: toolCall.id },
-              });
-            },
-            beforeProjection: () => this.currentSignal?.throwIfAborted(),
-          });
-
-          currentMessages.push({
-            role: 'tool',
-            content: resultContent,
-            tool_call_id: toolCall.id,
-          });
+          await this.observeLegacyToolInvocation(agent, toolCall, currentMessages, callbackMeta);
         }
 
         continue; // Next turn

@@ -93,10 +93,12 @@ await runtime.resolveDecision(executionId, { approved: true });
 await runtime.resolveDecision(executionId, { approved: false, reason: 'Not authorized' });
 ```
 
-In-process resolution is automatic. Cross-process resolution is not currently
-an exactly-once durability guarantee: built-in stores retain the pending request
-and execution state, but the current state-store contract does not durably
-retain/claim a resolved decision or bind checkpoints to a resume lineage. Applications
+In-process resolution is automatic. The runtime deletes the persisted pending
+request before releasing the workflow, so a store failure leaves the gate
+closed and retryable. Cross-process resolution is not supported: built-in
+stores retain the pending request for visibility, but not its continuation.
+The current contract does not durably retain/claim a resolved decision or bind
+checkpoints to a resume lineage. Applications
 that must approve across process loss should use an application-managed durable
 command/idempotency protocol until that state-store contract is added; do not
 assume `resolveDecision()` alone prevents repeated side effects after a crash.
@@ -107,7 +109,7 @@ route it through their durable application protocol without data loss.
 Decisions are validated before resolver/store mutation. They must be plain
 objects with an exact boolean `approved` discriminator and only the matching
 optional string field (`data` for approval, `reason` for denial). Truthy strings,
-arrays, accessors, and contradictory fields fail closed.
+arrays, accessors, symbol/unknown keys, and contradictory fields fail closed.
 
 **Axl Studio** provides a Decisions panel (`GET /api/decisions`, `POST /api/decisions/:id/resolve`) that renders pending approvals in a web UI, useful during development.
 

@@ -78,7 +78,7 @@ const store = await RedisStore.create({
   defaultTtl: 60 * 60 * 24 * 30,         // 30 days for everything
   ttls: {
     checkpoint:      60 * 60 * 24 * 7,   // 7 days — belongs to a run
-    executionState:  60 * 60 * 24,       // 1 day for suspend/resume state
+    executionState:  60 * 60 * 24,       // 1 day for legacy app-managed state
     streamingEvents: 60 * 60 * 24 * 7,   // OPT-IN safety net; must exceed max restart-gap
   },
 });
@@ -152,7 +152,7 @@ runtime.on('execution_deleted', (e) => {
 
 `runtime.deleteExecution(id)` sweeps every per-execution surface (data + indexes + checkpoints + state + streaming buffer + pending decisions) and emits `execution_deleted` for the audit pipeline. If the execution is still running, it aborts the workflow AND prevents the resulting `workflow_end` from resurrecting the row.
 
-`ExecutionInfo.metadata` strips internal control-plane keys (`sessionHistory`, `sessionId`, `resumeMode`) before persistence so a multi-tenant tag bag stays clean. The snapshot is `structuredClone`'d for isolation from caller mutation.
+`ExecutionInfo.metadata` strips internal session control-plane keys (`sessionHistory`, `sessionId`) before persistence so a multi-tenant tag bag stays clean. The snapshot is `structuredClone`'d for isolation from caller mutation.
 
 ## Axl Studio
 

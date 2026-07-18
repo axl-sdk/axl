@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { unlinkSync } from 'node:fs';
@@ -44,7 +44,7 @@ async function waitForPendingDecision(runtime: AxlRuntime, timeout = 2000) {
   throw new Error('Timed out waiting for pending decision');
 }
 
-describe('awaitHuman suspend/resume', () => {
+describe('awaitHuman in-process suspension', () => {
   // MemoryStore persists awaitHuman state to a shared temp file.
   // Clean it up before each test to prevent cross-run contamination.
   const TEMP_FILE = join(tmpdir(), 'axl-memory-store', 'await-human-state.json');
@@ -57,7 +57,7 @@ describe('awaitHuman suspend/resume', () => {
     }
   });
 
-  it('awaitHuman persists execution state to store', async () => {
+  it('awaitHuman persists the pending request without claiming durable workflow resume', async () => {
     const provider = new TestProvider();
 
     const approvalWorkflow = workflow({
@@ -90,12 +90,12 @@ describe('awaitHuman suspend/resume', () => {
     expect(pending[0].channel).toBe('slack');
     expect(pending[0].prompt).toContain('deploy');
 
-    // Check that execution state was persisted
+    // The pending request is durable for operator visibility, but the
+    // in-process continuation is not. Do not persist a misleading resumable
+    // workflow state until the store contract has decision claims + leases.
     const stateStore = runtime.getStateStore();
     const execState = await stateStore.getExecutionState(pending[0].executionId);
-    expect(execState).not.toBeNull();
-    expect(execState!.status).toBe('waiting');
-    expect(execState!.workflow).toBe('approval-flow');
+    expect(execState).toBeNull();
 
     // Resolve the decision
     await runtime.resolveDecision(pending[0].executionId, {
@@ -106,9 +106,7 @@ describe('awaitHuman suspend/resume', () => {
     const result = await resultPromise;
     expect(result).toEqual({ approved: true });
 
-    // After resolution, execution state should be updated to running
-    const postState = await stateStore.getExecutionState(pending[0].executionId);
-    expect(postState!.status).toBe('running');
+    expect(await stateStore.getExecutionState(pending[0].executionId)).toBeNull();
   });
 
   it('resolveDecision triggers resume of waiting workflow', async () => {
@@ -145,6 +143,69 @@ describe('awaitHuman suspend/resume', () => {
     expect(result).toBe('merged');
   });
 
+  it('keeps the gate closed and retryable when pending-request cleanup fails', async () => {
+    const wf = workflow({
+      name: 'decision-cleanup-retry',
+      input: z.object({}).strict(),
+      handler: async (ctx) => {
+        const decision = await ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' });
+        return decision.approved ? 'continued' : 'stopped';
+      },
+    });
+    const runtime = new AxlRuntime({ state: { store: 'memory' } });
+    runtime.register(wf);
+    const execution = runtime.execute(wf.name, {});
+    const [pending] = await waitForPendingDecision(runtime);
+    const store = runtime.getStateStore();
+    const originalResolve = store.resolveDecision.bind(store);
+    const cleanupFailure = new Error('store unavailable');
+    const resolveSpy = vi
+      .spyOn(store, 'resolveDecision')
+      .mockRejectedValueOnce(cleanupFailure)
+      .mockImplementation(originalResolve);
+
+    await expect(runtime.resolveDecision(pending.executionId, { approved: true })).rejects.toBe(
+      cleanupFailure,
+    );
+    expect(await runtime.getPendingDecisions()).toEqual([pending]);
+
+    let workflowSettled = false;
+    void execution.finally(() => {
+      workflowSettled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(workflowSettled).toBe(false);
+
+    await runtime.resolveDecision(pending.executionId, { approved: true });
+    await expect(execution).resolves.toBe('continued');
+    resolveSpy.mockRestore();
+  });
+
+  it('allows only one of two concurrent resolutions to release the workflow', async () => {
+    const wf = workflow({
+      name: 'decision-concurrency',
+      input: z.object({}).strict(),
+      handler: (ctx) => ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+    });
+    const runtime = new AxlRuntime({ state: { store: 'memory' } });
+    runtime.register(wf);
+    const execution = runtime.execute(wf.name, {});
+    const [pending] = await waitForPendingDecision(runtime);
+
+    const resolutions = await Promise.allSettled([
+      runtime.resolveDecision(pending.executionId, { approved: true, data: 'first' }),
+      runtime.resolveDecision(pending.executionId, { approved: false, reason: 'second' }),
+    ]);
+
+    expect(resolutions.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    const rejected = resolutions.find((result) => result.status === 'rejected');
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      reason: { code: 'PENDING_DECISION_NOT_FOUND' },
+    });
+    await expect(execution).resolves.toMatchObject({ approved: true, data: 'first' });
+  });
+
   it('rejects invalid runtime decisions before mutating the pending request', async () => {
     const wf = workflow({
       name: 'validate-decision-flow',
@@ -164,6 +225,51 @@ describe('awaitHuman suspend/resume', () => {
 
     await runtime.resolveDecision(pending.executionId, { approved: true, data: 'yes' });
     await expect(resultPromise).resolves.toEqual({ approved: true, data: 'yes' });
+  });
+
+  it.each([
+    [{ approved: true, extra: 'nope' }, 'enumerable unknown key'],
+    [Object.defineProperty({ approved: true }, 'extra', { value: 'nope' }), 'hidden unknown key'],
+    [
+      Object.assign(Object.create(null), { approved: false, reason: 'no', extra: 1 }),
+      'null prototype unknown key',
+    ],
+  ])('rejects an exact-union violation: %s (%s)', async (decision) => {
+    const runtime = new AxlRuntime();
+    await expect(runtime.resolveDecision('missing', decision as never)).rejects.toMatchObject({
+      code: 'INVALID_HUMAN_DECISION',
+    });
+  });
+
+  it('rejects symbol keys and unknown accessors without invoking getters', async () => {
+    const runtime = new AxlRuntime();
+    const getter = vi.fn(() => 'secret');
+    const withAccessor = Object.defineProperty({ approved: true }, 'extra', { get: getter });
+    const withSymbol = { approved: true, [Symbol('extra')]: 'nope' };
+
+    await expect(runtime.resolveDecision('missing', withAccessor as never)).rejects.toMatchObject({
+      code: 'INVALID_HUMAN_DECISION',
+    });
+    await expect(runtime.resolveDecision('missing', withSymbol as never)).rejects.toMatchObject({
+      code: 'INVALID_HUMAN_DECISION',
+    });
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it('rejects hostile ownKeys proxies as invalid decisions', async () => {
+    const runtime = new AxlRuntime();
+    const decision = new Proxy(
+      { approved: true },
+      {
+        ownKeys() {
+          throw new Error('hostile ownKeys');
+        },
+      },
+    );
+
+    await expect(runtime.resolveDecision('missing', decision)).rejects.toMatchObject({
+      code: 'INVALID_HUMAN_DECISION',
+    });
   });
 
   it('rejected decision flows through correctly', async () => {
@@ -260,12 +366,17 @@ describe('awaitHuman suspend/resume', () => {
     await expect(
       runtime.resolveDecision('exec-cross-process', { approved: true }),
     ).rejects.toMatchObject({ code: 'CROSS_PROCESS_RESUME_UNSUPPORTED' });
-    await expect(runtime.resumeExecution('exec-cross-process')).rejects.toMatchObject({
-      code: 'CROSS_PROCESS_RESUME_UNSUPPORTED',
-    });
     expect(handlerCalls).toBe(0);
     expect(await store.getPendingDecisions()).toHaveLength(1);
     expect((await store.getExecutionState('exec-cross-process'))?.status).toBe('waiting');
+  });
+
+  it('distinguishes a missing request from an orphan owned by another process', async () => {
+    const runtime = new AxlRuntime({ state: { store: new MemoryStore() } });
+
+    await expect(runtime.resolveDecision('not-pending', { approved: true })).rejects.toMatchObject({
+      code: 'PENDING_DECISION_NOT_FOUND',
+    });
   });
 
   it('preserves a pending decision even when its execution-state row is missing', async () => {
@@ -282,24 +393,6 @@ describe('awaitHuman suspend/resume', () => {
       runtime.resolveDecision('exec-state-missing', { approved: true }),
     ).rejects.toMatchObject({ code: 'CROSS_PROCESS_RESUME_UNSUPPORTED' });
     expect(await store.getPendingDecisions()).toHaveLength(1);
-  });
-
-  it('audits every pending resume failure without requiring an error listener', async () => {
-    const store = new MemoryStore();
-    for (const executionId of ['exec-resume-a', 'exec-resume-b']) {
-      await store.saveExecutionState(executionId, {
-        workflow: 'cross-process-flow',
-        input: {},
-        step: 1,
-        status: 'waiting',
-      });
-    }
-    const runtime = new AxlRuntime({ state: { store } });
-    const audited: string[] = [];
-    runtime.on('resume_failed', (event) => audited.push(event.executionId));
-
-    await expect(runtime.resumePending()).resolves.toEqual([]);
-    expect(audited.sort()).toEqual(['exec-resume-a', 'exec-resume-b']);
   });
 
   it('deleteExecution unblocks a workflow awaiting human decision (signal-driven abort)', async () => {

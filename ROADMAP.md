@@ -20,7 +20,7 @@
 - **Tool Middleware** — Approval gates (`requireApproval`) and lifecycle hooks (`before`/`after`)
 - **Model-Facing Tool Output Projection** — Opt-in synchronous `toModelOutput` allowlists the successful post-hook tool result sent to the model while preserving the complete host-observable result. Strict JSON-compatible validation fails closed, `sensitive` takes precedence, configured `AxlTestRuntime.mockTool()` overrides inherit projection policy, and direct/MCP/handoff paths remain unchanged.
 - **Agent Handoffs** — Oneway and roundtrip modes with descriptions, OTel spans, and session history
-- **Unified Event Model and v2 Tool Lifecycle** — Single live `AxlEvent` discriminated union with required `schemaVersion: 2`; `ExecutionInfo.eventSchemaVersion` selects the reducer without scanning events, while `HistoricalExecutionInfo` keeps v1 history honest. Provider-issued tools use pre-start `tool_call_rejected` plus one four-state terminal outcome (`succeeded`, `failed`, `denied`, `cancelled`) for accepted calls. Normal returns succeed regardless of an `error` property; explicit `ToolFailure` permits author-declared model-safe recovery. See the [stream-first and tool-lifecycle migration guide](docs/migration/stream-first-observation.md).
+- **Unified Event Model and v2 Tool Lifecycle** — Single live `AxlEvent` discriminated union with required `schemaVersion: 2`; `ExecutionInfo.eventSchemaVersion` selects the reducer without scanning events, while `HistoricalExecutionInfo` keeps v1 history honest. Provider-issued tools use pre-start `tool_call_rejected` plus one four-state terminal outcome (`succeeded`, `failed`, `denied`, `cancelled`) for accepted calls. Normal returns succeed regardless of an `error` property; explicit `ToolFailure` permits author-declared model-safe recovery. See the [stream-first and tool-lifecycle migration guide](docs/migration/stream-first-observation.md) and [release review](docs/tool-lifecycle-v2-release-review.md).
 - **Axl Studio** — Local development UI with 8 panels (Playground, Workflows, Traces, Costs, Memory, Sessions, Tools, Evals)
 - **Evaluation Framework** — `dataset()`, `scorer()`, `llmScorer()`, `evalCompare()`, `rescore()`, `aggregateRuns()`, CLI with `compare`, `rescore` subcommands, `--runs` multi-run support
 - **Configurable Model Parameters** — `temperature`, `maxTokens`, `effort`, `thinkingBudget`, `includeThoughts`, `toolChoice`, `stop` on `AgentConfig` and per-call via `AskOptions`
@@ -199,7 +199,7 @@ This is the long-term answer to the resolution complaint that drove the 0.17.x p
 
 #### Portable Run State
 
-`ctx.checkpoint()` + StateStore provides durable execution, but state is tied to a specific store instance. For serverless environments (Lambda, Cloudflare Workers) where there's no persistent store between invocations, a portable serializable state blob would be valuable.
+`ctx.checkpoint()` stores named results inside one execution scope; it is not a cross-process workflow-resume protocol. Durable resumption needs a portable serializable run state plus decision claims, leases, checkpoint lineage, and idempotency boundaries. Serverless environments (Lambda, Cloudflare Workers) make that missing contract especially visible.
 
 ```typescript
 // Serialize
@@ -210,7 +210,7 @@ const blob = JSON.stringify(snapshot); // store anywhere
 const restored = workflow.resume(JSON.parse(blob));
 ```
 
-This complements (not replaces) the existing StateStore-based approach. The snapshot captures enough state to replay from the last checkpoint without access to the original store.
+This would graduate the current StateStore checkpoint primitive into an explicit durable-resume protocol. Until then, Axl does not claim automatic workflow replay after process loss.
 
 ### Future Considerations
 

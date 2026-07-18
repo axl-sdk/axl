@@ -1,6 +1,14 @@
 import { EventEmitter } from 'node:events';
-import { AXL_EVENT_TYPES, type AxlEvent, type AxlEventOf, type AxlEventType } from './types.js';
+import {
+  AXL_EVENT_TYPES,
+  type AxlEvent,
+  type AxlEventOf,
+  type AxlEventType,
+  type ObservationStatus,
+} from './types.js';
 import { isRootLevel } from './event-utils.js';
+import { EventStreamOverflowError } from './errors.js';
+export { EventStreamOverflowError } from './errors.js';
 
 /** Wire-format event names callers can subscribe to via `.on(name, fn)`.
  *  Derived from the canonical `AXL_EVENT_TYPES` tuple — adding a new
@@ -167,40 +175,6 @@ export type StringStreamFilter = {
 // helper cannot pull `EventEmitter` from this file's `AxlEventBus`. See
 // that module for the implementation.
 
-/**
- * Thrown when an `AxlEventBus` queue exceeds `maxQueued` and `onOverflow`
- * is set to `'throw'`. Surfaced as a typed error so the runtime's emit
- * pipeline can distinguish a legitimate overflow signal (which must
- * propagate to fail the workflow) from a buggy trace-listener exception
- * (which gets swallowed).
- *
- * Consumers using `instanceof` to handle overflow specifically:
- * ```typescript
- * try {
- *   await runtime.execute('wf', input, { events: { onOverflow: 'throw' } });
- * } catch (err) {
- *   if (err instanceof EventStreamOverflowError) {
- *     // overflow — back off, retry, or surface to user
- *   }
- * }
- * ```
- */
-export class EventStreamOverflowError extends Error {
-  readonly maxQueued: number;
-  readonly eventType: string;
-
-  constructor(maxQueued: number, eventType: string) {
-    super(
-      `AxlEventBus queue exceeded maxQueued=${maxQueued} (event type: ${eventType}). ` +
-        `Consumer is too slow or the producer is unbounded. Configure ` +
-        `\`maxQueued\`/\`onOverflow\` on the runtime, or set maxQueued: Infinity to disable.`,
-    );
-    this.name = 'EventStreamOverflowError';
-    this.maxQueued = maxQueued;
-    this.eventType = eventType;
-  }
-}
-
 /** 10_000 is ~1 MB at typical event sizes (a few hundred bytes per event,
  *  with the structured-output `partial_object` payloads being the largest
  *  outliers at a few KB). High enough that no normal consumer hits it;
@@ -239,6 +213,7 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
   private readonly maxQueued: number;
   private readonly onOverflow: NonNullable<EventStreamOptions['onOverflow']>;
   private overflowWarned = false;
+  private droppedEvents = 0;
   /** Callbacks fired exactly once when `_finish()` is called. Used by
    *  curated views (e.g., `partialObjects`) that are listener-based and
    *  need a termination signal independent of any synthetic `done` event. */
@@ -344,6 +319,14 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     // contract); bus-level 'error' subscribers (if any) get the AxlEvent
     // payload directly.
     this.bus.on('error', () => {});
+  }
+
+  /** Machine-readable completeness of this bus's iterator view. Listener
+   *  delivery is independent and is not described by this status. */
+  get observationStatus(): ObservationStatus {
+    return this.droppedEvents === 0
+      ? { complete: true }
+      : { complete: false, reason: 'queue_overflow', droppedEvents: this.droppedEvents };
   }
 
   private unknownEventWarned = false;
@@ -1044,6 +1027,7 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     );
     if (droppedIdx >= 0) {
       this.eventQueue.splice(droppedIdx, 1);
+      this.droppedEvents++;
     }
     this.eventQueue.push(event);
   }

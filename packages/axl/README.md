@@ -466,11 +466,10 @@ const decision = await ctx.awaitHuman({
   prompt: 'Approve this action?',
 });
 
-// Durable checkpoint — on first run, executes and saves the result under
-// the given name. On replay after a restart, returns the saved result
-// without re-executing, preventing duplicate side effects (double API
-// calls, double charges, etc.). The name is a stable identifier and must
-// match across runs for replay to work.
+// Scoped checkpoint — on first evaluation, executes and saves the result
+// under the current execution ID. A later evaluation in that same explicit
+// execution scope can replay it. Axl does not automatically restart or
+// resume workflows across processes.
 const checkpointed = await ctx.checkpoint('expensive-op', async () => expensiveOperation());
 ```
 
@@ -624,7 +623,7 @@ const result = await ctx.ask(extractAgent, 'Extract user from this text', {
 
 ### State Stores
 
-Three built-in implementations. All persist the same data: workflow execution checkpoints, `awaitHuman` decisions, session history, memory entries, execution history, eval history, and the execution state needed for suspend/resume.
+Three built-in implementations persist workflow checkpoints, pending `awaitHuman` requests, session history, memory entries, execution history, and eval history. Pending approval requests remain visible after process loss, but their workflow continuation is in-process only; use an application-owned durable command/idempotency protocol for cross-process approval.
 
 **Memory** (default) — in-process, no persistence. Use for development and stateless workflows.
 
@@ -722,7 +721,7 @@ runtime.on('execution_deleted', (e) => {
 
 If the execution is still running, the workflow is aborted (and a paused `ctx.awaitHuman()` correctly wakes with `AbortError` — fixed in 0.17.7). The resurrection guard ensures the workflow's eventual `workflow_end` doesn't re-create the row.
 
-`ExecutionInfo.metadata` round-trips from `ExecuteOptions.metadata` (`userId`, `tenantId`, etc.) — queryable via `runtime.getExecutions().filter(...)`. Internal control-plane keys (`sessionHistory`, `sessionId`, `resumeMode`) are stripped before persistence; they remain available via `ctx.metadata` for dynamic selectors.
+`ExecutionInfo.metadata` round-trips from `ExecuteOptions.metadata` (`userId`, `tenantId`, etc.) — queryable via `runtime.getExecutions().filter(...)`. Internal session control-plane keys (`sessionHistory`, `sessionId`) are stripped before persistence; they remain available via `ctx.metadata` for dynamic selectors.
 
 ### Session Options
 

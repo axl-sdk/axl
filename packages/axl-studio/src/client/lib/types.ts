@@ -38,6 +38,7 @@ import type {
   GuardrailData,
   SchemaCheckData,
   ValidateData,
+  ObservationStatus,
 } from '@axlsdk/axl';
 
 /** Current live and WS event contract. Historical readers use
@@ -74,6 +75,7 @@ export type {
   GuardrailData,
   SchemaCheckData,
   ValidateData,
+  ObservationStatus,
 };
 
 declare global {
@@ -177,6 +179,7 @@ export type ExecutionInfo = {
   duration: number;
   result?: unknown;
   error?: string;
+  observation?: ObservationStatus;
 };
 
 type CostBucket = { cost: number; calls: number; unpricedCalls: number };

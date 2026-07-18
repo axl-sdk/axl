@@ -59,6 +59,58 @@ describe('Studio API: Decisions', () => {
     await expect(execution).resolves.toEqual({ approved: true, data: 'Looks good' });
   });
 
+  it('POST resolve returns 400 for an invalid decision union', async () => {
+    const { app } = createTestServer();
+    const res = await app.request('/api/decisions/missing/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ approved: true, reason: 'contradictory' }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await readJson(res)).toMatchObject({
+      ok: false,
+      error: { code: 'INVALID_HUMAN_DECISION' },
+    });
+  });
+
+  it('POST resolve returns 404 when no pending request exists', async () => {
+    const { app } = createTestServer();
+    const res = await app.request('/api/decisions/missing/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ approved: true }),
+    });
+
+    expect(res.status).toBe(404);
+    expect(await readJson(res)).toMatchObject({
+      ok: false,
+      error: { code: 'PENDING_DECISION_NOT_FOUND' },
+    });
+  });
+
+  it('POST resolve returns 409 when the pending request belongs to another process', async () => {
+    const { app, runtime } = createTestServer();
+    await runtime.getStateStore().savePendingDecision('orphaned', {
+      executionId: 'orphaned',
+      channel: 'approval',
+      prompt: 'Approve?',
+      createdAt: new Date().toISOString(),
+    });
+
+    const res = await app.request('/api/decisions/orphaned/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ approved: true }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(await readJson(res)).toMatchObject({
+      ok: false,
+      error: { code: 'CROSS_PROCESS_RESUME_UNSUPPORTED' },
+    });
+  });
+
   it('GET /api/decisions scrubs prompt when trace.redact is on', async () => {
     const { app, runtime } = createTestServer(undefined, { redact: true });
     // Seed a pending decision directly via the state store. We can't use

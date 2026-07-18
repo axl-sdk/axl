@@ -74,6 +74,11 @@ describe('AxlEventBus — overflow safety net', () => {
     // Capacity 3, pushed 5 → first 2 dropped → kept t2, t3, t4
     expect(seen).toHaveLength(3);
     expect(seen.map((e) => (e as { data: string }).data)).toEqual(['t2', 't3', 't4']);
+    expect(bus.observationStatus).toEqual({
+      complete: false,
+      reason: 'queue_overflow',
+      droppedEvents: 2,
+    });
   });
 
   it('preserves terminal events even when cap is exceeded', async () => {

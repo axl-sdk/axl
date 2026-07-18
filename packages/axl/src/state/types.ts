@@ -15,7 +15,8 @@ export type PendingDecision = {
   createdAt: string;
 };
 
-/** Persisted execution state for suspend/resume. */
+/** Legacy application-managed execution state. Axl does not automatically
+ * resume workflow continuations from this record. */
 export type ExecutionState = {
   workflow: string;
   input: unknown;
@@ -53,7 +54,8 @@ export interface StateStore {
   getPendingDecisions(): Promise<PendingDecision[]>;
   resolveDecision(executionId: string, result: HumanDecision): Promise<void>;
 
-  // Execution state persistence (for suspend/resume)
+  // Legacy application-managed execution-state persistence. Retained for
+  // custom-store compatibility; the runtime does not automatically resume it.
   saveExecutionState(executionId: string, state: ExecutionState): Promise<void>;
   getExecutionState(executionId: string): Promise<ExecutionState | null>;
   listPendingExecutions(): Promise<string[]>;

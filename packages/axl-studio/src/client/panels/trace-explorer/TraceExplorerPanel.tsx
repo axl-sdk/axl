@@ -326,6 +326,14 @@ export function TraceExplorerPanel() {
                 </div>
               )}
 
+              {selectedExecution?.observation?.complete === false && (
+                <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                  {selectedExecution.observation.reason === 'branch_drain_timeout'
+                    ? `Trace incomplete: terminal finalization stopped after ${selectedExecution.observation.timeoutMs} ms with ${selectedExecution.observation.pendingContinuations} branch continuations still running.`
+                    : `Trace incomplete: ${selectedExecution.observation.droppedEvents} queued events were dropped.`}
+                </div>
+              )}
+
               {/* Result for completed executions */}
               {selectedExecution?.status === 'completed' && selectedExecution.result != null && (
                 <div className="mb-4">
@@ -351,7 +359,10 @@ export function TraceExplorerPanel() {
                   events={filteredEvents}
                   lifecycleEvents={allEvents}
                   traceComplete={
-                    selectedExecution ? selectedExecution.status !== 'running' : undefined
+                    selectedExecution
+                      ? selectedExecution.status !== 'running' &&
+                        selectedExecution.observation?.complete !== false
+                      : undefined
                   }
                   maxDuration={maxDuration}
                 />

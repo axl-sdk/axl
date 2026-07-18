@@ -182,6 +182,102 @@ describe('TraceEventList', () => {
     expect(screen.getAllByText('"id"')).toHaveLength(2);
   });
 
+  it.each([
+    ['approval', 'infrastructure', 'abort'],
+    ['before_hook', 'tool_failure', 'continue'],
+    ['before_hook', 'unexpected', 'abort'],
+    ['handler', 'tool_failure', 'continue'],
+    ['handler', 'mcp_error', 'continue'],
+    ['handler', 'unexpected', 'abort'],
+    ['after_hook', 'tool_failure', 'continue'],
+    ['after_hook', 'unexpected', 'abort'],
+    ['projection', 'output', 'abort'],
+    ['serialization', 'output', 'abort'],
+  ] as const)('renders the %s/%s/%s failure terminal', async (phase, kind, disposition) => {
+    const retainsResult =
+      phase === 'after_hook' || phase === 'projection' || phase === 'serialization';
+    const event = makeEvent({
+      type: 'tool_call_end',
+      tool: 'lookup',
+      callId: `failed-${phase}-${kind}`,
+      duration: 4,
+      data: {
+        args: {},
+        outcome: {
+          status: 'failed',
+          failure: {
+            phase,
+            kind,
+            disposition,
+            ...(phase === 'handler' ? { attempts: 2 } : {}),
+            ...(retainsResult ? { result: { retained: true } } : {}),
+            error: { name: 'Error', message: `${phase} failed` },
+          },
+        },
+      },
+    });
+
+    render(<TraceEventList events={[event]} />);
+    expect(screen.getByText('failed')).toBeInTheDocument();
+    await userEvent.click(screen.getByText('#0').closest('button')!);
+    expect(screen.getByText(`${phase} · ${kind} · ${disposition}`)).toBeInTheDocument();
+    expect(screen.getByText(`Error: ${phase} failed`)).toBeInTheDocument();
+    if (retainsResult) expect(screen.getByText('Result before failure')).toBeInTheDocument();
+  });
+
+  it.each([
+    ['approval', false],
+    ['before_hook', false],
+    ['handler', false],
+    ['after_handler', true],
+    ['after_hook', true],
+    ['projection', true],
+    ['serialization', true],
+  ] as const)('renders the %s cancellation terminal', async (phase, retainsResult) => {
+    const event = makeEvent({
+      type: 'tool_call_end',
+      tool: 'lookup',
+      callId: `cancelled-${phase}`,
+      duration: 4,
+      data: {
+        args: {},
+        outcome: {
+          status: 'cancelled',
+          cancellation: {
+            phase,
+            reason: 'operator stopped the call',
+            ...(retainsResult ? { result: { retained: true } } : {}),
+          },
+        },
+      },
+    });
+
+    render(<TraceEventList events={[event]} />);
+    expect(screen.getByText('cancelled')).toBeInTheDocument();
+    await userEvent.click(screen.getByText('#0').closest('button')!);
+    expect(screen.getByText(phase)).toBeInTheDocument();
+    expect(screen.getByText('operator stopped the call')).toBeInTheDocument();
+    if (retainsResult) expect(screen.getByText('Result before cancellation')).toBeInTheDocument();
+  });
+
+  it('renders a denied terminal with its reason', async () => {
+    const event = makeEvent({
+      type: 'tool_call_end',
+      tool: 'lookup',
+      callId: 'denied-call',
+      duration: 4,
+      data: {
+        args: {},
+        outcome: { status: 'denied', reason: 'operator denied the call' },
+      },
+    });
+
+    render(<TraceEventList events={[event]} />);
+    expect(screen.getByText('denied')).toBeInTheDocument();
+    await userEvent.click(screen.getByText('#0').closest('button')!);
+    expect(screen.getByText('operator denied the call')).toBeInTheDocument();
+  });
+
   it('labels unmatched v2 and legacy starts honestly after a trace completes', () => {
     const v2Start = makeEvent({
       step: 1,
@@ -260,5 +356,36 @@ describe('TraceEventList', () => {
     await userEvent.click(screen.getByText('#0').closest('button')!);
     expect(screen.getByText('unavailable')).toBeInTheDocument();
     expect(screen.getByText('lookup')).toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      'invalid_json',
+      { reason: 'invalid_json', requestedTool: 'lookup', message: 'invalid JSON payload' },
+      'invalid JSON payload',
+    ],
+    [
+      'invalid_arguments',
+      {
+        reason: 'invalid_arguments',
+        requestedTool: 'lookup',
+        args: { id: 'wrong' },
+        issues: [{ path: ['id'], code: 'invalid_type' }],
+      },
+      'invalid_type',
+    ],
+  ] as const)('renders the %s rejection details', async (_reason, data, detail) => {
+    const event = makeEvent({
+      type: 'tool_call_rejected',
+      tool: 'lookup',
+      callId: `rejected-${_reason}`,
+      data,
+    });
+
+    const { container } = render(<TraceEventList events={[event]} />);
+    expect(screen.getByText('rejected')).toBeInTheDocument();
+    await userEvent.click(screen.getByText('#0').closest('button')!);
+    expect(screen.getByText(_reason)).toBeInTheDocument();
+    expect(container).toHaveTextContent(detail);
   });
 });

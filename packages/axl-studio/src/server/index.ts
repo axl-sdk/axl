@@ -115,7 +115,7 @@ export function createServer(options: CreateServerOptions) {
   if (options.cors !== false) {
     app.use('*', cors());
   }
-  app.use('*', errorHandler);
+  app.onError(errorHandler);
   app.use('*', async (c, next) => {
     c.set('runtime', runtime);
     await next();

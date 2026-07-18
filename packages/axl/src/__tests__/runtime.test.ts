@@ -3037,7 +3037,7 @@ describe('deleteExecution()', () => {
     expect(await runtime.getExecutions()).toHaveLength(0);
   });
 
-  it('ExecutionInfo.metadata strips control-plane keys (sessionHistory, sessionId, resumeMode)', async () => {
+  it('ExecutionInfo.metadata strips session control-plane keys', async () => {
     const runtime = new AxlRuntime();
     runtime.registerProvider('test', new TestProvider([{ content: 'ok' }]) as any);
     const wf = workflow({
@@ -3054,20 +3054,23 @@ describe('deleteExecution()', () => {
         metadata: {
           userId: 'u-42',
           tenantId: 't-7',
+          resumeMode: 'customer-tag',
           sessionHistory: [
             { role: 'user', content: 'a much longer message that we don’t want persisted' },
           ],
           sessionId: 'sess-internal',
-          resumeMode: true,
         },
       },
     );
     const [exec] = await runtime.getExecutions();
-    expect(exec.metadata).toEqual({ userId: 'u-42', tenantId: 't-7' });
+    expect(exec.metadata).toEqual({
+      userId: 'u-42',
+      tenantId: 't-7',
+      resumeMode: 'customer-tag',
+    });
     // Internal keys not present
     expect(exec.metadata?.sessionHistory).toBeUndefined();
     expect(exec.metadata?.sessionId).toBeUndefined();
-    expect(exec.metadata?.resumeMode).toBeUndefined();
   });
 
   it('ExecutionInfo.metadata is isolated from caller mutation post-execute', async () => {
@@ -3133,11 +3136,7 @@ describe('deleteExecution()', () => {
     });
     runtime.register(wf);
 
-    await runtime.execute(
-      'meta-only-internal',
-      {},
-      { metadata: { sessionId: 's', resumeMode: false } },
-    );
+    await runtime.execute('meta-only-internal', {}, { metadata: { sessionId: 's' } });
     const [exec] = await runtime.getExecutions();
     expect(exec.metadata).toBeUndefined();
   });

@@ -1,5 +1,9 @@
-import { ToolFailure, ToolModelOutputError } from './errors.js';
-import { EventStreamOverflowError } from './event-stream.js';
+import {
+  isEventStreamOverflowError,
+  rethrowEventStreamOverflow,
+  ToolFailure,
+  ToolModelOutputError,
+} from './errors.js';
 import { serializeToolModelOutput } from './tool-model-output.js';
 import { executePreparedTool, prepareToolInput, toolArgumentIssues, type Tool } from './tool.js';
 import type { WorkflowContext } from './context.js';
@@ -346,7 +350,7 @@ export async function executeAcceptedTool(options: {
       signal?.throwIfAborted();
       if (!approval.approved) return { kind: 'denied', reason: approval.reason };
     } catch (error) {
-      if (error instanceof EventStreamOverflowError) throw error;
+      rethrowEventStreamOverflow(error);
       const abort = cancellationError(signal, error);
       if (abort !== undefined) return cancellation('approval', abort);
       return {
@@ -368,7 +372,7 @@ export async function executeAcceptedTool(options: {
       effectiveArgs = await invocation.source.tool.hooks.before(effectiveArgs as never, context);
       signal?.throwIfAborted();
     } catch (error) {
-      if (error instanceof EventStreamOverflowError) throw error;
+      rethrowEventStreamOverflow(error);
       const abort = cancellationError(signal, error);
       if (abort !== undefined) return cancellation('before_hook', abort);
       return failed('before_hook', error);
@@ -421,7 +425,7 @@ export async function executeAcceptedTool(options: {
       }
     }
   } catch (error) {
-    if (error instanceof EventStreamOverflowError) throw error;
+    rethrowEventStreamOverflow(error);
     const abort = cancellationError(signal, error);
     if (abort !== undefined) return cancellation('handler', abort);
     return failed('handler', error, { attempts });
@@ -435,7 +439,7 @@ export async function executeAcceptedTool(options: {
       result = await invocation.source.tool.hooks.after(result as never, context);
       signal?.throwIfAborted();
     } catch (error) {
-      if (error instanceof EventStreamOverflowError) throw error;
+      rethrowEventStreamOverflow(error);
       const abort = cancellationError(signal, error);
       if (abort !== undefined) return cancellation('after_hook', abort, rawResult);
       return failed('after_hook', error, { result: rawResult });
@@ -477,7 +481,7 @@ export function prepareToolMessage(
     try {
       return { ok: true, content: mcpContent(outcome.result as McpToolResult) };
     } catch (error) {
-      if (error instanceof EventStreamOverflowError) throw error;
+      rethrowEventStreamOverflow(error);
       return { ok: false, phase: 'serialization', error };
     }
   }
@@ -493,11 +497,8 @@ export function prepareToolMessage(
         ),
       };
     } catch (error) {
-      if (error instanceof EventStreamOverflowError) throw error;
-      if (
-        error instanceof ToolModelOutputError &&
-        error.cause instanceof EventStreamOverflowError
-      ) {
+      rethrowEventStreamOverflow(error);
+      if (error instanceof ToolModelOutputError && isEventStreamOverflowError(error.cause)) {
         throw error.cause;
       }
       return {
@@ -516,7 +517,7 @@ export function prepareToolMessage(
     if (content === undefined) throw new Error('Tool result is not JSON serializable');
     return { ok: true, content };
   } catch (error) {
-    if (error instanceof EventStreamOverflowError) throw error;
+    rethrowEventStreamOverflow(error);
     return { ok: false, phase: 'serialization', error };
   }
 }

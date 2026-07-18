@@ -356,7 +356,7 @@ export class SQLiteStore implements StateStore {
     stmt.run(executionId);
   }
 
-  // ── Execution State (for awaitHuman suspend/resume) ────────────────────
+  // ── Legacy application-managed execution state ────────────────────────
 
   async saveExecutionState(executionId: string, state: ExecutionState): Promise<void> {
     const stmt = this.db.prepare(

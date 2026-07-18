@@ -23,6 +23,7 @@ import type {
   AgentCallParams,
   ValidateResult,
   VerifyRetry,
+  ObservationStatus,
 } from './types.js';
 import {
   AxlError,
@@ -34,12 +35,16 @@ import {
   BudgetExceededError,
   GuardrailError,
   ValidationError,
+  EventStreamOverflowError,
+  isEventStreamOverflowError,
+  preserveErrorCause,
+  rethrowEventStreamOverflow,
 } from './errors.js';
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
 import { StreamingWalker } from './streaming-walker.js';
 import { COST_BEARING_LEAF_TYPES, hasPositiveTokens, isUsableCost } from './event-utils.js';
-import { AxlEventBus, EventStreamOverflowError, type EventStreamOptions } from './event-stream.js';
+import { AxlEventBus, type EventStreamOptions } from './event-stream.js';
 import { redactHistoricalEvent } from './redaction.js';
 import {
   detectDroppedRefinements,
@@ -73,7 +78,33 @@ const signalStorage = new AsyncLocalStorage<AbortSignal>();
 type BranchDrainState = {
   pending: Set<Promise<unknown>>;
   overflow?: EventStreamOverflowError;
+  timeoutMs: number;
+  deadline?: number;
 };
+
+type WorkflowLifecycleState = {
+  startEmitted: boolean;
+  endEmitted: boolean;
+};
+
+export const DEFAULT_BRANCH_DRAIN_TIMEOUT_MS = 5_000;
+
+/** Resolve the public branch-drain timeout before runtime side effects begin. */
+export function resolveBranchDrainTimeoutMs(value: unknown): number {
+  const resolved = value === undefined ? DEFAULT_BRANCH_DRAIN_TIMEOUT_MS : value;
+  if (
+    typeof resolved !== 'number' ||
+    Number.isNaN(resolved) ||
+    !Number.isFinite(resolved) ||
+    resolved < 0
+  ) {
+    throw new AxlError(
+      'INVALID_CONFIG',
+      `branchDrainTimeoutMs must be a non-negative finite number (got ${String(resolved)})`,
+    );
+  }
+  return resolved;
+}
 
 /** Validate untyped host input at the human-decision boundary. */
 export function parseHumanDecision(value: unknown): HumanDecision {
@@ -92,6 +123,21 @@ export function parseHumanDecision(value: unknown): HumanDecision {
   }
   if (prototype !== Object.prototype && prototype !== null) invalid();
 
+  let ownKeys: (string | symbol)[];
+  try {
+    ownKeys = Reflect.ownKeys(value as object);
+  } catch {
+    return invalid();
+  }
+  if (
+    ownKeys.some(
+      (key) =>
+        typeof key !== 'string' || (key !== 'approved' && key !== 'data' && key !== 'reason'),
+    )
+  ) {
+    invalid();
+  }
+
   const readDataProperty = (
     key: 'approved' | 'data' | 'reason',
   ): { present: boolean; value: unknown } => {
@@ -101,7 +147,11 @@ export function parseHumanDecision(value: unknown): HumanDecision {
     } catch {
       return invalid();
     }
-    if (!descriptor) return { present: false, value: undefined };
+    if (!descriptor) {
+      if (ownKeys.includes(key)) invalid();
+      return { present: false, value: undefined };
+    }
+    if (!ownKeys.includes(key)) return invalid();
     if (!('value' in descriptor)) return invalid();
     return { present: true, value: descriptor.value };
   };
@@ -451,8 +501,6 @@ export type WorkflowContextInit = {
   spanManager?: SpanManager;
   /** MemoryManager for ctx.remember() / ctx.recall() operations. */
   memoryManager?: MemoryManager;
-  /** When true, the context replays from checkpoints before executing. */
-  resumeMode?: boolean;
   /** Override tool handlers by name. Bypasses normal tool lookup in executeAgentCall. */
   toolOverrides?: Map<string, (args: unknown) => Promise<unknown>>;
   /** Handler for awaitHuman — when set, returns immediately instead of waiting for pendingDecisions. */
@@ -493,6 +541,11 @@ export type WorkflowContextInit = {
   /** Internal: root-shared state for branch continuations that must settle
    *  before the runtime emits the workflow terminal and snapshots cost. */
   branchDrainState?: BranchDrainState;
+  /** Internal: root-shared lifecycle state. Prevents child contexts from
+   *  emitting trace events after the workflow terminal. */
+  workflowLifecycleState?: WorkflowLifecycleState;
+  /** Runtime terminal barrier for abort-ignoring race/quorum branches. */
+  branchDrainTimeoutMs?: number;
 };
 
 /**
@@ -539,23 +592,22 @@ export class WorkflowContext<TInput = unknown> {
    */
   private autoCheckpointCounters: { byAgent: Map<string, number>; root: number };
   private readonly branchDrainState: BranchDrainState;
-  /** Idempotency guards for `workflow_start` / `workflow_end` emission.
+  /** Root-shared idempotency guards for workflow lifecycle emission.
    *  Both `runtime.execute()` and `runtime.stream()` have paths where a
    *  post-emit side-effect (checkpoint deletion, state-store persistence)
    *  can throw AFTER `_emitWorkflowEnd({status: 'completed'})` has already
    *  fired — the outer catch would then fire `_emitWorkflowEnd({status:
    *  'failed'})` for a second time. These flags make both emitters
    *  single-fire so consumers never see paired-then-conflicting terminal
-   *  events for one execution. */
-  private _workflowStartEmitted = false;
-  private _workflowEndEmitted = false;
+   *  events for one execution. Sharing the state with child contexts also
+   *  suppresses late branch events after bounded finalization. */
+  private readonly workflowLifecycleState: WorkflowLifecycleState;
   private signal?: AbortSignal;
   private summaryCache?: string;
   private workflowName?: string;
   private mcpManager?: McpManager;
   private spanManager?: SpanManager;
   private memoryManager?: MemoryManager;
-  private resumeMode: boolean;
   private toolOverrides?: Map<string, (args: unknown) => Promise<unknown>>;
   private awaitHumanHandler?: (
     options: AwaitHumanOptions,
@@ -682,7 +734,6 @@ export class WorkflowContext<TInput = unknown> {
     this.mcpManager = init.mcpManager;
     this.spanManager = init.spanManager;
     this.memoryManager = init.memoryManager;
-    this.resumeMode = init.resumeMode ?? false;
     this.toolOverrides = init.toolOverrides;
     this.awaitHumanHandler = init.awaitHumanHandler;
     this.onAgentCallComplete = init.onAgentCallComplete;
@@ -730,7 +781,15 @@ export class WorkflowContext<TInput = unknown> {
       byAgent: new Map(),
       root: 0,
     };
-    this.branchDrainState = init.branchDrainState ?? { pending: new Set() };
+    const branchDrainTimeoutMs = resolveBranchDrainTimeoutMs(init.branchDrainTimeoutMs);
+    this.branchDrainState = init.branchDrainState ?? {
+      pending: new Set(),
+      timeoutMs: branchDrainTimeoutMs,
+    };
+    this.workflowLifecycleState = init.workflowLifecycleState ?? {
+      startEmitted: false,
+      endEmitted: false,
+    };
     // Restore cached summary from session metadata (survives across requests)
     if (init.metadata?.summaryCache) {
       this.summaryCache = init.metadata.summaryCache as string;
@@ -775,6 +834,7 @@ export class WorkflowContext<TInput = unknown> {
       // child context don't collide with the parent's in the state store.
       autoCheckpointCounters: this.autoCheckpointCounters,
       branchDrainState: this.branchDrainState,
+      workflowLifecycleState: this.workflowLifecycleState,
       // Share the parent's bus slot (mutable ref). Late allocation in
       // either parent or child propagates because both read the same
       // slot. Nested-ask events (agent-as-tool pattern) bubble up to
@@ -803,7 +863,7 @@ export class WorkflowContext<TInput = unknown> {
       () => state.pending.delete(promise),
       (error) => {
         state.pending.delete(promise);
-        if (!state.overflow && error instanceof EventStreamOverflowError) {
+        if (!state.overflow && isEventStreamOverflowError(error)) {
           state.overflow = error;
         }
       },
@@ -813,14 +873,45 @@ export class WorkflowContext<TInput = unknown> {
   /** Wait for race/quorum losers (including nested branch work) to settle.
    *  Primitive calls still resolve as soon as their winner/quorum is known;
    *  this is only the runtime's terminal/persistence barrier. */
-  async _drainBranchWork(): Promise<void> {
+  async _drainBranchWork(): Promise<ObservationStatus> {
     const state = this.branchDrainState;
+    state.deadline ??= Date.now() + state.timeoutMs;
     while (state.pending.size > 0) {
-      await Promise.allSettled([...state.pending]);
+      const overflow = state.overflow;
+      state.overflow = undefined;
+      if (overflow) throw overflow;
+
+      const remaining = state.deadline - Date.now();
+      if (remaining <= 0) {
+        return {
+          complete: false,
+          reason: 'branch_drain_timeout',
+          pendingContinuations: state.pending.size,
+          timeoutMs: state.timeoutMs,
+        };
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settled = await Promise.race([
+        Promise.allSettled([...state.pending]).then(() => true),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), remaining);
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (!settled) {
+        return {
+          complete: false,
+          reason: 'branch_drain_timeout',
+          pendingContinuations: state.pending.size,
+          timeoutMs: state.timeoutMs,
+        };
+      }
     }
     const overflow = state.overflow;
     state.overflow = undefined;
     if (overflow) throw overflow;
+    state.deadline = undefined;
+    return { complete: true };
   }
 
   /** Resolve, execute, and observe one non-handoff tool request. Rejections
@@ -1048,15 +1139,18 @@ export class WorkflowContext<TInput = unknown> {
           };
 
           // Spec decision 9 invariant: every `ask_start` has a matching
-          // `ask_end`. Implemented via try/finally so ANY exit path —
-          // current catches (gate exhaustion, budget, abort) AND any
-          // future failure path added between `ask_start` and the
-          // success emit — surfaces as `ask_end`. The workflow-level
-          // `error` event is reserved for failures with no ask_end
-          // available; consumers must never see both for the same failure.
+          // `ask_end`. Capture either outcome, emit the terminal once, then
+          // rethrow the captured failure. Current catches (gate exhaustion,
+          // budget, abort) and future failure paths between `ask_start` and
+          // the success emit therefore surface as `ask_end`. The workflow-
+          // level `error` event is reserved for failures with no ask_end;
+          // consumers must never see both for the same failure.
           let outcome: { ok: true; result: T } | { ok: false; error: string } | undefined;
+          let askFailure: unknown;
+          let askFailed = false;
+          let result: T | undefined;
           try {
-            const result: T = this.spanManager
+            result = this.spanManager
               ? await this.spanManager.withSpanAsync(
                   'axl.agent.ask',
                   {
@@ -1125,23 +1219,21 @@ export class WorkflowContext<TInput = unknown> {
                 );
               }
             }
-            return result;
           } catch (err) {
+            askFailed = true;
+            askFailure = err;
             outcome = {
               ok: false,
               error: err instanceof Error ? err.message : String(err),
             };
-            throw err;
-          } finally {
-            // Defensive: `outcome` is always set by either the success
-            // or catch branch above. The fallback covers an internal
-            // bug (e.g., a future synchronous throw before either
-            // branch runs) so we never silently drop the ask_end event.
-            //
-            // Strict overflow is an observability-integrity failure. It must
-            // propagate even while another ask error is unwinding; otherwise
-            // a missing terminal event could be hidden behind a branch retry
-            // or aggregation boundary.
+          }
+
+          // Defensive: `outcome` is always set by either the success or catch
+          // branch above. The fallback makes a future internal control-flow
+          // bug explicit without dropping ask_end.
+          let terminalFailure: unknown;
+          let terminalFailed = false;
+          try {
             this.emitEvent({
               type: 'ask_end',
               outcome:
@@ -1154,7 +1246,18 @@ export class WorkflowContext<TInput = unknown> {
               ...(frame.askUnpriced ? { unpriced: true } : {}),
               duration: Date.now() - askStart,
             });
+          } catch (error) {
+            terminalFailed = true;
+            terminalFailure = isEventStreamOverflowError(error)
+              ? preserveErrorCause(error, askFailure)
+              : error;
           }
+
+          // Strict overflow takes precedence over an in-flight ask failure so
+          // recovery boundaries cannot hide an incomplete terminal trace.
+          if (terminalFailed) throw terminalFailure;
+          if (askFailed) throw askFailure;
+          return result as T;
         });
       },
       { agent: agentName },
@@ -2164,7 +2267,7 @@ export class WorkflowContext<TInput = unknown> {
             metadata: this.metadata,
           });
         } catch (err) {
-          if (err instanceof EventStreamOverflowError) throw err;
+          rethrowEventStreamOverflow(err);
           const reason = err instanceof Error ? err.message : String(err);
           validateResult = { valid: false, reason: `Validator error: ${reason}` };
         }
@@ -2609,12 +2712,12 @@ export class WorkflowContext<TInput = unknown> {
    * Execute a function with checkpoint-replay semantics.
    *
    * On first execution, runs `fn()`, saves the result under `name`, and
-   * returns it. On replay (resume after restart), returns the saved result
-   * without re-executing. This prevents duplicate side effects (double API
-   * calls, double refunds, etc.).
+   * returns it. A later evaluation in the same explicit execution scope
+   * returns the saved result without re-executing. Axl does not restart or
+   * resume workflow continuations across processes.
    *
    * `name` must be a stable, caller-supplied identifier — the same call
-   * site MUST pass the same name across runs of the same execution for
+   * site MUST pass the same name across evaluations of the same execution for
    * replay to work. Names are scoped to a single execution and must be
    * unique within it; reusing a name (e.g. inside a loop) gives
    * last-write-wins behavior. For loops, compose names from the iterator:
@@ -2793,7 +2896,7 @@ export class WorkflowContext<TInput = unknown> {
               reject(new QuorumNotMet(quorum, successCount, results));
             }
           }).catch((err) => {
-            if (err instanceof EventStreamOverflowError) {
+            if (isEventStreamOverflowError(err)) {
               if (!settled) {
                 settled = true;
                 controller.abort();
@@ -2830,7 +2933,7 @@ export class WorkflowContext<TInput = unknown> {
         fn(i)
           .then((value): Result<T> => ({ ok: true, value }))
           .catch((err): Result<T> => {
-            if (err instanceof EventStreamOverflowError) throw err;
+            rethrowEventStreamOverflow(err);
             return {
               ok: false,
               error: err instanceof Error ? err.message : String(err),
@@ -3009,7 +3112,7 @@ export class WorkflowContext<TInput = unknown> {
           try {
             validateResult = await options.validate(parsed, { metadata: this.metadata });
           } catch (err) {
-            if (err instanceof EventStreamOverflowError) throw err;
+            rethrowEventStreamOverflow(err);
             const reason = err instanceof Error ? err.message : String(err);
             validateResult = { valid: false, reason: `Validator error: ${reason}` };
           }
@@ -3028,7 +3131,7 @@ export class WorkflowContext<TInput = unknown> {
         emitVerifyOutcome(true, attempt + 1);
         return parsed;
       } catch (err) {
-        if (err instanceof EventStreamOverflowError) throw err;
+        rethrowEventStreamOverflow(err);
         if (err instanceof ValidationError) {
           // ValidationError from our own validate block or from fn (e.g., ctx.ask() validate
           // exhausted). Extract the parsed object so the next retry can repair it.
@@ -3120,7 +3223,7 @@ export class WorkflowContext<TInput = unknown> {
         const unpriced = this.budgetContext!.unpriced;
         return { value, budgetExceeded: exceeded, totalCost, unpriced };
       } catch (err) {
-        if (err instanceof EventStreamOverflowError) throw err;
+        rethrowEventStreamOverflow(err);
         if (this.budgetContext!.exceeded) {
           return {
             value: null,
@@ -3278,7 +3381,7 @@ export class WorkflowContext<TInput = unknown> {
                     return;
                   }
                 } catch (err) {
-                  if (err instanceof EventStreamOverflowError) throw err;
+                  rethrowEventStreamOverflow(err);
                   remaining--;
                   lastError =
                     err instanceof Error ? err : new Error(`Validator error: ${String(err)}`);
@@ -3300,7 +3403,7 @@ export class WorkflowContext<TInput = unknown> {
             resolve(value);
           })
           .catch((err) => {
-            if (err instanceof EventStreamOverflowError) {
+            if (isEventStreamOverflowError(err)) {
               if (!settled) {
                 settled = true;
                 controller.abort();
@@ -3390,7 +3493,7 @@ export class WorkflowContext<TInput = unknown> {
             results[idx] = { ok: true, value };
             successCount++;
           } catch (err) {
-            if (err instanceof EventStreamOverflowError) {
+            if (isEventStreamOverflowError(err)) {
               settled = true;
               controller?.abort();
               reject(err);
@@ -3494,19 +3597,6 @@ export class WorkflowContext<TInput = unknown> {
         metadata: options.metadata,
         createdAt: new Date().toISOString(),
       });
-
-      // Persist execution state so we can resume after restart
-      await this.stateStore.saveExecutionState(this.executionId, {
-        workflow: this.workflowName ?? 'unknown',
-        input: this.input,
-        step: this.stepRefRoot.value,
-        status: 'waiting',
-        metadata: {
-          ...this.metadata,
-          awaitHumanChannel: options.channel,
-          awaitHumanPrompt: options.prompt,
-        },
-      });
     }
 
     this.emitEvent({
@@ -3538,24 +3628,59 @@ export class WorkflowContext<TInput = unknown> {
       return err;
     };
 
-    const decision = await new Promise<HumanDecision>((resolve, reject) => {
-      // Fast path: already aborted before we even register.
-      if (this.signal?.aborted) {
-        reject(makeAbortError(this.signal.reason));
-        return;
-      }
-      this.pendingDecisions!.set(this.executionId, resolve);
-      const onAbort = () => {
-        // Remove our registration ONLY if it's still ours — `resolveDecision`
-        // could have overwritten/cleared between abort and listener firing.
-        const current = this.pendingDecisions!.get(this.executionId);
-        if (current === resolve) {
-          this.pendingDecisions!.delete(this.executionId);
+    let registeredResolver: ((decision: HumanDecision) => void) | undefined;
+    let abortListener: (() => void) | undefined;
+    let decision: HumanDecision;
+    try {
+      decision = await new Promise<HumanDecision>((resolve, reject) => {
+        // Fast path: already aborted before we even register.
+        if (this.signal?.aborted) {
+          reject(makeAbortError(this.signal.reason));
+          return;
         }
-        reject(makeAbortError(this.signal?.reason));
-      };
-      this.signal?.addEventListener('abort', onAbort, { once: true });
-    });
+        registeredResolver = resolve;
+        this.pendingDecisions!.set(this.executionId, resolve);
+        abortListener = () => {
+          // Remove our registration ONLY if it's still ours — `resolveDecision`
+          // could have cleared it between abort and listener firing.
+          const current = this.pendingDecisions!.get(this.executionId);
+          if (current === resolve) {
+            this.pendingDecisions!.delete(this.executionId);
+          }
+          reject(makeAbortError(this.signal?.reason));
+        };
+        this.signal?.addEventListener('abort', abortListener, { once: true });
+      });
+    } catch (error) {
+      // A cancelled in-process continuation cannot consume a later decision.
+      // Remove the persisted request as compensation; deleteExecution may be
+      // racing this path, so StateStore resolution must remain idempotent.
+      if (this.stateStore) {
+        try {
+          await this.stateStore.resolveDecision(this.executionId, {
+            approved: false,
+            reason: 'Execution aborted while awaiting approval',
+          });
+        } catch (cleanupError) {
+          if (error instanceof Error && Object.isExtensible(error)) {
+            Object.defineProperty(error, 'cleanupError', {
+              configurable: true,
+              enumerable: false,
+              value: cleanupError,
+            });
+          }
+        }
+      }
+      throw error;
+    } finally {
+      if (abortListener) this.signal?.removeEventListener('abort', abortListener);
+      if (
+        registeredResolver &&
+        this.pendingDecisions!.get(this.executionId) === registeredResolver
+      ) {
+        this.pendingDecisions!.delete(this.executionId);
+      }
+    }
 
     // Mirror the synchronous-handler path — emit `await_human_resolved` so
     // every `await_human` has a paired terminal event regardless of whether
@@ -3564,16 +3689,6 @@ export class WorkflowContext<TInput = unknown> {
       type: 'await_human_resolved',
       data: { channel: options.channel, decision },
     });
-
-    // Update execution state to running after decision is received
-    if (this.stateStore) {
-      await this.stateStore.saveExecutionState(this.executionId, {
-        workflow: this.workflowName ?? 'unknown',
-        input: this.input,
-        step: this.stepRefRoot.value,
-        status: 'running',
-      });
-    }
 
     return decision;
   }
@@ -3631,8 +3746,8 @@ export class WorkflowContext<TInput = unknown> {
 
   /** @internal — idempotent; no-ops on second+ call within one ctx. */
   _emitWorkflowStart(input: unknown): void {
-    if (this._workflowStartEmitted) return;
-    this._workflowStartEmitted = true;
+    if (this.workflowLifecycleState.startEmitted) return;
+    this.workflowLifecycleState.startEmitted = true;
     this.emitEvent({
       type: 'workflow_start',
       workflow: this.workflowName,
@@ -3654,9 +3769,10 @@ export class WorkflowContext<TInput = unknown> {
     result?: unknown;
     error?: string;
     aborted?: boolean;
+    observation?: ObservationStatus;
   }): void {
-    if (this._workflowEndEmitted) return;
-    this._workflowEndEmitted = true;
+    if (this.workflowLifecycleState.endEmitted) return;
+    this.workflowLifecycleState.endEmitted = true;
     this.emitEvent({
       type: 'workflow_end',
       workflow: this.workflowName,
@@ -3667,6 +3783,7 @@ export class WorkflowContext<TInput = unknown> {
         ...(info.result !== undefined ? { result: info.result } : {}),
         ...(info.error !== undefined ? { error: info.error } : {}),
         ...(info.aborted ? { aborted: true } : {}),
+        ...(info.observation ? { observation: info.observation } : {}),
       },
     });
   }
@@ -4057,6 +4174,7 @@ export class WorkflowContext<TInput = unknown> {
     // responsible for pairing `type` with the matching variant fields.
     [key: string]: unknown;
   }): void {
+    if (this.workflowLifecycleState.endEmitted && partial.type !== 'workflow_end') return;
     // Redaction is now table-driven: `REDACTION_RULES` in `redaction.ts`
     // owns every per-variant scrub, applied below to the constructed
     // event via `redactEvent(...)`. The legacy if/else ladder that used
@@ -4207,7 +4325,7 @@ export class WorkflowContext<TInput = unknown> {
       try {
         this.onTrace(finalEvent);
       } catch (err) {
-        if (err instanceof EventStreamOverflowError) {
+        if (isEventStreamOverflowError(err)) {
           overflowErr = err;
         } else {
           console.error(
@@ -4225,7 +4343,7 @@ export class WorkflowContext<TInput = unknown> {
       try {
         bus._push(finalEvent);
       } catch (err) {
-        if (err instanceof EventStreamOverflowError) {
+        if (isEventStreamOverflowError(err)) {
           if (!overflowErr) {
             overflowErr = err;
           } else {

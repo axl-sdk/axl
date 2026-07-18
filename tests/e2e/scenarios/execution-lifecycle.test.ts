@@ -107,7 +107,7 @@ describe('Execution Lifecycle E2E: tag, list, delete, audit', () => {
   });
 
   it('strips internal control-plane keys from persisted metadata', async () => {
-    // Customers may use `metadata.sessionId` / `sessionHistory` / `resumeMode`
+    // Customers may use `metadata.sessionId` / `sessionHistory`
     // as control-plane channels. These must NOT leak into the persisted
     // `ExecutionInfo.metadata` queryable surface.
     const runtime = new AxlRuntime();
@@ -129,7 +129,6 @@ describe('Execution Lifecycle E2E: tag, list, delete, audit', () => {
           userId: 'u-1', // user tag → persisted
           sessionHistory: [{ role: 'user', content: 'big buffer' }], // internal → stripped
           sessionId: 'sess-internal', // internal → stripped
-          resumeMode: true, // internal → stripped
         },
       },
     );

@@ -230,7 +230,7 @@ export const AXL_EVENT_TYPES = [
   'memory_remember',
   'memory_recall',
   'memory_forget',
-  // Durable execution checkpoints (`ctx.checkpoint`)
+  // Scoped execution checkpoints (`ctx.checkpoint`)
   'checkpoint_save',
   'checkpoint_replay',
   // Human-in-the-loop (`ctx.awaitHuman`)
@@ -642,6 +642,21 @@ export type WorkflowStartData = {
   input: unknown;
 };
 
+/** Machine-readable completeness of an observation surface or execution trace. */
+export type ObservationStatus =
+  | { complete: true }
+  | {
+      complete: false;
+      reason: 'queue_overflow';
+      droppedEvents: number;
+    }
+  | {
+      complete: false;
+      reason: 'branch_drain_timeout';
+      pendingContinuations: number;
+      timeoutMs: number;
+    };
+
 /** Data shape for `workflow_end` events. Emitted once per workflow execution
  *  on completion, failure, or cancellation. Distinguish cancellation via `aborted`. */
 export type WorkflowEndData = {
@@ -654,6 +669,9 @@ export type WorkflowEndData = {
   /** True when the failure was an `AbortError` (user cancellation, budget hard_stop,
    *  or consumer disconnect on streaming workflows). */
   aborted?: boolean;
+  /** Completeness of the terminal trace. Present on new executions; absent
+   *  on historical events written before completeness signaling shipped. */
+  observation?: ObservationStatus;
 };
 
 /** Data shape for `checkpoint_save` / `checkpoint_replay` events.
@@ -984,7 +1002,7 @@ type LegacyAxlEventPayloadV1 =
         data: MemoryEventData;
       })
 
-  // ── Durable execution checkpoints (`ctx.checkpoint`) ────────────────────
+  // ── Scoped execution checkpoints (`ctx.checkpoint`) ─────────────────────
   | (AxlEventBase &
       Partial<AskScoped> & {
         type: 'checkpoint_save' | 'checkpoint_replay';
@@ -1149,6 +1167,9 @@ export type ExecutionInfoV1 = {
   duration: number;
   result?: unknown;
   error?: string;
+  /** Completeness of the persisted event timeline. Absent on historical
+   *  rows written before completeness signaling shipped. */
+  observation?: ObservationStatus;
   /** Caller-supplied metadata threaded verbatim from `ExecuteOptions.metadata`
    *  (or `runtime.stream()`'s `options.metadata`). Persisted as part of the
    *  `ExecutionInfo` snapshot so callers have a stable, queryable surface for

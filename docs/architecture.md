@@ -86,7 +86,7 @@ The `StateStore` interface abstracts persistence. Three built-in implementations
 | `SQLiteStore` | File-based persistence (requires `better-sqlite3`) |
 | `RedisStore` | Multi-process deployments (requires `redis`) |
 
-State stores handle workflow execution state (for `checkpoint`/resume), session history, memory entries, pending human decisions, execution history, eval history, and — when `state.persist: 'streaming'` is configured — per-execution streaming event buffers for crash-recovery via `runtime.recoverIncompleteStreams()`. All three built-in stores implement the optional `deleteExecution` method as a **total per-execution sweep**: one call removes the canonical row, checkpoints, suspended state, pending decisions, and the streaming buffer atomically (`RedisStore` via MULTI/EXEC, `SQLiteStore` via `db.transaction`, `MemoryStore` via ordered Map deletes).
+State stores handle scoped checkpoints, session history, memory entries, pending human-decision requests, execution history, eval history, legacy application-managed execution-state records, and — when `state.persist: 'streaming'` is configured — per-execution streaming event buffers for crash-recovery via `runtime.recoverIncompleteStreams()`. Axl does not automatically resume workflows across processes. All three built-in stores implement the optional `deleteExecution` method as a **total per-execution sweep**: one call removes the canonical row, checkpoints, legacy state, pending decisions, and the streaming buffer atomically (`RedisStore` via MULTI/EXEC, `SQLiteStore` via `db.transaction`, `MemoryStore` via ordered Map deletes).
 
 ```typescript
 // Memory — zero config, no persistence (default)

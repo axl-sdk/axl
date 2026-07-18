@@ -12,7 +12,7 @@ You should read further if you:
 1. Run **`RedisStore` in production** — pick TTLs (`defaultTtl`, `ttls`), choose a `keyPrefix` for shared clusters, and (recommended) opt into `state.persist: 'streaming'` for crash survival.
 2. Maintain a **custom `StateStore`** — `deleteExecution`'s contract widened; new optional streaming methods (`appendStreamingEvents` / `finalizeStreamingEvents` / `listStreamingExecutions` / `getStreamingEvents`).
 3. Want **GDPR right-to-be-forgotten** — `runtime.deleteExecution(id)` and `DELETE /api/executions/:id` are the canonical sweeps; subscribe to `execution_deleted` for the audit trail.
-4. Pass `metadata` to `runtime.execute()` — caller-supplied keys now persist to `ExecutionInfo.metadata` (queryable); `sessionHistory` / `sessionId` / `resumeMode` are stripped from the snapshot.
+4. Pass `metadata` to `runtime.execute()` — caller-supplied keys now persist to `ExecutionInfo.metadata` (queryable); `sessionHistory` / `sessionId` are stripped from the snapshot.
 
 ## What changed
 
@@ -92,7 +92,7 @@ const tenantRuns = execs.filter((e) => e.metadata?.tenantId === 't-7');
 
 **Persistence:** All three built-in stores roundtrip the field. `SQLiteStore` schema v3 auto-adds an `execution_history.metadata` column on first open.
 
-**Internal control-plane keys stripped.** `sessionHistory`, `sessionId`, and `resumeMode` are filtered before lift. The runtime reads these directly from `options.metadata` for control purposes, but they don't bloat the persisted row. Callers using these as control channels see no behavior change; the persisted snapshot stays JSON-clean.
+**Internal control-plane keys stripped.** `sessionHistory` and `sessionId` are filtered before lift. The runtime reads these directly from `options.metadata` for control purposes, but they don't bloat the persisted row. Callers using these as control channels see no behavior change; the persisted snapshot stays JSON-clean.
 
 **Isolation.** The snapshot is `structuredClone`'d so caller mutations to `options.metadata` after `execute()` returns don't surface mid-run through `getExecution(id)`. Non-cloneable values (functions, etc.) fall back to a sanitized shallow copy at the persist boundary — uncloneable keys are silently dropped, workflow execution is unaffected.
 
@@ -125,7 +125,7 @@ const store = await RedisStore.create({
   defaultTtl: 60 * 60 * 24 * 30,         // 30 days for everything
   ttls: {
     checkpoint:       60 * 60 * 24 * 7,  // shorter — checkpoints belong to a run
-    executionState:   60 * 60 * 24,      // suspend/resume state
+    executionState:   60 * 60 * 24,      // legacy app-managed state
     streamingEvents:  60 * 60 * 24 * 7,  // OPT-IN safety net (see below)
     sessionMeta:      null,              // explicit opt-out, even with defaultTtl
   },
@@ -137,7 +137,7 @@ Without TTLs, every save accumulates forever and Redis eventually OOMs. Categori
 **Window semantics:**
 - **Sliding** (`memory`, `session`, `sessionMeta`): every write resets the TTL. Active users keep their data; inactive users forget. Reads do NOT refresh — pair with a no-op write per turn if you need read-as-activity.
 - **Fixed-creation** (`checkpoint`, `streamingEvents`): TTL set on first write via `EXPIRE NX`. Subsequent writes don't extend the window — the hash ages out together with the run it belongs to.
-- **Fixed-refresh** (`executionState`, `executionHistory`, `evalHistory`): TTL via `SET ... EX`, refreshes on overwrite. `executionState` refreshes so a long-suspended workflow doesn't disappear mid-flight.
+- **Fixed-refresh** (`executionState`, `executionHistory`, `evalHistory`): TTL via `SET ... EX`, refreshes on overwrite. `executionState` is retained for application-managed state compatibility; Axl does not automatically resume it.
 
 **`streamingEvents` is opt-in only.** It does NOT fall back to `defaultTtl`. The TTL is the safety net for operators who forget to wire `runtime.recoverIncompleteStreams()` into startup — auto-applying a generous default would silently TTL-evict crashed-run buffers before recovery had a chance to run. **Must be longer than your max process-restart-gap** or recovery misses.
 

@@ -12,6 +12,57 @@ export class AxlError extends Error {
   }
 }
 
+/**
+ * Strict observation overflow. Kept in the shared error module so every
+ * recovery boundary can identify the same non-recoverable control error.
+ * Thrown at the producer when an event queue configured with
+ * `onOverflow: 'throw'` exceeds `maxQueued`.
+ */
+export class EventStreamOverflowError extends Error {
+  readonly maxQueued: number;
+  readonly eventType: string;
+  declare readonly cause?: unknown;
+
+  constructor(maxQueued: number, eventType: string, cause?: unknown) {
+    super(
+      `AxlEventBus queue exceeded maxQueued=${maxQueued} (event type: ${eventType}). ` +
+        `Consumer is too slow or the producer is unbounded. Configure ` +
+        `\`maxQueued\`/\`onOverflow\` on the runtime, or set maxQueued: Infinity to disable.`,
+    );
+    this.name = 'EventStreamOverflowError';
+    this.maxQueued = maxQueued;
+    this.eventType = eventType;
+    if (cause !== undefined) {
+      Object.defineProperty(this, 'cause', {
+        configurable: true,
+        enumerable: false,
+        value: cause,
+      });
+    }
+  }
+}
+
+export function isEventStreamOverflowError(error: unknown): error is EventStreamOverflowError {
+  return error instanceof EventStreamOverflowError;
+}
+
+/** Re-throw strict observation overflow before a recovery boundary can
+ * reinterpret it as an ordinary application failure. */
+export function rethrowEventStreamOverflow(error: unknown): void {
+  if (isEventStreamOverflowError(error)) throw error;
+}
+
+/** Preserve the application failure displaced by a stricter terminal error. */
+export function preserveErrorCause<T extends Error>(error: T, cause: unknown): T {
+  if (cause === undefined || cause === error || 'cause' in error) return error;
+  Object.defineProperty(error, 'cause', {
+    configurable: true,
+    enumerable: false,
+    value: cause,
+  });
+  return error;
+}
+
 /** A known tool failure whose author-provided model message is safe to expose. */
 export class ToolFailure extends AxlError {
   readonly modelMessage: string;

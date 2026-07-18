@@ -129,6 +129,7 @@ export type {
   VerifyData,
   WorkflowStartData,
   WorkflowEndData,
+  ObservationStatus,
   MemoryEventData,
   CheckpointEventData,
   AwaitHumanData,

@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handler retry policy still applies; a terminal `ToolFailure` records a
   structured failed outcome and permits agent-loop continuation without
   exposing an ordinary exception message.
+- **Machine-readable observation completeness.** `AxlEventBus` and
+  `AxlStream` expose `observationStatus` after lossy default queue overflow.
+  `workflow_end.data.observation` and `ExecutionInfo.observation` identify a
+  bounded branch-drain timeout instead of presenting a partial trace as whole.
 
 ### Removed
 
@@ -36,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Dead `ToolDenied` error export.** Unavailable provider requests are
   recoverable rejections, not thrown ACL errors. Historical `tool_denied`
   event data remains readable through the v1 history union.
+- **Misleading workflow-resume entry points.** `runtime.resumeExecution()` and
+  `runtime.resumePending()` are removed. Pending approvals remain visible after
+  process loss, but Axl only resolves the continuation in its owning process.
+  The inert `metadata.resumeMode` control channel is also removed; callers may
+  now use that key as ordinary persisted metadata.
 
 ### Changed
 
@@ -58,6 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Slow `stringStream()` subscribers are bounded.** Undrained deltas coalesce
   per ask/path without character loss; distinct pending fields obey the same
   `maxQueued` / `onOverflow` policy as the main event queue.
+- **Race/quorum terminal drain is bounded.** `branchDrainTimeoutMs` defaults to
+  5 seconds. Cooperative losers still finalize before `workflow_end`; an
+  abort-ignoring continuation no longer hangs the entire workflow forever and
+  instead marks the trace incomplete.
 
 ### Fixed
 
@@ -67,25 +80,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by projection or serialization settle as cancellation rather than output
   failure.
 - **Human decisions are runtime-validated.** Non-boolean discriminants,
-  arrays/accessors, invalid field types, and contradictory approval/denial data
-  fail before resolver or state-store mutation.
-- **Unsafe cross-process approval replay fails closed.** A persisted waiting
-  request without an in-process resolver now raises
-  `CROSS_PROCESS_RESUME_UNSUPPORTED` before deleting the decision or
-  re-executing side effects, including when its execution-state row is missing
-  or stale. `resumePending()` audits every row through a listener-safe
-  `resume_failed` event. Pending state remains available to an
-  application-managed durable approval protocol.
-- **Race/quorum losers finalize before the workflow snapshot.** Runtime
+  arrays/accessors, symbol or unknown keys, invalid field types, and
+  contradictory approval/denial data fail before resolver or state-store
+  mutation.
+- **In-process approval release is failure-atomic.** The runtime removes the
+  persisted pending request before releasing its resolver, so a state-store
+  failure keeps the gate closed and retryable. Unknown, orphaned, and
+  concurrently resolved requests have distinct error codes and Studio HTTP
+  statuses (404/409).
+- **Race/quorum losers finalize before the workflow snapshot when bounded.** Runtime
   completion drains `race`, `spawn({ quorum })`, and `map({ quorum })` branch
   continuations so losing cancellation terminals and late measurable provider
-  cost precede `workflow_end` and persistence. Late map losers cannot mutate a
-  resolved quorum result, and strict event overflow from any loser still fails
-  the workflow.
+  cost precede `workflow_end` and persistence within the configured terminal
+  bound. Late map losers cannot mutate a resolved quorum result, and strict
+  event overflow from any loser still fails the workflow.
 - **Strict event overflow bypasses recovery boundaries.** The typed integrity
   error now propagates through tool phases/retries, ask/verify/race validators,
   budgets, and concurrent result aggregation instead of being reclassified as
-  an ordinary application failure.
+  an ordinary application failure. If overflow replaces an in-flight
+  application failure at a terminal boundary, the original error is retained
+  as `.cause`.
 
 ## [0.19.1] - 2026-07-17
 

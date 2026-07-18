@@ -561,7 +561,7 @@ app.delete('/users/:id/data', async (req, res) => {
 
 If the execution is still in flight, the workflow is **aborted** and marked to skip persist on `workflow_end` — no resurrection. A workflow paused at `ctx.awaitHuman()` correctly wakes (rejects with `AbortError`); previously it would hang forever.
 
-**Internal metadata keys are stripped before persistence.** `sessionHistory`, `sessionId`, and `resumeMode` in `options.metadata` are consumed by the runtime as control-plane channels but filtered out of the persisted `ExecutionInfo.metadata`. So the queryable surface stays a clean tag bag.
+**Internal metadata keys are stripped before persistence.** `sessionHistory` and `sessionId` in `options.metadata` are consumed by the runtime as control-plane channels but filtered out of the persisted `ExecutionInfo.metadata`. So the queryable surface stays a clean tag bag.
 
 **Studio integration:** `DELETE /api/executions/:id` wraps `runtime.deleteExecution` and additionally scrubs the WebSocket replay buffer — late subscribers can't reconstruct a deleted run's events. Blocked in `readOnly` mode.
 

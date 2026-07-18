@@ -13,7 +13,7 @@ import { ProviderRegistry } from './providers/registry.js';
 import type { StateStore, PendingDecision, EvalHistoryEntry } from './state/types.js';
 import { MemoryStore } from './state/memory.js';
 import { SQLiteStore } from './state/sqlite.js';
-import { parseHumanDecision, WorkflowContext } from './context.js';
+import { parseHumanDecision, resolveBranchDrainTimeoutMs, WorkflowContext } from './context.js';
 import { Session, type SessionOptions } from './session.js';
 import { AxlStream } from './stream.js';
 import type { EventStreamOptions } from './event-stream.js';
@@ -31,7 +31,7 @@ import type {
   ChatMessage,
   HandoffRecord,
 } from './types.js';
-import { AxlError } from './errors.js';
+import { AxlError, preserveErrorCause } from './errors.js';
 import {
   getEventSchemaVersion,
   normalizeStoredExecution as normalizeHistoricalExecution,
@@ -114,11 +114,7 @@ const STREAMING_EXCLUDED_TYPES: ReadonlySet<string> = new Set([
  * `ctx.metadata` and dynamic selector callbacks — only the persisted snapshot
  * is filtered.
  */
-const INTERNAL_METADATA_KEYS: ReadonlySet<string> = new Set([
-  'sessionId',
-  'sessionHistory',
-  'resumeMode',
-]);
+const INTERNAL_METADATA_KEYS: ReadonlySet<string> = new Set(['sessionId', 'sessionHistory']);
 
 /**
  * Filter internal control-plane keys out of `ExecuteOptions.metadata` and
@@ -441,6 +437,9 @@ export type ExecuteOptions = {
    *  defaults are `maxQueued: 10_000` and `onOverflow:
    *  'drop-oldest-non-terminal'`. */
   events?: EventStreamOptions;
+  /** Maximum terminal wait for abort-ignoring race/quorum branches. Once
+   *  exceeded, finalization proceeds with observation.complete=false. */
+  branchDrainTimeoutMs?: number;
 };
 
 /**
@@ -723,9 +722,7 @@ export class AxlRuntime extends EventEmitter {
    * → parse output → emit `workflow_end` → delete checkpoints → persist.
    *
    * Shared between `execute()` and `stream()`. Centralizes the
-   * "start iff end" pairing invariant so a future emit path
-   * (e.g., `resumeExecution`) can inherit correct behavior by routing
-   * through this helper. Also factors out the AbortError detection.
+   * "start iff end" pairing invariant and AbortError detection.
    *
    * Side effects on `execInfo`: sets `status` / `completedAt` /
    * `duration` / `result` (or `error`) before emitting `workflow_end`.
@@ -756,23 +753,26 @@ export class AxlRuntime extends EventEmitter {
     cleanupAbortForwarder?: () => void;
   }): Promise<unknown> {
     const { workflow, ctx, execInfo, validated, span, cleanupAbortForwarder } = args;
+    let observation = execInfo.observation ?? { complete: true as const };
     try {
       // Spec/16 §3.6a: workflow_start is a first-class trace event
       // emitted inside the span context so OTel exporters that correlate
       // events to spans via active-context see it.
       ctx._emitWorkflowStart(validated);
       const raw = await workflow.handler(ctx);
-      await ctx._drainBranchWork();
+      observation = await ctx._drainBranchWork();
       const result = workflow.outputSchema ? workflow.outputSchema.parse(raw) : raw;
 
       execInfo.status = 'completed';
       execInfo.completedAt = Date.now();
       execInfo.duration = execInfo.completedAt - execInfo.startedAt;
       execInfo.result = result;
+      execInfo.observation = observation;
       ctx._emitWorkflowEnd({
         status: 'completed',
         duration: execInfo.duration,
         result,
+        observation,
       });
 
       // Clean up checkpoints for completed execution
@@ -791,11 +791,12 @@ export class AxlRuntime extends EventEmitter {
       // Their terminal events and measurable cost belong before the workflow
       // terminal/persisted snapshot just as they do on the success path.
       try {
-        await ctx._drainBranchWork();
+        observation = await ctx._drainBranchWork();
       } catch (drainErr) {
         // Strict event overflow is an observability-integrity failure and must
         // replace an ordinary branch/handler error without skipping workflow_end.
-        terminalError = drainErr;
+        terminalError =
+          drainErr instanceof Error ? preserveErrorCause(drainErr, terminalError) : drainErr;
       }
       const aborted = isAbortError(terminalError);
       execInfo.status = 'failed';
@@ -803,11 +804,13 @@ export class AxlRuntime extends EventEmitter {
       execInfo.duration = execInfo.completedAt - execInfo.startedAt;
       execInfo.error =
         terminalError instanceof Error ? terminalError.message : String(terminalError);
+      execInfo.observation = observation;
       ctx._emitWorkflowEnd({
         status: 'failed' as const,
         duration: execInfo.duration,
         error: execInfo.error,
         ...(aborted ? { aborted: true } : {}),
+        observation,
       });
       this.persistExecution(execInfo);
       throw terminalError;
@@ -1250,6 +1253,7 @@ export class AxlRuntime extends EventEmitter {
 
     // Validate input
     const validated = workflow.inputSchema.parse(input);
+    const branchDrainTimeoutMs = resolveBranchDrainTimeoutMs(options?.branchDrainTimeoutMs);
     const executionId = randomUUID();
     const controller = new AbortController();
     this.abortControllers.set(executionId, controller);
@@ -1273,7 +1277,7 @@ export class AxlRuntime extends EventEmitter {
     }
 
     // Create execution info. Persisted `metadata` strips internal control-
-    // plane keys (sessionHistory, sessionId, resumeMode) and is structurally
+    // plane keys (sessionHistory, sessionId) and is structurally
     // cloned to isolate from caller mutation.
     const execInfo: ExecutionInfo = {
       executionId,
@@ -1285,6 +1289,7 @@ export class AxlRuntime extends EventEmitter {
       unpriced: false,
       startedAt: Date.now(),
       duration: 0,
+      observation: { complete: true },
       metadata: liftPersistedMetadata(options?.metadata),
     };
     this.executions.set(executionId, execInfo);
@@ -1304,6 +1309,7 @@ export class AxlRuntime extends EventEmitter {
       sessionHistory,
       signal: controller.signal,
       eventStreamOptions: options?.events,
+      branchDrainTimeoutMs,
       onTrace: (event: AxlEvent) => {
         // High-volume stream-only events (`token`, `partial_object`)
         // are never persisted, plus a bounded cap on the rest to avoid
@@ -1374,7 +1380,6 @@ export class AxlRuntime extends EventEmitter {
       workflowName: name,
       mcpManager: this.mcpManager,
       memoryManager: this.memoryManager,
-      resumeMode: !!options?.metadata?.resumeMode,
       spanManager: this.spanManager,
       budgetContext: {
         totalCost: 0,
@@ -1408,6 +1413,7 @@ export class AxlRuntime extends EventEmitter {
 
   /** Execute a workflow and return a stream. */
   stream(name: string, input: unknown, options?: ExecuteOptions): AxlStream {
+    const branchDrainTimeoutMs = resolveBranchDrainTimeoutMs(options?.branchDrainTimeoutMs);
     // Forward `events` config to BOTH the AxlStream's internal bus (queue
     // cap on the wire) and the WorkflowContext's `ctx.events` bus (queue
     // cap inside the workflow). They're independent buses but share the
@@ -1467,6 +1473,7 @@ export class AxlRuntime extends EventEmitter {
         unpriced: false,
         startedAt: Date.now(),
         duration: 0,
+        observation: { complete: true },
         metadata: liftPersistedMetadata(options?.metadata),
       };
       this.executions.set(executionId, execInfo);
@@ -1480,6 +1487,7 @@ export class AxlRuntime extends EventEmitter {
         sessionHistory,
         signal: controller.signal,
         eventStreamOptions: options?.events,
+        branchDrainTimeoutMs,
         // Transport mode is explicit internal state. It is inherited by child
         // contexts and does not allocate an unconsumed ctx.events queue.
         _forceStreaming: true,
@@ -1539,7 +1547,6 @@ export class AxlRuntime extends EventEmitter {
         workflowName: name,
         mcpManager: this.mcpManager,
         memoryManager: this.memoryManager,
-        resumeMode: !!options?.metadata?.resumeMode,
         spanManager: this.spanManager,
         budgetContext: {
           totalCost: 0,
@@ -2091,59 +2098,32 @@ export class AxlRuntime extends EventEmitter {
     decision = parseHumanDecision(decision);
     const resolver = this.pendingDecisionResolvers.get(executionId);
     if (!resolver) {
+      const pending = await this.stateStore.getPendingDecisions();
+      if (!pending.some((request) => request.executionId === executionId)) {
+        throw new AxlError(
+          'PENDING_DECISION_NOT_FOUND',
+          `No pending human decision exists for execution "${executionId}".`,
+        );
+      }
       throw new AxlError(
         'CROSS_PROCESS_RESUME_UNSUPPORTED',
         `Execution "${executionId}" is not awaiting a decision in this runtime. ` +
           'Cross-process approval replay requires a durable decision/lease lineage and is not yet supported; any persisted pending request was preserved.',
       );
     }
-    // In-memory resolver exists — workflow is still running in this process.
-    resolver(decision);
-    this.pendingDecisionResolvers.delete(executionId);
+    // Keep the gate closed until durable request cleanup succeeds. If the
+    // store rejects, the resolver and request remain retryable and no
+    // post-approval workflow side effect can start.
     await this.stateStore.resolveDecision(executionId, decision);
-  }
-
-  /**
-   * Legacy resume entry point. Cross-process replay cannot be made safe with
-   * the current StateStore contract (no durable resolved decision, claim lease,
-   * or checkpoint lineage), so fail closed instead of duplicating side effects.
-   */
-  async resumeExecution(executionId: string): Promise<unknown> {
-    const state = await this.stateStore.getExecutionState(executionId);
-    if (!state) {
-      throw new Error(`No execution state found for "${executionId}"`);
+    const current = this.pendingDecisionResolvers.get(executionId);
+    if (current !== resolver) {
+      throw new AxlError(
+        'PENDING_DECISION_NOT_FOUND',
+        `The pending human decision for execution "${executionId}" is no longer active.`,
+      );
     }
-
-    throw new AxlError(
-      'CROSS_PROCESS_RESUME_UNSUPPORTED',
-      `Execution "${executionId}" cannot be resumed safely across processes with the current state-store contract; its pending state was preserved.`,
-    );
-  }
-
-  /**
-   * Audit pending execution-state rows through the fail-closed legacy resume
-   * entry point. No workflow is re-executed; each rejection emits
-   * `resume_failed`, and the returned list remains empty until a safe durable
-   * resume protocol exists.
-   */
-  async resumePending(): Promise<string[]> {
-    const pendingIds = await this.stateStore.listPendingExecutions();
-    const resumed: string[] = [];
-
-    for (const executionId of pendingIds) {
-      try {
-        await this.resumeExecution(executionId);
-        resumed.push(executionId);
-      } catch (err) {
-        this.emit('resume_failed', {
-          type: 'resume_failed',
-          executionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-
-    return resumed;
+    this.pendingDecisionResolvers.delete(executionId);
+    resolver(decision);
   }
 
   /**

@@ -6,7 +6,12 @@ import {
   type StringStreamEvent,
   type StringStreamFilter,
 } from './event-stream.js';
-import { type AxlEvent, type AxlEventOf, type AxlEventType } from './types.js';
+import {
+  type AxlEvent,
+  type AxlEventOf,
+  type AxlEventType,
+  type ObservationStatus,
+} from './types.js';
 import { isRootLevel } from './event-utils.js';
 
 /**
@@ -128,6 +133,12 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
 
   get lifecycle(): AsyncIterable<AxlEvent> {
     return this.events.lifecycle;
+  }
+
+  /** Completeness of this stream's iterator queue. Check after consumption
+   *  before treating an unmatched lifecycle event as a producer defect. */
+  get observationStatus(): ObservationStatus {
+    return this.events.observationStatus;
   }
 
   /** Coalescing iterator over `partial_object` events — yields the latest

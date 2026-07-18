@@ -56,6 +56,18 @@ function assertProjectionProbe(events: AxlEvent[]): void {
   expect(JSON.stringify(end?.data.outcome)).not.toContain('wireAnswer');
 }
 
+async function assertPersistedProjectionProbe(
+  runtime: AxlRuntime,
+  events: AxlEvent[],
+): Promise<void> {
+  assertProjectionProbe(events);
+  const executionId = events[0]?.executionId;
+  expect(executionId).toBeTruthy();
+  const execution = await runtime.getExecution(executionId!);
+  expect(execution?.observation).toEqual({ complete: true });
+  assertProjectionProbe((execution?.events ?? []) as AxlEvent[]);
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI Integration Tests
 // ---------------------------------------------------------------------------
@@ -103,7 +115,7 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('OpenAI Integration', () => {
 
     expect(typeof result).toBe('string');
     expect(String(result)).toContain(marker);
-    assertProjectionProbe(events);
+    await assertPersistedProjectionProbe(runtime, events);
   }, 30_000);
 
   it('streaming', async () => {
@@ -239,7 +251,7 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('OpenAI Responses API Integration',
 
     expect(typeof result).toBe('string');
     expect(String(result)).toContain(marker);
-    assertProjectionProbe(events);
+    await assertPersistedProjectionProbe(runtime, events);
   }, 30_000);
 
   it('streaming projected tool output', async () => {
@@ -266,7 +278,9 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('OpenAI Responses API Integration',
     });
 
     const tokens: string[] = [];
+    const events: AxlEvent[] = [];
     for await (const event of stream) {
+      events.push(event);
       if (event.type === 'token') {
         tokens.push(event.data);
       }
@@ -279,6 +293,8 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('OpenAI Responses API Integration',
     expect(result as string).toContain('AXL_RECORD_PROJECTION_9F4D2');
 
     expect(stream.fullText).toBe(tokens.join(''));
+    expect(stream.observationStatus).toEqual({ complete: true });
+    await assertPersistedProjectionProbe(runtime, events);
   }, 30_000);
 
   it('structured output with Zod schema', async () => {
@@ -372,7 +388,7 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('Anthropic Integration', () => {
 
     expect(typeof result).toBe('string');
     expect(String(result)).toContain(marker);
-    assertProjectionProbe(events);
+    await assertPersistedProjectionProbe(runtime, events);
   }, 30_000);
 
   it('streaming', async () => {
@@ -469,7 +485,7 @@ describe.skipIf(!process.env.GOOGLE_API_KEY)('Google Gemini Integration', () => 
 
     expect(typeof result).toBe('string');
     expect(String(result)).toContain(marker);
-    assertProjectionProbe(events);
+    await assertPersistedProjectionProbe(runtime, events);
   }, 30_000);
 
   it('multi-turn tool loop', async () => {
@@ -563,7 +579,9 @@ describe.skipIf(!process.env.GOOGLE_API_KEY)('Google Gemini Integration', () => 
     });
 
     const tokens: string[] = [];
+    const events: AxlEvent[] = [];
     for await (const event of stream) {
+      events.push(event);
       if (event.type === 'token') {
         tokens.push(event.data);
       }
@@ -576,6 +594,8 @@ describe.skipIf(!process.env.GOOGLE_API_KEY)('Google Gemini Integration', () => 
     expect(result as string).toContain('AXL_RECORD_PROJECTION_9F4D2');
 
     expect(stream.fullText).toBe(tokens.join(''));
+    expect(stream.observationStatus).toEqual({ complete: true });
+    await assertPersistedProjectionProbe(runtime, events);
   }, 30_000);
 
   it('structured output with Zod schema', async () => {

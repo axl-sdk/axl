@@ -1,6 +1,6 @@
 import { ZodError, type z } from 'zod';
 import type { WorkflowContext } from './context.js';
-import { EventStreamOverflowError } from './event-stream.js';
+import { rethrowEventStreamOverflow } from './errors.js';
 import type { ToolArgumentIssue } from './types.js';
 
 /** Retry policy for tool handlers */
@@ -250,7 +250,7 @@ export function tool<TInput extends z.ZodType, TOutput = unknown>(
       } catch (err) {
         if (options?.signal?.aborted) options.signal.throwIfAborted();
         if (isAbortError(err)) throw err;
-        if (err instanceof EventStreamOverflowError) throw err;
+        rethrowEventStreamOverflow(err);
         lastError = err instanceof Error ? err : new Error(String(err));
 
         if (attempt === maxAttempts) break;

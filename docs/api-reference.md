@@ -665,6 +665,7 @@ const wf = workflow({
 | `.textByAsk` | `AsyncIterable<{ askId, agent?, text }>` | Per-ask token chunks for split-pane UIs |
 | `.partialObjects` | `AsyncIterable<CoalescedPartialObject>` (`{ askId, agent?, object, attempt }`) | **Coalescing view** — yields the latest `partial_object` payload per `askId`. `attempt` is the 1-indexed attempt number; on schema/validate/guardrail retry, the runtime emits `pipeline(failed)` and the view drops any undrained pending value for the affected ask, so attempt-N snapshots cannot leak across the retry boundary. Listener-based: does NOT race with the main iterator; running both concurrently each receive every event. Memory bounded by `O(active asks)`, not `O(events emitted)` |
 | `.stringStream(opts?)` | `AsyncIterable<StringStreamEvent>` (`{ askId, agent?, path, delta, accumulated, attempt }`) | **Streaming view** over `string_delta` events with optional `{ path?, askId? }` filters. `delta` contains all new chars for that ask/path since this subscriber's previous yield (slow subscribers may receive several provider chunks coalesced); `accumulated` is canonical text-so-far. Late subscribers seed through the same bounded queue. Listener-based: does NOT race with the main iterator. Each subscriber is bounded by `EventStreamOptions`: pending updates coalesce per ask/path, and distinct fields use the configured overflow policy. Per-ask state clears on `pipeline(failed)` and `ask_end` |
+| `.observationStatus` | `ObservationStatus` | Machine-readable completeness of this iterator queue. `{ complete: false, reason: 'queue_overflow', droppedEvents }` after default-policy drops; `{ complete: true }` otherwise. Listener delivery is independent |
 | `.on(type, handler)` / `.off(type, handler)` | `(this)` | Subscribe/unsubscribe per AxlEvent type. Names outside `AxlEventType` are silently ignored on `AxlEventBus` (the bus emits no other names). On `AxlStream`, non-AxlEvent names like `'close'`, `'data'`, `'end'`, `'error'`, `'pause'`, `'resume'`, `'readable'` fall through to the underlying Node `Readable` — those work as standard Node stream events |
 | `.isFinished` | `boolean` | Whether the bus has been finalized (auto-set on `workflow_end` / `error`) |
 
@@ -773,9 +774,10 @@ const results = await ctx.map(reviews, async (review) => {
 ### `ctx.awaitHuman(options)`
 
 Suspend the workflow and wait for a human decision. The pending request is
-persisted to the state store and survives process restarts. Automatic resolution
-is reliable while the original process is alive; cross-process exactly-once
-decision replay is not yet provided (see Security > Approval Gates).
+persisted for operator visibility, but the continuation is owned by the current
+runtime process. A request left after process loss cannot be resolved through
+Axl; use an application-owned durable command/idempotency protocol for that
+case (see Security > Approval Gates).
 
 ```typescript
 const decision = await ctx.awaitHuman({
@@ -803,8 +805,9 @@ if (decision.approved) {
 
 Untyped input is validated at this boundary. `approved` must be an own boolean
 data property on a plain object; approval may carry only optional string `data`,
-and denial may carry only optional string `reason`. Arrays, accessors, truthy
-non-booleans, and contradictory branch fields fail with `AxlError` code
+and denial may carry only optional string `reason`. Arrays, accessors, symbol or
+unknown keys (including non-enumerable keys), truthy non-booleans, and
+contradictory branch fields fail with `AxlError` code
 `INVALID_HUMAN_DECISION` before the pending request is mutated.
 
 **Resolution:** The host app resolves decisions via `runtime.getPendingDecisions()` and `runtime.resolveDecision(executionId, decision)`. See [Security > Approval Gates](./security.md#approval-gates).
@@ -816,10 +819,9 @@ non-booleans, and contradictory branch fields fail with `AxlError` code
 ### `ctx.checkpoint(name, fn)`
 
 Persist a named result under the current execution ID and replay it when that
-same execution scope evaluates the checkpoint again. The legacy process-restart
-resume helper currently fails closed because the state-store contract has no
-complete cross-process decision, lease, or checkpoint-lineage protocol; do not
-rely on it for exactly-once side effects.
+same explicit execution scope evaluates the checkpoint again. Axl does not
+automatically restart or resume workflows across processes; do not use a
+checkpoint alone as an exactly-once side-effect boundary.
 
 ```typescript
 const value = await ctx.checkpoint('refund-customer', async () => expensiveOperation());
@@ -1292,6 +1294,7 @@ for await (const event of stream) {
 | `stream.partialObjects` | `AsyncIterable<CoalescedPartialObject>` (`{ askId, agent?, object, attempt }`) | **Coalescing view** — yields the latest `partial_object` payload per `askId`. `attempt` is the 1-indexed attempt number; the view drops pending snapshots on `pipeline(failed)` so attempt-N values never leak after a schema/validate/guardrail retry begins. Listener-based: does NOT race with the main iterator. Memory bounded by `O(active asks)`, not `O(events)`. The right shape for streaming-structured-output UIs |
 | `stream.stringStream(opts?)` | `AsyncIterable<StringStreamEvent>` (`{ askId, agent?, path, delta, accumulated, attempt }`) | **Streaming view** over `string_delta` events with optional `{ path?, askId? }` filters. `delta` is every new char since that subscriber's previous yield (several source chunks may coalesce); `accumulated` is canonical text-so-far. Late subscribers seed through the configured bounded queue. Listener-based: does NOT race with the main iterator. Per-ask state clears on `pipeline(failed)` and `ask_end` |
 | `stream.fullText` | `string` | Accumulated text from root-only tokens, committed on `pipeline(committed)`. Retried-attempt tokens are discarded on `pipeline(failed)` or `ask_end({ok:false})` so only the winning attempt's text appears |
+| `stream.observationStatus` | `ObservationStatus` | Machine-readable iterator-queue completeness; reports `queue_overflow` and the number of dropped events under the default overflow policy |
 | `stream.promise` | `Promise<unknown>` | Resolves with the workflow result; rejects with the thrown error. Errors are ALSO delivered via the iterator and `.on('error', ...)` (as a synthesized `AxlEvent{type:'error'}`). The promise has an internal no-op `.catch(() => {})` so consumers who only read the iterator never see unhandled-rejection warnings |
 | `stream.on('done', ...)` / `.on('error', ...)` | `EventEmitter` | Terminal events. `done.data = { result }`, `error.data = { message, name?, code? }` |
 
@@ -1329,19 +1332,18 @@ const runtime = new AxlRuntime({
 | `stream(name, input, options?)` | `AxlStream` | Execute a workflow and return a stream of events. Same lifecycle tracking as `execute()` |
 | `session(id, options?)` | `Session` | Create or resume a multi-turn session (see [Sessions](#sessions)) |
 | `abort(executionId)` | `void` | Abort a running execution by ID |
-| `resumeExecution(executionId)` | `Promise<unknown>` | Reserved legacy entry point. Currently fails closed with `CROSS_PROCESS_RESUME_UNSUPPORTED` because the state-store contract cannot replay a decision exactly once |
-| `resumePending()` | `Promise<string[]>` | Audits pending execution-state rows through the fail-closed resume entry point and emits `resume_failed`; it does not re-execute them |
 | `getPendingDecisions()` | `Promise<PendingDecision[]>` | List all pending human decisions |
-| `resolveDecision(executionId, decision)` | `Promise<void>` | Resolve a pending human decision in the owning runtime. A persisted request with no in-process resolver fails with `CROSS_PROCESS_RESUME_UNSUPPORTED` before mutation; see Security > Approval Gates |
+| `resolveDecision(executionId, decision)` | `Promise<void>` | Resolve a pending human decision in the owning runtime. Store cleanup completes before the workflow is released. Unknown IDs fail with `PENDING_DECISION_NOT_FOUND`; persisted requests with no in-process owner fail with `CROSS_PROCESS_RESUME_UNSUPPORTED` before mutation |
 
 `ExecuteOptions` (accepted by both `execute()` and `stream()`; exported from `@axlsdk/axl`):
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `metadata` | `Record<string, unknown>` | `{}` | Metadata passed to the workflow context. Reserved keys: `sessionId`, `sessionHistory`, `resumeMode` |
+| `metadata` | `Record<string, unknown>` | `{}` | Metadata passed to the workflow context. Reserved keys: `sessionId`, `sessionHistory` |
 | `awaitHumanHandler` | `(options) => Promise<HumanDecision>` | — | In-process approval handler for tool calls with `requireApproval`. Parity with `CreateContextOptions.awaitHumanHandler` — lets tests and embedded use cases resolve approvals inline instead of suspending execution and polling `getPendingDecisions()` |
 | `signal` | `AbortSignal` | — | External abort signal. Cancels the workflow exactly as `runtime.abort(executionId)` would. Lets callers use the standard JS pattern without having to track the execution id |
 | `events` | `EventStreamOptions` | `{ maxQueued: 10_000, onOverflow: 'drop-oldest-non-terminal' }` | Configures the iterator-queue cap and overflow policy on `ctx.events` (and on the `AxlStream` returned by `runtime.stream()`). See [`EventStreamOptions`](#eventstreamoptions) |
+| `branchDrainTimeoutMs` | `number` | `5_000` | Maximum terminal wait for abort-ignoring `race` / quorum branch continuations. On expiry, finalization proceeds and `workflow_end.data.observation` plus `ExecutionInfo.observation` report `branch_drain_timeout` |
 
 > **No observation callbacks here or on `runtime.createContext()`.**
 > `runtime.execute()` is final-result-only by design. To observe tokens, tool
@@ -1377,7 +1379,8 @@ Completed and failed executions are automatically persisted to the state store (
 | `duration` | `number` | Duration in ms |
 | `result` | `unknown \| undefined` | Workflow return value (when `status === 'completed'`) |
 | `error` | `string \| undefined` | Error message (when `status === 'failed'`) |
-| `metadata` | `Record<string, unknown> \| undefined` | Caller-supplied metadata lifted from `ExecuteOptions.metadata` (or `runtime.stream()`'s `options.metadata`). Stable, queryable surface for tags like `userId`, `tenantId`, or correlation ids — filter via `runtime.getExecutions()` + an in-process `.filter()`. Persisted by all three built-in stores (`MemoryStore`/`SQLiteStore`/`RedisStore`); `SQLiteStore` adds a `metadata` column in schema v3 (auto-migrated on first open). The internal control-plane keys `sessionHistory`, `sessionId`, and `resumeMode` are stripped before persistence — they remain readable on `ctx.metadata` for dynamic selectors but don't bloat the queryable surface. The snapshot is `structuredClone`'d so caller mutations to the original `options.metadata` after `execute()`/`stream()` returns don't surface mid-run. Scrubbed to `{ redacted: true }` by Studio's REST endpoints when `config.trace.redact: true`. Secondary indexes are intentionally not provided — `StateStore` is a persistence boundary, not a query engine |
+| `observation` | `ObservationStatus \| undefined` | Machine-readable trace completeness. New executions write `{ complete: true }` or `branch_drain_timeout` details; `undefined` means the historical row predates this field |
+| `metadata` | `Record<string, unknown> \| undefined` | Caller-supplied metadata lifted from `ExecuteOptions.metadata` (or `runtime.stream()`'s `options.metadata`). Stable, queryable surface for tags like `userId`, `tenantId`, or correlation ids — filter via `runtime.getExecutions()` + an in-process `.filter()`. Persisted by all three built-in stores (`MemoryStore`/`SQLiteStore`/`RedisStore`); `SQLiteStore` adds a `metadata` column in schema v3 (auto-migrated on first open). The internal session control-plane keys `sessionHistory` and `sessionId` are stripped before persistence — they remain readable on `ctx.metadata` for dynamic selectors but don't bloat the queryable surface. The snapshot is `structuredClone`'d so caller mutations to the original `options.metadata` after `execute()`/`stream()` returns don't surface mid-run. Scrubbed to `{ redacted: true }` by Studio's REST endpoints when `config.trace.redact: true`. Secondary indexes are intentionally not provided — `StateStore` is a persistence boundary, not a query engine |
 
 History readers return `HistoricalExecutionInfo = LegacyExecutionInfoV1 |
 ExecutionInfoV2`. Missing `eventSchemaVersion` is the v1 sentinel. New writers
@@ -1553,7 +1556,7 @@ ollama/vllm/lmstudio/llamacpp/sglang) are profiles; build your own by cloning on
 
 Every `StateStore` implementation must provide these methods.
 
-**Checkpoints** (for `ctx.checkpoint()` / suspend-resume):
+**Checkpoints** (named result storage within an execution scope):
 
 | Method | Description |
 |--------|-------------|
@@ -1578,11 +1581,11 @@ Every `StateStore` implementation must provide these methods.
 | `getPendingDecisions()` | List all pending decisions |
 | `resolveDecision(executionId, result)` | Resolve a pending decision |
 
-**Execution state** (for suspend/resume):
+**Legacy execution-state storage** (retained for custom-store compatibility; the runtime does not automatically resume it):
 
 | Method | Description |
 |--------|-------------|
-| `saveExecutionState(executionId, state)` | Save execution state for resume |
+| `saveExecutionState(executionId, state)` | Save an application-managed execution-state record |
 | `getExecutionState(executionId)` | Get execution state |
 | `listPendingExecutions()` | List execution IDs with status `'waiting'` |
 
@@ -1723,7 +1726,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `done` | — | `data: { result: unknown }` | Terminal — workflow completed |
 | `error` | `Partial<AskScoped>` | `data: { message: string, name?, code? }` | Terminal — non-ask-internal error (top-level workflow throws, infra/abort errors) |
 
-Per-variant data shape exports from `@axlsdk/axl`: `AgentCallStartData`, `AgentCallEndData`, `AgentCallParams`, `ToolCallStartDataV2`, `ToolCallRejectedData`, `ToolArgumentIssue`, `ToolCallEndData`, `ToolCallOutcome`, `ToolCallFailure`, `ToolCallCancellation`, `ToolEventError`, `ToolApprovalData`, `HandoffStartData`, `HandoffReturnData`, `DelegateData`, `VerifyData`, `WorkflowStartData`, `WorkflowEndData`, `MemoryEventData`, `CheckpointEventData`, `AwaitHumanData`, `AwaitHumanResolvedData`, `GuardrailData`, `SchemaCheckData`, `ValidateData`, `StringDeltaData`. Versioned exports include `AxlEventV2`, `HistoricalAxlEvent`, `ExecutionInfoV2`, `LegacyExecutionInfoV1`, and `HistoricalExecutionInfo`. View-helper event types: `CoalescedPartialObject`, `StringStreamEvent`, `StringStreamFilter`. The constant tuple `AXL_EVENT_TYPES` is the single source of truth for the live discriminator.
+Per-variant data shape exports from `@axlsdk/axl`: `AgentCallStartData`, `AgentCallEndData`, `AgentCallParams`, `ToolCallStartDataV2`, `ToolCallRejectedData`, `ToolArgumentIssue`, `ToolCallEndData`, `ToolCallOutcome`, `ToolCallFailure`, `ToolCallCancellation`, `ToolEventError`, `ToolApprovalData`, `HandoffStartData`, `HandoffReturnData`, `DelegateData`, `VerifyData`, `WorkflowStartData`, `WorkflowEndData`, `ObservationStatus`, `MemoryEventData`, `CheckpointEventData`, `AwaitHumanData`, `AwaitHumanResolvedData`, `GuardrailData`, `SchemaCheckData`, `ValidateData`, `StringDeltaData`. Versioned exports include `AxlEventV2`, `HistoricalAxlEvent`, `ExecutionInfoV2`, `LegacyExecutionInfoV1`, and `HistoricalExecutionInfo`. View-helper event types: `CoalescedPartialObject`, `StringStreamEvent`, `StringStreamFilter`. The constant tuple `AXL_EVENT_TYPES` is the single source of truth for the live discriminator.
 
 **Cost double-counting guard:** `ask_end.cost` is the per-ask rollup of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). Use the exported helper `eventCostContribution(event)` — returns `0` on `ask_end` and on non-finite values, `event.cost` otherwise. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, Studio's cost aggregator, and `AxlTestRuntime.totalCost()` all use this helper internally:
 
@@ -1916,7 +1919,8 @@ All errors extend `AxlError`.
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
 | `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`. Message is the provider's text verbatim (no prefix). |
 | `AxlError` / `INVALID_HUMAN_DECISION` | approval handlers, `runtime.resolveDecision()` | Untyped decision is not the exact plain-object approval/denial union; rejected before resolver/store mutation |
-| `AxlError` / `CROSS_PROCESS_RESUME_UNSUPPORTED` | `runtime.resolveDecision()`, `runtime.resumeExecution()` | Execution has no in-process decision resolver. Fails before deleting any pending request or re-executing side effects, even when execution-state persistence is missing or stale |
+| `AxlError` / `PENDING_DECISION_NOT_FOUND` | `runtime.resolveDecision()` | No active or persisted pending request exists, or another concurrent resolution already won |
+| `AxlError` / `CROSS_PROCESS_RESUME_UNSUPPORTED` | `runtime.resolveDecision()` | A persisted request exists but its in-process continuation owner is gone. Fails before deleting the request or starting side effects |
 
 ### `ProviderError` fields
 

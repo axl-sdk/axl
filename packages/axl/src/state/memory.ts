@@ -12,12 +12,13 @@ import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../eve
 
 /**
  * Path to the MemoryStore temp file for awaitHuman state.
- * Ensures awaitHuman state survives process restarts even
- * when using MemoryStore (spec requirement).
+ * Keeps orphaned pending requests visible after process loss even when using
+ * MemoryStore. It does not preserve the in-process workflow continuation.
  *
  * NOTE: tmpdir() persistence is best-effort. Temp directories may be cleaned
  * by the OS at any time (e.g., on reboot or via periodic cleanup policies).
- * For durable awaitHuman persistence, use SQLite or Redis state stores.
+ * For durable request visibility, use SQLite or Redis state stores. Durable
+ * approval execution remains application-managed.
  */
 const AWAIT_HUMAN_TEMP_DIR = join(tmpdir(), 'axl-memory-store');
 const AWAIT_HUMAN_TEMP_FILE = join(AWAIT_HUMAN_TEMP_DIR, 'await-human-state.json');

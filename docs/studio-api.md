@@ -41,7 +41,7 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `POST /api/evals/compare` | Compare two eval results by history ID. Body: `{ baselineId, candidateId, options? }` where each ID is `string` (single run) or `string[]` (pooled multi-run). Resolves IDs server-side from `runtime.getEvalHistory()` so the wire payload stays small |
 | `POST /api/playground/chat` | Chat with an agent directly (no workflow required). Accepts `{ message, agent?, sessionId? }`. Streams results via WebSocket |
 | `GET /api/decisions` | List pending decisions |
-| `POST /api/decisions/:id/resolve` | Resolve a pending decision |
+| `POST /api/decisions/:id/resolve` | Resolve a pending decision in its owning runtime. Returns 400 for an invalid exact decision union, 404 for an unknown/already-resolved ID, and 409 for a persisted request whose process-local owner is gone |
 
 All endpoints return `{ ok: true, data: {...} }` on success or `{ ok: false, error: { code, message } }` on error.
 

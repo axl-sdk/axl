@@ -616,10 +616,10 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       });
 
       const tokens: string[] = [];
-      const toolCallEvents: Array<Extract<AxlEvent, { type: 'tool_call_end' }>> = [];
+      const events: AxlEvent[] = [];
       for await (const event of stream) {
+        events.push(event);
         if (event.type === 'token') tokens.push(event.data);
-        if (event.type === 'tool_call_end') toolCallEvents.push(event);
       }
 
       // Should have received tokens (the final text response)
@@ -627,12 +627,33 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
 
       // Should have received at least one tool_call_end event for calculator.
       // Post-spec/16: tool name lives on `event.tool`, not `event.name`.
-      expect(toolCallEvents.length).toBeGreaterThanOrEqual(1);
-      expect(toolCallEvents[0].tool).toBe('calculator');
+      const start = events.find(
+        (event): event is Extract<AxlEvent, { type: 'tool_call_start' }> =>
+          event.type === 'tool_call_start' && event.tool === 'calculator',
+      );
+      const end = events.find(
+        (event): event is Extract<AxlEvent, { type: 'tool_call_end' }> =>
+          event.type === 'tool_call_end' && event.callId === start?.callId,
+      );
+      expect(start).toBeDefined();
+      expect(end?.data.outcome).toMatchObject({
+        status: 'succeeded',
+        result: { computed: 42, hostOnly: 'HOST_ONLY' },
+      });
+      expect(JSON.stringify(end?.data.outcome)).not.toContain('AXL_STRING_PROJECTION_7C3A1');
 
       // The final result must contain the otherwise unknowable projection marker.
       const result = await stream.promise;
       expect(String(result).toUpperCase()).toContain('AXL_STRING_PROJECTION_7C3A1');
+      expect(stream.observationStatus).toEqual({ complete: true });
+
+      const execution = await runtime.getExecution(start!.executionId);
+      const persistedEnd = execution?.events.find(
+        (event): event is Extract<AxlEvent, { type: 'tool_call_end' }> =>
+          event.type === 'tool_call_end' && event.callId === start!.callId,
+      );
+      expect(execution?.observation).toEqual({ complete: true });
+      expect(persistedEnd?.data.outcome).toEqual(end?.data.outcome);
     },
     60_000,
   );

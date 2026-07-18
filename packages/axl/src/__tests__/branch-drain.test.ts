@@ -13,6 +13,126 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe('runtime branch finalization barrier', () => {
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY, null])(
+    'rejects invalid branchDrainTimeoutMs=%s before runtime bookkeeping',
+    async (branchDrainTimeoutMs) => {
+      const wf = workflow({
+        name: `invalid-branch-drain-${String(branchDrainTimeoutMs)}`,
+        input: z.object({}).strict(),
+        handler: () => 'unreachable',
+      });
+      const runtime = new AxlRuntime();
+      runtime.register(wf);
+
+      await expect(
+        runtime.execute(
+          wf.name,
+          {},
+          {
+            branchDrainTimeoutMs: branchDrainTimeoutMs as number,
+          },
+        ),
+      ).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+      await expect(runtime.getExecutions()).resolves.toEqual([]);
+      expect(() =>
+        runtime.stream(
+          wf.name,
+          {},
+          {
+            branchDrainTimeoutMs: branchDrainTimeoutMs as number,
+          },
+        ),
+      ).toThrow(expect.objectContaining({ code: 'INVALID_CONFIG' }));
+      await expect(runtime.getExecutions()).resolves.toEqual([]);
+    },
+  );
+
+  it('finalizes with an incomplete marker when an abort-ignoring loser never settles', async () => {
+    const loserStarted = deferred();
+    const releaseLoser = deferred();
+    const events: Array<{ type: string; data?: unknown }> = [];
+    const wf = workflow({
+      name: 'bounded-branch-drain',
+      input: z.object({}).strict(),
+      handler: (ctx) =>
+        ctx.race([
+          async () => {
+            await loserStarted.promise;
+            return 'winner';
+          },
+          async () => {
+            loserStarted.resolve();
+            await releaseLoser.promise;
+            ctx.log('too-late');
+            return 'loser';
+          },
+        ]),
+    });
+    const runtime = new AxlRuntime();
+    runtime.register(wf);
+    runtime.on('trace', (event) => events.push(event));
+
+    await expect(runtime.execute(wf.name, {}, { branchDrainTimeoutMs: 10 })).resolves.toBe(
+      'winner',
+    );
+
+    const terminal = events.find((event) => event.type === 'workflow_end') as
+      | { data: { observation?: unknown } }
+      | undefined;
+    expect(terminal?.data.observation).toEqual({
+      complete: false,
+      reason: 'branch_drain_timeout',
+      pendingContinuations: 2,
+      timeoutMs: 10,
+    });
+    const executionId = (events[0] as { executionId?: string }).executionId!;
+    expect((await runtime.getExecution(executionId))?.observation).toEqual(
+      terminal?.data.observation,
+    );
+
+    const terminalIndex = events.findIndex((event) => event.type === 'workflow_end');
+    releaseLoser.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events).toHaveLength(terminalIndex + 1);
+  });
+
+  it('suppresses late child-context events after bounded finalization', async () => {
+    const loserStarted = deferred();
+    const releaseLoser = deferred();
+    const events: Array<{ type: string }> = [];
+    const wf = workflow({
+      name: 'bounded-child-branch-drain',
+      input: z.object({}).strict(),
+      handler: (ctx) => {
+        const child = ctx.createChildContext();
+        return ctx.race([
+          async () => {
+            await loserStarted.promise;
+            return 'winner';
+          },
+          async () => {
+            loserStarted.resolve();
+            await releaseLoser.promise;
+            child.log('too-late-child');
+            return 'loser';
+          },
+        ]);
+      },
+    });
+    const runtime = new AxlRuntime();
+    runtime.register(wf);
+    runtime.on('trace', (event) => events.push(event));
+
+    await expect(runtime.execute(wf.name, {}, { branchDrainTimeoutMs: 10 })).resolves.toBe(
+      'winner',
+    );
+
+    const terminalIndex = events.findIndex((event) => event.type === 'workflow_end');
+    releaseLoser.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(events).toHaveLength(terminalIndex + 1);
+  });
+
   it.each(['race', 'spawn', 'map'] as const)(
     'waits for an abort-ignoring %s loser before workflow_end',
     async (primitive) => {
@@ -221,6 +341,58 @@ describe('runtime branch finalization barrier', () => {
     await expect(execution).rejects.toMatchObject({
       name: 'EventStreamOverflowError',
       eventType: 'log',
+    });
+  });
+
+  it('preserves the handler failure as the cause when late strict overflow replaces it', async () => {
+    const loserStarted = deferred();
+    const releaseLoser = deferred();
+    const handlerFailure = new Error('primary handler failure');
+    const wf = workflow({
+      name: 'late-overflow-preserves-cause',
+      input: z.object({}).strict(),
+      handler: async (ctx) => {
+        const iterator = ctx.events[Symbol.asyncIterator]();
+        void (async () => {
+          while (!(await iterator.next()).done) {
+            // Drain mainline events so only the late burst saturates.
+          }
+        })();
+        await ctx.race([
+          async () => {
+            await loserStarted.promise;
+            return 'winner';
+          },
+          async () => {
+            loserStarted.resolve();
+            await releaseLoser.promise;
+            ctx.log('delivered to waiter');
+            ctx.log('fills queue');
+            ctx.log('overflows queue');
+            return 'loser';
+          },
+        ]);
+        throw handlerFailure;
+      },
+    });
+    const runtime = new AxlRuntime();
+    runtime.register(wf);
+
+    const execution = runtime.execute(
+      wf.name,
+      {},
+      {
+        events: { maxQueued: 1, onOverflow: 'throw' },
+      },
+    );
+    await loserStarted.promise;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    releaseLoser.resolve();
+
+    const error = await execution.catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      name: 'EventStreamOverflowError',
+      cause: handlerFailure,
     });
   });
 

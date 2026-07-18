@@ -748,7 +748,7 @@ export function TraceEventList({
   const lifecycleBadges = useMemo(() => {
     const badges = new Map<HistoricalAxlEvent, string>();
     const isComplete =
-      (traceComplete ?? false) ||
+      traceComplete ??
       lifecycleEvents.some(
         (event) =>
           event.type === 'done' ||

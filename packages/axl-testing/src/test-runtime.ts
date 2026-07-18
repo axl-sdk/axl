@@ -9,6 +9,7 @@ import type {
   AxlConfig,
   AnyWorkflow,
   ToolCallOutcome,
+  ObservationStatus,
 } from '@axlsdk/axl';
 import {
   WorkflowContext,
@@ -99,7 +100,11 @@ export class AxlTestRuntime {
   async execute(
     workflowName: string,
     input: unknown,
-    options?: { metadata?: Record<string, unknown>; events?: EventStreamOptions },
+    options?: {
+      metadata?: Record<string, unknown>;
+      events?: EventStreamOptions;
+      branchDrainTimeoutMs?: number;
+    },
   ): Promise<unknown> {
     const workflow = this.workflows.get(workflowName);
     if (!workflow) throw new Error(`Workflow "${workflowName}" not registered`);
@@ -159,6 +164,7 @@ export class AxlTestRuntime {
       // Thread `events` config so tests can exercise the queue cap and
       // overflow policy on `ctx.events`. Mirrors the production runtime.
       eventStreamOptions: options?.events,
+      branchDrainTimeoutMs: options?.branchDrainTimeoutMs,
       // Production runtime threads this (see `runtime.ts:594` in
       // `execute()` and `:765` in `stream()`). `emitEvent` auto-stamps
       // `event.workflow` from it, so consumers grouping by workflow
@@ -240,6 +246,7 @@ export class AxlTestRuntime {
     ctx._emitWorkflowStart(validated);
     try {
       const result = await workflow.handler(ctx);
+      const observation = await ctx._drainBranchWork();
 
       // Validate output schema if defined
       if (workflow.outputSchema) workflow.outputSchema.parse(result);
@@ -248,6 +255,7 @@ export class AxlTestRuntime {
         status: 'completed',
         duration: Date.now() - startedAt,
         result,
+        observation,
       });
       // `_steps` is populated by onTrace for every event (including
       // workflow_end); no separate `_recordStep` call needed — that
@@ -256,22 +264,30 @@ export class AxlTestRuntime {
       if (this.recordPath) await this._writeRecording();
       return result;
     } catch (err) {
+      let workflowError = err;
+      let observation: ObservationStatus = { complete: true };
+      try {
+        observation = await ctx._drainBranchWork();
+      } catch (drainError) {
+        workflowError = drainError;
+      }
       // Parity with production: failed workflows get a terminal
       // `workflow_end(status: 'failed')` event so consumers counting
       // workflow_start ↔ workflow_end pairs never see an unclosed one.
       // `aborted` flag mirrors the runtime.ts AbortError detection.
       const aborted =
-        typeof err === 'object' &&
-        err !== null &&
-        (err as { name?: unknown }).name === 'AbortError';
+        typeof workflowError === 'object' &&
+        workflowError !== null &&
+        (workflowError as { name?: unknown }).name === 'AbortError';
       ctx._emitWorkflowEnd({
         status: 'failed',
         duration: Date.now() - startedAt,
-        error: err instanceof Error ? err.message : String(err),
+        error: workflowError instanceof Error ? workflowError.message : String(workflowError),
         ...(aborted ? { aborted: true } : {}),
+        observation,
       });
       // `_steps` populated by onTrace (see comment on the success path).
-      throw err;
+      throw workflowError;
     }
   }
 

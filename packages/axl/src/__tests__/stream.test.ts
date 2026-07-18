@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { AxlStream } from '../stream.js';
 import { AXL_EVENT_TYPES, type AxlEvent, type AxlEventType } from '../types.js';
 
@@ -19,6 +19,22 @@ function ev(partial: Record<string, unknown>): AxlEvent {
 const ASK = { askId: 'test-ask', depth: 0 } as const;
 
 describe('AxlStream', () => {
+  it('exposes iterator queue loss through observationStatus', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const stream = new AxlStream({ maxQueued: 1 });
+
+    stream._push(ev({ type: 'token', data: 'first', ...ASK }));
+    stream._push(ev({ type: 'token', data: 'second', ...ASK }));
+
+    expect(stream.observationStatus).toEqual({
+      complete: false,
+      reason: 'queue_overflow',
+      droppedEvents: 1,
+    });
+    stream.destroy();
+    warn.mockRestore();
+  });
+
   it('pushing events makes them available via async iterator', async () => {
     const stream = new AxlStream();
 

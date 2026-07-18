@@ -52,6 +52,14 @@ const calculatorTool = tool({
   },
 });
 
+const streamingProjectionProbe = tool({
+  name: 'calculator',
+  description: 'Evaluates an expression or verification token supplied by the user.',
+  input: z.object({ expression: z.string() }),
+  handler: () => ({ computed: 42, hostOnly: 'HOST_ONLY' }),
+  toModelOutput: () => 'AXL_STRING_PROJECTION_7C3A1',
+});
+
 const failingTool = tool({
   name: 'failing_tool',
   description: 'A tool that reports a known, model-safe failure for recovery testing.',
@@ -589,8 +597,8 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       const mathAgent = agent({
         model,
         system:
-          'You are a math assistant. Use the calculator tool for arithmetic. After getting the result, write a short sentence with the answer.',
-        tools: [calculatorTool],
+          'Use the calculator tool whenever requested. After it returns, copy its result exactly; do not interpret, summarize, or calculate anything yourself.',
+        tools: [streamingProjectionProbe],
       });
 
       const runtime = new AxlRuntime();
@@ -603,7 +611,8 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       runtime.register(streamWorkflow);
 
       const stream = runtime.stream('stream-tools', {
-        question: 'What is 19 + 23? Use the calculator.',
+        question:
+          'Use the calculator with expression "verification-token-qz9" and report its exact returned result.',
       });
 
       const tokens: string[] = [];
@@ -621,9 +630,9 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       expect(toolCallEvents.length).toBeGreaterThanOrEqual(1);
       expect(toolCallEvents[0].tool).toBe('calculator');
 
-      // The final result should contain 42
+      // The final result must contain the otherwise unknowable projection marker.
       const result = await stream.promise;
-      expect(String(result)).toContain('42');
+      expect(String(result).toUpperCase()).toContain('AXL_STRING_PROJECTION_7C3A1');
     },
     60_000,
   );

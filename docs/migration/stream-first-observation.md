@@ -83,7 +83,7 @@ session.stream('two-step', input, { events: { onOverflow: 'throw' } });
 
 ### 1. `AxlStream` now applies a default queue cap
 
-Before this release, `AxlStream`'s iterator queue was unbounded — a slow consumer would let it grow until the process OOM'd. The default is now `maxQueued: 10_000` with `onOverflow: 'drop-oldest-non-terminal'`. Terminal events (`done`, `error`, `workflow_end`) are never dropped. The first overflow per stream emits a one-shot `console.warn`.
+Before this release, `AxlStream`'s iterator queue was unbounded — a slow consumer would let it grow until the process OOM'd. The default is now `maxQueued: 10_000` with `onOverflow: 'drop-oldest-non-terminal'`. Terminal events (`done`, `error`, `workflow_end`) are never dropped. Listener-based `stringStream()` subscribers use the same cap: undrained updates coalesce per ask/path and distinct pending fields follow the overflow policy. The first overflow per stream emits a one-shot `console.warn`.
 
 **Action required:** none for typical consumers. The cap is well above any normal usage.
 
@@ -517,7 +517,7 @@ is not supported.
 - **Auto-dispose on signal abort.** When `runtime.createContext({ signal })` is constructed with an `AbortSignal` and the signal fires, the bus is auto-disposed (iterators terminate with `done: true`). If `signal` is already aborted at the time `ctx.events` is first accessed, the bus terminates immediately on access. This protects long-lived ad-hoc context flows from leaking iterator consumers.
 - **Manual disposal for ad-hoc contexts without a signal.** `ctx.disposeEvents()` is idempotent and safe to call after `workflow_end` / `error` already auto-finished the bus. Workflow-driven contexts (`runtime.execute` / `runtime.stream`) terminate automatically and don't need this. Prefer `signal: AbortSignal.timeout(...)` over manual disposal — it composes with timeout/cancellation/budget without manual threading.
 - **Cost rollup — pick one channel.** Don't `total += event.cost` from `ctx.events` AND `runtime.on('trace', …)` — same events fan out to both, you'll double-count. Use `eventCostContribution(event)` from `@axlsdk/axl` (skips per-ask `ask_end` rollups) or read `ctx.totalCost`. The four observation channels are alternatives, not additive.
-- **`ctx.events` does not bridge across `awaitHuman` suspension.** When a workflow suspends and is later resumed via `runtime.resumeExecution()`, the resumed run gets a fresh `WorkflowContext` with its own bus. For cross-suspension observation, use `runtime.on('trace', …)` instead.
+- **`ctx.events` does not bridge across re-execution after `awaitHuman` suspension.** A later execution gets a fresh `WorkflowContext` with its own bus. For cross-execution observation, use `runtime.on('trace', …)` instead. The legacy cross-process resume helper is not an exactly-once decision protocol; see the approval-gate security notes.
 
 ## See also
 

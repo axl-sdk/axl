@@ -440,7 +440,7 @@ Axl competes primarily with [Mastra](https://mastra.ai) and [LangGraph.js](https
 | **Consensus / voting** | `vote` (7 strategies), `verify`                      | —                                                                   | —                                     |
 | **Cost control**       | `budget` with hard_stop / finish_and_stop / warn     | Token reporting only                                                | —                                     |
 | **Structured output**  | Zod schema on `ctx.ask()` + self-correcting retry    | Zod via Vercel AI SDK                                               | `withStructuredOutput()`              |
-| **Human-in-the-loop**  | `awaitHuman` + tool approval gates                   | Tool suspend/resume, `requireApproval`                              | `interrupt()` + `Command`             |
+| **Human-in-the-loop**  | `awaitHuman` + tool approval gates (in-process; cross-process exactly-once protocol is application-managed) | Tool suspend/resume, `requireApproval`                              | `interrupt()` + `Command`             |
 | **Testing utilities**  | `MockProvider`, `MockTool`, `AxlTestRuntime`         | —                                                                   | —                                     |
 | **Evaluation**         | `dataset`, `scorer`, `llmScorer`, `evalCompare`, CLI | Built-in scorers (`@mastra/evals`)                                  | Via LangSmith (external)              |
 | **Agent handoffs**     | `handoffs` with ACL isolation, oneway + roundtrip, agent-as-tool | Sub-agents as tools                                                 | Subgraphs as nodes                    |
@@ -450,7 +450,7 @@ Axl competes primarily with [Mastra](https://mastra.ai) and [LangGraph.js](https
 | **Local dev UI**       | Axl Studio                                           | Mastra Studio                                                       | LangGraph Studio                      |
 | **Deployment**         | Manual                                               | One-command (Vercel, CF, Netlify)                                   | LangGraph Platform                    |
 | **Dependencies**       | Zero (raw `fetch`)                                   | Vercel AI SDK                                                       | `@langchain/core` ecosystem           |
-| **Durable execution**  | `checkpoint` replay + `state.persist: 'streaming'` crash recovery | Workflow suspend/resume                              | Checkpointers (every superstep)       |
+| **Durable execution**  | Checkpoint storage + streaming trace recovery; cross-process workflow/approval replay is not yet atomic | Workflow suspend/resume                                             | Checkpointers (every superstep)       |
 
 **Where Axl shines:** Concurrency primitives, consensus/voting, cost control, testing story, zero dependencies, and imperative workflow style (plain TypeScript, no DSL).
 

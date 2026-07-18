@@ -369,6 +369,46 @@ describe('v2 tool lifecycle integration', () => {
     expect(harness.provider.calls).toHaveLength(1);
   });
 
+  it.each([
+    ['missing approved', {}],
+    ['non-boolean approved', { approved: 'yes' }],
+    ['approved with invalid data', { approved: true, data: 42 }],
+    ['approved with a denial reason', { approved: true, reason: 'contradictory' }],
+    ['denied with invalid reason', { approved: false, reason: { secret: true } }],
+    ['denied with approval data', { approved: false, data: 'contradictory' }],
+    ['array-shaped decision', [{ approved: true }]],
+  ])('treats an invalid approval decision (%s) as infrastructure failure', async (_, decision) => {
+    const handler = vi.fn();
+    const configuredTool = tool({
+      name: 'invalid_approval_decision',
+      description: 'fixture',
+      input: z.object({}),
+      requireApproval: true,
+      handler,
+    });
+    const harness = setup({
+      configuredTool,
+      awaitHumanHandler: async () => decision as never,
+    });
+
+    await expect(harness.ctx.ask(harness.testAgent, 'go')).rejects.toThrow(/human decision/i);
+
+    expect(lifecycle(harness.events).map((event) => event.type)).toEqual([
+      'tool_call_start',
+      'tool_call_end',
+    ]);
+    expect(lifecycle(harness.events)[1]).toMatchObject({
+      data: {
+        outcome: {
+          status: 'failed',
+          failure: { phase: 'approval', kind: 'infrastructure', disposition: 'abort' },
+        },
+      },
+    });
+    expect(handler).not.toHaveBeenCalled();
+    expect(harness.provider.calls).toHaveLength(1);
+  });
+
   it('pairs missing approval infrastructure and aborts before later siblings', async () => {
     const handler = vi.fn();
     const configuredTool = tool({

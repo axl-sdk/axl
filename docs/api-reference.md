@@ -111,7 +111,7 @@ const findOrder = tool({
 
 The mapper is synchronous, runs inline once per accepted agent-invoked tool call that has completed `hooks.after` and can continue to the provider, and receives the same result reference retained for the terminal host event. Axl rechecks cancellation before and after projection; cancellation closes the call as `cancelled` and sends no tool message. `Readonly<TOutput>` is shallow and is an authoring contract: Axl does not clone or freeze the result. Treat the mapper as pure; mutating the value is unsupported and can also mutate the object retained by the host event. A slow mapper blocks the ask once it starts. If a later workflow run re-executes the tool call, it evaluates the mapper again; a checkpoint replay that skips the call also skips mapping. Provider transport retries reuse the already-serialized tool message rather than rerunning the mapper or tool.
 
-`ToolModelOutput` supports strings, finite numbers, booleans, `null`, dense arrays, and plain or null-prototype records recursively. An `undefined` object property is omitted. A top-level `undefined`, array hole/`undefined`, bigint, function, symbol, non-finite number, cycle, Promise/thenable, accessor, callable custom `toJSON`, enumerable symbol key, or non-plain object fails with exported `ToolModelOutputError`. Shared non-cyclic references are valid. Projected strings become verbatim canonical tool-message content; every other value is validated and JSON-encoded once. Prefer record projections when the distinction between JSON-looking text and structured data must survive every provider's native tool-result envelope. Without a mapper, legacy `JSON.stringify` behavior is unchanged, including quoted string results.
+`ToolModelOutput` supports strings, finite numbers, booleans, `null`, dense arrays, and plain or null-prototype records recursively. An `undefined` object property is omitted. A top-level `undefined`, array hole/`undefined`, bigint, function, symbol, non-finite number, cycle, Promise/thenable, accessor, callable custom `toJSON`, any symbol key, or non-plain object fails with exported `ToolModelOutputError`. Shared non-cyclic references are valid. Projected strings become verbatim canonical tool-message content; every other value is validated and JSON-encoded once. Prefer record projections when the distinction between JSON-looking text and structured data must survive every provider's native tool-result envelope. Without a mapper, legacy `JSON.stringify` behavior is unchanged, including quoted string results.
 
 Configured local tools use this precedence:
 
@@ -664,7 +664,7 @@ const wf = workflow({
 | `.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only — `ask_*`, `agent_call_*`, `tool_call_*` (including `tool_call_rejected`), `tool_approval`, `handoff_start`, `handoff_return`, `delegate`, `pipeline`, `verify`, `schema_diagnostic`, `workflow_*`, `checkpoint_save`, `checkpoint_replay`, `await_human`, `await_human_resolved`. Skips per-token chatter and progressive `partial_object` emissions. Identical to `AxlStream.lifecycle` (single source of truth: `LIFECYCLE_TYPES` in `event-stream.ts`) |
 | `.textByAsk` | `AsyncIterable<{ askId, agent?, text }>` | Per-ask token chunks for split-pane UIs |
 | `.partialObjects` | `AsyncIterable<CoalescedPartialObject>` (`{ askId, agent?, object, attempt }`) | **Coalescing view** — yields the latest `partial_object` payload per `askId`. `attempt` is the 1-indexed attempt number; on schema/validate/guardrail retry, the runtime emits `pipeline(failed)` and the view drops any undrained pending value for the affected ask, so attempt-N snapshots cannot leak across the retry boundary. Listener-based: does NOT race with the main iterator; running both concurrently each receive every event. Memory bounded by `O(active asks)`, not `O(events emitted)` |
-| `.stringStream(opts?)` | `AsyncIterable<StringStreamEvent>` (`{ askId, agent?, path, delta, accumulated, attempt }`) | **Streaming view** over `string_delta` events with optional `{ path?, askId? }` filters. Yields `delta` (new chars from this chunk) and `accumulated` (running text-so-far for that ask + path). Late subscribers are seeded with one synthetic event per matching `(askId, path)` carrying `delta === accumulated === <full text-so-far>`, so a UI binding to `/summary` mid-stream renders the field's current state immediately. Listener-based: does NOT race with the main iterator. Per-ask accumulator cleared on `pipeline(failed)` (discarded attempt) and on `ask_end` (memory hygiene). Designed for chat-style typewriter rendering of long string fields |
+| `.stringStream(opts?)` | `AsyncIterable<StringStreamEvent>` (`{ askId, agent?, path, delta, accumulated, attempt }`) | **Streaming view** over `string_delta` events with optional `{ path?, askId? }` filters. `delta` contains all new chars for that ask/path since this subscriber's previous yield (slow subscribers may receive several provider chunks coalesced); `accumulated` is canonical text-so-far. Late subscribers seed through the same bounded queue. Listener-based: does NOT race with the main iterator. Each subscriber is bounded by `EventStreamOptions`: pending updates coalesce per ask/path, and distinct fields use the configured overflow policy. Per-ask state clears on `pipeline(failed)` and `ask_end` |
 | `.on(type, handler)` / `.off(type, handler)` | `(this)` | Subscribe/unsubscribe per AxlEvent type. Names outside `AxlEventType` are silently ignored on `AxlEventBus` (the bus emits no other names). On `AxlStream`, non-AxlEvent names like `'close'`, `'data'`, `'end'`, `'error'`, `'pause'`, `'resume'`, `'readable'` fall through to the underlying Node `Readable` — those work as standard Node stream events |
 | `.isFinished` | `boolean` | Whether the bus has been finalized (auto-set on `workflow_end` / `error`) |
 
@@ -691,7 +691,7 @@ Configures the iterator-queue cap and overflow policy on `ctx.events` and on the
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `maxQueued` | `number` | `10_000` | Soft cap on events buffered while waiting for a consumer. Terminal events (`done`, `error`, `workflow_end`) are exempt. Set to `Infinity` to disable |
+| `maxQueued` | `number` | `10_000` | Soft cap on events buffered while waiting for a consumer, including distinct pending fields in each listener-based `stringStream()` subscriber. Terminal events (`done`, `error`, `workflow_end`) are exempt from the main queue. Set to `Infinity` to disable |
 | `onOverflow` | `'drop-oldest-non-terminal' \| 'throw'` | `'drop-oldest-non-terminal'` | Policy on cap exceeded. `'drop-oldest-non-terminal'` drops the oldest non-terminal event and emits a one-shot `console.warn` per bus instance. `'throw'` throws an `EventStreamOverflowError` at the producer call site — **this will fail the active workflow** (the throw unwinds the agent loop and the runtime promise rejects with the typed error; catch via `instanceof EventStreamOverflowError`). Note: on `runtime.execute()` (no `AxlStream`), the throw only fires if the handler allocated `ctx.events` and that bus saturates. On `runtime.stream()`, the wire-side `AxlStream` bus always applies the policy. Use only in tests / strict environments |
 
 **Behavior change in this release.** Existing `AxlStream` consumers on 0.x gain the cap automatically. If your workflow somehow relied on unbounded queueing, opt out via `events: { maxQueued: Infinity }`.
@@ -772,7 +772,10 @@ const results = await ctx.map(reviews, async (review) => {
 
 ### `ctx.awaitHuman(options)`
 
-Suspend the workflow and wait for a human decision. The pending decision is persisted to the state store and survives process restarts.
+Suspend the workflow and wait for a human decision. The pending request is
+persisted to the state store and survives process restarts. Automatic resolution
+is reliable while the original process is alive; cross-process exactly-once
+decision replay is not yet provided (see Security > Approval Gates).
 
 ```typescript
 const decision = await ctx.awaitHuman({
@@ -798,6 +801,12 @@ if (decision.approved) {
 - `{ approved: true, data?: string }` — approved, with optional response data
 - `{ approved: false, reason?: string }` — denied, with optional reason
 
+Untyped input is validated at this boundary. `approved` must be an own boolean
+data property on a plain object; approval may carry only optional string `data`,
+and denial may carry only optional string `reason`. Arrays, accessors, truthy
+non-booleans, and contradictory branch fields fail with `AxlError` code
+`INVALID_HUMAN_DECISION` before the pending request is mutated.
+
 **Resolution:** The host app resolves decisions via `runtime.getPendingDecisions()` and `runtime.resolveDecision(executionId, decision)`. See [Security > Approval Gates](./security.md#approval-gates).
 
 **Cancellation:** If the execution is aborted while suspended at `awaitHuman` — via `runtime.abort(id)`, `runtime.deleteExecution(id)`, an external `options.signal`, or a budget hard-stop — the awaitHuman Promise rejects with `AbortError` and the workflow unwinds. The runtime cleans up its own bookkeeping (resolver map + persisted decision row) atomically as part of the delete sweep.
@@ -806,7 +815,11 @@ if (decision.approved) {
 
 ### `ctx.checkpoint(name, fn)`
 
-Durable execution. If the workflow is replayed (e.g., after a process restart), checkpointed results are restored from the state store instead of re-executing.
+Persist a named result under the current execution ID and replay it when that
+same execution scope evaluates the checkpoint again. The legacy process-restart
+resume helper currently fails closed because the state-store contract has no
+complete cross-process decision, lease, or checkpoint-lineage protocol; do not
+rely on it for exactly-once side effects.
 
 ```typescript
 const value = await ctx.checkpoint('refund-customer', async () => expensiveOperation());
@@ -1277,7 +1290,7 @@ for await (const event of stream) {
 | `stream.text` | `AsyncIterable<string>` | Root-only token stream (`depth === 0`). Nested-ask tokens (agent-as-tool handlers, `delegate`, `race` branches) are omitted — use `stream.textByAsk` or filter the raw stream on `event.depth >= 1` to see them |
 | `stream.textByAsk` | `AsyncIterable<{ askId, agent?, text }>` | **Every** token tagged with the producing ask frame. Complements `.text` — use for split-pane UIs that render each sub-agent's output in its own lane, grouped by `askId` |
 | `stream.partialObjects` | `AsyncIterable<CoalescedPartialObject>` (`{ askId, agent?, object, attempt }`) | **Coalescing view** — yields the latest `partial_object` payload per `askId`. `attempt` is the 1-indexed attempt number; the view drops pending snapshots on `pipeline(failed)` so attempt-N values never leak after a schema/validate/guardrail retry begins. Listener-based: does NOT race with the main iterator. Memory bounded by `O(active asks)`, not `O(events)`. The right shape for streaming-structured-output UIs |
-| `stream.stringStream(opts?)` | `AsyncIterable<StringStreamEvent>` (`{ askId, agent?, path, delta, accumulated, attempt }`) | **Streaming view** over `string_delta` events with optional `{ path?, askId? }` filters. Yields `delta` (new chars from this chunk) and `accumulated` (running text-so-far). Late subscribers seeded with the current state on first iteration. Listener-based: does NOT race with the main iterator. Per-ask accumulator cleared on `pipeline(failed)` and `ask_end`. The right shape for chat-style typewriter rendering of long string fields — `delta` for incremental UIs, `accumulated` for re-render-the-whole-field UIs |
+| `stream.stringStream(opts?)` | `AsyncIterable<StringStreamEvent>` (`{ askId, agent?, path, delta, accumulated, attempt }`) | **Streaming view** over `string_delta` events with optional `{ path?, askId? }` filters. `delta` is every new char since that subscriber's previous yield (several source chunks may coalesce); `accumulated` is canonical text-so-far. Late subscribers seed through the configured bounded queue. Listener-based: does NOT race with the main iterator. Per-ask state clears on `pipeline(failed)` and `ask_end` |
 | `stream.fullText` | `string` | Accumulated text from root-only tokens, committed on `pipeline(committed)`. Retried-attempt tokens are discarded on `pipeline(failed)` or `ask_end({ok:false})` so only the winning attempt's text appears |
 | `stream.promise` | `Promise<unknown>` | Resolves with the workflow result; rejects with the thrown error. Errors are ALSO delivered via the iterator and `.on('error', ...)` (as a synthesized `AxlEvent{type:'error'}`). The promise has an internal no-op `.catch(() => {})` so consumers who only read the iterator never see unhandled-rejection warnings |
 | `stream.on('done', ...)` / `.on('error', ...)` | `EventEmitter` | Terminal events. `done.data = { result }`, `error.data = { message, name?, code? }` |
@@ -1316,10 +1329,10 @@ const runtime = new AxlRuntime({
 | `stream(name, input, options?)` | `AxlStream` | Execute a workflow and return a stream of events. Same lifecycle tracking as `execute()` |
 | `session(id, options?)` | `Session` | Create or resume a multi-turn session (see [Sessions](#sessions)) |
 | `abort(executionId)` | `void` | Abort a running execution by ID |
-| `resumeExecution(executionId)` | `Promise<unknown>` | Resume a suspended execution (after `awaitHuman` is resolved) |
-| `resumePending()` | `Promise<string[]>` | Resume all pending executions from the state store. Call on startup to recover suspended workflows |
+| `resumeExecution(executionId)` | `Promise<unknown>` | Reserved legacy entry point. Currently fails closed with `CROSS_PROCESS_RESUME_UNSUPPORTED` because the state-store contract cannot replay a decision exactly once |
+| `resumePending()` | `Promise<string[]>` | Audits pending execution-state rows through the fail-closed resume entry point and emits `resume_failed`; it does not re-execute them |
 | `getPendingDecisions()` | `Promise<PendingDecision[]>` | List all pending human decisions |
-| `resolveDecision(executionId, decision)` | `Promise<void>` | Resolve a pending human decision. The suspended workflow resumes automatically |
+| `resolveDecision(executionId, decision)` | `Promise<void>` | Resolve a pending human decision in the owning runtime. A persisted request with no in-process resolver fails with `CROSS_PROCESS_RESUME_UNSUPPORTED` before mutation; see Security > Approval Gates |
 
 `ExecuteOptions` (accepted by both `execute()` and `stream()`; exported from `@axlsdk/axl`):
 
@@ -1902,6 +1915,8 @@ All errors extend `AxlError`.
 | `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy. Includes `.limit`, `.spent`, `.policy` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
 | `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`. Message is the provider's text verbatim (no prefix). |
+| `AxlError` / `INVALID_HUMAN_DECISION` | approval handlers, `runtime.resolveDecision()` | Untyped decision is not the exact plain-object approval/denial union; rejected before resolver/store mutation |
+| `AxlError` / `CROSS_PROCESS_RESUME_UNSUPPORTED` | `runtime.resolveDecision()`, `runtime.resumeExecution()` | Execution has no in-process decision resolver. Fails before deleting any pending request or re-executing side effects, even when execution-state persistence is missing or stale |
 
 ### `ProviderError` fields
 

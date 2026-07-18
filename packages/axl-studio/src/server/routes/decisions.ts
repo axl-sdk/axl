@@ -18,7 +18,9 @@ app.get('/decisions', async (c) => {
 app.post('/decisions/:executionId/resolve', async (c) => {
   const runtime = c.get('runtime');
   const executionId = c.req.param('executionId');
-  const body = await c.req.json<{ approved: boolean; reason?: string }>();
+  const body = await c.req.json<
+    { approved: true; data?: string } | { approved: false; reason?: string }
+  >();
 
   await runtime.resolveDecision(executionId, body);
   return c.json({ ok: true, data: { resolved: true } });

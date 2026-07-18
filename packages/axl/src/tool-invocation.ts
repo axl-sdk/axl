@@ -97,6 +97,24 @@ export function parseToolInvocation(options: {
       modelMessage: INVALID_JSON_MODEL_MESSAGE,
     };
   }
+  if (
+    typeof parsedArguments !== 'object' ||
+    parsedArguments === null ||
+    Array.isArray(parsedArguments)
+  ) {
+    return {
+      kind: 'rejected',
+      requestedTool,
+      toolName: mcpTraceName ?? requestedTool,
+      callId: toolCall.id,
+      data: {
+        reason: 'invalid_json',
+        requestedTool,
+        message: 'Tool arguments must decode to a JSON object.',
+      },
+      modelMessage: INVALID_JSON_MODEL_MESSAGE,
+    };
+  }
 
   const source: ToolInvocationSource = override
     ? { kind: 'override', execute: override }
@@ -104,7 +122,7 @@ export function parseToolInvocation(options: {
       ? { kind: 'local', tool: configuredTool }
       : { kind: 'mcp', call: mcpCall! };
 
-  let preparedArguments = parsedArguments;
+  let preparedArguments: unknown = parsedArguments;
   if (source.kind === 'local') {
     try {
       preparedArguments = prepareToolInput(source.tool, parsedArguments);
@@ -350,6 +368,7 @@ export async function executeAcceptedTool(options: {
       effectiveArgs = await invocation.source.tool.hooks.before(effectiveArgs as never, context);
       signal?.throwIfAborted();
     } catch (error) {
+      if (error instanceof EventStreamOverflowError) throw error;
       const abort = cancellationError(signal, error);
       if (abort !== undefined) return cancellation('before_hook', abort);
       return failed('before_hook', error);
@@ -402,6 +421,7 @@ export async function executeAcceptedTool(options: {
       }
     }
   } catch (error) {
+    if (error instanceof EventStreamOverflowError) throw error;
     const abort = cancellationError(signal, error);
     if (abort !== undefined) return cancellation('handler', abort);
     return failed('handler', error, { attempts });
@@ -415,6 +435,7 @@ export async function executeAcceptedTool(options: {
       result = await invocation.source.tool.hooks.after(result as never, context);
       signal?.throwIfAborted();
     } catch (error) {
+      if (error instanceof EventStreamOverflowError) throw error;
       const abort = cancellationError(signal, error);
       if (abort !== undefined) return cancellation('after_hook', abort, rawResult);
       return failed('after_hook', error, { result: rawResult });
@@ -456,6 +477,7 @@ export function prepareToolMessage(
     try {
       return { ok: true, content: mcpContent(outcome.result as McpToolResult) };
     } catch (error) {
+      if (error instanceof EventStreamOverflowError) throw error;
       return { ok: false, phase: 'serialization', error };
     }
   }
@@ -471,6 +493,13 @@ export function prepareToolMessage(
         ),
       };
     } catch (error) {
+      if (error instanceof EventStreamOverflowError) throw error;
+      if (
+        error instanceof ToolModelOutputError &&
+        error.cause instanceof EventStreamOverflowError
+      ) {
+        throw error.cause;
+      }
       return {
         ok: false,
         phase: 'projection',
@@ -487,6 +516,7 @@ export function prepareToolMessage(
     if (content === undefined) throw new Error('Tool result is not JSON serializable');
     return { ok: true, content };
   } catch (error) {
+    if (error instanceof EventStreamOverflowError) throw error;
     return { ok: false, phase: 'serialization', error };
   }
 }
@@ -548,6 +578,20 @@ export async function settleAcceptedTool(options: {
     };
   }
   if (!prepared.ok) {
+    const outputAbort =
+      cancellationError(options.signal, prepared.error) ??
+      (prepared.error instanceof ToolModelOutputError
+        ? cancellationError(options.signal, prepared.error.cause)
+        : undefined);
+    if (outputAbort !== undefined) {
+      return {
+        outcome: {
+          status: 'cancelled',
+          cancellation: { phase: prepared.phase, result },
+        },
+        abortError: outputAbort,
+      };
+    }
     const failure: ToolCallFailure = {
       phase: prepared.phase,
       kind: 'output',

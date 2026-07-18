@@ -341,6 +341,14 @@ describe('model-facing tool output projection', () => {
         return value;
       },
     ],
+    [
+      'non-enumerable symbol key',
+      () => {
+        const value: Record<PropertyKey, unknown> = {};
+        Object.defineProperty(value, Symbol('secret'), { enumerable: false, value: 'x' });
+        return value;
+      },
+    ],
   ])('fails closed for %s without a raw fallback', async (_label, makeProjection) => {
     const projected = tool({
       name: 'invalid_projection',

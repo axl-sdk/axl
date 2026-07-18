@@ -13,7 +13,7 @@ import { ProviderRegistry } from './providers/registry.js';
 import type { StateStore, PendingDecision, EvalHistoryEntry } from './state/types.js';
 import { MemoryStore } from './state/memory.js';
 import { SQLiteStore } from './state/sqlite.js';
-import { WorkflowContext } from './context.js';
+import { parseHumanDecision, WorkflowContext } from './context.js';
 import { Session, type SessionOptions } from './session.js';
 import { AxlStream } from './stream.js';
 import type { EventStreamOptions } from './event-stream.js';
@@ -762,6 +762,7 @@ export class AxlRuntime extends EventEmitter {
       // events to spans via active-context see it.
       ctx._emitWorkflowStart(validated);
       const raw = await workflow.handler(ctx);
+      await ctx._drainBranchWork();
       const result = workflow.outputSchema ? workflow.outputSchema.parse(raw) : raw;
 
       execInfo.status = 'completed';
@@ -785,11 +786,23 @@ export class AxlRuntime extends EventEmitter {
       this.persistExecution(execInfo);
       return result;
     } catch (err) {
-      const aborted = isAbortError(err);
+      let terminalError = err;
+      // A workflow can fail while race/quorum losers are still unwinding.
+      // Their terminal events and measurable cost belong before the workflow
+      // terminal/persisted snapshot just as they do on the success path.
+      try {
+        await ctx._drainBranchWork();
+      } catch (drainErr) {
+        // Strict event overflow is an observability-integrity failure and must
+        // replace an ordinary branch/handler error without skipping workflow_end.
+        terminalError = drainErr;
+      }
+      const aborted = isAbortError(terminalError);
       execInfo.status = 'failed';
       execInfo.completedAt = Date.now();
       execInfo.duration = execInfo.completedAt - execInfo.startedAt;
-      execInfo.error = err instanceof Error ? err.message : String(err);
+      execInfo.error =
+        terminalError instanceof Error ? terminalError.message : String(terminalError);
       ctx._emitWorkflowEnd({
         status: 'failed' as const,
         duration: execInfo.duration,
@@ -797,7 +810,7 @@ export class AxlRuntime extends EventEmitter {
         ...(aborted ? { aborted: true } : {}),
       });
       this.persistExecution(execInfo);
-      throw err;
+      throw terminalError;
     } finally {
       this.abortControllers.delete(execInfo.executionId);
       cleanupAbortForwarder?.();
@@ -2075,28 +2088,25 @@ export class AxlRuntime extends EventEmitter {
 
   /** Resolve a pending human decision. */
   async resolveDecision(executionId: string, decision: HumanDecision): Promise<void> {
+    decision = parseHumanDecision(decision);
     const resolver = this.pendingDecisionResolvers.get(executionId);
-    if (resolver) {
-      // In-memory resolver exists — workflow is still running in this process
-      resolver(decision);
-      this.pendingDecisionResolvers.delete(executionId);
-    }
-    await this.stateStore.resolveDecision(executionId, decision);
-
-    // Cross-restart: if no in-memory resolver, the workflow was lost on restart.
-    // Trigger a re-execution that replays from checkpoints.
     if (!resolver) {
-      const state = await this.stateStore.getExecutionState(executionId);
-      if (state && state.status === 'waiting') {
-        await this.resumeExecution(executionId);
-      }
+      throw new AxlError(
+        'CROSS_PROCESS_RESUME_UNSUPPORTED',
+        `Execution "${executionId}" is not awaiting a decision in this runtime. ` +
+          'Cross-process approval replay requires a durable decision/lease lineage and is not yet supported; any persisted pending request was preserved.',
+      );
     }
+    // In-memory resolver exists — workflow is still running in this process.
+    resolver(decision);
+    this.pendingDecisionResolvers.delete(executionId);
+    await this.stateStore.resolveDecision(executionId, decision);
   }
 
   /**
-   * Resume a specific execution that was waiting for a human decision.
-   * Re-runs the workflow from scratch; the workflow should use checkpoint-replay
-   * to skip already-completed steps and pick up from the awaitHuman point.
+   * Legacy resume entry point. Cross-process replay cannot be made safe with
+   * the current StateStore contract (no durable resolved decision, claim lease,
+   * or checkpoint lineage), so fail closed instead of duplicating side effects.
    */
   async resumeExecution(executionId: string): Promise<unknown> {
     const state = await this.stateStore.getExecutionState(executionId);
@@ -2104,23 +2114,17 @@ export class AxlRuntime extends EventEmitter {
       throw new Error(`No execution state found for "${executionId}"`);
     }
 
-    const workflow = this.workflows.get(state.workflow);
-    if (!workflow) {
-      throw new Error(
-        `Workflow "${state.workflow}" not registered. Cannot resume execution "${executionId}".`,
-      );
-    }
-
-    // Re-execute the workflow with the same input — checkpoint-replay will skip completed steps
-    return this.execute(state.workflow, state.input, {
-      metadata: { ...state.metadata, resumedFrom: executionId, resumeMode: true },
-    });
+    throw new AxlError(
+      'CROSS_PROCESS_RESUME_UNSUPPORTED',
+      `Execution "${executionId}" cannot be resumed safely across processes with the current state-store contract; its pending state was preserved.`,
+    );
   }
 
   /**
-   * Resume all pending executions that were waiting for human decisions.
-   * Call this on startup to resume workflows that were interrupted by a restart.
-   * Returns the execution IDs that were resumed.
+   * Audit pending execution-state rows through the fail-closed legacy resume
+   * entry point. No workflow is re-executed; each rejection emits
+   * `resume_failed`, and the returned list remains empty until a safe durable
+   * resume protocol exists.
    */
   async resumePending(): Promise<string[]> {
     const pendingIds = await this.stateStore.listPendingExecutions();
@@ -2131,7 +2135,7 @@ export class AxlRuntime extends EventEmitter {
         await this.resumeExecution(executionId);
         resumed.push(executionId);
       } catch (err) {
-        this.emit('error', {
+        this.emit('resume_failed', {
           type: 'resume_failed',
           executionId,
           error: err instanceof Error ? err.message : String(err),

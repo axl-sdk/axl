@@ -874,20 +874,6 @@ describe('ctx.events — streaming-gate behavior on late subscription', () => {
   });
 });
 
-// Note on ask_end finally masking-protection: the protection (commit
-// aed6b98) wraps the ask_end emit so that under `onOverflow: 'throw'`,
-// an overflow during the finally doesn't replace an in-flight error
-// from the catch branch. Verifying this in isolation requires
-// instrumenting the bus to selectively fail at ask_end time only — at
-// `maxQueued: 1` every emit overflows, so any in-flight error already
-// IS an EventStreamOverflowError, indistinguishable from the
-// finally's. The overflow + retry-rejection paths are pinned in the
-// other tests; the protection is a behavioral guarantee verified by
-// not seeing the documented "ask_end emit overflowed during error
-// path; preserving original error" log surface as an unhandled
-// rejection — covered implicitly by the throw-policy tests above
-// passing with stderr logs but no spurious rejections.
-
 // ─── AbortSignal listener cleanup (regression for commit bf17409) ───
 // The pre-fix `forwardAbortSignal` and constructor abort listener used
 // `{ once: true }`, which only auto-removes on abort. The success path

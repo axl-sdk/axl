@@ -248,7 +248,11 @@ See the [API reference](api-reference.md#validate) for the full type signatures,
 
 ## Human-in-the-Loop
 
-High-stakes actions (e.g., refunding > $500) require human approval. The workflow suspends, persists state, and resumes after review.
+High-stakes actions (e.g., refunding > $500) require human approval. While the
+runtime process remains alive, the workflow suspends, persists the pending
+request, and resumes after review. For process-loss recovery, add an
+application-managed durable command/idempotency protocol; Axl does not yet
+provide atomic cross-process decision replay.
 
 ```typescript
 const SafeRefund = workflow({

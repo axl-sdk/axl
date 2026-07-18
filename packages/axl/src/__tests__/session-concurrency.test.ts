@@ -781,7 +781,7 @@ describe('Session concurrency — per-session serializer', () => {
   // ────────────────────────────────────────────────────────────────────
   // 14. shutdown() drains in-flight session work before closing the store
   // ────────────────────────────────────────────────────────────────────
-  it('shutdown() awaits in-flight session locks before closing the state store', async () => {
+  it('shutdown() awaits aborted in-flight session locks before closing the state store', async () => {
     let saveSessionCalledAfterClose = false;
     let storeClosed = false;
     class TrackingStore extends MemoryStore {
@@ -799,10 +799,12 @@ describe('Session concurrency — per-session serializer', () => {
 
     // Fire send and shut down before it can save.
     const sendPromise = session.send('chat', 'in-flight');
+    sendPromise.catch(() => {});
     await new Promise((r) => setTimeout(r, 10));
     await runtime.shutdown();
-    // The send must have finished before shutdown returned.
-    await sendPromise;
+    // shutdown() aborts active executions, and must still wait for the
+    // session serializer to unwind before it closes the backing store.
+    await expect(sendPromise).rejects.toMatchObject({ name: 'AbortError' });
 
     expect(storeClosed).toBe(true);
     expect(saveSessionCalledAfterClose).toBe(false);

@@ -77,6 +77,19 @@ describe('v2 tool invocation seams', () => {
         issues: [{ path: ['id'], code: 'invalid_type' }],
       },
     });
+
+    for (const argumentsJson of ['null', '[]', '"text"', '42']) {
+      expect(
+        parseToolInvocation({
+          toolCall: call('unconfigured', argumentsJson),
+          override: async () => ({ mocked: true }),
+          availableTools: [],
+        }),
+      ).toMatchObject({
+        kind: 'rejected',
+        data: { reason: 'invalid_json' },
+      });
+    }
   });
 
   it('keeps configured overrides schema-agnostic and invokes them without a receiver', async () => {
@@ -428,6 +441,47 @@ describe('v2 tool invocation seams', () => {
     expect(settlement.providerContent).toBeUndefined();
   });
 
+  it.each(['projection', 'serialization'] as const)(
+    'preserves a directly thrown AbortError as %s cancellation',
+    async (phase) => {
+      const abort = new DOMException(`${phase} cancelled`, 'AbortError');
+      const configuredTool = tool({
+        name: `throw_abort_${phase}`,
+        description: 'throw AbortError while preparing provider output',
+        input: z.object({}),
+        handler: () =>
+          phase === 'serialization'
+            ? {
+                toJSON: () => {
+                  throw abort;
+                },
+              }
+            : { raw: true },
+        ...(phase === 'projection'
+          ? {
+              toModelOutput: () => {
+                throw abort;
+              },
+            }
+          : {}),
+      });
+
+      const settlement = await settleAcceptedTool({
+        invocation: accepted(configuredTool),
+        context,
+        requestApproval: approved,
+        createChildContext,
+      });
+
+      expect(settlement.outcome).toMatchObject({
+        status: 'cancelled',
+        cancellation: { phase, result: expect.anything() },
+      });
+      expect(settlement.abortError).toBe(abort);
+      expect(settlement.providerContent).toBeUndefined();
+    },
+  );
+
   it('never retries AbortError or an abort triggered by the retry predicate', async () => {
     const abortHandler = vi.fn(() => {
       throw new DOMException('cancelled', 'AbortError');
@@ -532,4 +586,48 @@ describe('v2 tool invocation seams', () => {
       }),
     ).rejects.toBe(overflow);
   });
+
+  it.each(['before', 'handler', 'after', 'projection', 'serialization'] as const)(
+    'does not reinterpret strict observation overflow in the %s phase',
+    async (phase) => {
+      const overflow = new EventStreamOverflowError(1, 'log');
+      const configuredTool = tool({
+        name: `overflow_${phase}`,
+        description: 'fixture',
+        input: z.object({}),
+        ...(phase === 'before'
+          ? { hooks: { before: () => Promise.reject(overflow) } }
+          : phase === 'after'
+            ? { hooks: { after: () => Promise.reject(overflow) } }
+            : {}),
+        handler: () => {
+          if (phase === 'handler') throw overflow;
+          if (phase === 'serialization') {
+            return {
+              toJSON: () => {
+                throw overflow;
+              },
+            };
+          }
+          return 'result';
+        },
+        ...(phase === 'projection'
+          ? {
+              toModelOutput: () => {
+                throw overflow;
+              },
+            }
+          : {}),
+      });
+
+      await expect(
+        settleAcceptedTool({
+          invocation: accepted(configuredTool),
+          context,
+          requestApproval: approved,
+          createChildContext,
+        }),
+      ).rejects.toBe(overflow);
+    },
+  );
 });

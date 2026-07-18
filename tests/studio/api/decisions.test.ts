@@ -1,4 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
+import { z } from 'zod';
+import { workflow } from '@axlsdk/axl';
 import { createTestServer } from '../helpers/setup.js';
 import { readJson } from '../helpers/json.js';
 
@@ -28,18 +30,33 @@ describe('Studio API: Decisions', () => {
   });
 
   it('POST /api/decisions/:executionId/resolve returns resolved confirmation', async () => {
-    const { app } = createTestServer();
+    const { app, runtime } = createTestServer();
+    const approvalWorkflow = workflow({
+      name: 'studio-approval',
+      input: z.object({}).strict(),
+      handler: (ctx) => ctx.awaitHuman({ channel: 'studio', prompt: 'Approve?' }),
+    });
+    runtime.register(approvalWorkflow);
+    const execution = runtime.execute(approvalWorkflow.name, {});
 
-    const res = await app.request('/api/decisions/exec-123/resolve', {
+    let pending = await runtime.getPendingDecisions();
+    for (let attempt = 0; pending.length === 0 && attempt < 100; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      pending = await runtime.getPendingDecisions();
+    }
+    expect(pending).toHaveLength(1);
+
+    const res = await app.request(`/api/decisions/${pending[0].executionId}/resolve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ approved: true, reason: 'Looks good' }),
+      body: JSON.stringify({ approved: true, data: 'Looks good' }),
     });
     expect(res.status).toBe(200);
 
     const body = await readJson(res);
     expect(body.ok).toBe(true);
     expect(body.data.resolved).toBe(true);
+    await expect(execution).resolves.toEqual({ approved: true, data: 'Looks good' });
   });
 
   it('GET /api/decisions scrubs prompt when trace.redact is on', async () => {

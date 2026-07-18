@@ -164,11 +164,15 @@ export const searchMemory = (query: string, scope?: string, limit?: number) =>
 
 // ── Decisions ──────────────────────────────────────────────────────
 export const fetchDecisions = () => request<PendingDecision[]>('/decisions');
-export const resolveDecision = (executionId: string, approved: boolean, reason?: string) =>
-  request<{ resolved: boolean }>(`/decisions/${encodeURIComponent(executionId)}/resolve`, {
+export const resolveDecision = (executionId: string, approved: boolean, response?: string) => {
+  const decision = approved
+    ? { approved: true as const, ...(response === undefined ? {} : { data: response }) }
+    : { approved: false as const, ...(response === undefined ? {} : { reason: response }) };
+  return request<{ resolved: boolean }>(`/decisions/${encodeURIComponent(executionId)}/resolve`, {
     method: 'POST',
-    body: JSON.stringify({ approved, reason }),
+    body: JSON.stringify(decision),
   });
+};
 
 // ── Costs ──────────────────────────────────────────────────────────
 export const fetchCosts = (window: WindowId = '7d') => request<CostData>(`/costs?window=${window}`);

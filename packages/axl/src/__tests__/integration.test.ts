@@ -29,6 +29,33 @@ const calculatorTool = tool({
   },
 });
 
+const projectionProbeTool = tool({
+  name: 'projection_probe',
+  description: 'Returns a host-only record and a distinct model-facing wire marker.',
+  input: z.object({}),
+  handler: () => ({ computed: 56, hostOnly: 'HOST_ONLY' }),
+  toModelOutput: () => ({ wireAnswer: 'AXL_RECORD_PROJECTION_9F4D2' }),
+});
+
+function assertProjectionProbe(events: AxlEvent[]): void {
+  const start = events.find(
+    (event): event is Extract<AxlEvent, { type: 'tool_call_start' }> =>
+      event.type === 'tool_call_start' && event.tool === 'projection_probe',
+  );
+  const end = events.find(
+    (event): event is Extract<AxlEvent, { type: 'tool_call_end' }> =>
+      event.type === 'tool_call_end' && event.tool === 'projection_probe',
+  );
+  expect(start).toBeDefined();
+  expect(end).toBeDefined();
+  expect(end?.callId).toBe(start?.callId);
+  expect(end?.data.outcome).toMatchObject({
+    status: 'succeeded',
+    result: { computed: 56, hostOnly: 'HOST_ONLY' },
+  });
+  expect(JSON.stringify(end?.data.outcome)).not.toContain('wireAnswer');
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI Integration Tests
 // ---------------------------------------------------------------------------
@@ -50,14 +77,17 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('OpenAI Integration', () => {
   }, 30_000);
 
   it('tool calling', async () => {
+    const marker = 'AXL_RECORD_PROJECTION_9F4D2';
     const mathAgent = agent({
       model: cheapModel,
       system:
-        'You are a math assistant. Always use the calculator tool to compute arithmetic. Return only the final numeric answer.',
-      tools: [calculatorTool],
+        'Always call projection_probe. Then return exactly the wireAnswer string from its result.',
+      tools: [projectionProbeTool],
     });
 
     const runtime = new AxlRuntime();
+    const events: AxlEvent[] = [];
+    runtime.on('trace', (event) => events.push(event));
 
     const mathWorkflow = workflow({
       name: 'math',
@@ -69,10 +99,11 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('OpenAI Integration', () => {
     });
 
     runtime.register(mathWorkflow);
-    const result = await runtime.execute('math', { question: 'What is 7 * 8?' });
+    const result = await runtime.execute('math', { question: 'Follow the system instructions.' });
 
     expect(typeof result).toBe('string');
-    expect(String(result)).toContain('56');
+    expect(String(result)).toContain(marker);
+    assertProjectionProbe(events);
   }, 30_000);
 
   it('streaming', async () => {
@@ -180,14 +211,17 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('OpenAI Responses API Integration',
   }, 30_000);
 
   it('tool calling', async () => {
+    const marker = 'AXL_RECORD_PROJECTION_9F4D2';
     const mathAgent = agent({
       model: cheapModel,
       system:
-        'You are a math assistant. Always use the calculator tool to compute arithmetic. Return only the final numeric answer.',
-      tools: [calculatorTool],
+        'Always call projection_probe. Then return exactly the wireAnswer string from its result.',
+      tools: [projectionProbeTool],
     });
 
     const runtime = new AxlRuntime();
+    const events: AxlEvent[] = [];
+    runtime.on('trace', (event) => events.push(event));
 
     const mathWorkflow = workflow({
       name: 'math-responses',
@@ -199,16 +233,21 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('OpenAI Responses API Integration',
     });
 
     runtime.register(mathWorkflow);
-    const result = await runtime.execute('math-responses', { question: 'What is 6 * 9?' });
+    const result = await runtime.execute('math-responses', {
+      question: 'Follow the system instructions.',
+    });
 
     expect(typeof result).toBe('string');
-    expect(String(result)).toContain('54');
+    expect(String(result)).toContain(marker);
+    assertProjectionProbe(events);
   }, 30_000);
 
-  it('streaming', async () => {
+  it('streaming projected tool output', async () => {
     const assistant = agent({
       model: cheapModel,
-      system: 'You are a helpful assistant. Keep answers very short.',
+      system:
+        'Always call projection_probe. Then include the exact wireAnswer marker in your final answer.',
+      tools: [projectionProbeTool],
     });
 
     const streamWorkflow = workflow({
@@ -223,7 +262,7 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('OpenAI Responses API Integration',
     runtime.register(streamWorkflow);
 
     const stream = runtime.stream('stream-test-responses', {
-      prompt: 'Say exactly: "Hello from Responses API"',
+      prompt: 'Use the projection probe and report its marker.',
     });
 
     const tokens: string[] = [];
@@ -237,7 +276,7 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('OpenAI Responses API Integration',
 
     const result = await stream.promise;
     expect(typeof result).toBe('string');
-    expect((result as string).length).toBeGreaterThan(0);
+    expect(result as string).toContain('AXL_RECORD_PROJECTION_9F4D2');
 
     expect(stream.fullText).toBe(tokens.join(''));
   }, 30_000);
@@ -305,14 +344,17 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('Anthropic Integration', () => {
   }, 30_000);
 
   it('tool calling', async () => {
+    const marker = 'AXL_RECORD_PROJECTION_9F4D2';
     const mathAgent = agent({
       model: cheapModel,
       system:
-        'You are a math assistant. Always use the calculator tool to compute arithmetic. Return only the final numeric answer.',
-      tools: [calculatorTool],
+        'Always call projection_probe. Then return exactly the wireAnswer string from its result.',
+      tools: [projectionProbeTool],
     });
 
     const runtime = new AxlRuntime();
+    const events: AxlEvent[] = [];
+    runtime.on('trace', (event) => events.push(event));
 
     const mathWorkflow = workflow({
       name: 'math-anthropic',
@@ -324,10 +366,13 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('Anthropic Integration', () => {
     });
 
     runtime.register(mathWorkflow);
-    const result = await runtime.execute('math-anthropic', { question: 'What is 12 * 5?' });
+    const result = await runtime.execute('math-anthropic', {
+      question: 'Follow the system instructions.',
+    });
 
     expect(typeof result).toBe('string');
-    expect(String(result)).toContain('60');
+    expect(String(result)).toContain(marker);
+    assertProjectionProbe(events);
   }, 30_000);
 
   it('streaming', async () => {
@@ -396,14 +441,17 @@ describe.skipIf(!process.env.GOOGLE_API_KEY)('Google Gemini Integration', () => 
   }, 30_000);
 
   it('tool calling', async () => {
+    const marker = 'AXL_RECORD_PROJECTION_9F4D2';
     const mathAgent = agent({
       model: cheapModel,
       system:
-        'You are a math assistant. Always use the calculator tool to compute arithmetic. Return only the final numeric answer.',
-      tools: [calculatorTool],
+        'Always call projection_probe. Then return exactly the wireAnswer string from its result.',
+      tools: [projectionProbeTool],
     });
 
     const runtime = new AxlRuntime();
+    const events: AxlEvent[] = [];
+    runtime.on('trace', (event) => events.push(event));
 
     const mathWorkflow = workflow({
       name: 'math-gemini',
@@ -415,10 +463,13 @@ describe.skipIf(!process.env.GOOGLE_API_KEY)('Google Gemini Integration', () => 
     });
 
     runtime.register(mathWorkflow);
-    const result = await runtime.execute('math-gemini', { question: 'What is 9 * 7?' });
+    const result = await runtime.execute('math-gemini', {
+      question: 'Follow the system instructions.',
+    });
 
     expect(typeof result).toBe('string');
-    expect(String(result)).toContain('63');
+    expect(String(result)).toContain(marker);
+    assertProjectionProbe(events);
   }, 30_000);
 
   it('multi-turn tool loop', async () => {
@@ -488,10 +539,12 @@ describe.skipIf(!process.env.GOOGLE_API_KEY)('Google Gemini Integration', () => 
     // network. Other multi-step pricing tests use 60s for the same reason.
   }, 60_000);
 
-  it('streaming', async () => {
+  it('streaming projected tool output', async () => {
     const assistant = agent({
       model: cheapModel,
-      system: 'You are a helpful assistant. Keep answers very short.',
+      system:
+        'Always call projection_probe. Then include the exact wireAnswer marker in your final answer.',
+      tools: [projectionProbeTool],
     });
 
     const streamWorkflow = workflow({
@@ -506,7 +559,7 @@ describe.skipIf(!process.env.GOOGLE_API_KEY)('Google Gemini Integration', () => 
     runtime.register(streamWorkflow);
 
     const stream = runtime.stream('stream-test-gemini', {
-      prompt: 'Say exactly: "Hello from Gemini streaming"',
+      prompt: 'Use the projection probe and report its marker.',
     });
 
     const tokens: string[] = [];
@@ -520,7 +573,7 @@ describe.skipIf(!process.env.GOOGLE_API_KEY)('Google Gemini Integration', () => 
 
     const result = await stream.promise;
     expect(typeof result).toBe('string');
-    expect((result as string).length).toBeGreaterThan(0);
+    expect(result as string).toContain('AXL_RECORD_PROJECTION_9F4D2');
 
     expect(stream.fullText).toBe(tokens.join(''));
   }, 30_000);

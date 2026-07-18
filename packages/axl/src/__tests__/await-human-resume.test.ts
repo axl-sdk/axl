@@ -145,6 +145,27 @@ describe('awaitHuman suspend/resume', () => {
     expect(result).toBe('merged');
   });
 
+  it('rejects invalid runtime decisions before mutating the pending request', async () => {
+    const wf = workflow({
+      name: 'validate-decision-flow',
+      input: z.object({}).strict(),
+      handler: async (ctx) => ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+    });
+    const runtime = new AxlRuntime({ state: { store: 'memory' } });
+    runtime.register(wf);
+
+    const resultPromise = runtime.execute('validate-decision-flow', {});
+    const [pending] = await waitForPendingDecision(runtime);
+
+    await expect(
+      runtime.resolveDecision(pending.executionId, { approved: true, reason: 'no' } as never),
+    ).rejects.toMatchObject({ code: 'INVALID_HUMAN_DECISION' });
+    expect(await runtime.getPendingDecisions()).toEqual([pending]);
+
+    await runtime.resolveDecision(pending.executionId, { approved: true, data: 'yes' });
+    await expect(resultPromise).resolves.toEqual({ approved: true, data: 'yes' });
+  });
+
   it('rejected decision flows through correctly', async () => {
     const provider = new TestProvider();
 
@@ -207,6 +228,78 @@ describe('awaitHuman suspend/resume', () => {
     expect(state).not.toBeNull();
     expect(state!.status).toBe('waiting');
     expect(state!.workflow).toBe('deploy-flow');
+  });
+
+  it('fails closed across runtimes without deleting or replaying the pending decision', async () => {
+    const store = new MemoryStore();
+    await store.saveExecutionState('exec-cross-process', {
+      workflow: 'cross-process-flow',
+      input: {},
+      step: 3,
+      status: 'waiting',
+    });
+    await store.savePendingDecision('exec-cross-process', {
+      executionId: 'exec-cross-process',
+      channel: 'ops',
+      prompt: 'approve?',
+      createdAt: new Date().toISOString(),
+    });
+    let handlerCalls = 0;
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.register(
+      workflow({
+        name: 'cross-process-flow',
+        input: z.object({}).strict(),
+        handler: async () => {
+          handlerCalls++;
+          return 'unexpected';
+        },
+      }),
+    );
+
+    await expect(
+      runtime.resolveDecision('exec-cross-process', { approved: true }),
+    ).rejects.toMatchObject({ code: 'CROSS_PROCESS_RESUME_UNSUPPORTED' });
+    await expect(runtime.resumeExecution('exec-cross-process')).rejects.toMatchObject({
+      code: 'CROSS_PROCESS_RESUME_UNSUPPORTED',
+    });
+    expect(handlerCalls).toBe(0);
+    expect(await store.getPendingDecisions()).toHaveLength(1);
+    expect((await store.getExecutionState('exec-cross-process'))?.status).toBe('waiting');
+  });
+
+  it('preserves a pending decision even when its execution-state row is missing', async () => {
+    const store = new MemoryStore();
+    await store.savePendingDecision('exec-state-missing', {
+      executionId: 'exec-state-missing',
+      channel: 'ops',
+      prompt: 'approve?',
+      createdAt: new Date().toISOString(),
+    });
+    const runtime = new AxlRuntime({ state: { store } });
+
+    await expect(
+      runtime.resolveDecision('exec-state-missing', { approved: true }),
+    ).rejects.toMatchObject({ code: 'CROSS_PROCESS_RESUME_UNSUPPORTED' });
+    expect(await store.getPendingDecisions()).toHaveLength(1);
+  });
+
+  it('audits every pending resume failure without requiring an error listener', async () => {
+    const store = new MemoryStore();
+    for (const executionId of ['exec-resume-a', 'exec-resume-b']) {
+      await store.saveExecutionState(executionId, {
+        workflow: 'cross-process-flow',
+        input: {},
+        step: 1,
+        status: 'waiting',
+      });
+    }
+    const runtime = new AxlRuntime({ state: { store } });
+    const audited: string[] = [];
+    runtime.on('resume_failed', (event) => audited.push(event.executionId));
+
+    await expect(runtime.resumePending()).resolves.toEqual([]);
+    expect(audited.sort()).toEqual(['exec-resume-a', 'exec-resume-b']);
   });
 
   it('deleteExecution unblocks a workflow awaiting human decision (signal-driven abort)', async () => {

@@ -25,6 +25,7 @@ import type {
   VerifyRetry,
 } from './types.js';
 import {
+  AxlError,
   VerifyError,
   QuorumNotMet,
   NoConsensus,
@@ -68,6 +69,61 @@ import {
  * without mutating shared state on the WorkflowContext instance.
  */
 const signalStorage = new AsyncLocalStorage<AbortSignal>();
+
+type BranchDrainState = {
+  pending: Set<Promise<unknown>>;
+  overflow?: EventStreamOverflowError;
+};
+
+/** Validate untyped host input at the human-decision boundary. */
+export function parseHumanDecision(value: unknown): HumanDecision {
+  const invalid = (): never => {
+    throw new AxlError(
+      'INVALID_HUMAN_DECISION',
+      'Human decision must be a plain object with a boolean approved field and only branch-appropriate string data',
+    );
+  };
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) invalid();
+  let prototype: object | null;
+  try {
+    prototype = Object.getPrototypeOf(value);
+  } catch {
+    return invalid();
+  }
+  if (prototype !== Object.prototype && prototype !== null) invalid();
+
+  const readDataProperty = (
+    key: 'approved' | 'data' | 'reason',
+  ): { present: boolean; value: unknown } => {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      return invalid();
+    }
+    if (!descriptor) return { present: false, value: undefined };
+    if (!('value' in descriptor)) return invalid();
+    return { present: true, value: descriptor.value };
+  };
+
+  const approved = readDataProperty('approved');
+  const data = readDataProperty('data');
+  const reason = readDataProperty('reason');
+  if (approved.present && approved.value === true && !reason.present) {
+    if (data.value === undefined || typeof data.value === 'string') {
+      return { approved: true, ...(data.value === undefined ? {} : { data: data.value }) };
+    }
+  }
+  if (approved.present && approved.value === false && !data.present) {
+    if (reason.value === undefined || typeof reason.value === 'string') {
+      return {
+        approved: false,
+        ...(reason.value === undefined ? {} : { reason: reason.value }),
+      };
+    }
+  }
+  return invalid();
+}
 
 /**
  * Per-ask frame propagated via AsyncLocalStorage.
@@ -434,6 +490,9 @@ export type WorkflowContextInit = {
    *
    *  Root contexts default to a fresh `{ byAgent: new Map(), root: 0 }`. */
   autoCheckpointCounters?: { byAgent: Map<string, number>; root: number };
+  /** Internal: root-shared state for branch continuations that must settle
+   *  before the runtime emits the workflow terminal and snapshots cost. */
+  branchDrainState?: BranchDrainState;
 };
 
 /**
@@ -479,6 +538,7 @@ export class WorkflowContext<TInput = unknown> {
    * the caller-supplied key.
    */
   private autoCheckpointCounters: { byAgent: Map<string, number>; root: number };
+  private readonly branchDrainState: BranchDrainState;
   /** Idempotency guards for `workflow_start` / `workflow_end` emission.
    *  Both `runtime.execute()` and `runtime.stream()` have paths where a
    *  post-emit side-effect (checkpoint deletion, state-store persistence)
@@ -670,6 +730,7 @@ export class WorkflowContext<TInput = unknown> {
       byAgent: new Map(),
       root: 0,
     };
+    this.branchDrainState = init.branchDrainState ?? { pending: new Set() };
     // Restore cached summary from session metadata (survives across requests)
     if (init.metadata?.summaryCache) {
       this.summaryCache = init.metadata.summaryCache as string;
@@ -713,6 +774,7 @@ export class WorkflowContext<TInput = unknown> {
       // emitted from `ctx.ask` / spawn / race / parallel / map in this
       // child context don't collide with the parent's in the state store.
       autoCheckpointCounters: this.autoCheckpointCounters,
+      branchDrainState: this.branchDrainState,
       // Share the parent's bus slot (mutable ref). Late allocation in
       // either parent or child propagates because both read the same
       // slot. Nested-ask events (agent-as-tool pattern) bubble up to
@@ -732,6 +794,33 @@ export class WorkflowContext<TInput = unknown> {
    */
   private get currentSignal(): AbortSignal | undefined {
     return signalStorage.getStore() ?? this.signal;
+  }
+
+  private _registerBranchDrain(promise: Promise<unknown>): void {
+    const state = this.branchDrainState;
+    state.pending.add(promise);
+    void promise.then(
+      () => state.pending.delete(promise),
+      (error) => {
+        state.pending.delete(promise);
+        if (!state.overflow && error instanceof EventStreamOverflowError) {
+          state.overflow = error;
+        }
+      },
+    );
+  }
+
+  /** Wait for race/quorum losers (including nested branch work) to settle.
+   *  Primitive calls still resolve as soon as their winner/quorum is known;
+   *  this is only the runtime's terminal/persistence barrier. */
+  async _drainBranchWork(): Promise<void> {
+    const state = this.branchDrainState;
+    while (state.pending.size > 0) {
+      await Promise.allSettled([...state.pending]);
+    }
+    const overflow = state.overflow;
+    state.overflow = undefined;
+    if (overflow) throw overflow;
   }
 
   /** Resolve, execute, and observe one non-handoff tool request. Rejections
@@ -1049,44 +1138,22 @@ export class WorkflowContext<TInput = unknown> {
             // bug (e.g., a future synchronous throw before either
             // branch runs) so we never silently drop the ask_end event.
             //
-            // Overflow protection on the error path: under `onOverflow:
-            // 'throw'`, this `emitEvent` can throw
-            // `EventStreamOverflowError`. If we're already unwinding
-            // an in-flight error from the catch branch, letting the
-            // overflow propagate would replace it — the user wants to
-            // see WHY their ask failed, not that an unrelated event
-            // couldn't be queued. Log the overflow so it's still
-            // observable; preserve the original error.
-            try {
-              this.emitEvent({
-                type: 'ask_end',
-                outcome:
-                  outcome ??
-                  ({
-                    ok: false,
-                    error: 'ask_end emitted without outcome — internal bug',
-                  } as const),
-                cost: frame.askCost.value,
-                ...(frame.askUnpriced ? { unpriced: true } : {}),
-                duration: Date.now() - askStart,
-              });
-            } catch (emitErr) {
-              if (emitErr instanceof EventStreamOverflowError && outcome && !outcome.ok) {
-                console.error(
-                  '[axl] ask_end emit overflowed during error path; preserving original error:',
-                  emitErr.message,
-                );
-              } else {
-                // Success-path overflow MUST propagate (documented
-                // strict-mode policy); non-overflow emit errors
-                // (unexpected) shouldn't be silently dropped either.
-                // The branch above explicitly protects the
-                // in-flight-error case where masking would be wrong;
-                // everything else legitimately surfaces from here.
-                // eslint-disable-next-line no-unsafe-finally
-                throw emitErr;
-              }
-            }
+            // Strict overflow is an observability-integrity failure. It must
+            // propagate even while another ask error is unwinding; otherwise
+            // a missing terminal event could be hidden behind a branch retry
+            // or aggregation boundary.
+            this.emitEvent({
+              type: 'ask_end',
+              outcome:
+                outcome ??
+                ({
+                  ok: false,
+                  error: 'ask_end emitted without outcome — internal bug',
+                } as const),
+              cost: frame.askCost.value,
+              ...(frame.askUnpriced ? { unpriced: true } : {}),
+              duration: Date.now() - askStart,
+            });
           }
         });
       },
@@ -1699,6 +1766,11 @@ export class WorkflowContext<TInput = unknown> {
         },
       });
 
+      // A race/quorum loser may use a provider that ignores AbortSignal and
+      // still returns a response. Retain its real cost above, then stop the
+      // cancelled branch before any tool/content continuation.
+      this.currentSignal?.throwIfAborted();
+
       // Handle tool calls
       if (response.tool_calls && response.tool_calls.length > 0) {
         currentMessages.push({
@@ -2092,6 +2164,7 @@ export class WorkflowContext<TInput = unknown> {
             metadata: this.metadata,
           });
         } catch (err) {
+          if (err instanceof EventStreamOverflowError) throw err;
           const reason = err instanceof Error ? err.message : String(err);
           validateResult = { valid: false, reason: `Validator error: ${reason}` };
         }
@@ -2704,6 +2777,7 @@ export class WorkflowContext<TInput = unknown> {
           const index = i;
           // Run each branch in an AsyncLocalStorage context with the composed signal
           const p = signalStorage.run(composedSignal, () => fn(index));
+          this._registerBranchDrain(p);
 
           p.then((value) => {
             if (settled) return;
@@ -2719,6 +2793,14 @@ export class WorkflowContext<TInput = unknown> {
               reject(new QuorumNotMet(quorum, successCount, results));
             }
           }).catch((err) => {
+            if (err instanceof EventStreamOverflowError) {
+              if (!settled) {
+                settled = true;
+                controller.abort();
+                reject(err);
+              }
+              return;
+            }
             if (settled) return;
             // AbortErrors from our cancellation don't count as failures
             const isAbort = err instanceof DOMException && err.name === 'AbortError';
@@ -2747,15 +2829,17 @@ export class WorkflowContext<TInput = unknown> {
       const run = () =>
         fn(i)
           .then((value): Result<T> => ({ ok: true, value }))
-          .catch(
-            (err): Result<T> => ({
+          .catch((err): Result<T> => {
+            if (err instanceof EventStreamOverflowError) throw err;
+            return {
               ok: false,
               error: err instanceof Error ? err.message : String(err),
-            }),
-          );
+            };
+          });
       // Propagate parent signal so budget hard_stop can cancel non-quorum spawns
       return parentSignal ? signalStorage.run(parentSignal, run) : run();
     });
+    for (const promise of promises) this._registerBranchDrain(promise);
 
     return Promise.all(promises);
   }
@@ -2925,6 +3009,7 @@ export class WorkflowContext<TInput = unknown> {
           try {
             validateResult = await options.validate(parsed, { metadata: this.metadata });
           } catch (err) {
+            if (err instanceof EventStreamOverflowError) throw err;
             const reason = err instanceof Error ? err.message : String(err);
             validateResult = { valid: false, reason: `Validator error: ${reason}` };
           }
@@ -2943,6 +3028,7 @@ export class WorkflowContext<TInput = unknown> {
         emitVerifyOutcome(true, attempt + 1);
         return parsed;
       } catch (err) {
+        if (err instanceof EventStreamOverflowError) throw err;
         if (err instanceof ValidationError) {
           // ValidationError from our own validate block or from fn (e.g., ctx.ask() validate
           // exhausted). Extract the parsed object so the next retry can repair it.
@@ -3034,6 +3120,7 @@ export class WorkflowContext<TInput = unknown> {
         const unpriced = this.budgetContext!.unpriced;
         return { value, budgetExceeded: exceeded, totalCost, unpriced };
       } catch (err) {
+        if (err instanceof EventStreamOverflowError) throw err;
         if (this.budgetContext!.exceeded) {
           return {
             value: null,
@@ -3155,77 +3242,90 @@ export class WorkflowContext<TInput = unknown> {
         // Run each branch in an AsyncLocalStorage context with the composed signal.
         // This ensures the signal persists through all awaits in the branch.
         const p = signalStorage.run(composedSignal, fn);
+        this._registerBranchDrain(p);
 
-        p.then(async (value) => {
-          if (settled) return;
-          // If a schema is provided, validate the result.
-          // Invalid results are discarded and the race continues.
-          if (schema) {
-            const parsed = schema.safeParse(value);
-            if (!parsed.success) {
-              remaining--;
-              lastError = new Error(`Schema validation failed: ${parsed.error.message}`);
-              if (remaining === 0 && !settled) {
-                settled = true;
-                reject(lastError);
-              }
-              return;
-            }
-            // Post-schema business rule validation — invalid results discarded like schema failures
-            if (options?.validate) {
-              try {
-                const validateResult = await options.validate(parsed.data as T, {
-                  metadata: this.metadata,
-                });
-                if (!validateResult.valid) {
-                  remaining--;
-                  lastError = new Error(
-                    `Validation failed: ${validateResult.reason ?? 'Validation failed'}`,
-                  );
-                  if (remaining === 0 && !settled) {
-                    settled = true;
-                    reject(lastError);
-                  }
-                  return;
-                }
-              } catch (err) {
+        const continuation = p
+          .then(async (value) => {
+            if (settled) return;
+            // If a schema is provided, validate the result.
+            // Invalid results are discarded and the race continues.
+            if (schema) {
+              const parsed = schema.safeParse(value);
+              if (!parsed.success) {
                 remaining--;
-                lastError =
-                  err instanceof Error ? err : new Error(`Validator error: ${String(err)}`);
+                lastError = new Error(`Schema validation failed: ${parsed.error.message}`);
                 if (remaining === 0 && !settled) {
                   settled = true;
                   reject(lastError);
                 }
                 return;
               }
+              // Post-schema business rule validation — invalid results discarded like schema failures
+              if (options?.validate) {
+                try {
+                  const validateResult = await options.validate(parsed.data as T, {
+                    metadata: this.metadata,
+                  });
+                  if (!validateResult.valid) {
+                    remaining--;
+                    lastError = new Error(
+                      `Validation failed: ${validateResult.reason ?? 'Validation failed'}`,
+                    );
+                    if (remaining === 0 && !settled) {
+                      settled = true;
+                      reject(lastError);
+                    }
+                    return;
+                  }
+                } catch (err) {
+                  if (err instanceof EventStreamOverflowError) throw err;
+                  remaining--;
+                  lastError =
+                    err instanceof Error ? err : new Error(`Validator error: ${String(err)}`);
+                  if (remaining === 0 && !settled) {
+                    settled = true;
+                    reject(lastError);
+                  }
+                  return;
+                }
+              }
+              if (settled) return; // another branch may have won during async validate
+              settled = true;
+              controller.abort();
+              resolve(parsed.data as T);
+              return;
             }
-            if (settled) return; // another branch may have won during async validate
             settled = true;
-            controller.abort();
-            resolve(parsed.data as T);
-            return;
-          }
-          settled = true;
-          controller.abort(); // Cancel losing branches
-          resolve(value);
-        }).catch((err) => {
-          if (settled) return;
-          // Ignore AbortErrors from our own cancellation
-          if (err instanceof DOMException && err.name === 'AbortError') {
+            controller.abort(); // Cancel losing branches
+            resolve(value);
+          })
+          .catch((err) => {
+            if (err instanceof EventStreamOverflowError) {
+              if (!settled) {
+                settled = true;
+                controller.abort();
+                reject(err);
+              }
+              throw err;
+            }
+            if (settled) return;
+            // Ignore AbortErrors from our own cancellation
+            if (err instanceof DOMException && err.name === 'AbortError') {
+              remaining--;
+              if (remaining === 0 && !settled) {
+                settled = true;
+                reject(lastError ?? new Error('All race branches were aborted'));
+              }
+              return;
+            }
             remaining--;
+            lastError = err instanceof Error ? err : new Error(String(err));
             if (remaining === 0 && !settled) {
               settled = true;
-              reject(lastError ?? new Error('All race branches were aborted'));
+              reject(lastError);
             }
-            return;
-          }
-          remaining--;
-          lastError = err instanceof Error ? err : new Error(String(err));
-          if (remaining === 0 && !settled) {
-            settled = true;
-            reject(lastError);
-          }
-        });
+          });
+        this._registerBranchDrain(continuation);
       }
     });
   }
@@ -3286,9 +3386,19 @@ export class WorkflowContext<TInput = unknown> {
             const value = mapSignal
               ? await signalStorage.run(mapSignal, () => fn(items[idx], idx))
               : await fn(items[idx], idx);
+            if (settled) return;
             results[idx] = { ok: true, value };
             successCount++;
           } catch (err) {
+            if (err instanceof EventStreamOverflowError) {
+              settled = true;
+              controller?.abort();
+              reject(err);
+              throw err;
+            }
+            if (settled) {
+              return;
+            }
             // Ignore AbortErrors from our own quorum cancellation
             if (
               err instanceof DOMException &&
@@ -3322,7 +3432,9 @@ export class WorkflowContext<TInput = unknown> {
 
       const workers = Math.min(concurrency, items.length);
       for (let i = 0; i < workers; i++) {
-        runNext().catch((err) => {
+        const worker = runNext();
+        this._registerBranchDrain(worker);
+        worker.catch((err) => {
           if (!settled) reject(err);
         });
       }
@@ -3359,7 +3471,7 @@ export class WorkflowContext<TInput = unknown> {
         type: 'await_human',
         data: { channel: options.channel, prompt: options.prompt },
       });
-      const decision = await this.awaitHumanHandler(options);
+      const decision = parseHumanDecision(await this.awaitHumanHandler(options));
       this.emitEvent({
         type: 'await_human_resolved',
         data: { channel: options.channel, decision },

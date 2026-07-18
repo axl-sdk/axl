@@ -53,11 +53,13 @@ const LIFECYCLE_TYPES: ReadonlySet<AxlEventType> = new Set<AxlEventType>([
 ]);
 
 /** Options shared between `AxlEventBus` (and therefore `AxlStream` and
- *  `ctx.events`). Controls the overflow safety net on the iterator queue. */
+ *  `ctx.events`). Controls the overflow safety net on the main iterator queue
+ *  and each listener-based `stringStream()` subscriber queue. */
 export interface EventStreamOptions {
-  /** Soft cap on the number of events held in the iterator queue while
-   *  waiting for a consumer. Terminal events (`done`, `error`,
-   *  `workflow_end`) are exempt and always pass through. Default 10_000.
+  /** Soft cap on the number of events held while waiting for a consumer,
+   *  including distinct pending fields in each `stringStream()` subscriber.
+   *  Terminal events (`done`, `error`, `workflow_end`) are exempt from the
+   *  main iterator cap and always pass through. Default 10_000.
    *
    *  Set to `Infinity` to disable the cap (matches pre-0.x behavior). */
   maxQueued?: number;
@@ -106,7 +108,8 @@ export type CoalescedPartialObject = {
 /**
  * The shape yielded by `AxlEventBus.stringStream` (and `AxlStream.stringStream`).
  *
- * A live `string_delta` event carries `delta` (the new chars from this chunk)
+ * A live `string_delta` event carries `delta` (the new chars since this
+ * subscriber's previous yield; slow subscribers may coalesce source chunks)
  * and `accumulated` (every char emitted so far for this ask + path,
  * i.e. `delta1 + delta2 + ...`). Consumers rendering full-field state set
  * their UI text to `accumulated`; consumers rendering incrementally use
@@ -130,8 +133,9 @@ export type StringStreamEvent = {
   agent?: string;
   /** RFC 6901 JSON Pointer; matches the source `string_delta.data.path`. */
   path: string;
-  /** Chars added in this delta. For seeded synthetic events on subscribe,
-   *  equals `accumulated` (the full text-so-far). */
+  /** Chars added since this subscriber's previous yield. May combine several
+   *  source chunks when the subscriber is slow. For seeded events, equals
+   *  `accumulated` (the full text-so-far). */
   delta: string;
   /** Concatenation of every delta this ask + path has emitted in the
    *  current attempt. Cleared on `pipeline(failed)` and `ask_end`. */
@@ -284,6 +288,14 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     string,
     Map<string, { agent?: string; text: string; attempt: number }>
   >();
+
+  /** Internal fan-out for `stringStream()` subscribers. Kept separate from
+   *  the public EventEmitter so strict curated-view overflow is a runtime
+   *  signal, not mistaken for (and swallowed as) a buggy user listener. */
+  private stringStreamSubscribers = new Set<{
+    push: (event: StringStreamEvent) => void;
+    reset: (askId: string) => void;
+  }>();
 
   /**
    * Hook fired when an iterator obtained from `[Symbol.asyncIterator]`
@@ -755,13 +767,12 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     }
     return {
       [Symbol.asyncIterator]() {
-        // FIFO buffer of events to yield. Listener pushes; iterator pops.
-        // Unlike `partialObjects` (which uses a per-askId Map for coalescing),
-        // string deltas are NOT coalesced — every delta is meaningful for
-        // typewriter rendering. The buffer can grow if the consumer is slow,
-        // but the producer cap (default 10k events on the underlying queue)
-        // bounds it.
-        const pending: StringStreamEvent[] = [];
+        // Insertion-ordered, coalescing buffer. A slow subscriber retains at
+        // most one event per ask/path; its `delta` is every character since
+        // that subscriber's previous yield, while `accumulated` is the latest
+        // canonical field state. Distinct pending fields are capped by the
+        // same EventStreamOptions policy as the main iterator queue.
+        const pending = new Map<string, StringStreamEvent>();
         let resolveWaiter: (() => void) | null = null;
         let finished = self.finished;
         let unsubscribed = false;
@@ -778,6 +789,33 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
           return true;
         };
 
+        const pendingKey = (askId: string, path: string): string => JSON.stringify([askId, path]);
+
+        const enqueue = (event: StringStreamEvent): void => {
+          const key = pendingKey(event.askId, event.path);
+          const existing = pending.get(key);
+          if (existing) {
+            pending.set(key, {
+              ...event,
+              delta: existing.delta + event.delta,
+            });
+            wakeWaiter();
+            return;
+          }
+          if (pending.size >= self.maxQueued) {
+            if (self.onOverflow === 'throw') {
+              throw new EventStreamOverflowError(self.maxQueued, 'string_delta');
+            }
+            const oldest = pending.keys().next().value as string | undefined;
+            if (oldest !== undefined) pending.delete(oldest);
+            self.warnOverflow(
+              'dropping oldest pending string field (stringStream subscriber is slower than producer)',
+            );
+          }
+          pending.set(key, event);
+          wakeWaiter();
+        };
+
         // Seed: walk the bus accumulator, push synthetic events for
         // every matching (askId, path) entry. Iteration is over the
         // outer `Map<string, Map<string, ...>>` in insertion order — so
@@ -786,7 +824,7 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
         for (const [askId, paths] of self.stringStreamByAsk) {
           for (const [path, acc] of paths) {
             if (!matchesFilter(askId, path)) continue;
-            pending.push({
+            enqueue({
               askId,
               agent: acc.agent,
               path,
@@ -797,75 +835,42 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
           }
         }
 
-        // Subscribe to live events. Filter at the listener so non-
-        // matching events don't even reach `pending`.
-        const handler = (event: AxlEvent) => {
-          if (event.type !== 'string_delta') return;
-          const askId = event.askId ?? '';
-          if (!matchesFilter(askId, event.data.path)) return;
-          // INVARIANT: by the time this listener runs, `_push` has already
-          // updated `stringStreamByAsk` for this event (the accumulator
-          // update is intentionally ordered BEFORE `bus.emit`). So
-          // `acc.text` reflects post-this-event state. The `?? delta`
-          // fallback is pure belt-and-braces — it would only fire if the
-          // _push order were inverted by a future refactor, in which case
-          // tests pinning the `accumulated` field would catch it. Leaving
-          // the fallback in keeps a malformed-state path from crashing the
-          // listener (which would unwind the bus's emit() and propagate to
-          // the workflow).
-          const paths = self.stringStreamByAsk.get(askId);
-          const acc = paths?.get(event.data.path);
-          const accumulated = acc?.text ?? event.data.delta;
-          pending.push({
-            askId,
-            agent: event.agent,
-            path: event.data.path,
-            delta: event.data.delta,
-            accumulated,
-            attempt: event.attempt,
-          });
-          wakeWaiter();
+        const subscriber = {
+          push(event: StringStreamEvent): void {
+            if (matchesFilter(event.askId, event.path)) enqueue(event);
+          },
+          reset(askId: string): void {
+            for (const [key, event] of pending) {
+              if (event.askId === askId) pending.delete(key);
+            }
+          },
         };
-        self.bus.on('string_delta', handler);
-
-        // Drop pending events on schema retry. Without this, undrained
-        // attempt-N deltas sit in `pending` while attempt-N+1 begins;
-        // the consumer's next iteration would surface attempt-N text
-        // BEFORE attempt-N+1's first delta arrives, causing the
-        // typewriter to render the wrong text. Mirrors partialObjects'
-        // per-attempt reset.
-        const pipelineHandler = (event: AxlEvent) => {
-          if (event.type !== 'pipeline') return;
-          if (event.status !== 'failed') return;
-          const askId = event.askId ?? '';
-          // Splice out pending events for this askId. Walk
-          // backwards so indices stay valid as we remove.
-          for (let i = pending.length - 1; i >= 0; i--) {
-            if (pending[i].askId === askId) pending.splice(i, 1);
-          }
-        };
-        self.bus.on('pipeline', pipelineHandler);
+        self.stringStreamSubscribers.add(subscriber);
 
         const unsubscribe = () => {
           if (unsubscribed) return;
           unsubscribed = true;
-          self.bus.off('string_delta', handler);
-          self.bus.off('pipeline', pipelineHandler);
+          self.stringStreamSubscribers.delete(subscriber);
           unsubscribeFinish();
         };
 
         const unsubscribeFinish = self._onFinish(() => {
           finished = true;
-          self.bus.off('string_delta', handler);
-          self.bus.off('pipeline', pipelineHandler);
+          self.stringStreamSubscribers.delete(subscriber);
           wakeWaiter();
         });
 
         return {
           async next(): Promise<IteratorResult<StringStreamEvent>> {
             while (true) {
-              if (pending.length > 0) {
-                return { value: pending.shift()!, done: false };
+              if (pending.size > 0) {
+                const first = pending.entries().next().value as
+                  | [string, StringStreamEvent]
+                  | undefined;
+                if (first) {
+                  pending.delete(first[0]);
+                  return { value: first[1], done: false };
+                }
               }
               if (finished) {
                 unsubscribe();
@@ -957,10 +962,22 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
         text: (existing?.text ?? '') + event.data.delta,
         attempt: event.attempt,
       });
+      const accumulated = paths.get(event.data.path)!.text;
+      for (const subscriber of this.stringStreamSubscribers) {
+        subscriber.push({
+          askId,
+          agent: event.agent,
+          path: event.data.path,
+          delta: event.data.delta,
+          accumulated,
+          attempt: event.attempt,
+        });
+      }
     } else if (event.type === 'pipeline' && event.status === 'failed') {
       const askId = event.askId ?? '';
       this.latestPartialByAsk.delete(askId);
       this.stringStreamByAsk.delete(askId);
+      for (const subscriber of this.stringStreamSubscribers) subscriber.reset(askId);
     } else if (event.type === 'ask_end') {
       this.stringStreamByAsk.delete(event.askId ?? '');
     }

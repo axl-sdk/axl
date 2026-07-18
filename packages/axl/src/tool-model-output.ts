@@ -59,8 +59,8 @@ function normalize(value: unknown, path: string, stack: WeakSet<object>): ToolMo
         'accessor properties are not supported',
       );
     }
-    if (typeof key === 'symbol' && descriptor?.enumerable) {
-      throw invalid(`${path}[symbol]`, 'enumerable symbol keys are not supported');
+    if (typeof key === 'symbol') {
+      throw invalid(`${path}[symbol]`, 'symbol keys are not supported');
     }
   }
 

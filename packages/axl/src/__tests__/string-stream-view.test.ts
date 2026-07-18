@@ -69,7 +69,7 @@ async function consumeWhileDriving<T>(iter: AsyncIterable<T>, drive: () => void)
 }
 
 describe('AxlEventBus.stringStream', () => {
-  it('yields live deltas with running `accumulated`', async () => {
+  it('coalesces undrained live deltas with running `accumulated`', async () => {
     const bus = new AxlEventBus();
     const events = await consumeWhileDriving(bus.stringStream(), () => {
       bus._push(delta(ASK, '/summary', 'Hello'));
@@ -79,9 +79,7 @@ describe('AxlEventBus.stringStream', () => {
     });
 
     expect(events.map((e) => ({ delta: e.delta, accumulated: e.accumulated }))).toEqual([
-      { delta: 'Hello', accumulated: 'Hello' },
-      { delta: ' world', accumulated: 'Hello world' },
-      { delta: '!', accumulated: 'Hello world!' },
+      { delta: 'Hello world!', accumulated: 'Hello world!' },
     ]);
   });
 
@@ -93,7 +91,7 @@ describe('AxlEventBus.stringStream', () => {
       bus._push(delta(ASK, '/summary', 'C'));
       bus._finish();
     });
-    expect(events.map((e) => e.path + '=' + e.delta)).toEqual(['/summary=A', '/summary=C']);
+    expect(events.map((e) => e.path + '=' + e.delta)).toEqual(['/summary=AC']);
   });
 
   it('filters by askId', async () => {
@@ -104,7 +102,7 @@ describe('AxlEventBus.stringStream', () => {
       bus._push(delta(ASK, '/x', 'c'));
       bus._finish();
     });
-    expect(events.map((e) => e.askId + '=' + e.delta)).toEqual([ASK + '=a', ASK + '=c']);
+    expect(events.map((e) => e.askId + '=' + e.delta)).toEqual([ASK + '=ac']);
   });
 
   it('filters by both path and askId', async () => {
@@ -248,7 +246,7 @@ describe('AxlEventBus.stringStream', () => {
       (async () => {
         for await (const e of bus.stringStream()) {
           stringEvents.push(e.delta);
-          if (stringEvents.length >= 2) break;
+          // Synchronous producer bursts may be coalesced per ask/path.
         }
       })(),
       (async () => {
@@ -262,10 +260,11 @@ describe('AxlEventBus.stringStream', () => {
           data: 'tok',
         } as unknown as AxlEvent);
         bus._push(askEnd(ASK));
+        bus._finish();
       })(),
     ]);
 
-    expect(stringEvents).toEqual(['A', 'B']);
+    expect(stringEvents).toEqual(['AB']);
     expect(allEvents.map((e) => e.type)).toEqual([
       'string_delta',
       'string_delta',
@@ -296,11 +295,48 @@ describe('AxlEventBus.stringStream', () => {
       bus._finish();
     });
     expect(events.map((e) => ({ askId: e.askId, accumulated: e.accumulated }))).toEqual([
-      { askId: ASK, accumulated: 'A1' },
-      { askId: ASK2, accumulated: 'B1' },
       { askId: ASK, accumulated: 'A1A2' },
       { askId: ASK2, accumulated: 'B1B2' },
     ]);
+  });
+
+  it('bounds a stalled same-field subscriber without losing characters', async () => {
+    const bus = new AxlEventBus({ maxQueued: 1 });
+    const iter = bus.stringStream({ askId: ASK, path: '/x' })[Symbol.asyncIterator]();
+
+    for (let i = 0; i < 1_000; i++) bus._push(delta(ASK, '/x', 'x'));
+    bus._finish();
+
+    const event = await iter.next();
+    expect(event.done).toBe(false);
+    expect(event.value?.delta).toHaveLength(1_000);
+    expect(event.value?.accumulated).toHaveLength(1_000);
+    expect((await iter.next()).done).toBe(true);
+  });
+
+  it('caps distinct stalled fields with the configured drop policy', async () => {
+    const bus = new AxlEventBus({ maxQueued: 2 });
+    const iter = bus.stringStream({ askId: ASK })[Symbol.asyncIterator]();
+
+    bus._push(delta(ASK, '/a', 'a'));
+    bus._push(delta(ASK, '/b', 'b'));
+    bus._push(delta(ASK, '/c', 'c'));
+    bus._finish();
+
+    const paths: string[] = [];
+    for await (const event of { [Symbol.asyncIterator]: () => iter }) paths.push(event.path);
+    expect(paths).toEqual(['/b', '/c']);
+  });
+
+  it('applies strict overflow to late-subscriber seed buffers', async () => {
+    const bus = new AxlEventBus({ maxQueued: 1, onOverflow: 'throw' });
+    const main = bus[Symbol.asyncIterator]();
+    bus._push(delta(ASK, '/a', 'a'));
+    await main.next();
+    bus._push(delta(ASK, '/b', 'b'));
+    await main.next();
+
+    expect(() => bus.stringStream({ askId: ASK })[Symbol.asyncIterator]()).toThrow(/maxQueued=1/);
   });
 
   it('rejects malformed path (no leading slash) with a clear error', () => {

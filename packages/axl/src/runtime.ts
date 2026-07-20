@@ -1233,6 +1233,7 @@ export class AxlRuntime extends EventEmitter {
       sessionHistory: options?.sessionHistory,
       signal: options?.signal,
       awaitHumanHandler: options?.awaitHumanHandler,
+      _onDecisionCleanupFailed: (event) => this.emit('decision_cleanup_failed', event),
       eventStreamOptions: options?.events,
       onTrace: (event: AxlEvent) => {
         // Note: createContext flows do NOT append to streamingFlusher.
@@ -1333,6 +1334,7 @@ export class AxlRuntime extends EventEmitter {
       signal: controller.signal,
       eventStreamOptions: options?.events,
       branchDrainTimeoutMs,
+      _onDecisionCleanupFailed: (event) => this.emit('decision_cleanup_failed', event),
       onTrace: (event: AxlEvent) => {
         // High-volume stream-only events (`token`, `partial_object`)
         // are never persisted, plus a bounded cap on the rest to avoid
@@ -1511,6 +1513,7 @@ export class AxlRuntime extends EventEmitter {
         signal: controller.signal,
         eventStreamOptions: options?.events,
         branchDrainTimeoutMs,
+        _onDecisionCleanupFailed: (event) => this.emit('decision_cleanup_failed', event),
         // Transport mode is explicit internal state. It is inherited by child
         // contexts and does not allocate an unconsumed ctx.events queue.
         _forceStreaming: true,

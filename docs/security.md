@@ -106,6 +106,15 @@ The runtime fails such a resolution with `CROSS_PROCESS_RESUME_UNSUPPORTED`
 before deleting the pending request or starting any handler, so operators can
 route it through their durable application protocol without data loss.
 
+Cancellation and public resolution share one store-mutation claim. An abort
+waits for an in-flight resolution, compensates only after a failed write, and
+treats a rejected `savePendingDecision()` as possibly committed. If that
+compensation also fails, the pending row remains visible and the runtime emits
+`decision_cleanup_failed` with `{ executionId, workflow?, operation, error }`.
+Alert on this trusted-host event and retry cleanup or call
+`runtime.deleteExecution(executionId)`; event-listener failures are isolated
+from the workflow's original failure.
+
 Decisions are validated before resolver/store mutation. They must be plain
 objects with an exact boolean `approved` discriminator and only the matching
 optional string field (`data` for approval, `reason` for denial). Truthy strings,
@@ -163,7 +172,7 @@ Two operator-facing primitives implement the GDPR deletion contract:
 - Pending `awaitHuman` decision (so it stops surfacing in `runtime.getPendingDecisions()` and the Studio Decisions panel)
 - In-memory resolver closure + abort controller
 
-If the execution is still running, `deleteExecution` aborts it via the registered controller AND adds the id to a `pendingDeletedExecutions` set so the workflow's eventual `workflow_end` does NOT resurrect the row in `persistExecution`. Aborting also correctly wakes a paused `ctx.awaitHuman()` (fixed in 0.17.7 — previously the awaitHuman Promise had no signal listener and hung forever on abort).
+If the execution is still running, `deleteExecution` aborts it via the registered controller AND adds the id to a `pendingDeletedExecutions` set so the workflow's eventual `workflow_end` does NOT resurrect the row in `persistExecution`. Aborting also correctly wakes a paused `ctx.awaitHuman()` (fixed in 0.17.7 — previously the awaitHuman Promise had no signal listener and hung forever on abort). Before sweeping the store, deletion joins any active approval resolution or cancellation-compensation barrier, so a late decision mutation cannot recreate approval state after the delete.
 
 ```typescript
 await runtime.deleteExecution(executionId);
@@ -183,7 +192,7 @@ The `execution_deleted` event fires on every call — including attempts against
 
 See [docs/migration/state-store-durability.md](./migration/state-store-durability.md#1-runtimedeleteexecutionid) for the full delete contract and the per-store sweep table.
 
-**Custom `StateStore` implementers:** `deleteExecution`'s contract requires you to sweep every per-execution surface your store maintains in one call. The runtime delegates the total sweep to your method — it does NOT call separate `deleteCheckpoints` / `finalizeStreamingEvents` after. See the JSDoc on `StateStore.deleteExecution?`.
+**Custom `StateStore` implementers:** `resolveDecision` must be idempotent because cancellation uses a denial as compensation when a save may have committed before rejecting. `deleteExecution` must then sweep every per-execution surface your store maintains in one call. The runtime serializes that total sweep behind known in-process approval cleanup, but delegates the sweep itself to your method — it does NOT call separate `deleteCheckpoints` / `finalizeStreamingEvents` after. See the JSDoc on `StateStore.deleteExecution?`.
 
 ## Observability-Boundary Redaction
 

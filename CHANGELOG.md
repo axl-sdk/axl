@@ -23,9 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   structured failed outcome and permits agent-loop continuation without
   exposing an ordinary exception message.
 - **Machine-readable observation completeness.** `AxlEventBus` and
-  `AxlStream` expose `observationStatus` after lossy default queue overflow.
-  `workflow_end.data.observation` and `ExecutionInfo.observation` identify a
-  bounded branch-drain timeout instead of presenting a partial trace as whole.
+  `AxlStream` expose `observationStatus` after lossy queue overflow, including
+  aggregate drops from slow `stringStream()` subscribers. Persisted executions
+  distinguish `persistence_truncated`, recovered v2 runs report
+  `process_interrupted`, and bounded loser finalization reports
+  `branch_drain_timeout` instead of presenting a partial trace as whole.
+- **Approval-cleanup operational signal.** The runtime emits
+  `decision_cleanup_failed` with the execution, workflow, compensation
+  operation, and store error when cancellation cannot remove a persisted
+  approval request. Listener failures cannot replace the original workflow
+  error.
 
 ### Removed
 
@@ -85,9 +92,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutation.
 - **In-process approval release is failure-atomic.** The runtime removes the
   persisted pending request before releasing its resolver, so a state-store
-  failure keeps the gate closed and retryable. Unknown, orphaned, and
-  concurrently resolved requests have distinct error codes and Studio HTTP
-  statuses (404/409).
+  failure keeps the gate closed and retryable. Cancellation serializes with
+  public resolution, compensates ambiguous saves, and keeps its cleanup barrier
+  discoverable until a total execution delete can join it. Unknown, orphaned,
+  invalid, and concurrently resolved requests have distinct error codes and
+  Studio HTTP statuses (400/404/409).
 - **Race/quorum losers finalize before the workflow snapshot when bounded.** Runtime
   completion drains `race`, `spawn({ quorum })`, and `map({ quorum })` branch
   continuations so losing cancellation terminals and late measurable provider

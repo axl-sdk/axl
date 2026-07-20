@@ -812,7 +812,7 @@ contradictory branch fields fail with `AxlError` code
 
 **Resolution:** The host app resolves decisions via `runtime.getPendingDecisions()` and `runtime.resolveDecision(executionId, decision)`. See [Security > Approval Gates](./security.md#approval-gates).
 
-**Cancellation:** If the execution is aborted while suspended at `awaitHuman` — via `runtime.abort(id)`, `runtime.deleteExecution(id)`, an external `options.signal`, or a budget hard-stop — the awaitHuman Promise rejects with `AbortError` and the workflow unwinds. The request becomes non-resolvable immediately; its cleanup record remains discoverable until persisted compensation finishes so a later total delete can join the barrier before sweeping the store.
+**Cancellation:** If the execution is aborted while suspended at `awaitHuman` — via `runtime.abort(id)`, `runtime.deleteExecution(id)`, an external `options.signal`, or a budget hard-stop — the awaitHuman Promise rejects with `AbortError` and the workflow unwinds. The request becomes non-resolvable immediately; its cleanup record remains discoverable until persisted compensation finishes so a later total delete can join the barrier before sweeping the store. If compensation fails, the original error retains a non-enumerable `cleanupError`, the durable request remains visible for retry or total deletion, and the runtime emits `decision_cleanup_failed`.
 
 ---
 
@@ -1245,6 +1245,7 @@ The `AxlRuntime` extends `EventEmitter`. Subscribe to lifecycle signals:
 | `'eval_result'` | `EvalHistoryEntry` | Fires when `saveEvalResult` lands (used by Studio's eval-trends aggregator; available to any consumer) |
 | `'execution_deleted'` | `{ executionId, workflow, wasActive, hadPendingDecision, removed }` | Audit signal for `runtime.deleteExecution(id)`. Fires on every call including attempts against unknown ids (`removed: false`, `workflow: undefined`). The `workflow` field is captured BEFORE the delete so compliance pipelines can categorize by workflow without a follow-up lookup. Synchronous — listeners run before `deleteExecution` returns; throwing listeners surface to the caller. Studio's aggregators subscribe to this and rebuild on every delete |
 | `'eval_deleted'` | `{ id, eval, removed }` | Symmetric audit signal for `runtime.deleteEvalResult(id)`. Fires on every call; `eval` captured before delete. Studio's `EvalAggregator` subscribes and rebuilds eval-trends snapshots on delete |
+| `'decision_cleanup_failed'` | `DecisionCleanupFailedEvent` (`{ executionId, workflow?, operation: 'resolveDecision_compensation', error }`) | Operational signal that cancellation compensation could not remove a persisted approval request. The request remains visible for retry or `deleteExecution`. Listener errors are logged and isolated so they cannot replace the workflow's original failure |
 | `'session_lock_contended'` | `{ sessionId }` | Fires when a `Session.send` / `stream` / `end` / `fork` queues behind an in-flight task on the same id |
 
 > **⚠️ Cross-process locking is NOT provided.** The lock is in-process — multiple Node workers (e.g., a horizontally-scaled web app) all hitting the same Redis-backed `sessionId` will still race. Production deployments behind a load balancer must either:

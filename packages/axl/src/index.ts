@@ -87,7 +87,7 @@ export type { SessionOptions } from './session.js';
 
 // Context
 export { WorkflowContext, zodToJsonSchema, extractJson } from './context.js';
-export type { WorkflowContextInit } from './context.js';
+export type { DecisionCleanupFailedEvent, WorkflowContextInit } from './context.js';
 export type {
   Result,
   BudgetResult,

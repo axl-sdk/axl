@@ -17,7 +17,9 @@ release. The full frozen scenario matrix remains an internal review artifact.
   an in-flight public resolution and compensates only if the write failed.
   Ambiguous save failures are also compensated because a custom store may
   durably write before losing its acknowledgement. Total execution deletion
-  joins the same cleanup barrier before sweeping the store.
+  joins the same cleanup barrier before sweeping the store. Compensation
+  failure emits `decision_cleanup_failed` without replacing the original
+  workflow error and leaves the durable request visible for operator action.
 - Pending decisions remain execution-keyed. Concurrent `awaitHuman()` calls in
   one execution fail loudly and cancel both waits; request-scoped concurrency
   belongs with the future durable replay design.
@@ -40,7 +42,7 @@ release. The full frozen scenario matrix remains an internal review artifact.
 | Gate | Required evidence | Status |
 |---|---|---|
 | Tool lifecycle v2 semantics | MockProvider integration and adversarial tool-boundary matrices | Passed |
-| In-process approval ownership | Exact decision validation, publish-before-audit, cleanup-before-release, single store mutation under concurrent resolution, concurrent-wait rejection, Studio 400/404/409 | Passed |
+| In-process approval ownership | Exact decision validation, publish-before-audit, cleanup-before-release, single store mutation under concurrent resolution, observable compensation failure, concurrent-wait rejection, Studio 400/404/409 | Passed |
 | Bounded branch finalization | Cooperative loser drain, non-cooperative timeout, persisted/terminal incomplete marker, no late trace mutation | Passed |
 | Lossy observation honesty | Main/string-view drop count through `observationStatus`; persistence/process markers; Studio terminal incomplete rendering | Passed |
 | Strict overflow integrity | Recovery-boundary propagation and original-cause preservation | Passed |
@@ -95,6 +97,24 @@ Redis integration tests skipped without a live Redis), 376 eval tests, 104
 testing tests, 745 Studio tests, 75 cross-package E2E tests, and 162 Studio API
 tests. Workspace typecheck, build, lint, formatting, and diff checks also
 passed; lint retains the same four pre-existing warnings.
+
+Owner closeout verification on 2026-07-20 then passed under Node 22.22.2:
+2,097 core tests (with the separately gated Redis cases skipped), 376 eval,
+104 testing, 745 Studio, 75 E2E, and 162 Studio API tests. The current build and
+typecheck passed across the workspace; lint passed with the same four
+pre-existing warnings; formatting and diff checks passed. The tarball/downstream
+type smoke suite passed all 6 cases, and a separately enabled real Redis run
+passed all 11 integration cases. After the Node 22 run, the native SQLite
+dependency was restored for Node 20.19.5 and its migration plus approval
+regressions passed there as well.
+
+The live-provider evidence above remains applicable to the closeout commit. All
+post-live changes are confined to local coordination, persistence/observation
+status, Studio rendering, tests/docs, and the trusted-host approval-cleanup
+event; provider adapters and model-facing continuation shapes did not change.
+No additional paid provider call was needed to establish a newly affected
+property beyond the four live cases and current-head deterministic suites;
+ordinary provider/model drift remains a release-time operational risk.
 
 ## Deferred product work
 

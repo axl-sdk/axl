@@ -483,6 +483,16 @@ type BudgetContextState = {
   unpricedWarned: boolean;
 };
 
+/** Structured host signal emitted when approval compensation cannot remove a
+ * persisted pending request. This is deliberately a runtime event rather than
+ * an `AxlEvent`: it describes control-plane store health, not workflow work. */
+export type DecisionCleanupFailedEvent = {
+  executionId: string;
+  workflow?: string;
+  operation: 'resolveDecision_compensation';
+  error: unknown;
+};
+
 export type WorkflowContextInit = {
   input: unknown;
   executionId: string;
@@ -510,6 +520,8 @@ export type WorkflowContextInit = {
   awaitHumanHandler?: (options: AwaitHumanOptions) => HumanDecision | Promise<HumanDecision>;
   /** Callback fired after each ctx.ask() completes (once per ask invocation). */
   onAgentCallComplete?: (call: AgentCallInfo) => void;
+  /** Internal: reports approval compensation failures to the owning runtime. */
+  _onDecisionCleanupFailed?: (event: DecisionCleanupFailedEvent) => void;
   /** Options for the lazy `ctx.events` `AxlEventBus`. Forwarded by
    *  `runtime.createContext({ events })` / `runtime.execute(name, input,
    *  { events })` / `runtime.stream(name, input, { events })`. If unset,
@@ -635,6 +647,7 @@ export class WorkflowContext<TInput = unknown> {
     options: AwaitHumanOptions,
   ) => HumanDecision | Promise<HumanDecision>;
   private onAgentCallComplete?: (call: AgentCallInfo) => void;
+  private _onDecisionCleanupFailed?: (event: DecisionCleanupFailedEvent) => void;
 
   /** Shared mutable slot for the lazy `AxlEventBus`. The slot is shared
    *  by reference across parent/child contexts so a late allocation
@@ -760,6 +773,7 @@ export class WorkflowContext<TInput = unknown> {
     this.toolOverrides = init.toolOverrides;
     this.awaitHumanHandler = init.awaitHumanHandler;
     this.onAgentCallComplete = init.onAgentCallComplete;
+    this._onDecisionCleanupFailed = init._onDecisionCleanupFailed;
     // The bus slot is shared mutable state across parent + children so a
     // late allocation in either is visible to all of them. Root contexts
     // get a fresh `{ current: undefined }`; child contexts inherit the
@@ -847,6 +861,7 @@ export class WorkflowContext<TInput = unknown> {
       memoryManager: this.memoryManager,
       onTrace: this.onTrace,
       onAgentCallComplete: this.onAgentCallComplete,
+      _onDecisionCleanupFailed: this._onDecisionCleanupFailed,
       awaitHumanHandler: this.awaitHumanHandler,
       pendingDecisions: this.pendingDecisions,
       awaitHumanClaims: this.awaitHumanClaims,
@@ -3777,6 +3792,22 @@ export class WorkflowContext<TInput = unknown> {
               enumerable: false,
               value: cleanupError,
             });
+          }
+          try {
+            this._onDecisionCleanupFailed?.({
+              executionId: this.executionId,
+              ...(this.workflowName ? { workflow: this.workflowName } : {}),
+              operation: 'resolveDecision_compensation',
+              error: cleanupError,
+            });
+          } catch (observerError) {
+            // Operational observation must never replace the original workflow
+            // failure. Surface a faulty listener out of band and keep unwinding
+            // with the error that triggered compensation.
+            console.error(
+              '[axl] decision_cleanup_failed listener threw; workflow outcome unchanged:',
+              observerError instanceof Error ? observerError.message : String(observerError),
+            );
           }
         }
       }

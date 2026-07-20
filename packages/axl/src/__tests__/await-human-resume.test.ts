@@ -282,6 +282,62 @@ describe('awaitHuman in-process suspension', () => {
     ).toBe(0);
   });
 
+  it('surfaces failed approval compensation without replacing the original failure', async () => {
+    const cleanupFailure = new Error('approval cleanup unavailable');
+    class CleanupFailureStore extends MemoryStore {
+      override async resolveDecision(): Promise<void> {
+        throw cleanupFailure;
+      }
+    }
+    const store = new CleanupFailureStore();
+    const wf = workflow({
+      name: 'decision-compensation-observation',
+      input: z.object({}).strict(),
+      handler: (ctx) => ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+    });
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.register(wf);
+    const events: Array<{
+      executionId: string;
+      workflow?: string;
+      operation: string;
+      error: unknown;
+    }> = [];
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    runtime.on('decision_cleanup_failed', (event) => events.push(event));
+    runtime.on('decision_cleanup_failed', () => {
+      throw new Error('observer failure');
+    });
+    const controller = new AbortController();
+    const execution = runtime.execute(wf.name, {}, { signal: controller.signal });
+    void execution.catch(() => {});
+    const [pending] = await waitForPendingDecision(runtime);
+
+    controller.abort();
+
+    const originalFailure = await execution.catch((error: unknown) => error);
+    expect(originalFailure).toMatchObject({ name: 'AbortError' });
+    expect((originalFailure as Error & { cleanupError?: unknown }).cleanupError).toBe(
+      cleanupFailure,
+    );
+    expect(events).toEqual([
+      {
+        executionId: pending.executionId,
+        workflow: wf.name,
+        operation: 'resolveDecision_compensation',
+        error: cleanupFailure,
+      },
+    ]);
+    expect(await store.getPendingDecisions()).toEqual([pending]);
+    expect(consoleError).toHaveBeenCalledWith(
+      '[axl] decision_cleanup_failed listener threw; workflow outcome unchanged:',
+      'observer failure',
+    );
+    consoleError.mockRestore();
+
+    await runtime.deleteExecution(pending.executionId);
+  });
+
   it('cleans up a published request when strict await_human observation overflows', async () => {
     const wf = workflow({
       name: 'decision-publication-overflow',

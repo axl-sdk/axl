@@ -623,7 +623,7 @@ const result = await ctx.ask(extractAgent, 'Extract user from this text', {
 
 ### State Stores
 
-Three built-in implementations persist workflow checkpoints, pending `awaitHuman` requests, session history, memory entries, execution history, and eval history. Pending approval requests remain visible after process loss, but their workflow continuation is in-process only; use an application-owned durable command/idempotency protocol for cross-process approval.
+Three built-in implementations persist workflow checkpoints, pending `awaitHuman` requests, session history, memory entries, execution history, and eval history. Pending approval requests remain visible after process loss, but their workflow continuation is in-process only; use an application-owned durable command/idempotency protocol for cross-process approval. Cancellation compensation is serialized with public resolution. If compensation fails, the request stays visible and the runtime emits `decision_cleanup_failed` for operator retry or total deletion.
 
 **Memory** (default) — in-process, no persistence. Use for development and stateless workflows.
 
@@ -702,7 +702,7 @@ app.listen(3000);
 
 Excluded events (never flushed): `token`, `partial_object`, `string_delta` — reconstructable from `agent_call_end.data.response`. Scope: `runtime.execute()` and `runtime.stream()` only — `createContext()` flows are deliberately excluded (no terminal finalize path).
 
-Synthesized recovered executions carry `status: 'failed'`, `error: 'process terminated (recovered from streaming buffer)'`, and `workflow: '__axl/recovered'` when no `workflow_start` was captured. Events bounded by `state.maxEventsPerExecution`. SQLite does not implement streaming methods — the runtime warns and falls back to terminal mode.
+Synthesized recovered executions carry `status: 'failed'`, `error: 'process terminated (recovered from streaming buffer)'`, and `observation: { complete: false, reason: 'process_interrupted' }`; `workflow` is `__axl/recovered` when no `workflow_start` was captured. Events are bounded by `state.maxEventsPerExecution`. SQLite does not implement streaming methods — the runtime warns and falls back to terminal mode.
 
 See [docs/migration/state-store-durability.md](../../docs/migration/state-store-durability.md) for the full design.
 
@@ -717,9 +717,13 @@ runtime.on('execution_deleted', (e) => {
   // e: { executionId, wasActive, hadPendingDecision, removed }
   auditLog.write({ event: 'execution.deleted', ...e });
 });
+
+runtime.on('decision_cleanup_failed', (e) => {
+  opsAlerts.write({ event: 'approval.cleanup_failed', ...e });
+});
 ```
 
-If the execution is still running, the workflow is aborted (and a paused `ctx.awaitHuman()` correctly wakes with `AbortError` — fixed in 0.17.7). The resurrection guard ensures the workflow's eventual `workflow_end` doesn't re-create the row.
+If the execution is still running, the workflow is aborted (and a paused `ctx.awaitHuman()` correctly wakes with `AbortError` — fixed in 0.17.7). The resurrection guard ensures the workflow's eventual `workflow_end` doesn't re-create the row. Deletion waits for any in-process approval resolution or cancellation compensation before the store sweep. Custom stores must make `resolveDecision` idempotent and implement the complete execution-scoped sweep in `deleteExecution`.
 
 `ExecutionInfo.metadata` round-trips from `ExecuteOptions.metadata` (`userId`, `tenantId`, etc.) — queryable via `runtime.getExecutions().filter(...)`. Internal session control-plane keys (`sessionHistory`, `sessionId`) are stripped before persistence; they remain available via `ctx.metadata` for dynamic selectors.
 

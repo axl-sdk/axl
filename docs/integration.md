@@ -148,9 +148,13 @@ app.delete('/users/:id/data', async (req, res) => {
 runtime.on('execution_deleted', (e) => {
   auditLog.write({ event: 'execution.deleted', operator: req.user.id, ...e });
 });
+
+runtime.on('decision_cleanup_failed', (e) => {
+  opsAlerts.write({ event: 'approval.cleanup_failed', ...e });
+});
 ```
 
-`runtime.deleteExecution(id)` sweeps every per-execution surface (data + indexes + checkpoints + state + streaming buffer + pending decisions) and emits `execution_deleted` for the audit pipeline. If the execution is still running, it aborts the workflow AND prevents the resulting `workflow_end` from resurrecting the row.
+`runtime.deleteExecution(id)` sweeps every per-execution surface (data + indexes + checkpoints + state + streaming buffer + pending decisions) and emits `execution_deleted` for the audit pipeline. If the execution is still running, it aborts the workflow AND prevents the resulting `workflow_end` from resurrecting the row. It also waits for any in-process approval resolution or cancellation compensation before invoking the store's total sweep. Custom stores must make `resolveDecision` idempotent and implement all execution-scoped deletion in `deleteExecution`; a failed compensation leaves the request visible and emits `decision_cleanup_failed` for operator retry or deletion.
 
 `ExecutionInfo.metadata` strips internal session control-plane keys (`sessionHistory`, `sessionId`) before persistence so a multi-tenant tag bag stays clean. The snapshot is `structuredClone`'d for isolation from caller mutation.
 

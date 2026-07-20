@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Tool-workflow documentation.** The Core, Studio, Eval, and migration guides now
+  explain in user-facing terms how explicit tool outcomes, safe failure messages, and
+  incomplete-run detection improve application behavior, debugging, and evaluation.
+
 ## [0.20.0] - 2026-07-20
 
 ### Added

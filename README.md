@@ -123,6 +123,23 @@ npx tsx app.ts
 
 The agent receives the question, decides to call the `calculator` tool, gets the result, and returns a natural language answer. Axl handles the tool-calling loop, input validation, and response parsing automatically.
 
+## Reliable Tool Workflows
+
+Tool-using assistants need to explain more than the final answer. Axl records whether
+each accepted tool call succeeded, failed, was denied, or was cancelled. Requests that
+cannot start are recorded separately as rejected, so an unavailable tool is not
+mistaken for one that ran and failed.
+
+Known failures can give the model a safe explanation while keeping internal error
+details inside your application. Unexpected errors stop the workflow instead of being
+quietly turned into model input.
+
+Axl also marks an observed or saved run as incomplete when events were lost, the
+process stopped, or concurrent work could not finish shutting down in time. Studio,
+audits, and eval tooling can then avoid treating a partial history as the whole story.
+See the [observation migration guide](./docs/migration/stream-first-observation.md) for
+the exact behavior and upgrade steps.
+
 ## Structured Output
 
 Agents return strings by default. Pass a `schema` to `ctx.ask()` to get typed, validated objects back. The schema is sent to the LLM — if it returns invalid JSON, Axl feeds the validation error back and retries automatically:

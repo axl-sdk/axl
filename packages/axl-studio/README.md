@@ -89,7 +89,9 @@ The `--conditions` flag is useful in monorepos where workspace packages use the 
 
 ## Panels
 
-Eight panels, all live over WebSocket. The screenshots below are placeholders — see [`docs/assets/CAPTURE.md`](../../docs/assets/CAPTURE.md) for how to record the real thing.
+Eight panels, all live over WebSocket. The captures below use representative seeded
+runs; see [`docs/assets/CAPTURE.md`](../../docs/assets/CAPTURE.md) for how to regenerate
+them.
 
 ### Agent Playground
 
@@ -101,7 +103,12 @@ Chat with any registered agent in real time. Streaming tokens, tool calls with e
 
 ### Trace Explorer
 
-Waterfall visualization of execution traces. Filter by type, agent, or tool; see token counts, cost per step, and duration. The Stats view shows the event-type distribution, top tools, and retry stacks.
+Waterfall visualization of execution traces. Filter by type, agent, or tool; see token
+counts, cost per step, and duration. Tool rows distinguish calls that succeeded,
+failed, were denied, were cancelled, or were rejected before they started. Studio also
+keeps older trace history readable and identifies incomplete runs instead of presenting
+missing events as a complete story. The Stats view shows the event-type distribution,
+top tools, and retry stacks.
 
 > **Studio vs `ctx.events`.** Studio consumes the same `AxlEvent` firehose via `runtime.on('trace', …)` — every event from every execution. Inside a workflow handler, `ctx.events` is the in-handler counterpart (per-context, scoped to the current workflow). The two coexist: Studio is for cross-execution observability and replay; `ctx.events` is for in-handler streaming UIs. See [`docs/observability.md`](../../docs/observability.md#observation-paths).
 
@@ -115,7 +122,14 @@ Track spending across agents, models, workflows, and embedders with time-window 
 
 ### Eval Runner
 
-Run evaluations from the UI, watch items stream in, and drill into per-item scores, timing, cost, and LLM-judge reasoning. Compare two runs (baseline vs candidate) with bootstrap-CI significance, a score-distribution chart, and an item-level diff table. The History tab groups multi-run results and tracks mean scores across runs. Toggle **Capture traces** to render each item's events inline. Requires `@axlsdk/eval` as an optional peer dependency.
+Run evaluations from the UI, watch items stream in, and drill into per-item scores,
+timing, cost, and LLM-judge reasoning. Compare two runs (baseline vs candidate) with
+bootstrap-CI significance, a score-distribution chart, and an item-level diff table.
+The History tab groups multi-run results and tracks mean scores across runs. Toggle
+**Capture traces** to render each item's events inline. For tool-using workflows, those
+events show whether a call failed, was denied, was cancelled, or never started, giving
+you better evidence for debugging and custom scorers. Studio does not turn those states
+into scores automatically. Requires `@axlsdk/eval` as an optional peer dependency.
 
 Amber banners flag runs you shouldn't fully trust — a scorer that failed on too many items, a subset run, or annotations dropped by the dataset schema — so a thinned or misconfigured run can't quietly look clean.
 

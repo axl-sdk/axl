@@ -482,6 +482,11 @@ for (const item of results.items) {
 
 `captureTraces` strips verbose-mode `agent_call_start.data.messages` request snapshots and high-volume events (`token`, `partial_object`) from the captured array to keep memory bounded. The structural events you'd want for debugging — `agent_call_start`/`agent_call_end`, `tool_call_*`, gate events, `pipeline`, `verify`, `handoff_*` — are all retained.
 
+For tool-using evals, these events let your own analysis distinguish a tool that
+failed after starting from one that was rejected, denied, or cancelled. Axl Evals does
+not assign scores to those states automatically; they are evidence for your scorers
+and debugging.
+
 #### Per-item live observation with `ctx.events`
 
 `captureTraces` collects events for post-hoc inspection on `EvalItem.traces`. For **live** per-item observation — e.g., printing each item's `partial_object` snapshots as they stream during eval execution — use `ctx.events` inside your top-level `executeWorkflow` export. The two are complementary: `captureTraces` records the structural timeline; `ctx.events` is the live firehose.

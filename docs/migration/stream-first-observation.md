@@ -1,7 +1,19 @@
 # Migration: Stream-First Observation
 
-> **Versions:** 0.19.x → next breaking release
+> **Versions:** 0.19.x → 0.20.0
 > **Scope:** Anyone iterating `AxlStream`, calling `runtime.execute()` / `runtime.stream()` / `runtime.createContext()`, using `Session.send` / `Session.stream`, observing events from inside a workflow handler, or using the legacy `onToken` / `onToolCall` / `onAgentStart` callbacks.
+
+## Why this matters
+
+Tool-using applications can now tell users what actually happened: a call succeeded,
+failed, was denied, was cancelled, or could not start. Known failures can give the
+model a safe explanation without exposing internal error details, while unexpected
+errors still stop the workflow.
+
+Observed and saved runs also say when their history is incomplete. A slow viewer, a
+stopped process, or concurrent work that does not finish shutting down can no longer
+silently make a partial record look complete. That gives application UIs, Studio, and
+eval tooling more trustworthy evidence before they explain or score a run.
 
 ## What changed
 

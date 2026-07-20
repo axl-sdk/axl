@@ -193,14 +193,17 @@ export class MemoryStore implements StateStore {
     // recoverIncompleteStreams could resurrect the streaming buffer into
     // a new ExecutionInfo, or `runtime.getPendingDecisions()` would still
     // surface the row).
-    const removed = this.executionHistory.delete(executionId);
-    this.checkpoints.delete(executionId);
-    this.executionStates.delete(executionId);
-    this.streamingEvents.delete(executionId);
-    if (this.decisions.delete(executionId)) {
+    const removedHistory = this.executionHistory.delete(executionId);
+    const removedCheckpoints = this.checkpoints.delete(executionId);
+    const removedState = this.executionStates.delete(executionId);
+    const removedStreaming = this.streamingEvents.delete(executionId);
+    const removedDecision = this.decisions.delete(executionId);
+    if (removedDecision) {
       this.persistAwaitHumanState();
     }
-    return removed;
+    return (
+      removedHistory || removedCheckpoints || removedState || removedStreaming || removedDecision
+    );
   }
 
   // ── Eval History ──────────────────────────────────────────────────

@@ -899,6 +899,89 @@ describe('AxlEventBus — listener exception isolation', () => {
     expect(() => {
       bus._push(ev({ type: 'token', data: 'b', ...ASK }));
     }).toThrow(EventStreamOverflowError);
+    expect(bus.observationStatus).toEqual({
+      complete: false,
+      reason: 'queue_overflow',
+      droppedEvents: 1,
+    });
+  });
+});
+
+describe('AxlEventBus — stringStream overflow completeness', () => {
+  it('marks observation incomplete when a slow stringStream subscriber drops a field', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const bus = new AxlEventBus({ maxQueued: 1 });
+    bus.stringStream()[Symbol.asyncIterator]();
+    const rawEvents: AxlEvent[] = [];
+    const rawDrainer = (async () => {
+      for await (const event of bus) rawEvents.push(event);
+    })();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    bus._push(
+      ev({
+        type: 'string_delta',
+        data: { path: '/a', delta: 'a' },
+        attempt: 1,
+        ...ASK,
+      }),
+    );
+    bus._push(
+      ev({
+        type: 'string_delta',
+        data: { path: '/b', delta: 'b' },
+        attempt: 1,
+        ...ASK,
+      }),
+    );
+
+    expect(bus.observationStatus).toEqual({
+      complete: false,
+      reason: 'queue_overflow',
+      droppedEvents: 1,
+    });
+    bus._finish();
+    await rawDrainer;
+    expect(rawEvents).toHaveLength(2);
+    warn.mockRestore();
+  });
+
+  it('strict stringStream overflow still delivers the event to a healthy raw iterator', async () => {
+    const bus = new AxlEventBus({ maxQueued: 1, onOverflow: 'throw' });
+    bus.stringStream()[Symbol.asyncIterator]();
+    const rawEvents: AxlEvent[] = [];
+    const rawDrainer = (async () => {
+      for await (const event of bus) rawEvents.push(event);
+    })();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    bus._push(
+      ev({
+        type: 'string_delta',
+        data: { path: '/a', delta: 'a' },
+        attempt: 1,
+        ...ASK,
+      }),
+    );
+    expect(() =>
+      bus._push(
+        ev({
+          type: 'string_delta',
+          data: { path: '/b', delta: 'b' },
+          attempt: 1,
+          ...ASK,
+        }),
+      ),
+    ).toThrow(EventStreamOverflowError);
+
+    bus._finish();
+    await rawDrainer;
+    expect(rawEvents).toHaveLength(2);
+    expect(bus.observationStatus).toEqual({
+      complete: false,
+      reason: 'queue_overflow',
+      droppedEvents: 1,
+    });
   });
 });
 

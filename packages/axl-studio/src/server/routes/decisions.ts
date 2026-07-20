@@ -18,9 +18,14 @@ app.get('/decisions', async (c) => {
 app.post('/decisions/:executionId/resolve', async (c) => {
   const runtime = c.get('runtime');
   const executionId = c.req.param('executionId');
-  const body = await c.req.json<
-    { approved: true; data?: string } | { approved: false; reason?: string }
-  >();
+  let body: { approved: true; data?: string } | { approved: false; reason?: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    const error = new Error('Invalid JSON request body');
+    Object.assign(error, { code: 'INVALID_HUMAN_DECISION', status: 400 });
+    throw error;
+  }
 
   await runtime.resolveDecision(executionId, body);
   return c.json({ ok: true, data: { resolved: true } });

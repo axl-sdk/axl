@@ -59,7 +59,8 @@ export type StateConfig = {
    * `log` event with `data.event === 'events_truncated'` is appended
    * recording the truncation. The trace channel (`runtime.on('trace')`)
    * and WS broadcast continue to receive every event — only the
-   * in-memory `ExecutionInfo.events` array is bounded.
+   * in-memory `ExecutionInfo.events` array is bounded. The execution's
+   * `observation` becomes `persistence_truncated`.
    *
    * Default: 50_000. Set to `Infinity` to disable the cap (legacy
    * behavior; only safe for short-lived executions). Must be a positive
@@ -80,7 +81,8 @@ export type StateConfig = {
    *   terminal exit. If the process crashes mid-run, call
    *   `runtime.recoverIncompleteStreams()` on the next process to reconstruct
    *   the partial `ExecutionInfo` from the streaming buffer (status: `'failed'`,
-   *   error: `'process terminated'`). Use this in production when you need to
+   *   error: `'process terminated'`, observation: `process_interrupted`). Use
+   *   this in production when you need to
    *   know "what did the workflow do up to the crash."
    *
    * Excluded from streaming flush even in `'streaming'` mode: `token`,

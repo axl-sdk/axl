@@ -143,6 +143,168 @@ describe('awaitHuman in-process suspension', () => {
     expect(result).toBe('merged');
   });
 
+  it('publishes the resolver before an await_human trace listener responds', async () => {
+    const wf = workflow({
+      name: 'immediate-trace-decision',
+      input: z.object({}).strict(),
+      handler: (ctx) => ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+    });
+    const runtime = new AxlRuntime({ state: { store: 'memory' } });
+    runtime.register(wf);
+    const responses: Promise<void>[] = [];
+    runtime.on('trace', (event) => {
+      if (event.type === 'await_human') {
+        responses.push(runtime.resolveDecision(event.executionId, { approved: true }));
+      }
+    });
+
+    await expect(runtime.execute(wf.name, {})).resolves.toEqual({ approved: true });
+    await expect(Promise.all(responses)).resolves.toEqual([undefined]);
+  });
+
+  it('waits for a visible pending-request save to finish before resolving it', async () => {
+    let markVisible!: () => void;
+    let finishSave!: () => void;
+    const visible = new Promise<void>((resolve) => {
+      markVisible = resolve;
+    });
+    const saveFinished = new Promise<void>((resolve) => {
+      finishSave = resolve;
+    });
+    class VisibleBeforeReturnStore extends MemoryStore {
+      override async savePendingDecision(
+        executionId: string,
+        decision: Parameters<MemoryStore['savePendingDecision']>[1],
+      ): Promise<void> {
+        await super.savePendingDecision(executionId, decision);
+        markVisible();
+        await saveFinished;
+      }
+    }
+    const store = new VisibleBeforeReturnStore();
+    const wf = workflow({
+      name: 'decision-visible-before-save-return',
+      input: z.object({}).strict(),
+      handler: (ctx) => ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+    });
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.register(wf);
+    const execution = runtime.execute(wf.name, {});
+    await visible;
+
+    let resolutionSettled = false;
+    const resolution = runtime.resolveDecision((await store.getPendingDecisions())[0].executionId, {
+      approved: true,
+    });
+    void resolution.then(
+      () => {
+        resolutionSettled = true;
+      },
+      () => {
+        resolutionSettled = true;
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(resolutionSettled).toBe(false);
+
+    finishSave();
+    await expect(resolution).resolves.toBeUndefined();
+    await expect(execution).resolves.toEqual({ approved: true });
+  });
+
+  it('releases a polling resolver when cancellation interrupts publication', async () => {
+    let markVisible!: () => void;
+    let finishSave!: () => void;
+    const visible = new Promise<void>((resolve) => {
+      markVisible = resolve;
+    });
+    const saveFinished = new Promise<void>((resolve) => {
+      finishSave = resolve;
+    });
+    class BlockedSaveStore extends MemoryStore {
+      override async savePendingDecision(
+        executionId: string,
+        decision: Parameters<MemoryStore['savePendingDecision']>[1],
+      ): Promise<void> {
+        await super.savePendingDecision(executionId, decision);
+        markVisible();
+        await saveFinished;
+      }
+    }
+    const store = new BlockedSaveStore();
+    const wf = workflow({
+      name: 'decision-cancel-during-publication',
+      input: z.object({}).strict(),
+      handler: (ctx) => ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+    });
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.register(wf);
+    const controller = new AbortController();
+    const execution = runtime.execute(wf.name, {}, { signal: controller.signal });
+    void execution.catch(() => {});
+    await visible;
+    const [pending] = await store.getPendingDecisions();
+
+    const resolution = runtime.resolveDecision(pending.executionId, { approved: true });
+    controller.abort();
+
+    await expect(resolution).rejects.toMatchObject({ code: 'PENDING_DECISION_NOT_FOUND' });
+    finishSave();
+    await expect(execution).rejects.toThrow();
+    expect(await store.getPendingDecisions()).toEqual([]);
+  });
+
+  it('compensates when a pending-request save writes and then rejects', async () => {
+    const saveFailure = new Error('save acknowledgement lost');
+    class WriteThenRejectStore extends MemoryStore {
+      override async savePendingDecision(
+        executionId: string,
+        decision: Parameters<MemoryStore['savePendingDecision']>[1],
+      ): Promise<void> {
+        await super.savePendingDecision(executionId, decision);
+        throw saveFailure;
+      }
+    }
+    const store = new WriteThenRejectStore();
+    const wf = workflow({
+      name: 'decision-save-ambiguous-failure',
+      input: z.object({}).strict(),
+      handler: (ctx) => ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+    });
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.register(wf);
+
+    await expect(runtime.execute(wf.name, {})).rejects.toBe(saveFailure);
+    expect(await store.getPendingDecisions()).toEqual([]);
+    expect(
+      (runtime as unknown as { pendingDecisionResolvers: Map<string, unknown> })
+        .pendingDecisionResolvers.size,
+    ).toBe(0);
+  });
+
+  it('cleans up a published request when strict await_human observation overflows', async () => {
+    const wf = workflow({
+      name: 'decision-publication-overflow',
+      input: z.object({}).strict(),
+      handler: async (ctx) => {
+        void ctx.events;
+        ctx.log('fill queue');
+        return ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' });
+      },
+    });
+    const runtime = new AxlRuntime({ state: { store: 'memory' } });
+    runtime.register(wf);
+
+    await expect(
+      runtime.execute(wf.name, {}, { events: { maxQueued: 1, onOverflow: 'throw' } }),
+    ).rejects.toMatchObject({ name: 'EventStreamOverflowError' });
+    expect(await runtime.getPendingDecisions()).toEqual([]);
+    expect(
+      (runtime as unknown as { pendingDecisionResolvers: Map<string, unknown> })
+        .pendingDecisionResolvers.size,
+    ).toBe(0);
+  });
+
   it('keeps the gate closed and retryable when pending-request cleanup fails', async () => {
     const wf = workflow({
       name: 'decision-cleanup-retry',
@@ -191,6 +353,8 @@ describe('awaitHuman in-process suspension', () => {
     runtime.register(wf);
     const execution = runtime.execute(wf.name, {});
     const [pending] = await waitForPendingDecision(runtime);
+    const store = runtime.getStateStore();
+    const resolveSpy = vi.spyOn(store, 'resolveDecision');
 
     const resolutions = await Promise.allSettled([
       runtime.resolveDecision(pending.executionId, { approved: true, data: 'first' }),
@@ -203,7 +367,308 @@ describe('awaitHuman in-process suspension', () => {
       status: 'rejected',
       reason: { code: 'PENDING_DECISION_NOT_FOUND' },
     });
+    expect(resolveSpy).toHaveBeenCalledTimes(1);
     await expect(execution).resolves.toMatchObject({ approved: true, data: 'first' });
+  });
+
+  it('serializes public resolution with abort compensation', async () => {
+    let markResolutionStarted!: () => void;
+    let releaseResolution!: () => void;
+    const resolutionStarted = new Promise<void>((resolve) => {
+      markResolutionStarted = resolve;
+    });
+    const resolutionReleased = new Promise<void>((resolve) => {
+      releaseResolution = resolve;
+    });
+    class DeferredResolveStore extends MemoryStore {
+      readonly observedDecisions: Parameters<MemoryStore['resolveDecision']>[1][] = [];
+      activeResolutions = 0;
+      maxActiveResolutions = 0;
+
+      override async resolveDecision(
+        executionId: string,
+        decision: Parameters<MemoryStore['resolveDecision']>[1],
+      ): Promise<void> {
+        this.observedDecisions.push(decision);
+        this.activeResolutions += 1;
+        this.maxActiveResolutions = Math.max(this.maxActiveResolutions, this.activeResolutions);
+        try {
+          if (this.observedDecisions.length === 1) {
+            markResolutionStarted();
+            await resolutionReleased;
+          }
+          await super.resolveDecision(executionId, decision);
+        } finally {
+          this.activeResolutions -= 1;
+        }
+      }
+    }
+    const store = new DeferredResolveStore();
+    const wf = workflow({
+      name: 'decision-resolution-abort-race',
+      input: z.object({}).strict(),
+      handler: (ctx) => ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+    });
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.register(wf);
+    const controller = new AbortController();
+    const execution = runtime.execute(wf.name, {}, { signal: controller.signal });
+    void execution.catch(() => {});
+    const [pending] = await waitForPendingDecision(runtime);
+
+    const resolution = runtime.resolveDecision(pending.executionId, { approved: true });
+    await resolutionStarted;
+    controller.abort();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(store.observedDecisions).toEqual([{ approved: true }]);
+    expect(store.maxActiveResolutions).toBe(1);
+
+    releaseResolution();
+    await expect(resolution).resolves.toBeUndefined();
+    await expect(execution).rejects.toThrow();
+    expect(store.observedDecisions).toEqual([{ approved: true }]);
+    expect(store.maxActiveResolutions).toBe(1);
+    expect(await store.getPendingDecisions()).toEqual([]);
+  });
+
+  it('runs abort compensation after a failed public resolution, never alongside it', async () => {
+    let markResolutionStarted!: () => void;
+    let releaseResolution!: () => void;
+    const resolutionStarted = new Promise<void>((resolve) => {
+      markResolutionStarted = resolve;
+    });
+    const resolutionReleased = new Promise<void>((resolve) => {
+      releaseResolution = resolve;
+    });
+    const publicFailure = new Error('decision store unavailable');
+    class FailFirstResolveStore extends MemoryStore {
+      readonly observedDecisions: Parameters<MemoryStore['resolveDecision']>[1][] = [];
+      activeResolutions = 0;
+      maxActiveResolutions = 0;
+
+      override async resolveDecision(
+        executionId: string,
+        decision: Parameters<MemoryStore['resolveDecision']>[1],
+      ): Promise<void> {
+        this.observedDecisions.push(decision);
+        this.activeResolutions += 1;
+        this.maxActiveResolutions = Math.max(this.maxActiveResolutions, this.activeResolutions);
+        try {
+          if (this.observedDecisions.length === 1) {
+            markResolutionStarted();
+            await resolutionReleased;
+            throw publicFailure;
+          }
+          await super.resolveDecision(executionId, decision);
+        } finally {
+          this.activeResolutions -= 1;
+        }
+      }
+    }
+    const store = new FailFirstResolveStore();
+    const wf = workflow({
+      name: 'decision-resolution-failure-abort-race',
+      input: z.object({}).strict(),
+      handler: (ctx) => ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+    });
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.register(wf);
+    const controller = new AbortController();
+    const execution = runtime.execute(wf.name, {}, { signal: controller.signal });
+    void execution.catch(() => {});
+    const [pending] = await waitForPendingDecision(runtime);
+
+    const resolution = runtime.resolveDecision(pending.executionId, { approved: true });
+    void resolution.catch(() => {});
+    await resolutionStarted;
+    controller.abort();
+    releaseResolution();
+
+    await expect(resolution).rejects.toBe(publicFailure);
+    await expect(execution).rejects.toThrow();
+    expect(store.observedDecisions).toEqual([
+      { approved: true },
+      { approved: false, reason: 'Execution aborted while awaiting approval' },
+    ]);
+    expect(store.maxActiveResolutions).toBe(1);
+    expect(await store.getPendingDecisions()).toEqual([]);
+  });
+
+  it('finishes approval cleanup before deleteExecution sweeps the store', async () => {
+    let markResolutionStarted!: () => void;
+    let releaseResolution!: () => void;
+    const resolutionStarted = new Promise<void>((resolve) => {
+      markResolutionStarted = resolve;
+    });
+    const resolutionReleased = new Promise<void>((resolve) => {
+      releaseResolution = resolve;
+    });
+    class OrderedDeleteStore extends MemoryStore {
+      readonly operations: string[] = [];
+      activeMutations = 0;
+      maxActiveMutations = 0;
+
+      private begin(operation: string): void {
+        this.operations.push(`${operation}:start`);
+        this.activeMutations += 1;
+        this.maxActiveMutations = Math.max(this.maxActiveMutations, this.activeMutations);
+      }
+
+      private end(operation: string): void {
+        this.operations.push(`${operation}:end`);
+        this.activeMutations -= 1;
+      }
+
+      override async resolveDecision(
+        executionId: string,
+        decision: Parameters<MemoryStore['resolveDecision']>[1],
+      ): Promise<void> {
+        this.begin('resolve');
+        markResolutionStarted();
+        await resolutionReleased;
+        try {
+          await super.resolveDecision(executionId, decision);
+        } finally {
+          this.end('resolve');
+        }
+      }
+
+      override async deleteExecution(executionId: string): Promise<boolean> {
+        this.begin('delete');
+        try {
+          return await super.deleteExecution(executionId);
+        } finally {
+          this.end('delete');
+        }
+      }
+    }
+    const store = new OrderedDeleteStore();
+    const wf = workflow({
+      name: 'decision-resolution-delete-race',
+      input: z.object({}).strict(),
+      handler: (ctx) => ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+    });
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.register(wf);
+    const execution = runtime.execute(wf.name, {});
+    void execution.catch(() => {});
+    const [pending] = await waitForPendingDecision(runtime);
+
+    const resolution = runtime.resolveDecision(pending.executionId, { approved: true });
+    await resolutionStarted;
+    const deletion = runtime.deleteExecution(pending.executionId);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(store.operations).toEqual(['resolve:start']);
+    releaseResolution();
+
+    await expect(resolution).resolves.toBeUndefined();
+    await expect(execution).rejects.toThrow();
+    await expect(deletion).resolves.toBe(true);
+    expect(store.operations).toEqual([
+      'resolve:start',
+      'resolve:end',
+      'delete:start',
+      'delete:end',
+    ]);
+    expect(store.maxActiveMutations).toBe(1);
+    expect(await store.getPendingDecisions()).toEqual([]);
+  });
+
+  it('keeps approval cleanup discoverable to concurrent deletes after abort', async () => {
+    let markCompensationStarted!: () => void;
+    let releaseCompensation!: () => void;
+    const compensationStarted = new Promise<void>((resolve) => {
+      markCompensationStarted = resolve;
+    });
+    const compensationReleased = new Promise<void>((resolve) => {
+      releaseCompensation = resolve;
+    });
+    class AbortThenDeleteStore extends MemoryStore {
+      readonly operations: string[] = [];
+
+      private begin(operation: string): void {
+        this.operations.push(`${operation}:start`);
+      }
+
+      private end(operation: string): void {
+        this.operations.push(`${operation}:end`);
+      }
+
+      override async resolveDecision(
+        executionId: string,
+        decision: Parameters<MemoryStore['resolveDecision']>[1],
+      ): Promise<void> {
+        this.begin('compensate');
+        markCompensationStarted();
+        await compensationReleased;
+        try {
+          await super.resolveDecision(executionId, decision);
+        } finally {
+          this.end('compensate');
+        }
+      }
+
+      override async deleteExecution(executionId: string): Promise<boolean> {
+        this.begin('delete');
+        try {
+          return await super.deleteExecution(executionId);
+        } finally {
+          this.end('delete');
+        }
+      }
+    }
+    const store = new AbortThenDeleteStore();
+    const wf = workflow({
+      name: 'decision-abort-before-delete-race',
+      input: z.object({}).strict(),
+      handler: (ctx) => ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+    });
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.register(wf);
+    const controller = new AbortController();
+    const execution = runtime.execute(wf.name, {}, { signal: controller.signal });
+    void execution.catch(() => {});
+    const [pending] = await waitForPendingDecision(runtime);
+
+    controller.abort();
+    await compensationStarted;
+    const deletions = [
+      runtime.deleteExecution(pending.executionId),
+      runtime.deleteExecution(pending.executionId),
+    ];
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(store.operations).toEqual(['compensate:start']);
+    releaseCompensation();
+
+    await expect(execution).rejects.toThrow();
+    const deletionResults = await Promise.all(deletions);
+    expect(deletionResults).toContain(true);
+    expect(store.operations.slice(0, 2)).toEqual(['compensate:start', 'compensate:end']);
+    expect(store.operations.filter((operation) => operation === 'delete:start')).toHaveLength(2);
+    expect(store.operations.filter((operation) => operation === 'delete:end')).toHaveLength(2);
+    expect(await store.getPendingDecisions()).toEqual([]);
+  });
+
+  it('rejects concurrent awaitHuman calls instead of overwriting one resolver', async () => {
+    const wf = workflow({
+      name: 'concurrent-await-human',
+      input: z.object({}).strict(),
+      handler: async (ctx) =>
+        Promise.all([
+          ctx.awaitHuman({ channel: 'ops', prompt: 'first?' }),
+          ctx.awaitHuman({ channel: 'ops', prompt: 'second?' }),
+        ]),
+    });
+    const runtime = new AxlRuntime({ state: { store: 'memory' } });
+    runtime.register(wf);
+
+    await expect(runtime.execute(wf.name, {})).rejects.toMatchObject({
+      code: 'CONCURRENT_HUMAN_DECISION_UNSUPPORTED',
+    });
+    expect(await runtime.getPendingDecisions()).toEqual([]);
   });
 
   it('rejects invalid runtime decisions before mutating the pending request', async () => {

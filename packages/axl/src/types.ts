@@ -655,6 +655,15 @@ export type ObservationStatus =
       reason: 'branch_drain_timeout';
       pendingContinuations: number;
       timeoutMs: number;
+    }
+  | {
+      complete: false;
+      reason: 'persistence_truncated';
+      maxEvents: number;
+    }
+  | {
+      complete: false;
+      reason: 'process_interrupted';
     };
 
 /** Data shape for `workflow_end` events. Emitted once per workflow execution

@@ -13,6 +13,52 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 }
 
 describe('runtime branch finalization barrier', () => {
+  it('cancels an awaitHuman handler through the losing branch signal', async () => {
+    const handlerStarted = deferred();
+    let resolveHandler!: (decision: { approved: true }) => void;
+    let continuedAfterApproval = false;
+    const events: string[] = [];
+    const wf = workflow({
+      name: 'await-human-race-loser',
+      input: z.object({}).strict(),
+      handler: (ctx) =>
+        ctx.race([
+          async () => {
+            await ctx.awaitHuman({ channel: 'ops', prompt: 'approve?' });
+            continuedAfterApproval = true;
+            return 'loser';
+          },
+          async () => {
+            await handlerStarted.promise;
+            return 'winner';
+          },
+        ]),
+    });
+    const runtime = new AxlRuntime();
+    runtime.register(wf);
+    runtime.on('trace', (event) => events.push(event.type));
+
+    await expect(
+      runtime.execute(
+        wf.name,
+        {},
+        {
+          awaitHumanHandler: () =>
+            new Promise((resolve) => {
+              resolveHandler = resolve;
+              handlerStarted.resolve();
+            }),
+        },
+      ),
+    ).resolves.toBe('winner');
+
+    resolveHandler({ approved: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(continuedAfterApproval).toBe(false);
+    expect(events).toContain('await_human');
+    expect(events).not.toContain('await_human_resolved');
+  });
+
   it.each([-1, Number.NaN, Number.POSITIVE_INFINITY, null])(
     'rejects invalid branchDrainTimeoutMs=%s before runtime bookkeeping',
     async (branchDrainTimeoutMs) => {

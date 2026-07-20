@@ -47,6 +47,16 @@ function generateExecutionId(): string {
   return `test-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function preserveDrainCause(error: Error, cause: unknown): Error {
+  if (cause === undefined || cause === error || 'cause' in error) return error;
+  Object.defineProperty(error, 'cause', {
+    configurable: true,
+    enumerable: false,
+    value: cause,
+  });
+  return error;
+}
+
 export type AxlTestRuntimeOptions = {
   record?: string;
   humanDecisions?: (options: AwaitHumanOptions) => HumanDecision;
@@ -269,7 +279,8 @@ export class AxlTestRuntime {
       try {
         observation = await ctx._drainBranchWork();
       } catch (drainError) {
-        workflowError = drainError;
+        workflowError =
+          drainError instanceof Error ? preserveDrainCause(drainError, workflowError) : drainError;
       }
       // Parity with production: failed workflows get a terminal
       // `workflow_end(status: 'failed')` event so consumers counting

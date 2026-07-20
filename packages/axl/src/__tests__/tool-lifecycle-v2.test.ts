@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { agent } from '../agent.js';
 import { WorkflowContext } from '../context.js';
-import { ToolFailure } from '../errors.js';
+import { EventStreamOverflowError, ToolFailure } from '../errors.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { tool, type Tool } from '../tool.js';
 import type {
@@ -131,6 +131,28 @@ function providerToolMessage(provider: ReturnType<typeof createSequenceProvider>
 }
 
 describe('v2 tool lifecycle integration', () => {
+  it('preserves the tool failure when strict overflow replaces terminal observation', async () => {
+    const failure = new Error('handler failed');
+    const overflow = new EventStreamOverflowError(1, 'tool_call_end');
+    const configuredTool = tool({
+      name: 'terminal_overflow',
+      description: 'fixture',
+      input: z.object({}),
+      handler: () => {
+        throw failure;
+      },
+    });
+    const harness = setup({
+      configuredTool,
+      onTrace: (event) => {
+        if (event.type === 'tool_call_end') throw overflow;
+      },
+    });
+
+    await expect(harness.ctx.ask(harness.testAgent, 'go')).rejects.toBe(overflow);
+    expect(overflow.cause).toBe(failure);
+  });
+
   it.each([
     {
       label: 'pre-start',

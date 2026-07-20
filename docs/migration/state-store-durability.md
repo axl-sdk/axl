@@ -69,7 +69,7 @@ app.listen(3000);
 
 **Excluded event types.** `token`, `partial_object`, `string_delta` are never flushed — they're high-volume, stream-only, and reconstructable from the persisted `agent_call_end.data.response`. Other event types flow through.
 
-**Synthesized executions.** Recovered runs have `status: 'failed'`, `error: 'process terminated (recovered from streaming buffer)'`, and `workflow: '__axl/recovered'` when the buffer didn't capture a `workflow_start`. The events array is bounded by `state.maxEventsPerExecution` (default 50k); pathological crashed runs don't resurrect as unbounded ExecutionInfos.
+**Synthesized executions.** Recovered v2 runs have `status: 'failed'`, `error: 'process terminated (recovered from streaming buffer)'`, and `observation: { complete: false, reason: 'process_interrupted' }`; `workflow` is `__axl/recovered` when the buffer didn't capture a `workflow_start`. The events array is bounded by `state.maxEventsPerExecution` (default 50k); pathological crashed runs don't resurrect as unbounded ExecutionInfos.
 
 **Save-failure preserves the buffer.** If `saveExecution` throws during recovery, the streaming buffer is left in place for the next attempt. No data loss on intermittent Redis failures.
 
@@ -151,7 +151,18 @@ Without TTLs, every save accumulates forever and Redis eventually OOMs. Categori
 
 ### 5. `ctx.awaitHuman()` wakes on signal abort
 
-A workflow paused at `ctx.awaitHuman()` previously had no abort listener — `runtime.deleteExecution(id)` on such a workflow would clean up the runtime's bookkeeping but the workflow Promise would hang forever. Now the awaitHuman Promise races the resolver against the context's abort signal: a fast-path check for already-aborted, then a listener that removes the registration and rejects with `AbortError`.
+A workflow paused at `ctx.awaitHuman()` previously had no abort listener — `runtime.deleteExecution(id)` on such a workflow would clean up the runtime's bookkeeping but the workflow Promise would hang forever. Now both persisted and handler-backed approval paths race the current branch signal: a fast-path check for already-aborted, then a listener that marks the request non-resolvable and rejects with `AbortError`. The cleanup record remains discoverable until compensation finishes. This also prevents a losing race branch from resuming workflow-side effects after terminal finalization.
+
+Pending decisions still use `executionId` as their key. Concurrent `awaitHuman()` calls in one execution are therefore rejected with `CONCURRENT_HUMAN_DECISION_UNSUPPORTED`; both sibling waits are cancelled and any persisted row is compensated. Supporting them requires request-scoped decision IDs as part of the future durable replay protocol.
+
+Custom stores must make `resolveDecision()` idempotent. A pending-request save
+can commit and then reject when its acknowledgement is lost, so Axl attempts
+compensation after any failed save attempt. Cancellation also waits for an
+in-flight public resolution before compensating; the store never receives an
+approval and cancellation denial concurrently from one runtime.
+`runtime.deleteExecution()` joins the same cleanup barrier before its total
+store sweep, preventing a late decision write from following a completed
+operator/GDPR deletion.
 
 No API change. Affects any caller that aborts a paused awaitHuman: `runtime.abort(id)`, `runtime.deleteExecution(id)`, an external `AbortController.abort()` passed via `options.signal`, or a budget hard-stop.
 

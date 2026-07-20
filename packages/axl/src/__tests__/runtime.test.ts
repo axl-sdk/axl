@@ -2567,6 +2567,11 @@ describe('config.state.maxEventsPerExecution (memory cap)', () => {
     const data = last.data as { event?: string; cap?: number };
     expect(data.event).toBe('events_truncated');
     expect(data.cap).toBe(5);
+    expect(ours.observation).toEqual({
+      complete: false,
+      reason: 'persistence_truncated',
+      maxEvents: 5,
+    });
     // Trace channel saw way more than the cap.
     expect(traceEventCount).toBeGreaterThan(50);
   });
@@ -2986,13 +2991,25 @@ describe('deleteExecution()', () => {
     // the cleanup contract).
     const resolvers = (runtime as unknown as { pendingDecisionResolvers: Map<string, unknown> })
       .pendingDecisionResolvers;
-    resolvers.set('exec-awaiting', () => {});
+    let finishCleanup!: () => void;
+    const cleanupFinished = new Promise<void>((resolve) => {
+      finishCleanup = resolve;
+    });
+    resolvers.set('exec-awaiting', {
+      cancelled: false,
+      cleanupFinished,
+    });
     expect(resolvers.has('exec-awaiting')).toBe(true);
 
     const audit: Array<{ executionId: string; hadPendingDecision: boolean }> = [];
     runtime.on('execution_deleted', (e) => audit.push(e));
 
-    await runtime.deleteExecution('exec-awaiting');
+    const deletion = runtime.deleteExecution('exec-awaiting');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(resolvers.has('exec-awaiting')).toBe(true);
+
+    finishCleanup();
+    await deletion;
     expect(resolvers.has('exec-awaiting')).toBe(false);
     expect(audit[0].hadPendingDecision).toBe(true);
   });
@@ -3730,6 +3747,7 @@ describe("state.persist: 'streaming' (#1)", () => {
   it('recoverIncompleteStreams applies maxEventsPerExecution bound to synthesized events', async () => {
     const cap = 5;
     const events = Array.from({ length: 50 }, (_, i) => ({
+      schemaVersion: 2 as const,
       type: i === 0 ? 'workflow_start' : 'log',
       executionId: 'big',
       workflow: 'huge-wf',
@@ -3780,6 +3798,10 @@ describe("state.persist: 'streaming' (#1)", () => {
     const last = recovered[0].events[cap - 1];
     expect(last.type).toBe('log');
     expect((last as unknown as { data: { event?: string } }).data.event).toBe('events_truncated');
+    expect(recovered[0].observation).toEqual({
+      complete: false,
+      reason: 'process_interrupted',
+    });
   });
 
   it('finalize awaits in-flight flush — no orphan buffer when size-flush races with finalize', async () => {

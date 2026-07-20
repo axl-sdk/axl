@@ -877,10 +877,11 @@ export class RedisStore implements StateStore {
     //     — the workflow may have been mid-flight when the operator
     //     deleted; the resolver-side cleanup happens in `runtime.deleteExecution`)
     //
-    // del()'s return is the "did it exist" signal for the canonical row —
-    // second result in the exec() array (sRem queued first, del second).
-    // Symmetric to deleteEvalResult on the index side.
-    const [, deletedCount] = await this.client
+    // Any positive mutation means the execution existed on at least one
+    // surface. This matters for fail-closed pending decisions that may have
+    // no canonical history blob yet: deleting the decision is still a
+    // successful total deletion and must return true.
+    const results = await this.client
       .multi()
       .sRem(this.execHistorySetKey(), executionId)
       .del(this.execHistoryKey(executionId))
@@ -892,8 +893,7 @@ export class RedisStore implements StateStore {
       .sRem(this.streamingIdsKey(), executionId)
       .hDel(this.decisionsKey(), executionId)
       .exec();
-    const deleted = typeof deletedCount === 'number' ? deletedCount : 0;
-    return deleted > 0;
+    return results.some((result) => typeof result === 'number' && result > 0);
   }
 
   // ── Eval History ────────────────────────────────────────────────────

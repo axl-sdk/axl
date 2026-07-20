@@ -32,6 +32,7 @@ type ExecutionHistoryRow = {
   events: string;
   metadata: string | null;
   event_schema_version: number | null;
+  observation: string | null;
 };
 
 function rowToExecutionInfo(row: ExecutionHistoryRow): HistoricalExecutionInfo {
@@ -54,6 +55,12 @@ function rowToExecutionInfo(row: ExecutionHistoryRow): HistoricalExecutionInfo {
     const parsed = safeJsonParse(row.metadata);
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       info.metadata = parsed as Record<string, unknown>;
+    }
+  }
+  if (row.observation != null) {
+    const parsed = safeJsonParse(row.observation);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      info.observation = parsed as HistoricalExecutionInfo['observation'];
     }
   }
   return normalizeStoredExecution(info);
@@ -111,6 +118,8 @@ export class SQLiteStore implements StateStore {
    *   rows get `NULL`, deserialized as `metadata: undefined`.
    * - v4 (event schema): add `execution_history.event_schema_version`.
    *   Existing rows remain `NULL`, the documented v1 sentinel.
+   * - v5 (observation completeness): add `execution_history.observation`.
+   *   Existing rows remain `NULL`, meaning they predate the contract.
    *
    * Applied BEFORE `initTables()` so the subsequent `CREATE TABLE
    * IF NOT EXISTS` runs against the post-migration column name. Fresh
@@ -128,7 +137,7 @@ export class SQLiteStore implements StateStore {
    * transactional re-read costs nothing.
    */
   private migrate(): void {
-    const TARGET_VERSION = 4;
+    const TARGET_VERSION = 5;
     const current = this.db.pragma('user_version', { simple: true }) as number;
     if (current >= TARGET_VERSION) return;
 
@@ -182,6 +191,12 @@ export class SQLiteStore implements StateStore {
         const cols = this.db.pragma('table_info(execution_history)') as Array<{ name: string }>;
         if (cols.length > 0 && !cols.some((c) => c.name === 'event_schema_version')) {
           this.db.exec('ALTER TABLE execution_history ADD COLUMN event_schema_version INTEGER');
+        }
+      }
+      if (committed < 5) {
+        const cols = this.db.pragma('table_info(execution_history)') as Array<{ name: string }>;
+        if (cols.length > 0 && !cols.some((c) => c.name === 'observation')) {
+          this.db.exec('ALTER TABLE execution_history ADD COLUMN observation TEXT');
         }
       }
       this.db.pragma(`user_version = ${TARGET_VERSION}`);
@@ -249,7 +264,8 @@ export class SQLiteStore implements StateStore {
         error TEXT,
         events TEXT NOT NULL,
         metadata TEXT,
-        event_schema_version INTEGER
+        event_schema_version INTEGER,
+        observation TEXT
       );
 
       CREATE TABLE IF NOT EXISTS eval_history (
@@ -413,7 +429,7 @@ export class SQLiteStore implements StateStore {
     } as HistoricalExecutionInfo);
     this.db
       .prepare(
-        'INSERT OR REPLACE INTO execution_history (execution_id, workflow, status, total_cost, started_at, completed_at, duration, error, events, metadata, event_schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT OR REPLACE INTO execution_history (execution_id, workflow, status, total_cost, started_at, completed_at, duration, error, events, metadata, event_schema_version, observation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         normalized.executionId,
@@ -427,6 +443,7 @@ export class SQLiteStore implements StateStore {
         JSON.stringify(normalized.events),
         normalized.metadata !== undefined ? JSON.stringify(normalized.metadata) : null,
         normalized.eventSchemaVersion,
+        normalized.observation !== undefined ? JSON.stringify(normalized.observation) : null,
       );
   }
 
@@ -455,13 +472,25 @@ export class SQLiteStore implements StateStore {
     // durability is a RedisStore-only feature), so the buffer-side cleanup
     // is a no-op here.
     const tx = this.db.transaction(() => {
-      const result = this.db
+      const historyResult = this.db
         .prepare('DELETE FROM execution_history WHERE execution_id = ?')
         .run(executionId);
-      this.db.prepare('DELETE FROM checkpoints WHERE execution_id = ?').run(executionId);
-      this.db.prepare('DELETE FROM execution_state WHERE execution_id = ?').run(executionId);
-      this.db.prepare('DELETE FROM decisions WHERE execution_id = ?').run(executionId);
-      return result.changes > 0;
+      const checkpointsResult = this.db
+        .prepare('DELETE FROM checkpoints WHERE execution_id = ?')
+        .run(executionId);
+      const stateResult = this.db
+        .prepare('DELETE FROM execution_state WHERE execution_id = ?')
+        .run(executionId);
+      const decisionsResult = this.db
+        .prepare('DELETE FROM decisions WHERE execution_id = ?')
+        .run(executionId);
+      return (
+        historyResult.changes +
+          checkpointsResult.changes +
+          stateResult.changes +
+          decisionsResult.changes >
+        0
+      );
     });
     return tx();
   }

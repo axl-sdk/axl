@@ -491,7 +491,10 @@ export type WorkflowContextInit = {
   providerRegistry: ProviderRegistry;
   sessionHistory?: ChatMessage[];
   onTrace?: (event: AxlEvent) => void;
-  pendingDecisions?: Map<string, (d: HumanDecision) => void>;
+  pendingDecisions?: Map<string, PendingDecisionResolver>;
+  /** Internal: root-shared guard because pending decisions are currently
+   *  keyed by executionId rather than requestId. */
+  awaitHumanClaims?: Map<string, AbortController>;
   budgetContext?: BudgetContextState;
   stateStore?: StateStore;
   signal?: AbortSignal;
@@ -548,6 +551,24 @@ export type WorkflowContextInit = {
   branchDrainTimeoutMs?: number;
 };
 
+/** @internal Coordination gate shared between WorkflowContext and AxlRuntime. */
+export type PendingDecisionResolver = {
+  resolve: (decision: HumanDecision) => void;
+  ready: Promise<void>;
+  state: 'preparing' | 'pending' | 'resolving' | 'resolved' | 'failed';
+  /** Set synchronously by the abort listener so no new public resolution can
+   *  claim the request while cleanup remains discoverable to deleteExecution. */
+  cancelled: boolean;
+  /** Present while runtime.resolveDecision owns the durable store mutation.
+   *  Cancellation waits for this result before deciding whether compensation
+   *  is still needed, so custom stores never receive contradictory writes in
+   *  parallel for the same request. */
+  resolution?: Promise<boolean>;
+  /** Resolves after cancellation compensation and resolver cleanup finish.
+   *  deleteExecution joins this barrier before its total store sweep. */
+  cleanupFinished: Promise<void>;
+};
+
 /**
  * The central coordination object for all Axl primitives.
  * Carries execution state, tracing, budget tracking, and session history.
@@ -570,7 +591,8 @@ export class WorkflowContext<TInput = unknown> {
   private providerRegistry: ProviderRegistry;
   private sessionHistory: ChatMessage[];
   private onTrace?: (event: AxlEvent) => void;
-  private pendingDecisions?: Map<string, (d: HumanDecision) => void>;
+  private pendingDecisions?: Map<string, PendingDecisionResolver>;
+  private readonly awaitHumanClaims: Map<string, AbortController>;
   private budgetContext?: BudgetContextState;
   private stateStore?: StateStore;
   /** Root step counter for this execution. Inherited by every ctx.ask()
@@ -727,6 +749,7 @@ export class WorkflowContext<TInput = unknown> {
     this.sessionHistory = init.sessionHistory ?? [];
     this.onTrace = init.onTrace;
     this.pendingDecisions = init.pendingDecisions;
+    this.awaitHumanClaims = init.awaitHumanClaims ?? new Map<string, AbortController>();
     this.budgetContext = init.budgetContext;
     this.stateStore = init.stateStore;
     this.signal = init.signal;
@@ -826,6 +849,7 @@ export class WorkflowContext<TInput = unknown> {
       onAgentCallComplete: this.onAgentCallComplete,
       awaitHumanHandler: this.awaitHumanHandler,
       pendingDecisions: this.pendingDecisions,
+      awaitHumanClaims: this.awaitHumanClaims,
       toolOverrides: this.toolOverrides,
       signal: this.signal,
       workflowName: this.workflowName,
@@ -1039,20 +1063,27 @@ export class WorkflowContext<TInput = unknown> {
         throw new Error(`Tool invocation ${parsed.callId} emitted more than one terminal event`);
       }
       terminalEmitted = true;
-      this.emitEvent({
-        type: 'tool_call_end',
-        agent: agent._name,
-        tool: parsed.toolName,
-        callId: parsed.callId,
-        duration,
-        data: {
-          args: cloneToolArguments(parsed.args),
-          ...(parsed.requestedTool !== parsed.toolName
-            ? { requestedTool: parsed.requestedTool }
-            : {}),
-          outcome: settlement.outcome,
-        },
-      });
+      try {
+        this.emitEvent({
+          type: 'tool_call_end',
+          agent: agent._name,
+          tool: parsed.toolName,
+          callId: parsed.callId,
+          duration,
+          data: {
+            args: cloneToolArguments(parsed.args),
+            ...(parsed.requestedTool !== parsed.toolName
+              ? { requestedTool: parsed.requestedTool }
+              : {}),
+            outcome: settlement.outcome,
+          },
+        });
+      } catch (error) {
+        if (error instanceof Error && settlement.abortError !== undefined) {
+          throw preserveErrorCause(error, settlement.abortError);
+        }
+        throw error;
+      }
       return settlement;
     };
 
@@ -3566,7 +3597,37 @@ export class WorkflowContext<TInput = unknown> {
   }
 
   private async _awaitHumanImpl(options: AwaitHumanOptions): Promise<HumanDecision> {
+    const branchSignal = this.currentSignal;
+    const makeAbortError = (reason: unknown): Error => {
+      if (typeof DOMException !== 'undefined') {
+        return new DOMException(
+          typeof reason === 'string' ? reason : 'awaitHuman aborted',
+          'AbortError',
+        );
+      }
+      const err = new Error(typeof reason === 'string' ? reason : 'awaitHuman aborted');
+      err.name = 'AbortError';
+      return err;
+    };
+    const awaitWithAbort = async <T>(promise: Promise<T>, signal = branchSignal): Promise<T> => {
+      if (!signal) return promise;
+      if (signal.aborted) throw makeAbortError(signal.reason);
+      let onAbort: (() => void) | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_, reject) => {
+            onAbort = () => reject(makeAbortError(signal.reason));
+            signal.addEventListener('abort', onAbort, { once: true });
+          }),
+        ]);
+      } finally {
+        if (onAbort) signal.removeEventListener('abort', onAbort);
+      }
+    };
+
     if (this.awaitHumanHandler) {
+      if (branchSignal?.aborted) throw makeAbortError(branchSignal.reason);
       // Emit `await_human` BEFORE invoking the handler so consumers see the
       // start/end pair regardless of which approval path is taken
       // (synchronous handler vs runtime-mediated pendingDecisions).
@@ -3574,7 +3635,10 @@ export class WorkflowContext<TInput = unknown> {
         type: 'await_human',
         data: { channel: options.channel, prompt: options.prompt },
       });
-      const decision = parseHumanDecision(await this.awaitHumanHandler(options));
+      if (branchSignal?.aborted) throw makeAbortError(branchSignal.reason);
+      const decision = parseHumanDecision(
+        await awaitWithAbort(Promise.resolve(this.awaitHumanHandler(options))),
+      );
       this.emitEvent({
         type: 'await_human_resolved',
         data: { channel: options.channel, decision },
@@ -3589,20 +3653,23 @@ export class WorkflowContext<TInput = unknown> {
       );
     }
 
-    if (this.stateStore) {
-      await this.stateStore.savePendingDecision(this.executionId, {
-        executionId: this.executionId,
-        channel: options.channel,
-        prompt: options.prompt,
-        metadata: options.metadata,
-        createdAt: new Date().toISOString(),
-      });
+    const existingClaim = this.awaitHumanClaims.get(this.executionId);
+    if (existingClaim) {
+      const error = new AxlError(
+        'CONCURRENT_HUMAN_DECISION_UNSUPPORTED',
+        `Execution "${this.executionId}" already has an active human decision. ` +
+          'Concurrent awaitHuman calls require request-scoped decision identifiers.',
+      );
+      // Fail the already-pending sibling too so a rejected Promise.all does
+      // not leave an unreachable persisted request and resolver behind.
+      existingClaim.abort(error);
+      throw error;
     }
-
-    this.emitEvent({
-      type: 'await_human',
-      data: { channel: options.channel, prompt: options.prompt },
-    });
+    const claimController = new AbortController();
+    this.awaitHumanClaims.set(this.executionId, claimController);
+    const signal = branchSignal
+      ? AbortSignal.any([branchSignal, claimController.signal])
+      : claimController.signal;
 
     // Honor abort: without a signal listener, an `AbortError`-driven cancel
     // (e.g., `runtime.deleteExecution` on a mid-flight workflow) cleans up
@@ -3611,51 +3678,93 @@ export class WorkflowContext<TInput = unknown> {
     // `pendingDecisions.set(id, resolve)` registration would just sit
     // there. Race the resolver Promise against the signal and clean up
     // either path's lingering registration in `finally`.
-    const makeAbortError = (reason: unknown): Error => {
-      // Match the existing AbortError shape used elsewhere in context.ts —
-      // `instanceof DOMException && name === 'AbortError'` is the
-      // detection used by `isAbortError` in runtime.ts and several catch
-      // sites here. Fall back to a tagged Error in environments missing
-      // the global DOMException constructor.
-      if (typeof DOMException !== 'undefined') {
-        return new DOMException(
-          typeof reason === 'string' ? reason : 'awaitHuman aborted',
-          'AbortError',
-        );
-      }
-      const err = new Error(typeof reason === 'string' ? reason : 'awaitHuman aborted');
-      err.name = 'AbortError';
-      return err;
+    let saveAttempted = false;
+    let markReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      markReady = resolve;
+    });
+    let markCleanupFinished!: () => void;
+    const cleanupFinished = new Promise<void>((resolve) => {
+      markCleanupFinished = resolve;
+    });
+    let resolveDecision!: (decision: HumanDecision) => void;
+    let rejectDecision!: (error: unknown) => void;
+    const decisionPromise = new Promise<HumanDecision>((resolve, reject) => {
+      resolveDecision = resolve;
+      rejectDecision = reject;
+    });
+    // Abort can fire while savePendingDecision is still awaited, before this
+    // promise becomes the active await below. Keep that early rejection
+    // handled without changing the later caller-visible rejection.
+    void decisionPromise.catch(() => {});
+    const registeredResolver: PendingDecisionResolver = {
+      resolve: resolveDecision,
+      ready,
+      state: 'preparing',
+      cancelled: false,
+      cleanupFinished,
     };
-
-    let registeredResolver: ((decision: HumanDecision) => void) | undefined;
-    let abortListener: (() => void) | undefined;
+    this.pendingDecisions.set(this.executionId, registeredResolver);
+    const abortListener = () => {
+      registeredResolver.cancelled = true;
+      // Release polling resolvers immediately even if a custom store's save is
+      // still blocked. Cancellation invalidates publication, so they must not
+      // wait indefinitely for the normal audit-readiness path.
+      markReady();
+      rejectDecision(makeAbortError(signal.reason));
+    };
+    signal.addEventListener('abort', abortListener, { once: true });
     let decision: HumanDecision;
     try {
-      decision = await new Promise<HumanDecision>((resolve, reject) => {
-        // Fast path: already aborted before we even register.
-        if (this.signal?.aborted) {
-          reject(makeAbortError(this.signal.reason));
-          return;
-        }
-        registeredResolver = resolve;
-        this.pendingDecisions!.set(this.executionId, resolve);
-        abortListener = () => {
-          // Remove our registration ONLY if it's still ours — `resolveDecision`
-          // could have cleared it between abort and listener firing.
-          const current = this.pendingDecisions!.get(this.executionId);
-          if (current === resolve) {
-            this.pendingDecisions!.delete(this.executionId);
-          }
-          reject(makeAbortError(this.signal?.reason));
-        };
-        this.signal?.addEventListener('abort', abortListener, { once: true });
-      });
-    } catch (error) {
-      // A cancelled in-process continuation cannot consume a later decision.
-      // Remove the persisted request as compensation; deleteExecution may be
-      // racing this path, so StateStore resolution must remain idempotent.
+      if (signal.aborted) throw makeAbortError(signal.reason);
       if (this.stateStore) {
+        // A store may durably write and then reject because its acknowledgement
+        // was lost. Treat every attempted save as possibly committed and run
+        // idempotent compensation on the failure path.
+        saveAttempted = true;
+        await this.stateStore.savePendingDecision(this.executionId, {
+          executionId: this.executionId,
+          channel: options.channel,
+          prompt: options.prompt,
+          metadata: options.metadata,
+          createdAt: new Date().toISOString(),
+        });
+      }
+      if (signal.aborted) throw makeAbortError(signal.reason);
+
+      // Publication order is deliberate: persistence first, then the
+      // in-process resolver, then the externally observable audit event, then
+      // release the readiness gate. Immediate trace listeners and store
+      // pollers can claim early, but cannot mutate the store before the save
+      // and audit publication have completed.
+      this.emitEvent({
+        type: 'await_human',
+        data: { channel: options.channel, prompt: options.prompt },
+      });
+      registeredResolver.state = 'pending';
+      markReady();
+      decision = await decisionPromise;
+    } catch (error) {
+      if (registeredResolver.state === 'preparing') {
+        registeredResolver.state = 'failed';
+        markReady();
+      }
+      // A cancelled in-process continuation cannot consume a later decision.
+      // If a public resolution already owns the durable mutation, wait for it
+      // to finish: a successful write linearized first and needs no competing
+      // denial; a failed write leaves compensation responsible for cleanup.
+      let needsCompensation = saveAttempted;
+      const inFlightResolution = registeredResolver.resolution;
+      if (registeredResolver.state === 'resolving' && inFlightResolution) {
+        needsCompensation = !(await inFlightResolution);
+      } else if (registeredResolver.state === 'resolved') {
+        needsCompensation = false;
+      }
+
+      // A save that wrote durably and then rejected is indistinguishable from
+      // one that failed before writing. StateStore resolution is therefore an
+      // idempotent compensation operation and is attempted in both cases.
+      if (this.stateStore && needsCompensation) {
         try {
           await this.stateStore.resolveDecision(this.executionId, {
             approved: false,
@@ -3673,13 +3782,14 @@ export class WorkflowContext<TInput = unknown> {
       }
       throw error;
     } finally {
-      if (abortListener) this.signal?.removeEventListener('abort', abortListener);
-      if (
-        registeredResolver &&
-        this.pendingDecisions!.get(this.executionId) === registeredResolver
-      ) {
+      signal.removeEventListener('abort', abortListener);
+      if (this.pendingDecisions!.get(this.executionId) === registeredResolver) {
         this.pendingDecisions!.delete(this.executionId);
       }
+      if (this.awaitHumanClaims.get(this.executionId) === claimController) {
+        this.awaitHumanClaims.delete(this.executionId);
+      }
+      markCleanupFinished();
     }
 
     // Mirror the synchronous-handler path — emit `await_human_resolved` so

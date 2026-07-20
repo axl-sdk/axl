@@ -11,7 +11,16 @@ release. The full frozen scenario matrix remains an internal review artifact.
   loss. Cross-process approval requires a separate decision-claim, lease,
   checkpoint-lineage, and idempotency design.
 - `runtime.resolveDecision()` removes the persisted request before releasing
-  the workflow. Cleanup failure leaves the gate closed and retryable.
+  the workflow. The in-process resolver is published before its audit event,
+  concurrent resolvers claim before store mutation, and cleanup failure leaves
+  the gate closed and retryable. Cancellation shares that claim: it waits for
+  an in-flight public resolution and compensates only if the write failed.
+  Ambiguous save failures are also compensated because a custom store may
+  durably write before losing its acknowledgement. Total execution deletion
+  joins the same cleanup barrier before sweeping the store.
+- Pending decisions remain execution-keyed. Concurrent `awaitHuman()` calls in
+  one execution fail loudly and cancel both waits; request-scoped concurrency
+  belongs with the future durable replay design.
 - `runtime.resumeExecution()` and `runtime.resumePending()` do not ship as
   misleading fail-only APIs.
 - Race and quorum losers get a bounded terminal drain. The default is 5
@@ -19,18 +28,21 @@ release. The full frozen scenario matrix remains an internal review artifact.
   later trace mutation.
 - Exact start/end pairing is a complete-trace invariant, not a delivery promise
   for lossy queues, capped persistence, disconnection, or process death.
-- Default queue overflow stays non-fatal, but every affected bus/stream exposes
-  `observationStatus`. Strict overflow stays fatal and preserves a displaced
+- Default queue overflow stays non-fatal, but every affected iterable view,
+  including `stringStream()`, contributes to `observationStatus`. Strict
+  overflow stays fatal, marks the view incomplete, and preserves a displaced
   application failure as `cause`.
+- Persisted traces report cap truncation and recovered v2 traces report process
+  interruption. All built-in stores retain the status; SQLite uses schema v5.
 
 ## Release gates
 
 | Gate | Required evidence | Status |
 |---|---|---|
 | Tool lifecycle v2 semantics | MockProvider integration and adversarial tool-boundary matrices | Passed |
-| In-process approval ownership | Exact decision validation, cleanup-before-release, concurrent resolution, Studio 400/404/409 | Passed |
+| In-process approval ownership | Exact decision validation, publish-before-audit, cleanup-before-release, single store mutation under concurrent resolution, concurrent-wait rejection, Studio 400/404/409 | Passed |
 | Bounded branch finalization | Cooperative loser drain, non-cooperative timeout, persisted/terminal incomplete marker, no late trace mutation | Passed |
-| Lossy observation honesty | Queue drop count through `observationStatus`; Studio incomplete rendering | Passed |
+| Lossy observation honesty | Main/string-view drop count through `observationStatus`; persistence/process markers; Studio terminal incomplete rendering | Passed |
 | Strict overflow integrity | Recovery-boundary propagation and original-cause preservation | Passed |
 | Historical compatibility | Explicit v1/v2 readers and mixed-history Studio fixtures | Passed in prior scenario review |
 | Redaction and Studio lifecycle rendering | Outcome/phase/reason and route/channel cross-products | Passed |
@@ -67,6 +79,22 @@ Verification completed on 2026-07-18 after the owner hardening pass:
 - lint passed with zero errors and four pre-existing `no-explicit-any`
   warnings; and
 - formatting and `git diff --check` passed.
+
+An independent session review on 2026-07-20 then adversarially checked the net
+diff from `b3cf695`. It closed approval publication, cancellation, and
+single-mutation races; SQLite observation loss; side-table-only delete return
+values; strict/string-view overflow signaling; recovered-process status;
+terminal incomplete rendering; malformed decision JSON; and testing-runtime
+cause parity. Its closure pass additionally verified serialized public-decision
+and cancellation cleanup, write-then-reject save compensation, and total-delete
+ordering behind approval cleanup. No finding required live-provider
+verification.
+
+Final post-review verification on 2026-07-20 passed 2,096 core tests (11
+Redis integration tests skipped without a live Redis), 376 eval tests, 104
+testing tests, 745 Studio tests, 75 cross-package E2E tests, and 162 Studio API
+tests. Workspace typecheck, build, lint, formatting, and diff checks also
+passed; lint retains the same four pre-existing warnings.
 
 ## Deferred product work
 

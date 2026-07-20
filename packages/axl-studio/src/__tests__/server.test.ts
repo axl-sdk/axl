@@ -348,4 +348,19 @@ describe('Studio Server', () => {
     expect(body.error).toBeDefined();
     expect(body.error.message).toBeDefined();
   });
+
+  it('returns 400 JSON for a malformed decision body', async () => {
+    const { app } = createTestApp();
+    const res = await app.request('/api/decisions/missing/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{not-json',
+    });
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      ok: false,
+      error: { code: 'INVALID_HUMAN_DECISION' },
+    });
+  });
 });

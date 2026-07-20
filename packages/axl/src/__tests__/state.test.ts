@@ -392,6 +392,19 @@ describe('MemoryStore', () => {
       const deleted = await store.deleteExecution('nonexistent');
       expect(deleted).toBe(false);
     });
+
+    it('deleteExecution returns true when only a pending decision was removed', async () => {
+      const store = new MemoryStore();
+      await store.savePendingDecision('decision-only', {
+        executionId: 'decision-only',
+        channel: 'ops',
+        prompt: 'approve?',
+        createdAt: new Date().toISOString(),
+      });
+
+      expect(await store.deleteExecution('decision-only')).toBe(true);
+      expect(await store.getPendingDecisions()).toEqual([]);
+    });
   });
 
   // ── Eval History ──────────────────────────────────────────────────
@@ -774,6 +787,23 @@ describe('SQLiteStore', () => {
       store.close();
     });
 
+    it('observation completeness round-trips through the observation column', async () => {
+      const store = createStore();
+      const exec: import('../types.js').ExecutionInfo = {
+        ...makeExec('incomplete', 1000),
+        observation: {
+          complete: false,
+          reason: 'branch_drain_timeout',
+          pendingContinuations: 1,
+          timeoutMs: 25,
+        },
+      };
+      await store.saveExecution(exec);
+
+      expect((await store.getExecution('incomplete'))?.observation).toEqual(exec.observation);
+      store.close();
+    });
+
     it('omits metadata when not provided (round-trip preserves absence)', async () => {
       const store = createStore();
       const exec = makeExec('e1', 1000);
@@ -804,6 +834,20 @@ describe('SQLiteStore', () => {
     it('deleteExecution returns false for unknown id', async () => {
       const store = createStore();
       expect(await store.deleteExecution('nonexistent')).toBe(false);
+      store.close();
+    });
+
+    it('deleteExecution returns true when only a pending decision was removed', async () => {
+      const store = createStore();
+      await store.savePendingDecision('decision-only', {
+        executionId: 'decision-only',
+        channel: 'ops',
+        prompt: 'approve?',
+        createdAt: new Date().toISOString(),
+      });
+
+      expect(await store.deleteExecution('decision-only')).toBe(true);
+      expect(await store.getPendingDecisions()).toEqual([]);
       store.close();
     });
 
@@ -1753,6 +1797,19 @@ describe('RedisStore', () => {
     it('deleteExecution returns false for unknown id', async () => {
       const { store } = createRedisStoreWithMockClient();
       expect(await store.deleteExecution('nonexistent')).toBe(false);
+    });
+
+    it('deleteExecution returns true when only a pending decision was removed', async () => {
+      const { store } = createRedisStoreWithMockClient();
+      await store.savePendingDecision('decision-only', {
+        executionId: 'decision-only',
+        channel: 'ops',
+        prompt: 'approve?',
+        createdAt: new Date().toISOString(),
+      });
+
+      expect(await store.deleteExecution('decision-only')).toBe(true);
+      expect(await store.getPendingDecisions()).toEqual([]);
     });
 
     it('deleteExecution cleans up the sorted-set index too', async () => {

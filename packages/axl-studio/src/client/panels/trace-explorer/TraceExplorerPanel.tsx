@@ -12,7 +12,7 @@ import { TraceEventList } from '../../components/shared/TraceEventList';
 import { fetchExecutions } from '../../lib/api';
 import { useWs } from '../../hooks/use-ws';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
-import type { ExecutionInfo, AxlEvent } from '../../lib/types';
+import type { ExecutionInfo, AxlEvent, ObservationStatus } from '../../lib/types';
 import { StatCard } from '../../components/shared/StatCard';
 import { ResizableSplit } from '../../components/shared/ResizableSplit';
 import { executionEventSchemaVersion } from '../../lib/trace-utils';
@@ -45,6 +45,19 @@ function formatTimestamp(ts: number): string {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+function incompleteObservationMessage(observation: Exclude<ObservationStatus, { complete: true }>) {
+  switch (observation.reason) {
+    case 'branch_drain_timeout':
+      return `Trace incomplete: terminal finalization stopped after ${observation.timeoutMs} ms with ${observation.pendingContinuations} branch continuations still running.`;
+    case 'queue_overflow':
+      return `Trace incomplete: ${observation.droppedEvents} queued events were dropped.`;
+    case 'persistence_truncated':
+      return `Trace incomplete: persisted events were truncated at ${observation.maxEvents} entries.`;
+    case 'process_interrupted':
+      return 'Trace incomplete: the process terminated before the execution reached a terminal boundary.';
+  }
 }
 
 export function TraceExplorerPanel() {
@@ -328,9 +341,7 @@ export function TraceExplorerPanel() {
 
               {selectedExecution?.observation?.complete === false && (
                 <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-                  {selectedExecution.observation.reason === 'branch_drain_timeout'
-                    ? `Trace incomplete: terminal finalization stopped after ${selectedExecution.observation.timeoutMs} ms with ${selectedExecution.observation.pendingContinuations} branch continuations still running.`
-                    : `Trace incomplete: ${selectedExecution.observation.droppedEvents} queued events were dropped.`}
+                  {incompleteObservationMessage(selectedExecution.observation)}
                 </div>
               )}
 
@@ -359,10 +370,7 @@ export function TraceExplorerPanel() {
                   events={filteredEvents}
                   lifecycleEvents={allEvents}
                   traceComplete={
-                    selectedExecution
-                      ? selectedExecution.status !== 'running' &&
-                        selectedExecution.observation?.complete !== false
-                      : undefined
+                    selectedExecution ? selectedExecution.status !== 'running' : undefined
                   }
                   maxDuration={maxDuration}
                 />

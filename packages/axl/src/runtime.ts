@@ -13,7 +13,12 @@ import { ProviderRegistry } from './providers/registry.js';
 import type { StateStore, PendingDecision, EvalHistoryEntry } from './state/types.js';
 import { MemoryStore } from './state/memory.js';
 import { SQLiteStore } from './state/sqlite.js';
-import { parseHumanDecision, resolveBranchDrainTimeoutMs, WorkflowContext } from './context.js';
+import {
+  parseHumanDecision,
+  resolveBranchDrainTimeoutMs,
+  WorkflowContext,
+  type PendingDecisionResolver,
+} from './context.js';
 import { Session, type SessionOptions } from './session.js';
 import { AxlStream } from './stream.js';
 import type { EventStreamOptions } from './event-stream.js';
@@ -346,6 +351,16 @@ function pushEventBounded(execInfo: ExecutionInfo, event: AxlEvent, cap: number)
     last.data !== null &&
     (last.data as { event?: string }).event === 'events_truncated';
   if (!alreadyTruncated) {
+    if (execInfo.observation?.complete !== false) {
+      execInfo.observation = {
+        complete: false,
+        reason: 'persistence_truncated',
+        maxEvents: cap,
+      };
+    }
+    if (event.type === 'workflow_end') {
+      event.data.observation = execInfo.observation;
+    }
     execInfo.events[execInfo.events.length - 1] = {
       schemaVersion: 2,
       type: 'log',
@@ -555,7 +570,7 @@ export class AxlRuntime extends EventEmitter {
   private providerRegistry: ProviderRegistry;
   private stateStore: StateStore;
   private executions = new Map<string, ExecutionInfo>();
-  private pendingDecisionResolvers = new Map<string, (d: HumanDecision) => void>();
+  private pendingDecisionResolvers = new Map<string, PendingDecisionResolver>();
   private abortControllers = new Map<string, AbortController>();
   private registeredEvals = new Map<
     string,
@@ -760,7 +775,11 @@ export class AxlRuntime extends EventEmitter {
       // events to spans via active-context see it.
       ctx._emitWorkflowStart(validated);
       const raw = await workflow.handler(ctx);
-      observation = await ctx._drainBranchWork();
+      const drainedObservation = await ctx._drainBranchWork();
+      observation =
+        drainedObservation.complete === false
+          ? drainedObservation
+          : (execInfo.observation ?? drainedObservation);
       const result = workflow.outputSchema ? workflow.outputSchema.parse(raw) : raw;
 
       execInfo.status = 'completed';
@@ -791,7 +810,11 @@ export class AxlRuntime extends EventEmitter {
       // Their terminal events and measurable cost belong before the workflow
       // terminal/persisted snapshot just as they do on the success path.
       try {
-        observation = await ctx._drainBranchWork();
+        const drainedObservation = await ctx._drainBranchWork();
+        observation =
+          drainedObservation.complete === false
+            ? drainedObservation
+            : (execInfo.observation ?? drainedObservation);
       } catch (drainErr) {
         // Strict event overflow is an observability-integrity failure and must
         // replace an ordinary branch/handler error without skipping workflow_end.
@@ -1838,6 +1861,7 @@ export class AxlRuntime extends EventEmitter {
               ...executionBase,
               eventSchemaVersion: 2,
               events: boundedEvents as AxlEventV2[],
+              observation: { complete: false, reason: 'process_interrupted' },
             }
           : {
               ...executionBase,
@@ -1948,7 +1972,8 @@ export class AxlRuntime extends EventEmitter {
    */
   async deleteExecution(id: string): Promise<boolean> {
     const wasActive = this.executions.has(id);
-    const hadPendingDecision = this.pendingDecisionResolvers.has(id);
+    const pendingDecisionResolver = this.pendingDecisionResolvers.get(id);
+    const hadPendingDecision = pendingDecisionResolver !== undefined;
 
     // Auto-abort: the doc-claimed "doesn't abort" behavior leads to
     // resurrection — the workflow keeps running, hits `persistExecution`,
@@ -1969,13 +1994,20 @@ export class AxlRuntime extends EventEmitter {
       }
     }
 
-    // Resolver-map cleanup: if the workflow was paused on `ctx.awaitHuman`,
-    // the in-memory resolver entry has no other code path that clears it
-    // (resolveDecision normally does). The abort above is what actually
-    // wakes the awaitHuman call (signal.throwIfAborted), so the resolver
-    // becomes unreachable; deleting it bounds map growth.
-    if (hadPendingDecision) {
-      this.pendingDecisionResolvers.delete(id);
+    // Stop new public resolutions immediately, but keep the cleanup record
+    // discoverable until WorkflowContext's finally block removes it. Every
+    // concurrent delete must be able to join the same barrier.
+    if (pendingDecisionResolver) pendingDecisionResolver.cancelled = true;
+
+    // A total store deletion must linearize after any approval mutation that
+    // already claimed this execution. Cleanup can outlive the active-execution
+    // map (for example after a bounded branch drain), so join whenever the
+    // resolver exists rather than conditioning on `wasActive`.
+    if (pendingDecisionResolver) {
+      await pendingDecisionResolver.cleanupFinished;
+      if (this.pendingDecisionResolvers.get(id) === pendingDecisionResolver) {
+        this.pendingDecisionResolvers.delete(id);
+      }
     }
 
     // Lazy-load just THIS id from the store (cheaper than the full list).
@@ -2096,34 +2128,82 @@ export class AxlRuntime extends EventEmitter {
   /** Resolve a pending human decision. */
   async resolveDecision(executionId: string, decision: HumanDecision): Promise<void> {
     decision = parseHumanDecision(decision);
-    const resolver = this.pendingDecisionResolvers.get(executionId);
+    let resolver = this.pendingDecisionResolvers.get(executionId);
+    if (resolver) {
+      if (resolver.cancelled) {
+        throw new AxlError(
+          'PENDING_DECISION_NOT_FOUND',
+          `The pending human decision for execution "${executionId}" is no longer active.`,
+        );
+      }
+      await resolver.ready;
+      if (
+        resolver.cancelled ||
+        resolver.state !== 'pending' ||
+        this.pendingDecisionResolvers.get(executionId) !== resolver
+      ) {
+        throw new AxlError(
+          'PENDING_DECISION_NOT_FOUND',
+          `The pending human decision for execution "${executionId}" is no longer active.`,
+        );
+      }
+    }
     if (!resolver) {
       const pending = await this.stateStore.getPendingDecisions();
-      if (!pending.some((request) => request.executionId === executionId)) {
+      // A store implementation can make the row visible before its async
+      // save call resumes and registers the in-process continuation. Re-read
+      // after the await so polling callers don't get a false cross-process 409.
+      resolver = this.pendingDecisionResolvers.get(executionId);
+      if (resolver) {
+        if (resolver.cancelled) {
+          throw new AxlError(
+            'PENDING_DECISION_NOT_FOUND',
+            `The pending human decision for execution "${executionId}" is no longer active.`,
+          );
+        }
+        await resolver.ready;
+        if (
+          resolver.cancelled ||
+          resolver.state !== 'pending' ||
+          this.pendingDecisionResolvers.get(executionId) !== resolver
+        ) {
+          throw new AxlError(
+            'PENDING_DECISION_NOT_FOUND',
+            `The pending human decision for execution "${executionId}" is no longer active.`,
+          );
+        }
+      } else if (!pending.some((request) => request.executionId === executionId)) {
         throw new AxlError(
           'PENDING_DECISION_NOT_FOUND',
           `No pending human decision exists for execution "${executionId}".`,
         );
+      } else {
+        throw new AxlError(
+          'CROSS_PROCESS_RESUME_UNSUPPORTED',
+          `Execution "${executionId}" is not awaiting a decision in this runtime. ` +
+            'Cross-process approval replay requires a durable decision/lease lineage and is not yet supported; any persisted pending request was preserved.',
+        );
       }
-      throw new AxlError(
-        'CROSS_PROCESS_RESUME_UNSUPPORTED',
-        `Execution "${executionId}" is not awaiting a decision in this runtime. ` +
-          'Cross-process approval replay requires a durable decision/lease lineage and is not yet supported; any persisted pending request was preserved.',
-      );
     }
+    let finishResolution!: (succeeded: boolean) => void;
+    const resolutionFinished = new Promise<boolean>((resolve) => {
+      finishResolution = resolve;
+    });
+    resolver.state = 'resolving';
+    resolver.resolution = resolutionFinished;
     // Keep the gate closed until durable request cleanup succeeds. If the
     // store rejects, the resolver and request remain retryable and no
     // post-approval workflow side effect can start.
-    await this.stateStore.resolveDecision(executionId, decision);
-    const current = this.pendingDecisionResolvers.get(executionId);
-    if (current !== resolver) {
-      throw new AxlError(
-        'PENDING_DECISION_NOT_FOUND',
-        `The pending human decision for execution "${executionId}" is no longer active.`,
-      );
+    try {
+      await this.stateStore.resolveDecision(executionId, decision);
+      resolver.state = 'resolved';
+      finishResolution(true);
+      resolver.resolve(decision);
+    } catch (error) {
+      resolver.state = 'pending';
+      finishResolution(false);
+      throw error;
     }
-    this.pendingDecisionResolvers.delete(executionId);
-    resolver(decision);
   }
 
   /**

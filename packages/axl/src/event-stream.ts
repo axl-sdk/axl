@@ -7,7 +7,7 @@ import {
   type ObservationStatus,
 } from './types.js';
 import { isRootLevel } from './event-utils.js';
-import { EventStreamOverflowError } from './errors.js';
+import { EventStreamOverflowError, isEventStreamOverflowError } from './errors.js';
 export { EventStreamOverflowError } from './errors.js';
 
 /** Wire-format event names callers can subscribe to via `.on(name, fn)`.
@@ -321,8 +321,9 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     this.bus.on('error', () => {});
   }
 
-  /** Machine-readable completeness of this bus's iterator view. Listener
-   *  delivery is independent and is not described by this status. */
+  /** Machine-readable completeness across this bus's bounded iterable views.
+   *  EventEmitter listener delivery is independent and is not described by
+   *  this status. */
   get observationStatus(): ObservationStatus {
     return this.droppedEvents === 0
       ? { complete: true }
@@ -787,10 +788,14 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
           }
           if (pending.size >= self.maxQueued) {
             if (self.onOverflow === 'throw') {
+              self.droppedEvents++;
               throw new EventStreamOverflowError(self.maxQueued, 'string_delta');
             }
             const oldest = pending.keys().next().value as string | undefined;
-            if (oldest !== undefined) pending.delete(oldest);
+            if (oldest !== undefined) {
+              pending.delete(oldest);
+              self.droppedEvents++;
+            }
             self.warnOverflow(
               'dropping oldest pending string field (stringStream subscriber is slower than producer)',
             );
@@ -913,6 +918,7 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
    */
   _push(event: AxlEvent): void {
     if (this.finished) return;
+    let overflowError: EventStreamOverflowError | undefined;
     // Update late-subscriber accumulators BEFORE emitting to listeners.
     // Listeners (specifically the `stringStream` view) read from these
     // maps to compute `accumulated` for the event they're about to be
@@ -947,14 +953,22 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
       });
       const accumulated = paths.get(event.data.path)!.text;
       for (const subscriber of this.stringStreamSubscribers) {
-        subscriber.push({
-          askId,
-          agent: event.agent,
-          path: event.data.path,
-          delta: event.data.delta,
-          accumulated,
-          attempt: event.attempt,
-        });
+        try {
+          subscriber.push({
+            askId,
+            agent: event.agent,
+            path: event.data.path,
+            delta: event.data.delta,
+            accumulated,
+            attempt: event.attempt,
+          });
+        } catch (error) {
+          if (isEventStreamOverflowError(error)) {
+            overflowError ??= error;
+          } else {
+            throw error;
+          }
+        }
       }
     } else if (event.type === 'pipeline' && event.status === 'failed') {
       const askId = event.askId ?? '';
@@ -984,14 +998,25 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
     const waiter = this.waiters.shift();
     if (waiter) {
       waiter({ value: event, done: false });
+      if (overflowError) throw overflowError;
       return;
     }
     // No active waiter — queue. Enforce the soft cap on non-terminal events.
     if (this.eventQueue.length >= this.maxQueued && !TERMINAL_TYPES.has(event.type)) {
-      this.handleOverflow(event);
+      try {
+        this.handleOverflow(event);
+      } catch (error) {
+        if (isEventStreamOverflowError(error)) {
+          overflowError ??= error;
+        } else {
+          throw error;
+        }
+      }
+      if (overflowError) throw overflowError;
       return;
     }
     this.eventQueue.push(event);
+    if (overflowError) throw overflowError;
   }
 
   /** Apply the overflow policy when the queue is at `maxQueued` and a
@@ -999,6 +1024,10 @@ export class AxlEventBus implements AsyncIterable<AxlEvent> {
    *  (checked by the caller). */
   private handleOverflow(event: AxlEvent): void {
     if (this.onOverflow === 'throw') {
+      // The triggering event is not delivered to this bounded iterator.
+      // Record the loss before failing the producer so callers inspecting
+      // the stream after the rejection never see a false "complete" status.
+      this.droppedEvents++;
       throw new EventStreamOverflowError(this.maxQueued, event.type);
     }
     // 'drop-oldest-non-terminal': scan from head for the oldest non-terminal

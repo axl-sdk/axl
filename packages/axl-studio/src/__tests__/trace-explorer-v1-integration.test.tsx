@@ -131,6 +131,50 @@ describe('TraceExplorerPanel persisted v1 compatibility', () => {
         'Trace incomplete: terminal finalization stopped after 10 ms with 2 branch continuations still running.',
       ),
     ).toBeInTheDocument();
-    expect(screen.queryByText('incomplete trace')).not.toBeInTheDocument();
+    expect(screen.getByText('incomplete trace')).toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      'persistence_truncated',
+      { complete: false, reason: 'persistence_truncated', maxEvents: 50 } as const,
+      'Trace incomplete: persisted events were truncated at 50 entries.',
+    ],
+    [
+      'process_interrupted',
+      { complete: false, reason: 'process_interrupted' } as const,
+      'Trace incomplete: the process terminated before the execution reached a terminal boundary.',
+    ],
+  ])('explains the %s observation boundary', async (reason, observation, message) => {
+    fetchExecutionsMock.mockResolvedValue([
+      {
+        executionId: `execution-${reason}`,
+        workflow: `workflow-${reason}`,
+        status: reason === 'process_interrupted' ? 'failed' : 'completed',
+        eventSchemaVersion: 2,
+        events: [
+          {
+            schemaVersion: 2,
+            type: 'log',
+            executionId: `execution-${reason}`,
+            step: 0,
+            timestamp: 1,
+            data: { event: reason },
+          },
+        ],
+        totalCost: 0,
+        startedAt: 1,
+        completedAt: 2,
+        duration: 1,
+        observation,
+      },
+    ]);
+
+    renderPanel();
+    fireEvent.click(
+      await screen.findByRole('button', { name: new RegExp(`workflow-${reason}`, 'i') }),
+    );
+
+    expect(screen.getByText(message)).toBeInTheDocument();
   });
 });

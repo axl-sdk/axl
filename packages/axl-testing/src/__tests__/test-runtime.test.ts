@@ -1,6 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod';
-import { workflow, agent, tool, ToolFailure, ToolModelOutputError } from '@axlsdk/axl';
+import {
+  workflow,
+  agent,
+  tool,
+  ToolFailure,
+  ToolModelOutputError,
+  EventStreamOverflowError,
+} from '@axlsdk/axl';
 import type { AxlEvent, Tool } from '@axlsdk/axl';
 import { AxlTestRuntime, MockProvider } from '../index.js';
 import type { RecordedToolCall } from '../index.js';
@@ -112,6 +119,37 @@ const SimpleWorkflow = workflow({
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 describe('AxlTestRuntime', () => {
+  it('preserves the workflow failure when branch-drain overflow replaces it', async () => {
+    const runtime = new AxlTestRuntime();
+    const applicationFailure = new Error('application failed');
+    const wf = workflow({
+      name: 'test-runtime-drain-cause',
+      input: z.object({}).strict(),
+      handler: async (ctx) => {
+        void ctx.events;
+        ctx.log('fill-queue');
+        const lateObservation = (async () => {
+          await new Promise((resolve) => setImmediate(resolve));
+          ctx.log('overflow-during-drain');
+        })();
+        (
+          ctx as unknown as { _registerBranchDrain(promise: Promise<unknown>): void }
+        )._registerBranchDrain(lateObservation);
+        throw applicationFailure;
+      },
+    });
+    runtime.register(wf);
+
+    const error = await runtime
+      .execute(wf.name, {}, { events: { maxQueued: 1, onOverflow: 'throw' } })
+      .then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+    expect(error).toBeInstanceOf(EventStreamOverflowError);
+    expect((error as Error & { cause?: unknown }).cause).toBe(applicationFailure);
+  });
+
   describe('register and execute', () => {
     it('registers workflow and executes with mock provider', async () => {
       const runtime = new AxlTestRuntime();

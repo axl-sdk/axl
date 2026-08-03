@@ -681,6 +681,81 @@ describe('GeminiProvider', () => {
       });
     });
 
+    it('prices the lowercase standard tier returned by the live API', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            ...makeGeminiResponse('Hi'),
+            modelVersion: 'gemini-3.5-flash-lite',
+            usageMetadata: {
+              promptTokenCount: 100,
+              candidatesTokenCount: 10,
+              totalTokenCount: 110,
+              serviceTier: 'standard',
+            },
+          }),
+      });
+
+      const response = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.5-flash-lite',
+      });
+      expect(response.cost).toBeCloseTo(0.000055, 8);
+    });
+
+    it('normalizes thinking-only MAX_TOKENS usage with zero visible candidates', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            modelVersion: 'gemini-3.6-flash',
+            candidates: [{ finishReason: 'MAX_TOKENS', content: { parts: [] } }],
+            usageMetadata: {
+              promptTokenCount: 3,
+              thoughtsTokenCount: 60,
+              totalTokenCount: 63,
+              serviceTier: 'standard',
+            },
+          }),
+      });
+
+      const response = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+      });
+      expect(response.usage).toEqual({
+        prompt_tokens: 3,
+        completion_tokens: 0,
+        total_tokens: 63,
+        reasoning_tokens: 60,
+      });
+      expect(response.cost).toBeCloseTo(0.0004545, 8);
+    });
+
+    it.each([
+      ['STOP', []],
+      ['MAX_TOKENS', [{ text: 'visible output' }]],
+    ])(
+      'rejects omitted candidate usage for %s with non-thinking candidate output',
+      async (finishReason, parts) => {
+        mockFetch({
+          json: () =>
+            Promise.resolve({
+              modelVersion: 'gemini-3.6-flash',
+              candidates: [{ finishReason, content: { parts } }],
+              usageMetadata: {
+                promptTokenCount: 3,
+                totalTokenCount: 3,
+                serviceTier: 'standard',
+              },
+            }),
+        });
+
+        const response = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model: 'gemini-3.6-flash',
+        });
+        expect(response.usage).toBeUndefined();
+        expect(response.cost).toBeUndefined();
+      },
+    );
+
     it('leaves Flex and Priority calls unpriced', async () => {
       const fetchMock = mockFetch({
         json: () =>
@@ -2399,7 +2474,7 @@ describe('GeminiProvider', () => {
                   candidatesTokenCount: 10,
                   thoughtsTokenCount: 20,
                   totalTokenCount: 130,
-                  serviceTier: 'SERVICE_TIER_STANDARD',
+                  serviceTier: 'standard',
                 },
               })}\n\n`,
             ),
@@ -2425,6 +2500,135 @@ describe('GeminiProvider', () => {
         reasoning_tokens: 20,
       });
       expect(done.cost).toBeCloseTo(0.000375, 8);
+    });
+
+    it('normalizes streamed thinking-only MAX_TOKENS usage with no candidate count', async () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                modelVersion: 'gemini-3.6-flash',
+                candidates: [
+                  {
+                    content: { role: 'model', parts: [{ thought: true, text: 'thinking' }] },
+                    finishReason: 'MAX_TOKENS',
+                  },
+                ],
+                usageMetadata: {
+                  promptTokenCount: 3,
+                  thoughtsTokenCount: 60,
+                  totalTokenCount: 63,
+                  serviceTier: 'standard',
+                },
+              })}\n\n`,
+            ),
+          );
+          controller.close();
+        },
+      });
+      mockFetch({ body: stream });
+      const chunks: any[] = [];
+      for await (const chunk of new GeminiProvider().stream([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+      })) {
+        chunks.push(chunk);
+      }
+      expect(chunks.at(-1)).toMatchObject({
+        type: 'done',
+        usage: {
+          prompt_tokens: 3,
+          completion_tokens: 0,
+          total_tokens: 63,
+          reasoning_tokens: 60,
+        },
+      });
+      expect(chunks.at(-1).cost).toBeCloseTo(0.0004545, 8);
+    });
+
+    it('rejects omitted streamed candidate usage after earlier visible output', async () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                candidates: [{ content: { role: 'model', parts: [{ text: 'visible' }] } }],
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                modelVersion: 'gemini-3.6-flash',
+                candidates: [{ finishReason: 'MAX_TOKENS', content: { role: 'model', parts: [] } }],
+                usageMetadata: {
+                  promptTokenCount: 3,
+                  totalTokenCount: 3,
+                  serviceTier: 'standard',
+                },
+              })}\n\n`,
+            ),
+          );
+          controller.close();
+        },
+      });
+      mockFetch({ body: stream });
+      const chunks: any[] = [];
+      for await (const chunk of new GeminiProvider().stream([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+      })) {
+        chunks.push(chunk);
+      }
+      expect(chunks.at(-1).usage).toBeUndefined();
+      expect(chunks.at(-1).cost).toBeUndefined();
+    });
+
+    it('rejects omitted streamed candidate usage for a contradictory thought function part', async () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                modelVersion: 'gemini-3.6-flash',
+                candidates: [
+                  {
+                    finishReason: 'MAX_TOKENS',
+                    content: {
+                      role: 'model',
+                      parts: [
+                        {
+                          thought: true,
+                          text: 'thinking',
+                          functionCall: { id: 'fc_bad', name: 'probe', args: {} },
+                        },
+                      ],
+                    },
+                  },
+                ],
+                usageMetadata: {
+                  promptTokenCount: 3,
+                  thoughtsTokenCount: 60,
+                  totalTokenCount: 63,
+                  serviceTier: 'standard',
+                },
+              })}\n\n`,
+            ),
+          );
+          controller.close();
+        },
+      });
+      mockFetch({ body: stream });
+      const chunks: any[] = [];
+      for await (const chunk of new GeminiProvider().stream([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+      })) {
+        chunks.push(chunk);
+      }
+      expect(chunks.at(-1).usage).toBeUndefined();
+      expect(chunks.at(-1).cost).toBeUndefined();
     });
 
     it('never recovers stream pricing after conflicting tier evidence', async () => {

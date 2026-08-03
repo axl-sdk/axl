@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only exact known models and observable Standard/on-demand calls. OpenRouter and xAI use
   provider-reported totals; current DeepSeek, Mistral, and Groq models use exact tables;
   unknown tiers, modifiers, deployments, or incomplete usage return `undefined`.
+- **Live-verified provider normalization.** OpenAI Chat Completions caps portable GPT-5.6
+  `max` effort to its accepted `xhigh` tier while Responses sends native `max`. Anthropic's
+  ordinary `inference_geo: "not_available"` and Gemini's lowercase Standard tier now retain
+  standard pricing; Gemini thinking-only token-limit responses normalize omitted visible
+  candidate tokens as zero only after the complete response proves a `MAX_TOKENS` finish
+  with no visible text or function output and the provider total validates that shape.
 
 - **Tool-workflow documentation.** The Core, Studio, Eval, and migration guides now
   explain in user-facing terms how explicit tool outcomes, safe failure messages, and

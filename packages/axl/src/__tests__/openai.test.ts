@@ -553,7 +553,7 @@ describe('OpenAIProvider', () => {
       expect(body.reasoning_effort).toBe('xhigh');
     });
 
-    it('emits native effort "max" only for exact GPT-5.6 family IDs', async () => {
+    it('caps GPT-5.6 max at xhigh on Chat Completions', async () => {
       for (const model of ['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
         const fetchMock = mockFetch({
           json: () =>
@@ -570,7 +570,7 @@ describe('OpenAIProvider', () => {
           effort: 'max',
         });
 
-        expect(getRequestBody(fetchMock).reasoning_effort).toBe('max');
+        expect(getRequestBody(fetchMock).reasoning_effort).toBe('xhigh');
       }
 
       const fetchMock = mockFetch({

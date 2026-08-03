@@ -161,7 +161,7 @@ describe.skipIf(!hasOpenAI)('Pricing Integration: OpenAI Chat Completions', () =
     }
   }, 60_000);
 
-  it('gpt-5.6-luna accepts native max effort and reports bounded cache usage', async () => {
+  it('gpt-5.6-luna safely caps portable max to Chat xhigh', async () => {
     const response = await provider.chat([{ role: 'user', content: 'Reply with exactly: ok' }], {
       model: 'gpt-5.6-luna',
       maxTokens: 64,

@@ -477,7 +477,7 @@ export function supportsReasoningEffort(model: string): boolean {
   return isOSeriesModel(model) || /^gpt-5/.test(model);
 }
 
-/** Exact GPT-5.6 IDs that support the native `max` reasoning tier. */
+/** Exact GPT-5.6 IDs that support native `max` on the Responses endpoint. */
 const GPT_56_REASONING_MODELS = new Set([
   'gpt-5.6',
   'gpt-5.6-sol',
@@ -514,7 +514,8 @@ export function supportsXhigh(model: string): boolean {
  * - gpt-5.1+: supports 'none', 'low', 'medium', 'high'
  * - Pre-gpt-5.1 (o-series, gpt-5, gpt-5-mini, gpt-5-nano): no 'none', default 'medium'
  * - xhigh: only models after gpt-5.1-codex-max (gpt-5.2+)
- * - max: only the exact GPT-5.6 family ids above
+ * - max: only the exact GPT-5.6 family ids above in the shared/Responses resolver;
+ *   Chat Completions applies its endpoint-specific xhigh cap afterward
  */
 export function clampReasoningEffort(model: string, effort: ReasoningEffort): ReasoningEffort {
   // gpt-5-pro only supports 'high'
@@ -523,8 +524,8 @@ export function clampReasoningEffort(model: string, effort: ReasoningEffort): Re
   // 'none' only supported on gpt-5.1+; clamp to 'minimal' (closest to 'none')
   if (effort === 'none' && !supportsReasoningNone(model)) return 'minimal';
 
-  // GPT-5.6 adds a distinct max tier. Preserve the established max→xhigh
-  // behavior for every earlier and unknown sibling.
+  // GPT-5.6 Responses adds a distinct max tier. Preserve max→xhigh for every
+  // earlier and unknown sibling; Chat applies its own xhigh cap downstream.
   if (effort === 'max' && !supportsMaxReasoningEffort(model)) {
     return clampReasoningEffort(model, 'xhigh');
   }
@@ -570,6 +571,19 @@ export function resolveOpenAIReasoningEffort(
 }
 
 /**
+ * Chat Completions currently caps GPT-5.6 at `xhigh`; the distinct `max`
+ * tier is accepted by Responses. Keep the endpoint difference local so the
+ * shared model capability resolver remains correct for Responses.
+ */
+export function resolveOpenAIChatReasoningEffort(
+  model: string,
+  resolved: ResolvedThinkingOptions,
+): ReasoningEffort | undefined {
+  const effort = resolveOpenAIReasoningEffort(model, resolved);
+  return effort === 'max' ? 'xhigh' : effort;
+}
+
+/**
  * OpenAI Chat Completions reasoning emit. Computes `reasoning_effort` for
  * o-series / GPT-5.x models from the unified effort/thinkingBudget knobs and
  * signals when to strip `temperature` (always for o-series; for GPT-5.x only
@@ -578,7 +592,7 @@ export function resolveOpenAIReasoningEffort(
 export const openaiReasoningEmit: ReasoningEmit = (body, resolved, model) => {
   const oSeries = isOSeriesModel(model);
   const reasoningCapable = supportsReasoningEffort(model);
-  const wireEffort = resolveOpenAIReasoningEffort(model, resolved);
+  const wireEffort = resolveOpenAIChatReasoningEffort(model, resolved);
 
   if (wireEffort) body.reasoning_effort = wireEffort;
 

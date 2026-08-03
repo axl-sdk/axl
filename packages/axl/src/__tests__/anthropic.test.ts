@@ -325,6 +325,31 @@ describe('AnthropicProvider', () => {
       expect(response.cost).toBeCloseTo(0.00175, 5);
     });
 
+    it('treats the ordinary not_available inference geo as Standard pricing', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-standard-geo',
+            type: 'message',
+            role: 'assistant',
+            model: 'claude-haiku-4-5-20251001',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: {
+              input_tokens: 100,
+              output_tokens: 50,
+              service_tier: 'standard',
+              inference_geo: 'not_available',
+            },
+          }),
+      });
+
+      const response = await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-haiku-4-5',
+      });
+      expect(response.cost).toBeCloseTo(0.00035, 8);
+    });
+
     it('leaves unknown modern Claude snapshot siblings unpriced', async () => {
       mockFetch({
         json: () =>
@@ -1768,6 +1793,29 @@ describe('AnthropicProvider', () => {
         providerOptions: { fallbacks: ['claude-sonnet-5'] },
       });
       expect(JSON.parse(fetchMock.mock.calls[0][1].body).fallbacks).toEqual(['claude-sonnet-5']);
+      expect(response.cost).toBeUndefined();
+    });
+
+    it('does not treat response-only not_available geo metadata as a safe request override', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-request-geo-not-available',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: {
+              input_tokens: 100,
+              output_tokens: 50,
+              inference_geo: 'not_available',
+            },
+          }),
+      });
+      const response = await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-haiku-4-5',
+        providerOptions: { inference_geo: 'not_available' },
+      });
       expect(response.cost).toBeUndefined();
     });
 

@@ -70,17 +70,16 @@ anthropic:claude-opus-4-6       # Previous flagship
 anthropic:claude-sonnet-4-6     # Balanced (latest)
 anthropic:claude-sonnet-4-5     # Balanced
 anthropic:claude-haiku-4-5      # Fast and affordable
-anthropic:claude-opus-4-5       # Previous gen (most capable)
-anthropic:claude-opus-4-1       # Previous gen
-anthropic:claude-sonnet-4       # Previous gen
-anthropic:claude-opus-4         # Previous gen
-anthropic:claude-3-7-sonnet     # Legacy
-anthropic:claude-3-5-sonnet     # Legacy
-anthropic:claude-3-5-haiku      # Legacy
-anthropic:claude-3-opus         # Legacy
-anthropic:claude-3-sonnet       # Legacy
-anthropic:claude-3-haiku        # Legacy
+anthropic:claude-opus-4-5       # Previous gen
 ```
+
+`claude-opus-4-1` is deprecated on Anthropic-operated APIs and retires August 5,
+2026; migrate to `claude-opus-4-8`. Claude Opus 4, Sonnet 4, Sonnet 3.7,
+Sonnet/Haiku 3.5, and all Claude 3 models previously shown here are retired on the
+first-party API. Migrate Opus workloads to `claude-opus-4-8`, Sonnet workloads to
+`claude-sonnet-4-6`, and Haiku workloads to `claude-haiku-4-5`. Axl does not enforce
+these lifecycle dates with a runtime allowlist: arbitrary IDs remain pass-through.
+[Anthropic-operated and partner-cloud schedules can differ](https://platform.claude.com/docs/en/about-claude/model-deprecations).
 
 ## Google Gemini
 
@@ -95,6 +94,13 @@ google:gemini-2.5-pro                # Previous gen (most capable)
 google:gemini-2.5-flash              # Previous gen (fast)
 google:gemini-2.5-flash-lite         # Previous gen (cheapest)
 ```
+
+First-party lifecycle migrations: `gemini-3-pro-preview` shut down March 9, 2026
+(`gemini-3.1-pro-preview` replacement); `gemini-3.1-flash-lite-preview` shut down
+May 25, 2026 (`gemini-3.1-flash-lite`, with `gemini-3.5-flash-lite` now preferred);
+and Gemini 2.0 Flash/Flash-Lite shut down June 1, 2026 (use `gemini-3.6-flash` /
+`gemini-3.1-flash-lite`). `gemini-3-flash-preview` remains available, but Google
+recommends `gemini-3.6-flash`. See [Gemini deprecations](https://ai.google.dev/gemini-api/docs/deprecations).
 
 This catalog was reviewed against provider documentation on August 3, 2026. Exact known
 IDs receive capabilities and pricing; unknown siblings may still be sent to the provider,
@@ -129,6 +135,28 @@ consequences worth knowing:
   transmitted structurally). On those providers the appended prompt schema is the
   *entire* schema signal, so its content matters more than on OpenAI.
 
+## xAI Grok (Chat preset)
+
+The `xai:` preset is intentionally the existing OpenAI-compatible Chat Completions
+surface. Current self-serve text IDs and aliases recognized by its exact capability
+descriptors are:
+
+```
+xai:grok-4.5                         # Agentic coding; aliases: grok-4.5-latest, grok-build-latest
+xai:grok-4.3                         # Fast general model; aliases: grok-4.3-latest, grok-latest
+xai:grok-4.20                        # Alias of grok-4.20-0309-reasoning
+xai:grok-4.20-non-reasoning          # Alias of grok-4.20-0309-non-reasoning
+```
+
+The exact Grok 4.20 beta/experimental aliases published on the corresponding xAI
+model pages receive the same reasoning or non-reasoning descriptor. Grok 4.5 accepts
+`low`/`medium`/`high` and maps portable `none` to `low`; Grok 4.3 additionally accepts
+`none`. The current Chat contract does not establish a portable `reasoning_effort`
+field for Grok 4.20, so Axl omits it for both 4.20 variants. Multi-agent, returned
+reasoning state, and encrypted reasoning replay belong to xAI's Responses API and are
+not claimed by this Chat preset. Unknown Grok siblings pass through without inferred
+capabilities. Cost uses xAI's returned USD tick total rather than a static rate table.
+
 ## OpenAI-compatible providers & presets
 
 The OpenAI `/v1/chat/completions` wire format is the de-facto standard, so one generic
@@ -160,7 +188,7 @@ name), or rely on its env vars. Most presets read `<PRESET>_API_KEY` and
 |---|---|---|---|---|
 | `openrouter` | `https://openrouter.ai/api/v1` | Bearer | `reasoning` object (effort/budget); captures `reasoning_details` | **provider-reported** (`usage.cost`, USD) |
 | `azure` | *your resource* (`AZURE_OPENAI_BASE_URL`) | `api-key` header | reuses OpenAI (o-series/GPT-5) | unknown (deployment billing is not inferred) |
-| `xai` | `https://api.x.ai/v1` | Bearer | exact Grok 4.20 Chat capabilities | **provider-reported** usage ticks |
+| `xai` | `https://api.x.ai/v1` | Bearer | exact Grok 4.3/4.5/4.20 Chat capabilities | **provider-reported** usage ticks |
 | `deepseek` | `https://api.deepseek.com/v1` | Bearer | captures `reasoning_content`, round-trips on tool turns; no `json_schema` | exact V4 table; cache-hit/miss split |
 | `mistral` | `https://api.mistral.ai/v1` | Bearer | `reasoning_effort` on supported families only | exact current-model table |
 | `groq` | `https://api.groq.com/openai/v1` | Bearer | `reasoning_effort` on reasoning families only | exact current-model table |
@@ -389,7 +417,7 @@ const solution = await ctx.ask(reasoner, problem, { effort: 'low' });
 
 ### `effort`
 
-The `effort` parameter provides a unified way to control reasoning depth across all providers. Values: `'none'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`. Exact model capabilities decide whether a tier is sent, clamped, or omitted. GPT-5.6 and Claude 5 accept native `'max'`; older families retain their documented caps.
+The `effort` parameter provides a unified way to control reasoning depth across all providers. Values: `'none'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`. Exact model and endpoint capabilities decide whether a tier is sent, clamped, or omitted. GPT-5.6 accepts native `'max'` on Responses; Chat Completions currently caps it to `'xhigh'`. Claude 5 accepts native `'max'`; older families retain their documented caps.
 
 ```typescript
 // Most users — just effort:
@@ -434,8 +462,8 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 | **OpenAI** (GPT-5.x pre-5.1) | `'minimal'`⁑ | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | capped to `'high'`⁂ | capped to `'high'`⁂ | nearest effort level* |
 | **OpenAI** (GPT-5.1+) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | capped to `'high'`⁂ | capped to `'high'`⁂ | nearest effort level* |
 | **OpenAI** (GPT-5.2+) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | `reasoning_effort: 'xhigh'` | nearest effort level* |
-| **OpenAI** (GPT-5.6) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | `reasoning_effort: 'max'` | nearest effort level* |
-| **OpenAI Responses** | same clamping as above | `reasoning.effort: 'low'` | `reasoning.effort: 'medium'` | `reasoning.effort: 'high'` | same clamping | same clamping | nearest effort level* |
+| **OpenAI Chat** (GPT-5.6) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | capped to `'xhigh'` | nearest effort level* |
+| **OpenAI Responses** (GPT-5.6) | `reasoning.effort: 'none'` | `reasoning.effort: 'low'` | `reasoning.effort: 'medium'` | `reasoning.effort: 'high'` | `reasoning.effort: 'xhigh'` | `reasoning.effort: 'max'` | nearest effort level* |
 | **Anthropic** (Claude 5) | model-specific minimum/default | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | unsupported |
 | **Anthropic** (Opus 4.8 / 4.7) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | manual `budget_tokens` |
 | **Anthropic** (4.6) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | capped to `'high'`◊ | adaptive + `effort: 'max'`† | manual `budget_tokens` |
@@ -445,7 +473,9 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 | **Gemini** (2.x) | `thinkingBudget: 0` | `thinkingBudget: 1024` | `thinkingBudget: 5000` | `thinkingBudget: 10000` | `thinkingBudget: 16384` | `thinkingBudget: 24576`§ | exact budget |
 | **OpenRouter** | `reasoning: {enabled:false}` | `reasoning: {effort:'low'}` | `'medium'` | `'high'` | clamped to `'high'` | clamped to `'high'` | `reasoning: {max_tokens: N}` ✓ |
 | **Azure OpenAI** | same as OpenAI (per deployment's underlying model) | | | | | | nearest effort* |
-| **xAI** (Grok 4.20 reasoning IDs) | omit | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'` | no-op◆ |
+| **xAI** (Grok 4.5) | `'low'` + warning | `'low'` | `'medium'` | `'high'` | capped to `'high'` | capped to `'high'` | no-op◆ |
+| **xAI** (Grok 4.3) | `'none'` | `'low'` | `'medium'` | `'high'` | capped to `'high'` | capped to `'high'` | no-op◆ |
+| **xAI** (Grok 4.20 reasoning IDs) | omit | omit | omit | omit | omit | omit | no-op◆ |
 | **xAI** (Grok 4.20 non-reasoning IDs) | omit | omit | omit | omit | omit | omit | no-op◆ |
 | **DeepSeek** | model-driven⊕ | model-driven⊕ | model-driven⊕ | model-driven⊕ | model-driven⊕ | model-driven⊕ | no-op◆ |
 | **Mistral** (small/medium) | omit | `reasoning_effort: 'high'`¶ | `'high'` | `'high'` | `'high'` | `'high'` | no-op◆ |
@@ -478,8 +508,8 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 #### Provider-specific behavior
 
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
-- **OpenAI GPT-5.x**: Supports `reasoning_effort` like o-series, strips temperature when reasoning active, uses `system`, and supports parallel tool calls. Model-specific constraints are exact: GPT-5.6 accepts native `'max'`; GPT-5.2–5.5 cap it to `'xhigh'`; earlier families retain their lower caps.
-- **OpenAI Responses API**: Same effort mapping via `reasoning: { effort }`. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
+- **OpenAI GPT-5.x Chat Completions**: Supports `reasoning_effort` like o-series, strips temperature when reasoning active, uses `system`, and supports parallel tool calls. Model-specific constraints are exact: GPT-5.6 and GPT-5.2–5.5 cap portable `'max'` to `'xhigh'`; earlier families retain their lower caps.
+- **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'`, while older models keep their documented clamps. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
 - **Anthropic Claude 5**: Fable 5 always reasons; Opus 5 and Sonnet 5 reason by default. All three accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are preserved in `providerMetadata` for tool continuations. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a different fallback model served the call, Axl fails before persisting history or estimating cost.
 - **Anthropic Opus 4.8**: Supports adaptive thinking and native `'xhigh'`/`'max'`.
 - **Anthropic Opus 4.7**: Same adaptive-thinking behavior as 4.6. Additionally supports `effort: 'xhigh'` as a first-class tier between `'high'` and `'max'`, sent as `output_config.effort: 'xhigh'`. Same pricing as Opus 4.6 ($5/$25 per 1M tokens).

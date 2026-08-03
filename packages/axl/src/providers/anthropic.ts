@@ -402,18 +402,24 @@ function pricingContextFromBody(body: Record<string, unknown>): AnthropicPricing
 
 function isModifiedAnthropicResponse(json: AnthropicMessageResponse): boolean {
   return (
-    isAnthropicModifier('inference_geo', json.inference_geo) ||
-    isAnthropicModifier('speed', json.speed) ||
-    isAnthropicModifier('inference_geo', json.usage?.inference_geo) ||
-    isAnthropicModifier('speed', json.usage?.speed) ||
+    isAnthropicModifier('inference_geo', json.inference_geo, true) ||
+    isAnthropicModifier('speed', json.speed, true) ||
+    isAnthropicModifier('inference_geo', json.usage?.inference_geo, true) ||
+    isAnthropicModifier('speed', json.usage?.speed, true) ||
     hasBilledUnmodeledUsage(json.usage?.server_tool_use) ||
     hasUnmodeledIterations(json.usage?.iterations)
   );
 }
 
-function isAnthropicModifier(kind: 'inference_geo' | 'speed', value: unknown): boolean {
+function isAnthropicModifier(
+  kind: 'inference_geo' | 'speed',
+  value: unknown,
+  responseMetadata = false,
+): boolean {
   if (value === undefined) return false;
-  return kind === 'speed' ? value !== 'standard' : value !== 'global';
+  return kind === 'speed'
+    ? value !== 'standard'
+    : value !== 'global' && !(responseMetadata && value === 'not_available');
 }
 
 function hasAnthropicServerTool(tools: unknown): boolean {
@@ -1118,10 +1124,10 @@ export class AnthropicProvider implements Provider {
               if (typeof event.message?.model === 'string') effectiveModel = event.message.model;
               const messageFallback = hasFallbackIteration(event.message?.usage?.iterations);
               if (
-                isAnthropicModifier('inference_geo', event.message?.inference_geo) ||
-                isAnthropicModifier('speed', event.message?.speed) ||
-                isAnthropicModifier('inference_geo', event.message?.usage?.inference_geo) ||
-                isAnthropicModifier('speed', event.message?.usage?.speed) ||
+                isAnthropicModifier('inference_geo', event.message?.inference_geo, true) ||
+                isAnthropicModifier('speed', event.message?.speed, true) ||
+                isAnthropicModifier('inference_geo', event.message?.usage?.inference_geo, true) ||
+                isAnthropicModifier('speed', event.message?.usage?.speed, true) ||
                 hasBilledUnmodeledUsage(event.message?.usage?.server_tool_use) ||
                 hasUnmodeledIterations(event.message?.usage?.iterations)
               ) {
@@ -1138,8 +1144,8 @@ export class AnthropicProvider implements Provider {
                 finalizeUsage();
                 const terminalFallback = hasFallbackIteration(event.usage.iterations);
                 if (
-                  isAnthropicModifier('speed', event.usage.speed) ||
-                  isAnthropicModifier('inference_geo', event.usage.inference_geo) ||
+                  isAnthropicModifier('speed', event.usage.speed, true) ||
+                  isAnthropicModifier('inference_geo', event.usage.inference_geo, true) ||
                   hasBilledUnmodeledUsage(event.usage.server_tool_use) ||
                   hasUnmodeledIterations(event.usage.iterations)
                 ) {

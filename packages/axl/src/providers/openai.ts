@@ -468,7 +468,7 @@ export const OPENAI_PROFILE: ProviderProfile = {
   defaultBaseUrl: 'https://api.openai.com/v1',
   envApiKey: 'OPENAI_API_KEY',
   envBaseUrl: 'OPENAI_BASE_URL',
-  pricing: { kind: 'table', table: OPENAI_PRICING },
+  pricing: { kind: 'table', table: OPENAI_PRICING, match: 'exact' },
   reasoning: { emit: openaiReasoningEmit, capture: 'none' },
   roleFor: (role, model) => (role === 'system' && isOSeriesModel(model) ? 'developer' : role),
   maxTokensField: 'max_completion_tokens',

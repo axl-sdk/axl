@@ -54,6 +54,17 @@ function ok(extra: Record<string, unknown> = {}, message: Record<string, unknown
   };
 }
 
+function sseStream(lines: string[]): ReadableStream<Uint8Array> {
+  const enc = new TextEncoder();
+  let index = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (index < lines.length) controller.enqueue(enc.encode(`${lines[index++]}\n`));
+      else controller.close();
+    },
+  });
+}
+
 const user: ChatMessage[] = [{ role: 'user', content: 'Hello' }];
 
 function provider(profile: ProviderProfile, apiKey: string | undefined = 'k', baseUrl?: string) {
@@ -82,7 +93,7 @@ describe('OpenRouter preset', () => {
     );
     const r = await provider(OPENROUTER_PROFILE).chat(user, { model: 'anthropic/claude-x' });
     expect(req(fetchMock).url).toBe('https://openrouter.ai/api/v1/chat/completions');
-    expect(req(fetchMock).body.usage).toEqual({ include: true });
+    expect(req(fetchMock).body).not.toHaveProperty('usage');
     expect(r.cost).toBe(0.0123);
   });
 
@@ -181,35 +192,106 @@ describe('Azure preset', () => {
 // ===========================================================================
 
 describe('xAI preset', () => {
-  it('emits reasoning_effort for grok-3-mini (low|high), clamping the rest to high', async () => {
+  it('uses exact Grok 4.5 descriptors and clamps irreducible none to low once', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     let fetchMock = mockFetch(ok());
-    await provider(XAI_PROFILE).chat(user, { model: 'grok-3-mini', effort: 'max' });
+    await provider(XAI_PROFILE).chat(user, { model: 'grok-4.5', effort: 'max' });
     expect(req(fetchMock).body.reasoning_effort).toBe('high');
 
     fetchMock = mockFetch(ok());
-    await provider(XAI_PROFILE).chat(user, { model: 'grok-3-mini', effort: 'medium' });
-    expect(req(fetchMock).body.reasoning_effort).toBe('high'); // grok-3-mini has no 'medium'
+    await provider(XAI_PROFILE).chat(user, { model: 'grok-build-latest', effort: 'medium' });
+    expect(req(fetchMock).body.reasoning_effort).toBe('medium');
 
     fetchMock = mockFetch(ok());
-    await provider(XAI_PROFILE).chat(user, { model: 'grok-3-mini', effort: 'low' });
+    await provider(XAI_PROFILE).chat(user, { model: 'grok-4.5-latest', effort: 'none' });
     expect(req(fetchMock).body.reasoning_effort).toBe('low');
+    expect(warn).toHaveBeenCalledTimes(2);
+
+    fetchMock = mockFetch(ok());
+    await provider(XAI_PROFILE).chat(user, { model: 'grok-4.5', effort: 'max' });
+    expect(req(fetchMock).body.reasoning_effort).toBe('high');
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
   });
 
-  it('does NOT send reasoning_effort to grok-4 (auto-reasons, would 400)', async () => {
+  it('maps exact Grok 4.3 aliases including disabled reasoning', async () => {
     const fetchMock = mockFetch(ok());
-    await provider(XAI_PROFILE).chat(user, { model: 'grok-4', effort: 'high' });
+    await provider(XAI_PROFILE).chat(user, { model: 'grok-latest', effort: 'none' });
+    expect(req(fetchMock).body.reasoning_effort).toBe('none');
+  });
+
+  it('bounds xAI high-effort clamp warnings without warning for supported or unknown values', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    for (const [model, effort] of [
+      ['grok-4.3', 'xhigh'],
+      ['grok-4.3', 'xhigh'],
+      ['grok-4.3', 'max'],
+      ['grok-4.5', 'low'],
+      ['grok-4.20-future', 'max'],
+      ['grok-4.20-multi-agent', 'max'],
+    ] as const) {
+      const fetchMock = mockFetch(ok());
+      await provider(XAI_PROFILE).chat(user, { model, effort });
+      if (model === 'grok-4.20-future' || model === 'grok-4.20-multi-agent') {
+        expect(req(fetchMock).body).not.toHaveProperty('reasoning_effort');
+      }
+    }
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
+  });
+
+  it('keeps Grok 4.20 behavior exact: reasoning strips params, non-reasoning does not', async () => {
+    for (const model of ['grok-4.20', 'grok-4.20-0309-reasoning']) {
+      const fetchMock = mockFetch(ok());
+      await provider(XAI_PROFILE).chat(user, {
+        model,
+        effort: 'high',
+        stop: ['END'],
+        providerOptions: { presence_penalty: 1, frequency_penalty: 1 },
+      });
+      expect(req(fetchMock).body, model).not.toHaveProperty('stop');
+      // Explicit providerOptions always remains last-write-wins.
+      expect(req(fetchMock).body.presence_penalty).toBe(1);
+      expect(req(fetchMock).body.frequency_penalty).toBe(1);
+    }
+    const fetchMock = mockFetch(ok());
+    await provider(XAI_PROFILE).chat(user, {
+      model: 'grok-4.20-non-reasoning',
+      effort: 'high',
+      stop: ['END'],
+    });
+    expect(req(fetchMock).body.stop).toEqual(['END']);
     expect(req(fetchMock).body).not.toHaveProperty('reasoning_effort');
   });
 
-  it('strips stop on reasoning models (grok-3-mini, grok-4) but keeps it on chat variants', async () => {
-    for (const model of ['grok-4', 'grok-3-mini']) {
+  it('does not infer Chat behavior for unknown siblings or Responses-only multi-agent ids', async () => {
+    for (const model of [
+      'grok-4.20-future',
+      'grok-4.20-multi-agent',
+      'grok-4.20-multi-agent-0309',
+    ]) {
       const fetchMock = mockFetch(ok());
-      await provider(XAI_PROFILE).chat(user, { model, stop: ['END'] });
-      expect(req(fetchMock).body, model).not.toHaveProperty('stop');
+      await provider(XAI_PROFILE).chat(user, { model, effort: 'xhigh', stop: ['END'] });
+      expect(req(fetchMock).body, model).not.toHaveProperty('reasoning_effort');
+      expect(req(fetchMock).body.stop).toEqual(['END']);
     }
-    const fetchMock = mockFetch(ok());
-    await provider(XAI_PROFILE).chat(user, { model: 'grok-3', stop: ['END'] });
-    expect(req(fetchMock).body.stop).toEqual(['END']);
+  });
+
+  it('uses the returned tick total exactly once regardless of cache, tier, or tool usage', async () => {
+    mockFetch(
+      ok({
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 10,
+          total_tokens: 110,
+          cost_in_usd_ticks: 25_000_000,
+          prompt_tokens_details: { cached_tokens: 90 },
+        },
+        service_tier: 'priority',
+      }),
+    );
+    const result = await provider(XAI_PROFILE).chat(user, { model: 'grok-4.5', tools: [] });
+    expect(result.cost).toBe(0.0025);
   });
 });
 
@@ -248,6 +330,83 @@ describe('DeepSeek preset', () => {
     await provider(DEEPSEEK_PROFILE).chat(user, { model: 'deepseek-chat', temperature: 0.7 });
     expect(req(fetchMock).body.temperature).toBe(0.7);
   });
+
+  it('prices exact V4 ids from normalized cache hit/miss usage only', async () => {
+    mockFetch(
+      ok({
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 10,
+          total_tokens: 110,
+          prompt_cache_hit_tokens: 80,
+          prompt_cache_miss_tokens: 20,
+        },
+      }),
+    );
+    const priced = await provider(DEEPSEEK_PROFILE).chat(user, { model: 'deepseek-v4-flash' });
+    expect(priced.usage?.cached_tokens).toBe(80);
+    expect(priced.cost).toBeCloseTo(80 * 0.0028e-6 + 20 * 0.14e-6 + 10 * 0.28e-6, 12);
+
+    mockFetch(
+      ok({
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 10,
+          total_tokens: 110,
+          prompt_cache_hit_tokens: 80,
+          prompt_cache_miss_tokens: 19,
+        },
+      }),
+    );
+    const malformed = await provider(DEEPSEEK_PROFILE).chat(user, { model: 'deepseek-v4-flash' });
+    expect(malformed.cost).toBeUndefined();
+
+    for (const usage of [
+      { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+      {
+        prompt_tokens: 100,
+        completion_tokens: 10,
+        total_tokens: 110,
+        prompt_cache_hit_tokens: 80,
+      },
+    ]) {
+      mockFetch(ok({ usage }));
+      const missingSplit = await provider(DEEPSEEK_PROFILE).chat(user, {
+        model: 'deepseek-v4-flash',
+      });
+      expect(missingSplit.cost).toBeUndefined();
+    }
+
+    const clonedProfile: ProviderProfile = {
+      ...DEEPSEEK_PROFILE,
+      pricing: { ...DEEPSEEK_PROFILE.pricing },
+    };
+    mockFetch(ok({ usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } }));
+    const clonedMissingSplit = await provider(clonedProfile).chat(user, {
+      model: 'deepseek-v4-flash',
+    });
+    expect(clonedMissingSplit.cost).toBeUndefined();
+
+    mockFetch({
+      body: sseStream([
+        'data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,"prompt_cache_hit_tokens":80}}',
+        'data: [DONE]',
+      ]),
+    });
+    const streamChunks = [];
+    for await (const chunk of provider(DEEPSEEK_PROFILE).stream(user, {
+      model: 'deepseek-v4-flash',
+    })) {
+      streamChunks.push(chunk);
+    }
+    expect(streamChunks.find((chunk) => chunk.type === 'done')?.cost).toBeUndefined();
+
+    mockFetch(ok());
+    const sibling = await provider(DEEPSEEK_PROFILE).chat(user, {
+      model: 'deepseek-v4-flash-next',
+    });
+    expect(sibling.cost).toBeUndefined();
+  });
 });
 
 // ===========================================================================
@@ -278,6 +437,60 @@ describe('Mistral preset', () => {
     const fetchMock = mockFetch(ok());
     await provider(MISTRAL_PROFILE).chat(user, { model: 'mistral-small-latest', effort: 'none' });
     expect(req(fetchMock).body).not.toHaveProperty('reasoning_effort');
+  });
+
+  it('prices only exact source-dated direct Chat rows with a 90% cache discount', async () => {
+    mockFetch(
+      ok({
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 10,
+          total_tokens: 110,
+          prompt_tokens_details: { cached_tokens: 80 },
+        },
+      }),
+    );
+    const priced = await provider(MISTRAL_PROFILE).chat(user, { model: 'mistral-small-latest' });
+    expect(priced.cost).toBeCloseTo(20 * 0.15e-6 + 80 * 0.15e-6 * 0.1 + 10 * 0.6e-6, 12);
+
+    mockFetch(ok());
+    const sibling = await provider(MISTRAL_PROFILE).chat(user, {
+      model: 'mistral-small-latest-next',
+    });
+    expect(sibling.cost).toBeUndefined();
+
+    mockFetch(ok());
+    const euRegional = await provider(MISTRAL_PROFILE, 'k', 'https://api.mistral.ai/v1/eu').chat(
+      user,
+      { model: 'mistral-small-latest' },
+    );
+    expect(euRegional.cost).toBeUndefined();
+
+    mockFetch(ok());
+    const customEndpoint = await provider(MISTRAL_PROFILE, 'k', 'https://mistral.example/v1').chat(
+      user,
+      { model: 'mistral-small-latest' },
+    );
+    expect(customEndpoint.cost).toBeUndefined();
+
+    mockFetch(ok());
+    const enterprise = await provider(
+      MISTRAL_PROFILE,
+      'k',
+      'https://api.mistral.ai/v1/enterprise',
+    ).chat(user, { model: 'mistral-small-latest' });
+    expect(enterprise.cost).toBeUndefined();
+
+    const clonedProfile: ProviderProfile = {
+      ...MISTRAL_PROFILE,
+      pricing: { ...MISTRAL_PROFILE.pricing },
+    };
+    mockFetch(ok());
+    const clonedCustomBase = await provider(clonedProfile, 'k', 'https://mistral.proxy/v1').chat(
+      user,
+      { model: 'mistral-small-latest' },
+    );
+    expect(clonedCustomBase.cost).toBeUndefined();
   });
 });
 
@@ -310,6 +523,142 @@ describe('Groq preset', () => {
       const fetchMock = mockFetch(ok());
       await provider(GROQ_PROFILE).chat(user, { model, effort: 'medium' });
       expect(req(fetchMock).body, model).not.toHaveProperty('reasoning_effort');
+    }
+  });
+
+  it('prices exact on-demand/Flex rows and leaves ambiguous or Performance tiers unpriced', async () => {
+    for (const [requestTier, responseTier, expected] of [
+      ['on_demand', undefined, true],
+      ['flex', undefined, true],
+      ['auto', 'on_demand', true],
+      ['performance', undefined, false],
+      ['auto', undefined, false],
+      ['auto', 'performance', false],
+    ] as const) {
+      mockFetch(ok(responseTier === undefined ? {} : { service_tier: responseTier }));
+      const result = await provider(GROQ_PROFILE).chat(user, {
+        model: 'openai/gpt-oss-20b',
+        providerOptions: { service_tier: requestTier },
+      });
+      expect(result.cost !== undefined, `${requestTier}/${responseTier}`).toBe(expected);
+    }
+
+    mockFetch(ok());
+    const compound = await provider(GROQ_PROFILE).chat(user, { model: 'groq/compound' });
+    expect(compound.cost).toBeUndefined();
+
+    mockFetch(ok());
+    const sibling = await provider(GROQ_PROFILE).chat(user, { model: 'openai/gpt-oss-20b-next' });
+    expect(sibling.cost).toBeUndefined();
+  });
+
+  it('prices cached GPT-OSS input but leaves server-side tools and modifiers unpriced', async () => {
+    mockFetch(
+      ok({
+        usage: {
+          prompt_tokens: 100,
+          completion_tokens: 10,
+          total_tokens: 110,
+          prompt_tokens_details: { cached_tokens: 80 },
+        },
+      }),
+    );
+    const cached = await provider(GROQ_PROFILE).chat(user, { model: 'openai/gpt-oss-20b' });
+    expect(cached.cost).toBeCloseTo(20 * 0.075e-6 + 80 * 0.075e-6 * 0.5 + 10 * 0.3e-6, 12);
+
+    for (const providerOptions of [
+      { tools: [{ type: 'browser_search' }] },
+      { browser_search: {} },
+      { code_interpreter: {} },
+    ]) {
+      mockFetch(ok());
+      const unpriced = await provider(GROQ_PROFILE).chat(user, {
+        model: 'openai/gpt-oss-20b',
+        providerOptions,
+      });
+      expect(unpriced.cost).toBeUndefined();
+    }
+
+    mockFetch(ok());
+    const functionTool = await provider(GROQ_PROFILE).chat(user, {
+      model: 'openai/gpt-oss-20b',
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'lookup', description: 'd', parameters: {} },
+        },
+      ],
+      providerOptions: { tools: [{ type: 'function', function: { name: 'native' } }] },
+    });
+    expect(functionTool.cost).toBeDefined();
+
+    const clonedProfile: ProviderProfile = {
+      ...GROQ_PROFILE,
+      pricing: { ...GROQ_PROFILE.pricing },
+    };
+    mockFetch(ok());
+    const clonedServerTool = await provider(clonedProfile).chat(user, {
+      model: 'openai/gpt-oss-20b',
+      providerOptions: { browser_search: {} },
+    });
+    expect(clonedServerTool.cost).toBeUndefined();
+  });
+});
+
+describe('canonical table-pricing endpoints', () => {
+  const policies = [
+    {
+      profile: GROQ_PROFILE,
+      model: 'openai/gpt-oss-20b',
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    },
+    {
+      profile: DEEPSEEK_PROFILE,
+      model: 'deepseek-v4-flash',
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 5,
+        total_tokens: 15,
+        prompt_cache_hit_tokens: 5,
+        prompt_cache_miss_tokens: 5,
+      },
+    },
+  ] as const;
+
+  it('keeps custom, env, and proxy base URLs unpriced in final and terminal streams', async () => {
+    for (const { profile, model, usage } of policies) {
+      for (const [kind, baseUrl] of [
+        ['custom', 'https://custom.example/v1'],
+        ['env', 'https://env.example/v1'],
+        ['proxy', 'https://proxy.example/v1'],
+      ] as const) {
+        if (kind === 'env') vi.stubEnv(profile.envBaseUrl!, baseUrl);
+        mockFetch(ok({ usage }));
+        const final = await provider(profile, 'k', kind === 'env' ? undefined : baseUrl).chat(
+          user,
+          {
+            model,
+          },
+        );
+        expect(final.cost, `${profile.name} ${kind} final`).toBeUndefined();
+
+        mockFetch({
+          body: sseStream([`data: ${JSON.stringify({ choices: [], usage })}`, 'data: [DONE]']),
+        });
+        const chunks = [];
+        for await (const chunk of provider(
+          profile,
+          'k',
+          kind === 'env' ? undefined : baseUrl,
+        ).stream(user, { model })) {
+          chunks.push(chunk);
+        }
+        expect(
+          chunks.find((chunk) => chunk.type === 'done')?.cost,
+          `${profile.name} ${kind} stream`,
+        ).toBeUndefined();
+        vi.unstubAllEnvs();
+      }
     }
   });
 });

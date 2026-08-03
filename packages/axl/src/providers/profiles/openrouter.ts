@@ -6,9 +6,9 @@ import { reasoningObjectEmit, type ProviderProfile } from '../openai-compatible.
  * - Reasoning is the unified `reasoning` object (`{ effort }` XOR `{ max_tokens }`,
  *   or `{ enabled: false }`); reasoning text comes back in `message.reasoning`
  *   with a structured `reasoning_details[]` we round-trip on tool-call turns.
- * - Cost is provider-reported: `usage: { include: true }` makes OpenRouter return
- *   `usage.cost` (USD), so Axl keeps cost-as-a-primitive working across the whole
- *   catalog where a static table never could.
+ * - Cost is provider-reported in `usage.cost` (USD), so Axl keeps
+ *   cost-as-a-primitive working across the whole catalog where a static table
+ *   never could. OpenRouter now returns it automatically; no request opt-in.
  * - Model ids are `vendor/model` slugs (e.g. `anthropic/claude-opus-4.7`); the
  *   registry's first-colon split keeps `openrouter:anthropic/claude-…` intact.
  *
@@ -22,8 +22,6 @@ export const OPENROUTER_PROFILE: ProviderProfile = {
   envApiKey: 'OPENROUTER_API_KEY',
   envBaseUrl: 'OPENROUTER_BASE_URL',
   pricing: { kind: 'from-response' },
-  // Ask OpenRouter to report per-call cost in usage.cost.
-  requestDefaults: { usage: { include: true } },
   reasoning: {
     // OpenRouter's effort vocabulary is low|medium|high; xhigh/max clamp to high.
     emit: reasoningObjectEmit((effort) =>

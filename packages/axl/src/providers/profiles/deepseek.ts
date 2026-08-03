@@ -1,4 +1,15 @@
-import type { ProviderProfile, ReasoningEmit } from '../openai-compatible.js';
+import type { PricingTable, ProviderProfile, ReasoningEmit } from '../openai-compatible.js';
+import { attachBuiltinTablePricingPolicy } from '../builtin-table-pricing.js';
+
+/**
+ * Direct V4 Chat prices, sourced 2026-08-03 from
+ * https://api-docs.deepseek.com/quick_start/pricing. The documented future
+ * 2x peak multiplier has no effective date, so this remains a flat-current table.
+ */
+const DEEPSEEK_PRICING: PricingTable = {
+  'deepseek-v4-flash': [0.14e-6, 0.28e-6, 0.02],
+  'deepseek-v4-pro': [0.435e-6, 0.87e-6, 1 / 120],
+};
 
 // Thinking models: the classic `deepseek-reasoner` (retires 2026-07-24) and the
 // V4 thinking families. They reason automatically and reject/ignore sampling
@@ -32,7 +43,7 @@ export const DEEPSEEK_PROFILE: ProviderProfile = {
   defaultBaseUrl: 'https://api.deepseek.com/v1',
   envApiKey: 'DEEPSEEK_API_KEY',
   envBaseUrl: 'DEEPSEEK_BASE_URL',
-  pricing: { kind: 'unknown' },
+  pricing: { kind: 'table', table: DEEPSEEK_PRICING, match: 'exact' },
   reasoning: {
     emit: deepseekEmit,
     capture: 'reasoning_content',
@@ -44,3 +55,8 @@ export const DEEPSEEK_PROFILE: ProviderProfile = {
       isReasoner(model) ? ['top_p', 'presence_penalty', 'frequency_penalty'] : [],
   },
 };
+
+attachBuiltinTablePricingPolicy(DEEPSEEK_PROFILE, {
+  canonicalBaseUrl: 'https://api.deepseek.com/v1',
+  requireCacheSplit: true,
+});

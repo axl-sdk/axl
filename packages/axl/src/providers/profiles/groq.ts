@@ -1,4 +1,23 @@
-import { reasoningEffortEmit, type ProviderProfile } from '../openai-compatible.js';
+import {
+  reasoningEffortEmit,
+  type PricingTable,
+  type ProviderProfile,
+} from '../openai-compatible.js';
+import { attachBuiltinTablePricingPolicy } from '../builtin-table-pricing.js';
+
+/**
+ * Direct production text prices, sourced 2026-08-03 from
+ * https://console.groq.com/docs/models. GPT-OSS prompt-cache reads are 50% of
+ * input; the other rows have no documented cache discount. On-demand and Flex
+ * share these rates; Performance, Compound, preview, and contact-sales
+ * offerings are unpriced.
+ */
+const GROQ_PRICING: PricingTable = {
+  'llama-3.1-8b-instant': [0.05e-6, 0.08e-6, 1],
+  'llama-3.3-70b-versatile': [0.59e-6, 0.79e-6, 1],
+  'openai/gpt-oss-120b': [0.15e-6, 0.6e-6, 0.5],
+  'openai/gpt-oss-20b': [0.075e-6, 0.3e-6, 0.5],
+};
 
 // `reasoning_effort` is per-FAMILY on Groq, not just per-reasoning-model:
 //  - gpt-oss accepts low | medium | high.
@@ -26,7 +45,11 @@ export const GROQ_PROFILE: ProviderProfile = {
   defaultBaseUrl: 'https://api.groq.com/openai/v1',
   envApiKey: 'GROQ_API_KEY',
   envBaseUrl: 'GROQ_BASE_URL',
-  pricing: { kind: 'unknown' },
+  pricing: {
+    kind: 'table',
+    table: GROQ_PRICING,
+    match: 'exact',
+  },
   reasoning: {
     emit: reasoningEffortEmit((resolved, model) => {
       if (!isGptOss(model) || resolved.thinkingDisabled || !resolved.activeEffort) {
@@ -47,3 +70,19 @@ export const GROQ_PROFILE: ProviderProfile = {
     supportsJsonSchema: isGptOss,
   },
 };
+
+attachBuiltinTablePricingPolicy(GROQ_PROFILE, {
+  canonicalBaseUrl: 'https://api.groq.com/openai/v1',
+  supportedServiceTiers: ['on_demand', 'flex'],
+  functionToolsOnly: true,
+  chargedRequestModifiers: [
+    'browser_search',
+    'code_interpreter',
+    'web_search',
+    'visit_website',
+    'wolfram_alpha',
+    'remote_mcp',
+    'mcp',
+    'compound_custom',
+  ],
+});

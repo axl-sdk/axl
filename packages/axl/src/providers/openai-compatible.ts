@@ -16,6 +16,7 @@ import {
 import { fetchWithRetry } from './retry.js';
 import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
+import { isBuiltinTablePricingEligible } from './builtin-table-pricing.js';
 
 // ===========================================================================
 // Generic OpenAI-compatible provider engine.
@@ -61,7 +62,12 @@ export type PricingTable = Record<string, [number, number, number]>;
  * free. See spec §6.
  */
 export type PricingSource =
-  | { kind: 'table'; table: PricingTable }
+  | {
+      kind: 'table';
+      table: PricingTable;
+      /** Exact matching prevents a future sibling from inheriting a base price. */
+      match?: 'prefix' | 'exact';
+    }
   /** Provider reports per-call cost in `usage.cost` (OpenRouter credits ≈ USD). */
   | { kind: 'from-response' }
   /** Local/self-hosted: cost is genuinely 0. */
@@ -211,9 +217,22 @@ export function priceFromTable(
   promptTokens: number,
   completionTokens: number,
   cachedTokens?: number,
+  match: 'prefix' | 'exact' = 'prefix',
 ): number | undefined {
+  const cached = cachedTokens ?? 0;
+  if (
+    !Number.isSafeInteger(promptTokens) ||
+    !Number.isSafeInteger(completionTokens) ||
+    !Number.isSafeInteger(cached) ||
+    promptTokens < 0 ||
+    completionTokens < 0 ||
+    cached < 0 ||
+    cached > promptTokens
+  ) {
+    return undefined;
+  }
   let pricing = table[model];
-  if (!pricing) {
+  if (!pricing && match === 'prefix') {
     for (const key of sortedKeys(table)) {
       if (model.startsWith(key)) {
         pricing = table[key];
@@ -223,7 +242,6 @@ export function priceFromTable(
   }
   if (!pricing) return undefined;
   const [inputRate, outputRate, cacheMultiplier] = pricing;
-  const cached = cachedTokens ?? 0;
   const inputCost = (promptTokens - cached) * inputRate + cached * inputRate * cacheMultiplier;
   return inputCost + completionTokens * outputRate;
 }
@@ -671,9 +689,25 @@ export class OpenAICompatibleProvider implements Provider {
       completion_tokens: raw.completion_tokens,
       total_tokens: raw.total_tokens,
       reasoning_tokens: raw.completion_tokens_details?.reasoning_tokens,
-      cached_tokens: raw.prompt_tokens_details?.cached_tokens,
+      // DeepSeek reports the cache split at the top level rather than under
+      // prompt_tokens_details. Preserve the normalized hit count for the
+      // generic table estimator; its split is validated before pricing.
+      cached_tokens: raw.prompt_cache_hit_tokens ?? raw.prompt_tokens_details?.cached_tokens,
       cache_write_tokens: raw.prompt_tokens_details?.cache_write_tokens,
     };
+  }
+
+  private reportedCost(raw: OpenAIUsage | undefined): number | undefined {
+    if (!raw) return undefined;
+    if (this.profile.name === 'xai') {
+      const ticks = raw.cost_in_usd_ticks;
+      return typeof ticks === 'number' && Number.isSafeInteger(ticks) && ticks >= 0
+        ? ticks / 10_000_000_000
+        : undefined;
+    }
+    return typeof raw.cost === 'number' && Number.isFinite(raw.cost) && raw.cost >= 0
+      ? raw.cost
+      : undefined;
   }
 
   /**
@@ -685,7 +719,7 @@ export class OpenAICompatibleProvider implements Provider {
     model: string,
     usage: ProviderResponse['usage'],
     reportedCost: number | undefined,
-    _context?: { request?: Record<string, unknown>; response?: OpenAIModelResponse },
+    context?: { request?: Record<string, unknown>; response?: OpenAIModelResponse },
   ): number | undefined {
     const p = this.profile.pricing;
     if (p.kind === 'zero') return 0;
@@ -694,10 +728,21 @@ export class OpenAICompatibleProvider implements Provider {
       case 'unknown':
         return undefined;
       case 'from-response':
-        return typeof reportedCost === 'number' && Number.isFinite(reportedCost)
+        return typeof reportedCost === 'number' &&
+          Number.isFinite(reportedCost) &&
+          reportedCost >= 0
           ? reportedCost
           : undefined;
       case 'table': {
+        if (
+          !isBuiltinTablePricingEligible(this.profile, {
+            baseUrl: this.baseUrl,
+            request: context?.request,
+            response: context?.response,
+          })
+        ) {
+          return undefined;
+        }
         // Guard against NaN from a provider that reports malformed token counts —
         // a NaN cost would poison budget totals and the axl.agent.cost span.
         const c = priceFromTable(
@@ -706,6 +751,7 @@ export class OpenAICompatibleProvider implements Provider {
           usage.prompt_tokens,
           usage.completion_tokens,
           usage.cached_tokens,
+          p.match,
         );
         return c !== undefined && Number.isFinite(c) ? c : undefined;
       }
@@ -770,7 +816,7 @@ export class OpenAICompatibleProvider implements Provider {
     }
 
     const usage = this.toUsage(json.usage);
-    const cost = this.computeCost(json.model ?? model, usage, json.usage?.cost, {
+    const cost = this.computeCost(json.model ?? model, usage, this.reportedCost(json.usage), {
       request,
       response: json,
     });
@@ -867,10 +913,15 @@ export class OpenAICompatibleProvider implements Provider {
       return {
         type: 'done',
         usage,
-        cost: this.computeCost(pricingResponse?.model ?? model, usage, usageData?.cost, {
-          request,
-          response: pricingResponse,
-        }),
+        cost: this.computeCost(
+          pricingResponse?.model ?? model,
+          usage,
+          this.reportedCost(usageData),
+          {
+            request,
+            response: pricingResponse,
+          },
+        ),
         providerMetadata,
       };
     };
@@ -927,10 +978,14 @@ export class OpenAICompatibleProvider implements Provider {
             parsed.service_tier !== undefined ||
             parsed.serviceTier !== undefined
           ) {
-            pricingResponse = parsed;
+            pricingResponse = { ...pricingResponse, ...parsed };
           }
           if (parsed.usage) {
             usageData = parsed.usage;
+            // Terminal usage normally arrives in its own empty-choices chunk.
+            // Retain it in pricing context before continuing so table-specific
+            // normalizers and response-tier selection see the terminal data.
+            pricingResponse = { ...pricingResponse, ...parsed };
             // Some providers send a usage-only final chunk with no choices.
             if (!parsed.choices || parsed.choices.length === 0) continue;
           }
@@ -1032,6 +1087,11 @@ type OpenAIUsage = {
   prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
   /** OpenRouter / Vercel Gateway: per-call cost in USD. */
   cost?: number;
+  /** xAI: exact billed USD cost in ten-billionths of a dollar. */
+  cost_in_usd_ticks?: number;
+  /** DeepSeek: normalized cache hit/miss split for table pricing. */
+  prompt_cache_hit_tokens?: number;
+  prompt_cache_miss_tokens?: number;
 };
 
 type OpenAIChatMessage = {
@@ -1055,6 +1115,7 @@ type OpenAIModelResponse = {
   model?: string;
   service_tier?: unknown;
   serviceTier?: unknown;
+  usage?: OpenAIUsage;
 };
 
 type OpenAIStreamChunk = {

@@ -183,6 +183,24 @@ describe('priceFromTable', () => {
     expect(priceFromTable(table, 'model-x-2026-01', 100, 50)).toBeCloseTo(100e-6 + 100e-6, 9);
   });
 
+  it('keeps prefix matching as the default but supports exact built-in rows', () => {
+    expect(priceFromTable(table, 'model-x-future', 100, 50)).toBeDefined();
+    expect(priceFromTable(table, 'model-x-future', 100, 50, undefined, 'exact')).toBeUndefined();
+    expect(priceFromTable(table, 'model-x', 100, 50, undefined, 'exact')).toBeDefined();
+  });
+
+  it('rejects malformed counts directly without weakening prefix or exact matching', () => {
+    for (const [prompt, completion, cached] of [
+      [-1, 1, undefined],
+      [1.5, 1, undefined],
+      [Number.MAX_SAFE_INTEGER + 1, 1, undefined],
+      [1, 1, 2],
+    ] as const) {
+      expect(priceFromTable(table, 'model-x-2026-01', prompt, completion, cached)).toBeUndefined();
+      expect(priceFromTable(table, 'model-x', prompt, completion, cached, 'exact')).toBeUndefined();
+    }
+  });
+
   it('applies the cache multiplier', () => {
     // 80 cached @ 0.5, 20 uncached, 50 out
     expect(priceFromTable(table, 'model-x', 100, 50, 80)).toBeCloseTo(
@@ -476,11 +494,86 @@ describe('pricing', () => {
     expect(r.cost).toBeUndefined();
   });
 
+  it('from-response accepts only finite nonnegative OpenRouter USD costs', async () => {
+    for (const cost of [0, 0.0042, undefined, -1, Infinity, NaN]) {
+      mockFetch(
+        okJson({
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, cost },
+        }),
+      );
+      const result = await makeProvider({ pricing: { kind: 'from-response' } }).chat(userMsg, {
+        model: 'm',
+      });
+      expect(result.cost).toBe(cost === 0 || cost === 0.0042 ? cost : undefined);
+    }
+  });
+
+  it('from-response converts only valid xAI USD ticks once', async () => {
+    for (const ticks of [
+      0,
+      12_500_000_000,
+      undefined,
+      -1,
+      Infinity,
+      1.5,
+      Number.MAX_SAFE_INTEGER + 1,
+    ]) {
+      mockFetch(
+        okJson({
+          usage: {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            cost_in_usd_ticks: ticks,
+          },
+        }),
+      );
+      const result = await makeProvider({ name: 'xai', pricing: { kind: 'from-response' } }).chat(
+        userMsg,
+        { model: 'grok-4.5' },
+      );
+      expect(result.cost).toBe(ticks === 0 ? 0 : ticks === 12_500_000_000 ? 1.25 : undefined);
+    }
+  });
+
   it('table → undefined on miss', async () => {
     const pricing: PricingSource = { kind: 'table', table: { known: [1e-6, 1e-6, 1] } };
     mockFetch(okJson());
     const r = await makeProvider({ pricing }).chat(userMsg, { model: 'unknown' });
     expect(r.cost).toBeUndefined();
+  });
+
+  it('table pricing rejects malformed token counts before calculating', async () => {
+    const pricing: PricingSource = { kind: 'table', table: { known: [1e-6, 1e-6, 0.5] } };
+    for (const usage of [
+      { prompt_tokens: -1, completion_tokens: 1, total_tokens: 0 },
+      { prompt_tokens: 1.5, completion_tokens: 1, total_tokens: 2.5 },
+      { prompt_tokens: Number.MAX_SAFE_INTEGER + 1, completion_tokens: 1, total_tokens: 2 },
+      {
+        prompt_tokens: 1,
+        completion_tokens: 1,
+        total_tokens: 2,
+        prompt_tokens_details: { cached_tokens: 2 },
+      },
+      {
+        prompt_tokens: 1,
+        completion_tokens: 1,
+        total_tokens: 2,
+        prompt_tokens_details: { cached_tokens: 0.5 },
+      },
+    ]) {
+      mockFetch(okJson({ usage }));
+      const result = await makeProvider({ pricing }).chat(userMsg, { model: 'known' });
+      expect(result.cost).toBeUndefined();
+    }
+  });
+
+  it('keeps custom table profiles priceable without built-in cache-split policy', async () => {
+    mockFetch(okJson({ usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }));
+    const result = await makeProvider({
+      pricing: { kind: 'table', table: { known: [1e-6, 2e-6, 0.5] }, match: 'exact' },
+    }).chat(userMsg, { model: 'known' });
+    expect(result.cost).toBeCloseTo(20e-6, 12);
   });
 });
 
@@ -693,6 +786,60 @@ describe('streaming', () => {
     });
     const chunks = await collect(makeProvider({ pricing: { kind: 'from-response' } }));
     expect(chunks.find((c) => c.type === 'done').cost).toBe(0.009);
+  });
+
+  it('uses valid xAI ticks from the terminal usage-only stream chunk', async () => {
+    mockFetch({
+      body: sseStream([
+        'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}',
+        'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"cost_in_usd_ticks":0}}',
+        'data: [DONE]',
+      ]),
+    });
+    const chunks = await collect(makeProvider({ name: 'xai', pricing: { kind: 'from-response' } }));
+    expect(chunks.find((c) => c.type === 'done').cost).toBe(0);
+  });
+
+  it('rejects malformed OpenRouter and xAI terminal costs', async () => {
+    for (const [name, key, value] of [
+      ['test', 'cost', -1],
+      ['test', 'cost', Infinity],
+      ['xai', 'cost_in_usd_ticks', -1],
+      ['xai', 'cost_in_usd_ticks', 1.5],
+      ['xai', 'cost_in_usd_ticks', Number.MAX_SAFE_INTEGER + 1],
+    ] as const) {
+      mockFetch({
+        body: sseStream([
+          `data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"${key}":${JSON.stringify(value)}}}`,
+          'data: [DONE]',
+        ]),
+      });
+      const chunks = await collect(makeProvider({ name, pricing: { kind: 'from-response' } }));
+      expect(chunks.find((c) => c.type === 'done').cost).toBeUndefined();
+    }
+  });
+
+  it('rejects malformed table usage from terminal stream chunks', async () => {
+    for (const usage of [
+      { prompt_tokens: -1, completion_tokens: 1, total_tokens: 0 },
+      { prompt_tokens: 1.5, completion_tokens: 1, total_tokens: 2.5 },
+      { prompt_tokens: Number.MAX_SAFE_INTEGER + 1, completion_tokens: 1, total_tokens: 2 },
+      {
+        prompt_tokens: 1,
+        completion_tokens: 1,
+        total_tokens: 2,
+        prompt_tokens_details: { cached_tokens: 2 },
+      },
+    ]) {
+      mockFetch({
+        body: sseStream([`data: ${JSON.stringify({ choices: [], usage })}`, 'data: [DONE]']),
+      });
+      const chunks = await collect(
+        makeProvider({ pricing: { kind: 'table', table: { known: [1e-6, 1e-6, 1] } } }),
+        'known',
+      );
+      expect(chunks.find((c) => c.type === 'done').cost).toBeUndefined();
+    }
   });
 
   it('separates streamed <think> tags split across chunks', async () => {

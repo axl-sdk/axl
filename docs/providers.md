@@ -1,12 +1,21 @@
 # Provider URI Reference
 
-Agents reference models using the `provider:model` URI scheme. Four built-in providers are supported, all using raw `fetch` with zero SDK dependencies.
+Agents reference models using the `provider:model` URI scheme. Axl ships four native
+adapters plus OpenAI-compatible presets, all built on raw `fetch` with no provider SDKs.
 
-All providers include automatic retry with exponential backoff on `429` (rate limit), `503` (service unavailable), and `529` (overloaded) responses.
+All providers retry `429` (rate limit), `503` (unavailable), and `529` (overloaded)
+responses with exponential backoff.
+
+The catalog was reviewed against first-party documentation on August 3, 2026. Current-model
+capabilities and pricing match exact known IDs; unknown IDs may pass through to the provider
+but remain unpriced and do not inherit newer behavior. See the
+[live verification record](./verification/latest-provider-models-2026-08-03.md).
 
 ## OpenAI — Responses API (preferred)
 
-The Responses API is the preferred OpenAI integration — it supports prompt caching, native reasoning, and automatic reasoning context round-tripping via `providerMetadata`. All models listed below are available with the `openai-responses:` prefix. Shares the `openai` provider config by default.
+The Responses API is the preferred OpenAI integration. It supports prompt caching, native
+reasoning, and automatic reasoning-context round-tripping through `providerMetadata`. All
+models below use the `openai-responses:` prefix and share `openai` configuration by default.
 
 ```
 openai-responses:gpt-5.6        # Alias of GPT-5.6 Sol
@@ -22,7 +31,8 @@ openai-responses:o3-pro          # Dedicated reasoning (pro)
 
 ## OpenAI — Chat Completions API
 
-Same models available with the `openai:` prefix. Use this when you need features not yet supported on the Responses API (e.g., stop sequences).
+The same models are available with the `openai:` prefix. Use Chat Completions for features the
+Responses adapter does not support, such as stop sequences.
 
 ```
 openai:gpt-5.6                  # Alias of GPT-5.6 Sol
@@ -56,7 +66,11 @@ openai:gpt-4                    # Legacy
 openai:gpt-3.5-turbo            # Legacy
 ```
 
-Reasoning model support (o-series): uses `developer` role instead of `system`, strips `temperature`, supports `effort` option. GPT-5.x models also support `effort` (reasoning) but use `system` role. For backward compatibility, unknown GPT-5-shaped IDs retain this broad baseline request mapping; they do not inherit exact pricing or newer capabilities such as GPT-5.6 native `max`. Exact GPT-5.6 Chat requests with portable `effort: 'max'` warn once per model and use `xhigh`; select `openai-responses:` for native `max`.
+OpenAI's o-series uses the `developer` role, strips `temperature`, and supports `effort`.
+GPT-5.x uses `system` and supports the same portable option. Exact GPT-5.6 Chat requests with
+`effort: 'max'` warn once per model and use `xhigh`; choose `openai-responses:` for native
+`max`. For compatibility, unknown GPT-5-shaped IDs retain the older baseline request mapping,
+but never inherit exact pricing or GPT-5.6-specific capabilities.
 
 ## Anthropic
 
@@ -67,7 +81,7 @@ anthropic:claude-sonnet-5       # Claude 5 balanced; thinking on by default
 anthropic:claude-opus-4-8       # Previous flagship
 anthropic:claude-opus-4-7       # Previous flagship (supports effort: 'xhigh')
 anthropic:claude-opus-4-6       # Previous flagship
-anthropic:claude-sonnet-4-6     # Balanced (latest)
+anthropic:claude-sonnet-4-6     # Previous balanced model
 anthropic:claude-sonnet-4-5     # Balanced
 anthropic:claude-haiku-4-5      # Fast and affordable
 anthropic:claude-opus-4-5       # Previous gen
@@ -101,10 +115,6 @@ May 25, 2026 (`gemini-3.1-flash-lite`, with `gemini-3.5-flash-lite` now preferre
 and Gemini 2.0 Flash/Flash-Lite shut down June 1, 2026 (use `gemini-3.6-flash` /
 `gemini-3.1-flash-lite`). `gemini-3-flash-preview` remains available, but Google
 recommends `gemini-3.6-flash`. See [Gemini deprecations](https://ai.google.dev/gemini-api/docs/deprecations).
-
-This catalog was reviewed against provider documentation on August 3, 2026. Exact known
-IDs receive capabilities and pricing; unknown siblings may still be sent to the provider,
-but remain unpriced and do not inherit newest-model request behavior.
 
 Gemini [requires every `functionResponse.response` to be a JSON
 object](https://ai.google.dev/api/generate-content#FunctionResponse). Axl parses canonical
@@ -231,30 +241,6 @@ Notes & caveats:
   callback covers the four chat adapters; the semantic-memory embedder still takes a static key.)
 
 Build your own preset by cloning a `ProviderProfile` (see [Custom Providers](#custom-providers)).
-
-## Maintaining model capabilities and pricing
-
-Provider catalogs are reviewed on every provider model/pricing announcement, before an Axl
-release, and at least monthly while a frontier family is current. For each review:
-
-1. Check first-party model, API, pricing, lifecycle, and usage-field documentation; record the
-   review date and source links beside the relevant adapter table or profile.
-2. Add only documented exact aliases and snapshot formats. Keep unknown siblings pass-through
-   but unpriced, and do not grant them newer request capabilities through a pricing match.
-3. Re-audit every billable input category and response modifier: cached input, cache writes,
-   reasoning/thought tokens, long context, service tier, geography, batch mode, hosted tools,
-   and provider-reported totals.
-4. Add request/response fixtures for non-streaming and streaming paths, including malformed or
-   missing usage fields. Missing billed categories must produce unknown usage/cost, not inferred
-   zeroes.
-5. Run unit/type/build gates, then `pnpm test:integration` and the paid
-   `pnpm test:integration:frontier`. Save the supported provider/model result matrix under
-   `docs/verification/`; note credential-gated gaps explicitly.
-
-Effective-dated prices require an additional check on both sides of the boundary and a live
-review on or before the transition date. In particular, revisit Claude Sonnet 5's scheduled
-price transition before its configured effective date rather than assuming the announced rate
-remains unchanged.
 
 ## Configuration
 
@@ -484,8 +470,8 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 |----------|----------|---------|-----------|----------|-----------|---------|---------------------|
 | **OpenAI** (o-series) | `'minimal'`⁑ | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | capped to `'high'`⁂ | capped to `'high'`⁂ | nearest effort level* |
 | **OpenAI** (GPT-5.x pre-5.1) | `'minimal'`⁑ | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | capped to `'high'`⁂ | capped to `'high'`⁂ | nearest effort level* |
-| **OpenAI** (GPT-5.1+) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | capped to `'high'`⁂ | capped to `'high'`⁂ | nearest effort level* |
-| **OpenAI** (GPT-5.2+) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | `reasoning_effort: 'xhigh'` | nearest effort level* |
+| **OpenAI** (GPT-5.1) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | capped to `'high'`⁂ | capped to `'high'`⁂ | nearest effort level* |
+| **OpenAI** (GPT-5.2+ baseline) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | `reasoning_effort: 'xhigh'` | nearest effort level* |
 | **OpenAI Chat** (GPT-5.6) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | capped to `'xhigh'` | nearest effort level* |
 | **OpenAI Responses** (GPT-5.6) | `reasoning.effort: 'none'` | `reasoning.effort: 'low'` | `reasoning.effort: 'medium'` | `reasoning.effort: 'high'` | `reasoning.effort: 'xhigh'` | `reasoning.effort: 'max'` | nearest effort level* |
 | **Anthropic** (Claude 5) | model-specific minimum/default | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | unsupported |
@@ -532,7 +518,7 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 #### Provider-specific behavior
 
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
-- **OpenAI GPT-5.x Chat Completions**: Supports `reasoning_effort` like o-series, strips temperature when reasoning active, uses `system`, and supports parallel tool calls. Model-specific constraints are exact: GPT-5.6 and GPT-5.2–5.5 cap portable `'max'` to `'xhigh'`; earlier families retain their lower caps.
+- **OpenAI GPT-5.x Chat Completions**: Uses `system`, strips temperature when reasoning is active, and supports parallel tool calls. The compatibility baseline maps GPT-5.2+ `'max'` to `'xhigh'`; exact GPT-5.6 IDs also emit a once-per-model warning. Earlier families retain their lower caps.
 - **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'`, while older models keep their documented clamps. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
 - **Anthropic Claude 5**: Fable 5 always reasons; Opus 5 and Sonnet 5 reason by default. All three accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are preserved in `providerMetadata` for tool continuations. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a different fallback model served the call, Axl fails before persisting history or estimating cost.
 - **Anthropic Opus 4.8**: Supports adaptive thinking and native `'xhigh'`/`'max'`.
@@ -726,6 +712,9 @@ and effective returned model IDs. If a model or required billing dimension is un
 treat a paid model as free. OpenRouter and xAI prefer provider-reported totals; local runtimes
 are the only built-ins that deliberately return zero.
 
+Claude Sonnet 5 uses Anthropic's introductory rate through August 31, 2026, then switches to
+the announced standard rate on September 1 without requiring an SDK update.
+
 ### Prompt caching rates
 
 Providers charge less for tokens served from cache. The rates differ by provider and, for OpenAI, by model generation.
@@ -826,3 +815,18 @@ Profile fields cover auth header shape (`authHeader`), per-model quirks (`PerMod
 servers), `maxTokensField`, `parallelToolCalls`, and `requestDefaults`. See the built-in
 presets in `packages/axl/src/providers/profiles/` for worked examples, and the
 [API reference](./api-reference.md#provider-profiles) for the full type.
+
+## Catalog maintenance
+
+Review catalogs after provider announcements, before release, and at least monthly while a
+frontier family is current:
+
+- Use first-party model, API, pricing, lifecycle, and usage documentation. Record the review
+  date and source beside each adapter table or profile.
+- Add only documented IDs and snapshot formats. Keep unknown IDs pass-through but unpriced.
+- Recheck every billed category, modifier, and effective-dated rate; missing billing data must
+  remain unknown rather than becoming an inferred zero.
+- Add unit fixtures, run both live integration gates, and save a dated result under
+  `docs/verification/`, including any credential-gated gaps.
+
+Recheck Claude Sonnet 5 on or before its September 1, 2026 price transition.

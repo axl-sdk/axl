@@ -337,9 +337,8 @@ pnpm test:integration           # routine cross-provider contract coverage
 pnpm test:integration:frontier  # paid exact newest-model certification
 ```
 
-The routine gate uses inexpensive models and excludes the newest-model matrix so it stays
-repeatable enough for regular provider work. Run the frontier gate when adding or revising a
-current model, before release, and during the monthly catalog review. It checks exact IDs,
-streaming, tool continuation, token usage, and pricing; static-priced native calls must report
-a positive cost, while response-priced providers may legitimately report a nonnegative total.
-Commit a dated, secret-free result under `docs/verification/` when the supported catalog changes.
+The routine gate uses inexpensive models and excludes the current-model matrix. Run the
+frontier gate when the catalog changes and before release; it checks exact IDs, streaming,
+tool continuation, usage, and pricing. Static-priced calls must report positive cost, while
+response-priced providers may report a nonnegative total. Record catalog changes in a dated,
+secret-free file under `docs/verification/`.

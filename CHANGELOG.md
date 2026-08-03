@@ -9,30 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Latest provider model support.** Adds GPT-5.6 Sol (and the `gpt-5.6` alias),
-  GPT-5.6 Terra, GPT-5.6 Luna, Claude Fable 5, Opus 5, Sonnet 5, Gemini 3.6 Flash,
-  and Gemini 3.5 Flash-Lite with exact per-model reasoning, tool-continuation,
-  streaming, and pricing behavior.
+- **Latest provider models.** Adds GPT-5.6 Sol (including the `gpt-5.6` alias),
+  Terra, and Luna; Claude Fable 5, Opus 5, and Sonnet 5; and Gemini 3.6 Flash and
+  3.5 Flash-Lite. The xAI Chat preset now recognizes current Grok 4.5, 4.3, and
+  4.20 variants. Each model has explicit reasoning, streaming, tool-continuation,
+  and pricing behavior.
 - **Cache-write usage telemetry.** `cache_write_tokens` now flows through provider
   responses and terminal stream chunks, including Anthropic's distinct 5-minute and
   1-hour cache-creation buckets.
 
 ### Changed
 
-- **Fail-closed provider pricing.** Native and compatible-provider estimators now price
-  only exact known models and observable Standard/on-demand calls. OpenRouter and xAI use
-  provider-reported totals; current DeepSeek, Mistral, and Groq models use exact tables;
-  unknown tiers, modifiers, deployments, or incomplete usage return `undefined`.
-- **Live-verified provider normalization.** OpenAI Chat Completions caps portable GPT-5.6
-  `max` effort to its accepted `xhigh` tier with a bounded warning while Responses sends
-  native `max`. Anthropic treats `inference_geo: "not_available"` as ordinary only for exact
-  pre-4.6 models; modern or unknown models fail closed. Gemini's lowercase Standard tier
-  retains standard pricing, while any omitted billed token category leaves usage and cost
-  unknown rather than inferring a zero.
-- **Tiered live-provider gates.** Routine integration excludes the expensive newest-model
-  matrix; `pnpm test:integration:frontier` runs explicit exact-model certification with
-  stronger usage and cost assertions and a dated result artifact.
-
+- **Honest provider cost estimates.** Built-in pricing now matches exact known models and
+  observable Standard/on-demand calls. OpenRouter and xAI use provider-reported totals;
+  DeepSeek, Mistral, and Groq use exact current-model tables. Unknown models, billing modes,
+  deployments, modifiers, or incomplete usage return `undefined` instead of a guessed cost.
+- **Endpoint-specific GPT-5.6 reasoning.** OpenAI Responses sends native `max`; Chat
+  Completions warns once per model and sends its highest accepted tier, `xhigh`.
 - **Tool-workflow documentation.** The Core, Studio, Eval, and migration guides now
   explain in user-facing terms how explicit tool outcomes, safe failure messages, and
   incomplete-run detection improve application behavior, debugging, and evaluation.

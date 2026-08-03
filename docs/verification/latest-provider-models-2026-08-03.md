@@ -1,4 +1,4 @@
-# Latest provider model verification — 2026-08-03
+# Current provider model verification — 2026-08-03
 
 This is the secret-free release artifact for the model catalog documented in
 [`docs/providers.md`](../providers.md). Live calls used the repository's configured direct
@@ -9,8 +9,8 @@ provider accounts; no request or response content is retained here.
 | Gate | Result | Coverage |
 |---|---:|---|
 | `pnpm test:integration` | 188 passed, 8 skipped | 186 core provider/orchestration cases plus 2 eval concurrency cases |
-| `pnpm test:integration:frontier` | 23 passed | Exact newest-model IDs, streams, tool continuation, usage, and cost |
-| Direct GPT-5.6 Chat `max` probe | 4 expected HTTP 400 responses | `gpt-5.6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |
+| `pnpm test:integration:frontier` | 23 passed | Exact current-model IDs, streams, tool continuation, usage, and cost |
+| Direct GPT-5.6 Chat `max` probe | 4/4 confirmed unsupported | `gpt-5.6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |
 
 The frontier matrix passed for:
 
@@ -22,15 +22,13 @@ The frontier matrix passed for:
   streaming and tool continuation.
 
 Static-priced OpenAI, Anthropic, and Gemini assertions required positive usage and cost.
-xAI assertions required a finite nonnegative provider-reported total. The routine suite's
-previous OpenAI projection and Anthropic multi-level-handoff failures both passed after the
-handoff tests made routing mandatory; no retry or quarantine was needed.
+xAI assertions required a finite, nonnegative provider-reported total.
 
 ## Contract observations
 
-- Chat Completions rejected `reasoning_effort: "max"` on every exact GPT-5.6 ID and listed
-  `xhigh` as its highest accepted tier. Axl therefore maps portable Chat `max` to `xhigh` with
-  a once-per-model warning; the Responses provider retains native `max`.
+- Chat Completions rejected `reasoning_effort: "max"` on every exact GPT-5.6 ID; `xhigh` was
+  the highest accepted tier. Axl maps portable Chat `max` to `xhigh` with a once-per-model
+  warning, while Responses retains native `max`.
 - Anthropic's `inference_geo: "not_available"` is an ordinary legacy response value only for
   exact models predating 4.6 geography selection. It is not a safe Standard-price signal for
   Claude 4.6+, Claude 5, or unknown models.

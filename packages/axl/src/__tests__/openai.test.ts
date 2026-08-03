@@ -1090,6 +1090,30 @@ describe('OpenAIProvider', () => {
       expect(unpriced.cost).toBeUndefined();
     });
 
+    it('fails closed on providerOptions Chat image content', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+          }),
+      });
+      const response = await new OpenAIProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-4o',
+        providerOptions: {
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'image_url', image_url: { url: 'https://example.test/image.png' } },
+              ],
+            },
+          ],
+        },
+      });
+      expect(response.cost).toBeUndefined();
+    });
+
     it('does not apply direct-OpenAI pricing through a custom base URL', async () => {
       mockFetch({
         json: () =>
@@ -1153,6 +1177,64 @@ describe('OpenAIProvider', () => {
         },
       });
     }
+
+    it('uses the providerOptions model for streaming role, reasoning, and temperature', async () => {
+      const fetchMock = mockFetch({
+        body: makeSSEStream([
+          'data: {"choices":[{"delta":{"content":"ok"}}]}',
+          '',
+          'data: [DONE]',
+          '',
+        ]),
+      });
+      for await (const chunk of new OpenAIProvider().stream(
+        [
+          { role: 'system', content: 'sys' },
+          { role: 'user', content: 'Hello' },
+        ],
+        {
+          model: 'gpt-4o',
+          effort: 'high',
+          temperature: 0.7,
+          providerOptions: { model: 'o3' },
+        },
+      )) {
+        expect(chunk).toBeDefined();
+      }
+      const body = getRequestBody(fetchMock);
+      expect(body.model).toBe('o3');
+      expect((body.messages as Array<{ role: string }>)[0].role).toBe('developer');
+      expect(body.reasoning_effort).toBe('high');
+      expect(body).not.toHaveProperty('temperature');
+    });
+
+    it('fails closed on providerOptions Chat image content in a stream', async () => {
+      mockFetch({
+        body: makeSSEStream([
+          'data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}}',
+          '',
+          'data: [DONE]',
+          '',
+        ]),
+      });
+      const chunks: Array<{ type: string; cost?: number }> = [];
+      for await (const chunk of new OpenAIProvider().stream([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-4o',
+        providerOptions: {
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'image_url', image_url: { url: 'https://example.test/image.png' } },
+              ],
+            },
+          ],
+        },
+      })) {
+        chunks.push(chunk);
+      }
+      expect(chunks.find((chunk) => chunk.type === 'done')?.cost).toBeUndefined();
+    });
 
     it('captures reasoning and cached tokens from stream usage chunk', async () => {
       const sseBody = makeSSEStream([

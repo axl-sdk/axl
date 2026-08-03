@@ -356,6 +356,77 @@ describe('request body', () => {
     expect(msgs[1].role).toBe('user');
   });
 
+  it('uses a merge-last providerOptions model for every synthesized capability', async () => {
+    const fetchMock = mockFetch(okJson());
+    await makeProvider({
+      roleFor: (role, model) => (role === 'system' && model === 'target' ? 'developer' : role),
+      reasoning: {
+        emit: (body, _resolved, model) => {
+          if (model === 'target') body.reasoning_effort = 'high';
+          return { stripTemperature: model === 'target' };
+        },
+        capture: 'none',
+      },
+      parallelToolCalls: (model) => model !== 'target',
+      capabilities: {
+        supportsJsonSchema: (model) => model !== 'target',
+        forbiddenParams: (model) => (model === 'target' ? ['stop'] : []),
+      },
+    }).chat(
+      [
+        { role: 'system', content: 'sys' },
+        { role: 'user', content: 'hello' },
+      ],
+      {
+        model: 'source',
+        effort: 'high',
+        temperature: 0.7,
+        stop: ['END'],
+        tools: [{ type: 'function', function: { name: 't', description: 'd', parameters: {} } }],
+        responseFormat: {
+          type: 'json_schema',
+          json_schema: { name: 'S', schema: { type: 'object' } },
+        },
+        providerOptions: { model: 'target' },
+      },
+    );
+    const body = lastRequest(fetchMock).body;
+    expect(body.model).toBe('target');
+    expect((body.messages as Array<{ role: string }>)[0].role).toBe('developer');
+    expect(body.reasoning_effort).toBe('high');
+    expect(body).not.toHaveProperty('temperature');
+    expect(body).not.toHaveProperty('parallel_tool_calls');
+    expect(body.response_format).toEqual({ type: 'json_object' });
+    expect(body).not.toHaveProperty('stop');
+  });
+
+  it('uses the providerOptions model for synthesized streaming capabilities', async () => {
+    const fetchMock = mockFetch({
+      body: sseStream(['data: {"choices":[{"delta":{"content":"ok"}}]}', 'data: [DONE]']),
+    });
+    const stream = makeProvider({
+      reasoning: {
+        emit: (body, _resolved, model) => {
+          if (model === 'target') body.reasoning_effort = 'high';
+          return { stripTemperature: model === 'target' };
+        },
+        capture: 'none',
+      },
+    }).stream(userMsg, {
+      model: 'source',
+      effort: 'high',
+      temperature: 0.7,
+      providerOptions: { model: 'target' },
+    });
+    for await (const chunk of stream) {
+      expect(chunk).toBeDefined();
+    }
+    const body = lastRequest(fetchMock).body;
+    expect(body.model).toBe('target');
+    expect(body.reasoning_effort).toBe('high');
+    expect(body).not.toHaveProperty('temperature');
+  });
+
   it('sends parallel_tool_calls only when the PerModel predicate is true', async () => {
     const tools = [
       { type: 'function' as const, function: { name: 't', description: 'd', parameters: {} } },

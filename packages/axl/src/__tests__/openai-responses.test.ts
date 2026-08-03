@@ -448,6 +448,78 @@ describe('OpenAIResponsesProvider', () => {
       expect(unpriced.cost).toBeUndefined();
     });
 
+    it('fails closed on providerOptions Responses image input', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-image',
+            output: [],
+            usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+          }),
+      });
+      const response = await new OpenAIResponsesProvider().chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gpt-4o',
+        providerOptions: {
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'input_image', image_url: 'https://example.test/image.png' }],
+            },
+          ],
+        },
+      });
+      expect(response.cost).toBeUndefined();
+    });
+
+    it('fails closed on opaque Responses context references', async () => {
+      for (const providerOptions of [
+        { previous_response_id: 'resp_previous' },
+        { conversation: 'conv_123' },
+        { prompt: 'pmpt_123' },
+      ]) {
+        mockFetch({
+          json: () =>
+            Promise.resolve({
+              id: 'resp-opaque-context',
+              output: [],
+              usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+            }),
+        });
+        const response = await new OpenAIResponsesProvider().chat(
+          [{ role: 'user', content: 'Hi' }],
+          {
+            model: 'gpt-4o',
+            providerOptions,
+          },
+        );
+        expect(response.cost).toBeUndefined();
+      }
+    });
+
+    it('prices text-only modalities and native custom client-tool inputs', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-custom-tool',
+            output: [],
+            usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+          }),
+      });
+      const response = await new OpenAIResponsesProvider().chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gpt-4o',
+        providerOptions: {
+          modalities: ['text'],
+          tools: [{ type: 'custom', name: 'run_code' }],
+          input: [
+            { type: 'custom_tool_call', call_id: 'call_1', name: 'run_code', input: 'print(1)' },
+            { type: 'custom_tool_call_output', call_id: 'call_1', output: '1' },
+          ],
+        },
+      });
+      expect(response.cost).toBeCloseTo(0.00035, 12);
+    });
+
     it('does not apply direct-OpenAI pricing through a custom base URL or hosted tool', async () => {
       mockFetch({
         json: () =>
@@ -759,6 +831,27 @@ describe('OpenAIResponsesProvider', () => {
       });
 
       const body = getRequestBody(fetchMock);
+      expect(body).not.toHaveProperty('temperature');
+    });
+
+    it('uses the providerOptions model for reasoning and temperature decisions', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-effective-model',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+      await new OpenAIResponsesProvider().chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gpt-4o',
+        effort: 'high',
+        temperature: 0.7,
+        providerOptions: { model: 'o3' },
+      });
+      const body = getRequestBody(fetchMock);
+      expect(body.model).toBe('o3');
+      expect(body.reasoning).toEqual({ effort: 'high' });
       expect(body).not.toHaveProperty('temperature');
     });
 
@@ -1250,6 +1343,100 @@ describe('OpenAIResponsesProvider', () => {
   });
 
   describe('stream()', () => {
+    it('uses the providerOptions model for streaming reasoning and temperature', async () => {
+      const fetchMock = mockFetch({
+        body: makeSSEStream([
+          {
+            event: 'response.completed',
+            data: {
+              response: {
+                usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+              },
+            },
+          },
+        ]),
+      });
+      for await (const chunk of new OpenAIResponsesProvider().stream(
+        [{ role: 'user', content: 'Hi' }],
+        {
+          model: 'gpt-4o',
+          effort: 'high',
+          temperature: 0.7,
+          providerOptions: { model: 'o3' },
+        },
+      )) {
+        expect(chunk).toBeDefined();
+      }
+      const body = getRequestBody(fetchMock);
+      expect(body.model).toBe('o3');
+      expect(body.reasoning).toEqual({ effort: 'high' });
+      expect(body.include).toEqual(['reasoning.encrypted_content']);
+      expect(body).not.toHaveProperty('temperature');
+    });
+
+    it('fails closed on providerOptions Responses image input in a stream', async () => {
+      mockFetch({
+        body: makeSSEStream([
+          {
+            event: 'response.completed',
+            data: {
+              response: {
+                usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+              },
+            },
+          },
+        ]),
+      });
+      const chunks: Array<{ type: string; cost?: number }> = [];
+      for await (const chunk of new OpenAIResponsesProvider().stream(
+        [{ role: 'user', content: 'Hi' }],
+        {
+          model: 'gpt-4o',
+          providerOptions: {
+            input: [
+              {
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_image', image_url: 'https://example.test/image.png' }],
+              },
+            ],
+          },
+        },
+      )) {
+        chunks.push(chunk);
+      }
+      expect(chunks.find((chunk) => chunk.type === 'done')?.cost).toBeUndefined();
+    });
+
+    it('fails closed on opaque Responses context references in a stream', async () => {
+      for (const providerOptions of [
+        { previous_response_id: 'resp_previous' },
+        { conversation: 'conv_123' },
+        { prompt: 'pmpt_123' },
+      ]) {
+        mockFetch({
+          body: makeSSEStream([
+            {
+              event: 'response.completed',
+              data: {
+                response: {
+                  usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+                },
+              },
+            },
+          ]),
+        });
+        const chunks: Array<{ type: string; cost?: number }> = [];
+        for await (const chunk of new OpenAIResponsesProvider().stream(
+          [{ role: 'user', content: 'Hi' }],
+          { model: 'gpt-4o', providerOptions },
+        )) {
+          chunks.push(chunk);
+        }
+        expect(chunks.find((chunk) => chunk.type === 'done')?.cost).toBeUndefined();
+      }
+    });
+
     it('emits text_delta from response.output_text.delta events', async () => {
       const sseBody = makeSSEStream([
         {

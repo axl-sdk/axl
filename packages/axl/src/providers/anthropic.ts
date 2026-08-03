@@ -493,8 +493,13 @@ function normalizeAnthropicUsage(raw: AnthropicUsage): NormalizedAnthropicUsage 
       completion_tokens: outputTokens,
       total_tokens: totalTokens,
       cached_tokens: cacheReadTokens > 0 ? cacheReadTokens : undefined,
+      // The aggregate is still useful public usage telemetry even though it
+      // cannot be priced without the 5m/1h split. Keep pricingUsage separate
+      // so estimateAnthropicCost continues to fail closed in that case.
       cache_write_tokens:
-        normalizedCacheWrite && normalizedCacheWrite > 0 ? normalizedCacheWrite : undefined,
+        (normalizedCacheWrite ?? aggregateCacheWriteTokens ?? 0) > 0
+          ? (normalizedCacheWrite ?? aggregateCacheWriteTokens)
+          : undefined,
     },
     pricingUsage: {
       inputTokens,
@@ -691,13 +696,20 @@ export class AnthropicProvider implements Provider {
     options: ChatOptions,
     stream: boolean,
   ): Record<string, unknown> {
+    // providerOptions is merged last, so its string model override determines
+    // the portable thinking and temperature transformations. Its native fields
+    // continue to be the final explicit request overrides below.
+    const effectiveModel =
+      typeof options.providerOptions?.model === 'string'
+        ? options.providerOptions.model
+        : options.model;
     // Extract system messages into a single system parameter
     const systemMessages = messages.filter((m) => m.role === 'system');
     const nonSystemMessages = messages.filter((m) => m.role !== 'system');
     const systemText = systemMessages.map((m) => m.content).join('\n\n');
 
     const body: Record<string, unknown> = {
-      model: options.model,
+      model: effectiveModel,
       messages: this.mapMessages(nonSystemMessages),
       max_tokens: options.maxTokens ?? 4096,
       stream,
@@ -719,7 +731,7 @@ export class AnthropicProvider implements Provider {
       body.tool_choice = this.mapToolChoice(options.toolChoice);
     }
 
-    const thinking = resolveClaudeThinking(options.model, resolveThinkingOptions(options));
+    const thinking = resolveClaudeThinking(effectiveModel, resolveThinkingOptions(options));
     if (thinking.thinking) body.thinking = thinking.thinking;
     if (thinking.outputConfig) body.output_config = thinking.outputConfig;
     if (thinking.manualBudget) {
@@ -1111,7 +1123,7 @@ export class AnthropicProvider implements Provider {
                 isAnthropicModifier('inference_geo', event.message?.usage?.inference_geo) ||
                 isAnthropicModifier('speed', event.message?.usage?.speed) ||
                 hasBilledUnmodeledUsage(event.message?.usage?.server_tool_use) ||
-                messageFallback
+                hasUnmodeledIterations(event.message?.usage?.iterations)
               ) {
                 unpricedModifier = true;
               }
@@ -1129,7 +1141,7 @@ export class AnthropicProvider implements Provider {
                   isAnthropicModifier('speed', event.usage.speed) ||
                   isAnthropicModifier('inference_geo', event.usage.inference_geo) ||
                   hasBilledUnmodeledUsage(event.usage.server_tool_use) ||
-                  terminalFallback
+                  hasUnmodeledIterations(event.usage.iterations)
                 ) {
                   unpricedModifier = true;
                 }

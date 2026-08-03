@@ -253,10 +253,96 @@ function directOpenAIModel(model: string): DirectOpenAIModel | undefined {
 
 const CANONICAL_OPENAI_BASE_URL = 'https://api.openai.com/v1';
 
+function isTextContentPart(value: unknown, type: 'text' | 'input_text'): boolean {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    (value as { type?: unknown }).type === type &&
+    typeof (value as { text?: unknown }).text === 'string'
+  );
+}
+
+/**
+ * Direct catalog pricing only covers text requests. Reject content shapes we
+ * cannot fully classify rather than silently applying text rates to image,
+ * audio, or future multimodal inputs supplied through providerOptions.
+ */
+function hasUnmodeledDirectOpenAIContent(request: Record<string, unknown>): boolean {
+  if ('messages' in request) {
+    if (!Array.isArray(request.messages)) return true;
+    for (const message of request.messages) {
+      if (message === null || typeof message !== 'object') return true;
+      const content = (message as { content?: unknown }).content;
+      if (content === undefined || content === null || typeof content === 'string') continue;
+      if (!Array.isArray(content) || content.some((part) => !isTextContentPart(part, 'text'))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if ('input' in request) {
+    const input = request.input;
+    if (typeof input === 'string') return false;
+    if (!Array.isArray(input)) return true;
+    for (const item of input) {
+      if (item === null || typeof item !== 'object') return true;
+      const typed = item as {
+        type?: unknown;
+        content?: unknown;
+        input?: unknown;
+        output?: unknown;
+      };
+      switch (typed.type) {
+        case 'message': {
+          const content = typed.content;
+          if (typeof content === 'string') break;
+          if (
+            !Array.isArray(content) ||
+            content.some((part) => !isTextContentPart(part, 'input_text'))
+          ) {
+            return true;
+          }
+          break;
+        }
+        case 'function_call':
+          break;
+        case 'function_call_output': {
+          const output = typed.output;
+          if (typeof output === 'string') break;
+          if (
+            !Array.isArray(output) ||
+            output.some((part) => !isTextContentPart(part, 'input_text'))
+          ) {
+            return true;
+          }
+          break;
+        }
+        case 'custom_tool_call':
+          if (typeof typed.input !== 'string') return true;
+          break;
+        case 'custom_tool_call_output':
+          if (typeof typed.output !== 'string') return true;
+          break;
+        case 'reasoning':
+          break;
+        default:
+          return true;
+      }
+    }
+    return false;
+  }
+
+  // The pure estimator is also used without a captured request context in
+  // unit-level callers. There is no content shape to classify in that case.
+  return false;
+}
+
 function isEligibleDirectOpenAIContext(context: DirectOpenAIPricingContext | undefined): boolean {
   const request = context?.request;
   const response = context?.response;
   if (context?.baseUrl !== undefined && context.baseUrl !== CANONICAL_OPENAI_BASE_URL) return false;
+  if (request && hasUnmodeledDirectOpenAIContent(request)) return false;
   const tier =
     response?.service_tier ??
     response?.serviceTier ??
@@ -271,6 +357,14 @@ function isEligibleDirectOpenAIContext(context: DirectOpenAIPricingContext | und
   if (['region', 'inference_geo', 'data_residency'].some((key) => request?.[key] !== undefined)) {
     return false;
   }
+  // These references can make input billing depend on server-side state that
+  // is not represented in the local token totals, so direct table pricing
+  // cannot account for them faithfully.
+  if (
+    ['previous_response_id', 'conversation', 'prompt'].some((key) => request?.[key] !== undefined)
+  ) {
+    return false;
+  }
   const reasoning = request?.reasoning;
   if (
     reasoning !== null &&
@@ -281,9 +375,11 @@ function isEligibleDirectOpenAIContext(context: DirectOpenAIPricingContext | und
     return false;
   }
   if (
-    ['modalities', 'audio', 'image_generation', 'web_search_options'].some(
-      (key) => request?.[key] !== undefined,
-    )
+    (request?.modalities !== undefined &&
+      (!Array.isArray(request.modalities) ||
+        request.modalities.length === 0 ||
+        request.modalities.some((modality) => modality !== 'text'))) ||
+    ['audio', 'image_generation', 'web_search_options'].some((key) => request?.[key] !== undefined)
   ) {
     return false;
   }
@@ -293,7 +389,7 @@ function isEligibleDirectOpenAIContext(context: DirectOpenAIPricingContext | und
       (tool) =>
         tool === null ||
         typeof tool !== 'object' ||
-        (tool as { type?: unknown }).type !== 'function',
+        !['function', 'custom'].includes((tool as { type?: unknown }).type as string),
     )
   ) {
     return false;

@@ -559,15 +559,23 @@ export class OpenAICompatibleProvider implements Provider {
   ): Record<string, unknown> {
     const profile = this.profile;
     const resolved = resolveThinkingOptions(options);
+    // providerOptions is merged last, so its string model override determines
+    // every model-specific transformation synthesized by the engine. Other
+    // providerOptions fields still merge last below and remain explicit escape
+    // hatches over those synthesized values.
+    const effectiveModel =
+      typeof options.providerOptions?.model === 'string'
+        ? options.providerOptions.model
+        : options.model;
 
     const body: Record<string, unknown> = {
-      model: options.model,
-      messages: messages.map((m) => this.formatMessage(m, options.model)),
+      model: effectiveModel,
+      messages: messages.map((m) => this.formatMessage(m, effectiveModel)),
       stream,
     };
 
     // Reasoning emit (may request temperature stripping).
-    const emitResult = profile.reasoning.emit(body, resolved, options.model) ?? {};
+    const emitResult = profile.reasoning.emit(body, resolved, effectiveModel) ?? {};
     const stripTemperature = emitResult.stripTemperature ?? false;
 
     if (options.temperature !== undefined && !stripTemperature) {
@@ -582,7 +590,7 @@ export class OpenAICompatibleProvider implements Provider {
 
     if (options.tools && options.tools.length > 0) {
       body.tools = options.tools;
-      if (resolvePerModel(profile.parallelToolCalls, options.model, false)) {
+      if (resolvePerModel(profile.parallelToolCalls, effectiveModel, false)) {
         body.parallel_tool_calls = true;
       }
     }
@@ -592,7 +600,7 @@ export class OpenAICompatibleProvider implements Provider {
     if (options.responseFormat) {
       const supportsSchema = resolvePerModel(
         profile.capabilities?.supportsJsonSchema,
-        options.model,
+        effectiveModel,
         true,
       );
       body.response_format =
@@ -611,7 +619,7 @@ export class OpenAICompatibleProvider implements Provider {
     if (options.providerOptions) Object.assign(body, options.providerOptions);
 
     // Strip engine-computed forbidden params, but never the user's explicit overrides.
-    const forbidden = resolvePerModel(profile.capabilities?.forbiddenParams, options.model, []);
+    const forbidden = resolvePerModel(profile.capabilities?.forbiddenParams, effectiveModel, []);
     for (const key of forbidden) {
       if (!userKeys.includes(key)) delete body[key];
     }

@@ -143,11 +143,18 @@ export class OpenAIResponsesProvider implements Provider {
     options: ChatOptions,
     stream: boolean,
   ): Record<string, unknown> {
-    const oSeries = isOSeriesModel(options.model);
-    const reasoningCapable = supportsReasoningEffort(options.model);
+    // providerOptions is merged last, so its string model override must drive
+    // all synthesized model-dependent fields. The full object still merges
+    // last below, preserving explicit native overrides.
+    const effectiveModel =
+      typeof options.providerOptions?.model === 'string'
+        ? options.providerOptions.model
+        : options.model;
+    const oSeries = isOSeriesModel(effectiveModel);
+    const reasoningCapable = supportsReasoningEffort(effectiveModel);
     const resolved = resolveThinkingOptions(options);
     const { includeThoughts } = resolved;
-    const wireEffort = resolveOpenAIReasoningEffort(options.model, resolved);
+    const wireEffort = resolveOpenAIReasoningEffort(effectiveModel, resolved);
 
     // Temperature: always strip for o-series; for GPT-5.x, strip only when reasoning active
     const stripTemp = oSeries || (reasoningCapable && wireEffort !== undefined);
@@ -157,7 +164,7 @@ export class OpenAIResponsesProvider implements Provider {
     const nonSystemMessages = messages.filter((m) => m.role !== 'system');
 
     const body: Record<string, unknown> = {
-      model: options.model,
+      model: effectiveModel,
       input: this.buildInput(nonSystemMessages),
       store: false,
       stream,

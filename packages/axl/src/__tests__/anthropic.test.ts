@@ -249,6 +249,34 @@ describe('AnthropicProvider', () => {
       });
     });
 
+    it('preserves aggregate-only cache writes in usage but leaves their cost undefined', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-aggregate-cache-write',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Hi' }],
+            stop_reason: 'end_turn',
+            usage: {
+              input_tokens: 100,
+              output_tokens: 50,
+              cache_creation_input_tokens: 20,
+            },
+          }),
+      });
+      const response = await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-5',
+      });
+      expect(response.usage).toEqual({
+        prompt_tokens: 120,
+        completion_tokens: 50,
+        total_tokens: 170,
+        cache_write_tokens: 20,
+      });
+      expect(response.cost).toBeUndefined();
+    });
+
     it('prices claude-opus-4-7 at $5/$25 per 1M tokens (same as 4.6)', async () => {
       mockFetch({
         json: () =>
@@ -962,6 +990,31 @@ describe('AnthropicProvider', () => {
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
       expect(body.temperature).toBeUndefined();
       expect(body.thinking).toEqual({ type: 'enabled', budget_tokens: 1024 });
+    });
+
+    it('uses the providerOptions model for Anthropic thinking and temperature', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-effective-model',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 10, output_tokens: 5 },
+          }),
+      });
+      await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        effort: 'low',
+        temperature: 0.7,
+        providerOptions: { model: 'claude-opus-4-5' },
+      });
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.model).toBe('claude-opus-4-5');
+      expect(body.thinking).toBeUndefined();
+      expect(body.output_config).toEqual({ effort: 'low' });
+      expect(body.temperature).toBe(0.7);
     });
 
     it('allows temperature when thinking is not set', async () => {
@@ -1862,6 +1915,66 @@ describe('AnthropicProvider', () => {
       });
     }
 
+    it('uses the providerOptions model for streaming thinking and temperature', async () => {
+      const fetchMock = mockFetch({
+        body: createSSEStream([
+          { type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 0 } } },
+          { type: 'message_delta', usage: { output_tokens: 5 } },
+          { type: 'message_stop' },
+        ]),
+      });
+      const chunks: StreamChunk[] = [];
+      for await (const chunk of new AnthropicProvider().stream(
+        [{ role: 'user', content: 'Hello' }],
+        {
+          model: 'claude-sonnet-4',
+          effort: 'low',
+          temperature: 0.7,
+          providerOptions: { model: 'claude-opus-4-5' },
+        },
+      )) {
+        chunks.push(chunk);
+      }
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.model).toBe('claude-opus-4-5');
+      expect(body.thinking).toBeUndefined();
+      expect(body.output_config).toEqual({ effort: 'low' });
+      expect(body.temperature).toBe(0.7);
+      expect(chunks.at(-1)).toMatchObject({ type: 'done' });
+    });
+
+    it('retains aggregate-only cache writes in stream usage without estimating their cost', async () => {
+      mockFetch({
+        body: createSSEStream([
+          {
+            type: 'message_start',
+            message: {
+              usage: { input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: 20 },
+            },
+          },
+          { type: 'message_delta', usage: { output_tokens: 50 } },
+          { type: 'message_stop' },
+        ]),
+      });
+      const chunks: StreamChunk[] = [];
+      for await (const chunk of new AnthropicProvider().stream(
+        [{ role: 'user', content: 'Hello' }],
+        { model: 'claude-opus-5' },
+      )) {
+        chunks.push(chunk);
+      }
+      expect(chunks.at(-1)).toMatchObject({
+        type: 'done',
+        usage: {
+          prompt_tokens: 120,
+          completion_tokens: 50,
+          total_tokens: 170,
+          cache_write_tokens: 20,
+        },
+        cost: undefined,
+      });
+    });
+
     it('emits thinking_delta chunks for thinking content blocks', async () => {
       const sseEvents = [
         {
@@ -2204,6 +2317,30 @@ describe('AnthropicProvider', () => {
           }
         })(),
       ).rejects.toThrow('fallback streams cannot be continued safely');
+    });
+
+    it('leaves a non-fallback iteration stream unpriced without rejecting it', async () => {
+      mockFetch({
+        body: createSSEStream([
+          { type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 0 } } },
+          {
+            type: 'message_delta',
+            usage: {
+              output_tokens: 5,
+              iterations: [{ type: 'message', model: 'claude-opus-5' }],
+            },
+          },
+          { type: 'message_stop' },
+        ]),
+      });
+      const chunks: StreamChunk[] = [];
+      for await (const chunk of new AnthropicProvider().stream(
+        [{ role: 'user', content: 'Hello' }],
+        { model: 'claude-opus-5' },
+      )) {
+        chunks.push(chunk);
+      }
+      expect(chunks.at(-1)).toMatchObject({ type: 'done', cost: undefined });
     });
 
     it('re-normalizes cumulative terminal usage and rejects TTL aggregate conflicts', async () => {

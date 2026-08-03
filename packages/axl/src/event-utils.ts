@@ -37,11 +37,20 @@ const COST_LEAF_SET: ReadonlySet<string> = new Set(COST_BEARING_LEAF_TYPES);
  * stay in lockstep.
  */
 export function hasPositiveTokens(event: {
-  tokens?: { input?: number; output?: number; reasoning?: number } | null;
+  tokens?: {
+    input?: number;
+    output?: number;
+    reasoning?: number;
+    cached?: number;
+    cacheWrite?: number;
+  } | null;
 }): boolean {
   const t = event.tokens;
   if (!t) return false;
-  return (t.input ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0) > 0;
+  return (
+    (t.input ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0) + (t.cached ?? 0) + (t.cacheWrite ?? 0) >
+    0
+  );
 }
 
 /**
@@ -130,7 +139,13 @@ export function isCostBearingLeaf(event: HistoricalAxlEvent): boolean {
 export function isUnpricedLeaf(event: {
   type?: string;
   cost?: unknown;
-  tokens?: { input?: number; output?: number; reasoning?: number } | null;
+  tokens?: {
+    input?: number;
+    output?: number;
+    reasoning?: number;
+    cached?: number;
+    cacheWrite?: number;
+  } | null;
 }): boolean {
   return (
     event.type !== undefined &&

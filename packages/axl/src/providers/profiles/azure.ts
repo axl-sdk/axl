@@ -1,4 +1,4 @@
-import { isOSeriesModel, openaiReasoningEmit, OPENAI_PRICING } from '../openai.js';
+import { isOSeriesModel, openaiReasoningEmit } from '../openai.js';
 import type { ProviderProfile } from '../openai-compatible.js';
 
 /**
@@ -14,10 +14,8 @@ import type { ProviderProfile } from '../openai-compatible.js';
  * Entra/AAD bearer-token auth uses the async key callback plus an `authHeader:
  * 'bearer'` override.
  *
- * Azure serves OpenAI models, so the OpenAI reasoning logic and pricing table
- * are reused. Caveat: deployment names are arbitrary, so o-series/GPT-5
- * detection and pricing only fire when the deployment is named after the model;
- * otherwise effort is a no-op and cost is `undefined` (honest, not a fake $0).
+ * Azure can share OpenAI's wire reasoning behavior, but never its direct-API
+ * price catalog: model meters, deployment types, regions, and agreements vary.
  */
 export const AZURE_PROFILE: ProviderProfile = {
   name: 'azure',
@@ -28,7 +26,7 @@ export const AZURE_PROFILE: ProviderProfile = {
   envApiKey: 'AZURE_OPENAI_API_KEY',
   envBaseUrl: 'AZURE_OPENAI_BASE_URL',
   authHeader: 'api-key',
-  pricing: { kind: 'table', table: OPENAI_PRICING },
+  pricing: { kind: 'unknown' },
   reasoning: { emit: openaiReasoningEmit, capture: 'none' },
   roleFor: (role, model) => (role === 'system' && isOSeriesModel(model) ? 'developer' : role),
   maxTokensField: 'max_completion_tokens',

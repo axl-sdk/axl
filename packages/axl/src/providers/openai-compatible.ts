@@ -481,7 +481,7 @@ export class OpenAICompatibleProvider implements Provider {
     }
 
     const json = (await res.json()) as OpenAIChatResponse;
-    return this.parseResponse(json, options.model);
+    return this.parseResponse(json, this.requestModel(body, options.model), body);
   }
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
@@ -513,7 +513,7 @@ export class OpenAICompatibleProvider implements Provider {
       throw new Error(`${this.profile.label ?? this.profile.name} stream response has no body`);
     }
 
-    yield* this.parseSSEStream(res.body, options.model);
+    yield* this.parseSSEStream(res.body, this.requestModel(body, options.model), body);
   }
 
   // ---------------------------------------------------------------------------
@@ -660,6 +660,10 @@ export class OpenAICompatibleProvider implements Provider {
     return `${label} API error (${status}): ${body}`;
   }
 
+  private requestModel(body: Record<string, unknown>, fallback: string): string {
+    return typeof body.model === 'string' ? body.model : fallback;
+  }
+
   private toUsage(raw: OpenAIUsage | undefined): ProviderResponse['usage'] {
     if (!raw) return undefined;
     return {
@@ -668,13 +672,20 @@ export class OpenAICompatibleProvider implements Provider {
       total_tokens: raw.total_tokens,
       reasoning_tokens: raw.completion_tokens_details?.reasoning_tokens,
       cached_tokens: raw.prompt_tokens_details?.cached_tokens,
+      cache_write_tokens: raw.prompt_tokens_details?.cache_write_tokens,
     };
   }
 
-  private computeCost(
+  /**
+   * The generic profile path stays flat and public. Native subclasses may
+   * override this protected seam to use a provider-internal estimator without
+   * widening `PricingSource` or `ProviderProfile`.
+   */
+  protected computeCost(
     model: string,
     usage: ProviderResponse['usage'],
     reportedCost: number | undefined,
+    _context?: { request?: Record<string, unknown>; response?: OpenAIModelResponse },
   ): number | undefined {
     const p = this.profile.pricing;
     if (p.kind === 'zero') return 0;
@@ -707,7 +718,11 @@ export class OpenAICompatibleProvider implements Provider {
     }
   }
 
-  protected parseResponse(json: OpenAIChatResponse, model: string): ProviderResponse {
+  protected parseResponse(
+    json: OpenAIChatResponse,
+    model: string,
+    request?: Record<string, unknown>,
+  ): ProviderResponse {
     const message = json.choices?.[0]?.message ?? {};
     let content = normalizeMessageContent(message.content);
     let thinking: string | undefined;
@@ -755,7 +770,10 @@ export class OpenAICompatibleProvider implements Provider {
     }
 
     const usage = this.toUsage(json.usage);
-    const cost = this.computeCost(model, usage, json.usage?.cost);
+    const cost = this.computeCost(json.model ?? model, usage, json.usage?.cost, {
+      request,
+      response: json,
+    });
 
     return {
       content,
@@ -791,11 +809,13 @@ export class OpenAICompatibleProvider implements Provider {
   protected async *parseSSEStream(
     body: ReadableStream<Uint8Array>,
     model: string,
+    request?: Record<string, unknown>,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
     let usageData: OpenAIUsage | undefined;
+    let pricingResponse: OpenAIModelResponse | undefined;
 
     const capture = this.profile.reasoning.capture;
     const thinkScanner = capture === 'think_tags' ? new ThinkTagScanner() : undefined;
@@ -847,7 +867,10 @@ export class OpenAICompatibleProvider implements Provider {
       return {
         type: 'done',
         usage,
-        cost: this.computeCost(model, usage, usageData?.cost),
+        cost: this.computeCost(pricingResponse?.model ?? model, usage, usageData?.cost, {
+          request,
+          response: pricingResponse,
+        }),
         providerMetadata,
       };
     };
@@ -899,6 +922,13 @@ export class OpenAICompatibleProvider implements Provider {
             });
           }
 
+          if (
+            parsed.model !== undefined ||
+            parsed.service_tier !== undefined ||
+            parsed.serviceTier !== undefined
+          ) {
+            pricingResponse = parsed;
+          }
           if (parsed.usage) {
             usageData = parsed.usage;
             // Some providers send a usage-only final chunk with no choices.
@@ -999,7 +1029,7 @@ type OpenAIUsage = {
   completion_tokens: number;
   total_tokens: number;
   completion_tokens_details?: { reasoning_tokens?: number };
-  prompt_tokens_details?: { cached_tokens?: number };
+  prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
   /** OpenRouter / Vercel Gateway: per-call cost in USD. */
   cost?: number;
 };
@@ -1019,6 +1049,12 @@ type OpenAIChatMessage = {
 type OpenAIChatResponse = {
   choices: Array<{ message: OpenAIChatMessage; finish_reason: string }>;
   usage?: OpenAIUsage;
+} & OpenAIModelResponse;
+
+type OpenAIModelResponse = {
+  model?: string;
+  service_tier?: unknown;
+  serviceTier?: unknown;
 };
 
 type OpenAIStreamChunk = {
@@ -1038,4 +1074,4 @@ type OpenAIStreamChunk = {
     finish_reason: string | null;
   }>;
   usage?: OpenAIUsage;
-};
+} & OpenAIModelResponse;

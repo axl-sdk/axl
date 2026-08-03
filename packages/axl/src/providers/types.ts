@@ -102,6 +102,8 @@ export type StreamChunk =
         total_tokens: number;
         reasoning_tokens?: number;
         cached_tokens?: number;
+        /** Tokens written to a provider prompt cache during this call, when reported. */
+        cache_write_tokens?: number;
       };
       /** Estimated cost in USD for this call, computed the same way as ProviderResponse.cost. */
       cost?: number;

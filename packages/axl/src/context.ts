@@ -1170,6 +1170,7 @@ export class WorkflowContext<TInput = unknown> {
               completion_tokens: number;
               total_tokens: number;
               cached_tokens?: number;
+              cache_write_tokens?: number;
             };
           } = {};
 
@@ -1221,6 +1222,11 @@ export class WorkflowContext<TInput = unknown> {
                         span.setAttribute(
                           'axl.agent.cached_tokens',
                           usageCapture.value.cached_tokens,
+                        );
+                      if (usageCapture.value.cache_write_tokens)
+                        span.setAttribute(
+                          'axl.agent.cache_write_tokens',
+                          usageCapture.value.cache_write_tokens,
                         );
                     }
                     return r;
@@ -1321,6 +1327,7 @@ export class WorkflowContext<TInput = unknown> {
         completion_tokens: number;
         total_tokens: number;
         cached_tokens?: number;
+        cache_write_tokens?: number;
       };
     },
   ): Promise<unknown> {
@@ -1904,6 +1911,8 @@ export class WorkflowContext<TInput = unknown> {
               input: response.usage.prompt_tokens,
               output: response.usage.completion_tokens,
               reasoning: response.usage.reasoning_tokens,
+              cached: response.usage.cached_tokens,
+              cacheWrite: response.usage.cache_write_tokens,
             }
           : undefined,
         duration: Date.now() - turnStart,
@@ -4305,7 +4314,13 @@ export class WorkflowContext<TInput = unknown> {
     promptVersion?: string;
     model?: string;
     cost?: number;
-    tokens?: { input?: number; output?: number; reasoning?: number };
+    tokens?: {
+      input?: number;
+      output?: number;
+      reasoning?: number;
+      cached?: number;
+      cacheWrite?: number;
+    };
     duration?: number;
     data?: unknown;
     // Variant-specific fields are accepted as `unknown`-typed extras so
@@ -4385,7 +4400,15 @@ export class WorkflowContext<TInput = unknown> {
       const unpriced =
         !usable &&
         hasPositiveTokens(
-          partial as { tokens?: { input?: number; output?: number; reasoning?: number } },
+          partial as {
+            tokens?: {
+              input?: number;
+              output?: number;
+              reasoning?: number;
+              cached?: number;
+              cacheWrite?: number;
+            };
+          },
         );
       if (frame) {
         if (usable) frame.askCost.value += cost;

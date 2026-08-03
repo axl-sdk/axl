@@ -111,11 +111,46 @@ afterEach(() => {
 });
 
 describe('budget honesty — BudgetResult.unpriced (Part A)', () => {
+  it('carries cache-write usage through the public trace while preserving budget cost', async () => {
+    const { ctx, traces } = createTestCtx({
+      provider: seqProvider([
+        {
+          content: 'ok',
+          usage: { ...usage, cached_tokens: 3, cache_write_tokens: 4 },
+          cost: 0.001,
+        },
+      ]),
+    });
+    const result = await ctx.budget({ cost: '$1' }, () => ctx.ask(plain(), 'hi'));
+    expect(result.totalCost).toBe(0.001);
+    expect(traces.find((event) => event.type === 'agent_call_end')).toMatchObject({
+      tokens: { input: 10, output: 5, cached: 3, cacheWrite: 4 },
+    });
+  });
+
   it('flags a budget whose call returned usage but NO cost (unpriced model)', async () => {
     const { ctx } = createTestCtx({ provider: seqProvider([{ content: 'ok', usage }]) });
     const r = await ctx.budget({ cost: '$5' }, () => ctx.ask(plain(), 'hi'));
     expect(r.unpriced).toBe(true);
     expect(r.totalCost).toBe(0); // unpriced spend is unmeasured, contributes 0
+  });
+
+  it('flags cache-write-only usage as unpriced work', async () => {
+    const { ctx } = createTestCtx({
+      provider: seqProvider([
+        {
+          content: 'ok',
+          usage: {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cache_write_tokens: 4,
+          },
+        },
+      ]),
+    });
+    const r = await ctx.budget({ cost: '$5' }, () => ctx.ask(plain(), 'hi'));
+    expect(r.unpriced).toBe(true);
   });
 
   it('does NOT flag a priced budget (and does not warn)', async () => {

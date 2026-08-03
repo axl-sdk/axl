@@ -788,7 +788,13 @@ export type AxlEventBase = {
    *  completion / reasoning tokens ONLY — embedder tokens live in
    *  `memory_*.data.usage.tokens` and are deliberately NOT summed into
    *  this field (different pricing, different model, different category). */
-  tokens?: { input?: number; output?: number; reasoning?: number };
+  tokens?: {
+    input?: number;
+    output?: number;
+    reasoning?: number;
+    cached?: number;
+    cacheWrite?: number;
+  };
   /** Duration in ms (set on `_end` variants and a few single-point events). */
   duration?: number;
 };
@@ -868,7 +874,13 @@ type LegacyAxlEventPayloadV1 =
          *  (pricing-table miss) and absent on the error path (no usage). */
         cost?: number;
         duration: number;
-        tokens?: { input?: number; output?: number; reasoning?: number };
+        tokens?: {
+          input?: number;
+          output?: number;
+          reasoning?: number;
+          cached?: number;
+          cacheWrite?: number;
+        };
         /** Response-side payload — response text, thinking. */
         data: AgentCallEndData;
       })
@@ -1295,6 +1307,8 @@ export type ProviderResponse = {
     total_tokens: number;
     reasoning_tokens?: number;
     cached_tokens?: number;
+    /** Tokens written to a provider prompt cache during this call, when reported. */
+    cache_write_tokens?: number;
   };
   cost?: number;
   /** Provider-specific opaque metadata that needs to round-trip through conversation history. */

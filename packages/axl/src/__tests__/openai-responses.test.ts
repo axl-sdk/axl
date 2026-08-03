@@ -223,7 +223,7 @@ describe('OpenAIResponsesProvider', () => {
 
       const provider = new OpenAIResponsesProvider();
       await provider.chat([{ role: 'user', content: 'test' }], {
-        model: 'gpt-4o',
+        model: 'gpt-5.6-terra',
         maxTokens: 1024,
         tools: [
           {
@@ -332,7 +332,7 @@ describe('OpenAIResponsesProvider', () => {
               output_tokens: 50,
               total_tokens: 150,
               output_tokens_details: { reasoning_tokens: 30 },
-              input_tokens_details: { cached_tokens: 20 },
+              input_tokens_details: { cached_tokens: 20, cache_write_tokens: 10 },
             },
           }),
       });
@@ -349,6 +349,7 @@ describe('OpenAIResponsesProvider', () => {
         total_tokens: 150,
         reasoning_tokens: 30,
         cached_tokens: 20,
+        cache_write_tokens: 10,
       });
     });
 
@@ -415,6 +416,70 @@ describe('OpenAIResponsesProvider', () => {
   });
 
   describe('chat() — request options', () => {
+    it('prices the fully merged providerOptions model and leaves a requested non-Standard tier unpriced', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+          }),
+      });
+      const provider = new OpenAIResponsesProvider();
+      const priced = await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gpt-4o',
+        providerOptions: { model: 'gpt-5.6-luna' },
+      });
+      expect(getRequestBody(fetchMock).model).toBe('gpt-5.6-luna');
+      expect(priced.cost).toBeCloseTo(32e-6, 12);
+
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_2',
+            output: [],
+            usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+          }),
+      });
+      const unpriced = await provider.chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gpt-5.6-luna',
+        providerOptions: { service_tier: 'flex' },
+      });
+      expect(unpriced.cost).toBeUndefined();
+    });
+
+    it('does not apply direct-OpenAI pricing through a custom base URL or hosted tool', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+      const custom = await new OpenAIResponsesProvider({
+        baseUrl: 'https://proxy.example/v1',
+      }).chat([{ role: 'user', content: 'Hi' }], { model: 'gpt-4o' });
+      expect(custom.cost).toBeUndefined();
+
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_2',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+      const hostedTool = await new OpenAIResponsesProvider().chat(
+        [{ role: 'user', content: 'Hi' }],
+        {
+          model: 'gpt-4o',
+          providerOptions: { tools: [{ type: 'web_search' }] },
+        },
+      );
+      expect(hostedTool.cost).toBeUndefined();
+    });
+
     it('sends store: false by default', async () => {
       const fetchMock = mockFetch({
         json: () =>
@@ -1142,7 +1207,12 @@ describe('OpenAIResponsesProvider', () => {
           event: 'response.completed',
           data: {
             response: {
-              usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+              usage: {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                input_tokens_details: { cache_write_tokens: 4 },
+              },
             },
           },
         },
@@ -1153,7 +1223,7 @@ describe('OpenAIResponsesProvider', () => {
       const provider = new OpenAIResponsesProvider();
       const chunks: any[] = [];
       for await (const chunk of provider.stream([{ role: 'user', content: 'Hi' }], {
-        model: 'gpt-4o',
+        model: 'gpt-5.6-terra',
         maxTokens: 1024,
       })) {
         chunks.push(chunk);
@@ -1170,9 +1240,10 @@ describe('OpenAIResponsesProvider', () => {
             total_tokens: 15,
             reasoning_tokens: undefined,
             cached_tokens: undefined,
+            cache_write_tokens: 4,
           },
-          // gpt-4o: [2.5e-6, 10e-6, 0.5] → 10 * 2.5e-6 + 5 * 10e-6 = 0.000025 + 0.00005 = 0.000075
-          cost: expect.closeTo(0.000075, 8),
+          // Terra: 6 ordinary @ $2, 4 cache writes @ $2.50, 5 output @ $12 per MTok.
+          cost: expect.closeTo(0.000082, 8),
           providerMetadata: undefined,
         },
       ]);

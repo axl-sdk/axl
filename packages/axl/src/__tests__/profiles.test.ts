@@ -151,10 +151,10 @@ describe('Azure preset', () => {
     expect(req(fetchMock).headers['api-key']).toBeUndefined();
   });
 
-  it('prices when the deployment is named after a known model, undefined otherwise', async () => {
+  it('remains unpriced even when a deployment is named after a direct OpenAI model', async () => {
     mockFetch(ok());
     const named = await azure().chat(user, { model: 'gpt-4o' });
-    expect(named.cost).toBeGreaterThan(0);
+    expect(named.cost).toBeUndefined();
 
     mockFetch(ok());
     const arbitrary = await azure().chat(user, { model: 'prod-deploy-7' });

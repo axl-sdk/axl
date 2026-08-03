@@ -1,10 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   OpenAIProvider,
+  OPENAI_PRICING,
   isOSeriesModel,
   supportsReasoningNone,
   supportsXhigh,
   clampReasoningEffort,
+  estimateDirectOpenAICost,
 } from '../providers/openai.js';
 
 // ── Mock fetch ──────────────────────────────────────────────────────────
@@ -1008,6 +1010,51 @@ describe('OpenAIProvider', () => {
       expect(body.temperature).toBe(0.5);
     });
 
+    it('prices the fully merged providerOptions model and leaves non-Standard tiers unpriced', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+          }),
+      });
+      const provider = new OpenAIProvider();
+      const priced = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-4o',
+        providerOptions: { model: 'gpt-5.6-luna' },
+      });
+      expect(getRequestBody(fetchMock).model).toBe('gpt-5.6-luna');
+      expect(priced.cost).toBeCloseTo(32e-6, 12);
+
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            service_tier: 'flex',
+            usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+          }),
+      });
+      const unpriced = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5.6-luna',
+      });
+      expect(unpriced.cost).toBeUndefined();
+    });
+
+    it('does not apply direct-OpenAI pricing through a custom base URL', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+      const response = await new OpenAIProvider({ baseUrl: 'https://proxy.example/v1' }).chat(
+        [{ role: 'user', content: 'Hello' }],
+        { model: 'gpt-4o' },
+      );
+      expect(response.cost).toBeUndefined();
+    });
+
     it('captures reasoning and cached tokens from usage', async () => {
       mockFetch({
         json: () =>
@@ -1018,7 +1065,7 @@ describe('OpenAIProvider', () => {
               completion_tokens: 200,
               total_tokens: 300,
               completion_tokens_details: { reasoning_tokens: 150 },
-              prompt_tokens_details: { cached_tokens: 50 },
+              prompt_tokens_details: { cached_tokens: 50, cache_write_tokens: 25 },
             },
           }),
       });
@@ -1035,6 +1082,7 @@ describe('OpenAIProvider', () => {
         total_tokens: 300,
         reasoning_tokens: 150,
         cached_tokens: 50,
+        cache_write_tokens: 25,
       });
     });
   });
@@ -1060,7 +1108,7 @@ describe('OpenAIProvider', () => {
       const sseBody = makeSSEStream([
         'data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}',
         '',
-        `data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":200,"total_tokens":300,"completion_tokens_details":{"reasoning_tokens":150},"prompt_tokens_details":{"cached_tokens":50}}}`,
+        `data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":200,"total_tokens":300,"completion_tokens_details":{"reasoning_tokens":150},"prompt_tokens_details":{"cached_tokens":50,"cache_write_tokens":25}}}`,
         '',
         'data: [DONE]',
         '',
@@ -1085,7 +1133,214 @@ describe('OpenAIProvider', () => {
         total_tokens: 300,
         reasoning_tokens: 150,
         cached_tokens: 50,
+        cache_write_tokens: 25,
       });
     });
+
+    it('uses model and default tier reported with a terminal usage-only chunk', async () => {
+      mockFetch({
+        body: makeSSEStream([
+          'data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}',
+          '',
+          'data: {"model":"gpt-5.6-luna","service_tier":"default","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}}',
+          '',
+          'data: [DONE]',
+          '',
+        ]),
+      });
+      const chunks: any[] = [];
+      for await (const chunk of new OpenAIProvider().stream([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-4o',
+      })) {
+        chunks.push(chunk);
+      }
+      expect(chunks.find((chunk) => chunk.type === 'done')?.cost).toBeCloseTo(32e-6, 12);
+    });
+  });
+});
+
+describe('direct OpenAI Standard estimator', () => {
+  const usage = (prompt_tokens: number, completion_tokens = 10, extra = {}) => ({
+    prompt_tokens,
+    completion_tokens,
+    total_tokens: prompt_tokens + completion_tokens,
+    ...extra,
+  });
+
+  it('recognizes only exact aliases and documented snapshots', () => {
+    expect(estimateDirectOpenAICost('gpt-5.6', usage(100))).toBeCloseTo(800e-6, 12);
+    expect(estimateDirectOpenAICost('gpt-4o-2024-05-13', usage(100))).toBeCloseTo(650e-6, 12);
+    expect(estimateDirectOpenAICost('gpt-3.5-turbo-1106', usage(100))).toBeCloseTo(120e-6, 12);
+    expect(estimateDirectOpenAICost('gpt-4o-2024-05-14', usage(100))).toBeUndefined();
+    expect(estimateDirectOpenAICost('gpt-5.6-sol-2026-08-03', usage(100))).toBeUndefined();
+  });
+
+  it.each([
+    ['gpt-4o', 12.5],
+    ['gpt-4o-2024-05-13', 20],
+    ['gpt-4-turbo-2024-04-09', 40],
+    ['gpt-4-0613', 90],
+    ['gpt-3.5-turbo-1106', 3],
+    ['o3', 10],
+    ['gpt-5.2-pro', 189],
+    ['gpt-5.4-mini', 5.25],
+    ['gpt-5-pro', 135],
+    ['davinci-002', 4],
+  ])('uses the audited Standard row for %s', (model, dollarsPerMillion) => {
+    expect(estimateDirectOpenAICost(model, usage(1, 1))).toBeCloseTo(
+      dollarsPerMillion / 1_000_000,
+      12,
+    );
+  });
+
+  it.each(['o1-mini', 'gpt-5.3', 'gpt-4', 'gpt-4-turbo'])(
+    'leaves absent row %s unpriced',
+    (model) => {
+      expect(estimateDirectOpenAICost(model, usage(1, 1))).toBeUndefined();
+    },
+  );
+
+  it.each([
+    'gpt-5.5-2026-04-23',
+    'gpt-5.5-pro-2026-04-23',
+    'gpt-5.4-2026-03-05',
+    'gpt-5.4-pro-2026-03-05',
+    'gpt-5.4-mini-2026-03-17',
+    'gpt-5.4-nano-2026-03-17',
+    'gpt-5.2-2025-12-11',
+    'gpt-5.2-pro-2025-12-11',
+    'gpt-5.1-2025-11-13',
+    'gpt-5-2025-08-07',
+    'gpt-5-pro-2025-10-06',
+    'gpt-5-mini-2025-08-07',
+    'gpt-5-nano-2025-08-07',
+    'gpt-4.1-2025-04-14',
+    'gpt-4.1-mini-2025-04-14',
+    'gpt-4.1-nano-2025-04-14',
+    'gpt-4o-2024-05-13',
+    'gpt-4o-2024-08-06',
+    'gpt-4o-2024-11-20',
+    'gpt-4o-mini-2024-07-18',
+    'o1-2024-12-17',
+    'o1-pro-2025-03-19',
+    'o3-2025-04-16',
+    'o3-pro-2025-06-10',
+    'o3-mini-2025-01-31',
+    'o4-mini-2025-04-16',
+  ])('prices the explicitly audited snapshot %s', (model) => {
+    expect(estimateDirectOpenAICost(model, usage(1, 1))).toBeDefined();
+  });
+
+  it.each([
+    'gpt-5.5-2026-04-24',
+    'gpt-5.4-mini-2026-03-18',
+    'gpt-5.2-2025-12-12',
+    'gpt-4.1-2025-04-15',
+    'o3-2025-04-17',
+  ])('rejects fictitious snapshot %s', (model) => {
+    expect(estimateDirectOpenAICost(model, usage(1, 1))).toBeUndefined();
+  });
+
+  it('uses literal cache-read/write rates and rejects invalid categories', () => {
+    // Terra: 50 ordinary @ $2, 20 cached @ $0.20, 30 writes @ $2.50, 10 output @ $12.
+    expect(
+      estimateDirectOpenAICost(
+        'gpt-5.6-terra',
+        usage(100, 10, { cached_tokens: 20, cache_write_tokens: 30 }),
+      ),
+    ).toBeCloseTo(299e-6, 12);
+    expect(
+      estimateDirectOpenAICost('o3-pro', usage(100, 10, { cached_tokens: 1 })),
+    ).toBeUndefined();
+    expect(
+      estimateDirectOpenAICost(
+        'gpt-5.6-terra',
+        usage(100, 10, { cached_tokens: 60, cache_write_tokens: 41 }),
+      ),
+    ).toBeUndefined();
+    expect(
+      estimateDirectOpenAICost('gpt-3.5-turbo', usage(100, 10, { cached_tokens: 1 })),
+    ).toBeUndefined();
+    expect(
+      estimateDirectOpenAICost('gpt-3.5-turbo-0125', usage(100, 10, { cached_tokens: 1 })),
+    ).toBeUndefined();
+  });
+
+  it('keeps the public tuple view limited to fully representable flat rows', () => {
+    expect(OPENAI_PRICING).toHaveProperty('gpt-4o');
+    expect(OPENAI_PRICING).toHaveProperty('gpt-4.1');
+    expect(OPENAI_PRICING).not.toHaveProperty('gpt-3.5-turbo');
+    expect(OPENAI_PRICING).not.toHaveProperty('gpt-3.5-turbo-0125');
+    expect(OPENAI_PRICING).not.toHaveProperty('gpt-4o-2024-05-13');
+    expect(OPENAI_PRICING).not.toHaveProperty('gpt-5.4');
+    expect(OPENAI_PRICING).not.toHaveProperty('gpt-5.5');
+    expect(OPENAI_PRICING).not.toHaveProperty('o3-pro');
+  });
+
+  it('changes full-request rates strictly above the long-context boundary', () => {
+    expect(estimateDirectOpenAICost('gpt-5.6-sol', usage(271_999, 1))).toBeCloseTo(
+      (271_999 * 5 + 30) / 1_000_000,
+      12,
+    );
+    expect(estimateDirectOpenAICost('gpt-5.6-sol', usage(272_000, 1))).toBeCloseTo(
+      (272_000 * 5 + 30) / 1_000_000,
+      12,
+    );
+    expect(estimateDirectOpenAICost('gpt-5.6-sol', usage(272_001, 1))).toBeCloseTo(
+      (272_001 * 10 + 45) / 1_000_000,
+      12,
+    );
+    expect(estimateDirectOpenAICost('gpt-5.4', usage(272_001, 1))).toBeCloseTo(
+      (272_001 * 5 + 22.5) / 1_000_000,
+      12,
+    );
+    expect(estimateDirectOpenAICost('gpt-5.4-pro', usage(272_001, 1))).toBeCloseTo(
+      (272_001 * 60 + 270) / 1_000_000,
+      12,
+    );
+    expect(estimateDirectOpenAICost('gpt-5.5', usage(272_001, 1))).toBeCloseTo(
+      (272_001 * 10 + 45) / 1_000_000,
+      12,
+    );
+    expect(estimateDirectOpenAICost('gpt-5.5-pro', usage(272_001, 1))).toBeCloseTo(
+      (272_001 * 60 + 270) / 1_000_000,
+      12,
+    );
+  });
+
+  it('does not estimate an ambiguous billing mode', () => {
+    expect(
+      estimateDirectOpenAICost('gpt-5.6', usage(10), { request: { service_tier: 'flex' } }),
+    ).toBeUndefined();
+    expect(
+      estimateDirectOpenAICost('gpt-5.6', usage(10), { response: { service_tier: 'fast' } }),
+    ).toBeUndefined();
+    expect(
+      estimateDirectOpenAICost('gpt-5.6', usage(10), {
+        baseUrl: 'https://regional.example.com/v1',
+      }),
+    ).toBeUndefined();
+    expect(
+      estimateDirectOpenAICost('gpt-5.6', usage(10), {
+        request: { service_tier: 'auto' },
+        response: { service_tier: 'default' },
+      }),
+    ).toBeDefined();
+    expect(
+      estimateDirectOpenAICost('gpt-5.6', usage(10), {
+        request: { service_tier: 'auto' },
+        response: { service_tier: 'flex' },
+      }),
+    ).toBeUndefined();
+    expect(
+      estimateDirectOpenAICost('gpt-5.6', usage(10), {
+        request: { reasoning: { mode: 'pro' } },
+      }),
+    ).toBeUndefined();
+    expect(
+      estimateDirectOpenAICost('gpt-5.6', usage(10), {
+        request: { tools: [{ type: 'web_search' }] },
+      }),
+    ).toBeUndefined();
   });
 });

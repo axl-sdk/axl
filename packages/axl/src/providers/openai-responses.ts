@@ -1,6 +1,6 @@
 import type { Provider, ChatOptions, ChatMessage, ProviderResponse, StreamChunk } from './types.js';
 import {
-  estimateOpenAICost,
+  estimateDirectOpenAICost,
   isOSeriesModel,
   supportsReasoningEffort,
   effortToReasoningEffort,
@@ -96,7 +96,7 @@ export class OpenAIResponsesProvider implements Provider {
     }
 
     const json = (await res.json()) as ResponsesAPIResponse;
-    return this.parseResponse(json, options.model);
+    return this.parseResponse(json, this.requestModel(body, options.model), body);
   }
 
   // ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ export class OpenAIResponsesProvider implements Provider {
       throw new Error('OpenAI Responses stream has no body');
     }
 
-    yield* this.parseSSEStream(res.body, options.model);
+    yield* this.parseSSEStream(res.body, this.requestModel(body, options.model), body);
   }
 
   // ---------------------------------------------------------------------------
@@ -233,6 +233,10 @@ export class OpenAIResponsesProvider implements Provider {
     return body;
   }
 
+  private requestModel(body: Record<string, unknown>, fallback: string): string {
+    return typeof body.model === 'string' ? body.model : fallback;
+  }
+
   // ---------------------------------------------------------------------------
   // Internal: message → input mapping
   // ---------------------------------------------------------------------------
@@ -315,7 +319,11 @@ export class OpenAIResponsesProvider implements Provider {
   // Internal: parse non-streaming response
   // ---------------------------------------------------------------------------
 
-  private parseResponse(json: ResponsesAPIResponse, model: string): ProviderResponse {
+  private parseResponse(
+    json: ResponsesAPIResponse,
+    model: string,
+    request?: Record<string, unknown>,
+  ): ProviderResponse {
     let content = '';
     let thinkingContent = '';
     const toolCalls: ProviderResponse['tool_calls'] = [];
@@ -358,11 +366,16 @@ export class OpenAIResponsesProvider implements Provider {
           total_tokens: json.usage.total_tokens,
           reasoning_tokens: json.usage.output_tokens_details?.reasoning_tokens,
           cached_tokens: json.usage.input_tokens_details?.cached_tokens,
+          cache_write_tokens: json.usage.input_tokens_details?.cache_write_tokens,
         }
       : undefined;
 
     const cost = usage
-      ? estimateOpenAICost(model, usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens)
+      ? estimateDirectOpenAICost(json.model ?? model, usage, {
+          baseUrl: this.baseUrl,
+          request,
+          response: json,
+        })
       : undefined;
 
     const providerMetadata =
@@ -385,6 +398,7 @@ export class OpenAIResponsesProvider implements Provider {
   private async *parseSSEStream(
     body: ReadableStream<Uint8Array>,
     model: string,
+    request?: Record<string, unknown>,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -422,7 +436,7 @@ export class OpenAIResponsesProvider implements Provider {
               continue;
             }
 
-            const chunk = this.handleStreamEvent(eventType, data, model, callIdMap);
+            const chunk = this.handleStreamEvent(eventType, data, model, callIdMap, request);
             if (chunk) {
               yield chunk;
               // If done, exit
@@ -446,6 +460,7 @@ export class OpenAIResponsesProvider implements Provider {
     data: ResponsesStreamEventData,
     model: string,
     callIdMap: Map<number, string>,
+    request?: Record<string, unknown>,
   ): StreamChunk | null {
     switch (eventType) {
       case 'response.output_text.delta':
@@ -486,6 +501,7 @@ export class OpenAIResponsesProvider implements Provider {
               total_tokens: response.usage.total_tokens,
               reasoning_tokens: response.usage.output_tokens_details?.reasoning_tokens,
               cached_tokens: response.usage.input_tokens_details?.cached_tokens,
+              cache_write_tokens: response.usage.input_tokens_details?.cache_write_tokens,
             }
           : undefined;
 
@@ -498,12 +514,11 @@ export class OpenAIResponsesProvider implements Provider {
           type: 'done',
           usage,
           cost: usage
-            ? estimateOpenAICost(
-                model,
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                usage.cached_tokens,
-              )
+            ? estimateDirectOpenAICost(response?.model ?? model, usage, {
+                baseUrl: this.baseUrl,
+                request,
+                response,
+              })
             : undefined,
           providerMetadata,
         };
@@ -597,6 +612,10 @@ type ResponsesAPIResponse = {
     };
     input_tokens_details?: {
       cached_tokens?: number;
+      cache_write_tokens?: number;
     };
   };
+  model?: string;
+  service_tier?: unknown;
+  serviceTier?: unknown;
 };

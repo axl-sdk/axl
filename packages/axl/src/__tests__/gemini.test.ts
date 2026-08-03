@@ -32,6 +32,7 @@ function makeGeminiResponse(
     totalTokenCount: number;
     cachedContentTokenCount?: number;
     thoughtsTokenCount?: number;
+    toolUsePromptTokenCount?: number;
   },
 ) {
   return {
@@ -41,7 +42,10 @@ function makeGeminiResponse(
         finishReason: 'STOP',
       },
     ],
-    usageMetadata: usage ?? { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+    usageMetadata: {
+      serviceTier: 'SERVICE_TIER_STANDARD',
+      ...(usage ?? { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 }),
+    },
   };
 }
 
@@ -84,10 +88,10 @@ describe('GeminiProvider', () => {
       });
 
       const provider = new GeminiProvider();
-      await provider.chat([{ role: 'user', content: 'Hi' }], { model: 'gemini-2.0-flash' });
+      await provider.chat([{ role: 'user', content: 'Hi' }], { model: 'gemini-2.5-flash' });
 
       const [url, opts] = fetchMock.mock.calls[0];
-      expect(url).toContain('/models/gemini-2.0-flash:generateContent');
+      expect(url).toContain('/models/gemini-2.5-flash:generateContent');
       expect(opts.headers['x-goog-api-key']).toBe('test-key');
       expect(opts.headers['Content-Type']).toBe('application/json');
     });
@@ -191,7 +195,7 @@ describe('GeminiProvider', () => {
       expect(response.tool_calls![0].function.arguments).toBe('{"query":"test"}');
     });
 
-    it('preserves functionCall.id from Gemini 3.x responses (non-streaming)', async () => {
+    it('preserves functionCall.id from Gemini 3.6 Flash responses (non-streaming)', async () => {
       mockFetch({
         json: () =>
           Promise.resolve({
@@ -218,7 +222,7 @@ describe('GeminiProvider', () => {
 
       const provider = new GeminiProvider();
       const response = await provider.chat([{ role: 'user', content: 'Search' }], {
-        model: 'gemini-3.5-flash',
+        model: 'gemini-3.6-flash',
       });
 
       expect(response.tool_calls).toHaveLength(1);
@@ -252,13 +256,14 @@ describe('GeminiProvider', () => {
               geminiParts: [
                 {
                   functionCall: { id: 'fc_abc', name: 'search', args: { query: 'test' } },
+                  thoughtSignature: 'sig-fc-abc',
                 },
               ],
             },
           },
           { role: 'tool', content: '{"hits":3}', tool_call_id: 'fc_abc' },
         ],
-        { model: 'gemini-3.5-flash' },
+        { model: 'gemini-3.6-flash' },
       );
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
@@ -283,6 +288,7 @@ describe('GeminiProvider', () => {
                   parts: [
                     {
                       functionCall: { id: 'fc_a', name: 'tool_a', args: { x: 1 } },
+                      thoughtSignature: 'sig-fc-a',
                     },
                     {
                       functionCall: { id: 'fc_b', name: 'tool_b', args: { y: 2 } },
@@ -298,7 +304,7 @@ describe('GeminiProvider', () => {
 
       const provider = new GeminiProvider();
       const response = await provider.chat([{ role: 'user', content: 'Use both' }], {
-        model: 'gemini-3.5-flash',
+        model: 'gemini-3.6-flash',
       });
 
       expect(response.tool_calls).toHaveLength(2);
@@ -322,7 +328,7 @@ describe('GeminiProvider', () => {
           { role: 'tool', content: '{"a":1}', tool_call_id: 'fc_a' },
           { role: 'tool', content: '{"b":2}', tool_call_id: 'fc_b' },
         ],
-        { model: 'gemini-3.5-flash' },
+        { model: 'gemini-3.6-flash' },
       );
 
       const body = JSON.parse(turn2Mock.mock.calls[0][1].body);
@@ -502,12 +508,11 @@ describe('GeminiProvider', () => {
 
       const provider = new GeminiProvider();
       const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
       });
 
-      // gemini-2.0-flash: [0.1e-6, 0.4e-6]
-      // Expected: 100 * 0.1e-6 + 50 * 0.4e-6 = 0.00001 + 0.00002 = 0.00003
-      expect(response.cost).toBeCloseTo(0.00003, 8);
+      // gemini-2.5-flash: input $0.30/M, output $2.50/M
+      expect(response.cost).toBeCloseTo(0.000155, 8);
       expect(response.usage).toEqual({
         prompt_tokens: 100,
         completion_tokens: 50,
@@ -530,15 +535,13 @@ describe('GeminiProvider', () => {
 
       const provider = new GeminiProvider();
       const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
       });
 
-      // gemini-2.0-flash: [0.1e-6, 0.4e-6]
-      // Non-cached input: 200 * 0.1e-6 = 0.00002
-      // Cached input:     800 * 0.1e-6 * 0.1 = 0.000008
-      // Output:           50 * 0.4e-6 = 0.00002
-      // Total: 0.000048
-      expect(response.cost).toBeCloseTo(0.000048, 8);
+      // Non-cached input: 200 * 0.3e-6 = 0.00006
+      // Cached input:     800 * 0.03e-6 = 0.000024
+      // Output:           50 * 2.5e-6 = 0.000125
+      expect(response.cost).toBeCloseTo(0.000209, 8);
       expect(response.usage).toEqual({
         prompt_tokens: 1000,
         completion_tokens: 50,
@@ -547,29 +550,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('estimates cost for gemini-3.1 models', async () => {
-      mockFetch({
-        json: () =>
-          Promise.resolve(
-            makeGeminiResponse('Hi', {
-              promptTokenCount: 100,
-              candidatesTokenCount: 50,
-              totalTokenCount: 150,
-            }),
-          ),
-      });
-
-      const provider = new GeminiProvider();
-      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
-        model: 'gemini-3.1-flash-lite-preview',
-      });
-
-      // gemini-3.1-flash-lite-preview: [0.25e-6, 1.5e-6]
-      // Expected: 100 * 0.25e-6 + 50 * 1.5e-6 = 0.000025 + 0.000075 = 0.0001
-      expect(response.cost).toBeCloseTo(0.0001, 8);
-    });
-
-    it('estimates cost for gemini-3.1-flash-lite GA identifier (same rate as preview)', async () => {
+    it('estimates cost for an exact current gemini-3.1 model id', async () => {
       mockFetch({
         json: () =>
           Promise.resolve(
@@ -586,9 +567,29 @@ describe('GeminiProvider', () => {
         model: 'gemini-3.1-flash-lite',
       });
 
-      // gemini-3.1-flash-lite (GA): [0.25e-6, 1.5e-6], identical to preview
-      // Expected: 100 * 0.25e-6 + 50 * 1.5e-6 = 0.0001
+      // gemini-3.1-flash-lite-preview: [0.25e-6, 1.5e-6]
+      // Expected: 100 * 0.25e-6 + 50 * 1.5e-6 = 0.000025 + 0.000075 = 0.0001
       expect(response.cost).toBeCloseTo(0.0001, 8);
+    });
+
+    it('returns undefined cost for retired Gemini 2.0 models', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve(
+            makeGeminiResponse('Hi', {
+              promptTokenCount: 100,
+              candidatesTokenCount: 50,
+              totalTokenCount: 150,
+            }),
+          ),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.0-flash',
+      });
+
+      expect(response.cost).toBeUndefined();
     });
 
     it('returns undefined cost for unknown models (honest lower-bound signal)', async () => {
@@ -611,9 +612,7 @@ describe('GeminiProvider', () => {
       expect(response.cost).toBeUndefined();
     });
 
-    it('prefers longer prefix matches for versioned model names', async () => {
-      // gemini-2.5-flash-lite-preview-0520 should match gemini-2.5-flash-lite (0.1e-6 input),
-      // not the shorter gemini-2.5-flash prefix (0.3e-6 input — a 3x overcharge).
+    it('does not infer pricing for a versioned sibling model id', async () => {
       mockFetch({
         json: () =>
           Promise.resolve(
@@ -630,13 +629,10 @@ describe('GeminiProvider', () => {
         model: 'gemini-2.5-flash-lite-preview-0520',
       });
 
-      // Should match gemini-2.5-flash-lite: [0.1e-6, 0.4e-6]
-      // NOT gemini-2.5-flash: [0.3e-6, 2.5e-6]
-      // Expected: 1000 * 0.1e-6 = 0.0001
-      expect(response.cost).toBeCloseTo(0.0001, 8);
+      expect(response.cost).toBeUndefined();
     });
 
-    it('resolves versioned gemini-3.5-flash IDs to the base rate', async () => {
+    it('does not infer pricing for a versioned gemini-3.5-flash sibling', async () => {
       mockFetch({
         json: () =>
           Promise.resolve(
@@ -653,9 +649,514 @@ describe('GeminiProvider', () => {
         model: 'gemini-3.5-flash-001',
       });
 
-      // Should match gemini-3.5-flash: [1.5e-6, 9e-6]
-      // Expected: 1000 * 1.5e-6 = 0.0015
-      expect(response.cost).toBeCloseTo(0.0015, 8);
+      expect(response.cost).toBeUndefined();
+    });
+
+    it('prices gemini-3.6-flash from the response model and bills thoughts once', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            ...makeGeminiResponse('Hi', {
+              promptTokenCount: 100,
+              candidatesTokenCount: 10,
+              thoughtsTokenCount: 20,
+              totalTokenCount: 130,
+            }),
+            modelVersion: 'gemini-3.6-flash',
+          }),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.5-flash-lite',
+      });
+
+      // $1.50/M input + (10 candidate + 20 thought) * $7.50/M output.
+      expect(response.cost).toBeCloseTo(0.000375, 8);
+      expect(response.usage).toEqual({
+        prompt_tokens: 100,
+        completion_tokens: 10,
+        total_tokens: 130,
+        reasoning_tokens: 20,
+      });
+    });
+
+    it('leaves Flex and Priority calls unpriced', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            ...makeGeminiResponse('Hi'),
+            modelVersion: 'gemini-3.6-flash',
+            usageMetadata: {
+              promptTokenCount: 10,
+              candidatesTokenCount: 5,
+              totalTokenCount: 15,
+              serviceTier: 'SERVICE_TIER_FLEX',
+            },
+          }),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+        providerOptions: { serviceTier: 'SERVICE_TIER_PRIORITY' },
+      });
+
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body).serviceTier).toBe('SERVICE_TIER_PRIORITY');
+      expect(response.cost).toBeUndefined();
+    });
+
+    it('fails closed on malformed billed token counts', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve(
+            makeGeminiResponse('Hi', {
+              promptTokenCount: 10,
+              candidatesTokenCount: 5,
+              totalTokenCount: 15,
+              cachedContentTokenCount: 11,
+            }),
+          ),
+      });
+
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+      });
+
+      expect(response.usage).toBeUndefined();
+      expect(response.cost).toBeUndefined();
+    });
+
+    it('strips portable temperature only for the two newest Gemini models', async () => {
+      const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      const provider = new GeminiProvider();
+
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+        temperature: 0.7,
+      });
+
+      expect(
+        JSON.parse(fetchMock.mock.calls[0][1].body).generationConfig?.temperature,
+      ).toBeUndefined();
+
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.5-flash-lite',
+        temperature: 0.7,
+        providerOptions: { generationConfig: { temperature: 0.2 } },
+      });
+
+      expect(JSON.parse(fetchMock.mock.calls[1][1].body).generationConfig).toEqual({
+        temperature: 0.2,
+      });
+    });
+
+    it('rejects a newest-family terminal model prefill before fetch without mutating messages', async () => {
+      const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      const messages = [
+        { role: 'user' as const, content: 'Hello' },
+        { role: 'assistant' as const, content: 'Prefilled answer' },
+      ];
+      const originalMessages = structuredClone(messages);
+      const provider = new GeminiProvider();
+
+      await expect(provider.chat(messages, { model: 'gemini-3.6-flash' })).rejects.toThrow(
+        'does not support a terminal assistant/model prefill',
+      );
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(messages).toEqual(originalMessages);
+    });
+
+    it('allows an empty terminal assistant message for the newest family', async () => {
+      const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      const provider = new GeminiProvider();
+
+      await provider.chat(
+        [
+          { role: 'user', content: 'Hello' },
+          { role: 'assistant', content: '' },
+        ],
+        { model: 'gemini-3.5-flash-lite' },
+      );
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+    });
+
+    it('rejects Gemini 3 tool continuations that lack native signed parts before fetch', async () => {
+      const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      const provider = new GeminiProvider();
+
+      await expect(
+        provider.chat(
+          [
+            { role: 'user', content: 'Search' },
+            {
+              role: 'assistant',
+              content: '',
+              tool_calls: [
+                {
+                  id: 'call_1',
+                  type: 'function' as const,
+                  function: { name: 'search', arguments: '{"query":"axl"}' },
+                },
+              ],
+            },
+            { role: 'tool', tool_call_id: 'call_1', content: '{"result":"ok"}' },
+          ],
+          { model: 'gemini-3.6-flash' },
+        ),
+      ).rejects.toThrow('require providerMetadata.geminiParts with thought signatures');
+
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects missing, duplicate, and stale Gemini 3 tool responses before fetch', async () => {
+      const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      const provider = new GeminiProvider();
+      const assistant = {
+        role: 'assistant' as const,
+        content: '',
+        tool_calls: [
+          { id: 'fc_a', type: 'function' as const, function: { name: 'tool_a', arguments: '{}' } },
+          { id: 'fc_b', type: 'function' as const, function: { name: 'tool_b', arguments: '{}' } },
+        ],
+        providerMetadata: {
+          geminiParts: [
+            {
+              functionCall: { id: 'fc_a', name: 'tool_a', args: {} },
+              thoughtSignature: 'sig-a',
+            },
+            { functionCall: { id: 'fc_b', name: 'tool_b', args: {} } },
+          ],
+        },
+      };
+
+      await expect(
+        provider.chat(
+          [
+            { role: 'user', content: 'Use both' },
+            assistant,
+            { role: 'tool', tool_call_id: 'fc_a', content: '{}' },
+          ],
+          { model: 'gemini-3.6-flash' },
+        ),
+      ).rejects.toThrow('one contiguous functionResponse for every native functionCall');
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['duplicate', ['fc_a', 'fc_a'], undefined, 'exactly one matching native functionCall'],
+      [
+        'extra/stale',
+        ['fc_a', 'fc_b', 'stale'],
+        undefined,
+        'exactly one matching native functionCall',
+      ],
+      [
+        'raw/normalized name mismatch',
+        ['fc_a', 'fc_b'],
+        'different_name',
+        'exact native functionCall id/name',
+      ],
+    ])(
+      'rejects a %s Gemini 3 continuation group before fetch',
+      async (_caseName, responseIds, rawSecondName, expectedError) => {
+        const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+        const provider = new GeminiProvider();
+        const assistant = {
+          role: 'assistant' as const,
+          content: '',
+          tool_calls: [
+            {
+              id: 'fc_a',
+              type: 'function' as const,
+              function: { name: 'tool_a', arguments: '{}' },
+            },
+            {
+              id: 'fc_b',
+              type: 'function' as const,
+              function: { name: 'tool_b', arguments: '{}' },
+            },
+          ],
+          providerMetadata: {
+            geminiParts: [
+              {
+                functionCall: { id: 'fc_a', name: 'tool_a', args: {} },
+                thoughtSignature: 'sig-a',
+              },
+              {
+                functionCall: { id: 'fc_b', name: rawSecondName ?? 'tool_b', args: {} },
+              },
+            ],
+          },
+        };
+        await expect(
+          provider.chat(
+            [
+              { role: 'user', content: 'Use both' },
+              assistant,
+              ...responseIds.map((tool_call_id) => ({
+                role: 'tool' as const,
+                tool_call_id,
+                content: '{}',
+              })),
+            ],
+            { model: 'gemini-3.6-flash' },
+          ),
+        ).rejects.toThrow(expectedError);
+        expect(fetchMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it('uses the long-context Gemini 2.5 Pro band only above 200K prompt tokens', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve(
+            makeGeminiResponse('Hi', {
+              promptTokenCount: 200_001,
+              candidatesTokenCount: 1,
+              totalTokenCount: 200_002,
+            }),
+          ),
+      });
+      const provider = new GeminiProvider();
+      const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-pro',
+      });
+
+      expect(response.cost).toBeCloseTo(0.5000175, 8);
+    });
+
+    it('keeps the short-context rate at exactly 200K prompt tokens', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve(
+            makeGeminiResponse('Hi', {
+              promptTokenCount: 200_000,
+              candidatesTokenCount: 1,
+              totalTokenCount: 200_001,
+            }),
+          ),
+      });
+      const response = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-pro',
+      });
+
+      expect(response.cost).toBeCloseTo(0.25001, 8);
+    });
+
+    it('uses providerOptions.model for URL/capabilities/pricing but omits it from the body', async () => {
+      const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      const response = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-2.5-flash-lite',
+        temperature: 0.7,
+        providerOptions: { model: 'gemini-3.6-flash' },
+      });
+
+      expect(fetchMock.mock.calls[0][0]).toContain('/models/gemini-3.6-flash:generateContent');
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.model).toBeUndefined();
+      expect(body.generationConfig?.temperature).toBeUndefined();
+      expect(response.cost).toBeCloseTo(0.0000525, 8);
+    });
+
+    it('validates Gemini usage totals and exposes valid tool-use usage without pricing it', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve(
+            makeGeminiResponse('Hi', {
+              promptTokenCount: 10,
+              candidatesTokenCount: 5,
+              thoughtsTokenCount: 2,
+              toolUsePromptTokenCount: 3,
+              totalTokenCount: 20,
+            }),
+          ),
+      });
+      const response = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+      });
+      expect(response.usage?.completion_tokens).toBe(5);
+      expect(response.cost).toBeUndefined();
+    });
+
+    it('fails closed on mismatched total usage and on a near customtools suffix', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve(
+            makeGeminiResponse('Hi', {
+              promptTokenCount: 10,
+              candidatesTokenCount: 5,
+              totalTokenCount: 16,
+            }),
+          ),
+      });
+      const provider = new GeminiProvider();
+      const malformed = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+      });
+      expect(malformed.usage).toBeUndefined();
+
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: () => Promise.resolve(makeGeminiResponse('Hi')),
+        text: () => Promise.resolve(''),
+      });
+      const sibling = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.1-pro-preview-customtools-001',
+      });
+      expect(sibling.cost).toBeUndefined();
+    });
+
+    it('prices the exact Gemini 3.1 Pro customtools descriptor', async () => {
+      mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      const response = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.1-pro-preview-customtools',
+      });
+      expect(response.cost).toBeCloseTo(0.00008, 8);
+    });
+
+    it('gives customtools the Gemini 3 low thinking floor and continuation safety', async () => {
+      const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      const provider = new GeminiProvider();
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.1-pro-preview-customtools',
+        effort: 'none',
+      });
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body).generationConfig.thinkingConfig).toEqual({
+        thinkingLevel: 'low',
+      });
+
+      await expect(
+        provider.chat(
+          [
+            { role: 'user', content: 'Hello' },
+            {
+              role: 'assistant',
+              content: '',
+              tool_calls: [
+                { id: 'call_1', type: 'function', function: { name: 't', arguments: '{}' } },
+              ],
+            },
+            { role: 'tool', tool_call_id: 'call_1', content: '{}' },
+          ],
+          { model: 'gemini-3.1-pro-preview-customtools' },
+        ),
+      ).rejects.toThrow('require providerMetadata.geminiParts with thought signatures');
+    });
+
+    it('rejects a reused native functionCall id with a different name across replay turns', async () => {
+      const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      const signedAssistant = (name: string, signature: string) => ({
+        role: 'assistant' as const,
+        content: '',
+        tool_calls: [
+          { id: 'fc_reused', type: 'function' as const, function: { name, arguments: '{}' } },
+        ],
+        providerMetadata: {
+          geminiParts: [
+            { functionCall: { id: 'fc_reused', name, args: {} }, thoughtSignature: signature },
+          ],
+        },
+      });
+      await expect(
+        new GeminiProvider().chat(
+          [
+            { role: 'user', content: 'First' },
+            signedAssistant('first_tool', 'sig-1'),
+            { role: 'tool', tool_call_id: 'fc_reused', content: '{}' },
+            { role: 'user', content: 'Second' },
+            signedAssistant('second_tool', 'sig-2'),
+            { role: 'tool', tool_call_id: 'fc_reused', content: '{}' },
+          ],
+          { model: 'gemini-3.6-flash' },
+        ),
+      ).rejects.toThrow('native functionCall ids must be globally unique across a replay');
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('treats fatal finish reasons as errors even when the candidate has partial text', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            ...makeGeminiResponse('partial'),
+            candidates: [
+              { content: { role: 'model', parts: [{ text: 'partial' }] }, finishReason: 'SAFETY' },
+            ],
+          }),
+      });
+      await expect(
+        new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model: 'gemini-3.6-flash',
+        }),
+      ).rejects.toThrow('non-success finish reason: SAFETY');
+    });
+
+    it('leaves custom-base, hosted-tool, and non-text calls unpriced', async () => {
+      const provider = new GeminiProvider({
+        apiKey: 'test-key',
+        baseUrl: 'https://proxy.example/v1',
+      });
+      mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      expect(
+        (await provider.chat([{ role: 'user', content: 'Hello' }], { model: 'gemini-3.6-flash' }))
+          .cost,
+      ).toBeUndefined();
+
+      mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      expect(
+        (
+          await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+            model: 'gemini-3.6-flash',
+            providerOptions: { tools: [{ googleSearch: {} }] },
+          })
+        ).cost,
+      ).toBeUndefined();
+
+      mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      expect(
+        (
+          await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+            model: 'gemini-3.6-flash',
+            providerOptions: {
+              contents: [
+                { role: 'user', parts: [{ inlineData: { mimeType: 'image/png', data: 'abc' } }] },
+              ],
+            },
+          })
+        ).cost,
+      ).toBeUndefined();
+
+      mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      expect(
+        (
+          await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+            model: 'gemini-3.6-flash',
+            providerOptions: { cachedContent: 'cachedContents/example' },
+          })
+        ).cost,
+      ).toBeUndefined();
+
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            ...makeGeminiResponse(''),
+            candidates: [
+              { content: { role: 'model', parts: [{ inlineData: { mimeType: 'image/png' } }] } },
+            ],
+          }),
+      });
+      expect(
+        (
+          await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+            model: 'gemini-3.6-flash',
+          })
+        ).cost,
+      ).toBeUndefined();
     });
 
     it('handles API errors gracefully', async () => {
@@ -838,7 +1339,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('maps effort "max" to thinkingBudget 32768 for gemini-2.5-pro-preview (prefix match)', async () => {
+    it('does not infer the Gemini 2.5 Pro thinking limit for an unknown sibling', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve(makeGeminiResponse('ok')),
       });
@@ -851,7 +1352,7 @@ describe('GeminiProvider', () => {
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
       expect(body.generationConfig.thinkingConfig).toEqual({
-        thinkingBudget: 32768,
+        thinkingBudget: 24576,
       });
     });
 
@@ -914,7 +1415,7 @@ describe('GeminiProvider', () => {
 
       const provider = new GeminiProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
-        model: 'gemini-3-pro',
+        model: 'gemini-3.6-flash',
         effort: 'xhigh',
       });
 
@@ -1884,6 +2385,168 @@ describe('GeminiProvider', () => {
       });
     });
 
+    it('keeps newest-family streamed usage and billing aligned with non-streaming', async () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                modelVersion: 'gemini-3.6-flash',
+                candidates: [{ content: { role: 'model', parts: [{ text: 'Hi' }] } }],
+                usageMetadata: {
+                  promptTokenCount: 100,
+                  candidatesTokenCount: 10,
+                  thoughtsTokenCount: 20,
+                  totalTokenCount: 130,
+                  serviceTier: 'SERVICE_TIER_STANDARD',
+                },
+              })}\n\n`,
+            ),
+          );
+          controller.close();
+        },
+      });
+
+      mockFetch({ body: stream });
+      const provider = new GeminiProvider();
+      const chunks: any[] = [];
+      for await (const chunk of provider.stream([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.5-flash-lite',
+      })) {
+        chunks.push(chunk);
+      }
+
+      const done = chunks.at(-1);
+      expect(done.usage).toEqual({
+        prompt_tokens: 100,
+        completion_tokens: 10,
+        total_tokens: 130,
+        reasoning_tokens: 20,
+      });
+      expect(done.cost).toBeCloseTo(0.000375, 8);
+    });
+
+    it('never recovers stream pricing after conflicting tier evidence', async () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                usageMetadata: { serviceTier: 'SERVICE_TIER_STANDARD' },
+              })}\n\n`,
+            ),
+          );
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                candidates: [{ content: { role: 'model', parts: [{ text: 'Hi' }] } }],
+                usageMetadata: {
+                  promptTokenCount: 10,
+                  candidatesTokenCount: 5,
+                  totalTokenCount: 15,
+                  serviceTier: 'SERVICE_TIER_FLEX',
+                },
+              })}\n\n`,
+            ),
+          );
+          controller.close();
+        },
+      });
+      mockFetch({ body: stream });
+      const chunks: any[] = [];
+      for await (const chunk of new GeminiProvider().stream([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+      })) {
+        chunks.push(chunk);
+      }
+      expect(chunks.at(-1).cost).toBeUndefined();
+    });
+
+    it('keeps valid streamed tool-use usage but leaves its separate billing unpriced', async () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                candidates: [{ content: { role: 'model', parts: [{ text: 'Hi' }] } }],
+                usageMetadata: {
+                  promptTokenCount: 10,
+                  candidatesTokenCount: 5,
+                  toolUsePromptTokenCount: 1,
+                  totalTokenCount: 16,
+                  serviceTier: 'SERVICE_TIER_STANDARD',
+                },
+              })}\n\n`,
+            ),
+          );
+          controller.close();
+        },
+      });
+      mockFetch({ body: stream });
+      const chunks: any[] = [];
+      for await (const chunk of new GeminiProvider().stream([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+      })) {
+        chunks.push(chunk);
+      }
+      expect(chunks.at(-1).usage?.total_tokens).toBe(16);
+      expect(chunks.at(-1).cost).toBeUndefined();
+    });
+
+    it('throws on a fatal streamed finish reason even after partial text', async () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                candidates: [
+                  {
+                    content: { role: 'model', parts: [{ text: 'partial' }] },
+                    finishReason: 'SAFETY',
+                  },
+                ],
+              })}\n\n`,
+            ),
+          );
+          controller.close();
+        },
+      });
+      mockFetch({ body: stream });
+      await expect(async () => {
+        for await (const chunk of new GeminiProvider().stream(
+          [{ role: 'user', content: 'Hello' }],
+          {
+            model: 'gemini-3.6-flash',
+          },
+        )) {
+          expect(chunk.type).toBe('text_delta');
+        }
+      }).rejects.toThrow('non-success finish reason: SAFETY');
+    });
+
+    it('rejects a newest-family terminal model prefill before a stream fetch', async () => {
+      const fetchMock = mockFetch({});
+      const provider = new GeminiProvider();
+      const messages = [
+        { role: 'user' as const, content: 'Hello' },
+        { role: 'assistant' as const, content: 'Prefilled answer' },
+      ];
+      const originalMessages = structuredClone(messages);
+
+      await expect(async () => {
+        for await (const chunk of provider.stream(messages, { model: 'gemini-3.5-flash-lite' })) {
+          expect(chunk).toBeUndefined();
+        }
+      }).rejects.toThrow('does not support a terminal assistant/model prefill');
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(messages).toEqual(originalMessages);
+    });
+
     it('yields tool_call_delta for functionCall chunks', async () => {
       const encoder = new TextEncoder();
       const stream = new ReadableStream<Uint8Array>({
@@ -1924,7 +2587,7 @@ describe('GeminiProvider', () => {
       });
     });
 
-    it('preserves functionCall.id from Gemini 3.x responses (streaming)', async () => {
+    it('preserves functionCall.id from Gemini 3.6 Flash responses (streaming)', async () => {
       const encoder = new TextEncoder();
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
@@ -1948,7 +2611,7 @@ describe('GeminiProvider', () => {
 
       const provider = new GeminiProvider();
       const gen = provider.stream([{ role: 'user', content: 'Search' }], {
-        model: 'gemini-3.5-flash',
+        model: 'gemini-3.6-flash',
       });
 
       const chunks: any[] = [];
@@ -1960,6 +2623,74 @@ describe('GeminiProvider', () => {
       expect(toolDelta).toBeDefined();
       expect(toolDelta.id).toBe('fc_abc');
       expect(toolDelta.name).toBe('search');
+    });
+
+    it('continues parallel calls from stream-derived signed metadata with an exact response group', async () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                candidates: [
+                  {
+                    content: {
+                      role: 'model',
+                      parts: [
+                        {
+                          functionCall: { id: 'fc_a', name: 'tool_a', args: {} },
+                          thoughtSignature: 'sig-a',
+                        },
+                        { functionCall: { id: 'fc_b', name: 'tool_b', args: {} } },
+                      ],
+                    },
+                  },
+                ],
+                usageMetadata: {
+                  promptTokenCount: 10,
+                  candidatesTokenCount: 5,
+                  totalTokenCount: 15,
+                  serviceTier: 'SERVICE_TIER_STANDARD',
+                },
+              })}\n\n`,
+            ),
+          );
+          controller.close();
+        },
+      });
+      mockFetch({ body: stream });
+      const streamed: any[] = [];
+      for await (const chunk of new GeminiProvider().stream([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+      })) {
+        streamed.push(chunk);
+      }
+      const metadata = streamed.at(-1).providerMetadata;
+
+      const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Done')) });
+      await new GeminiProvider().chat(
+        [
+          { role: 'user', content: 'Hello' },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              { id: 'fc_a', type: 'function', function: { name: 'tool_a', arguments: '{}' } },
+              { id: 'fc_b', type: 'function', function: { name: 'tool_b', arguments: '{}' } },
+            ],
+            providerMetadata: metadata,
+          },
+          { role: 'tool', tool_call_id: 'fc_a', content: '{}' },
+          { role: 'tool', tool_call_id: 'fc_b', content: '{}' },
+        ],
+        { model: 'gemini-3.6-flash' },
+      );
+
+      const parts = JSON.parse(fetchMock.mock.calls[0][1].body).contents.at(-1).parts;
+      expect(parts.map((part: any) => part.functionResponse)).toEqual([
+        { id: 'fc_a', name: 'tool_a', response: {} },
+        { id: 'fc_b', name: 'tool_b', response: {} },
+      ]);
     });
 
     it('yields thinking_delta for thought parts and text_delta for regular parts', async () => {
@@ -2037,7 +2768,7 @@ describe('GeminiProvider', () => {
 
       const provider = new GeminiProvider();
       const gen = provider.stream([{ role: 'user', content: 'Hi' }], {
-        model: 'gemini-3-pro-preview',
+        model: 'gemini-3.6-flash',
       });
 
       const chunks: any[] = [];
@@ -2119,7 +2850,10 @@ describe('GeminiProvider', () => {
     it('mapMessages uses raw geminiParts from providerMetadata when available', async () => {
       const rawParts = [
         { text: '', thoughtSignature: 'sig-round-trip' },
-        { functionCall: { name: 'search', args: { q: 'test' } }, thoughtSignature: 'sig-fc' },
+        {
+          functionCall: { id: 'tc_1', name: 'search', args: { q: 'test' } },
+          thoughtSignature: 'sig-fc',
+        },
       ];
 
       const fetchMock = mockFetch({

@@ -116,52 +116,169 @@ function parseGeminiFunctionResponse(content: string): Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------
-// Approximate per-token pricing (USD) for common Gemini models.
-// Format: [inputCostPerToken, outputCostPerToken]
-// Uses standard context pricing (<=200k) as default.
+// Per-token Standard-tier pricing (USD) for supported current Gemini models.
+// Model ids deliberately match exactly: a date/version suffix can change the
+// billing contract, so an unknown sibling must remain unpriced.
 // ---------------------------------------------------------------------------
 
-const GEMINI_PRICING: Record<string, [number, number]> = {
-  'gemini-2.5-pro': [1.25e-6, 10e-6],
-  'gemini-2.5-flash': [0.3e-6, 2.5e-6],
-  'gemini-2.5-flash-lite': [0.1e-6, 0.4e-6],
-  'gemini-2.0-flash': [0.1e-6, 0.4e-6],
-  'gemini-2.0-flash-lite': [0.1e-6, 0.4e-6],
-  'gemini-3-pro-preview': [2e-6, 12e-6],
-  'gemini-3-flash-preview': [0.5e-6, 3e-6],
-  'gemini-3.1-pro-preview': [2e-6, 12e-6],
-  'gemini-3.1-flash-lite': [0.25e-6, 1.5e-6],
-  'gemini-3.1-flash-lite-preview': [0.25e-6, 1.5e-6],
-  'gemini-3.5-flash': [1.5e-6, 9e-6],
+type GeminiRate = {
+  input: number;
+  cached: number;
+  output: number;
+  longContext?: { input: number; cached: number; output: number };
 };
 
-/** Pre-sorted keys (longest first) for prefix matching versioned model names. */
-const GEMINI_PRICING_KEYS_BY_LENGTH = Object.keys(GEMINI_PRICING).sort(
-  (a, b) => b.length - a.length,
-);
+const GEMINI_PRICING: Record<string, GeminiRate> = {
+  'gemini-2.5-pro': {
+    input: 1.25e-6,
+    cached: 0.125e-6,
+    output: 10e-6,
+    longContext: { input: 2.5e-6, cached: 0.25e-6, output: 15e-6 },
+  },
+  'gemini-2.5-flash': { input: 0.3e-6, cached: 0.03e-6, output: 2.5e-6 },
+  'gemini-2.5-flash-lite': { input: 0.1e-6, cached: 0.01e-6, output: 0.4e-6 },
+  'gemini-3-flash-preview': { input: 0.5e-6, cached: 0.05e-6, output: 3e-6 },
+  'gemini-3.1-pro-preview': {
+    input: 2e-6,
+    cached: 0.2e-6,
+    output: 12e-6,
+    longContext: { input: 4e-6, cached: 0.4e-6, output: 18e-6 },
+  },
+  'gemini-3.1-pro-preview-customtools': {
+    input: 2e-6,
+    cached: 0.2e-6,
+    output: 12e-6,
+    longContext: { input: 4e-6, cached: 0.4e-6, output: 18e-6 },
+  },
+  'gemini-3.1-flash-lite': { input: 0.25e-6, cached: 0.025e-6, output: 1.5e-6 },
+  'gemini-3.5-flash': { input: 1.5e-6, cached: 0.15e-6, output: 9e-6 },
+  'gemini-3.5-flash-lite': { input: 0.3e-6, cached: 0.03e-6, output: 2.5e-6 },
+  'gemini-3.6-flash': { input: 1.5e-6, cached: 0.15e-6, output: 7.5e-6 },
+};
 
-function estimateGeminiCost(
-  model: string,
-  inputTokens: number,
-  outputTokens: number,
-  cachedTokens?: number,
-): number | undefined {
-  let pricing = GEMINI_PRICING[model];
-  if (!pricing) {
-    for (const key of GEMINI_PRICING_KEYS_BY_LENGTH) {
-      if (model.startsWith(key)) {
-        pricing = GEMINI_PRICING[key];
-        break;
-      }
-    }
+type GeminiPriceUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens?: number;
+};
+
+type GeminiPricingContext = {
+  model: string;
+  serviceTier?: unknown;
+  eligibleRequest: boolean;
+};
+
+type NormalizedGeminiUsage = {
+  usage: NonNullable<ProviderResponse['usage']>;
+  pricingUsage: GeminiPriceUsage;
+  hasUnmodeledBilledUsage: boolean;
+};
+
+function isValidTokenCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isStandardGeminiRequestTier(value: unknown): boolean {
+  return (
+    value === undefined || value === 'SERVICE_TIER_UNSPECIFIED' || value === 'SERVICE_TIER_STANDARD'
+  );
+}
+
+function isDefinitiveStandardGeminiResponseTier(value: unknown): boolean {
+  return value === 'SERVICE_TIER_UNSPECIFIED' || value === 'SERVICE_TIER_STANDARD';
+}
+
+function isEligibleGeminiPricing(
+  context: GeminiPricingContext,
+  hasDefinitiveStandardResponseTier: boolean,
+  hasInvalidResponseTier: boolean,
+): boolean {
+  return (
+    context.eligibleRequest &&
+    isStandardGeminiRequestTier(context.serviceTier) &&
+    hasDefinitiveStandardResponseTier &&
+    !hasInvalidResponseTier
+  );
+}
+
+function estimateGeminiCost(model: string, usage: GeminiPriceUsage): number | undefined {
+  const pricing = GEMINI_PRICING[model];
+  const cached = usage.cachedTokens ?? 0;
+  if (
+    !pricing ||
+    !isValidTokenCount(usage.inputTokens) ||
+    !isValidTokenCount(usage.outputTokens) ||
+    !isValidTokenCount(cached) ||
+    cached > usage.inputTokens
+  ) {
+    return undefined;
   }
-  if (!pricing) return undefined;
 
-  const [inputRate, outputRate] = pricing;
-  const cached = cachedTokens ?? 0;
-  // Gemini charges 10% of input rate for cached tokens (90% discount)
-  const inputCost = (inputTokens - cached) * inputRate + cached * inputRate * 0.1;
-  return inputCost + outputTokens * outputRate;
+  const rate = usage.inputTokens > 200_000 && pricing.longContext ? pricing.longContext : pricing;
+  return (
+    (usage.inputTokens - cached) * rate.input +
+    cached * rate.cached +
+    usage.outputTokens * rate.output
+  );
+}
+
+function safeTokenSum(...values: number[]): number | undefined {
+  const total = values.reduce((sum, value) => sum + value, 0);
+  return Number.isSafeInteger(total) ? total : undefined;
+}
+
+function normalizeGeminiUsage(raw: GeminiUsageMetadata): NormalizedGeminiUsage | undefined {
+  const inputTokens = raw.promptTokenCount;
+  const completionTokens = raw.candidatesTokenCount;
+  const totalTokens = raw.totalTokenCount;
+  const cachedTokens = raw.cachedContentTokenCount ?? 0;
+  const reasoningTokens = raw.thoughtsTokenCount ?? 0;
+  const toolUsePromptTokens = raw.toolUsePromptTokenCount ?? 0;
+  if (
+    !isValidTokenCount(inputTokens) ||
+    !isValidTokenCount(completionTokens) ||
+    !isValidTokenCount(totalTokens) ||
+    !isValidTokenCount(cachedTokens) ||
+    !isValidTokenCount(reasoningTokens) ||
+    !isValidTokenCount(toolUsePromptTokens) ||
+    cachedTokens > inputTokens
+  ) {
+    return undefined;
+  }
+
+  // Gemini reports candidate output and thinking output separately. Its public
+  // Axl completion count intentionally remains candidatesTokenCount semantics,
+  // while billing includes thoughts exactly once.
+  const billedOutputTokens = safeTokenSum(completionTokens, reasoningTokens);
+  const expectedTotal = safeTokenSum(
+    inputTokens,
+    completionTokens,
+    reasoningTokens,
+    toolUsePromptTokens,
+  );
+  if (
+    billedOutputTokens === undefined ||
+    expectedTotal === undefined ||
+    totalTokens !== expectedTotal
+  ) {
+    return undefined;
+  }
+
+  return {
+    usage: {
+      prompt_tokens: inputTokens,
+      completion_tokens: completionTokens,
+      total_tokens: totalTokens,
+      cached_tokens: cachedTokens > 0 ? cachedTokens : undefined,
+      reasoning_tokens: reasoningTokens > 0 ? reasoningTokens : undefined,
+    },
+    pricingUsage: {
+      inputTokens,
+      outputTokens: billedOutputTokens,
+      cachedTokens,
+    },
+    hasUnmodeledBilledUsage: toolUsePromptTokens !== 0,
+  };
 }
 
 /** Default thinking budget tokens for each effort level (Gemini 2.x). */
@@ -182,9 +299,27 @@ const THINKING_LEVELS: Record<string, string> = {
   max: 'high', // 3.x caps at 'high'
 };
 
-/** Check if a model is Gemini 3.x generation (uses thinkingLevel instead of thinkingBudget). */
+/** Exact Gemini 3.x descriptors with thinkingLevel support. */
+const GEMINI_3X_MIN_THINKING_LEVEL = new Map<string, string>([
+  ['gemini-3-pro-preview', 'minimal'],
+  ['gemini-3-flash-preview', 'minimal'],
+  ['gemini-3.1-pro-preview', 'low'],
+  ['gemini-3.1-pro-preview-customtools', 'low'],
+  ['gemini-3.1-flash-lite', 'minimal'],
+  ['gemini-3.1-flash-lite-preview', 'minimal'],
+  ['gemini-3.5-flash', 'minimal'],
+  ['gemini-3.5-flash-lite', 'minimal'],
+  ['gemini-3.6-flash', 'minimal'],
+]);
+
+const GEMINI_MODELS_WITHOUT_PORTABLE_TEMPERATURE = new Set([
+  'gemini-3.5-flash-lite',
+  'gemini-3.6-flash',
+]);
+
+/** Check whether this exact descriptor uses thinkingLevel rather than thinkingBudget. */
 function isGemini3x(model: string): boolean {
-  return /^gemini-3[.-]/.test(model);
+  return GEMINI_3X_MIN_THINKING_LEVEL.has(model);
 }
 
 /**
@@ -203,9 +338,7 @@ function budgetToThinkingLevel(budgetTokens: number): string {
 
 /** Get the minimum supported thinkingLevel for a 3.x model. */
 function minThinkingLevel(model: string): string {
-  // 3.1 Pro doesn't support 'minimal' — 'low' is the floor
-  if (model.startsWith('gemini-3.1-pro')) return 'low';
-  return 'minimal';
+  return GEMINI_3X_MIN_THINKING_LEVEL.get(model) ?? 'minimal';
 }
 
 /** Warn once per model that effort: 'none' cannot fully disable thinking on Gemini 3.x. */
@@ -281,11 +414,13 @@ export class GeminiProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
-    const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options);
+    const pricingContext = this.pricingContext(this.requestModel(options), body);
+    this.assertSafeGemini3Continuation(messages, pricingContext.model);
+    const headers = this.buildHeaders(await this.resolveKey());
 
     const res = await fetchWithRetry(
-      `${this.baseUrl}/models/${options.model}:generateContent`,
+      `${this.baseUrl}/models/${pricingContext.model}:generateContent`,
       {
         method: 'POST',
         headers,
@@ -308,7 +443,7 @@ export class GeminiProvider implements Provider {
     }
 
     const json = (await res.json()) as GeminiResponse;
-    return this.parseResponse(json, options.model);
+    return this.parseResponse(json, pricingContext);
   }
 
   // ---------------------------------------------------------------------------
@@ -316,11 +451,13 @@ export class GeminiProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
-    const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options);
+    const pricingContext = this.pricingContext(this.requestModel(options), body);
+    this.assertSafeGemini3Continuation(messages, pricingContext.model);
+    const headers = this.buildHeaders(await this.resolveKey());
 
     const res = await fetchWithRetry(
-      `${this.baseUrl}/models/${options.model}:streamGenerateContent?alt=sse`,
+      `${this.baseUrl}/models/${pricingContext.model}:streamGenerateContent?alt=sse`,
       {
         method: 'POST',
         headers,
@@ -346,7 +483,7 @@ export class GeminiProvider implements Provider {
       throw new Error('Gemini stream response has no body');
     }
 
-    yield* this.parseSSEStream(res.body, options.model);
+    yield* this.parseSSEStream(res.body, pricingContext);
   }
 
   // ---------------------------------------------------------------------------
@@ -374,7 +511,168 @@ export class GeminiProvider implements Provider {
     return `Gemini API error (${status}): ${body}`;
   }
 
+  private pricingContext(
+    fallbackModel: string,
+    body: Record<string, unknown>,
+  ): GeminiPricingContext {
+    return {
+      // Gemini's model is normally selected in the URL. providerOptions is an
+      // explicit raw escape hatch, so honor a post-merge model override for both
+      // the URL and pricing rather than pricing a different request.
+      model: typeof body.model === 'string' ? body.model : fallbackModel,
+      serviceTier: body.serviceTier,
+      eligibleRequest:
+        this.baseUrl === 'https://generativelanguage.googleapis.com/v1beta' &&
+        this.isTextOnlyClientRequest(body),
+    };
+  }
+
+  private requestModel(options: ChatOptions): string {
+    return typeof options.providerOptions?.model === 'string'
+      ? options.providerOptions.model
+      : options.model;
+  }
+
+  private assertSafeGemini3Continuation(messages: ChatMessage[], model: string): void {
+    // Map into fresh request objects before inspecting the terminal turn. This
+    // treats an empty assistant message as absent, does not mutate the caller's
+    // history, and catches an actual model/tool-call continuation prefill.
+    if (GEMINI_MODELS_WITHOUT_PORTABLE_TEMPERATURE.has(model)) {
+      const mapped = this.mapMessages(messages.filter((message) => message.role !== 'system'));
+      if (mapped.at(-1)?.role === 'model') {
+        throw new Error(
+          `${model} does not support a terminal assistant/model prefill; end the request with a user or tool message.`,
+        );
+      }
+    }
+
+    if (!isGemini3x(model)) return;
+
+    const replayedNativeCallIds = new Set<string>();
+    for (const message of messages) {
+      if (message.role !== 'assistant' || !Array.isArray(message.providerMetadata?.geminiParts)) {
+        continue;
+      }
+      for (const part of message.providerMetadata.geminiParts) {
+        const id =
+          part !== null && typeof part === 'object'
+            ? (part as GeminiPart).functionCall?.id
+            : undefined;
+        if (!id) continue;
+        if (replayedNativeCallIds.has(id)) {
+          throw new Error(
+            `${model} native functionCall ids must be globally unique across a replay.`,
+          );
+        }
+        replayedNativeCallIds.add(id);
+      }
+    }
+
+    const consumedToolMessages = new Set<number>();
+    for (const [assistantIndex, message] of messages.entries()) {
+      if (message.role !== 'assistant' || !message.tool_calls?.length) continue;
+      const rawParts = message.providerMetadata?.geminiParts;
+      if (!Array.isArray(rawParts)) {
+        throw new Error(
+          `${model} tool continuations require providerMetadata.geminiParts with thought signatures.`,
+        );
+      }
+
+      const nativeCalls = rawParts.flatMap((part) => {
+        const functionCall =
+          part !== null && typeof part === 'object' ? (part as GeminiPart).functionCall : undefined;
+        return functionCall?.id ? [{ id: functionCall.id, name: functionCall.name, part }] : [];
+      });
+      const expectedCalls = new Map(
+        message.tool_calls.map((call) => [call.id, call.function.name]),
+      );
+      if (
+        expectedCalls.size !== message.tool_calls.length ||
+        nativeCalls.length !== message.tool_calls.length ||
+        new Set(nativeCalls.map((call) => call.id)).size !== nativeCalls.length ||
+        typeof nativeCalls[0]?.part.thoughtSignature !== 'string' ||
+        nativeCalls[0].part.thoughtSignature.length === 0 ||
+        nativeCalls.some((call) => expectedCalls.get(call.id) !== call.name)
+      ) {
+        throw new Error(
+          `${model} tool continuations require exact native functionCall id/name and a thoughtSignature on the first function call.`,
+        );
+      }
+      const seenResponses = new Set<string>();
+      let toolIndex = assistantIndex + 1;
+      while (messages[toolIndex]?.role === 'tool') {
+        const toolMessage = messages[toolIndex];
+        const toolCallId = toolMessage.tool_call_id;
+        if (!toolCallId || !expectedCalls.has(toolCallId) || seenResponses.has(toolCallId)) {
+          throw new Error(
+            `${model} functionResponse requires exactly one matching native functionCall id and name.`,
+          );
+        }
+        seenResponses.add(toolCallId);
+        consumedToolMessages.add(toolIndex);
+        toolIndex++;
+      }
+      if (seenResponses.size !== expectedCalls.size) {
+        throw new Error(
+          `${model} tool continuations require one contiguous functionResponse for every native functionCall.`,
+        );
+      }
+    }
+
+    for (const [index, message] of messages.entries()) {
+      if (message.role === 'tool' && !consumedToolMessages.has(index)) {
+        throw new Error(
+          `${model} functionResponse requires exactly one matching native functionCall id and name.`,
+        );
+      }
+    }
+  }
+
+  private isTextOnlyClientRequest(body: Record<string, unknown>): boolean {
+    if (!Array.isArray(body.contents) || body.cachedContent !== undefined) return false;
+    if (
+      body.contents.some(
+        (content) =>
+          content === null ||
+          typeof content !== 'object' ||
+          !Array.isArray((content as GeminiContent).parts) ||
+          (content as GeminiContent).parts.some((part) => this.isNonTextGeminiPart(part)),
+      )
+    ) {
+      return false;
+    }
+    if (
+      body.tools !== undefined &&
+      (!Array.isArray(body.tools) ||
+        body.tools.some(
+          (tool) =>
+            tool === null ||
+            typeof tool !== 'object' ||
+            !Array.isArray((tool as { functionDeclarations?: unknown }).functionDeclarations) ||
+            Object.keys(tool).some((key) => key !== 'functionDeclarations'),
+        ))
+    ) {
+      return false;
+    }
+    const modalities = (body.generationConfig as { responseModalities?: unknown } | undefined)
+      ?.responseModalities;
+    return (
+      modalities === undefined ||
+      modalities === 'TEXT' ||
+      (Array.isArray(modalities) && modalities.length === 1 && modalities[0] === 'TEXT')
+    );
+  }
+
+  private isNonTextGeminiPart(part: unknown): boolean {
+    return (
+      part === null ||
+      typeof part !== 'object' ||
+      ['inlineData', 'fileData', 'executableCode', 'codeExecutionResult'].some((key) => key in part)
+    );
+  }
+
   private buildRequestBody(messages: ChatMessage[], options: ChatOptions): Record<string, unknown> {
+    const requestModel = this.requestModel(options);
     const systemMessages = messages.filter((m) => m.role === 'system');
     const nonSystemMessages = messages.filter((m) => m.role !== 'system');
     const systemText = systemMessages.map((m) => m.content).join('\n\n');
@@ -397,7 +695,10 @@ export class GeminiProvider implements Provider {
 
     const generationConfig: Record<string, unknown> = {};
 
-    if (options.temperature !== undefined) {
+    if (
+      options.temperature !== undefined &&
+      !GEMINI_MODELS_WITHOUT_PORTABLE_TEMPERATURE.has(requestModel)
+    ) {
       generationConfig.temperature = options.temperature;
     }
     if (options.maxTokens !== undefined) {
@@ -435,11 +736,11 @@ export class GeminiProvider implements Provider {
 
     if (thinkingDisabled) {
       // effort: 'none' or thinkingBudget: 0 → minimize thinking
-      if (isGemini3x(options.model)) {
+      if (isGemini3x(requestModel)) {
         if (effort === 'none') {
-          warnGemini3xEffortNone(options.model);
+          warnGemini3xEffortNone(requestModel);
         }
-        generationConfig.thinkingConfig = { thinkingLevel: minThinkingLevel(options.model) };
+        generationConfig.thinkingConfig = { thinkingLevel: minThinkingLevel(requestModel) };
       } else {
         generationConfig.thinkingConfig = { thinkingBudget: 0 };
       }
@@ -447,7 +748,7 @@ export class GeminiProvider implements Provider {
     } else if (hasBudgetOverride) {
       // Explicit budget takes precedence over effort
       const config: Record<string, unknown> = {};
-      if (isGemini3x(options.model)) {
+      if (isGemini3x(requestModel)) {
         config.thinkingLevel = budgetToThinkingLevel(thinkingBudget!);
       } else {
         config.thinkingBudget = thinkingBudget!;
@@ -457,11 +758,11 @@ export class GeminiProvider implements Provider {
       if (!body.generationConfig) body.generationConfig = generationConfig;
     } else if (activeEffort) {
       const config: Record<string, unknown> = {};
-      if (isGemini3x(options.model)) {
+      if (isGemini3x(requestModel)) {
         config.thinkingLevel = THINKING_LEVELS[activeEffort] ?? 'medium';
       } else {
         // 2.5 Pro supports a higher max budget (32768) than other 2.5 models (24576)
-        if (activeEffort === 'max' && options.model.startsWith('gemini-2.5-pro')) {
+        if (activeEffort === 'max' && requestModel === 'gemini-2.5-pro') {
           config.thinkingBudget = 32768;
         } else {
           config.thinkingBudget = THINKING_BUDGETS[activeEffort] ?? 5000;
@@ -482,7 +783,9 @@ export class GeminiProvider implements Provider {
     }
 
     if (options.providerOptions) {
-      Object.assign(body, options.providerOptions);
+      const bodyOptions = { ...options.providerOptions };
+      delete bodyOptions.model;
+      Object.assign(body, bodyOptions);
     }
 
     return body;
@@ -507,6 +810,7 @@ export class GeminiProvider implements Provider {
     // NOT send one in that case (preserves 2.x behavior bit-for-bit).
     const toolCallIdToName = new Map<string, string>();
     const geminiNativeIds = new Set<string>();
+    const geminiNativeNames = new Map<string, string>();
     for (const msg of messages) {
       if (msg.role === 'assistant' && msg.tool_calls) {
         for (const tc of msg.tool_calls) {
@@ -517,7 +821,10 @@ export class GeminiProvider implements Provider {
         const rawParts = msg.providerMetadata?.geminiParts as GeminiPart[] | undefined;
         if (rawParts) {
           for (const p of rawParts) {
-            if (p.functionCall?.id) geminiNativeIds.add(p.functionCall.id);
+            if (p.functionCall?.id) {
+              geminiNativeIds.add(p.functionCall.id);
+              geminiNativeNames.set(p.functionCall.id, p.functionCall.name);
+            }
           }
         }
       }
@@ -563,7 +870,10 @@ export class GeminiProvider implements Provider {
           }
         }
       } else if (msg.role === 'tool') {
-        const functionName = toolCallIdToName.get(msg.tool_call_id!) ?? 'unknown';
+        const functionName =
+          (msg.tool_call_id ? geminiNativeNames.get(msg.tool_call_id) : undefined) ??
+          toolCallIdToName.get(msg.tool_call_id!) ??
+          'unknown';
         const functionResponse: {
           id?: string;
           name: string;
@@ -652,7 +962,10 @@ export class GeminiProvider implements Provider {
   // Internal: response parsing
   // ---------------------------------------------------------------------------
 
-  private parseResponse(json: GeminiResponse, model: string): ProviderResponse {
+  private parseResponse(
+    json: GeminiResponse,
+    pricingContext: GeminiPricingContext,
+  ): ProviderResponse {
     const candidate = json.candidates?.[0];
     let content = '';
     let thinkingContent = '';
@@ -680,21 +993,28 @@ export class GeminiProvider implements Provider {
       }
     }
 
-    const cachedTokens = json.usageMetadata?.cachedContentTokenCount;
-    const reasoningTokens = json.usageMetadata?.thoughtsTokenCount;
-    const usage = json.usageMetadata
-      ? {
-          prompt_tokens: json.usageMetadata.promptTokenCount ?? 0,
-          completion_tokens: json.usageMetadata.candidatesTokenCount ?? 0,
-          total_tokens: json.usageMetadata.totalTokenCount ?? 0,
-          cached_tokens: cachedTokens && cachedTokens > 0 ? cachedTokens : undefined,
-          reasoning_tokens: reasoningTokens && reasoningTokens > 0 ? reasoningTokens : undefined,
-        }
-      : undefined;
+    if (!candidate) {
+      throw new Error('Gemini response did not include a candidate.');
+    }
+    if (candidate.finishReason && !['STOP', 'MAX_TOKENS'].includes(candidate.finishReason)) {
+      throw new Error(`Gemini returned non-success finish reason: ${candidate.finishReason}`);
+    }
 
-    const cost = usage
-      ? estimateGeminiCost(model, usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens)
-      : undefined;
+    const normalized = json.usageMetadata ? normalizeGeminiUsage(json.usageMetadata) : undefined;
+    const effectiveModel =
+      typeof json.modelVersion === 'string' ? json.modelVersion : pricingContext.model;
+    const cost =
+      normalized &&
+      !normalized.hasUnmodeledBilledUsage &&
+      this.isTextOnlyGeminiResponse(candidate) &&
+      isEligibleGeminiPricing(
+        pricingContext,
+        isDefinitiveStandardGeminiResponseTier(json.usageMetadata?.serviceTier),
+        json.usageMetadata?.serviceTier !== undefined &&
+          !isDefinitiveStandardGeminiResponseTier(json.usageMetadata.serviceTier),
+      )
+        ? estimateGeminiCost(effectiveModel, normalized.pricingUsage)
+        : undefined;
 
     // Attach raw Gemini parts as providerMetadata so they can be sent back
     // verbatim in subsequent turns, preserving thoughtSignature and other opaque fields.
@@ -705,10 +1025,14 @@ export class GeminiProvider implements Provider {
       content,
       thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
-      usage,
+      usage: normalized?.usage,
       cost,
       providerMetadata,
     };
+  }
+
+  private isTextOnlyGeminiResponse(candidate: GeminiCandidate | undefined): boolean {
+    return candidate?.content?.parts.every((part) => !this.isNonTextGeminiPart(part)) ?? false;
   }
 
   // ---------------------------------------------------------------------------
@@ -717,20 +1041,17 @@ export class GeminiProvider implements Provider {
 
   private async *parseSSEStream(
     body: ReadableStream<Uint8Array>,
-    model: string,
+    pricingContext: GeminiPricingContext,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let usage:
-      | {
-          prompt_tokens: number;
-          completion_tokens: number;
-          total_tokens: number;
-          cached_tokens?: number;
-          reasoning_tokens?: number;
-        }
-      | undefined;
+    let normalizedUsage: NormalizedGeminiUsage | undefined;
+    let effectiveModel = pricingContext.model;
+    let hasDefinitiveStandardResponseTier = false;
+    let hasInvalidResponseTier = false;
+    let responseIsTextOnly = true;
+    let terminalFailure: string | undefined;
     // Accumulate raw parts across stream chunks for providerMetadata round-tripping
     const accumulatedParts: Array<Record<string, unknown>> = [];
 
@@ -757,22 +1078,25 @@ export class GeminiProvider implements Provider {
             continue;
           }
 
-          // Extract usage from this chunk (accumulate from final chunk)
+          if (typeof chunk.modelVersion === 'string') effectiveModel = chunk.modelVersion;
+
+          // Extract usage from this chunk. A malformed or incomplete usage
+          // report remains unpriced rather than manufacturing token counts.
           if (chunk.usageMetadata) {
-            const cached = chunk.usageMetadata.cachedContentTokenCount;
-            const reasoning = chunk.usageMetadata.thoughtsTokenCount;
-            usage = {
-              prompt_tokens: chunk.usageMetadata.promptTokenCount ?? 0,
-              completion_tokens: chunk.usageMetadata.candidatesTokenCount ?? 0,
-              total_tokens: chunk.usageMetadata.totalTokenCount ?? 0,
-              cached_tokens: cached && cached > 0 ? cached : undefined,
-              reasoning_tokens: reasoning && reasoning > 0 ? reasoning : undefined,
-            };
+            normalizedUsage = normalizeGeminiUsage(chunk.usageMetadata);
+            if (chunk.usageMetadata.serviceTier !== undefined) {
+              if (isDefinitiveStandardGeminiResponseTier(chunk.usageMetadata.serviceTier)) {
+                hasDefinitiveStandardResponseTier = true;
+              } else {
+                hasInvalidResponseTier = true;
+              }
+            }
           }
 
           const candidate = chunk.candidates?.[0];
           if (candidate?.content?.parts) {
             for (const part of candidate.content.parts) {
+              if (this.isNonTextGeminiPart(part)) responseIsTextOnly = false;
               // Accumulate raw parts for providerMetadata
               accumulatedParts.push(part);
 
@@ -793,22 +1117,32 @@ export class GeminiProvider implements Provider {
               }
             }
           }
+          if (candidate?.finishReason && !['STOP', 'MAX_TOKENS'].includes(candidate.finishReason)) {
+            terminalFailure = candidate.finishReason;
+          }
         }
+      }
+
+      if (terminalFailure) {
+        throw new Error(`Gemini returned non-success finish reason: ${terminalFailure}`);
       }
 
       const providerMetadata =
         accumulatedParts.length > 0 ? { geminiParts: accumulatedParts } : undefined;
       yield {
         type: 'done',
-        usage,
-        cost: usage
-          ? estimateGeminiCost(
-              model,
-              usage.prompt_tokens,
-              usage.completion_tokens,
-              usage.cached_tokens,
-            )
-          : undefined,
+        usage: normalizedUsage?.usage,
+        cost:
+          normalizedUsage &&
+          !normalizedUsage.hasUnmodeledBilledUsage &&
+          responseIsTextOnly &&
+          isEligibleGeminiPricing(
+            pricingContext,
+            hasDefinitiveStandardResponseTier,
+            hasInvalidResponseTier,
+          )
+            ? estimateGeminiCost(effectiveModel, normalizedUsage.pricingUsage)
+            : undefined,
         providerMetadata,
       };
     } finally {
@@ -840,23 +1174,30 @@ type GeminiContent = {
 };
 
 type GeminiResponse = {
-  candidates?: Array<{
-    content?: {
-      role: string;
-      parts: Array<{
-        text?: string;
-        thought?: boolean;
-        functionCall?: { id?: string; name: string; args: Record<string, unknown> };
-        [key: string]: unknown;
-      }>;
-    };
-    finishReason?: string;
-  }>;
-  usageMetadata?: {
-    promptTokenCount?: number;
-    candidatesTokenCount?: number;
-    totalTokenCount?: number;
-    cachedContentTokenCount?: number;
-    thoughtsTokenCount?: number;
+  modelVersion?: string;
+  candidates?: GeminiCandidate[];
+  usageMetadata?: GeminiUsageMetadata;
+};
+
+type GeminiCandidate = {
+  content?: {
+    role: string;
+    parts: Array<{
+      text?: string;
+      thought?: boolean;
+      functionCall?: { id?: string; name: string; args: Record<string, unknown> };
+      [key: string]: unknown;
+    }>;
   };
+  finishReason?: string;
+};
+
+type GeminiUsageMetadata = {
+  promptTokenCount?: number;
+  candidatesTokenCount?: number;
+  totalTokenCount?: number;
+  cachedContentTokenCount?: number;
+  thoughtsTokenCount?: number;
+  toolUsePromptTokenCount?: number;
+  serviceTier?: unknown;
 };

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-08-03
+
 ### Added
 
 - **Latest provider models.** Adds GPT-5.6 Sol (including the `gpt-5.6` alias),

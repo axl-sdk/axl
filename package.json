@@ -11,6 +11,7 @@
     "test:e2e": "pnpm --filter axl-tests test:e2e",
     "test:studio": "pnpm --filter axl-tests test:studio",
     "test:integration": "pnpm -r test:integration",
+    "test:integration:frontier": "pnpm --filter @axlsdk/axl test:integration:frontier",
     "test:smoke": "pnpm --filter axl-tests test:smoke",
     "lint": "eslint packages/*/src/",
     "format": "prettier --write packages/*/src/",

@@ -350,6 +350,31 @@ describe('AnthropicProvider', () => {
       expect(response.cost).toBeCloseTo(0.00035, 8);
     });
 
+    it('leaves not_available inference geo unpriced for Claude 4.6 and later', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-modern-unknown-geo',
+            type: 'message',
+            role: 'assistant',
+            model: 'claude-sonnet-5',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: {
+              input_tokens: 100,
+              output_tokens: 50,
+              service_tier: 'standard',
+              inference_geo: 'not_available',
+            },
+          }),
+      });
+
+      const response = await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-5',
+      });
+      expect(response.cost).toBeUndefined();
+    });
+
     it('leaves unknown modern Claude snapshot siblings unpriced', async () => {
       mockFetch({
         json: () =>

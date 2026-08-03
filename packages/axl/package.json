@@ -27,6 +27,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:integration:frontier": "vitest run --config vitest.frontier-integration.config.ts",
     "test:watch": "vitest watch",
     "lint": "tsc --noEmit"
   },

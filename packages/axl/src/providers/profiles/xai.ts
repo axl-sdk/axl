@@ -1,7 +1,9 @@
 import { reasoningEffortEmit, type ProviderProfile } from '../openai-compatible.js';
 
-// Exact Chat Completions descriptors only. Unknown siblings intentionally pass
-// through untouched: xAI model names are not a capability contract.
+// Exact Chat Completions descriptors only. Reviewed 2026-08-03 against the
+// first-party xAI model catalog and capability pages. Unknown siblings
+// intentionally pass through untouched: xAI model names are not a capability
+// contract.
 const GROK_45 = new Set(['grok-4.5', 'grok-4.5-latest', 'grok-build-latest']);
 const GROK_43 = new Set(['grok-4.3', 'grok-4.3-latest', 'grok-latest']);
 const GROK_420_REASONING = new Set([

@@ -16,7 +16,8 @@ import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 const ANTHROPIC_API_VERSION = '2023-06-01';
 
 // ---------------------------------------------------------------------------
-// Exact Anthropic model capabilities and Standard text pricing.
+// Exact Anthropic model capabilities and Standard text pricing. Reviewed
+// 2026-08-03 against https://platform.claude.com/docs/en/about-claude/pricing.
 //
 // Modern IDs intentionally use exact matching. A future sibling can still pass
 // through to Anthropic, but it must not inherit request semantics or a price.
@@ -122,6 +123,13 @@ const LEGACY_CLAUDE_MODELS = new Set([
   'claude-3-sonnet-20240229',
   'claude-3-haiku',
   'claude-3-haiku-20240307',
+]);
+
+/** Exact known models predating first-party inference_geo request support. */
+const PRE_INFERENCE_GEO_MODELS = new Set([
+  ...LEGACY_CLAUDE_MODELS,
+  'claude-opus-4-5',
+  'claude-opus-4-5-20251101',
 ]);
 
 function resolveClaudeCapability(model: string): ClaudeCapability | undefined {
@@ -400,26 +408,34 @@ function pricingContextFromBody(body: Record<string, unknown>): AnthropicPricing
   };
 }
 
-function isModifiedAnthropicResponse(json: AnthropicMessageResponse): boolean {
+function isModifiedAnthropicResponse(
+  json: AnthropicMessageResponse,
+  model: string | undefined,
+): boolean {
   return (
-    isAnthropicModifier('inference_geo', json.inference_geo, true) ||
-    isAnthropicModifier('speed', json.speed, true) ||
-    isAnthropicModifier('inference_geo', json.usage?.inference_geo, true) ||
-    isAnthropicModifier('speed', json.usage?.speed, true) ||
+    isAnthropicResponseModifier('inference_geo', json.inference_geo, model) ||
+    isAnthropicResponseModifier('speed', json.speed, model) ||
+    isAnthropicResponseModifier('inference_geo', json.usage?.inference_geo, model) ||
+    isAnthropicResponseModifier('speed', json.usage?.speed, model) ||
     hasBilledUnmodeledUsage(json.usage?.server_tool_use) ||
     hasUnmodeledIterations(json.usage?.iterations)
   );
 }
 
-function isAnthropicModifier(
+function isAnthropicModifier(kind: 'inference_geo' | 'speed', value: unknown): boolean {
+  if (value === undefined) return false;
+  return kind === 'speed' ? value !== 'standard' : value !== 'global';
+}
+
+function isAnthropicResponseModifier(
   kind: 'inference_geo' | 'speed',
   value: unknown,
-  responseMetadata = false,
+  model: string | undefined,
 ): boolean {
   if (value === undefined) return false;
-  return kind === 'speed'
-    ? value !== 'standard'
-    : value !== 'global' && !(responseMetadata && value === 'not_available');
+  if (kind === 'speed') return value !== 'standard';
+  if (value === 'global') return false;
+  return value !== 'not_available' || model === undefined || !PRE_INFERENCE_GEO_MODELS.has(model);
 }
 
 function hasAnthropicServerTool(tools: unknown): boolean {
@@ -967,7 +983,7 @@ export class AnthropicProvider implements Provider {
     const cost =
       normalized &&
       !pricingContext.unpricedModifier &&
-      !isModifiedAnthropicResponse(json) &&
+      !isModifiedAnthropicResponse(json, effectiveModel) &&
       !hasFallbackBoundary &&
       !refused
         ? estimateAnthropicCost(effectiveModel, normalized.pricingUsage)
@@ -1124,10 +1140,18 @@ export class AnthropicProvider implements Provider {
               if (typeof event.message?.model === 'string') effectiveModel = event.message.model;
               const messageFallback = hasFallbackIteration(event.message?.usage?.iterations);
               if (
-                isAnthropicModifier('inference_geo', event.message?.inference_geo, true) ||
-                isAnthropicModifier('speed', event.message?.speed, true) ||
-                isAnthropicModifier('inference_geo', event.message?.usage?.inference_geo, true) ||
-                isAnthropicModifier('speed', event.message?.usage?.speed, true) ||
+                isAnthropicResponseModifier(
+                  'inference_geo',
+                  event.message?.inference_geo,
+                  effectiveModel,
+                ) ||
+                isAnthropicResponseModifier('speed', event.message?.speed, effectiveModel) ||
+                isAnthropicResponseModifier(
+                  'inference_geo',
+                  event.message?.usage?.inference_geo,
+                  effectiveModel,
+                ) ||
+                isAnthropicResponseModifier('speed', event.message?.usage?.speed, effectiveModel) ||
                 hasBilledUnmodeledUsage(event.message?.usage?.server_tool_use) ||
                 hasUnmodeledIterations(event.message?.usage?.iterations)
               ) {
@@ -1144,8 +1168,12 @@ export class AnthropicProvider implements Provider {
                 finalizeUsage();
                 const terminalFallback = hasFallbackIteration(event.usage.iterations);
                 if (
-                  isAnthropicModifier('speed', event.usage.speed, true) ||
-                  isAnthropicModifier('inference_geo', event.usage.inference_geo, true) ||
+                  isAnthropicResponseModifier('speed', event.usage.speed, effectiveModel) ||
+                  isAnthropicResponseModifier(
+                    'inference_geo',
+                    event.usage.inference_geo,
+                    effectiveModel,
+                  ) ||
                   hasBilledUnmodeledUsage(event.usage.server_tool_use) ||
                   hasUnmodeledIterations(event.usage.iterations)
                 ) {

@@ -554,6 +554,8 @@ describe('OpenAIProvider', () => {
     });
 
     it('caps GPT-5.6 max at xhigh on Chat Completions', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
       for (const model of ['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
         const fetchMock = mockFetch({
           json: () =>
@@ -573,6 +575,18 @@ describe('OpenAIProvider', () => {
         expect(getRequestBody(fetchMock).reasoning_effort).toBe('xhigh');
       }
 
+      expect(warn).toHaveBeenCalledTimes(4);
+      for (const model of ['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining(`for ${model};`));
+      }
+
+      await new OpenAIProvider().chat([{ role: 'user', content: 'Hello again' }], {
+        model: 'gpt-5.6-luna',
+        maxTokens: 1024,
+        effort: 'max',
+      });
+      expect(warn).toHaveBeenCalledTimes(4);
+
       const fetchMock = mockFetch({
         json: () =>
           Promise.resolve({
@@ -589,6 +603,8 @@ describe('OpenAIProvider', () => {
       });
 
       expect(getRequestBody(fetchMock).reasoning_effort).toBe('xhigh');
+      expect(warn).toHaveBeenCalledTimes(4);
+      warn.mockRestore();
     });
 
     it('passes reasoning_effort "xhigh" on gpt-5.4 (xhigh supported)', async () => {

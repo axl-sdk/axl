@@ -327,3 +327,19 @@ Testing and [evaluation](../packages/axl-eval/README.md) are complementary but d
 - **Evaluation** uses real LLM calls, runs on demand during prompt iteration, costs money, and measures semantic output quality with scoring functions ("is this workout plan actually good?").
 
 Use testing to verify your workflow works correctly. Use evaluation to verify your prompts produce quality outputs — and to catch regressions when you change them.
+
+## Live provider gates
+
+Live tests are opt-in and load provider keys from the repository-root `.env`:
+
+```bash
+pnpm test:integration           # routine cross-provider contract coverage
+pnpm test:integration:frontier  # paid exact newest-model certification
+```
+
+The routine gate uses inexpensive models and excludes the newest-model matrix so it stays
+repeatable enough for regular provider work. Run the frontier gate when adding or revising a
+current model, before release, and during the monthly catalog review. It checks exact IDs,
+streaming, tool continuation, token usage, and pricing; static-priced native calls must report
+a positive cost, while response-priced providers may legitimately report a nonnegative total.
+Commit a dated, secret-free result under `docs/verification/` when the supported catalog changes.

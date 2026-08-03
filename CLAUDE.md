@@ -50,7 +50,8 @@ READMEs. Also keep `CHANGELOG.md` (`[Unreleased]`), `ROADMAP.md`, and the gitign
 pnpm test            # all tests (unit + e2e + studio) — MockProvider, no API keys
 pnpm -r typecheck    # type-check, no emit
 pnpm build           # build all packages (tsup)
-pnpm test:e2e | test:studio | test:smoke | test:integration   # integration needs API keys
+pnpm test:e2e | test:studio | test:smoke | test:integration   # routine live integration
+pnpm test:integration:frontier                                # paid newest-model certification
 pnpm --filter @axlsdk/studio dev    # Studio: concurrent Vite + server dev
 ```
 Run from the repo root. Per-area detail: `.claude/rules/testing.md` and the package rules.
@@ -69,9 +70,10 @@ Run from the repo root. Per-area detail: `.claude/rules/testing.md` and the pack
 
 ## Repo-specific conventions
 - **0.x SemVer**: patch = features *and* fixes; bump minor *only* for breaking changes.
-- **Tests use `MockProvider`** (no real keys). Live-API tests are gated
-  `skipIf(!…_API_KEY)` and run only via `pnpm test:integration` — cheapest model, tiny
-  payloads.
+- **Tests use `MockProvider`** (no real keys). Routine live-API tests are gated
+  `skipIf(!…_API_KEY)` and run via `pnpm test:integration` with cheap models and tiny
+  payloads. Exact newest-model certification is the separate, paid
+  `pnpm test:integration:frontier` gate.
 - **Never commit gitignored paths** (`.internal/**`); no `git add -f`.
 - **Never commit, push, or tag without explicit approval.**
 

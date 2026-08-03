@@ -24,11 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider-reported totals; current DeepSeek, Mistral, and Groq models use exact tables;
   unknown tiers, modifiers, deployments, or incomplete usage return `undefined`.
 - **Live-verified provider normalization.** OpenAI Chat Completions caps portable GPT-5.6
-  `max` effort to its accepted `xhigh` tier while Responses sends native `max`. Anthropic's
-  ordinary `inference_geo: "not_available"` and Gemini's lowercase Standard tier now retain
-  standard pricing; Gemini thinking-only token-limit responses normalize omitted visible
-  candidate tokens as zero only after the complete response proves a `MAX_TOKENS` finish
-  with no visible text or function output and the provider total validates that shape.
+  `max` effort to its accepted `xhigh` tier with a bounded warning while Responses sends
+  native `max`. Anthropic treats `inference_geo: "not_available"` as ordinary only for exact
+  pre-4.6 models; modern or unknown models fail closed. Gemini's lowercase Standard tier
+  retains standard pricing, while any omitted billed token category leaves usage and cost
+  unknown rather than inferring a zero.
+- **Tiered live-provider gates.** Routine integration excludes the expensive newest-model
+  matrix; `pnpm test:integration:frontier` runs explicit exact-model certification with
+  stronger usage and cost assertions and a dated result artifact.
 
 - **Tool-workflow documentation.** The Core, Studio, Eval, and migration guides now
   explain in user-facing terms how explicit tool outcomes, safe failure messages, and

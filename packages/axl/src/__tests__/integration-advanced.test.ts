@@ -382,6 +382,7 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
       system:
         'You are a triage agent. For ANY math question, immediately hand off to the math_expert agent. Do not attempt to answer math questions yourself.',
       handoffs: [{ agent: mathExpert }],
+      toolChoice: 'required',
     });
 
     const runtime = new AxlRuntime();
@@ -1080,6 +1081,7 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
         system:
           'You are a specialist. For any math computation, immediately hand off to calculator_agent. Do not try to compute yourself.',
         handoffs: [{ agent: calculatorAgent }],
+        toolChoice: 'required',
       });
 
       const router = agent({
@@ -1088,6 +1090,7 @@ describe.skipIf(providers.length === 0)('Advanced Integration', () => {
         system:
           'You are a router. For any question, immediately hand off to the specialist. Do not answer yourself.',
         handoffs: [{ agent: specialist }],
+        toolChoice: 'required',
       });
 
       const runtime = new AxlRuntime();

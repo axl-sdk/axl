@@ -36,14 +36,19 @@ async function collectDone(
   return done!;
 }
 
-function expectMetered(response: ProviderResponse): void {
+function expectMetered(response: ProviderResponse, cost: 'static' | 'reported'): void {
   expect(response.content.trim().length).toBeGreaterThan(0);
   expect(response.usage?.total_tokens).toBeGreaterThan(0);
   expect(response.cost).toBeTypeOf('number');
-  expect(response.cost).toBeGreaterThanOrEqual(0);
+  if (cost === 'static') expect(response.cost).toBeGreaterThan(0);
+  else expect(response.cost).toBeGreaterThanOrEqual(0);
 }
 
-async function toolContinuation(provider: Provider, model: string): Promise<void> {
+async function toolContinuation(
+  provider: Provider,
+  model: string,
+  cost: 'static' | 'reported',
+): Promise<void> {
   const first = await provider.chat(
     [{ role: 'user', content: 'Call acceptance_probe now. Do not answer directly.' }],
     {
@@ -71,6 +76,9 @@ async function toolContinuation(provider: Provider, model: string): Promise<void
   ];
   const second = await provider.chat(continuation, { model, maxTokens: 128, tools });
   expect(second.usage?.total_tokens).toBeGreaterThan(0);
+  expect(second.cost).toBeTypeOf('number');
+  if (cost === 'static') expect(second.cost).toBeGreaterThan(0);
+  else expect(second.cost).toBeGreaterThanOrEqual(0);
 }
 
 describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live acceptance', () => {
@@ -80,7 +88,7 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
   it.each(['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])(
     'Chat non-stream accepts exact model %s',
     async (model) => {
-      expectMetered(await chat.chat(prompt, { model, maxTokens: 32, effort: 'none' }));
+      expectMetered(await chat.chat(prompt, { model, maxTokens: 32, effort: 'none' }), 'static');
     },
     60_000,
   );
@@ -88,6 +96,7 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
   it('Responses non-stream accepts gpt-5.6-luna with native max', async () => {
     expectMetered(
       await responses.chat(prompt, { model: 'gpt-5.6-luna', maxTokens: 64, effort: 'max' }),
+      'static',
     );
   }, 60_000);
 
@@ -96,7 +105,7 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
       chat.stream(prompt, { model: 'gpt-5.6-luna', maxTokens: 32, effort: 'none' }),
     );
     expect(done.usage?.total_tokens).toBeGreaterThan(0);
-    expect(done.cost).toBeGreaterThanOrEqual(0);
+    expect(done.cost).toBeGreaterThan(0);
   }, 60_000);
 
   it('Responses stream returns terminal metered usage for gpt-5.6-luna', async () => {
@@ -104,11 +113,11 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
       responses.stream(prompt, { model: 'gpt-5.6-luna', maxTokens: 32, effort: 'none' }),
     );
     expect(done.usage?.total_tokens).toBeGreaterThan(0);
-    expect(done.cost).toBeGreaterThanOrEqual(0);
+    expect(done.cost).toBeGreaterThan(0);
   }, 60_000);
 
   it('Responses tool continuation succeeds on gpt-5.6-luna', async () => {
-    await toolContinuation(responses, 'gpt-5.6-luna');
+    await toolContinuation(responses, 'gpt-5.6-luna', 'static');
   }, 120_000);
 });
 
@@ -118,7 +127,7 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live a
   it.each(['claude-fable-5', 'claude-opus-5', 'claude-sonnet-5'])(
     'non-stream accepts exact model %s with its default thinking mode',
     async (model) => {
-      expectMetered(await provider.chat(prompt, { model, maxTokens: 128 }));
+      expectMetered(await provider.chat(prompt, { model, maxTokens: 128 }), 'static');
     },
     120_000,
   );
@@ -128,11 +137,11 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live a
       provider.stream(prompt, { model: 'claude-sonnet-5', maxTokens: 128 }),
     );
     expect(done.usage?.total_tokens).toBeGreaterThan(0);
-    expect(done.cost).toBeGreaterThanOrEqual(0);
+    expect(done.cost).toBeGreaterThan(0);
   }, 120_000);
 
   it('tool continuation replays Claude 5 provider metadata', async () => {
-    await toolContinuation(provider, 'claude-sonnet-5');
+    await toolContinuation(provider, 'claude-sonnet-5', 'static');
   }, 180_000);
 });
 
@@ -142,7 +151,10 @@ describe.skipIf(!process.env.GOOGLE_API_KEY)('latest models: Gemini live accepta
   it.each(['gemini-3.6-flash', 'gemini-3.5-flash-lite'])(
     'non-stream accepts exact model %s without deprecated sampling fields',
     async (model) => {
-      expectMetered(await provider.chat(prompt, { model, maxTokens: 256, temperature: 0.7 }));
+      expectMetered(
+        await provider.chat(prompt, { model, maxTokens: 256, temperature: 0.7 }),
+        'static',
+      );
     },
     60_000,
   );
@@ -152,11 +164,11 @@ describe.skipIf(!process.env.GOOGLE_API_KEY)('latest models: Gemini live accepta
       provider.stream(prompt, { model: 'gemini-3.5-flash-lite', maxTokens: 256 }),
     );
     expect(done.usage?.total_tokens).toBeGreaterThan(0);
-    expect(done.cost).toBeGreaterThanOrEqual(0);
+    expect(done.cost).toBeGreaterThan(0);
   }, 60_000);
 
   it('tool continuation preserves Gemini 3.5 function identity metadata', async () => {
-    await toolContinuation(provider, 'gemini-3.5-flash-lite');
+    await toolContinuation(provider, 'gemini-3.5-flash-lite', 'static');
   }, 120_000);
 });
 
@@ -166,7 +178,7 @@ describe.skipIf(!process.env.XAI_API_KEY)('latest models: xAI Chat live acceptan
   it.each(['grok-4.5', 'grok-4.3', 'grok-4.20', 'grok-4.20-non-reasoning'])(
     'non-stream accepts exact current Chat model %s and returned USD ticks',
     async (model) => {
-      expectMetered(await provider.chat(prompt, { model, maxTokens: 32 }));
+      expectMetered(await provider.chat(prompt, { model, maxTokens: 32 }), 'reported');
     },
     60_000,
   );
@@ -178,6 +190,6 @@ describe.skipIf(!process.env.XAI_API_KEY)('latest models: xAI Chat live acceptan
   }, 60_000);
 
   it('client function-tool continuation succeeds on grok-4.20', async () => {
-    await toolContinuation(provider, 'grok-4.20');
+    await toolContinuation(provider, 'grok-4.20', 'reported');
   }, 120_000);
 });

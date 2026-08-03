@@ -117,6 +117,7 @@ function parseGeminiFunctionResponse(content: string): Record<string, unknown> {
 
 // ---------------------------------------------------------------------------
 // Per-token Standard-tier pricing (USD) for supported current Gemini models.
+// Reviewed 2026-08-03 against https://ai.google.dev/gemini-api/docs/pricing.
 // Model ids deliberately match exactly: a date/version suffix can change the
 // billing contract, so an unknown sibling must remain unpriced.
 // ---------------------------------------------------------------------------
@@ -231,18 +232,9 @@ function safeTokenSum(...values: number[]): number | undefined {
   return Number.isSafeInteger(total) ? total : undefined;
 }
 
-function normalizeGeminiUsage(
-  raw: GeminiUsageMetadata,
-  allowOmittedCandidateTokens = false,
-): NormalizedGeminiUsage | undefined {
+function normalizeGeminiUsage(raw: GeminiUsageMetadata): NormalizedGeminiUsage | undefined {
   const inputTokens = raw.promptTokenCount;
-  // Gemini omits candidatesTokenCount when a thinking-only response reaches
-  // MAX_TOKENS before emitting visible text. The response parser must prove
-  // that complete terminal shape before allowing the omitted field as zero.
-  if (raw.candidatesTokenCount === undefined && !allowOmittedCandidateTokens) {
-    return undefined;
-  }
-  const completionTokens = raw.candidatesTokenCount ?? 0;
+  const completionTokens = raw.candidatesTokenCount;
   const totalTokens = raw.totalTokenCount;
   const cachedTokens = raw.cachedContentTokenCount ?? 0;
   const reasoningTokens = raw.thoughtsTokenCount ?? 0;
@@ -1013,14 +1005,7 @@ export class GeminiProvider implements Provider {
       throw new Error(`Gemini returned non-success finish reason: ${candidate.finishReason}`);
     }
 
-    const allowOmittedCandidateTokens =
-      candidate.finishReason === 'MAX_TOKENS' &&
-      !(candidate.content?.parts ?? []).some(
-        (part) => (!part.thought && part.text !== undefined) || part.functionCall !== undefined,
-      );
-    const normalized = json.usageMetadata
-      ? normalizeGeminiUsage(json.usageMetadata, allowOmittedCandidateTokens)
-      : undefined;
+    const normalized = json.usageMetadata ? normalizeGeminiUsage(json.usageMetadata) : undefined;
     const effectiveModel =
       typeof json.modelVersion === 'string' ? json.modelVersion : pricingContext.model;
     const cost =
@@ -1066,13 +1051,11 @@ export class GeminiProvider implements Provider {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let latestUsageMetadata: GeminiUsageMetadata | undefined;
+    let normalizedUsage: NormalizedGeminiUsage | undefined;
     let effectiveModel = pricingContext.model;
     let hasDefinitiveStandardResponseTier = false;
     let hasInvalidResponseTier = false;
     let responseIsTextOnly = true;
-    let hasVisibleCandidateOutput = false;
-    let terminalFinishReason: string | undefined;
     let terminalFailure: string | undefined;
     // Accumulate raw parts across stream chunks for providerMetadata round-tripping
     const accumulatedParts: Array<Record<string, unknown>> = [];
@@ -1105,7 +1088,7 @@ export class GeminiProvider implements Provider {
           // Extract usage from this chunk. A malformed or incomplete usage
           // report remains unpriced rather than manufacturing token counts.
           if (chunk.usageMetadata) {
-            latestUsageMetadata = chunk.usageMetadata;
+            normalizedUsage = normalizeGeminiUsage(chunk.usageMetadata);
             if (chunk.usageMetadata.serviceTier !== undefined) {
               if (isDefinitiveStandardGeminiResponseTier(chunk.usageMetadata.serviceTier)) {
                 hasDefinitiveStandardResponseTier = true;
@@ -1119,9 +1102,6 @@ export class GeminiProvider implements Provider {
           if (candidate?.content?.parts) {
             for (const part of candidate.content.parts) {
               if (this.isNonTextGeminiPart(part)) responseIsTextOnly = false;
-              if ((!part.thought && part.text !== undefined) || part.functionCall !== undefined) {
-                hasVisibleCandidateOutput = true;
-              }
               // Accumulate raw parts for providerMetadata
               accumulatedParts.push(part);
 
@@ -1142,7 +1122,6 @@ export class GeminiProvider implements Provider {
               }
             }
           }
-          if (candidate?.finishReason) terminalFinishReason = candidate.finishReason;
           if (candidate?.finishReason && !['STOP', 'MAX_TOKENS'].includes(candidate.finishReason)) {
             terminalFailure = candidate.finishReason;
           }
@@ -1155,12 +1134,6 @@ export class GeminiProvider implements Provider {
 
       const providerMetadata =
         accumulatedParts.length > 0 ? { geminiParts: accumulatedParts } : undefined;
-      const normalizedUsage = latestUsageMetadata
-        ? normalizeGeminiUsage(
-            latestUsageMetadata,
-            terminalFinishReason === 'MAX_TOKENS' && !hasVisibleCandidateOutput,
-          )
-        : undefined;
       yield {
         type: 'done',
         usage: normalizedUsage?.usage,

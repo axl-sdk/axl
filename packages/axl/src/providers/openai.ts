@@ -61,7 +61,8 @@ const withLongContext = (short: OpenAIRates): DirectOpenAIModel['long'] => ({
 });
 
 /**
- * Direct OpenAI Standard text pricing, per token. This is deliberately private:
+ * Direct OpenAI Standard text pricing, per token. Reviewed 2026-08-03 against
+ * https://developers.openai.com/api/docs/pricing. This is deliberately private:
  * the public tuple API cannot faithfully express cache writes or context tiers.
  * Every catalog id is explicit; arbitrary siblings and unlisted snapshots
  * never inherit an alias price.
@@ -570,6 +571,8 @@ export function resolveOpenAIReasoningEffort(
   return resolved.thinkingDisabled ? clampReasoningEffort(model, 'none') : undefined;
 }
 
+const warnedChatMaxDowngrades = new Set<string>();
+
 /**
  * Chat Completions currently caps GPT-5.6 at `xhigh`; the distinct `max`
  * tier is accepted by Responses. Keep the endpoint difference local so the
@@ -580,7 +583,17 @@ export function resolveOpenAIChatReasoningEffort(
   resolved: ResolvedThinkingOptions,
 ): ReasoningEffort | undefined {
   const effort = resolveOpenAIReasoningEffort(model, resolved);
-  return effort === 'max' ? 'xhigh' : effort;
+  if (effort !== 'max') return effort;
+
+  if (resolved.activeEffort === 'max' && !warnedChatMaxDowngrades.has(model)) {
+    warnedChatMaxDowngrades.add(model);
+    console.warn(
+      `[axl] OpenAI Chat Completions does not accept effort "max" for ${model}; ` +
+        'using "xhigh". Use the OpenAI Responses provider for native "max".',
+    );
+  }
+
+  return 'xhigh';
 }
 
 /**

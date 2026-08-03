@@ -17,10 +17,11 @@ implementation details.
   content validation via `pnpm pack`).
 - **Run from the repo root**: `pnpm test` (all), `pnpm test:e2e | test:studio | test:smoke`,
   `pnpm test:watch`, `pnpm -r test`.
-- **Live-API integration tests** are gated `describe.skipIf(!process.env.<PROVIDER>_API_KEY)`,
-  excluded from the default run, and fire only via `pnpm test:integration`. Use the
-  **cheapest model and tiny payloads** — keep integration cost minimal. Each package with
-  live tests has its own `vitest.integration.config.ts` loading the repo-root `.env`.
+- **Live-API integration tests** are gated `describe.skipIf(!process.env.<PROVIDER>_API_KEY)`
+  and excluded from the default run. Routine, repeatable coverage fires via
+  `pnpm test:integration`; use the **cheapest model and tiny payloads**. Expensive exact-model
+  certification fires only via `pnpm test:integration:frontier`. Each package with live tests
+  has an integration config that loads the repo-root `.env`.
 - **Studio React tests** opt into jsdom with a per-file `// @vitest-environment jsdom`
   directive; `setup-dom.ts` loads jest-dom matchers + RTL `cleanup` only when a DOM is
   present.

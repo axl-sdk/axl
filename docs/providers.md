@@ -56,7 +56,7 @@ openai:gpt-4                    # Legacy
 openai:gpt-3.5-turbo            # Legacy
 ```
 
-Reasoning model support (o-series): uses `developer` role instead of `system`, strips `temperature`, supports `effort` option. GPT-5.x models also support `effort` (reasoning) but use `system` role.
+Reasoning model support (o-series): uses `developer` role instead of `system`, strips `temperature`, supports `effort` option. GPT-5.x models also support `effort` (reasoning) but use `system` role. For backward compatibility, unknown GPT-5-shaped IDs retain this broad baseline request mapping; they do not inherit exact pricing or newer capabilities such as GPT-5.6 native `max`. Exact GPT-5.6 Chat requests with portable `effort: 'max'` warn once per model and use `xhigh`; select `openai-responses:` for native `max`.
 
 ## Anthropic
 
@@ -231,6 +231,30 @@ Notes & caveats:
   callback covers the four chat adapters; the semantic-memory embedder still takes a static key.)
 
 Build your own preset by cloning a `ProviderProfile` (see [Custom Providers](#custom-providers)).
+
+## Maintaining model capabilities and pricing
+
+Provider catalogs are reviewed on every provider model/pricing announcement, before an Axl
+release, and at least monthly while a frontier family is current. For each review:
+
+1. Check first-party model, API, pricing, lifecycle, and usage-field documentation; record the
+   review date and source links beside the relevant adapter table or profile.
+2. Add only documented exact aliases and snapshot formats. Keep unknown siblings pass-through
+   but unpriced, and do not grant them newer request capabilities through a pricing match.
+3. Re-audit every billable input category and response modifier: cached input, cache writes,
+   reasoning/thought tokens, long context, service tier, geography, batch mode, hosted tools,
+   and provider-reported totals.
+4. Add request/response fixtures for non-streaming and streaming paths, including malformed or
+   missing usage fields. Missing billed categories must produce unknown usage/cost, not inferred
+   zeroes.
+5. Run unit/type/build gates, then `pnpm test:integration` and the paid
+   `pnpm test:integration:frontier`. Save the supported provider/model result matrix under
+   `docs/verification/`; note credential-gated gaps explicitly.
+
+Effective-dated prices require an additional check on both sides of the boundary and a live
+review on or before the transition date. In particular, revisit Claude Sonnet 5's scheduled
+price transition before its configured effective date rather than assuming the announced rate
+remains unchanged.
 
 ## Configuration
 
@@ -417,7 +441,7 @@ const solution = await ctx.ask(reasoner, problem, { effort: 'low' });
 
 ### `effort`
 
-The `effort` parameter provides a unified way to control reasoning depth across all providers. Values: `'none'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`. Exact model and endpoint capabilities decide whether a tier is sent, clamped, or omitted. GPT-5.6 accepts native `'max'` on Responses; Chat Completions currently caps it to `'xhigh'`. Claude 5 accepts native `'max'`; older families retain their documented caps.
+The `effort` parameter provides a unified way to control reasoning depth across all providers. Values: `'none'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`. Exact model and endpoint capabilities decide whether a tier is sent, clamped, or omitted. GPT-5.6 accepts native `'max'` on Responses; Chat Completions currently warns once per exact model and caps it to `'xhigh'`. Claude 5 accepts native `'max'`; older families retain their documented caps.
 
 ```typescript
 // Most users — just effort:

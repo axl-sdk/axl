@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Latest provider model support.** Adds GPT-5.6, GPT-5.6 Pro, GPT-5.6 Luna,
-  Claude Fable 5, Opus 5, Sonnet 5, Gemini 3.6 Flash, and Gemini 3.5 Flash-Lite
-  with exact per-model reasoning, tool-continuation, streaming, and pricing behavior.
+- **Latest provider model support.** Adds GPT-5.6 Sol (and the `gpt-5.6` alias),
+  GPT-5.6 Terra, GPT-5.6 Luna, Claude Fable 5, Opus 5, Sonnet 5, Gemini 3.6 Flash,
+  and Gemini 3.5 Flash-Lite with exact per-model reasoning, tool-continuation,
+  streaming, and pricing behavior.
 - **Cache-write usage telemetry.** `cache_write_tokens` now flows through provider
   responses and terminal stream chunks, including Anthropic's distinct 5-minute and
   1-hour cache-creation buckets.

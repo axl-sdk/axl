@@ -9,8 +9,9 @@ All providers include automatic retry with exponential backoff on `429` (rate li
 The Responses API is the preferred OpenAI integration — it supports prompt caching, native reasoning, and automatic reasoning context round-tripping via `providerMetadata`. All models listed below are available with the `openai-responses:` prefix. Shares the `openai` provider config by default.
 
 ```
-openai-responses:gpt-5.6        # Flagship
-openai-responses:gpt-5.6-pro    # Highest-compute flagship
+openai-responses:gpt-5.6        # Alias of GPT-5.6 Sol
+openai-responses:gpt-5.6-sol    # Highest-capability GPT-5.6 variant
+openai-responses:gpt-5.6-terra  # Balanced GPT-5.6 variant
 openai-responses:gpt-5.6-luna   # Fast GPT-5.6 variant
 openai-responses:gpt-5-mini     # Cost-optimized reasoning and chat
 openai-responses:gpt-5-nano     # High-throughput, straightforward tasks
@@ -24,8 +25,9 @@ openai-responses:o3-pro          # Dedicated reasoning (pro)
 Same models available with the `openai:` prefix. Use this when you need features not yet supported on the Responses API (e.g., stop sequences).
 
 ```
-openai:gpt-5.6                  # Flagship
-openai:gpt-5.6-pro              # Highest-compute flagship
+openai:gpt-5.6                  # Alias of GPT-5.6 Sol
+openai:gpt-5.6-sol              # Highest-capability GPT-5.6 variant
+openai:gpt-5.6-terra            # Balanced GPT-5.6 variant
 openai:gpt-5.6-luna             # Fast GPT-5.6 variant
 openai:gpt-5.5                  # Previous gen
 openai:gpt-5.5-pro              # Previous gen (pro)

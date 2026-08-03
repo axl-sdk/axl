@@ -16,66 +16,207 @@ import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 const ANTHROPIC_API_VERSION = '2023-06-01';
 
 // ---------------------------------------------------------------------------
-// Approximate per-token pricing (USD) for common Anthropic models.
-// Format: [inputCostPerToken, outputCostPerToken]
-// These are rough estimates for budget tracking; not guaranteed to be exact.
+// Exact Anthropic model capabilities and Standard text pricing.
+//
+// Modern IDs intentionally use exact matching. A future sibling can still pass
+// through to Anthropic, but it must not inherit request semantics or a price.
 // ---------------------------------------------------------------------------
 
-const ANTHROPIC_PRICING: Record<string, [number, number]> = {
-  'claude-opus-4-8': [5e-6, 25e-6],
-  'claude-opus-4-7': [5e-6, 25e-6],
-  'claude-opus-4-6': [5e-6, 25e-6],
-  'claude-sonnet-4-6': [3e-6, 15e-6],
-  'claude-opus-4-5': [5e-6, 25e-6],
-  'claude-opus-4-1': [15e-6, 75e-6],
-  'claude-sonnet-4-5': [3e-6, 15e-6],
-  'claude-haiku-4-5': [1e-6, 5e-6],
-  'claude-sonnet-4': [3e-6, 15e-6],
-  'claude-opus-4': [15e-6, 75e-6],
-  'claude-3-7-sonnet': [3e-6, 15e-6],
-  'claude-3-5-sonnet': [3e-6, 15e-6],
-  'claude-3-5-haiku': [0.8e-6, 4e-6],
-  'claude-3-opus': [15e-6, 75e-6],
-  'claude-3-sonnet': [3e-6, 15e-6],
-  'claude-3-haiku': [0.25e-6, 1.25e-6],
+type ClaudeThinkingMode =
+  | 'legacy-manual'
+  | 'effort-only'
+  | 'adaptive-optional'
+  | 'adaptive-default-on'
+  | 'adaptive-always-on';
+
+type ClaudeCapability = {
+  thinking: ClaudeThinkingMode;
+  effortLevels?: readonly Exclude<Effort, 'none'>[];
+  manualBudget: boolean;
+  stripTemperature?: boolean;
+  disableAt?: Exclude<Effort, 'none'>;
 };
 
-/** Pre-sorted keys (longest first) for prefix matching versioned model names. */
-const ANTHROPIC_PRICING_KEYS_BY_LENGTH = Object.keys(ANTHROPIC_PRICING).sort(
-  (a, b) => b.length - a.length,
-);
+const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
+  'claude-fable-5': {
+    thinking: 'adaptive-always-on',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    manualBudget: false,
+    stripTemperature: true,
+  },
+  'claude-opus-5': {
+    thinking: 'adaptive-default-on',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    manualBudget: false,
+    stripTemperature: true,
+    disableAt: 'high',
+  },
+  'claude-sonnet-5': {
+    thinking: 'adaptive-default-on',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    manualBudget: false,
+    stripTemperature: true,
+    disableAt: 'max',
+  },
+  'claude-opus-4-8': {
+    thinking: 'adaptive-optional',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    manualBudget: false,
+    stripTemperature: true,
+  },
+  'claude-opus-4-7': {
+    thinking: 'adaptive-optional',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    manualBudget: false,
+    stripTemperature: true,
+  },
+  'claude-opus-4-6': {
+    thinking: 'adaptive-optional',
+    effortLevels: ['low', 'medium', 'high', 'max'],
+    manualBudget: true,
+  },
+  'claude-sonnet-4-6': {
+    thinking: 'adaptive-optional',
+    effortLevels: ['low', 'medium', 'high', 'max'],
+    manualBudget: true,
+  },
+  'claude-opus-4-5': {
+    thinking: 'effort-only',
+    effortLevels: ['low', 'medium', 'high'],
+    manualBudget: true,
+  },
+  'claude-opus-4-5-20251101': {
+    thinking: 'effort-only',
+    effortLevels: ['low', 'medium', 'high'],
+    manualBudget: true,
+  },
+};
 
-function estimateAnthropicCost(
-  model: string,
-  inputTokens: number,
-  outputTokens: number,
-  cacheReadTokens?: number,
-  cacheWriteTokens?: number,
+const LEGACY_CLAUDE_CAPABILITY: ClaudeCapability = {
+  thinking: 'legacy-manual',
+  manualBudget: true,
+};
+
+/** Exact legacy IDs retain the established manual-thinking fallback. */
+const LEGACY_CLAUDE_MODELS = new Set([
+  'claude-opus-4-1',
+  'claude-opus-4-1-20250805',
+  'claude-sonnet-4-5',
+  'claude-sonnet-4-5-20250929',
+  'claude-haiku-4-5',
+  'claude-haiku-4-5-20251001',
+  'claude-sonnet-4',
+  'claude-sonnet-4-20250514',
+  'claude-opus-4',
+  'claude-opus-4-20250514',
+  'claude-3-7-sonnet',
+  'claude-3-7-sonnet-20250219',
+  'claude-3-5-sonnet',
+  'claude-3-5-sonnet-20241022',
+  'claude-3-5-sonnet-20240620',
+  'claude-3-5-haiku',
+  'claude-3-5-haiku-20241022',
+  'claude-3-opus',
+  'claude-3-opus-20240229',
+  'claude-3-sonnet',
+  'claude-3-sonnet-20240229',
+  'claude-3-haiku',
+  'claude-3-haiku-20240307',
+]);
+
+function resolveClaudeCapability(model: string): ClaudeCapability | undefined {
+  return (
+    CLAUDE_CAPABILITIES[model] ??
+    (LEGACY_CLAUDE_MODELS.has(model) ? LEGACY_CLAUDE_CAPABILITY : undefined)
+  );
+}
+
+type AnthropicRate = { input: number; output: number; sonnet5Intro?: boolean };
+
+const ANTHROPIC_RATES: Record<string, AnthropicRate> = {
+  'claude-fable-5': { input: 10e-6, output: 50e-6 },
+  'claude-opus-5': { input: 5e-6, output: 25e-6 },
+  'claude-sonnet-5': { input: 3e-6, output: 15e-6, sonnet5Intro: true },
+  'claude-opus-4-8': { input: 5e-6, output: 25e-6 },
+  'claude-opus-4-7': { input: 5e-6, output: 25e-6 },
+  'claude-opus-4-6': { input: 5e-6, output: 25e-6 },
+  'claude-sonnet-4-6': { input: 3e-6, output: 15e-6 },
+  'claude-opus-4-5': { input: 5e-6, output: 25e-6 },
+  'claude-opus-4-5-20251101': { input: 5e-6, output: 25e-6 },
+  'claude-opus-4-1': { input: 15e-6, output: 75e-6 },
+  'claude-opus-4-1-20250805': { input: 15e-6, output: 75e-6 },
+  'claude-sonnet-4-5': { input: 3e-6, output: 15e-6 },
+  'claude-sonnet-4-5-20250929': { input: 3e-6, output: 15e-6 },
+  'claude-haiku-4-5': { input: 1e-6, output: 5e-6 },
+  'claude-haiku-4-5-20251001': { input: 1e-6, output: 5e-6 },
+};
+
+export type AnthropicPriceUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWrite5mTokens?: number;
+  cacheWrite1hTokens?: number;
+  /** Aggregate-only cache creation is intentionally unpriced. */
+  aggregateCacheWriteTokens?: number;
+};
+
+function isValidTokenCount(value: number | undefined): value is number {
+  return value !== undefined && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Price an observable Standard Anthropic text call. `now` is injectable so
+ * Sonnet 5's announced rate transition is deterministic in pure tests.
+ */
+export function estimateAnthropicCost(
+  model: string | undefined,
+  usage: AnthropicPriceUsage,
+  now: Date = new Date(),
 ): number | undefined {
-  // Try exact match first, then prefix match for versioned models
-  let pricing = ANTHROPIC_PRICING[model];
-  if (!pricing) {
-    for (const key of ANTHROPIC_PRICING_KEYS_BY_LENGTH) {
-      if (model.startsWith(key)) {
-        pricing = ANTHROPIC_PRICING[key];
-        break;
-      }
-    }
+  if (!model || !isValidTokenCount(usage.inputTokens) || !isValidTokenCount(usage.outputTokens)) {
+    return undefined;
   }
-  if (!pricing) return undefined;
+  const rate = ANTHROPIC_RATES[model];
+  if (!rate) return undefined;
 
-  const [inputRate, outputRate] = pricing;
-  const cacheRead = cacheReadTokens ?? 0;
-  const cacheWrite = cacheWriteTokens ?? 0;
-  // Anthropic cache reads cost 10% of base input rate (uniform across all models).
-  // Cache writes cost 125% for the default 5-minute TTL, or 200% for the 1-hour TTL.
-  // The API response does not distinguish between TTLs in cache_creation_input_tokens,
-  // so we conservatively assume 5-minute writes (1.25x) for all cache creation tokens.
-  const inputCost =
-    (inputTokens - cacheRead - cacheWrite) * inputRate +
-    cacheRead * inputRate * 0.1 +
-    cacheWrite * inputRate * 1.25;
-  return inputCost + outputTokens * outputRate;
+  const cacheRead = usage.cacheReadTokens ?? 0;
+  const cacheWrite5m = usage.cacheWrite5mTokens ?? 0;
+  const cacheWrite1h = usage.cacheWrite1hTokens ?? 0;
+  if (
+    !isValidTokenCount(cacheRead) ||
+    !isValidTokenCount(cacheWrite5m) ||
+    !isValidTokenCount(cacheWrite1h)
+  ) {
+    return undefined;
+  }
+
+  const cacheWriteTotal = safeTokenSum(cacheWrite5m, cacheWrite1h);
+  if (
+    cacheWriteTotal === undefined ||
+    safeTokenSum(usage.inputTokens, cacheRead, cacheWriteTotal) === undefined
+  ) {
+    return undefined;
+  }
+  if (
+    usage.aggregateCacheWriteTokens !== undefined &&
+    (!isValidTokenCount(usage.aggregateCacheWriteTokens) ||
+      usage.aggregateCacheWriteTokens !== cacheWriteTotal)
+  ) {
+    return undefined;
+  }
+
+  const { input, output } =
+    rate.sonnet5Intro && now < new Date('2026-09-01T00:00:00Z')
+      ? { input: 2e-6, output: 10e-6 }
+      : rate;
+  return (
+    usage.inputTokens * input +
+    cacheRead * input * 0.1 +
+    cacheWrite5m * input * 1.25 +
+    cacheWrite1h * input * 2 +
+    usage.outputTokens * output
+  );
 }
 
 /** Default thinking budget tokens for each effort level (manual mode fallback). */
@@ -83,68 +224,313 @@ const THINKING_BUDGETS: Record<string, number> = {
   low: 1024,
   medium: 5000,
   high: 10000,
+  xhigh: 20000,
   // 30000 (not 32000) to stay under the 32K max_tokens limit on Opus 4/4.1.
   // With auto-bump (+1024), max_tokens becomes 31024 which fits all models.
   max: 30000,
 };
 
-/**
- * Check if a model supports Anthropic's adaptive thinking mode.
- * Adaptive thinking is supported on Claude Opus 4.8, Opus 4.7, Opus 4.6, and Sonnet 4.6.
- */
-function supportsAdaptiveThinking(model: string): boolean {
-  return (
-    model.startsWith('claude-opus-4-8') ||
-    model.startsWith('claude-opus-4-7') ||
-    model.startsWith('claude-opus-4-6') ||
-    model.startsWith('claude-sonnet-4-6')
-  );
-}
-
-/**
- * Check if a model supports effort: 'max' in adaptive thinking mode.
- * Opus 4.8, Opus 4.7, and Opus 4.6 support max effort. Sonnet 4.6 supports
- * adaptive mode but not the 'max' effort level.
- */
-function supportsMaxEffort(model: string): boolean {
-  return (
-    model.startsWith('claude-opus-4-8') ||
-    model.startsWith('claude-opus-4-7') ||
-    model.startsWith('claude-opus-4-6')
-  );
-}
-
-/**
- * Check if a model supports effort: 'xhigh' (extra-high tier between 'high' and 'max').
- * Introduced on Claude Opus 4.7; also supported on Opus 4.8.
- */
-function supportsXhigh(model: string): boolean {
-  return model.startsWith('claude-opus-4-8') || model.startsWith('claude-opus-4-7');
-}
-
-/** Models that support output_config.effort (Opus 4.8, Opus 4.7, Opus 4.6, Sonnet 4.6, Opus 4.5). */
-function supportsEffort(model: string): boolean {
-  return (
-    model.startsWith('claude-opus-4-8') ||
-    model.startsWith('claude-opus-4-7') ||
-    model.startsWith('claude-opus-4-6') ||
-    model.startsWith('claude-sonnet-4-6') ||
-    model.startsWith('claude-opus-4-5')
-  );
-}
-
-/**
- * Clamp the Axl effort tier to the wire value the model supports.
- * - `'max'` → `'high'` on models that don't support max
- * - `'xhigh'` → `'high'` on models that don't support xhigh
- */
 function clampAnthropicEffort(
-  model: string,
+  capability: ClaudeCapability,
   effort: Exclude<Effort, 'none'>,
 ): Exclude<Effort, 'none'> {
-  if (effort === 'max' && !supportsMaxEffort(model)) return 'high';
-  if (effort === 'xhigh' && !supportsXhigh(model)) return 'high';
-  return effort;
+  const levels = capability.effortLevels;
+  if (!levels) return effort === 'max' || effort === 'xhigh' ? 'high' : effort;
+  if (levels.includes(effort)) return effort;
+  return 'high';
+}
+
+function budgetToClaudeEffort(budget: number): Exclude<Effort, 'none'> {
+  if (budget <= THINKING_BUDGETS.low) return 'low';
+  if (budget <= THINKING_BUDGETS.medium) return 'medium';
+  if (budget <= THINKING_BUDGETS.high) return 'high';
+  if (budget <= THINKING_BUDGETS.xhigh) return 'xhigh';
+  return 'max';
+}
+
+const warnedFableDisable = new Set<string>();
+function warnFableDisable(model: string): void {
+  if (warnedFableDisable.has(model)) return;
+  warnedFableDisable.add(model);
+  console.warn(
+    `[axl] thinking cannot be disabled on Anthropic ${model}; using adaptive thinking at effort 'low'.`,
+  );
+}
+
+type ClaudeThinkingConfig = {
+  thinking?: Record<string, unknown>;
+  outputConfig?: Record<string, unknown>;
+  manualBudget?: number;
+  stripTemperature: boolean;
+};
+
+/** Resolve every portable thinking control to one valid Anthropic request shape. */
+function resolveClaudeThinking(
+  model: string,
+  resolved: ReturnType<typeof resolveThinkingOptions>,
+): ClaudeThinkingConfig {
+  const capability = resolveClaudeCapability(model);
+  // Unknown IDs pass through without a synthesized capability field. This
+  // avoids accidentally sending a newly introduced control to a future model.
+  if (!capability) return { stripTemperature: false };
+  const activeEffort = resolved.activeEffort
+    ? clampAnthropicEffort(capability, resolved.activeEffort)
+    : undefined;
+  const isClaude5 =
+    capability.thinking === 'adaptive-default-on' || capability.thinking === 'adaptive-always-on';
+
+  if (isClaude5) {
+    if (resolved.hasBudgetOverride) {
+      const effort = clampAnthropicEffort(
+        capability,
+        budgetToClaudeEffort(resolved.thinkingBudget!),
+      );
+      return {
+        thinking: { type: 'adaptive' },
+        outputConfig: { effort },
+        stripTemperature: true,
+      };
+    }
+
+    if (resolved.thinkingDisabled) {
+      if (capability.thinking === 'adaptive-always-on') {
+        warnFableDisable(model);
+        return {
+          thinking: { type: 'adaptive' },
+          outputConfig: { effort: 'low' },
+          stripTemperature: true,
+        };
+      }
+      if (
+        activeEffort &&
+        capability.disableAt &&
+        !isEffortAtOrBelow(activeEffort, capability.disableAt)
+      ) {
+        return {
+          thinking: { type: 'adaptive' },
+          outputConfig: { effort: activeEffort },
+          stripTemperature: true,
+        };
+      }
+      return {
+        thinking: { type: 'disabled' },
+        outputConfig: activeEffort ? { effort: activeEffort } : undefined,
+        stripTemperature: true,
+      };
+    }
+
+    return activeEffort
+      ? {
+          thinking: { type: 'adaptive' },
+          outputConfig: { effort: activeEffort },
+          stripTemperature: true,
+        }
+      : { stripTemperature: true };
+  }
+
+  if (resolved.hasBudgetOverride) {
+    if (!capability.manualBudget) {
+      const effort = clampAnthropicEffort(
+        capability,
+        budgetToClaudeEffort(resolved.thinkingBudget!),
+      );
+      return capability.thinking === 'adaptive-optional'
+        ? {
+            thinking: { type: 'adaptive' },
+            outputConfig: { effort },
+            stripTemperature: capability.stripTemperature ?? true,
+          }
+        : { outputConfig: { effort }, stripTemperature: capability.stripTemperature ?? false };
+    }
+    return {
+      thinking: { type: 'enabled', budget_tokens: resolved.thinkingBudget! },
+      outputConfig: activeEffort && capability.effortLevels ? { effort: activeEffort } : undefined,
+      manualBudget: resolved.thinkingBudget,
+      stripTemperature: capability.stripTemperature ?? true,
+    };
+  }
+  if (resolved.thinkingDisabled) {
+    return {
+      outputConfig: activeEffort && capability.effortLevels ? { effort: activeEffort } : undefined,
+      stripTemperature: capability.stripTemperature ?? false,
+    };
+  }
+  if (activeEffort && capability.thinking === 'adaptive-optional') {
+    return {
+      thinking: { type: 'adaptive' },
+      outputConfig: { effort: activeEffort },
+      stripTemperature: capability.stripTemperature ?? true,
+    };
+  }
+  if (activeEffort && capability.thinking === 'effort-only') {
+    return { outputConfig: { effort: activeEffort }, stripTemperature: false };
+  }
+  if (activeEffort) {
+    const budget = THINKING_BUDGETS[activeEffort] ?? THINKING_BUDGETS.medium;
+    return {
+      thinking: { type: 'enabled', budget_tokens: budget },
+      manualBudget: budget,
+      stripTemperature: true,
+    };
+  }
+  return { stripTemperature: capability.stripTemperature ?? false };
+}
+
+function isEffortAtOrBelow(
+  effort: Exclude<Effort, 'none'>,
+  ceiling: Exclude<Effort, 'none'>,
+): boolean {
+  const levels: Exclude<Effort, 'none'>[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+  return levels.indexOf(effort) <= levels.indexOf(ceiling);
+}
+
+type AnthropicPricingContext = {
+  model?: string;
+  unpricedModifier: boolean;
+};
+
+function pricingContextFromBody(body: Record<string, unknown>): AnthropicPricingContext {
+  return {
+    model: typeof body.model === 'string' ? body.model : undefined,
+    unpricedModifier:
+      isAnthropicModifier('inference_geo', body.inference_geo) ||
+      isAnthropicModifier('speed', body.speed) ||
+      hasAnthropicServerTool(body.tools) ||
+      body.fallbacks !== undefined,
+  };
+}
+
+function isModifiedAnthropicResponse(json: AnthropicMessageResponse): boolean {
+  return (
+    isAnthropicModifier('inference_geo', json.inference_geo) ||
+    isAnthropicModifier('speed', json.speed) ||
+    isAnthropicModifier('inference_geo', json.usage?.inference_geo) ||
+    isAnthropicModifier('speed', json.usage?.speed) ||
+    hasBilledUnmodeledUsage(json.usage?.server_tool_use) ||
+    hasUnmodeledIterations(json.usage?.iterations)
+  );
+}
+
+function isAnthropicModifier(kind: 'inference_geo' | 'speed', value: unknown): boolean {
+  if (value === undefined) return false;
+  return kind === 'speed' ? value !== 'standard' : value !== 'global';
+}
+
+function hasAnthropicServerTool(tools: unknown): boolean {
+  return (
+    Array.isArray(tools) &&
+    tools.some(
+      (tool) =>
+        tool !== null &&
+        typeof tool === 'object' &&
+        typeof (tool as { type?: unknown }).type === 'string',
+    )
+  );
+}
+
+function hasBilledUnmodeledUsage(value: unknown): boolean {
+  return value !== undefined && value !== 0;
+}
+
+function hasUnmodeledIterations(value: unknown): boolean {
+  return value !== undefined;
+}
+
+function hasFallbackIteration(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.some(
+      (iteration) =>
+        iteration !== null &&
+        typeof iteration === 'object' &&
+        (iteration as { type?: unknown }).type === 'fallback_message',
+    )
+  );
+}
+
+type NormalizedAnthropicUsage = {
+  usage: NonNullable<ProviderResponse['usage']>;
+  pricingUsage: AnthropicPriceUsage;
+};
+
+function safeTokenSum(...values: number[]): number | undefined {
+  const total = values.reduce((sum, value) => sum + value, 0);
+  return Number.isSafeInteger(total) ? total : undefined;
+}
+
+function normalizeAnthropicUsage(raw: AnthropicUsage): NormalizedAnthropicUsage | undefined {
+  const inputTokens = raw.input_tokens;
+  const outputTokens = raw.output_tokens;
+  const cacheReadTokens = raw.cache_read_input_tokens ?? 0;
+  const cacheWrite5mTokens = raw.cache_creation?.ephemeral_5m_input_tokens ?? 0;
+  const cacheWrite1hTokens = raw.cache_creation?.ephemeral_1h_input_tokens ?? 0;
+  if (
+    !isValidTokenCount(inputTokens) ||
+    !isValidTokenCount(outputTokens) ||
+    !isValidTokenCount(cacheReadTokens) ||
+    !isValidTokenCount(cacheWrite5mTokens) ||
+    !isValidTokenCount(cacheWrite1hTokens)
+  ) {
+    return undefined;
+  }
+  const hasTtlBreakdown =
+    raw.cache_creation?.ephemeral_5m_input_tokens !== undefined ||
+    raw.cache_creation?.ephemeral_1h_input_tokens !== undefined;
+  const aggregateCacheWriteTokens = raw.cache_creation_input_tokens;
+  const normalizedCacheWrite = hasTtlBreakdown
+    ? safeTokenSum(cacheWrite5mTokens, cacheWrite1hTokens)
+    : undefined;
+  if (hasTtlBreakdown && normalizedCacheWrite === undefined) return undefined;
+  const promptCacheWrite = aggregateCacheWriteTokens ?? normalizedCacheWrite ?? 0;
+  if (!isValidTokenCount(promptCacheWrite)) return undefined;
+  const promptTokens = safeTokenSum(inputTokens, cacheReadTokens, promptCacheWrite);
+  if (promptTokens === undefined) return undefined;
+  const totalTokens = safeTokenSum(promptTokens, outputTokens);
+  if (totalTokens === undefined) return undefined;
+  return {
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: outputTokens,
+      total_tokens: totalTokens,
+      cached_tokens: cacheReadTokens > 0 ? cacheReadTokens : undefined,
+      cache_write_tokens:
+        normalizedCacheWrite && normalizedCacheWrite > 0 ? normalizedCacheWrite : undefined,
+    },
+    pricingUsage: {
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheWrite5mTokens,
+      cacheWrite1hTokens,
+      aggregateCacheWriteTokens,
+    },
+  };
+}
+
+/** Terminal Anthropic stream usage is cumulative; preserve omitted start fields. */
+function mergeAnthropicUsage(
+  initial: AnthropicUsage | undefined,
+  update: AnthropicUsage,
+): AnthropicUsage {
+  return {
+    input_tokens: update.input_tokens ?? initial?.input_tokens,
+    output_tokens: update.output_tokens ?? initial?.output_tokens,
+    cache_read_input_tokens: update.cache_read_input_tokens ?? initial?.cache_read_input_tokens,
+    cache_creation_input_tokens:
+      update.cache_creation_input_tokens ?? initial?.cache_creation_input_tokens,
+    cache_creation: {
+      ephemeral_5m_input_tokens:
+        update.cache_creation?.ephemeral_5m_input_tokens ??
+        initial?.cache_creation?.ephemeral_5m_input_tokens,
+      ephemeral_1h_input_tokens:
+        update.cache_creation?.ephemeral_1h_input_tokens ??
+        initial?.cache_creation?.ephemeral_1h_input_tokens,
+    },
+    speed: update.speed ?? initial?.speed,
+    inference_geo: update.inference_geo ?? initial?.inference_geo,
+    iterations: update.iterations ?? initial?.iterations,
+    server_tool_use: update.server_tool_use ?? initial?.server_tool_use,
+  };
 }
 
 /**
@@ -207,6 +593,7 @@ export class AnthropicProvider implements Provider {
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, false);
+    const pricingContext = pricingContextFromBody(body);
 
     const res = await fetchWithRetry(
       `${this.baseUrl}/messages`,
@@ -232,7 +619,7 @@ export class AnthropicProvider implements Provider {
     }
 
     const json = (await res.json()) as AnthropicMessageResponse;
-    return this.parseResponse(json, options.model);
+    return this.parseResponse(json, pricingContext);
   }
 
   // ---------------------------------------------------------------------------
@@ -242,6 +629,7 @@ export class AnthropicProvider implements Provider {
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, true);
+    const pricingContext = pricingContextFromBody(body);
 
     const res = await fetchWithRetry(
       `${this.baseUrl}/messages`,
@@ -270,7 +658,7 @@ export class AnthropicProvider implements Provider {
       throw new Error('Anthropic stream response has no body');
     }
 
-    yield* this.parseSSEStream(res.body, options.model);
+    yield* this.parseSSEStream(res.body, pricingContext);
   }
 
   // ---------------------------------------------------------------------------
@@ -331,51 +719,19 @@ export class AnthropicProvider implements Provider {
       body.tool_choice = this.mapToolChoice(options.toolChoice);
     }
 
-    // Build thinking/effort config
-    const { thinkingBudget, thinkingDisabled, activeEffort, hasBudgetOverride } =
-      resolveThinkingOptions(options);
-    const resolvedEffort = activeEffort
-      ? clampAnthropicEffort(options.model, activeEffort)
-      : undefined;
-
-    if (hasBudgetOverride) {
-      // Explicit budget → manual mode (precise override), regardless of model
-      body.thinking = { type: 'enabled', budget_tokens: thinkingBudget! };
+    const thinking = resolveClaudeThinking(options.model, resolveThinkingOptions(options));
+    if (thinking.thinking) body.thinking = thinking.thinking;
+    if (thinking.outputConfig) body.output_config = thinking.outputConfig;
+    if (thinking.manualBudget) {
       const currentMax = body.max_tokens as number;
-      if (currentMax < thinkingBudget! + 1024) {
-        body.max_tokens = thinkingBudget! + 1024;
-      }
-      // If effort also set on a model that supports it, send output_config alongside
-      if (resolvedEffort && supportsEffort(options.model)) {
-        body.output_config = { effort: resolvedEffort };
-      }
-    } else if (thinkingDisabled) {
-      // effort: 'none' or thinkingBudget: 0 → no thinking block
-      // thinkingBudget: 0 + effort → standalone effort (Anthropic optimization)
-      if (resolvedEffort && supportsEffort(options.model)) {
-        body.output_config = { effort: resolvedEffort };
-      }
-    } else if (resolvedEffort && supportsAdaptiveThinking(options.model)) {
-      // 4.6 models (default): adaptive thinking + effort (recommended combo)
-      body.thinking = { type: 'adaptive' };
-      body.output_config = { effort: resolvedEffort };
-    } else if (resolvedEffort && supportsEffort(options.model)) {
-      // Opus 4.5: supports effort but not adaptive thinking → effort only
-      body.output_config = { effort: resolvedEffort };
-    } else if (resolvedEffort) {
-      // Older models: no effort support → map effort to thinking budget as fallback
-      const budget = THINKING_BUDGETS[resolvedEffort] ?? 5000;
-      body.thinking = { type: 'enabled', budget_tokens: budget };
-      const currentMax = body.max_tokens as number;
-      if (currentMax < budget + 1024) {
-        body.max_tokens = budget + 1024;
+      if (currentMax < thinking.manualBudget + 1024) {
+        body.max_tokens = thinking.manualBudget + 1024;
       }
     }
-    // No effort, no budget → no thinking, no effort sent
 
-    // Anthropic rejects temperature when thinking is enabled.
-    // Strip when any thinking block is present in the built body.
-    if (options.temperature !== undefined && !body.thinking) {
+    // Temperature is invalid for Claude 5 and Opus 4.7/4.8 even without an
+    // explicit thinking control. providerOptions remains the native escape hatch.
+    if (options.temperature !== undefined && !thinking.stripTemperature) {
       body.temperature = options.temperature;
     }
 
@@ -408,9 +764,10 @@ export class AnthropicProvider implements Provider {
 
     for (const msg of messages) {
       if (msg.role === 'assistant') {
+        const replayedThinking = this.getReplayedThinkingBlocks(msg);
         if (msg.tool_calls && msg.tool_calls.length > 0) {
           // Assistant message with tool calls
-          const content: AnthropicContentBlock[] = [];
+          const content: AnthropicContentBlock[] = [...replayedThinking];
 
           // Include text content if present
           if (msg.content) {
@@ -433,6 +790,12 @@ export class AnthropicProvider implements Provider {
             });
           }
 
+          result.push({ role: 'assistant', content });
+        } else if (replayedThinking.length > 0) {
+          // Claude 5 requires the opaque thinking/signature blocks from the
+          // preceding turn before any replayed text or tool-use content.
+          const content: AnthropicContentBlock[] = [...replayedThinking];
+          if (msg.content) content.push({ type: 'text', text: msg.content });
           result.push({ role: 'assistant', content });
         } else {
           result.push({ role: 'assistant', content: msg.content });
@@ -459,6 +822,18 @@ export class AnthropicProvider implements Provider {
     // Anthropic requires alternating user/assistant turns.
     // Merge consecutive same-role messages if necessary.
     return this.mergeConsecutiveRoles(result);
+  }
+
+  private getReplayedThinkingBlocks(msg: ChatMessage): AnthropicContentBlock[] {
+    const blocks = msg.providerMetadata?.anthropicThinkingBlocks;
+    if (!Array.isArray(blocks)) return [];
+    return blocks.filter(
+      (block): block is AnthropicOpaqueThinkingBlock =>
+        block !== null &&
+        typeof block === 'object' &&
+        ((block as { type?: unknown }).type === 'thinking' ||
+          (block as { type?: unknown }).type === 'redacted_thinking'),
+    );
   }
 
   /**
@@ -527,17 +902,28 @@ export class AnthropicProvider implements Provider {
   // Internal: response parsing
   // ---------------------------------------------------------------------------
 
-  private parseResponse(json: AnthropicMessageResponse, model: string): ProviderResponse {
+  private parseResponse(
+    json: AnthropicMessageResponse,
+    pricingContext: AnthropicPricingContext,
+  ): ProviderResponse {
     let content = '';
     let thinkingContent = '';
     const toolCalls: ToolCallMessage[] = [];
+    const thinkingBlocks: AnthropicOpaqueThinkingBlock[] = [];
+    const fallbackIndex = lastFallbackIndex(json.content);
+    const hasFallbackBoundary = fallbackIndex >= 0 || hasFallbackIteration(json.usage?.iterations);
+    let refused = json.stop_reason === 'refusal';
 
-    for (const block of json.content) {
+    for (const [index, block] of json.content.entries()) {
       if (block.type === 'thinking') {
         thinkingContent += block.thinking;
+        thinkingBlocks.push(block);
+      } else if (block.type === 'redacted_thinking') {
+        thinkingBlocks.push(block);
       } else if (block.type === 'text') {
         content += block.text;
       } else if (block.type === 'tool_use') {
+        if (fallbackIndex >= 0 && index < fallbackIndex) continue;
         toolCalls.push({
           id: block.id,
           type: 'function',
@@ -546,33 +932,39 @@ export class AnthropicProvider implements Provider {
             arguments: JSON.stringify(block.input),
           },
         });
+      } else if (block.type === 'fallback') {
+        // The response is rejected below before it can enter conversation history.
+      } else if (block.type === 'refusal') {
+        refused = true;
       }
     }
 
-    const cacheRead = json.usage?.cache_read_input_tokens ?? 0;
-    const cacheWrite = json.usage?.cache_creation_input_tokens ?? 0;
-    // Anthropic's input_tokens excludes cached tokens; total prompt is the sum of all three
-    const totalInput = (json.usage?.input_tokens ?? 0) + cacheRead + cacheWrite;
-
-    const usage = json.usage
-      ? {
-          prompt_tokens: totalInput,
-          completion_tokens: json.usage.output_tokens,
-          total_tokens: totalInput + json.usage.output_tokens,
-          cached_tokens: cacheRead > 0 ? cacheRead : undefined,
-        }
-      : undefined;
-
-    const cost = json.usage
-      ? estimateAnthropicCost(model, totalInput, json.usage.output_tokens, cacheRead, cacheWrite)
-      : undefined;
+    const normalized = json.usage ? normalizeAnthropicUsage(json.usage) : undefined;
+    const effectiveModel = typeof json.model === 'string' ? json.model : pricingContext.model;
+    if (hasFallbackBoundary) {
+      throw new Error(
+        'Anthropic fallback responses cannot be continued safely; retry without fallbacks.',
+      );
+    }
+    const cost =
+      normalized &&
+      !pricingContext.unpricedModifier &&
+      !isModifiedAnthropicResponse(json) &&
+      !hasFallbackBoundary &&
+      !refused
+        ? estimateAnthropicCost(effectiveModel, normalized.pricingUsage)
+        : undefined;
 
     return {
       content,
       thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
-      usage,
+      usage: normalized?.usage,
       cost,
+      providerMetadata:
+        thinkingBlocks.length > 0 && !hasFallbackBoundary
+          ? { anthropicThinkingBlocks: thinkingBlocks }
+          : undefined,
     };
   }
 
@@ -582,7 +974,7 @@ export class AnthropicProvider implements Provider {
 
   private async *parseSSEStream(
     body: ReadableStream<Uint8Array>,
-    model: string,
+    pricingContext: AnthropicPricingContext,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -591,15 +983,35 @@ export class AnthropicProvider implements Provider {
     // Track current content block type being streamed
     let currentToolId = '';
     let currentToolName = '';
-    let usage:
-      | {
-          prompt_tokens: number;
-          completion_tokens: number;
-          total_tokens: number;
-          cached_tokens?: number;
-        }
-      | undefined;
-    let cacheWrite = 0;
+    let usage: NormalizedAnthropicUsage['usage'] | undefined;
+    let pricingUsage: AnthropicPriceUsage | undefined;
+    let rawUsage: AnthropicUsage | undefined;
+    const thinkingBlocks: AnthropicOpaqueThinkingBlock[] = [];
+    let currentThinkingBlock: AnthropicOpaqueThinkingBlock | undefined;
+    let effectiveModel = pricingContext.model;
+    let unpricedModifier = pricingContext.unpricedModifier;
+    let hasFallbackBoundary = false;
+    let hasFallbackIterationSignal = false;
+    let refused = false;
+
+    const finalizeUsage = () => {
+      const normalized = rawUsage ? normalizeAnthropicUsage(rawUsage) : undefined;
+      usage = normalized?.usage;
+      pricingUsage = normalized?.pricingUsage;
+    };
+
+    const doneChunk = (): Extract<StreamChunk, { type: 'done' }> => ({
+      type: 'done',
+      usage,
+      cost:
+        pricingUsage && !unpricedModifier && !hasFallbackBoundary && !refused
+          ? estimateAnthropicCost(effectiveModel, pricingUsage)
+          : undefined,
+      providerMetadata:
+        thinkingBlocks.length > 0 && !hasFallbackBoundary && !hasFallbackIterationSignal
+          ? { anthropicThinkingBlocks: thinkingBlocks }
+          : undefined,
+    });
 
     try {
       while (true) {
@@ -637,6 +1049,15 @@ export class AnthropicProvider implements Provider {
                   name: currentToolName,
                   arguments: '',
                 };
+              } else if (block?.type === 'thinking' || block?.type === 'redacted_thinking') {
+                currentThinkingBlock = {
+                  ...block,
+                  type: block.type,
+                } as AnthropicOpaqueThinkingBlock;
+              } else if (block?.type === 'fallback') {
+                hasFallbackBoundary = true;
+              } else if (block?.type === 'refusal') {
+                refused = true;
               }
               break;
             }
@@ -644,7 +1065,16 @@ export class AnthropicProvider implements Provider {
             case 'content_block_delta': {
               const delta = event.delta;
               if (delta?.type === 'thinking_delta' && delta.thinking) {
+                if (currentThinkingBlock?.type === 'thinking') {
+                  const current = currentThinkingBlock.thinking;
+                  currentThinkingBlock.thinking = `${typeof current === 'string' ? current : ''}${delta.thinking}`;
+                }
                 yield { type: 'thinking_delta', content: delta.thinking };
+              } else if (delta?.type === 'signature_delta' && delta.signature) {
+                if (currentThinkingBlock) {
+                  const current = currentThinkingBlock.signature;
+                  currentThinkingBlock.signature = `${typeof current === 'string' ? current : ''}${delta.signature}`;
+                }
               } else if (delta?.type === 'text_delta' && delta.text) {
                 yield { type: 'text_delta', content: delta.text };
               } else if (delta?.type === 'input_json_delta' && delta.partial_json) {
@@ -658,6 +1088,10 @@ export class AnthropicProvider implements Provider {
             }
 
             case 'content_block_stop': {
+              if (currentThinkingBlock) {
+                thinkingBlocks.push(currentThinkingBlock);
+                currentThinkingBlock = undefined;
+              }
               // Reset block tracking
               currentToolId = '';
               currentToolName = '';
@@ -667,56 +1101,52 @@ export class AnthropicProvider implements Provider {
             case 'message_start': {
               // message_start arrives first in the SSE stream with input token counts
               if (event.message?.usage) {
-                const cacheRead = event.message.usage.cache_read_input_tokens ?? 0;
-                cacheWrite = event.message.usage.cache_creation_input_tokens ?? 0;
-                const inputTokens =
-                  (event.message.usage.input_tokens ?? 0) + cacheRead + cacheWrite;
-                usage = {
-                  prompt_tokens: inputTokens,
-                  completion_tokens: 0,
-                  total_tokens: inputTokens,
-                  cached_tokens: cacheRead > 0 ? cacheRead : undefined,
-                };
+                rawUsage = mergeAnthropicUsage(rawUsage, event.message.usage);
               }
+              if (typeof event.message?.model === 'string') effectiveModel = event.message.model;
+              const messageFallback = hasFallbackIteration(event.message?.usage?.iterations);
+              if (
+                isAnthropicModifier('inference_geo', event.message?.inference_geo) ||
+                isAnthropicModifier('speed', event.message?.speed) ||
+                isAnthropicModifier('inference_geo', event.message?.usage?.inference_geo) ||
+                isAnthropicModifier('speed', event.message?.usage?.speed) ||
+                hasBilledUnmodeledUsage(event.message?.usage?.server_tool_use) ||
+                messageFallback
+              ) {
+                unpricedModifier = true;
+              }
+              if (messageFallback) hasFallbackIterationSignal = true;
               break;
             }
 
             case 'message_delta': {
               // message_delta arrives near the end with output token counts
               if (event.usage) {
-                const outputTokens = event.usage.output_tokens ?? 0;
-                if (usage) {
-                  usage.completion_tokens = outputTokens;
-                  usage.total_tokens = usage.prompt_tokens + outputTokens;
-                } else {
-                  usage = {
-                    prompt_tokens: 0,
-                    completion_tokens: outputTokens,
-                    total_tokens: outputTokens,
-                  };
+                rawUsage = mergeAnthropicUsage(rawUsage, event.usage);
+                finalizeUsage();
+                const terminalFallback = hasFallbackIteration(event.usage.iterations);
+                if (
+                  isAnthropicModifier('speed', event.usage.speed) ||
+                  isAnthropicModifier('inference_geo', event.usage.inference_geo) ||
+                  hasBilledUnmodeledUsage(event.usage.server_tool_use) ||
+                  terminalFallback
+                ) {
+                  unpricedModifier = true;
                 }
+                if (terminalFallback) hasFallbackIterationSignal = true;
               }
+              if (event.delta?.stop_reason === 'refusal') refused = true;
               break;
             }
 
             case 'message_stop': {
-              // Finalize usage totals
-              if (usage) {
-                usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+              finalizeUsage();
+              if (hasFallbackBoundary || hasFallbackIterationSignal) {
+                throw new Error(
+                  'Anthropic fallback streams cannot be continued safely; retry without fallbacks.',
+                );
               }
-              yield {
-                type: 'done',
-                usage,
-                cost: usage
-                  ? estimateAnthropicCost(
-                      model,
-                      usage.prompt_tokens,
-                      usage.completion_tokens,
-                      usage.cached_tokens,
-                      cacheWrite,
-                    )
-                  : undefined,
-              };
+              yield doneChunk();
               return;
             }
           }
@@ -724,19 +1154,13 @@ export class AnthropicProvider implements Provider {
       }
 
       // If we exit without a message_stop, still emit done
-      yield {
-        type: 'done',
-        usage,
-        cost: usage
-          ? estimateAnthropicCost(
-              model,
-              usage.prompt_tokens,
-              usage.completion_tokens,
-              usage.cached_tokens,
-              cacheWrite,
-            )
-          : undefined,
-      };
+      finalizeUsage();
+      if (hasFallbackBoundary || hasFallbackIterationSignal) {
+        throw new Error(
+          'Anthropic fallback streams cannot be continued safely; retry without fallbacks.',
+        );
+      }
+      yield doneChunk();
     } finally {
       reader.releaseLock();
     }
@@ -750,7 +1174,21 @@ export class AnthropicProvider implements Provider {
 type AnthropicContentBlock =
   | { type: 'text'; text: string }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
-  | { type: 'tool_result'; tool_use_id: string; content: string };
+  | { type: 'tool_result'; tool_use_id: string; content: string }
+  | AnthropicOpaqueThinkingBlock
+  | { type: 'fallback'; [key: string]: unknown }
+  | { type: 'refusal'; [key: string]: unknown };
+
+function lastFallbackIndex(blocks: Array<{ type: string }>): number {
+  for (let index = blocks.length - 1; index >= 0; index--) {
+    if (blocks[index].type === 'fallback') return index;
+  }
+  return -1;
+}
+
+type AnthropicOpaqueThinkingBlock = Record<string, unknown> & {
+  type: 'thinking' | 'redacted_thinking';
+};
 
 type AnthropicMessage = {
   role: 'user' | 'assistant';
@@ -767,18 +1205,41 @@ type AnthropicMessageResponse = {
   id: string;
   type: 'message';
   role: 'assistant';
+  model?: string;
+  speed?: string;
+  inference_geo?: string;
   content: Array<
-    | { type: 'thinking'; thinking: string }
+    | (AnthropicOpaqueThinkingBlock & { type: 'thinking'; thinking: string })
+    | AnthropicOpaqueThinkingBlock
     | { type: 'text'; text: string }
     | { type: 'tool_use'; id: string; name: string; input: unknown }
+    | { type: 'fallback'; [key: string]: unknown }
+    | { type: 'refusal'; [key: string]: unknown }
   >;
   stop_reason: string | null;
-  usage: {
-    input_tokens: number;
-    output_tokens: number;
+  usage: AnthropicUsage;
+};
+
+type AnthropicUsage = {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_creation?: {
+    ephemeral_5m_input_tokens?: number;
+    ephemeral_1h_input_tokens?: number;
+  };
+  speed?: string;
+  inference_geo?: string;
+  server_tool_use?: number;
+  iterations?: Array<{
+    type?: 'message' | 'fallback_message';
+    model?: string;
+    input_tokens?: number;
+    output_tokens?: number;
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
-  };
+  }>;
 };
 
 type AnthropicStreamEvent = {
@@ -791,26 +1252,28 @@ type AnthropicStreamEvent = {
     | 'message_stop'
     | 'ping';
   message?: {
-    usage?: {
-      input_tokens?: number;
-      output_tokens?: number;
-      cache_read_input_tokens?: number;
-      cache_creation_input_tokens?: number;
-    };
+    model?: string;
+    speed?: string;
+    inference_geo?: string;
+    usage?: AnthropicUsage;
   };
   content_block?: {
-    type?: 'text' | 'thinking' | 'tool_use';
+    type?: 'text' | 'thinking' | 'redacted_thinking' | 'tool_use' | 'fallback' | 'refusal';
     id?: string;
     name?: string;
     text?: string;
+    thinking?: string;
+    signature?: string;
+    data?: string;
+    [key: string]: unknown;
   };
   delta?: {
-    type?: 'text_delta' | 'thinking_delta' | 'input_json_delta';
+    type?: 'text_delta' | 'thinking_delta' | 'signature_delta' | 'input_json_delta';
     text?: string;
     thinking?: string;
+    signature?: string;
     partial_json?: string;
+    stop_reason?: string;
   };
-  usage?: {
-    output_tokens?: number;
-  };
+  usage?: AnthropicUsage;
 };

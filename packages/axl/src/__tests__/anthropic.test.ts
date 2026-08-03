@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { AnthropicProvider } from '../providers/anthropic.js';
+import { AnthropicProvider, estimateAnthropicCost } from '../providers/anthropic.js';
 import type { StreamChunk } from '../providers/types.js';
 
 // ── Mock fetch ──────────────────────────────────────────────────────────
@@ -193,11 +193,11 @@ describe('AnthropicProvider', () => {
 
       const provider = new AnthropicProvider();
       const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
-        model: 'claude-sonnet-4',
+        model: 'claude-sonnet-4-6',
         maxTokens: 1024,
       });
 
-      // claude-sonnet-4: [3e-6, 15e-6]
+      // claude-sonnet-4-6: [3e-6, 15e-6]
       // Expected: 100 * 3e-6 + 50 * 15e-6 = 0.0003 + 0.00075 = 0.00105
       expect(response.cost).toBeCloseTo(0.00105, 5);
       expect(response.usage).toEqual({
@@ -221,17 +221,18 @@ describe('AnthropicProvider', () => {
               output_tokens: 50,
               cache_read_input_tokens: 800,
               cache_creation_input_tokens: 200,
+              cache_creation: { ephemeral_5m_input_tokens: 200 },
             },
           }),
       });
 
       const provider = new AnthropicProvider();
       const response = await provider.chat([{ role: 'user', content: 'Hello' }], {
-        model: 'claude-sonnet-4',
+        model: 'claude-sonnet-4-6',
         maxTokens: 1024,
       });
 
-      // claude-sonnet-4: [3e-6, 15e-6]
+      // claude-sonnet-4-6: [3e-6, 15e-6]
       // Total input: 100 + 800 + 200 = 1100
       // Regular:     100 * 3e-6 = 0.0003
       // Cache read:  800 * 3e-6 * 0.1 = 0.00024
@@ -244,6 +245,7 @@ describe('AnthropicProvider', () => {
         completion_tokens: 50,
         total_tokens: 1150,
         cached_tokens: 800,
+        cache_write_tokens: 200,
       });
     });
 
@@ -295,7 +297,7 @@ describe('AnthropicProvider', () => {
       expect(response.cost).toBeCloseTo(0.00175, 5);
     });
 
-    it('resolves versioned claude-opus-4-7-YYYYMMDD via prefix match', async () => {
+    it('leaves unknown modern Claude snapshot siblings unpriced', async () => {
       mockFetch({
         json: () =>
           Promise.resolve({
@@ -314,8 +316,7 @@ describe('AnthropicProvider', () => {
         maxTokens: 1024,
       });
 
-      // Dated variants match the base 'claude-opus-4-7' entry
-      expect(response.cost).toBeCloseTo(0.00175, 5);
+      expect(response.cost).toBeUndefined();
     });
 
     it('returns undefined cost for unknown models (honest lower-bound signal)', async () => {
@@ -606,7 +607,7 @@ describe('AnthropicProvider', () => {
       expect(body.output_config).toEqual({ effort: 'max' });
     });
 
-    it('maps effort "max" to adaptive mode with effort "high" on Sonnet 4.6 (max downgraded)', async () => {
+    it('maps effort "max" to adaptive mode with effort "max" on Sonnet 4.6', async () => {
       const fetchMock = mockFetch({
         json: () =>
           Promise.resolve({
@@ -627,10 +628,8 @@ describe('AnthropicProvider', () => {
       });
 
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-      // Sonnet 4.6 does NOT support effort: 'max', so it's downgraded to 'high'
-      // and uses adaptive mode since Sonnet 4.6 supports it
       expect(body.thinking).toEqual({ type: 'adaptive' });
-      expect(body.output_config).toEqual({ effort: 'high' });
+      expect(body.output_config).toEqual({ effort: 'max' });
       // Adaptive mode does not bump max_tokens
       expect(body.max_tokens).toBe(4096);
     });
@@ -1206,6 +1205,519 @@ describe('AnthropicProvider', () => {
       expect(body.output_config).toBeUndefined();
     });
 
+    it('resolves every Claude 5 portable-thinking control to a valid request body', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const models = [
+        ['claude-fable-5', false],
+        ['claude-opus-5', true],
+        ['claude-sonnet-5', true],
+      ] as const;
+      const response = {
+        id: 'msg-5',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      };
+      const request = async (
+        model: string,
+        controls: Record<string, unknown>,
+      ): Promise<Record<string, unknown>> => {
+        const fetchMock = mockFetch({ json: () => Promise.resolve(response) });
+        await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model,
+          maxTokens: 1024,
+          temperature: 0.7,
+          ...controls,
+        });
+        return JSON.parse(fetchMock.mock.calls[0][1].body);
+      };
+
+      try {
+        for (const [model, disableable] of models) {
+          const omitted = await request(model, {});
+          expect(omitted.thinking).toBeUndefined();
+          expect(omitted.output_config).toBeUndefined();
+          expect(omitted.temperature).toBeUndefined();
+
+          const none = await request(model, { effort: 'none' });
+          expect(none.thinking).toEqual(disableable ? { type: 'disabled' } : { type: 'adaptive' });
+          expect(none.output_config).toEqual(disableable ? undefined : { effort: 'low' });
+
+          for (const effort of ['low', 'xhigh', 'max'] as const) {
+            const body = await request(model, { effort });
+            expect(body.thinking).toEqual({ type: 'adaptive' });
+            expect(body.output_config).toEqual({ effort });
+          }
+
+          const disabled = await request(model, { thinkingBudget: 0 });
+          expect(disabled.thinking).toEqual(
+            disableable ? { type: 'disabled' } : { type: 'adaptive' },
+          );
+
+          const budget = await request(model, { thinkingBudget: 2000 });
+          expect(budget.thinking).toEqual({ type: 'adaptive' });
+          expect(budget.output_config).toEqual({ effort: 'medium' });
+          expect(budget.thinking.budget_tokens).toBeUndefined();
+
+          const conflict = await request(model, { effort: 'max', thinkingBudget: 2000 });
+          expect(conflict.thinking).toEqual({ type: 'adaptive' });
+          expect(conflict.output_config).toEqual({ effort: 'medium' });
+        }
+
+        const opusConflict = await request('claude-opus-5', { effort: 'xhigh', thinkingBudget: 0 });
+        expect(opusConflict.thinking).toEqual({ type: 'adaptive' });
+        expect(opusConflict.output_config).toEqual({ effort: 'xhigh' });
+        expect(
+          warn.mock.calls.filter(([message]) => String(message).includes('claude-fable-5')),
+        ).toHaveLength(1);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('strips temperature for Opus 4.7/4.8 without thinking but preserves 4.6 behavior', async () => {
+      for (const model of ['claude-opus-4-7', 'claude-opus-4-8', 'claude-opus-4-6']) {
+        const fetchMock = mockFetch({
+          json: () =>
+            Promise.resolve({
+              id: 'msg-temp-regression',
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'text', text: 'ok' }],
+              stop_reason: 'end_turn',
+              usage: { input_tokens: 1, output_tokens: 1 },
+            }),
+        });
+        await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model,
+          maxTokens: 1024,
+          temperature: 0.7,
+        });
+        const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+        expect(body.temperature).toBe(model === 'claude-opus-4-6' ? 0.7 : undefined);
+      }
+    });
+
+    it('keeps 4.6 manual budgets but maps 4.7/4.8 budgets to adaptive effort', async () => {
+      for (const [model, expectedThinking] of [
+        ['claude-opus-4-6', { type: 'enabled', budget_tokens: 2000 }],
+        ['claude-opus-4-7', { type: 'adaptive' }],
+        ['claude-opus-4-8', { type: 'adaptive' }],
+      ]) {
+        const fetchMock = mockFetch({
+          json: () =>
+            Promise.resolve({
+              id: 'msg-budget-regression',
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'text', text: 'ok' }],
+              stop_reason: 'end_turn',
+              usage: { input_tokens: 1, output_tokens: 1 },
+            }),
+        });
+        await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model,
+          maxTokens: 1024,
+          thinkingBudget: 2000,
+        });
+        const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+        expect(body.thinking).toEqual(expectedThinking);
+        expect(body.output_config).toEqual(
+          model === 'claude-opus-4-6' ? undefined : { effort: 'medium' },
+        );
+      }
+    });
+
+    it('maps Claude 5 manual-budget anchors through every supported effort tier', async () => {
+      for (const [budget, effort] of [
+        [1024, 'low'],
+        [1025, 'medium'],
+        [5000, 'medium'],
+        [5001, 'high'],
+        [10000, 'high'],
+        [10001, 'xhigh'],
+        [20000, 'xhigh'],
+        [20001, 'max'],
+        [30000, 'max'],
+      ]) {
+        const fetchMock = mockFetch({
+          json: () =>
+            Promise.resolve({
+              id: 'msg-budget-anchor',
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'text', text: 'ok' }],
+              stop_reason: 'end_turn',
+              usage: { input_tokens: 1, output_tokens: 1 },
+            }),
+        });
+        await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model: 'claude-opus-5',
+          maxTokens: 1024,
+          thinkingBudget: budget,
+        });
+        expect(JSON.parse(fetchMock.mock.calls[0][1].body).output_config).toEqual({ effort });
+      }
+    });
+
+    it('does not infer Claude 5 capabilities for an unknown sibling', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-unknown-sibling',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 1, output_tokens: 1 },
+          }),
+      });
+      const response = await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-5-future',
+        maxTokens: 1024,
+        temperature: 0.7,
+        effort: 'high',
+      });
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.thinking).toBeUndefined();
+      expect(body.output_config).toBeUndefined();
+      expect(body.temperature).toBe(0.7);
+      expect(response.cost).toBeUndefined();
+    });
+
+    it('retains manual thinking only for documented legacy snapshots', async () => {
+      for (const [model, expectedThinking] of [
+        ['claude-3-7-sonnet-20250219', { type: 'enabled', budget_tokens: 10000 }],
+        ['claude-3-5-sonnet-20240620', { type: 'enabled', budget_tokens: 10000 }],
+        ['claude-3-7-sonnet-future', undefined],
+      ]) {
+        const fetchMock = mockFetch({
+          json: () =>
+            Promise.resolve({
+              id: 'msg-legacy-snapshot',
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'text', text: 'ok' }],
+              stop_reason: 'end_turn',
+              usage: { input_tokens: 1, output_tokens: 1 },
+            }),
+        });
+        await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model,
+          maxTokens: 1024,
+          effort: 'high',
+          temperature: 0.7,
+        });
+        const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+        expect(body.thinking).toEqual(expectedThinking);
+        expect(body.temperature).toBe(expectedThinking ? undefined : 0.7);
+      }
+    });
+
+    it('preserves opaque thinking blocks and signatures for non-stream continuations', async () => {
+      const firstFetch = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-thoughts',
+            type: 'message',
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'reasoning', signature: 'sig-1' },
+              { type: 'redacted_thinking', data: 'opaque-redacted' },
+              { type: 'tool_use', id: 'tool-1', name: 'lookup', input: { q: 'a' } },
+            ],
+            stop_reason: 'tool_use',
+            usage: { input_tokens: 1, output_tokens: 1 },
+          }),
+      });
+      const provider = new AnthropicProvider();
+      const first = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-5',
+        maxTokens: 1024,
+      });
+      expect(first.providerMetadata).toEqual({
+        anthropicThinkingBlocks: [
+          { type: 'thinking', thinking: 'reasoning', signature: 'sig-1' },
+          { type: 'redacted_thinking', data: 'opaque-redacted' },
+        ],
+      });
+      expect(firstFetch).toHaveBeenCalledTimes(1);
+
+      const continuationFetch = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-continuation',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'done' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 1, output_tokens: 1 },
+          }),
+      });
+      await provider.chat(
+        [
+          { role: 'user', content: 'Hello' },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: first.tool_calls,
+            providerMetadata: first.providerMetadata,
+          },
+          { role: 'tool', content: 'result', tool_call_id: 'tool-1' },
+        ],
+        { model: 'claude-sonnet-5', maxTokens: 1024 },
+      );
+      const assistant = JSON.parse(continuationFetch.mock.calls[0][1].body).messages[1];
+      expect(assistant.content).toEqual([
+        { type: 'thinking', thinking: 'reasoning', signature: 'sig-1' },
+        { type: 'redacted_thinking', data: 'opaque-redacted' },
+        { type: 'tool_use', id: 'tool-1', name: 'lookup', input: { q: 'a' } },
+      ]);
+    });
+
+    it('rejects any fallback-served response before it enters continuation history', async () => {
+      const fallbackFetch = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-fallback',
+            type: 'message',
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'reasoning', signature: 'sig-fallback' },
+              { type: 'fallback', model: 'claude-other' },
+              { type: 'text', text: 'answer' },
+              { type: 'tool_use', id: 'fallback-tool', name: 'lookup', input: { q: 'a' } },
+            ],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 100, output_tokens: 50 },
+          }),
+      });
+      await expect(
+        new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model: 'claude-opus-5',
+          maxTokens: 1024,
+        }),
+      ).rejects.toThrow('fallback responses cannot be continued safely');
+      expect(fallbackFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a text-only fallback response before it enters history', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-fallback-text',
+            type: 'message',
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'discard this', signature: 'sig' },
+              { type: 'fallback', model: 'claude-other' },
+              { type: 'text', text: 'answer' },
+            ],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 100, output_tokens: 50 },
+          }),
+      });
+      await expect(
+        new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model: 'claude-opus-5',
+          maxTokens: 1024,
+        }),
+      ).rejects.toThrow('fallback responses cannot be continued safely');
+    });
+
+    it('leaves a refusal response unpriced', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-refusal',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'cannot comply' }],
+            stop_reason: 'refusal',
+            usage: { input_tokens: 100, output_tokens: 50 },
+          }),
+      });
+      const refusal = await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-5',
+        maxTokens: 1024,
+      });
+      expect(refusal.cost).toBeUndefined();
+    });
+
+    it('rejects response-reported fallback iterations and suppresses thinking metadata', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-iterations',
+            type: 'message',
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'do not replay', signature: 'iteration-sig' },
+              { type: 'text', text: 'ok' },
+            ],
+            stop_reason: 'end_turn',
+            usage: {
+              input_tokens: 100,
+              output_tokens: 50,
+              iterations: [{ type: 'fallback_message', model: 'claude-sonnet-5' }],
+            },
+          }),
+      });
+      await expect(
+        new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model: 'claude-opus-5',
+          maxTokens: 1024,
+        }),
+      ).rejects.toThrow('fallback responses cannot be continued safely');
+    });
+
+    it('never estimates cost from absent or malformed mandatory token counts', async () => {
+      for (const usage of [
+        { input_tokens: 1 },
+        { output_tokens: 1 },
+        { input_tokens: -1, output_tokens: 1 },
+        { input_tokens: 1.5, output_tokens: 1 },
+        { input_tokens: Number.POSITIVE_INFINITY, output_tokens: 1 },
+        { input_tokens: Number.MAX_SAFE_INTEGER, output_tokens: 1 },
+      ]) {
+        mockFetch({
+          json: () =>
+            Promise.resolve({
+              id: 'msg-malformed-usage',
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'text', text: 'ok' }],
+              stop_reason: 'end_turn',
+              usage,
+            }),
+        });
+        const response = await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model: 'claude-opus-5',
+          maxTokens: 1024,
+        });
+        expect(response.cost).toBeUndefined();
+        expect(response.usage).toBeUndefined();
+      }
+    });
+
+    it('prices Claude 5 exact models, TTL cache buckets, and Sonnet 5 date boundaries', () => {
+      expect(
+        estimateAnthropicCost('claude-fable-5', { inputTokens: 100, outputTokens: 50 }),
+      ).toBeCloseTo(0.0035, 10);
+      expect(
+        estimateAnthropicCost('claude-opus-5', {
+          inputTokens: 100,
+          outputTokens: 50,
+          cacheReadTokens: 50,
+          cacheWrite5mTokens: 20,
+          cacheWrite1hTokens: 10,
+          aggregateCacheWriteTokens: 30,
+        }),
+      ).toBeCloseTo(0.002, 10);
+      for (const model of [
+        'claude-opus-4-8',
+        'claude-opus-4-7',
+        'claude-opus-4-6',
+        'claude-sonnet-4-6',
+        'claude-opus-4-5-20251101',
+        'claude-sonnet-4-5-20250929',
+        'claude-haiku-4-5-20251001',
+        'claude-opus-4-1-20250805',
+      ]) {
+        expect(estimateAnthropicCost(model, { inputTokens: 1, outputTokens: 1 })).toBeDefined();
+      }
+      expect(
+        estimateAnthropicCost('claude-opus-4', { inputTokens: 1, outputTokens: 1 }),
+      ).toBeUndefined();
+      expect(
+        estimateAnthropicCost(
+          'claude-sonnet-5',
+          { inputTokens: 100, outputTokens: 50 },
+          new Date('2026-08-31T23:59:59Z'),
+        ),
+      ).toBeCloseTo(0.0007, 10);
+      expect(
+        estimateAnthropicCost(
+          'claude-sonnet-5',
+          { inputTokens: 100, outputTokens: 50 },
+          new Date('2026-09-01T00:00:00Z'),
+        ),
+      ).toBeCloseTo(0.00105, 10);
+      expect(
+        estimateAnthropicCost('claude-opus-5', {
+          inputTokens: 100,
+          outputTokens: 50,
+          aggregateCacheWriteTokens: 20,
+        }),
+      ).toBeUndefined();
+      expect(
+        estimateAnthropicCost('claude-opus-5-future', { inputTokens: 1, outputTokens: 1 }),
+      ).toBeUndefined();
+    });
+
+    it('prices from the merged effective model and leaves speed/geo modifiers unpriced', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-effective',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 100, output_tokens: 50 },
+          }),
+      });
+      const provider = new AnthropicProvider();
+      const effective = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4-6',
+        maxTokens: 1024,
+        providerOptions: { model: 'claude-fable-5' },
+      });
+      expect(effective.cost).toBeCloseTo(0.0035, 10);
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body).model).toBe('claude-fable-5');
+
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-fast',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 100, output_tokens: 50, speed: 'fast' },
+          }),
+      });
+      const fast = await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-5',
+        maxTokens: 1024,
+        providerOptions: { speed: 'fast', inference_geo: 'us' },
+      });
+      expect(fast.cost).toBeUndefined();
+    });
+
+    it('leaves an explicit fallback request unpriced', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-fallback-request-isolated',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 100, output_tokens: 50 },
+          }),
+      });
+      const response = await new AnthropicProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-5',
+        maxTokens: 1024,
+        providerOptions: { fallbacks: ['claude-sonnet-5'] },
+      });
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body).fallbacks).toEqual(['claude-sonnet-5']);
+      expect(response.cost).toBeUndefined();
+    });
+
     it('merges providerOptions into request body', async () => {
       const fetchMock = mockFetch({
         json: () =>
@@ -1463,6 +1975,297 @@ describe('AnthropicProvider', () => {
       const textChunks = chunks.filter((c) => c.type === 'text_delta');
       expect(textChunks).toHaveLength(1);
       expect(textChunks[0]).toEqual({ type: 'text_delta', content: 'Hello!' });
+    });
+
+    it('captures streamed thinking signatures and replays them before tool blocks', async () => {
+      const sseEvents = [
+        {
+          type: 'message_start',
+          message: { usage: { input_tokens: 10, output_tokens: 0 } },
+        },
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'thinking', thinking: '' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'thinking_delta', thinking: 'reason' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'signature_delta', signature: 'sig-' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'signature_delta', signature: 'stream' },
+        },
+        { type: 'content_block_stop', index: 0 },
+        {
+          type: 'content_block_start',
+          index: 1,
+          content_block: { type: 'redacted_thinking', data: 'opaque' },
+        },
+        { type: 'content_block_stop', index: 1 },
+        {
+          type: 'content_block_start',
+          index: 2,
+          content_block: { type: 'tool_use', id: 'tool-stream', name: 'lookup' },
+        },
+        { type: 'content_block_stop', index: 2 },
+        { type: 'message_delta', usage: { output_tokens: 4 } },
+        { type: 'message_stop' },
+      ];
+      mockFetch({ body: createSSEStream(sseEvents) });
+      const provider = new AnthropicProvider();
+      const chunks: StreamChunk[] = [];
+      for await (const chunk of provider.stream([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-5',
+        maxTokens: 1024,
+      })) {
+        chunks.push(chunk);
+      }
+      const done = chunks.at(-1);
+      expect(done).toMatchObject({
+        type: 'done',
+        providerMetadata: {
+          anthropicThinkingBlocks: [
+            { type: 'thinking', thinking: 'reason', signature: 'sig-stream' },
+            { type: 'redacted_thinking', data: 'opaque' },
+          ],
+        },
+      });
+
+      const continuationFetch = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'msg-after-stream',
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'done' }],
+            stop_reason: 'end_turn',
+            usage: { input_tokens: 1, output_tokens: 1 },
+          }),
+      });
+      await provider.chat(
+        [
+          { role: 'user', content: 'Hello' },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'tool-stream',
+                type: 'function',
+                function: { name: 'lookup', arguments: '{}' },
+              },
+            ],
+            providerMetadata: done!.type === 'done' ? done!.providerMetadata : undefined,
+          },
+          { role: 'tool', content: 'result', tool_call_id: 'tool-stream' },
+        ],
+        { model: 'claude-opus-5', maxTokens: 1024 },
+      );
+      const assistant = JSON.parse(continuationFetch.mock.calls[0][1].body).messages[1];
+      expect(assistant.content.slice(0, 2)).toEqual([
+        { type: 'thinking', thinking: 'reason', signature: 'sig-stream' },
+        { type: 'redacted_thinking', data: 'opaque' },
+      ]);
+      expect(assistant.content[2]).toMatchObject({ type: 'tool_use', id: 'tool-stream' });
+    });
+
+    it('retains TTL cache-write usage and uses the same stream cost estimator', async () => {
+      const sseEvents = [
+        {
+          type: 'message_start',
+          message: {
+            model: 'claude-opus-5',
+            usage: {
+              input_tokens: 100,
+              cache_read_input_tokens: 50,
+              cache_creation_input_tokens: 30,
+              cache_creation: {
+                ephemeral_5m_input_tokens: 20,
+                ephemeral_1h_input_tokens: 10,
+              },
+            },
+          },
+        },
+        {
+          type: 'message_delta',
+          usage: { output_tokens: 50, speed: 'standard', inference_geo: 'global' },
+        },
+        { type: 'message_stop' },
+      ];
+      mockFetch({ body: createSSEStream(sseEvents) });
+      const chunks: StreamChunk[] = [];
+      for await (const chunk of new AnthropicProvider().stream(
+        [{ role: 'user', content: 'Hello' }],
+        {
+          model: 'claude-opus-5',
+          maxTokens: 1024,
+        },
+      )) {
+        chunks.push(chunk);
+      }
+      const done = chunks.at(-1);
+      expect(done).toMatchObject({
+        type: 'done',
+        usage: {
+          prompt_tokens: 180,
+          completion_tokens: 50,
+          total_tokens: 230,
+          cached_tokens: 50,
+          cache_write_tokens: 30,
+        },
+      });
+      expect(done!.type === 'done' && done!.cost).toBeCloseTo(0.002, 10);
+    });
+
+    it('rejects any fallback stream before a successful done chunk', async () => {
+      const sseEvents = [
+        {
+          type: 'message_start',
+          message: { usage: { input_tokens: 100, output_tokens: 0 } },
+        },
+        {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'thinking', thinking: '' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'thinking_delta', thinking: 'reason' },
+        },
+        { type: 'content_block_stop', index: 0 },
+        {
+          type: 'content_block_start',
+          index: 1,
+          content_block: { type: 'fallback', model: 'other' },
+        },
+        { type: 'content_block_stop', index: 1 },
+        {
+          type: 'content_block_start',
+          index: 2,
+          content_block: { type: 'tool_use', id: 'stream-fallback-tool', name: 'lookup' },
+        },
+        {
+          type: 'content_block_delta',
+          index: 2,
+          delta: { type: 'input_json_delta', partial_json: '{"q":"a"}' },
+        },
+        { type: 'content_block_stop', index: 2 },
+        {
+          type: 'message_delta',
+          usage: { output_tokens: 50 },
+        },
+        { type: 'message_stop' },
+      ];
+      mockFetch({ body: createSSEStream(sseEvents) });
+      const stream = new AnthropicProvider().stream([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-5',
+        maxTokens: 1024,
+      });
+      await expect(
+        (async () => {
+          for await (const chunk of stream) {
+            expect(chunk.type).not.toBe('done');
+          }
+        })(),
+      ).rejects.toThrow('fallback streams cannot be continued safely');
+    });
+
+    it('rejects a fallback-message iteration stream without client tools', async () => {
+      mockFetch({
+        body: createSSEStream([
+          { type: 'message_start', message: { usage: { input_tokens: 10, output_tokens: 0 } } },
+          {
+            type: 'message_delta',
+            usage: {
+              output_tokens: 5,
+              iterations: [{ type: 'fallback_message', model: 'claude-sonnet-5' }],
+            },
+          },
+          { type: 'message_stop' },
+        ]),
+      });
+      const stream = new AnthropicProvider().stream([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-opus-5',
+        maxTokens: 1024,
+      });
+      await expect(
+        (async () => {
+          for await (const chunk of stream) {
+            expect(chunk.type).not.toBe('done');
+          }
+        })(),
+      ).rejects.toThrow('fallback streams cannot be continued safely');
+    });
+
+    it('re-normalizes cumulative terminal usage and rejects TTL aggregate conflicts', async () => {
+      const sseEvents = [
+        {
+          type: 'message_start',
+          message: {
+            usage: {
+              input_tokens: 100,
+              cache_read_input_tokens: 50,
+              cache_creation_input_tokens: 30,
+              cache_creation: { ephemeral_5m_input_tokens: 20, ephemeral_1h_input_tokens: 10 },
+            },
+          },
+        },
+        {
+          type: 'message_delta',
+          usage: {
+            input_tokens: 110,
+            cache_read_input_tokens: 55,
+            cache_creation_input_tokens: 20,
+            output_tokens: 50,
+          },
+        },
+        { type: 'message_stop' },
+      ];
+      mockFetch({ body: createSSEStream(sseEvents) });
+      const chunks: StreamChunk[] = [];
+      for await (const chunk of new AnthropicProvider().stream(
+        [{ role: 'user', content: 'Hello' }],
+        { model: 'claude-opus-5', maxTokens: 1024 },
+      )) {
+        chunks.push(chunk);
+      }
+      const done = chunks.at(-1);
+      expect(done).toMatchObject({
+        type: 'done',
+        usage: {
+          prompt_tokens: 185,
+          completion_tokens: 50,
+          total_tokens: 235,
+          cache_write_tokens: 30,
+        },
+        cost: undefined,
+      });
+    });
+
+    it('leaves a stream refusal unpriced', async () => {
+      const sseEvents = [
+        { type: 'message_start', message: { usage: { input_tokens: 100, output_tokens: 0 } } },
+        { type: 'message_delta', delta: { stop_reason: 'refusal' }, usage: { output_tokens: 50 } },
+        { type: 'message_stop' },
+      ];
+      mockFetch({ body: createSSEStream(sseEvents) });
+      const chunks: StreamChunk[] = [];
+      for await (const chunk of new AnthropicProvider().stream(
+        [{ role: 'user', content: 'Hello' }],
+        { model: 'claude-opus-5', maxTokens: 1024 },
+      )) {
+        chunks.push(chunk);
+      }
+      expect(chunks.at(-1)).toMatchObject({ type: 'done', cost: undefined });
     });
   });
 });

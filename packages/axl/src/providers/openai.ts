@@ -1,4 +1,4 @@
-import type { Effort, ApiKeySource } from './types.js';
+import type { Effort, ApiKeySource, ResolvedThinkingOptions } from './types.js';
 import type { RateLimitConfig } from './rate-limiter.js';
 import {
   OpenAICompatibleProvider,
@@ -381,7 +381,19 @@ export function supportsReasoningEffort(model: string): boolean {
   return isOSeriesModel(model) || /^gpt-5/.test(model);
 }
 
-export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+/** Exact GPT-5.6 IDs that support the native `max` reasoning tier. */
+const GPT_56_REASONING_MODELS = new Set([
+  'gpt-5.6',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+]);
+
+export function supportsMaxReasoningEffort(model: string): boolean {
+  return GPT_56_REASONING_MODELS.has(model);
+}
+
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 /** Returns true for models that support reasoning_effort: 'none' (gpt-5.1+). */
 export function supportsReasoningNone(model: string): boolean {
@@ -406,6 +418,7 @@ export function supportsXhigh(model: string): boolean {
  * - gpt-5.1+: supports 'none', 'low', 'medium', 'high'
  * - Pre-gpt-5.1 (o-series, gpt-5, gpt-5-mini, gpt-5-nano): no 'none', default 'medium'
  * - xhigh: only models after gpt-5.1-codex-max (gpt-5.2+)
+ * - max: only the exact GPT-5.6 family ids above
  */
 export function clampReasoningEffort(model: string, effort: ReasoningEffort): ReasoningEffort {
   // gpt-5-pro only supports 'high'
@@ -414,6 +427,12 @@ export function clampReasoningEffort(model: string, effort: ReasoningEffort): Re
   // 'none' only supported on gpt-5.1+; clamp to 'minimal' (closest to 'none')
   if (effort === 'none' && !supportsReasoningNone(model)) return 'minimal';
 
+  // GPT-5.6 adds a distinct max tier. Preserve the established max→xhigh
+  // behavior for every earlier and unknown sibling.
+  if (effort === 'max' && !supportsMaxReasoningEffort(model)) {
+    return clampReasoningEffort(model, 'xhigh');
+  }
+
   // 'xhigh' only supported on gpt-5.2+
   if (effort === 'xhigh' && !supportsXhigh(model)) return 'high';
 
@@ -421,8 +440,15 @@ export function clampReasoningEffort(model: string, effort: ReasoningEffort): Re
 }
 
 /** Map Effort to OpenAI reasoning_effort wire value. */
-export function effortToReasoningEffort(effort: Exclude<Effort, 'none'>): ReasoningEffort {
-  return effort === 'max' ? 'xhigh' : effort;
+export function effortToReasoningEffort(
+  effort: Exclude<Effort, 'none'>,
+  model?: string,
+): ReasoningEffort {
+  return effort === 'max' && model !== undefined && supportsMaxReasoningEffort(model)
+    ? 'max'
+    : effort === 'max'
+      ? 'xhigh'
+      : effort;
 }
 
 /** Map budgetTokens to nearest OpenAI reasoning_effort. */
@@ -430,6 +456,21 @@ export function budgetToReasoningEffort(budget: number): ReasoningEffort {
   if (budget <= 1024) return 'low';
   if (budget <= 8192) return 'medium';
   return 'high';
+}
+
+/** Resolve portable thinking controls to the one native OpenAI effort value. */
+export function resolveOpenAIReasoningEffort(
+  model: string,
+  resolved: ResolvedThinkingOptions,
+): ReasoningEffort | undefined {
+  if (!supportsReasoningEffort(model)) return undefined;
+  if (resolved.hasBudgetOverride) {
+    return clampReasoningEffort(model, budgetToReasoningEffort(resolved.thinkingBudget!));
+  }
+  if (!resolved.thinkingDisabled && resolved.activeEffort) {
+    return clampReasoningEffort(model, effortToReasoningEffort(resolved.activeEffort, model));
+  }
+  return resolved.thinkingDisabled ? clampReasoningEffort(model, 'none') : undefined;
 }
 
 /**
@@ -441,20 +482,7 @@ export function budgetToReasoningEffort(budget: number): ReasoningEffort {
 export const openaiReasoningEmit: ReasoningEmit = (body, resolved, model) => {
   const oSeries = isOSeriesModel(model);
   const reasoningCapable = supportsReasoningEffort(model);
-  const { thinkingBudget, thinkingDisabled, activeEffort, hasBudgetOverride } = resolved;
-
-  let wireEffort: ReasoningEffort | undefined;
-  if (reasoningCapable) {
-    if (hasBudgetOverride) {
-      // Explicit budget always takes precedence (consistent with Anthropic/Gemini)
-      wireEffort = clampReasoningEffort(model, budgetToReasoningEffort(thinkingBudget!));
-    } else if (!thinkingDisabled && activeEffort) {
-      wireEffort = clampReasoningEffort(model, effortToReasoningEffort(activeEffort));
-    } else if (thinkingDisabled) {
-      // Disable reasoning: covers both effort='none' and thinkingBudget=0
-      wireEffort = clampReasoningEffort(model, 'none');
-    }
-  }
+  const wireEffort = resolveOpenAIReasoningEffort(model, resolved);
 
   if (wireEffort) body.reasoning_effort = wireEffort;
 

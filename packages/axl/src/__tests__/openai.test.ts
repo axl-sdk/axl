@@ -4,6 +4,7 @@ import {
   OPENAI_PRICING,
   isOSeriesModel,
   supportsReasoningNone,
+  supportsMaxReasoningEffort,
   supportsXhigh,
   clampReasoningEffort,
   estimateDirectOpenAICost,
@@ -97,6 +98,17 @@ describe('OpenAIProvider', () => {
       expect(supportsReasoningNone('gpt-5-mini')).toBe(false);
       expect(supportsReasoningNone('gpt-5-nano')).toBe(false);
       expect(supportsReasoningNone('gpt-5-pro')).toBe(false);
+    });
+  });
+
+  describe('supportsMaxReasoningEffort()', () => {
+    it('only recognizes the exact GPT-5.6 family IDs', () => {
+      expect(supportsMaxReasoningEffort('gpt-5.6')).toBe(true);
+      expect(supportsMaxReasoningEffort('gpt-5.6-sol')).toBe(true);
+      expect(supportsMaxReasoningEffort('gpt-5.6-terra')).toBe(true);
+      expect(supportsMaxReasoningEffort('gpt-5.6-luna')).toBe(true);
+      expect(supportsMaxReasoningEffort('gpt-5.6-sol-2099-01-01')).toBe(false);
+      expect(supportsMaxReasoningEffort('gpt-5.7')).toBe(false);
     });
   });
 
@@ -520,7 +532,7 @@ describe('OpenAIProvider', () => {
       expect(body.reasoning_effort).toBe('high');
     });
 
-    it('maps effort "max" to "xhigh" on gpt-5.4 (xhigh supported)', async () => {
+    it('maps effort "max" to "xhigh" on gpt-5.5 (native max not supported)', async () => {
       const fetchMock = mockFetch({
         json: () =>
           Promise.resolve({
@@ -532,13 +544,51 @@ describe('OpenAIProvider', () => {
 
       const provider = new OpenAIProvider();
       await provider.chat([{ role: 'user', content: 'Hello' }], {
-        model: 'gpt-5.4',
+        model: 'gpt-5.5',
         maxTokens: 1024,
         effort: 'max',
       });
 
       const body = getRequestBody(fetchMock);
       expect(body.reasoning_effort).toBe('xhigh');
+    });
+
+    it('emits native effort "max" only for exact GPT-5.6 family IDs', async () => {
+      for (const model of ['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+        const fetchMock = mockFetch({
+          json: () =>
+            Promise.resolve({
+              id: 'resp-56',
+              choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+              usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+            }),
+        });
+
+        await new OpenAIProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model,
+          maxTokens: 1024,
+          effort: 'max',
+        });
+
+        expect(getRequestBody(fetchMock).reasoning_effort).toBe('max');
+      }
+
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-unknown',
+            choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      await new OpenAIProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5.6-sol-2099-01-01',
+        maxTokens: 1024,
+        effort: 'max',
+      });
+
+      expect(getRequestBody(fetchMock).reasoning_effort).toBe('xhigh');
     });
 
     it('passes reasoning_effort "xhigh" on gpt-5.4 (xhigh supported)', async () => {

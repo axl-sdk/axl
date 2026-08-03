@@ -548,6 +548,63 @@ describe('OpenAIResponsesProvider', () => {
       expect(body.reasoning).toEqual({ effort: 'high' });
     });
 
+    it('maps effort "max" to "xhigh" on gpt-5.5 (native max not supported)', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-55',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      await new OpenAIResponsesProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5.5',
+        maxTokens: 1024,
+        effort: 'max',
+      });
+
+      expect(getRequestBody(fetchMock).reasoning).toEqual({ effort: 'xhigh' });
+    });
+
+    it('emits native effort "max" only for exact GPT-5.6 family IDs', async () => {
+      for (const model of ['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+        const fetchMock = mockFetch({
+          json: () =>
+            Promise.resolve({
+              id: 'resp-56',
+              output: [],
+              usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+            }),
+        });
+
+        await new OpenAIResponsesProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model,
+          maxTokens: 1024,
+          effort: 'max',
+        });
+
+        expect(getRequestBody(fetchMock).reasoning).toEqual({ effort: 'max' });
+      }
+
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp-unknown',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      await new OpenAIResponsesProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gpt-5.6-sol-2099-01-01',
+        maxTokens: 1024,
+        effort: 'max',
+      });
+
+      expect(getRequestBody(fetchMock).reasoning).toEqual({ effort: 'xhigh' });
+    });
+
     it('passes reasoning { effort: "xhigh" } on gpt-5.4 (xhigh supported)', async () => {
       const fetchMock = mockFetch({
         json: () =>

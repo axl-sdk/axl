@@ -3,11 +3,8 @@ import {
   estimateDirectOpenAICost,
   isOSeriesModel,
   supportsReasoningEffort,
-  effortToReasoningEffort,
-  budgetToReasoningEffort,
-  clampReasoningEffort,
+  resolveOpenAIReasoningEffort,
 } from './openai.js';
-import type { ReasoningEffort } from './openai.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
 import { buildProviderError, ProviderError } from './errors.js';
@@ -148,22 +145,9 @@ export class OpenAIResponsesProvider implements Provider {
   ): Record<string, unknown> {
     const oSeries = isOSeriesModel(options.model);
     const reasoningCapable = supportsReasoningEffort(options.model);
-    const { thinkingBudget, includeThoughts, thinkingDisabled, activeEffort, hasBudgetOverride } =
-      resolveThinkingOptions(options);
-
-    // Compute effective reasoning effort for wire format
-    let wireEffort: ReasoningEffort | undefined;
-    if (reasoningCapable) {
-      if (hasBudgetOverride) {
-        // Explicit budget always takes precedence (consistent with Anthropic/Gemini)
-        wireEffort = clampReasoningEffort(options.model, budgetToReasoningEffort(thinkingBudget!));
-      } else if (!thinkingDisabled && activeEffort) {
-        wireEffort = clampReasoningEffort(options.model, effortToReasoningEffort(activeEffort));
-      } else if (thinkingDisabled) {
-        // Disable reasoning: covers both effort='none' and thinkingBudget=0
-        wireEffort = clampReasoningEffort(options.model, 'none');
-      }
-    }
+    const resolved = resolveThinkingOptions(options);
+    const { includeThoughts } = resolved;
+    const wireEffort = resolveOpenAIReasoningEffort(options.model, resolved);
 
     // Temperature: always strip for o-series; for GPT-5.x, strip only when reasoning active
     const stripTemp = oSeries || (reasoningCapable && wireEffort !== undefined);

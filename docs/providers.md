@@ -9,8 +9,9 @@ All providers include automatic retry with exponential backoff on `429` (rate li
 The Responses API is the preferred OpenAI integration — it supports prompt caching, native reasoning, and automatic reasoning context round-tripping via `providerMetadata`. All models listed below are available with the `openai-responses:` prefix. Shares the `openai` provider config by default.
 
 ```
-openai-responses:gpt-5.5        # Flagship — most capable general-purpose model
-openai-responses:gpt-5.5-pro    # Deepest reasoning for highest-stakes problems
+openai-responses:gpt-5.6        # Flagship
+openai-responses:gpt-5.6-pro    # Highest-compute flagship
+openai-responses:gpt-5.6-luna   # Fast GPT-5.6 variant
 openai-responses:gpt-5-mini     # Cost-optimized reasoning and chat
 openai-responses:gpt-5-nano     # High-throughput, straightforward tasks
 openai-responses:o4-mini        # Dedicated reasoning (small)
@@ -23,8 +24,11 @@ openai-responses:o3-pro          # Dedicated reasoning (pro)
 Same models available with the `openai:` prefix. Use this when you need features not yet supported on the Responses API (e.g., stop sequences).
 
 ```
-openai:gpt-5.5                  # Flagship — most capable general-purpose model
-openai:gpt-5.5-pro              # Deepest reasoning for highest-stakes problems
+openai:gpt-5.6                  # Flagship
+openai:gpt-5.6-pro              # Highest-compute flagship
+openai:gpt-5.6-luna             # Fast GPT-5.6 variant
+openai:gpt-5.5                  # Previous gen
+openai:gpt-5.5-pro              # Previous gen (pro)
 openai:gpt-5-mini               # Cost-optimized reasoning and chat
 openai:gpt-5-nano               # High-throughput, straightforward tasks
 openai:gpt-5.4                  # Previous gen
@@ -55,7 +59,10 @@ Reasoning model support (o-series): uses `developer` role instead of `system`, s
 ## Anthropic
 
 ```
-anthropic:claude-opus-4-8       # Most capable (supports effort: 'xhigh' and 'max')
+anthropic:claude-fable-5        # Highest-capability Claude 5; thinking always on
+anthropic:claude-opus-5         # Claude 5 flagship; thinking on by default
+anthropic:claude-sonnet-5       # Claude 5 balanced; thinking on by default
+anthropic:claude-opus-4-8       # Previous flagship
 anthropic:claude-opus-4-7       # Previous flagship (supports effort: 'xhigh')
 anthropic:claude-opus-4-6       # Previous flagship
 anthropic:claude-sonnet-4-6     # Balanced (latest)
@@ -76,18 +83,20 @@ anthropic:claude-3-haiku        # Legacy
 ## Google Gemini
 
 ```
-google:gemini-3.1-pro-preview        # Most capable (preview)
-google:gemini-3.5-flash              # Fast (GA)
-google:gemini-3-flash-preview        # Fast (preview)
-google:gemini-3.1-flash-lite         # Cheapest (GA)
+google:gemini-3.6-flash              # Latest fast model (GA)
+google:gemini-3.5-flash              # Previous fast model (GA)
+google:gemini-3.5-flash-lite         # Latest low-cost model (GA)
+google:gemini-3.1-pro-preview        # Pro preview
+google:gemini-3-flash-preview        # Flash preview
+google:gemini-3.1-flash-lite         # Previous low-cost model (GA)
 google:gemini-2.5-pro                # Previous gen (most capable)
 google:gemini-2.5-flash              # Previous gen (fast)
 google:gemini-2.5-flash-lite         # Previous gen (cheapest)
-google:gemini-2.0-flash              # Legacy
-google:gemini-2.0-flash-lite         # Legacy
-google:gemini-3-pro-preview          # Deprecated (shut down March 9, 2026)
-google:gemini-3.1-flash-lite-preview # Deprecated (shuts down May 25, 2026)
 ```
+
+This catalog was reviewed against provider documentation on August 3, 2026. Exact known
+IDs receive capabilities and pricing; unknown siblings may still be sent to the provider,
+but remain unpriced and do not inherit newest-model request behavior.
 
 Gemini [requires every `functionResponse.response` to be a JSON
 object](https://ai.google.dev/api/generate-content#FunctionResponse). Axl parses canonical
@@ -127,10 +136,10 @@ endpoint that speaks it. Axl ships built-in **presets** registered under their o
 
 ```
 openrouter:anthropic/claude-opus-4.7   # 300+ models behind one key (vendor/model slug)
-openrouter:openai/gpt-5.5
+openrouter:openai/gpt-5.6
 azure:my-deployment                    # deployment name is the "model"
-xai:grok-4
-deepseek:deepseek-reasoner
+xai:grok-4.20
+deepseek:deepseek-v4-pro
 mistral:mistral-large-latest
 groq:openai/gpt-oss-120b               # fastest inference; open-weight only
 bedrock:openai.gpt-oss-120b            # AWS Bedrock (gpt-oss); region base URL + bearer token
@@ -148,11 +157,11 @@ name), or rely on its env vars. Most presets read `<PRESET>_API_KEY` and
 | Preset | Default base URL | Auth | Reasoning | Pricing |
 |---|---|---|---|---|
 | `openrouter` | `https://openrouter.ai/api/v1` | Bearer | `reasoning` object (effort/budget); captures `reasoning_details` | **provider-reported** (`usage.cost`, USD) |
-| `azure` | *your resource* (`AZURE_OPENAI_BASE_URL`) | `api-key` header | reuses OpenAI (o-series/GPT-5) | OpenAI table when deployment is model-named, else unknown |
-| `xai` | `https://api.x.ai/v1` | Bearer | `reasoning_effort` (`max`→`high`) | unknown |
-| `deepseek` | `https://api.deepseek.com/v1` | Bearer | captures `reasoning_content`, round-trips on tool turns; no `json_schema` | unknown |
-| `mistral` | `https://api.mistral.ai/v1` | Bearer | `reasoning_effort` (active→`high`; `magistral-*` omit) | unknown |
-| `groq` | `https://api.groq.com/openai/v1` | Bearer | `reasoning_effort` on reasoning families only | unknown |
+| `azure` | *your resource* (`AZURE_OPENAI_BASE_URL`) | `api-key` header | reuses OpenAI (o-series/GPT-5) | unknown (deployment billing is not inferred) |
+| `xai` | `https://api.x.ai/v1` | Bearer | exact Grok 4.20 Chat capabilities | **provider-reported** usage ticks |
+| `deepseek` | `https://api.deepseek.com/v1` | Bearer | captures `reasoning_content`, round-trips on tool turns; no `json_schema` | exact V4 table; cache-hit/miss split |
+| `mistral` | `https://api.mistral.ai/v1` | Bearer | `reasoning_effort` on supported families only | exact current-model table |
+| `groq` | `https://api.groq.com/openai/v1` | Bearer | `reasoning_effort` on reasoning families only | exact current-model table |
 | `bedrock` | *your region* (`BEDROCK_BASE_URL`) | Bearer (`AWS_BEARER_TOKEN_BEDROCK`) | `reasoning_effort` for gpt-oss | unknown |
 | `ollama` | `http://localhost:11434/v1` | none | inline `<think>` | **$0** |
 | `vllm` | `http://localhost:8000/v1` | optional | inline `<think>` | **$0** |
@@ -164,9 +173,11 @@ Notes & caveats:
 - **`effort` works across reasoning models**, not just OpenAI — each preset maps the unified
   knob to its provider's mechanism (and omits it where the provider/model rejects it, so it's
   never a silent 400).
-- **Cost where competitors drop it.** OpenRouter returns per-call cost, which Axl surfaces
-  directly; local presets are an explicit `$0`. Where a provider's per-token prices aren't
-  tracked, cost is `undefined` (**unknown**, never a misleading `$0`).
+- **Honest cost.** OpenRouter and xAI return per-call charges, which Axl surfaces directly;
+  DeepSeek, Mistral, and Groq use exact built-in current-model tables; local presets are an
+  explicit `$0`. Unknown models, Azure deployments, non-representable tiers, and unsupported
+  billing modifiers return `undefined` (**unknown**, never a misleading `$0`). Built-in tables
+  match exact IDs; custom profile tables retain prefix matching unless `match: 'exact'` is set.
 - **Capability is per-model on marketplaces** (OpenRouter/Groq): one model supports
   strict `json_schema` and the next doesn't. Profile flags are sensible defaults; use
   [`providerOptions`](#provideroptions) for per-call overrides.
@@ -340,7 +351,7 @@ All model parameters are configurable on `AgentConfig` (agent-level defaults) an
 
 ```typescript
 const creative = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-5.6',
   system: 'Write creative stories.',
   temperature: 0.9,   // higher = more creative (0.0–2.0)
   maxTokens: 8192,
@@ -353,7 +364,7 @@ const reasoner = agent({
 });
 
 const precise = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-5.6',
   system: 'Extract structured data.',
   temperature: 0.1,   // lower = more deterministic
   toolChoice: 'required',
@@ -376,7 +387,7 @@ const solution = await ctx.ask(reasoner, problem, { effort: 'low' });
 
 ### `effort`
 
-The `effort` parameter provides a unified way to control reasoning depth across all providers. Values: `'none'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`. `'xhigh'` is a first-class tier between `'high'` and `'max'`, supported natively on Anthropic Opus 4.8/4.7 and OpenAI gpt-5.2+; it clamps to `'high'` on other models.
+The `effort` parameter provides a unified way to control reasoning depth across all providers. Values: `'none'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`. Exact model capabilities decide whether a tier is sent, clamped, or omitted. GPT-5.6 and Claude 5 accept native `'max'`; older families retain their documented caps.
 
 ```typescript
 // Most users — just effort:
@@ -421,7 +432,9 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 | **OpenAI** (GPT-5.x pre-5.1) | `'minimal'`⁑ | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | capped to `'high'`⁂ | capped to `'high'`⁂ | nearest effort level* |
 | **OpenAI** (GPT-5.1+) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | capped to `'high'`⁂ | capped to `'high'`⁂ | nearest effort level* |
 | **OpenAI** (GPT-5.2+) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | `reasoning_effort: 'xhigh'` | nearest effort level* |
+| **OpenAI** (GPT-5.6) | `reasoning_effort: 'none'` | `reasoning_effort: 'low'` | `reasoning_effort: 'medium'` | `reasoning_effort: 'high'` | `reasoning_effort: 'xhigh'` | `reasoning_effort: 'max'` | nearest effort level* |
 | **OpenAI Responses** | same clamping as above | `reasoning.effort: 'low'` | `reasoning.effort: 'medium'` | `reasoning.effort: 'high'` | same clamping | same clamping | nearest effort level* |
+| **Anthropic** (Claude 5) | model-specific minimum/default | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | unsupported |
 | **Anthropic** (Opus 4.8 / 4.7) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | adaptive + `effort: 'xhigh'` | adaptive + `effort: 'max'` | manual `budget_tokens` |
 | **Anthropic** (4.6) | disabled | adaptive + `effort: 'low'` | adaptive + `effort: 'medium'` | adaptive + `effort: 'high'` | capped to `'high'`◊ | adaptive + `effort: 'max'`† | manual `budget_tokens` |
 | **Anthropic** (4.5) | disabled | `output_config.effort: 'low'` | `output_config.effort: 'medium'` | `output_config.effort: 'high'` | capped to `'high'`◊ | capped to `'high'` | manual `budget_tokens` |
@@ -430,19 +443,19 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 | **Gemini** (2.x) | `thinkingBudget: 0` | `thinkingBudget: 1024` | `thinkingBudget: 5000` | `thinkingBudget: 10000` | `thinkingBudget: 16384` | `thinkingBudget: 24576`§ | exact budget |
 | **OpenRouter** | `reasoning: {enabled:false}` | `reasoning: {effort:'low'}` | `'medium'` | `'high'` | clamped to `'high'` | clamped to `'high'` | `reasoning: {max_tokens: N}` ✓ |
 | **Azure OpenAI** | same as OpenAI (per deployment's underlying model) | | | | | | nearest effort* |
-| **xAI** (grok-3-mini) | omit | `reasoning_effort: 'low'` | `'high'`¶ | `'high'` | `'high'` | `'high'` | no-op◆ |
-| **xAI** (grok-4*) | omit | omit (auto-reasons) | omit | omit | omit | omit | no-op◆ |
+| **xAI** (Grok 4.20 reasoning IDs) | omit | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'` | no-op◆ |
+| **xAI** (Grok 4.20 non-reasoning IDs) | omit | omit | omit | omit | omit | omit | no-op◆ |
 | **DeepSeek** | model-driven⊕ | model-driven⊕ | model-driven⊕ | model-driven⊕ | model-driven⊕ | model-driven⊕ | no-op◆ |
 | **Mistral** (small/medium) | omit | `reasoning_effort: 'high'`¶ | `'high'` | `'high'` | `'high'` | `'high'` | no-op◆ |
 | **Groq** (gpt-oss) | omit | `reasoning_effort: 'low'` | `'medium'` | `'high'` | `'high'` | `'high'` | no-op◆ |
 | **Bedrock** (gpt-oss) | omit | `reasoning_effort: 'low'` | `'medium'` | `'high'` | `'high'` | `'high'` | no-op◆ |
 | **Self-hosted** (ollama/vllm/…) | deploy-time⊗ | deploy-time⊗ | deploy-time⊗ | deploy-time⊗ | deploy-time⊗ | deploy-time⊗ | no-op◆ |
 
-¶ The provider's `reasoning_effort` vocabulary is narrower than Axl's, so multiple levels collapse (xAI grok-3-mini exposes only `low`/`high`; Mistral maps any active effort to `'high'`). Models/families not listed (xAI grok-4, Mistral `magistral-*` and `large`/`ministral`/etc., Groq qwen3/llama) **omit** `reasoning_effort` — `effort` is a documented no-op there, never an error.
+¶ Mistral's supported reasoning vocabulary is narrower than Axl's, so multiple levels collapse. Models/families not listed **omit** `reasoning_effort` — `effort` is a documented no-op there, never an error.
 
 ◆ These presets don't accept an explicit token budget, and (unlike OpenAI) Axl does **not** translate `thinkingBudget` to a nearest effort for them — it is a no-op. Use `effort`, or `providerOptions` for provider-native budget params.
 
-⊕ DeepSeek reasoning is determined by model choice (`deepseek-reasoner`/V4-thinking always reason; `deepseek-chat` doesn't); `effort` is a no-op. Captured reasoning round-trips on tool-call turns.
+⊕ DeepSeek reasoning is determined by the exact V4 model choice; `effort` is a no-op. Captured reasoning round-trips on tool-call turns.
 
 ⊗ Reasoning on self-hosted runtimes is configured at the server (launch flags / `chat_template_kwargs`), so `effort` is generally a no-op; inline `<think>` output is captured.
 
@@ -463,15 +476,16 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 #### Provider-specific behavior
 
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
-- **OpenAI GPT-5.x**: Supports `reasoning_effort` like o-series, strips temperature when reasoning active. Uses `system` role (not `developer`). Supports parallel tool calls. Model-specific constraints: `gpt-5-pro` only supports `'high'`; `gpt-5.1+` supports `'none'`; `gpt-5.2+` (including `gpt-5.5`) supports `'xhigh'`. Latest flagship: `gpt-5.5` ($5/$30 per 1M tokens); `gpt-5.5-pro` ($30/$180).
+- **OpenAI GPT-5.x**: Supports `reasoning_effort` like o-series, strips temperature when reasoning active, uses `system`, and supports parallel tool calls. Model-specific constraints are exact: GPT-5.6 accepts native `'max'`; GPT-5.2–5.5 cap it to `'xhigh'`; earlier families retain their lower caps.
 - **OpenAI Responses API**: Same effort mapping via `reasoning: { effort }`. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
-- **Anthropic Opus 4.8**: Latest flagship. Same adaptive-thinking behavior as Opus 4.7 — supports `effort: 'xhigh'` and `'max'`, sent as `output_config.effort`. Default `effort` is `'high'`.
+- **Anthropic Claude 5**: Fable 5 always reasons; Opus 5 and Sonnet 5 reason by default. All three accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are preserved in `providerMetadata` for tool continuations. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a different fallback model served the call, Axl fails before persisting history or estimating cost.
+- **Anthropic Opus 4.8**: Supports adaptive thinking and native `'xhigh'`/`'max'`.
 - **Anthropic Opus 4.7**: Same adaptive-thinking behavior as 4.6. Additionally supports `effort: 'xhigh'` as a first-class tier between `'high'` and `'max'`, sent as `output_config.effort: 'xhigh'`. Same pricing as Opus 4.6 ($5/$25 per 1M tokens).
 - **Anthropic 4.6** (Opus 4.6, Sonnet 4.6): `effort` enables adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`). Temperature stripped when thinking active. `thinkingBudget: 0` + `effort` sends only `output_config.effort` (no thinking block, temperature allowed). `effort: 'xhigh'` clamps to `'high'` (4.6 doesn't expose a distinct xhigh tier).
 - **Anthropic 4.5** (Opus 4.5): Supports `output_config.effort` but not adaptive thinking. Temperature passes through. `effort: 'xhigh'` clamps to `'high'`.
 - **Anthropic older**: Falls back to manual thinking (`budget_tokens`). No `effort` support.
 - **Anthropic + maxTokens**: Auto-bumps `max_tokens` when thinking budget exceeds it (`budget + 1024`).
-- **Gemini 3.x** (gemini-3-*, gemini-3.1-*, gemini-3.5-*): Uses `thinkingLevel` string enum. **Cannot fully disable thinking** — `effort: 'none'` maps to the model's minimum level (`'minimal'` for most models, `'low'` for 3.1 Pro). Axl emits a one-time console warning when this happens. `thinkingBudget: N` maps to nearest level (≤1024→low, ≤5000→medium, >5000→high).
+- **Gemini 3.x**: Exact current IDs use `thinkingLevel` and cannot fully disable thinking; `effort: 'none'` maps to the model minimum. Gemini 3.6 Flash ignores the portable `temperature` field because that model no longer accepts it. Tool-call signature metadata is preserved and validated across continuations.
 - **Gemini 2.x**: Uses integer `thinkingBudget`. Can be set to 0 to disable.
 - **`includeThoughts`**: Returns thought/reasoning summaries. Works on Gemini (`includeThoughts` in `thinkingConfig`) and OpenAI Responses API (`reasoning.summary: 'detailed'`). No-op on Anthropic (thoughts always returned when thinking active) and OpenAI Chat Completions.
 
@@ -600,7 +614,7 @@ Controls whether the model calls tools when tools are available:
 
 ```typescript
 const coder = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-5.6',
   system: 'You are a coding assistant.',
   tools: [runTests, writeCode],
 });
@@ -627,7 +641,7 @@ Stop sequences tell the model to stop generating when it produces any of the spe
 
 ```typescript
 const agent = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-5.6',
   system: 'Generate markdown sections.',
   stop: ['\n---', '\n## '],  // stop at section breaks
 });
@@ -641,7 +655,8 @@ Axl tracks approximate USD cost for every LLM call and surfaces it via `ctx.budg
 
 ### How it works
 
-Each provider adapter maintains a pricing table (input and output rates per token). After every call, Axl computes:
+Each provider adapter maintains an exact pricing contract for the billing dimensions it can
+observe. A simple cached-input call is computed as:
 
 ```
 cost = (non_cached_input_tokens × input_rate)
@@ -649,7 +664,11 @@ cost = (non_cached_input_tokens × input_rate)
      + (output_tokens × output_rate)
 ```
 
-If a model is not in the pricing table (including all versioned snapshots not explicitly listed), cost is returned as `undefined` — **"unknown", never a misleading `0`**. A fake `$0` would let `ctx.budget()` treat a paid model as free and would show `$0.00` in cost dashboards; `undefined` is unmeasured and contributes nothing to budget totals. (OpenAI-compatible presets choose their pricing per provider: provider-reported, `undefined`, or an explicit `0` for local runtimes — see [presets](#openai-compatible-providers--presets).)
+Structured estimators additionally handle long-context rates, service tiers, cache-write TTLs,
+and effective returned model IDs. If a model or required billing dimension is unknown, cost is
+`undefined` — **"unknown", never a misleading `0`**. A fake `$0` would let `ctx.budget()`
+treat a paid model as free. OpenRouter and xAI prefer provider-reported totals; local runtimes
+are the only built-ins that deliberately return zero.
 
 ### Prompt caching rates
 
@@ -661,11 +680,11 @@ Providers charge less for tokens served from cache. The rates differ by provider
 |-----------|--------|-----------------|
 | gpt-4o / o1 | `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`, `o1-pro` | **50%** of input rate |
 | gpt-4.1 / o3 / o4 | `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `o3`, `o3-mini`, `o3-pro`, `o4-mini` | **25%** of input rate |
-| gpt-5 | `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5.1`–`gpt-5.5`, `gpt-5.4-pro`, `gpt-5.5-pro` | **10%** of input rate |
+| gpt-5 | `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, and exact known GPT-5.x IDs | model-specific |
 
-Versioned model names (e.g. `gpt-4o-2024-05-13`) are matched by prefix to the base model entry.
+Only documented snapshot forms inherit a base model's price. An arbitrary suffix does not.
 
-#### Anthropic — uniform rates, write TTL caveat
+#### Anthropic — observable cache-read and write TTLs
 
 | Operation | Multiplier |
 |-----------|-----------|
@@ -673,13 +692,16 @@ Versioned model names (e.g. `gpt-4o-2024-05-13`) are matched by prefix to the ba
 | Cache write — 5-minute TTL (default) | **125%** of input rate |
 | Cache write — 1-hour TTL | **200%** of input rate |
 
-Axl always applies **125%** for cache writes because the API response (`cache_creation_input_tokens`) does not indicate which TTL was used. If you are using 1-hour TTL caching, your actual write costs will be higher than what Axl reports.
+Axl reads the 5-minute and 1-hour creation buckets when Anthropic provides them and prices
+each at the correct multiplier. It also exposes their sum as `usage.cache_write_tokens`.
+An aggregate-only cache-write count stays observable but makes `cost` undefined because its
+TTL mix cannot be reconstructed safely.
 
-Multipliers are uniform across all Anthropic models.
+#### Google Gemini — exact cached-input rates
 
-#### Google Gemini — uniform 10% rate
-
-Cached tokens are charged at **10% of the standard input rate** across all Gemini models. A separate per-hour storage fee applies (charged by Google, not reflected in Axl's per-call estimate).
+Current known Gemini rows carry explicit cached-input rates. A separate per-hour storage fee
+applies and is not reflected in Axl's per-call estimate. Non-Standard tiers and unmodeled
+billable modalities/tools are left unpriced.
 
 ### Custom providers
 

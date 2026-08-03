@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: July 2026
+> Last updated: August 2026
 
 ## Guiding Principles
 
@@ -24,7 +24,8 @@
 - **Axl Studio** — Local development UI with 8 panels (Playground, Workflows, Traces, Costs, Memory, Sessions, Tools, Evals)
 - **Evaluation Framework** — `dataset()`, `scorer()`, `llmScorer()`, `evalCompare()`, `rescore()`, `aggregateRuns()`, CLI with `compare`, `rescore` subcommands, `--runs` multi-run support
 - **Configurable Model Parameters** — `temperature`, `maxTokens`, `effort`, `thinkingBudget`, `includeThoughts`, `toolChoice`, `stop` on `AgentConfig` and per-call via `AskOptions`
-- **Unified Effort** — Cross-provider `effort` parameter (`'none'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`) maps to reasoning_effort (OpenAI o-series + GPT-5.x, `'xhigh'` on gpt-5.2+), adaptive thinking + output_config.effort (Anthropic 4.7/4.6, `'xhigh'` on Opus 4.7), thinkingLevel (Gemini 3.x), thinkingBudget (Gemini 2.x)
+- **Unified Effort** — Cross-provider `effort` uses exact model capabilities, including native `max` on GPT-5.6 and Claude 5, adaptive thinking on supported Claude families, `thinkingLevel` on Gemini 3.x, and `thinkingBudget` on Gemini 2.x.
+- **Current Provider Catalog and Honest Pricing** — GPT-5.6, Claude 5, Gemini 3.6/3.5, and current compatible-provider profiles ship with exact model matching, observable cache-write accounting, context/tier-aware pricing, and fail-closed unknown cost.
 - **State Durability & Lifecycle (0.17.7)** — `state.persist: 'streaming'` flushes events during the run via the `StreamingFlusher`; `runtime.recoverIncompleteStreams()` reconstructs partial `ExecutionInfo`s after a crash (live-execution-skip guard, event-cap bound, save-failure preserves buffer, `__axl/recovered` sentinel). `runtime.deleteExecution(id)` is the GDPR right-to-be-forgotten sweep (data + indexes + checkpoints + suspended state + streaming buffer + pending decisions; in-flight resurrection guard; signal-abort propagates to paused `ctx.awaitHuman`). `execution_deleted` runtime event for audit trails. Studio: `DELETE /api/executions/:id` + WS replay buffer scrub. `ExecutionInfo.metadata` lifts caller-supplied tags (`userId`/`tenantId`) into a queryable surface with control-plane key stripping + isolation. `runtime.shutdown()` drains the streaming flusher AND in-flight `persistExecution` chains. See [migration guide](docs/migration/state-store-durability.md).
 - **Redis Production Hardening (0.17.7)** — `RedisStore.create({ keyPrefix, defaultTtl, ttls, skipMigration })` with per-category TTL config (`memory`/`session`/`sessionMeta` sliding, `checkpoint`/`streamingEvents` fixed-creation, `executionHistory`/`evalHistory`/`executionState` fixed-refresh). Every multi-key write atomic via `MULTI/EXEC`. `listExecutions`/`listEvalResults` use sorted-set fast path (reverse `ZRANGE ... BYSCORE` + `MGET`, O(log N), 2× over-fetch for TTL drift). Lazy backfill from legacy SET on startup. `RedisStore` now implements memory methods (race-safe legacy migration). `listPendingExecutions` self-prunes stale ids.
 - **Structured-Output & `ctx.ask` Pipeline Control** — Prompt-guided structured output stays the portable default; the appended JSON Schema is now `$ref`-hoisted + compact + rendered from the schema's input side (order-of-magnitude token cut on large unions, correct for `.transform()`). `schemaPrompt` (`'json-schema'` | `'none'` | `{ render }`) decouples the model-facing prompt from the parse gate; `nativeStructuredOutput` opts into the provider's native `json_schema` (derived from the same Zod schema) with a per-adapter capability tier (`Provider.nativeStructuredOutputSupport`) that warns-and-proceeds when unsupported. Silent cliffs surface as a new `schema_diagnostic` event (oversized / dropped-refinements / streaming-disabled / no-guidance / native-unsupported) plus a bounded one-time `console.warn`. Repair via Zod `.transform()` / `ctx.verify`. Verified live across 8 providers. See [api-reference.md#structured-output](docs/api-reference.md#structured-output).
@@ -69,13 +70,16 @@ Currently: `InMemoryVectorStore` (testing) and `SqliteVectorStore` (production).
 |---------|-----|
 | pgvector | Most deployed vector DB in production |
 
-#### Provider Ecosystem Expansion
+#### Remaining Provider Ecosystem Expansion
 
-The OpenAI `/v1/chat/completions` + Bearer wire format is the de-facto standard — aggregators, the non-Big-3 labs, every self-hosted runtime, and (now) the enterprise clouds all speak it. The `OpenAIProvider` already accepts a custom `baseUrl`, so basic chat/tools/streaming works against these today. Rather than hand-write one ~500-line adapter per provider, the plan generalizes the existing adapter into a **generic `OpenAICompatibleProvider` parameterized by a `ProviderProfile`**, and ships breadth as **registry presets** — turning a coverage problem into a configuration problem (the shape Vercel's `@ai-sdk/openai-compatible` and LiteLLM converged on). The native `anthropic`/`gemini` adapters stay native to preserve thinking/effort fidelity, and the zero-dependency raw-`fetch` guarantee is preserved.
+The generic `OpenAICompatibleProvider` and Tier 1 presets are complete. Remaining work
+focuses on enterprise authentication/reach and provider-specific fidelity while keeping the
+native Anthropic and Gemini adapters for thinking and tool-continuation semantics.
 
-The generalization fixes three OpenAI-specific behaviors that currently misfire on other providers: the unified `effort` knob is gated to OpenAI model names (silent no-op elsewhere), unpriced models report a misleading `$0` instead of "unknown" cost, and reasoning traces from non-OpenAI providers are dropped. A profile carries per-preset pricing, reasoning emit/capture, auth-header shape, and capability flags (with per-model overrides where providers diverge).
+The shipped profile contract carries per-preset pricing, reasoning emit/capture, auth-header
+shape, and per-model capability flags. Unknown billing remains `undefined`, never zero.
 
-**Tier 1 — the generic engine + highest-leverage breadth:**
+**Tier 1 — complete:**
 
 | Preset | URI example | Notes |
 |--------|-------------|-------|

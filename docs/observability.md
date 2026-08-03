@@ -39,9 +39,9 @@ AXL_TRACE_ENABLED=true AXL_TRACE_LEVEL=full node server.js
 
 ```
 [axl] execution:abc-123 | workflow:HandleSupport | started
-[axl] execution:abc-123 | step:1 agent_call_end | agent:SupportBot | model:openai-responses:gpt-5.5 | 1.2s | $0.003
+[axl] execution:abc-123 | step:1 agent_call_end | agent:SupportBot | model:openai-responses:gpt-5.6 | 1.2s | $0.003
 [axl] execution:abc-123 | step:2 tool_call_end  | tool:get_order | args:["ORD-456"] | 45ms
-[axl] execution:abc-123 | step:3 agent_call_end | agent:SupportBot | model:openai-responses:gpt-5.5 | 0.8s | $0.002
+[axl] execution:abc-123 | step:3 agent_call_end | agent:SupportBot | model:openai-responses:gpt-5.6 | 0.8s | $0.002
 [axl] execution:abc-123 | step:4 tool_call_end  | tool:refund_order | args:["ORD-456"] | 120ms
 [axl] execution:abc-123 | workflow:HandleSupport | completed | 2.4s | $0.005
 ```
@@ -688,7 +688,8 @@ Axl emits **cost-per-span** as an OTel attribute. Because Axl already tracks LLM
 
 ### Token Usage
 
-Provider responses include detailed token usage. For reasoning models (o1, o3, o4-mini), the usage object also reports `reasoning_tokens` and `cached_tokens`:
+Provider responses include detailed token usage. Reasoning and caching calls can also report
+`reasoning_tokens`, `cached_tokens`, and `cache_write_tokens`:
 
 ```typescript
 {
@@ -696,11 +697,15 @@ Provider responses include detailed token usage. For reasoning models (o1, o3, o
   completion_tokens: 450,
   total_tokens: 1650,
   reasoning_tokens: 300,  // Reasoning models only
-  cached_tokens: 800,     // When prompt caching is active
+  cached_tokens: 800,     // Prompt-cache reads
+  cache_write_tokens: 200 // Prompt-cache creation
 }
 ```
 
-Cost estimates automatically account for provider-specific cache discounts (OpenAI: 50%, Anthropic: 10% reads / 125% writes, Gemini: 10%).
+Cost estimates use the exact model and observable billing dimensions. This includes
+model-specific OpenAI cache rates, Anthropic 5-minute/1-hour cache-write buckets, and exact
+Gemini cached-input rates. If a provider omits a required billing dimension, cost is
+`undefined` instead of an optimistic estimate.
 
 ### `ctx.log()` as Span Events
 

@@ -171,7 +171,7 @@ Define an agent with a model, system prompt, tools, and optional handoffs.
 import { agent } from '@axlsdk/axl';
 
 const myAgent = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-5.6',
   system: 'You are a helpful assistant.',
   tools: [search, calculator],
   temperature: 0.7,
@@ -193,7 +193,7 @@ const myAgent = agent({
 | `mcpTools` | `string[]` | — | Whitelist: only expose these specific MCP tools |
 | `temperature` | `number` | provider default | LLM sampling temperature |
 | `maxTokens` | `number` | `4096` | Maximum tokens in the LLM response |
-| `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'`. Controls reasoning depth across all providers. `'xhigh'` is supported natively on Anthropic Opus 4.8/4.7 and OpenAI gpt-5.2+ (including gpt-5.5); clamps to `'high'` on other models |
+| `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'`. Exact model capabilities decide whether a tier is sent, clamped, or omitted. GPT-5.6 and Claude 5 support native `'max'`; earlier families retain their documented caps |
 | `thinkingBudget` | `number` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. Set to `0` to disable thinking while keeping effort |
 | `includeThoughts` | `boolean` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini |
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool |
@@ -967,7 +967,7 @@ User-defined validation functions that run at the agent boundary, before and aft
 
 ```typescript
 const safe = agent({
-  model: 'openai-responses:gpt-5.5',
+  model: 'openai-responses:gpt-5.6',
   system: 'You are a helpful assistant.',
   guardrails: {
     input: async (prompt, ctx) => {
@@ -1529,7 +1529,14 @@ ollama/vllm/lmstudio/llamacpp/sglang) are profiles; build your own by cloning on
 | `parallelToolCalls` | `PerModel<boolean>` | off | Send `parallel_tool_calls: true` when tools are present |
 | `requestDefaults` | `Record<string,unknown>` | — | Static body fields merged before `providerOptions` |
 
-**`PricingSource`** — `{ kind: 'table'; table: PricingTable }` · `{ kind: 'from-response' }` (provider returns `usage.cost`) · `{ kind: 'zero' }` (local) · `{ kind: 'unknown' }`. A `'table'` miss yields `cost: undefined`, never `0`.
+**`PricingSource`** — `{ kind: 'table'; table: PricingTable; match?: 'prefix' | 'exact' }` · `{ kind: 'from-response' }` (provider returns `usage.cost`) · `{ kind: 'zero' }` (local) · `{ kind: 'unknown' }`. Custom tables default to prefix matching for compatibility; built-in current catalogs use exact matching. A table miss yields `cost: undefined`, never `0`.
+
+**Provider usage** — `ProviderResponse.usage` and terminal stream chunks expose
+`prompt_tokens`, `completion_tokens`, `total_tokens`, and optional `reasoning_tokens`,
+`cached_tokens`, and `cache_write_tokens`. Anthropic cache creation is included in
+`cache_write_tokens`; when the response provides 5-minute and 1-hour TTL buckets, Axl prices
+each bucket at its actual multiplier. Aggregate-only cache-write usage remains observable but
+is deliberately unpriced.
 
 **`ReasoningProfile`** — `{ emit: ReasoningEmit; capture: ReasoningCapture; roundTrip?: ReasoningRoundTrip }`.
 - `capture`: `'none'` · `'reasoning_content'` · `'reasoning'` · `'reasoning_details'` · `'think_tags'` (inline `<think>`).

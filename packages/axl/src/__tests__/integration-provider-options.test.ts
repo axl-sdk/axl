@@ -257,11 +257,11 @@ describe.skipIf(!hasGoogle)('providerOptions: Gemini 2.x', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Gemini 3.x (gemini-3.1-flash-lite) — uses thinkingLevel code path
+// Gemini 3.x (gemini-3.5-flash-lite) — uses thinkingLevel code path
 // ---------------------------------------------------------------------------
 
 describe.skipIf(!hasGoogle)('providerOptions: Gemini 3.x', () => {
-  const model = 'google:gemini-3.1-flash-lite';
+  const model = 'google:gemini-3.5-flash-lite';
 
   it('passes safetySettings via providerOptions on 3.x model', async () => {
     const a = agent({

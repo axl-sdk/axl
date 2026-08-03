@@ -434,14 +434,9 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)('Anthropic Integration', () => {
 // ---------------------------------------------------------------------------
 
 describe.skipIf(!process.env.GOOGLE_API_KEY)('Google Gemini Integration', () => {
-  // gemini-2.5-flash-lite has the same input/output pricing as 2.0-flash
-  // ($0.10/$0.40 per 1M tokens) but a much higher free-tier per-minute
-  // quota. Switched here after the spec/16 verification pass — running
-  // the full Gemini integration suite against 2.0-flash hit 429s
-  // intermittently mid-suite. Also exercised by `Pricing Integration:
-  // Gemini` and the streaming pricing tests, which confirm it works on
-  // every code path we care about.
-  const cheapModel = 'google:gemini-2.5-flash-lite';
+  // Gemini 3.5 Flash-Lite is the current low-cost Gemini 3 descriptor. This
+  // suite intentionally exercises native signed tool continuations on it.
+  const cheapModel = 'google:gemini-3.5-flash-lite';
 
   it('basic text response', async () => {
     const assistant = agent({

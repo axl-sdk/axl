@@ -58,13 +58,13 @@ type Tier = 'schema' | 'downgraded' | 'lossy' | 'unsupported';
 const MATRIX: Array<{ key: string; uri: string; tier: Tier }> = [
   { key: 'OPENAI_API_KEY', uri: 'openai:gpt-4.1-nano', tier: 'schema' },
   { key: 'ANTHROPIC_API_KEY', uri: 'anthropic:claude-haiku-4-5', tier: 'unsupported' },
-  { key: 'GOOGLE_API_KEY', uri: 'google:gemini-2.5-flash-lite', tier: 'lossy' },
-  { key: 'DEEPSEEK_API_KEY', uri: 'deepseek:deepseek-chat', tier: 'downgraded' },
+  { key: 'GOOGLE_API_KEY', uri: 'google:gemini-3.5-flash-lite', tier: 'lossy' },
+  { key: 'DEEPSEEK_API_KEY', uri: 'deepseek:deepseek-v4-flash', tier: 'downgraded' },
   { key: 'GROQ_API_KEY', uri: 'groq:llama-3.1-8b-instant', tier: 'downgraded' },
   { key: 'GROQ_API_KEY', uri: 'groq:openai/gpt-oss-20b', tier: 'schema' },
   { key: 'MISTRAL_API_KEY', uri: 'mistral:mistral-small-latest', tier: 'schema' },
   { key: 'OPENROUTER_API_KEY', uri: 'openrouter:openai/gpt-4o-mini', tier: 'schema' },
-  { key: 'XAI_API_KEY', uri: 'xai:grok-3-mini', tier: 'schema' },
+  { key: 'XAI_API_KEY', uri: 'xai:grok-4.20', tier: 'schema' },
 ];
 
 for (const m of MATRIX) {

@@ -70,13 +70,47 @@ describe.skipIf(!process.env.OPENROUTER_API_KEY)('preset: OpenRouter', () => {
 describe.skipIf(!process.env.XAI_API_KEY)('preset: xAI', () => {
   const provider = () => new OpenAICompatibleProvider({ profile: XAI_PROFILE });
 
-  it('grok-3-mini accepts reasoning_effort (the family we map onto)', async () => {
-    const res = await smoke(provider(), 'grok-3-mini', { effort: 'low' });
+  it('current Grok Chat id returns terminal cost ticks', async () => {
+    const res = await smoke(provider(), 'grok-4.20', { effort: 'low' });
     expect(typeof res.content).toBe('string');
+    expect(res.cost).toBeTypeOf('number');
+    expect(res.cost!).toBeGreaterThanOrEqual(0);
   });
 
-  it('grok-4 does not 400 when effort is set (we omit reasoning_effort there)', async () => {
-    await expect(smoke(provider(), 'grok-4', { effort: 'high' })).resolves.toBeDefined();
+  it('current non-reasoning Grok Chat id does not 400 when effort is set', async () => {
+    await expect(
+      smoke(provider(), 'grok-4.20-non-reasoning', { effort: 'high' }),
+    ).resolves.toBeDefined();
+  });
+
+  it('round-trips a client function call with the current Chat id', async () => {
+    const tools = [
+      {
+        type: 'function' as const,
+        function: {
+          name: 'echo_probe',
+          description: 'Return a short fixed value.',
+          parameters: { type: 'object', properties: {} },
+        },
+      },
+    ];
+    const first = await provider().chat(
+      [{ role: 'user', content: 'Call echo_probe now. Do not answer directly.' }],
+      { model: 'grok-4.20', maxTokens: 64, tools },
+    );
+    expect(first.tool_calls?.length).toBeGreaterThan(0);
+    expect(first.cost).toBeGreaterThanOrEqual(0);
+
+    const followup = await provider().chat(
+      [
+        { role: 'user', content: 'Call echo_probe now. Do not answer directly.' },
+        { role: 'assistant', content: first.content, tool_calls: first.tool_calls },
+        { role: 'tool', content: 'ok', tool_call_id: first.tool_calls![0].id },
+      ],
+      { model: 'grok-4.20', maxTokens: 64, tools },
+    );
+    expect(typeof followup.content).toBe('string');
+    expect(followup.cost).toBeGreaterThanOrEqual(0);
   });
 });
 
@@ -85,13 +119,14 @@ describe.skipIf(!process.env.XAI_API_KEY)('preset: xAI', () => {
 describe.skipIf(!process.env.DEEPSEEK_API_KEY)('preset: DeepSeek', () => {
   const provider = () => new OpenAICompatibleProvider({ profile: DEEPSEEK_PROFILE });
 
-  it('deepseek-chat accepts a chat call', async () => {
-    const res = await smoke(provider(), 'deepseek-chat');
+  it('deepseek-v4-flash accepts a priced chat call', async () => {
+    const res = await smoke(provider(), 'deepseek-v4-flash');
     expect(typeof res.content).toBe('string');
     expect(res.usage?.total_tokens).toBeGreaterThan(0);
+    expect(res.cost).toBeGreaterThanOrEqual(0);
   });
 
-  it('deepseek-reasoner captures reasoning_content + does not 400 on a tool-call round-trip', async () => {
+  it('deepseek-v4-pro captures reasoning_content + does not 400 on a tool-call round-trip', async () => {
     const tools = [
       {
         type: 'function' as const,
@@ -105,7 +140,7 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('preset: DeepSeek', () => {
     const first = await provider().chat(
       [{ role: 'user', content: 'Call the get_time function now. Do not answer directly.' }],
       {
-        model: 'deepseek-reasoner',
+        model: 'deepseek-v4-pro',
         maxTokens: 64,
         tools,
       },
@@ -124,7 +159,7 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('preset: DeepSeek', () => {
         },
         { role: 'tool', content: '12:00', tool_call_id: first.tool_calls![0].id },
       ],
-      { model: 'deepseek-reasoner', maxTokens: 64, tools },
+      { model: 'deepseek-v4-pro', maxTokens: 64, tools },
     );
     expect(typeof followup.content).toBe('string');
   });
@@ -138,6 +173,7 @@ describe.skipIf(!process.env.MISTRAL_API_KEY)('preset: Mistral', () => {
   it('mistral-small accepts reasoning_effort (the family we map onto)', async () => {
     const res = await smoke(provider(), 'mistral-small-latest', { effort: 'high' });
     expect(typeof res.content).toBe('string');
+    expect(res.cost).toBeGreaterThanOrEqual(0);
   });
 
   it('mistral-large does NOT 422 when effort is set (we omit reasoning_effort there)', async () => {
@@ -155,6 +191,7 @@ describe.skipIf(!process.env.GROQ_API_KEY)('preset: Groq', () => {
   it('gpt-oss accepts reasoning_effort (low/medium/high)', async () => {
     const res = await smoke(provider(), 'openai/gpt-oss-20b', { effort: 'low' });
     expect(typeof res.content).toBe('string');
+    expect(res.cost).toBeGreaterThanOrEqual(0);
   });
 
   it('a non-gpt-oss model does NOT 400 when effort is set (we omit it there)', async () => {

@@ -160,6 +160,19 @@ describe.skipIf(!hasOpenAI)('Pricing Integration: OpenAI Chat Completions', () =
       expect(done.usage!.cached_tokens).toBeLessThanOrEqual(done.usage!.prompt_tokens);
     }
   }, 60_000);
+
+  it('gpt-5.6-luna accepts native max effort and reports bounded cache usage', async () => {
+    const response = await provider.chat([{ role: 'user', content: 'Reply with exactly: ok' }], {
+      model: 'gpt-5.6-luna',
+      maxTokens: 64,
+      effort: 'max',
+    });
+    expect(response.usage?.total_tokens).toBeGreaterThan(0);
+    expect(response.cost).toBeGreaterThan(0);
+    if (response.usage?.cached_tokens !== undefined) {
+      expect(response.usage.cached_tokens).toBeLessThanOrEqual(response.usage.prompt_tokens);
+    }
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -257,6 +270,16 @@ describe.skipIf(!hasOpenAI)('Pricing Integration: OpenAI Responses API', () => {
     expect(done.usage).toBeDefined();
     expect(done.usage!.prompt_tokens).toBeGreaterThan(0);
     expect(done.usage!.completion_tokens).toBeGreaterThan(0);
+  }, 30_000);
+
+  it('gpt-5.6-luna supports native max effort with effective priced usage', async () => {
+    const response = await provider.chat([{ role: 'user', content: 'Reply with exactly: ok' }], {
+      model: 'gpt-5.6-luna',
+      maxTokens: 64,
+      effort: 'max',
+    });
+    expect(response.usage?.total_tokens).toBeGreaterThan(0);
+    expect(response.cost).toBeGreaterThan(0);
   }, 30_000);
 });
 
@@ -407,6 +430,27 @@ describe.skipIf(!hasAnthropic)('Pricing Integration: Anthropic', () => {
       expect(done.usage!.cached_tokens).toBeLessThanOrEqual(done.usage!.prompt_tokens);
     }
   }, 60_000);
+
+  it('Sonnet 5 accepts default and effort requests with observable thinking metadata', async () => {
+    const baseline = await provider.chat([{ role: 'user', content: 'Reply with exactly: ok' }], {
+      model: 'claude-sonnet-5',
+      maxTokens: 64,
+    });
+    expect(baseline.usage?.total_tokens).toBeGreaterThan(0);
+    expect(baseline.cost).toBeGreaterThan(0);
+
+    const effort = await provider.chat(
+      [{ role: 'user', content: 'What is 2 + 2? Reply with only the number.' }],
+      { model: 'claude-sonnet-5', maxTokens: 128, effort: 'low' },
+    );
+    expect(effort.usage?.total_tokens).toBeGreaterThan(0);
+    expect(effort.cost).toBeGreaterThan(0);
+    // Providers may choose not to expose visible summaries for trivial calls;
+    // when they do, Axl must retain the opaque blocks for continuation.
+    if (effort.providerMetadata !== undefined) {
+      expect(effort.providerMetadata.anthropicThinkingBlocks).toBeDefined();
+    }
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -415,7 +459,7 @@ describe.skipIf(!hasAnthropic)('Pricing Integration: Anthropic', () => {
 
 describe.skipIf(!hasGoogle)('Pricing Integration: Gemini', () => {
   let provider: GeminiProvider;
-  const model = 'gemini-2.5-flash-lite';
+  const model = 'gemini-3.5-flash-lite';
   const messages: ChatMessage[] = [{ role: 'user', content: 'Reply with exactly one word: Hello' }];
   const opts = { model, maxTokens: 10 };
 
@@ -432,9 +476,11 @@ describe.skipIf(!hasGoogle)('Pricing Integration: Gemini', () => {
     expect(response.usage).toBeDefined();
     expect(response.usage!.prompt_tokens).toBeGreaterThan(0);
     expect(response.usage!.completion_tokens).toBeGreaterThan(0);
-    // Gemini totalTokenCount should equal prompt + candidates for non-thinking models
+    // Gemini reports thoughts separately; public completion remains candidate output.
     expect(response.usage!.total_tokens).toBe(
-      response.usage!.prompt_tokens + response.usage!.completion_tokens,
+      response.usage!.prompt_tokens +
+        response.usage!.completion_tokens +
+        (response.usage!.reasoning_tokens ?? 0),
     );
     if (response.usage!.cached_tokens != null) {
       expect(response.usage!.cached_tokens).toBeGreaterThanOrEqual(0);
@@ -454,7 +500,9 @@ describe.skipIf(!hasGoogle)('Pricing Integration: Gemini', () => {
     expect(done!.usage!.prompt_tokens).toBeGreaterThan(0);
     expect(done!.usage!.completion_tokens).toBeGreaterThan(0);
     expect(done!.usage!.total_tokens).toBe(
-      done!.usage!.prompt_tokens + done!.usage!.completion_tokens,
+      done!.usage!.prompt_tokens +
+        done!.usage!.completion_tokens +
+        (done!.usage!.reasoning_tokens ?? 0),
     );
   }, 30_000);
 
@@ -471,12 +519,12 @@ describe.skipIf(!hasGoogle)('Pricing Integration: Gemini', () => {
     expect(ratio).toBeLessThan(10);
   }, 60_000);
 
-  it('chat() cost and usage correct for thinking model (gemini-2.5-flash)', async () => {
+  it('chat() accepts Gemini 3.6 Flash without portable temperature and reports priced usage', async () => {
     // Gemini thinking models return thoughtsTokenCount in usageMetadata.
     // Verify cost and usage are still parsed correctly.
     const response = await provider.chat(
       [{ role: 'user', content: 'What is 2+2? Reply with just the number.' }],
-      { model: 'gemini-2.5-flash', maxTokens: 1024, effort: 'low' },
+      { model: 'gemini-3.6-flash', maxTokens: 64, effort: 'low', temperature: 0.7 },
     );
 
     expect(response.cost).toBeTypeOf('number');
@@ -488,11 +536,11 @@ describe.skipIf(!hasGoogle)('Pricing Integration: Gemini', () => {
     expect(response.usage!.total_tokens).toBeGreaterThan(0);
   }, 30_000);
 
-  it('stream() cost and usage correct for thinking model (gemini-2.5-flash)', async () => {
+  it('stream() cost and usage correct for Gemini 3.6 Flash', async () => {
     const chunks = await collectChunks(
       provider.stream([{ role: 'user', content: 'What is 2+2? Reply with just the number.' }], {
-        model: 'gemini-2.5-flash',
-        maxTokens: 1024,
+        model: 'gemini-3.6-flash',
+        maxTokens: 64,
         effort: 'low',
       }),
     );

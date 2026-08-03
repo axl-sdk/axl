@@ -32,10 +32,16 @@ and the rule differ.
 
 ## Shared skills and roles
 
-Repo skills are authored once under `.claude/skills/` and exposed to Codex by
-the tracked `.agents/skills` symlink. Keep the symlink relative so it remains
-valid in clones and worktrees.
+Claude project skills live under `.claude/skills/`. Codex discovers repository
+skills through `.agents/skills`, which points to `.codex/skills`. The shared
+`live-api-verification` methodology skill is linked individually from
+`.codex/skills` back to `.claude/skills`; Codex-specific orchestration variants
+(`plan-doc`, `tackle-plan`, `session-review`, and `scenario-review`) live as
+native files under `.codex/skills` because they route named Codex agents and
+model tiers. Update both platform variants only when shared orchestration
+semantics change.
 
-Project-scoped Codex roles live in `.codex/agents/`. Their matching Claude role
-charters under `.claude/agents/` are the canonical detailed instructions; keep
-the two discovery surfaces aligned when adding, removing, or renaming a role.
+Project-scoped Codex roles live in `.codex/agents/`; matching Claude-native
+roles live in `.claude/agents/`. Keep both discovery surfaces aligned on role
+names, responsibilities, and escalation outcomes while allowing platform model
+and tool instructions to differ.

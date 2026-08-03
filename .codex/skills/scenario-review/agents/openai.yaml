@@ -1,0 +1,6 @@
+interface:
+  display_name: 'Scenario Review'
+  short_description: 'Verify Axl behavior from blind scenarios'
+  default_prompt: 'Use $scenario-review to derive and verify Axl user scenarios.'
+policy:
+  allow_implicit_invocation: false

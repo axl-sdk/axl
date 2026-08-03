@@ -1,0 +1,6 @@
+interface:
+  display_name: 'Tackle Plan'
+  short_description: 'Drive an Axl plan through verified completion'
+  default_prompt: 'Use $tackle-plan to implement and verify this Axl plan.'
+policy:
+  allow_implicit_invocation: false

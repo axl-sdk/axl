@@ -1,0 +1,6 @@
+interface:
+  display_name: 'Plan Doc'
+  short_description: 'Create a grounded Axl implementation plan'
+  default_prompt: 'Use $plan-doc to create a living plan for this Axl work.'
+policy:
+  allow_implicit_invocation: false

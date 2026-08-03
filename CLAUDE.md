@@ -75,11 +75,50 @@ Run from the repo root. Per-area detail: `.claude/rules/testing.md` and the pack
 - **Never commit gitignored paths** (`.internal/**`); no `git add -f`.
 - **Never commit, push, or tag without explicit approval.**
 
+## Agent routing
+
+The project roles are cost- and risk-tiered. Codex uses `repo-explorer`
+(Luna/medium) for bounded discovery, `routine-implementer` (Luna default effort)
+for highly specified pattern work, `balanced-implementer` (Terra/medium) for
+moderate implementation, `behavioral-test-analyst` (Terra/high) for blind
+scenario and test design, `boundary-implementer` (Terra/high) for settled
+consequential seams, `pragmatic-code-reviewer` (Terra/high) for ordinary review,
+and `adversarial-code-reviewer` (Sol/high) only for consequential risk. Use
+Sol/medium to lead orchestrated plan and review work; raise lead effort only
+when architecture or conflicting evidence makes the lead the primary reasoner.
+
+Claude mirrors those outcomes with Sonnet/low for exploration and routine work,
+Sonnet/medium for balanced implementation, Sonnet/high for behavioral analysis,
+boundary implementation, and pragmatic review, and Opus/high for premium
+adversarial review. Fable is the preferred Claude lead for long-horizon
+orchestration, with Opus as the economical alternative; lead at medium effort
+and raise it only for consequential synthesis or adjudication.
+
+Do not delegate merely because a slot exists. `boundary-implementer` receives
+only settled designs and always requires a focused premium review. Review waves
+scale from one pragmatic reviewer on a small milestone to two ordinary lanes
+plus one focused premium pass on a high-risk diff.
+
+Read-only role configuration is defense in depth, not a portable hard boundary:
+the host's permission profile may override a role's `sandbox_mode`. Discovery,
+behavioral-analysis, and review agents must still be explicitly instructed not
+to edit or run artifact-writing commands, and the lead must confirm a review
+wave did not mutate the working tree before accepting its findings or committing.
+
 ## Workflow skills
 
-These are explicit-invoke skills (`disable-model-invocation: true`). They live
-in `.claude/skills/` and are exposed to Codex through the tracked
-`.agents/skills` symlink, so one Axl-specific skill body serves both tools.
+Claude skills live in `.claude/skills/`. Codex discovers repository skills
+through `.agents/skills`, which points to `.codex/skills`. The Codex directory
+links `live-api-verification` back here individually, so its Axl knowledge still
+has one source. The four orchestration workflows are native Codex
+variants because they name Codex agents and choose Terra/Sol tiers; keep the two
+platform variants aligned on outcomes, not implementation details.
+
+All five workflows are explicit-invoke (`disable-model-invocation: true` in
+Claude; `policy.allow_implicit_invocation: false` in Codex). Invoke them with
+Claude's `/skill` syntax or Codex's `$skill` syntax. This list is the model's
+only index of explicit skills, so keep it complete and synchronized with both
+skill directories.
 
 - `/plan-doc` — create a living journeys-to-architecture plan under
   `.internal/spec/`.

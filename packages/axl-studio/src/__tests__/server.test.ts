@@ -89,15 +89,26 @@ describe('Studio Server', () => {
     expect(res.status).toBe(200);
   });
 
-  it('cors: false disables CORS headers', async () => {
+  it('disables CORS headers by default', async () => {
     const runtime = new AxlRuntime();
     runtime.registerProvider('mock', MockProvider.echo());
-    const { app } = createServer({ runtime, cors: false });
+    const { app } = createServer({ runtime });
 
     const res = await app.request('/api/health', {
       headers: { Origin: 'http://example.com' },
     });
     expect(res.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  it('enables wildcard CORS only when explicitly requested', async () => {
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('mock', MockProvider.echo());
+    const { app } = createServer({ runtime, cors: true });
+
+    const res = await app.request('/api/health', {
+      headers: { Origin: 'http://example.com' },
+    });
+    expect(res.headers.get('access-control-allow-origin')).toBe('*');
   });
 
   it('basePath injects <base> and __AXL_STUDIO_BASE__ into index.html', async () => {

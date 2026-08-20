@@ -9,6 +9,32 @@
 
 export { CONFIG_CANDIDATES, findConfig, needsTsxLoader, importModule } from '@axlsdk/axl';
 
+/** Standalone Studio is an unauthenticated local-development surface. */
+export const STUDIO_CLI_HOST = '127.0.0.1';
+
+/**
+ * Browser WebSocket handshakes carry an Origin header even though they are not
+ * governed by CORS. Standalone Studio accepts only local browser origins; CLI
+ * and other non-browser clients may omit Origin.
+ */
+export function isAllowedStandaloneOrigin(origin: string | undefined): boolean {
+  if (origin === undefined) return true;
+
+  let url: URL;
+  try {
+    url = new URL(origin);
+  } catch {
+    return false;
+  }
+
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+  if (url.username || url.password || url.pathname !== '/' || url.search || url.hash) return false;
+
+  return (
+    url.hostname === 'localhost' || url.hostname === 'localhost.' || url.hostname === '127.0.0.1'
+  );
+}
+
 // ── Parse CLI args ──────────────────────────────────────────────────
 
 export interface CliArgs {

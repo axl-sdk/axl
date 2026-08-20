@@ -5,7 +5,14 @@ import { serve } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
 import { createServer } from './server/index.js';
 import { resolveRuntime } from './resolve-runtime.js';
-import { parseArgs, findConfig, importModule, CONFIG_CANDIDATES } from './cli-utils.js';
+import {
+  parseArgs,
+  findConfig,
+  importModule,
+  CONFIG_CANDIDATES,
+  STUDIO_CLI_HOST,
+  isAllowedStandaloneOrigin,
+} from './cli-utils.js';
 
 // ── Main ────────────────────────────────────────────────────────────
 
@@ -134,6 +141,7 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
     runtime,
     staticRoot: hasStaticAssets ? staticRoot : undefined,
     readOnly: args.readOnly,
+    cors: false,
   });
 
   if (args.readOnly) {
@@ -143,6 +151,21 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
   // Set up WebSocket
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
   const wsHandlers = createWsHandlers();
+  app.use('/ws', async (c, next) => {
+    if (!isAllowedStandaloneOrigin(c.req.header('Origin'))) {
+      return c.json(
+        {
+          ok: false,
+          error: {
+            code: 'FORBIDDEN_ORIGIN',
+            message: 'Standalone Studio accepts WebSocket connections only from local origins',
+          },
+        },
+        403,
+      );
+    }
+    await next();
+  });
   app.get(
     '/ws',
     upgradeWebSocket(() => wsHandlers),
@@ -152,9 +175,10 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
     {
       fetch: app.fetch,
       port: args.port,
+      hostname: STUDIO_CLI_HOST,
     },
     (info) => {
-      console.log(`[axl-studio] Server running at http://localhost:${info.port}`);
+      console.log(`[axl-studio] Server running at http://${STUDIO_CLI_HOST}:${info.port}`);
       console.log(`[axl-studio] Workflows: ${runtime.getWorkflowNames().join(', ') || '(none)'}`);
       console.log(
         `[axl-studio] Agents: ${
@@ -185,7 +209,7 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
 
   // Auto-open browser
   if (args.open) {
-    const url = `http://localhost:${args.port}`;
+    const url = `http://${STUDIO_CLI_HOST}:${args.port}`;
     const { exec } = await import('node:child_process');
     const cmd =
       process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';

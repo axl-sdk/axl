@@ -56,7 +56,7 @@ export type CreateServerOptions = {
   basePath?: string;
   /** When true, disable all mutating API endpoints. */
   readOnly?: boolean;
-  /** Apply CORS headers. Default: true (standalone CLI). Set false for embedded middleware. */
+  /** Apply wildcard CORS headers. Default: false. Enable only for a trusted cross-origin client. */
   cors?: boolean;
   /** Lazy eval file loader. Called before eval routes access the runtime's registered evals. */
   evalLoader?: () => Promise<void>;
@@ -112,7 +112,7 @@ export function createServer(options: CreateServerOptions) {
   });
 
   // ── Middleware ──────────────────────────────────────────────────────
-  if (options.cors !== false) {
+  if (options.cors === true) {
     app.use('*', cors());
   }
   app.onError(errorHandler);

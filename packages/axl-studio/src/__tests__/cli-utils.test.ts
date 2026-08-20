@@ -2,7 +2,38 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { parseArgs, findConfig, needsTsxLoader, CONFIG_CANDIDATES } from '../cli-utils.js';
+import {
+  parseArgs,
+  findConfig,
+  needsTsxLoader,
+  CONFIG_CANDIDATES,
+  STUDIO_CLI_HOST,
+  isAllowedStandaloneOrigin,
+} from '../cli-utils.js';
+
+describe('standalone network boundary', () => {
+  it('binds the CLI to explicit IPv4 loopback', () => {
+    expect(STUDIO_CLI_HOST).toBe('127.0.0.1');
+  });
+
+  it.each([undefined, 'http://localhost:4400', 'http://localhost.:4401', 'https://127.0.0.1'])(
+    'accepts local or absent browser Origin %s',
+    (origin) => {
+      expect(isAllowedStandaloneOrigin(origin)).toBe(true);
+    },
+  );
+
+  it.each([
+    'https://example.com',
+    'http://localhost.evil.test',
+    'null',
+    'file:///',
+    'http://localhost/path',
+    'not a url',
+  ])('rejects non-local or malformed browser Origin %s', (origin) => {
+    expect(isAllowedStandaloneOrigin(origin)).toBe(false);
+  });
+});
 
 // ── parseArgs ──────────────────────────────────────────────────────
 

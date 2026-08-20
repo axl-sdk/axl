@@ -14,9 +14,9 @@ export default defineConfig({
   server: {
     port: 4401,
     proxy: {
-      '/api': 'http://localhost:4400',
+      '/api': 'http://127.0.0.1:4400',
       '/ws': {
-        target: 'ws://localhost:4400',
+        target: 'ws://127.0.0.1:4400',
         ws: true,
       },
     },

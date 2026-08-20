@@ -635,7 +635,12 @@ export const OPENAI_PROFILE: ProviderProfile = {
  */
 export class OpenAIProvider extends OpenAICompatibleProvider {
   constructor(
-    options: { apiKey?: ApiKeySource; baseUrl?: string; rateLimit?: RateLimitConfig } = {},
+    options: {
+      apiKey?: ApiKeySource;
+      baseUrl?: string;
+      dangerouslyAllowInsecureHttp?: boolean;
+      rateLimit?: RateLimitConfig;
+    } = {},
   ) {
     super({ profile: OPENAI_PROFILE, ...options });
   }

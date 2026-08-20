@@ -17,6 +17,7 @@ import { fetchWithRetry } from './retry.js';
 import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { isBuiltinTablePricingEligible } from './builtin-table-pricing.js';
+import { assertSafeProviderBaseUrl } from './transport.js';
 
 // ===========================================================================
 // Generic OpenAI-compatible provider engine.
@@ -398,6 +399,8 @@ export type OpenAICompatibleOptions = {
   /** API key or a per-request resolver (expiring tokens). See {@link ApiKeySource}. */
   apiKey?: ApiKeySource;
   baseUrl?: string;
+  /** Permit a non-loopback HTTP endpoint for this provider instance. */
+  dangerouslyAllowInsecureHttp?: boolean;
   /** Override the profile's auth header shape (e.g. Azure Entra bearer tokens). */
   authHeader?: AuthHeader;
   rateLimit?: RateLimitConfig;
@@ -440,6 +443,11 @@ export class OpenAICompatibleProvider implements Provider {
     const envBase = p.envBaseUrl ? process.env[p.envBaseUrl] : undefined;
     const explicitBase = options.baseUrl ?? envBase;
     this.baseUrl = (explicitBase ?? p.defaultBaseUrl).replace(/\/$/, '');
+    assertSafeProviderBaseUrl(
+      this.baseUrl,
+      `${p.label ?? p.name} provider`,
+      options.dangerouslyAllowInsecureHttp,
+    );
     this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
 
     const label = p.label ?? p.name;

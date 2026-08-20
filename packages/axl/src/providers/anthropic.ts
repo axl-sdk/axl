@@ -12,6 +12,7 @@ import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './type
 import { fetchWithRetry } from './retry.js';
 import { buildProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
+import { assertSafeProviderBaseUrl } from './transport.js';
 
 const ANTHROPIC_API_VERSION = '2023-06-01';
 
@@ -587,10 +588,20 @@ export class AnthropicProvider implements Provider {
   private governor?: RateLimiter;
 
   constructor(
-    options: { apiKey?: ApiKeySource; baseUrl?: string; rateLimit?: RateLimitConfig } = {},
+    options: {
+      apiKey?: ApiKeySource;
+      baseUrl?: string;
+      dangerouslyAllowInsecureHttp?: boolean;
+      rateLimit?: RateLimitConfig;
+    } = {},
   ) {
     this.apiKeySource = options.apiKey ?? process.env.ANTHROPIC_API_KEY ?? '';
     this.baseUrl = (options.baseUrl ?? 'https://api.anthropic.com/v1').replace(/\/$/, '');
+    assertSafeProviderBaseUrl(
+      this.baseUrl,
+      'Anthropic provider',
+      options.dangerouslyAllowInsecureHttp,
+    );
     this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
 
     // Eager validation for the string case; a function source is validated per

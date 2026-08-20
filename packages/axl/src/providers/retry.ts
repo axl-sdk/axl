@@ -127,7 +127,9 @@ export async function fetchWithRetry(
     for (let attempt = 0; ; attempt++) {
       let res: Response;
       try {
-        res = await fetch(input, init);
+        // Never re-send provider request bodies or credentials to a redirect
+        // target. A provider must be configured with its final endpoint.
+        res = await fetch(input, { ...init, redirect: 'manual' });
       } catch (err) {
         // Network / non-HTTP failure (DNS, connection reset, TLS, socket
         // hangup). A user/budget abort must NEVER become a ProviderError —

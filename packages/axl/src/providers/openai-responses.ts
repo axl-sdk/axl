@@ -9,6 +9,7 @@ import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './type
 import { fetchWithRetry } from './retry.js';
 import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
+import { assertSafeProviderBaseUrl } from './transport.js';
 
 /**
  * OpenAI Responses API provider using raw fetch (no SDK dependency).
@@ -30,7 +31,12 @@ export class OpenAIResponsesProvider implements Provider {
   private governor?: RateLimiter;
 
   constructor(
-    options: { apiKey?: ApiKeySource; baseUrl?: string; rateLimit?: RateLimitConfig } = {},
+    options: {
+      apiKey?: ApiKeySource;
+      baseUrl?: string;
+      dangerouslyAllowInsecureHttp?: boolean;
+      rateLimit?: RateLimitConfig;
+    } = {},
   ) {
     this.apiKeySource = options.apiKey ?? process.env.OPENAI_API_KEY ?? '';
     this.baseUrl = (
@@ -38,6 +44,11 @@ export class OpenAIResponsesProvider implements Provider {
       process.env.OPENAI_BASE_URL ??
       'https://api.openai.com/v1'
     ).replace(/\/$/, '');
+    assertSafeProviderBaseUrl(
+      this.baseUrl,
+      'OpenAI Responses provider',
+      options.dangerouslyAllowInsecureHttp,
+    );
     this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
 
     // Eager validation for the string case; a function source is validated per

@@ -9,6 +9,11 @@ export type ProviderConfig = {
    *  the common case. See {@link ApiKeySource}. */
   apiKey?: ApiKeySource;
   baseUrl?: string;
+  /**
+   * Allow a non-loopback HTTP endpoint for this provider. HTTP can expose
+   * prompts and credentials in transit; prefer HTTPS whenever possible.
+   */
+  dangerouslyAllowInsecureHttp?: boolean;
   /** OpenAI-compatible presets only: override the profile auth header shape. */
   authHeader?: AuthHeader;
   /**

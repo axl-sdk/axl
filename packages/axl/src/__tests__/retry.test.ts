@@ -1,3 +1,4 @@
+import { createServer } from 'node:http';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { fetchWithRetry } from '../providers/retry.js';
 import { RateLimiter } from '../providers/rate-limiter.js';
@@ -93,7 +94,7 @@ describe('fetchWithRetry', () => {
     expect(globalThis.fetch).toHaveBeenCalledTimes(1);
   });
 
-  it('passes init options through to fetch', async () => {
+  it('passes init options through while forcing manual redirects', async () => {
     const mockRes = { ok: true, status: 200, headers: new Headers() };
     globalThis.fetch = vi.fn().mockResolvedValue(mockRes) as any;
 
@@ -104,8 +105,60 @@ describe('fetchWithRetry', () => {
     };
 
     await fetchWithRetry('https://example.com', init);
-    expect(globalThis.fetch).toHaveBeenCalledWith('https://example.com', init);
+    expect(globalThis.fetch).toHaveBeenCalledWith('https://example.com', {
+      ...init,
+      redirect: 'manual',
+    });
   });
+
+  it('overrides a caller attempt to follow redirects', async () => {
+    const mockRes = { ok: false, status: 302, headers: new Headers({ location: 'https://other' }) };
+    globalThis.fetch = vi.fn().mockResolvedValue(mockRes) as any;
+
+    await expect(fetchWithRetry('https://example.com', { redirect: 'follow' })).resolves.toBe(
+      mockRes,
+    );
+    expect(globalThis.fetch).toHaveBeenCalledWith('https://example.com', { redirect: 'manual' });
+  });
+
+  it.each([301, 302, 303, 307, 308])(
+    'does not follow a %i redirect to a second endpoint',
+    async (status) => {
+      vi.useRealTimers();
+      let initialRequests = 0;
+      let targetRequests = 0;
+      const server = createServer((request, response) => {
+        if (request.url === '/initial') {
+          initialRequests++;
+          response.writeHead(status, { Location: '/target' });
+          response.end();
+          return;
+        }
+        if (request.url === '/target') targetRequests++;
+        response.writeHead(200);
+        response.end('target');
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('expected TCP test server');
+
+      try {
+        const response = await fetchWithRetry(`http://127.0.0.1:${address.port}/initial`, {
+          method: 'POST',
+          headers: { Authorization: 'Bearer test' },
+          body: 'prompt body',
+        });
+
+        expect(response.status).toBe(status);
+        expect(initialRequests).toBe(1);
+        expect(targetRequests).toBe(0);
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
+    },
+  );
 });
 
 describe('fetchWithRetry + governor', () => {

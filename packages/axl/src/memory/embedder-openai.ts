@@ -1,6 +1,7 @@
 import type { Embedder, EmbedResult } from './types.js';
 import { fetchWithRetry } from '../providers/retry.js';
 import { buildProviderError } from '../providers/errors.js';
+import { assertSafeProviderBaseUrl } from '../providers/transport.js';
 
 /**
  * Per-million-token USD pricing for OpenAI embedding models.
@@ -46,6 +47,7 @@ export class OpenAIEmbedder implements Embedder {
       apiKey?: string;
       model?: string;
       baseUrl?: string;
+      dangerouslyAllowInsecureHttp?: boolean;
       dimensions?: number;
     } = {},
   ) {
@@ -55,6 +57,11 @@ export class OpenAIEmbedder implements Embedder {
     }
     this.model = options.model ?? 'text-embedding-3-small';
     this.baseUrl = options.baseUrl ?? 'https://api.openai.com';
+    assertSafeProviderBaseUrl(
+      this.baseUrl,
+      'OpenAI embedder',
+      options.dangerouslyAllowInsecureHttp,
+    );
     this.dimensions = options.dimensions ?? 1536;
   }
 

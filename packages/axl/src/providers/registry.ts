@@ -27,6 +27,7 @@ const builtinFactories: Record<string, ProviderFactory> = {
     return new OpenAIProvider({
       apiKey: opts.apiKey,
       baseUrl: opts.baseUrl,
+      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
       rateLimit: opts.rateLimit,
     });
   },
@@ -42,6 +43,7 @@ const builtinFactories: Record<string, ProviderFactory> = {
     return new OpenAIResponsesProvider({
       apiKey: opts.apiKey,
       baseUrl: opts.baseUrl,
+      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
       rateLimit: opts.rateLimit,
     });
   },
@@ -50,6 +52,7 @@ const builtinFactories: Record<string, ProviderFactory> = {
     return new AnthropicProvider({
       apiKey: opts.apiKey,
       baseUrl: opts.baseUrl,
+      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
       rateLimit: opts.rateLimit,
     });
   },
@@ -58,6 +61,7 @@ const builtinFactories: Record<string, ProviderFactory> = {
     return new GeminiProvider({
       apiKey: opts.apiKey,
       baseUrl: opts.baseUrl,
+      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
       rateLimit: opts.rateLimit,
     });
   },
@@ -75,6 +79,7 @@ function presetFactory(profile: ProviderProfile): ProviderFactory {
       profile,
       apiKey: opts.apiKey,
       baseUrl: opts.baseUrl,
+      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
       authHeader: opts.authHeader,
       rateLimit: opts.rateLimit,
     });

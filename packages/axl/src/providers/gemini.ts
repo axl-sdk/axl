@@ -11,6 +11,7 @@ import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './type
 import { fetchWithRetry } from './retry.js';
 import { buildProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
+import { assertSafeProviderBaseUrl } from './transport.js';
 
 // ---------------------------------------------------------------------------
 // Schema sanitization for Gemini's tool/responseSchema dialect.
@@ -388,13 +389,23 @@ export class GeminiProvider implements Provider {
   private governor?: RateLimiter;
 
   constructor(
-    options: { apiKey?: ApiKeySource; baseUrl?: string; rateLimit?: RateLimitConfig } = {},
+    options: {
+      apiKey?: ApiKeySource;
+      baseUrl?: string;
+      dangerouslyAllowInsecureHttp?: boolean;
+      rateLimit?: RateLimitConfig;
+    } = {},
   ) {
     this.apiKeySource =
       options.apiKey ?? process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY ?? '';
     this.baseUrl = (options.baseUrl ?? 'https://generativelanguage.googleapis.com/v1beta').replace(
       /\/$/,
       '',
+    );
+    assertSafeProviderBaseUrl(
+      this.baseUrl,
+      'Google provider',
+      options.dangerouslyAllowInsecureHttp,
     );
     this.governor = options.rateLimit ? new RateLimiter(options.rateLimit) : undefined;
 

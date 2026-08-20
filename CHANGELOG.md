@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-20
+
 ### Breaking Changes
 
 - **SDK transport guard.** Built-in providers, `OpenAIEmbedder`, and HTTP MCP
@@ -45,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Studio session redaction.** `trace.redact: true` now scrubs non-streaming session
   results and every session WebSocket event at the Studio serialization boundary.
+
+- **Studio session client payloads.** The exported session send and stream
+  helpers now accept a workflow name and send the server's required
+  `{ workflow, message }` request body.
 
 ## [0.20.1] - 2026-08-03
 
@@ -1092,7 +1098,10 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.19.1...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/axl-sdk/axl/compare/v0.20.1...v0.21.0
+[0.20.1]: https://github.com/axl-sdk/axl/compare/v0.20.0...v0.20.1
+[0.20.0]: https://github.com/axl-sdk/axl/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/axl-sdk/axl/compare/v0.19.0...v0.19.1
 [0.15.0]: https://github.com/axl-sdk/axl/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/axl-sdk/axl/compare/v0.13.8...v0.14.0

@@ -82,6 +82,7 @@ Options:
   --dangerously-bind <ip>  Bind for a loopback-published container/local-forward tunnel
   --config <path>          Path to config file (default: auto-detect)
   --conditions <list>      Comma-separated Node.js import conditions (e.g., development)
+  --read-only              Disable mutating endpoints
   --open                   Auto-open browser
   -h, --help               Show help
 ```

@@ -21,15 +21,16 @@ trusted proxy installed on the backend host is different: it is inside the
 execution trust boundary, as are host administrators, process instrumentation,
 application logs, and the selected model provider.
 
-Axl's built-in providers and `OpenAIEmbedder` reject plaintext remote HTTP
-endpoints by default. HTTPS is always accepted; HTTP is accepted without an
-override only for literal loopback (`localhost`, IPv4 `127/8`, and IPv6 `::1`).
-Deliberate Docker, private-network, or other remote HTTP deployments must set
-`dangerouslyAllowInsecureHttp: true` on that specific provider or embedder.
-Provider requests also do not follow redirects. See
+Axl's built-in providers, `OpenAIEmbedder`, and HTTP MCP client reject plaintext
+remote HTTP endpoints by default. HTTPS is always accepted; HTTP is accepted
+without an override only for literal loopback (`localhost`, IPv4 `127/8`, and
+IPv6 `::1`). Deliberate Docker, private-network, or other remote HTTP deployments
+must set `dangerouslyAllowInsecureHttp: true` on that specific provider,
+embedder, or MCP server entry. Provider, embedding, and HTTP MCP requests do not
+follow redirects. See
 [Providers > Transport security](./providers.md#transport-security) for the
-configuration and migration details. Custom `Provider` implementations and HTTP MCP clients own
-their own transport policy.
+configuration and migration details. Custom `Provider` implementations own
+their transport policy.
 
 This is a network-boundary guarantee, not prompt DRM. A model can repeat,
 paraphrase, or help an adversarial user infer its system instructions. Do not put
@@ -40,7 +41,10 @@ guarantee.
 
 Raw `AxlEvent` streams, lifecycle events, traces, execution history, and Studio
 are trusted/operator surfaces and can contain prompts, resolved system messages,
-tool data, and provider output. A public application should consume an
+tool data, and provider output. Studio agent/tool routes intentionally expose
+static prompt configuration even when `trace.redact` is enabled, so deployed
+Studio middleware requires HTTP authentication plus WebSocket `verifyUpgrade`.
+A public application should consume an
 output-only view on the server and send its own DTO to the client; do not forward
 the raw event firehose. See the
 [server-to-client streaming guidance](./observability.md#server-to-client-streaming-boundary).

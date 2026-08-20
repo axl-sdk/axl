@@ -68,7 +68,9 @@ Your application imports from `src/runtime.ts` directly. Studio discovers everyt
 npx @axlsdk/studio --open
 ```
 
-This loads your config, starts the server on `http://localhost:4400`, and opens the browser.
+This loads your config and starts the server on `http://127.0.0.1:4400`. The
+standalone CLI binds only to IPv4 loopback, emits no CORS headers, and accepts
+browser WebSocket connections only from local origins.
 
 ## CLI Options
 
@@ -179,14 +181,15 @@ const studio = createStudioMiddleware({
   runtime,
   basePath: '/studio',
   // WebSocket upgrades bypass Express middleware — always authenticate here.
-  verifyUpgrade: (req) => {
-    const url = new URL(req.url!, `http://${req.headers.host}`);
-    return url.searchParams.get('token') === process.env.MY_SECRET;
-  },
+  verifyUpgrade: (req) => authenticateStudioRequest(req)?.isAdmin === true,
 });
 
 const app = express();
-app.use('/studio', studio.handler);
+const authenticateStudioHttp: express.RequestHandler = (req, res, next) => {
+  if (authenticateStudioRequest(req)?.isAdmin !== true) return res.sendStatus(403);
+  next();
+};
+app.use('/studio', authenticateStudioHttp, studio.handler);
 const server = app.listen(3000);
 studio.upgradeWebSocket(server); // required for live data
 ```
@@ -197,6 +200,13 @@ Key options: `readOnly` (disable mutating endpoints for production monitoring), 
 
 ## Security
 
+- **Treat Studio as an administrative surface, never as a public application
+  API.** Agent routes intentionally expose resolved system prompts, tool
+  descriptions, schemas, and runtime configuration. `trace.redact` protects
+  user/model observability content; it is not authentication and does not hide
+  static agent configuration.
+- Protect the Studio HTTP mount with your framework's authentication and
+  authorization middleware.
 - **Always** provide `verifyUpgrade` — WebSocket upgrades bypass Express/Fastify/Koa middleware, so your auth middleware does **not** protect WebSocket connections.
 - Consider `readOnly: true` for production monitoring — view traces, costs, and schemas without execution capability.
 - CORS is not applied in embedded mode — the host framework owns CORS policy.

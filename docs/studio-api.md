@@ -88,7 +88,7 @@ events, so the expanded tool lifecycle does not add spend.
 
 ## WebSocket
 
-Single endpoint at `ws://localhost:4400/ws` with channel multiplexing:
+Single endpoint at `ws://127.0.0.1:4400/ws` with channel multiplexing:
 
 ```json
 { "type": "subscribe", "channel": "trace:*" }
@@ -124,16 +124,18 @@ const runtime = new AxlRuntime({ providers: ['openai'] });
 const studio = createStudioMiddleware({
   runtime,
   basePath: '/studio',
-  // Your auth logic here — check a token, cookie, or header.
+  // Reuse your application auth. Browser WebSockets commonly authenticate
+  // with the same secure session cookie as the HTTP mount.
   // This runs on WebSocket upgrades, which bypass Express middleware.
-  verifyUpgrade: (req) => {
-    const url = new URL(req.url!, `http://${req.headers.host}`);
-    return url.searchParams.get('token') === process.env.MY_SECRET;
-  },
+  verifyUpgrade: (req) => authenticateStudioRequest(req)?.isAdmin === true,
 });
 
 const app = express();
-app.use('/studio', studio.handler);
+const authenticateStudioHttp: express.RequestHandler = (req, res, next) => {
+  if (authenticateStudioRequest(req)?.isAdmin !== true) return res.sendStatus(403);
+  next();
+};
+app.use('/studio', authenticateStudioHttp, studio.handler);
 
 const server = app.listen(3000);
 studio.upgradeWebSocket(server);
@@ -163,9 +165,27 @@ studio.upgradeWebSocket(server);
 | `connectionManager` | WS connection/channel manager |
 | `close()` | Shut down middleware (removes listeners, closes connections) |
 
+### Security boundary
+
+Studio is an administrative/operator surface, not a public application API.
+Its agent and tool routes intentionally expose resolved system prompts, tool
+descriptions, schemas, and runtime configuration. `trace.redact` scrubs
+user/model observability content; it is not authentication and does not hide
+static agent configuration.
+
+For embedded Studio, protect the HTTP mount with the host framework's
+authentication and authorization middleware **and** provide `verifyUpgrade` for
+WebSockets. Framework HTTP middleware does not run for upgrade requests. The
+standalone CLI is for local development: it binds to `127.0.0.1`, omits CORS
+headers, and rejects browser WebSocket origins that are not local.
+
 **Note:** `upgradeWebSocket(server)` is required for real-time features (trace streaming, cost updates, execution events, decision resolution). Without it, the Studio SPA loads but panels relying on live data will show no updates. If your framework manages WebSocket connections itself (NestJS gateway, Fastify plugin), use `handleWebSocket()` instead.
 
 ### Host body limits
+
+In the examples below, `authenticateStudioHttp`, `authenticateStudioHono`, and
+`authenticateStudioRequest` stand for application-owned admin authorization.
+They are required security boundaries, not SDK helpers.
 
 Studio's API uses small request bodies — the eval comparison flow sends history IDs (~100 bytes), not full result payloads — so the default body limits in Express, NestJS, Fastify, and Koa (typically 100KB) are sufficient for normal use.
 
@@ -177,7 +197,7 @@ The one exception is `POST /api/evals/import`, which accepts a full `EvalResult`
 import express from 'express';
 const app = express();
 // Larger limit just for Studio; the rest of the app keeps its defaults.
-app.use('/studio', express.json({ limit: '10mb' }), studio.handler);
+app.use('/studio', authenticateStudioHttp, express.json({ limit: '10mb' }), studio.handler);
 ```
 
 **NestJS:** NestJS registers its own body-parser at bootstrap, so `app.use(express.json(...))` added after `NestFactory.create()` does *not* override it — the built-in parser runs first and still rejects with `PayloadTooLargeError`. Disable the built-in parser and register a conditional one:
@@ -204,7 +224,7 @@ async function bootstrap() {
 
   const studio = createStudioMiddleware({ runtime });
   const expressApp = app.get(HttpAdapterHost).httpAdapter.getInstance();
-  expressApp.use('/studio', studio.handler);
+  expressApp.use('/studio', authenticateStudioHttp, studio.handler);
   studio.upgradeWebSocket(app.getHttpServer());
 
   await app.listen(3000);
@@ -244,7 +264,7 @@ export class AppModule implements OnModuleInit, OnModuleDestroy {
     // Mount on the underlying Express instance — this is the recommended
     // NestJS pattern for sub-application mounting (see NestJS HTTP adapter docs).
     const expressApp = this.httpAdapterHost.httpAdapter.getInstance();
-    expressApp.use('/studio', this.studio.handler);
+    expressApp.use('/studio', authenticateStudioHttp, this.studio.handler);
     this.studio.upgradeWebSocket(this.httpAdapterHost.httpAdapter.getHttpServer());
   }
 
@@ -261,11 +281,15 @@ import Fastify from 'fastify';
 import middie from '@fastify/middie';
 import { createStudioMiddleware } from '@axlsdk/studio/middleware';
 
-const studio = createStudioMiddleware({ runtime, basePath: '/studio' });
+const studio = createStudioMiddleware({
+  runtime,
+  basePath: '/studio',
+  verifyUpgrade: (req) => authenticateStudioRequest(req)?.isAdmin === true,
+});
 const fastify = Fastify();
 
 await fastify.register(middie);
-fastify.use('/studio', studio.handler);
+fastify.use('/studio', authenticateStudioHttp, studio.handler);
 
 await fastify.listen({ port: 3000 });
 studio.upgradeWebSocket(fastify.server);
@@ -277,8 +301,17 @@ studio.upgradeWebSocket(fastify.server);
 import { createServer } from 'node:http';
 import { createStudioMiddleware } from '@axlsdk/studio/middleware';
 
-const studio = createStudioMiddleware({ runtime });
-const server = createServer(studio.handler);
+const studio = createStudioMiddleware({
+  runtime,
+  verifyUpgrade: (req) => authenticateStudioRequest(req)?.isAdmin === true,
+});
+const server = createServer((req, res) => {
+  if (authenticateStudioRequest(req)?.isAdmin !== true) {
+    res.writeHead(403).end();
+    return;
+  }
+  studio.handler(req, res);
+});
 studio.upgradeWebSocket(server);
 server.listen(3000);
 ```
@@ -291,6 +324,7 @@ import { createStudioMiddleware, handleWsMessage } from '@axlsdk/studio/middlewa
 
 const studio = createStudioMiddleware({ runtime, basePath: '/studio' });
 const app = new Hono();
+app.use('/studio/*', authenticateStudioHono);
 app.route('/studio', studio.app);
 // Wire WebSocket via Hono's native WS support — see spec for full example
 ```
@@ -302,7 +336,7 @@ app.route('/studio', studio.app);
 ```typescript
 // These must match:
 createStudioMiddleware({ basePath: '/studio' })  // tells the SPA
-app.use('/studio', studio.handler)                // tells Express
+app.use('/studio', authenticateStudioHttp, studio.handler) // tells Express and enforces auth
 ```
 
 If they don't match, the SPA will load but API calls will fail (the SPA sends requests to the wrong path).

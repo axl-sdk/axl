@@ -1508,6 +1508,22 @@ const runtime3 = new AxlRuntime({
 
 > **Scope:** caps request *concurrency*, not token throughput (TPM) — a permit releases at response headers. Governs **chat calls only** (memory embedder calls are not governed in this version) and is **per provider instance / process** (not shared across processes on the same key). Full caveats in [providers.md → Rate limiting](providers.md#rate-limiting-opt-in).
 
+### MCP server configuration
+
+Each `config.mcp.servers` entry (`McpServerConfig`) accepts:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `string` | Server name referenced by `agent({ mcp: [...] })` |
+| `command` | `string?` | Executable for a stdio MCP server |
+| `args` | `string[]?` | Arguments passed to the stdio command |
+| `env` | `Record<string, string>?` | Additional environment for the stdio child process |
+| `uri` | `string?` | HTTP MCP endpoint. HTTPS and literal loopback HTTP are allowed by default; other HTTP fails before network I/O |
+| `dangerouslyAllowInsecureHttp` | `boolean?` | Permit this one HTTP MCP endpoint to use non-loopback plaintext HTTP. Prefer HTTPS |
+
+HTTP MCP requests use `redirect: 'manual'` and are never automatically retried,
+because a tool call may be non-idempotent. Configure the final endpoint URI.
+
 ### Provider profiles
 
 The generic `OpenAICompatibleProvider` is parameterized by a `ProviderProfile`. Built-in
@@ -1753,7 +1769,7 @@ Also exported: `isCostBearingLeaf(event: AxlEvent): boolean` (takes an event, ch
 
 **`parsePartialJson(text: string): unknown`** — tolerant JSON parser used internally for `partial_object` streaming. Recovers from truncated input (unclosed strings/objects/arrays) and is hardened against deeply-nested input via a 256-depth cap (returns `null` on overflow). Exported from `@axlsdk/axl` for consumers building their own progressive-render pipelines that need to share Axl's truncation-recovery and stack-overflow guard rails. Zero dependencies.
 
-**`stringStreamFromEvents(source: AsyncIterable<AxlEvent>, opts?: StringStreamFilter): AsyncIterable<StringStreamEvent>`** — browser-safe reconstructor for the `stringStream` view from a raw `AxlEvent` source. Use when consuming events over WebSocket / SSE on the client side, where you don't have access to `AxlStream` / `AxlEventBus`. Same `{ path?, askId? }` filter shape and same retry/`ask_end`-clear semantics as `AxlEventBus.stringStream`. Yields `StringStreamEvent` (`{ askId, agent?, path, delta, accumulated, attempt }`); maintains a per-(askId, path) text accumulator client-side. Pure ECMAScript, no Node dependencies. **Differences from the live-bus view:** no late-subscriber seeding (start iterating before events arrive); no race-with-iterator pending buffer (events yield as they arrive). For full SPA recipe see `docs/observability.md`.
+**`stringStreamFromEvents(source: AsyncIterable<AxlEvent>, opts?: StringStreamFilter): AsyncIterable<StringStreamEvent>`** — browser-bundle-safe reconstructor for the `stringStream` view from an authorized raw `AxlEvent` source. It does not redact or sanitize its input; use it only for trusted operator clients that are allowed to receive the complete event stream. Public applications should project an application-owned output DTO on the server and render that DTO with application code instead. Same `{ path?, askId? }` filter shape and same retry/`ask_end`-clear semantics as `AxlEventBus.stringStream`. Yields `StringStreamEvent` (`{ askId, agent?, path, delta, accumulated, attempt }`); maintains a per-(askId, path) text accumulator client-side. Pure ECMAScript, no Node dependencies. **Differences from the live-bus view:** no late-subscriber seeding (start iterating before events arrive); no race-with-iterator pending buffer (events yield as they arrive). For the trusted-wire and public-projection recipes, see `docs/observability.md`.
 
 **`AnyWorkflow`** — type alias for `Workflow<any, any>`, exported from `@axlsdk/axl`. Used by `AxlRuntime.register` (and `AxlTestRuntime.register`) to accept any workflow regardless of its specific input/output schema. Useful for typing helper functions that operate on registered workflows generically.
 

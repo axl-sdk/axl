@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
-- **Provider transport guard.** Built-in providers and `OpenAIEmbedder` now reject
-  non-loopback HTTP endpoints unless that endpoint explicitly sets
+- **SDK transport guard.** Built-in providers, `OpenAIEmbedder`, and HTTP MCP
+  clients now reject non-loopback HTTP endpoints unless that endpoint explicitly sets
   `dangerouslyAllowInsecureHttp: true`. HTTPS and literal loopback HTTP remain
   zero-configuration; unsafe URLs fail before async credential callbacks or
   network I/O. Migrate remote endpoints to HTTPS. If a trusted development
@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follow HTTP redirects, preventing request bodies or authorization headers from
   being resent to a redirect target. Existing redirecting gateways must be
   reconfigured to use their final HTTPS endpoint URL directly.
+
+- **HTTP MCP redirects fail closed.** MCP POST requests no longer follow
+  redirects or retry automatically, so non-idempotent tool-call arguments are
+  never resent to another endpoint. Configure the final MCP URI directly.
+
+- **Standalone Studio is local-only by default.** The CLI now binds explicitly
+  to `127.0.0.1`, does not emit wildcard CORS headers, and rejects browser
+  WebSocket handshakes from non-local origins. `createServer()` now applies CORS
+  only when explicitly passed `cors: true`; embedded middleware continues to
+  leave HTTP authentication and CORS to the host application.
 
 ### Fixed
 

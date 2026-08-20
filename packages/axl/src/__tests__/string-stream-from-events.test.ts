@@ -1,6 +1,6 @@
 /**
- * Tests for `stringStreamFromEvents` — the browser-safe reconstructor
- * for raw `AxlEvent` streams arriving over the wire (WS / SSE).
+ * Tests for `stringStreamFromEvents` — the browser-bundle-safe reconstructor
+ * for authorized raw `AxlEvent` streams arriving over the wire (WS / SSE).
  *
  * Behaviour must match `AxlEventBus.stringStream` for the same event
  * sequence (modulo late-subscriber seeding, which the wire helper

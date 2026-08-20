@@ -286,24 +286,27 @@ export default defineConfig({
 `dangerouslyAllowInsecureHttp` defaults to `false`. It permits only an otherwise
 valid HTTP URL; it does not permit malformed URLs or other schemes. Direct
 provider constructors, compatible-provider profiles, environment-provided base
-URLs, and `OpenAIEmbedder` follow the same rule. `openai-responses` inherits the
-complete `openai` provider block—including this option—only when it has no block
-of its own.
+URLs, `OpenAIEmbedder`, and built-in HTTP MCP clients follow the same rule.
+`openai-responses` inherits the complete `openai` provider block—including this
+option—only when it has no block of its own. HTTP MCP sets the option on its own
+server entry.
 
 Validation happens when that provider is first resolved, before an async API-key
 callback or network request. An unused provider block remains lazy. A rejected
 endpoint throws `AxlError` with `code: 'UNSAFE_TRANSPORT'` and an actionable
 message that does not echo URL credentials or query values.
 
-Provider and embedding requests never follow HTTP redirects. A 3xx response is
-handled through the adapter's existing non-success `ProviderError` path with its
-original status; configure the final endpoint URL instead. This prevents a POST
-body or authorization header from being resent to a redirect target.
+Provider, embedding, and HTTP MCP requests never follow HTTP redirects.
+Provider/embedder 3xx responses use the adapter's existing non-success
+`ProviderError` path with the original status; HTTP MCP reports an MCP HTTP
+error. Configure the final endpoint URL instead. This prevents a POST body or
+authorization header from being resent to a redirect target.
 
-Custom `Provider` implementations and HTTP MCP clients do not use this built-in
-endpoint guard and must enforce their own transport policy. The guard also does
-not defeat a trusted TLS-inspection root installed on the backend host; that host
-is part of the application's trust boundary. See
+HTTP MCP tool calls intentionally do not use provider retry behavior because
+they may be non-idempotent; a failed call is returned through the MCP error path.
+Custom `Provider` implementations own their transport policy. The guard does not
+defeat a trusted TLS-inspection root installed on the backend host; that host is
+part of the application's trust boundary. See
 [Security > Prompt confidentiality](./security.md#prompt-confidentiality-and-the-trusted-backend).
 
 ### Rate limiting (opt-in)

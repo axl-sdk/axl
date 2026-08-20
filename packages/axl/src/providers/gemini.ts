@@ -11,7 +11,7 @@ import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './type
 import { fetchWithRetry } from './retry.js';
 import { buildProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
-import { assertSafeProviderBaseUrl } from './transport.js';
+import { assertSafeProviderBaseUrl } from '../http-transport.js';
 
 // ---------------------------------------------------------------------------
 // Schema sanitization for Gemini's tool/responseSchema dialect.

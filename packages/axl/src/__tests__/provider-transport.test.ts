@@ -7,7 +7,7 @@ import { OpenAICompatibleProvider, type ProviderProfile } from '../providers/ope
 import { OpenAIProvider } from '../providers/openai.js';
 import { OpenAIResponsesProvider } from '../providers/openai-responses.js';
 import { ProviderRegistry } from '../providers/registry.js';
-import { assertSafeProviderBaseUrl } from '../providers/transport.js';
+import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { AxlConfig } from '../config.js';
 
 const TEST_PROFILE: ProviderProfile = {

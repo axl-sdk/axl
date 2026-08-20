@@ -7,6 +7,7 @@ import type {
   JsonRpcRequest,
   JsonRpcResponse,
 } from './types.js';
+import { assertSafeHttpEndpoint } from '../http-transport.js';
 
 /**
  * MCP client using stdio transport.
@@ -207,6 +208,14 @@ export class HttpMcpClient implements McpServer {
   constructor(private config: McpServerConfig) {
     this.name = config.name;
     this.baseUrl = (config.uri ?? '').replace(/\/$/, '');
+    if (this.baseUrl) {
+      assertSafeHttpEndpoint(
+        this.baseUrl,
+        `MCP server "${this.name}"`,
+        config.dangerouslyAllowInsecureHttp,
+        'tool arguments and results',
+      );
+    }
   }
 
   async connect(): Promise<void> {
@@ -242,6 +251,8 @@ export class HttpMcpClient implements McpServer {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(request),
       signal: AbortSignal.timeout(timeoutMs),
+      // Tool calls can be non-idempotent: never forward or retry their body.
+      redirect: 'manual',
     });
 
     if (!res.ok) {

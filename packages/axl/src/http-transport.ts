@@ -1,4 +1,4 @@
-import { AxlError } from '../errors.js';
+import { AxlError } from './errors.js';
 
 /**
  * Guard the provider endpoints that Axl's built-in adapters send prompts and
@@ -11,17 +11,30 @@ export function assertSafeProviderBaseUrl(
   surface: string,
   dangerouslyAllowInsecureHttp = false,
 ): void {
+  assertSafeHttpEndpoint(baseUrl, surface, dangerouslyAllowInsecureHttp, 'prompts and credentials');
+}
+
+/**
+ * Shared secure-default policy for SDK-owned HTTP transports. Callers provide
+ * the data-at-risk wording so errors remain accurate at provider and MCP seams.
+ */
+export function assertSafeHttpEndpoint(
+  endpoint: string,
+  surface: string,
+  dangerouslyAllowInsecureHttp = false,
+  exposedData = 'sensitive data',
+): void {
   let url: URL;
   try {
-    url = new URL(baseUrl);
+    url = new URL(endpoint);
   } catch {
-    throw unsafeTransportError(surface, 'a valid absolute HTTP(S) URL');
+    throw unsafeTransportError(surface, 'a valid absolute HTTP(S) URL', exposedData);
   }
 
   if (url.protocol === 'https:') return;
 
   if (url.protocol !== 'http:') {
-    throw unsafeTransportError(surface, 'an HTTPS URL');
+    throw unsafeTransportError(surface, 'an HTTPS URL', exposedData);
   }
 
   if (dangerouslyAllowInsecureHttp || isLiteralLoopbackHost(url.hostname)) return;
@@ -29,6 +42,7 @@ export function assertSafeProviderBaseUrl(
   throw unsafeTransportError(
     surface,
     'an HTTPS URL, or set dangerouslyAllowInsecureHttp: true only for a deliberately insecure endpoint',
+    exposedData,
   );
 }
 
@@ -44,9 +58,9 @@ function isLiteralLoopbackHost(hostname: string): boolean {
   );
 }
 
-function unsafeTransportError(surface: string, remediation: string): AxlError {
+function unsafeTransportError(surface: string, remediation: string, exposedData: string): AxlError {
   return new AxlError(
     'UNSAFE_TRANSPORT',
-    `${surface} requires ${remediation}. Remote HTTP can expose prompts and credentials in transit.`,
+    `${surface} requires ${remediation}. Remote HTTP can expose ${exposedData} in transit.`,
   );
 }

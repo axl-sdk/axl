@@ -9,7 +9,7 @@ import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './type
 import { fetchWithRetry } from './retry.js';
 import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
-import { assertSafeProviderBaseUrl } from './transport.js';
+import { assertSafeProviderBaseUrl } from '../http-transport.js';
 
 /**
  * OpenAI Responses API provider using raw fetch (no SDK dependency).

@@ -17,7 +17,7 @@ import { fetchWithRetry } from './retry.js';
 import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { isBuiltinTablePricingEligible } from './builtin-table-pricing.js';
-import { assertSafeProviderBaseUrl } from './transport.js';
+import { assertSafeProviderBaseUrl } from '../http-transport.js';
 
 // ===========================================================================
 // Generic OpenAI-compatible provider engine.

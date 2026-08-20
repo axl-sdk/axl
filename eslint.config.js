@@ -19,6 +19,23 @@ export default tseslint.config(
       'no-constant-condition': ['error', { checkLoops: false }],
     },
   },
+  // Provider requests must pass through the shared retry/redirect chokepoint.
+  // This makes the transport policy an enforced architecture boundary instead
+  // of a convention each new adapter has to remember.
+  {
+    files: ['packages/axl/src/providers/**/*.ts', 'packages/axl/src/memory/embedder-openai.ts'],
+    ignores: ['packages/axl/src/providers/retry.ts'],
+    rules: {
+      'no-restricted-globals': [
+        'error',
+        {
+          name: 'fetch',
+          message:
+            'Provider network calls must use fetchWithRetry so redirects fail closed and retry policy stays centralized.',
+        },
+      ],
+    },
+  },
   // Relax rules for test files
   {
     files: ['**/__tests__/**', '**/*.test.ts'],

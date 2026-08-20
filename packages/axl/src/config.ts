@@ -1,6 +1,7 @@
 import type { RateLimitConfig } from './providers/rate-limiter.js';
 import type { ApiKeySource } from './providers/types.js';
 import type { AuthHeader } from './providers/openai-compatible.js';
+import type { McpServerConfig } from './mcp/types.js';
 
 /** Provider configuration */
 export type ProviderConfig = {
@@ -25,14 +26,6 @@ export type ProviderConfig = {
    * outside the registry) and NOT other processes sharing the same API key.
    */
   rateLimit?: RateLimitConfig;
-};
-
-/** MCP server configuration */
-export type McpServerConfig = {
-  name: string;
-  command?: string;
-  uri?: string;
-  env?: Record<string, string>;
 };
 
 /** Trace configuration */

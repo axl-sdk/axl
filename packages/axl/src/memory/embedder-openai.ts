@@ -1,7 +1,7 @@
 import type { Embedder, EmbedResult } from './types.js';
 import { fetchWithRetry } from '../providers/retry.js';
 import { buildProviderError } from '../providers/errors.js';
-import { assertSafeProviderBaseUrl } from '../providers/transport.js';
+import { assertSafeProviderBaseUrl } from '../http-transport.js';
 
 /**
  * Per-million-token USD pricing for OpenAI embedding models.

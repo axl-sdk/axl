@@ -28,8 +28,16 @@ per-provider quirks in the profile (allowed to rot), not in the engine.
 - **Two OpenAI adapters**: `openai` (Chat Completions) and `openai-responses` (Responses
   API). They share config but build *separate* instances — using both means effective
   concurrency/limits are the sum, not a shared counter.
-- **Retry**: every network call goes through `fetchWithRetry` (exponential backoff on
-  429/503/529). Its 3rd arg is an options object `{ maxRetries?, governor?, provider? }`.
+- **Transport security and retry**: validate every adapter/embedder base URL with
+  `assertSafeProviderBaseUrl` in its constructor before resolving an API-key
+  callback. Every provider and embedder network call goes through
+  `fetchWithRetry`; ESLint forbids direct global `fetch` in those source paths.
+  `fetchWithRetry` forces manual redirects and retries 429/503/529 with
+  exponential backoff. Its 3rd arg is an options object
+  `{ maxRetries?, governor?, provider? }`. The built-in HTTP MCP client shares
+  the endpoint classifier and manual-redirect policy but deliberately does not
+  retry potentially non-idempotent tool calls. Custom `Provider`
+  implementations own their separate transport policy.
 - **Typed errors**: every `!res.ok` site throws a `ProviderError` (extends `AxlError`,
   `code: 'PROVIDER_ERROR'`, message verbatim from each adapter's own
   `extractErrorMessage`) built via `buildProviderError` in `providers/errors.ts`;

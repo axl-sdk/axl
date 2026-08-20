@@ -18,6 +18,8 @@ export type McpServerConfig = {
   args?: string[];
   /** HTTP/SSE endpoint URI for HTTP transport */
   uri?: string;
+  /** Allow this MCP server to use non-loopback HTTP. Prefer HTTPS. */
+  dangerouslyAllowInsecureHttp?: boolean;
   /** Environment variables to pass to the spawned process */
   env?: Record<string, string>;
 };

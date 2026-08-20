@@ -111,17 +111,17 @@ export const abortExecution = (id: string) =>
 export const fetchSessions = () => request<SessionSummary[]>('/sessions');
 export const fetchSession = (id: string) =>
   request<SessionDetail>(`/sessions/${encodeURIComponent(id)}`);
-export const sendSessionMessage = (id: string, message: string) =>
+export const sendSessionMessage = (id: string, workflow: string, message: string) =>
   request<{ result: unknown }>(`/sessions/${encodeURIComponent(id)}/send`, {
     method: 'POST',
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ workflow, message }),
   });
-export const streamSessionMessage = (id: string, message: string) =>
+export const streamSessionMessage = (id: string, workflow: string, message: string) =>
   request<{ executionId: string; streaming: boolean }>(
     `/sessions/${encodeURIComponent(id)}/stream`,
     {
       method: 'POST',
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ workflow, message }),
     },
   );
 export const deleteSession = (id: string) =>

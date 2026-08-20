@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { StudioEnv, SessionSummary } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
-import { redactSessionHistory } from '../redact.js';
+import { redactSessionHistory, redactStreamEvent, redactValue } from '../redact.js';
 
 export function createSessionRoutes(connMgr: ConnectionManager) {
   const app = new Hono<StudioEnv>();
@@ -51,7 +51,10 @@ export function createSessionRoutes(connMgr: ConnectionManager) {
 
     const session = runtime.session(id);
     const result = await session.send(body.workflow, body.message);
-    return c.json({ ok: true, data: { result } });
+    return c.json({
+      ok: true,
+      data: { result: redactValue(result, runtime.isRedactEnabled()) },
+    });
   });
 
   // Stream session message
@@ -63,11 +66,15 @@ export function createSessionRoutes(connMgr: ConnectionManager) {
     const session = runtime.session(id);
     const stream = await session.stream(body.workflow, body.message);
     const executionId = `session-${id}-${Date.now()}`;
+    const redactOn = runtime.isRedactEnabled();
 
     // Forward stream events to WS (error events flow through the iterator)
     (async () => {
       for await (const event of stream) {
-        connMgr.broadcastWithWildcard(`execution:${executionId}`, event);
+        connMgr.broadcastWithWildcard(
+          `execution:${executionId}`,
+          redactStreamEvent(event, redactOn),
+        );
       }
     })();
 

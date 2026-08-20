@@ -123,6 +123,17 @@ describe('built-in provider transport policy', () => {
     expectUnsafe(() => new AnthropicProvider({ apiKey: 'k', baseUrl: 'http://remote.test/v1' }));
   });
 
+  it('permits a remote HTTP embedder endpoint only when that embedder opts in', () => {
+    expect(
+      () =>
+        new OpenAIEmbedder({
+          apiKey: 'k',
+          baseUrl: 'http://remote.test/v1',
+          dangerouslyAllowInsecureHttp: true,
+        }),
+    ).not.toThrow();
+  });
+
   it('validates a direct provider before invoking a lazy API-key source or fetch', () => {
     const apiKey = vi.fn(() => 'k');
     const fetchSpy = vi.fn();

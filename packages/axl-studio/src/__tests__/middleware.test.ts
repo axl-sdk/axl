@@ -299,6 +299,46 @@ describe('upgradeWebSocket with http.Server', () => {
     expect(server.listenerCount('upgrade')).toBeGreaterThanOrEqual(1);
   });
 
+  it('fails closed when production upgradeWebSocket has no verifier', () => {
+    const originalEnv = process.env.NODE_ENV;
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      process.env.NODE_ENV = 'production';
+      const runtime = createTestRuntime();
+      studio = createStudioMiddleware({ runtime, serveClient: false });
+      server = createHttpServer(studio.handler);
+
+      expect(() => studio.upgradeWebSocket(server)).toThrow(
+        'Refusing unauthenticated WebSocket upgrades',
+      );
+      expect(server.listenerCount('upgrade')).toBe(0);
+    } finally {
+      process.env.NODE_ENV = originalEnv;
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('allows an explicit production acknowledgement for an outer upgrade gate', () => {
+    const originalEnv = process.env.NODE_ENV;
+
+    try {
+      process.env.NODE_ENV = 'production';
+      const runtime = createTestRuntime();
+      studio = createStudioMiddleware({
+        runtime,
+        serveClient: false,
+        dangerouslyAllowUnauthenticatedWebSockets: true,
+      });
+      server = createHttpServer(studio.handler);
+      studio.upgradeWebSocket(server);
+
+      expect(server.listenerCount('upgrade')).toBeGreaterThanOrEqual(1);
+    } finally {
+      process.env.NODE_ENV = originalEnv;
+    }
+  });
+
   it('throws on double upgradeWebSocket call', () => {
     const runtime = createTestRuntime();
     studio = createStudioMiddleware({ runtime, serveClient: false });

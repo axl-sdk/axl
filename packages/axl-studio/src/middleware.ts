@@ -72,6 +72,15 @@ export type StudioMiddlewareOptions = {
     | Promise<boolean | { allowed: boolean; metadata?: unknown }>;
 
   /**
+   * Permit `upgradeWebSocket()` without `verifyUpgrade` in production.
+   * This exposes Studio's administrative event channels without SDK-level
+   * authentication and should be used only when an outer upgrade gate is
+   * independently guaranteed.
+   * @default false
+   */
+  dangerouslyAllowUnauthenticatedWebSockets?: boolean;
+
+  /**
    * Optional per-event filter used by multi-tenant deployments to scope the
    * trace firehose. Called on every outbound WebSocket broadcast; return
    * `true` to deliver to this connection, `false` to drop.
@@ -189,6 +198,7 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
     runtime,
     serveClient = true,
     verifyUpgrade,
+    dangerouslyAllowUnauthenticatedWebSockets = false,
     readOnly = false,
     filterTraceEvent,
   } = options;
@@ -230,12 +240,16 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
     connMgr.setFilter(filterTraceEvent);
   }
 
-  // Log production safety warning
-  if (process.env.NODE_ENV === 'production' && !verifyUpgrade) {
+  // Warn early; upgradeWebSocket() also fails closed unless explicitly acknowledged.
+  if (
+    process.env.NODE_ENV === 'production' &&
+    !verifyUpgrade &&
+    !dangerouslyAllowUnauthenticatedWebSockets
+  ) {
     console.warn(
       '[axl-studio] WARNING: Studio middleware mounted in production without verifyUpgrade. ' +
-        'WebSocket connections are not authenticated. All registered workflows, tools, and ' +
-        'agents are accessible. See https://axlsdk.com/docs/studio/security',
+        'upgradeWebSocket() will refuse to attach. Provide verifyUpgrade or explicitly set ' +
+        'dangerouslyAllowUnauthenticatedWebSockets: true only when an outer upgrade gate is guaranteed.',
     );
   }
 
@@ -328,6 +342,17 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
 
   // Convenience: attach WS handling to an http.Server.
   function upgradeWebSocket(server: Server, path?: string) {
+    if (
+      process.env.NODE_ENV === 'production' &&
+      !verifyUpgrade &&
+      !dangerouslyAllowUnauthenticatedWebSockets
+    ) {
+      throw new Error(
+        '[axl-studio] Refusing unauthenticated WebSocket upgrades in production. ' +
+          'Provide verifyUpgrade or explicitly set dangerouslyAllowUnauthenticatedWebSockets: true.',
+      );
+    }
+
     if (wss) {
       throw new Error(
         '[axl-studio] upgradeWebSocket() has already been called. ' +

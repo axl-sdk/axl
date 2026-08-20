@@ -11,7 +11,8 @@ import {
   importModule,
   CONFIG_CANDIDATES,
   STUDIO_CLI_HOST,
-  isAllowedStandaloneOrigin,
+  isAllowedStandaloneRequest,
+  withStandaloneRequestGuard,
 } from './cli-utils.js';
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -28,6 +29,7 @@ Usage:
 
 Options:
   --port <number>          Server port (default: 4400)
+  --dangerously-bind <ip>  Bind for a loopback-published container/local-forward tunnel
   --config <path>          Path to config file (default: auto-detect)
   --conditions <list>      Comma-separated Node.js import conditions (e.g., development)
   --read-only              Disable all mutating endpoints (runs, imports, rescore, etc)
@@ -152,13 +154,13 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
   const wsHandlers = createWsHandlers();
   app.use('/ws', async (c, next) => {
-    if (!isAllowedStandaloneOrigin(c.req.header('Origin'))) {
+    if (!isAllowedStandaloneRequest(c.req.header('Host'), c.req.header('Origin'))) {
       return c.json(
         {
           ok: false,
           error: {
-            code: 'FORBIDDEN_ORIGIN',
-            message: 'Standalone Studio accepts WebSocket connections only from local origins',
+            code: 'FORBIDDEN_HOST_ORIGIN',
+            message: 'Standalone Studio accepts WebSocket connections only locally',
           },
         },
         403,
@@ -173,9 +175,9 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
 
   const server = serve(
     {
-      fetch: app.fetch,
+      fetch: withStandaloneRequestGuard((request) => app.fetch(request)),
       port: args.port,
-      hostname: STUDIO_CLI_HOST,
+      hostname: args.host,
     },
     (info) => {
       console.log(`[axl-studio] Server running at http://${STUDIO_CLI_HOST}:${info.port}`);
@@ -206,6 +208,13 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
   );
 
   injectWebSocket(server);
+
+  if (args.host !== STUDIO_CLI_HOST) {
+    console.warn(
+      `[axl-studio] WARNING: binding to ${args.host}. Use this only behind a local-only ` +
+        'container port mapping or local-forward tunnel; standalone Studio remains unauthenticated.',
+    );
+  }
 
   // Auto-open browser
   if (args.open) {

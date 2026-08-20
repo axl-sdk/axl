@@ -44,6 +44,10 @@ are trusted/operator surfaces and can contain prompts, resolved system messages,
 tool data, and provider output. Studio agent/tool routes intentionally expose
 static prompt configuration even when `trace.redact` is enabled, so deployed
 Studio middleware requires HTTP authentication plus WebSocket `verifyUpgrade`.
+In production, `upgradeWebSocket()` fails closed when that verifier is absent;
+the dangerous opt-out is only for hosts that independently authenticate the
+raw upgrade. Standalone Studio also rejects non-local Host and Origin values on
+REST and WebSocket requests, preventing browser CSRF and DNS-rebinding access.
 A public application should consume an
 output-only view on the server and send its own DTO to the client; do not forward
 the raw event firehose. See the

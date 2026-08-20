@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -8,7 +8,10 @@ import {
   needsTsxLoader,
   CONFIG_CANDIDATES,
   STUDIO_CLI_HOST,
+  isAllowedStandaloneHost,
   isAllowedStandaloneOrigin,
+  isAllowedStandaloneRequest,
+  withStandaloneRequestGuard,
 } from '../cli-utils.js';
 
 describe('standalone network boundary', () => {
@@ -33,6 +36,65 @@ describe('standalone network boundary', () => {
   ])('rejects non-local or malformed browser Origin %s', (origin) => {
     expect(isAllowedStandaloneOrigin(origin)).toBe(false);
   });
+
+  it.each(['localhost:4400', 'localhost.:4400', '127.0.0.1:4400', '127.1:4400'])(
+    'accepts loopback Host %s',
+    (host) => {
+      expect(isAllowedStandaloneHost(host)).toBe(true);
+    },
+  );
+
+  it.each([undefined, 'studio.attacker.test:4400', 'localhost.evil.test', 'evil@127.0.0.1'])(
+    'rejects missing, rebinding, or malformed Host %s',
+    (host) => {
+      expect(isAllowedStandaloneHost(host)).toBe(false);
+    },
+  );
+
+  it('rejects a hostile simple POST before invoking the Studio app', async () => {
+    const appFetch = vi.fn(async () => Response.json({ secret: 'prompt' }));
+    const guardedFetch = withStandaloneRequestGuard(appFetch);
+    const response = await guardedFetch(
+      new Request('http://127.0.0.1:4400/api/tools/danger/test', {
+        method: 'POST',
+        headers: {
+          Host: '127.0.0.1:4400',
+          Origin: 'https://attacker.test',
+          'Content-Type': 'text/plain',
+        },
+        body: JSON.stringify({ input: 'run' }),
+      }),
+    );
+
+    expect(response.status).toBe(403);
+    expect(appFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects a DNS-rebinding read before invoking the Studio app', async () => {
+    const appFetch = vi.fn(async () => Response.json({ system: 'secret prompt' }));
+    const guardedFetch = withStandaloneRequestGuard(appFetch);
+    const response = await guardedFetch(
+      new Request('http://studio.attacker.test:4400/api/agents', {
+        headers: { Host: 'studio.attacker.test:4400' },
+      }),
+    );
+
+    expect(response.status).toBe(403);
+    expect(appFetch).not.toHaveBeenCalled();
+  });
+
+  it('passes a local request through to the Studio app', async () => {
+    const appFetch = vi.fn(async () => Response.json({ ok: true }));
+    const response = await withStandaloneRequestGuard(appFetch)(
+      new Request('http://localhost:4400/api/health', {
+        headers: { Host: 'localhost:4400', Origin: 'http://localhost:4400' },
+      }),
+    );
+
+    expect(isAllowedStandaloneRequest('localhost:4400', 'http://localhost:4400')).toBe(true);
+    expect(response.status).toBe(200);
+    expect(appFetch).toHaveBeenCalledOnce();
+  });
 });
 
 // ── parseArgs ──────────────────────────────────────────────────────
@@ -45,6 +107,7 @@ describe('parseArgs', () => {
     const result = parseArgs(argv());
     expect(result).toEqual({
       port: 4400,
+      host: '127.0.0.1',
       config: undefined,
       open: false,
       help: false,
@@ -55,6 +118,10 @@ describe('parseArgs', () => {
 
   it('parses --port', () => {
     expect(parseArgs(argv('--port', '3000')).port).toBe(3000);
+  });
+
+  it('parses the explicit dangerous bind escape hatch', () => {
+    expect(parseArgs(argv('--dangerously-bind', '0.0.0.0')).host).toBe('0.0.0.0');
   });
 
   it('parses --config', () => {
@@ -98,6 +165,7 @@ describe('parseArgs', () => {
     );
     expect(result).toEqual({
       port: 8080,
+      host: '127.0.0.1',
       config: 'app.mts',
       open: true,
       help: false,

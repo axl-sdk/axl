@@ -28,9 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Standalone Studio is local-only by default.** The CLI now binds explicitly
   to `127.0.0.1`, does not emit wildcard CORS headers, and rejects browser
-  WebSocket handshakes from non-local origins. `createServer()` now applies CORS
-  only when explicitly passed `cors: true`; embedded middleware continues to
-  leave HTTP authentication and CORS to the host application.
+  requests with non-local Host or Origin values before REST or WebSocket
+  routing, preventing cross-origin mutation and DNS-rebinding access to its
+  administrative API. Container users can explicitly use
+  `--dangerously-bind 0.0.0.0` behind a loopback-only published port.
+  `createServer()` now applies CORS only when explicitly passed `cors: true`;
+  embedded middleware continues to leave HTTP authentication and CORS to the
+  host application.
+
+- **Production Studio WebSockets fail closed.** `upgradeWebSocket()` now refuses
+  to attach in production without `verifyUpgrade`. Deployments whose host
+  independently authenticates raw upgrades must explicitly set
+  `dangerouslyAllowUnauthenticatedWebSockets: true`.
 
 ### Fixed
 

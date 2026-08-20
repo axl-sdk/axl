@@ -88,7 +88,9 @@ events, so the expanded tool lifecycle does not add spend.
 
 ## WebSocket
 
-Single endpoint at `ws://127.0.0.1:4400/ws` with channel multiplexing:
+The standalone CLI defaults to `ws://127.0.0.1:4400/ws`. Embedded Studio uses
+the host application's origin and optional base path, for example
+`wss://app.example.com/studio/ws`. Both forms use channel multiplexing:
 
 ```json
 { "type": "subscribe", "channel": "trace:*" }
@@ -149,6 +151,7 @@ studio.upgradeWebSocket(server);
 | `basePath` | `string` | `''` | URL path prefix (e.g., `'/studio'`) |
 | `serveClient` | `boolean` | `true` | Serve the pre-built SPA |
 | `verifyUpgrade` | `(req) => boolean \| { allowed: boolean, metadata?: unknown } \| Promise<...>` | — | Auth callback for WebSocket upgrades. The object form attaches `metadata` (tenant/user id / role) to the connection, available to `filterTraceEvent` on every outbound broadcast. Bare boolean still works (back-compat) |
+| `dangerouslyAllowUnauthenticatedWebSockets` | `boolean` | `false` | Permit `upgradeWebSocket()` to attach in production without `verifyUpgrade`. Use only when an outer upgrade gate is independently guaranteed; otherwise production attachment fails closed |
 | `filterTraceEvent` | `(event, metadata) => boolean` | — | Per-connection broadcast filter for multi-tenant deployments. Called on every outbound trace event (and on replay buffer events for late subscribers, so historical cross-tenant events can't leak on reconnect). Predicate errors are fail-closed — event is dropped |
 | `readOnly` | `boolean` | `false` | Disable all mutating endpoints. `POST /api/evals/compare` is allowed (pure computation); `POST /api/evals/import`, `POST /api/evals/:name/run`, `POST /api/evals/:name/rescore`, `POST /api/evals/runs/:evalRunId/cancel`, `DELETE /api/evals/history/:id`, and `DELETE /api/executions/:id` are blocked (405 with `error.code: 'READ_ONLY'`) |
 | `evals` | `string \| string[] \| { files, conditions? }` | — | Lazy-load eval files for the Eval Runner panel |
@@ -177,7 +180,20 @@ For embedded Studio, protect the HTTP mount with the host framework's
 authentication and authorization middleware **and** provide `verifyUpgrade` for
 WebSockets. Framework HTTP middleware does not run for upgrade requests. The
 standalone CLI is for local development: it binds to `127.0.0.1`, omits CORS
-headers, and rejects browser WebSocket origins that are not local.
+headers, and rejects non-local Host and browser Origin values before REST or
+WebSocket routing. CORS headers alone are not its security boundary.
+
+Container and devcontainer users may bind only the published host port to
+loopback while broadening the container listener explicitly:
+
+```bash
+docker run -p 127.0.0.1:4400:4400 ... axl-studio --dangerously-bind 0.0.0.0
+```
+
+`upgradeWebSocket()` fails closed in production when `verifyUpgrade` is absent.
+The `dangerouslyAllowUnauthenticatedWebSockets: true` acknowledgement exists for
+hosts that independently authenticate the raw upgrade before Axl receives it;
+it must not replace an actual upgrade gate.
 
 **Note:** `upgradeWebSocket(server)` is required for real-time features (trace streaming, cost updates, execution events, decision resolution). Without it, the Studio SPA loads but panels relying on live data will show no updates. If your framework manages WebSocket connections itself (NestJS gateway, Fastify plugin), use `handleWebSocket()` instead.
 

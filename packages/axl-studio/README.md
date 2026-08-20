@@ -69,8 +69,8 @@ npx @axlsdk/studio --open
 ```
 
 This loads your config and starts the server on `http://127.0.0.1:4400`. The
-standalone CLI binds only to IPv4 loopback, emits no CORS headers, and accepts
-browser WebSocket connections only from local origins.
+standalone CLI binds only to IPv4 loopback, emits no CORS headers, and rejects
+non-local HTTP hosts and browser origins across both REST and WebSocket routes.
 
 ## CLI Options
 
@@ -79,11 +79,22 @@ axl-studio [options]
 
 Options:
   --port <number>          Server port (default: 4400)
+  --dangerously-bind <ip>  Bind for a loopback-published container/local-forward tunnel
   --config <path>          Path to config file (default: auto-detect)
   --conditions <list>      Comma-separated Node.js import conditions (e.g., development)
   --open                   Auto-open browser
   -h, --help               Show help
 ```
+
+For a container or devcontainer, bind the published host port to loopback and
+make only the container listener broad:
+
+```bash
+docker run -p 127.0.0.1:4400:4400 ... axl-studio --dangerously-bind 0.0.0.0
+```
+
+The Host/Origin guard remains active. Do not publish that port on a public or
+LAN interface; standalone Studio has no user authentication.
 
 The `--conditions` flag is useful in monorepos where workspace packages use the `"development"` export condition to point at source instead of built dist files. Pass `--conditions development` to resolve imports through source paths.
 
@@ -194,7 +205,7 @@ const server = app.listen(3000);
 studio.upgradeWebSocket(server); // required for live data
 ```
 
-Key options: `readOnly` (disable mutating endpoints for production monitoring), `evals` (lazy-load eval files), `filterTraceEvent` (per-tenant broadcast scoping), `bufferCaps` (WS replay-buffer limits). `basePath` must match your framework's mount path.
+Key options: `readOnly` (disable mutating endpoints for production monitoring), `evals` (lazy-load eval files), `filterTraceEvent` (per-tenant broadcast scoping), `bufferCaps` (WS replay-buffer limits). `basePath` must match your framework's mount path. In production, `upgradeWebSocket()` refuses to attach without `verifyUpgrade`; `dangerouslyAllowUnauthenticatedWebSockets` is the explicit escape hatch only when an outer upgrade gate is independently guaranteed.
 
 **See [`docs/studio-api.md`](../../docs/studio-api.md) for the full reference:** every REST endpoint, the WebSocket protocol, the complete middleware options/return tables, NestJS/Fastify/Hono examples, host body-limit guidance, lazy eval loading, multi-tenant setup, and the internal architecture.
 

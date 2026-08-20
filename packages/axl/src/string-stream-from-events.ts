@@ -63,7 +63,14 @@ import type { StringStreamEvent, StringStreamFilter } from './event-stream.js';
  *    attempt-N text never leaks into attempt-N+1).
  *  - `ask_end` clears the per-ask accumulator (memory hygiene).
  *
- * Example (browser, consuming Studio's WS firehose):
+ * SECURITY: "browser-safe" here means this module has no Node runtime
+ * dependency. It does not redact or authorize the raw `AxlEvent` source.
+ * Prompts, system messages, tool data, and traces should remain on the trusted
+ * backend; public applications should relay an output-only DTO produced from a
+ * server-side curated view. Use this helper only when the browser is authorized
+ * to receive the underlying event stream.
+ *
+ * Example (trusted operator browser, consuming an authorized Studio WS firehose):
  *
  * ```ts
  * import { stringStreamFromEvents } from '@axlsdk/axl';

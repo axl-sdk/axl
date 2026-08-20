@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **Provider transport guard.** Built-in providers and `OpenAIEmbedder` now reject
+  non-loopback HTTP endpoints unless that endpoint explicitly sets
+  `dangerouslyAllowInsecureHttp: true`. HTTPS and literal loopback HTTP remain
+  zero-configuration; unsafe URLs fail before async credential callbacks or
+  network I/O. Migrate remote endpoints to HTTPS. If a trusted development
+  endpoint cannot support TLS yet, opt in on that endpoint only with
+  `dangerouslyAllowInsecureHttp: true`.
+
+- **Provider redirects fail closed.** Provider and embedding POST requests no longer
+  follow HTTP redirects, preventing request bodies or authorization headers from
+  being resent to a redirect target. Existing redirecting gateways must be
+  reconfigured to use their final HTTPS endpoint URL directly.
+
+### Fixed
+
+- **Studio session redaction.** `trace.redact: true` now scrubs non-streaming session
+  results and every session WebSocket event at the Studio serialization boundary.
+
 ## [0.20.1] - 2026-08-03
 
 ### Added

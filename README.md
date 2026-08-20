@@ -36,6 +36,13 @@ const reliableMath = workflow({
 
 **No DSL, no graph builder, no compiler — and zero runtime dependencies** (provider calls go through raw `fetch`). Axl is a plain TypeScript library you drop into an existing Node.js backend. [Run the examples →](./examples)
 
+Keep provider calls, API keys, and proprietary system prompts on that backend—not
+in a browser, mobile app, Electron renderer, or other user-controlled process.
+A proxy certificate installed on an end user's device cannot inspect a provider
+request that originates on your server, but raw events or traces forwarded to the
+client can still disclose prompt content. See the
+[prompt-confidentiality boundary](./docs/security.md#prompt-confidentiality-and-the-trusted-backend).
+
 ## Install
 
 ```bash
@@ -270,7 +277,7 @@ for await (const e of stream.stringStream({ path: '/summary' })) {
 }
 ```
 
-`path` is an [RFC 6901](https://datatracker.ietf.org/doc/html/rfc6901) JSON Pointer — `/summary`, `/sources/0/title`. Late subscribers see the current state on first iteration. Filter by `askId` for fan-out workflows. For browser SPAs receiving raw events over WebSocket / SSE, `stringStreamFromEvents(source, opts)` reconstructs the same view client-side without pulling Node deps. See [docs/observability.md](./docs/observability.md#picking-the-right-view) for the decision matrix and the React recipe.
+`path` is an [RFC 6901](https://datatracker.ietf.org/doc/html/rfc6901) JSON Pointer — `/summary`, `/sources/0/title`. Late subscribers see the current state on first iteration. Filter by `askId` for fan-out workflows. Public clients should receive an output-only DTO produced from this server-side view, not raw `AxlEvent` objects. `stringStreamFromEvents(source, opts)` remains available for trusted browser/operator clients that already receive a deliberately authorized event stream; it reconstructs text but does not sanitize the wire source. See [docs/observability.md](./docs/observability.md#server-to-client-streaming-boundary) for the boundary and recipes.
 
 ## Sessions
 

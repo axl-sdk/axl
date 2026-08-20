@@ -356,11 +356,43 @@ Notes:
 - **Schema retries reset the stream.** On `pipeline(failed)`, the per-ask accumulator is cleared and pending events are dropped, so attempt-N text never leaks into attempt-N+1's render. Watch `event.attempt` to render a "regenerating" indicator.
 - **Same gating as `partial_object`.** Schema must be set, no tools registered, schema root must be a `z.object(...)`.
 
-##### Recipe: typewriter rendering on the wire (browser SPA)
+#### Server-to-client streaming boundary
+
+Raw `AxlEvent` is an operator/debugging surface. Depending on trace level and
+redaction configuration, it can contain the original prompt, resolved system
+message, complete provider request messages, tool arguments/results, and model
+output. Sending that firehose to an untrusted browser defeats the trusted-backend
+prompt boundary even though the provider request itself originated on the server.
+
+For a public application, consume a curated view on the server and serialize an
+application-owned DTO containing only fields the client is meant to receive:
+
+```typescript
+const stream = runtime.stream('chat', { message });
+
+for await (const delta of stream.text) {
+  sendToClient({ type: 'text_delta', delta });
+}
+
+const result = await stream.promise;
+sendToClient({ type: 'done', result }); // apply your application's output policy
+```
+
+For structured output, relay selected fields from `stream.stringStream()` or
+`stream.partialObjects` instead. Do not relay `.lifecycle`, the raw stream
+iterator, `runtime.on('trace')`, or execution-history records to public clients.
+`trace.redact` is an observability/compliance mode and also removes output a chat
+UI may need; it is not a replacement for an application-specific public DTO.
+
+Model output remains untrusted and may repeat system instructions. Server-side
+topology prevents client-side packet interception of the provider request; it
+does not guarantee that the model will never disclose or help infer its prompt.
+
+##### Recipe: typewriter rendering on an authorized wire (trusted browser/operator client)
 
 The pattern above assumes the consumer holds a live `AxlStream` instance — true for Node-side servers, but not for a browser SPA receiving events over WebSocket / SSE. There the events arrive as raw JSON and there's no bus accumulator on the client.
 
-`stringStreamFromEvents(source, opts?)` is a browser-safe reconstructor: same shape and filter API as `bus.stringStream(...)`, but takes any `AsyncIterable<AxlEvent>` as input. Pure ECMAScript, no Node deps.
+`stringStreamFromEvents(source, opts?)` is browser-safe in the bundling sense: it has no Node dependencies. It reconstructs the `stringStream` view from an authorized raw `AxlEvent` source, but does **not** redact or sanitize events already sent over the wire. Use it only where the browser is authorized to receive raw events, such as a trusted operator client. A public projection should use an application-owned DTO and application-owned browser rendering instead—not this helper.
 
 ```typescript
 import { stringStreamFromEvents } from '@axlsdk/axl';
@@ -398,7 +430,8 @@ Differences from the live-bus view:
 | Structured response, render whole object as it builds (form, card, validation UI) | `.partialObjects` | Each event has the complete current state of the object. Throttled to structural JSON seams so consumers don't re-render mid-key. |
 | Structured response with one (or more) long string fields you want to typewrite | `.stringStream({ path: '/summary' })` | `partial_object` doesn't emit while the string is mid-flight. `stringStream` emits per chunk with running `accumulated`. |
 | Both — render the structure AND typewrite long fields inside it | Subscribe to BOTH on the same bus | Listener-based views don't race; one consumer of each is fine. |
-| Wire/SSE/WebSocket from browser, no `AxlStream` access | `stringStreamFromEvents(source, opts)` | Browser-safe reconstructor with the same shape as `.stringStream`. |
+| Authorized raw-event wire to a trusted browser/operator client | `stringStreamFromEvents(source, opts)` | Browser-bundle-safe reconstructor; does not sanitize its source. |
+| Public browser/client | Server-side `.text` / `.stringStream()` projected into an application DTO | Keeps prompts, system messages, tool data, and traces off the untrusted wire. |
 | Audit log / debugging — every event in order | `for await (const e of ctx.events)` | Raw firehose. Use the curated views to filter. |
 
 ##### Common pitfalls (when things look broken)
@@ -577,12 +610,13 @@ The filter applies at three layers:
 | `DELETE /api/executions/:id` | (no content) | (blocked in `readOnly`; also scrubs the WS replay buffer for `execution:{id}` via `ConnectionManager.clearChannelBuffer`) |
 | `GET /api/memory/:scope` / `:key` | `value` | `key` (programmer-chosen identifier, needed for navigation) |
 | `GET /api/sessions/:id` | `message.content`, `message.tool_calls[*].function.arguments`; `message.providerMetadata` is dropped entirely (opaque bag that may carry encoded reasoning / cache keys) | `role`, `name`, `tool_call_id`, `tool_calls[*].id`, `tool_calls[*].type`, `tool_calls[*].function.name`, `handoffHistory` (no content fields to scrub) |
+| `POST /api/sessions/:id/send` | `result` | response envelope |
 | `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore` | per-item `input`, `output`, `error`, `annotations`, `scorerErrors`, `scoreDetails[*].metadata` | per-item `scores`, `duration`, `cost`, `scorerCost`, `metadata` (models / tokens / workflows), `traces` (already scrubbed at emit time); result-level `summary`, `metadata`, `totalCost`, `duration`, `timestamp` |
 | `GET /api/decisions` | `prompt`, `metadata` (replaced with `{ redacted: true }`) | `executionId`, `channel`, `createdAt` |
 | `POST /api/tools/:name/test` | `result` | tool name, input schema |
 | `POST /api/workflows/:name/execute` (sync) | `result` | — |
 
-**3. Studio WebSocket broadcasts** — for streaming endpoints (playground, workflow execute with `stream: true`) **and** the trace firehose (`trace:*` channels). Scrubs the new `AxlEvent` variants directly via `redactStreamEvent`:
+**3. Studio WebSocket broadcasts** — for streaming endpoints (playground, session stream, workflow execute with `stream: true`) **and** the trace firehose (`trace:*` channels). Scrubs the new `AxlEvent` variants directly via `redactStreamEvent`:
 
 - `token.data` — streaming LLM output
 - `tool_call_rejected.data.args`/diagnostic messages
@@ -597,7 +631,7 @@ In 0.16.0 the trace WS channel applies `redactStreamEvent` directly so the fireh
 
 **Top-level numeric fields (`cost`, `tokens`, `duration`) are never scrubbed**, even under `redact: true`. They're load-bearing — `trackExecution`'s cost-aggregation listener and Studio's `TraceAggregator<CostData>` both read `event.cost` directly, so zeroing them would silently break total cost tracking when redaction is enabled. If your compliance environment treats aggregate spend as sensitive, filter events out entirely in your `onTrace` / `filterTraceEvent` handler rather than relying on redaction to scrub them.
 
-**Redaction is an observability-boundary filter, not a data-at-rest transform.** Programmatic callers of `runtime.execute()`, `runtime.getExecution()`, and direct `StateStore` access still receive raw values. Write endpoints (`PUT /api/memory`, `POST /api/sessions/:id/send`) still accept raw data. If you need scrubbed state-at-rest, configure your own `StateStore` wrapper that stores scrubbed values.
+**Redaction is an observability-boundary filter, not a data-at-rest transform.** Programmatic callers of `runtime.execute()`, `runtime.getExecution()`, and direct `StateStore` access still receive raw values. Write endpoints (`PUT /api/memory`, `POST /api/sessions/:id/send`) still accept and persist raw input even though the session-send response is scrubbed. If you need scrubbed state-at-rest, configure your own `StateStore` wrapper that stores scrubbed values.
 
 ```typescript
 const runtime = new AxlRuntime({

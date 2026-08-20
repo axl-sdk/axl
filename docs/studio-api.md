@@ -20,6 +20,9 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `GET /api/tools/:name` | Tool detail |
 | `POST /api/tools/:name/test` | Test a tool with `{ input: {...} }` |
 | `GET /api/sessions` | List sessions |
+| `GET /api/sessions/:id` | Read session history and handoff history |
+| `POST /api/sessions/:id/send` | Send one session message. Body: `{ workflow: string, message: string }`. Returns the workflow result |
+| `POST /api/sessions/:id/stream` | Start a session message. Body: `{ workflow: string, message: string }`. Broadcasts `AxlEvent`s on the returned `execution:{executionId}` channel |
 | `GET /api/executions` | List executions |
 | `GET /api/executions/:id` | Execution detail. `?since={step}` filters `events` to those with `step > since` (polling tail) |
 | `POST /api/executions/:id/abort` | Abort a running execution (signal-driven; wakes paused `ctx.awaitHuman`) |
@@ -403,6 +406,10 @@ const studio = createStudioMiddleware({ runtime });
 ```
 
 Under `redact: true`, the following Studio endpoints scrub user content server-side before responding: `GET /api/executions{,/:id}` (also scrubs `ExecutionInfo.metadata` to `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces), `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser stays navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync); streaming WS broadcasts on `/workflows/:name/execute` with `stream: true`, `/api/playground/chat`, AND the trace channel firehose (`trace:{executionId}`) all scrub `AxlEvent` content before send.
+
+Session execution has the same boundary: `POST /api/sessions/:id/send` scrubs
+its result, and `POST /api/sessions/:id/stream` scrubs every `AxlEvent` before
+broadcasting it on the returned `execution:{executionId}` channel.
 
 **`DELETE /api/executions/:id` is a second cleanup boundary** alongside redaction. Redaction scrubs *content* on read; the delete endpoint removes the *whole row + indexes + checkpoints + suspended state + streaming buffer + pending decisions* AND scrubs the WebSocket replay buffer for `execution:{id}` so late subscribers can't reconstruct events for a deleted run. Audit via `runtime.on('execution_deleted', ...)`.
 

@@ -257,6 +257,55 @@ export default defineConfig({
 });
 ```
 
+### Transport security
+
+Built-in provider adapters and `OpenAIEmbedder` require an absolute HTTP(S)
+endpoint. HTTPS is accepted for any host. Plain HTTP is accepted automatically
+only for literal loopback hosts: `localhost` (including a trailing dot), IPv4
+`127.0.0.0/8`, and IPv6 `::1`. Classification uses the parsed URL hostname and
+does not trust DNS resolution.
+
+Docker service names, private IPs, `host.docker.internal`, and other non-loopback
+HTTP endpoints therefore require an explicit, per-endpoint acknowledgement:
+
+> **Migration:** an existing non-loopback `http://` `baseUrl` now fails closed.
+> Move the endpoint to HTTPS when possible; otherwise add the explicit override
+> to that provider block after confirming the network is intentionally trusted.
+
+```typescript
+export default defineConfig({
+  providers: {
+    ollama: {
+      baseUrl: 'http://ollama:11434/v1',
+      dangerouslyAllowInsecureHttp: true,
+    },
+  },
+});
+```
+
+`dangerouslyAllowInsecureHttp` defaults to `false`. It permits only an otherwise
+valid HTTP URL; it does not permit malformed URLs or other schemes. Direct
+provider constructors, compatible-provider profiles, environment-provided base
+URLs, and `OpenAIEmbedder` follow the same rule. `openai-responses` inherits the
+complete `openai` provider block—including this option—only when it has no block
+of its own.
+
+Validation happens when that provider is first resolved, before an async API-key
+callback or network request. An unused provider block remains lazy. A rejected
+endpoint throws `AxlError` with `code: 'UNSAFE_TRANSPORT'` and an actionable
+message that does not echo URL credentials or query values.
+
+Provider and embedding requests never follow HTTP redirects. A 3xx response is
+handled through the adapter's existing non-success `ProviderError` path with its
+original status; configure the final endpoint URL instead. This prevents a POST
+body or authorization header from being resent to a redirect target.
+
+Custom `Provider` implementations and HTTP MCP clients do not use this built-in
+endpoint guard and must enforce their own transport policy. The guard also does
+not defeat a trusted TLS-inspection root installed on the backend host; that host
+is part of the application's trust boundary. See
+[Security > Prompt confidentiality](./security.md#prompt-confidentiality-and-the-trusted-backend).
+
 ### Rate limiting (opt-in)
 
 The automatic 429/503/529 backoff above is **reactive** — it only kicks in after a

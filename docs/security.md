@@ -1,5 +1,50 @@
 # Security Model
 
+## Prompt Confidentiality and the Trusted Backend
+
+Axl is a Node.js backend SDK. Keep provider credentials, system prompts, tool
+definitions, and provider requests on infrastructure controlled by the
+application operator:
+
+```text
+untrusted client  -- user input / public output -->  your Axl backend
+                                                       |
+                                                       | HTTPS provider request
+                                                       v
+                                                  model provider
+```
+
+With this topology, a passive packet capture or a trusted interception
+certificate installed **only on the end user's device** cannot inspect the
+backend-to-provider request. The client never originates that connection. A
+trusted proxy installed on the backend host is different: it is inside the
+execution trust boundary, as are host administrators, process instrumentation,
+application logs, and the selected model provider.
+
+Axl's built-in providers and `OpenAIEmbedder` reject plaintext remote HTTP
+endpoints by default. HTTPS is always accepted; HTTP is accepted without an
+override only for literal loopback (`localhost`, IPv4 `127/8`, and IPv6 `::1`).
+Deliberate Docker, private-network, or other remote HTTP deployments must set
+`dangerouslyAllowInsecureHttp: true` on that specific provider or embedder.
+Provider requests also do not follow redirects. See
+[Providers > Transport security](./providers.md#transport-security) for the
+configuration and migration details. Custom `Provider` implementations and HTTP MCP clients own
+their own transport policy.
+
+This is a network-boundary guarantee, not prompt DRM. A model can repeat,
+paraphrase, or help an adversarial user infer its system instructions. Do not put
+credentials or true secrets in prompts. Keep valuable deterministic logic in
+server-side tools or application code, minimize the guidance sent to the model,
+and treat output guardrails as risk reduction rather than a non-disclosure
+guarantee.
+
+Raw `AxlEvent` streams, lifecycle events, traces, execution history, and Studio
+are trusted/operator surfaces and can contain prompts, resolved system messages,
+tool data, and provider output. A public application should consume an
+output-only view on the server and send its own DTO to the client; do not forward
+the raw event firehose. See the
+[server-to-client streaming guidance](./observability.md#server-to-client-streaming-boundary).
+
 ## Tool Access Control
 
 Agents can **only** invoke tools listed in their `tools` configuration. This is enforced at runtime.
@@ -209,6 +254,11 @@ const runtime = new AxlRuntime({
 1. **AxlEvents** at emission — `agent_call_start.data.prompt`/`.system`/`.messages`, `agent_call_end.data.response`/`.thinking`/`.error`, `ask_start.prompt`, `ask_end.outcome` (`outcome.result` on success, `outcome.error` on failure), gate-event `reason`/`feedbackMessage`, rejected-tool args/messages, `tool_call_start.data.args`, tool-end args/results/reasons/error details, `tool_approval.data.args`/`.reason`, `handoff_start.data.message` (roundtrip only), `workflow_start.data.input`, `workflow_end.data.result`/`.error`, `done.data.result`, `error.data.message`, string fields on `log` events (one-level walk — nested numeric/boolean fields like `usage.tokens` / `usage.cost` survive so the Cost Dashboard's byEmbedder bucket still works).
 2. **Studio REST route responses** at serialization — `GET /api/executions{,/:id}` (also scrubs `ExecutionInfo.metadata` to `{ redacted: true }` — caller-supplied `userId`/`tenantId`/correlation ids are PII surfaces compliance mode must protect), `GET /api/memory/:scope{,/:key}` (keys preserved so Memory Browser remains navigable), `GET /api/sessions/:id`, `GET /api/evals/history`, `POST /api/evals/:name/run` (sync), `POST /api/evals/:name/rescore`, `GET /api/decisions`, `POST /api/tools/:name/test`, `POST /api/workflows/:name/execute` (sync).
 3. **Studio WebSocket broadcasts** — `AxlEvent` content scrubbed on `POST /api/workflows/:name/execute` with `stream: true` and `POST /api/playground/chat` (`token.data`, rejected-tool args/messages, `tool_call_start.data.args`, tool-end args/results/reasons/error details, `tool_approval.data.args`/`.reason`, `ask_start.prompt`, `ask_end.outcome`, `done.data.result`, `error.data.message`, `handoff_start.data.message`). The **trace firehose channel** (`trace:*`) applies the same event redaction filter, so it cannot bypass the per-route scrub.
+
+Session routes follow the same serialization boundary:
+`POST /api/sessions/:id/send` scrubs its result, while
+`POST /api/sessions/:id/stream` scrubs every event before the Studio WebSocket
+broadcast. Both endpoints still accept and persist the caller's raw input.
 
 **What's NOT scrubbed:** Programmatic callers of `runtime.execute()` and direct `StateStore` access still receive raw data — redaction is an observability-boundary filter, **not** a data-at-rest transform. For a data-at-rest scrub of a specific execution (GDPR right-to-be-forgotten), use `runtime.deleteExecution(id)` instead. Write endpoints (`PUT /api/memory`, `POST /api/sessions/:id/send`) still accept raw data. Top-level numeric fields (`cost`, `tokens`, `duration`) on every event are never scrubbed — they're load-bearing for `trackExecution` and the cost aggregator. Structural ask-graph metadata (`askId`, `parentAskId`, `depth`, `executionId`, `step`, `timestamp`) is also preserved (random IDs, no PII surface). Caller-supplied `ExecutionInfo.metadata` is scrubbed at the observability boundary when `redact: true` but persists raw in the store — operators wanting the raw values should query `runtime.getExecutions()` programmatically.
 

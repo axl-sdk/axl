@@ -71,6 +71,13 @@ Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`,
 
 Each provider also accepts an opt-in `rateLimit` (`{ maxConcurrent?, minIntervalMs?, acquireTimeoutMs? }`) for proactive client-side pacing on top of the automatic 429/503/529 backoff — useful when a large fan-out (e.g. an eval) shares one API key. It caps in-flight request concurrency (not token throughput) for that provider's chat calls. See [Providers → Rate limiting](../../docs/providers.md#rate-limiting-opt-in).
 
+Built-in providers require HTTPS for remote endpoints and never follow redirects.
+Literal loopback HTTP remains automatic for local inference; Docker service names,
+private-network URLs, and other remote HTTP endpoints require the provider-local
+`dangerouslyAllowInsecureHttp: true` acknowledgement. Keep Axl and proprietary
+system prompts on your trusted backend—see
+[Prompt confidentiality](../../docs/security.md#prompt-confidentiality-and-the-trusted-backend).
+
 State store options: `'memory'` (default), `'sqlite'` (requires `better-sqlite3`), or a `RedisStore` instance for multi-process deployments. See [State Stores](#state-stores).
 
 ### Tools, Agents, and Workflows

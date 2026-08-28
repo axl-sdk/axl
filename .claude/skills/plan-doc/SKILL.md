@@ -7,7 +7,10 @@ disable-model-invocation: true
 Create a living plan for the work in the user's request. The root lead owns
 product decisions, architecture, acceptance criteria, and final synthesis. Use
 `repo-explorer` for bounded read-only discovery with a precise question and
-file-backed evidence; do not delegate plan authorship or trivial discovery.
+file-backed evidence. Ask discovery questions rather than design questions and
+verify negative claims before they enter the plan under
+`.claude/rules/discovery-evidence.md`; do not delegate plan authorship or
+trivial discovery.
 
 Default location: `.internal/spec/<name>-plan.md`. This is the gitignored plan
 staging area; public `docs/` are lasting references, not working plans. Never

@@ -11,8 +11,10 @@ available, use Sol/medium for the lead and raise effort only for consequential
 unresolved ambiguity.
 
 Use `repo-explorer` (Luna/medium) for bounded read-only discovery with a precise
-question and file-backed evidence. Do not delegate plan authorship or trivial
-discovery.
+question and file-backed evidence. Ask discovery questions rather than design
+questions and verify negative claims before they enter the plan under
+`.claude/rules/discovery-evidence.md`. Do not delegate plan authorship or
+trivial discovery.
 
 Default location: `.internal/spec/<name>-plan.md`. This is the gitignored plan
 staging area; public `docs/` are lasting references. Never force-add

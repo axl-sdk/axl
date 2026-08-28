@@ -33,7 +33,8 @@ charters. Treat platform isolation as defense in depth because the host may
 override it: reviewer instructions must prohibit edits and artifact-writing
 commands, and the lead must confirm the wave did not mutate the working tree.
 Each finding must include `REAL BUG`, `NOT A BUG`,
-`NEEDS-LIVE-API-VERIFICATION`, or `ESCALATE-OPUS` with file-backed evidence.
+`NEEDS-LIVE-API-VERIFICATION`, or `ESCALATE-ADVERSARIAL` with file-backed
+evidence.
 
 ## Triage and close
 

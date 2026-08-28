@@ -11,7 +11,8 @@ content here; update `CLAUDE.md` when shared guidance changes.
 The files in `.claude/rules/` are shared repo rules, not Claude-only rules.
 Load every rule that matches the files being edited, reviewed, or investigated:
 
-- Always load `.claude/rules/documentation.md`.
+- Always load `.claude/rules/documentation.md` and
+  `.claude/rules/discovery-evidence.md`.
 - Load `.claude/rules/core-sdk.md` for `packages/axl/src/**`.
 - Load `.claude/rules/providers.md` for `packages/axl/src/providers/**`.
 - Load `.claude/rules/events-streaming-redaction.md` for event, streaming,
@@ -34,14 +35,15 @@ and the rule differ.
 
 Claude project skills live under `.claude/skills/`. Codex discovers repository
 skills through `.agents/skills`, which points to `.codex/skills`. The shared
-`live-api-verification` methodology skill is linked individually from
-`.codex/skills` back to `.claude/skills`; Codex-specific orchestration variants
+`live-api-verification` and `prompt-iteration` methodology skills are linked
+individually from `.codex/skills` back to `.claude/skills`; Codex-specific
+orchestration variants
 (`plan-doc`, `tackle-plan`, `session-review`, and `scenario-review`) live as
 native files under `.codex/skills` because they route named Codex agents and
 model tiers. Update both platform variants only when shared orchestration
 semantics change.
 
-Project-scoped Codex roles live in `.codex/agents/`; matching Claude-native
-roles live in `.claude/agents/`. Keep both discovery surfaces aligned on role
-names, responsibilities, and escalation outcomes while allowing platform model
-and tool instructions to differ.
+Project-scoped Codex roles live in `.codex/agents/`; Claude-native roles live in
+`.claude/agents/`. Keep shared roles aligned on responsibilities and escalation
+outcomes while allowing platform model/tool instructions and platform-specific
+escalation lanes to differ.

@@ -1,0 +1,4 @@
+interface:
+  display_name: 'Prompt Iteration'
+  short_description: 'Improve Axl runtime prompts with minimal paid evals'
+  default_prompt: 'Use $prompt-iteration to improve and evaluate this Axl-owned runtime model-facing behavior.'

@@ -58,6 +58,7 @@ Run from the repo root. Per-area detail: `.claude/rules/testing.md` and the pack
 
 ## `.claude/rules/` map
 - `documentation.md` — what to update where (always loaded)
+- `discovery-evidence.md` — decision-grade discovery evidence (always loaded)
 - `core-sdk.md` — `packages/axl` orchestration core
 - `providers.md` — provider adapters
 - `events-streaming-redaction.md` — AxlEvent model, streaming views, redaction
@@ -89,17 +90,26 @@ and `adversarial-code-reviewer` (Sol/high) only for consequential risk. Use
 Sol/medium to lead orchestrated plan and review work; raise lead effort only
 when architecture or conflicting evidence makes the lead the primary reasoner.
 
-Claude mirrors those outcomes with Sonnet/low for exploration and routine work,
-Sonnet/medium for balanced implementation, Sonnet/high for behavioral analysis,
-boundary implementation, and pragmatic review, and Opus/high for premium
-adversarial review. Fable is the preferred Claude lead for long-horizon
+Claude uses Sonnet/low for exploration and routine patterned work. Opus/medium
+handles balanced implementation, settled boundary implementation, and
+pragmatic review; Opus/high handles blind behavioral analysis, hard debugging,
+and premium adversarial review. The separate boundary role remains deliberate
+even though it shares a tier with balanced implementation: the five-part grant
+and mandatory consolidated premium review make the consequential seam explicit.
+`deep-debugger` is the escalation lane when uncertainty itself is the work, not
+for settled implementation. Fable is the preferred Claude lead for long-horizon
 orchestration, with Opus as the economical alternative; lead at medium effort
-and raise it only for consequential synthesis or adjudication.
+and raise it only for consequential synthesis or adjudication. If Opus/medium
+review fan-out raises cost without better findings, pragmatic review is the
+first lane to move back to Sonnet/high.
 
 Do not delegate merely because a slot exists. `boundary-implementer` receives
-only settled designs and always requires a focused premium review. Review waves
-scale from one pragmatic reviewer on a small milestone to two ordinary lanes
-plus one focused premium pass on a high-risk diff.
+only settled five-part grants and requires one focused premium review of the
+consolidated seam diff after the tree is quiescent. Review waves scale from one
+pragmatic reviewer on a small milestone to two ordinary lanes plus one focused
+premium pass on a high-risk diff. Resume the same implementer or reviewer for a
+related fix or re-check while its context is current; never resume across the
+implementation/review or behavioral-analysis independence boundaries.
 
 Read-only role configuration is defense in depth, not a portable hard boundary:
 the host's permission profile may override a role's `sandbox_mode`. Discovery,
@@ -111,26 +121,31 @@ wave did not mutate the working tree before accepting its findings or committing
 
 Claude skills live in `.claude/skills/`. Codex discovers repository skills
 through `.agents/skills`, which points to `.codex/skills`. The Codex directory
-links `live-api-verification` back here individually, so its Axl knowledge still
-has one source. The four orchestration workflows are native Codex
+links `live-api-verification` and `prompt-iteration` back here individually, so
+their Axl knowledge still has one source. The four orchestration workflows are
+native Codex
 variants because they name Codex agents and choose Terra/Sol tiers; keep the two
 platform variants aligned on outcomes, not implementation details.
 
-All five workflows are explicit-invoke (`disable-model-invocation: true` in
-Claude; `policy.allow_implicit_invocation: false` in Codex). Invoke them with
-Claude's `/skill` syntax or Codex's `$skill` syntax. This list is the model's
-only index of explicit skills, so keep it complete and synchronized with both
-skill directories.
+The five orchestration and live-verification workflows are explicit-invoke
+(`disable-model-invocation: true` in Claude;
+`policy.allow_implicit_invocation: false` in Codex). Invoke them with Claude's
+`/skill` syntax or Codex's `$skill` syntax. `prompt-iteration` is methodology and
+may be selected automatically when Axl-owned runtime model-facing behavior
+changes. Keep this index complete and synchronized with both skill directories.
 
 - `/plan-doc` — create a living journeys-to-architecture plan under
   `.internal/spec/`.
-- `/tackle-plan` — implement, test, independently review, and commit a named
-  plan to completion.
+- `/tackle-plan` — orchestrate a named plan to completion through delegated
+  implementation, testing, independent review, and logical commits.
 - `/session-review` — adversarial white-box review of a concrete net diff.
 - `/scenario-review` — black-box scenario derivation before implementation
   inspection, followed by evidence-based gap closure.
 - `/live-api-verification` — close the canonical provider-gated checklist with
   bounded paid integration tests and explicit provider/model evidence.
+- `/prompt-iteration` — improve Axl-owned runtime model-facing behavior with
+  zero-provider diagnosis, explicitly approved minimal paid probes, complete
+  qualitative mining, and one final evidence lock.
 
 > `AGENTS.md` is the agent-neutral entrypoint that routes Codex and other tools
 > through this index and the applicable shared `.claude/rules/` files.

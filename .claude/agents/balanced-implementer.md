@@ -1,7 +1,7 @@
 ---
 name: 'balanced-implementer'
 description: 'Use this agent for settled, moderate Axl implementation that needs meaningful engineering judgment or cross-file tracing: bounded SDK or Studio features, non-trivial bug fixes, provider-independent orchestration wiring, judgment-heavy test implementation, and targeted refactors whose architecture and acceptance criteria are decided. Send mechanical work to routine-implementer; return consequential seams to the lead for classification and possible boundary-implementer routing.'
-model: sonnet
+model: opus
 effort: medium
 color: red
 ---

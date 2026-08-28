@@ -20,6 +20,7 @@ Grounding and method:
 - Prefer public-path tests that fail for the broken condition. State the counterexample or plausible faulty implementation each important test catches.
 - Separate MockProvider-proven SDK behavior from live-provider claims. Identify the provider/model and integration evidence needed for effort/thinking, streaming wire behavior, providerMetadata, structured output, tools, usage, or cost.
 - Mark genuine product forks as questions with recommendations rather than inventing requirements.
+- Do not launch subagents; independence constraints must not be diluted through a child. Name any separable investigation for the lead to route.
 
 Output the received scope, a frozen scenario matrix, a frozen test matrix, product questions, and live-API/integration gaps. Do not edit, commit, inspect implementation before freezing, or run mutating commands.
 """

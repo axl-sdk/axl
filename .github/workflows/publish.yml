@@ -20,9 +20,9 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 22
-          cache: pnpm
+          node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
       - run: pnpm install --frozen-lockfile
 
@@ -35,7 +35,41 @@ jobs:
       - name: Unit Tests
         run: pnpm test
 
-      - name: Publish
-        run: pnpm -r publish --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Pack release artifacts
+        shell: bash
+        run: |
+          release_dir="${RUNNER_TEMP}/axl-release"
+          release_version="${GITHUB_REF_NAME#v}"
+          rm -rf "${release_dir}"
+          mkdir -p "${release_dir}"
+
+          pnpm --dir packages/axl pack --pack-destination "${release_dir}"
+          pnpm --dir packages/axl-eval pack --pack-destination "${release_dir}"
+          pnpm --dir packages/axl-testing pack --pack-destination "${release_dir}"
+          pnpm --dir packages/axl-studio pack --pack-destination "${release_dir}"
+
+          test -f "${release_dir}/axlsdk-axl-${release_version}.tgz"
+          test -f "${release_dir}/axlsdk-eval-${release_version}.tgz"
+          test -f "${release_dir}/axlsdk-testing-${release_version}.tgz"
+          test -f "${release_dir}/axlsdk-studio-${release_version}.tgz"
+
+      - name: Publish with npm trusted publishing
+        shell: bash
+        run: |
+          release_dir="${RUNNER_TEMP}/axl-release"
+          release_version="${GITHUB_REF_NAME#v}"
+
+          publish_if_missing() {
+            local package_name="$1"
+            local tarball="$2"
+            if npm view "${package_name}@${release_version}" version --json >/dev/null 2>&1; then
+              echo "${package_name}@${release_version} already exists; skipping"
+              return
+            fi
+            npm publish "${tarball}"
+          }
+
+          publish_if_missing "@axlsdk/axl" "${release_dir}/axlsdk-axl-${release_version}.tgz"
+          publish_if_missing "@axlsdk/eval" "${release_dir}/axlsdk-eval-${release_version}.tgz"
+          publish_if_missing "@axlsdk/testing" "${release_dir}/axlsdk-testing-${release_version}.tgz"
+          publish_if_missing "@axlsdk/studio" "${release_dir}/axlsdk-studio-${release_version}.tgz"

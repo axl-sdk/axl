@@ -15,11 +15,16 @@ path-matched rule, including `core-sdk.md`, `providers.md`, `eval.md`, and
 1. Trace the assembled system and user messages, schema guidance, native
    structured-output or tool definitions, validation and retry feedback,
    provider mapping, returned value, events, and every public consumer.
+   Prove each constant or instruction being changed is reachable from the
+   production runtime path; an exported prompt with no production caller is not
+   evidence of changed behavior.
 2. Define the intended developer-visible behavior, representative cases, and
    counter-cases that must remain flexible.
 3. Inspect the failing input, raw provider output, parsed result, retry/repair
    path, scorer reasoning, and a passing sibling before deciding where the
    defect belongs.
+   Treat validator, repair, and retry messages returned to the model as prompts:
+   audit their content, reachability, and interaction with the initial guidance.
 4. Prefer types, Zod, deterministic validation, and code for structural,
    numeric, authorization, compatibility, and data-integrity requirements.
    Leave semantic interpretation to the model. Do not make prose compensate
@@ -69,6 +74,11 @@ compiled `dist`, so source edits are not live evidence by default.
   before the provider call. The checker proves location, not freshness: the
   targeted build immediately before it is the freshness proof. A paid result
   against old code is invalid evidence.
+
+Before a paid probe, choose an explicit `--output` artifact path. Add
+`--capture-traces` when failure diagnosis needs model-facing trace evidence, and
+confirm rejected, failed, or timed-out items will retain enough input, output,
+error, and trace context to diagnose the run rather than forcing a blind rerun.
 
 Before the first paid command, obtain explicit user approval for a capped
 budget. Before each paid command, state the exact provider/model, cases, runs,

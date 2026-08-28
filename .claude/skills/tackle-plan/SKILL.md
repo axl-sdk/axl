@@ -37,10 +37,9 @@ irreversible actions, or approved spend.
 - **Routine implementation:** `routine-implementer` (Sonnet/low) for patterned,
   highly specified, objectively verifiable work and mechanical implementation
   of a frozen test matrix.
-- **Moderate implementation:** `balanced-implementer` (Opus/medium) for settled
-  work needing cross-file or framework judgment.
-- **Settled boundary implementation:** `boundary-implementer` (Opus/medium) only
-  after the lead supplies all five grant elements: design, invariants,
+- **Settled implementation:** `implementer` (Opus/medium) for work needing
+  cross-file or framework judgment. Consequential seams are allowed only after
+  the lead supplies all five grant elements: design, invariants,
   acceptance criteria, owned files, and verification. A partial grant is not a
   grant and covers only the named seam. Require a focused
   `adversarial-code-reviewer` (Opus/high) pass on the consolidated seam diff.
@@ -63,7 +62,7 @@ overhead. Parallelize only disjoint scopes, core/shared types first, under
 - For bugs, establish the behavior-focused failing test first when feasible.
 - For new features, have `behavioral-test-analyst` freeze a discriminating
   matrix from acceptance criteria and public behavior, then give it to a fresh
-  `routine-implementer` for mechanical tests or `balanced-implementer` when the
+  `routine-implementer` for mechanical tests or `implementer` when the
   harness needs judgment. The root owns coverage judgment and product questions.
 - Run targeted tests and typechecks while iterating, then the appropriate final
   repository gate once work is consolidated.
@@ -82,6 +81,11 @@ Resume the idle implementer that built a seam for related fixes, and resume the
 reviewer for a focused re-check of its own findings. Spawn fresh for a different
 seam or stale context. Never cross the independence boundary: implementers do
 not review their own work and `behavioral-test-analyst` remains blind.
+
+Before resumed work edits the tree, require it to re-read the current plan,
+status, diff, and owned files. If review or new evidence changes the design,
+update the plan first and derive every remaining implementation brief from the
+current plan rather than an earlier handoff.
 
 - **Small, low-risk diff:** one `pragmatic-code-reviewer` with a composite
   correctness, architecture, and tests charter.

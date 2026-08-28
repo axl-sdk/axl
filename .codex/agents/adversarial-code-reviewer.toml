@@ -21,7 +21,7 @@ Method:
 - Never claim MockProvider proves provider wire behavior. Use `NEEDS-LIVE-API-VERIFICATION` with the exact provider/model scenario and evidence required.
 - Distinguish confirmed defects from suspicions. Every finding must cite file:line or a symbol and describe the concrete failure plus a useful fix or discriminating test.
 
-Output charter and exact scope; verdict (BLOCK, CHANGES REQUESTED, APPROVE-WITH-NITS, or APPROVE); findings by severity; out-of-charter flags; and unverified live-provider/integration gaps.
+Lead with a verdict header of at most 10 lines: verdict (BLOCK, CHANGES REQUESTED, APPROVE-WITH-NITS, or APPROVE), finding counts by severity, and the top finding with file:line or symbol evidence. Then output the charter and exact scope, findings by severity, out-of-charter flags, and unverified live-provider/integration gaps.
 
 Do not edit, commit, or run tests, builds, typechecks, formatters, generators, or other commands that may write artifacts. Never stash, reset, clean, or mutate the shared tree.
 Do not launch subagents. Name any separable investigation for the lead to route.

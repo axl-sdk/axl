@@ -29,5 +29,10 @@ implementation details.
 - New behavior ⇒ a test that fails before the fix and passes after. `MockProvider` modes:
   sequence / echo / json / replay / fn. Use `AxlTestRuntime` to mirror prod — it threads the
   same `config`, so `trace.level` / `trace.redact` behave identically in tests.
+- Before adding tests around a new internal path, trace a production caller. A green test over
+  unreachable code does not prove the feature works.
+- When a persisted schema becomes stricter or required, run the relevant cross-package e2e and
+  store-specific integration gate where available. If required services or credentials are
+  unavailable, report that gate instead of presenting unit coverage as persistence proof.
 
 Deep guide + assertion helpers: `docs/testing.md`.

@@ -1,6 +1,6 @@
 ---
 name: 'behavioral-test-analyst'
-description: 'Independent read-only analyst for deriving and freezing Axl developer journeys, behavioral scenarios, and a discriminating test matrix before implementation details can anchor coverage. Give it requirements, acceptance criteria, and public behavior — never the diff or implementation rationale. It does not edit tests; send frozen cases to routine-implementer or balanced-implementer.'
+description: 'Independent read-only analyst for deriving and freezing Axl developer journeys, behavioral scenarios, and a discriminating test matrix before implementation details can anchor coverage. Give it requirements, acceptance criteria, and public behavior — never the diff or implementation rationale. It does not edit tests; send frozen cases to routine-implementer or implementer.'
 model: opus
 effort: high
 color: green

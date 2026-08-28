@@ -38,6 +38,14 @@ staging area; public `docs/` are lasting references. Never force-add
 For Studio UI phases, include a dev-server iteration pass. Maintain one live-API
 checklist with scenario, provider/model, expected behavior, and evidence.
 
+Before asking for approval on a plan that changes public contracts, structured
+output or provider mapping, streaming/events/redaction, durable state,
+concurrency, usage/cost accounting, or Axl-owned runtime prompts, give the named
+plan artifact to one `pragmatic-code-reviewer`. Charter architecture,
+production reachability of every proposed path, and unresolved product forks.
+Fold confirmed findings into the plan. A blind `behavioral-test-analyst` pass is
+optional for product-heavy behavior; it is not a default plan-review tax.
+
 Mark durable versus ephemeral content. At completion, graduate lasting internal
 design to numbered `.internal/spec/` docs and user-facing material to public
 `docs/`; remove or archive execution scaffolding and update `CHANGELOG.md` for

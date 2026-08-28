@@ -91,25 +91,26 @@ Sol/medium to lead orchestrated plan and review work; raise lead effort only
 when architecture or conflicting evidence makes the lead the primary reasoner.
 
 Claude uses Sonnet/low for exploration and routine patterned work. Opus/medium
-handles balanced implementation, settled boundary implementation, and
-pragmatic review; Opus/high handles blind behavioral analysis, hard debugging,
-and premium adversarial review. The separate boundary role remains deliberate
-even though it shares a tier with balanced implementation: the five-part grant
-and mandatory consolidated premium review make the consequential seam explicit.
-`deep-debugger` is the escalation lane when uncertainty itself is the work, not
-for settled implementation. Fable is the preferred Claude lead for long-horizon
+handles settled implementation and pragmatic review; Opus/high handles blind
+behavioral analysis, hard debugging, and premium adversarial review. Claude's
+single `implementer` role covers both moderate work and consequential seams,
+but seam work still requires the explicit five-part grant and mandatory
+consolidated premium review. Codex retains separate balanced and boundary roles
+because those roles use different effort tiers. `deep-debugger` is the Claude
+escalation lane when uncertainty itself is the work, not for settled
+implementation. Fable is the preferred Claude lead for long-horizon
 orchestration, with Opus as the economical alternative; lead at medium effort
-and raise it only for consequential synthesis or adjudication. If Opus/medium
-review fan-out raises cost without better findings, pragmatic review is the
-first lane to move back to Sonnet/high.
+and raise it only for consequential synthesis or adjudication.
 
-Do not delegate merely because a slot exists. `boundary-implementer` receives
-only settled five-part grants and requires one focused premium review of the
-consolidated seam diff after the tree is quiescent. Review waves scale from one
-pragmatic reviewer on a small milestone to two ordinary lanes plus one focused
-premium pass on a high-risk diff. Resume the same implementer or reviewer for a
-related fix or re-check while its context is current; never resume across the
-implementation/review or behavioral-analysis independence boundaries.
+Do not delegate merely because a slot exists. Consequential implementation
+receives only settled five-part grants: Claude routes that mode through
+`implementer`, while Codex routes it through `boundary-implementer`. Require one
+focused premium review of the consolidated seam diff after the tree is
+quiescent. Review waves scale from one pragmatic reviewer on a small milestone
+to two ordinary lanes plus one focused premium pass on a high-risk diff. Resume
+the same implementer or reviewer for a related fix or re-check while its context
+is current; never resume across implementation/review or behavioral-analysis
+independence boundaries.
 
 Read-only role configuration is defense in depth, not a portable hard boundary:
 the host's permission profile may override a role's `sandbox_mode`. Discovery,

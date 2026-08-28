@@ -44,9 +44,11 @@ completing an explicitly requested review.
   `file:line` or a symbol and describe the concrete failure plus a useful fix or
   discriminating test.
 
-Output charter and exact scope; verdict (BLOCK, CHANGES REQUESTED,
-APPROVE-WITH-NITS, or APPROVE); findings by severity; out-of-charter flags; and
-unverified live-provider/integration gaps.
+Lead with a verdict header of at most 10 lines: verdict (BLOCK, CHANGES
+REQUESTED, APPROVE-WITH-NITS, or APPROVE), finding counts by severity, and the
+top finding with `file:line` or symbol evidence. Then output the charter and
+exact scope, findings by severity, out-of-charter flags, and unverified
+live-provider/integration gaps.
 
 Do not edit, commit, or run tests, builds, typechecks, formatters, generators,
 or other commands that may write artifacts. Never stash, reset, clean, or

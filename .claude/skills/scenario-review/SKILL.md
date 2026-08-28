@@ -25,7 +25,7 @@ For every scenario, establish expected behavior and verify it by the strongest
 cheap method. Prefer discriminating Vitest, type-level, e2e, Studio, or
 integration tests over code reading. Use `repo-explorer` for bounded source
 mapping, `routine-implementer` for mechanical test additions or clear fixes, and
-`balanced-implementer` when the harness or fix needs judgment. Keep new product
+`implementer` when the harness or fix needs judgment. Keep new product
 scope and architecture with the lead. Route unclear, intermittent,
 provider-specific, concurrency, or twice-failed bugs to `deep-debugger`.
 

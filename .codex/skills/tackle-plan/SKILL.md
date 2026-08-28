@@ -84,6 +84,11 @@ reviewer for a focused re-check of its own findings. Spawn fresh for a different
 seam or stale context. Never cross the independence boundary: implementers do
 not review their own work and `behavioral-test-analyst` remains blind.
 
+Before resumed work edits the tree, require it to re-read the current plan,
+status, diff, and owned files. If review or new evidence changes the design,
+update the plan first and derive every remaining implementation brief from the
+current plan rather than an earlier handoff.
+
 - **Small, low-risk:** one `pragmatic-code-reviewer` (Terra/high) with a composite
   correctness, architecture, and tests charter.
 - **Moderate or user-facing:** two pragmatic reviewers with disjoint

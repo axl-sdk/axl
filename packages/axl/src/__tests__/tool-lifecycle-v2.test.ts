@@ -252,10 +252,48 @@ describe('v2 tool lifecycle integration', () => {
         callId: 'call-1',
         data: { reason },
       });
-      expect(providerToolMessage(harness.provider).content).toBe(expectedMessage);
+      const content = providerToolMessage(harness.provider).content;
+      if (reason === 'invalid_arguments') {
+        expect(content).toMatch(/\/(id|value)/);
+        expect(content).toMatch(/string|maximum|max|limit/i);
+      } else {
+        expect(content).toBe(expectedMessage);
+      }
       expect(spans.spans.filter((span) => span.name === 'axl.tool.call')).toEqual([]);
     },
   );
+
+  it('delivers safe structural feedback for a sensitive tool without accepting the call', async () => {
+    const rejectedValue = 'SENSITIVE_REJECTED_ARGUMENT';
+    const customMessage = 'SENSITIVE_CUSTOM_VALIDATION';
+    const handler = vi.fn();
+    const before = vi.fn();
+    const after = vi.fn();
+    const configuredTool = tool({
+      name: 'sensitive_validation',
+      description: 'fixture',
+      sensitive: true,
+      input: z.object({ account: z.string().min(100, customMessage) }),
+      handler,
+      hooks: { before, after },
+    });
+    const harness = setup({
+      configuredTool,
+      arguments: JSON.stringify({ account: rejectedValue }),
+    });
+
+    await expect(harness.ctx.ask(harness.testAgent, 'go')).resolves.toBe('done');
+
+    const content = providerToolMessage(harness.provider).content;
+    expect(content).toMatch(/\/account/);
+    expect(content).toMatch(/minimum|at least|length|100/i);
+    expect(content).not.toContain(rejectedValue);
+    expect(content).not.toContain(customMessage);
+    expect(lifecycle(harness.events).map((event) => event.type)).toEqual(['tool_call_rejected']);
+    expect(handler).not.toHaveBeenCalled();
+    expect(before).not.toHaveBeenCalled();
+    expect(after).not.toHaveBeenCalled();
+  });
 
   it('pairs approval denial and skips hooks and handler', async () => {
     const before = vi.fn();

@@ -5,7 +5,13 @@ import {
   ToolModelOutputError,
 } from './errors.js';
 import { serializeToolModelOutput } from './tool-model-output.js';
-import { executePreparedTool, prepareToolInput, toolArgumentIssues, type Tool } from './tool.js';
+import {
+  executePreparedTool,
+  prepareToolInput,
+  toolArgumentIssues,
+  toolArgumentModelMessage,
+  type Tool,
+} from './tool.js';
 import type { WorkflowContext } from './context.js';
 import type { McpToolResult } from './mcp/types.js';
 import type {
@@ -66,8 +72,18 @@ export function parseToolInvocation(options: {
   mcpCall?: (args: unknown) => Promise<McpToolResult>;
   mcpTraceName?: string;
   availableTools: string[];
+  /** Provider-facing JSON Schema built for a local tool. */
+  providerVisibleSchema?: unknown;
 }): PreparedToolInvocation | ToolInvocationRejection {
-  const { toolCall, configuredTool, override, mcpCall, mcpTraceName, availableTools } = options;
+  const {
+    toolCall,
+    configuredTool,
+    override,
+    mcpCall,
+    mcpTraceName,
+    availableTools,
+    providerVisibleSchema,
+  } = options;
   const requestedTool = toolCall.function.name;
 
   // Configured mocks intentionally win even when no real tool is registered.
@@ -142,7 +158,8 @@ export function parseToolInvocation(options: {
           args: parsedArguments,
           issues: toolArgumentIssues(error),
         },
-        modelMessage: INVALID_ARGUMENTS_MODEL_MESSAGE,
+        modelMessage:
+          toolArgumentModelMessage(error, providerVisibleSchema) ?? INVALID_ARGUMENTS_MODEL_MESSAGE,
       };
     }
   }

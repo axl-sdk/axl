@@ -82,6 +82,13 @@ Tool arguments received from the LLM are validated against the tool's Zod input 
 - **String length limits:** Configurable max length per parameter (default: 10,000 chars).
 - **No code execution:** There is no `eval`, `exec`, or dynamic code generation in Axl. Agents cannot produce or run arbitrary code.
 
+When local validation rejects a call, Axl gives the model bounded correction
+using paths and constraints resolved from the provider-facing JSON Schema. The
+separate string-length guard may also report its configured Axl limit. Rejected
+values, Zod issue messages, custom issue parameters, dynamic record keys, and
+homogeneous-array indices are not copied into provider content. Unresolved paths
+and unsupported schema shapes fail closed to masked or generic guidance.
+
 ## Prompt Injection Mitigations
 
 Prompt injection is an inherent risk in any system where untrusted text is passed to an LLM. Axl does not claim to solve prompt injection, but provides structural mitigations:

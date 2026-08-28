@@ -9,12 +9,19 @@ import {
   settleAcceptedTool,
 } from '../tool-invocation.js';
 import { tool } from '../tool.js';
-import type { WorkflowContext } from '../context.js';
+import { zodToJsonSchema, type WorkflowContext } from '../context.js';
 import type { ToolCallMessage, ToolCallOutcome } from '../types.js';
 
 const context = {} as WorkflowContext;
 const createChildContext = () => context;
 const approved = async () => ({ approved: true });
+
+function localParserOptions(configuredTool: ReturnType<typeof tool>) {
+  return {
+    configuredTool,
+    providerVisibleSchema: zodToJsonSchema(configuredTool.inputSchema),
+  };
+}
 
 function call(name: string, args = '{}'): ToolCallMessage {
   return {
@@ -30,7 +37,7 @@ function accepted(
 ): Exclude<ReturnType<typeof parseToolInvocation>, { kind: 'rejected' }> {
   const invocation = parseToolInvocation({
     toolCall: call(configuredTool.name, args),
-    configuredTool,
+    ...localParserOptions(configuredTool),
     availableTools: [configuredTool.name],
   });
   if ('kind' in invocation) throw new Error('Expected accepted invocation');
@@ -59,14 +66,14 @@ describe('v2 tool invocation seams', () => {
     expect(
       parseToolInvocation({
         toolCall: call('lookup', '{bad'),
-        configuredTool: lookup,
+        ...localParserOptions(lookup),
         availableTools: ['lookup'],
       }),
     ).toMatchObject({ kind: 'rejected', data: { reason: 'invalid_json' } });
     expect(
       parseToolInvocation({
         toolCall: call('lookup', '{"id":1}'),
-        configuredTool: lookup,
+        ...localParserOptions(lookup),
         availableTools: ['lookup'],
       }),
     ).toMatchObject({
@@ -90,6 +97,293 @@ describe('v2 tool invocation seams', () => {
         data: { reason: 'invalid_json' },
       });
     }
+  });
+
+  it('renders actionable structural feedback for common schema mismatches', () => {
+    const optionalNull = tool({
+      name: 'optional_null',
+      description: 'fixture',
+      input: z.object({ note: z.string().optional() }),
+      handler: () => 'unused',
+    });
+    const nullRejection = parseToolInvocation({
+      toolCall: call(optionalNull.name, '{"note":null}'),
+      ...localParserOptions(optionalNull),
+      availableTools: [optionalNull.name],
+    });
+    expect('kind' in nullRejection ? nullRejection.modelMessage : '').toMatch(/\/note/);
+    expect('kind' in nullRejection ? nullRejection.modelMessage : '').toMatch(/string/i);
+
+    const numberTool = tool({
+      name: 'number_input',
+      description: 'fixture',
+      input: z.object({ count: z.number() }),
+      handler: () => 'unused',
+    });
+    const numberRejection = parseToolInvocation({
+      toolCall: call(numberTool.name, '{"count":"12"}'),
+      ...localParserOptions(numberTool),
+      availableTools: [numberTool.name],
+    });
+    expect('kind' in numberRejection ? numberRejection.modelMessage : '').toMatch(/\/count/);
+    expect('kind' in numberRejection ? numberRejection.modelMessage : '').toMatch(/number/i);
+    expect('kind' in numberRejection ? numberRejection.modelMessage : '').not.toContain('12');
+
+    const choiceTool = tool({
+      name: 'choice_input',
+      description: 'fixture',
+      input: z.object({
+        unit: z.union([z.literal('km'), z.literal('mi')]),
+        value: z.union([z.string(), z.number()]),
+      }),
+      handler: () => 'unused',
+    });
+    const choiceRejection = parseToolInvocation({
+      toolCall: call(choiceTool.name, '{"unit":"yards","value":{}}'),
+      ...localParserOptions(choiceTool),
+      availableTools: [choiceTool.name],
+    });
+    const choiceMessage = 'kind' in choiceRejection ? choiceRejection.modelMessage : '';
+    expect(choiceMessage).toMatch(/\/unit/);
+    expect(choiceMessage).toMatch(/km/);
+    expect(choiceMessage).toMatch(/mi/);
+    expect(choiceMessage).toMatch(/\/value/);
+    expect(choiceMessage).toMatch(/string/i);
+    expect(choiceMessage).toMatch(/number/i);
+    expect(choiceMessage).not.toContain('yards');
+  });
+
+  it('escapes nested RFC 6901 paths and excludes rejected values and custom diagnostics', () => {
+    const rejectedValue = 'REJECTED_ARGUMENT_SECRET';
+    const customMessage = 'CUSTOM_VALIDATION_SECRET';
+    const pattern = 'REGEX_PATTERN_SECRET';
+    const pathKey = 'a/b~c\nline';
+    const configuredTool = tool({
+      name: 'nested_diagnostics',
+      description: 'fixture',
+      input: z.object({
+        items: z.array(
+          z.object({
+            [pathKey]: z.string().regex(new RegExp(pattern), customMessage),
+          }),
+        ),
+      }),
+      handler: () => 'unused',
+    });
+    const rejection = parseToolInvocation({
+      toolCall: call(
+        configuredTool.name,
+        JSON.stringify({ items: [{ [pathKey]: rejectedValue }] }),
+      ),
+      ...localParserOptions(configuredTool),
+      availableTools: [configuredTool.name],
+    });
+    const message = 'kind' in rejection ? rejection.modelMessage : '';
+
+    expect(message).toContain('/items/<index>/a~1b~0c\\nline');
+    expect(message).not.toContain(rejectedValue);
+    expect(message).not.toContain(customMessage);
+    expect(message).not.toContain(pattern);
+    expect(message).not.toContain(pathKey);
+  });
+
+  it('derives feedback only from the provider-visible schema when Zod issues are forged', () => {
+    const issueSecret = 'FORGED_ZOD_ISSUE_SECRET';
+    const forgedPath = 'FORGED_ZOD_PATH_SECRET';
+    const configuredTool = tool({
+      name: 'forged_diagnostics',
+      description: 'fixture',
+      input: z
+        .object({
+          unit: z.enum(['km', 'mi']),
+          amount: z.number().multipleOf(4),
+          name: z.string().min(3),
+          value: z.union([z.string(), z.number()]),
+        })
+        .superRefine((_value, ctx) => {
+          ctx.addIssue({ code: 'invalid_value', path: ['unit'], values: [issueSecret] } as never);
+          ctx.addIssue({
+            code: 'too_small',
+            path: ['name'],
+            origin: 'number',
+            minimum: 999_999,
+          } as never);
+          ctx.addIssue({
+            code: 'not_multiple_of',
+            path: ['amount'],
+            divisor: 999_999,
+          } as never);
+          ctx.addIssue({
+            code: 'invalid_union',
+            path: ['value'],
+            errors: [[{ code: 'custom', path: [issueSecret], message: issueSecret }]],
+          } as never);
+          ctx.addIssue({ code: 'custom', path: [forgedPath], params: { issueSecret } } as never);
+        }),
+      handler: () => 'unused',
+    });
+    const rejection = parseToolInvocation({
+      toolCall: call(configuredTool.name, '{"unit":"km","amount":4,"name":"valid","value":"ok"}'),
+      ...localParserOptions(configuredTool),
+      availableTools: [configuredTool.name],
+    });
+    const message = 'kind' in rejection ? rejection.modelMessage : '';
+
+    expect(message).toMatch(/\/unit/);
+    expect(message).toMatch(/km/);
+    expect(message).toMatch(/mi/);
+    expect(message).toMatch(/\/name/);
+    expect(message).toMatch(/3/);
+    expect(message).toMatch(/\/amount/);
+    expect(message).toMatch(/multiple of 4/);
+    expect(message).toMatch(/\/value/);
+    expect(message).toMatch(/string/);
+    expect(message).toMatch(/number/);
+    expect(message).toContain('<path omitted>');
+    expect(message).not.toContain(issueSecret);
+    expect(message).not.toContain(forgedPath);
+    expect(message).not.toContain('999999');
+  });
+
+  it('masks dynamic record keys and escapes provider-visible controls', () => {
+    const dynamicKey = 'DYNAMIC_RECORD_KEY_SECRET';
+    const recordTool = tool({
+      name: 'record_key',
+      description: 'fixture',
+      input: z.record(z.string(), z.string()),
+      handler: () => 'unused',
+    });
+    const recordRejection = parseToolInvocation({
+      toolCall: call(recordTool.name, JSON.stringify({ [dynamicKey]: 1 })),
+      ...localParserOptions(recordTool),
+      availableTools: [recordTool.name],
+    });
+    const recordMessage = 'kind' in recordRejection ? recordRejection.modelMessage : '';
+    expect(recordMessage).toContain('/<key>');
+    expect(recordMessage).not.toContain(dynamicKey);
+
+    const dynamicIndex = 123_456_789;
+    const arrayTool = tool({
+      name: 'array_index',
+      description: 'fixture',
+      input: z.object({ items: z.array(z.string()) }).superRefine((_value, ctx) => {
+        ctx.addIssue({ code: 'custom', path: ['items', dynamicIndex] });
+      }),
+      handler: () => 'unused',
+    });
+    const arrayRejection = parseToolInvocation({
+      toolCall: call(arrayTool.name, '{"items":[]}'),
+      ...localParserOptions(arrayTool),
+      availableTools: [arrayTool.name],
+    });
+    const arrayMessage = 'kind' in arrayRejection ? arrayRejection.modelMessage : '';
+    expect(arrayMessage).toContain('/items/<index>');
+    expect(arrayMessage).not.toContain(String(dynamicIndex));
+
+    const controlledPath = `safe\u2028path\u2029\u202e`;
+    const controlledLiteral = `safe\u061cvalue\u2069`;
+    const controlsTool = tool({
+      name: 'schema_controls',
+      description: 'fixture',
+      input: z.object({ [controlledPath]: z.enum([controlledLiteral]) }),
+      handler: () => 'unused',
+    });
+    const controlsRejection = parseToolInvocation({
+      toolCall: call(controlsTool.name, JSON.stringify({ [controlledPath]: 'wrong' })),
+      ...localParserOptions(controlsTool),
+      availableTools: [controlsTool.name],
+    });
+    const controlsMessage = 'kind' in controlsRejection ? controlsRejection.modelMessage : '';
+    expect(controlsMessage).toContain('\\u2028');
+    expect(controlsMessage).toContain('\\u2029');
+    expect(controlsMessage).toContain('\\u202e');
+    expect(controlsMessage).toContain('\\u061c');
+    expect(controlsMessage).toContain('\\u2069');
+    expect(controlsMessage).not.toContain('\u2028');
+    expect(controlsMessage).not.toContain('\u2029');
+    expect(controlsMessage).not.toContain('\u202e');
+    expect(controlsMessage).not.toContain('\u061c');
+    expect(controlsMessage).not.toContain('\u2069');
+  });
+
+  it('bounds multiple structural issues and marks omitted issues', () => {
+    const input = z.object(
+      Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`field${index}`, z.string()])),
+    );
+    const configuredTool = tool({
+      name: 'many_issues',
+      description: 'fixture',
+      input,
+      handler: () => 'unused',
+    });
+    const rejection = parseToolInvocation({
+      toolCall: call(configuredTool.name, '{}'),
+      ...localParserOptions(configuredTool),
+      availableTools: [configuredTool.name],
+    });
+    const message = 'kind' in rejection ? rejection.modelMessage : '';
+    const issueLines = message.split('\n').filter((line) => /^\s*-\s/.test(line));
+
+    expect(issueLines.length).toBeLessThanOrEqual(8);
+    expect(message.length).toBeLessThanOrEqual(2_000);
+    expect(message).toMatch(/additional|omitted|more/i);
+  });
+
+  it('reports string-length limits by path and keeps clone and unknown failures generic', () => {
+    const boundedTool = tool({
+      name: 'bounded_nested_string',
+      description: 'fixture',
+      input: z.object({ items: z.array(z.string()) }),
+      maxStringLength: 4,
+      handler: () => 'unused',
+    });
+    const boundedRejection = parseToolInvocation({
+      toolCall: call(
+        boundedTool.name,
+        JSON.stringify({ items: ['ok', 'TOO_LONG_REJECTED_VALUE'] }),
+      ),
+      ...localParserOptions(boundedTool),
+      availableTools: [boundedTool.name],
+    });
+    const boundedMessage = 'kind' in boundedRejection ? boundedRejection.modelMessage : '';
+    expect(boundedMessage).toMatch(/\/items\/<index>/);
+    expect(boundedMessage).toMatch(/4/);
+    expect(boundedMessage).toMatch(/maximum|max|limit/i);
+    expect(boundedMessage).not.toContain('TOO_LONG_REJECTED_VALUE');
+
+    const cloneTool = tool({
+      name: 'clone_failure',
+      description: 'fixture',
+      input: z.object({}).transform(() => ({ nonCloneable: () => 'private' })),
+      handler: () => 'unused',
+    });
+    const cloneRejection = parseToolInvocation({
+      toolCall: call(cloneTool.name),
+      ...localParserOptions(cloneTool),
+      availableTools: [cloneTool.name],
+    });
+    expect('kind' in cloneRejection ? cloneRejection.modelMessage : '').toBe(
+      'Error: Tool arguments are invalid. Correct the arguments and try again.',
+    );
+
+    const unknownTool = tool({
+      name: 'unknown_failure',
+      description: 'fixture',
+      input: z.object({}).transform(() => {
+        throw new Error('UNKNOWN_FAILURE_SECRET');
+      }),
+      handler: () => 'unused',
+    });
+    const unknownRejection = parseToolInvocation({
+      toolCall: call(unknownTool.name),
+      ...localParserOptions(unknownTool),
+      availableTools: [unknownTool.name],
+    });
+    const unknownMessage = 'kind' in unknownRejection ? unknownRejection.modelMessage : '';
+    expect(unknownMessage).toBe(
+      'Error: Tool arguments are invalid. Correct the arguments and try again.',
+    );
+    expect(unknownMessage).not.toContain('UNKNOWN_FAILURE_SECRET');
   });
 
   it('keeps configured overrides schema-agnostic and invokes them without a receiver', async () => {

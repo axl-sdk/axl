@@ -113,9 +113,13 @@ and approval/output infrastructure failures abort it.
   result only when execution had already produced one.
 
 Failure event details are host observability data, never an implicit provider
-message. Only `ToolFailure.modelMessage`, bounded MCP protocol error content,
-and denial content cross the provider boundary. `trace.redact` scrubs host
-arguments, results, reasons, error messages, and error causes.
+message. Provider continuations include explicit `ToolFailure.modelMessage`,
+bounded MCP protocol error content, denial content, and pre-start rejection
+corrections. Local invalid-argument corrections use bounded schema-resolved
+paths and expectations; the separate string-length guard reports its configured
+limit. Rejected arguments and Zod issue messages remain host-only.
+`trace.redact` scrubs host arguments, results, reasons, error messages, and error
+causes.
 
 For v2 events, pair an accepted call with
 `(executionId, askId, callId)`. Every complete, untruncated trace has one end per

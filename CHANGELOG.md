@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Actionable invalid tool arguments.** Local schema rejections now give the
+  model bounded field paths and expectations derived from the provider-facing
+  tool schema, allowing corrective retries without exposing rejected values,
+  custom Zod messages, or dynamic record keys.
+
 ## [0.21.0] - 2026-08-20
 
 ### Breaking Changes

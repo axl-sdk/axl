@@ -1839,6 +1839,16 @@ An issue is `{ path: readonly (string | number)[]; code: string; message? }` and
 contains no rejected values. Rejections never emit `tool_call_start` or
 `tool_call_end`.
 
+For a local `invalid_arguments` rejection, Axl sends the model bounded corrective
+feedback: schema-resolved field paths plus safe type, enum, format, or size
+expectations. Its separate string-length guard reports the configured Axl limit.
+It never copies rejected arguments or Zod issue messages into provider content.
+Dynamic record keys and homogeneous array indices are masked, and an
+unresolvable schema path receives only masked, schema-derived guidance. Feedback
+contains at most eight issue lines and 2,000 characters. This changes only the
+continuation message; `ToolCallRejectedData` remains the host-observable
+rejection contract.
+
 `ToolCallEndData` is `{ args, requestedTool?, outcome }`. `callId` stays
 top-level on the event. End args exactly match start args. The outcome union is:
 

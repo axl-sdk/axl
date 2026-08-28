@@ -140,6 +140,11 @@ const rejected = runtime
 expect(rejected[0]?.data.reason).toBe('invalid_arguments');
 ```
 
+To test model-facing recovery rather than host diagnostics, drive an invalid
+local call with `MockProvider.sequence()` and inspect the next request in
+`provider.calls`. Its correlated tool message should contain bounded
+schema-derived guidance; do not assert that host `issues[].message` is forwarded.
+
 In a complete, non-overflowed test trace, assert one end per start by the full
 correlation key rather than by tool name. Deliberately capped or interrupted
 streams may be incomplete and should not manufacture a terminal outcome.

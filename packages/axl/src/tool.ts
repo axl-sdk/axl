@@ -63,6 +63,290 @@ export type Tool<TInput extends z.ZodType = z.ZodType, TOutput = unknown> = {
 };
 
 const DEFAULT_MAX_STRING_LENGTH = 10_000;
+const MAX_MODEL_ARGUMENT_ISSUES = 8;
+const MAX_MODEL_ARGUMENT_MESSAGE_LENGTH = 2_000;
+const MAX_MODEL_ARGUMENT_LINE_LENGTH = 220;
+const MAX_MODEL_ARGUMENT_PATH_LENGTH = 160;
+const MAX_UNION_DEPTH = 3;
+const MAX_UNION_BRANCHES = 4;
+const MAX_LITERAL_ALTERNATIVES = 10;
+
+const SAFE_SCHEMA_TYPES = new Set([
+  'string',
+  'number',
+  'boolean',
+  'null',
+  'array',
+  'object',
+  'integer',
+]);
+
+const SAFE_STRING_FORMATS = new Set([
+  'email',
+  'url',
+  'emoji',
+  'uuid',
+  'guid',
+  'nanoid',
+  'cuid',
+  'cuid2',
+  'ulid',
+  'xid',
+  'ksuid',
+  'datetime',
+  'date',
+  'time',
+  'duration',
+  'ipv4',
+  'ipv6',
+  'cidrv4',
+  'cidrv6',
+  'base64',
+  'base64url',
+  'json_string',
+  'e164',
+  'lowercase',
+  'uppercase',
+  'jwt',
+]);
+
+function truncateModelFeedback(value: string, maximum: number): string {
+  return value.length <= maximum ? value : `${value.slice(0, Math.max(0, maximum - 1))}…`;
+}
+
+const DISPLAY_CONTROL_CHARACTERS = /[\u061C\u200B-\u200F\u202A-\u202E\u2066-\u2069\u2028\u2029]/g;
+
+type JsonSchema = Record<string, unknown>;
+
+type ResolvedSchemaPath = {
+  node: JsonSchema;
+  segments: string[];
+};
+
+function isJsonSchema(value: unknown): value is JsonSchema {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function escapeDisplayControls(value: string): string {
+  return value.replace(
+    DISPLAY_CONTROL_CHARACTERS,
+    (character) => `\\u${character.codePointAt(0)!.toString(16).padStart(4, '0')}`,
+  );
+}
+
+function quoteModelText(value: string): string {
+  return escapeDisplayControls(JSON.stringify(value));
+}
+
+function schemaNumber(value: unknown): string | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? String(value) : undefined;
+}
+
+function schemaLiteral(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const rendered = quoteModelText(value);
+    return rendered.length <= 120 ? rendered : '"<literal omitted>"';
+  }
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : undefined;
+  if (typeof value === 'boolean') return String(value);
+  if (value === null) return 'null';
+  return undefined;
+}
+
+function schemaType(schema: JsonSchema): string | undefined {
+  const type = schema.type;
+  return typeof type === 'string' && SAFE_SCHEMA_TYPES.has(type) ? type : undefined;
+}
+
+function compositionBranches(schema: JsonSchema): JsonSchema[] {
+  const branches: JsonSchema[] = [];
+  for (const key of ['anyOf', 'oneOf', 'allOf'] as const) {
+    const value = schema[key];
+    if (!Array.isArray(value)) continue;
+    for (const branch of value.slice(0, MAX_UNION_BRANCHES)) {
+      if (isJsonSchema(branch)) branches.push(branch);
+    }
+  }
+  return branches;
+}
+
+function unionBranches(schema: JsonSchema): JsonSchema[] {
+  const branches: JsonSchema[] = [];
+  for (const key of ['anyOf', 'oneOf'] as const) {
+    const value = schema[key];
+    if (!Array.isArray(value)) continue;
+    for (const branch of value.slice(0, MAX_UNION_BRANCHES)) {
+      if (isJsonSchema(branch)) branches.push(branch);
+    }
+  }
+  return branches;
+}
+
+function resolvePathSegment(
+  schema: JsonSchema,
+  segment: PropertyKey,
+  depth = 0,
+): { node: JsonSchema; renderedSegment: string } | undefined {
+  if (depth >= MAX_UNION_DEPTH) return undefined;
+
+  if (typeof segment === 'string') {
+    const properties = schema.properties;
+    if (isJsonSchema(properties) && Object.hasOwn(properties, segment)) {
+      const child = properties[segment];
+      if (isJsonSchema(child)) return { node: child, renderedSegment: segment };
+    }
+    if (isJsonSchema(schema.additionalProperties)) {
+      return { node: schema.additionalProperties, renderedSegment: '<key>' };
+    }
+  } else if (typeof segment === 'number' && Number.isSafeInteger(segment) && segment >= 0) {
+    const prefixItems = schema.prefixItems;
+    if (Array.isArray(prefixItems) && isJsonSchema(prefixItems[segment])) {
+      return { node: prefixItems[segment], renderedSegment: String(segment) };
+    }
+    if (isJsonSchema(schema.items)) {
+      return { node: schema.items, renderedSegment: '<index>' };
+    }
+  }
+
+  for (const branch of compositionBranches(schema)) {
+    const resolved = resolvePathSegment(branch, segment, depth + 1);
+    if (resolved !== undefined) return resolved;
+  }
+  return undefined;
+}
+
+function resolveSchemaPath(
+  providerVisibleSchema: unknown,
+  issuePath: readonly PropertyKey[],
+): ResolvedSchemaPath | undefined {
+  if (!isJsonSchema(providerVisibleSchema)) return undefined;
+
+  let node = providerVisibleSchema;
+  const segments: string[] = [];
+  for (const segment of issuePath) {
+    const resolved = resolvePathSegment(node, segment);
+    if (resolved === undefined) {
+      segments.push('<path omitted>');
+      return { node, segments };
+    }
+    node = resolved.node;
+    segments.push(resolved.renderedSegment);
+  }
+  return { node, segments };
+}
+
+function jsonPointerPath(segments: readonly string[]): string {
+  if (segments.length === 0) return '<root>';
+  const pointer = `/${segments.map((segment) => segment.replaceAll('~', '~0').replaceAll('/', '~1')).join('/')}`;
+  const rendered = quoteModelText(pointer);
+  return rendered.length <= MAX_MODEL_ARGUMENT_PATH_LENGTH ? rendered : '"<path omitted>"';
+}
+
+function schemaAlternatives(schema: JsonSchema, depth = 0): string[] {
+  if (depth >= MAX_UNION_DEPTH) return [];
+  const constant = 'const' in schema ? schemaLiteral(schema.const) : undefined;
+  if (constant !== undefined) return [constant];
+
+  if (Array.isArray(schema.enum)) {
+    const values = schema.enum.slice(0, MAX_LITERAL_ALTERNATIVES).map(schemaLiteral);
+    if (values.every((value): value is string => value !== undefined)) return values;
+  }
+
+  const type = schemaType(schema);
+  if (type !== undefined) return [type];
+
+  const alternatives = unionBranches(schema).flatMap((branch) =>
+    schemaAlternatives(branch, depth + 1),
+  );
+  return alternatives.slice(0, MAX_LITERAL_ALTERNATIVES);
+}
+
+function schemaEnumExpectation(schema: JsonSchema): string | undefined {
+  if ('const' in schema) {
+    const constant = schemaLiteral(schema.const);
+    return constant === undefined ? undefined : `expected ${constant}`;
+  }
+  if (!Array.isArray(schema.enum)) return undefined;
+  const values = schema.enum.slice(0, MAX_LITERAL_ALTERNATIVES).map(schemaLiteral);
+  if (values.some((value) => value === undefined)) return undefined;
+  const rendered = values as string[];
+  if (rendered.length === 0) return undefined;
+  const omission = schema.enum.length > rendered.length ? ', …' : '';
+  return `expected ${rendered.length === 1 ? rendered[0] : `one of ${rendered.join(', ')}`}${omission}`;
+}
+
+function schemaTypeExpectation(schema: JsonSchema): string | undefined {
+  const type = schemaType(schema);
+  if (type !== undefined) return `expected ${type}`;
+  const alternatives = schemaAlternatives(schema);
+  return alternatives.length === 0 ? undefined : `expected one of: ${alternatives.join(', ')}`;
+}
+
+function schemaSizeExpectation(schema: JsonSchema, direction: 'small' | 'big'): string | undefined {
+  const type = schemaType(schema);
+  const keyword =
+    direction === 'small'
+      ? type === 'string'
+        ? 'minLength'
+        : type === 'array'
+          ? 'minItems'
+          : 'minimum'
+      : type === 'string'
+        ? 'maxLength'
+        : type === 'array'
+          ? 'maxItems'
+          : 'maximum';
+  const value = schemaNumber(schema[keyword]);
+  if (value === undefined) return undefined;
+  const label = type === 'string' ? 'string length' : type === 'array' ? 'array length' : type;
+  if (label === undefined) return undefined;
+  return `expected ${label} ${direction === 'small' ? 'at least' : 'at most'} ${value}`;
+}
+
+function schemaExpectation(schema: JsonSchema, issueCode: string): string {
+  switch (issueCode) {
+    case 'invalid_type':
+      return schemaTypeExpectation(schema) ?? 'failed structural validation';
+    case 'invalid_value':
+      return (
+        schemaEnumExpectation(schema) ??
+        schemaTypeExpectation(schema) ??
+        'failed structural validation'
+      );
+    case 'too_small':
+      return (
+        schemaSizeExpectation(schema, 'small') ??
+        schemaTypeExpectation(schema) ??
+        'failed structural validation'
+      );
+    case 'too_big':
+      return (
+        schemaSizeExpectation(schema, 'big') ??
+        schemaTypeExpectation(schema) ??
+        'failed structural validation'
+      );
+    case 'not_multiple_of': {
+      const multipleOf = schemaNumber(schema.multipleOf);
+      return multipleOf === undefined
+        ? (schemaTypeExpectation(schema) ?? 'failed structural validation')
+        : `expected a multiple of ${multipleOf}`;
+    }
+    case 'invalid_format': {
+      const format = schema.format;
+      return typeof format === 'string' && SAFE_STRING_FORMATS.has(format)
+        ? `expected valid ${format} format`
+        : (schemaTypeExpectation(schema) ?? 'failed structural validation');
+    }
+    case 'invalid_union':
+      return schemaTypeExpectation(schema) ?? 'failed structural validation';
+    default: {
+      const typeExpectation = schemaTypeExpectation(schema);
+      return typeExpectation === undefined
+        ? 'failed structural validation'
+        : `failed structural validation; ${typeExpectation}`;
+    }
+  }
+}
 
 /**
  * Recursively validate string lengths in parsed tool arguments.
@@ -83,6 +367,49 @@ class ToolStringLengthError extends Error {
       `String argument${renderedPath ? ` at "${renderedPath}"` : ''} exceeds maximum length (${actual} > ${maximum})`,
     );
     this.name = 'ToolStringLengthError';
+  }
+}
+
+/** Build bounded, model-safe corrective feedback from provider-visible schema only. */
+export function toolArgumentModelMessage(
+  error: unknown,
+  providerVisibleSchema: unknown,
+): string | undefined {
+  try {
+    let lines: string[];
+    let omitted = false;
+
+    if (error instanceof ZodError) {
+      if (error.issues.length === 0) return undefined;
+      lines = [];
+      for (const issue of error.issues.slice(0, MAX_MODEL_ARGUMENT_ISSUES)) {
+        const resolved = resolveSchemaPath(providerVisibleSchema, issue.path);
+        if (resolved === undefined) return undefined;
+        const path = jsonPointerPath(resolved.segments);
+        const expectation = schemaExpectation(resolved.node, issue.code);
+        lines.push(
+          truncateModelFeedback(`- ${path}: ${expectation}`, MAX_MODEL_ARGUMENT_LINE_LENGTH),
+        );
+      }
+      omitted = error.issues.length > lines.length;
+    } else if (error instanceof ToolStringLengthError) {
+      const resolved = resolveSchemaPath(providerVisibleSchema, error.path);
+      const maximum = schemaNumber(error.maximum);
+      if (resolved === undefined || maximum === undefined) return undefined;
+      const path = jsonPointerPath(resolved.segments);
+      lines = [`- ${path}: maximum string length is ${maximum}`];
+    } else {
+      return undefined;
+    }
+
+    const header = 'Error: Invalid tool arguments:';
+    const footer = 'Correct the arguments and try again.';
+    const omission = omitted ? 'Additional validation issues were omitted.' : undefined;
+    const parts = [header, ...lines, ...(omission ? [omission] : []), footer];
+    const message = parts.join('\n');
+    return message.length <= MAX_MODEL_ARGUMENT_MESSAGE_LENGTH ? message : undefined;
+  } catch {
+    return undefined;
   }
 }
 

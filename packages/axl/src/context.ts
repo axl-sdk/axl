@@ -960,7 +960,7 @@ export class WorkflowContext<TInput = unknown> {
     agent: Agent,
     toolCall: ToolCallMessage,
     currentMessages: ChatMessage[],
-    availableTools: string[],
+    toolDefs: ToolDefinition[],
   ): Promise<void> {
     const signal = this.currentSignal;
     signal?.throwIfAborted();
@@ -975,6 +975,8 @@ export class WorkflowContext<TInput = unknown> {
           ?.getToolsForAgent(agent._config.mcp, agent._config.mcpTools)
           .find(({ tool }) => tool.name === requestedTool)
       : undefined;
+    const providerVisibleSchema = toolDefs.find((tool) => tool.function.name === requestedTool)
+      ?.function.parameters;
     const parsed = parseToolInvocation({
       toolCall,
       configuredTool,
@@ -985,7 +987,8 @@ export class WorkflowContext<TInput = unknown> {
             mcpTraceName: `${mcpMatch.server}:${requestedTool}`,
           }
         : {}),
-      availableTools,
+      availableTools: toolDefs.map((tool) => tool.function.name),
+      ...(configuredTool ? { providerVisibleSchema } : {}),
     });
     signal?.throwIfAborted();
 
@@ -2153,12 +2156,7 @@ export class WorkflowContext<TInput = unknown> {
             }
           }
 
-          await this.observeToolInvocation(
-            agent,
-            toolCall,
-            currentMessages,
-            toolDefs.map((tool) => tool.function.name),
-          );
+          await this.observeToolInvocation(agent, toolCall, currentMessages, toolDefs);
         }
 
         continue; // Next turn

@@ -14,6 +14,12 @@ Implement directly only when a chunk is smaller than the delegation overhead,
 tightly coupled to the live conversation, or inseparable from a product or
 architecture decision the lead is making.
 
+Judge that overhead by expected lead round-trips times accumulated lead
+context, not step count alone. Keep single-pass work with the lead; batch small
+related edits; delegate settled implementation likely to require multiple
+edit, debug, or verification cycles. Resume a suitable idle agent before
+spawning another when its context remains relevant.
+
 ## Establish done
 
 Turn the plan into explicit acceptance criteria and affected developer journeys

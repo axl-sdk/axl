@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-08-28
+
 ### Fixed
 
 - **Actionable invalid tool arguments.** Local schema rejections now give the
@@ -1105,7 +1107,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.21.1...HEAD
+[0.21.1]: https://github.com/axl-sdk/axl/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/axl-sdk/axl/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/axl-sdk/axl/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/axl-sdk/axl/compare/v0.19.1...v0.20.0

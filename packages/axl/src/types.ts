@@ -308,8 +308,10 @@ export type AgentCallStartData = {
  *
  * Pair invariant: every `agent_call_start` is followed by exactly one
  * `agent_call_end`, even on provider error. On the error path `response` is
- * empty and `error` carries the provider's message; cost/tokens/duration are
- * still emitted (top-level on the event) when partial usage is available.
+ * empty and `error` carries the provider's message for legacy string calls.
+ * Rich-input calls use a fixed safe message because providers can echo inline
+ * media in their request errors. Cost/tokens/duration are still emitted
+ * (top-level on the event) when partial usage is available.
  */
 export type AgentCallEndData = {
   /** Final LLM response content for this turn. Empty string on error. */
@@ -322,8 +324,9 @@ export type AgentCallEndData = {
    *  reading `agent_call_end` (cost lives here) can bucket without joining. */
   retryReason?: 'schema' | 'validate' | 'guardrail';
   /** Provider error message when the call threw (network failure, 4xx/5xx,
-   *  abort, etc). Mutually exclusive with `response` content. Subject to
-   *  `config.trace.redact` (vendor errors can echo prompt text). */
+   *  abort, etc). Mutually exclusive with `response` content. Rich-input
+   *  calls always use a fixed safe projection, independently of trace
+   *  redaction, because vendor errors can echo request media. */
   error?: string;
   /** HTTP status when the thrown error was a `ProviderError` (`0` for network
    *  failures). Omitted for non-provider errors. The raw error body is
@@ -332,6 +335,14 @@ export type AgentCallEndData = {
   /** Semantic failover hint from a thrown `ProviderError` (see
    *  `ProviderError.retryable`). Omitted for non-provider errors. */
   retryable?: boolean;
+  /** Stable typed error code for a rich-input failure, when available. */
+  code?: string;
+  /** Provider identifier from a typed provider error on a rich-input failure. */
+  provider?: string;
+  /** Provider request id from a typed provider error on a rich-input failure. */
+  requestId?: string;
+  /** Retry-after delay in milliseconds from a typed provider error on a rich-input failure. */
+  retryAfterMs?: number;
 };
 
 /** Data shape for `tool_call_end` events. */

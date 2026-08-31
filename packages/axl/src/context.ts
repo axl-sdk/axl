@@ -540,6 +540,40 @@ function appendHandoffInstruction(
   return [...input, { type: 'text', text: instruction }];
 }
 
+const RICH_MODEL_INPUT_ERROR_MESSAGE = 'Provider request failed while processing rich model input';
+const RICH_MODEL_INPUT_ERROR_NAME = 'RichModelInputError';
+const MAX_RICH_FAILURE_ASSOCIATIONS = 32;
+const MAX_RICH_FAILURE_CAUSE_DEPTH = 4;
+
+type ObserverErrorProjection = { readonly message: string; readonly name: string };
+type RichFailureState = {
+  associations: unknown[];
+  overflowed: boolean;
+  indeterminate: boolean;
+};
+
+function legacyErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function providerErrorEventMetadata(error: unknown, richRequest: boolean): Record<string, unknown> {
+  if (!(error instanceof ProviderError)) {
+    return error instanceof AxlError && richRequest ? { code: error.code } : {};
+  }
+  return {
+    status: error.status,
+    retryable: error.retryable,
+    ...(richRequest
+      ? {
+          code: error.code,
+          provider: error.provider,
+          ...(error.requestId ? { requestId: error.requestId } : {}),
+          ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
+        }
+      : {}),
+  };
+}
+
 /**
  * Active `ctx.budget()` accounting state. One mutable object per budget block,
  * shared by reference across the block's async branches (spawn/race/map).
@@ -641,6 +675,9 @@ export type WorkflowContextInit = {
   /** Internal: root-shared lifecycle state. Prevents child contexts from
    *  emitting trace events after the workflow terminal. */
   workflowLifecycleState?: WorkflowLifecycleState;
+  /** Internal: bounded rich-failure state shared by child contexts in one
+   * execution. Never pass across independently created contexts. */
+  richFailureState?: RichFailureState;
   /** Runtime terminal barrier for abort-ignoring race/quorum branches. */
   branchDrainTimeoutMs?: number;
 };
@@ -708,6 +745,10 @@ export class WorkflowContext<TInput = unknown> {
    */
   private autoCheckpointCounters: { byAgent: Map<string, number>; root: number };
   private readonly branchDrainState: BranchDrainState;
+  /** Bounded exact-identity failure association for this execution tree.
+   * Unlike a process-global marker, this cannot affect another context that
+   * happens to reuse the same Error object. */
+  private readonly richFailureState: RichFailureState;
   /** Root-shared idempotency guards for workflow lifecycle emission.
    *  Both `runtime.execute()` and `runtime.stream()` have paths where a
    *  post-emit side-effect (checkpoint deletion, state-store persistence)
@@ -900,6 +941,11 @@ export class WorkflowContext<TInput = unknown> {
       byAgent: new Map(),
       root: 0,
     };
+    this.richFailureState = init.richFailureState ?? {
+      associations: [],
+      overflowed: false,
+      indeterminate: false,
+    };
     const branchDrainTimeoutMs = resolveBranchDrainTimeoutMs(init.branchDrainTimeoutMs);
     this.branchDrainState = init.branchDrainState ?? {
       pending: new Set(),
@@ -956,6 +1002,7 @@ export class WorkflowContext<TInput = unknown> {
       autoCheckpointCounters: this.autoCheckpointCounters,
       branchDrainState: this.branchDrainState,
       workflowLifecycleState: this.workflowLifecycleState,
+      richFailureState: this.richFailureState,
       // Share the parent's bus slot (mutable ref). Late allocation in
       // either parent or child propagates because both read the same
       // slot. Nested-ask events (agent-as-tool pattern) bubble up to
@@ -966,6 +1013,54 @@ export class WorkflowContext<TInput = unknown> {
       eventStreamOptions: this._eventStreamOptions,
       // Isolated: sessionHistory (empty)
     });
+  }
+
+  /** Associate an exact thrown value with rich input in this execution only. */
+  private recordRichFailure(error: unknown): void {
+    const state = this.richFailureState;
+    if (state.associations.some((known) => Object.is(known, error))) return;
+    if (state.associations.length >= MAX_RICH_FAILURE_ASSOCIATIONS) {
+      state.associations.shift();
+      state.overflowed = true;
+      state.indeterminate = true;
+    }
+    state.associations.push(error);
+  }
+
+  /** @internal Safe observer projection for a failure associated with rich input. */
+  _observerErrorProjection(error: unknown): ObserverErrorProjection | undefined {
+    const state = this.richFailureState;
+    const safe = (): ObserverErrorProjection => ({
+      message: RICH_MODEL_INPUT_ERROR_MESSAGE,
+      name: RICH_MODEL_INPUT_ERROR_NAME,
+    });
+    const indeterminate = (): ObserverErrorProjection | undefined => {
+      if (state.associations.length === 0) return undefined;
+      state.indeterminate = true;
+      return safe();
+    };
+    let current = error;
+    const seen = new WeakSet<object>();
+    for (let depth = 0; depth < MAX_RICH_FAILURE_CAUSE_DEPTH; depth++) {
+      if (state.associations.some((known) => Object.is(known, current))) {
+        return safe();
+      }
+      if ((typeof current !== 'object' || current === null) && typeof current !== 'function') {
+        return state.overflowed || state.indeterminate ? safe() : undefined;
+      }
+      if (seen.has(current)) return indeterminate();
+      seen.add(current);
+      let descriptor: PropertyDescriptor | undefined;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(current, 'cause');
+      } catch {
+        return indeterminate();
+      }
+      if (!descriptor) return state.overflowed || state.indeterminate ? safe() : undefined;
+      if (!('value' in descriptor)) return indeterminate();
+      current = descriptor.value;
+    }
+    return indeterminate();
   }
 
   /**
@@ -1218,6 +1313,11 @@ export class WorkflowContext<TInput = unknown> {
         delegateInputHolder._delegateOriginalInput,
       );
     }
+    const richAsk =
+      typeof normalizedInput !== 'string' ||
+      hasRichMessage(normalizedHistory) ||
+      (delegateInputHolder._delegateOriginalInput !== undefined &&
+        typeof delegateInputHolder._delegateOriginalInput !== 'string');
     const promptText = inputText(normalizedInput);
     const inputDescriptor = describeModelInput(normalizedInput);
     const agentName = agent._name;
@@ -1381,9 +1481,10 @@ export class WorkflowContext<TInput = unknown> {
           } catch (err) {
             askFailed = true;
             askFailure = err;
+            if (richAsk) this.recordRichFailure(err);
             outcome = {
               ok: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
             };
           }
 
@@ -2106,6 +2207,7 @@ export class WorkflowContext<TInput = unknown> {
           response = await provider.chat(cloneMessagesForProvider(currentMessages), chatOptions);
         }
       } catch (err) {
+        if (richRequest) this.recordRichFailure(err);
         // Emit the paired `agent_call_end` before rethrowing. Empty response,
         // error message in `data.error`. No usage/cost — provider didn't
         // deliver one. `duration` reflects time-to-failure.
@@ -2119,13 +2221,11 @@ export class WorkflowContext<TInput = unknown> {
             response: '',
             turn: turns,
             ...(retryReason ? { retryReason } : {}),
-            error: err instanceof Error ? err.message : String(err),
+            error: this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
             // Enrich with typed-error metadata when available. `body` is
             // deliberately NOT emitted — it's redaction-eligible (see
             // docs/security.md). `data.error` already carries the message.
-            ...(err instanceof ProviderError
-              ? { status: err.status, retryable: err.retryable }
-              : {}),
+            ...providerErrorEventMetadata(err, richRequest),
           },
         });
         throw err;
@@ -2293,11 +2393,15 @@ export class WorkflowContext<TInput = unknown> {
                     });
                     return result;
                   } catch (err) {
+                    const richHandoff =
+                      typeof enrichedHandoffInput !== 'string' || hasRichMessage(sessionHistory);
+                    if (richHandoff) this.recordRichFailure(err);
                     this.emitEvent({
                       type: 'ask_end',
                       outcome: {
                         ok: false,
-                        error: err instanceof Error ? err.message : String(err),
+                        error:
+                          this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
                       },
                       cost: targetFrame.askCost.value,
                       ...(targetFrame.askUnpriced ? { unpriced: true } : {}),

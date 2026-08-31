@@ -323,6 +323,19 @@ function isAbortError(err: unknown): boolean {
   );
 }
 
+/** Preserve caller-facing errors while projecting context-associated rich
+ * failures safely to this execution's observer and persistence surfaces. */
+function executionErrorProjection(
+  ctx: WorkflowContext | undefined,
+  error: unknown,
+): {
+  message: string;
+  name?: string;
+} {
+  const safe = ctx?._observerErrorProjection(error);
+  return safe ?? { message: error instanceof Error ? error.message : String(error) };
+}
+
 /** Bounded push to `execInfo.events`. Skips high-volume stream-only
  *  variants (token, partial_object — never persisted).
  *
@@ -826,8 +839,7 @@ export class AxlRuntime extends EventEmitter {
       execInfo.status = 'failed';
       execInfo.completedAt = Date.now();
       execInfo.duration = execInfo.completedAt - execInfo.startedAt;
-      execInfo.error =
-        terminalError instanceof Error ? terminalError.message : String(terminalError);
+      execInfo.error = executionErrorProjection(ctx, terminalError).message;
       execInfo.observation = observation;
       ctx._emitWorkflowEnd({
         status: 'failed' as const,
@@ -1470,6 +1482,7 @@ export class AxlRuntime extends EventEmitter {
     // allocated inside `run()` — the catch path is defensive about
     // running before `execInfo` is assigned).
     let execInfo: ExecutionInfo | undefined;
+    let wfCtx: WorkflowContext | undefined;
 
     const run = async () => {
       const workflow = this.workflows.get(name);
@@ -1504,7 +1517,7 @@ export class AxlRuntime extends EventEmitter {
       };
       this.executions.set(executionId, execInfo);
 
-      const wfCtx = new WorkflowContext({
+      const context = new WorkflowContext({
         input: validated,
         executionId,
         metadata: options?.metadata,
@@ -1586,6 +1599,8 @@ export class AxlRuntime extends EventEmitter {
         },
       });
 
+      wfCtx = context;
+
       return this.spanManager.withSpanAsync(
         'axl.workflow.execute',
         {
@@ -1596,7 +1611,7 @@ export class AxlRuntime extends EventEmitter {
         (span) =>
           this.runWorkflowBody({
             workflow,
-            ctx: wfCtx,
+            ctx: context,
             execInfo: execInfo!,
             validated,
             span,
@@ -1618,7 +1633,7 @@ export class AxlRuntime extends EventEmitter {
           execInfo.status = 'failed';
           execInfo.completedAt = Date.now();
           execInfo.duration = execInfo.completedAt - execInfo.startedAt;
-          execInfo.error = err instanceof Error ? err.message : String(err);
+          execInfo.error = executionErrorProjection(wfCtx, err).message;
           // No `ctx` available on this path — `wfCtx` lives inside the
           // run() closure and was never assigned to a closure variable.
           // workflow_start was also never emitted (helper hadn't run),
@@ -1637,7 +1652,9 @@ export class AxlRuntime extends EventEmitter {
         // leak a listener on the user's signal forever.
         this.abortControllers.delete(executionId);
         cleanupAbortForwarder();
-        axlStream._error(err instanceof Error ? err : new Error(String(err)), executionId);
+        const originalError = err instanceof Error ? err : new Error(String(err));
+        const projection = executionErrorProjection(wfCtx, err);
+        axlStream._error(originalError, executionId, projection.message, projection.name);
       });
 
     return axlStream;

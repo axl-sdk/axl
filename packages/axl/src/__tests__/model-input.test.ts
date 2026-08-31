@@ -3,10 +3,17 @@ import { z } from 'zod';
 import { agent } from '../agent.js';
 import { WorkflowContext } from '../context.js';
 import type { WorkflowContextInit } from '../context.js';
-import { InvalidModelInputError, UnsupportedModelInputError } from '../errors.js';
+import {
+  InvalidModelInputError,
+  UnsupportedModelInputError,
+  preserveErrorCause,
+} from '../errors.js';
 import { inputText, normalizeModelInput, type ModelInput } from '../input.js';
 import { ProviderRegistry } from '../providers/registry.js';
+import { ProviderError } from '../providers/errors.js';
 import { redactEvent, REDACTED } from '../redaction.js';
+import { AxlRuntime } from '../runtime.js';
+import { MemoryStore } from '../state/memory.js';
 import type { AxlEvent, ChatMessage } from '../types.js';
 import type {
   ChatOptions,
@@ -17,6 +24,7 @@ import type {
 } from '../providers/types.js';
 import type { StateStore } from '../state/types.js';
 import type { SpanManager } from '../telemetry/types.js';
+import { workflow } from '../workflow.js';
 
 class InputProvider implements Provider {
   readonly name = 'input';
@@ -97,6 +105,438 @@ describe('ModelInput', () => {
         { type: 'image', source: { type: 'url', url: 'file:///secret' } },
       ] as never),
     ).toThrow(InvalidModelInputError);
+  });
+
+  it('keeps legacy string provider error messages byte-for-byte in events', async () => {
+    const failure = new Error('legacy upstream error: exact message');
+    const provider: Provider = {
+      name: 'input',
+      chat: async () => {
+        throw failure;
+      },
+      stream: async function* () {
+        yield* [];
+        throw failure;
+      },
+    };
+    const traces: AxlEvent[] = [];
+    await expect(
+      context(provider, traces).ask(
+        agent({ model: 'input:legacy-style', system: 'inspect' }),
+        'plain text',
+      ),
+    ).rejects.toBe(failure);
+    const end = traces.find((event) => event.type === 'agent_call_end');
+    const askEnd = traces.find((event) => event.type === 'ask_end');
+    expect(end?.data.error).toBe(failure.message);
+    expect(askEnd?.outcome).toEqual({ ok: false, error: failure.message });
+  });
+
+  it('projects rich provider failures safely to traces and persistence without changing the caller error', async () => {
+    const sentinel = 'RICH_PROVIDER_ERROR_BASE64_SENTINEL_c2VjcmV0LWltYWdl';
+    const failure = new ProviderError({
+      provider: 'input',
+      status: 413,
+      retryable: false,
+      requestId: 'request-safe-123',
+      retryAfterMs: 500,
+      message: `request messages contained ${sentinel}`,
+      body: sentinel,
+    });
+    const provider: Provider = {
+      name: 'input',
+      validateInput: (request) => ({ effectiveModel: request.model }),
+      chat: async () => {
+        throw failure;
+      },
+      stream: async function* () {
+        yield* [];
+        throw failure;
+      },
+    };
+    const store = new MemoryStore();
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.registerProvider('input', provider);
+    runtime.register(
+      workflow({
+        name: 'rich-provider-failure',
+        input: z.object({}),
+        handler: async (ctx) => ctx.ask(agent({ model: 'input:vision', system: 'inspect' }), image),
+      }),
+    );
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (event) => traces.push(event));
+
+    await expect(runtime.execute('rich-provider-failure', {})).rejects.toBe(failure);
+    await runtime.shutdown();
+
+    const serializedTrace = JSON.stringify(traces);
+    expect(serializedTrace).not.toContain(sentinel);
+    const callEnd = traces.find((event) => event.type === 'agent_call_end');
+    expect(callEnd?.data).toMatchObject({
+      error: 'Provider request failed while processing rich model input',
+      status: 413,
+      retryable: false,
+      code: 'PROVIDER_ERROR',
+      provider: 'input',
+      requestId: 'request-safe-123',
+      retryAfterMs: 500,
+    });
+    const starts = traces.filter((event) => event.type === 'ask_start');
+    const ends = traces.filter((event) => event.type === 'ask_end');
+    expect(starts).toHaveLength(1);
+    expect(ends).toHaveLength(1);
+    expect(ends[0]?.outcome).toEqual({
+      ok: false,
+      error: 'Provider request failed while processing rich model input',
+    });
+
+    const execution = await store.getExecution(traces[0]!.executionId);
+    expect(JSON.stringify(execution)).not.toContain(sentinel);
+    expect(execution?.error).toBe('Provider request failed while processing rich model input');
+    const workflowEnd = execution?.events.find((event) => event.type === 'workflow_end');
+    expect(workflowEnd?.data.error).toBe(
+      'Provider request failed while processing rich model input',
+    );
+  });
+
+  it('sanitizes streamed rich provider errors without changing stream.promise rejection identity', async () => {
+    const sentinel = 'RICH_STREAM_ERROR_BASE64_SENTINEL_c3RyZWFtLXNlY3JldA==';
+    const failure = new Error(`stream rejected request: ${sentinel}`);
+    failure.name = 'RICH_STREAM_ERROR_NAME_SENTINEL';
+    const provider: Provider = {
+      name: 'input',
+      validateInput: (request) => ({ effectiveModel: request.model }),
+      chat: async () => ({ content: 'chat must not be used' }),
+      stream: async function* () {
+        yield* [];
+        throw failure;
+      },
+    };
+    const store = new MemoryStore();
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.registerProvider('input', provider);
+    runtime.register(
+      workflow({
+        name: 'rich-stream-provider-failure',
+        input: z.object({}),
+        handler: async (ctx) => ctx.ask(agent({ model: 'input:vision', system: 'inspect' }), image),
+      }),
+    );
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (event) => traces.push(event));
+
+    const stream = runtime.stream('rich-stream-provider-failure', {});
+    const wireErrors: Extract<AxlEvent, { type: 'error' }>[] = [];
+    stream.on('error', (event) => wireErrors.push(event));
+    await expect(stream.promise).rejects.toBe(failure);
+    await runtime.shutdown();
+
+    expect(JSON.stringify(traces)).not.toContain(sentinel);
+    expect(JSON.stringify(wireErrors)).not.toContain(sentinel);
+    expect(JSON.stringify(wireErrors)).not.toContain(failure.name);
+    const persisted = await store.getExecution(traces[0]!.executionId);
+    expect(JSON.stringify(persisted)).not.toContain(sentinel);
+    expect(JSON.stringify(persisted)).not.toContain(failure.name);
+    expect(wireErrors).toHaveLength(1);
+    expect(wireErrors[0]?.data.message).toBe(
+      'Provider request failed while processing rich model input',
+    );
+    expect(wireErrors[0]?.data.name).toBe('RichModelInputError');
+    expect(traces.find((event) => event.type === 'agent_call_end')?.data.error).toBe(
+      'Provider request failed while processing rich model input',
+    );
+  });
+
+  it('associates primitive rich failures locally for execute and stream observer surfaces', async () => {
+    const sentinel = 'RICH_PRIMITIVE_ERROR_BASE64_SENTINEL_cHJpbWl0aXZlLXNlY3JldA==';
+    const provider: Provider = {
+      name: 'input',
+      validateInput: (request) => ({ effectiveModel: request.model }),
+      chat: async () => {
+        throw sentinel;
+      },
+      stream: async function* () {
+        yield* [];
+        throw sentinel;
+      },
+    };
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('input', provider);
+    runtime.register(
+      workflow({
+        name: 'rich-primitive-failure',
+        input: z.object({}),
+        handler: async (ctx) => ctx.ask(agent({ model: 'input:vision', system: 'inspect' }), image),
+      }),
+    );
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (event) => traces.push(event));
+
+    await expect(runtime.execute('rich-primitive-failure', {})).rejects.toBe(sentinel);
+    const stream = runtime.stream('rich-primitive-failure', {});
+    const wireErrors: Extract<AxlEvent, { type: 'error' }>[] = [];
+    stream.on('error', (event) => wireErrors.push(event));
+    await expect(stream.promise).rejects.toThrow(sentinel);
+    await runtime.shutdown();
+
+    expect(JSON.stringify(traces)).not.toContain(sentinel);
+    expect(wireErrors).toHaveLength(1);
+    expect(wireErrors[0]?.data).toEqual({
+      message: 'Provider request failed while processing rich model input',
+      name: 'RichModelInputError',
+    });
+    const workflowEnds = traces.filter((event) => event.type === 'workflow_end');
+    expect(workflowEnds).toHaveLength(2);
+    for (const end of workflowEnds) {
+      expect(end.data.error).toBe('Provider request failed while processing rich model input');
+    }
+  });
+
+  it('keeps rich failure association local when the same Error is reused by text executions', async () => {
+    const failure = new Error('REUSED_ERROR_MESSAGE_SENTINEL');
+    failure.name = 'REUSED_ERROR_NAME_SENTINEL';
+    const provider: Provider = {
+      name: 'input',
+      validateInput: (request) => ({ effectiveModel: request.model }),
+      chat: async () => {
+        throw failure;
+      },
+      stream: async function* () {
+        yield* [];
+        throw failure;
+      },
+    };
+    const runtime = new AxlRuntime();
+    runtime.registerProvider('input', provider);
+    runtime.register(
+      workflow({
+        name: 'reused-rich-error',
+        input: z.object({}),
+        handler: async (ctx) =>
+          ctx.ask(agent({ name: 'rich', model: 'input:vision', system: 'inspect' }), image),
+      }),
+    );
+    runtime.register(
+      workflow({
+        name: 'reused-text-error',
+        input: z.object({}),
+        handler: async (ctx) =>
+          ctx.ask(agent({ name: 'text', model: 'input:plain', system: 'inspect' }), 'plain text'),
+      }),
+    );
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (event) => traces.push(event));
+
+    await expect(runtime.execute('reused-rich-error', {})).rejects.toBe(failure);
+    await expect(runtime.execute('reused-text-error', {})).rejects.toBe(failure);
+    const textStream = runtime.stream('reused-text-error', {});
+    const textWireErrors: Extract<AxlEvent, { type: 'error' }>[] = [];
+    textStream.on('error', (event) => textWireErrors.push(event));
+    await expect(textStream.promise).rejects.toBe(failure);
+    const concurrent = await Promise.allSettled([
+      runtime.execute('reused-rich-error', {}),
+      runtime.execute('reused-text-error', {}),
+    ]);
+    expect(concurrent).toEqual([
+      { status: 'rejected', reason: failure },
+      { status: 'rejected', reason: failure },
+    ]);
+    await runtime.shutdown();
+
+    const richEnds = traces.filter(
+      (event) => event.type === 'agent_call_end' && event.agent === 'rich',
+    );
+    const textEnds = traces.filter(
+      (event) => event.type === 'agent_call_end' && event.agent === 'text',
+    );
+    expect(richEnds).not.toHaveLength(0);
+    expect(textEnds).not.toHaveLength(0);
+    for (const end of richEnds) {
+      expect(end.data.error).toBe('Provider request failed while processing rich model input');
+    }
+    for (const end of textEnds) {
+      expect(end.data.error).toBe(failure.message);
+    }
+    const textWorkflowEnds = traces.filter(
+      (event) => event.type === 'workflow_end' && event.workflow === 'reused-text-error',
+    );
+    for (const end of textWorkflowEnds) {
+      expect(end.data.error).toBe(failure.message);
+    }
+    expect(textWireErrors).toHaveLength(1);
+    expect(textWireErrors[0]?.data).toEqual({ message: failure.message, name: failure.name });
+  });
+
+  it('projects a bounded own-data cause wrapper of a rich failure safely', async () => {
+    const sentinel = 'RICH_CAUSE_SENTINEL_c2FmZS1jYXVzZQ==';
+    const failure = new Error(sentinel);
+    const wrapper = new Error('outer wrapper');
+    const provider: Provider = {
+      name: 'input',
+      validateInput: (request) => ({ effectiveModel: request.model }),
+      chat: async () => {
+        throw failure;
+      },
+      stream: async function* () {
+        yield* [];
+        throw failure;
+      },
+    };
+    const store = new MemoryStore();
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.registerProvider('input', provider);
+    runtime.register(
+      workflow({
+        name: 'rich-cause-failure',
+        input: z.object({}),
+        handler: async (ctx) => {
+          try {
+            return await ctx.ask(agent({ model: 'input:vision', system: 'inspect' }), image);
+          } catch (error) {
+            throw preserveErrorCause(wrapper, error);
+          }
+        },
+      }),
+    );
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (event) => traces.push(event));
+
+    await expect(runtime.execute('rich-cause-failure', {})).rejects.toBe(wrapper);
+    await runtime.shutdown();
+
+    expect(JSON.stringify(traces)).not.toContain(sentinel);
+    const execution = await store.getExecution(traces[0]!.executionId);
+    expect(JSON.stringify(execution)).not.toContain(sentinel);
+    expect(execution?.error).toBe('Provider request failed while processing rich model input');
+  });
+
+  it('fails closed after rich failure association eviction across execute and stream', async () => {
+    const failures = Array.from(
+      { length: 33 },
+      (_, index) => new Error(`RICH_EVICTION_SENTINEL_${index}_c2Vuc2l0aXZl`),
+    );
+    let nextFailure = 0;
+    const throwNextFailure = (): never => {
+      const failure = failures[nextFailure++];
+      if (!failure) throw new Error('test provider exhausted unexpectedly');
+      throw failure;
+    };
+    const provider: Provider = {
+      name: 'input',
+      validateInput: (request) => ({ effectiveModel: request.model }),
+      chat: async () => throwNextFailure(),
+      stream: async function* () {
+        yield* [];
+        throwNextFailure();
+      },
+    };
+    const store = new MemoryStore();
+    const runtime = new AxlRuntime({ state: { store } });
+    runtime.registerProvider('input', provider);
+    const a = agent({ model: 'input:vision', system: 'inspect' });
+    runtime.register(
+      workflow({
+        name: 'rich-eviction-failure',
+        input: z.object({}),
+        handler: async (ctx) => {
+          let firstFailure: Error | undefined;
+          for (let index = 0; index < failures.length; index++) {
+            try {
+              await ctx.ask(a, image);
+            } catch (error) {
+              firstFailure ??= error as Error;
+            }
+          }
+          throw firstFailure!;
+        },
+      }),
+    );
+    const traces: AxlEvent[] = [];
+    runtime.on('trace', (event) => traces.push(event));
+
+    await expect(runtime.execute('rich-eviction-failure', {})).rejects.toBe(failures[0]);
+    nextFailure = 0;
+    const stream = runtime.stream('rich-eviction-failure', {});
+    const wireErrors: Extract<AxlEvent, { type: 'error' }>[] = [];
+    stream.on('error', (event) => wireErrors.push(event));
+    await expect(stream.promise).rejects.toBe(failures[0]);
+    await runtime.shutdown();
+
+    const serializedTrace = JSON.stringify(traces);
+    for (const failure of failures) {
+      expect(serializedTrace).not.toContain(failure.message);
+    }
+    const agentEnds = traces.filter((event) => event.type === 'agent_call_end');
+    const askEnds = traces.filter((event) => event.type === 'ask_end');
+    expect(agentEnds).toHaveLength(66);
+    expect(askEnds).toHaveLength(66);
+    for (const end of agentEnds) {
+      expect(end.data.error).toBe('Provider request failed while processing rich model input');
+    }
+    for (const end of askEnds) {
+      expect(end.outcome).toEqual({
+        ok: false,
+        error: 'Provider request failed while processing rich model input',
+      });
+    }
+    const workflowEnds = traces.filter((event) => event.type === 'workflow_end');
+    expect(workflowEnds).toHaveLength(2);
+    for (const end of workflowEnds) {
+      expect(end.data.error).toBe('Provider request failed while processing rich model input');
+      const execution = await store.getExecution(end.executionId);
+      for (const failure of failures) {
+        expect(JSON.stringify(execution)).not.toContain(failure.message);
+      }
+    }
+    expect(wireErrors).toHaveLength(1);
+    expect(wireErrors[0]?.data).toEqual({
+      message: 'Provider request failed while processing rich model input',
+      name: 'RichModelInputError',
+    });
+  });
+
+  it('fails closed on bounded cause depth and never invokes unsafe own cause getters', async () => {
+    const failure = new Error('RICH_CAUSE_INSPECTION_SENTINEL');
+    const provider: Provider = {
+      name: 'input',
+      validateInput: (request) => ({ effectiveModel: request.model }),
+      chat: async () => {
+        throw failure;
+      },
+      stream: async function* () {
+        yield* [];
+        throw failure;
+      },
+    };
+    const safe = {
+      message: 'Provider request failed while processing rich model input',
+      name: 'RichModelInputError',
+    };
+    const unsafeContext = context(provider);
+    await expect(
+      unsafeContext.ask(agent({ model: 'input:vision', system: 'inspect' }), image),
+    ).rejects.toBe(failure);
+    let getterCalls = 0;
+    const unsafeCause = {};
+    Object.defineProperty(unsafeCause, 'cause', {
+      get: () => {
+        getterCalls++;
+        return failure;
+      },
+    });
+    expect(unsafeContext._observerErrorProjection(unsafeCause)).toEqual(safe);
+    expect(getterCalls).toBe(0);
+
+    const depthContext = context(provider);
+    await expect(
+      depthContext.ask(agent({ model: 'input:vision', system: 'inspect' }), image),
+    ).rejects.toBe(failure);
+    const chain = Array.from({ length: 5 }, () => ({}));
+    for (let index = 0; index < chain.length - 1; index++) {
+      Object.defineProperty(chain[index]!, 'cause', { value: chain[index + 1] });
+    }
+    expect(depthContext._observerErrorProjection(chain[0])).toEqual(safe);
   });
 
   it('preflights rich input before a call and dispatches its effective model', async () => {

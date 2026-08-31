@@ -3,11 +3,108 @@ import { z } from 'zod';
 import type {
   ChatMessage,
   ChatOptions,
+  InputContentPart,
+  InputMediaSource,
+  ModelInput,
   ToolCallMessage,
   ProviderResponse,
   StreamChunk,
   Provider,
+  ProviderInputValidationRequest,
+  ProviderInputValidationResult,
 } from '@axlsdk/axl';
+import { inputText, UnsupportedModelInputError } from '@axlsdk/axl';
+
+function cloneValue(value: unknown): unknown {
+  if (value instanceof Uint8Array) return value.slice();
+  if (Array.isArray(value)) return value.map(cloneValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneValue(item)]));
+  }
+  return value;
+}
+
+function cloneModelInput(input: ModelInput): ModelInput {
+  if (typeof input === 'string') return input;
+  return input.map((part): InputContentPart => {
+    if (part.type === 'text') return { type: 'text', text: part.text };
+    const { source } = part;
+    switch (source.type) {
+      case 'bytes':
+        return {
+          type: 'image',
+          source: { type: 'bytes', data: source.data.slice(), mediaType: source.mediaType },
+          ...(part.label ? { label: part.label } : {}),
+        };
+      case 'url':
+        return {
+          type: 'image',
+          source: {
+            type: 'url',
+            url: source.url,
+            ...(source.mediaType ? { mediaType: source.mediaType } : {}),
+          },
+          ...(part.label ? { label: part.label } : {}),
+        };
+      case 'base64':
+        return {
+          type: 'image',
+          source: { type: 'base64', data: source.data, mediaType: source.mediaType },
+          ...(part.label ? { label: part.label } : {}),
+        };
+      case 'provider-file':
+        return {
+          type: 'image',
+          source: {
+            type: 'provider-file',
+            provider: source.provider,
+            reference: source.reference,
+            ...(source.mediaType ? { mediaType: source.mediaType } : {}),
+          },
+          ...(part.label ? { label: part.label } : {}),
+        };
+    }
+  });
+}
+
+function cloneMessages(messages: readonly ChatMessage[]): ChatMessage[] {
+  return messages.map((message) => ({
+    ...message,
+    content: cloneModelInput(message.content),
+    ...(message.tool_calls
+      ? {
+          tool_calls: message.tool_calls.map((toolCall) => ({
+            ...toolCall,
+            function: { ...toolCall.function },
+          })),
+        }
+      : {}),
+    ...(message.providerMetadata
+      ? { providerMetadata: cloneValue(message.providerMetadata) as Record<string, unknown> }
+      : {}),
+  }));
+}
+
+function cloneOptions(options: ChatOptions): ChatOptions {
+  return {
+    ...options,
+    ...(options.tools
+      ? {
+          tools: options.tools.map((tool) => ({
+            ...tool,
+            function: { ...tool.function, parameters: cloneValue(tool.function.parameters) },
+          })),
+        }
+      : {}),
+    ...(options.providerOptions
+      ? { providerOptions: cloneValue(options.providerOptions) as Record<string, unknown> }
+      : {}),
+  };
+}
+
+function richParts(input: ModelInput): readonly InputContentPart[] {
+  return typeof input === 'string' ? [] : input;
+}
 
 function randomAlphanumeric(length: number): string {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -82,8 +179,58 @@ export class MockProvider implements Provider {
   }
 
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
-    this._calls.push({ messages, options });
-    return await this.responseFn(messages, this._calls.length - 1);
+    // Each consumer gets independent ownership: a handler can inspect or mutate
+    // its copy without changing the durable assertion record (including bytes).
+    const recordedMessages = cloneMessages(messages);
+    this._calls.push({ messages: recordedMessages, options: cloneOptions(options) });
+    return await this.responseFn(cloneMessages(messages), this._calls.length - 1);
+  }
+
+  inputCapabilities(_model: string): { image: { sources: readonly InputMediaSource['type'][] } } {
+    return { image: { sources: ['url', 'bytes', 'base64', 'provider-file'] } };
+  }
+
+  validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
+    const effectiveModel =
+      typeof request.providerOptions?.model === 'string'
+        ? request.providerOptions.model
+        : request.model;
+    const fail = (source?: string, feature?: string): never => {
+      throw new UnsupportedModelInputError({
+        provider: this.name,
+        model: effectiveModel || request.model,
+        modality: 'image',
+        ...(source ? { source } : {}),
+        ...(feature ? { feature } : {}),
+      });
+    };
+
+    if (request.providerOptions && 'input' in request.providerOptions) {
+      fail(undefined, 'raw input-container providerOptions');
+    }
+    for (const message of request.history) {
+      if (typeof message.content === 'string') continue;
+      if (message.role !== 'user') fail(undefined, 'rich non-user history');
+      for (const part of richParts(message.content)) {
+        if (
+          part.type === 'image' &&
+          part.source.type === 'provider-file' &&
+          part.source.provider !== this.name
+        ) {
+          fail('provider-file');
+        }
+      }
+    }
+    for (const part of richParts(request.input)) {
+      if (
+        part.type === 'image' &&
+        part.source.type === 'provider-file' &&
+        part.source.provider !== this.name
+      ) {
+        fail('provider-file');
+      }
+    }
+    return { effectiveModel };
   }
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
@@ -177,7 +324,7 @@ export class MockProvider implements Provider {
     return new MockProvider((messages) => {
       const lastUser = [...messages].reverse().find((m) => m.role === 'user');
       return {
-        content: lastUser?.content ?? '',
+        content: lastUser ? inputText(lastUser.content) : '',
         usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
         cost: 0,
       };

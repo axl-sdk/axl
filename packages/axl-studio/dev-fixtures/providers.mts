@@ -33,6 +33,7 @@ import type {
   ProviderResponse,
   StreamChunk,
 } from '@axlsdk/axl';
+import { inputText } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
 
 // ── chunkingFnProvider helper ─────────────────────────────────────────
@@ -112,7 +113,7 @@ export const realisticEchoProvider = MockProvider.fn(async (messages) => {
   // ~$3/M input, ~$15/M output (gpt-4o-like pricing)
   const cost = promptTokens * 0.000003 + completionTokens * 0.000015;
   return {
-    content: lastUser?.content ?? '',
+    content: lastUser ? inputText(lastUser.content) : '',
     usage: {
       prompt_tokens: promptTokens,
       completion_tokens: completionTokens,

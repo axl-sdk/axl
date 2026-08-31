@@ -90,6 +90,11 @@ All model parameters (`effort`, `thinkingBudget`, `includeThoughts`, `temperatur
 expect(provider.calls[0].options.effort).toBe('high');
 ```
 
+`MockProvider` also certifies logical image input in tests. It accepts ordered text/image
+parts from URL, bytes, base64, and `provider-file` sources (the latter must be owned by
+`mock`), preserves them in `calls`, and copies inline bytes before recording. `echo()`
+returns only the deterministic text projection, never serialized media.
+
 ### `MockTool`
 
 Create a mock tool to intercept and record calls:

@@ -877,6 +877,8 @@ describe('AxlStream', () => {
     const categorization: Record<AxlEventType, 'lifecycle' | 'excluded'> = {
       workflow_start: 'lifecycle',
       workflow_end: 'lifecycle',
+      transcription_start: 'lifecycle',
+      transcription_end: 'lifecycle',
       ask_start: 'lifecycle',
       ask_end: 'lifecycle',
       agent_call_start: 'lifecycle',
@@ -938,6 +940,15 @@ describe('AxlStream', () => {
           type: 'workflow_end',
           workflow: 'w',
           data: { status: 'completed', duration: 1 },
+        },
+        transcription_start: {
+          type: 'transcription_start',
+          data: { audio: { source: 'bytes' } },
+        },
+        transcription_end: {
+          type: 'transcription_end',
+          duration: 1,
+          data: { status: 'completed' },
         },
         ask_start: { type: 'ask_start', prompt: 'p', ...ASK_ },
         ask_end: {

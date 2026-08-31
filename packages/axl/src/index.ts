@@ -15,6 +15,8 @@ export type {
   ModelInputDescriptor,
 } from './input.js';
 
+export type { RecordedAudioSource, TranscriptionRequest, Transcript } from './transcription.js';
+
 export { workflow } from './workflow.js';
 export type { Workflow, WorkflowConfig, AnyWorkflow } from './workflow.js';
 
@@ -73,6 +75,7 @@ export {
   isUnpricedLeaf,
   isRootLevel,
   hasPositiveTokens,
+  hasPositiveBillableWork,
   isUsableCost,
   COST_BEARING_LEAF_TYPES,
 } from './event-utils.js';
@@ -245,6 +248,7 @@ export type {
   OpenAICompatibleOptions,
 } from './providers/openai-compatible.js';
 export { ProviderRegistry } from './providers/registry.js';
+export { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
 export { RateLimiter } from './providers/rate-limiter.js';
 export type { RateLimitConfig } from './providers/rate-limiter.js';
 export type {
@@ -261,6 +265,17 @@ export type {
   ProviderInputValidationRequest,
   ProviderInputValidationResult,
 } from './providers/types.js';
+export type {
+  TranscriptionProvider,
+  TranscriptionProviderRequest,
+  TranscriptionProviderResult,
+  TranscriptionCapabilities,
+} from './providers/transcription-types.js';
+export {
+  InvalidTranscriptionInputError,
+  UnsupportedTranscriptionInputError,
+  TranscriptionOperationError,
+} from './errors.js';
 export {
   resolveThinkingOptions,
   resolveApiKey,

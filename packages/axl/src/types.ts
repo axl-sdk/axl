@@ -189,6 +189,9 @@ export const AXL_EVENT_TYPES = [
   // Workflow lifecycle
   'workflow_start',
   'workflow_end',
+  // Transcription operation lifecycle (separate from chat/agent turns)
+  'transcription_start',
+  'transcription_end',
   // Ask boundary
   'ask_start',
   'ask_end',
@@ -1108,6 +1111,48 @@ export type LegacyAxlEventV1 = LegacyAxlEventPayloadV1 & { schemaVersion?: 1 };
 /** Named v2 rejection event for consumers that do not need the full union. */
 export type ToolCallRejectedEvent = Extract<ToolLifecycleEventV2, { type: 'tool_call_rejected' }>;
 
+/** Current-schema-only operation events. Deliberately excluded from the
+ * frozen legacy v1 payload so old persisted records never gain new variants. */
+type TranscriptionLifecycleEventV2 =
+  | (AxlEventBase & {
+      schemaVersion: 2;
+      type: 'transcription_start';
+      transcriptionId: string;
+      model?: string;
+      data: {
+        provider?: string;
+        model?: string;
+        audio: { source: string; bytes?: number; mediaType?: string };
+      };
+    })
+  | (AxlEventBase & {
+      schemaVersion: 2;
+      type: 'transcription_end';
+      transcriptionId: string;
+      model?: string;
+      duration: number;
+      cost?: number;
+      tokens?: { input?: number; output?: number };
+      data: {
+        status: 'completed' | 'failed' | 'aborted';
+        provider?: string;
+        model?: string;
+        audio?: { source: string; bytes?: number; mediaType?: string };
+        text?: string;
+        usage?: {
+          audioSeconds?: number;
+          inputTokens?: number;
+          outputTokens?: number;
+          totalTokens?: number;
+          cost?: number;
+        };
+        pricingStatus?: 'priced' | 'unpriced' | 'zero';
+        cleanupStatus?: 'not_required' | 'deleted' | 'failed' | 'timed_out';
+        error?: string;
+        errorCode?: 'TRANSCRIPTION_PROVIDER_ERROR';
+      };
+    });
+
 /** Event contract written by the next breaking runtime.
  *
  * This additive prototype lets consumers and type tests lock the schema before
@@ -1116,6 +1161,7 @@ export type ToolCallRejectedEvent = Extract<ToolLifecycleEventV2, { type: 'tool_
  */
 export type AxlEventV2 =
   | ToolLifecycleEventV2
+  | TranscriptionLifecycleEventV2
   | (Exclude<
       LegacyAxlEventPayloadV1,
       { type: 'tool_call_start' | 'tool_call_end' | 'tool_denied' }

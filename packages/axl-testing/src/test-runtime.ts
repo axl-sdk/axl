@@ -1,5 +1,6 @@
 import { MockProvider } from './mock-provider.js';
 import { MockTool } from './mock-tool.js';
+import { MockTranscriptionProvider } from './mock-transcription-provider.js';
 import type {
   AxlEvent,
   AwaitHumanOptions,
@@ -15,6 +16,7 @@ import {
   WorkflowContext,
   MemoryStore,
   ProviderRegistry,
+  TranscriptionProviderRegistry,
   eventCostContribution,
   isUnpricedLeaf,
 } from '@axlsdk/axl';
@@ -69,6 +71,7 @@ export type AxlTestRuntimeOptions = {
 export class AxlTestRuntime {
   private workflows = new Map<string, AnyWorkflow>();
   private mockProviders = new Map<string, MockProvider>();
+  private mockTranscriptionProviders = new Map<string, MockTranscriptionProvider>();
   private mockToolMap = new Map<string, MockTool>();
   private _toolCalls: RecordedToolCall[] = [];
   private _agentCalls: RecordedAgentCall[] = [];
@@ -95,6 +98,10 @@ export class AxlTestRuntime {
 
   mockProvider(name: string, provider: MockProvider): void {
     this.mockProviders.set(name, provider);
+  }
+
+  mockTranscriptionProvider(name: string, provider: MockTranscriptionProvider): void {
+    this.mockTranscriptionProviders.set(name, provider);
   }
 
   mockTool<TInput = unknown>(
@@ -137,6 +144,10 @@ export class AxlTestRuntime {
     registry.clearFactories(); // Remove built-in factories; only use explicit mocks
     for (const [name, provider] of this.mockProviders) {
       registry.registerInstance(name, provider);
+    }
+    const transcriptionRegistry = new TranscriptionProviderRegistry();
+    for (const [name, provider] of this.mockTranscriptionProviders) {
+      transcriptionRegistry.registerInstance(name, provider);
     }
     // Fallback resolution: 'default' key or single-provider
     const defaultProvider = this.mockProviders.get('default');
@@ -182,6 +193,7 @@ export class AxlTestRuntime {
       // any eval runner) see the same attribution in tests and prod.
       workflowName,
       providerRegistry: registry,
+      transcriptionProviderRegistry: transcriptionRegistry,
       stateStore: new MemoryStore(),
       toolOverrides: toolOverrides.size > 0 ? toolOverrides : undefined,
       awaitHumanHandler: this._humanDecisionHandler

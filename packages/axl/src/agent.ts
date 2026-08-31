@@ -3,6 +3,7 @@ import type { AskOptions, GuardrailsConfig, SchemaPromptOption } from './types.j
 import type { ModelInput } from './input.js';
 import type { Effort, ToolChoice } from './providers/types.js';
 import { ProviderRegistry } from './providers/registry.js';
+import { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
 import { WorkflowContext } from './context.js';
 import { randomUUID } from 'node:crypto';
 
@@ -93,11 +94,13 @@ export function agent(config: AgentConfig): Agent {
       // This is a simplified path for quick experiments and prototyping;
       // production use should use ctx.ask() inside a workflow.
       const registry = new ProviderRegistry();
+      const transcriptionRegistry = new TranscriptionProviderRegistry();
       const ctx = new WorkflowContext({
         input: prompt,
         executionId: randomUUID(),
         config: {},
         providerRegistry: registry,
+        transcriptionProviderRegistry: transcriptionRegistry,
       });
       return ctx.ask(agentInstance, prompt, options);
     },

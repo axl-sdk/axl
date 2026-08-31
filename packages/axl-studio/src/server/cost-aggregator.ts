@@ -63,7 +63,10 @@ export class CostAggregator {
       return;
     }
 
-    if (event.cost == null && !event.tokens) return;
+    // A transcription leaf may report only audio duration or total tokens in
+    // `data.usage`; classify it before the ordinary cost/token fast-path.
+    const unpricedLeaf = isUnpricedLeaf(event);
+    if (event.cost == null && !event.tokens && !unpricedLeaf) return;
 
     const cost = Number.isFinite(event.cost) ? event.cost! : 0;
     const tokens = event.tokens ?? {};
@@ -73,7 +76,6 @@ export class CostAggregator {
     // discriminator so the dashboard count stays in lockstep with the SDK's
     // `ExecutionInfo.unpriced` / `ask_end.unpriced` (ask_end carries a numeric
     // cost and tool_call_end has no tokens, so both are excluded).
-    const unpricedLeaf = isUnpricedLeaf(event);
     if (unpricedLeaf) {
       this.data.unpricedCalls += 1;
     }

@@ -11,6 +11,8 @@ import type { Agent } from './agent.js';
 import type { Provider } from './providers/types.js';
 import { summarizeModelInput } from './input.js';
 import { ProviderRegistry } from './providers/registry.js';
+import { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
+import type { TranscriptionProvider } from './providers/transcription-types.js';
 import type { StateStore, PendingDecision, EvalHistoryEntry } from './state/types.js';
 import { MemoryStore } from './state/memory.js';
 import { SQLiteStore } from './state/sqlite.js';
@@ -582,6 +584,7 @@ export class AxlRuntime extends EventEmitter {
   private tools = new Map<string, Tool>();
   private agents = new Map<string, Agent>();
   private providerRegistry: ProviderRegistry;
+  private transcriptionProviderRegistry: TranscriptionProviderRegistry;
   private stateStore: StateStore;
   private executions = new Map<string, ExecutionInfo>();
   private pendingDecisionResolvers = new Map<string, PendingDecisionResolver>();
@@ -641,6 +644,7 @@ export class AxlRuntime extends EventEmitter {
     super();
     this.config = resolveConfig(config ?? {});
     this.providerRegistry = new ProviderRegistry();
+    this.transcriptionProviderRegistry = new TranscriptionProviderRegistry();
     this.stateStore = this.createStateStore();
     // Resolve + validate the events cap once at construction. Reject
     // 0 / negatives / fractions / NaN early; allow Infinity for the
@@ -1239,6 +1243,7 @@ export class AxlRuntime extends EventEmitter {
       metadata: options?.metadata,
       config: this.config,
       providerRegistry: this.providerRegistry,
+      transcriptionProviderRegistry: this.transcriptionProviderRegistry,
       stateStore: this.stateStore,
       mcpManager: this.mcpManager,
       spanManager: this.spanManager,
@@ -1272,6 +1277,11 @@ export class AxlRuntime extends EventEmitter {
   /** Register a custom provider instance. */
   registerProvider(name: string, provider: Provider): void {
     this.providerRegistry.registerInstance(name, provider);
+  }
+
+  /** Register a dedicated transcription adapter. It is never used for chat. */
+  registerTranscriptionProvider(name: string, provider: TranscriptionProvider): void {
+    this.transcriptionProviderRegistry.registerInstance(name, provider);
   }
 
   /** Resolve a provider:model URI to a Provider instance and model name. */
@@ -1343,6 +1353,7 @@ export class AxlRuntime extends EventEmitter {
       metadata: options?.metadata,
       config: this.config,
       providerRegistry: this.providerRegistry,
+      transcriptionProviderRegistry: this.transcriptionProviderRegistry,
       sessionHistory,
       signal: controller.signal,
       eventStreamOptions: options?.events,
@@ -1523,6 +1534,7 @@ export class AxlRuntime extends EventEmitter {
         metadata: options?.metadata,
         config: this.config,
         providerRegistry: this.providerRegistry,
+        transcriptionProviderRegistry: this.transcriptionProviderRegistry,
         sessionHistory,
         signal: controller.signal,
         eventStreamOptions: options?.events,

@@ -367,6 +367,18 @@ function reuseLegacyRule<T extends CommonV2EventType>(type: T): RuleFor<T> {
 const COMMON_V2_REDACTION_RULES = {
   workflow_start: reuseLegacyRule('workflow_start'),
   workflow_end: reuseLegacyRule('workflow_end'),
+  transcription_start: (e) => e,
+  transcription_end: (e) => {
+    const d = e.data;
+    return {
+      ...e,
+      data: {
+        ...d,
+        ...(d.text !== undefined ? { text: REDACTED } : {}),
+        ...(d.error !== undefined ? { error: REDACTED } : {}),
+      },
+    };
+  },
   ask_start: reuseLegacyRule('ask_start'),
   ask_end: reuseLegacyRule('ask_end'),
   agent_call_start: reuseLegacyRule('agent_call_start'),

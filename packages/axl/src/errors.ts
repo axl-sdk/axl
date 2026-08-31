@@ -46,6 +46,73 @@ export class UnsupportedModelInputError extends AxlError {
   }
 }
 
+/** Thrown when the public transcription request contains unsupported or unsafe input. */
+export class InvalidTranscriptionInputError extends AxlError {
+  constructor(message: string) {
+    super('INVALID_TRANSCRIPTION_INPUT', message);
+    this.name = 'InvalidTranscriptionInputError';
+  }
+}
+
+/** Thrown before dispatch when no explicit transcription adapter can serve a URI. */
+export class UnsupportedTranscriptionInputError extends AxlError {
+  readonly provider: string;
+  readonly model: string;
+
+  constructor(options: { provider: string; model: string; feature?: string }) {
+    super(
+      'UNSUPPORTED_TRANSCRIPTION_INPUT',
+      `Transcription provider '${options.provider}'${options.model ? ` model '${options.model}'` : ''} does not support ${options.feature ?? 'this request'}`,
+    );
+    this.name = 'UnsupportedTranscriptionInputError';
+    this.provider = options.provider;
+    this.model = options.model;
+  }
+}
+
+/** Safe boundary error for an adapter failure. The original provider error is
+ * retained only as a non-enumerable cause because vendor messages/bodies may
+ * echo raw audio or provider-file references. */
+export class TranscriptionOperationError extends AxlError {
+  readonly provider: string;
+  readonly model: string;
+  readonly usage?: {
+    audioSeconds?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    cost?: number;
+  };
+  readonly pricingStatus?: 'priced' | 'unpriced' | 'zero';
+  readonly cleanupStatus?: 'not_required' | 'deleted' | 'failed' | 'timed_out';
+  declare readonly cause?: unknown;
+
+  constructor(options: {
+    provider: string;
+    model: string;
+    usage?: {
+      audioSeconds?: number;
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+      cost?: number;
+    };
+    pricingStatus?: 'priced' | 'unpriced' | 'zero';
+    cleanupStatus?: 'not_required' | 'deleted' | 'failed' | 'timed_out';
+    cause?: unknown;
+  }) {
+    super('TRANSCRIPTION_PROVIDER_ERROR', 'Transcription provider operation failed');
+    this.name = 'TranscriptionOperationError';
+    this.provider = options.provider;
+    this.model = options.model;
+    this.usage = options.usage;
+    this.pricingStatus = options.pricingStatus;
+    this.cleanupStatus = options.cleanupStatus;
+    if (options.cause !== undefined)
+      Object.defineProperty(this, 'cause', { enumerable: false, value: options.cause });
+  }
+}
+
 /**
  * Strict observation overflow. Kept in the shared error module so every
  * recovery boundary can identify the same non-recoverable control error.

@@ -93,6 +93,19 @@ describe('eventCostContribution', () => {
     expect(eventCostContribution(e)).toBe(0.0003);
   });
 
+  it('returns the single terminal transcription charge', () => {
+    expect(
+      eventCostContribution(
+        ev({
+          type: 'transcription_end',
+          transcriptionId: 'tr-1',
+          cost: 0.004,
+          data: { status: 'failed' },
+        }),
+      ),
+    ).toBe(0.004);
+  });
+
   it('treats zero cost as zero (not as falsy skip)', () => {
     // An `agent_call_end` with cost=0 is a real event (e.g., cached turn);
     // the helper must return 0 (finite, valid), not swap it for some sentinel.
@@ -110,12 +123,15 @@ describe('eventCostContribution', () => {
 });
 
 describe('isCostBearingLeaf', () => {
-  it.each(['agent_call_end', 'tool_call_end', 'memory_remember', 'memory_recall'])(
-    'returns true for %s',
-    (type) => {
-      expect(isCostBearingLeaf(ev({ type }))).toBe(true);
-    },
-  );
+  it.each([
+    'agent_call_end',
+    'tool_call_end',
+    'memory_remember',
+    'memory_recall',
+    'transcription_end',
+  ])('returns true for %s', (type) => {
+    expect(isCostBearingLeaf(ev({ type }))).toBe(true);
+  });
 
   it.each([
     'ask_end',
@@ -154,7 +170,7 @@ describe('isRootLevel', () => {
 });
 
 describe('COST_BEARING_LEAF_TYPES', () => {
-  it('contains exactly the four authoritative leaf types', () => {
+  it('contains exactly the five authoritative leaf types', () => {
     // Pinning the contents catches accidental additions/removals — a new leaf
     // type requires a conscious update here PLUS the cost accumulator sites.
     expect([...COST_BEARING_LEAF_TYPES]).toEqual([
@@ -162,6 +178,7 @@ describe('COST_BEARING_LEAF_TYPES', () => {
       'tool_call_end',
       'memory_remember',
       'memory_recall',
+      'transcription_end',
     ]);
   });
 
@@ -224,5 +241,33 @@ describe('isUnpricedLeaf', () => {
 
   it('counts reasoning-only tokens as billable work', () => {
     expect(isUnpricedLeaf(ev({ type: 'agent_call_end', tokens: { reasoning: 7 } }))).toBe(true);
+  });
+
+  it('counts transcription duration or total-tokens-only usage as billable work', () => {
+    expect(
+      isUnpricedLeaf(
+        ev({
+          type: 'transcription_end',
+          data: { status: 'completed', usage: { audioSeconds: 2 } },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isUnpricedLeaf(
+        ev({ type: 'transcription_end', data: { status: 'failed', usage: { totalTokens: 7 } } }),
+      ),
+    ).toBe(true);
+  });
+
+  it('treats an explicit transcription zero charge as priced', () => {
+    expect(
+      isUnpricedLeaf(
+        ev({
+          type: 'transcription_end',
+          cost: 0,
+          data: { status: 'completed', usage: { audioSeconds: 2 }, pricingStatus: 'zero' },
+        }),
+      ),
+    ).toBe(false);
   });
 });

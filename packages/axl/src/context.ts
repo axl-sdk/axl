@@ -36,6 +36,8 @@ import {
   GuardrailError,
   ValidationError,
   InvalidModelInputError,
+  InvalidTranscriptionInputError,
+  TranscriptionOperationError,
   UnsupportedModelInputError,
   EventStreamOverflowError,
   isEventStreamOverflowError,
@@ -54,7 +56,7 @@ import type { ModelInput } from './input.js';
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
 import { StreamingWalker } from './streaming-walker.js';
-import { COST_BEARING_LEAF_TYPES, hasPositiveTokens, isUsableCost } from './event-utils.js';
+import { COST_BEARING_LEAF_TYPES, hasPositiveBillableWork, isUsableCost } from './event-utils.js';
 import { AxlEventBus, type EventStreamOptions } from './event-stream.js';
 import { redactHistoricalEvent } from './redaction.js';
 import {
@@ -65,6 +67,14 @@ import {
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
 import { ProviderError } from './providers/errors.js';
 import type { ProviderRegistry } from './providers/registry.js';
+import type { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
+import type { TranscriptionProviderRequest } from './providers/transcription-types.js';
+import {
+  cloneTranscript,
+  normalizeTranscriptionAccounting,
+  normalizeTranscriptionRequest,
+} from './transcription.js';
+import type { Transcript, TranscriptionRequest } from './transcription.js';
 import type { AxlConfig } from './config.js';
 import { parseDuration, parseCost } from './config.js';
 import type { StateStore } from './state/types.js';
@@ -615,6 +625,7 @@ export type WorkflowContextInit = {
   metadata?: Record<string, unknown>;
   config: AxlConfig;
   providerRegistry: ProviderRegistry;
+  transcriptionProviderRegistry?: TranscriptionProviderRegistry;
   sessionHistory?: ChatMessage[];
   onTrace?: (event: AxlEvent) => void;
   pendingDecisions?: Map<string, PendingDecisionResolver>;
@@ -720,6 +731,7 @@ export class WorkflowContext<TInput = unknown> {
 
   private config: AxlConfig;
   private providerRegistry: ProviderRegistry;
+  private transcriptionProviderRegistry?: TranscriptionProviderRegistry;
   private sessionHistory: ChatMessage[];
   private onTrace?: (event: AxlEvent) => void;
   private pendingDecisions?: Map<string, PendingDecisionResolver>;
@@ -841,7 +853,8 @@ export class WorkflowContext<TInput = unknown> {
       // when the signal is still alive). A consumer accessing `ctx.events`
       // after abort would otherwise get a never-finishing bus. Finish
       // immediately so iterators resolve cleanly with `done: true`.
-      if (this.signal?.aborted) {
+      const signal = this.currentSignal;
+      if (signal?.aborted) {
         this._busRef.current._finish();
       }
     }
@@ -882,6 +895,7 @@ export class WorkflowContext<TInput = unknown> {
     this.metadata = init.metadata ?? {};
     this.config = init.config;
     this.providerRegistry = init.providerRegistry;
+    this.transcriptionProviderRegistry = init.transcriptionProviderRegistry;
     this.sessionHistory = init.sessionHistory ?? [];
     this.onTrace = init.onTrace;
     this.pendingDecisions = init.pendingDecisions;
@@ -980,6 +994,7 @@ export class WorkflowContext<TInput = unknown> {
       executionId: this.executionId,
       config: this.config,
       providerRegistry: this.providerRegistry,
+      transcriptionProviderRegistry: this.transcriptionProviderRegistry,
       metadata: { ...this.metadata },
       // Shared infrastructure
       budgetContext: this.budgetContext,
@@ -4667,6 +4682,299 @@ export class WorkflowContext<TInput = unknown> {
     });
   }
 
+  /** Transcribe recorded audio through the dedicated transcription registry.
+   * This operation never enters the chat history or chat-provider path. */
+  async transcribe(request: TranscriptionRequest): Promise<Transcript> {
+    const startedAt = Date.now();
+    const transcriptionId = randomUUID();
+    const signal = this.currentSignal;
+    const rawAudio =
+      request && typeof request === 'object' && 'audio' in request
+        ? (request as { audio?: { type?: unknown; data?: unknown; mediaType?: unknown } }).audio
+        : undefined;
+    const source = rawAudio?.type;
+    const requestedUri = typeof request?.model === 'string' ? request.model : undefined;
+    const colon = requestedUri?.indexOf(':') ?? -1;
+    const requestedProvider = colon > 0 ? requestedUri!.slice(0, colon) : undefined;
+    const requestedModel =
+      colon > 0 && colon < requestedUri!.length - 1 ? requestedUri!.slice(colon + 1) : undefined;
+    const startAudio = {
+      source: typeof source === 'string' ? source : 'unknown',
+      ...(rawAudio?.data instanceof Uint8Array ? { bytes: rawAudio.data.byteLength } : {}),
+      ...(typeof rawAudio?.mediaType === 'string' ? { mediaType: rawAudio.mediaType } : {}),
+    };
+    this.emitEvent({
+      type: 'transcription_start',
+      transcriptionId,
+      model: requestedModel,
+      data: {
+        ...(requestedProvider ? { provider: requestedProvider } : {}),
+        ...(requestedModel ? { model: requestedModel } : {}),
+        audio: startAudio,
+      },
+    });
+    let terminalEmitted = false;
+    const emitTerminal = (partial: {
+      model?: string;
+      cost?: number;
+      tokens?: { input?: number; output?: number };
+      data: Record<string, unknown>;
+    }) => {
+      if (terminalEmitted) return;
+      terminalEmitted = true;
+      this.emitEvent({
+        type: 'transcription_end',
+        transcriptionId,
+        model: partial.model,
+        duration: Date.now() - startedAt,
+        ...(partial.cost !== undefined ? { cost: partial.cost } : {}),
+        ...(partial.tokens ? { tokens: partial.tokens } : {}),
+        data: partial.data,
+      });
+    };
+    const abortError = () =>
+      new DOMException('The transcription operation was aborted', 'AbortError');
+    const cleanupStatus = (value: unknown) =>
+      value === 'not_required' || value === 'deleted' || value === 'failed' || value === 'timed_out'
+        ? value
+        : undefined;
+    const safeProviderFailure = (error: unknown, provider: string, model: string) => {
+      const details =
+        error && typeof error === 'object' ? (error as Record<string, unknown>) : undefined;
+      const accounting = normalizeTranscriptionAccounting(details?.usage, details?.pricingStatus);
+      const cleanup = cleanupStatus(details?.cleanupStatus);
+      return {
+        accounting,
+        cleanup,
+        error: new TranscriptionOperationError({
+          provider,
+          model,
+          ...(accounting.usage ? { usage: accounting.usage } : {}),
+          ...(accounting.pricingStatus ? { pricingStatus: accounting.pricingStatus } : {}),
+          ...(cleanup ? { cleanupStatus: cleanup } : {}),
+          cause: error,
+        }),
+      };
+    };
+    const terminalData = (
+      status: 'completed' | 'failed' | 'aborted',
+      provider: string | undefined,
+      model: string | undefined,
+      audio: Record<string, unknown> | undefined,
+      accounting: ReturnType<typeof normalizeTranscriptionAccounting>,
+      extras: Record<string, unknown> = {},
+    ) => ({
+      status,
+      ...(provider ? { provider } : {}),
+      ...(model ? { model } : {}),
+      ...(audio ? { audio } : {}),
+      ...(accounting.usage ? { usage: accounting.usage } : {}),
+      ...(accounting.pricingStatus ? { pricingStatus: accounting.pricingStatus } : {}),
+      ...extras,
+    });
+    try {
+      const normalized = normalizeTranscriptionRequest(request);
+      const descriptor = {
+        source: normalized.audio.type,
+        ...(normalized.audio.type === 'bytes' ? { bytes: normalized.audio.data.byteLength } : {}),
+        ...(normalized.audio.mediaType !== undefined
+          ? { mediaType: normalized.audio.mediaType }
+          : {}),
+      };
+      if (this.currentSignal?.aborted || signal?.aborted) {
+        emitTerminal({
+          model: requestedModel,
+          data: terminalData('aborted', requestedProvider, requestedModel, descriptor, {
+            hasWork: false,
+          }),
+        });
+        throw abortError();
+      }
+      if (this.budgetContext?.exceeded) {
+        const { limit, totalCost: spent, policy } = this.budgetContext;
+        if (policy === 'warn') {
+          this.emitEvent({
+            type: 'log',
+            data: { warning: 'Budget exceeded', limit, spent, policy },
+          });
+        } else {
+          throw new BudgetExceededError(limit, spent, policy);
+        }
+      }
+      if (!this.transcriptionProviderRegistry) {
+        throw new InvalidTranscriptionInputError(
+          'No transcription provider registry is configured',
+        );
+      }
+      const resolved = this.transcriptionProviderRegistry.resolve(normalized.model, this.config);
+      if (
+        normalized.audio.type === 'provider-file' &&
+        normalized.audio.provider !== resolved.providerName
+      ) {
+        throw new InvalidTranscriptionInputError(
+          'Transcription provider-file source does not match the requested provider',
+        );
+      }
+      const capabilities = resolved.provider.capabilities(resolved.model);
+      if (!capabilities || !capabilities.sources.includes(normalized.audio.type)) {
+        throw new InvalidTranscriptionInputError(
+          'The requested transcription model does not support this audio source',
+        );
+      }
+      if (normalized.timestamps && !capabilities.timestamps?.includes(normalized.timestamps)) {
+        throw new InvalidTranscriptionInputError(
+          'The requested transcription model does not support requested timestamps',
+        );
+      }
+      if (normalized.diarization && !capabilities.diarization) {
+        throw new InvalidTranscriptionInputError(
+          'The requested transcription model does not support diarization',
+        );
+      }
+      const providerRequest: TranscriptionProviderRequest = {
+        ...normalized,
+        model: resolved.model,
+        ...(signal ? { signal } : {}),
+      };
+      let result;
+      try {
+        result = await resolved.provider.transcribe(providerRequest);
+      } catch (error) {
+        const failure = safeProviderFailure(error, resolved.providerName, resolved.model);
+        if (this.currentSignal?.aborted || signal?.aborted) {
+          if (failure.accounting.cost !== undefined)
+            this._accumulateBudgetCost(failure.accounting.cost);
+          emitTerminal({
+            model: resolved.model,
+            ...(failure.accounting.cost !== undefined ? { cost: failure.accounting.cost } : {}),
+            ...(failure.accounting.tokens ? { tokens: failure.accounting.tokens } : {}),
+            data: terminalData(
+              'aborted',
+              resolved.providerName,
+              resolved.model,
+              descriptor,
+              failure.accounting,
+              ...(failure.cleanup ? [{ cleanupStatus: failure.cleanup }] : []),
+            ),
+          });
+          throw abortError();
+        }
+        if (failure.accounting.cost !== undefined)
+          this._accumulateBudgetCost(failure.accounting.cost);
+        emitTerminal({
+          model: resolved.model,
+          ...(failure.accounting.cost !== undefined ? { cost: failure.accounting.cost } : {}),
+          ...(failure.accounting.tokens ? { tokens: failure.accounting.tokens } : {}),
+          data: terminalData(
+            'failed',
+            resolved.providerName,
+            resolved.model,
+            descriptor,
+            failure.accounting,
+            {
+              error: 'Transcription operation failed',
+              errorCode: failure.error.code,
+              ...(failure.cleanup ? { cleanupStatus: failure.cleanup } : {}),
+            },
+          ),
+        });
+        throw failure.error;
+      }
+      const accounting = normalizeTranscriptionAccounting(
+        result.transcript?.usage,
+        result.transcript?.pricingStatus,
+      );
+      if (accounting.cost !== undefined) this._accumulateBudgetCost(accounting.cost);
+      if (this.currentSignal?.aborted || signal?.aborted) {
+        emitTerminal({
+          model: resolved.model,
+          ...(accounting.cost !== undefined ? { cost: accounting.cost } : {}),
+          ...(accounting.tokens ? { tokens: accounting.tokens } : {}),
+          data: terminalData(
+            'aborted',
+            resolved.providerName,
+            resolved.model,
+            descriptor,
+            accounting,
+            ...(cleanupStatus(result.cleanupStatus)
+              ? [{ cleanupStatus: cleanupStatus(result.cleanupStatus)! }]
+              : []),
+          ),
+        });
+        throw abortError();
+      }
+      let transcript: Transcript;
+      try {
+        transcript = cloneTranscript(result.transcript);
+      } catch (error) {
+        const cleanup = cleanupStatus(result.cleanupStatus);
+        const failure = new TranscriptionOperationError({
+          provider: resolved.providerName,
+          model: resolved.model,
+          ...(accounting.usage ? { usage: accounting.usage } : {}),
+          ...(accounting.pricingStatus ? { pricingStatus: accounting.pricingStatus } : {}),
+          ...(cleanup ? { cleanupStatus: cleanup } : {}),
+          cause: error,
+        });
+        emitTerminal({
+          model: resolved.model,
+          ...(accounting.cost !== undefined ? { cost: accounting.cost } : {}),
+          ...(accounting.tokens ? { tokens: accounting.tokens } : {}),
+          data: terminalData(
+            'failed',
+            resolved.providerName,
+            resolved.model,
+            descriptor,
+            accounting,
+            {
+              error: 'Transcription operation failed',
+              errorCode: 'TRANSCRIPTION_PROVIDER_ERROR',
+              ...(cleanup ? { cleanupStatus: cleanup } : {}),
+            },
+          ),
+        });
+        throw failure;
+      }
+      emitTerminal({
+        model: resolved.model,
+        ...(accounting.cost !== undefined ? { cost: accounting.cost } : {}),
+        ...(accounting.tokens ? { tokens: accounting.tokens } : {}),
+        data: terminalData(
+          'completed',
+          resolved.providerName,
+          resolved.model,
+          descriptor,
+          accounting,
+          {
+            text: transcript.text,
+            ...(cleanupStatus(result.cleanupStatus)
+              ? { cleanupStatus: cleanupStatus(result.cleanupStatus)! }
+              : {}),
+          },
+        ),
+      });
+      return transcript;
+    } catch (error) {
+      if (!terminalEmitted) {
+        const aborted = signal?.aborted || (error instanceof Error && error.name === 'AbortError');
+        emitTerminal({
+          model: requestedModel,
+          data: terminalData(
+            aborted ? 'aborted' : 'failed',
+            requestedProvider,
+            requestedModel,
+            undefined,
+            { hasWork: false },
+            {
+              error: aborted ? 'Transcription operation aborted' : 'Transcription operation failed',
+            },
+          ),
+        });
+      }
+      throw error;
+    }
+  }
+
   // ── Private ───────────────────────────────────────────────────────────
 
   /**
@@ -4768,7 +5076,7 @@ export class WorkflowContext<TInput = unknown> {
       const usable = isUsableCost(cost);
       const unpriced =
         !usable &&
-        hasPositiveTokens(
+        hasPositiveBillableWork(
           partial as {
             tokens?: {
               input?: number;
@@ -4777,6 +5085,7 @@ export class WorkflowContext<TInput = unknown> {
               cached?: number;
               cacheWrite?: number;
             };
+            data?: { usage?: { audioSeconds?: number; totalTokens?: number } };
           },
         );
       if (frame) {

@@ -220,6 +220,25 @@ describe('AxlEventBus — overflow safety net', () => {
     expect(warnSpy).toHaveBeenCalledOnce();
   });
 
+  it('does not let many transcription terminals bypass maxQueued', async () => {
+    const bus = new AxlEventBus({ maxQueued: 2 });
+    for (let index = 0; index < 8; index++) {
+      bus._push(
+        ev({
+          type: 'transcription_end',
+          transcriptionId: `tr-${index}`,
+          duration: 1,
+          data: { status: 'completed' },
+        }),
+      );
+    }
+    bus._finish();
+    const seen: AxlEvent[] = [];
+    for await (const event of bus) seen.push(event);
+    expect(seen).toHaveLength(2);
+    expect(seen.every((event) => event.type === 'transcription_end')).toBe(true);
+  });
+
   it('allows an explicitly incomplete lifecycle view without exceeding maxQueued', async () => {
     const bus = new AxlEventBus({ maxQueued: 1 });
     bus._push(toolStart());

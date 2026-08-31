@@ -158,6 +158,10 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
       throw new InvalidTranscriptionInputError(
         'Gemini smart transcription does not support timestamps or diarization',
       );
+    if (request.timestamps && options.customVocabulary !== undefined)
+      throw new InvalidTranscriptionInputError(
+        'Gemini transcription customVocabulary cannot be combined with timestamps',
+      );
     if (request.timestamps && request.timestamps !== 'word')
       throw new UnsupportedTranscriptionInputError({
         provider: this.name,

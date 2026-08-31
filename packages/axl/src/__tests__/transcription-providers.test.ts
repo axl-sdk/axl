@@ -157,7 +157,7 @@ describe('dedicated transcription adapters', () => {
       language: 'en',
       timestamps: 'word',
       diarization: true,
-      providerOptions: { mode: 'verbatim', customVocabulary: ['Axl'] },
+      providerOptions: { mode: 'verbatim' },
     });
     expect(fetch).toHaveBeenCalledTimes(5);
     expect(fetch.mock.calls.map((call) => [call[0], (call[1] as RequestInit).method])).toEqual([
@@ -180,7 +180,6 @@ describe('dedicated transcription adapters', () => {
             diarization_mode: 'speaker',
           },
           language_codes: ['en'],
-          custom_vocabulary: ['Axl'],
         },
       },
     });
@@ -196,14 +195,12 @@ describe('dedicated transcription adapters', () => {
   });
 
   it('uses caller-owned Gemini provider files without an upload lifecycle and rejects smart timestamp requests before fetch', async () => {
-    const fetch = vi
-      .fn()
-      .mockResolvedValue(
-        response({
-          status: 'completed',
-          steps: [{ type: 'model_output', content: [{ type: 'text', text: 'hello' }] }],
-        }),
-      );
+    const fetch = vi.fn().mockResolvedValue(
+      response({
+        status: 'completed',
+        steps: [{ type: 'model_output', content: [{ type: 'text', text: 'hello' }] }],
+      }),
+    );
     globalThis.fetch = fetch as typeof globalThis.fetch;
     const provider = new GeminiTranscriptionProvider({ apiKey: 'key' });
     await expect(
@@ -273,14 +270,12 @@ describe('dedicated transcription adapters', () => {
   });
 
   it('uses Gemini verbatim mode by default for a caller-owned file', async () => {
-    const fetch = vi
-      .fn()
-      .mockResolvedValue(
-        response({
-          status: 'completed',
-          steps: [{ type: 'model_output', content: [{ type: 'text', text: 'hello' }] }],
-        }),
-      );
+    const fetch = vi.fn().mockResolvedValue(
+      response({
+        status: 'completed',
+        steps: [{ type: 'model_output', content: [{ type: 'text', text: 'hello' }] }],
+      }),
+    );
     globalThis.fetch = fetch as typeof globalThis.fetch;
     const provider = new GeminiTranscriptionProvider({ apiKey: 'key' });
     await provider.transcribe({
@@ -380,6 +375,14 @@ describe('dedicated transcription adapters', () => {
         model: 'gemini-3.5-transcribe',
         audio: { type: 'bytes', data: bytes, mediaType: 'audio/wav' },
         diarization: true,
+      }),
+    ).rejects.toBeInstanceOf(InvalidTranscriptionInputError);
+    await expect(
+      provider.transcribe({
+        model: 'gemini-3.5-transcribe',
+        audio: { type: 'bytes', data: bytes, mediaType: 'audio/wav' },
+        timestamps: 'word',
+        providerOptions: { customVocabulary: ['Axl'] },
       }),
     ).rejects.toBeInstanceOf(InvalidTranscriptionInputError);
     expect(fetch).not.toHaveBeenCalled();
@@ -743,14 +746,12 @@ describe('dedicated transcription adapters', () => {
   });
 
   it('uses the OpenRouter dedicated JSON endpoint and maps authoritative cost', async () => {
-    const fetch = vi
-      .fn()
-      .mockResolvedValue(
-        response({
-          text: 'hello',
-          usage: { seconds: 3, input_tokens: 2, output_tokens: 1, total_tokens: 3, cost: 0.04 },
-        }),
-      );
+    const fetch = vi.fn().mockResolvedValue(
+      response({
+        text: 'hello',
+        usage: { seconds: 3, input_tokens: 2, output_tokens: 1, total_tokens: 3, cost: 0.04 },
+      }),
+    );
     globalThis.fetch = fetch as typeof globalThis.fetch;
     const provider = new OpenRouterTranscriptionProvider({ apiKey: 'key' });
     const result = await provider.transcribe({

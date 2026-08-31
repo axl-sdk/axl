@@ -1,6 +1,9 @@
 import type { AxlConfig } from '../config.js';
 import { UnsupportedTranscriptionInputError } from '../errors.js';
 import type { TranscriptionProvider } from './transcription-types.js';
+import { OpenAITranscriptionProvider } from './openai-transcription.js';
+import { GeminiTranscriptionProvider } from './gemini-transcription.js';
+import { OpenRouterTranscriptionProvider } from './openrouter-transcription.js';
 
 export type TranscriptionProviderFactory = (config: AxlConfig) => TranscriptionProvider;
 export type ResolvedTranscriptionProvider = {
@@ -9,11 +12,46 @@ export type ResolvedTranscriptionProvider = {
   providerName: string;
 };
 
+const builtinFactories: Record<string, TranscriptionProviderFactory> = {
+  'openai-transcription': (config) => {
+    const opts = config.providers?.openai ?? {};
+    return new OpenAITranscriptionProvider({
+      apiKey: opts.apiKey,
+      baseUrl: opts.baseUrl,
+      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
+      rateLimit: opts.rateLimit,
+    });
+  },
+  'gemini-transcription': (config) => {
+    const opts = config.providers?.google ?? {};
+    return new GeminiTranscriptionProvider({
+      apiKey: opts.apiKey,
+      baseUrl: opts.baseUrl,
+      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
+      rateLimit: opts.rateLimit,
+    });
+  },
+  'openrouter-transcription': (config) => {
+    const opts = config.providers?.openrouter ?? {};
+    return new OpenRouterTranscriptionProvider({
+      apiKey: opts.apiKey,
+      baseUrl: opts.baseUrl,
+      dangerouslyAllowInsecureHttp: opts.dangerouslyAllowInsecureHttp,
+      rateLimit: opts.rateLimit,
+    });
+  },
+};
+
 /** Dedicated registry: transcription URIs are always explicit `provider:model`.
  * It intentionally has no chat-provider/default-model or test fallback. */
 export class TranscriptionProviderRegistry {
   private instances = new Map<string, TranscriptionProvider>();
   private factories = new Map<string, TranscriptionProviderFactory>();
+
+  constructor() {
+    for (const [name, factory] of Object.entries(builtinFactories))
+      this.factories.set(name, factory);
+  }
 
   register(name: string, factory: TranscriptionProviderFactory): void {
     this.factories.set(name, factory);

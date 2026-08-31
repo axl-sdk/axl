@@ -249,6 +249,9 @@ export type {
 } from './providers/openai-compatible.js';
 export { ProviderRegistry } from './providers/registry.js';
 export { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
+export { OpenAITranscriptionProvider } from './providers/openai-transcription.js';
+export { GeminiTranscriptionProvider } from './providers/gemini-transcription.js';
+export { OpenRouterTranscriptionProvider } from './providers/openrouter-transcription.js';
 export { RateLimiter } from './providers/rate-limiter.js';
 export type { RateLimitConfig } from './providers/rate-limiter.js';
 export type {

@@ -347,3 +347,41 @@ frontier gate when the catalog changes and before release; it checks exact IDs, 
 tool continuation, usage, and pricing. Static-priced calls must report positive cost, while
 response-priced providers may report a nonnegative total. Record catalog changes in a dated,
 secret-free file under `docs/verification/`.
+
+### Multimodal image lighthouse
+
+The image lighthouse is separately armed even when provider keys are present:
+
+```bash
+# One selected row. Each selector targets only the lighthouse file. L1, L2,
+# L4, L5, L11, and L12 each make one logical model invocation; L3 makes two.
+# `fetchWithRetry` can make up to three HTTP attempts per invocation.
+AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]'
+
+# Native blocking rows: five logical invocations on a normal successful path
+# (L1/L2/L4/L11/L12). L6 is local and makes zero HTTP attempts.
+AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]|\[L2\]|\[L4\]|\[L11\]|\[L12\]|\[L6\]'
+
+# Non-blocking OpenRouter certification: one additional logical invocation.
+AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L5\]'
+
+# L3 requires an existing Anthropic Files API reference; it makes two logical
+# invocations (the image ask plus one tool continuation) and is deliberately
+# absent unless ANTHROPIC_IMAGE_FILE_ID is supplied.
+AXL_MULTIMODAL_LIVE=1 ANTHROPIC_IMAGE_FILE_ID=file_... pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L3\]'
+```
+
+The tests use `gpt-4o-mini`, `claude-sonnet-4-5`, `gemini-3.7-flash`, and
+OpenRouter `openai/gpt-4o-mini`, each with a tiny 1×1 PNG and low output token
+limit. On a normal successful path, the native blocking rows make five logical
+model invocations, seven with L3 configured, and eight with the optional L5
+OpenRouter row. `fetchWithRetry` permits up to three HTTP attempts per logical
+invocation (the initial request plus two retries for eligible transport,
+`429`, `503`, or `529` failures): the corresponding transport-attempt ceilings
+are 15, 21, and 24. These are not hard paid-call or spend caps—an upstream may
+process a request even when its transport result is failed or ambiguous. Run
+named rows individually when controlling spend. A key without
+`AXL_MULTIMODAL_LIVE=1` does not run this suite; setting
+`AXL_DISABLE_LIVE_INTEGRATION=1` is an absolute kill switch even when the live
+flag and keys are present. The detailed checklist and pending evidence placeholders live in
+[`docs/verification/multimodal-input-lighthouse-2026-08-31.md`](./verification/multimodal-input-lighthouse-2026-08-31.md).

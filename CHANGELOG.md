@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Ordered image input.** `ModelInput` accepts text and image parts on `ask` and
+  `delegate`, with bounded observability descriptors, typed preflight errors,
+  native OpenAI Responses/Anthropic/Gemini mappings, and one non-blocking
+  OpenRouter certification path. See `docs/multimodal-input.md` for exact
+  model/source allowlists and attachment lifetime rules.
+
 ## [0.21.1] - 2026-08-28
 
 ### Fixed

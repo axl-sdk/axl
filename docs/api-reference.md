@@ -359,6 +359,15 @@ All primitives are available on `ctx` inside workflow handlers.
 
 Invoke an agent. Runs the tool-call loop until the agent produces a final response or hits `maxTurns`.
 
+`prompt` is `ModelInput`: the legacy `string` shorthand or a non-empty ordered
+readonly array of `{ type: 'text', text }` and `{ type: 'image', source, label? }`
+parts. Image sources are URL, bytes, base64, or a provider-scoped file reference;
+see [Multimodal model input](./multimodal-input.md) for their exact shapes and
+the per-provider allowlist. `inputText(prompt)` returns its deterministic text
+projection. Rich evidence survives retries, tool turns, handoffs, and the
+selected delegate inside this ask, but is not automatically retained for later
+session turns.
+
 ```typescript
 const answer = await ctx.ask(myAgent, 'What is 2+2?');
 
@@ -405,13 +414,14 @@ Select the best agent from a list of candidates and invoke it. Creates a tempora
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `agents` | `Agent[]` | Candidate agents to choose from (at least 1) |
-| `prompt` | `string` | The prompt to route and process |
+| `prompt` | `ModelInput` | Ordered evidence to route and process; the router receives full evidence by default |
 | `options.schema` | `z.ZodType<T>` | Zod schema for structured output from the selected agent |
 | `options.routerModel` | `string` | Model URI for the internal router (default: first candidate's model) |
 | `options.metadata` | `Record<string, unknown>` | Additional metadata passed to router and selected agent |
 | `options.retries` | `number` | Retries for structured output validation |
 | `options.validate` | `OutputValidator<T>` | Post-schema business rule validation. Forwarded to the final `ctx.ask()` call |
 | `options.validateRetries` | `number` | Maximum retries for validate failures (default: 2) |
+| `options.routerInput` | `'full' \| 'text'` | `'full'` (default) routes ordered evidence; `'text'` routes `inputText(prompt)` only |
 
 **Returns:** `Promise<T>` — the selected agent's response.
 
@@ -1958,6 +1968,8 @@ All errors extend `AxlError`.
 | `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy. Includes `.limit`, `.spent`, `.policy` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
 | `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`. Message is the provider's text verbatim (no prefix). |
+| `InvalidModelInputError` | `ctx.ask()`, `ctx.delegate()`, `agent.ask()` | Malformed `ModelInput`. `code: 'INVALID_MODEL_INPUT'`. Invalid inputs fail before dispatch and the message never includes raw media. |
+| `UnsupportedModelInputError` | rich `ctx.ask()` / `ctx.delegate()` | The exact provider/model/source/composition is unsupported. `code: 'UNSUPPORTED_MODEL_INPUT'`; includes safe `.provider`, `.model`, `.modality`, and optional source kind, never the raw locator or bytes. |
 | `AxlError` / `INVALID_HUMAN_DECISION` | approval handlers, `runtime.resolveDecision()` | Untyped decision is not the exact plain-object approval/denial union; rejected before resolver/store mutation |
 | `AxlError` / `PENDING_DECISION_NOT_FOUND` | `runtime.resolveDecision()` | No active or persisted pending request exists, or another concurrent resolution already won |
 | `AxlError` / `CROSS_PROCESS_RESUME_UNSUPPORTED` | `runtime.resolveDecision()` | A persisted request exists but its in-process continuation owner is gone. Fails before deleting the request or starting side effects |

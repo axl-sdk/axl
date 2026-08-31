@@ -6,10 +6,11 @@
   "scripts": {
     "quickstart": "tsx quickstart.ts",
     "consensus": "tsx consensus.ts",
-    "support-bot": "tsx support-bot.ts"
+    "support-bot": "tsx support-bot.ts",
+    "image-lighthouse": "tsx image-lighthouse.ts"
   },
   "dependencies": {
-    "@axlsdk/axl": "^0.17.0",
+    "@axlsdk/axl": "file:../packages/axl",
     "zod": "^4.0.0"
   },
   "devDependencies": {

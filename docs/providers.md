@@ -126,6 +126,16 @@ adapter boundary. Use a record projection such as `{ result: text }` when that s
 distinction matters. This provider-envelope normalization does not change the canonical
 `ChatMessage.content` seen by Axl or other providers.
 
+### Rich image transport
+
+String-only `google:` calls continue to use `generateContent` unchanged. Rich
+image input is supported only for `google:gemini-3.7-flash` and uses the GA
+[Interactions API](https://ai.google.dev/gemini-api/docs/interactions-overview)
+with `store: false`. It is stateless: Axl sends application-owned history and
+does not use `previous_interaction_id`, background execution, or raw transport
+overrides. See [Multimodal model input](./multimodal-input.md) for exact source
+rules and the cross-provider table.
+
 ### Structured output & schema handling on Gemini
 
 Gemini's schema sanitizer (`sanitizeSchemaForGemini`) strips a set of JSON-Schema

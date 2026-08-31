@@ -42,7 +42,7 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `POST /api/evals/import` | Import a CLI eval artifact (parsed `EvalResult` JSON) into runtime history. Body: `{ result: EvalResult \| EvalResult[], eval? }`. The CLI's `--output` writes a JSON array when `--runs N > 1` (including for partial batches), so array form is supported — each entry imports as its own history entry with shared `runGroupId`, rendering as a coherent group in the History tab. Single-object response is `{ id, eval, timestamp }`; array response is `{ imported: [{ id, eval, timestamp }, ...] }`. Per-entry validation; import is all-or-nothing |
 | `DELETE /api/evals/history/:id` | Delete a single history entry. Blocked in readOnly |
 | `POST /api/evals/compare` | Compare two eval results by history ID. Body: `{ baselineId, candidateId, options? }` where each ID is `string` (single run) or `string[]` (pooled multi-run). Resolves IDs server-side from `runtime.getEvalHistory()` so the wire payload stays small |
-| `POST /api/playground/chat` | Chat with an agent directly (no workflow required). Accepts `{ message, agent?, sessionId? }`. Streams results via WebSocket |
+| `POST /api/playground/chat` | Chat with an agent directly (no workflow required). Accepts `{ message, agent?, sessionId?, image? }`, where `image` is `{ mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif', data: string }`: standard base64 only (no data URL), one image, up to 5 MiB decoded. Streams results via WebSocket. |
 | `GET /api/decisions` | List pending decisions |
 | `POST /api/decisions/:id/resolve` | Resolve a pending decision in its owning runtime. Returns 400 for an invalid exact decision union, 404 for an unknown/already-resolved ID, and 409 for a persisted request whose process-local owner is gone |
 
@@ -205,7 +205,14 @@ They are required security boundaries, not SDK helpers.
 
 Studio's API uses small request bodies — the eval comparison flow sends history IDs (~100 bytes), not full result payloads — so the default body limits in Express, NestJS, Fastify, and Koa (typically 100KB) are sufficient for normal use.
 
-The one exception is `POST /api/evals/import`, which accepts a full `EvalResult` JSON (typically a CLI artifact from `axl-eval --output result.json`). If you import sizeable eval files through Studio, raise your host framework's JSON body limit *on the Studio sub-mount only*.
+The Playground's optional local image attachment is the small exception: Studio accepts one
+PNG, JPEG, WebP, or GIF per run, capped at 5 MiB decoded. Base64 plus its JSON envelope is
+about 6.7 MiB on the wire. Studio rejects requests above that route cap with HTTP 413 before
+JSON parsing, but an embedded host parser runs first; configure at least an 8 MiB JSON limit
+on the Studio mount for Playground image runs. Attachments are sent only with that run request
+and are not persisted to the Playground session.
+
+The other exception is `POST /api/evals/import`, which accepts a full `EvalResult` JSON (typically a CLI artifact from `axl-eval --output result.json`). If you import sizeable eval files through Studio, raise your host framework's JSON body limit *on the Studio sub-mount only*.
 
 **Express:**
 

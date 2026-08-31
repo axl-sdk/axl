@@ -2,8 +2,17 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
-import { redactStreamEvent } from '../redact.js';
-import type { AxlEventV2 as AxlEvent } from '@axlsdk/axl';
+import { redactStreamEvent, sanitizeRichInputFailure } from '../redact.js';
+import type { AxlEventV2 as AxlEvent, ModelInput } from '@axlsdk/axl';
+import {
+  base64ByteLength,
+  hasMatchingImageSignature,
+  isPlaygroundImageMediaType,
+  PLAYGROUND_IMAGE_MAX_BASE64_CHARACTERS,
+  PLAYGROUND_IMAGE_MAX_BYTES,
+  PLAYGROUND_IMAGE_REQUEST_MAX_BYTES,
+  type PlaygroundImageAttachment,
+} from '../../playground-image.js';
 
 // Demo schemas keyed by agent name. When the playground UI selects an agent
 // in this map, the chat-bubble render path exercises the spec/17
@@ -26,17 +35,82 @@ const DEMO_SCHEMA_BY_AGENT: Record<string, z.ZodObject<Record<string, z.ZodTypeA
   }),
 };
 
+class PlaygroundBodyTooLargeError extends Error {}
+
+async function readPlaygroundBody(request: Request): Promise<unknown> {
+  const contentLength = request.headers.get('content-length');
+  if (contentLength !== null) {
+    const bytes = Number(contentLength);
+    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > PLAYGROUND_IMAGE_REQUEST_MAX_BYTES) {
+      throw new PlaygroundBodyTooLargeError();
+    }
+  }
+  if (!request.body) throw new SyntaxError('missing body');
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      total += next.value.byteLength;
+      if (total > PLAYGROUND_IMAGE_REQUEST_MAX_BYTES) {
+        await reader.cancel();
+        throw new PlaygroundBodyTooLargeError();
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(body));
+}
+
 export function createPlaygroundRoutes(connMgr: ConnectionManager) {
   const app = new Hono<StudioEnv>();
 
   // Chat with an agent directly — no workflow required
   app.post('/playground/chat', async (c) => {
     const runtime = c.get('runtime');
-    const body = await c.req.json<{
+    let parsedBody: unknown;
+    try {
+      parsedBody = await readPlaygroundBody(c.req.raw);
+    } catch (error) {
+      if (error instanceof PlaygroundBodyTooLargeError) {
+        return c.json(
+          {
+            ok: false,
+            error: { code: 'REQUEST_TOO_LARGE', message: 'playground image request is too large' },
+          },
+          413,
+        );
+      }
+      return c.json(
+        { ok: false, error: { code: 'INVALID_INPUT', message: 'request body must be valid JSON' } },
+        400,
+      );
+    }
+    if (!parsedBody || typeof parsedBody !== 'object' || Array.isArray(parsedBody)) {
+      return c.json(
+        {
+          ok: false,
+          error: { code: 'INVALID_INPUT', message: 'request body must be a JSON object' },
+        },
+        400,
+      );
+    }
+    const body = parsedBody as {
       sessionId?: string;
-      message: string;
+      message?: unknown;
       agent?: string;
-    }>();
+      image?: unknown;
+    };
 
     if (!body.message || typeof body.message !== 'string' || !body.message.trim()) {
       return c.json(
@@ -49,6 +123,64 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
         },
         400,
       );
+    }
+    const message = body.message;
+
+    let image: PlaygroundImageAttachment | undefined;
+    if (body.image !== undefined) {
+      const candidate = body.image as Partial<PlaygroundImageAttachment> | null;
+      if (
+        !candidate ||
+        typeof candidate !== 'object' ||
+        !isPlaygroundImageMediaType(candidate.mediaType) ||
+        typeof candidate.data !== 'string'
+      ) {
+        return c.json(
+          {
+            ok: false,
+            error: { code: 'INVALID_IMAGE', message: 'image must be a supported base64 image' },
+          },
+          400,
+        );
+      }
+      if (candidate.data.length > PLAYGROUND_IMAGE_MAX_BASE64_CHARACTERS) {
+        return c.json(
+          { ok: false, error: { code: 'IMAGE_TOO_LARGE', message: 'image must be at most 5 MiB' } },
+          400,
+        );
+      }
+      const bytes = base64ByteLength(candidate.data);
+      if (bytes === undefined) {
+        return c.json(
+          {
+            ok: false,
+            error: { code: 'INVALID_IMAGE', message: 'image data must be valid base64' },
+          },
+          400,
+        );
+      }
+      if (bytes > PLAYGROUND_IMAGE_MAX_BYTES) {
+        return c.json(
+          {
+            ok: false,
+            error: {
+              code: 'IMAGE_TOO_LARGE',
+              message: `image must be at most ${PLAYGROUND_IMAGE_MAX_BYTES / 1024 / 1024} MiB`,
+            },
+          },
+          400,
+        );
+      }
+      if (!hasMatchingImageSignature(candidate.mediaType, candidate.data)) {
+        return c.json(
+          {
+            ok: false,
+            error: { code: 'INVALID_IMAGE', message: 'image data does not match its media type' },
+          },
+          400,
+        );
+      }
+      image = { mediaType: candidate.mediaType, data: candidate.data };
     }
 
     const agents = runtime.getAgents();
@@ -66,9 +198,10 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
     const sessionId = body.sessionId ?? `playground-${Date.now()}`;
     const store = runtime.getStateStore();
 
-    // Load session history for multi-turn conversations
+    // The current user turn belongs to the ask, not its inherited history.
+    // Keep a separate text-only snapshot for persistence after the run.
     const history = await store.getSession(sessionId);
-    history.push({ role: 'user', content: body.message });
+    const persistedHistory = [...history, { role: 'user' as const, content: message }];
 
     const redactOn = runtime.isRedactEnabled();
 
@@ -90,7 +223,11 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
     // handoff, pipeline, etc. — not just tokens.
     const traceListener = (event: AxlEvent) => {
       if (event.executionId !== executionId) return;
-      connMgr.broadcastWithWildcard(`execution:${executionId}`, redactStreamEvent(event, redactOn));
+      const safeEvent = image ? sanitizeRichInputFailure(event) : event;
+      connMgr.broadcastWithWildcard(
+        `execution:${executionId}`,
+        redactStreamEvent(safeEvent, redactOn),
+      );
     };
     runtime.on('trace', traceListener);
 
@@ -110,11 +247,22 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
         // string_delta — exercising the typewriter UX in the chat
         // bubble. Without a match, the ask is plain free-text.
         const schema = DEMO_SCHEMA_BY_AGENT[agent._name];
-        const result = await ctx.ask(agent, body.message, schema ? { schema } : undefined);
+        // Images are single-run evidence: they enter only this ask and are never
+        // appended to `history` or written to the session store.
+        const input: ModelInput = image
+          ? [
+              { type: 'text', text: message },
+              {
+                type: 'image',
+                source: { type: 'base64', data: image.data, mediaType: image.mediaType },
+              },
+            ]
+          : message;
+        const result = await ctx.ask(agent, input, schema ? { schema } : undefined);
         const resultText = typeof result === 'string' ? result : JSON.stringify(result);
 
-        history.push({ role: 'assistant', content: resultText });
-        await store.saveSession(sessionId, history);
+        persistedHistory.push({ role: 'assistant', content: resultText });
+        await store.saveSession(sessionId, persistedHistory);
 
         const doneEvent: AxlEvent = {
           ...terminalFields(),
@@ -129,7 +277,15 @@ export function createPlaygroundRoutes(connMgr: ConnectionManager) {
         const errorEvent: AxlEvent = {
           ...terminalFields(),
           type: 'error',
-          data: { message: err instanceof Error ? err.message : String(err) },
+          // Media payloads can make providers echo user-controlled content in
+          // errors. The manual terminal event is deliberately fixed and safe.
+          data: {
+            message: image
+              ? 'Playground media input failed'
+              : err instanceof Error
+                ? err.message
+                : String(err),
+          },
         };
         connMgr.broadcastWithWildcard(
           `execution:${executionId}`,

@@ -16,7 +16,25 @@ function safeParseJson(str: string): unknown {
   }
 }
 
-function renderContent(content: string, role: string) {
+function renderContent(content: ChatMessage['content'], role: string) {
+  if (typeof content !== 'string') {
+    return (
+      <div className="space-y-1 text-xs text-[hsl(var(--muted-foreground))]">
+        <div>Rich model input</div>
+        {content.parts.map((part, index) =>
+          part.type === 'text' ? (
+            <div key={index}>Text: {part.characters} characters</div>
+          ) : (
+            <div key={index}>
+              Image: {part.source}
+              {part.mediaType ? ` (${part.mediaType})` : ''}
+              {part.bytes !== undefined ? `, ${part.bytes} bytes` : ''}
+            </div>
+          ),
+        )}
+      </div>
+    );
+  }
   if (role === 'assistant') {
     const trimmed = content.trim();
     if (trimmed.startsWith('{') || trimmed.startsWith('[')) {

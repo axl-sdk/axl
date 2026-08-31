@@ -419,6 +419,20 @@ function AskStartBody({ event }: { event: HistoricalAxlEvent }) {
       ) : (
         <p className="text-xs text-[hsl(var(--muted-foreground))]">(no prompt)</p>
       )}
+      {event.input && (
+        <div className="mt-2 text-xs text-[hsl(var(--muted-foreground))]">
+          <strong>Model input:</strong>{' '}
+          {event.input.parts
+            .map((part) =>
+              part.type === 'text'
+                ? `text (${part.characters} characters)`
+                : `image (${part.source}${part.mediaType ? `, ${part.mediaType}` : ''}${
+                    part.bytes !== undefined ? `, ${part.bytes} bytes` : ''
+                  })`,
+            )
+            .join(', ')}
+        </div>
+      )}
     </>
   );
 }

@@ -195,7 +195,6 @@ export function createServer(options: CreateServerOptions) {
     // sees it in logs but the runtime keeps going.
     try {
       const traceEvent = event as AxlEvent;
-
       // Broadcast to trace channels — apply the same scrubbing as the
       // playground/workflow execution paths so the trace firehose doesn't
       // leak content the per-route broadcasts are scrubbing.

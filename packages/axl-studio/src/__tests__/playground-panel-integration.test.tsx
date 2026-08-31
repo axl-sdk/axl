@@ -55,8 +55,10 @@ vi.mock('../client/lib/api', async () => {
     schemaVersion: 2,
     ...actual,
     fetchAgents: () => fetchAgentsMock(),
-    playgroundChat: (msg: string, sid?: string, agent?: string) =>
-      playgroundChatMock(msg, sid, agent),
+    playgroundChat: (msg: string, sid?: string, agent?: string, image?: unknown) =>
+      image === undefined
+        ? playgroundChatMock(msg, sid, agent)
+        : playgroundChatMock(msg, sid, agent, image),
   };
 });
 
@@ -64,6 +66,8 @@ vi.mock('../client/lib/api', async () => {
 // auto-scroll on every message append).
 beforeEach(() => {
   (Element.prototype as any).scrollIntoView = vi.fn();
+  URL.createObjectURL = vi.fn(() => 'blob:image-preview');
+  URL.revokeObjectURL = vi.fn();
 });
 
 afterEach(() => {
@@ -161,6 +165,105 @@ describe('PlaygroundPanel integration', () => {
     expect(screen.getByText('Hi there')).toBeInTheDocument();
     // The user message bubble is also visible.
     expect(screen.getByText('hello')).toBeInTheDocument();
+  });
+
+  it('previews, sends once, and discards a local image attachment', async () => {
+    renderWithQuery(<PlaygroundPanel />);
+    const file = new File([new Uint8Array([1, 2, 3])], 'receipt.png', { type: 'image/png' });
+    const picker = screen.getByLabelText('Choose image');
+    await act(async () => {
+      fireEvent.change(picker, { target: { files: [file] } });
+    });
+    await waitFor(() => expect(screen.getByAltText('Selected image preview')).toBeInTheDocument());
+    const invalid = new File(['not an image'], 'notes.txt', { type: 'text/plain' });
+    fireEvent.change(picker, { target: { files: [invalid] } });
+    expect(screen.queryByAltText('Selected image preview')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Choose a PNG, JPEG, WebP, or GIF image.');
+    await act(async () => {
+      fireEvent.change(picker, { target: { files: [file] } });
+    });
+    await waitFor(() => expect(screen.getByAltText('Selected image preview')).toBeInTheDocument());
+    fireEvent.click(screen.getByLabelText('Remove selected image'));
+    expect(screen.queryByAltText('Selected image preview')).not.toBeInTheDocument();
+    await act(async () => {
+      fireEvent.change(picker, { target: { files: [file] } });
+    });
+    await waitFor(() => expect(screen.getByAltText('Selected image preview')).toBeInTheDocument());
+
+    const textarea = screen.getByPlaceholderText('Type a message...');
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: 'look at this' } });
+    });
+    await waitFor(() => expect(textarea).toHaveValue('look at this'));
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false });
+    });
+    await waitFor(() =>
+      expect(playgroundChatMock).toHaveBeenCalledWith('look at this', undefined, undefined, {
+        mediaType: 'image/png',
+        data: 'AQID',
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByAltText('Selected image preview')).not.toBeInTheDocument(),
+    );
+  });
+
+  it('clears a selected image and image error when starting a new chat', async () => {
+    renderWithQuery(<PlaygroundPanel />);
+    const picker = screen.getByLabelText('Choose image');
+    const file = new File([new Uint8Array([1, 2, 3])], 'receipt.png', { type: 'image/png' });
+    await act(async () => {
+      fireEvent.change(picker, { target: { files: [file] } });
+    });
+    await waitFor(() => expect(screen.getByAltText('Selected image preview')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('New chat'));
+    expect(screen.queryByAltText('Selected image preview')).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('ignores an out-of-order FileReader completion after replacement', async () => {
+    const OriginalFileReader = globalThis.FileReader;
+    class DeferredReader {
+      static instances: DeferredReader[] = [];
+      result: string | ArrayBuffer | null = null;
+      onload: ((event: ProgressEvent<FileReader>) => unknown) | null = null;
+      onerror: ((event: ProgressEvent<FileReader>) => unknown) | null = null;
+      abort = vi.fn();
+      readAsDataURL() {
+        DeferredReader.instances.push(this);
+      }
+    }
+    globalThis.FileReader = DeferredReader as unknown as typeof FileReader;
+    try {
+      renderWithQuery(<PlaygroundPanel />);
+      const picker = screen.getByLabelText('Choose image');
+      const first = new File(['one'], 'one.png', { type: 'image/png' });
+      const second = new File(['two'], 'two.png', { type: 'image/png' });
+      await act(async () => {
+        fireEvent.change(picker, { target: { files: [first] } });
+        fireEvent.change(picker, { target: { files: [second] } });
+      });
+      expect(DeferredReader.instances).toHaveLength(2);
+      DeferredReader.instances[0]!.result = 'data:image/png;base64,iVBORw0KGgo=';
+      await act(async () => {
+        DeferredReader.instances[0]!.onload?.(
+          new ProgressEvent('load') as ProgressEvent<FileReader>,
+        );
+      });
+      expect(screen.queryByAltText('Selected image preview')).not.toBeInTheDocument();
+      DeferredReader.instances[1]!.result = 'data:image/png;base64,iVBORw0KGgo=';
+      await act(async () => {
+        DeferredReader.instances[1]!.onload?.(
+          new ProgressEvent('load') as ProgressEvent<FileReader>,
+        );
+      });
+      await waitFor(() =>
+        expect(screen.getByAltText('Selected image preview')).toBeInTheDocument(),
+      );
+    } finally {
+      globalThis.FileReader = OriginalFileReader;
+    }
   });
 
   it('renders tool_call_start args and tool_call_end result rows', async () => {

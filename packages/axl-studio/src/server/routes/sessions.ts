@@ -1,7 +1,33 @@
 import { Hono } from 'hono';
+import type { ChatMessage, ModelInputDescriptor } from '@axlsdk/axl';
 import type { StudioEnv, SessionSummary } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import { redactSessionHistory, redactStreamEvent, redactValue } from '../redact.js';
+
+function describeStudioInput(content: ChatMessage['content']): ModelInputDescriptor | undefined {
+  if (typeof content === 'string') return undefined;
+  return {
+    parts: content.map((part) => {
+      if (part.type === 'text') return { type: 'text' as const, characters: part.text.length };
+      const { source } = part;
+      const bytes =
+        source.type === 'bytes'
+          ? source.data.byteLength
+          : source.type === 'base64'
+            ? Math.floor((source.data.length * 3) / 4) -
+              (source.data.endsWith('==') ? 2 : source.data.endsWith('=') ? 1 : 0)
+            : undefined;
+      return {
+        type: 'image' as const,
+        source: source.type,
+        ...(source.mediaType ? { mediaType: source.mediaType } : {}),
+        ...(bytes !== undefined ? { bytes } : {}),
+        // URLs, provider-file references, and labels are intentionally not
+        // included: this is a Studio-safe descriptor, not a replay payload.
+      };
+    }),
+  };
+}
 
 export function createSessionRoutes(connMgr: ConnectionManager) {
   const app = new Hono<StudioEnv>();
@@ -31,11 +57,23 @@ export function createSessionRoutes(connMgr: ConnectionManager) {
     const id = c.req.param('id');
     const history = await store.getSession(id);
     const handoffHistory = await store.getSessionMeta(id, 'handoffHistory');
+    // Rich programmatic history may contain base64, URLs, or provider file
+    // references. Studio is an observation boundary, so expose only the
+    // core's bounded descriptor — never attachment data or locators.
+    const redact = runtime.isRedactEnabled();
+    const studioHistory = history.map((message) => {
+      const input = describeStudioInput(message.content);
+      // Project rich values before redaction. The descriptor contains only
+      // structural/count data, so redact mode preserves it for diagnosis
+      // while never exposing text, labels, locators, or attachment bytes.
+      if (input) return { ...message, content: input };
+      return redact ? redactSessionHistory([message], true)[0]! : message;
+    });
     return c.json({
       ok: true,
       data: {
         id,
-        history: redactSessionHistory(history, runtime.isRedactEnabled()),
+        history: studioHistory,
         // HandoffRecord has no content fields (source/target/mode/
         // timestamp/duration) — nothing to scrub.
         handoffHistory: handoffHistory ?? [],

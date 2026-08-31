@@ -19,6 +19,7 @@ import type {
   WorkflowStatsResponse,
   TraceStatsData,
 } from './types';
+import type { PlaygroundImageAttachment } from '../../playground-image';
 
 const BASE = (window.__AXL_STUDIO_BASE__ ?? '') + '/api';
 
@@ -34,6 +35,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // error envelope, so check status first regardless of content-type and
   // surface a specific, actionable message pointing at the README.
   if (res.status === 413) {
+    const contentType = res.headers.get('content-type') ?? '';
+    if (contentType.includes('application/json')) {
+      const body = (await res.json().catch(() => undefined)) as ApiResponse<unknown> | undefined;
+      if (body && !body.ok) throw new Error(body.error.message);
+    }
     throw new Error(
       `Request body too large (HTTP 413). If you're importing a large eval file ` +
         `through an embedded Studio middleware, raise your host framework's JSON ` +
@@ -244,8 +250,16 @@ export const deleteEvalHistoryEntry = (id: string) =>
   });
 
 // ── Playground ─────────────────────────────────────────────────────
-export const playgroundChat = (message: string, sessionId?: string, agent?: string) =>
+export const playgroundChat = (
+  message: string,
+  sessionId?: string,
+  agent?: string,
+  image?: PlaygroundImageAttachment,
+) =>
   request<{ sessionId: string; executionId: string; streaming: boolean }>('/playground/chat', {
     method: 'POST',
-    body: JSON.stringify({ message, sessionId, agent }),
+    // Preserve the legacy string-only request shape byte-for-byte.
+    body: image
+      ? JSON.stringify({ message, sessionId, agent, image })
+      : JSON.stringify({ message, sessionId, agent }),
   });

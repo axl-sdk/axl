@@ -1,6 +1,14 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Send, ArrowRight, ShieldCheck, MessageSquarePlus, Activity } from 'lucide-react';
+import {
+  Send,
+  ArrowRight,
+  ShieldCheck,
+  MessageSquarePlus,
+  Activity,
+  ImagePlus,
+  X,
+} from 'lucide-react';
 import { eventCostContribution } from '../../lib/event-utils';
 import type { AxlEvent, ToolCallOutcome, ToolCallRejectedData } from '../../lib/types';
 import { PanelHeader } from '../../components/layout/PanelHeader';
@@ -14,6 +22,12 @@ import { ResizableSplit } from '../../components/shared/ResizableSplit';
 import { fetchAgents, playgroundChat } from '../../lib/api';
 import { useWsStream } from '../../hooks/use-ws-stream';
 import { cn, formatCost, formatTokens } from '../../lib/utils';
+import {
+  base64ByteLength,
+  isPlaygroundImageMediaType,
+  PLAYGROUND_IMAGE_MAX_BYTES,
+  type PlaygroundImageAttachment,
+} from '../../../playground-image';
 
 type ToolCallBase = {
   name: string;
@@ -213,6 +227,15 @@ function tryParseJsonObject(text: string): unknown {
 export function PlaygroundPanel() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
+  const [image, setImage] = useState<(PlaygroundImageAttachment & { previewUrl: string }) | null>(
+    null,
+  );
+  const [imageError, setImageError] = useState<string | null>(null);
+  const [isImageLoading, setIsImageLoading] = useState(false);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const imageReaderRef = useRef<FileReader | null>(null);
+  const imageGenerationRef = useRef(0);
+  const previewUrlRef = useRef<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [executionId, setExecutionId] = useState<string | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<string>('');
@@ -509,8 +532,77 @@ export function PlaygroundPanel() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  const clearImage = useCallback((error?: string | null) => {
+    imageGenerationRef.current += 1;
+    imageReaderRef.current?.abort();
+    imageReaderRef.current = null;
+    if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+    previewUrlRef.current = null;
+    setImage(null);
+    setImageError(error ?? null);
+    setIsImageLoading(false);
+    if (imageInputRef.current) imageInputRef.current.value = '';
+  }, []);
+
+  const removeImage = useCallback(() => clearImage(), [clearImage]);
+
+  const handleImageSelection = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      // A replacement invalidates any previous reader/result immediately.
+      clearImage();
+      if (!isPlaygroundImageMediaType(file.type)) {
+        setImageError('Choose a PNG, JPEG, WebP, or GIF image.');
+        return;
+      }
+      const mediaType = file.type;
+      if (file.size > PLAYGROUND_IMAGE_MAX_BYTES) {
+        setImageError('Image must be 5 MiB or smaller.');
+        return;
+      }
+      const reader = new FileReader();
+      const generation = imageGenerationRef.current;
+      imageReaderRef.current = reader;
+      setIsImageLoading(true);
+      reader.onerror = () => {
+        if (generation !== imageGenerationRef.current) return;
+        imageReaderRef.current = null;
+        setIsImageLoading(false);
+        setImageError('Could not read that image.');
+      };
+      reader.onload = () => {
+        if (generation !== imageGenerationRef.current) return;
+        imageReaderRef.current = null;
+        setIsImageLoading(false);
+        const result = typeof reader.result === 'string' ? reader.result : '';
+        const data = result.split(',', 2)[1] ?? '';
+        const bytes = base64ByteLength(data);
+        if (bytes === undefined || bytes > PLAYGROUND_IMAGE_MAX_BYTES) {
+          setImageError('Could not read that image safely.');
+          return;
+        }
+        const previewUrl = URL.createObjectURL(file);
+        previewUrlRef.current = previewUrl;
+        setImage({ mediaType, data, previewUrl });
+        setImageError(null);
+      };
+      reader.readAsDataURL(file);
+    },
+    [clearImage],
+  );
+
+  useEffect(
+    () => () => {
+      imageGenerationRef.current += 1;
+      imageReaderRef.current?.abort();
+      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+    },
+    [],
+  );
+
   const handleSend = useCallback(async () => {
-    if (!input.trim() || isStreaming) return;
+    if (!input.trim() || isStreaming || isImageLoading) return;
 
     const userMessage = input.trim();
     setInput('');
@@ -518,11 +610,14 @@ export function PlaygroundPanel() {
     setIsStreaming(true);
 
     try {
-      const res = await playgroundChat(
-        userMessage,
-        sessionId ?? undefined,
-        selectedAgent || undefined,
-      );
+      const res = image
+        ? await playgroundChat(userMessage, sessionId ?? undefined, selectedAgent || undefined, {
+            mediaType: image.mediaType,
+            data: image.data,
+          })
+        : await playgroundChat(userMessage, sessionId ?? undefined, selectedAgent || undefined);
+      // The browser retains no attachment after the request has been accepted.
+      clearImage();
       setSessionId(res.sessionId);
       setExecutionId(res.executionId);
     } catch (err) {
@@ -535,7 +630,7 @@ export function PlaygroundPanel() {
         },
       ]);
     }
-  }, [input, isStreaming, sessionId, selectedAgent]);
+  }, [input, isStreaming, isImageLoading, sessionId, selectedAgent, image, clearImage]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -745,7 +840,52 @@ export function PlaygroundPanel() {
       </div>
 
       <div className="border-t border-[hsl(var(--border))] p-4 shrink-0">
+        {(image || imageError) && (
+          <div className="max-w-3xl mx-auto mb-2">
+            {image && (
+              <div className="inline-flex items-center gap-2 rounded-lg border border-[hsl(var(--input))] bg-[hsl(var(--secondary))] p-1.5 text-xs text-[hsl(var(--secondary-foreground))]">
+                <img
+                  src={image.previewUrl}
+                  alt="Selected image preview"
+                  className="h-10 w-10 rounded object-cover"
+                />
+                <span>Image attached</span>
+                <button
+                  type="button"
+                  onClick={removeImage}
+                  aria-label="Remove selected image"
+                  className="rounded p-1 hover:bg-[hsl(var(--background))]"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            )}
+            {imageError && (
+              <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-400">
+                {imageError}
+              </p>
+            )}
+          </div>
+        )}
         <div className="flex items-end gap-2 max-w-3xl mx-auto">
+          <input
+            ref={imageInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif"
+            className="hidden"
+            aria-label="Choose image"
+            onChange={handleImageSelection}
+          />
+          <button
+            type="button"
+            onClick={() => imageInputRef.current?.click()}
+            disabled={isStreaming || isImageLoading}
+            aria-label="Attach image"
+            title="Attach PNG, JPEG, WebP, or GIF (max 5 MiB)"
+            className="p-2.5 rounded-xl border border-[hsl(var(--input))] hover:bg-[hsl(var(--secondary))] disabled:opacity-50"
+          >
+            <ImagePlus size={16} />
+          </button>
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -756,7 +896,7 @@ export function PlaygroundPanel() {
           />
           <button
             onClick={handleSend}
-            disabled={!input.trim() || isStreaming}
+            disabled={!input.trim() || isStreaming || isImageLoading}
             className="p-2.5 rounded-xl bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] hover:opacity-90 disabled:opacity-50 transition-opacity"
           >
             <Send size={16} />
@@ -881,6 +1021,7 @@ export function PlaygroundPanel() {
               />
               <button
                 onClick={() => {
+                  clearImage();
                   setMessages([]);
                   setSessionId(null);
                   setExecutionId(null);

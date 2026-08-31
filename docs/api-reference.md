@@ -406,6 +406,31 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 
 ---
 
+### `ctx.transcribe(request)`
+
+Transcribe one finite recorded-audio source through the separate transcription
+registry. This is not an agent invocation: it neither changes session history
+nor makes a chat-provider call or fallback. Pass `Transcript.text` explicitly
+to `ctx.ask()` when a normal text agent should analyze it.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `model` | `string` | Required `provider:model` transcription URI. Built-ins accept exactly `openai-transcription:gpt-transcribe`, `gemini-transcription:gemini-3.5-transcribe`, or `openrouter-transcription:openai/whisper-1`; registered custom adapters define their own models. |
+| `audio` | `RecordedAudioSource` | Required `{ type: 'bytes', data, mediaType }`, `{ type: 'base64', data, mediaType }`, or matching `{ type: 'provider-file', provider, reference, mediaType? }`. No URL, path, stream, or realtime source. |
+| `language` | `string` | Optional provider-supported language hint. |
+| `timestamps` | `'segment' \| 'word'` | Optional; validated against the exact adapter capability. |
+| `diarization` | `boolean` | Optional; validated against the exact adapter capability. |
+| `providerOptions` | `Record<string, unknown>` | Provider-specific escape hatch. Built-ins accept only their documented keys; registered custom adapters define and validate their own options. |
+
+Returns `Promise<Transcript>`. `Transcript` has required `text`; optional
+`detectedLanguages`, timestamped `segments`/`words`, `usage`, `pricingStatus`,
+and opaque `providerMetadata`. Provider-reported cost is canonical. A duration
+or token-bearing response without usable pricing is `unpriced`, never silently
+priced at zero. See [Multimodal model input](./multimodal-input.md) for exact
+capabilities, Gemini temporary-file retention, and source rules.
+
+---
+
 ### `ctx.delegate(agents, prompt, options?)`
 
 Select the best agent from a list of candidates and invoke it. Creates a temporary router agent that uses handoffs to pick the right specialist.
@@ -1338,6 +1363,7 @@ const runtime = new AxlRuntime({
 | `registerTool(...tools)` | Register one or more standalone tools |
 | `registerAgent(...agents)` | Register one or more standalone agents |
 | `registerProvider(name, provider)` | Register a custom provider instance |
+| `registerTranscriptionProvider(name, provider)` | Register a custom dedicated `TranscriptionProvider` for `name:model` URIs. It is never used for chat-provider resolution or fallback. |
 | `registerEval(name, config, executeWorkflow?)` | Register an eval configuration |
 
 ### Execution
@@ -1740,6 +1766,8 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `type` | Mixin | Required variant fields | When emitted |
 |---|---|---|---|
 | `workflow_start` / `workflow_end` | — | `workflow`, `data: WorkflowStartData/WorkflowEndData` | Workflow lifecycle |
+| `transcription_start` | — | `transcriptionId`, `model?`, `data: { provider?, model?, audio: { source, bytes?, mediaType? } }` | Immediately before a dedicated `ctx.transcribe()` operation. `bytes` is present only for a bytes source; raw audio/base64/reference are never emitted. |
+| `transcription_end` | — | `transcriptionId`, `model?`, `duration`, `cost?`, `tokens?`, `data: { status, provider?, model?, audio?, text?, usage?, pricingStatus?, cleanupStatus?, error?, errorCode? }` | Exactly once after transcription completes, fails, or aborts. `text` is present on an unredacted successful event and scrubbed by `trace.redact`; raw audio/base64/reference/provider body are never emitted. |
 | `ask_start` | `AskScoped` | `prompt: string` | Top of every `ctx.ask()` |
 | `ask_end` | `AskScoped` | `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration` | Every `ctx.ask()` exit. Ask-internal failures surface here, NOT via the workflow-level `error` event |
 | `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number`, `data: AgentCallStartData` | Before each LLM call (one per loop turn) |
@@ -1775,7 +1803,7 @@ import { eventCostContribution } from '@axlsdk/axl';
 const total = info.events.reduce((sum, e) => sum + eventCostContribution(e), 0);
 ```
 
-Also exported: `isCostBearingLeaf(event: AxlEvent): boolean` (takes an event, checks its `type` against the leaf set — pass the event, not the type string), `isUnpricedLeaf(event): boolean` (the single source of truth for the unpriced signal — `true` when a cost-bearing leaf did billable work but had no usable cost; drives `ExecutionInfo.unpriced` / `trackExecution().unpriced` / Studio's `unpricedCalls`), `COST_BEARING_LEAF_TYPES` (the canonical `as const` tuple: `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall`), and `isRootLevel(event: AxlEvent): boolean` (true when `depth === 0` or undefined — used for root-only token filtering).
+Also exported: `isCostBearingLeaf(event: AxlEvent): boolean` (takes an event, checks its `type` against the leaf set — pass the event, not the type string), `isUnpricedLeaf(event): boolean` (the single source of truth for the unpriced signal — `true` when a cost-bearing leaf did billable work but had no usable cost; drives `ExecutionInfo.unpriced` / `trackExecution().unpriced` / Studio's `unpricedCalls`), `COST_BEARING_LEAF_TYPES` (the canonical `as const` tuple: `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall`, `transcription_end`), and `isRootLevel(event: AxlEvent): boolean` (true when `depth === 0` or undefined — used for root-only token filtering).
 
 **`parsePartialJson(text: string): unknown`** — tolerant JSON parser used internally for `partial_object` streaming. Recovers from truncated input (unclosed strings/objects/arrays) and is hardened against deeply-nested input via a 256-depth cap (returns `null` on overflow). Exported from `@axlsdk/axl` for consumers building their own progressive-render pipelines that need to share Axl's truncation-recovery and stack-overflow guard rails. Zero dependencies.
 

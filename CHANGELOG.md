@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native OpenAI Responses/Anthropic/Gemini mappings, and one non-blocking
   OpenRouter certification path. See `docs/multimodal-input.md` for exact
   model/source allowlists and attachment lifetime rules.
+- **Completed-file transcription.** `ctx.transcribe()` provides a typed,
+  non-chat operation for finite recording bytes/base64 (plus Gemini-owned file
+  references), with exact OpenAI `gpt-transcribe`, Gemini
+  `gemini-3.5-transcribe`, and OpenRouter `openai/whisper-1` adapters. It emits
+  safe paired lifecycle events, keeps provider-reported pricing honest, and
+  composes explicitly with `ctx.ask()`. See `docs/multimodal-input.md`.
 
 ## [0.21.1] - 2026-08-28
 

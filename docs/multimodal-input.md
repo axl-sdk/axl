@@ -102,13 +102,74 @@ GA Interactions API and are stateless (`store: false`): Axl sends
 application-owned history and does not use `previous_interaction_id`,
 background execution, or a raw transport override.
 
-## Transcription and general audio status
+## Completed-file transcription (B1)
 
-These tables are separate so image input is never mistaken for audio support.
+`ctx.transcribe(request)` is a dedicated completed-recording operation. It does
+not call an agent, alter chat history, fall back to a general multimodal model,
+or turn audio into a hidden `ctx.ask()`. Compose explicitly when analysis is
+wanted: `const transcript = await ctx.transcribe(...); await ctx.ask(agent,
+transcript.text)`. It accepts finite bytes, canonical base64, or the exact
+provider-scoped reference documented below; local paths, URLs, streams, and
+realtime audio are not input types.
+
+```ts
+const transcript = await ctx.transcribe({
+  model: 'openai-transcription:gpt-transcribe',
+  audio: { type: 'bytes', data: recording, mediaType: 'audio/mpeg' },
+  language: 'en',
+});
+const review = await ctx.ask(
+  agent({ model: 'openai-responses:gpt-4o-mini' }),
+  `Summarize and extract action items:\n${transcript.text}`,
+);
+```
+
+`TranscriptionRequest` is `{ model, audio, language?, timestamps?, diarization?,
+providerOptions? }`. `RecordedAudioSource` is a closed `bytes | base64 |
+provider-file` union. `Transcript` always contains `text`, and may contain
+detected languages, timestamped segments/words, provider-reported usage, a
+pricing status, and opaque provider metadata. `timestamps` is `'segment' |
+'word'`; a provider rejects unsupported options locally before dispatch.
+
+| Provider URI | Exact B1 model | Sources | Native options / accounting |
+| --- | --- | --- | --- |
+| `openai-transcription:` | `gpt-transcribe` | Bytes, base64 | `language`; `providerOptions: { prompt?, temperature? }`. Axl sends multipart `/audio/transcriptions`; no provider-file or timestamps/diarization capability is claimed. Usage is only reported when OpenAI returns it. |
+| `gemini-transcription:` | `gemini-3.5-transcribe` | Bytes, base64, `provider-file` scoped to `gemini-transcription` | `language`, word timestamps, diarization with word timestamps; `providerOptions: { mode?: 'verbatim' | 'smart', customVocabulary?: string[] }`. The default is `verbatim`; `customVocabulary` accepts at most 1,000 entries but cannot be combined with timestamps. Smart mode cannot request timestamps or diarization. A provider-file requires its explicit audio `mediaType`. Bytes/base64 use temporary Files upload, readiness polling when needed, stateless Interactions (`store: false`), then best-effort deletion. |
+| `openrouter-transcription:` | `openai/whisper-1` | Bytes, base64 | `language`; `providerOptions: { temperature?, provider? }`. Axl sends JSON to OpenRouter's dedicated STT endpoint. Response `seconds`, token counts, and `cost` are authoritative when present; missing price is surfaced as unpriced rather than zero. |
+
+Gemini uploaded files are a narrow, request-scoped adapter transaction—not a
+public Files client. The adapter attempts deletion after success, failure, or
+caller cancellation and records only its bounded cleanup outcome. If deletion
+cannot complete, Gemini may retain a temporary file for up to 48 hours; do not
+put sensitive data in the fixture unless that residual retention is acceptable.
+If a finalize response is ambiguous and omits a usable file name, Axl cannot
+target a compensating delete; that identifier-less provider-side uncertainty is
+the remaining unavoidable case.
+For reuse, callers own the prior Gemini Files lifecycle and may pass their URI
+as a matching provider-file reference. Axl never lists, downloads, hosts, or
+fetches that reference.
+
+`transcription_start` and paired `transcription_end` are v2-only lifecycle
+events. They never contain inline audio, base64, provider-file references, or
+raw provider bodies. Their descriptor carries a byte count only for a `bytes`
+source; base64/provider-file sources carry no inferred size. With tracing
+unredacted, `transcription_end.data.text` contains transcript text; with
+`trace.redact`, transcript text and user error content are scrubbed while safe
+structural/accounting fields remain. See the authoritative event fields in the
+[API reference](./api-reference.md#axlevent-variants).
+
+Built-in URI prefixes above are exact allowlists. Applications can register a
+custom dedicated adapter with `runtime.registerTranscriptionProvider(name,
+provider)` and use `name:model`; it remains separate from chat-provider
+registration and receives no hidden fallback.
+
+## General audio status
+
+This table is separate so completed-file transcription is never mistaken for
+general audio understanding.
 
 | Surface | Status | Planned providers | Contract |
 | --- | --- | --- | --- |
-| B1 `ctx.transcribe()` | Pending; not shipped in this milestone | OpenAI `gpt-transcribe`, Gemini `gemini-3.5-transcribe`, OpenRouter STT | A distinct finite-recording operation returning a typed transcript; it is not `ctx.ask()` media. |
 | B2 general audio understanding | Deferred | To be certified separately | Audio parts, non-speech reasoning, audio tool continuations, and audio structured output are not accepted now. |
 
 Anthropic transcription, audio fallback through a general chat model, video,
@@ -138,12 +199,32 @@ finding and a second agent to verify it; start with the first native command to
 confirm your key and chosen model. It intentionally makes paid calls and is not
 part of default tests.
 
+## Recorded-call lighthouse
+
+The separately armed transcription rows decode the checked-in eight-second MP3
+fixture in memory. It is an excerpt from the Open Speech Repository Harvard
+sentences recording; see
+[`recorded-call.README.md`](../packages/axl/src/__tests__/fixtures/recorded-call.README.md)
+for attribution and license notice. `L7` proves transcription alone;
+`R7`/`R8`/`R17` separately prove explicit transcription followed by a normal
+text agent for a schema-valid summary and nonempty action-item list. The Gemini
+`L8` requests language, word timestamps, and diarization and requires timed,
+speaker-labelled words on success. `L8V` separately certifies custom
+vocabulary because the live API rejects vocabulary combined with timestamps.
+The Gemini `R8` analysis call uses an ordered text `ModelInput`, proving the
+same stateless Interactions transport used by new rich calls. See
+[Testing](./testing.md#completed-file-transcription-lighthouse) for opt-in
+commands, count caveats, and the kill switch.
+
 ## Provider sources (accessed 2026-08-31)
 
 - [OpenAI Responses image inputs](https://platform.openai.com/docs/guides/images)
 - [Anthropic vision](https://platform.claude.com/docs/en/build-with-claude/vision)
 - [Gemini Interactions overview](https://ai.google.dev/gemini-api/docs/interactions-overview), [migration guide](https://ai.google.dev/gemini-api/docs/migrate-to-interactions), and [image understanding](https://ai.google.dev/gemini-api/docs/image-understanding)
 - [OpenRouter multimodal inputs](https://openrouter.ai/docs/guides/overview/multimodal/overview)
+- [OpenAI speech to text](https://developers.openai.com/api/docs/guides/speech-to-text)
+- [Gemini transcription](https://ai.google.dev/gemini-api/docs/transcribe) and [Files API](https://ai.google.dev/gemini-api/docs/files)
+- [OpenRouter speech-to-text](https://openrouter.ai/docs/guides/overview/multimodal/stt)
 
 Those provider documents establish upstream surfaces, not broader Axl
 allowlists. The table above is the supported Axl contract.

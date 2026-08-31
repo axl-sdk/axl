@@ -136,6 +136,20 @@ does not use `previous_interaction_id`, background execution, or raw transport
 overrides. See [Multimodal model input](./multimodal-input.md) for exact source
 rules and the cross-provider table.
 
+### Completed-file transcription
+
+Transcription has its own registry and URI family; it is never routed through
+chat adapters. The B1 exact mappings are `openai-transcription:gpt-transcribe`
+to OpenAI multipart `/audio/transcriptions`,
+`gemini-transcription:gemini-3.5-transcribe` to Gemini Files plus stateless
+Interactions, and `openrouter-transcription:openai/whisper-1` to OpenRouter's
+JSON `/audio/transcriptions`. Gemini byte/base64 sources create a temporary
+provider file, wait for readiness when necessary, transcribe with `store:
+false`, and attempt deletion in `finally`; callers own any reusable
+provider-file URI. OpenAI and OpenRouter accept inline sources only. See
+[Multimodal model input](./multimodal-input.md#completed-file-transcription-b1)
+for exact source/options/cost semantics and the temporary-file retention risk.
+
 ### Structured output & schema handling on Gemini
 
 Gemini's schema sanitizer (`sanitizeSchemaForGemini`) strips a set of JSON-Schema

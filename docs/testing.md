@@ -390,3 +390,43 @@ expiry bounds retention if cleanup cannot complete. A key without
 `AXL_DISABLE_LIVE_INTEGRATION=1` is an absolute kill switch even when the live
 flag and keys are present. The detailed checklist and pending evidence placeholders live in
 [`docs/verification/multimodal-input-lighthouse-2026-08-31.md`](./verification/multimodal-input-lighthouse-2026-08-31.md).
+
+### Completed-file transcription lighthouse
+
+Transcription uses a separate flag. Provider keys and `AXL_MULTIMODAL_LIVE=1`
+do not arm it; `AXL_DISABLE_LIVE_INTEGRATION=1` remains an absolute kill switch.
+The checked-in base64 fixture is decoded only in memory and is attributed in
+[`recorded-call.README.md`](../packages/axl/src/__tests__/fixtures/recorded-call.README.md).
+
+```bash
+# Run one named operation row at a time.
+AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L7\]'
+AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L8\]'
+AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L8V\]'
+AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L9\]'
+AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L17\]'
+
+# Local, exact negative preflight: zero network requests.
+pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L10\]'
+
+# Product recipe: independently arm the explicit transcription -> text-agent
+# composition. Select only one of R7/R8/R17 at a time.
+AXL_TRANSCRIPTION_LIVE=1 AXL_TRANSCRIPTION_RECIPE_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[R7\]'
+```
+
+L7 and L17 have one logical transcription invocation and one provider request
+on an ordinary successful path. L8 has one logical transcription invocation;
+its ordinary successful transport sequence is Files start + finalize, optional
+readiness reads, one Interactions request, and one delete. It requests English,
+word timestamps, and diarization, then requires word timing and speaker output.
+L8V separately certifies a small verbatim custom vocabulary because the live
+API rejects vocabulary combined with timestamps. L9 adds a test-owned Files
+start/finalize, bounded readiness reads, and delete around one provider-file
+transcription interaction; it never asks Axl to host-fetch the recording.
+The test validates the resumable upload URL for HTTPS, same origin, and absent
+URL credentials before it writes bytes.
+`fetchWithRetry` can retry the inference request, while resumable upload,
+readiness, and cleanup deliberately avoid retries to prevent duplicate files or
+unbounded cleanup. These are request-shape expectations, not spend ceilings:
+an ambiguous transport result can still have been processed upstream. Run named
+rows individually and record outcomes in the dated verification artifact.

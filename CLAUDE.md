@@ -41,9 +41,10 @@ tsup (ESM + CJS + DTS).
 ## Living documentation (always)
 Docs are living. **In the same change that touches code, update the affected docs.** Authority
 order: `docs/api-reference.md` (option types/values/defaults) > other `docs/` guides > package
-READMEs. Also keep `CHANGELOG.md` (`[Unreleased]`), `ROADMAP.md`, and the gitignored
-`.internal/spec/` + `.internal/docs/` current. The subsystem → doc map is in
-`.claude/rules/documentation.md`.
+READMEs. Also keep `CHANGELOG.md` (`[Unreleased]`), `ROADMAP.md`, and the gitignored durable
+specs under `.internal/spec/` current. Time-bounded work belongs under the product- and
+lifecycle-organized `.internal/plans/` convention in `.internal/README.md`. The subsystem →
+doc map is in `.claude/rules/documentation.md`.
 
 ## Commands
 ```bash
@@ -135,8 +136,8 @@ The five orchestration and live-verification workflows are explicit-invoke
 may be selected automatically when Axl-owned runtime model-facing behavior
 changes. Keep this index complete and synchronized with both skill directories.
 
-- `/plan-doc` — create a living journeys-to-architecture plan under
-  `.internal/spec/`.
+- `/plan-doc` — create a living journeys-to-architecture workstream under
+  `.internal/plans/<product-area>/active/` and graduate it after completion.
 - `/tackle-plan` — orchestrate a named plan to completion through delegated
   implementation, testing, independent review, and logical commits.
 - `/session-review` — adversarial white-box review of a concrete net diff.

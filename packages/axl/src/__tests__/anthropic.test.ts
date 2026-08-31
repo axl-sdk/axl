@@ -2477,5 +2477,75 @@ describe('AnthropicProvider', () => {
       }
       expect(chunks.at(-1)).toMatchObject({ type: 'done', cost: undefined });
     });
+
+    it('maps ordered image input blocks and keeps rich text-table cost unpriced', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            content: [{ type: 'text', text: 'ok' }],
+            usage: { input_tokens: 10, output_tokens: 1 },
+          }),
+      });
+      const provider = new AnthropicProvider();
+      const response = await provider.chat(
+        [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image',
+                label: 'receipt',
+                source: { type: 'base64', data: 'AQID', mediaType: 'image/png' },
+              },
+              { type: 'text', text: 'read it' },
+              {
+                type: 'image',
+                source: { type: 'provider-file', provider: 'anthropic', reference: 'file_123' },
+              },
+            ],
+          },
+        ],
+        { model: 'claude-sonnet-4-5' },
+      );
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.messages[0].content).toEqual([
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AQID' } },
+        { type: 'text', text: '[Image: receipt]' },
+        { type: 'text', text: 'read it' },
+        { type: 'image', source: { type: 'file', file_id: 'file_123' } },
+      ]);
+      expect(response.cost).toBeUndefined();
+      expect(() =>
+        provider.validateInput({
+          model: 'claude-sonnet-4-5',
+          input: [
+            {
+              type: 'image',
+              source: { type: 'provider-file', provider: 'google', reference: 'secret' },
+            },
+          ],
+          history: [],
+          stream: false,
+          hasTools: false,
+          responseMode: 'text',
+        }),
+      ).toThrow('provider-file');
+      expect(() =>
+        provider.validateInput({
+          model: 'claude-haiku-4-5',
+          input: [
+            { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+          ],
+          history: [],
+          stream: false,
+          hasTools: false,
+          responseMode: 'text',
+        }),
+      ).toThrow('image input for this model');
+      expect(provider.inputCapabilities('claude-sonnet-4-5')).toEqual({
+        image: { sources: ['url', 'bytes', 'base64', 'provider-file'] },
+      });
+      expect(provider.inputCapabilities('claude-haiku-4-5')).toEqual({});
+    });
   });
 });

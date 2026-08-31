@@ -9,6 +9,7 @@ import type { Workflow, AnyWorkflow } from './workflow.js';
 import type { Tool } from './tool.js';
 import type { Agent } from './agent.js';
 import type { Provider } from './providers/types.js';
+import { summarizeModelInput } from './input.js';
 import { ProviderRegistry } from './providers/registry.js';
 import type { StateStore, PendingDecision, EvalHistoryEntry } from './state/types.js';
 import { MemoryStore } from './state/memory.js';
@@ -2224,7 +2225,7 @@ export class AxlRuntime extends EventEmitter {
         },
         {
           role: 'user',
-          content: messages.map((m) => `${m.role}: ${m.content}`).join('\n'),
+          content: messages.map((m) => `${m.role}: ${summarizeModelInput(m.content)}`).join('\n'),
         },
       ],
       { model, maxTokens: 1024 },

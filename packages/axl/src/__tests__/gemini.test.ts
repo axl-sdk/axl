@@ -222,7 +222,7 @@ describe('GeminiProvider', () => {
 
       const provider = new GeminiProvider();
       const response = await provider.chat([{ role: 'user', content: 'Search' }], {
-        model: 'gemini-3.6-flash',
+        model: 'gemini-3.7-flash',
       });
 
       expect(response.tool_calls).toHaveLength(1);
@@ -304,7 +304,7 @@ describe('GeminiProvider', () => {
 
       const provider = new GeminiProvider();
       const response = await provider.chat([{ role: 'user', content: 'Use both' }], {
-        model: 'gemini-3.6-flash',
+        model: 'gemini-3.7-flash',
       });
 
       expect(response.tool_calls).toHaveLength(2);
@@ -3037,6 +3037,498 @@ describe('GeminiProvider', () => {
       // Both opaque fields preserved
       expect(modelMsg.parts[0].thoughtSignature).toBe('sig-1');
       expect(modelMsg.parts[0].inlineDataSignature).toBe('data-sig-2');
+    });
+
+    it('routes rich images through stateless Interactions with structured output and tool steps', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            status: 'requires_action',
+            steps: [
+              { type: 'thought', summary: [{ type: 'text', text: 'thinking' }] },
+              {
+                type: 'function_call',
+                id: 'call_1',
+                name: 'inspect',
+                arguments: { item: 'receipt' },
+              },
+            ],
+            usage: {
+              total_input_tokens: 12,
+              total_output_tokens: 3,
+              total_tokens: 15,
+              total_thought_tokens: 1,
+            },
+          }),
+      });
+      const provider = new GeminiProvider();
+      const response = await provider.chat(
+        [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'read' },
+              {
+                type: 'image',
+                label: 'receipt',
+                source: { type: 'bytes', data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' },
+              },
+              {
+                type: 'image',
+                source: {
+                  type: 'provider-file',
+                  provider: 'google',
+                  reference: 'files/123',
+                  mediaType: 'image/png',
+                },
+              },
+            ],
+          },
+        ],
+        {
+          model: 'gemini-3.7-flash',
+          tools: [
+            {
+              type: 'function',
+              function: { name: 'inspect', description: 'inspect', parameters: {} },
+            },
+          ],
+          responseFormat: {
+            type: 'json_schema',
+            json_schema: { name: 'result', schema: { type: 'object' } },
+          },
+        },
+      );
+      const [url, opts] = fetchMock.mock.calls[0];
+      expect(url).toContain('/interactions');
+      const body = JSON.parse(opts.body);
+      expect(body).toMatchObject({ model: 'gemini-3.7-flash', store: false, stream: false });
+      expect(body.input[0]).toEqual({
+        type: 'user_input',
+        content: [
+          { type: 'text', text: 'read' },
+          { type: 'image', data: 'AQID', mime_type: 'image/png' },
+          { type: 'text', text: '[Image: receipt]' },
+          { type: 'image', uri: 'files/123', mime_type: 'image/png' },
+        ],
+      });
+      expect(body.response_format).toMatchObject({ type: 'text', mime_type: 'application/json' });
+      expect(response).toMatchObject({
+        thinking_content: 'thinking',
+        tool_calls: [{ id: 'call_1' }],
+        cost: undefined,
+      });
+      expect(response.providerMetadata).toEqual({ geminiInteractionSteps: expect.any(Array) });
+    });
+
+    it('faithfully accumulates rich Interactions stream steps for tool continuation', async () => {
+      const encoder = new TextEncoder();
+      const events = [
+        {
+          event_type: 'step.start',
+          index: 0,
+          step: { type: 'thought', summary: [{ type: 'text', text: 'initial ' }] },
+        },
+        {
+          event_type: 'step.delta',
+          index: 0,
+          delta: { type: 'thought_summary', content: { type: 'text', text: 'thought' } },
+        },
+        {
+          event_type: 'step.delta',
+          index: 0,
+          delta: { type: 'thought_signature', signature: 'sig_123' },
+        },
+        { event_type: 'step.stop', index: 0 },
+        {
+          event_type: 'step.start',
+          index: 1,
+          step: { type: 'function_call', id: 'call_1', name: 'inspect', arguments: {} },
+        },
+        {
+          event_type: 'step.delta',
+          index: 1,
+          delta: { type: 'arguments_delta', arguments: '{"item":' },
+        },
+        {
+          event_type: 'step.delta',
+          index: 1,
+          delta: { type: 'arguments_delta', arguments: '"receipt"}' },
+        },
+        { event_type: 'step.stop', index: 1 },
+        {
+          event_type: 'step.start',
+          index: 2,
+          step: { type: 'model_output', content: [{ type: 'text', text: 'prefix ' }] },
+        },
+        { event_type: 'step.delta', index: 2, delta: { type: 'text', text: 'done' } },
+        { event_type: 'step.stop', index: 2 },
+        {
+          event_type: 'interaction.completed',
+          interaction: {
+            status: 'requires_action',
+            usage: { total_input_tokens: 10, total_output_tokens: 2, total_tokens: 12 },
+          },
+        },
+      ];
+      const fetchMock = mockFetch({
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')),
+            );
+            controller.close();
+          },
+        }),
+      });
+      const chunks: any[] = [];
+      for await (const chunk of new GeminiProvider().stream(
+        [
+          {
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+            ],
+          },
+        ],
+        { model: 'gemini-3.7-flash' },
+      ))
+        chunks.push(chunk);
+      expect(chunks).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: 'tool_call_delta', id: 'call_1', name: 'inspect' }),
+          { type: 'tool_call_delta', id: 'call_1', arguments: '{"item":' },
+          { type: 'tool_call_delta', id: 'call_1', arguments: '"receipt"}' },
+          { type: 'thinking_delta', content: 'initial ' },
+          { type: 'thinking_delta', content: 'thought' },
+          { type: 'text_delta', content: 'prefix ' },
+          { type: 'text_delta', content: 'done' },
+          expect.objectContaining({
+            type: 'done',
+            usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+          }),
+        ]),
+      );
+      expect(chunks).not.toContainEqual(
+        expect.objectContaining({ type: 'tool_call_delta', arguments: '{}' }),
+      );
+      const done = chunks.find((chunk) => chunk.type === 'done');
+      expect(done.providerMetadata.geminiInteractionSteps).toEqual([
+        {
+          type: 'thought',
+          summary: [{ type: 'text', text: 'initial thought' }],
+          signature: 'sig_123',
+        },
+        { type: 'function_call', id: 'call_1', name: 'inspect', arguments: { item: 'receipt' } },
+        { type: 'model_output', content: [{ type: 'text', text: 'prefix done' }] },
+      ]);
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({
+        stream: true,
+        store: false,
+      });
+      const continuationFetch = mockFetch({
+        json: () => Promise.resolve({ status: 'completed', steps: [] }),
+      });
+      await new GeminiProvider().chat(
+        [
+          {
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+            ],
+          },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'call_1',
+                type: 'function',
+                function: { name: 'inspect', arguments: '{"item":"receipt"}' },
+              },
+            ],
+            providerMetadata: done.providerMetadata,
+          },
+          { role: 'tool', tool_call_id: 'call_1', content: '{"ok":true}' },
+        ],
+        { model: 'gemini-3.7-flash' },
+      );
+      expect(JSON.parse(continuationFetch.mock.calls[0][1].body).input).toEqual([
+        { type: 'user_input', content: [{ type: 'image', uri: 'https://example.test/image.png' }] },
+        ...done.providerMetadata.geminiInteractionSteps,
+        {
+          type: 'function_result',
+          call_id: 'call_1',
+          result: [{ type: 'text', text: '{"ok":true}' }],
+        },
+      ]);
+    });
+
+    it.each([
+      ['auto', 'auto'],
+      ['none', 'none'],
+      ['required', 'any'],
+    ] as const)(
+      'places %s toolChoice in Interactions generation_config',
+      async (toolChoice, expected) => {
+        const fetchMock = mockFetch({
+          json: () => Promise.resolve({ status: 'completed', steps: [] }),
+        });
+        await new GeminiProvider().chat(
+          [
+            {
+              role: 'user',
+              content: [
+                { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+              ],
+            },
+          ],
+          { model: 'gemini-3.7-flash', toolChoice },
+        );
+        expect(JSON.parse(fetchMock.mock.calls[0][1].body).generation_config.tool_choice).toBe(
+          expected,
+        );
+      },
+    );
+
+    it('places a named tool choice in generation_config.allowed_tools', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve({ status: 'completed', steps: [] }),
+      });
+      await new GeminiProvider().chat(
+        [
+          {
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+            ],
+          },
+        ],
+        {
+          model: 'gemini-3.7-flash',
+          toolChoice: { type: 'function', function: { name: 'inspect' } },
+        },
+      );
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body).generation_config.tool_choice).toEqual({
+        allowed_tools: { mode: 'any', tools: ['inspect'] },
+      });
+    });
+
+    it('does not map portable temperature to rich Interactions generation_config', async () => {
+      const richFetch = mockFetch({
+        json: () => Promise.resolve({ status: 'completed', steps: [] }),
+      });
+      await new GeminiProvider().chat(
+        [
+          {
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+            ],
+          },
+        ],
+        {
+          model: 'gemini-3.7-flash',
+          temperature: 0.2,
+          providerOptions: { generation_config: { temperature: 0.8 } },
+        },
+      );
+      expect(
+        JSON.parse(richFetch.mock.calls[0][1].body).generation_config?.temperature,
+      ).toBeUndefined();
+
+      const textFetch = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('ok')) });
+      await new GeminiProvider().chat([{ role: 'user', content: 'text remains legacy' }], {
+        model: 'gemini-2.5-flash',
+        temperature: 0.2,
+      });
+      expect(JSON.parse(textFetch.mock.calls[0][1].body).generationConfig.temperature).toBe(0.2);
+    });
+
+    it.each([
+      ['stream', true],
+      ['store', true],
+      ['background', true],
+      ['previous_interaction_id', 'interaction_123'],
+    ])('rejects rich providerOptions.%s before unary or stream fetch', async (key, value) => {
+      const provider = new GeminiProvider();
+      const input = [
+        {
+          role: 'user' as const,
+          content: [
+            {
+              type: 'image' as const,
+              source: { type: 'url' as const, url: 'https://example.test/image.png' },
+            },
+          ],
+        },
+      ];
+      const options = { model: 'gemini-3.7-flash', providerOptions: { [key]: value } };
+      const unaryFetch = mockFetch({
+        json: () => Promise.resolve({ status: 'completed', steps: [] }),
+      });
+      await expect(provider.chat(input, options)).rejects.toThrow(`raw ${key} providerOptions`);
+      expect(unaryFetch).not.toHaveBeenCalled();
+
+      const streamFetch = mockFetch({ body: new ReadableStream() });
+      await expect(
+        (async () => {
+          for await (const chunk of provider.stream(input, options)) void chunk;
+        })(),
+      ).rejects.toThrow(`raw ${key} providerOptions`);
+      expect(streamFetch).not.toHaveBeenCalled();
+    });
+
+    it.each(['failed', 'cancelled', 'incomplete', 'in_progress'])(
+      'rejects non-success Interactions unary status %s without echoing response body',
+      async (status) => {
+        mockFetch({ json: () => Promise.resolve({ status, steps: [], secret: 'do not echo' }) });
+        await expect(
+          new GeminiProvider().chat(
+            [
+              {
+                role: 'user',
+                content: [
+                  { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+                ],
+              },
+            ],
+            { model: 'gemini-3.7-flash' },
+          ),
+        ).rejects.toMatchObject({
+          name: 'ProviderError',
+          provider: 'google',
+          status: 0,
+          body: undefined,
+        });
+      },
+    );
+
+    it.each(['failed', 'cancelled', 'incomplete', 'in_progress'])(
+      'rejects non-success Interactions stream status %s',
+      async (status) => {
+        const encoder = new TextEncoder();
+        mockFetch({
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ event_type: 'interaction.completed', interaction: { status, secret: 'do not echo' } })}\n\n`,
+                ),
+              );
+              controller.close();
+            },
+          }),
+        });
+        await expect(
+          (async () => {
+            for await (const chunk of new GeminiProvider().stream(
+              [
+                {
+                  role: 'user',
+                  content: [
+                    {
+                      type: 'image',
+                      source: { type: 'url', url: 'https://example.test/image.png' },
+                    },
+                  ],
+                },
+              ],
+              { model: 'gemini-3.7-flash' },
+            ))
+              void chunk;
+          })(),
+        ).rejects.toMatchObject({
+          name: 'ProviderError',
+          provider: 'google',
+          status: 0,
+          body: undefined,
+        });
+      },
+    );
+
+    it('accepts completed and tool-bearing requires_action Interactions terminals', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            status: 'requires_action',
+            steps: [{ type: 'function_call', id: 'call_1', name: 'inspect', arguments: {} }],
+          }),
+      });
+      await expect(
+        new GeminiProvider().chat(
+          [
+            {
+              role: 'user',
+              content: [
+                { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+              ],
+            },
+          ],
+          { model: 'gemini-3.7-flash' },
+        ),
+      ).resolves.toMatchObject({ tool_calls: [{ id: 'call_1' }] });
+    });
+
+    it('treats an Interactions stream EOF before completion as an error', async () => {
+      const encoder = new TextEncoder();
+      mockFetch({
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(
+                'data: {"event_type":"step.start","index":0,"step":{"type":"model_output"}}\n\n',
+              ),
+            );
+            controller.enqueue(encoder.encode('data: {"event_type":"step.stop","index":0}\n\n'));
+            controller.close();
+          },
+        }),
+      });
+      const provider = new GeminiProvider();
+      await expect(
+        (async () => {
+          for await (const chunk of provider.stream(
+            [
+              {
+                role: 'user',
+                content: [
+                  { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+                ],
+              },
+            ],
+            { model: 'gemini-3.7-flash' },
+          ))
+            void chunk;
+        })(),
+      ).rejects.toThrow('ended before interaction.completed');
+    });
+
+    it('fails closed before fetch for non-Interactions and unknown image model siblings', () => {
+      const provider = new GeminiProvider();
+      const request = (model: string) => ({
+        model,
+        input: [
+          {
+            type: 'image' as const,
+            source: { type: 'url' as const, url: 'https://example.test/image.png' },
+          },
+        ],
+        history: [],
+        stream: false,
+        hasTools: false,
+        responseMode: 'text' as const,
+      });
+      expect(() => provider.validateInput(request('gemini-2.0-flash'))).toThrow(
+        'image input for this model',
+      );
+      expect(() => provider.validateInput(request('gemini-3.7-flash-preview'))).toThrow(
+        'image input for this model',
+      );
+      expect(provider.inputCapabilities('gemini-3.7-flash')).toEqual({
+        image: { sources: ['url', 'bytes', 'base64', 'provider-file'] },
+      });
+      expect(provider.inputCapabilities('gemini-2.0-flash')).toEqual({});
     });
   });
 });

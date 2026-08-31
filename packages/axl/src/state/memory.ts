@@ -9,6 +9,7 @@ import type {
 } from '../types.js';
 import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } from './types.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
+import { normalizePersistedSessionHistory } from '../input.js';
 
 /**
  * Path to the MemoryStore temp file for awaitHuman state.
@@ -69,7 +70,7 @@ export class MemoryStore implements StateStore {
   }
 
   async saveSession(sessionId: string, history: ChatMessage[]): Promise<void> {
-    this.sessions.set(sessionId, structuredClone(history));
+    this.sessions.set(sessionId, structuredClone(normalizePersistedSessionHistory(history)));
   }
 
   async getSession(sessionId: string): Promise<ChatMessage[]> {

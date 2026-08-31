@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import type { InputContentPart, ModelInput, ModelInputDescriptor } from './input.js';
 import type { Effort, ToolChoice } from './providers/types.js';
 
 /** Result type for concurrent operations (spawn, map) */
@@ -156,6 +157,8 @@ export type DelegateOptions<T = unknown> = {
   nativeStructuredOutput?: boolean;
   /** Model URI for the internal router agent (default: first candidate's model). */
   routerModel?: string;
+  /** Route using the full evidence (default) or only its ordered text projection. */
+  routerInput?: 'full' | 'text';
   /** Additional metadata passed to the router and selected agent. */
   metadata?: Record<string, unknown>;
   /** Number of retries for structured output validation (passed to the final ask). */
@@ -279,6 +282,8 @@ export type AgentCallParams = {
 export type AgentCallStartData = {
   /** Original user prompt passed to `ctx.ask()`. Does not include retry feedback or tool results. */
   prompt: string;
+  /** Bounded rich-input shape; omitted for legacy string calls. */
+  input?: ModelInputDescriptor;
   /** Resolved system prompt (after evaluating dynamic system selectors). */
   system?: string;
   /** Resolved model parameters sent to the provider for this call. */
@@ -291,6 +296,9 @@ export type AgentCallStartData = {
   toolNames?: string[];
   /** Full ChatMessage[] sent to the provider this turn. Only populated when `trace.level === 'full'`. */
   messages?: ChatMessage[];
+  /** Descriptor-only counterparts for rich messages in a full snapshot. The
+   * matching `messages[index].content` is its text projection, never media. */
+  messageInputs?: readonly { readonly index: number; readonly input: ModelInputDescriptor }[];
 };
 
 /**
@@ -835,7 +843,7 @@ type LegacyAxlEventPayloadV1 =
   | (AxlEventBase & { type: 'workflow_end'; workflow: string; data: WorkflowEndData })
 
   // ── Ask boundary (user-level ctx.ask() call) ────────────────────────────
-  | (AxlEventBase & AskScoped & { type: 'ask_start'; prompt: string })
+  | (AxlEventBase & AskScoped & { type: 'ask_start'; prompt: string; input?: ModelInputDescriptor })
   | (AxlEventBase &
       AskScoped & {
         type: 'ask_end';
@@ -1125,7 +1133,7 @@ export type GuardrailResult = {
 /** Input guardrail function. Runs before the LLM call. */
 export type InputGuardrail = (
   prompt: string,
-  ctx: { metadata: Record<string, unknown> },
+  ctx: { metadata: Record<string, unknown>; input: ModelInput },
 ) => GuardrailResult | Promise<GuardrailResult>;
 
 /** Output guardrail function. Runs after the LLM response. */
@@ -1244,6 +1252,7 @@ export type HandoffRecord = {
 export type AgentCallInfo = {
   agent: string;
   prompt: string;
+  input?: ModelInputDescriptor;
   response: string;
   model: string;
   cost: number;
@@ -1267,7 +1276,7 @@ export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 
 export type ChatMessage = {
   role: ChatRole;
-  content: string;
+  content: string | readonly InputContentPart[];
   name?: string;
   tool_calls?: ToolCallMessage[];
   tool_call_id?: string;

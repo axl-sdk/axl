@@ -5,6 +5,16 @@ export type { Tool, ToolConfig, ToolHooks, ToolModelOutput, RetryPolicy } from '
 export { agent } from './agent.js';
 export type { Agent, AgentConfig, HandoffDescriptor } from './agent.js';
 
+export { inputText } from './input.js';
+export type {
+  ModelInput,
+  InputContentPart,
+  InputTextPart,
+  InputImagePart,
+  InputMediaSource,
+  ModelInputDescriptor,
+} from './input.js';
+
 export { workflow } from './workflow.js';
 export type { Workflow, WorkflowConfig, AnyWorkflow } from './workflow.js';
 
@@ -181,6 +191,8 @@ export {
   ValidationError,
   ToolModelOutputError,
   ToolFailure,
+  InvalidModelInputError,
+  UnsupportedModelInputError,
 } from './errors.js';
 export type { ToolFailureConstructor } from './errors.js';
 export { ProviderError, isRetryableStatus } from './providers/errors.js';
@@ -245,6 +257,9 @@ export type {
   ChatOptions,
   Effort,
   ToolChoice,
+  InputModalitySupport,
+  ProviderInputValidationRequest,
+  ProviderInputValidationResult,
 } from './providers/types.js';
 export {
   resolveThinkingOptions,

@@ -1667,5 +1667,80 @@ describe('OpenAIResponsesProvider', () => {
       });
       expect(chunks).toEqual([]);
     });
+
+    it('maps ordered rich images without changing text-only request content', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11 },
+          }),
+      });
+      const provider = new OpenAIResponsesProvider();
+      await provider.chat(
+        [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image',
+                label: 'first',
+                source: { type: 'bytes', data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' },
+              },
+              { type: 'text', text: 'between' },
+              { type: 'image', source: { type: 'url', url: 'https://example.test/two.png' } },
+              {
+                type: 'image',
+                source: {
+                  type: 'provider-file',
+                  provider: 'openai-responses',
+                  reference: 'file_123',
+                },
+              },
+            ],
+          },
+        ],
+        { model: 'gpt-4o' },
+      );
+      const body = getRequestBody(fetchMock);
+      expect((body.input as any[])[0].content).toEqual([
+        { type: 'input_image', image_url: 'data:image/png;base64,AQID' },
+        { type: 'input_text', text: '[Image: first]' },
+        { type: 'input_text', text: 'between' },
+        { type: 'input_image', image_url: 'https://example.test/two.png' },
+        { type: 'input_image', file_id: 'file_123' },
+      ]);
+      expect(() =>
+        provider.validateInput({
+          model: 'gpt-4o',
+          input: [
+            {
+              type: 'image',
+              source: { type: 'provider-file', provider: 'anthropic', reference: 'secret' },
+            },
+          ],
+          history: [],
+          stream: false,
+          hasTools: false,
+          responseMode: 'text',
+        }),
+      ).toThrow('provider-file');
+      expect(() =>
+        provider.validateInput({
+          model: 'gpt-4.1',
+          input: [
+            { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+          ],
+          history: [],
+          stream: false,
+          hasTools: false,
+          responseMode: 'text',
+        }),
+      ).toThrow('image input for this model');
+      expect(provider.inputCapabilities('gpt-4o')).toEqual({
+        image: { sources: ['url', 'bytes', 'base64', 'provider-file'] },
+      });
+      expect(provider.inputCapabilities('gpt-4.1')).toEqual({});
+    });
   });
 });

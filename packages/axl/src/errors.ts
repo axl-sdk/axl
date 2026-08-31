@@ -12,6 +12,40 @@ export class AxlError extends Error {
   }
 }
 
+/** Thrown when the public logical model-input shape is malformed. */
+export class InvalidModelInputError extends AxlError {
+  constructor(message: string) {
+    super('INVALID_MODEL_INPUT', message);
+    this.name = 'InvalidModelInputError';
+  }
+}
+
+/** Thrown before dispatch when a provider/model cannot accept a rich input. */
+export class UnsupportedModelInputError extends AxlError {
+  readonly provider: string;
+  readonly model: string;
+  readonly modality: string;
+  readonly source?: string;
+
+  constructor(options: {
+    provider: string;
+    model: string;
+    modality: string;
+    source?: string;
+    feature?: string;
+  }) {
+    super(
+      'UNSUPPORTED_MODEL_INPUT',
+      `Provider '${options.provider}' model '${options.model}' does not support ${options.feature ?? options.modality}${options.source ? ` from ${options.source}` : ''}`,
+    );
+    this.name = 'UnsupportedModelInputError';
+    this.provider = options.provider;
+    this.model = options.model;
+    this.modality = options.modality;
+    this.source = options.source;
+  }
+}
+
 /**
  * Strict observation overflow. Kept in the shared error module so every
  * recovery boundary can identify the same non-recoverable control error.

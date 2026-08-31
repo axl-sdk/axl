@@ -35,11 +35,22 @@ import {
   BudgetExceededError,
   GuardrailError,
   ValidationError,
+  InvalidModelInputError,
+  UnsupportedModelInputError,
   EventStreamOverflowError,
   isEventStreamOverflowError,
   preserveErrorCause,
   rethrowEventStreamOverflow,
 } from './errors.js';
+import {
+  cloneModelInput,
+  describeModelInput,
+  inputText,
+  normalizeModelInput,
+  sanitizeModelInputForTrace,
+  summarizeModelInput,
+} from './input.js';
+import type { ModelInput } from './input.js';
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
 import { StreamingWalker } from './streaming-walker.js';
@@ -444,10 +455,16 @@ function appendRetryMessages(
   messages.push({ role: 'system', content: feedbackMessage });
 }
 
-function estimateMessagesTokens(messages: ChatMessage[]): number {
+function estimateMessagesTokens(messages: ChatMessage[]): { tokens: number; unmeasured: boolean } {
   let total = 0;
+  let unmeasured = false;
   for (const msg of messages) {
-    total += estimateTokens(msg.content);
+    // Media has no portable token estimate. Count only its text projection;
+    // placeholders are for summary prompts, never a synthetic media estimate.
+    total += estimateTokens(inputText(msg.content));
+    if (typeof msg.content !== 'string') {
+      unmeasured ||= msg.content.some((part) => part.type === 'image');
+    }
     if (msg.tool_calls) {
       for (const tc of msg.tool_calls) {
         total += estimateTokens(tc.function.name + tc.function.arguments);
@@ -455,7 +472,72 @@ function estimateMessagesTokens(messages: ChatMessage[]): number {
     }
     total += 4; // per-message overhead (role, separators)
   }
-  return total;
+  return { tokens: total, unmeasured };
+}
+
+/** Providers receive a disposable view: a mutating custom adapter cannot alter
+ * the ask-owned evidence retained for retries, tools, or handoffs. */
+function cloneMessagesForProvider(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((message) => ({
+    ...message,
+    content: cloneModelInput(message.content),
+    ...(message.tool_calls
+      ? {
+          tool_calls: message.tool_calls.map((call) => ({
+            ...call,
+            function: { ...call.function },
+          })),
+        }
+      : {}),
+  }));
+}
+
+function assertRichMessagesAreUserOnly(messages: ChatMessage[]): void {
+  for (const message of messages) {
+    if (typeof message.content !== 'string' && message.role !== 'user') {
+      throw new InvalidModelInputError(
+        'Non-text model input parts are only supported on user messages',
+      );
+    }
+  }
+}
+
+/** Validate the application-owned history into an ask-local snapshot. */
+function normalizeSessionHistory(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((message) => {
+    if (typeof message.content === 'string') return { ...message };
+    if (message.role !== 'user') {
+      throw new InvalidModelInputError(
+        'Non-text model input parts are only supported on user messages',
+      );
+    }
+    return { ...message, content: normalizeModelInput(message.content) };
+  });
+}
+
+function hasRichMessage(messages: readonly ChatMessage[]): boolean {
+  return messages.some((message) => typeof message.content !== 'string');
+}
+
+function firstImageSource(
+  input: ModelInput,
+  history: readonly ChatMessage[],
+): 'bytes' | 'base64' | 'url' | 'provider-file' | undefined {
+  const find = (value: ModelInput) =>
+    typeof value === 'string'
+      ? undefined
+      : value.find((part) => part.type === 'image')?.source.type;
+  return find(input) ?? history.map((message) => find(message.content)).find(Boolean);
+}
+
+function appendHandoffInstruction(
+  input: ModelInput,
+  originalText: string,
+  instruction: string,
+): ModelInput {
+  if (typeof input === 'string' || instruction.length === 0 || instruction === originalText)
+    return input;
+  return [...input, { type: 'text', text: instruction }];
 }
 
 /**
@@ -1125,7 +1207,19 @@ export class WorkflowContext<TInput = unknown> {
 
   // ── ctx.ask() ─────────────────────────────────────────────────────────
 
-  async ask<T = string>(agent: Agent, prompt: string, options?: AskOptions<T>): Promise<T> {
+  async ask<T = string>(agent: Agent, prompt: ModelInput, options?: AskOptions<T>): Promise<T> {
+    // Take ownership before any checkpoint/state work can await. Never derive a
+    // descriptor or text projection from raw caller data.
+    const normalizedInput = normalizeModelInput(prompt);
+    const normalizedHistory = normalizeSessionHistory(this.sessionHistory);
+    const delegateInputHolder = agent as Agent & { _delegateOriginalInput?: ModelInput };
+    if (delegateInputHolder._delegateOriginalInput !== undefined) {
+      delegateInputHolder._delegateOriginalInput = normalizeModelInput(
+        delegateInputHolder._delegateOriginalInput,
+      );
+    }
+    const promptText = inputText(normalizedInput);
+    const inputDescriptor = describeModelInput(normalizedInput);
     const agentName = agent._name;
     return this._checkpoint(
       this._autoCheckpointName('ask', agentName),
@@ -1152,7 +1246,11 @@ export class WorkflowContext<TInput = unknown> {
 
         return askStorage.run(frame, async () => {
           const askStart = Date.now();
-          this.emitEvent({ type: 'ask_start', prompt });
+          this.emitEvent({
+            type: 'ask_start',
+            prompt: promptText,
+            ...(inputDescriptor ? { input: inputDescriptor } : {}),
+          });
 
           // `costBefore` snapshots the global budget so we can pass the per-ask
           // cost delta to onAgentCallComplete (legacy callback that reports the
@@ -1175,15 +1273,17 @@ export class WorkflowContext<TInput = unknown> {
               cached_tokens?: number;
               cache_write_tokens?: number;
             };
+            modelUri?: string;
           } = {};
 
           const doCall = async () => {
             const result = await this.executeAgentCall(
               agent,
-              prompt,
+              normalizedInput,
               options as AskOptions<unknown>,
               undefined,
               usageCapture,
+              normalizedHistory,
             );
             return result as T;
           };
@@ -1209,6 +1309,9 @@ export class WorkflowContext<TInput = unknown> {
                   },
                   async (span) => {
                     const r = await doCall();
+                    if (usageCapture.modelUri) {
+                      span.setAttribute('axl.agent.model', usageCapture.modelUri);
+                    }
                     const costAfter = this.budgetContext?.totalCost ?? 0;
                     span.setAttribute('axl.agent.cost', costAfter - costBefore);
                     span.setAttribute('axl.agent.duration', Date.now() - askStart);
@@ -1251,9 +1354,10 @@ export class WorkflowContext<TInput = unknown> {
               try {
                 this.onAgentCallComplete({
                   agent: agent._name,
-                  prompt,
+                  prompt: promptText,
+                  ...(inputDescriptor ? { input: inputDescriptor } : {}),
                   response: typeof result === 'string' ? result : JSON.stringify(result),
-                  model: agent.resolveModel(resolveCtx),
+                  model: usageCapture.modelUri ?? agent.resolveModel(resolveCtx),
                   cost: costAfter - costBefore,
                   unpriced: frame.askUnpriced || unpricedCountAfter > unpricedCountBefore,
                   duration: Date.now() - askStart,
@@ -1321,7 +1425,7 @@ export class WorkflowContext<TInput = unknown> {
 
   private async executeAgentCall(
     agent: Agent,
-    prompt: string,
+    input: ModelInput,
     options?: AskOptions<unknown>,
     handoffMessages?: ChatMessage[],
     usageCapture?: {
@@ -1332,7 +1436,9 @@ export class WorkflowContext<TInput = unknown> {
         cached_tokens?: number;
         cache_write_tokens?: number;
       };
+      modelUri?: string;
     },
+    sessionHistory: ChatMessage[] = normalizeSessionHistory(this.sessionHistory),
   ): Promise<unknown> {
     // Budget check
     if (this.budgetContext?.exceeded) {
@@ -1357,7 +1463,103 @@ export class WorkflowContext<TInput = unknown> {
       : { metadata: this.metadata };
     const modelUri = agent.resolveModel(resolveCtx);
     const systemPrompt = agent.resolveSystem(resolveCtx);
-    const { provider, model } = this.providerRegistry.resolve(modelUri, this.config);
+    const { provider, model: resolvedModel } = this.providerRegistry.resolve(modelUri, this.config);
+    let model = resolvedModel;
+    const prompt = inputText(input);
+    const providerOptions = options?.providerOptions ?? agent._config.providerOptions;
+
+    // Rich calls fail closed before any dynamic handoff resolution, context
+    // summarization, guardrail callback, diagnostics, or provider dispatch.
+    const richRequest = typeof input !== 'string' || hasRichMessage(sessionHistory);
+    if (richRequest) {
+      if (providerOptions && ('messages' in providerOptions || 'input' in providerOptions)) {
+        throw new UnsupportedModelInputError({
+          provider: provider.name ?? modelUri.split(':', 1)[0],
+          model,
+          modality: 'image',
+          feature: 'raw input-container providerOptions',
+        });
+      }
+      const source = firstImageSource(input, sessionHistory);
+      if (!provider.validateInput) {
+        throw new UnsupportedModelInputError({
+          provider: provider.name ?? modelUri.split(':', 1)[0],
+          model,
+          modality: 'image',
+          ...(source ? { source } : {}),
+        });
+      }
+      const validation = provider.validateInput({
+        model,
+        input: cloneModelInput(input),
+        history: cloneMessagesForProvider(sessionHistory),
+        stream: this._streamingEnabled,
+        hasTools: Boolean(
+          agent._config.tools?.length ||
+          agent._config.mcp?.length ||
+          agent._config.mcpTools?.length ||
+          agent._config.handoffs,
+        ),
+        responseMode: options?.schema ? 'structured' : 'text',
+        providerOptions,
+      });
+      if (
+        !validation ||
+        typeof validation.effectiveModel !== 'string' ||
+        validation.effectiveModel.length === 0
+      ) {
+        throw new UnsupportedModelInputError({
+          provider: provider.name ?? modelUri.split(':', 1)[0],
+          model,
+          modality: 'image',
+          ...(source ? { source } : {}),
+        });
+      }
+      model = validation.effectiveModel;
+    }
+
+    // Text calls retain the original URI byte-for-byte. Rich validators may
+    // substitute only the model component while preserving the caller's
+    // provider prefix/style for every observability surface.
+    const effectiveModelUri = !richRequest
+      ? modelUri
+      : `${modelUri.slice(0, modelUri.indexOf(':') + 1)}${model}`;
+    // The root ask owns callback/span attribution. Handoff targets share its
+    // usage capture for cost/token aggregation, but must never replace the
+    // root's effective request URI.
+    if (usageCapture) usageCapture.modelUri ??= effectiveModelUri;
+
+    if (richRequest) {
+      const descriptors = [
+        describeModelInput(input),
+        ...sessionHistory.map((message) => describeModelInput(message.content)),
+      ].filter(
+        (descriptor): descriptor is NonNullable<typeof descriptor> => descriptor !== undefined,
+      );
+      const parts = descriptors.flatMap((descriptor) => descriptor.parts);
+      this.spanManager?.addEventToActiveSpan('axl.model_input', {
+        'axl.input.parts': parts.length,
+        'axl.input.images': parts.filter((part) => part.type === 'image').length,
+        'axl.input.source.bytes': parts.filter(
+          (part) => part.type === 'image' && part.source === 'bytes',
+        ).length,
+        'axl.input.source.base64': parts.filter(
+          (part) => part.type === 'image' && part.source === 'base64',
+        ).length,
+        'axl.input.source.url': parts.filter(
+          (part) => part.type === 'image' && part.source === 'url',
+        ).length,
+        'axl.input.source.provider_file': parts.filter(
+          (part) => part.type === 'image' && part.source === 'provider-file',
+        ).length,
+        'axl.input.inline_bytes': parts.reduce(
+          (sum, part) => sum + (part.type === 'image' ? (part.bytes ?? 0) : 0),
+          0,
+        ),
+      });
+    }
+
+    assertRichMessagesAreUserOnly(sessionHistory);
 
     // Resolve dynamic handoffs once per call to ensure consistency
     // between tool definitions and handoff lookup within the same turn.
@@ -1389,32 +1591,41 @@ export class WorkflowContext<TInput = unknown> {
 
     // Include session history (with context window management)
     const maxContext = agent._config.maxContext;
-    if (maxContext && this.sessionHistory.length > 0) {
+    if (maxContext && sessionHistory.length > 0) {
       const reserveTokens = this.config.contextManagement?.reserveTokens ?? 2000;
       const systemTokens = systemPrompt ? estimateTokens(systemPrompt) : 0;
       const toolTokens = toolDefs.length > 0 ? estimateTokens(JSON.stringify(toolDefs)) : 0;
       const overhead = systemTokens + toolTokens + reserveTokens;
       const availableForHistory = maxContext - overhead;
 
-      const historyTokens = estimateMessagesTokens(this.sessionHistory);
-      if (historyTokens > availableForHistory) {
+      const historyEstimate = estimateMessagesTokens(sessionHistory);
+      if (historyEstimate.unmeasured) {
+        this.emitEvent({
+          type: 'log',
+          data: {
+            warning:
+              'Context media contribution is unmeasured; provider will enforce its context limit',
+          },
+        });
+      }
+      if (historyEstimate.tokens > availableForHistory) {
         // Need to summarize: find the split point
         const summarizedMessages = await this.summarizeHistory(
           provider,
           model,
-          this.sessionHistory,
+          sessionHistory,
           availableForHistory,
         );
         for (const msg of summarizedMessages) {
           messages.push(msg);
         }
       } else {
-        for (const msg of this.sessionHistory) {
+        for (const msg of sessionHistory) {
           messages.push(msg);
         }
       }
     } else {
-      for (const msg of this.sessionHistory) {
+      for (const msg of sessionHistory) {
         messages.push(msg);
       }
     }
@@ -1425,7 +1636,7 @@ export class WorkflowContext<TInput = unknown> {
     // Precedence: AskOptions > AgentConfig > default ('json-schema').
     const schemaPromptMode: SchemaPromptOption =
       options?.schemaPrompt ?? agent._config.schemaPrompt ?? 'json-schema';
-    let userContent = prompt;
+    let userContent: ModelInput = input;
     let appendedSchemaText: string | undefined;
     if (options?.schema) {
       const schema = options.schema as z.ZodType;
@@ -1438,7 +1649,11 @@ export class WorkflowContext<TInput = unknown> {
         // structural schema on the wire, so the Gemini `$ref` cliff does not
         // apply here (it only bites tool-def schemas).
         appendedSchemaText = renderSchemaForPrompt(schema);
-        userContent += `\n\nRespond with valid JSON matching this schema:\n${appendedSchemaText}`;
+        const guidance = `\n\nRespond with valid JSON matching this schema:\n${appendedSchemaText}`;
+        userContent =
+          typeof input === 'string'
+            ? input + guidance
+            : [...input, { type: 'text', text: guidance }];
       } else {
         // Custom rendering: append exactly what the author supplies (string or
         // function of the schema). No wrapper phrasing — they own the guidance.
@@ -1446,7 +1661,11 @@ export class WorkflowContext<TInput = unknown> {
           typeof schemaPromptMode.render === 'function'
             ? schemaPromptMode.render(schema)
             : schemaPromptMode.render;
-        userContent += `\n\n${appendedSchemaText}`;
+        const guidance = `\n\n${appendedSchemaText}`;
+        userContent =
+          typeof input === 'string'
+            ? input + guidance
+            : [...input, { type: 'text', text: guidance }];
       }
     }
 
@@ -1491,7 +1710,10 @@ export class WorkflowContext<TInput = unknown> {
     // -- Input guardrail --
     const guardrails = agent._config.guardrails;
     if (guardrails?.input) {
-      const inputResult = await guardrails.input(prompt, { metadata: this.metadata });
+      const inputResult = await guardrails.input(prompt, {
+        metadata: this.metadata,
+        input: cloneModelInput(input),
+      });
       this.emitEvent({
         type: 'guardrail',
         agent: agent._name,
@@ -1617,7 +1839,7 @@ export class WorkflowContext<TInput = unknown> {
         includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
         toolChoice: options?.toolChoice ?? agent._config.toolChoice,
         stop: options?.stop ?? agent._config.stop,
-        providerOptions: options?.providerOptions ?? agent._config.providerOptions,
+        providerOptions,
         signal: this.currentSignal,
       };
 
@@ -1666,15 +1888,31 @@ export class WorkflowContext<TInput = unknown> {
       // mutations (tool results, retry feedback) don't bleed back into the
       // already-emitted event.
       let messagesSnapshot: ChatMessage[] | undefined;
+      let messageInputs:
+        | Array<{
+            readonly index: number;
+            readonly input: ReturnType<typeof describeModelInput> & {};
+          }>
+        | undefined;
       if (verboseTrace) {
         try {
-          messagesSnapshot = structuredClone(currentMessages);
+          messageInputs = currentMessages.flatMap((message, index) => {
+            const descriptor = describeModelInput(message.content);
+            return descriptor ? [{ index, input: descriptor }] : [];
+          });
+          messagesSnapshot = currentMessages.map((message) => ({
+            ...message,
+            content: sanitizeModelInputForTrace(message.content),
+          }));
         } catch (err) {
           console.warn(
             '[axl] verbose trace messages snapshot failed to clone; emitting shallow copy:',
             err instanceof Error ? err.message : String(err),
           );
-          messagesSnapshot = [...currentMessages];
+          messagesSnapshot = currentMessages.map((message) => ({
+            ...message,
+            content: sanitizeModelInputForTrace(message.content),
+          }));
         }
       }
 
@@ -1686,16 +1924,18 @@ export class WorkflowContext<TInput = unknown> {
       this.emitEvent({
         type: 'agent_call_start',
         agent: agent._name,
-        model: modelUri,
+        model: effectiveModelUri,
         turn: turns,
         data: {
           prompt,
+          ...(typeof input === 'string' ? {} : { input: describeModelInput(input) }),
           ...(systemPrompt ? { system: systemPrompt } : {}),
           params: callParams,
           turn: turns,
           ...(retryReason ? { retryReason } : {}),
           ...(toolDefs.length > 0 ? { toolNames: toolDefs.map((t) => t.function.name) } : {}),
           ...(messagesSnapshot ? { messages: messagesSnapshot } : {}),
+          ...(messageInputs && messageInputs.length > 0 ? { messageInputs } : {}),
         },
       });
 
@@ -1771,7 +2011,10 @@ export class WorkflowContext<TInput = unknown> {
               })
             : undefined;
 
-          for await (const chunk of provider.stream(currentMessages, chatOptions)) {
+          for await (const chunk of provider.stream(
+            cloneMessagesForProvider(currentMessages),
+            chatOptions,
+          )) {
             if (chunk.type === 'text_delta') {
               content += chunk.content;
               // Emit a `token` AxlEvent so wire consumers (AxlStream) and
@@ -1860,7 +2103,7 @@ export class WorkflowContext<TInput = unknown> {
             response.thinking_content = thinkingContent;
           }
         } else {
-          response = await provider.chat(currentMessages, chatOptions);
+          response = await provider.chat(cloneMessagesForProvider(currentMessages), chatOptions);
         }
       } catch (err) {
         // Emit the paired `agent_call_end` before rethrowing. Empty response,
@@ -1869,7 +2112,7 @@ export class WorkflowContext<TInput = unknown> {
         this.emitEvent({
           type: 'agent_call_end',
           agent: agent._name,
-          model: modelUri,
+          model: effectiveModelUri,
           promptVersion: agent._config.version,
           duration: Date.now() - turnStart,
           data: {
@@ -1906,7 +2149,7 @@ export class WorkflowContext<TInput = unknown> {
       this.emitEvent({
         type: 'agent_call_end',
         agent: agent._name,
-        model: modelUri,
+        model: effectiveModelUri,
         promptVersion: agent._config.version,
         cost: response.cost,
         tokens: response.usage
@@ -1951,15 +2194,17 @@ export class WorkflowContext<TInput = unknown> {
             if (descriptor) {
               const mode = descriptor.mode ?? 'oneway';
 
-              // For roundtrip, parse the message parameter from tool call args
+              // Preserve a model-provided handoff instruction for either mode.
+              // Oneway definitions currently have no required parameter, but a
+              // custom/router tool call may still provide a useful message.
               let handoffPrompt = prompt;
-              if (mode === 'roundtrip') {
-                try {
-                  const args = JSON.parse(toolCall.function.arguments);
-                  if (args.message) handoffPrompt = args.message;
-                } catch {
-                  // Fall back to original prompt if args can't be parsed
+              try {
+                const args = JSON.parse(toolCall.function.arguments);
+                if (typeof args.message === 'string' && args.message.length > 0) {
+                  handoffPrompt = args.message;
                 }
+              } catch {
+                // Fall back to original prompt if args can't be parsed.
               }
 
               const handoffStart = Date.now();
@@ -2012,15 +2257,32 @@ export class WorkflowContext<TInput = unknown> {
               // outcome) works uniformly for direct and handoff asks.
               const handoffFn = () =>
                 askStorage.run(targetFrame, async () => {
-                  this.emitEvent({ type: 'ask_start', prompt: handoffPrompt });
+                  const delegateOriginal = (
+                    agent as Agent & { _delegateOriginalInput?: ModelInput }
+                  )._delegateOriginalInput;
+                  const handoffInput =
+                    delegateOriginal ?? (typeof input === 'string' ? handoffPrompt : input);
+                  const enrichedHandoffInput = appendHandoffInstruction(
+                    handoffInput,
+                    inputText(input),
+                    handoffPrompt,
+                  );
+                  this.emitEvent({
+                    type: 'ask_start',
+                    prompt: inputText(enrichedHandoffInput),
+                    ...(typeof enrichedHandoffInput === 'string'
+                      ? {}
+                      : { input: describeModelInput(enrichedHandoffInput) }),
+                  });
                   const targetAskStart = Date.now();
                   try {
                     const result = await this.executeAgentCall(
                       descriptor.agent,
-                      handoffPrompt,
+                      enrichedHandoffInput,
                       handoffOptions,
                       currentMessages,
                       usageCapture,
+                      sessionHistory,
                     );
                     this.emitEvent({
                       type: 'ask_end',
@@ -2679,14 +2941,14 @@ export class WorkflowContext<TInput = unknown> {
         role: 'system',
         content: `Summary of earlier conversation:\n${this.summaryCache}`,
       };
-      const summaryTokens = estimateTokens(summaryMsg.content) + 4;
+      const summaryTokens = estimateTokens(summarizeModelInput(summaryMsg.content)) + 4;
       const remaining = availableTokens - summaryTokens;
 
       // Find how many recent messages fit
       let recentTokens = 0;
       let splitIdx = history.length;
       for (let i = history.length - 1; i >= 0; i--) {
-        const msgTokens = estimateTokens(history[i].content) + 4;
+        const msgTokens = estimateTokens(summarizeModelInput(history[i].content)) + 4;
         if (recentTokens + msgTokens > remaining) break;
         recentTokens += msgTokens;
         splitIdx = i;
@@ -2704,7 +2966,7 @@ export class WorkflowContext<TInput = unknown> {
     const targetRecent = Math.floor(availableTokens * 0.6); // 60% for recent messages
 
     for (let i = history.length - 1; i >= 0; i--) {
-      const msgTokens = estimateTokens(history[i].content) + 4;
+      const msgTokens = estimateTokens(summarizeModelInput(history[i].content)) + 4;
       if (recentTokens + msgTokens > targetRecent) break;
       recentTokens += msgTokens;
       splitIdx = i;
@@ -2729,7 +2991,9 @@ export class WorkflowContext<TInput = unknown> {
       summaryModel = model;
     }
 
-    const oldContent = oldMessages.map((m) => `${m.role}: ${m.content}`).join('\n');
+    const oldContent = oldMessages
+      .map((m) => `${m.role}: ${summarizeModelInput(m.content)}`)
+      .join('\n');
 
     const summaryResponse = await summaryProvider.chat(
       [
@@ -4194,7 +4458,7 @@ export class WorkflowContext<TInput = unknown> {
    */
   async delegate<T = string>(
     agents: Agent[],
-    prompt: string,
+    prompt: ModelInput,
     options?: DelegateOptions<T>,
   ): Promise<T> {
     if (agents.length === 0) {
@@ -4285,7 +4549,10 @@ export class WorkflowContext<TInput = unknown> {
       },
     });
 
-    return this.ask(routerAgent, prompt, {
+    const routerInput = options?.routerInput === 'text' ? inputText(prompt) : prompt;
+    (routerAgent as Agent & { _delegateOriginalInput?: ModelInput })._delegateOriginalInput =
+      prompt;
+    return this.ask(routerAgent, routerInput, {
       schema: options?.schema,
       schemaPrompt: options?.schemaPrompt,
       nativeStructuredOutput: options?.nativeStructuredOutput,

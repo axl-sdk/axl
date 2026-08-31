@@ -11,6 +11,7 @@ import {
   type CapabilityFlags,
 } from '../providers/openai-compatible.js';
 import type { ChatMessage } from '../providers/types.js';
+import { OPENROUTER_PROFILE } from '../providers/profiles/openrouter.js';
 
 // ── fetch mock harness (mirrors openai.test.ts) ───────────────────────────
 
@@ -1210,5 +1211,69 @@ describe('think_tags malformed input', () => {
   it('treats a stray </think> with no opening tag as ordinary text', () => {
     // No <think> ever opened → nothing to close → the literal stays visible.
     expect(extractThinkTags('a</think>b')).toEqual({ content: 'a</think>b', thinking: '' });
+  });
+});
+
+describe('OpenRouter bounded image capability', () => {
+  it('maps only the certified model path and retains response-reported cost', async () => {
+    const fetchMock = mockFetch(
+      okJson({ usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cost: 0.012 } }),
+    );
+    const provider = new OpenAICompatibleProvider({
+      profile: OPENROUTER_PROFILE,
+      apiKey: 'test-key',
+    });
+    const response = await provider.chat(
+      [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image',
+              label: 'receipt',
+              source: { type: 'base64', data: 'AQID', mediaType: 'image/png' },
+            },
+            { type: 'text', text: 'read it' },
+          ],
+        },
+      ],
+      { model: 'openai/gpt-4o-mini' },
+    );
+    expect(lastRequest(fetchMock).body.messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+          { type: 'text', text: '[Image: receipt]' },
+          { type: 'text', text: 'read it' },
+        ],
+      },
+    ]);
+    expect(response.cost).toBe(0.012);
+    expect(() =>
+      provider.validateInput({
+        model: 'openai/gpt-4o-mini',
+        input: [
+          {
+            type: 'image',
+            source: { type: 'provider-file', provider: 'openrouter', reference: 'file' },
+          },
+        ],
+        history: [],
+        stream: false,
+        hasTools: false,
+        responseMode: 'text',
+      }),
+    ).toThrow('provider-file');
+    expect(() =>
+      provider.validateInput({
+        model: 'openai/gpt-4o',
+        input: [{ type: 'image', source: { type: 'url', url: 'https://example.test/a.png' } }],
+        history: [],
+        stream: false,
+        hasTools: false,
+        responseMode: 'text',
+      }),
+    ).toThrow('image input for this model');
   });
 });

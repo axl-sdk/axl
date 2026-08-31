@@ -6,6 +6,7 @@ import type {
   HumanDecision,
 } from '../types.js';
 import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } from './types.js';
+import { normalizePersistedSessionHistory } from '../input.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
 
 // Minimal interface for the node-redis client methods we use.
@@ -585,7 +586,11 @@ export class RedisStore implements StateStore {
     const setOptions = ttl !== undefined ? { EX: ttl } : undefined;
     await this.client
       .multi()
-      .set(this.sessionKey(sessionId), JSON.stringify(history), setOptions)
+      .set(
+        this.sessionKey(sessionId),
+        JSON.stringify(normalizePersistedSessionHistory(history)),
+        setOptions,
+      )
       .sAdd(this.sessionIdsKey(), sessionId)
       .exec();
   }

@@ -5,6 +5,8 @@ import type {
   ProviderResponse,
   StreamChunk,
   Effort,
+  ProviderInputValidationRequest,
+  ProviderInputValidationResult,
 } from './types.js';
 import type { ChatRole } from '../types.js';
 import {
@@ -18,6 +20,50 @@ import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { isBuiltinTablePricingEligible } from './builtin-table-pricing.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
+import type { InputContentPart, InputMediaSource } from '../input.js';
+import { UnsupportedModelInputError } from '../errors.js';
+
+const OPENROUTER_IMAGE_MODEL = 'openai/gpt-4o-mini';
+
+function compatibleImageBase64(
+  source: Extract<InputMediaSource, { type: 'bytes' | 'base64' }>,
+): string {
+  return source.type === 'base64'
+    ? source.data
+    : Buffer.from(source.data.buffer, source.data.byteOffset, source.data.byteLength).toString(
+        'base64',
+      );
+}
+
+function openRouterImageParts(parts: readonly InputContentPart[]): Array<Record<string, unknown>> {
+  const content: Array<Record<string, unknown>> = [];
+  for (const part of parts) {
+    if (part.type === 'text') {
+      content.push({ type: 'text', text: part.text });
+      continue;
+    }
+    const { source } = part;
+    if (source.type === 'provider-file') {
+      throw new UnsupportedModelInputError({
+        provider: 'openrouter',
+        model: OPENROUTER_IMAGE_MODEL,
+        modality: 'image',
+        source: 'provider-file',
+      });
+    }
+    content.push({
+      type: 'image_url',
+      image_url: {
+        url:
+          source.type === 'url'
+            ? source.url
+            : `data:${source.mediaType};base64,${compatibleImageBase64(source)}`,
+      },
+    });
+    if (part.label) content.push({ type: 'text', text: `[Image: ${part.label}]` });
+  }
+  return content;
+}
 
 // ===========================================================================
 // Generic OpenAI-compatible provider engine.
@@ -413,6 +459,53 @@ export type OpenAICompatibleOptions = {
 export class OpenAICompatibleProvider implements Provider {
   readonly name: string;
 
+  inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
+    return this.name === 'openrouter' && model === OPENROUTER_IMAGE_MODEL
+      ? { image: { sources: ['url', 'bytes', 'base64'] } }
+      : {};
+  }
+
+  validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
+    const effectiveModel =
+      typeof request.providerOptions?.model === 'string'
+        ? request.providerOptions.model
+        : request.model;
+    const fail = (source?: string, feature?: string): never => {
+      throw new UnsupportedModelInputError({
+        provider: this.name,
+        model: effectiveModel || request.model,
+        modality: 'image',
+        ...(source ? { source } : {}),
+        ...(feature ? { feature } : {}),
+      });
+    };
+    if (this.name !== 'openrouter' || effectiveModel !== OPENROUTER_IMAGE_MODEL) {
+      fail(undefined, 'image input for this model');
+    }
+    if (request.providerOptions && 'messages' in request.providerOptions) {
+      fail(undefined, 'raw messages providerOptions');
+    }
+    if (request.hasTools) fail(undefined, 'tools with image input');
+    for (const message of request.history) {
+      if (!Array.isArray(message.content)) continue;
+      if (message.role !== 'user') fail(undefined, 'rich non-user history');
+      if (
+        message.content.some(
+          (part) => part.type === 'image' && part.source.type === 'provider-file',
+        )
+      ) {
+        fail('provider-file');
+      }
+    }
+    if (
+      Array.isArray(request.input) &&
+      request.input.some((part) => part.type === 'image' && part.source.type === 'provider-file')
+    ) {
+      fail('provider-file');
+    }
+    return { effectiveModel };
+  }
+
   /** `json_schema` is honored natively when the profile's `supportsJsonSchema`
    *  capability is true for this model (the default); otherwise the engine
    *  downgrades the request to plain `json_object` (see `buildRequestBody`),
@@ -638,7 +731,10 @@ export class OpenAICompatibleProvider implements Provider {
   protected formatMessage(msg: ChatMessage, model: string): Record<string, unknown> {
     const out: Record<string, unknown> = {
       role: this.profile.roleFor ? this.profile.roleFor(msg.role, model) : msg.role,
-      content: msg.content,
+      content:
+        Array.isArray(msg.content) && this.name === 'openrouter' && model === OPENROUTER_IMAGE_MODEL
+          ? openRouterImageParts(msg.content)
+          : msg.content,
     };
     if (msg.name && (this.profile.capabilities?.emitsMessageName ?? true)) out.name = msg.name;
     if (msg.tool_calls) out.tool_calls = msg.tool_calls;

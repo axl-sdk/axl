@@ -2508,6 +2508,7 @@ describe('AnthropicProvider', () => {
         { model: 'claude-sonnet-4-5' },
       );
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(fetchMock.mock.calls[0][1].headers['anthropic-beta']).toBe('files-api-2025-04-14');
       expect(body.messages[0].content).toEqual([
         { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AQID' } },
         { type: 'text', text: '[Image: receipt]' },
@@ -2546,6 +2547,96 @@ describe('AnthropicProvider', () => {
         image: { sources: ['url', 'bytes', 'base64', 'provider-file'] },
       });
       expect(provider.inputCapabilities('claude-haiku-4-5')).toEqual({});
+    });
+
+    it('sets the Files beta header only for provider-file image current/history in chat and stream', async () => {
+      const historyWithFile = [
+        {
+          role: 'user' as const,
+          content: [
+            {
+              type: 'image' as const,
+              source: {
+                type: 'provider-file' as const,
+                provider: 'anthropic',
+                reference: 'file_123',
+              },
+            },
+          ],
+        },
+        {
+          role: 'assistant' as const,
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function' as const,
+              function: { name: 'inspect', arguments: '{}' },
+            },
+          ],
+        },
+        { role: 'tool' as const, tool_call_id: 'call_1', content: '{"ok":true}' },
+      ];
+      const chatFetch = mockFetch({
+        json: () => Promise.resolve({ content: [], usage: { input_tokens: 1, output_tokens: 1 } }),
+      });
+      await new AnthropicProvider().chat(historyWithFile, {
+        model: 'claude-sonnet-4-5',
+        providerOptions: { 'anthropic-beta': 'attempted-override' },
+      });
+      expect(chatFetch.mock.calls[0][1].headers['anthropic-beta']).toBe('files-api-2025-04-14');
+
+      const streamFetch = mockFetch({
+        body: createSSEStream([
+          { type: 'message_start', message: { usage: { input_tokens: 1, output_tokens: 0 } } },
+          { type: 'message_stop' },
+        ]),
+      });
+      for await (const chunk of new AnthropicProvider().stream(historyWithFile, {
+        model: 'claude-sonnet-4-5',
+      })) {
+        // Drain the stream; the header is the assertion seam.
+        void chunk;
+      }
+      expect(streamFetch.mock.calls[0][1].headers['anthropic-beta']).toBe('files-api-2025-04-14');
+
+      const noFileInputs = [
+        [{ role: 'user' as const, content: 'plain text' }],
+        [
+          {
+            role: 'user' as const,
+            content: [
+              {
+                type: 'image' as const,
+                source: { type: 'url' as const, url: 'https://example.test/image.png' },
+              },
+            ],
+          },
+        ],
+        [
+          {
+            role: 'user' as const,
+            content: [
+              {
+                type: 'image' as const,
+                source: {
+                  type: 'bytes' as const,
+                  data: new Uint8Array([1]),
+                  mediaType: 'image/png',
+                },
+              },
+            ],
+          },
+        ],
+      ];
+      for (const messages of noFileInputs) {
+        const noFileFetch = mockFetch({
+          json: () =>
+            Promise.resolve({ content: [], usage: { input_tokens: 1, output_tokens: 1 } }),
+        });
+        await new AnthropicProvider().chat(messages, { model: 'claude-sonnet-4-5' });
+        expect(noFileFetch.mock.calls[0][1].headers['anthropic-beta']).toBeUndefined();
+      }
     });
   });
 });

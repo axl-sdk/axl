@@ -3121,6 +3121,71 @@ describe('GeminiProvider', () => {
       expect(response.providerMetadata).toEqual({ geminiInteractionSteps: expect.any(Array) });
     });
 
+    it('maps rich gemini-3.7-flash effort none to its supported low thinking level', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve({ status: 'completed', steps: [] }),
+      });
+      await new GeminiProvider().chat(
+        [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image',
+                source: {
+                  type: 'url',
+                  url: 'https://example.test/image.png',
+                  mediaType: 'image/png',
+                },
+              },
+            ],
+          },
+        ],
+        { model: 'gemini-3.7-flash', effort: 'none' },
+      );
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.generation_config.thinking_level).toBe('low');
+      expect(body.generation_config.thinking_level).not.toBe('minimal');
+    });
+
+    it.each([
+      ['url', { type: 'url', url: 'https://example.test/private-image.png' }],
+      [
+        'provider-file',
+        { type: 'provider-file', provider: 'google', reference: 'files/private-image' },
+      ],
+    ])(
+      'requires an explicit mediaType for rich Interactions %s URIs before fetch',
+      async (sourceType, source) => {
+        const provider = new GeminiProvider();
+        const input = [{ type: 'image' as const, source }];
+        const request = {
+          model: 'gemini-3.7-flash',
+          input,
+          history: [],
+          stream: false,
+          hasTools: false,
+          responseMode: 'text' as const,
+        };
+        expect(() => provider.validateInput(request as any)).toThrow(
+          'Interactions URI image mediaType',
+        );
+
+        const fetchMock = mockFetch({
+          json: () => Promise.resolve({ status: 'completed', steps: [] }),
+        });
+        await expect(
+          provider.chat([{ role: 'user', content: input }], { model: 'gemini-3.7-flash' }),
+        ).rejects.toMatchObject({
+          name: 'UnsupportedModelInputError',
+          provider: 'google',
+          model: 'gemini-3.7-flash',
+          source: sourceType,
+        });
+        expect(fetchMock).not.toHaveBeenCalled();
+      },
+    );
+
     it('faithfully accumulates rich Interactions stream steps for tool continuation', async () => {
       const encoder = new TextEncoder();
       const events = [
@@ -3187,7 +3252,14 @@ describe('GeminiProvider', () => {
           {
             role: 'user',
             content: [
-              { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+              {
+                type: 'image',
+                source: {
+                  type: 'url',
+                  url: 'https://example.test/image.png',
+                  mediaType: 'image/png',
+                },
+              },
             ],
           },
         ],
@@ -3234,7 +3306,14 @@ describe('GeminiProvider', () => {
           {
             role: 'user',
             content: [
-              { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+              {
+                type: 'image',
+                source: {
+                  type: 'url',
+                  url: 'https://example.test/image.png',
+                  mediaType: 'image/png',
+                },
+              },
             ],
           },
           {
@@ -3254,7 +3333,12 @@ describe('GeminiProvider', () => {
         { model: 'gemini-3.7-flash' },
       );
       expect(JSON.parse(continuationFetch.mock.calls[0][1].body).input).toEqual([
-        { type: 'user_input', content: [{ type: 'image', uri: 'https://example.test/image.png' }] },
+        {
+          type: 'user_input',
+          content: [
+            { type: 'image', uri: 'https://example.test/image.png', mime_type: 'image/png' },
+          ],
+        },
         ...done.providerMetadata.geminiInteractionSteps,
         {
           type: 'function_result',
@@ -3279,7 +3363,14 @@ describe('GeminiProvider', () => {
             {
               role: 'user',
               content: [
-                { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+                {
+                  type: 'image',
+                  source: {
+                    type: 'url',
+                    url: 'https://example.test/image.png',
+                    mediaType: 'image/png',
+                  },
+                },
               ],
             },
           ],
@@ -3300,7 +3391,14 @@ describe('GeminiProvider', () => {
           {
             role: 'user',
             content: [
-              { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+              {
+                type: 'image',
+                source: {
+                  type: 'url',
+                  url: 'https://example.test/image.png',
+                  mediaType: 'image/png',
+                },
+              },
             ],
           },
         ],
@@ -3323,7 +3421,14 @@ describe('GeminiProvider', () => {
           {
             role: 'user',
             content: [
-              { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+              {
+                type: 'image',
+                source: {
+                  type: 'url',
+                  url: 'https://example.test/image.png',
+                  mediaType: 'image/png',
+                },
+              },
             ],
           },
         ],
@@ -3358,7 +3463,11 @@ describe('GeminiProvider', () => {
           content: [
             {
               type: 'image' as const,
-              source: { type: 'url' as const, url: 'https://example.test/image.png' },
+              source: {
+                type: 'url' as const,
+                url: 'https://example.test/image.png',
+                mediaType: 'image/png',
+              },
             },
           ],
         },
@@ -3389,7 +3498,14 @@ describe('GeminiProvider', () => {
               {
                 role: 'user',
                 content: [
-                  { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+                  {
+                    type: 'image',
+                    source: {
+                      type: 'url',
+                      url: 'https://example.test/image.png',
+                      mediaType: 'image/png',
+                    },
+                  },
                 ],
               },
             ],
@@ -3429,7 +3545,11 @@ describe('GeminiProvider', () => {
                   content: [
                     {
                       type: 'image',
-                      source: { type: 'url', url: 'https://example.test/image.png' },
+                      source: {
+                        type: 'url',
+                        url: 'https://example.test/image.png',
+                        mediaType: 'image/png',
+                      },
                     },
                   ],
                 },
@@ -3461,7 +3581,14 @@ describe('GeminiProvider', () => {
             {
               role: 'user',
               content: [
-                { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+                {
+                  type: 'image',
+                  source: {
+                    type: 'url',
+                    url: 'https://example.test/image.png',
+                    mediaType: 'image/png',
+                  },
+                },
               ],
             },
           ],
@@ -3493,7 +3620,14 @@ describe('GeminiProvider', () => {
               {
                 role: 'user',
                 content: [
-                  { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+                  {
+                    type: 'image',
+                    source: {
+                      type: 'url',
+                      url: 'https://example.test/image.png',
+                      mediaType: 'image/png',
+                    },
+                  },
                 ],
               },
             ],
@@ -3511,7 +3645,11 @@ describe('GeminiProvider', () => {
         input: [
           {
             type: 'image' as const,
-            source: { type: 'url' as const, url: 'https://example.test/image.png' },
+            source: {
+              type: 'url' as const,
+              url: 'https://example.test/image.png',
+              mediaType: 'image/png',
+            },
           },
         ],
         history: [],

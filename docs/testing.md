@@ -365,14 +365,17 @@ AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.
 # Non-blocking OpenRouter certification: one additional logical invocation.
 AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L5\]'
 
-# L3 requires an existing Anthropic Files API reference; it makes two logical
-# invocations (the image ask plus one tool continuation) and is deliberately
-# absent unless ANTHROPIC_IMAGE_FILE_ID is supplied.
+# L3 accepts an existing Anthropic Files API reference. It makes two logical
+# invocations (the image ask plus one tool continuation).
 AXL_MULTIMODAL_LIVE=1 ANTHROPIC_IMAGE_FILE_ID=file_... pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L3\]'
+
+# Or explicitly allow the harness to upload the checked-in PNG with a one-hour
+# expiry and delete it in `finally`. This adds one upload and one delete request.
+AXL_MULTIMODAL_LIVE=1 AXL_ANTHROPIC_TEMP_FILE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L3\]'
 ```
 
 The tests use `gpt-4o-mini`, `claude-sonnet-4-5`, `gemini-3.7-flash`, and
-OpenRouter `openai/gpt-4o-mini`, each with a tiny 1×1 PNG and low output token
+OpenRouter `openai/gpt-4o-mini`, each with the checked-in Studio screenshot and low output token
 limit. On a normal successful path, the native blocking rows make five logical
 model invocations, seven with L3 configured, and eight with the optional L5
 OpenRouter row. `fetchWithRetry` permits up to three HTTP attempts per logical
@@ -380,7 +383,9 @@ invocation (the initial request plus two retries for eligible transport,
 `429`, `503`, or `529` failures): the corresponding transport-attempt ceilings
 are 15, 21, and 24. These are not hard paid-call or spend caps—an upstream may
 process a request even when its transport result is failed or ambiguous. Run
-named rows individually when controlling spend. A key without
+named rows individually when controlling spend. The temporary L3 path adds two
+Files API operations outside those model-transport ceilings; its one-hour
+expiry bounds retention if cleanup cannot complete. A key without
 `AXL_MULTIMODAL_LIVE=1` does not run this suite; setting
 `AXL_DISABLE_LIVE_INTEGRATION=1` is an absolute kill switch even when the live
 flag and keys are present. The detailed checklist and pending evidence placeholders live in

@@ -58,8 +58,22 @@ function anthropicImageBlocks(parts: readonly InputContentPart[]): AnthropicCont
 }
 
 const ANTHROPIC_API_VERSION = '2023-06-01';
+const ANTHROPIC_FILES_BETA = 'files-api-2025-04-14';
 
 const ANTHROPIC_IMAGE_MODELS = new Set(['claude-sonnet-4-5', 'claude-opus-4-8']);
+
+function hasAnthropicProviderFileImage(messages: readonly ChatMessage[]): boolean {
+  return messages.some(
+    (message) =>
+      Array.isArray(message.content) &&
+      message.content.some(
+        (part) =>
+          part.type === 'image' &&
+          part.source.type === 'provider-file' &&
+          part.source.provider === 'anthropic',
+      ),
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Exact Anthropic model capabilities and Standard text pricing. Reviewed
@@ -742,7 +756,10 @@ export class AnthropicProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
-    const headers = this.buildHeaders(await this.resolveKey());
+    const headers = this.buildHeaders(
+      await this.resolveKey(),
+      hasAnthropicProviderFileImage(messages),
+    );
     const body = this.buildRequestBody(messages, options, false);
     const pricingContext = pricingContextFromBody(body);
 
@@ -778,7 +795,10 @@ export class AnthropicProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
-    const headers = this.buildHeaders(await this.resolveKey());
+    const headers = this.buildHeaders(
+      await this.resolveKey(),
+      hasAnthropicProviderFileImage(messages),
+    );
     const body = this.buildRequestBody(messages, options, true);
     const pricingContext = pricingContextFromBody(body);
 
@@ -816,11 +836,12 @@ export class AnthropicProvider implements Provider {
   // Internal: request building
   // ---------------------------------------------------------------------------
 
-  private buildHeaders(apiKey: string): Record<string, string> {
+  private buildHeaders(apiKey: string, requiresFilesBeta = false): Record<string, string> {
     return {
       'Content-Type': 'application/json',
       'x-api-key': apiKey,
       'anthropic-version': ANTHROPIC_API_VERSION,
+      ...(requiresFilesBeta ? { 'anthropic-beta': ANTHROPIC_FILES_BETA } : {}),
     };
   }
 

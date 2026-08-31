@@ -33,6 +33,7 @@ function geminiImageBase64(
 
 function geminiInteractionContent(
   parts: readonly InputContentPart[],
+  model: string,
 ): Array<Record<string, unknown>> {
   const content: Array<Record<string, unknown>> = [];
   for (const part of parts) {
@@ -45,21 +46,39 @@ function geminiInteractionContent(
       if (source.provider !== 'google') {
         throw new UnsupportedModelInputError({
           provider: 'google',
-          model: 'unknown',
+          model,
           modality: 'image',
           source: 'provider-file',
+        });
+      }
+      if (!source.mediaType) {
+        throw new UnsupportedModelInputError({
+          provider: 'google',
+          model,
+          modality: 'image',
+          source: 'provider-file',
+          feature: 'Interactions URI image mediaType',
         });
       }
       content.push({
         type: 'image',
         uri: source.reference,
-        ...(source.mediaType ? { mime_type: source.mediaType } : {}),
+        mime_type: source.mediaType,
       });
     } else if (source.type === 'url') {
+      if (!source.mediaType) {
+        throw new UnsupportedModelInputError({
+          provider: 'google',
+          model,
+          modality: 'image',
+          source: 'url',
+          feature: 'Interactions URI image mediaType',
+        });
+      }
       content.push({
         type: 'image',
         uri: source.url,
-        ...(source.mediaType ? { mime_type: source.mediaType } : {}),
+        mime_type: source.mediaType,
       });
     } else {
       content.push({ type: 'image', data: geminiImageBase64(source), mime_type: source.mediaType });
@@ -375,6 +394,9 @@ const GEMINI_3X_MIN_THINKING_LEVEL = new Map<string, string>([
   ['gemini-3.5-flash', 'minimal'],
   ['gemini-3.5-flash-lite', 'minimal'],
   ['gemini-3.6-flash', 'minimal'],
+  // L4 live evidence: Interactions gemini-3.7-flash accepts low/medium/high,
+  // but rejects minimal. Keep this exact entry isolated from legacy aliases.
+  ['gemini-3.7-flash', 'low'],
 ]);
 
 const GEMINI_MODELS_WITHOUT_PORTABLE_TEMPERATURE = new Set([
@@ -436,8 +458,9 @@ export class GeminiProvider implements Provider {
   readonly name = 'google';
 
   inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
-    // Interactions accepts inline data and Gemini File URIs. HTTPS URI support is
-    // documented for the current Interactions surface; Axl never retrieves it.
+    // Interactions accepts inline data and URI images. Current Google examples
+    // include mime_type for HTTPS URLs and Gemini Files URIs, so those sources
+    // require explicit mediaType; Axl never retrieves or infers it.
     return GEMINI_INTERACTIONS_IMAGE_MODELS.has(model)
       ? { image: { sources: ['url', 'bytes', 'base64', 'provider-file'] } }
       : {};
@@ -479,6 +502,12 @@ export class GeminiProvider implements Provider {
         if (part.type !== 'image') continue;
         if (part.source.type === 'provider-file' && part.source.provider !== this.name)
           fail('provider-file');
+        if (
+          (part.source.type === 'url' || part.source.type === 'provider-file') &&
+          !part.source.mediaType
+        ) {
+          fail(part.source.type, 'Interactions URI image mediaType');
+        }
       }
     }
     if (Array.isArray(request.input)) {
@@ -486,6 +515,12 @@ export class GeminiProvider implements Provider {
         if (part.type !== 'image') continue;
         if (part.source.type === 'provider-file' && part.source.provider !== this.name)
           fail('provider-file');
+        if (
+          (part.source.type === 'url' || part.source.type === 'provider-file') &&
+          !part.source.mediaType
+        ) {
+          fail(part.source.type, 'Interactions URI image mediaType');
+        }
       }
     }
     return { effectiveModel };
@@ -692,7 +727,10 @@ export class GeminiProvider implements Provider {
       .join('\n\n');
     const body: Record<string, unknown> = {
       model,
-      input: this.mapInteractionInput(messages.filter((message) => message.role !== 'system')),
+      input: this.mapInteractionInput(
+        messages.filter((message) => message.role !== 'system'),
+        model,
+      ),
       stream,
     };
     if (systemInstruction) body.system_instruction = systemInstruction;
@@ -789,14 +827,14 @@ export class GeminiProvider implements Provider {
     if (forbidden) fail(`raw ${forbidden} providerOptions`);
   }
 
-  private mapInteractionInput(messages: ChatMessage[]): GeminiInteractionStep[] {
+  private mapInteractionInput(messages: ChatMessage[], model: string): GeminiInteractionStep[] {
     const steps: GeminiInteractionStep[] = [];
     for (const message of messages) {
       if (message.role === 'user') {
         steps.push({
           type: 'user_input',
           content: Array.isArray(message.content)
-            ? geminiInteractionContent(message.content)
+            ? geminiInteractionContent(message.content, model)
             : [{ type: 'text', text: message.content }],
         });
       } else if (message.role === 'assistant') {

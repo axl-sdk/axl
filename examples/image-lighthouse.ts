@@ -1,10 +1,12 @@
+import { readFileSync } from 'node:fs';
 import { agent, type ModelInput } from '@axlsdk/axl';
 import { z } from 'zod';
 
-// A transparent 1×1 PNG. Keeping this tiny fixture as source makes the
-// example runnable without a local file path, hosted URL, or upload service.
-const PNG_1X1 =
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL4HgAAAABJRU5ErkJggg==';
+// Reuse the repository's real Studio screenshot: no hosted URL or upload
+// service is needed, and providers receive a normal, decodable PNG.
+const screenshotBytes = readFileSync(
+  new URL('../docs/assets/studio-playground.png', import.meta.url),
+);
 
 const model = process.env.IMAGE_MODEL ?? 'openai-responses:gpt-4o-mini';
 
@@ -12,8 +14,8 @@ const screenshot: ModelInput = [
   { type: 'text', text: 'Inspect this UI screenshot fixture.' },
   {
     type: 'image',
-    label: 'transparent pixel fixture',
-    source: { type: 'base64', data: PNG_1X1, mediaType: 'image/png' },
+    label: 'Studio Playground screenshot',
+    source: { type: 'bytes', data: screenshotBytes, mediaType: 'image/png' },
   },
   { type: 'text', text: 'Return a concise visual finding.' },
 ];

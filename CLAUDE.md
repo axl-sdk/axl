@@ -43,8 +43,9 @@ Docs are living. **In the same change that touches code, update the affected doc
 order: `docs/api-reference.md` (option types/values/defaults) > other `docs/` guides > package
 READMEs. Also keep `CHANGELOG.md` (`[Unreleased]`), `ROADMAP.md`, and the gitignored durable
 specs under `.internal/spec/` current. Time-bounded work belongs under the product- and
-lifecycle-organized `.internal/plans/` convention in `.internal/README.md`. The subsystem →
-doc map is in `.claude/rules/documentation.md`.
+lifecycle-organized `.internal/plans/`; durable decision inputs belong under
+`.internal/research/`. Follow `.internal/README.md`. The subsystem → doc map is in
+`.claude/rules/documentation.md`.
 
 ## Commands
 ```bash

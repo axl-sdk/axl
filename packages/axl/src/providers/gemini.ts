@@ -66,19 +66,15 @@ function geminiInteractionContent(
         mime_type: source.mediaType,
       });
     } else if (source.type === 'url') {
-      if (!source.mediaType) {
-        throw new UnsupportedModelInputError({
-          provider: 'google',
-          model,
-          modality: 'image',
-          source: 'url',
-          feature: 'Interactions URI image mediaType',
-        });
-      }
-      content.push({
-        type: 'image',
-        uri: source.url,
-        mime_type: source.mediaType,
+      // Gemini's image guide routes URL-originated images through Files API.
+      // Axl deliberately does not retrieve caller URLs or create hidden chat
+      // uploads, so a raw HTTPS locator cannot reach this mapping.
+      throw new UnsupportedModelInputError({
+        provider: 'google',
+        model,
+        modality: 'image',
+        source: 'url',
+        feature: 'direct URL image input; pass bytes/base64 or a Gemini provider-file',
       });
     } else {
       content.push({ type: 'image', data: geminiImageBase64(source), mime_type: source.mediaType });
@@ -458,11 +454,10 @@ export class GeminiProvider implements Provider {
   readonly name = 'google';
 
   inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
-    // Interactions accepts inline data and URI images. Current Google examples
-    // include mime_type for HTTPS URLs and Gemini Files URIs, so those sources
-    // require explicit mediaType; Axl never retrieves or infers it.
+    // Interactions accepts inline data and Gemini Files URIs. Axl never
+    // retrieves caller URLs or creates hidden image uploads.
     return GEMINI_INTERACTIONS_IMAGE_MODELS.has(model)
-      ? { image: { sources: ['url', 'bytes', 'base64', 'provider-file'] } }
+      ? { image: { sources: ['bytes', 'base64', 'provider-file'] } }
       : {};
   }
 
@@ -500,27 +495,23 @@ export class GeminiProvider implements Provider {
       if (message.role !== 'user') fail(undefined, 'rich non-user history');
       for (const part of message.content) {
         if (part.type !== 'image') continue;
+        if (part.source.type === 'url')
+          fail('url', 'direct URL image input; pass bytes/base64 or a Gemini provider-file');
         if (part.source.type === 'provider-file' && part.source.provider !== this.name)
           fail('provider-file');
-        if (
-          (part.source.type === 'url' || part.source.type === 'provider-file') &&
-          !part.source.mediaType
-        ) {
-          fail(part.source.type, 'Interactions URI image mediaType');
-        }
+        if (part.source.type === 'provider-file' && !part.source.mediaType)
+          fail('provider-file', 'Interactions URI image mediaType');
       }
     }
     if (Array.isArray(request.input)) {
       for (const part of request.input) {
         if (part.type !== 'image') continue;
+        if (part.source.type === 'url')
+          fail('url', 'direct URL image input; pass bytes/base64 or a Gemini provider-file');
         if (part.source.type === 'provider-file' && part.source.provider !== this.name)
           fail('provider-file');
-        if (
-          (part.source.type === 'url' || part.source.type === 'provider-file') &&
-          !part.source.mediaType
-        ) {
-          fail(part.source.type, 'Interactions URI image mediaType');
-        }
+        if (part.source.type === 'provider-file' && !part.source.mediaType)
+          fail('provider-file', 'Interactions URI image mediaType');
       }
     }
     return { effectiveModel };

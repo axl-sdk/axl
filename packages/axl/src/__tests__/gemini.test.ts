@@ -49,6 +49,18 @@ function makeGeminiResponse(
   };
 }
 
+function geminiFileImage(reference = 'files/test-image') {
+  return {
+    type: 'image' as const,
+    source: {
+      type: 'provider-file' as const,
+      provider: 'google',
+      reference,
+      mediaType: 'image/png',
+    },
+  };
+}
+
 beforeEach(() => {
   process.env.GOOGLE_API_KEY = 'test-key';
 });
@@ -3129,16 +3141,7 @@ describe('GeminiProvider', () => {
         [
           {
             role: 'user',
-            content: [
-              {
-                type: 'image',
-                source: {
-                  type: 'url',
-                  url: 'https://example.test/image.png',
-                  mediaType: 'image/png',
-                },
-              },
-            ],
+            content: [geminiFileImage()],
           },
         ],
         { model: 'gemini-3.7-flash', effort: 'none' },
@@ -3149,11 +3152,7 @@ describe('GeminiProvider', () => {
     });
 
     it.each([
-      ['url', { type: 'url', url: 'https://example.test/private-image.png' }],
-      [
-        'provider-file',
-        { type: 'provider-file', provider: 'google', reference: 'files/private-image' },
-      ],
+      ['provider-file', { type: 'provider-file', provider: 'google', reference: 'files/private' }],
     ])(
       'requires an explicit mediaType for rich Interactions %s URIs before fetch',
       async (sourceType, source) => {
@@ -3185,6 +3184,40 @@ describe('GeminiProvider', () => {
         expect(fetchMock).not.toHaveBeenCalled();
       },
     );
+
+    it('rejects direct image URLs before fetch and points to explicit source alternatives', async () => {
+      const provider = new GeminiProvider();
+      const input = [
+        {
+          type: 'image' as const,
+          source: {
+            type: 'url' as const,
+            url: 'https://example.test/private-image.png',
+            mediaType: 'image/png',
+          },
+        },
+      ];
+      expect(() =>
+        provider.validateInput({
+          model: 'gemini-3.7-flash',
+          input,
+          history: [],
+          stream: false,
+          hasTools: false,
+          responseMode: 'text',
+        }),
+      ).toThrow('pass bytes/base64 or a Gemini provider-file');
+      const fetchMock = mockFetch({ json: () => Promise.resolve({}) });
+      await expect(
+        provider.chat([{ role: 'user', content: input }], { model: 'gemini-3.7-flash' }),
+      ).rejects.toMatchObject({
+        name: 'UnsupportedModelInputError',
+        provider: 'google',
+        model: 'gemini-3.7-flash',
+        source: 'url',
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
 
     it('faithfully accumulates rich Interactions stream steps for tool continuation', async () => {
       const encoder = new TextEncoder();
@@ -3251,16 +3284,7 @@ describe('GeminiProvider', () => {
         [
           {
             role: 'user',
-            content: [
-              {
-                type: 'image',
-                source: {
-                  type: 'url',
-                  url: 'https://example.test/image.png',
-                  mediaType: 'image/png',
-                },
-              },
-            ],
+            content: [geminiFileImage()],
           },
         ],
         { model: 'gemini-3.7-flash' },
@@ -3305,16 +3329,7 @@ describe('GeminiProvider', () => {
         [
           {
             role: 'user',
-            content: [
-              {
-                type: 'image',
-                source: {
-                  type: 'url',
-                  url: 'https://example.test/image.png',
-                  mediaType: 'image/png',
-                },
-              },
-            ],
+            content: [geminiFileImage()],
           },
           {
             role: 'assistant',
@@ -3335,9 +3350,7 @@ describe('GeminiProvider', () => {
       expect(JSON.parse(continuationFetch.mock.calls[0][1].body).input).toEqual([
         {
           type: 'user_input',
-          content: [
-            { type: 'image', uri: 'https://example.test/image.png', mime_type: 'image/png' },
-          ],
+          content: [{ type: 'image', uri: 'files/test-image', mime_type: 'image/png' }],
         },
         ...done.providerMetadata.geminiInteractionSteps,
         {
@@ -3362,16 +3375,7 @@ describe('GeminiProvider', () => {
           [
             {
               role: 'user',
-              content: [
-                {
-                  type: 'image',
-                  source: {
-                    type: 'url',
-                    url: 'https://example.test/image.png',
-                    mediaType: 'image/png',
-                  },
-                },
-              ],
+              content: [geminiFileImage()],
             },
           ],
           { model: 'gemini-3.7-flash', toolChoice },
@@ -3390,16 +3394,7 @@ describe('GeminiProvider', () => {
         [
           {
             role: 'user',
-            content: [
-              {
-                type: 'image',
-                source: {
-                  type: 'url',
-                  url: 'https://example.test/image.png',
-                  mediaType: 'image/png',
-                },
-              },
-            ],
+            content: [geminiFileImage()],
           },
         ],
         {
@@ -3420,16 +3415,7 @@ describe('GeminiProvider', () => {
         [
           {
             role: 'user',
-            content: [
-              {
-                type: 'image',
-                source: {
-                  type: 'url',
-                  url: 'https://example.test/image.png',
-                  mediaType: 'image/png',
-                },
-              },
-            ],
+            content: [geminiFileImage()],
           },
         ],
         {
@@ -3460,16 +3446,7 @@ describe('GeminiProvider', () => {
       const input = [
         {
           role: 'user' as const,
-          content: [
-            {
-              type: 'image' as const,
-              source: {
-                type: 'url' as const,
-                url: 'https://example.test/image.png',
-                mediaType: 'image/png',
-              },
-            },
-          ],
+          content: [geminiFileImage()],
         },
       ];
       const options = { model: 'gemini-3.7-flash', providerOptions: { [key]: value } };
@@ -3497,16 +3474,7 @@ describe('GeminiProvider', () => {
             [
               {
                 role: 'user',
-                content: [
-                  {
-                    type: 'image',
-                    source: {
-                      type: 'url',
-                      url: 'https://example.test/image.png',
-                      mediaType: 'image/png',
-                    },
-                  },
-                ],
+                content: [geminiFileImage()],
               },
             ],
             { model: 'gemini-3.7-flash' },
@@ -3542,16 +3510,7 @@ describe('GeminiProvider', () => {
               [
                 {
                   role: 'user',
-                  content: [
-                    {
-                      type: 'image',
-                      source: {
-                        type: 'url',
-                        url: 'https://example.test/image.png',
-                        mediaType: 'image/png',
-                      },
-                    },
-                  ],
+                  content: [geminiFileImage()],
                 },
               ],
               { model: 'gemini-3.7-flash' },
@@ -3580,16 +3539,7 @@ describe('GeminiProvider', () => {
           [
             {
               role: 'user',
-              content: [
-                {
-                  type: 'image',
-                  source: {
-                    type: 'url',
-                    url: 'https://example.test/image.png',
-                    mediaType: 'image/png',
-                  },
-                },
-              ],
+              content: [geminiFileImage()],
             },
           ],
           { model: 'gemini-3.7-flash' },
@@ -3619,16 +3569,7 @@ describe('GeminiProvider', () => {
             [
               {
                 role: 'user',
-                content: [
-                  {
-                    type: 'image',
-                    source: {
-                      type: 'url',
-                      url: 'https://example.test/image.png',
-                      mediaType: 'image/png',
-                    },
-                  },
-                ],
+                content: [geminiFileImage()],
               },
             ],
             { model: 'gemini-3.7-flash' },
@@ -3646,8 +3587,8 @@ describe('GeminiProvider', () => {
           {
             type: 'image' as const,
             source: {
-              type: 'url' as const,
-              url: 'https://example.test/image.png',
+              type: 'bytes' as const,
+              data: new Uint8Array([1]),
               mediaType: 'image/png',
             },
           },
@@ -3664,7 +3605,7 @@ describe('GeminiProvider', () => {
         'image input for this model',
       );
       expect(provider.inputCapabilities('gemini-3.7-flash')).toEqual({
-        image: { sources: ['url', 'bytes', 'base64', 'provider-file'] },
+        image: { sources: ['bytes', 'base64', 'provider-file'] },
       });
       expect(provider.inputCapabilities('gemini-2.0-flash')).toEqual({});
     });

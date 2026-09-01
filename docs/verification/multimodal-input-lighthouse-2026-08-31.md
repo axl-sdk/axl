@@ -1,8 +1,9 @@
 # Multimodal image lighthouse — verification record
 
 **Prepared:** 2026-08-31  
-**Status:** Partial pass — L1/L2/L3/L4/L5/L6/L11 passed; L12 is blocked by
-Gemini project quota after request-shape validation.
+**Status:** Passed — L1-L6 and L11-L12 passed for Axl's final advertised
+capabilities. L12 is a local zero-request rejection backed by a discriminating
+live provider probe.
 
 The opt-in tests are `packages/axl/src/__tests__/integration-multimodal-input.test.ts`.
 They use the checked-in Studio Playground PNG, low output limits, and require `AXL_MULTIMODAL_LIVE=1` in
@@ -18,12 +19,12 @@ authorization header, or provider-file reference belongs in this record.
 | L5 (non-blocking) | `-t '\[L5\]'` | `openrouter:openai/gpt-4o-mini` | 1 / 3 | Base64 image returned text with response-priced accounting and no event leakage | Passed |
 | L6 | `-t '\[L6\]'` | `openai-responses:gpt-4.1-nano` | 0 / 0 | Local `UNSUPPORTED_MODEL_INPUT` preflight | Passed locally |
 | L11 | `-t '\[L11\]'` | `anthropic:claude-sonnet-4-5` | 1 / 3 | URL accepted without Axl host retrieval; terminal accounting passed | Passed |
-| L12 | `-t '\[L12\]'` | `google:gemini-3.7-flash` | 1 / 3 | Explicit MIME fixed local/provider request validation; inference remained unavailable due repeated `429` quota responses | Quota blocked |
+| L12 | `-t '\[L12\]'` | `google:gemini-3.7-flash` | 0 / 0 | Direct HTTP image URLs fail capability preflight; use inline bytes/base64 or an explicit Gemini Files provider reference | Passed locally |
 
-On a normal successful path, native blocking rows are five logical invocations,
-seven with L3's existing provider-file reference, and eight with optional L5.
+On a normal successful path, native blocking rows are four logical invocations,
+six with L3's existing provider-file reference, and seven with optional L5.
 Because `fetchWithRetry` permits two retries for eligible transport, `429`,
-`503`, and `529` failures, their maximum HTTP attempts are 15, 21, and 24.
+`503`, and `529` failures, their maximum HTTP attempts are 12, 18, and 21.
 Those figures do not bound paid provider processing or spend: a provider can
 process a request even when the client sees a failed or ambiguous transport
 result. The optional `AXL_ANTHROPIC_TEMP_FILE=1` route adds one Files API
@@ -40,10 +41,15 @@ did not execute this double-gated lighthouse.
 L1 initially exposed that a synthetic 1×1 PNG was not accepted as a real image,
 so the harness now uses the checked-in Studio screenshot. L4 exposed Gemini
 3.7 Flash's `low` minimum thinking level; the adapter and contract tests were
-corrected before the passing rerun. L12 first exposed that Gemini URI parts need
-an explicit MIME type. After that request-shape repair, three direct reruns
-reached only project quota responses, so URL inference is deliberately not
-claimed as passed.
+corrected before the passing rerun. L12 initially passed an HTTPS URL as an
+Interactions image URI and received repeated generic `429` responses. A paired
+probe on the same key, model, endpoint, and settings returned `200` for text and
+inline forms but `429` for the URL. Uploading the identical 109,932-byte PNG
+through Gemini Files, passing the returned URI, and deleting it all returned
+`200`; the file was `ACTIVE` and the interaction consumed the same 1,075 image
+tokens as inline input. Google's URL-image guide also uploads through Files.
+Axl therefore fails direct Gemini URLs locally rather than misclassifying the
+provider response as project quota or adding hidden host fetch/upload behavior.
 
 ## Sources checked for selection (accessed 2026-08-31)
 

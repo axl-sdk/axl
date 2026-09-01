@@ -133,8 +133,11 @@ image input is supported only for `google:gemini-3.7-flash` and uses the GA
 [Interactions API](https://ai.google.dev/gemini-api/docs/interactions-overview)
 with `store: false`. It is stateless: Axl sends application-owned history and
 does not use `previous_interaction_id`, background execution, or raw transport
-overrides. See [Multimodal model input](./multimodal-input.md) for exact source
-rules and the cross-provider table.
+overrides. Direct HTTP image URLs are not sent as Gemini file URIs: applications
+must pass bytes/base64 or explicitly upload through Gemini Files and supply the
+returned URI as a `google` provider-file. Axl does not host-fetch or silently
+upload chat images. See [Multimodal model input](./multimodal-input.md) for exact
+source rules and the cross-provider table.
 
 ### Completed-file transcription
 

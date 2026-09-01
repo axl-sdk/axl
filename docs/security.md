@@ -106,6 +106,16 @@ Prompt injection is an inherent risk in any system where untrusted text is passe
 
 ## Secrets Handling
 
+### Image handling
+
+Axl never host-fetches image URLs. Providers that natively support an HTTP
+image source receive the locator directly. Gemini is deliberately narrower:
+its certified Interactions paths are inline bytes/base64 or an explicit,
+caller-owned Gemini Files URI, so direct HTTP image URLs fail before dispatch.
+Axl does not silently fetch, upload, retain, or delete chat images. Applications
+that choose a Gemini Files workflow own URL retrieval controls, upload cleanup,
+and Google's temporary retention boundary.
+
 ### Recorded-audio handling
 
 `ctx.transcribe()` accepts only finite caller-supplied bytes, canonical base64,

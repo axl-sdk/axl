@@ -354,12 +354,12 @@ The image lighthouse is separately armed even when provider keys are present:
 
 ```bash
 # One selected row. Each selector targets only the lighthouse file. L1, L2,
-# L4, L5, L11, and L12 each make one logical model invocation; L3 makes two.
+# L4, L5, and L11 each make one logical model invocation; L3 makes two.
 # `fetchWithRetry` can make up to three HTTP attempts per invocation.
 AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]'
 
-# Native blocking rows: five logical invocations on a normal successful path
-# (L1/L2/L4/L11/L12). L6 is local and makes zero HTTP attempts.
+# Native blocking rows: four logical invocations on a normal successful path
+# (L1/L2/L4/L11). L6 and L12 are local and make zero HTTP attempts.
 AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]|\[L2\]|\[L4\]|\[L11\]|\[L12\]|\[L6\]'
 
 # Non-blocking OpenRouter certification: one additional logical invocation.

@@ -92,7 +92,7 @@ its upstream API but is unsupported until Axl verifies its request contract.
 | --- | --- | --- | --- |
 | `openai-responses:` | `gpt-4o`, `gpt-4o-2024-08-06`, `gpt-4o-2024-11-20`, `gpt-4o-mini`, `gpt-4o-mini-2024-07-18` | URL, bytes, base64, `provider-file` scoped to `openai-responses` | Uses Responses image items; no host fetch/upload by Axl. |
 | `anthropic:` | `claude-sonnet-4-5`, `claude-opus-4-8` | URL, bytes, base64, `provider-file` scoped to `anthropic` | Provider files are opaque references, not an Axl file API. |
-| `google:` | `gemini-3.7-flash` | URL, bytes, base64, `provider-file` scoped to `google` | Rich calls use Gemini Interactions with `store: false`; URL and provider-file sources require an explicit `mediaType`. |
+| `google:` | `gemini-3.7-flash` | Bytes, base64, `provider-file` scoped to `google` | Rich calls use Gemini Interactions with `store: false`; provider-files require an explicit `mediaType`. Direct HTTP image URLs fail locally: fetch them in application code and pass bytes/base64, or upload through Gemini Files and pass the returned URI as a provider-file. |
 | `openrouter:` | `openai/gpt-4o-mini` | URL, bytes, base64 | Non-blocking certification only; provider files and image+tools are rejected. Do not infer catalog-wide OpenRouter support. |
 
 Gemini transport is deliberately hybrid. Legacy string-only `google:` requests
@@ -101,6 +101,9 @@ parameter normalization still applies. Rich image requests use the
 GA Interactions API and are stateless (`store: false`): Axl sends
 application-owned history and does not use `previous_interaction_id`,
 background execution, or a raw transport override.
+Gemini Files are caller-owned for image input; unlike the explicit temporary
+upload inside `ctx.transcribe()`, Axl does not fetch image URLs, upload chat
+images, or delete caller-supplied image references.
 
 ## Completed-file transcription (B1)
 

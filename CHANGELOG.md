@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   safe paired lifecycle events, keeps provider-reported pricing honest, and
   composes explicitly with `ctx.ask()`. See `docs/multimodal-input.md`.
 
+### Fixed
+
+- **Gemini image URLs now fail before dispatch.** Live discrimination showed
+  that `gemini-3.7-flash` accepts the same image inline or through a Gemini
+  Files URI while a raw HTTPS image URI returns a misleading `429`. Axl keeps
+  its no-host-fetch/no-hidden-upload boundary: pass bytes/base64 or explicitly
+  upload through Gemini Files and use a `google` provider-file reference.
+
 ## [0.21.1] - 2026-08-28
 
 ### Fixed

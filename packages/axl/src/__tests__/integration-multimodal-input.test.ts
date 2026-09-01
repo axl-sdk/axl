@@ -487,27 +487,6 @@ describe.skipIf(!RUN || !process.env.GOOGLE_API_KEY)(
   },
 );
 
-describe.skipIf(!RUN || !process.env.GOOGLE_API_KEY)(
-  'multimodal live [L12]: Gemini Interactions gemini-3.7-flash',
-  () => {
-    it('[L12] forwards an HTTPS image URL through stateless Interactions', async () => {
-      const { context, events } = liveContext();
-      const a = agent({ model: 'google:gemini-3.7-flash', system: 'Reply with one word.' });
-      const result = await context.ask(
-        a,
-        input({ type: 'url', url: HTTPS_IMAGE, mediaType: 'image/png' }),
-        {
-          maxTokens: 128,
-          temperature: 0,
-          effort: 'none',
-        },
-      );
-      expect(result.length).toBeGreaterThan(0);
-      assertHonestTerminal(events);
-    });
-  },
-);
-
 describe.skipIf(!RUN || !process.env.OPENROUTER_API_KEY)(
   'multimodal live [L5] (non-blocking): OpenRouter openai/gpt-4o-mini',
   () => {
@@ -879,6 +858,20 @@ describe('multimodal local L6: preflight', () => {
       provider.validateInput({
         model: 'gpt-4.1-nano',
         input: input({ type: 'base64', data: PNG_BASE64, mediaType: 'image/png' }),
+        history: [],
+        stream: false,
+        hasTools: false,
+        responseMode: 'text',
+      }),
+    ).toThrow(UnsupportedModelInputError);
+  });
+
+  it('[L12] rejects a direct Gemini image URL before dispatch', () => {
+    const { provider } = new ProviderRegistry().resolve('google:gemini-3.7-flash');
+    expect(() =>
+      provider.validateInput?.({
+        model: 'gemini-3.7-flash',
+        input: input({ type: 'url', url: HTTPS_IMAGE, mediaType: 'image/png' }),
         history: [],
         stream: false,
         hasTools: false,

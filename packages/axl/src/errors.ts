@@ -12,6 +12,120 @@ export class AxlError extends Error {
   }
 }
 
+/** Thrown when the public logical model-input shape is malformed. */
+export class InvalidModelInputError extends AxlError {
+  constructor(message: string) {
+    super('INVALID_MODEL_INPUT', message);
+    this.name = 'InvalidModelInputError';
+  }
+}
+
+/** Thrown before dispatch when a provider/model cannot accept a rich input. */
+export class UnsupportedModelInputError extends AxlError {
+  readonly provider: string;
+  readonly model: string;
+  readonly modality: string;
+  readonly source?: string;
+
+  constructor(options: {
+    provider: string;
+    model: string;
+    modality: string;
+    source?: string;
+    feature?: string;
+  }) {
+    super(
+      'UNSUPPORTED_MODEL_INPUT',
+      `Provider '${options.provider}' model '${options.model}' does not support ${options.feature ?? options.modality}${options.source ? ` from ${options.source}` : ''}`,
+    );
+    this.name = 'UnsupportedModelInputError';
+    this.provider = options.provider;
+    this.model = options.model;
+    this.modality = options.modality;
+    this.source = options.source;
+  }
+}
+
+/** Thrown when the public transcription request contains unsupported or unsafe input. */
+export class InvalidTranscriptionInputError extends AxlError {
+  constructor(message: string) {
+    super('INVALID_TRANSCRIPTION_INPUT', message);
+    this.name = 'InvalidTranscriptionInputError';
+  }
+}
+
+/** Thrown before dispatch when no explicit transcription adapter can serve a URI. */
+export class UnsupportedTranscriptionInputError extends AxlError {
+  readonly provider: string;
+  readonly model: string;
+
+  constructor(options: { provider: string; model: string; feature?: string }) {
+    super(
+      'UNSUPPORTED_TRANSCRIPTION_INPUT',
+      `Transcription provider '${options.provider}'${options.model ? ` model '${options.model}'` : ''} does not support ${options.feature ?? 'this request'}`,
+    );
+    this.name = 'UnsupportedTranscriptionInputError';
+    this.provider = options.provider;
+    this.model = options.model;
+  }
+}
+
+/** Safe boundary error for an adapter failure. The original provider error is
+ * retained only as a non-enumerable cause because vendor messages/bodies may
+ * echo raw audio or provider-file references. */
+export class TranscriptionOperationError extends AxlError {
+  readonly provider: string;
+  readonly model: string;
+  readonly usage?: {
+    audioSeconds?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    cost?: number;
+  };
+  readonly pricingStatus?: 'priced' | 'unpriced' | 'zero';
+  readonly cleanupStatus?: 'not_required' | 'deleted' | 'failed' | 'timed_out';
+  /** Safe HTTP diagnostics projected from ProviderError when available. */
+  readonly status?: number;
+  readonly retryable?: boolean;
+  readonly retryAfterMs?: number;
+  readonly requestId?: string;
+  declare readonly cause?: unknown;
+
+  constructor(options: {
+    provider: string;
+    model: string;
+    usage?: {
+      audioSeconds?: number;
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+      cost?: number;
+    };
+    pricingStatus?: 'priced' | 'unpriced' | 'zero';
+    cleanupStatus?: 'not_required' | 'deleted' | 'failed' | 'timed_out';
+    status?: number;
+    retryable?: boolean;
+    retryAfterMs?: number;
+    requestId?: string;
+    cause?: unknown;
+  }) {
+    super('TRANSCRIPTION_PROVIDER_ERROR', 'Transcription provider operation failed');
+    this.name = 'TranscriptionOperationError';
+    this.provider = options.provider;
+    this.model = options.model;
+    this.usage = options.usage;
+    this.pricingStatus = options.pricingStatus;
+    this.cleanupStatus = options.cleanupStatus;
+    this.status = options.status;
+    this.retryable = options.retryable;
+    this.retryAfterMs = options.retryAfterMs;
+    this.requestId = options.requestId;
+    if (options.cause !== undefined)
+      Object.defineProperty(this, 'cause', { enumerable: false, value: options.cause });
+  }
+}
+
 /**
  * Strict observation overflow. Kept in the shared error module so every
  * recovery boundary can identify the same non-recoverable control error.

@@ -34,6 +34,14 @@ emerges, and record material discoveries or deviations in the plan. Ask only
 when an adaptation changes product behavior, accepted scope, authority,
 irreversible actions, or approved spend.
 
+For a plan under `.internal/plans/`, keep all review artifacts in its workstream
+directory. Once accepted scope is implemented and verified, fold durable
+content into `.internal/spec/` or public `docs/` and move the whole workstream
+from `active/` to `graduated/` as defined by `.internal/README.md`. A stopped or
+partially implemented plan remains active, or moves to `paused/` with a reason
+and resume condition. Keep the active index in `.internal/plans/README.md`
+aligned with lifecycle moves.
+
 ## Route work by cost and risk
 
 - **Discovery:** `repo-explorer` (Sonnet/low) for bounded read-only questions.

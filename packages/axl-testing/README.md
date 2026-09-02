@@ -90,6 +90,35 @@ All model parameters (`effort`, `thinkingBudget`, `includeThoughts`, `temperatur
 expect(provider.calls[0].options.effort).toBe('high');
 ```
 
+`MockProvider` also certifies logical image input in tests. It accepts ordered text/image
+parts from URL, bytes, base64, and `provider-file` sources (the latter must be owned by
+`mock`), preserves them in `calls`, and copies inline bytes before recording. `echo()`
+returns only the deterministic text projection, never serialized media.
+
+### `MockTranscriptionProvider`
+
+Completed-file transcription has a separate mock so chat fixtures cannot
+accidentally stand in for transcription adapters:
+
+```typescript
+import { AxlTestRuntime, MockTranscriptionProvider } from '@axlsdk/testing';
+
+const runtime = new AxlTestRuntime();
+const transcription = MockTranscriptionProvider.text('The recorded transcript.');
+
+runtime.mockTranscriptionProvider('mock-stt', transcription);
+
+// A workflow can now call ctx.transcribe({ model: 'mock-stt:any-model', ... }).
+// Inspect defensive request snapshots after execution:
+expect(transcription.calls).toHaveLength(1);
+expect(transcription.calls[0].audio.type).toBe('bytes');
+```
+
+Use the constructor for request-aware or asynchronous fixtures. Its optional
+second callback declares model capabilities. Inline bytes, provider options,
+and results are defensively copied; recorded requests omit `AbortSignal`, while
+the fixture callback receives the original signal so cancellation is testable.
+
 ### `MockTool`
 
 Create a mock tool to intercept and record calls:

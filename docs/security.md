@@ -106,6 +106,35 @@ Prompt injection is an inherent risk in any system where untrusted text is passe
 
 ## Secrets Handling
 
+### Image handling
+
+Axl never host-fetches image URLs. Providers that natively support an HTTP
+image source receive the locator directly. Gemini is deliberately narrower:
+its certified Interactions paths are inline bytes/base64 or an explicit,
+caller-owned Gemini Files URI, so direct HTTP image URLs fail before dispatch.
+Axl does not silently fetch, upload, retain, or delete chat images. Applications
+that choose a Gemini Files workflow own URL retrieval controls, upload cleanup,
+and Google's temporary retention boundary.
+
+### Recorded-audio handling
+
+`ctx.transcribe()` accepts only finite caller-supplied bytes, canonical base64,
+or a provider-owned reference. Axl does not fetch URLs or local paths, host
+media, persist inline audio into chat history, or use a chat-model fallback.
+Transcription events never contain audio bytes, base64, raw provider-file
+identifiers, authorization headers, or raw provider response bodies. With
+tracing unredacted, their terminal event contains transcript text; enable
+`trace.redact` when transcript text or error content is sensitive. Byte count
+is emitted only for a bytes source, never inferred for base64 or a provider
+reference. Gemini inline audio is the narrow exception to the
+no-upload rule: its adapter temporarily uploads solely to complete one
+transcription request and attempts deletion; a failed deletion can leave the
+file at Gemini for up to 48 hours. Use caller-owned Gemini references for reuse
+and assess that retention period before submitting sensitive recordings.
+Provider failures retain only safe HTTP diagnostics—status, retryability,
+optional retry delay, and optional request ID—on the boundary error and event;
+the raw error body remains confined to the non-enumerable cause.
+
 - API keys configured in `axl.config.ts` or environment variables are **never** included in LLM prompts or logged in traces.
 - Tools marked with `sensitive: true` have their return values redacted from LLM context in subsequent calls.
 

@@ -1,7 +1,26 @@
 import type { ChatMessage, ProviderResponse, ToolCallMessage } from '../types.js';
+import type { InputMediaSource, ModelInput } from '../input.js';
 
 // Re-export for convenience
 export type { ChatMessage, ProviderResponse, ToolCallMessage };
+
+export type InputModalitySupport = {
+  image?: { sources: readonly InputMediaSource['type'][] };
+};
+
+export type ProviderInputValidationRequest = {
+  model: string;
+  input: ModelInput;
+  /** Application-owned history that will accompany this input. Validators must
+   * cover every rich part/source across both input and history. */
+  history: readonly ChatMessage[];
+  stream: boolean;
+  hasTools: boolean;
+  responseMode: 'text' | 'structured';
+  providerOptions?: Record<string, unknown>;
+};
+
+export type ProviderInputValidationResult = { effectiveModel: string };
 
 /**
  * Tool definition in OpenAI-compatible format.
@@ -117,6 +136,10 @@ export type StreamChunk =
 export interface Provider {
   /** Human-readable name for the provider (e.g. "openai", "anthropic") */
   readonly name?: string;
+  /** Coarse, model-aware input metadata for UI/documentation. */
+  inputCapabilities?(model: string): InputModalitySupport;
+  /** Authoritative request-scoped rich-input validation. Omission means text-only. */
+  validateInput?(request: ProviderInputValidationRequest): ProviderInputValidationResult;
 
   /**
    * Send a chat completion request and return the full response.

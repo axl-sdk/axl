@@ -284,7 +284,12 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
   /** Signal an error. `executionId` is required for the same reason as
    *  `_done`: terminal events must carry a real id even when the
    *  failure happens before any real trace event fires (review S4). */
-  _error(error: Error, executionId: string): void {
+  _error(
+    error: Error,
+    executionId: string,
+    observerMessage = error.message,
+    observerName = error.name,
+  ): void {
     if (this.events.isFinished) return;
     const errorEvent: AxlEvent = {
       schemaVersion: 2,
@@ -292,7 +297,7 @@ export class AxlStream extends Readable implements AsyncIterable<AxlEvent> {
       executionId,
       step: Number.MAX_SAFE_INTEGER,
       timestamp: Date.now(),
-      data: { message: error.message, name: error.name },
+      data: { message: observerMessage, name: observerName },
     };
     this.events._push(errorEvent);
     this.push(errorEvent);

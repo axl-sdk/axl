@@ -20,6 +20,10 @@ function assertExhaustive(ev: AxlEvent): string {
       return ev.workflow;
     case 'workflow_end':
       return ev.data.status;
+    case 'transcription_start':
+      return ev.data.audio.source;
+    case 'transcription_end':
+      return ev.data.status;
     case 'ask_start':
       return ev.askId;
     case 'ask_end':

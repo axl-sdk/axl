@@ -39,6 +39,7 @@ import type {
   SchemaCheckData,
   ValidateData,
   ObservationStatus,
+  ModelInputDescriptor,
 } from '@axlsdk/axl';
 
 /** Current live and WS event contract. Historical readers use
@@ -253,7 +254,8 @@ export type SessionDetail = {
  *  `agent` was added in 0.18), update this type. */
 export type ChatMessage = {
   role: string;
-  content: string;
+  /** Rich programmatic history is serialized by Studio as a bounded descriptor. */
+  content: string | ModelInputDescriptor;
   agent?: string;
   tool_calls?: Array<{
     id: string;

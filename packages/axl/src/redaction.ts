@@ -110,6 +110,22 @@ function redactGate<T extends 'guardrail' | 'schema_check' | 'validate'>(
   } as LegacyEventOf<T>;
 }
 
+function redactInputDescriptor<T extends { parts: readonly unknown[] }>(input: T): T {
+  return {
+    ...input,
+    parts: input.parts.map((part) => {
+      if (!part || typeof part !== 'object' || !('type' in part) || part.type === 'text')
+        return part;
+      const value = part as { locator?: unknown; label?: unknown };
+      return {
+        ...part,
+        ...(value.locator !== undefined ? { locator: REDACTED } : {}),
+        ...(value.label !== undefined ? { label: REDACTED } : {}),
+      };
+    }),
+  } as T;
+}
+
 /** Shared rule for the three `memory_*` events. */
 function redactMemory<T extends 'memory_remember' | 'memory_recall' | 'memory_forget'>(
   event: LegacyEventOf<T>,
@@ -150,7 +166,11 @@ const LEGACY_REDACTION_RULES: { [K in LegacyEventType]: LegacyRuleFor<K> } = {
       },
     };
   },
-  ask_start: (e) => ({ ...e, prompt: REDACTED }),
+  ask_start: (e) => ({
+    ...e,
+    prompt: REDACTED,
+    ...(e.input ? { input: redactInputDescriptor(e.input) } : {}),
+  }),
   ask_end: (e) => ({
     ...e,
     outcome: e.outcome.ok ? { ok: true, result: REDACTED } : { ok: false, error: REDACTED },
@@ -158,6 +178,14 @@ const LEGACY_REDACTION_RULES: { [K in LegacyEventType]: LegacyRuleFor<K> } = {
   agent_call_start: (e) => {
     const d = e.data;
     const out = { ...d, prompt: REDACTED } as typeof d;
+    if (d.input) {
+      out.input = redactInputDescriptor(d.input);
+    }
+    if (d.messageInputs)
+      out.messageInputs = d.messageInputs.map((entry) => ({
+        ...entry,
+        input: redactInputDescriptor(entry.input),
+      }));
     if (d.system !== undefined) out.system = REDACTED;
     if (Array.isArray(d.messages)) {
       out.messages = [{ role: 'system', content: `[${d.messages.length} messages redacted]` }];
@@ -339,6 +367,18 @@ function reuseLegacyRule<T extends CommonV2EventType>(type: T): RuleFor<T> {
 const COMMON_V2_REDACTION_RULES = {
   workflow_start: reuseLegacyRule('workflow_start'),
   workflow_end: reuseLegacyRule('workflow_end'),
+  transcription_start: (e) => e,
+  transcription_end: (e) => {
+    const d = e.data;
+    return {
+      ...e,
+      data: {
+        ...d,
+        ...(d.text !== undefined ? { text: REDACTED } : {}),
+        ...(d.error !== undefined ? { error: REDACTED } : {}),
+      },
+    };
+  },
   ask_start: reuseLegacyRule('ask_start'),
   ask_end: reuseLegacyRule('ask_end'),
   agent_call_start: reuseLegacyRule('agent_call_start'),

@@ -58,8 +58,11 @@ export function reduceCost(acc: CostData, event: HistoricalAxlEvent): CostData {
     return { ...acc, byWorkflow };
   }
 
-  // Early return for events with no cost data.
-  if (event.cost == null && !event.tokens) return acc;
+  // A transcription leaf can carry measurable work only in data.usage.
+  // Classify before this fast-path so duration/total-token unpriced work is
+  // represented consistently with the core runtime.
+  const unpricedLeaf = isUnpricedLeaf(event);
+  if (event.cost == null && !event.tokens && !unpricedLeaf) return acc;
 
   // Rollup guard: `eventCostContribution` encapsulates the spec §10
   // "skip ask_end, finite-check, leaf-only" invariant. The rest of
@@ -76,7 +79,6 @@ export function reduceCost(acc: CostData, event: HistoricalAxlEvent): CostData {
   // flag totalCost as a lower bound. Uses the core `isUnpricedLeaf` so it stays
   // in lockstep with `ExecutionInfo.unpriced` / `ask_end.unpriced` (a
   // no-usage/zero-token streamed call isn't miscounted).
-  const unpricedLeaf = isUnpricedLeaf(event);
 
   // Only count tokens from agent_call_end events — embedder tokens are
   // bucketed separately into byEmbedder.tokens.

@@ -23,6 +23,7 @@ export const COST_BEARING_LEAF_TYPES = [
   'tool_call_end',
   'memory_remember',
   'memory_recall',
+  'transcription_end',
 ] as const;
 
 const COST_LEAF_SET: ReadonlySet<string> = new Set(COST_BEARING_LEAF_TYPES);
@@ -50,6 +51,22 @@ export function hasPositiveTokens(event: {
   return (
     (t.input ?? 0) + (t.output ?? 0) + (t.reasoning ?? 0) + (t.cached ?? 0) + (t.cacheWrite ?? 0) >
     0
+  );
+}
+
+/** Audio duration is independently billable work even when a provider exposes
+ * no token count. Kept alongside token accounting so unpriced duration cannot
+ * silently look like a free operation. */
+export function hasPositiveBillableWork(event: {
+  tokens?: Parameters<typeof hasPositiveTokens>[0]['tokens'];
+  data?: { usage?: { audioSeconds?: number; totalTokens?: number } } | null;
+}): boolean {
+  if (hasPositiveTokens(event)) return true;
+  const seconds = event.data?.usage?.audioSeconds;
+  const totalTokens = event.data?.usage?.totalTokens;
+  return (
+    (typeof seconds === 'number' && Number.isFinite(seconds) && seconds > 0) ||
+    (typeof totalTokens === 'number' && Number.isFinite(totalTokens) && totalTokens > 0)
   );
 }
 
@@ -151,7 +168,7 @@ export function isUnpricedLeaf(event: {
     event.type !== undefined &&
     COST_LEAF_SET.has(event.type) &&
     !isUsableCost(event.cost) &&
-    hasPositiveTokens(event)
+    hasPositiveBillableWork(event)
   );
 }
 

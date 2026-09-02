@@ -35,6 +35,25 @@ describe('CostAggregator', () => {
     expect(data.totalTokens.reasoning).toBe(10);
   });
 
+  it.each([
+    { usage: { audioSeconds: 2 }, label: 'duration-only' },
+    { usage: { totalTokens: 9 }, label: 'total-tokens-only' },
+  ])('counts unpriced transcription $label work without ordinary tokens', ({ usage }) => {
+    aggregator.onTrace({
+      type: 'transcription_end',
+      transcriptionId: 'tr-1',
+      model: 'stt',
+      workflow: 'wf',
+      duration: 1,
+      data: { status: 'completed', usage },
+    });
+    const data = aggregator.getData();
+    expect(data.totalCost).toBe(0);
+    expect(data.unpricedCalls).toBe(1);
+    expect(data.byModel.stt.unpricedCalls).toBe(1);
+    expect(data.byWorkflow.wf.unpricedCalls).toBe(1);
+  });
+
   it('getData returns breakdown by agent, model, and workflow', () => {
     aggregator.onTrace({
       type: 'agent_call_end',

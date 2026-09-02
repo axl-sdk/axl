@@ -54,6 +54,8 @@ const LIFECYCLE_TYPES: ReadonlySet<AxlEventType> = new Set<AxlEventType>([
   'schema_diagnostic',
   'workflow_start',
   'workflow_end',
+  'transcription_start',
+  'transcription_end',
   'checkpoint_save',
   'checkpoint_replay',
   'await_human',

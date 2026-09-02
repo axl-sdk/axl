@@ -104,6 +104,30 @@ describe('MockProvider.echo()', () => {
     expect(r.usage).toBeDefined();
     expect(r.cost).toBe(0);
   });
+
+  it('projects ordered rich user input to text without serializing media', async () => {
+    const provider = MockProvider.echo();
+    const response = await provider.chat(
+      [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'before' },
+            {
+              type: 'image',
+              source: { type: 'base64', data: 'AQID', mediaType: 'image/png' },
+              label: 'receipt',
+            },
+            { type: 'text', text: 'after' },
+          ],
+        },
+      ],
+      {},
+    );
+
+    expect(response.content).toBe('before\nafter');
+    expect(response.content).not.toContain('AQID');
+  });
 });
 
 // ── MockProvider.json() ──────────────────────────────────────────────────────
@@ -306,6 +330,49 @@ describe('MockProvider.fn()', () => {
     expect(provider.calls[0].messages[0].content).toBe('msg1');
     expect(provider.calls[1].options.model).toBe('test');
   });
+
+  it('exposes ordered rich parts to handlers while retaining an isolated call record', async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const messages = [
+      {
+        role: 'user' as const,
+        content: [
+          { type: 'text' as const, text: 'first' },
+          {
+            type: 'image' as const,
+            source: { type: 'bytes' as const, data: bytes, mediaType: 'image/png' },
+          },
+          { type: 'text' as const, text: 'last' },
+        ],
+      },
+    ];
+    const provider = MockProvider.fn((handlerMessages) => {
+      const content = handlerMessages[0].content;
+      expect(content).toHaveLength(3);
+      if (
+        Array.isArray(content) &&
+        content[1].type === 'image' &&
+        content[1].source.type === 'bytes'
+      ) {
+        content[1].source.data[0] = 99;
+      }
+      return { content: 'ok' };
+    });
+
+    await provider.chat(messages, { providerOptions: { nested: { original: true } } });
+    bytes[0] = 42;
+    messages[0].content[0].text = 'changed';
+
+    const recorded = provider.calls[0].messages[0].content;
+    expect(recorded).toEqual([
+      { type: 'text', text: 'first' },
+      {
+        type: 'image',
+        source: { type: 'bytes', data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' },
+      },
+      { type: 'text', text: 'last' },
+    ]);
+  });
 });
 
 // ── MockProvider.replay() from file ─────────────────────────────────────
@@ -393,6 +460,49 @@ describe('MockProvider .calls tracking', () => {
 
     expect(provider.calls).toHaveLength(1);
     expect(provider.calls[0].messages[0].content).toBe('stream me');
+  });
+
+  it('advertises and validates every logical image source, rejecting cross-provider files', () => {
+    const provider = MockProvider.echo();
+    expect(provider.inputCapabilities('anything').image?.sources).toEqual([
+      'url',
+      'bytes',
+      'base64',
+      'provider-file',
+    ]);
+    const sources = [
+      { type: 'url' as const, url: 'https://example.com/image.png' },
+      { type: 'bytes' as const, data: new Uint8Array([1]), mediaType: 'image/png' },
+      { type: 'base64' as const, data: 'AQ==', mediaType: 'image/png' },
+      { type: 'provider-file' as const, provider: 'mock', reference: 'file_123' },
+    ];
+    for (const source of sources) {
+      expect(
+        provider.validateInput({
+          model: 'anything',
+          input: [{ type: 'image', source }],
+          history: [],
+          stream: false,
+          hasTools: false,
+          responseMode: 'text',
+        }),
+      ).toEqual({ effectiveModel: 'anything' });
+    }
+    expect(() =>
+      provider.validateInput({
+        model: 'anything',
+        input: [
+          {
+            type: 'image',
+            source: { type: 'provider-file', provider: 'another-provider', reference: 'file_123' },
+          },
+        ],
+        history: [],
+        stream: false,
+        hasTools: false,
+        responseMode: 'text',
+      }),
+    ).toThrow(/provider-file/);
   });
 });
 

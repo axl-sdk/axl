@@ -1,7 +1,9 @@
 import type { Tool } from './tool.js';
 import type { AskOptions, GuardrailsConfig, SchemaPromptOption } from './types.js';
+import type { ModelInput } from './input.js';
 import type { Effort, ToolChoice } from './providers/types.js';
 import { ProviderRegistry } from './providers/registry.js';
+import { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
 import { WorkflowContext } from './context.js';
 import { randomUUID } from 'node:crypto';
 
@@ -52,7 +54,7 @@ export type Agent = {
   readonly _config: AgentConfig;
   readonly _name: string;
   /** Direct invocation for prototyping (no workflow context) */
-  ask<T = string>(prompt: string, options?: AskOptions<T>): Promise<T>;
+  ask<T = string>(prompt: ModelInput, options?: AskOptions<T>): Promise<T>;
   /** Resolve model string for given context */
   resolveModel(ctx?: { metadata?: Record<string, unknown> }): string;
   /** Resolve system prompt for given context */
@@ -87,16 +89,18 @@ export function agent(config: AgentConfig): Agent {
     _config: config,
     _name: defaultName,
 
-    async ask<T = string>(prompt: string, options?: AskOptions<T>): Promise<T> {
+    async ask<T = string>(prompt: ModelInput, options?: AskOptions<T>): Promise<T> {
       // Direct invocation — creates a lightweight implicit context
       // This is a simplified path for quick experiments and prototyping;
       // production use should use ctx.ask() inside a workflow.
       const registry = new ProviderRegistry();
+      const transcriptionRegistry = new TranscriptionProviderRegistry();
       const ctx = new WorkflowContext({
         input: prompt,
         executionId: randomUUID(),
         config: {},
         providerRegistry: registry,
+        transcriptionProviderRegistry: transcriptionRegistry,
       });
       return ctx.ask(agentInstance, prompt, options);
     },

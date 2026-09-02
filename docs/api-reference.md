@@ -359,6 +359,18 @@ All primitives are available on `ctx` inside workflow handlers.
 
 Invoke an agent. Runs the tool-call loop until the agent produces a final response or hits `maxTurns`.
 
+`prompt` is `ModelInput`: the legacy `string` shorthand or a non-empty ordered
+readonly array of `{ type: 'text', text }` and `{ type: 'image', source, label? }`
+parts. Image sources are URL, bytes, base64, or a provider-scoped file reference;
+see [Multimodal model input](./multimodal-input.md) for their exact shapes and
+the per-provider allowlist. Decoded inline image data is capped at 25 MiB total
+per logical input before copying/decoding; URL and provider-file contents are
+not loaded by Axl. The byte ceiling is exported as
+`MAX_INLINE_MODEL_INPUT_BYTES`; `inputText(prompt)` returns its deterministic text
+projection. Rich evidence survives retries, tool turns, handoffs, and the
+selected delegate inside this ask, but is not automatically retained for later
+session turns.
+
 ```typescript
 const answer = await ctx.ask(myAgent, 'What is 2+2?');
 
@@ -397,6 +409,31 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 
 ---
 
+### `ctx.transcribe(request)`
+
+Transcribe one finite recorded-audio source through the separate transcription
+registry. This is not an agent invocation: it neither changes session history
+nor makes a chat-provider call or fallback. Pass `Transcript.text` explicitly
+to `ctx.ask()` when a normal text agent should analyze it.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `model` | `string` | Required `provider:model` transcription URI. Built-ins accept exactly `openai-transcription:gpt-transcribe`, `gemini-transcription:gemini-3.5-transcribe`, or `openrouter-transcription:openai/whisper-1`; registered custom adapters define their own models. |
+| `audio` | `RecordedAudioSource` | Required `{ type: 'bytes', data, mediaType }`, `{ type: 'base64', data, mediaType }`, or matching `{ type: 'provider-file', provider, reference, mediaType? }`. Inline decoded data is capped at 25 MiB before copying/decoding. No URL, path, stream, or realtime source. |
+| `language` | `string` | Optional provider-supported language hint. |
+| `timestamps` | `'segment' \| 'word'` | Optional; validated against the exact adapter capability. |
+| `diarization` | `boolean` | Optional; validated against the exact adapter capability. |
+| `providerOptions` | `Record<string, unknown>` | Provider-specific escape hatch. Built-ins accept only their documented keys; registered custom adapters define and validate their own options. |
+
+Returns `Promise<Transcript>`. `Transcript` has required `text`; optional
+`detectedLanguages`, timestamped `segments`/`words`, `usage`, `pricingStatus`,
+and opaque `providerMetadata`. Provider-reported cost is canonical. A duration
+or token-bearing response without usable pricing is `unpriced`, never silently
+priced at zero. See [Multimodal model input](./multimodal-input.md) for exact
+capabilities, Gemini temporary-file retention, and source rules.
+
+---
+
 ### `ctx.delegate(agents, prompt, options?)`
 
 Select the best agent from a list of candidates and invoke it. Creates a temporary router agent that uses handoffs to pick the right specialist.
@@ -405,13 +442,14 @@ Select the best agent from a list of candidates and invoke it. Creates a tempora
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `agents` | `Agent[]` | Candidate agents to choose from (at least 1) |
-| `prompt` | `string` | The prompt to route and process |
+| `prompt` | `ModelInput` | Ordered evidence to route and process; the router receives full evidence by default |
 | `options.schema` | `z.ZodType<T>` | Zod schema for structured output from the selected agent |
 | `options.routerModel` | `string` | Model URI for the internal router (default: first candidate's model) |
 | `options.metadata` | `Record<string, unknown>` | Additional metadata passed to router and selected agent |
 | `options.retries` | `number` | Retries for structured output validation |
 | `options.validate` | `OutputValidator<T>` | Post-schema business rule validation. Forwarded to the final `ctx.ask()` call |
 | `options.validateRetries` | `number` | Maximum retries for validate failures (default: 2) |
+| `options.routerInput` | `'full' \| 'text'` | `'full'` (default) routes ordered evidence; `'text'` routes `inputText(prompt)` only |
 
 **Returns:** `Promise<T>` — the selected agent's response.
 
@@ -1328,6 +1366,7 @@ const runtime = new AxlRuntime({
 | `registerTool(...tools)` | Register one or more standalone tools |
 | `registerAgent(...agents)` | Register one or more standalone agents |
 | `registerProvider(name, provider)` | Register a custom provider instance |
+| `registerTranscriptionProvider(name, provider)` | Register a custom dedicated `TranscriptionProvider` for `name:model` URIs. It is never used for chat-provider resolution or fallback. |
 | `registerEval(name, config, executeWorkflow?)` | Register an eval configuration |
 
 ### Execution
@@ -1730,6 +1769,8 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `type` | Mixin | Required variant fields | When emitted |
 |---|---|---|---|
 | `workflow_start` / `workflow_end` | — | `workflow`, `data: WorkflowStartData/WorkflowEndData` | Workflow lifecycle |
+| `transcription_start` | — | `transcriptionId`, `model?`, `data: { provider?, model?, audio: { source, bytes?, mediaType? } }` | Immediately before a dedicated `ctx.transcribe()` operation. `bytes` is present only for a bytes source; raw audio/base64/reference are never emitted. |
+| `transcription_end` | — | `transcriptionId`, `model?`, `duration`, `cost?`, `tokens?`, `data: { status, provider?, model?, audio?, text?, usage?, pricingStatus?, cleanupStatus?, error?, errorCode?, providerError?: { status, retryable, retryAfterMs?, requestId? } }` | Exactly once after transcription completes, fails, or aborts. Provider failures retain only safe HTTP diagnostics. `text` is present on an unredacted successful event and scrubbed by `trace.redact`; raw audio/base64/reference/provider body are never emitted. |
 | `ask_start` | `AskScoped` | `prompt: string` | Top of every `ctx.ask()` |
 | `ask_end` | `AskScoped` | `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration` | Every `ctx.ask()` exit. Ask-internal failures surface here, NOT via the workflow-level `error` event |
 | `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number`, `data: AgentCallStartData` | Before each LLM call (one per loop turn) |
@@ -1765,7 +1806,7 @@ import { eventCostContribution } from '@axlsdk/axl';
 const total = info.events.reduce((sum, e) => sum + eventCostContribution(e), 0);
 ```
 
-Also exported: `isCostBearingLeaf(event: AxlEvent): boolean` (takes an event, checks its `type` against the leaf set — pass the event, not the type string), `isUnpricedLeaf(event): boolean` (the single source of truth for the unpriced signal — `true` when a cost-bearing leaf did billable work but had no usable cost; drives `ExecutionInfo.unpriced` / `trackExecution().unpriced` / Studio's `unpricedCalls`), `COST_BEARING_LEAF_TYPES` (the canonical `as const` tuple: `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall`), and `isRootLevel(event: AxlEvent): boolean` (true when `depth === 0` or undefined — used for root-only token filtering).
+Also exported: `isCostBearingLeaf(event: AxlEvent): boolean` (takes an event, checks its `type` against the leaf set — pass the event, not the type string), `isUnpricedLeaf(event): boolean` (the single source of truth for the unpriced signal — `true` when a cost-bearing leaf did billable work but had no usable cost; drives `ExecutionInfo.unpriced` / `trackExecution().unpriced` / Studio's `unpricedCalls`), `COST_BEARING_LEAF_TYPES` (the canonical `as const` tuple: `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall`, `transcription_end`), and `isRootLevel(event: AxlEvent): boolean` (true when `depth === 0` or undefined — used for root-only token filtering).
 
 **`parsePartialJson(text: string): unknown`** — tolerant JSON parser used internally for `partial_object` streaming. Recovers from truncated input (unclosed strings/objects/arrays) and is hardened against deeply-nested input via a 256-depth cap (returns `null` on overflow). Exported from `@axlsdk/axl` for consumers building their own progressive-render pipelines that need to share Axl's truncation-recovery and stack-overflow guard rails. Zero dependencies.
 
@@ -1958,6 +1999,9 @@ All errors extend `AxlError`.
 | `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy. Includes `.limit`, `.spent`, `.policy` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
 | `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`. Message is the provider's text verbatim (no prefix). |
+| `InvalidModelInputError` | `ctx.ask()`, `ctx.delegate()`, `agent.ask()` | Malformed `ModelInput`. `code: 'INVALID_MODEL_INPUT'`. Invalid inputs fail before dispatch and the message never includes raw media. |
+| `UnsupportedModelInputError` | rich `ctx.ask()` / `ctx.delegate()` | The exact provider/model/source/composition is unsupported. `code: 'UNSUPPORTED_MODEL_INPUT'`; includes safe `.provider`, `.model`, `.modality`, and optional source kind, never the raw locator or bytes. |
+| `TranscriptionOperationError` | `ctx.transcribe()` | Safe transcription boundary error. `code: 'TRANSCRIPTION_PROVIDER_ERROR'`; includes `.provider`, `.model`, accounting/cleanup fields, and provider-safe `.status?`, `.retryable?`, `.retryAfterMs?`, `.requestId?`. The original error remains available as a non-enumerable `.cause`; raw provider bodies never enter events. |
 | `AxlError` / `INVALID_HUMAN_DECISION` | approval handlers, `runtime.resolveDecision()` | Untyped decision is not the exact plain-object approval/denial union; rejected before resolver/store mutation |
 | `AxlError` / `PENDING_DECISION_NOT_FOUND` | `runtime.resolveDecision()` | No active or persisted pending request exists, or another concurrent resolution already won |
 | `AxlError` / `CROSS_PROCESS_RESUME_UNSUPPORTED` | `runtime.resolveDecision()` | A persisted request exists but its in-process continuation owner is gone. Fails before deleting the request or starting side effects |

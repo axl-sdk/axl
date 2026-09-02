@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: August 2026
+> Last updated: September 2026
 
 ## Guiding Principles
 
@@ -12,6 +12,12 @@
 ## Status
 
 ### Complete
+
+- **Completed-file transcription** — `ctx.transcribe()` is a dedicated,
+  non-chat finite-recording operation with OpenAI, Gemini Interactions/Files,
+  and OpenRouter STT adapters; paired safe lifecycle events, cleanup status,
+  mock coverage, and an explicit transcript-to-agent recipe. General audio
+  understanding and realtime voice remain separate work.
 
 - **OpenTelemetry** — Automatic span emission for every `ctx.*` primitive with cost-per-span attribution
 - **Memory Primitives** — `ctx.remember()`, `ctx.recall()`, `ctx.forget()` with session/global scope and semantic vector search

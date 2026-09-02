@@ -16,9 +16,12 @@ questions and verify negative claims before they enter the plan under
 `.claude/rules/discovery-evidence.md`. Do not delegate plan authorship or
 trivial discovery.
 
-Default location: `.internal/spec/<name>-plan.md`. This is the gitignored plan
-staging area; public `docs/` are lasting references. Never force-add
-`.internal/` content.
+Default location:
+`.internal/plans/<product-area>/active/<name>/plan.md`. Choose the narrowest
+durable product owner using `.internal/README.md`, and keep reviews or other
+supporting artifacts in the same workstream directory. Public `docs/` are
+lasting references. Add the workstream to the active index in
+`.internal/plans/README.md`. Never force-add `.internal/` content.
 
 ## Required flow
 
@@ -46,10 +49,13 @@ production reachability of every proposed path, and unresolved product forks.
 Fold confirmed findings into the plan. A blind `behavioral-test-analyst` pass is
 optional for product-heavy behavior; it is not a default plan-review tax.
 
-Mark durable versus ephemeral content. At completion, graduate lasting internal
-design to numbered `.internal/spec/` docs and user-facing material to public
-`docs/`; remove or archive execution scaffolding and update `CHANGELOG.md` for
-user-visible changes.
+Mark durable versus ephemeral content. At completion, fold lasting internal
+design into `.internal/spec/` and user-facing material into public `docs/`, then
+move the complete workstream directory from `active/` to `graduated/`. Preserve
+useful execution and review evidence there; remove redundant scratch material.
+Remove it from the active index in `.internal/plans/README.md`. Update
+`CHANGELOG.md` for user-visible changes. Use `paused/` only for accepted work
+with a documented reason and resume condition.
 
 Resolve questions through source inspection or research. Ask only about real
 product forks, include a recommendation, and record architecture-changing

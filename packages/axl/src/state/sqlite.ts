@@ -6,6 +6,7 @@ import type {
 } from '../types.js';
 import { getExecutionEventSchemaVersion, normalizeStoredExecution } from '../event-schema.js';
 import type { StateStore, PendingDecision, ExecutionState, EvalHistoryEntry } from './types.js';
+import { normalizePersistedSessionHistory } from '../input.js';
 
 // Lazy-loaded better-sqlite3 types
 type Database = import('better-sqlite3').Database;
@@ -303,7 +304,7 @@ export class SQLiteStore implements StateStore {
     const stmt = this.db.prepare(
       'INSERT OR REPLACE INTO sessions (session_id, history) VALUES (?, ?)',
     );
-    stmt.run(sessionId, JSON.stringify(history));
+    stmt.run(sessionId, JSON.stringify(normalizePersistedSessionHistory(history)));
   }
 
   async getSession(sessionId: string): Promise<ChatMessage[]> {

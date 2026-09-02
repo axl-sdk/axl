@@ -35,15 +35,28 @@ import {
   BudgetExceededError,
   GuardrailError,
   ValidationError,
+  InvalidModelInputError,
+  InvalidTranscriptionInputError,
+  TranscriptionOperationError,
+  UnsupportedModelInputError,
   EventStreamOverflowError,
   isEventStreamOverflowError,
   preserveErrorCause,
   rethrowEventStreamOverflow,
 } from './errors.js';
+import {
+  cloneModelInput,
+  describeModelInput,
+  inputText,
+  normalizeModelInput,
+  sanitizeModelInputForTrace,
+  summarizeModelInput,
+} from './input.js';
+import type { ModelInput } from './input.js';
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
 import { StreamingWalker } from './streaming-walker.js';
-import { COST_BEARING_LEAF_TYPES, hasPositiveTokens, isUsableCost } from './event-utils.js';
+import { COST_BEARING_LEAF_TYPES, hasPositiveBillableWork, isUsableCost } from './event-utils.js';
 import { AxlEventBus, type EventStreamOptions } from './event-stream.js';
 import { redactHistoricalEvent } from './redaction.js';
 import {
@@ -54,6 +67,14 @@ import {
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
 import { ProviderError } from './providers/errors.js';
 import type { ProviderRegistry } from './providers/registry.js';
+import type { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
+import type { TranscriptionProviderRequest } from './providers/transcription-types.js';
+import {
+  cloneTranscript,
+  normalizeTranscriptionAccounting,
+  normalizeTranscriptionRequest,
+} from './transcription.js';
+import type { Transcript, TranscriptionRequest } from './transcription.js';
 import type { AxlConfig } from './config.js';
 import { parseDuration, parseCost } from './config.js';
 import type { StateStore } from './state/types.js';
@@ -444,10 +465,16 @@ function appendRetryMessages(
   messages.push({ role: 'system', content: feedbackMessage });
 }
 
-function estimateMessagesTokens(messages: ChatMessage[]): number {
+function estimateMessagesTokens(messages: ChatMessage[]): { tokens: number; unmeasured: boolean } {
   let total = 0;
+  let unmeasured = false;
   for (const msg of messages) {
-    total += estimateTokens(msg.content);
+    // Media has no portable token estimate. Count only its text projection;
+    // placeholders are for summary prompts, never a synthetic media estimate.
+    total += estimateTokens(inputText(msg.content));
+    if (typeof msg.content !== 'string') {
+      unmeasured ||= msg.content.some((part) => part.type === 'image');
+    }
     if (msg.tool_calls) {
       for (const tc of msg.tool_calls) {
         total += estimateTokens(tc.function.name + tc.function.arguments);
@@ -455,7 +482,106 @@ function estimateMessagesTokens(messages: ChatMessage[]): number {
     }
     total += 4; // per-message overhead (role, separators)
   }
-  return total;
+  return { tokens: total, unmeasured };
+}
+
+/** Providers receive a disposable view: a mutating custom adapter cannot alter
+ * the ask-owned evidence retained for retries, tools, or handoffs. */
+function cloneMessagesForProvider(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((message) => ({
+    ...message,
+    content: cloneModelInput(message.content),
+    ...(message.tool_calls
+      ? {
+          tool_calls: message.tool_calls.map((call) => ({
+            ...call,
+            function: { ...call.function },
+          })),
+        }
+      : {}),
+  }));
+}
+
+function assertRichMessagesAreUserOnly(messages: ChatMessage[]): void {
+  for (const message of messages) {
+    if (typeof message.content !== 'string' && message.role !== 'user') {
+      throw new InvalidModelInputError(
+        'Non-text model input parts are only supported on user messages',
+      );
+    }
+  }
+}
+
+/** Validate the application-owned history into an ask-local snapshot. */
+function normalizeSessionHistory(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((message) => {
+    if (typeof message.content === 'string') return { ...message };
+    if (message.role !== 'user') {
+      throw new InvalidModelInputError(
+        'Non-text model input parts are only supported on user messages',
+      );
+    }
+    return { ...message, content: normalizeModelInput(message.content) };
+  });
+}
+
+function hasRichMessage(messages: readonly ChatMessage[]): boolean {
+  return messages.some((message) => typeof message.content !== 'string');
+}
+
+function firstImageSource(
+  input: ModelInput,
+  history: readonly ChatMessage[],
+): 'bytes' | 'base64' | 'url' | 'provider-file' | undefined {
+  const find = (value: ModelInput) =>
+    typeof value === 'string'
+      ? undefined
+      : value.find((part) => part.type === 'image')?.source.type;
+  return find(input) ?? history.map((message) => find(message.content)).find(Boolean);
+}
+
+function appendHandoffInstruction(
+  input: ModelInput,
+  originalText: string,
+  instruction: string,
+): ModelInput {
+  if (typeof input === 'string' || instruction.length === 0 || instruction === originalText)
+    return input;
+  return [...input, { type: 'text', text: instruction }];
+}
+
+const RICH_MODEL_INPUT_ERROR_MESSAGE = 'Provider request failed while processing rich model input';
+const RICH_MODEL_INPUT_ERROR_NAME = 'RichModelInputError';
+const MAX_RICH_FAILURE_ASSOCIATIONS = 32;
+const MAX_RICH_FAILURE_CAUSE_DEPTH = 4;
+
+type ObserverErrorProjection = { readonly message: string; readonly name: string };
+type RichFailureState = {
+  associations: unknown[];
+  overflowed: boolean;
+  indeterminate: boolean;
+};
+
+function legacyErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function providerErrorEventMetadata(error: unknown, richRequest: boolean): Record<string, unknown> {
+  if (!(error instanceof ProviderError)) {
+    return error instanceof AxlError && richRequest ? { code: error.code } : {};
+  }
+  return {
+    status: error.status,
+    retryable: error.retryable,
+    ...(richRequest
+      ? {
+          code: error.code,
+          provider: error.provider,
+          ...(error.requestId ? { requestId: error.requestId } : {}),
+          ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
+        }
+      : {}),
+  };
 }
 
 /**
@@ -499,6 +625,7 @@ export type WorkflowContextInit = {
   metadata?: Record<string, unknown>;
   config: AxlConfig;
   providerRegistry: ProviderRegistry;
+  transcriptionProviderRegistry?: TranscriptionProviderRegistry;
   sessionHistory?: ChatMessage[];
   onTrace?: (event: AxlEvent) => void;
   pendingDecisions?: Map<string, PendingDecisionResolver>;
@@ -559,6 +686,9 @@ export type WorkflowContextInit = {
   /** Internal: root-shared lifecycle state. Prevents child contexts from
    *  emitting trace events after the workflow terminal. */
   workflowLifecycleState?: WorkflowLifecycleState;
+  /** Internal: bounded rich-failure state shared by child contexts in one
+   * execution. Never pass across independently created contexts. */
+  richFailureState?: RichFailureState;
   /** Runtime terminal barrier for abort-ignoring race/quorum branches. */
   branchDrainTimeoutMs?: number;
 };
@@ -601,6 +731,7 @@ export class WorkflowContext<TInput = unknown> {
 
   private config: AxlConfig;
   private providerRegistry: ProviderRegistry;
+  private transcriptionProviderRegistry?: TranscriptionProviderRegistry;
   private sessionHistory: ChatMessage[];
   private onTrace?: (event: AxlEvent) => void;
   private pendingDecisions?: Map<string, PendingDecisionResolver>;
@@ -626,6 +757,10 @@ export class WorkflowContext<TInput = unknown> {
    */
   private autoCheckpointCounters: { byAgent: Map<string, number>; root: number };
   private readonly branchDrainState: BranchDrainState;
+  /** Bounded exact-identity failure association for this execution tree.
+   * Unlike a process-global marker, this cannot affect another context that
+   * happens to reuse the same Error object. */
+  private readonly richFailureState: RichFailureState;
   /** Root-shared idempotency guards for workflow lifecycle emission.
    *  Both `runtime.execute()` and `runtime.stream()` have paths where a
    *  post-emit side-effect (checkpoint deletion, state-store persistence)
@@ -718,7 +853,8 @@ export class WorkflowContext<TInput = unknown> {
       // when the signal is still alive). A consumer accessing `ctx.events`
       // after abort would otherwise get a never-finishing bus. Finish
       // immediately so iterators resolve cleanly with `done: true`.
-      if (this.signal?.aborted) {
+      const signal = this.currentSignal;
+      if (signal?.aborted) {
         this._busRef.current._finish();
       }
     }
@@ -759,6 +895,7 @@ export class WorkflowContext<TInput = unknown> {
     this.metadata = init.metadata ?? {};
     this.config = init.config;
     this.providerRegistry = init.providerRegistry;
+    this.transcriptionProviderRegistry = init.transcriptionProviderRegistry;
     this.sessionHistory = init.sessionHistory ?? [];
     this.onTrace = init.onTrace;
     this.pendingDecisions = init.pendingDecisions;
@@ -818,6 +955,11 @@ export class WorkflowContext<TInput = unknown> {
       byAgent: new Map(),
       root: 0,
     };
+    this.richFailureState = init.richFailureState ?? {
+      associations: [],
+      overflowed: false,
+      indeterminate: false,
+    };
     const branchDrainTimeoutMs = resolveBranchDrainTimeoutMs(init.branchDrainTimeoutMs);
     this.branchDrainState = init.branchDrainState ?? {
       pending: new Set(),
@@ -852,6 +994,7 @@ export class WorkflowContext<TInput = unknown> {
       executionId: this.executionId,
       config: this.config,
       providerRegistry: this.providerRegistry,
+      transcriptionProviderRegistry: this.transcriptionProviderRegistry,
       metadata: { ...this.metadata },
       // Shared infrastructure
       budgetContext: this.budgetContext,
@@ -874,6 +1017,7 @@ export class WorkflowContext<TInput = unknown> {
       autoCheckpointCounters: this.autoCheckpointCounters,
       branchDrainState: this.branchDrainState,
       workflowLifecycleState: this.workflowLifecycleState,
+      richFailureState: this.richFailureState,
       // Share the parent's bus slot (mutable ref). Late allocation in
       // either parent or child propagates because both read the same
       // slot. Nested-ask events (agent-as-tool pattern) bubble up to
@@ -884,6 +1028,54 @@ export class WorkflowContext<TInput = unknown> {
       eventStreamOptions: this._eventStreamOptions,
       // Isolated: sessionHistory (empty)
     });
+  }
+
+  /** Associate an exact thrown value with rich input in this execution only. */
+  private recordRichFailure(error: unknown): void {
+    const state = this.richFailureState;
+    if (state.associations.some((known) => Object.is(known, error))) return;
+    if (state.associations.length >= MAX_RICH_FAILURE_ASSOCIATIONS) {
+      state.associations.shift();
+      state.overflowed = true;
+      state.indeterminate = true;
+    }
+    state.associations.push(error);
+  }
+
+  /** @internal Safe observer projection for a failure associated with rich input. */
+  _observerErrorProjection(error: unknown): ObserverErrorProjection | undefined {
+    const state = this.richFailureState;
+    const safe = (): ObserverErrorProjection => ({
+      message: RICH_MODEL_INPUT_ERROR_MESSAGE,
+      name: RICH_MODEL_INPUT_ERROR_NAME,
+    });
+    const indeterminate = (): ObserverErrorProjection | undefined => {
+      if (state.associations.length === 0) return undefined;
+      state.indeterminate = true;
+      return safe();
+    };
+    let current = error;
+    const seen = new WeakSet<object>();
+    for (let depth = 0; depth < MAX_RICH_FAILURE_CAUSE_DEPTH; depth++) {
+      if (state.associations.some((known) => Object.is(known, current))) {
+        return safe();
+      }
+      if ((typeof current !== 'object' || current === null) && typeof current !== 'function') {
+        return state.overflowed || state.indeterminate ? safe() : undefined;
+      }
+      if (seen.has(current)) return indeterminate();
+      seen.add(current);
+      let descriptor: PropertyDescriptor | undefined;
+      try {
+        descriptor = Object.getOwnPropertyDescriptor(current, 'cause');
+      } catch {
+        return indeterminate();
+      }
+      if (!descriptor) return state.overflowed || state.indeterminate ? safe() : undefined;
+      if (!('value' in descriptor)) return indeterminate();
+      current = descriptor.value;
+    }
+    return indeterminate();
   }
 
   /**
@@ -1125,7 +1317,24 @@ export class WorkflowContext<TInput = unknown> {
 
   // ── ctx.ask() ─────────────────────────────────────────────────────────
 
-  async ask<T = string>(agent: Agent, prompt: string, options?: AskOptions<T>): Promise<T> {
+  async ask<T = string>(agent: Agent, prompt: ModelInput, options?: AskOptions<T>): Promise<T> {
+    // Take ownership before any checkpoint/state work can await. Never derive a
+    // descriptor or text projection from raw caller data.
+    const normalizedInput = normalizeModelInput(prompt);
+    const normalizedHistory = normalizeSessionHistory(this.sessionHistory);
+    const delegateInputHolder = agent as Agent & { _delegateOriginalInput?: ModelInput };
+    if (delegateInputHolder._delegateOriginalInput !== undefined) {
+      delegateInputHolder._delegateOriginalInput = normalizeModelInput(
+        delegateInputHolder._delegateOriginalInput,
+      );
+    }
+    const richAsk =
+      typeof normalizedInput !== 'string' ||
+      hasRichMessage(normalizedHistory) ||
+      (delegateInputHolder._delegateOriginalInput !== undefined &&
+        typeof delegateInputHolder._delegateOriginalInput !== 'string');
+    const promptText = inputText(normalizedInput);
+    const inputDescriptor = describeModelInput(normalizedInput);
     const agentName = agent._name;
     return this._checkpoint(
       this._autoCheckpointName('ask', agentName),
@@ -1152,7 +1361,11 @@ export class WorkflowContext<TInput = unknown> {
 
         return askStorage.run(frame, async () => {
           const askStart = Date.now();
-          this.emitEvent({ type: 'ask_start', prompt });
+          this.emitEvent({
+            type: 'ask_start',
+            prompt: promptText,
+            ...(inputDescriptor ? { input: inputDescriptor } : {}),
+          });
 
           // `costBefore` snapshots the global budget so we can pass the per-ask
           // cost delta to onAgentCallComplete (legacy callback that reports the
@@ -1175,15 +1388,17 @@ export class WorkflowContext<TInput = unknown> {
               cached_tokens?: number;
               cache_write_tokens?: number;
             };
+            modelUri?: string;
           } = {};
 
           const doCall = async () => {
             const result = await this.executeAgentCall(
               agent,
-              prompt,
+              normalizedInput,
               options as AskOptions<unknown>,
               undefined,
               usageCapture,
+              normalizedHistory,
             );
             return result as T;
           };
@@ -1209,6 +1424,9 @@ export class WorkflowContext<TInput = unknown> {
                   },
                   async (span) => {
                     const r = await doCall();
+                    if (usageCapture.modelUri) {
+                      span.setAttribute('axl.agent.model', usageCapture.modelUri);
+                    }
                     const costAfter = this.budgetContext?.totalCost ?? 0;
                     span.setAttribute('axl.agent.cost', costAfter - costBefore);
                     span.setAttribute('axl.agent.duration', Date.now() - askStart);
@@ -1251,9 +1469,10 @@ export class WorkflowContext<TInput = unknown> {
               try {
                 this.onAgentCallComplete({
                   agent: agent._name,
-                  prompt,
+                  prompt: promptText,
+                  ...(inputDescriptor ? { input: inputDescriptor } : {}),
                   response: typeof result === 'string' ? result : JSON.stringify(result),
-                  model: agent.resolveModel(resolveCtx),
+                  model: usageCapture.modelUri ?? agent.resolveModel(resolveCtx),
                   cost: costAfter - costBefore,
                   unpriced: frame.askUnpriced || unpricedCountAfter > unpricedCountBefore,
                   duration: Date.now() - askStart,
@@ -1277,9 +1496,10 @@ export class WorkflowContext<TInput = unknown> {
           } catch (err) {
             askFailed = true;
             askFailure = err;
+            if (richAsk) this.recordRichFailure(err);
             outcome = {
               ok: false,
-              error: err instanceof Error ? err.message : String(err),
+              error: this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
             };
           }
 
@@ -1321,7 +1541,7 @@ export class WorkflowContext<TInput = unknown> {
 
   private async executeAgentCall(
     agent: Agent,
-    prompt: string,
+    input: ModelInput,
     options?: AskOptions<unknown>,
     handoffMessages?: ChatMessage[],
     usageCapture?: {
@@ -1332,7 +1552,9 @@ export class WorkflowContext<TInput = unknown> {
         cached_tokens?: number;
         cache_write_tokens?: number;
       };
+      modelUri?: string;
     },
+    sessionHistory: ChatMessage[] = normalizeSessionHistory(this.sessionHistory),
   ): Promise<unknown> {
     // Budget check
     if (this.budgetContext?.exceeded) {
@@ -1357,7 +1579,103 @@ export class WorkflowContext<TInput = unknown> {
       : { metadata: this.metadata };
     const modelUri = agent.resolveModel(resolveCtx);
     const systemPrompt = agent.resolveSystem(resolveCtx);
-    const { provider, model } = this.providerRegistry.resolve(modelUri, this.config);
+    const { provider, model: resolvedModel } = this.providerRegistry.resolve(modelUri, this.config);
+    let model = resolvedModel;
+    const prompt = inputText(input);
+    const providerOptions = options?.providerOptions ?? agent._config.providerOptions;
+
+    // Rich calls fail closed before any dynamic handoff resolution, context
+    // summarization, guardrail callback, diagnostics, or provider dispatch.
+    const richRequest = typeof input !== 'string' || hasRichMessage(sessionHistory);
+    if (richRequest) {
+      if (providerOptions && ('messages' in providerOptions || 'input' in providerOptions)) {
+        throw new UnsupportedModelInputError({
+          provider: provider.name ?? modelUri.split(':', 1)[0],
+          model,
+          modality: 'image',
+          feature: 'raw input-container providerOptions',
+        });
+      }
+      const source = firstImageSource(input, sessionHistory);
+      if (!provider.validateInput) {
+        throw new UnsupportedModelInputError({
+          provider: provider.name ?? modelUri.split(':', 1)[0],
+          model,
+          modality: 'image',
+          ...(source ? { source } : {}),
+        });
+      }
+      const validation = provider.validateInput({
+        model,
+        input: cloneModelInput(input),
+        history: cloneMessagesForProvider(sessionHistory),
+        stream: this._streamingEnabled,
+        hasTools: Boolean(
+          agent._config.tools?.length ||
+          agent._config.mcp?.length ||
+          agent._config.mcpTools?.length ||
+          agent._config.handoffs,
+        ),
+        responseMode: options?.schema ? 'structured' : 'text',
+        providerOptions,
+      });
+      if (
+        !validation ||
+        typeof validation.effectiveModel !== 'string' ||
+        validation.effectiveModel.length === 0
+      ) {
+        throw new UnsupportedModelInputError({
+          provider: provider.name ?? modelUri.split(':', 1)[0],
+          model,
+          modality: 'image',
+          ...(source ? { source } : {}),
+        });
+      }
+      model = validation.effectiveModel;
+    }
+
+    // Text calls retain the original URI byte-for-byte. Rich validators may
+    // substitute only the model component while preserving the caller's
+    // provider prefix/style for every observability surface.
+    const effectiveModelUri = !richRequest
+      ? modelUri
+      : `${modelUri.slice(0, modelUri.indexOf(':') + 1)}${model}`;
+    // The root ask owns callback/span attribution. Handoff targets share its
+    // usage capture for cost/token aggregation, but must never replace the
+    // root's effective request URI.
+    if (usageCapture) usageCapture.modelUri ??= effectiveModelUri;
+
+    if (richRequest) {
+      const descriptors = [
+        describeModelInput(input),
+        ...sessionHistory.map((message) => describeModelInput(message.content)),
+      ].filter(
+        (descriptor): descriptor is NonNullable<typeof descriptor> => descriptor !== undefined,
+      );
+      const parts = descriptors.flatMap((descriptor) => descriptor.parts);
+      this.spanManager?.addEventToActiveSpan('axl.model_input', {
+        'axl.input.parts': parts.length,
+        'axl.input.images': parts.filter((part) => part.type === 'image').length,
+        'axl.input.source.bytes': parts.filter(
+          (part) => part.type === 'image' && part.source === 'bytes',
+        ).length,
+        'axl.input.source.base64': parts.filter(
+          (part) => part.type === 'image' && part.source === 'base64',
+        ).length,
+        'axl.input.source.url': parts.filter(
+          (part) => part.type === 'image' && part.source === 'url',
+        ).length,
+        'axl.input.source.provider_file': parts.filter(
+          (part) => part.type === 'image' && part.source === 'provider-file',
+        ).length,
+        'axl.input.inline_bytes': parts.reduce(
+          (sum, part) => sum + (part.type === 'image' ? (part.bytes ?? 0) : 0),
+          0,
+        ),
+      });
+    }
+
+    assertRichMessagesAreUserOnly(sessionHistory);
 
     // Resolve dynamic handoffs once per call to ensure consistency
     // between tool definitions and handoff lookup within the same turn.
@@ -1389,32 +1707,41 @@ export class WorkflowContext<TInput = unknown> {
 
     // Include session history (with context window management)
     const maxContext = agent._config.maxContext;
-    if (maxContext && this.sessionHistory.length > 0) {
+    if (maxContext && sessionHistory.length > 0) {
       const reserveTokens = this.config.contextManagement?.reserveTokens ?? 2000;
       const systemTokens = systemPrompt ? estimateTokens(systemPrompt) : 0;
       const toolTokens = toolDefs.length > 0 ? estimateTokens(JSON.stringify(toolDefs)) : 0;
       const overhead = systemTokens + toolTokens + reserveTokens;
       const availableForHistory = maxContext - overhead;
 
-      const historyTokens = estimateMessagesTokens(this.sessionHistory);
-      if (historyTokens > availableForHistory) {
+      const historyEstimate = estimateMessagesTokens(sessionHistory);
+      if (historyEstimate.unmeasured) {
+        this.emitEvent({
+          type: 'log',
+          data: {
+            warning:
+              'Context media contribution is unmeasured; provider will enforce its context limit',
+          },
+        });
+      }
+      if (historyEstimate.tokens > availableForHistory) {
         // Need to summarize: find the split point
         const summarizedMessages = await this.summarizeHistory(
           provider,
           model,
-          this.sessionHistory,
+          sessionHistory,
           availableForHistory,
         );
         for (const msg of summarizedMessages) {
           messages.push(msg);
         }
       } else {
-        for (const msg of this.sessionHistory) {
+        for (const msg of sessionHistory) {
           messages.push(msg);
         }
       }
     } else {
-      for (const msg of this.sessionHistory) {
+      for (const msg of sessionHistory) {
         messages.push(msg);
       }
     }
@@ -1425,7 +1752,7 @@ export class WorkflowContext<TInput = unknown> {
     // Precedence: AskOptions > AgentConfig > default ('json-schema').
     const schemaPromptMode: SchemaPromptOption =
       options?.schemaPrompt ?? agent._config.schemaPrompt ?? 'json-schema';
-    let userContent = prompt;
+    let userContent: ModelInput = input;
     let appendedSchemaText: string | undefined;
     if (options?.schema) {
       const schema = options.schema as z.ZodType;
@@ -1438,7 +1765,11 @@ export class WorkflowContext<TInput = unknown> {
         // structural schema on the wire, so the Gemini `$ref` cliff does not
         // apply here (it only bites tool-def schemas).
         appendedSchemaText = renderSchemaForPrompt(schema);
-        userContent += `\n\nRespond with valid JSON matching this schema:\n${appendedSchemaText}`;
+        const guidance = `\n\nRespond with valid JSON matching this schema:\n${appendedSchemaText}`;
+        userContent =
+          typeof input === 'string'
+            ? input + guidance
+            : [...input, { type: 'text', text: guidance }];
       } else {
         // Custom rendering: append exactly what the author supplies (string or
         // function of the schema). No wrapper phrasing — they own the guidance.
@@ -1446,7 +1777,11 @@ export class WorkflowContext<TInput = unknown> {
           typeof schemaPromptMode.render === 'function'
             ? schemaPromptMode.render(schema)
             : schemaPromptMode.render;
-        userContent += `\n\n${appendedSchemaText}`;
+        const guidance = `\n\n${appendedSchemaText}`;
+        userContent =
+          typeof input === 'string'
+            ? input + guidance
+            : [...input, { type: 'text', text: guidance }];
       }
     }
 
@@ -1491,7 +1826,10 @@ export class WorkflowContext<TInput = unknown> {
     // -- Input guardrail --
     const guardrails = agent._config.guardrails;
     if (guardrails?.input) {
-      const inputResult = await guardrails.input(prompt, { metadata: this.metadata });
+      const inputResult = await guardrails.input(prompt, {
+        metadata: this.metadata,
+        input: cloneModelInput(input),
+      });
       this.emitEvent({
         type: 'guardrail',
         agent: agent._name,
@@ -1617,7 +1955,7 @@ export class WorkflowContext<TInput = unknown> {
         includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
         toolChoice: options?.toolChoice ?? agent._config.toolChoice,
         stop: options?.stop ?? agent._config.stop,
-        providerOptions: options?.providerOptions ?? agent._config.providerOptions,
+        providerOptions,
         signal: this.currentSignal,
       };
 
@@ -1666,15 +2004,31 @@ export class WorkflowContext<TInput = unknown> {
       // mutations (tool results, retry feedback) don't bleed back into the
       // already-emitted event.
       let messagesSnapshot: ChatMessage[] | undefined;
+      let messageInputs:
+        | Array<{
+            readonly index: number;
+            readonly input: ReturnType<typeof describeModelInput> & {};
+          }>
+        | undefined;
       if (verboseTrace) {
         try {
-          messagesSnapshot = structuredClone(currentMessages);
+          messageInputs = currentMessages.flatMap((message, index) => {
+            const descriptor = describeModelInput(message.content);
+            return descriptor ? [{ index, input: descriptor }] : [];
+          });
+          messagesSnapshot = currentMessages.map((message) => ({
+            ...message,
+            content: sanitizeModelInputForTrace(message.content),
+          }));
         } catch (err) {
           console.warn(
             '[axl] verbose trace messages snapshot failed to clone; emitting shallow copy:',
             err instanceof Error ? err.message : String(err),
           );
-          messagesSnapshot = [...currentMessages];
+          messagesSnapshot = currentMessages.map((message) => ({
+            ...message,
+            content: sanitizeModelInputForTrace(message.content),
+          }));
         }
       }
 
@@ -1686,16 +2040,18 @@ export class WorkflowContext<TInput = unknown> {
       this.emitEvent({
         type: 'agent_call_start',
         agent: agent._name,
-        model: modelUri,
+        model: effectiveModelUri,
         turn: turns,
         data: {
           prompt,
+          ...(typeof input === 'string' ? {} : { input: describeModelInput(input) }),
           ...(systemPrompt ? { system: systemPrompt } : {}),
           params: callParams,
           turn: turns,
           ...(retryReason ? { retryReason } : {}),
           ...(toolDefs.length > 0 ? { toolNames: toolDefs.map((t) => t.function.name) } : {}),
           ...(messagesSnapshot ? { messages: messagesSnapshot } : {}),
+          ...(messageInputs && messageInputs.length > 0 ? { messageInputs } : {}),
         },
       });
 
@@ -1771,7 +2127,10 @@ export class WorkflowContext<TInput = unknown> {
               })
             : undefined;
 
-          for await (const chunk of provider.stream(currentMessages, chatOptions)) {
+          for await (const chunk of provider.stream(
+            cloneMessagesForProvider(currentMessages),
+            chatOptions,
+          )) {
             if (chunk.type === 'text_delta') {
               content += chunk.content;
               // Emit a `token` AxlEvent so wire consumers (AxlStream) and
@@ -1860,29 +2219,28 @@ export class WorkflowContext<TInput = unknown> {
             response.thinking_content = thinkingContent;
           }
         } else {
-          response = await provider.chat(currentMessages, chatOptions);
+          response = await provider.chat(cloneMessagesForProvider(currentMessages), chatOptions);
         }
       } catch (err) {
+        if (richRequest) this.recordRichFailure(err);
         // Emit the paired `agent_call_end` before rethrowing. Empty response,
         // error message in `data.error`. No usage/cost — provider didn't
         // deliver one. `duration` reflects time-to-failure.
         this.emitEvent({
           type: 'agent_call_end',
           agent: agent._name,
-          model: modelUri,
+          model: effectiveModelUri,
           promptVersion: agent._config.version,
           duration: Date.now() - turnStart,
           data: {
             response: '',
             turn: turns,
             ...(retryReason ? { retryReason } : {}),
-            error: err instanceof Error ? err.message : String(err),
+            error: this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
             // Enrich with typed-error metadata when available. `body` is
             // deliberately NOT emitted — it's redaction-eligible (see
             // docs/security.md). `data.error` already carries the message.
-            ...(err instanceof ProviderError
-              ? { status: err.status, retryable: err.retryable }
-              : {}),
+            ...providerErrorEventMetadata(err, richRequest),
           },
         });
         throw err;
@@ -1906,7 +2264,7 @@ export class WorkflowContext<TInput = unknown> {
       this.emitEvent({
         type: 'agent_call_end',
         agent: agent._name,
-        model: modelUri,
+        model: effectiveModelUri,
         promptVersion: agent._config.version,
         cost: response.cost,
         tokens: response.usage
@@ -1951,15 +2309,17 @@ export class WorkflowContext<TInput = unknown> {
             if (descriptor) {
               const mode = descriptor.mode ?? 'oneway';
 
-              // For roundtrip, parse the message parameter from tool call args
+              // Preserve a model-provided handoff instruction for either mode.
+              // Oneway definitions currently have no required parameter, but a
+              // custom/router tool call may still provide a useful message.
               let handoffPrompt = prompt;
-              if (mode === 'roundtrip') {
-                try {
-                  const args = JSON.parse(toolCall.function.arguments);
-                  if (args.message) handoffPrompt = args.message;
-                } catch {
-                  // Fall back to original prompt if args can't be parsed
+              try {
+                const args = JSON.parse(toolCall.function.arguments);
+                if (typeof args.message === 'string' && args.message.length > 0) {
+                  handoffPrompt = args.message;
                 }
+              } catch {
+                // Fall back to original prompt if args can't be parsed.
               }
 
               const handoffStart = Date.now();
@@ -2012,15 +2372,32 @@ export class WorkflowContext<TInput = unknown> {
               // outcome) works uniformly for direct and handoff asks.
               const handoffFn = () =>
                 askStorage.run(targetFrame, async () => {
-                  this.emitEvent({ type: 'ask_start', prompt: handoffPrompt });
+                  const delegateOriginal = (
+                    agent as Agent & { _delegateOriginalInput?: ModelInput }
+                  )._delegateOriginalInput;
+                  const handoffInput =
+                    delegateOriginal ?? (typeof input === 'string' ? handoffPrompt : input);
+                  const enrichedHandoffInput = appendHandoffInstruction(
+                    handoffInput,
+                    inputText(input),
+                    handoffPrompt,
+                  );
+                  this.emitEvent({
+                    type: 'ask_start',
+                    prompt: inputText(enrichedHandoffInput),
+                    ...(typeof enrichedHandoffInput === 'string'
+                      ? {}
+                      : { input: describeModelInput(enrichedHandoffInput) }),
+                  });
                   const targetAskStart = Date.now();
                   try {
                     const result = await this.executeAgentCall(
                       descriptor.agent,
-                      handoffPrompt,
+                      enrichedHandoffInput,
                       handoffOptions,
                       currentMessages,
                       usageCapture,
+                      sessionHistory,
                     );
                     this.emitEvent({
                       type: 'ask_end',
@@ -2031,11 +2408,15 @@ export class WorkflowContext<TInput = unknown> {
                     });
                     return result;
                   } catch (err) {
+                    const richHandoff =
+                      typeof enrichedHandoffInput !== 'string' || hasRichMessage(sessionHistory);
+                    if (richHandoff) this.recordRichFailure(err);
                     this.emitEvent({
                       type: 'ask_end',
                       outcome: {
                         ok: false,
-                        error: err instanceof Error ? err.message : String(err),
+                        error:
+                          this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
                       },
                       cost: targetFrame.askCost.value,
                       ...(targetFrame.askUnpriced ? { unpriced: true } : {}),
@@ -2679,14 +3060,14 @@ export class WorkflowContext<TInput = unknown> {
         role: 'system',
         content: `Summary of earlier conversation:\n${this.summaryCache}`,
       };
-      const summaryTokens = estimateTokens(summaryMsg.content) + 4;
+      const summaryTokens = estimateTokens(summarizeModelInput(summaryMsg.content)) + 4;
       const remaining = availableTokens - summaryTokens;
 
       // Find how many recent messages fit
       let recentTokens = 0;
       let splitIdx = history.length;
       for (let i = history.length - 1; i >= 0; i--) {
-        const msgTokens = estimateTokens(history[i].content) + 4;
+        const msgTokens = estimateTokens(summarizeModelInput(history[i].content)) + 4;
         if (recentTokens + msgTokens > remaining) break;
         recentTokens += msgTokens;
         splitIdx = i;
@@ -2704,7 +3085,7 @@ export class WorkflowContext<TInput = unknown> {
     const targetRecent = Math.floor(availableTokens * 0.6); // 60% for recent messages
 
     for (let i = history.length - 1; i >= 0; i--) {
-      const msgTokens = estimateTokens(history[i].content) + 4;
+      const msgTokens = estimateTokens(summarizeModelInput(history[i].content)) + 4;
       if (recentTokens + msgTokens > targetRecent) break;
       recentTokens += msgTokens;
       splitIdx = i;
@@ -2729,7 +3110,9 @@ export class WorkflowContext<TInput = unknown> {
       summaryModel = model;
     }
 
-    const oldContent = oldMessages.map((m) => `${m.role}: ${m.content}`).join('\n');
+    const oldContent = oldMessages
+      .map((m) => `${m.role}: ${summarizeModelInput(m.content)}`)
+      .join('\n');
 
     const summaryResponse = await summaryProvider.chat(
       [
@@ -4194,7 +4577,7 @@ export class WorkflowContext<TInput = unknown> {
    */
   async delegate<T = string>(
     agents: Agent[],
-    prompt: string,
+    prompt: ModelInput,
     options?: DelegateOptions<T>,
   ): Promise<T> {
     if (agents.length === 0) {
@@ -4285,7 +4668,10 @@ export class WorkflowContext<TInput = unknown> {
       },
     });
 
-    return this.ask(routerAgent, prompt, {
+    const routerInput = options?.routerInput === 'text' ? inputText(prompt) : prompt;
+    (routerAgent as Agent & { _delegateOriginalInput?: ModelInput })._delegateOriginalInput =
+      prompt;
+    return this.ask(routerAgent, routerInput, {
       schema: options?.schema,
       schemaPrompt: options?.schemaPrompt,
       nativeStructuredOutput: options?.nativeStructuredOutput,
@@ -4294,6 +4680,313 @@ export class WorkflowContext<TInput = unknown> {
       validate: options?.validate,
       validateRetries: options?.validateRetries,
     });
+  }
+
+  /** Transcribe recorded audio through the dedicated transcription registry.
+   * This operation never enters the chat history or chat-provider path. */
+  async transcribe(request: TranscriptionRequest): Promise<Transcript> {
+    const startedAt = Date.now();
+    const transcriptionId = randomUUID();
+    const signal = this.currentSignal;
+    const rawAudio =
+      request && typeof request === 'object' && 'audio' in request
+        ? (request as { audio?: { type?: unknown; data?: unknown; mediaType?: unknown } }).audio
+        : undefined;
+    const source = rawAudio?.type;
+    const requestedUri = typeof request?.model === 'string' ? request.model : undefined;
+    const colon = requestedUri?.indexOf(':') ?? -1;
+    const requestedProvider = colon > 0 ? requestedUri!.slice(0, colon) : undefined;
+    const requestedModel =
+      colon > 0 && colon < requestedUri!.length - 1 ? requestedUri!.slice(colon + 1) : undefined;
+    const startAudio = {
+      source: typeof source === 'string' ? source : 'unknown',
+      ...(rawAudio?.data instanceof Uint8Array ? { bytes: rawAudio.data.byteLength } : {}),
+      ...(typeof rawAudio?.mediaType === 'string' ? { mediaType: rawAudio.mediaType } : {}),
+    };
+    this.emitEvent({
+      type: 'transcription_start',
+      transcriptionId,
+      model: requestedModel,
+      data: {
+        ...(requestedProvider ? { provider: requestedProvider } : {}),
+        ...(requestedModel ? { model: requestedModel } : {}),
+        audio: startAudio,
+      },
+    });
+    let terminalEmitted = false;
+    const emitTerminal = (partial: {
+      model?: string;
+      cost?: number;
+      tokens?: { input?: number; output?: number };
+      data: Record<string, unknown>;
+    }) => {
+      if (terminalEmitted) return;
+      terminalEmitted = true;
+      this.emitEvent({
+        type: 'transcription_end',
+        transcriptionId,
+        model: partial.model,
+        duration: Date.now() - startedAt,
+        ...(partial.cost !== undefined ? { cost: partial.cost } : {}),
+        ...(partial.tokens ? { tokens: partial.tokens } : {}),
+        data: partial.data,
+      });
+    };
+    const abortError = () =>
+      new DOMException('The transcription operation was aborted', 'AbortError');
+    const cleanupStatus = (value: unknown) =>
+      value === 'not_required' || value === 'deleted' || value === 'failed' || value === 'timed_out'
+        ? value
+        : undefined;
+    const safeProviderFailure = (error: unknown, provider: string, model: string) => {
+      const details =
+        error && typeof error === 'object' ? (error as Record<string, unknown>) : undefined;
+      const accounting = normalizeTranscriptionAccounting(details?.usage, details?.pricingStatus);
+      const cleanup = cleanupStatus(details?.cleanupStatus);
+      const providerError = error instanceof ProviderError ? error : undefined;
+      const diagnostics = providerError
+        ? {
+            status: providerError.status,
+            retryable: providerError.retryable,
+            ...(providerError.retryAfterMs !== undefined
+              ? { retryAfterMs: providerError.retryAfterMs }
+              : {}),
+            ...(providerError.requestId ? { requestId: providerError.requestId } : {}),
+          }
+        : undefined;
+      return {
+        accounting,
+        cleanup,
+        diagnostics,
+        error: new TranscriptionOperationError({
+          provider,
+          model,
+          ...(accounting.usage ? { usage: accounting.usage } : {}),
+          ...(accounting.pricingStatus ? { pricingStatus: accounting.pricingStatus } : {}),
+          ...(cleanup ? { cleanupStatus: cleanup } : {}),
+          ...(diagnostics ?? {}),
+          cause: error,
+        }),
+      };
+    };
+    const terminalData = (
+      status: 'completed' | 'failed' | 'aborted',
+      provider: string | undefined,
+      model: string | undefined,
+      audio: Record<string, unknown> | undefined,
+      accounting: ReturnType<typeof normalizeTranscriptionAccounting>,
+      extras: Record<string, unknown> = {},
+    ) => ({
+      status,
+      ...(provider ? { provider } : {}),
+      ...(model ? { model } : {}),
+      ...(audio ? { audio } : {}),
+      ...(accounting.usage ? { usage: accounting.usage } : {}),
+      ...(accounting.pricingStatus ? { pricingStatus: accounting.pricingStatus } : {}),
+      ...extras,
+    });
+    try {
+      const normalized = normalizeTranscriptionRequest(request);
+      const descriptor = {
+        source: normalized.audio.type,
+        ...(normalized.audio.type === 'bytes' ? { bytes: normalized.audio.data.byteLength } : {}),
+        ...(normalized.audio.mediaType !== undefined
+          ? { mediaType: normalized.audio.mediaType }
+          : {}),
+      };
+      if (this.currentSignal?.aborted || signal?.aborted) {
+        emitTerminal({
+          model: requestedModel,
+          data: terminalData('aborted', requestedProvider, requestedModel, descriptor, {
+            hasWork: false,
+          }),
+        });
+        throw abortError();
+      }
+      if (this.budgetContext?.exceeded) {
+        const { limit, totalCost: spent, policy } = this.budgetContext;
+        if (policy === 'warn') {
+          this.emitEvent({
+            type: 'log',
+            data: { warning: 'Budget exceeded', limit, spent, policy },
+          });
+        } else {
+          throw new BudgetExceededError(limit, spent, policy);
+        }
+      }
+      if (!this.transcriptionProviderRegistry) {
+        throw new InvalidTranscriptionInputError(
+          'No transcription provider registry is configured',
+        );
+      }
+      const resolved = this.transcriptionProviderRegistry.resolve(normalized.model, this.config);
+      if (
+        normalized.audio.type === 'provider-file' &&
+        normalized.audio.provider !== resolved.providerName
+      ) {
+        throw new InvalidTranscriptionInputError(
+          'Transcription provider-file source does not match the requested provider',
+        );
+      }
+      const capabilities = resolved.provider.capabilities(resolved.model);
+      if (!capabilities || !capabilities.sources.includes(normalized.audio.type)) {
+        throw new InvalidTranscriptionInputError(
+          'The requested transcription model does not support this audio source',
+        );
+      }
+      if (normalized.timestamps && !capabilities.timestamps?.includes(normalized.timestamps)) {
+        throw new InvalidTranscriptionInputError(
+          'The requested transcription model does not support requested timestamps',
+        );
+      }
+      if (normalized.diarization && !capabilities.diarization) {
+        throw new InvalidTranscriptionInputError(
+          'The requested transcription model does not support diarization',
+        );
+      }
+      const providerRequest: TranscriptionProviderRequest = {
+        ...normalized,
+        model: resolved.model,
+        ...(signal ? { signal } : {}),
+      };
+      let result;
+      try {
+        result = await resolved.provider.transcribe(providerRequest);
+      } catch (error) {
+        const failure = safeProviderFailure(error, resolved.providerName, resolved.model);
+        if (this.currentSignal?.aborted || signal?.aborted) {
+          if (failure.accounting.cost !== undefined)
+            this._accumulateBudgetCost(failure.accounting.cost);
+          emitTerminal({
+            model: resolved.model,
+            ...(failure.accounting.cost !== undefined ? { cost: failure.accounting.cost } : {}),
+            ...(failure.accounting.tokens ? { tokens: failure.accounting.tokens } : {}),
+            data: terminalData(
+              'aborted',
+              resolved.providerName,
+              resolved.model,
+              descriptor,
+              failure.accounting,
+              ...(failure.cleanup ? [{ cleanupStatus: failure.cleanup }] : []),
+            ),
+          });
+          throw abortError();
+        }
+        if (failure.accounting.cost !== undefined)
+          this._accumulateBudgetCost(failure.accounting.cost);
+        emitTerminal({
+          model: resolved.model,
+          ...(failure.accounting.cost !== undefined ? { cost: failure.accounting.cost } : {}),
+          ...(failure.accounting.tokens ? { tokens: failure.accounting.tokens } : {}),
+          data: terminalData(
+            'failed',
+            resolved.providerName,
+            resolved.model,
+            descriptor,
+            failure.accounting,
+            {
+              error: 'Transcription operation failed',
+              errorCode: failure.error.code,
+              ...(failure.diagnostics ? { providerError: failure.diagnostics } : {}),
+              ...(failure.cleanup ? { cleanupStatus: failure.cleanup } : {}),
+            },
+          ),
+        });
+        throw failure.error;
+      }
+      const accounting = normalizeTranscriptionAccounting(
+        result.transcript?.usage,
+        result.transcript?.pricingStatus,
+      );
+      if (accounting.cost !== undefined) this._accumulateBudgetCost(accounting.cost);
+      if (this.currentSignal?.aborted || signal?.aborted) {
+        emitTerminal({
+          model: resolved.model,
+          ...(accounting.cost !== undefined ? { cost: accounting.cost } : {}),
+          ...(accounting.tokens ? { tokens: accounting.tokens } : {}),
+          data: terminalData(
+            'aborted',
+            resolved.providerName,
+            resolved.model,
+            descriptor,
+            accounting,
+            ...(cleanupStatus(result.cleanupStatus)
+              ? [{ cleanupStatus: cleanupStatus(result.cleanupStatus)! }]
+              : []),
+          ),
+        });
+        throw abortError();
+      }
+      let transcript: Transcript;
+      try {
+        transcript = cloneTranscript(result.transcript);
+      } catch (error) {
+        const cleanup = cleanupStatus(result.cleanupStatus);
+        const failure = new TranscriptionOperationError({
+          provider: resolved.providerName,
+          model: resolved.model,
+          ...(accounting.usage ? { usage: accounting.usage } : {}),
+          ...(accounting.pricingStatus ? { pricingStatus: accounting.pricingStatus } : {}),
+          ...(cleanup ? { cleanupStatus: cleanup } : {}),
+          cause: error,
+        });
+        emitTerminal({
+          model: resolved.model,
+          ...(accounting.cost !== undefined ? { cost: accounting.cost } : {}),
+          ...(accounting.tokens ? { tokens: accounting.tokens } : {}),
+          data: terminalData(
+            'failed',
+            resolved.providerName,
+            resolved.model,
+            descriptor,
+            accounting,
+            {
+              error: 'Transcription operation failed',
+              errorCode: 'TRANSCRIPTION_PROVIDER_ERROR',
+              ...(cleanup ? { cleanupStatus: cleanup } : {}),
+            },
+          ),
+        });
+        throw failure;
+      }
+      emitTerminal({
+        model: resolved.model,
+        ...(accounting.cost !== undefined ? { cost: accounting.cost } : {}),
+        ...(accounting.tokens ? { tokens: accounting.tokens } : {}),
+        data: terminalData(
+          'completed',
+          resolved.providerName,
+          resolved.model,
+          descriptor,
+          accounting,
+          {
+            text: transcript.text,
+            ...(cleanupStatus(result.cleanupStatus)
+              ? { cleanupStatus: cleanupStatus(result.cleanupStatus)! }
+              : {}),
+          },
+        ),
+      });
+      return transcript;
+    } catch (error) {
+      if (!terminalEmitted) {
+        const aborted = signal?.aborted || (error instanceof Error && error.name === 'AbortError');
+        emitTerminal({
+          model: requestedModel,
+          data: terminalData(
+            aborted ? 'aborted' : 'failed',
+            requestedProvider,
+            requestedModel,
+            undefined,
+            { hasWork: false },
+            {
+              error: aborted ? 'Transcription operation aborted' : 'Transcription operation failed',
+            },
+          ),
+        });
+      }
+      throw error;
+    }
   }
 
   // ── Private ───────────────────────────────────────────────────────────
@@ -4397,7 +5090,7 @@ export class WorkflowContext<TInput = unknown> {
       const usable = isUsableCost(cost);
       const unpriced =
         !usable &&
-        hasPositiveTokens(
+        hasPositiveBillableWork(
           partial as {
             tokens?: {
               input?: number;
@@ -4406,6 +5099,7 @@ export class WorkflowContext<TInput = unknown> {
               cached?: number;
               cacheWrite?: number;
             };
+            data?: { usage?: { audioSeconds?: number; totalTokens?: number } };
           },
         );
       if (frame) {

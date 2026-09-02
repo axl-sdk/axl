@@ -5,6 +5,19 @@ export type { Tool, ToolConfig, ToolHooks, ToolModelOutput, RetryPolicy } from '
 export { agent } from './agent.js';
 export type { Agent, AgentConfig, HandoffDescriptor } from './agent.js';
 
+export { inputText, MAX_INLINE_MODEL_INPUT_BYTES } from './input.js';
+export type {
+  ModelInput,
+  InputContentPart,
+  InputTextPart,
+  InputImagePart,
+  InputMediaSource,
+  ModelInputDescriptor,
+} from './input.js';
+
+export { MAX_INLINE_TRANSCRIPTION_BYTES } from './transcription.js';
+export type { RecordedAudioSource, TranscriptionRequest, Transcript } from './transcription.js';
+
 export { workflow } from './workflow.js';
 export type { Workflow, WorkflowConfig, AnyWorkflow } from './workflow.js';
 
@@ -63,6 +76,7 @@ export {
   isUnpricedLeaf,
   isRootLevel,
   hasPositiveTokens,
+  hasPositiveBillableWork,
   isUsableCost,
   COST_BEARING_LEAF_TYPES,
 } from './event-utils.js';
@@ -181,6 +195,8 @@ export {
   ValidationError,
   ToolModelOutputError,
   ToolFailure,
+  InvalidModelInputError,
+  UnsupportedModelInputError,
 } from './errors.js';
 export type { ToolFailureConstructor } from './errors.js';
 export { ProviderError, isRetryableStatus } from './providers/errors.js';
@@ -233,6 +249,10 @@ export type {
   OpenAICompatibleOptions,
 } from './providers/openai-compatible.js';
 export { ProviderRegistry } from './providers/registry.js';
+export { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
+export { OpenAITranscriptionProvider } from './providers/openai-transcription.js';
+export { GeminiTranscriptionProvider } from './providers/gemini-transcription.js';
+export { OpenRouterTranscriptionProvider } from './providers/openrouter-transcription.js';
 export { RateLimiter } from './providers/rate-limiter.js';
 export type { RateLimitConfig } from './providers/rate-limiter.js';
 export type {
@@ -245,7 +265,21 @@ export type {
   ChatOptions,
   Effort,
   ToolChoice,
+  InputModalitySupport,
+  ProviderInputValidationRequest,
+  ProviderInputValidationResult,
 } from './providers/types.js';
+export type {
+  TranscriptionProvider,
+  TranscriptionProviderRequest,
+  TranscriptionProviderResult,
+  TranscriptionCapabilities,
+} from './providers/transcription-types.js';
+export {
+  InvalidTranscriptionInputError,
+  UnsupportedTranscriptionInputError,
+  TranscriptionOperationError,
+} from './errors.js';
 export {
   resolveThinkingOptions,
   resolveApiKey,

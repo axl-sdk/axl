@@ -6,6 +6,9 @@ const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 /** Load the repository-root .env for opt-in live provider suites. */
 export function loadLiveIntegrationEnv(): Record<string, string> {
+  // Lets CI and local type/collection checks load live-test files without
+  // importing repository .env credentials into Vitest.
+  if (process.env.AXL_DISABLE_LIVE_INTEGRATION === '1') return {};
   try {
     const content = readFileSync(resolve(workspaceRoot, '.env'), 'utf-8');
     const env: Record<string, string> = {};

@@ -1,4 +1,12 @@
-import type { Provider, ChatOptions, ChatMessage, ProviderResponse, StreamChunk } from './types.js';
+import type {
+  Provider,
+  ChatOptions,
+  ChatMessage,
+  ProviderInputValidationRequest,
+  ProviderInputValidationResult,
+  ProviderResponse,
+  StreamChunk,
+} from './types.js';
 import {
   estimateDirectOpenAICost,
   isOSeriesModel,
@@ -10,6 +18,55 @@ import { fetchWithRetry } from './retry.js';
 import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
+import type { InputContentPart, InputMediaSource } from '../input.js';
+import { UnsupportedModelInputError } from '../errors.js';
+
+const OPENAI_RESPONSES_IMAGE_MODELS = new Set([
+  'gpt-4o',
+  'gpt-4o-2024-08-06',
+  'gpt-4o-2024-11-20',
+  'gpt-4o-mini',
+  'gpt-4o-mini-2024-07-18',
+]);
+
+function base64FromSource(source: Extract<InputMediaSource, { type: 'bytes' | 'base64' }>): string {
+  return source.type === 'base64'
+    ? source.data
+    : Buffer.from(source.data.buffer, source.data.byteOffset, source.data.byteLength).toString(
+        'base64',
+      );
+}
+
+function responseImageParts(parts: readonly InputContentPart[]): Array<Record<string, unknown>> {
+  const mapped: Array<Record<string, unknown>> = [];
+  for (const part of parts) {
+    if (part.type === 'text') {
+      mapped.push({ type: 'input_text', text: part.text });
+      continue;
+    }
+    const { source } = part;
+    if (source.type === 'provider-file') {
+      if (source.provider !== 'openai-responses') {
+        throw new UnsupportedModelInputError({
+          provider: 'openai-responses',
+          model: 'unknown',
+          modality: 'image',
+          source: 'provider-file',
+        });
+      }
+      mapped.push({ type: 'input_image', file_id: source.reference });
+    } else if (source.type === 'url') {
+      mapped.push({ type: 'input_image', image_url: source.url });
+    } else {
+      mapped.push({
+        type: 'input_image',
+        image_url: `data:${source.mediaType};base64,${base64FromSource(source)}`,
+      });
+    }
+    if (part.label) mapped.push({ type: 'input_text', text: `[Image: ${part.label}]` });
+  }
+  return mapped;
+}
 
 /**
  * OpenAI Responses API provider using raw fetch (no SDK dependency).
@@ -20,6 +77,59 @@ import { assertSafeProviderBaseUrl } from '../http-transport.js';
  */
 export class OpenAIResponsesProvider implements Provider {
   readonly name = 'openai-responses';
+
+  inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
+    return OPENAI_RESPONSES_IMAGE_MODELS.has(model)
+      ? { image: { sources: ['url', 'bytes', 'base64', 'provider-file'] } }
+      : {};
+  }
+
+  validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
+    const effectiveModel =
+      typeof request.providerOptions?.model === 'string'
+        ? request.providerOptions.model
+        : request.model;
+    const fail = (source?: string, feature?: string): never => {
+      throw new UnsupportedModelInputError({
+        provider: this.name,
+        model: effectiveModel || request.model,
+        modality: 'image',
+        ...(source ? { source } : {}),
+        ...(feature ? { feature } : {}),
+      });
+    };
+    if (!OPENAI_RESPONSES_IMAGE_MODELS.has(effectiveModel)) {
+      fail(undefined, 'image input for this model');
+    }
+    if (request.providerOptions && 'input' in request.providerOptions) {
+      fail(undefined, 'raw input-container providerOptions');
+    }
+    for (const message of request.history) {
+      if (!Array.isArray(message.content)) continue;
+      if (message.role !== 'user') fail(undefined, 'rich non-user history');
+      for (const part of message.content) {
+        if (
+          part.type === 'image' &&
+          part.source.type === 'provider-file' &&
+          part.source.provider !== this.name
+        ) {
+          fail('provider-file');
+        }
+      }
+    }
+    if (Array.isArray(request.input)) {
+      for (const part of request.input) {
+        if (
+          part.type === 'image' &&
+          part.source.type === 'provider-file' &&
+          part.source.provider !== this.name
+        ) {
+          fail('provider-file');
+        }
+      }
+    }
+    return { effectiveModel };
+  }
 
   /** The Responses API honors `json_schema` (structured outputs) natively. */
   nativeStructuredOutputSupport(): 'schema' {
@@ -247,11 +357,12 @@ export class OpenAIResponsesProvider implements Provider {
     const input: ResponsesInputItem[] = [];
 
     for (const msg of messages) {
+      const text = typeof msg.content === 'string' ? msg.content : '';
       if (msg.role === 'tool') {
         input.push({
           type: 'function_call_output',
           call_id: msg.tool_call_id ?? '',
-          output: msg.content,
+          output: text,
         });
       } else if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
         // Inject reasoning items from providerMetadata if present (round-trip)
@@ -264,8 +375,8 @@ export class OpenAIResponsesProvider implements Provider {
           }
         }
 
-        if (msg.content) {
-          input.push({ type: 'message', role: 'assistant', content: msg.content });
+        if (text) {
+          input.push({ type: 'message', role: 'assistant', content: text });
         }
         for (const tc of msg.tool_calls) {
           input.push({
@@ -287,7 +398,7 @@ export class OpenAIResponsesProvider implements Provider {
         input.push({
           type: 'message',
           role: msg.role,
-          content: msg.content,
+          content: typeof msg.content === 'string' ? msg.content : responseImageParts(msg.content),
         });
       }
     }
@@ -372,13 +483,14 @@ export class OpenAIResponsesProvider implements Provider {
         }
       : undefined;
 
-    const cost = usage
-      ? estimateDirectOpenAICost(json.model ?? model, usage, {
-          baseUrl: this.baseUrl,
-          request,
-          response: json,
-        })
-      : undefined;
+    const cost =
+      usage && !this.requestContainsImages(request)
+        ? estimateDirectOpenAICost(json.model ?? model, usage, {
+            baseUrl: this.baseUrl,
+            request,
+            response: json,
+          })
+        : undefined;
 
     const providerMetadata =
       reasoningItems.length > 0 ? { openaiReasoningItems: reasoningItems } : undefined;
@@ -391,6 +503,26 @@ export class OpenAIResponsesProvider implements Provider {
       cost,
       providerMetadata,
     };
+  }
+
+  /** Responses usage does not report a media-inclusive price, so rich calls stay unpriced. */
+  private requestContainsImages(request: Record<string, unknown> | undefined): boolean {
+    return (
+      Array.isArray(request?.input) &&
+      request.input.some((item) => {
+        if (!item || typeof item !== 'object') return false;
+        const content = (item as { content?: unknown }).content;
+        return (
+          Array.isArray(content) &&
+          content.some(
+            (part) =>
+              part !== null &&
+              typeof part === 'object' &&
+              (part as { type?: unknown }).type === 'input_image',
+          )
+        );
+      })
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -515,13 +647,14 @@ export class OpenAIResponsesProvider implements Provider {
         return {
           type: 'done',
           usage,
-          cost: usage
-            ? estimateDirectOpenAICost(response?.model ?? model, usage, {
-                baseUrl: this.baseUrl,
-                request,
-                response,
-              })
-            : undefined,
+          cost:
+            usage && !this.requestContainsImages(request)
+              ? estimateDirectOpenAICost(response?.model ?? model, usage, {
+                  baseUrl: this.baseUrl,
+                  request,
+                  response,
+                })
+              : undefined,
           providerMetadata,
         };
       }
@@ -577,7 +710,11 @@ type ResponsesStreamEventData = {
 };
 
 type ResponsesInputItem =
-  | { type: 'message'; role: 'user' | 'assistant'; content: string }
+  | {
+      type: 'message';
+      role: 'user' | 'assistant';
+      content: string | Array<Record<string, unknown>>;
+    }
   | { type: 'function_call'; call_id: string; name: string; arguments: string }
   | { type: 'function_call_output'; call_id: string; output: string }
   | { type: 'reasoning'; id: string; encrypted_content: string; [key: string]: unknown };

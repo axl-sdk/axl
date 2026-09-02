@@ -451,6 +451,7 @@ Studio also embeds as middleware (Express, Fastify, NestJS, raw HTTP) with auth 
 | [Observability](./docs/observability.md) | Trace modes, OpenTelemetry integration, cost-per-span attribution                        |
 | [Security](./docs/security.md)           | Tool ACL, input sanitization, prompt injection mitigations                               |
 | [Integration](./docs/integration.md)     | Express.js integration, Axl Studio setup, local development workflow                     |
+| [Multimodal input](./docs/multimodal-input.md) | Ordered image input, provider allowlists, observability, and lighthouse recipe       |
 | [Roadmap](./ROADMAP.md)                  | What's planned for Axl                                                                   |
 
 ## How Axl Compares
@@ -482,7 +483,7 @@ Axl competes primarily with [Mastra](https://mastra.ai) and [LangGraph.js](https
 
 ## Requirements
 
-- Node.js >= 20.0.0
+- Node.js >= 22.0.0
 - TypeScript >= 5.7 (recommended)
 
 ## License

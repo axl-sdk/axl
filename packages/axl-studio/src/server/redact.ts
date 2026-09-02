@@ -260,6 +260,25 @@ export function redactStreamEvent(event: HistoricalAxlEvent, redact: boolean): H
   return redactHistoricalEvent(event);
 }
 
+/**
+ * Rich media errors may echo attacker-controlled provider diagnostics. Keep
+ * ordinary text-only traces intact while making media-run terminal failures
+ * safe for Studio's REST/WS observability boundary even with redact disabled.
+ */
+export function sanitizeRichInputFailure(event: HistoricalAxlEvent): HistoricalAxlEvent {
+  const message = 'Playground media input failed';
+  if (event.type === 'ask_end' && !event.outcome.ok) {
+    return { ...event, outcome: { ok: false, error: message } };
+  }
+  if (event.type === 'agent_call_end' && event.data.error !== undefined) {
+    return { ...event, data: { ...event.data, error: message } };
+  }
+  if (event.type === 'error') {
+    return { ...event, data: { ...event.data, message } };
+  }
+  return event;
+}
+
 // ── Eval results ─────────────────────────────────────────────────────
 
 /**

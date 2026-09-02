@@ -788,6 +788,15 @@ google:gemini-3.1-pro-preview          # Google Gemini
 
 See [docs/providers.md](../../docs/providers.md) for the full model list including reasoning models.
 
+### Completed-file transcription
+
+Use `ctx.transcribe()` for finite recordings, then explicitly pass
+`Transcript.text` to an agent if analysis is needed. It is separate from chat
+history and chat providers. B1 supports exact OpenAI, Gemini, and OpenRouter
+transcription URIs; see [Multimodal input](../../docs/multimodal-input.md) for
+the 25 MiB inline bound, source types, options, transcript redaction, temporary
+Gemini Files cleanup, and live-verification commands.
+
 ## License
 
 [Apache 2.0](../../LICENSE)

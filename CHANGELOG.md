@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-09-02
+
+### Added
+
+- **Ordered image input.** `ModelInput` accepts text and image parts on `ask` and
+  `delegate`, with bounded observability descriptors, typed preflight errors,
+  native OpenAI Responses/Anthropic/Gemini mappings, and one non-blocking
+  OpenRouter certification path. See `docs/multimodal-input.md` for exact
+  model/source allowlists and attachment lifetime rules.
+- **Completed-file transcription.** `ctx.transcribe()` provides a typed,
+  non-chat operation for finite recording bytes/base64 (plus Gemini-owned file
+  references), with exact OpenAI `gpt-transcribe`, Gemini
+  `gemini-3.5-transcribe`, and OpenRouter `openai/whisper-1` adapters. It emits
+  safe paired lifecycle events, keeps provider-reported pricing honest, and
+  composes explicitly with `ctx.ask()`. See `docs/multimodal-input.md`.
+
+### Breaking Changes
+
+- **Node.js 22 is now the minimum supported runtime.** Node.js 20 reached end
+  of life in March 2026, so CI and all published package engine declarations
+  now target supported Node.js 22 and 24 releases.
+
+### Fixed
+
+- **Inline media is bounded before allocation.** Ordered image inputs accept at
+  most 25 MiB decoded across one logical input, and transcription bytes/base64
+  accept at most 25 MiB. Oversized values fail before ownership copies,
+  base64 decoding, provider validation, or network dispatch. Both limits are
+  exported for caller-side preflight and chunking.
+- **Transcription failures retain safe provider diagnostics.** Wrapped errors
+  and terminal events now expose HTTP status, retryability, optional retry
+  delay, and optional request ID while keeping raw provider bodies out of
+  observer and persistence surfaces.
+
+- **Gemini image URLs now fail before dispatch.** Live discrimination showed
+  that `gemini-3.7-flash` accepts the same image inline or through a Gemini
+  Files URI while a raw HTTPS image URI returns a misleading `429`. Axl keeps
+  its no-host-fetch/no-hidden-upload boundary: pass bytes/base64 or explicitly
+  upload through Gemini Files and use a `google` provider-file reference.
+
 ## [0.21.1] - 2026-08-28
 
 ### Fixed
@@ -1107,7 +1147,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.21.1...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/axl-sdk/axl/compare/v0.21.1...v0.22.0
 [0.21.1]: https://github.com/axl-sdk/axl/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/axl-sdk/axl/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/axl-sdk/axl/compare/v0.20.0...v0.20.1

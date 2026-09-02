@@ -7,14 +7,73 @@ import type {
   StreamChunk,
   ToolDefinition,
   ToolCallMessage,
+  ProviderInputValidationRequest,
+  ProviderInputValidationResult,
 } from './types.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
 import { buildProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
+import type { InputContentPart, InputMediaSource } from '../input.js';
+import { UnsupportedModelInputError } from '../errors.js';
+
+function anthropicBase64(source: Extract<InputMediaSource, { type: 'bytes' | 'base64' }>): string {
+  return source.type === 'base64'
+    ? source.data
+    : Buffer.from(source.data.buffer, source.data.byteOffset, source.data.byteLength).toString(
+        'base64',
+      );
+}
+
+function anthropicImageBlocks(parts: readonly InputContentPart[]): AnthropicContentBlock[] {
+  const blocks: AnthropicContentBlock[] = [];
+  for (const part of parts) {
+    if (part.type === 'text') {
+      blocks.push({ type: 'text', text: part.text });
+      continue;
+    }
+    const { source } = part;
+    if (source.type === 'provider-file') {
+      if (source.provider !== 'anthropic') {
+        throw new UnsupportedModelInputError({
+          provider: 'anthropic',
+          model: 'unknown',
+          modality: 'image',
+          source: 'provider-file',
+        });
+      }
+      blocks.push({ type: 'image', source: { type: 'file', file_id: source.reference } });
+    } else if (source.type === 'url') {
+      blocks.push({ type: 'image', source: { type: 'url', url: source.url } });
+    } else {
+      blocks.push({
+        type: 'image',
+        source: { type: 'base64', media_type: source.mediaType, data: anthropicBase64(source) },
+      });
+    }
+    if (part.label) blocks.push({ type: 'text', text: `[Image: ${part.label}]` });
+  }
+  return blocks;
+}
 
 const ANTHROPIC_API_VERSION = '2023-06-01';
+const ANTHROPIC_FILES_BETA = 'files-api-2025-04-14';
+
+const ANTHROPIC_IMAGE_MODELS = new Set(['claude-sonnet-4-5', 'claude-opus-4-8']);
+
+function hasAnthropicProviderFileImage(messages: readonly ChatMessage[]): boolean {
+  return messages.some(
+    (message) =>
+      Array.isArray(message.content) &&
+      message.content.some(
+        (part) =>
+          part.type === 'image' &&
+          part.source.type === 'provider-file' &&
+          part.source.provider === 'anthropic',
+      ),
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Exact Anthropic model capabilities and Standard text pricing. Reviewed
@@ -396,11 +455,26 @@ function isEffortAtOrBelow(
 type AnthropicPricingContext = {
   model?: string;
   unpricedModifier: boolean;
+  hasRichInput: boolean;
 };
 
 function pricingContextFromBody(body: Record<string, unknown>): AnthropicPricingContext {
   return {
     model: typeof body.model === 'string' ? body.model : undefined,
+    hasRichInput:
+      Array.isArray(body.messages) &&
+      body.messages.some(
+        (message) =>
+          message !== null &&
+          typeof message === 'object' &&
+          Array.isArray((message as { content?: unknown }).content) &&
+          (message as { content: unknown[] }).content.some(
+            (part) =>
+              part !== null &&
+              typeof part === 'object' &&
+              (part as { type?: unknown }).type === 'image',
+          ),
+      ),
     unpricedModifier:
       isAnthropicModifier('inference_geo', body.inference_geo) ||
       isAnthropicModifier('speed', body.speed) ||
@@ -577,6 +651,59 @@ function mergeAnthropicUsage(
 export class AnthropicProvider implements Provider {
   readonly name = 'anthropic';
 
+  inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
+    return ANTHROPIC_IMAGE_MODELS.has(model)
+      ? { image: { sources: ['url', 'bytes', 'base64', 'provider-file'] } }
+      : {};
+  }
+
+  validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
+    const effectiveModel =
+      typeof request.providerOptions?.model === 'string'
+        ? request.providerOptions.model
+        : request.model;
+    const fail = (source?: string, feature?: string): never => {
+      throw new UnsupportedModelInputError({
+        provider: this.name,
+        model: effectiveModel || request.model,
+        modality: 'image',
+        ...(source ? { source } : {}),
+        ...(feature ? { feature } : {}),
+      });
+    };
+    if (!ANTHROPIC_IMAGE_MODELS.has(effectiveModel)) {
+      fail(undefined, 'image input for this model');
+    }
+    if (request.providerOptions && 'messages' in request.providerOptions) {
+      fail(undefined, 'raw messages providerOptions');
+    }
+    for (const message of request.history) {
+      if (!Array.isArray(message.content)) continue;
+      if (message.role !== 'user') fail(undefined, 'rich non-user history');
+      for (const part of message.content) {
+        if (
+          part.type === 'image' &&
+          part.source.type === 'provider-file' &&
+          part.source.provider !== this.name
+        ) {
+          fail('provider-file');
+        }
+      }
+    }
+    if (Array.isArray(request.input)) {
+      for (const part of request.input) {
+        if (
+          part.type === 'image' &&
+          part.source.type === 'provider-file' &&
+          part.source.provider !== this.name
+        ) {
+          fail('provider-file');
+        }
+      }
+    }
+    return { effectiveModel };
+  }
+
   /** Anthropic ignores native `json_schema` structurally — Axl uses a system
    *  prompt JSON instruction + client-side Zod validation (see buildRequest). */
   nativeStructuredOutputSupport(): 'unsupported' {
@@ -629,7 +756,10 @@ export class AnthropicProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
-    const headers = this.buildHeaders(await this.resolveKey());
+    const headers = this.buildHeaders(
+      await this.resolveKey(),
+      hasAnthropicProviderFileImage(messages),
+    );
     const body = this.buildRequestBody(messages, options, false);
     const pricingContext = pricingContextFromBody(body);
 
@@ -665,7 +795,10 @@ export class AnthropicProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
-    const headers = this.buildHeaders(await this.resolveKey());
+    const headers = this.buildHeaders(
+      await this.resolveKey(),
+      hasAnthropicProviderFileImage(messages),
+    );
     const body = this.buildRequestBody(messages, options, true);
     const pricingContext = pricingContextFromBody(body);
 
@@ -703,11 +836,12 @@ export class AnthropicProvider implements Provider {
   // Internal: request building
   // ---------------------------------------------------------------------------
 
-  private buildHeaders(apiKey: string): Record<string, string> {
+  private buildHeaders(apiKey: string, requiresFilesBeta = false): Record<string, string> {
     return {
       'Content-Type': 'application/json',
       'x-api-key': apiKey,
       'anthropic-version': ANTHROPIC_API_VERSION,
+      ...(requiresFilesBeta ? { 'anthropic-beta': ANTHROPIC_FILES_BETA } : {}),
     };
   }
 
@@ -808,6 +942,7 @@ export class AnthropicProvider implements Provider {
     const result: AnthropicMessage[] = [];
 
     for (const msg of messages) {
+      const text = typeof msg.content === 'string' ? msg.content : '';
       if (msg.role === 'assistant') {
         const replayedThinking = this.getReplayedThinkingBlocks(msg);
         if (msg.tool_calls && msg.tool_calls.length > 0) {
@@ -815,8 +950,8 @@ export class AnthropicProvider implements Provider {
           const content: AnthropicContentBlock[] = [...replayedThinking];
 
           // Include text content if present
-          if (msg.content) {
-            content.push({ type: 'text', text: msg.content });
+          if (text) {
+            content.push({ type: 'text', text });
           }
 
           // Map each tool call to a tool_use block
@@ -840,10 +975,10 @@ export class AnthropicProvider implements Provider {
           // Claude 5 requires the opaque thinking/signature blocks from the
           // preceding turn before any replayed text or tool-use content.
           const content: AnthropicContentBlock[] = [...replayedThinking];
-          if (msg.content) content.push({ type: 'text', text: msg.content });
+          if (text) content.push({ type: 'text', text });
           result.push({ role: 'assistant', content });
         } else {
-          result.push({ role: 'assistant', content: msg.content });
+          result.push({ role: 'assistant', content: text });
         }
       } else if (msg.role === 'tool') {
         // Tool result messages become user messages with tool_result content blocks.
@@ -854,12 +989,16 @@ export class AnthropicProvider implements Provider {
             {
               type: 'tool_result',
               tool_use_id: msg.tool_call_id!,
-              content: msg.content,
+              content: text,
             },
           ],
         });
       } else if (msg.role === 'user') {
-        result.push({ role: 'user', content: msg.content });
+        result.push({
+          role: 'user',
+          content:
+            typeof msg.content === 'string' ? msg.content : anthropicImageBlocks(msg.content),
+        });
       }
       // system messages already handled at top level
     }
@@ -993,6 +1132,7 @@ export class AnthropicProvider implements Provider {
     }
     const cost =
       normalized &&
+      !pricingContext.hasRichInput &&
       !pricingContext.unpricedModifier &&
       !isModifiedAnthropicResponse(json, effectiveModel) &&
       !hasFallbackBoundary &&
@@ -1049,7 +1189,11 @@ export class AnthropicProvider implements Provider {
       type: 'done',
       usage,
       cost:
-        pricingUsage && !unpricedModifier && !hasFallbackBoundary && !refused
+        pricingUsage &&
+        !pricingContext.hasRichInput &&
+        !unpricedModifier &&
+        !hasFallbackBoundary &&
+        !refused
           ? estimateAnthropicCost(effectiveModel, pricingUsage)
           : undefined,
       providerMetadata:
@@ -1230,6 +1374,13 @@ export class AnthropicProvider implements Provider {
 
 type AnthropicContentBlock =
   | { type: 'text'; text: string }
+  | {
+      type: 'image';
+      source:
+        | { type: 'base64'; media_type: string; data: string }
+        | { type: 'url'; url: string }
+        | { type: 'file'; file_id: string };
+    }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
   | { type: 'tool_result'; tool_use_id: string; content: string }
   | AnthropicOpaqueThinkingBlock

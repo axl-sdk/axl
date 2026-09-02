@@ -812,3 +812,27 @@ npx axl-eval ./evals/workout-plan.ts --output results/candidate.json
 # Compare — catch regressions before deploying
 npx axl-eval compare results/baseline.json results/candidate.json
 ```
+
+## Recorded-call review
+
+Use the completed-file transcription operation first, then deliberately send
+only the returned text to a normal agent. This keeps transcription endpoint
+semantics, chat history, and model cost boundaries explicit.
+
+```typescript
+const transcript = await ctx.transcribe({
+  model: 'gemini-transcription:gemini-3.5-transcribe',
+  audio: { type: 'bytes', data: callBytes, mediaType: 'audio/mpeg' },
+  timestamps: 'word',
+});
+
+const review = await ctx.ask(
+  agent({ model: 'google:gemini-3.7-flash' }),
+  `Summarize this call and list concrete action items:\n${transcript.text}`,
+  { maxTokens: 256 },
+);
+```
+
+There is no hidden audio-to-chat fallback and the recording is not retained in
+history. For exact provider capabilities, temporary Gemini Files retention, and
+the OpenAI/OpenRouter alternatives, see [Multimodal model input](./multimodal-input.md).

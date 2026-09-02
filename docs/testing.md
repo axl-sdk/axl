@@ -347,3 +347,93 @@ frontier gate when the catalog changes and before release; it checks exact IDs, 
 tool continuation, usage, and pricing. Static-priced calls must report positive cost, while
 response-priced providers may report a nonnegative total. Record catalog changes in a dated,
 secret-free file under `docs/verification/`.
+
+### Multimodal image lighthouse
+
+The image lighthouse is separately armed even when provider keys are present:
+
+```bash
+# One selected row. Each selector targets only the lighthouse file. L1, L2,
+# L4, L5, L11, L13, and L14 each make one logical model invocation; L3 makes two.
+# `fetchWithRetry` can make up to three HTTP attempts per invocation.
+AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]'
+
+# Native blocking rows: six logical invocations on a normal successful path
+# (L1/L2/L4/L11/L13/L14). L6 and L12 are local and make zero HTTP attempts.
+# L13 and L14 each add a test-owned upload, one model call, and deletion.
+AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]|\[L2\]|\[L4\]|\[L11\]|\[L13\]|\[L14\]|\[L12\]|\[L6\]'
+
+# File-reference certification rows can be run separately to bound spend.
+AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L13\]'
+AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L14\]'
+
+# Non-blocking OpenRouter certification: one additional logical invocation.
+AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L5\]'
+
+# L3 accepts an existing Anthropic Files API reference. It makes two logical
+# invocations (the image ask plus one tool continuation).
+AXL_MULTIMODAL_LIVE=1 ANTHROPIC_IMAGE_FILE_ID=file_... pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L3\]'
+
+# Or explicitly allow the harness to upload the checked-in PNG with a one-hour
+# expiry and delete it in `finally`. This adds one upload and one delete request.
+AXL_MULTIMODAL_LIVE=1 AXL_ANTHROPIC_TEMP_FILE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L3\]'
+```
+
+The tests use `gpt-4o-mini`, `claude-sonnet-4-5`, `gemini-3.7-flash`, and
+OpenRouter `openai/gpt-4o-mini`, each with the checked-in Studio screenshot and low output token
+limit. On a normal successful path, the native blocking rows make six logical
+model invocations, eight with L3 configured, and nine with the optional L5
+OpenRouter row. `fetchWithRetry` permits up to three HTTP attempts per logical
+invocation (the initial request plus two retries for eligible transport,
+`429`, `503`, or `529` failures): the corresponding transport-attempt ceilings
+are 18, 24, and 27. These are not hard paid-call or spend caps—an upstream may
+process a request even when its transport result is failed or ambiguous. Run
+named rows individually when controlling spend. L13 uses Gemini resumable
+start/finalize, bounded readiness reads, and deletion; L14 uses OpenAI file
+upload and deletion. Those test-owned Files operations sit outside the model
+transport ceilings. The temporary L3 path adds Anthropic upload/deletion; its
+one-hour expiry bounds retention if cleanup cannot complete. A key without
+`AXL_MULTIMODAL_LIVE=1` does not run this suite; setting
+`AXL_DISABLE_LIVE_INTEGRATION=1` is an absolute kill switch even when the live
+flag and keys are present. The detailed checklist and pending evidence placeholders live in
+[`docs/verification/multimodal-input-lighthouse-2026-08-31.md`](./verification/multimodal-input-lighthouse-2026-08-31.md).
+
+### Completed-file transcription lighthouse
+
+Transcription uses a separate flag. Provider keys and `AXL_MULTIMODAL_LIVE=1`
+do not arm it; `AXL_DISABLE_LIVE_INTEGRATION=1` remains an absolute kill switch.
+The checked-in base64 fixture is decoded only in memory and is attributed in
+[`recorded-call.README.md`](../packages/axl/src/__tests__/fixtures/recorded-call.README.md).
+
+```bash
+# Run one named operation row at a time.
+AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L7\]'
+AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L8\]'
+AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L8V\]'
+AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L9\]'
+AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L17\]'
+
+# Local, exact negative preflight: zero network requests.
+pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L10\]'
+
+# Product recipe: independently arm the explicit transcription -> text-agent
+# composition. Select only one of R7/R8/R17 at a time.
+AXL_TRANSCRIPTION_LIVE=1 AXL_TRANSCRIPTION_RECIPE_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[R7\]'
+```
+
+L7 and L17 have one logical transcription invocation and one provider request
+on an ordinary successful path. L8 has one logical transcription invocation;
+its ordinary successful transport sequence is Files start + finalize, optional
+readiness reads, one Interactions request, and one delete. It requests English,
+word timestamps, and diarization, then requires word timing and speaker output.
+L8V separately certifies a small verbatim custom vocabulary because the live
+API rejects vocabulary combined with timestamps. L9 adds a test-owned Files
+start/finalize, bounded readiness reads, and delete around one provider-file
+transcription interaction; it never asks Axl to host-fetch the recording.
+The test validates the resumable upload URL for HTTPS, same origin, and absent
+URL credentials before it writes bytes.
+`fetchWithRetry` can retry the inference request, while resumable upload,
+readiness, and cleanup deliberately avoid retries to prevent duplicate files or
+unbounded cleanup. These are request-shape expectations, not spend ceilings:
+an ambiguous transport result can still have been processed upstream. Run named
+rows individually and record outcomes in the dated verification artifact.

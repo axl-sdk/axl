@@ -368,6 +368,21 @@ const invalidV2MarkerOnLegacyEvent: LegacyAxlEventV1 = {
   schemaVersion: 2,
 };
 
+const transcriptionV2Event = {
+  schemaVersion: 2,
+  type: 'transcription_end',
+  transcriptionId: 'tr-1',
+  executionId: 'exec-1',
+  step: 1,
+  timestamp: 1,
+  duration: 1,
+  data: { status: 'completed' as const },
+} satisfies AxlEventV2;
+
+// @ts-expect-error transcription is a current v2-only event, never legacy v1
+const transcriptionLegacyEvent: LegacyAxlEventV1 = transcriptionV2Event;
+void transcriptionLegacyEvent;
+
 function readHistoricalEventVersion(event: HistoricalAxlEvent): 1 | 2 {
   if (event.schemaVersion === 2) return event.schemaVersion;
   return event.schemaVersion ?? 1;

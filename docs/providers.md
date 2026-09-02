@@ -126,6 +126,38 @@ adapter boundary. Use a record projection such as `{ result: text }` when that s
 distinction matters. This provider-envelope normalization does not change the canonical
 `ChatMessage.content` seen by Axl or other providers.
 
+### Rich image transport
+
+String-only `google:` calls continue to use `generateContent` unchanged. Rich
+image input is supported only for `google:gemini-3.7-flash` and uses the GA
+[Interactions API](https://ai.google.dev/gemini-api/docs/interactions-overview)
+with `store: false`. It is stateless: Axl sends application-owned history and
+does not use `previous_interaction_id`, background execution, or raw transport
+overrides. Direct HTTP image URLs are not sent as Gemini file URIs: applications
+must pass bytes/base64 or explicitly upload through Gemini Files and supply the
+returned URI as a `google` provider-file. Axl does not host-fetch or silently
+upload chat images. See [Multimodal model input](./multimodal-input.md) for exact
+source rules and the cross-provider table.
+
+### Completed-file transcription
+
+Transcription has its own registry and URI family; it is never routed through
+chat adapters. The B1 exact mappings are `openai-transcription:gpt-transcribe`
+to OpenAI multipart `/audio/transcriptions`,
+`gemini-transcription:gemini-3.5-transcribe` to Gemini Files plus stateless
+Interactions, and `openrouter-transcription:openai/whisper-1` to OpenRouter's
+JSON `/audio/transcriptions`. Gemini byte/base64 sources create a temporary
+provider file, wait for readiness when necessary, transcribe with `store:
+false`, and attempt deletion in `finally`; callers own any reusable
+provider-file URI. OpenAI and OpenRouter accept inline sources only. See
+[Multimodal model input](./multimodal-input.md#completed-file-transcription-b1)
+for exact source/options/cost semantics and the temporary-file retention risk.
+All built-in inline transcription sources are capped at 25 MiB decoded before
+copying or base64 decoding. `ctx.transcribe()` converts adapter failures into a
+safe `TranscriptionOperationError` while preserving status, retryability,
+optional retry delay, and optional request ID from `ProviderError`; the raw
+provider body remains confined to the non-enumerable cause.
+
 ### Structured output & schema handling on Gemini
 
 Gemini's schema sanitizer (`sanitizeSchemaForGemini`) strips a set of JSON-Schema

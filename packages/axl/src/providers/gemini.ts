@@ -6,12 +6,83 @@ import type {
   StreamChunk,
   ToolDefinition,
   ToolCallMessage,
+  ProviderInputValidationRequest,
+  ProviderInputValidationResult,
 } from './types.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
-import { buildProviderError } from './errors.js';
+import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
+import type { InputContentPart, InputMediaSource } from '../input.js';
+import { UnsupportedModelInputError } from '../errors.js';
+
+function hasRichGeminiMessages(messages: readonly ChatMessage[]): boolean {
+  return messages.some((message) => Array.isArray(message.content));
+}
+
+function geminiImageBase64(
+  source: Extract<InputMediaSource, { type: 'bytes' | 'base64' }>,
+): string {
+  return source.type === 'base64'
+    ? source.data
+    : Buffer.from(source.data.buffer, source.data.byteOffset, source.data.byteLength).toString(
+        'base64',
+      );
+}
+
+function geminiInteractionContent(
+  parts: readonly InputContentPart[],
+  model: string,
+): Array<Record<string, unknown>> {
+  const content: Array<Record<string, unknown>> = [];
+  for (const part of parts) {
+    if (part.type === 'text') {
+      content.push({ type: 'text', text: part.text });
+      continue;
+    }
+    const { source } = part;
+    if (source.type === 'provider-file') {
+      if (source.provider !== 'google') {
+        throw new UnsupportedModelInputError({
+          provider: 'google',
+          model,
+          modality: 'image',
+          source: 'provider-file',
+        });
+      }
+      if (!source.mediaType) {
+        throw new UnsupportedModelInputError({
+          provider: 'google',
+          model,
+          modality: 'image',
+          source: 'provider-file',
+          feature: 'Interactions URI image mediaType',
+        });
+      }
+      content.push({
+        type: 'image',
+        uri: source.reference,
+        mime_type: source.mediaType,
+      });
+    } else if (source.type === 'url') {
+      // Gemini's image guide routes URL-originated images through Files API.
+      // Axl deliberately does not retrieve caller URLs or create hidden chat
+      // uploads, so a raw HTTPS locator cannot reach this mapping.
+      throw new UnsupportedModelInputError({
+        provider: 'google',
+        model,
+        modality: 'image',
+        source: 'url',
+        feature: 'direct URL image input; pass bytes/base64 or a Gemini provider-file',
+      });
+    } else {
+      content.push({ type: 'image', data: geminiImageBase64(source), mime_type: source.mediaType });
+    }
+    if (part.label) content.push({ type: 'text', text: `[Image: ${part.label}]` });
+  }
+  return content;
+}
 
 // ---------------------------------------------------------------------------
 // Schema sanitization for Gemini's tool/responseSchema dialect.
@@ -157,6 +228,9 @@ const GEMINI_PRICING: Record<string, GeminiRate> = {
   'gemini-3.5-flash-lite': { input: 0.3e-6, cached: 0.03e-6, output: 2.5e-6 },
   'gemini-3.6-flash': { input: 1.5e-6, cached: 0.15e-6, output: 7.5e-6 },
 };
+
+/** Only this current documented image model is admitted to Interactions. */
+const GEMINI_INTERACTIONS_IMAGE_MODELS = new Set(['gemini-3.7-flash']);
 
 type GeminiPriceUsage = {
   inputTokens: number;
@@ -316,6 +390,9 @@ const GEMINI_3X_MIN_THINKING_LEVEL = new Map<string, string>([
   ['gemini-3.5-flash', 'minimal'],
   ['gemini-3.5-flash-lite', 'minimal'],
   ['gemini-3.6-flash', 'minimal'],
+  // L4 live evidence: Interactions gemini-3.7-flash accepts low/medium/high,
+  // but rejects minimal. Keep this exact entry isolated from legacy aliases.
+  ['gemini-3.7-flash', 'low'],
 ]);
 
 const GEMINI_MODELS_WITHOUT_PORTABLE_TEMPERATURE = new Set([
@@ -376,6 +453,70 @@ function warnGemini3xEffortNone(model: string): void {
 export class GeminiProvider implements Provider {
   readonly name = 'google';
 
+  inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
+    // Interactions accepts inline data and Gemini Files URIs. Axl never
+    // retrieves caller URLs or creates hidden image uploads.
+    return GEMINI_INTERACTIONS_IMAGE_MODELS.has(model)
+      ? { image: { sources: ['bytes', 'base64', 'provider-file'] } }
+      : {};
+  }
+
+  validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
+    const effectiveModel =
+      typeof request.providerOptions?.model === 'string'
+        ? request.providerOptions.model
+        : request.model;
+    const fail = (source?: string, feature?: string): never => {
+      throw new UnsupportedModelInputError({
+        provider: this.name,
+        model: effectiveModel || request.model,
+        modality: 'image',
+        ...(source ? { source } : {}),
+        ...(feature ? { feature } : {}),
+      });
+    };
+    if (!GEMINI_INTERACTIONS_IMAGE_MODELS.has(effectiveModel)) {
+      fail(undefined, 'image input for this model');
+    }
+    if (request.providerOptions) {
+      const forbidden = [
+        'input',
+        'contents',
+        'messages',
+        'previous_interaction_id',
+        'background',
+        'stream',
+        'store',
+      ].find((key) => key in request.providerOptions!);
+      if (forbidden) fail(undefined, `raw ${forbidden} providerOptions`);
+    }
+    for (const message of request.history) {
+      if (!Array.isArray(message.content)) continue;
+      if (message.role !== 'user') fail(undefined, 'rich non-user history');
+      for (const part of message.content) {
+        if (part.type !== 'image') continue;
+        if (part.source.type === 'url')
+          fail('url', 'direct URL image input; pass bytes/base64 or a Gemini provider-file');
+        if (part.source.type === 'provider-file' && part.source.provider !== this.name)
+          fail('provider-file');
+        if (part.source.type === 'provider-file' && !part.source.mediaType)
+          fail('provider-file', 'Interactions URI image mediaType');
+      }
+    }
+    if (Array.isArray(request.input)) {
+      for (const part of request.input) {
+        if (part.type !== 'image') continue;
+        if (part.source.type === 'url')
+          fail('url', 'direct URL image input; pass bytes/base64 or a Gemini provider-file');
+        if (part.source.type === 'provider-file' && part.source.provider !== this.name)
+          fail('provider-file');
+        if (part.source.type === 'provider-file' && !part.source.mediaType)
+          fail('provider-file', 'Interactions URI image mediaType');
+      }
+    }
+    return { effectiveModel };
+  }
+
   /** Gemini accepts a `responseSchema` but `sanitizeSchemaForGemini` strips
    *  keywords it doesn't support (`$ref`/`$defs`/`additionalProperties`/…), so a
    *  derived schema can lose constraints — lossy, not faithful. */
@@ -430,6 +571,7 @@ export class GeminiProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async chat(messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
+    if (hasRichGeminiMessages(messages)) return this.chatInteraction(messages, options);
     const body = this.buildRequestBody(messages, options);
     const pricingContext = this.pricingContext(this.requestModel(options), body);
     this.assertSafeGemini3Continuation(messages, pricingContext.model);
@@ -467,6 +609,10 @@ export class GeminiProvider implements Provider {
   // ---------------------------------------------------------------------------
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
+    if (hasRichGeminiMessages(messages)) {
+      yield* this.streamInteraction(messages, options);
+      return;
+    }
     const body = this.buildRequestBody(messages, options);
     const pricingContext = this.pricingContext(this.requestModel(options), body);
     this.assertSafeGemini3Continuation(messages, pricingContext.model);
@@ -500,6 +646,404 @@ export class GeminiProvider implements Provider {
     }
 
     yield* this.parseSSEStream(res.body, pricingContext);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Rich image requests use Gemini Interactions. It is deliberately stateless:
+  // Axl sends the complete application-owned history and never asks Google to
+  // retain an interaction or follow a previous_interaction_id.
+  // ---------------------------------------------------------------------------
+
+  private async chatInteraction(
+    messages: ChatMessage[],
+    options: ChatOptions,
+  ): Promise<ProviderResponse> {
+    this.assertSafeInteractionOptions(options);
+    const body = this.buildInteractionRequestBody(messages, options, false);
+    const headers = this.buildHeaders(await this.resolveKey());
+    const res = await fetchWithRetry(
+      `${this.baseUrl}/interactions`,
+      { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },
+      { governor: this.governor, provider: this.name },
+    );
+    if (!res.ok) {
+      const errorBody = await res.text();
+      throw buildProviderError({
+        provider: this.name,
+        status: res.status,
+        headers: res.headers,
+        message: this.extractErrorMessage(errorBody, res.status),
+        body: errorBody,
+      });
+    }
+    return this.parseInteractionResponse((await res.json()) as GeminiInteractionResponse);
+  }
+
+  private async *streamInteraction(
+    messages: ChatMessage[],
+    options: ChatOptions,
+  ): AsyncGenerator<StreamChunk> {
+    this.assertSafeInteractionOptions(options);
+    const body = this.buildInteractionRequestBody(messages, options, true);
+    const headers = this.buildHeaders(await this.resolveKey());
+    const res = await fetchWithRetry(
+      `${this.baseUrl}/interactions?alt=sse`,
+      { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },
+      { governor: this.governor, provider: this.name },
+    );
+    if (!res.ok) {
+      const errorBody = await res.text();
+      throw buildProviderError({
+        provider: this.name,
+        status: res.status,
+        headers: res.headers,
+        message: this.extractErrorMessage(errorBody, res.status),
+        body: errorBody,
+      });
+    }
+    if (!res.body) throw new Error('Gemini Interactions stream has no body');
+    yield* this.parseInteractionSSEStream(res.body);
+  }
+
+  private buildInteractionRequestBody(
+    messages: ChatMessage[],
+    options: ChatOptions,
+    stream: boolean,
+  ): Record<string, unknown> {
+    const model = this.requestModel(options);
+    const systemInstruction = messages
+      .filter((message) => message.role === 'system')
+      .map((message) => (typeof message.content === 'string' ? message.content : ''))
+      .filter(Boolean)
+      .join('\n\n');
+    const body: Record<string, unknown> = {
+      model,
+      input: this.mapInteractionInput(
+        messages.filter((message) => message.role !== 'system'),
+        model,
+      ),
+      stream,
+    };
+    if (systemInstruction) body.system_instruction = systemInstruction;
+    if (options.tools?.length) {
+      body.tools = options.tools.map((tool) => ({
+        type: 'function',
+        name: tool.function.name,
+        description: tool.function.description,
+        parameters: sanitizeSchemaForGemini(tool.function.parameters),
+      }));
+    }
+    const generationConfig: Record<string, unknown> = {};
+    if (options.maxTokens !== undefined) generationConfig.max_output_tokens = options.maxTokens;
+    if (options.stop) generationConfig.stop_sequences = options.stop;
+    if (options.toolChoice !== undefined) {
+      generationConfig.tool_choice =
+        typeof options.toolChoice === 'string'
+          ? options.toolChoice === 'required'
+            ? 'any'
+            : options.toolChoice
+          : { allowed_tools: { mode: 'any', tools: [options.toolChoice.function.name] } };
+    }
+    const thinking = resolveThinkingOptions(options);
+    if (thinking.thinkingDisabled) {
+      generationConfig.thinking_level = isGemini3x(model) ? minThinkingLevel(model) : 'minimal';
+    } else if (thinking.hasBudgetOverride) {
+      generationConfig.thinking_level = budgetToThinkingLevel(thinking.thinkingBudget!);
+    } else if (thinking.activeEffort) {
+      generationConfig.thinking_level = isGemini3x(model)
+        ? (THINKING_LEVELS[thinking.activeEffort] ?? 'medium')
+        : budgetToThinkingLevel(THINKING_BUDGETS[thinking.activeEffort] ?? 5000);
+    }
+    if (thinking.includeThoughts) generationConfig.thinking_summaries = 'auto';
+    if (Object.keys(generationConfig).length) body.generation_config = generationConfig;
+    if (options.responseFormat?.type && options.responseFormat.type !== 'text') {
+      body.response_format = {
+        type: 'text',
+        mime_type: 'application/json',
+        ...(options.responseFormat.type === 'json_schema'
+          ? { schema: sanitizeSchemaForGemini(options.responseFormat.json_schema.schema) }
+          : {}),
+      };
+    }
+    if (options.providerOptions) {
+      const overrides = { ...options.providerOptions };
+      delete overrides.model;
+      delete overrides.input;
+      delete overrides.contents;
+      delete overrides.messages;
+      delete overrides.previous_interaction_id;
+      delete overrides.background;
+      delete overrides.stream;
+      delete overrides.store;
+      const rawGenerationConfig = overrides.generation_config;
+      if (
+        rawGenerationConfig &&
+        typeof rawGenerationConfig === 'object' &&
+        !Array.isArray(rawGenerationConfig)
+      ) {
+        const generationConfigOverrides = { ...(rawGenerationConfig as Record<string, unknown>) };
+        delete generationConfigOverrides.temperature;
+        if (Object.keys(generationConfigOverrides).length)
+          overrides.generation_config = generationConfigOverrides;
+        else delete overrides.generation_config;
+      }
+      Object.assign(body, overrides);
+    }
+    // Method selection and retention are transport invariants, never an escape hatch.
+    body.stream = stream;
+    body.store = false;
+    return body;
+  }
+
+  private assertSafeInteractionOptions(options: ChatOptions): void {
+    const model = this.requestModel(options);
+    const fail = (feature: string): never => {
+      throw new UnsupportedModelInputError({
+        provider: this.name,
+        model,
+        modality: 'image',
+        feature,
+      });
+    };
+    if (!GEMINI_INTERACTIONS_IMAGE_MODELS.has(model)) fail('image input for this model');
+    const forbidden = [
+      'input',
+      'contents',
+      'messages',
+      'previous_interaction_id',
+      'background',
+      'stream',
+      'store',
+    ].find((key) => key in (options.providerOptions ?? {}));
+    if (forbidden) fail(`raw ${forbidden} providerOptions`);
+  }
+
+  private mapInteractionInput(messages: ChatMessage[], model: string): GeminiInteractionStep[] {
+    const steps: GeminiInteractionStep[] = [];
+    for (const message of messages) {
+      if (message.role === 'user') {
+        steps.push({
+          type: 'user_input',
+          content: Array.isArray(message.content)
+            ? geminiInteractionContent(message.content, model)
+            : [{ type: 'text', text: message.content }],
+        });
+      } else if (message.role === 'assistant') {
+        const nativeSteps = message.providerMetadata?.geminiInteractionSteps;
+        if (Array.isArray(nativeSteps) && nativeSteps.every(isGeminiInteractionStep)) {
+          steps.push(...nativeSteps);
+          continue;
+        }
+        if (typeof message.content === 'string' && message.content) {
+          steps.push({ type: 'model_output', content: [{ type: 'text', text: message.content }] });
+        }
+        for (const call of message.tool_calls ?? []) {
+          steps.push({
+            type: 'function_call',
+            id: call.id,
+            name: call.function.name,
+            arguments: safeJsonObject(call.function.arguments),
+          });
+        }
+      } else if (message.role === 'tool') {
+        steps.push({
+          type: 'function_result',
+          call_id: message.tool_call_id ?? '',
+          result: [
+            { type: 'text', text: typeof message.content === 'string' ? message.content : '' },
+          ],
+        });
+      }
+    }
+    return steps;
+  }
+
+  private parseInteractionResponse(json: GeminiInteractionResponse): ProviderResponse {
+    let content = '';
+    let thinkingContent = '';
+    const toolCalls: ToolCallMessage[] = [];
+    for (const step of json.steps ?? []) {
+      if (step.type === 'model_output') content += interactionText(step.content);
+      else if (step.type === 'thought') thinkingContent += interactionText(step.summary);
+      else if (step.type === 'function_call' && step.id && step.name) {
+        toolCalls.push({
+          id: step.id,
+          type: 'function',
+          function: { name: step.name, arguments: JSON.stringify(step.arguments ?? {}) },
+        });
+      }
+    }
+    this.assertInteractionTerminalStatus(json.status, toolCalls.length);
+    const usage = normalizeInteractionUsage(json.usage);
+    return {
+      content,
+      thinking_content: thinkingContent || undefined,
+      tool_calls: toolCalls.length ? toolCalls : undefined,
+      usage,
+      // Interactions returns modality usage but no authoritative monetary cost.
+      cost: undefined,
+      providerMetadata: json.steps?.length
+        ? { geminiInteractionSteps: json.steps.filter(isGeminiInteractionStep) }
+        : undefined,
+    };
+  }
+
+  private async *parseInteractionSSEStream(
+    body: ReadableStream<Uint8Array>,
+  ): AsyncGenerator<StreamChunk> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const steps = new Map<number, GeminiInteractionStep>();
+    const argumentBuffers = new Map<number, string>();
+    const stopped = new Set<number>();
+    let completed = false;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data: ')) continue;
+          if (trimmed.slice(6) === '[DONE]') continue;
+          let event: GeminiInteractionSSEEvent;
+          try {
+            event = JSON.parse(trimmed.slice(6)) as GeminiInteractionSSEEvent;
+          } catch {
+            continue;
+          }
+          if (event.event_type === 'error') {
+            throw new Error(event.error?.message ?? 'Gemini Interactions stream failed');
+          }
+          if (event.event_type === 'step.start' && event.step) {
+            const index = event.index;
+            if (index === undefined || steps.has(index)) {
+              throw new Error('Gemini Interactions stream contained an invalid step.start index');
+            }
+            const step = cloneInteractionStep(event.step);
+            steps.set(index, step);
+            if (step.type === 'model_output') {
+              for (const text of interactionTextChunks(step.content)) {
+                yield { type: 'text_delta', content: text };
+              }
+            } else if (step.type === 'thought') {
+              for (const text of interactionTextChunks(step.summary)) {
+                yield { type: 'thinking_delta', content: text };
+              }
+            }
+            if (step.type === 'function_call' && step.id && step.name) {
+              // The start event's empty object is a placeholder; only real
+              // arguments_delta bytes are emitted and replayed.
+              argumentBuffers.set(index, '');
+              yield { type: 'tool_call_delta', id: step.id, name: step.name };
+            }
+          } else if (event.event_type === 'step.delta' && event.delta) {
+            const delta = event.delta as GeminiInteractionDelta;
+            const index = event.index;
+            if (index === undefined || stopped.has(index)) {
+              throw new Error('Gemini Interactions stream delta arrived outside an active step');
+            }
+            const step = steps.get(index);
+            if (!step)
+              throw new Error('Gemini Interactions stream delta arrived before step.start');
+            if (
+              delta.type === 'text' &&
+              typeof delta.text === 'string' &&
+              step.type === 'model_output'
+            ) {
+              appendInteractionContent(step, 'content', { type: 'text', text: delta.text });
+              yield { type: 'text_delta', content: delta.text };
+            } else if (
+              delta.type === 'thought_summary' &&
+              step.type === 'thought' &&
+              delta.content
+            ) {
+              appendInteractionContent(step, 'summary', delta.content);
+              for (const text of interactionTextChunks([delta.content])) {
+                yield { type: 'thinking_delta', content: text };
+              }
+            } else if (
+              delta.type === 'thought_signature' &&
+              step.type === 'thought' &&
+              typeof delta.signature === 'string'
+            ) {
+              step.signature = delta.signature;
+            } else if (
+              delta.type === 'arguments_delta' &&
+              step.type === 'function_call' &&
+              typeof delta.arguments === 'string'
+            ) {
+              argumentBuffers.set(index, (argumentBuffers.get(index) ?? '') + delta.arguments);
+              if (step.id)
+                yield { type: 'tool_call_delta', id: step.id, arguments: delta.arguments };
+            }
+          } else if (event.event_type === 'step.stop') {
+            const index = event.index;
+            const step = index === undefined ? undefined : steps.get(index);
+            if (step === undefined || stopped.has(index!)) {
+              throw new Error('Gemini Interactions stream contained an invalid step.stop index');
+            }
+            if (step.type === 'function_call') {
+              const rawArguments = argumentBuffers.get(index!) ?? '';
+              if (rawArguments) {
+                try {
+                  const parsed: unknown = JSON.parse(rawArguments);
+                  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                    throw new Error('not an object');
+                  }
+                  step.arguments = parsed as Record<string, unknown>;
+                } catch {
+                  throw new Error(
+                    'Gemini Interactions function_call arguments were not valid JSON',
+                  );
+                }
+              }
+            }
+            stopped.add(index!);
+          } else if (event.event_type === 'interaction.completed') {
+            if (steps.size !== stopped.size) {
+              throw new Error('Gemini Interactions stream completed before all steps stopped');
+            }
+            const toolCallCount = [...steps.values()].filter(
+              (step) => step.type === 'function_call' && !!step.id && !!step.name,
+            ).length;
+            this.assertInteractionTerminalStatus(event.interaction?.status, toolCallCount);
+            completed = true;
+            yield {
+              type: 'done',
+              usage: normalizeInteractionUsage(event.interaction?.usage),
+              providerMetadata: steps.size
+                ? {
+                    geminiInteractionSteps: [...steps.entries()]
+                      .sort(([a], [b]) => a - b)
+                      .map(([, step]) => step),
+                  }
+                : undefined,
+            };
+            return;
+          }
+        }
+      }
+      if (!completed)
+        throw new Error('Gemini Interactions stream ended before interaction.completed');
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  private assertInteractionTerminalStatus(status: unknown, toolCallCount: number): void {
+    if (status === 'completed') return;
+    if (status === 'requires_action' && toolCallCount > 0) return;
+    const normalizedStatus = typeof status === 'string' ? status : 'unknown';
+    throw new ProviderError({
+      provider: this.name,
+      status: 0,
+      retryable: false,
+      message: `Gemini Interactions ended with non-success status: ${normalizedStatus}`,
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -850,6 +1394,7 @@ export class GeminiProvider implements Provider {
     const result: GeminiContent[] = [];
 
     for (const msg of messages) {
+      const text = typeof msg.content === 'string' ? msg.content : '';
       if (msg.role === 'assistant') {
         // If we have raw Gemini parts from a previous response, use them directly.
         // This preserves thoughtSignature and other opaque fields that Gemini requires
@@ -860,8 +1405,8 @@ export class GeminiProvider implements Provider {
         } else {
           const parts: GeminiPart[] = [];
 
-          if (msg.content) {
-            parts.push({ text: msg.content });
+          if (text) {
+            parts.push({ text });
           }
 
           if (msg.tool_calls && msg.tool_calls.length > 0) {
@@ -896,7 +1441,7 @@ export class GeminiProvider implements Provider {
           response: Record<string, unknown>;
         } = {
           name: functionName,
-          response: parseGeminiFunctionResponse(msg.content),
+          response: parseGeminiFunctionResponse(text),
         };
         // Gemini 3.x requires the id from the originating functionCall be echoed
         // here. Only include it when this id was native to a prior Gemini turn,
@@ -909,7 +1454,7 @@ export class GeminiProvider implements Provider {
           parts: [{ functionResponse }],
         });
       } else if (msg.role === 'user') {
-        result.push({ role: 'user', parts: [{ text: msg.content }] });
+        result.push({ role: 'user', parts: [{ text }] });
       }
       // system messages already handled at top level
     }
@@ -1170,6 +1715,142 @@ export class GeminiProvider implements Provider {
 // ---------------------------------------------------------------------------
 // Gemini API types (internal)
 // ---------------------------------------------------------------------------
+
+type GeminiInteractionContent = { type: 'text'; text: string } | Record<string, unknown>;
+
+type GeminiInteractionStep = {
+  type: 'user_input' | 'model_output' | 'thought' | 'function_call' | 'function_result';
+  id?: string;
+  call_id?: string;
+  name?: string;
+  arguments?: Record<string, unknown>;
+  content?: GeminiInteractionContent[];
+  summary?: GeminiInteractionContent[];
+  result?: GeminiInteractionContent[];
+  [key: string]: unknown;
+};
+
+type GeminiInteractionUsage = {
+  total_input_tokens?: number;
+  total_output_tokens?: number;
+  total_tokens?: number;
+  total_cached_tokens?: number;
+  total_thought_tokens?: number;
+};
+
+type GeminiInteractionResponse = {
+  model?: string;
+  status?: string;
+  steps?: GeminiInteractionStep[];
+  usage?: GeminiInteractionUsage;
+};
+
+type GeminiInteractionSSEEvent = {
+  event_type?: string;
+  index?: number;
+  step?: GeminiInteractionStep;
+  delta?: GeminiInteractionDelta;
+  interaction?: GeminiInteractionResponse;
+  error?: { message?: string };
+};
+
+type GeminiInteractionDelta = {
+  type: 'text' | 'thought_summary' | 'thought_signature' | 'arguments_delta';
+  id?: string;
+  name?: string;
+  text?: string;
+  arguments?: Record<string, unknown> | string;
+  content?: GeminiInteractionContent;
+  signature?: string;
+};
+
+function isGeminiInteractionStep(value: unknown): value is GeminiInteractionStep {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    ['user_input', 'model_output', 'thought', 'function_call', 'function_result'].includes(
+      (value as { type?: unknown }).type as string,
+    )
+  );
+}
+
+function interactionText(content: GeminiInteractionContent[] | undefined): string {
+  return (
+    content
+      ?.map((part) => (part.type === 'text' && typeof part.text === 'string' ? part.text : ''))
+      .join('') ?? ''
+  );
+}
+
+function interactionTextChunks(content: GeminiInteractionContent[] | undefined): string[] {
+  return (
+    content?.flatMap((part) =>
+      part.type === 'text' && typeof part.text === 'string' ? [part.text] : [],
+    ) ?? []
+  );
+}
+
+function cloneInteractionStep(step: GeminiInteractionStep): GeminiInteractionStep {
+  return JSON.parse(JSON.stringify(step)) as GeminiInteractionStep;
+}
+
+function appendInteractionContent(
+  step: GeminiInteractionStep,
+  field: 'content' | 'summary',
+  content: GeminiInteractionContent,
+): void {
+  const existing = step[field] ?? [];
+  const last = existing.at(-1);
+  if (
+    content.type === 'text' &&
+    last?.type === 'text' &&
+    typeof content.text === 'string' &&
+    typeof last.text === 'string'
+  ) {
+    last.text += content.text;
+  } else {
+    existing.push(content);
+  }
+  step[field] = existing;
+}
+
+function safeJsonObject(value: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeInteractionUsage(
+  usage: GeminiInteractionUsage | undefined,
+): ProviderResponse['usage'] | undefined {
+  if (
+    !usage ||
+    !isValidTokenCount(usage.total_input_tokens) ||
+    !isValidTokenCount(usage.total_output_tokens) ||
+    !isValidTokenCount(usage.total_tokens)
+  ) {
+    return undefined;
+  }
+  const cached = usage.total_cached_tokens;
+  const thinking = usage.total_thought_tokens;
+  if (
+    (cached !== undefined && (!isValidTokenCount(cached) || cached > usage.total_input_tokens)) ||
+    (thinking !== undefined && !isValidTokenCount(thinking))
+  )
+    return undefined;
+  return {
+    prompt_tokens: usage.total_input_tokens,
+    completion_tokens: usage.total_output_tokens,
+    total_tokens: usage.total_tokens,
+    ...(cached ? { cached_tokens: cached } : {}),
+    ...(thinking ? { reasoning_tokens: thinking } : {}),
+  };
+}
 
 /**
  * Gemini part type for request building.

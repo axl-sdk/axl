@@ -295,6 +295,27 @@ describe('reduceCost', () => {
       expect(out.byEmbedder.embedder.unpricedCalls).toBe(1);
     });
 
+    it.each([
+      { usage: { audioSeconds: 3 }, label: 'audio duration' },
+      { usage: { totalTokens: 11 }, label: 'total-tokens-only usage' },
+    ])('counts unpriced transcription work reported only as $label', ({ usage }) => {
+      const event = makeEvent({
+        type: 'transcription_end',
+        transcriptionId: 'tr-1',
+        model: 'stt',
+        workflow: 'wf',
+        duration: 1,
+        data: { status: 'completed', usage },
+      });
+      const reduced = reduceCost(emptyCostData(), event);
+      const aggregator = new CostAggregator(new ConnectionManager());
+      aggregator.onTrace(event);
+      expect(reduced.unpricedCalls).toBe(1);
+      expect(aggregator.getData().unpricedCalls).toBe(1);
+      expect(reduced.byModel.stt.unpricedCalls).toBe(1);
+      expect(reduced.byWorkflow.wf.unpricedCalls).toBe(1);
+    });
+
     it('stays in parity with CostAggregator on the unpriced count', () => {
       const ev = makeEvent({
         type: 'agent_call_end',

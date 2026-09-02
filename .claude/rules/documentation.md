@@ -30,8 +30,16 @@ defaults) — those rot, and the source is the ground truth.
 - `CHANGELOG.md` — an entry under `[Unreleased]` for every user-visible change (Keep a
   Changelog format; SemVer per the 0.x rule in `releasing.md`).
 - `ROADMAP.md` — when scope or direction changes.
-- `.internal/spec/` and `.internal/docs/` — gitignored design specs; update alongside
-  the feature they describe. **Never `git add -f` them.**
+- `.internal/spec/` — durable gitignored design contracts; update alongside the
+  feature they describe.
+- `.internal/plans/<product-area>/<lifecycle>/<workstream>/` — gitignored living
+  plans and their review artifacts. Follow `.internal/README.md`; graduate a
+  completed workstream only after lasting content reaches `.internal/spec/` or
+  public `docs/`.
+- `.internal/research/<subject-area>/` — durable gitignored decision inputs that
+  are neither authoritative specs nor accepted implementation plans. Revalidate
+  time-sensitive research before using it.
+- **Never `git add -f` `.internal/` content.**
 - Package `README.md` files when their package's public surface changes.
 
 ## Known doc gaps (don't assume coverage)

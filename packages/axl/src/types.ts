@@ -1,4 +1,5 @@
 import type { z } from 'zod';
+import type { InputContentPart, ModelInput, ModelInputDescriptor } from './input.js';
 import type { Effort, ToolChoice } from './providers/types.js';
 
 /** Result type for concurrent operations (spawn, map) */
@@ -156,6 +157,8 @@ export type DelegateOptions<T = unknown> = {
   nativeStructuredOutput?: boolean;
   /** Model URI for the internal router agent (default: first candidate's model). */
   routerModel?: string;
+  /** Route using the full evidence (default) or only its ordered text projection. */
+  routerInput?: 'full' | 'text';
   /** Additional metadata passed to the router and selected agent. */
   metadata?: Record<string, unknown>;
   /** Number of retries for structured output validation (passed to the final ask). */
@@ -186,6 +189,9 @@ export const AXL_EVENT_TYPES = [
   // Workflow lifecycle
   'workflow_start',
   'workflow_end',
+  // Transcription operation lifecycle (separate from chat/agent turns)
+  'transcription_start',
+  'transcription_end',
   // Ask boundary
   'ask_start',
   'ask_end',
@@ -279,6 +285,8 @@ export type AgentCallParams = {
 export type AgentCallStartData = {
   /** Original user prompt passed to `ctx.ask()`. Does not include retry feedback or tool results. */
   prompt: string;
+  /** Bounded rich-input shape; omitted for legacy string calls. */
+  input?: ModelInputDescriptor;
   /** Resolved system prompt (after evaluating dynamic system selectors). */
   system?: string;
   /** Resolved model parameters sent to the provider for this call. */
@@ -291,6 +299,9 @@ export type AgentCallStartData = {
   toolNames?: string[];
   /** Full ChatMessage[] sent to the provider this turn. Only populated when `trace.level === 'full'`. */
   messages?: ChatMessage[];
+  /** Descriptor-only counterparts for rich messages in a full snapshot. The
+   * matching `messages[index].content` is its text projection, never media. */
+  messageInputs?: readonly { readonly index: number; readonly input: ModelInputDescriptor }[];
 };
 
 /**
@@ -300,8 +311,10 @@ export type AgentCallStartData = {
  *
  * Pair invariant: every `agent_call_start` is followed by exactly one
  * `agent_call_end`, even on provider error. On the error path `response` is
- * empty and `error` carries the provider's message; cost/tokens/duration are
- * still emitted (top-level on the event) when partial usage is available.
+ * empty and `error` carries the provider's message for legacy string calls.
+ * Rich-input calls use a fixed safe message because providers can echo inline
+ * media in their request errors. Cost/tokens/duration are still emitted
+ * (top-level on the event) when partial usage is available.
  */
 export type AgentCallEndData = {
   /** Final LLM response content for this turn. Empty string on error. */
@@ -314,8 +327,9 @@ export type AgentCallEndData = {
    *  reading `agent_call_end` (cost lives here) can bucket without joining. */
   retryReason?: 'schema' | 'validate' | 'guardrail';
   /** Provider error message when the call threw (network failure, 4xx/5xx,
-   *  abort, etc). Mutually exclusive with `response` content. Subject to
-   *  `config.trace.redact` (vendor errors can echo prompt text). */
+   *  abort, etc). Mutually exclusive with `response` content. Rich-input
+   *  calls always use a fixed safe projection, independently of trace
+   *  redaction, because vendor errors can echo request media. */
   error?: string;
   /** HTTP status when the thrown error was a `ProviderError` (`0` for network
    *  failures). Omitted for non-provider errors. The raw error body is
@@ -324,6 +338,14 @@ export type AgentCallEndData = {
   /** Semantic failover hint from a thrown `ProviderError` (see
    *  `ProviderError.retryable`). Omitted for non-provider errors. */
   retryable?: boolean;
+  /** Stable typed error code for a rich-input failure, when available. */
+  code?: string;
+  /** Provider identifier from a typed provider error on a rich-input failure. */
+  provider?: string;
+  /** Provider request id from a typed provider error on a rich-input failure. */
+  requestId?: string;
+  /** Retry-after delay in milliseconds from a typed provider error on a rich-input failure. */
+  retryAfterMs?: number;
 };
 
 /** Data shape for `tool_call_end` events. */
@@ -835,7 +857,7 @@ type LegacyAxlEventPayloadV1 =
   | (AxlEventBase & { type: 'workflow_end'; workflow: string; data: WorkflowEndData })
 
   // ── Ask boundary (user-level ctx.ask() call) ────────────────────────────
-  | (AxlEventBase & AskScoped & { type: 'ask_start'; prompt: string })
+  | (AxlEventBase & AskScoped & { type: 'ask_start'; prompt: string; input?: ModelInputDescriptor })
   | (AxlEventBase &
       AskScoped & {
         type: 'ask_end';
@@ -1089,6 +1111,54 @@ export type LegacyAxlEventV1 = LegacyAxlEventPayloadV1 & { schemaVersion?: 1 };
 /** Named v2 rejection event for consumers that do not need the full union. */
 export type ToolCallRejectedEvent = Extract<ToolLifecycleEventV2, { type: 'tool_call_rejected' }>;
 
+/** Current-schema-only operation events. Deliberately excluded from the
+ * frozen legacy v1 payload so old persisted records never gain new variants. */
+type TranscriptionLifecycleEventV2 =
+  | (AxlEventBase & {
+      schemaVersion: 2;
+      type: 'transcription_start';
+      transcriptionId: string;
+      model?: string;
+      data: {
+        provider?: string;
+        model?: string;
+        audio: { source: string; bytes?: number; mediaType?: string };
+      };
+    })
+  | (AxlEventBase & {
+      schemaVersion: 2;
+      type: 'transcription_end';
+      transcriptionId: string;
+      model?: string;
+      duration: number;
+      cost?: number;
+      tokens?: { input?: number; output?: number };
+      data: {
+        status: 'completed' | 'failed' | 'aborted';
+        provider?: string;
+        model?: string;
+        audio?: { source: string; bytes?: number; mediaType?: string };
+        text?: string;
+        usage?: {
+          audioSeconds?: number;
+          inputTokens?: number;
+          outputTokens?: number;
+          totalTokens?: number;
+          cost?: number;
+        };
+        pricingStatus?: 'priced' | 'unpriced' | 'zero';
+        cleanupStatus?: 'not_required' | 'deleted' | 'failed' | 'timed_out';
+        error?: string;
+        errorCode?: 'TRANSCRIPTION_PROVIDER_ERROR';
+        providerError?: {
+          status: number;
+          retryable: boolean;
+          retryAfterMs?: number;
+          requestId?: string;
+        };
+      };
+    });
+
 /** Event contract written by the next breaking runtime.
  *
  * This additive prototype lets consumers and type tests lock the schema before
@@ -1097,6 +1167,7 @@ export type ToolCallRejectedEvent = Extract<ToolLifecycleEventV2, { type: 'tool_
  */
 export type AxlEventV2 =
   | ToolLifecycleEventV2
+  | TranscriptionLifecycleEventV2
   | (Exclude<
       LegacyAxlEventPayloadV1,
       { type: 'tool_call_start' | 'tool_call_end' | 'tool_denied' }
@@ -1125,7 +1196,7 @@ export type GuardrailResult = {
 /** Input guardrail function. Runs before the LLM call. */
 export type InputGuardrail = (
   prompt: string,
-  ctx: { metadata: Record<string, unknown> },
+  ctx: { metadata: Record<string, unknown>; input: ModelInput },
 ) => GuardrailResult | Promise<GuardrailResult>;
 
 /** Output guardrail function. Runs after the LLM response. */
@@ -1244,6 +1315,7 @@ export type HandoffRecord = {
 export type AgentCallInfo = {
   agent: string;
   prompt: string;
+  input?: ModelInputDescriptor;
   response: string;
   model: string;
   cost: number;
@@ -1267,7 +1339,7 @@ export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 
 export type ChatMessage = {
   role: ChatRole;
-  content: string;
+  content: string | readonly InputContentPart[];
   name?: string;
   tool_calls?: ToolCallMessage[];
   tool_call_id?: string;

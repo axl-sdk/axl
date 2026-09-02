@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-09-02
+
 ### Changed
 
 - **Native image transports follow provider catalogs.** OpenAI Responses,
@@ -1197,7 +1199,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.22.1...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.22.2...HEAD
+[0.22.2]: https://github.com/axl-sdk/axl/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/axl-sdk/axl/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/axl-sdk/axl/compare/v0.21.1...v0.22.0
 [0.21.1]: https://github.com/axl-sdk/axl/compare/v0.21.0...v0.21.1

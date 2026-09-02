@@ -152,6 +152,11 @@ false`, and attempt deletion in `finally`; callers own any reusable
 provider-file URI. OpenAI and OpenRouter accept inline sources only. See
 [Multimodal model input](./multimodal-input.md#completed-file-transcription-b1)
 for exact source/options/cost semantics and the temporary-file retention risk.
+All built-in inline transcription sources are capped at 25 MiB decoded before
+copying or base64 decoding. `ctx.transcribe()` converts adapter failures into a
+safe `TranscriptionOperationError` while preserving status, retryability,
+optional retry delay, and optional request ID from `ProviderError`; the raw
+provider body remains confined to the non-enumerable cause.
 
 ### Structured output & schema handling on Gemini
 

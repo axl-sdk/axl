@@ -86,7 +86,7 @@ Tip: Use .mts for configs with top-level await or in projects without "type": "m
       ].join('\n');
       nodeModule.register(`data:text/javascript,${encodeURIComponent(hookCode)}`);
     } catch {
-      console.warn(`[axl-studio] Warning: --conditions requires Node.js 20.6+`);
+      console.warn(`[axl-studio] Warning: this Node.js runtime does not support --conditions`);
     }
   }
 

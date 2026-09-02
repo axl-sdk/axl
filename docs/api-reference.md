@@ -363,7 +363,10 @@ Invoke an agent. Runs the tool-call loop until the agent produces a final respon
 readonly array of `{ type: 'text', text }` and `{ type: 'image', source, label? }`
 parts. Image sources are URL, bytes, base64, or a provider-scoped file reference;
 see [Multimodal model input](./multimodal-input.md) for their exact shapes and
-the per-provider allowlist. `inputText(prompt)` returns its deterministic text
+the per-provider allowlist. Decoded inline image data is capped at 25 MiB total
+per logical input before copying/decoding; URL and provider-file contents are
+not loaded by Axl. The byte ceiling is exported as
+`MAX_INLINE_MODEL_INPUT_BYTES`; `inputText(prompt)` returns its deterministic text
 projection. Rich evidence survives retries, tool turns, handoffs, and the
 selected delegate inside this ask, but is not automatically retained for later
 session turns.
@@ -416,7 +419,7 @@ to `ctx.ask()` when a normal text agent should analyze it.
 | Field | Type | Description |
 | --- | --- | --- |
 | `model` | `string` | Required `provider:model` transcription URI. Built-ins accept exactly `openai-transcription:gpt-transcribe`, `gemini-transcription:gemini-3.5-transcribe`, or `openrouter-transcription:openai/whisper-1`; registered custom adapters define their own models. |
-| `audio` | `RecordedAudioSource` | Required `{ type: 'bytes', data, mediaType }`, `{ type: 'base64', data, mediaType }`, or matching `{ type: 'provider-file', provider, reference, mediaType? }`. No URL, path, stream, or realtime source. |
+| `audio` | `RecordedAudioSource` | Required `{ type: 'bytes', data, mediaType }`, `{ type: 'base64', data, mediaType }`, or matching `{ type: 'provider-file', provider, reference, mediaType? }`. Inline decoded data is capped at 25 MiB before copying/decoding. No URL, path, stream, or realtime source. |
 | `language` | `string` | Optional provider-supported language hint. |
 | `timestamps` | `'segment' \| 'word'` | Optional; validated against the exact adapter capability. |
 | `diarization` | `boolean` | Optional; validated against the exact adapter capability. |
@@ -1767,7 +1770,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 |---|---|---|---|
 | `workflow_start` / `workflow_end` | — | `workflow`, `data: WorkflowStartData/WorkflowEndData` | Workflow lifecycle |
 | `transcription_start` | — | `transcriptionId`, `model?`, `data: { provider?, model?, audio: { source, bytes?, mediaType? } }` | Immediately before a dedicated `ctx.transcribe()` operation. `bytes` is present only for a bytes source; raw audio/base64/reference are never emitted. |
-| `transcription_end` | — | `transcriptionId`, `model?`, `duration`, `cost?`, `tokens?`, `data: { status, provider?, model?, audio?, text?, usage?, pricingStatus?, cleanupStatus?, error?, errorCode? }` | Exactly once after transcription completes, fails, or aborts. `text` is present on an unredacted successful event and scrubbed by `trace.redact`; raw audio/base64/reference/provider body are never emitted. |
+| `transcription_end` | — | `transcriptionId`, `model?`, `duration`, `cost?`, `tokens?`, `data: { status, provider?, model?, audio?, text?, usage?, pricingStatus?, cleanupStatus?, error?, errorCode?, providerError?: { status, retryable, retryAfterMs?, requestId? } }` | Exactly once after transcription completes, fails, or aborts. Provider failures retain only safe HTTP diagnostics. `text` is present on an unredacted successful event and scrubbed by `trace.redact`; raw audio/base64/reference/provider body are never emitted. |
 | `ask_start` | `AskScoped` | `prompt: string` | Top of every `ctx.ask()` |
 | `ask_end` | `AskScoped` | `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration` | Every `ctx.ask()` exit. Ask-internal failures surface here, NOT via the workflow-level `error` event |
 | `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number`, `data: AgentCallStartData` | Before each LLM call (one per loop turn) |
@@ -1998,6 +2001,7 @@ All errors extend `AxlError`.
 | `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`. Message is the provider's text verbatim (no prefix). |
 | `InvalidModelInputError` | `ctx.ask()`, `ctx.delegate()`, `agent.ask()` | Malformed `ModelInput`. `code: 'INVALID_MODEL_INPUT'`. Invalid inputs fail before dispatch and the message never includes raw media. |
 | `UnsupportedModelInputError` | rich `ctx.ask()` / `ctx.delegate()` | The exact provider/model/source/composition is unsupported. `code: 'UNSUPPORTED_MODEL_INPUT'`; includes safe `.provider`, `.model`, `.modality`, and optional source kind, never the raw locator or bytes. |
+| `TranscriptionOperationError` | `ctx.transcribe()` | Safe transcription boundary error. `code: 'TRANSCRIPTION_PROVIDER_ERROR'`; includes `.provider`, `.model`, accounting/cleanup fields, and provider-safe `.status?`, `.retryable?`, `.retryAfterMs?`, `.requestId?`. The original error remains available as a non-enumerable `.cause`; raw provider bodies never enter events. |
 | `AxlError` / `INVALID_HUMAN_DECISION` | approval handlers, `runtime.resolveDecision()` | Untyped decision is not the exact plain-object approval/denial union; rejected before resolver/store mutation |
 | `AxlError` / `PENDING_DECISION_NOT_FOUND` | `runtime.resolveDecision()` | No active or persisted pending request exists, or another concurrent resolution already won |
 | `AxlError` / `CROSS_PROCESS_RESUME_UNSUPPORTED` | `runtime.resolveDecision()` | A persisted request exists but its in-process continuation owner is gone. Fails before deleting the request or starting side effects |

@@ -85,6 +85,11 @@ export class TranscriptionOperationError extends AxlError {
   };
   readonly pricingStatus?: 'priced' | 'unpriced' | 'zero';
   readonly cleanupStatus?: 'not_required' | 'deleted' | 'failed' | 'timed_out';
+  /** Safe HTTP diagnostics projected from ProviderError when available. */
+  readonly status?: number;
+  readonly retryable?: boolean;
+  readonly retryAfterMs?: number;
+  readonly requestId?: string;
   declare readonly cause?: unknown;
 
   constructor(options: {
@@ -99,6 +104,10 @@ export class TranscriptionOperationError extends AxlError {
     };
     pricingStatus?: 'priced' | 'unpriced' | 'zero';
     cleanupStatus?: 'not_required' | 'deleted' | 'failed' | 'timed_out';
+    status?: number;
+    retryable?: boolean;
+    retryAfterMs?: number;
+    requestId?: string;
     cause?: unknown;
   }) {
     super('TRANSCRIPTION_PROVIDER_ERROR', 'Transcription provider operation failed');
@@ -108,6 +117,10 @@ export class TranscriptionOperationError extends AxlError {
     this.usage = options.usage;
     this.pricingStatus = options.pricingStatus;
     this.cleanupStatus = options.cleanupStatus;
+    this.status = options.status;
+    this.retryable = options.retryable;
+    this.retryAfterMs = options.retryAfterMs;
+    this.requestId = options.requestId;
     if (options.cause !== undefined)
       Object.defineProperty(this, 'cause', { enumerable: false, value: options.cause });
   }

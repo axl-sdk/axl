@@ -483,7 +483,7 @@ Axl competes primarily with [Mastra](https://mastra.ai) and [LangGraph.js](https
 
 ## Requirements
 
-- Node.js >= 20.0.0
+- Node.js >= 22.0.0
 - TypeScript >= 5.7 (recommended)
 
 ## License

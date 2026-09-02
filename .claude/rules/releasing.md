@@ -36,6 +36,6 @@ git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z
 git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z
 ```
 
-CI required before merge: `Typecheck & Unit Tests (20)`, `Typecheck & Unit Tests (22)`,
-`Lint & Format` (Node 20 + 22 matrix). The current version's source of truth is
+CI required before merge: `Typecheck & Unit Tests (22)`, `Typecheck & Unit Tests (24)`,
+and `Lint & Format`. The current version's source of truth is
 `packages/*/package.json` + the latest git tag — don't trust a number written elsewhere.

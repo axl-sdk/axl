@@ -354,13 +354,18 @@ The image lighthouse is separately armed even when provider keys are present:
 
 ```bash
 # One selected row. Each selector targets only the lighthouse file. L1, L2,
-# L4, L5, and L11 each make one logical model invocation; L3 makes two.
+# L4, L5, L11, L13, and L14 each make one logical model invocation; L3 makes two.
 # `fetchWithRetry` can make up to three HTTP attempts per invocation.
 AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]'
 
-# Native blocking rows: four logical invocations on a normal successful path
-# (L1/L2/L4/L11). L6 and L12 are local and make zero HTTP attempts.
-AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]|\[L2\]|\[L4\]|\[L11\]|\[L12\]|\[L6\]'
+# Native blocking rows: six logical invocations on a normal successful path
+# (L1/L2/L4/L11/L13/L14). L6 and L12 are local and make zero HTTP attempts.
+# L13 and L14 each add a test-owned upload, one model call, and deletion.
+AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]|\[L2\]|\[L4\]|\[L11\]|\[L13\]|\[L14\]|\[L12\]|\[L6\]'
+
+# File-reference certification rows can be run separately to bound spend.
+AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L13\]'
+AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L14\]'
 
 # Non-blocking OpenRouter certification: one additional logical invocation.
 AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L5\]'
@@ -376,16 +381,18 @@ AXL_MULTIMODAL_LIVE=1 AXL_ANTHROPIC_TEMP_FILE=1 pnpm --filter @axlsdk/axl exec v
 
 The tests use `gpt-4o-mini`, `claude-sonnet-4-5`, `gemini-3.7-flash`, and
 OpenRouter `openai/gpt-4o-mini`, each with the checked-in Studio screenshot and low output token
-limit. On a normal successful path, the native blocking rows make five logical
-model invocations, seven with L3 configured, and eight with the optional L5
+limit. On a normal successful path, the native blocking rows make six logical
+model invocations, eight with L3 configured, and nine with the optional L5
 OpenRouter row. `fetchWithRetry` permits up to three HTTP attempts per logical
 invocation (the initial request plus two retries for eligible transport,
 `429`, `503`, or `529` failures): the corresponding transport-attempt ceilings
-are 15, 21, and 24. These are not hard paid-call or spend caps—an upstream may
+are 18, 24, and 27. These are not hard paid-call or spend caps—an upstream may
 process a request even when its transport result is failed or ambiguous. Run
-named rows individually when controlling spend. The temporary L3 path adds two
-Files API operations outside those model-transport ceilings; its one-hour
-expiry bounds retention if cleanup cannot complete. A key without
+named rows individually when controlling spend. L13 uses Gemini resumable
+start/finalize, bounded readiness reads, and deletion; L14 uses OpenAI file
+upload and deletion. Those test-owned Files operations sit outside the model
+transport ceilings. The temporary L3 path adds Anthropic upload/deletion; its
+one-hour expiry bounds retention if cleanup cannot complete. A key without
 `AXL_MULTIMODAL_LIVE=1` does not run this suite; setting
 `AXL_DISABLE_LIVE_INTEGRATION=1` is an absolute kill switch even when the live
 flag and keys are present. The detailed checklist and pending evidence placeholders live in

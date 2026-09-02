@@ -1150,6 +1150,12 @@ type TranscriptionLifecycleEventV2 =
         cleanupStatus?: 'not_required' | 'deleted' | 'failed' | 'timed_out';
         error?: string;
         errorCode?: 'TRANSCRIPTION_PROVIDER_ERROR';
+        providerError?: {
+          status: number;
+          retryable: boolean;
+          retryAfterMs?: number;
+          requestId?: string;
+        };
       };
     });
 

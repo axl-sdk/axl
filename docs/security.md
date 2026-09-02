@@ -131,6 +131,9 @@ no-upload rule: its adapter temporarily uploads solely to complete one
 transcription request and attempts deletion; a failed deletion can leave the
 file at Gemini for up to 48 hours. Use caller-owned Gemini references for reuse
 and assess that retention period before submitting sensitive recordings.
+Provider failures retain only safe HTTP diagnostics—status, retryability,
+optional retry delay, and optional request ID—on the boundary error and event;
+the raw error body remains confined to the non-enumerable cause.
 
 - API keys configured in `axl.config.ts` or environment variables are **never** included in LLM prompts or logged in traces.
 - Tools marked with `sensitive: true` have their return values redacted from LLM context in subsequent calls.

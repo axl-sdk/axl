@@ -55,6 +55,9 @@ export type NormalizedTranscriptionAccounting = {
   readonly hasWork: boolean;
 };
 
+/** Maximum decoded size of caller-supplied inline audio. */
+export const MAX_INLINE_TRANSCRIPTION_BYTES = 25 * 1024 * 1024;
+
 const RESERVED_PROVIDER_OPTION_KEYS = new Set([
   'model',
   'audio',
@@ -100,6 +103,11 @@ export function normalizeTranscriptionRequest(request: TranscriptionRequest): Tr
         'Inline transcription bytes require nonempty data and mediaType',
       );
     }
+    if (audio.data.byteLength > MAX_INLINE_TRANSCRIPTION_BYTES) {
+      throw new InvalidTranscriptionInputError(
+        'Inline transcription audio must not exceed 25 MiB; chunk it or use a supported provider-file source',
+      );
+    }
     normalizedAudio = {
       type: 'bytes',
       data: new Uint8Array(audio.data),
@@ -109,6 +117,13 @@ export function normalizeTranscriptionRequest(request: TranscriptionRequest): Tr
     if (!nonEmptyString(audio.data) || !nonEmptyString(audio.mediaType)) {
       throw new InvalidTranscriptionInputError(
         'Inline base64 transcription audio requires data and mediaType',
+      );
+    }
+    // Bound the encoded value before allocating a decoded copy for canonical
+    // validation. The exact decoded length is checked below as well.
+    if (audio.data.length > 4 * Math.ceil(MAX_INLINE_TRANSCRIPTION_BYTES / 3)) {
+      throw new InvalidTranscriptionInputError(
+        'Inline transcription audio must not exceed 25 MiB; chunk it or use a supported provider-file source',
       );
     }
     let decoded: Uint8Array;
@@ -122,6 +137,11 @@ export function normalizeTranscriptionRequest(request: TranscriptionRequest): Tr
     if (!decoded.byteLength || Buffer.from(decoded).toString('base64') !== audio.data) {
       throw new InvalidTranscriptionInputError(
         'Transcription base64 must be canonical and decode to nonempty audio',
+      );
+    }
+    if (decoded.byteLength > MAX_INLINE_TRANSCRIPTION_BYTES) {
+      throw new InvalidTranscriptionInputError(
+        'Inline transcription audio must not exceed 25 MiB; chunk it or use a supported provider-file source',
       );
     }
     normalizedAudio = { type: 'base64', data: audio.data, mediaType: audio.mediaType };

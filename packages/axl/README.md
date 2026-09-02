@@ -794,8 +794,8 @@ Use `ctx.transcribe()` for finite recordings, then explicitly pass
 `Transcript.text` to an agent if analysis is needed. It is separate from chat
 history and chat providers. B1 supports exact OpenAI, Gemini, and OpenRouter
 transcription URIs; see [Multimodal input](../../docs/multimodal-input.md) for
-source types, options, temporary Gemini Files cleanup, and live-verification
-commands.
+the 25 MiB inline bound, source types, options, transcript redaction, temporary
+Gemini Files cleanup, and live-verification commands.
 
 ## License
 

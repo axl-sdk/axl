@@ -95,6 +95,12 @@ its upstream API but is unsupported until Axl verifies its request contract.
 | `google:` | `gemini-3.7-flash` | Bytes, base64, `provider-file` scoped to `google` | Rich calls use Gemini Interactions with `store: false`; provider-files require an explicit `mediaType`. Direct HTTP image URLs fail locally: fetch them in application code and pass bytes/base64, or upload through Gemini Files and pass the returned URI as a provider-file. |
 | `openrouter:` | `openai/gpt-4o-mini` | URL, bytes, base64 | Non-blocking certification only; provider files and image+tools are rejected. Do not infer catalog-wide OpenRouter support. |
 
+Axl accepts at most 25 MiB of decoded inline image data across one `ModelInput`.
+The bound is checked before bytes are copied or base64 is decoded. URL and
+provider-file sources do not count toward it because Axl does not load their
+contents; upstream request, image-count, and model limits still apply. Callers
+can import `MAX_INLINE_MODEL_INPUT_BYTES` when preflighting their own inputs.
+
 Gemini transport is deliberately hybrid. Legacy string-only `google:` requests
 continue to use the existing `generateContent` transport. Model-specific
 parameter normalization still applies. Rich image requests use the
@@ -105,6 +111,45 @@ Gemini Files are caller-owned for image input; unlike the explicit temporary
 upload inside `ctx.transcribe()`, Axl does not fetch image URLs, upload chat
 images, or delete caller-supplied image references.
 
+For a Gemini image URL or a large/reused image, upload it in application code
+and pass the returned URI. This example uses Google's optional SDK; Axl itself
+keeps no Google SDK dependency:
+
+```ts
+import { GoogleGenAI } from '@google/genai';
+
+const google = new GoogleGenAI({});
+const uploaded = await google.files.upload({
+  file: 'receipt.png',
+  config: { mime_type: 'image/png' },
+});
+if (!uploaded.name || !uploaded.uri || !uploaded.mimeType) {
+  throw new Error('Gemini Files returned an incomplete image reference');
+}
+
+try {
+  const answer = await ctx.ask(visionAgent, [
+    { type: 'text', text: 'Read this receipt.' },
+    {
+      type: 'image',
+      source: {
+        type: 'provider-file',
+        provider: 'google',
+        reference: uploaded.uri,
+        mediaType: uploaded.mimeType,
+      },
+    },
+  ]);
+} finally {
+  await google.files.delete({ name: uploaded.name });
+}
+```
+
+Google requires Files when its complete request exceeds 100 MB and currently
+retains uploaded files for up to 48 hours. Axl's 25 MiB inline safety bound is
+intentionally lower and applies before provider selection; use a supported URL
+or provider-file source rather than raising process memory exposure.
+
 ## Completed-file transcription (B1)
 
 `ctx.transcribe(request)` is a dedicated completed-recording operation. It does
@@ -114,6 +159,12 @@ wanted: `const transcript = await ctx.transcribe(...); await ctx.ask(agent,
 transcript.text)`. It accepts finite bytes, canonical base64, or the exact
 provider-scoped reference documented below; local paths, URLs, streams, and
 realtime audio are not input types.
+
+Inline transcription bytes/base64 are limited to 25 MiB decoded. The limit is
+checked before ownership copies and before base64 decoding. Split longer audio,
+or upload it through a provider's file API and pass a provider-file reference
+where the exact adapter supports one (currently Gemini). The corresponding
+exported ceiling is `MAX_INLINE_TRANSCRIPTION_BYTES`.
 
 ```ts
 const transcript = await ctx.transcribe({
@@ -126,6 +177,11 @@ const review = await ctx.ask(
   `Summarize and extract action items:\n${transcript.text}`,
 );
 ```
+
+Transcript text is included in unredacted trace events and persisted execution
+history, just like ordinary model responses. Enable `trace.redact` before
+processing sensitive recordings if observers or state stores should receive
+only structural and accounting fields.
 
 `TranscriptionRequest` is `{ model, audio, language?, timestamps?, diarization?,
 providerOptions? }`. `RecordedAudioSource` is a closed `bytes | base64 |
@@ -160,6 +216,10 @@ unredacted, `transcription_end.data.text` contains transcript text; with
 `trace.redact`, transcript text and user error content are scrubbed while safe
 structural/accounting fields remain. See the authoritative event fields in the
 [API reference](./api-reference.md#axlevent-variants).
+On provider failure, safe HTTP diagnostics (`status`, `retryable`, optional
+`retryAfterMs`, and optional `requestId`) are retained on
+`TranscriptionOperationError` and under `transcription_end.data.providerError`;
+raw response bodies stay only on the non-enumerable error cause.
 
 Built-in URI prefixes above are exact allowlists. Applications can register a
 custom dedicated adapter with `runtime.registerTranscriptionProvider(name,

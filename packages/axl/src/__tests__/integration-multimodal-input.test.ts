@@ -86,12 +86,47 @@ async function deleteTemporaryAnthropicImage(fileId: string): Promise<void> {
   }
 }
 
+async function uploadTemporaryOpenAIImage(): Promise<string> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error('OPENAI_API_KEY is required');
+  const body = new FormData();
+  body.set('file', new Blob([Uint8Array.from(PNG_BYTES)], { type: 'image/png' }), 'lighthouse.png');
+  body.set('purpose', 'vision');
+  const response = await fetch('https://api.openai.com/v1/files', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body,
+    redirect: 'manual',
+  });
+  assertNoRedirect(response, 'OpenAI temporary image upload');
+  if (!response.ok) throw new Error(`OpenAI temporary image upload failed (${response.status})`);
+  const result = (await response.json()) as { id?: unknown };
+  if (typeof result.id !== 'string' || result.id.length === 0) {
+    throw new Error('OpenAI temporary image upload returned no file ID');
+  }
+  return result.id;
+}
+
+async function deleteTemporaryOpenAIImage(fileId: string): Promise<void> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error('OPENAI_API_KEY is required');
+  const response = await fetch(`https://api.openai.com/v1/files/${encodeURIComponent(fileId)}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${apiKey}` },
+    redirect: 'manual',
+  });
+  assertNoRedirect(response, 'OpenAI temporary image deletion');
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`OpenAI temporary image deletion failed (${response.status})`);
+  }
+}
+
 function input(
   source:
     | { type: 'bytes'; data: Uint8Array; mediaType: string }
     | { type: 'base64'; data: string; mediaType: string }
     | { type: 'url'; url: string; mediaType?: string }
-    | { type: 'provider-file'; provider: string; reference: string },
+    | { type: 'provider-file'; provider: string; reference: string; mediaType?: string },
 ) {
   return [
     { type: 'text' as const, text: 'Inspect this image and answer concisely.' },
@@ -277,10 +312,10 @@ type TemporaryGeminiFile = {
 
 function geminiTemporaryFileName(value: unknown): string {
   if (!value || typeof value !== 'object')
-    throw new Error('Gemini temporary audio upload returned no file name');
+    throw new Error('Gemini temporary file upload returned no file name');
   const name = (value as Record<string, unknown>).name;
   if (typeof name !== 'string' || !/^files\/[A-Za-z0-9_-]+$/.test(name)) {
-    throw new Error('Gemini temporary audio upload returned an invalid file name');
+    throw new Error('Gemini temporary file upload returned an invalid file name');
   }
   return name;
 }
@@ -293,7 +328,7 @@ function assertNoRedirect(response: Response, operation: string): void {
 
 function geminiTemporaryFile(value: unknown): TemporaryGeminiFile {
   if (!value || typeof value !== 'object')
-    throw new Error('Gemini temporary audio returned no file');
+    throw new Error('Gemini temporary upload returned no file');
   const file = value as Record<string, unknown>;
   const mimeType = file.mimeType ?? file.mime_type;
   if (
@@ -304,7 +339,7 @@ function geminiTemporaryFile(value: unknown): TemporaryGeminiFile {
     typeof file.state !== 'string' ||
     typeof mimeType !== 'string'
   ) {
-    throw new Error('Gemini temporary audio upload returned an invalid file reference');
+    throw new Error('Gemini temporary upload returned an invalid file reference');
   }
   return { name: file.name, uri: file.uri, state: file.state, mimeType };
 }
@@ -314,17 +349,21 @@ function assertTrustedGeminiUploadUrl(uploadUrl: string): URL {
   try {
     parsed = new URL(uploadUrl);
   } catch {
-    throw new Error('Gemini temporary audio upload returned an invalid upload URL');
+    throw new Error('Gemini temporary upload returned an invalid upload URL');
   }
   const base = new URL(GEMINI_API_BASE_URL);
   if (parsed.username || parsed.password || parsed.origin !== base.origin) {
-    throw new Error('Gemini temporary audio upload returned an untrusted upload URL');
+    throw new Error('Gemini temporary upload returned an untrusted upload URL');
   }
   assertSafeProviderBaseUrl(parsed.toString(), 'Gemini live-test upload endpoint');
   return parsed;
 }
 
-async function uploadTemporaryGeminiAudio(): Promise<TemporaryGeminiFile> {
+async function uploadTemporaryGeminiFile(
+  data: Uint8Array,
+  mediaType: string,
+  displayName: string,
+): Promise<TemporaryGeminiFile> {
   const apiKey = process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GOOGLE_API_KEY or GEMINI_API_KEY is required');
   assertSafeProviderBaseUrl(GEMINI_API_BASE_URL, 'Gemini live-test Files API');
@@ -334,67 +373,65 @@ async function uploadTemporaryGeminiAudio(): Promise<TemporaryGeminiFile> {
       'x-goog-api-key': apiKey,
       'X-Goog-Upload-Protocol': 'resumable',
       'X-Goog-Upload-Command': 'start',
-      'X-Goog-Upload-Header-Content-Length': String(RECORDED_CALL_BYTES.byteLength),
-      'X-Goog-Upload-Header-Content-Type': 'audio/mpeg',
+      'X-Goog-Upload-Header-Content-Length': String(data.byteLength),
+      'X-Goog-Upload-Header-Content-Type': mediaType,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ file: { display_name: 'axl-live-transcription-fixture' } }),
+    body: JSON.stringify({ file: { display_name: displayName } }),
     redirect: 'manual',
   });
-  assertNoRedirect(start, 'Gemini temporary audio upload start');
-  if (!start.ok) throw new Error(`Gemini temporary audio upload start failed (${start.status})`);
+  assertNoRedirect(start, 'Gemini temporary file upload start');
+  if (!start.ok) throw new Error(`Gemini temporary file upload start failed (${start.status})`);
   const uploadUrl = start.headers.get('x-goog-upload-url');
-  if (!uploadUrl) throw new Error('Gemini temporary audio upload returned no upload URL');
+  if (!uploadUrl) throw new Error('Gemini temporary file upload returned no upload URL');
   const trustedUploadUrl = assertTrustedGeminiUploadUrl(uploadUrl);
   const finalized = await fetch(trustedUploadUrl, {
     method: 'POST',
     headers: {
       'X-Goog-Upload-Command': 'upload, finalize',
       'X-Goog-Upload-Offset': '0',
-      'Content-Length': String(RECORDED_CALL_BYTES.byteLength),
+      'Content-Length': String(data.byteLength),
     },
-    body: RECORDED_CALL_BYTES,
+    body: data,
     redirect: 'manual',
   });
-  assertNoRedirect(finalized, 'Gemini temporary audio upload finalize');
+  assertNoRedirect(finalized, 'Gemini temporary file upload finalize');
   if (!finalized.ok)
-    throw new Error(`Gemini temporary audio upload finalize failed (${finalized.status})`);
+    throw new Error(`Gemini temporary file upload finalize failed (${finalized.status})`);
   const body = (await finalized.json()) as { file?: unknown };
   const name = geminiTemporaryFileName(body.file);
   try {
     return geminiTemporaryFile(body.file);
   } catch (error) {
-    await deleteTemporaryGeminiAudio(name).catch(() => undefined);
+    await deleteTemporaryGeminiFile(name).catch(() => undefined);
     throw error;
   }
 }
 
-async function waitForTemporaryGeminiAudio(
-  file: TemporaryGeminiFile,
-): Promise<TemporaryGeminiFile> {
+async function waitForTemporaryGeminiFile(file: TemporaryGeminiFile): Promise<TemporaryGeminiFile> {
   const apiKey = process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GOOGLE_API_KEY or GEMINI_API_KEY is required');
   let current = file;
   const deadline = Date.now() + GEMINI_FILE_READY_TIMEOUT_MS;
   while (current.state !== 'ACTIVE') {
-    if (current.state === 'FAILED') throw new Error('Gemini temporary audio processing failed');
-    if (Date.now() >= deadline) throw new Error('Gemini temporary audio readiness timed out');
+    if (current.state === 'FAILED') throw new Error('Gemini temporary file processing failed');
+    if (Date.now() >= deadline) throw new Error('Gemini temporary file readiness timed out');
     await new Promise((resolve) => setTimeout(resolve, GEMINI_FILE_READY_POLL_MS));
     const response = await fetch(`${GEMINI_API_BASE_URL}/${current.name}`, {
       method: 'GET',
       headers: { 'x-goog-api-key': apiKey },
       redirect: 'manual',
     });
-    assertNoRedirect(response, 'Gemini temporary audio readiness read');
+    assertNoRedirect(response, 'Gemini temporary file readiness read');
     if (!response.ok) {
-      throw new Error(`Gemini temporary audio readiness read failed (${response.status})`);
+      throw new Error(`Gemini temporary file readiness read failed (${response.status})`);
     }
     current = geminiTemporaryFile(await response.json());
   }
   return current;
 }
 
-async function deleteTemporaryGeminiAudio(fileName: string): Promise<void> {
+async function deleteTemporaryGeminiFile(fileName: string): Promise<void> {
   const apiKey = process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GOOGLE_API_KEY or GEMINI_API_KEY is required');
   const response = await fetch(`${GEMINI_API_BASE_URL}/${fileName}`, {
@@ -402,9 +439,9 @@ async function deleteTemporaryGeminiAudio(fileName: string): Promise<void> {
     headers: { 'x-goog-api-key': apiKey },
     redirect: 'manual',
   });
-  assertNoRedirect(response, 'Gemini temporary audio deletion');
+  assertNoRedirect(response, 'Gemini temporary file deletion');
   if (!response.ok && response.status !== 404) {
-    throw new Error(`Gemini temporary audio deletion failed (${response.status})`);
+    throw new Error(`Gemini temporary file deletion failed (${response.status})`);
   }
 }
 
@@ -422,6 +459,41 @@ describe.skipIf(!RUN || !process.env.OPENAI_API_KEY)(
       expect(result.length).toBeGreaterThan(0);
       assertHonestTerminal(events);
       assertNoBase64InEvents(events);
+    });
+  },
+);
+
+describe.skipIf(!RUN || !process.env.OPENAI_API_KEY)(
+  'multimodal live [L14]: OpenAI Responses provider-file image',
+  () => {
+    it('[L14] uses a caller-owned OpenAI vision file and deletes the test fixture', async () => {
+      await observeFetch(async (requests) => {
+        const fileId = await uploadTemporaryOpenAIImage();
+        try {
+          const { context, events } = liveContext();
+          const beforeAsk = requests.length;
+          const a = agent({
+            model: 'openai-responses:gpt-4o-mini',
+            system: 'Reply with one word.',
+          });
+          const result = await context.ask(
+            a,
+            input({ type: 'provider-file', provider: 'openai-responses', reference: fileId }),
+            { maxTokens: 32, temperature: 0 },
+          );
+          expect(result.length).toBeGreaterThan(0);
+          expect(requests.slice(beforeAsk)).toEqual([{ method: 'POST', path: '/v1/responses' }]);
+          assertHonestTerminal(events);
+        } finally {
+          await deleteTemporaryOpenAIImage(fileId);
+        }
+        expect(requests.filter((request) => request.path === '/v1/files')).toHaveLength(1);
+        expect(
+          requests.filter(
+            (request) => request.method === 'DELETE' && request.path.startsWith('/v1/files/'),
+          ),
+        ).toHaveLength(1);
+      });
     });
   },
 );
@@ -483,6 +555,52 @@ describe.skipIf(!RUN || !process.env.GOOGLE_API_KEY)(
       expect(typeof result.visible).toBe('boolean');
       assertHonestTerminal(events);
       assertNoBase64InEvents(events);
+    });
+  },
+);
+
+describe.skipIf(!RUN || (!process.env.GOOGLE_API_KEY && !process.env.GEMINI_API_KEY))(
+  'multimodal live [L13]: Gemini Files provider-file image',
+  () => {
+    it('[L13] uses a test-owned Gemini Files URI and deletes the fixture', async () => {
+      await observeFetch(async (requests) => {
+        const uploaded = await uploadTemporaryGeminiFile(
+          Uint8Array.from(PNG_BYTES),
+          'image/png',
+          'axl-live-image-fixture',
+        );
+        try {
+          const temporary = await waitForTemporaryGeminiFile(uploaded);
+          expect(temporary.mimeType).toBe('image/png');
+          const { context, events } = liveContext();
+          const beforeAsk = requests.length;
+          const a = agent({ model: 'google:gemini-3.7-flash', system: 'Reply with one word.' });
+          const result = await context.ask(
+            a,
+            input({
+              type: 'provider-file',
+              provider: 'google',
+              reference: temporary.uri,
+              mediaType: 'image/png',
+            }),
+            { maxTokens: 128, temperature: 0, effort: 'none' },
+          );
+          expect(result.length).toBeGreaterThan(0);
+          expect(requests.slice(beforeAsk)).toHaveLength(1);
+          expect(requests.slice(beforeAsk)[0]).toMatchObject({
+            method: 'POST',
+            path: '/v1beta/interactions',
+          });
+          assertHonestTerminal(events);
+        } finally {
+          await deleteTemporaryGeminiFile(uploaded.name);
+        }
+        expect(
+          requests.filter(
+            (request) => request.method === 'DELETE' && request.path.startsWith('/v1beta/files/'),
+          ),
+        ).toHaveLength(1);
+      });
     });
   },
 );
@@ -678,9 +796,13 @@ describe.skipIf(!TRANSCRIPTION_RUN || (!process.env.GOOGLE_API_KEY && !process.e
   () => {
     it('[L9] supplies a test-owned temporary Files URI without host fetching and deletes it', async () => {
       await observeFetch(async (requests) => {
-        const uploaded = await uploadTemporaryGeminiAudio();
+        const uploaded = await uploadTemporaryGeminiFile(
+          RECORDED_CALL_BYTES,
+          'audio/mpeg',
+          'axl-live-transcription-fixture',
+        );
         try {
-          const temporary = await waitForTemporaryGeminiAudio(uploaded);
+          const temporary = await waitForTemporaryGeminiFile(uploaded);
           expect(temporary.mimeType).toBe('audio/mpeg');
           const { context, events } = liveContext();
           const beforeTranscribe = requests.length;
@@ -710,7 +832,7 @@ describe.skipIf(!TRANSCRIPTION_RUN || (!process.env.GOOGLE_API_KEY && !process.e
           assertTranscriptionTerminal(events, { source: 'provider-file', cleanup: 'not_required' });
           assertNoRecordedAudioInEvents(events, temporary.name, temporary.uri);
         } finally {
-          await deleteTemporaryGeminiAudio(uploaded.name);
+          await deleteTemporaryGeminiFile(uploaded.name);
         }
         expect(
           requests.filter(

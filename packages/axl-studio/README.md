@@ -20,7 +20,7 @@ Or run directly with npx (no install needed):
 npx @axlsdk/studio
 ```
 
-**Requirements:** Node.js 20+, an existing Axl project with `@axlsdk/axl` installed.
+**Requirements:** Node.js 22+, an existing Axl project with `@axlsdk/axl` installed.
 
 ## Quick Start
 

@@ -1,6 +1,6 @@
 # Roadmap
 
-> Last updated: August 2026
+> Last updated: September 2026
 
 ## Guiding Principles
 
@@ -13,7 +13,7 @@
 
 ### Complete
 
-- **Completed-file transcription (implementation complete; named live certification pending)** — `ctx.transcribe()` is a dedicated,
+- **Completed-file transcription** — `ctx.transcribe()` is a dedicated,
   non-chat finite-recording operation with OpenAI, Gemini Interactions/Files,
   and OpenRouter STT adapters; paired safe lifecycle events, cleanup status,
   mock coverage, and an explicit transcript-to-agent recipe. General audio

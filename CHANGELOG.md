@@ -21,7 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   safe paired lifecycle events, keeps provider-reported pricing honest, and
   composes explicitly with `ctx.ask()`. See `docs/multimodal-input.md`.
 
+### Breaking Changes
+
+- **Node.js 22 is now the minimum supported runtime.** Node.js 20 reached end
+  of life in March 2026, so CI and all published package engine declarations
+  now target supported Node.js 22 and 24 releases.
+
 ### Fixed
+
+- **Inline media is bounded before allocation.** Ordered image inputs accept at
+  most 25 MiB decoded across one logical input, and transcription bytes/base64
+  accept at most 25 MiB. Oversized values fail before ownership copies,
+  base64 decoding, provider validation, or network dispatch. Both limits are
+  exported for caller-side preflight and chunking.
+- **Transcription failures retain safe provider diagnostics.** Wrapped errors
+  and terminal events now expose HTTP status, retryability, optional retry
+  delay, and optional request ID while keeping raw provider bodies out of
+  observer and persistence surfaces.
 
 - **Gemini image URLs now fail before dispatch.** Live discrimination showed
   that `gemini-3.7-flash` accepts the same image inline or through a Gemini

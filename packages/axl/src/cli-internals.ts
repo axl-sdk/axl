@@ -276,6 +276,6 @@ export async function registerConditions(conditions: string[]): Promise<void> {
     ].join('\n');
     nodeModule.register(`data:text/javascript,${encodeURIComponent(hookCode)}`);
   } catch {
-    console.warn('Warning: --conditions requires Node.js 20.6+');
+    console.warn('Warning: this Node.js runtime does not support --conditions');
   }
 }

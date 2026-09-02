@@ -11,6 +11,7 @@ import type {
   TranscriptionProviderRequest,
   TranscriptionProviderResult,
 } from './transcription-types.js';
+import { MAX_INLINE_TRANSCRIPTION_BYTES } from '../transcription.js';
 import {
   OPENAI_TRANSCRIPTION_MODEL,
   assertOnlyProviderOptions,
@@ -21,7 +22,6 @@ import {
   transcriptUsage,
 } from './transcription-utils.js';
 
-const MAX_OPENAI_AUDIO_BYTES = 25 * 1024 * 1024;
 const OPENAI_FILE_EXTENSIONS: Record<string, string> = {
   'audio/flac': 'flac',
   'audio/m4a': 'm4a',
@@ -100,7 +100,7 @@ export class OpenAITranscriptionProvider implements TranscriptionProvider {
         feature: 'this audio media type',
       });
     const bytes = inlineAudioBytes(request.audio);
-    if (bytes.byteLength > MAX_OPENAI_AUDIO_BYTES)
+    if (bytes.byteLength > MAX_INLINE_TRANSCRIPTION_BYTES)
       throw new InvalidTranscriptionInputError('OpenAI transcription audio must not exceed 25 MiB');
     const form = new FormData();
     form.set('file', new Blob([Buffer.from(bytes)], { type: mediaType }), `audio.${extension}`);

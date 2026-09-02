@@ -19,7 +19,7 @@ Monorepo (pnpm workspaces), four packages:
   embeddable middleware.
 
 ## Tech stack
-TypeScript (strict, ESM) · Zod v4 (peer dep `zod@^4`) · Vitest · pnpm workspaces · Node 20+ ·
+TypeScript (strict, ESM) · Zod v4 (peer dep `zod@^4`) · Vitest · pnpm workspaces · Node 22+ ·
 tsup (ESM + CJS + DTS).
 
 ## Core conventions

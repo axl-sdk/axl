@@ -4743,15 +4743,28 @@ export class WorkflowContext<TInput = unknown> {
         error && typeof error === 'object' ? (error as Record<string, unknown>) : undefined;
       const accounting = normalizeTranscriptionAccounting(details?.usage, details?.pricingStatus);
       const cleanup = cleanupStatus(details?.cleanupStatus);
+      const providerError = error instanceof ProviderError ? error : undefined;
+      const diagnostics = providerError
+        ? {
+            status: providerError.status,
+            retryable: providerError.retryable,
+            ...(providerError.retryAfterMs !== undefined
+              ? { retryAfterMs: providerError.retryAfterMs }
+              : {}),
+            ...(providerError.requestId ? { requestId: providerError.requestId } : {}),
+          }
+        : undefined;
       return {
         accounting,
         cleanup,
+        diagnostics,
         error: new TranscriptionOperationError({
           provider,
           model,
           ...(accounting.usage ? { usage: accounting.usage } : {}),
           ...(accounting.pricingStatus ? { pricingStatus: accounting.pricingStatus } : {}),
           ...(cleanup ? { cleanupStatus: cleanup } : {}),
+          ...(diagnostics ?? {}),
           cause: error,
         }),
       };
@@ -4874,6 +4887,7 @@ export class WorkflowContext<TInput = unknown> {
             {
               error: 'Transcription operation failed',
               errorCode: failure.error.code,
+              ...(failure.diagnostics ? { providerError: failure.diagnostics } : {}),
               ...(failure.cleanup ? { cleanupStatus: failure.cleanup } : {}),
             },
           ),

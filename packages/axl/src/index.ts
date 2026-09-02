@@ -5,7 +5,7 @@ export type { Tool, ToolConfig, ToolHooks, ToolModelOutput, RetryPolicy } from '
 export { agent } from './agent.js';
 export type { Agent, AgentConfig, HandoffDescriptor } from './agent.js';
 
-export { inputText } from './input.js';
+export { inputText, MAX_INLINE_MODEL_INPUT_BYTES } from './input.js';
 export type {
   ModelInput,
   InputContentPart,
@@ -15,6 +15,7 @@ export type {
   ModelInputDescriptor,
 } from './input.js';
 
+export { MAX_INLINE_TRANSCRIPTION_BYTES } from './transcription.js';
 export type { RecordedAudioSource, TranscriptionRequest, Transcript } from './transcription.js';
 
 export { workflow } from './workflow.js';

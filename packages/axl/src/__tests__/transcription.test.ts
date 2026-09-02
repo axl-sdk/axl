@@ -14,7 +14,12 @@ import type {
   TranscriptionProviderRequest,
 } from '../providers/transcription-types.js';
 import type { AxlEvent } from '../types.js';
-import { normalizeTranscriptionAccounting } from '../transcription.js';
+import {
+  MAX_INLINE_TRANSCRIPTION_BYTES,
+  normalizeTranscriptionAccounting,
+  normalizeTranscriptionRequest,
+} from '../transcription.js';
+import { ProviderError } from '../providers/errors.js';
 
 function makeProvider(): TranscriptionProvider & { calls: TranscriptionProviderRequest[] } {
   const calls: TranscriptionProviderRequest[] = [];
@@ -122,6 +127,32 @@ describe('WorkflowContext.transcribe', () => {
     expect(events.filter((event) => event.type === 'transcription_end')).toHaveLength(3);
   });
 
+  it('rejects oversized inline audio before dispatch or base64 decoding', async () => {
+    const provider = makeProvider();
+    const { ctx } = makeContext(provider);
+    await expect(
+      ctx.transcribe({
+        model: 'test:stt',
+        audio: {
+          type: 'bytes',
+          data: new Uint8Array(MAX_INLINE_TRANSCRIPTION_BYTES + 1),
+          mediaType: 'audio/wav',
+        },
+      }),
+    ).rejects.toThrow('must not exceed 25 MiB');
+    expect(() =>
+      normalizeTranscriptionRequest({
+        model: 'test:stt',
+        audio: {
+          type: 'base64',
+          data: 'A'.repeat(4 * Math.ceil(MAX_INLINE_TRANSCRIPTION_BYTES / 3) + 4),
+          mediaType: 'audio/wav',
+        },
+      }),
+    ).toThrow('must not exceed 25 MiB');
+    expect(provider.calls).toHaveLength(0);
+  });
+
   it('redacts transcript output without recording provider-file references', async () => {
     const provider = makeProvider();
     const transcription = new TranscriptionProviderRegistry();
@@ -148,7 +179,15 @@ describe('WorkflowContext.transcribe', () => {
     const provider: TranscriptionProvider = {
       capabilities: () => ({ sources: ['base64'] }),
       async transcribe() {
-        const error = new Error(`vendor echoed ${secret}`) as Error & {
+        const error = new ProviderError({
+          provider: 'test',
+          status: 429,
+          retryable: true,
+          retryAfterMs: 2_000,
+          requestId: 'request-safe-123',
+          message: `vendor echoed ${secret}`,
+          body: secret,
+        }) as ProviderError & {
           usage: unknown;
           pricingStatus: unknown;
           cleanupStatus: unknown;
@@ -160,12 +199,19 @@ describe('WorkflowContext.transcribe', () => {
       },
     };
     const { ctx, events } = makeContext(provider);
-    await expect(
+    const rejection = expect(
       ctx.transcribe({
         model: 'test:stt',
         audio: { type: 'base64', data: 'AQI=', mediaType: 'audio/wav' },
       }),
-    ).rejects.toBeInstanceOf(TranscriptionOperationError);
+    ).rejects;
+    await rejection.toBeInstanceOf(TranscriptionOperationError);
+    await rejection.toMatchObject({
+      status: 429,
+      retryable: true,
+      retryAfterMs: 2_000,
+      requestId: 'request-safe-123',
+    });
     const end = events.find((event) => event.type === 'transcription_end');
     expect(end?.type).toBe('transcription_end');
     if (end?.type === 'transcription_end') {
@@ -174,6 +220,12 @@ describe('WorkflowContext.transcribe', () => {
         status: 'failed',
         cleanupStatus: 'timed_out',
         usage: { audioSeconds: 4, totalTokens: 9 },
+        providerError: {
+          status: 429,
+          retryable: true,
+          retryAfterMs: 2_000,
+          requestId: 'request-safe-123',
+        },
       });
     }
     expect(JSON.stringify(events)).not.toContain(secret);

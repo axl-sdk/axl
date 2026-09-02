@@ -8,7 +8,12 @@ import {
   UnsupportedModelInputError,
   preserveErrorCause,
 } from '../errors.js';
-import { inputText, normalizeModelInput, type ModelInput } from '../input.js';
+import {
+  inputText,
+  MAX_INLINE_MODEL_INPUT_BYTES,
+  normalizeModelInput,
+  type ModelInput,
+} from '../input.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import { ProviderError } from '../providers/errors.js';
 import { redactEvent, REDACTED } from '../redaction.js';
@@ -105,6 +110,43 @@ describe('ModelInput', () => {
         { type: 'image', source: { type: 'url', url: 'file:///secret' } },
       ] as never),
     ).toThrow(InvalidModelInputError);
+  });
+
+  it('rejects oversized inline images before provider validation and counts aggregate bytes', async () => {
+    const provider = new InputProvider();
+    const a = agent({ model: 'input:vision', system: 'inspect' });
+    const oversized = new Uint8Array(MAX_INLINE_MODEL_INPUT_BYTES + 1);
+    await expect(
+      context(provider).ask(a, [
+        { type: 'image', source: { type: 'bytes', data: oversized, mediaType: 'image/png' } },
+      ]),
+    ).rejects.toThrow('must not exceed 25 MiB total');
+
+    const half = Math.floor(MAX_INLINE_MODEL_INPUT_BYTES / 2) + 1;
+    expect(() =>
+      normalizeModelInput([
+        {
+          type: 'image',
+          source: { type: 'bytes', data: new Uint8Array(half), mediaType: 'image/png' },
+        },
+        {
+          type: 'image',
+          source: { type: 'bytes', data: new Uint8Array(half), mediaType: 'image/png' },
+        },
+      ]),
+    ).toThrow('must not exceed 25 MiB total');
+
+    const oversizedBase64 = 'A'.repeat(4 * Math.ceil(MAX_INLINE_MODEL_INPUT_BYTES / 3) + 4);
+    expect(() =>
+      normalizeModelInput([
+        {
+          type: 'image',
+          source: { type: 'base64', data: oversizedBase64, mediaType: 'image/png' },
+        },
+      ]),
+    ).toThrow('must not exceed 25 MiB total');
+    expect(provider.validations).toHaveLength(0);
+    expect(provider.calls).toHaveLength(0);
   });
 
   it('keeps legacy string provider error messages byte-for-byte in events', async () => {

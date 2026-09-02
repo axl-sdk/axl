@@ -25,6 +25,9 @@ export type InputImagePart = {
 
 export type InputContentPart = InputTextPart | InputImagePart;
 
+/** Maximum decoded bytes retained across inline images in one logical input. */
+export const MAX_INLINE_MODEL_INPUT_BYTES = 25 * 1024 * 1024;
+
 /** Bounded, observation-safe representation of a rich input. */
 export type ModelInputDescriptor = {
   readonly parts: readonly (
@@ -58,11 +61,27 @@ function validBase64(value: string): boolean {
   return value.length > 0 && value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value);
 }
 
+function decodedBase64Bytes(value: string): number {
+  return (
+    Math.floor((value.length * 3) / 4) - (value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0)
+  );
+}
+
 /** Validate and take private ownership of an input once per ask. */
 export function normalizeModelInput(input: ModelInput): ModelInput {
   if (typeof input === 'string') return input;
   if (!Array.isArray(input) || input.length === 0)
     invalid('ModelInput parts must be a non-empty array');
+
+  let inlineBytes = 0;
+  const reserveInlineBytes = (bytes: number) => {
+    if (bytes > MAX_INLINE_MODEL_INPUT_BYTES - inlineBytes) {
+      invalid(
+        'Inline image data must not exceed 25 MiB total; use a URL or provider-file source where supported',
+      );
+    }
+    inlineBytes += bytes;
+  };
 
   return input.map((part, index): InputContentPart => {
     if (!part || typeof part !== 'object') invalid(`ModelInput part ${index} must be an object`);
@@ -95,6 +114,8 @@ export function normalizeModelInput(input: ModelInput): ModelInput {
       case 'bytes':
         if (!(source.data instanceof Uint8Array) || source.data.byteLength === 0)
           invalid(`part ${index}.source.data must be a non-empty Uint8Array`);
+        // Enforce the aggregate bound before taking the ownership copy.
+        reserveInlineBytes(source.data.byteLength);
         clone = {
           type: 'bytes',
           data: source.data.slice(),
@@ -103,7 +124,15 @@ export function normalizeModelInput(input: ModelInput): ModelInput {
         break;
       case 'base64': {
         const data = nonEmptyString(source.data, `part ${index}.source.data`);
+        // Reject by encoded length before the regex scans an arbitrarily large
+        // value. Padding is accounted for after syntax validation.
+        if (data.length > 4 * Math.ceil(MAX_INLINE_MODEL_INPUT_BYTES / 3)) {
+          invalid(
+            'Inline image data must not exceed 25 MiB total; use a URL or provider-file source where supported',
+          );
+        }
         if (!validBase64(data)) invalid(`part ${index}.source.data must be valid base64`);
+        reserveInlineBytes(decodedBase64Bytes(data));
         clone = {
           type: 'base64',
           data,
@@ -163,9 +192,7 @@ export function describeModelInput(input: ModelInput): ModelInputDescriptor | un
         ...(source.type === 'bytes' ? { bytes: source.data.byteLength } : {}),
         ...(source.type === 'base64'
           ? {
-              bytes:
-                Math.floor((source.data.length * 3) / 4) -
-                (source.data.endsWith('==') ? 2 : source.data.endsWith('=') ? 1 : 0),
+              bytes: decodedBase64Bytes(source.data),
             }
           : {}),
         ...((

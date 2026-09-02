@@ -1,9 +1,10 @@
 # Multimodal image lighthouse — verification record
 
 **Prepared:** 2026-08-31  
-**Status:** Passed — L1-L6 and L11-L12 passed for Axl's final advertised
+**Updated:** 2026-09-02
+**Status:** Passed — L1-L6 and L11-L14 passed for Axl's final advertised
 capabilities. L12 is a local zero-request rejection backed by a discriminating
-live provider probe.
+live provider probe; L13-L14 are durable provider-file lifecycle rows.
 
 The opt-in tests are `packages/axl/src/__tests__/integration-multimodal-input.test.ts`.
 They use the checked-in Studio Playground PNG, low output limits, and require `AXL_MULTIMODAL_LIVE=1` in
@@ -20,14 +21,17 @@ authorization header, or provider-file reference belongs in this record.
 | L6 | `-t '\[L6\]'` | `openai-responses:gpt-4.1-nano` | 0 / 0 | Local `UNSUPPORTED_MODEL_INPUT` preflight | Passed locally |
 | L11 | `-t '\[L11\]'` | `anthropic:claude-sonnet-4-5` | 1 / 3 | URL accepted without Axl host retrieval; terminal accounting passed | Passed |
 | L12 | `-t '\[L12\]'` | `google:gemini-3.7-flash` | 0 / 0 | Direct HTTP image URLs fail capability preflight; use inline bytes/base64 or an explicit Gemini Files provider reference | Passed locally |
+| L13 | `-t '\[L13\]'` | `google:gemini-3.7-flash` | Files start/finalize + bounded readiness reads; 1 / 3 model attempts; delete | Test-owned Files URI reached one stateless Interaction; terminal accounting and deletion passed | Passed live |
+| L14 | `-t '\[L14\]'` | `openai-responses:gpt-4o-mini` | Files upload; 1 / 3 model attempts; delete | Test-owned vision file ID reached one Responses request; terminal accounting and deletion passed | Passed live |
 
-On a normal successful path, native blocking rows are four logical invocations,
-six with L3's existing provider-file reference, and seven with optional L5.
+On a normal successful path, native blocking rows are six logical invocations,
+eight with L3's existing provider-file reference, and nine with optional L5.
 Because `fetchWithRetry` permits two retries for eligible transport, `429`,
-`503`, and `529` failures, their maximum HTTP attempts are 12, 18, and 21.
+`503`, and `529` failures, their maximum HTTP attempts are 18, 24, and 27.
 Those figures do not bound paid provider processing or spend: a provider can
 process a request even when the client sees a failed or ambiguous transport
-result. The optional `AXL_ANTHROPIC_TEMP_FILE=1` route adds one Files API
+result. L13 and L14 add test-owned file lifecycles outside those model request
+counts. The optional `AXL_ANTHROPIC_TEMP_FILE=1` route adds one Files API
 upload and one delete operation. The uploaded fixture expires after one hour
 even if cleanup cannot complete. This harness-only setup does not expose file
 management as an Axl runtime API.
@@ -50,8 +54,12 @@ through Gemini Files, passing the returned URI, and deleting it all returned
 tokens as inline input. Google's URL-image guide also uploads through Files.
 Axl therefore fails direct Gemini URLs locally rather than misclassifying the
 provider response as project quota or adding hidden host fetch/upload behavior.
+The durable L13 rerun then reproduced the supported Files path with a
+test-owned upload and observed deletion. L14 independently certified the
+advertised OpenAI Responses `file_id` mapping with a test-owned `vision` file
+and observed deletion. Each selector made exactly one model request.
 
-## Sources checked for selection (accessed 2026-08-31)
+## Sources checked for selection (accessed through 2026-09-02)
 
 - [OpenAI image inputs](https://platform.openai.com/docs/guides/images)
 - [Anthropic vision](https://platform.claude.com/docs/en/build-with-claude/vision)

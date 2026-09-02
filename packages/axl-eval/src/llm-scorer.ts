@@ -33,6 +33,21 @@ export type LlmScorerConfig = {
   applies?: ScorerApplies<unknown, unknown, unknown>;
 };
 
+type ZodIssueLike = {
+  readonly path: readonly (string | number)[];
+  readonly message: string;
+};
+
+function isZodIssueLike(value: unknown): value is ZodIssueLike {
+  if (!value || typeof value !== 'object') return false;
+  const issue = value as { path?: unknown; message?: unknown };
+  return (
+    Array.isArray(issue.path) &&
+    issue.path.every((segment) => typeof segment === 'string' || typeof segment === 'number') &&
+    typeof issue.message === 'string'
+  );
+}
+
 export function llmScorer(config: LlmScorerConfig): Scorer {
   // Resolve schema and its JSON representation once at construction time —
   // both are fixed for the lifetime of this scorer instance.
@@ -113,16 +128,8 @@ export function llmScorer(config: LlmScorerConfig): Scorer {
         attachScorerErrorCost(err, responseCost);
         // Duck-type check instead of instanceof to handle potential dual-instance
         // scenarios where two copies of zod are present in the dependency tree.
-        if (
-          err &&
-          typeof err === 'object' &&
-          'issues' in err &&
-          Array.isArray((err as any).issues)
-        ) {
-          const issues = (err as any).issues as Array<{
-            path: (string | number)[];
-            message: string;
-          }>;
+        const issues = err && typeof err === 'object' && 'issues' in err ? err.issues : undefined;
+        if (Array.isArray(issues) && issues.every(isZodIssueLike)) {
           const messages = issues
             .map((i) => `${i.path.length ? `${i.path.join('.')}: ` : ''}${i.message}`)
             .join('; ');

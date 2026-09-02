@@ -278,6 +278,31 @@ describe('llmScorer()', () => {
     );
   });
 
+  it('formats a structurally compatible validation error without relying on Zod identity', async () => {
+    const mockProvider = {
+      async chat(_messages: any[], _options: any) {
+        return { content: JSON.stringify({ score: 0.8, reasoning: 'OK' }) };
+      },
+    };
+    const schema = z.object({ score: z.number(), reasoning: z.string() });
+    const s = llmScorer({
+      name: 'quality',
+      description: 'test',
+      model: 'test:model',
+      system: 'Rate it',
+      schema,
+    });
+    Object.defineProperty(schema, 'parse', {
+      value: () => {
+        throw { issues: [{ path: ['score'], message: 'Plain structural issue' }] };
+      },
+    });
+
+    await expect(s.score('output', 'input', undefined, mockContext(mockProvider))).rejects.toThrow(
+      'LLM scorer "quality" returned an invalid response: score: Plain structural issue',
+    );
+  });
+
   it('strips provider prefix from model string', async () => {
     let capturedOptions: any = {};
 

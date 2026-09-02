@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import { InvalidTranscriptionInputError, UnsupportedTranscriptionInputError } from '../errors.js';
+import { WorkflowContext } from '../context.js';
 import { GeminiTranscriptionProvider } from '../providers/gemini-transcription.js';
 import { OpenAITranscriptionProvider } from '../providers/openai-transcription.js';
 import { OpenRouterTranscriptionProvider } from '../providers/openrouter-transcription.js';
+import { ProviderRegistry } from '../providers/registry.js';
 import { TranscriptionProviderRegistry } from '../providers/transcription-registry.js';
 
 const originalFetch = globalThis.fetch;
@@ -745,7 +748,7 @@ describe('dedicated transcription adapters', () => {
     ).toHaveLength(1);
   });
 
-  it('uses the OpenRouter dedicated JSON endpoint and maps authoritative cost', async () => {
+  it('uses the OpenRouter dedicated JSON endpoint for arbitrary transcription models and maps authoritative cost', async () => {
     const fetch = vi.fn().mockResolvedValue(
       response({
         text: 'hello',
@@ -755,14 +758,14 @@ describe('dedicated transcription adapters', () => {
     globalThis.fetch = fetch as typeof globalThis.fetch;
     const provider = new OpenRouterTranscriptionProvider({ apiKey: 'key' });
     const result = await provider.transcribe({
-      model: 'openai/whisper-1',
+      model: 'mistralai/voxtral-mini',
       audio: { type: 'bytes', data: bytes, mediaType: 'audio/mpeg' },
       language: 'en',
       providerOptions: { temperature: 0, provider: { order: ['openai'] } },
     });
     expect(fetch.mock.calls[0][0]).toBe('https://openrouter.ai/api/v1/audio/transcriptions');
     expect(JSON.parse((fetch.mock.calls[0][1] as RequestInit).body as string)).toEqual({
-      model: 'openai/whisper-1',
+      model: 'mistralai/voxtral-mini',
       input_audio: { data: 'AQID', format: 'mp3' },
       language: 'en',
       temperature: 0,
@@ -780,7 +783,7 @@ describe('dedicated transcription adapters', () => {
     const provider = new OpenRouterTranscriptionProvider({ apiKey: 'key' });
     await expect(
       provider.transcribe({
-        model: 'openai/whisper-1',
+        model: 'mistralai/voxtral-mini',
         audio: { type: 'bytes', data: bytes, mediaType: 'audio/aac' },
       }),
     ).resolves.toMatchObject({ transcript: { text: 'aac' } });
@@ -789,12 +792,61 @@ describe('dedicated transcription adapters', () => {
     ).toBe('aac');
     await expect(
       provider.transcribe({
-        model: 'openai/whisper-1',
+        model: 'mistralai/voxtral-mini',
         audio: { type: 'bytes', data: bytes, mediaType: 'audio/aac' },
         providerOptions: { temperature: 1.1 },
       }),
     ).rejects.toBeInstanceOf(InvalidTranscriptionInputError);
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('advertises arbitrary OpenRouter models but rejects unsupported inputs before network', async () => {
+    const fetch = vi.fn();
+    globalThis.fetch = fetch as typeof globalThis.fetch;
+    const provider = new OpenRouterTranscriptionProvider({ apiKey: 'key' });
+    expect(provider.capabilities('provider/future-stt')).toEqual({ sources: ['bytes', 'base64'] });
+    expect(provider.capabilities('')).toBeUndefined();
+    await expect(
+      provider.transcribe({
+        model: 'provider/future-stt',
+        audio: { type: 'provider-file', provider: 'openrouter-transcription', reference: 'file' },
+      }),
+    ).rejects.toBeInstanceOf(UnsupportedTranscriptionInputError);
+    await expect(
+      provider.transcribe({
+        model: 'provider/future-stt',
+        audio: { type: 'bytes', data: bytes, mediaType: 'text/plain' },
+      }),
+    ).rejects.toBeInstanceOf(UnsupportedTranscriptionInputError);
+    await expect(
+      provider.transcribe({
+        model: 'provider/future-stt',
+        audio: { type: 'base64', data: 'AQID', mediaType: 'audio/wav' },
+        providerOptions: { unsupported: true },
+      }),
+    ).rejects.toBeInstanceOf(InvalidTranscriptionInputError);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('preserves colon-qualified OpenRouter models through the registry into the dedicated request', async () => {
+    const fetch = vi.fn().mockResolvedValue(response({ text: 'variant' }));
+    globalThis.fetch = fetch as typeof globalThis.fetch;
+    const ctx = new WorkflowContext({
+      input: undefined,
+      executionId: randomUUID(),
+      config: { providers: { openrouter: { apiKey: 'key' } } },
+      providerRegistry: new ProviderRegistry(),
+      transcriptionProviderRegistry: new TranscriptionProviderRegistry(),
+    });
+    await expect(
+      ctx.transcribe({
+        model: 'openrouter-transcription:vendor/model:variant',
+        audio: { type: 'base64', data: 'AQID', mediaType: 'audio/wav' },
+      }),
+    ).resolves.toMatchObject({ text: 'variant' });
+    expect(JSON.parse((fetch.mock.calls[0][1] as RequestInit).body as string).model).toBe(
+      'vendor/model:variant',
+    );
   });
 
   it('registers only the explicit built-in adapters with their matching config blocks', () => {

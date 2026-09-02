@@ -23,8 +23,6 @@ import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import { UnsupportedModelInputError } from '../errors.js';
 
-const OPENROUTER_IMAGE_MODEL = 'openai/gpt-4o-mini';
-
 function compatibleImageBase64(
   source: Extract<InputMediaSource, { type: 'bytes' | 'base64' }>,
 ): string {
@@ -35,7 +33,10 @@ function compatibleImageBase64(
       );
 }
 
-function openRouterImageParts(parts: readonly InputContentPart[]): Array<Record<string, unknown>> {
+function openRouterImageParts(
+  parts: readonly InputContentPart[],
+  model: string,
+): Array<Record<string, unknown>> {
   const content: Array<Record<string, unknown>> = [];
   for (const part of parts) {
     if (part.type === 'text') {
@@ -46,7 +47,7 @@ function openRouterImageParts(parts: readonly InputContentPart[]): Array<Record<
     if (source.type === 'provider-file') {
       throw new UnsupportedModelInputError({
         provider: 'openrouter',
-        model: OPENROUTER_IMAGE_MODEL,
+        model,
         modality: 'image',
         source: 'provider-file',
       });
@@ -460,7 +461,7 @@ export class OpenAICompatibleProvider implements Provider {
   readonly name: string;
 
   inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
-    return this.name === 'openrouter' && model === OPENROUTER_IMAGE_MODEL
+    return this.name === 'openrouter' && model.trim().length > 0
       ? { image: { sources: ['url', 'bytes', 'base64'] } }
       : {};
   }
@@ -479,13 +480,12 @@ export class OpenAICompatibleProvider implements Provider {
         ...(feature ? { feature } : {}),
       });
     };
-    if (this.name !== 'openrouter' || effectiveModel !== OPENROUTER_IMAGE_MODEL) {
+    if (this.name !== 'openrouter' || effectiveModel.trim().length === 0) {
       fail(undefined, 'image input for this model');
     }
     if (request.providerOptions && 'messages' in request.providerOptions) {
       fail(undefined, 'raw messages providerOptions');
     }
-    if (request.hasTools) fail(undefined, 'tools with image input');
     for (const message of request.history) {
       if (!Array.isArray(message.content)) continue;
       if (message.role !== 'user') fail(undefined, 'rich non-user history');
@@ -732,8 +732,8 @@ export class OpenAICompatibleProvider implements Provider {
     const out: Record<string, unknown> = {
       role: this.profile.roleFor ? this.profile.roleFor(msg.role, model) : msg.role,
       content:
-        Array.isArray(msg.content) && this.name === 'openrouter' && model === OPENROUTER_IMAGE_MODEL
-          ? openRouterImageParts(msg.content)
+        Array.isArray(msg.content) && this.name === 'openrouter'
+          ? openRouterImageParts(msg.content, model)
           : msg.content,
     };
     if (msg.name && (this.profile.capabilities?.emitsMessageName ?? true)) out.name = msg.name;

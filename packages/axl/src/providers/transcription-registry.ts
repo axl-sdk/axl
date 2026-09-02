@@ -84,7 +84,7 @@ export class TranscriptionProviderRegistry {
 
   resolve(uri: string, config: AxlConfig = {}): ResolvedTranscriptionProvider {
     const colon = typeof uri === 'string' ? uri.indexOf(':') : -1;
-    if (colon <= 0 || colon === uri.length - 1 || uri.indexOf(':', colon + 1) !== -1) {
+    if (colon <= 0 || colon === uri.length - 1) {
       throw new UnsupportedTranscriptionInputError({
         provider: 'unknown',
         model: '',

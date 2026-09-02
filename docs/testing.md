@@ -367,8 +367,13 @@ AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.
 AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L13\]'
 AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L14\]'
 
-# Non-blocking OpenRouter certification: one additional logical invocation.
+# Representative OpenRouter transport certification: one additional logical
+# invocation. This model is not an allowlist.
 AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L5\]'
+
+# Cross-catalog OpenRouter image + tool continuation: independently armed.
+# Override OPENROUTER_CATALOG_IMAGE_MODEL to certify a different catalog slug.
+AXL_MULTIMODAL_LIVE=1 AXL_OPENROUTER_CATALOG_IMAGE_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L19\]'
 
 # L3 accepts an existing Anthropic Files API reference. It makes two logical
 # invocations (the image ask plus one tool continuation).
@@ -379,9 +384,11 @@ AXL_MULTIMODAL_LIVE=1 ANTHROPIC_IMAGE_FILE_ID=file_... pnpm --filter @axlsdk/axl
 AXL_MULTIMODAL_LIVE=1 AXL_ANTHROPIC_TEMP_FILE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L3\]'
 ```
 
-The tests use `gpt-4o-mini`, `claude-sonnet-4-5`, `gemini-3.7-flash`, and
-OpenRouter `openai/gpt-4o-mini`, each with the checked-in Studio screenshot and low output token
-limit. On a normal successful path, the native blocking rows make six logical
+The tests use `gpt-4o-mini`, `claude-sonnet-4-5`, `gemini-3.7-flash`, and the
+representative OpenRouter `openai/gpt-4o-mini`, each with the checked-in Studio
+screenshot and low output token limit. The OpenRouter row certifies Axl's
+generic transport, not the OpenRouter catalog; model/route capability remains
+upstream. On a normal successful path, the native blocking rows make six logical
 model invocations, eight with L3 configured, and nine with the optional L5
 OpenRouter row. `fetchWithRetry` permits up to three HTTP attempts per logical
 invocation (the initial request plus two retries for eligible transport,
@@ -398,6 +405,15 @@ one-hour expiry bounds retention if cleanup cannot complete. A key without
 flag and keys are present. The detailed checklist and pending evidence placeholders live in
 [`docs/verification/multimodal-input-lighthouse-2026-08-31.md`](./verification/multimodal-input-lighthouse-2026-08-31.md).
 
+`L19` is a separately armed, non-blocking cross-catalog check. It uses the
+env-overridable representative `openrouter:mistralai/mistral-medium-3-5` by
+default, asks it to ground one local tool call in the fixture image, and then
+requires its continuation. A successful run makes two chat requests; retryable
+transport failures can raise that ceiling to six attempts, and an ambiguous
+attempt can still be processed and billed upstream. It certifies Axl transport,
+not a model allowlist or the whole OpenRouter catalog. See the dated
+[OpenRouter catalog evidence](./verification/openrouter-catalog-multimodal-2026-09-02.md).
+
 ### Completed-file transcription lighthouse
 
 Transcription uses a separate flag. Provider keys and `AXL_MULTIMODAL_LIVE=1`
@@ -412,6 +428,10 @@ AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vite
 AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L8V\]'
 AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L9\]'
 AXL_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L17\]'
+
+# Cross-catalog OpenRouter transcription: independently armed. Override
+# OPENROUTER_CATALOG_TRANSCRIPTION_MODEL to certify a different catalog slug.
+AXL_TRANSCRIPTION_LIVE=1 AXL_OPENROUTER_CATALOG_TRANSCRIPTION_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L20\]'
 
 # Local, exact negative preflight: zero network requests.
 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L10\]'
@@ -437,3 +457,10 @@ readiness, and cleanup deliberately avoid retries to prevent duplicate files or
 unbounded cleanup. These are request-shape expectations, not spend ceilings:
 an ambiguous transport result can still have been processed upstream. Run named
 rows individually and record outcomes in the dated verification artifact.
+
+`L20` is a separately armed, non-blocking cross-catalog check. Its default is
+the env-overridable representative
+`openrouter-transcription:mistralai/voxtral-mini-3b-2507`; a successful run
+makes one transcription request, with up to three attempts possible for eligible
+retryable transport failure. This is not a spend ceiling or an allowlist; see
+the dated [OpenRouter catalog evidence](./verification/openrouter-catalog-multimodal-2026-09-02.md).

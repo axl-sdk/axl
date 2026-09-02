@@ -15,8 +15,9 @@
 
 - **Completed-file transcription** — `ctx.transcribe()` is a dedicated,
   non-chat finite-recording operation with OpenAI, Gemini Interactions/Files,
-  and OpenRouter STT adapters; paired safe lifecycle events, cleanup status,
-  mock coverage, and an explicit transcript-to-agent recipe. General audio
+  and catalog-capable OpenRouter STT adapters; paired safe lifecycle events,
+  cleanup status, mock coverage, and an explicit transcript-to-agent recipe.
+  OpenRouter model/route capability remains authoritative; general audio
   understanding and realtime voice remain separate work.
 
 - **OpenTelemetry** — Automatic span emission for every `ctx.*` primitive with cost-per-span attribution
@@ -89,7 +90,7 @@ shape, and per-model capability flags. Unknown billing remains `undefined`, neve
 
 | Preset | URI example | Notes |
 |--------|-------------|-------|
-| OpenRouter | `openrouter:vendor/model` | One key → 300+ models; unified reasoning + provider-reported cost |
+| OpenRouter | `openrouter:vendor/model` | One key → 300+ models; chat/tools/reasoning/cost plus pass-through image transport when the selected model/route supports it |
 | Azure OpenAI (v1) | `azure:<deployment>` | Deployment-name-as-model; `api-key` header auth |
 | xAI Grok · DeepSeek · Mistral · Groq | `xai:…` `deepseek:…` `mistral:…` `groq:…` | Each a profile + small quirk set |
 | Self-hosted (Ollama, vLLM, LM Studio, llama.cpp, SGLang) | `ollama:…` `vllm:…` … | First-class local presets — keyless, zero-cost, correct default ports |

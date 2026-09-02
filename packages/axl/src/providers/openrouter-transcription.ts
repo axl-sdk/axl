@@ -12,10 +12,8 @@ import type {
   TranscriptionProviderResult,
 } from './transcription-types.js';
 import {
-  OPENROUTER_TRANSCRIPTION_MODEL,
   assertOnlyProviderOptions,
   inlineAudioBytes,
-  requireExactTranscriptionModel,
   requireNoProviderFile,
   safeProviderMessage,
   transcriptUsage,
@@ -62,11 +60,17 @@ export class OpenRouterTranscriptionProvider implements TranscriptionProvider {
   }
 
   capabilities(model: string): TranscriptionCapabilities | undefined {
-    return model === OPENROUTER_TRANSCRIPTION_MODEL ? { sources: ['bytes', 'base64'] } : undefined;
+    return model.trim().length > 0 ? { sources: ['bytes', 'base64'] } : undefined;
   }
 
   async transcribe(request: TranscriptionProviderRequest): Promise<TranscriptionProviderResult> {
-    requireExactTranscriptionModel(this.name, request.model, OPENROUTER_TRANSCRIPTION_MODEL);
+    if (request.model.trim().length === 0) {
+      throw new UnsupportedTranscriptionInputError({
+        provider: this.name,
+        model: request.model,
+        feature: 'this transcription model',
+      });
+    }
     requireNoProviderFile(request.audio, this.name, request.model);
     if (request.audio.type === 'provider-file')
       throw new UnsupportedTranscriptionInputError({

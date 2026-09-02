@@ -15,9 +15,9 @@ import { tool } from '../tool.js';
 // ---------------------------------------------------------------------------
 // Multimodal live lighthouse. This file is intentionally double-gated: a key
 // alone never spends. Run one named L-row at a time with the direct Vitest
-// command documented in docs/testing.md.
-// The current allowlists are exercised exactly; an available key is not hidden
-// behind a fallback model.
+// command documented in docs/testing.md. Historical representative rows keep
+// their exact defaults; catalog rows use an explicitly armed, env-overridable
+// model without treating it as an allowlist.
 // ---------------------------------------------------------------------------
 
 function liveEnabled(env: Record<string, string | undefined>): boolean {
@@ -28,7 +28,20 @@ function transcriptionLiveEnabled(env: Record<string, string | undefined>): bool
   return env.AXL_TRANSCRIPTION_LIVE === '1' && env.AXL_DISABLE_LIVE_INTEGRATION !== '1';
 }
 
+function openRouterCatalogImageLiveEnabled(env: Record<string, string | undefined>): boolean {
+  return liveEnabled(env) && env.AXL_OPENROUTER_CATALOG_IMAGE_LIVE === '1';
+}
+
+function openRouterCatalogTranscriptionLiveEnabled(
+  env: Record<string, string | undefined>,
+): boolean {
+  return transcriptionLiveEnabled(env) && env.AXL_OPENROUTER_CATALOG_TRANSCRIPTION_LIVE === '1';
+}
+
 const RUN = liveEnabled(process.env);
+const OPENROUTER_CATALOG_IMAGE_RUN = openRouterCatalogImageLiveEnabled(process.env);
+const OPENROUTER_CATALOG_IMAGE_MODEL =
+  process.env.OPENROUTER_CATALOG_IMAGE_MODEL ?? 'mistralai/mistral-medium-3-5';
 const PNG_BYTES = readFileSync(
   new URL('../../../../docs/assets/studio-playground.png', import.meta.url),
 );
@@ -216,9 +229,16 @@ type InteractionObservation = {
 type FetchObservation = {
   readonly method: string;
   readonly path: string;
+  readonly model?: string;
   readonly uploadCommand?: string;
   readonly interaction?: InteractionObservation;
 };
+
+function boundedRequestModel(body: unknown): string | undefined {
+  if (typeof body !== 'string') return undefined;
+  const match = /"model"\s*:\s*"([^"\\]{1,256})"/.exec(body.slice(0, 1024));
+  return match?.[1];
+}
 
 function stringArray(value: unknown): readonly string[] | undefined {
   return Array.isArray(value) && value.every((entry) => typeof entry === 'string')
@@ -286,9 +306,14 @@ async function observeFetch<T>(fn: (requests: FetchObservation[]) => Promise<T>)
         interaction = undefined;
       }
     }
+    const model =
+      url.pathname === '/api/v1/chat/completions' || url.pathname === '/api/v1/audio/transcriptions'
+        ? boundedRequestModel(body)
+        : undefined;
     requests.push({
       method: init?.method ?? request?.method ?? 'GET',
       path: url.pathname,
+      ...(model ? { model } : {}),
       ...(headers.get('x-goog-upload-command')
         ? { uploadCommand: headers.get('x-goog-upload-command')! }
         : {}),
@@ -623,6 +648,66 @@ describe.skipIf(!RUN || !process.env.OPENROUTER_API_KEY)(
   },
 );
 
+describe.skipIf(!OPENROUTER_CATALOG_IMAGE_RUN || !process.env.OPENROUTER_API_KEY)(
+  'multimodal live [L19] (non-blocking): OpenRouter cross-catalog image and tool',
+  () => {
+    it('[L19] grounds a local tool call in the visible primary heading and completes the continuation', async () => {
+      await observeFetch(async (requests) => {
+        const { context, events } = liveContext();
+        const headings: string[] = [];
+        const confirmHeading = tool({
+          name: 'confirm_visible_heading',
+          description: 'Record the primary heading observed in the supplied image.',
+          input: z.object({ heading: z.string().trim().min(1).max(200) }),
+          handler: ({ heading }) => {
+            headings.push(heading);
+            return { confirmed: true };
+          },
+        });
+        const a = agent({
+          model: `openrouter:${OPENROUTER_CATALOG_IMAGE_MODEL}`,
+          system:
+            'Inspect the image. Call confirm_visible_heading with the primary heading you observe, then give a concise final answer.',
+          tools: [confirmHeading],
+          maxTurns: 2,
+        });
+        const result = await context.ask(
+          a,
+          [
+            {
+              type: 'text',
+              text: 'Use the image to identify its visible primary heading before calling the tool.',
+            },
+            {
+              type: 'image',
+              label: 'lighthouse fixture',
+              source: { type: 'base64', data: PNG_BASE64, mediaType: 'image/png' },
+            },
+          ],
+          { maxTokens: 64, temperature: 0 },
+        );
+        expect(headings).toHaveLength(1);
+        expect(headings[0]?.trim().replace(/\s+/g, ' ')).toBe('Agent Playground');
+        expect(result.trim().length).toBeGreaterThan(0);
+        expect(requests).toEqual([
+          {
+            method: 'POST',
+            path: '/api/v1/chat/completions',
+            model: OPENROUTER_CATALOG_IMAGE_MODEL,
+          },
+          {
+            method: 'POST',
+            path: '/api/v1/chat/completions',
+            model: OPENROUTER_CATALOG_IMAGE_MODEL,
+          },
+        ]);
+        assertHonestTerminal(events);
+        assertNoBase64InEvents(events);
+      });
+    });
+  },
+);
+
 describe.skipIf(
   !RUN ||
     !process.env.ANTHROPIC_API_KEY ||
@@ -667,6 +752,9 @@ describe.skipIf(
 // ---------------------------------------------------------------------------
 
 const TRANSCRIPTION_RUN = transcriptionLiveEnabled(process.env);
+const OPENROUTER_CATALOG_TRANSCRIPTION_RUN = openRouterCatalogTranscriptionLiveEnabled(process.env);
+const OPENROUTER_CATALOG_TRANSCRIPTION_MODEL =
+  process.env.OPENROUTER_CATALOG_TRANSCRIPTION_MODEL ?? 'mistralai/voxtral-mini-3b-2507';
 
 describe.skipIf(!TRANSCRIPTION_RUN || !process.env.OPENAI_API_KEY)(
   'transcription live [L7]: OpenAI gpt-transcribe',
@@ -895,6 +983,37 @@ describe.skipIf(!TRANSCRIPTION_RUN || !process.env.OPENROUTER_API_KEY)(
         expect(end.data.usage).toEqual(transcript.usage);
         expect(end.data.pricingStatus).toBe(transcript.pricingStatus);
         expect(end.cost).toBe(transcript.usage?.cost);
+        assertNoRecordedAudioInEvents(events);
+      });
+    });
+  },
+);
+
+describe.skipIf(!OPENROUTER_CATALOG_TRANSCRIPTION_RUN || !process.env.OPENROUTER_API_KEY)(
+  'transcription live [L20] (non-blocking): OpenRouter cross-catalog STT',
+  () => {
+    it('[L20] transcribes fixture bytes through the selected catalog model with honest terminal accounting', async () => {
+      await observeFetch(async (requests) => {
+        const { context, events } = liveContext();
+        const transcript = await context.transcribe({
+          model: `openrouter-transcription:${OPENROUTER_CATALOG_TRANSCRIPTION_MODEL}`,
+          audio: { type: 'bytes', data: RECORDED_CALL_BYTES, mediaType: 'audio/mpeg' },
+        });
+        expect(transcript.text.trim().length).toBeGreaterThan(0);
+        expect(requests).toEqual([
+          {
+            method: 'POST',
+            path: '/api/v1/audio/transcriptions',
+            model: OPENROUTER_CATALOG_TRANSCRIPTION_MODEL,
+          },
+        ]);
+        expect(['priced', 'unpriced']).toContain(transcript.pricingStatus);
+        assertTranscriptionTerminal(events, { source: 'bytes', cleanup: 'not_required' });
+        const end = completedTranscriptionEnd(events);
+        expect(end.data.usage).toEqual(transcript.usage);
+        expect(end.data.pricingStatus).toBe(transcript.pricingStatus);
+        if (transcript.pricingStatus === 'priced') expect(end.cost).toBe(transcript.usage?.cost);
+        else expect(end.cost).toBeUndefined();
         assertNoRecordedAudioInEvents(events);
       });
     });

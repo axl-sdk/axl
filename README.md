@@ -355,7 +355,7 @@ agent({ model: 'groq:openai/gpt-oss-120b', ... })             // fastest inferen
 agent({ model: 'ollama:llama3', ... })                        // local — no key, $0
 ```
 
-Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, plus self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them; build your own by cloning a `ProviderProfile`.
+Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, plus self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them; OpenRouter also passes image input through to the selected model/route. Axl does not claim every catalog model supports images, tools, or transcription—see [provider details](./docs/providers.md#openai-compatible-providers--presets) and [multimodal input](./docs/multimodal-input.md). Build your own by cloning a `ProviderProfile`.
 
 The `effort` parameter controls reasoning depth identically across all providers:
 
@@ -451,7 +451,7 @@ Studio also embeds as middleware (Express, Fastify, NestJS, raw HTTP) with auth 
 | [Observability](./docs/observability.md) | Trace modes, OpenTelemetry integration, cost-per-span attribution                        |
 | [Security](./docs/security.md)           | Tool ACL, input sanitization, prompt injection mitigations                               |
 | [Integration](./docs/integration.md)     | Express.js integration, Axl Studio setup, local development workflow                     |
-| [Multimodal input](./docs/multimodal-input.md) | Ordered image input, provider allowlists, observability, and lighthouse recipe       |
+| [Multimodal input](./docs/multimodal-input.md) | Ordered image input, provider transport contracts, observability, and lighthouse recipe |
 | [Roadmap](./ROADMAP.md)                  | What's planned for Axl                                                                   |
 
 ## How Axl Compares

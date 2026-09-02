@@ -67,7 +67,7 @@ agent({ model: 'deepseek:deepseek-reasoner' });           // DEEPSEEK_API_KEY
 agent({ model: 'ollama:llama3' });                        // local — no key, $0
 ```
 
-Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, and self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them. Build your own by cloning a `ProviderProfile`. See [docs/providers.md](../../docs/providers.md#openai-compatible-providers--presets).
+Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, and self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them. OpenRouter passes image input through to the selected model/route, but Axl does not claim every catalog model supports images, tools, or transcription. Build your own by cloning a `ProviderProfile`; see [provider details](../../docs/providers.md#openai-compatible-providers--presets) and [multimodal input](../../docs/multimodal-input.md).
 
 Each provider also accepts an opt-in `rateLimit` (`{ maxConcurrent?, minIntervalMs?, acquireTimeoutMs? }`) for proactive client-side pacing on top of the automatic 429/503/529 backoff — useful when a large fan-out (e.g. an eval) shares one API key. It caps in-flight request concurrency (not token throughput) for that provider's chat calls. See [Providers → Rate limiting](../../docs/providers.md#rate-limiting-opt-in).
 
@@ -792,10 +792,12 @@ See [docs/providers.md](../../docs/providers.md) for the full model list includi
 
 Use `ctx.transcribe()` for finite recordings, then explicitly pass
 `Transcript.text` to an agent if analysis is needed. It is separate from chat
-history and chat providers. B1 supports exact OpenAI, Gemini, and OpenRouter
-transcription URIs; see [Multimodal input](../../docs/multimodal-input.md) for
-the 25 MiB inline bound, source types, options, transcript redaction, temporary
-Gemini Files cleanup, and live-verification commands.
+history and chat providers. OpenAI and Gemini use their documented model
+contracts; any nonblank `openrouter-transcription:<vendor/model>` URI can
+dispatch supported bytes/base64 to OpenRouter, where the selected model/route
+decides endpoint compatibility. See [Multimodal input](../../docs/multimodal-input.md)
+for the 25 MiB inline bound, source types, options, transcript redaction,
+temporary Gemini Files cleanup, and live-verification commands.
 
 ## License
 

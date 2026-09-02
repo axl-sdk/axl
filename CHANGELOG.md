@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **OpenRouter multimodal transport is catalog-capable.** Any nonblank
+  `openrouter:<vendor/model>` URI now accepts image URL, bytes, and base64
+  sources, including requests with tools, streaming, or structured output.
+  Any nonblank `openrouter-transcription:<vendor/model>` URI now dispatches
+  supported completed-file bytes/base64 to OpenRouter's transcription endpoint.
+  Axl does not fetch OpenRouter's catalog at runtime: the selected model and
+  route remain authoritative for modality and composition support. An image
+  rejection surfaces through `ctx.ask()` as `ProviderError`; `ctx.transcribe()`
+  wraps an upstream endpoint/model rejection as safe
+  `TranscriptionOperationError` with bounded provider diagnostics and a
+  non-enumerable `ProviderError` cause.
+  Provider-file images, raw rich input-container overrides, URL/realtime audio,
+  and general audio input remain unsupported.
 - **Release communication is automated.** Successful tag-triggered npm publishing
   now creates a GitHub Release and Announcements discussion from the canonical
   versioned changelog section, with an extraction contract checked in CI.

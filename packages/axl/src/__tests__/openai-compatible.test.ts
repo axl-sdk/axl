@@ -1214,8 +1214,8 @@ describe('think_tags malformed input', () => {
   });
 });
 
-describe('OpenRouter bounded image capability', () => {
-  it('maps only the certified model path and retains response-reported cost', async () => {
+describe('OpenRouter image transport capability', () => {
+  it('maps arbitrary model image content with tools and retains response-reported cost', async () => {
     const fetchMock = mockFetch(
       okJson({ usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, cost: 0.012 } }),
     );
@@ -1228,6 +1228,17 @@ describe('OpenRouter bounded image capability', () => {
         {
           role: 'user',
           content: [
+            { type: 'text', text: 'compare' },
+            {
+              type: 'image',
+              label: 'remote',
+              source: { type: 'url', url: 'https://example.test/receipt.png' },
+            },
+            {
+              type: 'image',
+              label: 'inline',
+              source: { type: 'bytes', data: new Uint8Array([4, 5, 6]), mediaType: 'image/jpeg' },
+            },
             {
               type: 'image',
               label: 'receipt',
@@ -1237,12 +1248,30 @@ describe('OpenRouter bounded image capability', () => {
           ],
         },
       ],
-      { model: 'openai/gpt-4o-mini' },
+      {
+        model: 'catalog/default',
+        providerOptions: { model: 'anthropic/claude-vision-example' },
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'lookup',
+              description: 'Look up the receipt.',
+              parameters: { type: 'object' },
+            },
+          },
+        ],
+      },
     );
     expect(lastRequest(fetchMock).body.messages).toEqual([
       {
         role: 'user',
         content: [
+          { type: 'text', text: 'compare' },
+          { type: 'image_url', image_url: { url: 'https://example.test/receipt.png' } },
+          { type: 'text', text: '[Image: remote]' },
+          { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,BAUG' } },
+          { type: 'text', text: '[Image: inline]' },
           { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
           { type: 'text', text: '[Image: receipt]' },
           { type: 'text', text: 'read it' },
@@ -1250,9 +1279,22 @@ describe('OpenRouter bounded image capability', () => {
       },
     ]);
     expect(response.cost).toBe(0.012);
+    expect(lastRequest(fetchMock).body.tools).toEqual([
+      {
+        type: 'function',
+        function: {
+          name: 'lookup',
+          description: 'Look up the receipt.',
+          parameters: { type: 'object' },
+        },
+      },
+    ]);
+    expect(provider.inputCapabilities('google/gemini-vision-example')).toEqual({
+      image: { sources: ['url', 'bytes', 'base64'] },
+    });
     expect(() =>
       provider.validateInput({
-        model: 'openai/gpt-4o-mini',
+        model: 'google/gemini-vision-example',
         input: [
           {
             type: 'image',
@@ -1261,19 +1303,96 @@ describe('OpenRouter bounded image capability', () => {
         ],
         history: [],
         stream: false,
-        hasTools: false,
+        hasTools: true,
         responseMode: 'text',
       }),
     ).toThrow('provider-file');
-    expect(() =>
+    expect(
       provider.validateInput({
-        model: 'openai/gpt-4o',
+        model: 'catalog/default',
         input: [{ type: 'image', source: { type: 'url', url: 'https://example.test/a.png' } }],
         history: [],
+        providerOptions: { model: 'openai/gpt-4o-mini' },
+        stream: false,
+        hasTools: true,
+        responseMode: 'text',
+      }),
+    ).toEqual({ effectiveModel: 'openai/gpt-4o-mini' });
+    expect(() =>
+      provider.validateInput({
+        model: 'openai/gpt-4o-mini',
+        input: [{ type: 'image', source: { type: 'url', url: 'https://example.test/a.png' } }],
+        history: [],
+        providerOptions: { model: '' },
         stream: false,
         hasTools: false,
         responseMode: 'text',
       }),
     ).toThrow('image input for this model');
+    expect(() =>
+      provider.validateInput({
+        model: 'vendor/vision-model',
+        input: [{ type: 'image', source: { type: 'url', url: 'https://example.test/a.png' } }],
+        history: [],
+        providerOptions: { messages: [] },
+        stream: false,
+        hasTools: false,
+        responseMode: 'text',
+      }),
+    ).toThrow('raw messages providerOptions');
+    expect(() =>
+      provider.validateInput({
+        model: 'vendor/vision-model',
+        input: [{ type: 'text', text: 'continue' }],
+        history: [
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'image',
+                source: { type: 'url', url: 'https://example.test/a.png' },
+              },
+            ],
+          },
+        ],
+        stream: false,
+        hasTools: false,
+        responseMode: 'text',
+      }),
+    ).toThrow('rich non-user history');
+  });
+
+  it('surfaces an upstream catalog capability rejection as ProviderError', async () => {
+    mockFetch({
+      ok: false,
+      status: 400,
+      text: () =>
+        Promise.resolve(JSON.stringify({ error: { message: 'image input is unsupported' } })),
+    });
+    const provider = new OpenAICompatibleProvider({
+      profile: OPENROUTER_PROFILE,
+      apiKey: 'test-key',
+    });
+    await expect(
+      provider.chat(
+        [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image',
+                source: { type: 'url', url: 'https://example.test/a.png' },
+              },
+            ],
+          },
+        ],
+        { model: 'vendor/not-vision' },
+      ),
+    ).rejects.toMatchObject({
+      name: 'ProviderError',
+      provider: 'openrouter',
+      status: 400,
+      message: expect.stringContaining('image input is unsupported'),
+    });
   });
 });

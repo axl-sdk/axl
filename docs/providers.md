@@ -145,11 +145,15 @@ Transcription has its own registry and URI family; it is never routed through
 chat adapters. The B1 exact mappings are `openai-transcription:gpt-transcribe`
 to OpenAI multipart `/audio/transcriptions`,
 `gemini-transcription:gemini-3.5-transcribe` to Gemini Files plus stateless
-Interactions, and `openrouter-transcription:openai/whisper-1` to OpenRouter's
+Interactions, and `openrouter-transcription:<vendor/model>` to OpenRouter's
 JSON `/audio/transcriptions`. Gemini byte/base64 sources create a temporary
 provider file, wait for readiness when necessary, transcribe with `store:
 false`, and attempt deletion in `finally`; callers own any reusable
-provider-file URI. OpenAI and OpenRouter accept inline sources only. See
+provider-file URI. OpenAI and OpenRouter accept inline sources only. OpenRouter
+does not receive a runtime catalog lookup: its endpoint/model compatibility is
+authoritative. `ctx.transcribe()` wraps an OpenRouter provider failure as safe
+`TranscriptionOperationError`, retaining only bounded provider diagnostics and
+the original `ProviderError` as a non-enumerable cause. See
 [Multimodal model input](./multimodal-input.md#completed-file-transcription-b1)
 for exact source/options/cost semantics and the temporary-file retention risk.
 All built-in inline transcription sources are capped at 25 MiB decoded before
@@ -253,6 +257,18 @@ Notes & caveats:
 - **Capability is per-model on marketplaces** (OpenRouter/Groq): one model supports
   strict `json_schema` and the next doesn't. Profile flags are sensible defaults; use
   [`providerOptions`](#provideroptions) for per-call overrides.
+- **OpenRouter multimodal transport is catalog-capable, not catalog-aware.** Any
+  nonblank `openrouter:<vendor/model>` URI accepts image URL, bytes, and base64
+  in the standard `image_url` wire shape. Image requests may also use Axl tools,
+  streaming, and structured output; whether the selected model/route supports
+  that combination is OpenRouter's decision. Axl performs no catalog lookup and
+  surfaces an image capability rejection through `ctx.ask()` as `ProviderError`.
+  Provider-file images and raw rich input-container overrides remain local
+  rejections. Any nonblank `openrouter-transcription:<vendor/model>` URI
+  similarly sends supported completed-file bytes/base64 to the dedicated
+  transcription endpoint; its failure reaches callers as the safe
+  `TranscriptionOperationError` described above. URL, realtime, and
+  general-audio input are not part of that adapter.
 - **Self-hosted** is keyless by default; pass a key only if your server enforces one. Server
   caveats (not Axl bugs): Ollama's `/v1` drops streaming `tool_calls` deltas and lacks
   `tool_choice` (use its native `/api/chat` for heavy tool use); vLLM/SGLang/LM Studio

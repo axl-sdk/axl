@@ -1,10 +1,19 @@
 # Multimodal image lighthouse — verification record
 
 **Prepared:** 2026-08-31  
-**Updated:** 2026-09-02
-**Status:** Passed — L1-L6 and L11-L14 passed for Axl's final advertised
+**Updated:** 2026-09-02<br>
+**Historical status:** Passed — L1-L6 and L11-L14 passed for Axl's then-advertised
 capabilities. L12 is a local zero-request rejection backed by a discriminating
 live provider probe; L13-L14 are durable provider-file lifecycle rows.
+
+> **Superseded for OpenRouter scope (2026-09-02):** This record accurately
+> captures the representative `openrouter:openai/gpt-4o-mini` and
+> `openrouter-transcription:openai/whisper-1` live certifications that existed
+> at the time. They are now transport certifications, not Axl allowlists:
+> arbitrary nonblank OpenRouter model slugs dispatch through the same supported
+> image or transcription transport, while OpenRouter's selected model/route
+> remains authoritative for actual capability. No broader OpenRouter catalog
+> was live-certified by this historical run.
 
 The opt-in tests are `packages/axl/src/__tests__/integration-multimodal-input.test.ts`.
 They use the checked-in Studio Playground PNG, low output limits, and require `AXL_MULTIMODAL_LIVE=1` in
@@ -66,8 +75,9 @@ and observed deletion. Each selector made exactly one model request.
 - [Gemini Interactions overview](https://ai.google.dev/gemini-api/docs/interactions-overview), [migration](https://ai.google.dev/gemini-api/docs/migrate-to-interactions), and [image understanding](https://ai.google.dev/gemini-api/docs/image-understanding)
 - [OpenRouter multimodal overview](https://openrouter.ai/docs/guides/overview/multimodal/overview) and [selected model metadata](https://openrouter.ai/openai/gpt-4o-mini)
 
-Provider documentation shows possible upstream surfaces; Axl's exact supported
-allowlists are in `docs/multimodal-input.md` and are what these rows certify.
+Provider documentation shows possible upstream surfaces. This historical run
+certifies the named models only; the current OpenRouter transport contract is
+documented in `docs/multimodal-input.md`.
 
 ## Completed-file transcription checklist
 

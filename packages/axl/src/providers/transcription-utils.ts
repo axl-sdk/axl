@@ -4,7 +4,6 @@ import type { TranscriptionProviderRequest } from './transcription-types.js';
 
 export const OPENAI_TRANSCRIPTION_MODEL = 'gpt-transcribe';
 export const GEMINI_TRANSCRIPTION_MODEL = 'gemini-3.5-transcribe';
-export const OPENROUTER_TRANSCRIPTION_MODEL = 'openai/whisper-1';
 
 export function requireExactTranscriptionModel(
   provider: string,

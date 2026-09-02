@@ -363,7 +363,10 @@ Invoke an agent. Runs the tool-call loop until the agent produces a final respon
 readonly array of `{ type: 'text', text }` and `{ type: 'image', source, label? }`
 parts. Image sources are URL, bytes, base64, or a provider-scoped file reference;
 see [Multimodal model input](./multimodal-input.md) for their exact shapes and
-the per-provider allowlist. Decoded inline image data is capped at 25 MiB total
+the per-provider transport contract. For `openrouter:<vendor/model>`, URL,
+bytes, and base64 images are passed through without a catalog lookup; the
+selected OpenRouter model/route decides modality and composition support.
+Decoded inline image data is capped at 25 MiB total
 per logical input before copying/decoding; URL and provider-file contents are
 not loaded by Axl. The byte ceiling is exported as
 `MAX_INLINE_MODEL_INPUT_BYTES`; `inputText(prompt)` returns its deterministic text
@@ -418,7 +421,7 @@ to `ctx.ask()` when a normal text agent should analyze it.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `model` | `string` | Required `provider:model` transcription URI. Built-ins accept exactly `openai-transcription:gpt-transcribe`, `gemini-transcription:gemini-3.5-transcribe`, or `openrouter-transcription:openai/whisper-1`; registered custom adapters define their own models. |
+| `model` | `string` | Required `provider:model` transcription URI. Built-ins accept `openai-transcription:gpt-transcribe`, `gemini-transcription:gemini-3.5-transcribe`, or any nonblank `openrouter-transcription:<vendor/model>` URI; registered custom adapters define their own models. OpenRouter endpoint/model compatibility is decided upstream. |
 | `audio` | `RecordedAudioSource` | Required `{ type: 'bytes', data, mediaType }`, `{ type: 'base64', data, mediaType }`, or matching `{ type: 'provider-file', provider, reference, mediaType? }`. Inline decoded data is capped at 25 MiB before copying/decoding. No URL, path, stream, or realtime source. |
 | `language` | `string` | Optional provider-supported language hint. |
 | `timestamps` | `'segment' \| 'word'` | Optional; validated against the exact adapter capability. |

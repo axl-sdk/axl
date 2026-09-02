@@ -85,15 +85,18 @@ sensitive application data.
 
 ## Image capability table (Milestone A)
 
-The allowlists below are intentionally exact; another model may be accepted by
-its upstream API but is unsupported until Axl verifies its request contract.
+The native-provider entries below are intentionally exact. OpenRouter is
+different: Axl supports its normalized image transport for arbitrary nonblank
+model slugs, but does not query or duplicate OpenRouter's catalog. The selected
+model and route decide whether they support images and combinations such as
+tools or structured output.
 
 | Provider URI | Supported image models | Sources | Constraints |
 | --- | --- | --- | --- |
 | `openai-responses:` | `gpt-4o`, `gpt-4o-2024-08-06`, `gpt-4o-2024-11-20`, `gpt-4o-mini`, `gpt-4o-mini-2024-07-18` | URL, bytes, base64, `provider-file` scoped to `openai-responses` | Uses Responses image items; no host fetch/upload by Axl. |
 | `anthropic:` | `claude-sonnet-4-5`, `claude-opus-4-8` | URL, bytes, base64, `provider-file` scoped to `anthropic` | Provider files are opaque references, not an Axl file API. |
 | `google:` | `gemini-3.7-flash` | Bytes, base64, `provider-file` scoped to `google` | Rich calls use Gemini Interactions with `store: false`; provider-files require an explicit `mediaType`. Direct HTTP image URLs fail locally: fetch them in application code and pass bytes/base64, or upload through Gemini Files and pass the returned URI as a provider-file. |
-| `openrouter:` | `openai/gpt-4o-mini` | URL, bytes, base64 | Non-blocking certification only; provider files and image+tools are rejected. Do not infer catalog-wide OpenRouter support. |
+| `openrouter:` | Any nonblank `<vendor/model>` slug | URL, bytes, base64 | Axl passes the normalized `image_url` transport through without a catalog lookup. Tools, streaming, and structured output are permitted; selected model/route capability remains authoritative. Provider-file images and raw rich input-container overrides fail locally. An upstream capability rejection surfaces through `ctx.ask()` as typed `ProviderError`. |
 
 Axl accepts at most 25 MiB of decoded inline image data across one `ModelInput`.
 The bound is checked before bytes are copied or base64 is decoded. URL and
@@ -194,7 +197,7 @@ pricing status, and opaque provider metadata. `timestamps` is `'segment' |
 | --- | --- | --- | --- |
 | `openai-transcription:` | `gpt-transcribe` | Bytes, base64 | `language`; `providerOptions: { prompt?, temperature? }`. Axl sends multipart `/audio/transcriptions`; no provider-file or timestamps/diarization capability is claimed. Usage is only reported when OpenAI returns it. |
 | `gemini-transcription:` | `gemini-3.5-transcribe` | Bytes, base64, `provider-file` scoped to `gemini-transcription` | `language`, word timestamps, diarization with word timestamps; `providerOptions: { mode?: 'verbatim' | 'smart', customVocabulary?: string[] }`. The default is `verbatim`; `customVocabulary` accepts at most 1,000 entries but cannot be combined with timestamps. Smart mode cannot request timestamps or diarization. A provider-file requires its explicit audio `mediaType`. Bytes/base64 use temporary Files upload, readiness polling when needed, stateless Interactions (`store: false`), then best-effort deletion. |
-| `openrouter-transcription:` | `openai/whisper-1` | Bytes, base64 | `language`; `providerOptions: { temperature?, provider? }`. Axl sends JSON to OpenRouter's dedicated STT endpoint. Response `seconds`, token counts, and `cost` are authoritative when present; missing price is surfaced as unpriced rather than zero. |
+| `openrouter-transcription:` | Any nonblank `<vendor/model>` slug | Bytes, base64 | `language`; `providerOptions: { temperature?, provider? }`. Axl sends JSON to OpenRouter's dedicated STT endpoint without a catalog lookup; selected endpoint/model compatibility is authoritative. An upstream failure is wrapped as safe `TranscriptionOperationError`; response `seconds`, token counts, and `cost` are authoritative when present; missing price is surfaced as unpriced rather than zero. |
 
 Gemini uploaded files are a narrow, request-scoped adapter transaction—not a
 public Files client. The adapter attempts deletion after success, failure, or
@@ -221,10 +224,12 @@ On provider failure, safe HTTP diagnostics (`status`, `retryable`, optional
 `TranscriptionOperationError` and under `transcription_end.data.providerError`;
 raw response bodies stay only on the non-enumerable error cause.
 
-Built-in URI prefixes above are exact allowlists. Applications can register a
-custom dedicated adapter with `runtime.registerTranscriptionProvider(name,
-provider)` and use `name:model`; it remains separate from chat-provider
-registration and receives no hidden fallback.
+The OpenAI and Gemini transcription URI/model entries above are exact. OpenRouter
+accepts any nonblank model slug and leaves endpoint compatibility to OpenRouter;
+that is transport support, not a claim that every catalog model can transcribe.
+Applications can register a custom dedicated adapter with
+`runtime.registerTranscriptionProvider(name, provider)` and use `name:model`; it
+remains separate from chat-provider registration and receives no hidden fallback.
 
 ## General audio status
 
@@ -252,7 +257,7 @@ npm install
 IMAGE_MODEL=openai-responses:gpt-4o-mini npm run image-lighthouse
 IMAGE_MODEL=anthropic:claude-sonnet-4-5 npm run image-lighthouse
 IMAGE_MODEL=google:gemini-3.7-flash npm run image-lighthouse
-# Non-blocking certification path:
+# Representative OpenRouter transport certification path (not an allowlist):
 IMAGE_MODEL=openrouter:openai/gpt-4o-mini npm run image-lighthouse
 ```
 
@@ -261,6 +266,13 @@ Set the matching `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, or
 finding and a second agent to verify it; start with the first native command to
 confirm your key and chosen model. It intentionally makes paid calls and is not
 part of default tests.
+
+The independently armed `L19` and `L20` integration rows additionally certify
+cross-catalog OpenRouter image-plus-tool continuation and dedicated
+transcription transport with representative non-OpenAI model slugs. Their
+models are env-overridable and never allowlists; rerun commands, request-count
+ceilings, and the 2026-09-02 outcomes are in [Testing](./testing.md) and the
+[dated OpenRouter catalog evidence](./verification/openrouter-catalog-multimodal-2026-09-02.md).
 
 ## Recorded-call lighthouse
 
@@ -289,5 +301,6 @@ commands, count caveats, and the kill switch.
 - [Gemini transcription](https://ai.google.dev/gemini-api/docs/transcribe) and [Files API](https://ai.google.dev/gemini-api/docs/files)
 - [OpenRouter speech-to-text](https://openrouter.ai/docs/guides/overview/multimodal/stt)
 
-Those provider documents establish upstream surfaces, not broader Axl
-allowlists. The table above is the supported Axl contract.
+Those provider documents establish upstream surfaces. For OpenRouter, the table
+documents Axl's generic transport contract; it does not guarantee modality or
+parameter support for every catalog model/route.

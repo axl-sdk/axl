@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Release communication is automated.** Successful tag-triggered npm publishing
+  now creates a GitHub Release and Announcements discussion from the canonical
+  versioned changelog section, with an extraction contract checked in CI.
+
+### Fixed
+
+- **Lint is clean.** Eval Zod-error recognition now uses a structural type guard,
+  and Studio's HTTP upgrade listener uses Node's `Duplex` signature instead of
+  unbounded `any` types.
+
 ## [0.22.0] - 2026-09-02
 
 ### Added

@@ -73,3 +73,37 @@ jobs:
           publish_if_missing "@axlsdk/eval" "${release_dir}/axlsdk-eval-${release_version}.tgz"
           publish_if_missing "@axlsdk/testing" "${release_dir}/axlsdk-testing-${release_version}.tgz"
           publish_if_missing "@axlsdk/studio" "${release_dir}/axlsdk-studio-${release_version}.tgz"
+
+  release:
+    name: Create GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      discussions: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Create release page and announcement discussion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "GitHub Release ${GITHUB_REF_NAME} already exists; skipping"
+            exit 0
+          fi
+
+          release_version="${GITHUB_REF_NAME#v}"
+          node .github/scripts/extract-release-notes.mjs "${release_version}" |
+            gh release create "${GITHUB_REF_NAME}" \
+              --verify-tag \
+              --title "Axl ${GITHUB_REF_NAME}" \
+              --notes-file - \
+              --discussion-category Announcements

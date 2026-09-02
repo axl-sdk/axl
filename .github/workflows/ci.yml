@@ -58,6 +58,9 @@ jobs:
       - name: Check formatting
         run: pnpm format:check
 
+      - name: Release notes contract
+        run: pnpm test:release-notes
+
   smoke:
     name: Pack Smoke Test
     runs-on: ubuntu-latest

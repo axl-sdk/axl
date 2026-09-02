@@ -10,6 +10,7 @@ import type { EvalLoaderConfig } from './eval-loader.js';
 import type { BufferCaps } from './server/ws/connection-manager.js';
 import type { AxlRuntime } from '@axlsdk/axl';
 import type { IncomingMessage, ServerResponse, Server } from 'node:http';
+import type { Duplex } from 'node:stream';
 
 export type { EvalLoaderConfig } from './eval-loader.js';
 export type { BufferCaps } from './server/ws/connection-manager.js';
@@ -337,7 +338,9 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
   // Internal WebSocketServer — created lazily by upgradeWebSocket()
   let wss: InstanceType<typeof WebSocketServer> | undefined;
   // References for cleanup: the upgrade handler and server it's attached to
-  let upgradeHandler: ((...args: any[]) => void) | undefined;
+  let upgradeHandler:
+    | ((request: IncomingMessage, socket: Duplex, head: Buffer) => void)
+    | undefined;
   let serverRef: Server | undefined;
 
   // Convenience: attach WS handling to an http.Server.
@@ -365,7 +368,7 @@ export function createStudioMiddleware(options: StudioMiddlewareOptions) {
     wss = new WebSocketServer({ noServer: true });
     serverRef = server;
 
-    upgradeHandler = async (req: IncomingMessage, socket: any, head: Buffer) => {
+    upgradeHandler = async (req: IncomingMessage, socket: Duplex, head: Buffer) => {
       // Match path, ignoring query string
       const pathname = new URL(req.url!, `http://${req.headers.host}`).pathname;
       if (pathname !== wsPath) return; // Let other upgrade handlers run

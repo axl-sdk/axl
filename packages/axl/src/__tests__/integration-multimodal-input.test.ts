@@ -15,9 +15,9 @@ import { tool } from '../tool.js';
 // ---------------------------------------------------------------------------
 // Multimodal live lighthouse. This file is intentionally double-gated: a key
 // alone never spends. Run one named L-row at a time with the direct Vitest
-// command documented in docs/testing.md. Historical representative rows keep
-// their exact defaults; catalog rows use an explicitly armed, env-overridable
-// model without treating it as an allowlist.
+// command documented in docs/testing.md. Representative defaults remain
+// reproducible; selected catalog-capability rows accept an env-overridable
+// model without treating the default as an allowlist.
 // ---------------------------------------------------------------------------
 
 function liveEnabled(env: Record<string, string | undefined>): boolean {
@@ -39,6 +39,9 @@ function openRouterCatalogTranscriptionLiveEnabled(
 }
 
 const RUN = liveEnabled(process.env);
+const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL ?? 'gpt-4o-mini';
+const ANTHROPIC_IMAGE_MODEL = process.env.ANTHROPIC_IMAGE_MODEL ?? 'claude-sonnet-4-5';
+const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL ?? 'gemini-3.7-flash';
 const OPENROUTER_CATALOG_IMAGE_RUN = openRouterCatalogImageLiveEnabled(process.env);
 const OPENROUTER_CATALOG_IMAGE_MODEL =
   process.env.OPENROUTER_CATALOG_IMAGE_MODEL ?? 'mistralai/mistral-medium-3-5';
@@ -471,15 +474,18 @@ async function deleteTemporaryGeminiFile(fileName: string): Promise<void> {
 }
 
 describe.skipIf(!RUN || !process.env.OPENAI_API_KEY)(
-  'multimodal live [L1]: OpenAI Responses gpt-4o-mini',
+  `multimodal live [L1]: OpenAI Responses ${OPENAI_IMAGE_MODEL}`,
   () => {
     it('[L1] byte image + text returns text with honest terminal accounting', async () => {
       const { context, events } = liveContext();
-      const a = agent({ model: 'openai-responses:gpt-4o-mini', system: 'Reply with one word.' });
+      const a = agent({
+        model: `openai-responses:${OPENAI_IMAGE_MODEL}`,
+        system: 'Reply with one word.',
+      });
       const result = await context.ask(
         a,
         input({ type: 'bytes', data: PNG_BYTES, mediaType: 'image/png' }),
-        { maxTokens: 32, temperature: 0 },
+        { maxTokens: 256, temperature: 0 },
       );
       expect(result.length).toBeGreaterThan(0);
       assertHonestTerminal(events);
@@ -546,14 +552,16 @@ describe.skipIf(!RUN || !process.env.OPENAI_API_KEY)(
 );
 
 describe.skipIf(!RUN || !process.env.ANTHROPIC_API_KEY)(
-  'multimodal live [L11]: Anthropic claude-sonnet-4-5',
+  `multimodal live [L11]: Anthropic ${ANTHROPIC_IMAGE_MODEL}`,
   () => {
     it('[L11] forwards an HTTPS URL as native image input without host retrieval', async () => {
       const { context, events } = liveContext();
-      const a = agent({ model: 'anthropic:claude-sonnet-4-5', system: 'Reply with one word.' });
+      const a = agent({
+        model: `anthropic:${ANTHROPIC_IMAGE_MODEL}`,
+        system: 'Reply with one word.',
+      });
       const result = await context.ask(a, input({ type: 'url', url: HTTPS_IMAGE }), {
-        maxTokens: 32,
-        temperature: 0,
+        maxTokens: 256,
       });
       expect(result.length).toBeGreaterThan(0);
       assertHonestTerminal(events);
@@ -562,17 +570,16 @@ describe.skipIf(!RUN || !process.env.ANTHROPIC_API_KEY)(
 );
 
 describe.skipIf(!RUN || !process.env.GOOGLE_API_KEY)(
-  'multimodal live [L4]: Gemini Interactions gemini-3.7-flash',
+  `multimodal live [L4]: Gemini Interactions ${GEMINI_IMAGE_MODEL}`,
   () => {
     it('[L4] byte image + schema uses the rich Gemini transport', async () => {
       const { context, events } = liveContext();
-      const a = agent({ model: 'google:gemini-3.7-flash', system: 'Return only JSON.' });
+      const a = agent({ model: `google:${GEMINI_IMAGE_MODEL}`, system: 'Return only JSON.' });
       const result = await context.ask(
         a,
         input({ type: 'bytes', data: PNG_BYTES, mediaType: 'image/png' }),
         {
           maxTokens: 256,
-          temperature: 0,
           effort: 'none',
           schema: z.object({ visible: z.boolean() }),
         },
@@ -1093,11 +1100,11 @@ describe.skipIf(!RECIPE_RUN || !process.env.OPENROUTER_API_KEY)(
 );
 
 describe('multimodal local L6: preflight', () => {
-  it('[L6] rejects a known text-only Responses model before any dispatch', () => {
+  it('[L6] rejects an empty Responses model before any dispatch', () => {
     const provider = new OpenAIResponsesProvider({ apiKey: 'not-used' });
     expect(() =>
       provider.validateInput({
-        model: 'gpt-4.1-nano',
+        model: '   ',
         input: input({ type: 'base64', data: PNG_BASE64, mediaType: 'image/png' }),
         history: [],
         stream: false,

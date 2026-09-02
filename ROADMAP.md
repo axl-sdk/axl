@@ -27,7 +27,7 @@
 - **Tool Middleware** — Approval gates (`requireApproval`) and lifecycle hooks (`before`/`after`)
 - **Model-Facing Tool Output Projection** — Opt-in synchronous `toModelOutput` allowlists the successful post-hook tool result sent to the model while preserving the complete host-observable result. Strict JSON-compatible validation fails closed, `sensitive` takes precedence, configured `AxlTestRuntime.mockTool()` overrides inherit projection policy, and direct/MCP/handoff paths remain unchanged.
 - **Agent Handoffs** — Oneway and roundtrip modes with descriptions, OTel spans, and session history
-- **Unified Event Model and v2 Tool Lifecycle** — Single live `AxlEvent` discriminated union with required `schemaVersion: 2`; `ExecutionInfo.eventSchemaVersion` selects the reducer without scanning events, while `HistoricalExecutionInfo` keeps v1 history honest. Provider-issued tools use pre-start `tool_call_rejected` plus one four-state terminal outcome (`succeeded`, `failed`, `denied`, `cancelled`) for accepted calls. Normal returns succeed regardless of an `error` property; explicit `ToolFailure` permits author-declared model-safe recovery. See the [stream-first and tool-lifecycle migration guide](docs/migration/stream-first-observation.md) and [release review](docs/tool-lifecycle-v2-release-review.md).
+- **Unified Event Model and v2 Tool Lifecycle** — Single live `AxlEvent` discriminated union with required `schemaVersion: 2`; `ExecutionInfo.eventSchemaVersion` selects the reducer without scanning events, while `HistoricalExecutionInfo` keeps v1 history honest. Provider-issued tools use pre-start `tool_call_rejected` plus one four-state terminal outcome (`succeeded`, `failed`, `denied`, `cancelled`) for accepted calls. Normal returns succeed regardless of an `error` property; explicit `ToolFailure` permits author-declared model-safe recovery. See the [stream-first and tool-lifecycle migration guide](docs/migration/stream-first-observation.md).
 - **Axl Studio** — Local development UI with 8 panels (Playground, Workflows, Traces, Costs, Memory, Sessions, Tools, Evals)
 - **Evaluation Framework** — `dataset()`, `scorer()`, `llmScorer()`, `evalCompare()`, `rescore()`, `aggregateRuns()`, CLI with `compare`, `rescore` subcommands, `--runs` multi-run support
 - **Configurable Model Parameters** — `temperature`, `maxTokens`, `effort`, `thinkingBudget`, `includeThoughts`, `toolChoice`, `stop` on `AgentConfig` and per-call via `AskOptions`
@@ -226,6 +226,45 @@ This would graduate the current StateStore checkpoint primitive into an explicit
 ### Future Considerations
 
 Items we're tracking but not actively planning. These would move to Planned based on user demand.
+
+#### Multimodal Extensions
+
+Axl currently supports ordered image input and completed-file transcription.
+The following are intentionally tracked as separate future product surfaces,
+not implied by today's `ModelInput` or `ctx.transcribe()` contracts:
+
+- **General audio understanding** — Direct audio parts for speech and
+  non-speech reasoning, with independent proof for ordinary responses, tool
+  continuations, and structured output. Each provider/model combination must
+  be certified; transcription must never become a hidden fallback.
+- **Documents, video, and generated media** — New input and output content
+  types with their own limits, provider mappings, observation rules, and live
+  evidence. Multimodal tool results belong here as an explicit output contract,
+  not an accidental extension of JSON tool results.
+- **File and artifact lifecycle** — Provider file upload/list/download/delete,
+  durable media sessions, or an Axl-managed artifact service require explicit
+  ownership, retention, security, and cleanup semantics before becoming public
+  APIs.
+- **Studio media workflows** — Audio selection, hosted uploads, attachment
+  libraries, multi-file composition, drag/drop, clipboard capture, and Session
+  Manager media UX should follow—not invent—the corresponding core lifecycle.
+- **Compatible-provider certification** — Add direct Mistral and other
+  OpenAI-compatible multimodal certifications when there is user demand. These
+  remain evidence-backed provider/model claims; Axl will not advertise a
+  universal compatibility guarantee.
+- **Gemini Interactions consolidation and stable endpoint** — Legacy
+  string-only `google:` calls intentionally remain on `generateContent`; move
+  them to Interactions only after focused compatibility certification. That
+  certification must cover ordinary and streaming text, structured output,
+  tools and tool continuation, thinking/effort controls, usage and cost,
+  provider metadata, errors and retries, and observable request behavior. Axl
+  currently targets Google's `/v1beta` Interactions route for rich image and
+  transcription traffic; moving all Interactions traffic to `/v1` requires a
+  separate endpoint and lifecycle certification. Neither migration should be
+  treated as a silent transport swap.
+
+Promote any item to Planned only when its user journey, lifecycle owner,
+provider scope, and live-verification budget are explicit.
 
 #### Realtime / Voice Agents
 

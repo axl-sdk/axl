@@ -2505,7 +2505,7 @@ describe('AnthropicProvider', () => {
             ],
           },
         ],
-        { model: 'claude-sonnet-4-5' },
+        { model: 'claude-opus-5' },
       );
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
       expect(fetchMock.mock.calls[0][1].headers['anthropic-beta']).toBe('files-api-2025-04-14');
@@ -2531,9 +2531,22 @@ describe('AnthropicProvider', () => {
           responseMode: 'text',
         }),
       ).toThrow('provider-file');
+      expect(
+        provider.validateInput({
+          model: 'base-model',
+          input: [
+            { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+          ],
+          history: [],
+          stream: false,
+          hasTools: false,
+          responseMode: 'text',
+          providerOptions: { model: 'future-claude-model' },
+        }),
+      ).toEqual({ effectiveModel: 'future-claude-model' });
       expect(() =>
         provider.validateInput({
-          model: 'claude-haiku-4-5',
+          model: '',
           input: [
             { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
           ],
@@ -2543,10 +2556,55 @@ describe('AnthropicProvider', () => {
           responseMode: 'text',
         }),
       ).toThrow('image input for this model');
-      expect(provider.inputCapabilities('claude-sonnet-4-5')).toEqual({
+      expect(provider.inputCapabilities('claude-opus-5')).toEqual({
         image: { sources: ['url', 'bytes', 'base64', 'provider-file'] },
       });
-      expect(provider.inputCapabilities('claude-haiku-4-5')).toEqual({});
+      expect(provider.inputCapabilities('future-claude-model')).toEqual({
+        image: { sources: ['url', 'bytes', 'base64', 'provider-file'] },
+      });
+      expect(provider.inputCapabilities('')).toEqual({});
+      for (const model of [undefined, 42, '   ']) {
+        expect(() =>
+          provider.validateInput({
+            model: 'claude-opus-5',
+            input: [
+              { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+            ],
+            history: [],
+            stream: false,
+            hasTools: false,
+            responseMode: 'text',
+            providerOptions: { model },
+          }),
+        ).toThrow('invalid model providerOptions');
+      }
+    });
+
+    it('surfaces Anthropic SSE error events as typed provider failures', async () => {
+      mockFetch({
+        body: createSSEStream([
+          {
+            type: 'error',
+            error: { type: 'invalid_request_error', message: 'image model rejected' },
+          },
+        ]),
+      });
+
+      await expect(
+        (async () => {
+          for await (const chunk of new AnthropicProvider().stream(
+            [{ role: 'user', content: 'Hello' }],
+            { model: 'future-claude-model' },
+          ))
+            void chunk;
+        })(),
+      ).rejects.toMatchObject({
+        name: 'ProviderError',
+        provider: 'anthropic',
+        status: 400,
+        retryable: false,
+        body: undefined,
+      });
     });
 
     it('sets the Files beta header only for provider-file image current/history in chat and stream', async () => {

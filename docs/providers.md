@@ -6,10 +6,13 @@ adapters plus OpenAI-compatible presets, all built on raw `fetch` with no provid
 All providers retry `429` (rate limit), `503` (unavailable), and `529` (overloaded)
 responses with exponential backoff.
 
-The catalog was reviewed against first-party documentation on August 3, 2026. Current-model
-capabilities and pricing match exact known IDs; unknown IDs may pass through to the provider
-but remain unpriced and do not inherit newer behavior. See the
-[live verification record](./verification/latest-provider-models-2026-08-03.md).
+The base catalog and pricing were reviewed against first-party documentation on
+August 3, 2026; native image transport and the current GPT-5.6, Claude Opus 5,
+and Gemini 3.8 Flash parameter seams were refreshed on September 2. Exact known
+IDs receive their documented parameter and pricing behavior. Other IDs may pass
+through to the provider but remain unpriced and do not inherit model-specific
+behavior. See the [catalog verification](./verification/latest-provider-models-2026-08-03.md)
+and [native image refresh](./verification/native-image-catalog-2026-09-02.md).
 
 ## OpenAI — Responses API (preferred)
 
@@ -98,9 +101,10 @@ these lifecycle dates with a runtime allowlist: arbitrary IDs remain pass-throug
 ## Google Gemini
 
 ```
-google:gemini-3.6-flash              # Latest fast model (GA)
+google:gemini-3.8-flash              # Current image-capable fast model
+google:gemini-3.6-flash              # Earlier fast model (GA)
 google:gemini-3.5-flash              # Previous fast model (GA)
-google:gemini-3.5-flash-lite         # Latest low-cost model (GA)
+google:gemini-3.5-flash-lite         # Low-cost model (GA)
 google:gemini-3.1-pro-preview        # Pro preview
 google:gemini-3-flash-preview        # Flash preview
 google:gemini-3.1-flash-lite         # Previous low-cost model (GA)
@@ -129,20 +133,23 @@ distinction matters. This provider-envelope normalization does not change the ca
 ### Rich image transport
 
 String-only `google:` calls continue to use `generateContent` unchanged. Rich
-image input is supported only for `google:gemini-3.7-flash` and uses the GA
+image input accepts any nonblank `google:` model ID and currently uses the
+`/v1beta`
 [Interactions API](https://ai.google.dev/gemini-api/docs/interactions-overview)
 with `store: false`. It is stateless: Axl sends application-owned history and
 does not use `previous_interaction_id`, background execution, or raw transport
-overrides. Direct HTTP image URLs are not sent as Gemini file URIs: applications
-must pass bytes/base64 or explicitly upload through Gemini Files and supply the
-returned URI as a `google` provider-file. Axl does not host-fetch or silently
-upload chat images. See [Multimodal model input](./multimodal-input.md) for exact
-source rules and the cross-provider table.
+overrides. Google remains authoritative for whether the selected model supports
+Interactions and image input. Direct HTTP image URLs are not sent as Gemini
+file URIs: applications must pass bytes/base64 or explicitly upload through
+Gemini Files and supply the returned URI as a `google` provider-file. Axl does
+not host-fetch or silently upload chat images. See
+[Multimodal model input](./multimodal-input.md) for source rules and the
+cross-provider table.
 
 ### Completed-file transcription
 
 Transcription has its own registry and URI family; it is never routed through
-chat adapters. The B1 exact mappings are `openai-transcription:gpt-transcribe`
+chat adapters. The built-in mappings are `openai-transcription:gpt-transcribe`
 to OpenAI multipart `/audio/transcriptions`,
 `gemini-transcription:gemini-3.5-transcribe` to Gemini Files plus stateless
 Interactions, and `openrouter-transcription:<vendor/model>` to OpenRouter's
@@ -154,7 +161,7 @@ does not receive a runtime catalog lookup: its endpoint/model compatibility is
 authoritative. `ctx.transcribe()` wraps an OpenRouter provider failure as safe
 `TranscriptionOperationError`, retaining only bounded provider diagnostics and
 the original `ProviderError` as a non-enumerable cause. See
-[Multimodal model input](./multimodal-input.md#completed-file-transcription-b1)
+[Multimodal model input](./multimodal-input.md#completed-file-transcription)
 for exact source/options/cost semantics and the temporary-file retention risk.
 All built-in inline transcription sources are capped at 25 MiB decoded before
 copying or base64 decoding. `ctx.transcribe()` converts adapter failures into a
@@ -609,7 +616,9 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 
 ⁂ `reasoning_effort: 'xhigh'` is only supported on models after gpt-5.1-codex-max (gpt-5.2+). On earlier models, `effort: 'xhigh'` and `effort: 'max'` both clamp to `'high'`. Additionally, `gpt-5-pro` only supports `'high'` — all effort values are clamped to `'high'`.
 
-‡ Gemini 3.x cannot fully disable thinking. `effort: 'none'` maps to the model's minimum: `'minimal'` for most models, `'low'` for 3.1 Pro (which doesn't support `'minimal'`).
+‡ Gemini 3.x cannot fully disable thinking. `effort: 'none'` maps to the
+model's minimum: `'minimal'` for most known models, and `'low'` for 3.1 Pro and
+Gemini 3.7/3.8 Flash, which do not support `'minimal'`.
 
 § Gemini 2.5 Pro supports up to 32768; other 2.5 models cap at 24576.
 
@@ -619,7 +628,7 @@ agent({ model: 'google:gemini-2.5-pro', effort: 'high', includeThoughts: true })
 
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
 - **OpenAI GPT-5.x Chat Completions**: Uses `system`, strips temperature when reasoning is active, and supports parallel tool calls. The compatibility baseline maps GPT-5.2+ `'max'` to `'xhigh'`; exact GPT-5.6 IDs also emit a once-per-model warning. Earlier families retain their lower caps.
-- **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'`, while older models keep their documented clamps. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
+- **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'` and omit `temperature` because that family rejects it even when reasoning uses the provider default. Older models keep their documented clamps. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
 - **Anthropic Claude 5**: Fable 5 always reasons; Opus 5 and Sonnet 5 reason by default. All three accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are preserved in `providerMetadata` for tool continuations. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a different fallback model served the call, Axl fails before persisting history or estimating cost.
 - **Anthropic Opus 4.8**: Supports adaptive thinking and native `'xhigh'`/`'max'`.
 - **Anthropic Opus 4.7**: Same adaptive-thinking behavior as 4.6. Additionally supports `effort: 'xhigh'` as a first-class tier between `'high'` and `'max'`, sent as `output_config.effort: 'xhigh'`. Same pricing as Opus 4.6 ($5/$25 per 1M tokens).

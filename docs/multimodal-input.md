@@ -1,9 +1,9 @@
 # Multimodal model input
 
-Milestone A adds ordered image input to `ctx.ask()`, `ctx.delegate()`, and
-`agent.ask()`. It is deliberately a small, per-call surface: it does not add a
-durable attachment store, upload service, document parser, video support, or
-realtime voice.
+Axl accepts ordered image input in `ctx.ask()`, `ctx.delegate()`, and
+`agent.ask()`. Images are evidence for one call: Axl preserves them through
+that call's retries and tool continuations, but does not turn them into stored
+attachments or a general-purpose file service.
 
 ## Build one input shape
 
@@ -59,11 +59,11 @@ JSON-compatible rich user history can be persisted; inline `Uint8Array` image
 data cannot be silently persisted and fails loudly. Context estimates count
 text and mark media as unmeasured rather than treating it as free context.
 
-For rich input, Axl validates the exact effective model and every rich history
+For rich input, Axl validates the effective model ID and every rich history
 part before any provider call, context-summary call, or dynamic handoff. Raw
 provider `messages`/`input`/`contents` container overrides are rejected. Invalid
 shape throws `InvalidModelInputError` (`INVALID_MODEL_INPUT`); an unsupported
-model, source, or composition throws `UnsupportedModelInputError`
+source or composition throws `UnsupportedModelInputError`
 (`UNSUPPORTED_MODEL_INPUT`). Neither error includes media bytes, base64, URLs,
 or provider-file references.
 
@@ -83,19 +83,20 @@ labels, and provider-file references while retaining provider/model metadata and
 structural source kind/count/size information. Treat unredacted URL locators as
 sensitive application data.
 
-## Image capability table (Milestone A)
+## Image capabilities
 
-The native-provider entries below are intentionally exact. OpenRouter is
-different: Axl supports its normalized image transport for arbitrary nonblank
-model slugs, but does not query or duplicate OpenRouter's catalog. The selected
-model and route decide whether they support images and combinations such as
-tools or structured output.
+Image support is transport-based rather than a model allowlist. Axl accepts any
+nonblank model ID on the native image transports below and does not duplicate
+the providers' changing model catalogs. The selected provider model decides
+whether it supports images and combinations such as tools or structured output;
+an upstream capability rejection surfaces through `ctx.ask()` as a typed
+`ProviderError`.
 
-| Provider URI | Supported image models | Sources | Constraints |
+| Provider URI | Accepted model IDs | Sources | Constraints |
 | --- | --- | --- | --- |
-| `openai-responses:` | `gpt-4o`, `gpt-4o-2024-08-06`, `gpt-4o-2024-11-20`, `gpt-4o-mini`, `gpt-4o-mini-2024-07-18` | URL, bytes, base64, `provider-file` scoped to `openai-responses` | Uses Responses image items; no host fetch/upload by Axl. |
-| `anthropic:` | `claude-sonnet-4-5`, `claude-opus-4-8` | URL, bytes, base64, `provider-file` scoped to `anthropic` | Provider files are opaque references, not an Axl file API. |
-| `google:` | `gemini-3.7-flash` | Bytes, base64, `provider-file` scoped to `google` | Rich calls use Gemini Interactions with `store: false`; provider-files require an explicit `mediaType`. Direct HTTP image URLs fail locally: fetch them in application code and pass bytes/base64, or upload through Gemini Files and pass the returned URI as a provider-file. |
+| `openai-responses:` | Any nonblank model ID | URL, bytes, base64, `provider-file` scoped to `openai-responses` | Uses Responses image items; the selected OpenAI model must support image input. No host fetch/upload by Axl. The legacy `openai:` Chat Completions adapter remains text-only. |
+| `anthropic:` | Any nonblank model ID | URL, bytes, base64, `provider-file` scoped to `anthropic` | Uses native content blocks; the selected Anthropic model must support image input. Provider files are opaque references, not an Axl file API. |
+| `google:` | Any nonblank model ID | Bytes, base64, `provider-file` scoped to `google` | Rich calls use Gemini Interactions with `store: false`; the selected model must support both Interactions and image input. Provider-files require an explicit `mediaType`. Direct HTTP image URLs fail locally: fetch them in application code and pass bytes/base64, or upload through Gemini Files and pass the returned URI as a provider-file. |
 | `openrouter:` | Any nonblank `<vendor/model>` slug | URL, bytes, base64 | Axl passes the normalized `image_url` transport through without a catalog lookup. Tools, streaming, and structured output are permitted; selected model/route capability remains authoritative. Provider-file images and raw rich input-container overrides fail locally. An upstream capability rejection surfaces through `ctx.ask()` as typed `ProviderError`. |
 
 Axl accepts at most 25 MiB of decoded inline image data across one `ModelInput`.
@@ -106,8 +107,8 @@ can import `MAX_INLINE_MODEL_INPUT_BYTES` when preflighting their own inputs.
 
 Gemini transport is deliberately hybrid. Legacy string-only `google:` requests
 continue to use the existing `generateContent` transport. Model-specific
-parameter normalization still applies. Rich image requests use the
-GA Interactions API and are stateless (`store: false`): Axl sends
+parameter normalization still applies. Rich image requests use the `/v1beta`
+Interactions API and are stateless (`store: false`): Axl sends
 application-owned history and does not use `previous_interaction_id`,
 background execution, or a raw transport override.
 Gemini Files are caller-owned for image input; unlike the explicit temporary
@@ -153,7 +154,7 @@ retains uploaded files for up to 48 hours. Axl's 25 MiB inline safety bound is
 intentionally lower and applies before provider selection; use a supported URL
 or provider-file source rather than raising process memory exposure.
 
-## Completed-file transcription (B1)
+## Completed-file transcription
 
 `ctx.transcribe(request)` is a dedicated completed-recording operation. It does
 not call an agent, alter chat history, fall back to a general multimodal model,
@@ -193,7 +194,7 @@ detected languages, timestamped segments/words, provider-reported usage, a
 pricing status, and opaque provider metadata. `timestamps` is `'segment' |
 'word'`; a provider rejects unsupported options locally before dispatch.
 
-| Provider URI | Exact B1 model | Sources | Native options / accounting |
+| Provider URI | Supported model | Sources | Native options / accounting |
 | --- | --- | --- | --- |
 | `openai-transcription:` | `gpt-transcribe` | Bytes, base64 | `language`; `providerOptions: { prompt?, temperature? }`. Axl sends multipart `/audio/transcriptions`; no provider-file or timestamps/diarization capability is claimed. Usage is only reported when OpenAI returns it. |
 | `gemini-transcription:` | `gemini-3.5-transcribe` | Bytes, base64, `provider-file` scoped to `gemini-transcription` | `language`, word timestamps, diarization with word timestamps; `providerOptions: { mode?: 'verbatim' | 'smart', customVocabulary?: string[] }`. The default is `verbatim`; `customVocabulary` accepts at most 1,000 entries but cannot be combined with timestamps. Smart mode cannot request timestamps or diarization. A provider-file requires its explicit audio `mediaType`. Bytes/base64 use temporary Files upload, readiness polling when needed, stateless Interactions (`store: false`), then best-effort deletion. |
@@ -231,23 +232,24 @@ Applications can register a custom dedicated adapter with
 `runtime.registerTranscriptionProvider(name, provider)` and use `name:model`; it
 remains separate from chat-provider registration and receives no hidden fallback.
 
-## General audio status
+## What is not supported
 
-This table is separate so completed-file transcription is never mistaken for
-general audio understanding.
+Completed-file transcription converts a finite recording to text. It does not
+let a chat model reason directly about music, environmental sounds, tone, or
+other non-speech audio. Axl does not currently accept audio parts in
+`ModelInput`, continue tool calls with an original audio attachment, or combine
+direct audio understanding with structured output. It never substitutes
+transcription when a caller asks for general audio understanding.
 
-| Surface | Status | Planned providers | Contract |
-| --- | --- | --- | --- |
-| B2 general audio understanding | Deferred | To be certified separately | Audio parts, non-speech reasoning, audio tool continuations, and audio structured output are not accepted now. |
+Anthropic transcription, video, PDF/document input, multimodal tool results,
+generated media, durable media sessions, public provider-file management, and
+realtime voice are also unsupported. These boundaries are deliberate: Axl
+rejects unsupported input instead of dropping it or silently converting it.
 
-Anthropic transcription, audio fallback through a general chat model, video,
-PDF/document input, multimodal tool results, generated media, durable media
-sessions, public provider-file management, and realtime voice are unsupported
-or deferred rather than silently coerced.
+## Try image input end to end
 
-## First-result lighthouse (about 15 minutes)
-
-Run the repository example with one of the selectable exact model URIs. It
+Run the repository example with a current image-capable model URI. The examples
+below are representative defaults, not model allowlists. The command
 reuses the checked-in Studio Playground screenshot, so no upload is needed:
 
 ```bash
@@ -267,27 +269,25 @@ finding and a second agent to verify it; start with the first native command to
 confirm your key and chosen model. It intentionally makes paid calls and is not
 part of default tests.
 
-The independently armed `L19` and `L20` integration rows additionally certify
-cross-catalog OpenRouter image-plus-tool continuation and dedicated
-transcription transport with representative non-OpenAI model slugs. Their
-models are env-overridable and never allowlists; rerun commands, request-count
-ceilings, and the 2026-09-02 outcomes are in [Testing](./testing.md) and the
-[dated OpenRouter catalog evidence](./verification/openrouter-catalog-multimodal-2026-09-02.md).
+Optional cross-catalog integration tests also certify OpenRouter
+image-plus-tool continuation and dedicated transcription transport with
+representative non-OpenAI model slugs. Their models are configurable examples,
+not allowlists. Commands, request-count ceilings, and the dated results are in
+[Testing](./testing.md) and the
+[OpenRouter verification record](./verification/openrouter-catalog-multimodal-2026-09-02.md).
 
-## Recorded-call lighthouse
+## Verify transcription end to end
 
-The separately armed transcription rows decode the checked-in eight-second MP3
-fixture in memory. It is an excerpt from the Open Speech Repository Harvard
-sentences recording; see
+The optional transcription integration suite decodes the checked-in
+eight-second MP3 fixture in memory. It is an excerpt from the Open Speech
+Repository Harvard sentences recording; see
 [`recorded-call.README.md`](../packages/axl/src/__tests__/fixtures/recorded-call.README.md)
-for attribution and license notice. `L7` proves transcription alone;
-`R7`/`R8`/`R17` separately prove explicit transcription followed by a normal
-text agent for a schema-valid summary and nonempty action-item list. The Gemini
-`L8` requests language, word timestamps, and diarization and requires timed,
-speaker-labelled words on success. `L8V` separately certifies custom
-vocabulary because the live API rejects vocabulary combined with timestamps.
-The Gemini `R8` analysis call uses an ordered text `ModelInput`, proving the
-same stateless Interactions transport used by new rich calls. See
+for attribution and license notice. It separately verifies transcription and
+the explicit composition of a transcript with a normal text agent for a
+schema-valid summary and action-item list. Gemini coverage verifies language,
+word timestamps, diarization, and custom vocabulary in the combinations the
+API supports. Its analysis call uses ordered text input through the same
+stateless Interactions transport used by rich calls. See
 [Testing](./testing.md#completed-file-transcription-lighthouse) for opt-in
 commands, count caveats, and the kill switch.
 

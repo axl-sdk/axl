@@ -467,10 +467,8 @@ export class OpenAICompatibleProvider implements Provider {
   }
 
   validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
-    const effectiveModel =
-      typeof request.providerOptions?.model === 'string'
-        ? request.providerOptions.model
-        : request.model;
+    const modelOverride = request.providerOptions?.model;
+    const effectiveModel = typeof modelOverride === 'string' ? modelOverride : request.model;
     const fail = (source?: string, feature?: string): never => {
       throw new UnsupportedModelInputError({
         provider: this.name,
@@ -480,6 +478,13 @@ export class OpenAICompatibleProvider implements Provider {
         ...(feature ? { feature } : {}),
       });
     };
+    if (
+      request.providerOptions &&
+      'model' in request.providerOptions &&
+      (typeof modelOverride !== 'string' || modelOverride.trim().length === 0)
+    ) {
+      fail(undefined, 'invalid model providerOptions');
+    }
     if (this.name !== 'openrouter' || effectiveModel.trim().length === 0) {
       fail(undefined, 'image input for this model');
     }

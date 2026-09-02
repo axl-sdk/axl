@@ -355,7 +355,7 @@ agent({ model: 'groq:openai/gpt-oss-120b', ... })             // fastest inferen
 agent({ model: 'ollama:llama3', ... })                        // local — no key, $0
 ```
 
-Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, plus self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them; OpenRouter also passes image input through to the selected model/route. Axl does not claim every catalog model supports images, tools, or transcription—see [provider details](./docs/providers.md#openai-compatible-providers--presets) and [multimodal input](./docs/multimodal-input.md). Build your own by cloning a `ProviderProfile`.
+Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, plus self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them. OpenAI Responses, Anthropic, Google, and OpenRouter accept image input without hard-coding a model catalog; the selected upstream model remains authoritative. Completed-file transcription is a separate, narrower contract—see [provider details](./docs/providers.md) and [multimodal input](./docs/multimodal-input.md). Build your own compatible provider by cloning a `ProviderProfile`.
 
 The `effort` parameter controls reasoning depth identically across all providers:
 

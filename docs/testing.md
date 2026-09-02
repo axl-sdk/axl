@@ -358,6 +358,10 @@ The image lighthouse is separately armed even when provider keys are present:
 # `fetchWithRetry` can make up to three HTTP attempts per invocation.
 AXL_MULTIMODAL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]'
 
+# L1, L11, and L4 accept model overrides for catalog-capability smoke tests.
+# This makes exactly one model invocation for each provider whose key is set.
+AXL_MULTIMODAL_LIVE=1 OPENAI_IMAGE_MODEL=gpt-5.6 ANTHROPIC_IMAGE_MODEL=claude-opus-5 GEMINI_IMAGE_MODEL=gemini-3.8-flash pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-multimodal-input.test.ts -t '\[L1\]|\[L11\]|\[L4\]'
+
 # Native blocking rows: six logical invocations on a normal successful path
 # (L1/L2/L4/L11/L13/L14). L6 and L12 are local and make zero HTTP attempts.
 # L13 and L14 each add a test-owned upload, one model call, and deletion.

@@ -834,6 +834,25 @@ describe('OpenAIResponsesProvider', () => {
       expect(body).not.toHaveProperty('temperature');
     });
 
+    it('strips temperature for GPT-5.6 when reasoning uses the provider default', async () => {
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            id: 'resp_1',
+            output: [],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+          }),
+      });
+
+      await new OpenAIResponsesProvider().chat([{ role: 'user', content: 'Hi' }], {
+        model: 'gpt-5.6',
+        maxTokens: 1024,
+        temperature: 0.7,
+      });
+
+      expect(getRequestBody(fetchMock)).not.toHaveProperty('temperature');
+    });
+
     it('uses the providerOptions model for reasoning and temperature decisions', async () => {
       const fetchMock = mockFetch({
         json: () =>
@@ -1700,7 +1719,7 @@ describe('OpenAIResponsesProvider', () => {
             ],
           },
         ],
-        { model: 'gpt-4o' },
+        { model: 'gpt-5.6' },
       );
       const body = getRequestBody(fetchMock);
       expect((body.input as any[])[0].content).toEqual([
@@ -1725,9 +1744,22 @@ describe('OpenAIResponsesProvider', () => {
           responseMode: 'text',
         }),
       ).toThrow('provider-file');
+      expect(
+        provider.validateInput({
+          model: 'base-model',
+          input: [
+            { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+          ],
+          history: [],
+          stream: false,
+          hasTools: false,
+          responseMode: 'text',
+          providerOptions: { model: 'future-vision-model' },
+        }),
+      ).toEqual({ effectiveModel: 'future-vision-model' });
       expect(() =>
         provider.validateInput({
-          model: 'gpt-4.1',
+          model: '   ',
           input: [
             { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
           ],
@@ -1737,10 +1769,28 @@ describe('OpenAIResponsesProvider', () => {
           responseMode: 'text',
         }),
       ).toThrow('image input for this model');
-      expect(provider.inputCapabilities('gpt-4o')).toEqual({
+      expect(provider.inputCapabilities('gpt-5.6')).toEqual({
         image: { sources: ['url', 'bytes', 'base64', 'provider-file'] },
       });
-      expect(provider.inputCapabilities('gpt-4.1')).toEqual({});
+      expect(provider.inputCapabilities('future-vision-model')).toEqual({
+        image: { sources: ['url', 'bytes', 'base64', 'provider-file'] },
+      });
+      expect(provider.inputCapabilities('   ')).toEqual({});
+      for (const model of [undefined, 42, '   ']) {
+        expect(() =>
+          provider.validateInput({
+            model: 'gpt-5.6',
+            input: [
+              { type: 'image', source: { type: 'url', url: 'https://example.test/image.png' } },
+            ],
+            history: [],
+            stream: false,
+            hasTools: false,
+            responseMode: 'text',
+            providerOptions: { model },
+          }),
+        ).toThrow('invalid model providerOptions');
+      }
     });
   });
 });

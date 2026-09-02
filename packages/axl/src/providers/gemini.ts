@@ -229,9 +229,6 @@ const GEMINI_PRICING: Record<string, GeminiRate> = {
   'gemini-3.6-flash': { input: 1.5e-6, cached: 0.15e-6, output: 7.5e-6 },
 };
 
-/** Only this current documented image model is admitted to Interactions. */
-const GEMINI_INTERACTIONS_IMAGE_MODELS = new Set(['gemini-3.7-flash']);
-
 type GeminiPriceUsage = {
   inputTokens: number;
   outputTokens: number;
@@ -266,6 +263,57 @@ function isDefinitiveStandardGeminiResponseTier(value: unknown): boolean {
     value === 'SERVICE_TIER_STANDARD' ||
     value === 'standard'
   );
+}
+
+/** Interactions string codes mapped from Google's current standard API error table. */
+function geminiInteractionErrorStatus(code: string | number | undefined): number | undefined {
+  if (typeof code === 'number' && Number.isInteger(code) && code >= 100 && code <= 599) {
+    return code;
+  }
+  switch (code) {
+    case 'invalid_request':
+    case 'invalid_argument':
+    case 'parameter_unknown':
+    case 'failed_precondition':
+      return 400;
+    case 'authentication':
+    case 'unauthenticated':
+      return 401;
+    case 'permission_denied':
+      return 403;
+    case 'not_found':
+    case 'model_not_found':
+      return 404;
+    case 'request_timeout':
+      return 408;
+    case 'conflict':
+    case 'already_exists':
+      return 409;
+    case 'request_too_large':
+      return 413;
+    case 'out_of_range':
+      return 416;
+    case 'quota_exceeded':
+    case 'resource_exhausted':
+    case 'rate_limit_exceeded':
+      return 429;
+    case 'cancelled':
+      return 499;
+    case 'api_error':
+    case 'internal':
+    case 'internal_server_error':
+      return 500;
+    case 'bad_gateway':
+      return 502;
+    case 'unavailable':
+    case 'service_unavailable':
+      return 503;
+    case 'deadline_exceeded':
+    case 'gateway_timeout':
+      return 504;
+    default:
+      return undefined;
+  }
 }
 
 function isEligibleGeminiPricing(
@@ -393,6 +441,8 @@ const GEMINI_3X_MIN_THINKING_LEVEL = new Map<string, string>([
   // L4 live evidence: Interactions gemini-3.7-flash accepts low/medium/high,
   // but rejects minimal. Keep this exact entry isolated from legacy aliases.
   ['gemini-3.7-flash', 'low'],
+  // Current-model live evidence: gemini-3.8-flash has the same low floor.
+  ['gemini-3.8-flash', 'low'],
 ]);
 
 const GEMINI_MODELS_WITHOUT_PORTABLE_TEMPERATURE = new Set([
@@ -456,16 +506,14 @@ export class GeminiProvider implements Provider {
   inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
     // Interactions accepts inline data and Gemini Files URIs. Axl never
     // retrieves caller URLs or creates hidden image uploads.
-    return GEMINI_INTERACTIONS_IMAGE_MODELS.has(model)
+    return model.trim().length > 0
       ? { image: { sources: ['bytes', 'base64', 'provider-file'] } }
       : {};
   }
 
   validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
-    const effectiveModel =
-      typeof request.providerOptions?.model === 'string'
-        ? request.providerOptions.model
-        : request.model;
+    const modelOverride = request.providerOptions?.model;
+    const effectiveModel = typeof modelOverride === 'string' ? modelOverride : request.model;
     const fail = (source?: string, feature?: string): never => {
       throw new UnsupportedModelInputError({
         provider: this.name,
@@ -475,7 +523,14 @@ export class GeminiProvider implements Provider {
         ...(feature ? { feature } : {}),
       });
     };
-    if (!GEMINI_INTERACTIONS_IMAGE_MODELS.has(effectiveModel)) {
+    if (
+      request.providerOptions &&
+      'model' in request.providerOptions &&
+      (typeof modelOverride !== 'string' || modelOverride.trim().length === 0)
+    ) {
+      fail(undefined, 'invalid model providerOptions');
+    }
+    if (effectiveModel.trim().length === 0) {
       fail(undefined, 'image input for this model');
     }
     if (request.providerOptions) {
@@ -702,7 +757,7 @@ export class GeminiProvider implements Provider {
       });
     }
     if (!res.body) throw new Error('Gemini Interactions stream has no body');
-    yield* this.parseInteractionSSEStream(res.body);
+    yield* this.parseInteractionSSEStream(res.body, res.headers);
   }
 
   private buildInteractionRequestBody(
@@ -796,6 +851,7 @@ export class GeminiProvider implements Provider {
   }
 
   private assertSafeInteractionOptions(options: ChatOptions): void {
+    const modelOverride = options.providerOptions?.model;
     const model = this.requestModel(options);
     const fail = (feature: string): never => {
       throw new UnsupportedModelInputError({
@@ -805,7 +861,14 @@ export class GeminiProvider implements Provider {
         feature,
       });
     };
-    if (!GEMINI_INTERACTIONS_IMAGE_MODELS.has(model)) fail('image input for this model');
+    if (
+      options.providerOptions &&
+      'model' in options.providerOptions &&
+      (typeof modelOverride !== 'string' || modelOverride.trim().length === 0)
+    ) {
+      fail('invalid model providerOptions');
+    }
+    if (model.trim().length === 0) fail('image input for this model');
     const forbidden = [
       'input',
       'contents',
@@ -890,6 +953,7 @@ export class GeminiProvider implements Provider {
 
   private async *parseInteractionSSEStream(
     body: ReadableStream<Uint8Array>,
+    responseHeaders: Headers,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -916,7 +980,22 @@ export class GeminiProvider implements Provider {
             continue;
           }
           if (event.event_type === 'error') {
-            throw new Error(event.error?.message ?? 'Gemini Interactions stream failed');
+            const status = geminiInteractionErrorStatus(event.error?.code);
+            const message = event.error?.message ?? 'Gemini Interactions stream failed';
+            if (status !== undefined) {
+              throw buildProviderError({
+                provider: this.name,
+                status,
+                headers: responseHeaders,
+                message,
+              });
+            }
+            throw new ProviderError({
+              provider: this.name,
+              status: 0,
+              retryable: false,
+              message,
+            });
           }
           if (event.event_type === 'step.start' && event.step) {
             const index = event.index;
@@ -1751,7 +1830,7 @@ type GeminiInteractionSSEEvent = {
   step?: GeminiInteractionStep;
   delta?: GeminiInteractionDelta;
   interaction?: GeminiInteractionResponse;
-  error?: { message?: string };
+  error?: { message?: string; code?: string | number; status?: string };
 };
 
 type GeminiInteractionDelta = {

@@ -1318,17 +1318,19 @@ describe('OpenRouter image transport capability', () => {
         responseMode: 'text',
       }),
     ).toEqual({ effectiveModel: 'openai/gpt-4o-mini' });
-    expect(() =>
-      provider.validateInput({
-        model: 'openai/gpt-4o-mini',
-        input: [{ type: 'image', source: { type: 'url', url: 'https://example.test/a.png' } }],
-        history: [],
-        providerOptions: { model: '' },
-        stream: false,
-        hasTools: false,
-        responseMode: 'text',
-      }),
-    ).toThrow('image input for this model');
+    for (const model of [undefined, 42, '']) {
+      expect(() =>
+        provider.validateInput({
+          model: 'openai/gpt-4o-mini',
+          input: [{ type: 'image', source: { type: 'url', url: 'https://example.test/a.png' } }],
+          history: [],
+          providerOptions: { model },
+          stream: false,
+          hasTools: false,
+          responseMode: 'text',
+        }),
+      ).toThrow('invalid model providerOptions');
+    }
     expect(() =>
       provider.validateInput({
         model: 'vendor/vision-model',

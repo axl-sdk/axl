@@ -67,7 +67,7 @@ agent({ model: 'deepseek:deepseek-reasoner' });           // DEEPSEEK_API_KEY
 agent({ model: 'ollama:llama3' });                        // local — no key, $0
 ```
 
-Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, and self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them. OpenRouter passes image input through to the selected model/route, but Axl does not claim every catalog model supports images, tools, or transcription. Build your own by cloning a `ProviderProfile`; see [provider details](../../docs/providers.md#openai-compatible-providers--presets) and [multimodal input](../../docs/multimodal-input.md).
+Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, and self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them. OpenAI Responses, Anthropic, Google, and OpenRouter accept image input without hard-coding a model catalog; the selected upstream model remains authoritative. Completed-file transcription is a separate, narrower contract. Build your own compatible provider by cloning a `ProviderProfile`; see [provider details](../../docs/providers.md) and [multimodal input](../../docs/multimodal-input.md).
 
 Each provider also accepts an opt-in `rateLimit` (`{ maxConcurrent?, minIntervalMs?, acquireTimeoutMs? }`) for proactive client-side pacing on top of the automatic 429/503/529 backoff — useful when a large fan-out (e.g. an eval) shares one API key. It caps in-flight request concurrency (not token throughput) for that provider's chat calls. See [Providers → Rate limiting](../../docs/providers.md#rate-limiting-opt-in).
 

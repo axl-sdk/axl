@@ -37,4 +37,4 @@ Or run any file directly: `npx tsx quickstart.ts`.
 - [Use Cases](../docs/use-cases.md) — support bots, batch processing, budgets, voting strategies
 - [API Reference](../docs/api-reference.md) — every `ctx.*` primitive and option
 - [Axl Studio](../packages/axl-studio/README.md) — a local UI to watch any of these run
-- [Multimodal input](../docs/multimodal-input.md) — exact image allowlists, source types, and live-lighthouse commands
+- [Multimodal input](../docs/multimodal-input.md) — image transport capabilities, source types, and live-verification commands

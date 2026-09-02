@@ -60,8 +60,6 @@ function anthropicImageBlocks(parts: readonly InputContentPart[]): AnthropicCont
 const ANTHROPIC_API_VERSION = '2023-06-01';
 const ANTHROPIC_FILES_BETA = 'files-api-2025-04-14';
 
-const ANTHROPIC_IMAGE_MODELS = new Set(['claude-sonnet-4-5', 'claude-opus-4-8']);
-
 function hasAnthropicProviderFileImage(messages: readonly ChatMessage[]): boolean {
   return messages.some(
     (message) =>
@@ -231,6 +229,29 @@ export type AnthropicPriceUsage = {
 
 function isValidTokenCount(value: number | undefined): value is number {
   return value !== undefined && Number.isSafeInteger(value) && value >= 0;
+}
+
+function anthropicStreamErrorStatus(type: string | undefined): number {
+  switch (type) {
+    case 'invalid_request_error':
+      return 400;
+    case 'authentication_error':
+      return 401;
+    case 'permission_error':
+      return 403;
+    case 'not_found_error':
+      return 404;
+    case 'request_too_large':
+      return 413;
+    case 'rate_limit_error':
+      return 429;
+    case 'api_error':
+      return 500;
+    case 'overloaded_error':
+      return 529;
+    default:
+      return 0;
+  }
 }
 
 /**
@@ -652,16 +673,14 @@ export class AnthropicProvider implements Provider {
   readonly name = 'anthropic';
 
   inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
-    return ANTHROPIC_IMAGE_MODELS.has(model)
+    return model.trim().length > 0
       ? { image: { sources: ['url', 'bytes', 'base64', 'provider-file'] } }
       : {};
   }
 
   validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
-    const effectiveModel =
-      typeof request.providerOptions?.model === 'string'
-        ? request.providerOptions.model
-        : request.model;
+    const modelOverride = request.providerOptions?.model;
+    const effectiveModel = typeof modelOverride === 'string' ? modelOverride : request.model;
     const fail = (source?: string, feature?: string): never => {
       throw new UnsupportedModelInputError({
         provider: this.name,
@@ -671,7 +690,14 @@ export class AnthropicProvider implements Provider {
         ...(feature ? { feature } : {}),
       });
     };
-    if (!ANTHROPIC_IMAGE_MODELS.has(effectiveModel)) {
+    if (
+      request.providerOptions &&
+      'model' in request.providerOptions &&
+      (typeof modelOverride !== 'string' || modelOverride.trim().length === 0)
+    ) {
+      fail(undefined, 'invalid model providerOptions');
+    }
+    if (effectiveModel.trim().length === 0) {
       fail(undefined, 'image input for this model');
     }
     if (request.providerOptions && 'messages' in request.providerOptions) {
@@ -829,7 +855,7 @@ export class AnthropicProvider implements Provider {
       throw new Error('Anthropic stream response has no body');
     }
 
-    yield* this.parseSSEStream(res.body, pricingContext);
+    yield* this.parseSSEStream(res.body, pricingContext, res.headers);
   }
 
   // ---------------------------------------------------------------------------
@@ -1160,6 +1186,7 @@ export class AnthropicProvider implements Provider {
   private async *parseSSEStream(
     body: ReadableStream<Uint8Array>,
     pricingContext: AnthropicPricingContext,
+    responseHeaders: Headers,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -1226,6 +1253,16 @@ export class AnthropicProvider implements Provider {
           }
 
           switch (event.type) {
+            case 'error': {
+              const status = anthropicStreamErrorStatus(event.error?.type);
+              throw buildProviderError({
+                provider: this.name,
+                status,
+                headers: responseHeaders,
+                message: event.error?.message ?? 'Anthropic stream failed',
+              });
+            }
+
             case 'content_block_start': {
               const block = event.content_block;
               if (block?.type === 'tool_use') {
@@ -1458,7 +1495,9 @@ type AnthropicStreamEvent = {
     | 'content_block_stop'
     | 'message_delta'
     | 'message_stop'
-    | 'ping';
+    | 'ping'
+    | 'error';
+  error?: { type?: string; message?: string };
   message?: {
     model?: string;
     speed?: string;

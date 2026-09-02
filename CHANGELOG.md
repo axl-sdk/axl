@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-09-02
+
+### Changed
+
+- **Native image transports follow provider catalogs.** OpenAI Responses,
+  Anthropic, and Google image input now accept any nonblank model ID instead of
+  maintaining stale model allowlists. Axl still validates source types,
+  provider-file ownership, request composition, and raw overrides locally; the
+  upstream provider remains authoritative for whether its selected model
+  supports images and reports an unsupported model through `ProviderError`.
+- **Current-model parameter normalization.** GPT-5.6 Responses requests omit
+  unsupported `temperature` even when reasoning uses the provider default, and
+  Gemini 3.8 Flash maps `effort: 'none'` to its supported `low` thinking floor.
+- **Rich model overrides and stream failures fail coherently.** Native image
+  adapters and OpenRouter reject non-string or blank `providerOptions.model`
+  values before dispatch, so validation, observation, and the wire model cannot
+  diverge. Anthropic and Gemini in-band streaming error events now surface as
+  typed `ProviderError` failures instead of being ignored or thrown as plain
+  errors.
+- **Multimodal documentation is product-facing.** The public guide now explains
+  shipped image and transcription behavior without internal milestone labels,
+  while the roadmap tracks the complete set of deferred multimodal extensions
+  and the criteria for promoting them into planned work. The public docs also
+  omit historical release checklists that do not help SDK consumers.
+
 ## [0.22.1] - 2026-09-02
 
 ### Changed
@@ -41,8 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Ordered image input.** `ModelInput` accepts text and image parts on `ask` and
   `delegate`, with bounded observability descriptors, typed preflight errors,
   native OpenAI Responses/Anthropic/Gemini mappings, and one non-blocking
-  OpenRouter certification path. See `docs/multimodal-input.md` for exact
-  model/source allowlists and attachment lifetime rules.
+  OpenRouter certification path. See `docs/multimodal-input.md` for provider
+  transport/source capabilities and attachment lifetime rules.
 - **Completed-file transcription.** `ctx.transcribe()` provides a typed,
   non-chat operation for finite recording bytes/base64 (plus Gemini-owned file
   references), with exact OpenAI `gpt-transcribe`, Gemini
@@ -1174,7 +1199,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.22.1...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.22.2...HEAD
+[0.22.2]: https://github.com/axl-sdk/axl/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/axl-sdk/axl/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/axl-sdk/axl/compare/v0.21.1...v0.22.0
 [0.21.1]: https://github.com/axl-sdk/axl/compare/v0.21.0...v0.21.1

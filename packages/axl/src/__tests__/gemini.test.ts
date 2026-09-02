@@ -3098,7 +3098,7 @@ describe('GeminiProvider', () => {
           },
         ],
         {
-          model: 'gemini-3.7-flash',
+          model: 'gemini-3.8-flash',
           tools: [
             {
               type: 'function',
@@ -3114,7 +3114,7 @@ describe('GeminiProvider', () => {
       const [url, opts] = fetchMock.mock.calls[0];
       expect(url).toContain('/interactions');
       const body = JSON.parse(opts.body);
-      expect(body).toMatchObject({ model: 'gemini-3.7-flash', store: false, stream: false });
+      expect(body).toMatchObject({ model: 'gemini-3.8-flash', store: false, stream: false });
       expect(body.input[0]).toEqual({
         type: 'user_input',
         content: [
@@ -3133,23 +3133,26 @@ describe('GeminiProvider', () => {
       expect(response.providerMetadata).toEqual({ geminiInteractionSteps: expect.any(Array) });
     });
 
-    it('maps rich gemini-3.7-flash effort none to its supported low thinking level', async () => {
-      const fetchMock = mockFetch({
-        json: () => Promise.resolve({ status: 'completed', steps: [] }),
-      });
-      await new GeminiProvider().chat(
-        [
-          {
-            role: 'user',
-            content: [geminiFileImage()],
-          },
-        ],
-        { model: 'gemini-3.7-flash', effort: 'none' },
-      );
-      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-      expect(body.generation_config.thinking_level).toBe('low');
-      expect(body.generation_config.thinking_level).not.toBe('minimal');
-    });
+    it.each(['gemini-3.7-flash', 'gemini-3.8-flash'])(
+      'maps rich %s effort none to its supported low thinking level',
+      async (model) => {
+        const fetchMock = mockFetch({
+          json: () => Promise.resolve({ status: 'completed', steps: [] }),
+        });
+        await new GeminiProvider().chat(
+          [
+            {
+              role: 'user',
+              content: [geminiFileImage()],
+            },
+          ],
+          { model, effort: 'none' },
+        );
+        const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+        expect(body.generation_config.thinking_level).toBe('low');
+        expect(body.generation_config.thinking_level).not.toBe('minimal');
+      },
+    );
 
     it.each([
       ['provider-file', { type: 'provider-file', provider: 'google', reference: 'files/private' }],
@@ -3465,6 +3468,79 @@ describe('GeminiProvider', () => {
       expect(streamFetch).not.toHaveBeenCalled();
     });
 
+    it.each([undefined, 42, '   '])(
+      'rejects invalid rich providerOptions.model=%j before unary or stream fetch',
+      async (model) => {
+        const messages = [{ role: 'user' as const, content: [geminiFileImage()] }];
+        const options = { model: 'gemini-3.8-flash', providerOptions: { model } };
+        const unaryFetch = mockFetch({
+          json: () => Promise.resolve({ status: 'completed', steps: [] }),
+        });
+        await expect(new GeminiProvider().chat(messages, options)).rejects.toThrow(
+          'invalid model providerOptions',
+        );
+        expect(unaryFetch).not.toHaveBeenCalled();
+
+        const streamFetch = mockFetch({ body: new ReadableStream() });
+        await expect(
+          (async () => {
+            for await (const chunk of new GeminiProvider().stream(messages, options)) void chunk;
+          })(),
+        ).rejects.toThrow('invalid model providerOptions');
+        expect(streamFetch).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      ['invalid_request', 400, false],
+      ['parameter_unknown', 400, false],
+      ['failed_precondition', 400, false],
+      ['authentication', 401, false],
+      ['permission_denied', 403, false],
+      ['model_not_found', 404, false],
+      ['already_exists', 409, false],
+      ['out_of_range', 416, false],
+      ['quota_exceeded', 429, true],
+      ['cancelled', 499, false],
+      ['api_error', 500, true],
+      ['bad_gateway', 502, true],
+      ['service_unavailable', 503, true],
+      ['gateway_timeout', 504, true],
+    ])(
+      'surfaces Interactions SSE %s as a typed status %i provider failure',
+      async (code, status, retryable) => {
+        const encoder = new TextEncoder();
+        mockFetch({
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({ event_type: 'error', error: { code, message: 'image model rejected' } })}\n\n`,
+                ),
+              );
+              controller.close();
+            },
+          }),
+        });
+
+        await expect(
+          (async () => {
+            for await (const chunk of new GeminiProvider().stream(
+              [{ role: 'user', content: [geminiFileImage()] }],
+              { model: 'future-gemini-model' },
+            ))
+              void chunk;
+          })(),
+        ).rejects.toMatchObject({
+          name: 'ProviderError',
+          provider: 'google',
+          status,
+          retryable,
+          body: undefined,
+        });
+      },
+    );
+
     it.each(['failed', 'cancelled', 'incomplete', 'in_progress'])(
       'rejects non-success Interactions unary status %s without echoing response body',
       async (status) => {
@@ -3579,7 +3655,7 @@ describe('GeminiProvider', () => {
       ).rejects.toThrow('ended before interaction.completed');
     });
 
-    it('fails closed before fetch for non-Interactions and unknown image model siblings', () => {
+    it('admits nonblank image model slugs to Interactions and rejects an empty model', () => {
       const provider = new GeminiProvider();
       const request = (model: string) => ({
         model,
@@ -3598,16 +3674,26 @@ describe('GeminiProvider', () => {
         hasTools: false,
         responseMode: 'text' as const,
       });
-      expect(() => provider.validateInput(request('gemini-2.0-flash'))).toThrow(
-        'image input for this model',
-      );
-      expect(() => provider.validateInput(request('gemini-3.7-flash-preview'))).toThrow(
-        'image input for this model',
-      );
-      expect(provider.inputCapabilities('gemini-3.7-flash')).toEqual({
+      expect(provider.validateInput(request('gemini-3.8-flash'))).toEqual({
+        effectiveModel: 'gemini-3.8-flash',
+      });
+      expect(provider.validateInput(request('future-gemini-model'))).toEqual({
+        effectiveModel: 'future-gemini-model',
+      });
+      expect(
+        provider.validateInput({
+          ...request('base-model'),
+          providerOptions: { model: 'future-gemini-model' },
+        }),
+      ).toEqual({ effectiveModel: 'future-gemini-model' });
+      expect(() => provider.validateInput(request('  '))).toThrow('image input for this model');
+      expect(provider.inputCapabilities('gemini-3.8-flash')).toEqual({
         image: { sources: ['bytes', 'base64', 'provider-file'] },
       });
-      expect(provider.inputCapabilities('gemini-2.0-flash')).toEqual({});
+      expect(provider.inputCapabilities('future-gemini-model')).toEqual({
+        image: { sources: ['bytes', 'base64', 'provider-file'] },
+      });
+      expect(provider.inputCapabilities('  ')).toEqual({});
     });
   });
 });

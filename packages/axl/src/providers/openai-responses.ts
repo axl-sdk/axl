@@ -11,6 +11,7 @@ import {
   estimateDirectOpenAICost,
   isOSeriesModel,
   supportsReasoningEffort,
+  supportsMaxReasoningEffort,
   resolveOpenAIReasoningEffort,
 } from './openai.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
@@ -20,14 +21,6 @@ import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import { UnsupportedModelInputError } from '../errors.js';
-
-const OPENAI_RESPONSES_IMAGE_MODELS = new Set([
-  'gpt-4o',
-  'gpt-4o-2024-08-06',
-  'gpt-4o-2024-11-20',
-  'gpt-4o-mini',
-  'gpt-4o-mini-2024-07-18',
-]);
 
 function base64FromSource(source: Extract<InputMediaSource, { type: 'bytes' | 'base64' }>): string {
   return source.type === 'base64'
@@ -79,16 +72,14 @@ export class OpenAIResponsesProvider implements Provider {
   readonly name = 'openai-responses';
 
   inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
-    return OPENAI_RESPONSES_IMAGE_MODELS.has(model)
+    return model.trim().length > 0
       ? { image: { sources: ['url', 'bytes', 'base64', 'provider-file'] } }
       : {};
   }
 
   validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
-    const effectiveModel =
-      typeof request.providerOptions?.model === 'string'
-        ? request.providerOptions.model
-        : request.model;
+    const modelOverride = request.providerOptions?.model;
+    const effectiveModel = typeof modelOverride === 'string' ? modelOverride : request.model;
     const fail = (source?: string, feature?: string): never => {
       throw new UnsupportedModelInputError({
         provider: this.name,
@@ -98,7 +89,14 @@ export class OpenAIResponsesProvider implements Provider {
         ...(feature ? { feature } : {}),
       });
     };
-    if (!OPENAI_RESPONSES_IMAGE_MODELS.has(effectiveModel)) {
+    if (
+      request.providerOptions &&
+      'model' in request.providerOptions &&
+      (typeof modelOverride !== 'string' || modelOverride.trim().length === 0)
+    ) {
+      fail(undefined, 'invalid model providerOptions');
+    }
+    if (effectiveModel.trim().length === 0) {
       fail(undefined, 'image input for this model');
     }
     if (request.providerOptions && 'input' in request.providerOptions) {
@@ -277,8 +275,12 @@ export class OpenAIResponsesProvider implements Provider {
     const { includeThoughts } = resolved;
     const wireEffort = resolveOpenAIReasoningEffort(effectiveModel, resolved);
 
-    // Temperature: always strip for o-series; for GPT-5.x, strip only when reasoning active
-    const stripTemp = oSeries || (reasoningCapable && wireEffort !== undefined);
+    // GPT-5.6 Responses rejects temperature even when no explicit effort is
+    // supplied because reasoning is active by default for that family.
+    const stripTemp =
+      oSeries ||
+      supportsMaxReasoningEffort(effectiveModel) ||
+      (reasoningCapable && wireEffort !== undefined);
 
     // Extract system messages → instructions
     const systemMessages = messages.filter((m) => m.role === 'system');

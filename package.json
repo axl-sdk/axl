@@ -12,6 +12,7 @@
     "test:studio": "pnpm --filter axl-tests test:studio",
     "test:integration": "pnpm -r test:integration",
     "test:integration:frontier": "pnpm --filter @axlsdk/axl test:integration:frontier",
+    "test:release-notes": "node --test .github/scripts/extract-release-notes.test.mjs",
     "test:smoke": "pnpm --filter axl-tests test:smoke",
     "lint": "eslint packages/*/src/",
     "format": "prettier --write packages/*/src/",

@@ -79,6 +79,10 @@ Run from the repo root. Per-area detail: `.claude/rules/testing.md` and the pack
   `pnpm test:integration:frontier` gate.
 - **Never commit gitignored paths** (`.internal/**`); no `git add -f`.
 - **Never commit, push, or tag without explicit approval.**
+- **Releases are changelog-backed and tag-triggered.** After npm trusted publishing
+  succeeds, the publish workflow creates the GitHub Release and an Announcements
+  discussion from the matching versioned `CHANGELOG.md` section. Follow
+  `.claude/rules/releasing.md`; do not duplicate release prose manually.
 
 ## Agent routing
 

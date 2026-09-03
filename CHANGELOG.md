@@ -36,9 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped** — including the newest one the next reply depends on. The cached
   summary could never be reused in that state either, so each ask paid a fresh
   summarization call and overwrote the persisted `summaryCache`. Summarization
-  now retains the most recent exchange where it can, always anchored so the
-  request never begins on an assistant message — `sessionHistory` does not
-  alternate roles, since `ctx.ask` only ever appends assistant turns. Where no
+  now retains the most recent exchange where it can, always anchored on a user
+  turn so the request opens the way every provider documents — `sessionHistory`
+  does not alternate roles, since `ctx.ask` only ever appends assistant turns.
+  (Live-probed 2026-09-03: Anthropic, OpenAI and Gemini each accepted an
+  assistant-first request, so this is well-formedness and portability, not a
+  workaround for a rejection.) Where no
   user turn is available to anchor on, the history is summarized in full
   instead; the current input is appended separately either way, so no ask
   reaches a provider without a user turn. An unsatisfiable context budget emits a `log` warning

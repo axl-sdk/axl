@@ -501,8 +501,11 @@ function describeValue(value: unknown): string {
  * Index of the nearest `user` turn at or after `from`, or `undefined` when the
  * remaining history has none.
  *
- * Providers require the first non-system message of a request to be a user
- * turn, and `sessionHistory` does NOT alternate: `ctx.ask` only ever appends
+ * A request should open on a user turn -- that is the shape every provider
+ * documents, and it keeps a retained tail portable rather than dependent on
+ * one provider's leniency (Anthropic, OpenAI and Gemini all accepted an
+ * assistant-first request when probed on 2026-09-03; see docs/verification).
+ * `sessionHistory` does NOT alternate: `ctx.ask` only ever appends
  * assistant messages (see `pushAssistantToSessionHistory`), so a workflow that
  * asks several times in one session turn accumulates consecutive assistant
  * messages and may hold no user turn at all. Any retained tail therefore has to
@@ -3339,8 +3342,8 @@ export class WorkflowContext<TInput = unknown> {
       splitIdx = i;
     }
 
-    // Anchor the retained tail on a user turn. Providers require the first
-    // non-system message to be a user turn, and `sessionHistory` does not
+    // Anchor the retained tail on a user turn so the request opens the way
+    // every provider documents (see nextUserTurn). `sessionHistory` does not
     // alternate, so the index the budget loop stopped at is frequently an
     // assistant message. Three cases, all of which must end user-first:
     const anchored = nextUserTurn(history, splitIdx);

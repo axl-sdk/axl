@@ -3372,8 +3372,9 @@ export class WorkflowContext<TInput = unknown> {
       splitIdx = history.length;
     }
 
-    // If nothing to summarize (all messages are "recent", or only the newest
-    // message remains and it is retained unconditionally), just return all.
+    // Nothing to summarize: the whole history is "recent". After the anchoring
+    // above this is reachable only when history[0] is itself a user turn, so
+    // returning the history unchanged keeps the request user-first.
     if (splitIdx === 0) return history;
 
     const oldMessages = history.slice(0, splitIdx);

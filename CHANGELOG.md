@@ -22,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1,618 cached tokens at ~1/10 the cost, and a 2,000-token unique user turn wrote
   nothing. When it is on and two consecutive calls on one context write to the
   cache without reading, one `log` warning names the agent — the signature of a
-  per-call-changing prefix. See
+  per-call-changing prefix. If `providerOptions` supplies a top-level
+  `cache_control`, `system`, or `tools`, Axl adds no breakpoint of its own — the
+  caller owns the prefix. See
   [providers.md#prompt-caching](docs/providers.md#prompt-caching).
 
 ### Added

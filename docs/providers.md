@@ -912,8 +912,11 @@ the cache without ever reading from it, Axl emits one `log` warning naming the a
 the signature of a prefix that changes per call. (Scope is one `WorkflowContext`; a
 `Session` builds a fresh context per turn, so churn across session turns is not observed.)
 
-Explicit block-level breakpoints via `providerOptions` still merge last and win.
-Verified live 2026-09-03; see `docs/verification/`.
+**Interaction with `providerOptions`.** If `providerOptions` supplies a top-level
+`cache_control` (Anthropic's automatic mode), or its own `system` or `tools`, the caller
+owns the prefix and Axl adds no breakpoint of its own — otherwise the shallow merge would
+either discard Axl's breakpoint or stack a second one beside the caller's. Verified live
+2026-09-03; see `docs/verification/`.
 
 #### Anthropic — observable cache-read and write TTLs
 

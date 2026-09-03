@@ -2812,7 +2812,7 @@ describe('AnthropicProvider prompt caching (promptCache)', () => {
     expect(JSON.stringify(body)).not.toContain('cache_control');
   });
 
-  it('explicit providerOptions still win over the computed system blocks', async () => {
+  it('steps aside when providerOptions replaces system: no Axl breakpoint remains', async () => {
     const body = await send(
       [
         { role: 'system', content: 'AGENT' },
@@ -2824,6 +2824,35 @@ describe('AnthropicProvider prompt caching (promptCache)', () => {
       },
     );
     expect(body.system).toBe('USER OVERRIDE');
+    expect(JSON.stringify(body)).not.toContain('cache_control');
+  });
+
+  it('steps aside when providerOptions sets a top-level cache_control (automatic mode)', async () => {
+    // Otherwise the request would carry two breakpoints: ours on system[0] and
+    // the caller's automatic one, which moves to the last block and re-enables
+    // whole-prompt caching the first-block strategy exists to avoid.
+    const body = await send(
+      [
+        { role: 'system', content: 'AGENT' },
+        { role: 'user', content: 'hi' },
+      ],
+      { promptCache: true, tools, providerOptions: { cache_control: { type: 'ephemeral' } } },
+    );
+    expect(body.cache_control).toEqual({ type: 'ephemeral' });
+    expect(typeof body.system).toBe('string'); // not re-rendered as blocks
+    expect(body.tools.every((t: any) => t.cache_control === undefined)).toBe(true);
+  });
+
+  it('steps aside when providerOptions replaces tools, even with no system prompt', async () => {
+    const body = await send([{ role: 'user', content: 'hi' }], {
+      promptCache: true,
+      tools,
+      providerOptions: {
+        tools: [{ name: 'x', description: 'X', input_schema: { type: 'object' } }],
+      },
+    });
+    expect(body.tools).toHaveLength(1);
+    expect(JSON.stringify(body)).not.toContain('cache_control');
   });
 });
 

@@ -1010,7 +1010,17 @@ export class AnthropicProvider implements Provider {
     // caches the prefix in the order tools -> system -> messages, so this one
     // breakpoint also covers the tool definitions. When off, the request is
     // byte-identical to the uncached shape.
-    const promptCache = options.promptCache === true;
+    // If the caller is already steering caching or replacing the prefix through
+    // providerOptions -- a top-level `cache_control` (automatic mode), or their
+    // own `system` / `tools` -- they own the breakpoints. Adding ours would
+    // either be discarded by the shallow merge or stack a second breakpoint
+    // beside theirs, so step aside rather than compete.
+    const callerOwnsPrefix =
+      options.providerOptions !== undefined &&
+      ('cache_control' in options.providerOptions ||
+        'system' in options.providerOptions ||
+        'tools' in options.providerOptions);
+    const promptCache = options.promptCache === true && !callerOwnsPrefix;
     if (promptCache && systemMessages.length > 0) {
       body.system = systemMessages.map((m, index) => ({
         type: 'text',

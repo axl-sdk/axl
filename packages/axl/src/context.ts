@@ -497,6 +497,24 @@ function describeValue(value: unknown): string {
   return `a value of type ${typeof value}`;
 }
 
+/**
+ * Index of the nearest `user` turn at or after `from`, or `undefined` when the
+ * remaining history has none.
+ *
+ * Providers require the first non-system message of a request to be a user
+ * turn, and `sessionHistory` does NOT alternate: `ctx.ask` only ever appends
+ * assistant messages (see `pushAssistantToSessionHistory`), so a workflow that
+ * asks several times in one session turn accumulates consecutive assistant
+ * messages and may hold no user turn at all. Any retained tail therefore has to
+ * be anchored on a real user turn rather than assumed to alternate.
+ */
+function nextUserTurn(history: ChatMessage[], from: number): number | undefined {
+  for (let i = Math.max(0, from); i < history.length; i++) {
+    if (history[i].role === 'user') return i;
+  }
+  return undefined;
+}
+
 function estimateMessagesTokens(messages: ChatMessage[]): { tokens: number; unmeasured: boolean } {
   let total = 0;
   let unmeasured = false;
@@ -3293,11 +3311,16 @@ export class WorkflowContext<TInput = unknown> {
         splitIdx = i;
       }
 
+      // Anchor the reused tail on a user turn, shrinking it forward so it stays
+      // inside `remaining`. With no user turn left to anchor on, decline: the
+      // fall-through regenerates a summary that covers the newer turns.
+      //
       // No clamp here on purpose. `splitIdx === history.length` means not even
       // the newest message fits beside this summary, and the correct response
-      // is to fall through and regenerate a summary that covers the turns
-      // added since — clamping instead would make this branch total and pin
-      // the first summary forever, silently hiding everything after it.
+      // is to fall through and regenerate — clamping instead would make this
+      // branch total and pin the first summary forever, silently hiding
+      // everything said after it.
+      splitIdx = nextUserTurn(history, splitIdx) ?? history.length;
       if (splitIdx < history.length) {
         return [summaryMsg, ...history.slice(splitIdx)];
       }
@@ -3327,11 +3350,19 @@ export class WorkflowContext<TInput = unknown> {
     // with safe placeholders) rather than forwarding a message we already
     // estimated cannot fit.
     if (splitIdx === history.length && history.length > 1) {
-      splitIdx = history.length - 1;
-      // Providers require the first non-system message to be a user turn, so a
-      // retained tail that starts on the assistant reply would be rejected.
-      // Pull in its preceding user turn to keep the pair intact.
-      if (history[splitIdx].role === 'assistant' && splitIdx > 0) splitIdx -= 1;
+      // Retain the most recent exchange rather than summarizing it all away,
+      // anchored on the newest user turn that still leaves something to
+      // summarize. Index 0 is excluded deliberately: anchoring there would
+      // leave nothing to summarize and return the whole history unchanged.
+      // With no such anchor the history is summarized in full as before, which
+      // is still a valid request — this ask's own input is appended separately
+      // as the user turn.
+      for (let i = history.length - 1; i > 0; i--) {
+        if (history[i].role === 'user') {
+          splitIdx = i;
+          break;
+        }
+      }
     }
 
     // If nothing to summarize (all messages are "recent", or only the newest

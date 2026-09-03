@@ -229,6 +229,51 @@ describe('Context Window Management', () => {
     expect(provider.calls.length).toBeGreaterThan(callsAfterFirst + 1);
   });
 
+  it('keeps the request user-first when history holds consecutive assistant turns', async () => {
+    // sessionHistory does not alternate: ctx.ask only ever appends assistant
+    // messages, so a workflow asking several times accumulates a run of them.
+    // A retained tail must still start on a user turn.
+    const history: ChatMessage[] = [
+      { role: 'user', content: `q: ${'x'.repeat(200)}` },
+      { role: 'assistant', content: `a1: ${'x'.repeat(200)}` },
+      { role: 'user', content: `q2: ${'x'.repeat(200)}` },
+      { role: 'assistant', content: `a2: ${'x'.repeat(200)}` },
+      { role: 'assistant', content: `a3: ${'x'.repeat(200)}` },
+      { role: 'assistant', content: `a4: ${'x'.repeat(200)}` },
+    ];
+    const provider = new TestProvider([{ content: 'Summary.' }, { content: 'Response.' }]);
+    const ctx = createTestContext(provider, { sessionHistory: history });
+    await ctx.ask(
+      agent({ model: 'test:test-model', system: 'You are a test agent', maxContext: 500 }),
+      'Next question',
+    );
+
+    const actualCall = provider.calls[provider.calls.length - 1].messages;
+    const firstNonSystem = actualCall.find((m: any) => m.role !== 'system');
+    expect(firstNonSystem.role).toBe('user');
+  });
+
+  it('summarizes in full when history has no user turn to anchor on', async () => {
+    // All-assistant history (several ctx.ask calls, no seeded user turn). There
+    // is no anchor, so everything is summarized — still valid, because the
+    // ask's own input is appended as the user turn.
+    const history: ChatMessage[] = [
+      { role: 'assistant', content: `a1: ${'x'.repeat(200)}` },
+      { role: 'assistant', content: `a2: ${'x'.repeat(200)}` },
+      { role: 'assistant', content: `a3: ${'x'.repeat(200)}` },
+    ];
+    const provider = new TestProvider([{ content: 'Summary.' }, { content: 'Response.' }]);
+    const ctx = createTestContext(provider, { sessionHistory: history });
+    await ctx.ask(
+      agent({ model: 'test:test-model', system: 'You are a test agent', maxContext: 500 }),
+      'Next question',
+    );
+
+    const actualCall = provider.calls[provider.calls.length - 1].messages;
+    const firstNonSystem = actualCall.find((m: any) => m.role !== 'system');
+    expect(firstNonSystem.role).toBe('user');
+  });
+
   it('caches summary across calls in the same session', async () => {
     const longHistory = generateHistory(100, 200);
 

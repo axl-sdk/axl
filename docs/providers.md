@@ -626,24 +626,23 @@ Gemini 3.7/3.8 Flash, which do not support `'minimal'`.
 
 #### Seeing a clamp at runtime
 
-Every clamp in the table above is reported, not silent. When the resolved
-provider cannot honor the requested `effort`, the runtime emits one
-`provider_diagnostic { kind: 'effort_clamped' }` event per ask — carrying
-`requested`, the provider-native `effective` level, and a `cause` — plus a
-deduped `console.warn`. Adapters expose this through the optional
-`Provider.effortResolution()` capability; the runtime owns the event and the
-warning, so a third-party adapter that omits the method simply reports nothing.
+Every clamp in the table above is reported: the runtime emits one
+`provider_diagnostic { kind: 'effort_clamped' }` event per ask with the requested and
+effective levels and a cause, plus a deduped `console.warn`. See
+[observability.md#provider-diagnostics](observability.md#provider-diagnostics).
 
-Currently reported: **Gemini 3.x** `'none'` (→ model minimum) and
-`'xhigh'`/`'max'` (→ `'high'`); **OpenAI Chat Completions** `'max'` (→ `'xhigh'`),
-pre-5.1 `'none'` (→ `'minimal'`), sub-5.2 `'xhigh'` (→ `'high'`), and
-`gpt-5-pro` (always `'high'`); **OpenAI Responses** the same minus the `'max'`
-cap; **Anthropic** any effort outside a model's supported `output_config.effort`
-levels, models that cannot disable thinking (`'none'` → adaptive `'low'`), and
-the legacy `budget_tokens` families, where `'xhigh'`/`'max'` fall to the
-`'high'` tier's budget.
-An explicit `thinkingBudget` documented to override `effort` is not a clamp.
-See [observability.md#provider-diagnostics](observability.md#provider-diagnostics).
+| Provider | Requested | Sent as |
+|---|---|---|
+| Gemini 3.x | `'none'` | model minimum thinking level |
+| Gemini 3.x | `'xhigh'`, `'max'` | `'high'` |
+| OpenAI Chat Completions | `'max'` | `'xhigh'` |
+| OpenAI Chat / Responses | `'none'` (pre-5.1), `'xhigh'` (sub-5.2), any level on `gpt-5-pro` | `'minimal'`, `'high'`, `'high'` |
+| Anthropic | a level the model's `output_config.effort` does not support | nearest supported level |
+| Anthropic | `'none'` on models that cannot disable thinking | adaptive `'low'` |
+| Anthropic legacy `budget_tokens` models | `'xhigh'`, `'max'` | the `'high'` tier's budget |
+
+An explicit `thinkingBudget` overrides `effort` by design and is not reported as a clamp.
+Third-party providers that omit `Provider.effortResolution()` report nothing.
 
 #### Provider-specific behavior
 

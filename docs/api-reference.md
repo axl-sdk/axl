@@ -1178,20 +1178,21 @@ const order = await ctx.ask(extractor, invoiceText, {
 });
 ```
 
-Semantics:
+Return values:
 
-- **A non-empty string** replaces `defaultMessage` verbatim as the user turn the model receives, and becomes `pipeline(failed).reason`. Decorate rather than replace by composing with `info.defaultMessage`.
-- **`undefined` or `''`** keeps the default text. A hook that returns nothing at all — used purely for logging or inspection — is the same case, which is why the return type admits `void`.
-- **`{ retry: false }`** stops retrying: the gate immediately throws the same typed error it would throw on exhaustion, with the same payload (`GuardrailError`, `VerifyError` with the raw output and Zod error, or `ValidationError` with the last parsed value). No further provider call is made.
-- **A thrown exception propagates** out of `ctx.ask()` unchanged, and no further provider call is made. Unlike `validate`, whose exceptions become validation failures, a broken feedback hook is caller-code breakage, not a model failure, and is never retried into silence.
-- The hook is **never called on the exhausting attempt** — when no retry is left, the gate throws without consulting it.
-- The legacy gate events (`guardrail`, `schema_check`, `validate`) are emitted **before** the hook runs and always carry `defaultMessage` in `feedbackMessage`, so a hook that throws or aborts can never erase the record that the gate rejected. Only `pipeline(failed).reason` and the appended user turn carry the final text.
-- **Any other return value throws a `TypeError`** naming the shape received. TypeScript rules these out, but a JavaScript caller returning `{ message: '…' }` or `{ retry: true }` would otherwise get the default text with no signal at all.
-- The second argument is the **workflow** `ctx.metadata`, exactly what `OutputValidator` receives. Per-call `AskOptions.metadata` is **not** merged in — it is merged only for dynamic `model` / `system` selectors — so scope multi-tenant feedback on the context metadata, not on per-call metadata.
+- **Non-empty string** — sent to the model verbatim as the corrective user turn, and recorded as `pipeline(failed).reason`. Compose with `info.defaultMessage` to add to the default instead of replacing it.
+- **`undefined`, `''`, or no return value** — Axl's default text is used. A hook used only for logging needs no return.
+- **`{ retry: false }`** — stop retrying now. The gate throws the same typed error it throws on exhaustion, with the same payload (`GuardrailError`, `VerifyError`, `ValidationError`), and no further provider call is made.
+- **Thrown error** — propagates out of `ctx.ask()` unchanged; no further provider call is made. Unlike `validate`, hook exceptions are not turned into validation failures.
+- Any other value throws a `TypeError`.
 
-**Supported on:** `ctx.ask()` and `ctx.delegate()`. On delegate and handoffs, `retryFeedback` is forwarded to the final agent call, exactly like [`validate`](#validate) — including a plain `ctx.ask()` on an agent with `handoffs`, where the hook travels to the handoff target's ask.
+Notes:
 
-The hook is ask-scoped: it is not available on `AgentConfig`, and it does not apply to `ctx.verify()` (whose retry feedback goes to caller code, not to the model) or `ctx.race()` (which discards failures rather than retrying).
+- The hook runs only while a retry remains. On the exhausting attempt the gate throws without consulting it.
+- The gate events (`guardrail`, `schema_check`, `validate`) always carry the default text in `feedbackMessage`. The text actually sent is `pipeline(failed).reason`.
+- `ctx.metadata` is the workflow metadata, the same object `validate` receives. Per-call `AskOptions.metadata` is not merged in.
+
+**Supported on:** `ctx.ask()` and `ctx.delegate()`. Like [`validate`](#validate), it is forwarded to the final agent call on delegate and on handoffs. Not available on `AgentConfig`; not applicable to `ctx.verify()` (its feedback goes to your code, not the model) or `ctx.race()` (which discards failures).
 
 ---
 

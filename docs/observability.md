@@ -509,7 +509,7 @@ Three common symptoms and what to look for in traces:
 
 **"My structured output keeps failing."** Filter for `schema_check` events with `valid: false`. The `reason` field has the Zod parse error; the `feedbackMessage` is Axl's default corrective text. If the feedback isn't clear enough to help the model correct itself, that's a prompt/schema design problem, not a retry-count problem.
 
-> **Reading the message the model actually saw.** The gate events always carry Axl's default text. When the ask supplies a [`retryFeedback`](api-reference.md#custom-retry-feedback) hook, the hook's text — not `feedbackMessage` — is what was sent, and it appears on the matching `pipeline` event with `status: 'failed'` as `reason`. Read `pipeline(failed).reason` whenever a hook may be in play, or you will tune text the model never received.
+> **With a `retryFeedback` hook,** the gate events still show Axl's default text; the text the model received is `pipeline(failed).reason`. See [Custom retry feedback](api-reference.md#custom-retry-feedback).
 
 **"Why did my agent respond that way?"** Enable `trace.level: 'full'` and check the `data.messages` array on the relevant `agent_call_start` — it has the exact request conversation (system prompt, history, tool results, retry feedback) immediately before the provider call. Request-side `system` and `params`, plus response-side `thinking`, are visible in default mode without needing verbose; `retryReason` is mirrored on both start and end.
 
@@ -591,19 +591,14 @@ config change. The structured events always fire regardless.
 
 ### Provider diagnostics
 
-The unified [`effort`](providers.md) knob is portable, but not every model
-accepts every level: Gemini 3.x cannot disable thinking at all, OpenAI Chat
-Completions caps `'max'` at `'xhigh'`, and some Anthropic models always think.
-The adapters have always clamped to what the model accepts — silently, so run
-provenance recorded `effort: 'none'` for a request that actually thought.
+Not every model accepts every [`effort`](providers.md#effort) level. When the resolved
+provider has to send a different level than you asked for, the runtime emits one
+`provider_diagnostic` event per ask, before that ask's first `agent_call_start`, plus a
+deduped `console.warn`:
 
-`provider_diagnostic` makes the clamp first-class. It is `AskScoped`, carries a
-`kind`-discriminated `data`, and fires **once per ask** (not once per provider
-call in a tool loop), **before** the ask's first `agent_call_start`:
-
-| `data.kind` | Fires when | `console.warn`? |
+| `data.kind` | Fires when | Fields |
 |---|---|---|
-| `effort_clamped` | The resolved provider could not honor the requested `effort` and sent a different native level (`data.requested`, `data.effective`, `data.cause`, `data.model`, `data.provider?`) | Yes |
+| `effort_clamped` | The provider sent a different native level than the requested `effort` | `requested`, `effective` (provider-native string), `cause`, `model`, `provider?` |
 
 ```ts
 for await (const event of stream.lifecycle) {
@@ -614,28 +609,14 @@ for await (const event of stream.lifecycle) {
 }
 ```
 
-Notes:
-- **Silence means honored.** No event ⇒ the effort was sent as asked (or the
-  adapter does not implement the optional `Provider.effortResolution` capability,
-  which third-party providers may omit).
-- `data.effective` is a provider-**native** level string (`'minimal'`,
-  `'xhigh'`, `'low'`, …), not an `Effort`, because not every native level maps
-  back onto the unified union.
-- `agent_call_start` keeps reporting the **requested** effort — it describes what
-  the runtime asked for. Join the two by `askId` for full provenance.
-- The `console.warn` follows the same rules as the schema diagnostics above:
-  deduped per distinct clamp for the life of the process, silenced by
-  `AxlConfig.diagnostics.silent` or `AXL_DIAGNOSTICS_SILENT=true` — neither of
-  which suppresses the event.
-- Redaction passes the event through unchanged: it carries provider capability
-  metadata only, never prompt or response content.
-- **A broken adapter fails the ask.** `Provider.effortResolution()` is optional,
-  but a provider that implements it and then throws — or reports `clamped: true`
-  without a non-empty `requested`/`effective` pair — surfaces that error from
-  `ctx.ask()` (a `TypeError` naming the provider for the malformed case) rather
-  than being swallowed: a capability method that misreports what was sent is a
-  provider bug, and silently ignoring it would re-bury the very clamp this
-  event exists to expose.
+- No event means the effort was sent as requested (or the provider does not implement the
+  optional `Provider.effortResolution()` capability).
+- `agent_call_start` keeps reporting the *requested* effort; join the two by `askId`.
+- The warning is deduped per distinct clamp and silenced by `AxlConfig.diagnostics.silent`
+  or `AXL_DIAGNOSTICS_SILENT=true`. The event is never silenced.
+- Redaction passes the event through unchanged; it carries no prompt or response content.
+- A provider whose `effortResolution()` throws or reports a malformed clamp fails the ask
+  with that error.
 
 ### PII and redaction
 

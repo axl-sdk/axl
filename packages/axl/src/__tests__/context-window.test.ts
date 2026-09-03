@@ -343,7 +343,10 @@ describe('Context Window Management', () => {
       .filter((i: number) => i >= 0);
     expect(systemIdx.length).toBeGreaterThanOrEqual(2);
     expect(sent[systemIdx[0]].content).toBe('AGENT PROMPT');
+    expect(sent[systemIdx[0]].origin).toBeUndefined();
     expect(String(sent[systemIdx[1]].content)).toContain('Summary of earlier conversation');
+    // The runtime marks what it synthesizes so adapters never anchor on it.
+    expect(sent[systemIdx[1]].origin).toBe('runtime');
   });
 
   it('caches summary across calls in the same session', async () => {

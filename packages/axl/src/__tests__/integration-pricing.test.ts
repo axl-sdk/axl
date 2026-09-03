@@ -388,13 +388,11 @@ describe.skipIf(!hasAnthropic)('Pricing Integration: Anthropic', () => {
   }, 30_000);
 
   it('chat() with promptCache writes the prefix on the first call and reads it on the second', async () => {
-    // Anthropic caches only when asked, so this opts in. The first call's cache
-    // WRITE is deterministic once the prefix clears the model's minimum
-    // (1,024 on Sonnet 4.6) -- that is the assertion that proves the feature is
-    // wired. Reads on the second call depend on the cache still being warm, so
-    // they are asserted when present and must then lower the cost.
-    // A per-run salt makes the prefix unique, so the first call is always a
-    // cold WRITE and the second -- inside the 5-minute TTL -- always a READ.
+    // Anthropic caches only when asked, so this opts in. A per-run salt makes
+    // the prefix unique, so once it clears the model's minimum (1,024 on Sonnet
+    // 4.6) the first call is always a cold WRITE -- the assertion that proves
+    // the feature is wired -- and the second, inside the 5-minute TTL, is
+    // always a READ at lower cost.
     const longMessages: ChatMessage[] = [
       { role: 'system', content: `${saltedRun()}\n${CACHE_ELIGIBLE_SYSTEM}` },
       { role: 'user', content: 'Say hi.' },

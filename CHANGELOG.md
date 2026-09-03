@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or show no cache activity at all (a prefix below the model's minimum, which
   Anthropic silently ignores). If `providerOptions` supplies a top-level
   `cache_control`, `system`, or `tools`, Axl adds no breakpoint of its own — the
-  caller owns the prefix. See
+  caller owns the prefix. `ChatMessage` gains an optional `origin?: 'runtime'`
+  provenance field, set by the runtime on the summary and handoff-header system
+  messages it synthesizes and never sent on the wire, so adapters can tell them
+  from the caller's own prompt. See
   [providers.md#prompt-caching](docs/providers.md#prompt-caching).
 - **Claude Fable 5.1 (`claude-fable-5-1`) capabilities and pricing.** Adaptive
   always-on thinking with all five effort levels (thinking cannot be disabled;

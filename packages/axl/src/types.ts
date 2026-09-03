@@ -1440,6 +1440,13 @@ export type ChatMessage = {
    *  (the option name and shape are not yet stable); today it is purely
    *  informational. */
   agent?: string;
+  /** Provenance of a message the Axl runtime synthesized rather than the caller
+   *  authored: the rolling conversation summary and the handoff header. Like
+   *  `agent`, never sent on the wire. Adapters use it to avoid treating
+   *  runtime-injected text as the caller's stable prompt -- the Anthropic
+   *  adapter will not place its prompt-cache breakpoint on a system message
+   *  with `origin: 'runtime'`. */
+  origin?: 'runtime';
 };
 
 export type ToolCallMessage = {

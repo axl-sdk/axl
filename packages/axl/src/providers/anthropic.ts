@@ -1015,21 +1015,20 @@ export class AnthropicProvider implements Provider {
     // own `system` / `tools` -- they own the breakpoints. Adding ours would
     // either be discarded by the shallow merge or stack a second breakpoint
     // beside theirs, so step aside rather than compete.
+    const po = options.providerOptions;
     const callerOwnsPrefix =
-      options.providerOptions !== undefined &&
-      ('cache_control' in options.providerOptions ||
-        'system' in options.providerOptions ||
-        'tools' in options.providerOptions);
+      po !== undefined &&
+      (po.cache_control !== undefined || po.system !== undefined || po.tools !== undefined);
     const promptCache = options.promptCache === true && !callerOwnsPrefix;
-    // The agent's own system prompt, when it has one, is always the FIRST
-    // message the runtime builds; injected system messages (rolling summary,
-    // handoff header) are appended later. So a system block is a valid anchor
-    // only when messages[0] is a system message. An agent without a system
-    // prompt can still have injected system text -- small, and different every
-    // summarizing turn -- which must not become the breakpoint: it would sit
-    // below the model's cacheable minimum and stop caching entirely. In that
-    // case the stable prefix is the tool set (see below).
-    const anchorOnSystem = promptCache && messages[0]?.role === 'system';
+    // Anchor on the first system block only if the CALLER authored it. The
+    // runtime marks the system messages it synthesizes -- the rolling summary
+    // and the handoff header -- with `origin: 'runtime'`; when the agent has no
+    // system prompt of its own, one of those can be the first (even the only)
+    // system message. They are small and change every summarizing turn, so a
+    // breakpoint on them sits below the model's cacheable minimum and silently
+    // stops caching. In that case the stable prefix is the tool set (below).
+    const anchorOnSystem =
+      promptCache && systemMessages.length > 0 && systemMessages[0].origin !== 'runtime';
     if (anchorOnSystem) {
       body.system = systemMessages.map((m, index) => ({
         type: 'text',

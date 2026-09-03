@@ -2805,18 +2805,63 @@ describe('AnthropicProvider prompt caching (promptCache)', () => {
     expect(body.tools[1].cache_control).toEqual({ type: 'ephemeral' });
   });
 
-  it('on, no agent prompt, but an injected summary: anchors on the last tool, not the summary', async () => {
-    // The runtime appends the rolling summary as a system message even when
-    // the agent has no system prompt of its own. It is small and changes every
-    // summarizing turn, so anchoring on it would fall below the cacheable
-    // minimum and silently stop caching. The agent prompt is always
-    // messages[0] when present; here it is not, so the tool set is the prefix.
+  it('on: a runtime-synthesized summary that is the FIRST system message is never the anchor', async () => {
+    // With no agent system prompt, summarizeHistory returns the summary as the
+    // first element, so it is both messages[0] and systemMessages[0]. Position
+    // cannot tell it apart from an agent prompt; provenance can.
+    const body = await send(
+      [
+        { role: 'system', origin: 'runtime', content: 'Summary of earlier conversation:\nS' },
+        { role: 'user', content: 'hi' },
+      ] as any,
+      { promptCache: true, tools },
+    );
+    expect(typeof body.system).toBe('string');
+    expect(body.tools[1].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('on: a runtime handoff header as the only system message is never the anchor', async () => {
+    const body = await send(
+      [
+        {
+          role: 'system',
+          origin: 'runtime',
+          content:
+            'The following is the conversation history from the previous agent that handed off to you:',
+        },
+        { role: 'user', content: 'hi' },
+      ] as any,
+      { promptCache: true, tools },
+    );
+    expect(typeof body.system).toBe('string');
+    expect(body.tools[1].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('on: an agent prompt followed by a runtime summary anchors on the agent prompt only', async () => {
+    const body = await send(
+      [
+        { role: 'system', content: 'AGENT' },
+        { role: 'system', origin: 'runtime', content: 'Summary of earlier conversation:\nS' },
+        { role: 'user', content: 'hi' },
+      ] as any,
+      { promptCache: true },
+    );
+    expect(body.system).toEqual([
+      { type: 'text', text: 'AGENT', cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: 'Summary of earlier conversation:\nS' },
+    ]);
+  });
+
+  it('on, no agent prompt, runtime summary after history: anchors on the last tool', async () => {
+    // Same provenance rule at a different position: the synthesized summary is
+    // not the first message here, but it is still the first SYSTEM message and
+    // still carries origin: 'runtime', so the tool set remains the prefix.
     const body = await send(
       [
         { role: 'user', content: 'earlier' },
-        { role: 'system', content: 'Summary of earlier conversation:\nS' },
+        { role: 'system', origin: 'runtime', content: 'Summary of earlier conversation:\nS' },
         { role: 'user', content: 'hi' },
-      ],
+      ] as any,
       { promptCache: true, tools },
     );
     expect(typeof body.system).toBe('string'); // injected text stays uncached, unchanged shape

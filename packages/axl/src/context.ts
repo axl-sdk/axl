@@ -1897,6 +1897,7 @@ export class WorkflowContext<TInput = unknown> {
       if (handoffContext.length > 0) {
         messages.push({
           role: 'system',
+          origin: 'runtime',
           content:
             'The following is the conversation history from the previous agent that handed off to you:',
         });
@@ -3351,6 +3352,7 @@ export class WorkflowContext<TInput = unknown> {
     if (this.summaryCache) {
       const summaryMsg: ChatMessage = {
         role: 'system',
+        origin: 'runtime',
         content: `Summary of earlier conversation:\n${this.summaryCache}`,
       };
       const summaryTokens = estimateTokens(summarizeModelInput(summaryMsg.content)) + 4;
@@ -3474,6 +3476,7 @@ export class WorkflowContext<TInput = unknown> {
 
     const summaryMsg: ChatMessage = {
       role: 'system',
+      origin: 'runtime',
       content: `Summary of earlier conversation:\n${summaryResponse.content}`,
     };
 

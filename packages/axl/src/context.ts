@@ -3339,30 +3339,37 @@ export class WorkflowContext<TInput = unknown> {
       splitIdx = i;
     }
 
-    // Nothing fit the recent budget. That happens when the fixed overhead
-    // (system prompt, tool defs, reserve) already meets or exceeds maxContext,
-    // leaving `availableTokens` non-positive. Summarizing *everything* would
-    // hand the model a summary with no current turn, so keep the newest
-    // message regardless of budget — it is what the next reply depends on.
-    // Restricted to histories with something to lose: with a single message
-    // there is no earlier context a summary could stand in for, so that case
-    // keeps its existing behavior (summarize it, which also replaces media
-    // with safe placeholders) rather than forwarding a message we already
-    // estimated cannot fit.
-    if (splitIdx === history.length && history.length > 1) {
-      // Retain the most recent exchange rather than summarizing it all away,
-      // anchored on the newest user turn that still leaves something to
-      // summarize. Index 0 is excluded deliberately: anchoring there would
-      // leave nothing to summarize and return the whole history unchanged.
-      // With no such anchor the history is summarized in full as before, which
-      // is still a valid request — this ask's own input is appended separately
-      // as the user turn.
+    // Anchor the retained tail on a user turn. Providers require the first
+    // non-system message to be a user turn, and `sessionHistory` does not
+    // alternate, so the index the budget loop stopped at is frequently an
+    // assistant message. Three cases, all of which must end user-first:
+    const anchored = nextUserTurn(history, splitIdx);
+    if (anchored !== undefined) {
+      // Part of the history fits and that window contains a user turn. Shrink
+      // forward to it, which keeps the tail inside the budget just computed.
+      splitIdx = anchored;
+    } else if (splitIdx === history.length && history.length > 1) {
+      // Nothing fit at all — the fixed overhead (system prompt, tool defs,
+      // reserve) meets or exceeds maxContext. Summarizing everything away
+      // would leave no verbatim recent context, so retain the most recent
+      // exchange anyway, anchored on the newest user turn that still leaves
+      // something to summarize. This is the one case that may exceed the
+      // budget, deliberately. Index 0 is excluded: anchoring there would leave
+      // nothing to summarize and return the history unchanged, forwarding
+      // content already judged not to fit and skipping the media-placeholder
+      // pass.
       for (let i = history.length - 1; i > 0; i--) {
         if (history[i].role === 'user') {
           splitIdx = i;
           break;
         }
       }
+    } else {
+      // A window fits but holds no user turn (an all-assistant tail, normal
+      // after several asks). Summarize the whole history: valid and within
+      // budget, since this ask's own input is appended separately as the user
+      // turn.
+      splitIdx = history.length;
     }
 
     // If nothing to summarize (all messages are "recent", or only the newest

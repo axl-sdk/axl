@@ -299,6 +299,30 @@ describe('Context Window Management', () => {
     ).toBe(true);
   });
 
+  it('anchors an ordinary partial-fit split on a user turn', async () => {
+    // No misconfiguration needed: the 60%-of-budget loop routinely stops on an
+    // assistant turn. Four 4000-char messages at ~1004 tokens each with
+    // maxContext 4020 leaves ~2000 for history and a 1200 recent target, so
+    // only the final assistant message fits -- an assistant-first tail unless
+    // the split is anchored.
+    const history: ChatMessage[] = [
+      { role: 'user', content: `u1: ${'x'.repeat(4000)}` },
+      { role: 'assistant', content: `a1: ${'x'.repeat(4000)}` },
+      { role: 'user', content: `u2: ${'x'.repeat(4000)}` },
+      { role: 'assistant', content: `a2: ${'x'.repeat(4000)}` },
+    ];
+    const provider = new TestProvider([{ content: 'Summary.' }, { content: 'Response.' }]);
+    const ctx = createTestContext(provider, { sessionHistory: history });
+    await ctx.ask(
+      agent({ model: 'test:test-model', system: 'You are a test agent', maxContext: 4020 }),
+      'Next question',
+    );
+
+    const actualCall = provider.calls[provider.calls.length - 1].messages;
+    const firstNonSystem = actualCall.find((m: any) => m.role !== 'system');
+    expect(firstNonSystem.role).toBe('user');
+  });
+
   it('caches summary across calls in the same session', async () => {
     const longHistory = generateHistory(100, 200);
 

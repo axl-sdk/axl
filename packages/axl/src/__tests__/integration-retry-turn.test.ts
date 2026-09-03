@@ -22,13 +22,13 @@ const MATRIX: Array<{ key: string; uri: string }> = [
 
 const ValueSchema = z.object({ value: z.number().int() });
 
-function ctxLive() {
+function ctxLive(config: ConstructorParameters<typeof WorkflowContext>[0]['config'] = {}) {
   const events: AxlEvent[] = [];
   const registry = new ProviderRegistry();
   const ctx = new WorkflowContext({
     input: 'x',
     executionId: `int-${randomUUID()}`,
-    config: {},
+    config,
     providerRegistry: registry,
     onTrace: (e) => events.push(e),
   });
@@ -80,3 +80,81 @@ for (const m of MATRIX) {
     }, 120_000);
   });
 }
+
+function pipelineStages(events: AxlEvent[]): string[] {
+  return events
+    .filter((e) => e.type === 'pipeline')
+    .map((e) => `${(e as { stage: string }).stage}:${e.status}`);
+}
+
+describe.skipIf(!process.env.OPENAI_API_KEY)(
+  'retry turn live: accumulated pairs on the Responses API',
+  () => {
+    it('replays three encrypted-reasoning attempts in one store:false input and still commits', async () => {
+      const { ctx, events } = ctxLive();
+      const a = agent({
+        name: 'v',
+        model: 'openai-responses:gpt-5-nano',
+        system: 'Reply with a single JSON object and nothing else.',
+      });
+      const seen: number[] = [];
+      await ctx.ask(a, 'Return {"value": 1}.', {
+        maxTokens: 1024,
+        schema: ValueSchema,
+        validateRetries: 3,
+        validate: (o) => {
+          seen.push(o.value);
+          return seen.length <= 3
+            ? {
+                valid: false,
+                reason: `${o.value} is rejected; choose an integer you have not used.`,
+              }
+            : { valid: true };
+        },
+      });
+      expect(seen).toHaveLength(4);
+      expect(pipelineStages(events).filter((s) => s === 'validate:failed')).toHaveLength(3);
+      expect(pipelineStages(events).at(-1)).toBe('validate:committed');
+    }, 180_000);
+  },
+);
+
+describe.skipIf(!process.env.ANTHROPIC_API_KEY)(
+  'retry turn live: Anthropic thinking replay',
+  () => {
+    it('replays signed thinking blocks on the non-terminal attempt and answers afresh', async () => {
+      const { ctx, events } = ctxLive({ trace: { level: 'full' } });
+      const a = agent({
+        name: 'v',
+        model: 'anthropic:claude-haiku-4-5',
+        system: 'Reply with a single JSON object and nothing else.',
+      });
+      const seen: number[] = [];
+      const r = await ctx.ask(a, 'Return {"value": 7}.', {
+        thinkingBudget: 2048,
+        maxTokens: 4096,
+        schema: ValueSchema,
+        validate: (o) => {
+          seen.push(o.value);
+          return o.value === 7
+            ? { valid: false, reason: '7 is reserved. Choose a different integer.' }
+            : { valid: true };
+        },
+      });
+      expect(seen[0]).toBe(7);
+      expect(r.value).not.toBe(7);
+      const secondCall = events.filter((e) => e.type === 'agent_call_start')[1] as
+        | {
+            data?: {
+              messages?: Array<{ role: string; providerMetadata?: Record<string, unknown> }>;
+            };
+          }
+        | undefined;
+      const replayed = secondCall?.data?.messages;
+      const attempt = replayed?.at(-2);
+      expect(attempt?.role).toBe('assistant');
+      expect(attempt?.providerMetadata).toHaveProperty('anthropicThinkingBlocks');
+      expect(replayed?.at(-1)?.role).toBe('user');
+    }, 120_000);
+  },
+);

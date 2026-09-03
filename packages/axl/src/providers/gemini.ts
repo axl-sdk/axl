@@ -191,7 +191,12 @@ function parseGeminiFunctionResponse(content: string): Record<string, unknown> {
 
 // ---------------------------------------------------------------------------
 // Per-token Standard-tier pricing (USD) for supported current Gemini models.
-// Reviewed 2026-08-03 against https://ai.google.dev/gemini-api/docs/pricing.
+// Reviewed 2026-09-03 against https://ai.google.dev/gemini-api/docs/pricing.
+// Promotional rates are recorded at their current value, never as a
+// forward-dated transition -- an announced revert can be cancelled, and a
+// clock-gated table then silently misprices from the date it predicted.
+// The 3.6/3.7/3.8 Flash promotion is announced through 2026-12-31 ($1.50 /
+// $0.15 / $7.50 after); re-verify then rather than encoding the change here.
 // Model ids deliberately match exactly: a date/version suffix can change the
 // billing contract, so an unknown sibling must remain unpriced.
 // ---------------------------------------------------------------------------
@@ -212,7 +217,6 @@ const GEMINI_PRICING: Record<string, GeminiRate> = {
   },
   'gemini-2.5-flash': { input: 0.3e-6, cached: 0.03e-6, output: 2.5e-6 },
   'gemini-2.5-flash-lite': { input: 0.1e-6, cached: 0.01e-6, output: 0.4e-6 },
-  'gemini-3-flash-preview': { input: 0.5e-6, cached: 0.05e-6, output: 3e-6 },
   'gemini-3.1-pro-preview': {
     input: 2e-6,
     cached: 0.2e-6,
@@ -228,7 +232,9 @@ const GEMINI_PRICING: Record<string, GeminiRate> = {
   'gemini-3.1-flash-lite': { input: 0.25e-6, cached: 0.025e-6, output: 1.5e-6 },
   'gemini-3.5-flash': { input: 1.5e-6, cached: 0.15e-6, output: 9e-6 },
   'gemini-3.5-flash-lite': { input: 0.3e-6, cached: 0.03e-6, output: 2.5e-6 },
-  'gemini-3.6-flash': { input: 1.5e-6, cached: 0.15e-6, output: 7.5e-6 },
+  'gemini-3.6-flash': { input: 0.75e-6, cached: 0.075e-6, output: 3.75e-6 },
+  'gemini-3.7-flash': { input: 0.75e-6, cached: 0.075e-6, output: 3.75e-6 },
+  'gemini-3.8-flash': { input: 0.75e-6, cached: 0.075e-6, output: 3.75e-6 },
 };
 
 type GeminiPriceUsage = {

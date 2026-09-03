@@ -1311,6 +1311,7 @@ describe('AnthropicProvider', () => {
     it('resolves every Claude 5 portable-thinking control to a valid request body', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const models = [
+        ['claude-fable-5-1', false],
         ['claude-fable-5', false],
         ['claude-opus-5', true],
         ['claude-sonnet-5', true],
@@ -1705,7 +1706,7 @@ describe('AnthropicProvider', () => {
       }
     });
 
-    it('prices Claude 5 exact models, TTL cache buckets, and Sonnet 5 date boundaries', () => {
+    it('prices Claude 5 exact models and TTL cache buckets', () => {
       expect(
         estimateAnthropicCost('claude-fable-5', { inputTokens: 100, outputTokens: 50 }),
       ).toBeCloseTo(0.0035, 10);
@@ -1734,20 +1735,31 @@ describe('AnthropicProvider', () => {
       expect(
         estimateAnthropicCost('claude-opus-4', { inputTokens: 1, outputTokens: 1 }),
       ).toBeUndefined();
+      // Sonnet 5 is $2/$10: the announced 2026-09-01 increase to $3/$15 was
+      // cancelled, so the rate is flat and must not vary with the clock.
       expect(
-        estimateAnthropicCost(
-          'claude-sonnet-5',
-          { inputTokens: 100, outputTokens: 50 },
-          new Date('2026-08-31T23:59:59Z'),
-        ),
+        estimateAnthropicCost('claude-sonnet-5', { inputTokens: 100, outputTokens: 50 }),
       ).toBeCloseTo(0.0007, 10);
-      expect(
-        estimateAnthropicCost(
-          'claude-sonnet-5',
-          { inputTokens: 100, outputTokens: 50 },
-          new Date('2026-09-01T00:00:00Z'),
-        ),
-      ).toBeCloseTo(0.00105, 10);
+      // Fable 5.1 and Mythos 5.1 read cache at 0.025x base input, not 0.1x.
+      for (const model of ['claude-fable-5-1', 'claude-mythos-5-1']) {
+        expect(
+          estimateAnthropicCost(model, {
+            inputTokens: 100,
+            outputTokens: 50,
+            cacheReadTokens: 1000,
+          }),
+        ).toBeCloseTo(100 * 10e-6 + 1000 * 10e-6 * 0.025 + 50 * 50e-6, 10);
+      }
+      // Fable 5 and Mythos 5 keep the standard 0.1x cache-read multiplier.
+      for (const model of ['claude-fable-5', 'claude-mythos-5']) {
+        expect(
+          estimateAnthropicCost(model, {
+            inputTokens: 100,
+            outputTokens: 50,
+            cacheReadTokens: 1000,
+          }),
+        ).toBeCloseTo(100 * 10e-6 + 1000 * 10e-6 * 0.1 + 50 * 50e-6, 10);
+      }
       expect(
         estimateAnthropicCost('claude-opus-5', {
           inputTokens: 100,
@@ -2802,6 +2814,24 @@ describe('AnthropicProvider.effortResolution', () => {
     expect(
       provider.effortResolution({ model: 'claude-fable-5', effort: 'none', thinkingBudget: 2000 }),
     ).toBeUndefined();
+  });
+
+  it('reports that a priced-but-uncharacterized model dropped the requested effort', () => {
+    const provider = new AnthropicProvider();
+    // Mythos is priced (so Axl claims support) but has no capability entry, so
+    // no reasoning control reaches the wire. That must be visible, not silent.
+    for (const model of ['claude-mythos-5-1', 'claude-mythos-5']) {
+      const resolution = provider.effortResolution({ model, effort: 'max' });
+      expect(resolution).toMatchObject({
+        requested: 'max',
+        effective: 'unset',
+        clamped: true,
+      });
+      expect(resolution!.cause).toContain('no capability entry');
+    }
+
+    // An unpriced pass-through ID stays silent: Axl claims nothing about it.
+    expect(provider.effortResolution({ model: 'claude-unknown-9', effort: 'max' })).toBeUndefined();
   });
 
   it('resolves against the providerOptions model override', () => {

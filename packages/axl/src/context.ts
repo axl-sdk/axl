@@ -497,6 +497,27 @@ function describeValue(value: unknown): string {
   return `a value of type ${typeof value}`;
 }
 
+/**
+ * Index of the nearest `user` turn at or after `from`, or `undefined` when the
+ * remaining history has none.
+ *
+ * A request should open on a user turn -- that is the shape every provider
+ * documents, and it keeps a retained tail portable rather than dependent on
+ * one provider's leniency (Anthropic, OpenAI and Gemini all accepted an
+ * assistant-first request when probed on 2026-09-03; see docs/verification).
+ * `sessionHistory` does NOT alternate: `ctx.ask` only ever appends
+ * assistant messages (see `pushAssistantToSessionHistory`), so a workflow that
+ * asks several times in one session turn accumulates consecutive assistant
+ * messages and may hold no user turn at all. Any retained tail therefore has to
+ * be anchored on a real user turn rather than assumed to alternate.
+ */
+function nextUserTurn(history: ChatMessage[], from: number): number | undefined {
+  for (let i = Math.max(0, from); i < history.length; i++) {
+    if (history[i].role === 'user') return i;
+  }
+  return undefined;
+}
+
 function estimateMessagesTokens(messages: ChatMessage[]): { tokens: number; unmeasured: boolean } {
   let total = 0;
   let unmeasured = false;
@@ -1745,6 +1766,27 @@ export class WorkflowContext<TInput = unknown> {
       const toolTokens = toolDefs.length > 0 ? estimateTokens(JSON.stringify(toolDefs)) : 0;
       const overhead = systemTokens + toolTokens + reserveTokens;
       const availableForHistory = maxContext - overhead;
+
+      // The fixed overhead alone meets or exceeds maxContext, so no history
+      // can ever fit and every ask will summarize. That is a misconfiguration
+      // (usually maxContext below contextManagement.reserveTokens, or an
+      // oversized system prompt / tool set), not a condition to absorb
+      // silently: summarization still runs, but the operator is told why
+      // history is being condensed on every ask.
+      if (availableForHistory <= 0) {
+        this.emitEvent({
+          type: 'log',
+          data: {
+            warning:
+              `Agent '${agent._name}' maxContext (${maxContext}) is at or below its fixed ` +
+              `overhead (${overhead} = system ${systemTokens} + tools ${toolTokens} + reserve ` +
+              `${reserveTokens}); no session history can fit, so every ask summarizes, ` +
+              `retaining at most the most recent exchange and sometimes none of it verbatim. ` +
+              `The current input is always sent. Raise maxContext or lower ` +
+              `contextManagement.reserveTokens.`,
+          },
+        });
+      }
 
       const historyEstimate = estimateMessagesTokens(sessionHistory);
       if (historyEstimate.unmeasured) {
@@ -3272,6 +3314,16 @@ export class WorkflowContext<TInput = unknown> {
         splitIdx = i;
       }
 
+      // Anchor the reused tail on a user turn, shrinking it forward so it stays
+      // inside `remaining`. With no user turn left to anchor on, decline: the
+      // fall-through regenerates a summary that covers the newer turns.
+      //
+      // No clamp here on purpose. `splitIdx === history.length` means not even
+      // the newest message fits beside this summary, and the correct response
+      // is to fall through and regenerate — clamping instead would make this
+      // branch total and pin the first summary forever, silently hiding
+      // everything said after it.
+      splitIdx = nextUserTurn(history, splitIdx) ?? history.length;
       if (splitIdx < history.length) {
         return [summaryMsg, ...history.slice(splitIdx)];
       }
@@ -3290,7 +3342,42 @@ export class WorkflowContext<TInput = unknown> {
       splitIdx = i;
     }
 
-    // If nothing to summarize (all messages are "recent"), just return all
+    // Anchor the retained tail on a user turn so the request opens the way
+    // every provider documents (see nextUserTurn). `sessionHistory` does not
+    // alternate, so the index the budget loop stopped at is frequently an
+    // assistant message. Three cases, all of which must end user-first:
+    const anchored = nextUserTurn(history, splitIdx);
+    if (anchored !== undefined) {
+      // Part of the history fits and that window contains a user turn. Shrink
+      // forward to it, which keeps the tail inside the budget just computed.
+      splitIdx = anchored;
+    } else if (splitIdx === history.length && history.length > 1) {
+      // Nothing fit at all — the fixed overhead (system prompt, tool defs,
+      // reserve) meets or exceeds maxContext. Summarizing everything away
+      // would leave no verbatim recent context, so retain the most recent
+      // exchange anyway, anchored on the newest user turn that still leaves
+      // something to summarize. This is the one case that may exceed the
+      // budget, deliberately. Index 0 is excluded: anchoring there would leave
+      // nothing to summarize and return the history unchanged, forwarding
+      // content already judged not to fit and skipping the media-placeholder
+      // pass.
+      for (let i = history.length - 1; i > 0; i--) {
+        if (history[i].role === 'user') {
+          splitIdx = i;
+          break;
+        }
+      }
+    } else {
+      // A window fits but holds no user turn (an all-assistant tail, normal
+      // after several asks). Summarize the whole history: valid and within
+      // budget, since this ask's own input is appended separately as the user
+      // turn.
+      splitIdx = history.length;
+    }
+
+    // Nothing to summarize: the whole history is "recent". After the anchoring
+    // above this is reachable only when history[0] is itself a user turn, so
+    // returning the history unchanged keeps the request user-first.
     if (splitIdx === 0) return history;
 
     const oldMessages = history.slice(0, splitIdx);

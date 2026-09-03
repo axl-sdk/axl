@@ -816,8 +816,12 @@ describe('ModelInput', () => {
         },
       ],
     }).ask(agent({ model: 'input:vision', system: 'inspect', maxContext: 1 }), 'continue');
-    const warnings = traces.filter((event) => event.type === 'log' && event.data?.warning);
-    expect(warnings).toHaveLength(1);
+    const warnings = traces
+      .filter((event) => event.type === 'log' && event.data?.warning)
+      .map((event) => String(event.data?.warning));
+    // Assert the warning this test is about, not a bare count: `maxContext: 1`
+    // also (correctly) reports an unsatisfiable context budget.
+    expect(warnings.filter((w) => w.includes('media contribution is unmeasured'))).toHaveLength(1);
     expect(provider.calls[0].messages[1].content).toContain('[image image/png]');
     expect(String(provider.calls[0].messages[1].content)).not.toContain(base64);
     expect(JSON.stringify(traces)).not.toContain(base64);

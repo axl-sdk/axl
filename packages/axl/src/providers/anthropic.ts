@@ -76,7 +76,8 @@ function hasAnthropicProviderFileImage(messages: readonly ChatMessage[]): boolea
 
 // ---------------------------------------------------------------------------
 // Exact Anthropic model capabilities and Standard text pricing. Reviewed
-// 2026-08-03 against https://platform.claude.com/docs/en/about-claude/pricing.
+// 2026-09-03 against https://platform.claude.com/docs/en/about-claude/pricing
+// and .../build-with-claude/effort for the per-model effort levels.
 //
 // Modern IDs intentionally use exact matching. A future sibling can still pass
 // through to Anthropic, but it must not inherit request semantics or a price.
@@ -98,6 +99,12 @@ type ClaudeCapability = {
 };
 
 const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
+  'claude-fable-5-1': {
+    thinking: 'adaptive-always-on',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    manualBudget: false,
+    stripTemperature: true,
+  },
   'claude-fable-5': {
     thinking: 'adaptive-always-on',
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
@@ -198,12 +205,30 @@ function resolveClaudeCapability(model: string): ClaudeCapability | undefined {
   );
 }
 
-type AnthropicRate = { input: number; output: number; sonnet5Intro?: boolean };
+type AnthropicRate = {
+  input: number;
+  output: number;
+  /**
+   * Cache-hit price as a fraction of base input. 0.1x on every model except
+   * Claude Fable 5.1 / Mythos 5.1, which read cache at 0.025x.
+   */
+  cacheReadMultiplier?: number;
+};
+
+/** Cache-read multiplier when a rate does not override it. */
+const DEFAULT_CACHE_READ_MULTIPLIER = 0.1;
 
 const ANTHROPIC_RATES: Record<string, AnthropicRate> = {
+  'claude-fable-5-1': { input: 10e-6, output: 50e-6, cacheReadMultiplier: 0.025 },
   'claude-fable-5': { input: 10e-6, output: 50e-6 },
+  // Limited availability (Glasswing). Priced from the public pricing table; no
+  // CLAUDE_CAPABILITIES entry, because their thinking semantics are not
+  // documented per-model and an unverified capability would send the wrong
+  // request shape. Unknown IDs pass through unmodified, which is the safe side.
+  'claude-mythos-5-1': { input: 10e-6, output: 50e-6, cacheReadMultiplier: 0.025 },
+  'claude-mythos-5': { input: 10e-6, output: 50e-6 },
   'claude-opus-5': { input: 5e-6, output: 25e-6 },
-  'claude-sonnet-5': { input: 3e-6, output: 15e-6, sonnet5Intro: true },
+  'claude-sonnet-5': { input: 2e-6, output: 10e-6 },
   'claude-opus-4-8': { input: 5e-6, output: 25e-6 },
   'claude-opus-4-7': { input: 5e-6, output: 25e-6 },
   'claude-opus-4-6': { input: 5e-6, output: 25e-6 },
@@ -256,13 +281,17 @@ function anthropicStreamErrorStatus(type: string | undefined): number {
 }
 
 /**
- * Price an observable Standard Anthropic text call. `now` is injectable so
- * Sonnet 5's announced rate transition is deterministic in pure tests.
+ * Price an observable Standard Anthropic text call.
+ *
+ * Rates are the currently published price only. We deliberately do not encode
+ * announced future transitions: Sonnet 5's scheduled 2026-09-01 increase to
+ * $3/$15 was cancelled and $2/$10 became the standard price, so a forward-dated
+ * gate silently overcharged for every call made after the date it predicted.
+ * Re-verify against the pricing page instead (see the dated review comment above).
  */
 export function estimateAnthropicCost(
   model: string | undefined,
   usage: AnthropicPriceUsage,
-  now: Date = new Date(),
 ): number | undefined {
   if (!model || !isValidTokenCount(usage.inputTokens) || !isValidTokenCount(usage.outputTokens)) {
     return undefined;
@@ -296,13 +325,11 @@ export function estimateAnthropicCost(
     return undefined;
   }
 
-  const { input, output } =
-    rate.sonnet5Intro && now < new Date('2026-09-01T00:00:00Z')
-      ? { input: 2e-6, output: 10e-6 }
-      : rate;
+  const { input, output } = rate;
+  const cacheReadRate = input * (rate.cacheReadMultiplier ?? DEFAULT_CACHE_READ_MULTIPLIER);
   return (
     usage.inputTokens * input +
-    cacheRead * input * 0.1 +
+    cacheRead * cacheReadRate +
     cacheWrite5m * input * 1.25 +
     cacheWrite1h * input * 2 +
     usage.outputTokens * output
@@ -702,6 +729,27 @@ export class AnthropicProvider implements Provider {
       typeof options.providerOptions?.model === 'string'
         ? options.providerOptions.model
         : options.model;
+    // A model with no capability entry passes through untouched: no `thinking`
+    // and no `output_config` are sent, so the requested effort silently has no
+    // effect. For an arbitrary pass-through ID that silence is deliberate --
+    // Axl makes no claim about a model it does not know.
+    //
+    // But a model Axl *prices* is one it claims to support, and dropping its
+    // primary reasoning knob without a word contradicts that claim: Claude
+    // Mythos would bill at $10/$50 while the caller believed their effort
+    // applied. Report the mismatch for priced-but-uncharacterized models only,
+    // leaving unpriced pass-through IDs as quiet as before.
+    if (ANTHROPIC_RATES[model] && !resolveClaudeCapability(model)) {
+      return {
+        requested: resolved.effort,
+        effective: 'unset',
+        clamped: true,
+        cause:
+          `Axl has no capability entry for Anthropic ${model}, so no reasoning control was ` +
+          `sent and effort '${resolved.effort}' had no effect`,
+      };
+    }
+
     const config = resolveClaudeThinking(model, resolved);
     const wireEffort =
       typeof config.outputConfig?.effort === 'string' ? config.outputConfig.effort : undefined;

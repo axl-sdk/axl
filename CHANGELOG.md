@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Claude Fable 5.1 (`claude-fable-5-1`) capabilities and pricing.** Adaptive
+  always-on thinking with all five effort levels (thinking cannot be disabled;
+  `effort: 'none'` clamps to `'low'` and reports a `provider_diagnostic`), priced
+  at $10/$50. `claude-mythos-5-1` and `claude-mythos-5` are priced at the same
+  rates but intentionally have **no** capability entry: they are
+  limited-availability models with no published per-model thinking semantics, so
+  their requests pass through unmodified rather than carrying an inferred shape.
+  Because Axl prices them, it also now reports that pass-through: requesting an
+  `effort` on a **priced** model with no capability entry emits
+  `provider_diagnostic { kind: 'effort_clamped', effective: 'unset' }` so the
+  dropped knob is visible rather than silently billed at full rate. Unpriced
+  pass-through IDs stay silent as before. No new event type or `kind` value.
+- **Per-model cache-read multipliers on Anthropic.** Cache hits are 0.1x base
+  input on every model except Claude Fable 5.1 and Mythos 5.1, which read cache
+  at **0.025x**. `estimateAnthropicCost` previously hardcoded 0.1x, which would
+  have overpriced Fable 5.1 cache reads 4x.
+
+### Fixed
+
+- **Context summarization could discard the entire conversation.** When an
+  agent's fixed overhead (system prompt + tool definitions +
+  `contextManagement.reserveTokens`, which defaults to 2000) met or exceeded its
+  `maxContext`, the history budget went non-positive, no message could "fit",
+  and `summarizeHistory` returned a lone summary message with **every real turn
+  dropped** — including the newest one the next reply depends on. The cached
+  summary could never be reused in that state either, so each ask paid a fresh
+  summarization call and overwrote the persisted `summaryCache`. Summarization
+  now retains the most recent exchange where it can, always anchored on a user
+  turn so the request opens the way every provider documents — `sessionHistory`
+  does not alternate roles, since `ctx.ask` only ever appends assistant turns.
+  (Live-probed 2026-09-03: Anthropic, OpenAI and Gemini each accepted an
+  assistant-first request, so this is well-formedness and portability, not a
+  workaround for a rejection.) Where no
+  user turn is available to anchor on, the history is summarized in full
+  instead; the current input is appended separately either way, so no ask
+  reaches a provider without a user turn. An unsatisfiable context budget emits a `log` warning
+  naming the agent, its `maxContext`, and the overhead breakdown instead of
+  silently discarding history. A cached summary that no longer leaves room for
+  the newest turn is regenerated rather than reused, so turns added since the
+  previous summary cannot become permanently invisible to the model.
+
+- **`gemini-3.7-flash` and `gemini-3.8-flash` had no pricing.** Both were
+  already supported for requests (effort mapping, multimodal input) but were
+  missing from the rate table, so `response.cost` was `undefined` for the two
+  newest Flash models. Both are now priced at $0.75 / $0.075 cached / $3.75.
+- **`gemini-3.6-flash` was priced ~2x too high.** It moved onto the same Flash
+  promotional rate ($0.75 / $3.75, announced through 2026-12-31); the table still
+  carried the pre-promotion $1.50 / $7.50.
+- **`gemini-3-flash-preview` is no longer priced.** It has dropped off Google's
+  published pricing page while remaining callable, so its usage is now reported
+  with `cost: undefined` instead of a stale, unverifiable rate. Requests to it
+  are unaffected, but **cost enforcement changes**: per the existing unpriced
+  contract, `ctx.budget()` cannot enforce a cost limit on spend it cannot price,
+  so a `maxCost` cap no longer trips on this model. The spend is still surfaced —
+  the budget reports `unpriced: true` and warns once per scope — but if you
+  relied on a hard cost cap here, pin a priced model such as
+  `gemini-3.8-flash`.
+- **`gpt-5.6` / `gpt-5.6-sol` was priced above its current rate.** The catalog
+  held $5 / $0.50 cached / $6.25 cache write / $30, but Sol is on a promotional
+  $4 / $0.40 / $5 / $20 (announced as running at least through 2026-11-21), so
+  output was overestimated 50%. The long-context tier derives from the short row
+  and moves with it. `gpt-5.6-terra` and `gpt-5.6-luna` were already correct.
+- **Claude Sonnet 5 was overpriced 50% from September 1, 2026.** The rate table
+  encoded Anthropic's *announced* increase from the introductory $2/$10 to
+  $3/$15 as a forward-dated gate, so every `claude-sonnet-5` cost estimate
+  switched to $3/$15 once that date arrived. Anthropic cancelled the increase and
+  $2/$10 is now the standard price. `estimateAnthropicCost` no longer takes a
+  `now` argument and no rate varies with the clock: tables hold only the
+  currently published price. See
+  [providers.md#cost-estimation](docs/providers.md#cost-estimation).
+
 ## [0.22.3] - 2026-09-03
 
 ### Added

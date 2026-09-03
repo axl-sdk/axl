@@ -68,8 +68,13 @@ const withLongContext = (short: OpenAIRates): DirectOpenAIModel['long'] => ({
 });
 
 /**
- * Direct OpenAI Standard text pricing, per token. Reviewed 2026-08-03 against
- * https://developers.openai.com/api/docs/pricing. This is deliberately private:
+ * Direct OpenAI Standard text pricing, per token. Reviewed 2026-09-03 against
+ * https://developers.openai.com/api/docs/pricing. Promotional rates are recorded
+ * at their current value, never as a forward-dated transition: an announced
+ * revert can be cancelled, and a clock-gated table then silently misprices from
+ * the date it predicted. GPT-5.6 Sol's promotion is announced as running at
+ * least through 2026-11-21; re-verify then instead of encoding the change here.
+ * This is deliberately private:
  * the public tuple API cannot faithfully express cache writes or context tiers.
  * Every catalog id is explicit; arbitrary siblings and unlisted snapshots
  * never inherit an alias price.
@@ -78,12 +83,12 @@ const DIRECT_OPENAI_CATALOG: readonly DirectOpenAIModel[] = [
   {
     aliases: ['gpt-5.6', 'gpt-5.6-sol'],
     snapshotBase: 'gpt-5.6-sol',
-    short: { input: 5 / M, cachedInput: 0.5 / M, cacheWrite: 6.25 / M, output: 30 / M },
+    short: { input: 4 / M, cachedInput: 0.4 / M, cacheWrite: 5 / M, output: 20 / M },
     long: withLongContext({
-      input: 5 / M,
-      cachedInput: 0.5 / M,
-      cacheWrite: 6.25 / M,
-      output: 30 / M,
+      input: 4 / M,
+      cachedInput: 0.4 / M,
+      cacheWrite: 5 / M,
+      output: 20 / M,
     }),
     contextBoundary: LONG_CONTEXT_BOUNDARY,
   },

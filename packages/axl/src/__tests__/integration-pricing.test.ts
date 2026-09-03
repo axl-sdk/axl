@@ -536,6 +536,24 @@ describe.skipIf(!hasGoogle)('Pricing Integration: Gemini', () => {
     expect(response.usage!.total_tokens).toBeGreaterThan(0);
   }, 30_000);
 
+  it.each(['gemini-3.7-flash', 'gemini-3.8-flash'])(
+    'chat() reports priced usage for %s',
+    async (model) => {
+      // Both were request-supported before they were priced (see the 2026-09-03
+      // catalog refresh); this pins that cost is now a positive number live.
+      const response = await provider.chat(
+        [{ role: 'user', content: 'What is 2+2? Reply with just the number.' }],
+        { model, maxTokens: 64, effort: 'low' },
+      );
+
+      expect(response.cost).toBeTypeOf('number');
+      expect(response.cost).toBeGreaterThan(0);
+      expect(response.usage!.prompt_tokens).toBeGreaterThan(0);
+      expect(response.usage!.completion_tokens).toBeGreaterThan(0);
+    },
+    30_000,
+  );
+
   it('stream() cost and usage correct for Gemini 3.6 Flash', async () => {
     const chunks = await collectChunks(
       provider.stream([{ role: 'user', content: 'What is 2+2? Reply with just the number.' }], {

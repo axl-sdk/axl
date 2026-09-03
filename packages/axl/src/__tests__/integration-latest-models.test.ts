@@ -124,7 +124,7 @@ describe.skipIf(!process.env.OPENAI_API_KEY)('latest models: OpenAI live accepta
 describe.skipIf(!process.env.ANTHROPIC_API_KEY)('latest models: Anthropic live acceptance', () => {
   const provider = new AnthropicProvider();
 
-  it.each(['claude-fable-5', 'claude-opus-5', 'claude-sonnet-5'])(
+  it.each(['claude-fable-5-1', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5'])(
     'non-stream accepts exact model %s with its default thinking mode',
     async (model) => {
       expectMetered(await provider.chat(prompt, { model, maxTokens: 128 }), 'static');

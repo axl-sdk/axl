@@ -36,9 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped** — including the newest one the next reply depends on. The cached
   summary could never be reused in that state either, so each ask paid a fresh
   summarization call and overwrote the persisted `summaryCache`. Summarization
-  now always retains the newest turn — together with its preceding user turn
-  when the newest is an assistant reply, so the request never begins on an
-  assistant message — and an unsatisfiable context budget emits a `log` warning
+  now retains the most recent exchange — the newest turn, plus its preceding
+  user turn when the newest is an assistant reply, so the request never begins
+  on an assistant message. (A single-message history has no earlier context for
+  a summary to stand in for, so it is still summarized in full; the current
+  input is appended separately either way, so no ask reaches the provider
+  without a user turn.) An unsatisfiable context budget emits a `log` warning
   naming the agent, its `maxContext`, and the overhead breakdown instead of
   silently discarding history. A cached summary that no longer leaves room for
   the newest turn is regenerated rather than reused, so turns added since the

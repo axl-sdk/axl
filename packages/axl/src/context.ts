@@ -1759,8 +1759,9 @@ export class WorkflowContext<TInput = unknown> {
             warning:
               `Agent '${agent._name}' maxContext (${maxContext}) is at or below its fixed ` +
               `overhead (${overhead} = system ${systemTokens} + tools ${toolTokens} + reserve ` +
-              `${reserveTokens}); no session history can fit, so every ask summarizes and only ` +
-              `the newest turn is retained. Raise maxContext or lower ` +
+              `${reserveTokens}); no session history can fit, so every ask summarizes and ` +
+              `retains only the most recent exchange (a single-message history is summarized ` +
+              `in full). The current input is always sent. Raise maxContext or lower ` +
               `contextManagement.reserveTokens.`,
           },
         });

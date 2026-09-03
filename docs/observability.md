@@ -629,6 +629,13 @@ Notes:
   which suppresses the event.
 - Redaction passes the event through unchanged: it carries provider capability
   metadata only, never prompt or response content.
+- **A broken adapter fails the ask.** `Provider.effortResolution()` is optional,
+  but a provider that implements it and then throws — or reports `clamped: true`
+  without a non-empty `requested`/`effective` pair — surfaces that error from
+  `ctx.ask()` (a `TypeError` naming the provider for the malformed case) rather
+  than being swallowed: a capability method that misreports what was sent is a
+  provider bug, and silently ignoring it would re-bury the very clamp this
+  event exists to expose.
 
 ### PII and redaction
 

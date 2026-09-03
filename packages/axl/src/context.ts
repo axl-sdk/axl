@@ -3148,6 +3148,22 @@ export class WorkflowContext<TInput = unknown> {
       providerOptions: ctx.providerOptions,
     });
     if (!resolution?.clamped) return;
+    // A clamp report that cannot name what was actually sent is a broken adapter,
+    // not a diagnostic: emitting it would put `effective: undefined` on a typed
+    // event and warn "clamped to ''". Fail loudly for the same reason a throwing
+    // `effortResolution` propagates.
+    if (
+      typeof resolution.effective !== 'string' ||
+      resolution.effective.length === 0 ||
+      typeof resolution.requested !== 'string' ||
+      resolution.requested.length === 0
+    ) {
+      throw new TypeError(
+        `Provider '${ctx.provider.name ?? 'unknown'}' returned a malformed EffortResolution for ` +
+          `model '${ctx.model}': 'requested' and 'effective' must be non-empty strings when ` +
+          `'clamped' is true. Received ${JSON.stringify(resolution)}.`,
+      );
+    }
 
     const cause = resolution.cause ?? `effort '${resolution.requested}' is not supported as asked`;
     this.emitEvent({

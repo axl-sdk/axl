@@ -639,7 +639,9 @@ Currently reported: **Gemini 3.x** `'none'` (→ model minimum) and
 pre-5.1 `'none'` (→ `'minimal'`), sub-5.2 `'xhigh'` (→ `'high'`), and
 `gpt-5-pro` (always `'high'`); **OpenAI Responses** the same minus the `'max'`
 cap; **Anthropic** any effort outside a model's supported `output_config.effort`
-levels, and models that cannot disable thinking (`'none'` → adaptive `'low'`).
+levels, models that cannot disable thinking (`'none'` → adaptive `'low'`), and
+the legacy `budget_tokens` families, where `'xhigh'`/`'max'` fall to the
+`'high'` tier's budget.
 An explicit `thinkingBudget` documented to override `effort` is not a clamp.
 See [observability.md#provider-diagnostics](observability.md#provider-diagnostics).
 

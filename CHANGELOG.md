@@ -35,7 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clamp the unified `effort` to what each model actually accepts (Gemini 3.x
   cannot disable thinking and caps at `'high'`; OpenAI Chat Completions caps
   `'max'` at `'xhigh'` and pre-5.1 `'none'` at `'minimal'`; some Anthropic models
-  always think and fall back to adaptive `'low'`). That clamp was previously
+  always think and fall back to adaptive `'low'`, and the legacy Anthropic
+  `budget_tokens` families fold `'xhigh'`/`'max'` into the `'high'` tier's
+  budget). That clamp was previously
   invisible to run provenance — `agent_call_start` reported only the requested
   value — so a trace could record `effort: 'none'` for a request that thought.
   The runtime now emits one `provider_diagnostic { kind: 'effort_clamped' }`
@@ -45,8 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `askId`. Providers opt in through a new optional
   `Provider.effortResolution()` capability method (exported types
   `EffortResolution`, `ProviderDiagnosticData`), so a third-party adapter that
-  omits it simply reports nothing. `MockProvider.withEffortResolution()` drives
-  the path in tests.
+  omits it simply reports nothing. An adapter that implements the method and then
+  throws — or reports `clamped: true` without a non-empty `requested`/`effective`
+  pair (a `TypeError` naming the provider) — fails the ask rather than being
+  swallowed. `MockProvider.withEffortResolution()` drives the path in tests.
   **`provider_diagnostic` is a new member of the `AxlEvent['type']` union** — a
   consumer with an exhaustive `switch` over event types gains a case. It is
   included in `AXL_EVENT_TYPES`, the `.lifecycle` view, and the redaction table

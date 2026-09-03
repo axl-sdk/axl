@@ -303,8 +303,8 @@ describe('provider_diagnostic — event plumbing (B6, B7)', () => {
 // A throwing capability method is a provider bug — it must not be swallowed
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('provider_diagnostic — a throwing effortResolution propagates', () => {
-  it('fails the ask loudly rather than hiding a broken adapter', async () => {
+describe('provider_diagnostic — a broken effortResolution fails loudly', () => {
+  it('propagates a throw rather than hiding a broken adapter', async () => {
     const { ctx, provider } = makeCtx({
       effortResolution: () => {
         throw new Error('adapter bug');
@@ -313,5 +313,27 @@ describe('provider_diagnostic — a throwing effortResolution propagates', () =>
 
     await expect(ctx.ask(echoAgent, 'hi', { effort: 'none' })).rejects.toThrow('adapter bug');
     expect(provider.seenOptions).toHaveLength(0);
+  });
+
+  it.each([
+    ['a missing effective', { requested: 'none', clamped: true }],
+    ['an empty effective', { requested: 'none', effective: '', clamped: true }],
+    ['a non-string effective', { requested: 'none', effective: 3, clamped: true }],
+    ['a missing requested', { effective: 'low', clamped: true }],
+  ])('rejects a clamp report with %s', async (_label, malformed) => {
+    const { ctx, provider, events } = makeCtx({
+      effortResolution: () => malformed as unknown as EffortResolution,
+    });
+
+    await expect(ctx.ask(echoAgent, 'hi', { effort: 'none' })).rejects.toThrow(
+      /malformed EffortResolution/,
+    );
+    // The message names the provider and the shape it received, so the adapter
+    // author can find the bug without a debugger.
+    await expect(ctx.ask(echoAgent, 'hi', { effort: 'none' })).rejects.toThrow(
+      new RegExp(`'test'.*'model-x'`),
+    );
+    expect(provider.seenOptions).toHaveLength(0);
+    expect(diagnostics(events)).toHaveLength(0);
   });
 });

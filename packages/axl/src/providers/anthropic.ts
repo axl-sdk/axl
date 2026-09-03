@@ -458,6 +458,21 @@ function resolveClaudeThinking(
       thinking: { type: 'enabled', budget_tokens: budget },
       manualBudget: budget,
       stripTemperature: true,
+      // Legacy models take `budget_tokens`, not an effort level, and have no
+      // `effortLevels` — so `clampAnthropicEffort` folds 'max'/'xhigh' down to
+      // the 'high' tier and the request silently carries that tier's budget.
+      // Report it: an unreported budget-tier downgrade is exactly the silent
+      // clamp this capability exists to expose.
+      clamp:
+        activeEffort === resolved.activeEffort
+          ? undefined
+          : {
+              effective: activeEffort,
+              cause:
+                `Anthropic ${model} takes thinking budget_tokens rather than an effort level, ` +
+                `and its ceiling tier is '${activeEffort}'; effort '${resolved.activeEffort}' ` +
+                `sends budget_tokens ${budget}`,
+            },
     };
   }
   return { stripTemperature: capability.stripTemperature ?? false };

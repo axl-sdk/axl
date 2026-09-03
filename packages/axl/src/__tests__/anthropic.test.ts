@@ -2731,6 +2731,48 @@ describe('AnthropicProvider.effortResolution', () => {
     expect(body.output_config).toEqual({ effort: 'low' });
   });
 
+  it.each([
+    ['max', 10000],
+    ['xhigh', 10000],
+  ] as const)(
+    'reports the legacy budget-tier downgrade of effort %s',
+    async (effort, budgetTokens) => {
+      const provider = new AnthropicProvider();
+      const resolution = provider.effortResolution({ model: 'claude-sonnet-4', effort });
+      expect(resolution).toMatchObject({ requested: effort, effective: 'high', clamped: true });
+      expect(resolution!.cause).toContain('budget_tokens');
+
+      // Pairing: the request carries the 'high' tier's budget, not the tier the
+      // caller asked for ('max' would be 30000, 'xhigh' 20000).
+      const fetchMock = mockFetch({ json: () => Promise.resolve(response) });
+      await provider.chat([{ role: 'user', content: 'Hello' }], {
+        model: 'claude-sonnet-4',
+        maxTokens: 4096,
+        effort,
+      });
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body).thinking).toEqual({
+        type: 'enabled',
+        budget_tokens: budgetTokens,
+      });
+    },
+  );
+
+  it('reports nothing when a legacy model gets the ceiling tier it asked for', async () => {
+    const provider = new AnthropicProvider();
+    expect(provider.effortResolution({ model: 'claude-sonnet-4', effort: 'high' })).toBeUndefined();
+
+    const fetchMock = mockFetch({ json: () => Promise.resolve(response) });
+    await provider.chat([{ role: 'user', content: 'Hello' }], {
+      model: 'claude-sonnet-4',
+      maxTokens: 4096,
+      effort: 'high',
+    });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).thinking).toEqual({
+      type: 'enabled',
+      budget_tokens: 10000,
+    });
+  });
+
   it('reports an effort level the model does not support', async () => {
     const provider = new AnthropicProvider();
     const resolution = provider.effortResolution({ model: 'claude-opus-4-5', effort: 'max' });

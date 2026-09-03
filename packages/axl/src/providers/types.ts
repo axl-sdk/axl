@@ -1,8 +1,10 @@
-import type { ChatMessage, ProviderResponse, ToolCallMessage } from '../types.js';
+import type { CallTiming, ChatMessage, ProviderResponse, ToolCallMessage } from '../types.js';
 import type { InputMediaSource, ModelInput } from '../input.js';
 
-// Re-export for convenience
-export type { ChatMessage, ProviderResponse, ToolCallMessage };
+// Re-export for convenience. `CallTiming` is defined in `../types.js` beside
+// `ProviderResponse` (which also carries it) — defining it here would make
+// `types.ts` import from this module, reversing the existing dependency edge.
+export type { CallTiming, ChatMessage, ProviderResponse, ToolCallMessage };
 
 export type InputModalitySupport = {
   image?: { sources: readonly InputMediaSource['type'][] };
@@ -134,6 +136,12 @@ export type StreamChunk =
       cost?: number;
       /** Provider-specific opaque metadata (e.g. raw Gemini parts with thought signatures). */
       providerMetadata?: Record<string, unknown>;
+      /**
+       * Per-call latency breakdown. The `done` chunk is the only channel a
+       * stream has back to the runtime, so every terminal `done` must carry it
+       * — including the usage-less fallbacks, or a $0 stream loses its timing.
+       */
+      timing?: CallTiming;
     };
 
 /**

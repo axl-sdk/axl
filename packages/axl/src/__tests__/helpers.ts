@@ -1,3 +1,4 @@
+import { expect } from 'vitest';
 import { ProviderRegistry } from '../providers/registry.js';
 import { WorkflowContext } from '../context.js';
 import { randomUUID } from 'node:crypto';
@@ -88,4 +89,25 @@ export function createTestCtx(overrides: Record<string, unknown> = {}) {
     provider,
     registry,
   };
+}
+
+/**
+ * Assert a measured millisecond figure falls inside a TWO-SIDED window.
+ *
+ * Timing assertions must bound both ends. A bare `>=` is satisfied by an
+ * implementation that reports total elapsed time in every bucket — precisely
+ * the latency inflation `CallTiming` exists to separate out — so a one-sided
+ * threshold silently stops discriminating.
+ *
+ * `actual` accepts `undefined` so an optional field (`firstTokenMs`) fails with
+ * the window in the message rather than on a non-null assertion.
+ */
+export function expectWindow(
+  actual: number | undefined,
+  [lo, hi]: [number, number],
+  label: string,
+): void {
+  const message = `${label}: expected ${lo}..${hi}ms, got ${String(actual)}ms`;
+  expect(actual, message).toBeGreaterThanOrEqual(lo);
+  expect(actual, message).toBeLessThanOrEqual(hi);
 }

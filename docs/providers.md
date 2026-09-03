@@ -444,6 +444,71 @@ governor; if you need pacing there, add a minimal `axl.config.ts` exporting an
 You can also construct a `RateLimiter` directly (exported from `@axlsdk/axl`) if you
 build a custom provider adapter.
 
+#### What you can observe
+
+Every call through a built-in chat adapter reports a `CallTiming` block — on
+`ProviderResponse.timing`, on the terminal `done` stream chunk, and on
+`agent_call_end.timing`. It exists so the three things `duration` conflates can be told
+apart: your own pacing, the provider's throttling, and the model's latency. Field-by-field
+reference: [api-reference.md → `CallTiming`](api-reference.md#calltiming).
+
+- **`queuedMs`** — time parked in *this* governor, measured around the permit acquire.
+  `minIntervalMs` spacing counts here too, because waiting for the interval is
+  self-imposed. `0` when the provider has no `rateLimit`.
+- **`retryMs` and `attempts`** — the reactive 429/503/529 loop. Failed attempts and their
+  backoff sleeps land here, not in `wireMs`, so a provider having a bad throttling day
+  does not silently inflate its measured latency.
+- **`ttfbMs` and `firstTokenMs`** — response headers and, on a stream, the first content
+  delta. Headers land at roughly one round trip on any model; first token is the figure
+  that actually separates a fast model from a slow one.
+- **`wireMs`** — provider time. On a stream it counts only time spent *awaiting* body
+  reads, so a heavy `ctx.events` consumer or a busy trace listener does not get charged to
+  the model.
+
+**The permit releases at response headers, on both transports**, which shapes what
+`queuedMs` can and cannot tell you. `fetchWithRetry` releases in a `finally` as it returns
+the `Response`; every adapter reads the body afterwards, so body transfer is never inside a
+permit.
+
+What that means differs by transport, because headers mean different things:
+
+- **Non-streaming.** The provider does not send headers until it has generated the whole
+  completion, so the permit is *effectively* held across generation. `queuedMs` therefore
+  tracks the inflation you feel fairly closely — but the body download that follows is
+  outside the permit and outside every `CallTiming` bucket.
+- **Streaming.** Headers arrive before the first token, so the permit covers admission
+  only, not the stream body. `maxConcurrent` does not bound how many stream bodies are open
+  at once, and under a streaming fan-out `queuedMs` will be far smaller than the wall-clock
+  inflation you observe. That is the metric being accurate, not broken.
+
+Either way, time spent downloading or draining a body lands in `agent_call_end.duration`
+and in the `other` remainder of a `TimeoutError` breakdown, never in `queuedMs`.
+
+**Not every millisecond lands in a bucket.** An `apiKey` callback is awaited *before* the
+request enters the transport, deliberately, so a slow token refresh does not hold a rate
+limiter permit — which also means its time is in no `CallTiming` bucket. It shows up in
+`agent_call_end.duration` and in the `other` remainder of a `TimeoutError` breakdown. If you
+use an async credential source, cache the token in your callback rather than refreshing per
+request.
+
+**`chat()` and `stream()` do not measure `wireMs` over quite the same interval.** For
+`chat()` the clock stops once the parsed response is in hand, so response parsing and cost
+estimation are inside the figure; for `stream()` it is the sum of body-read waits and
+nothing else. Both are honest measures of "time attributable to the provider" for their own
+transport, but do not read a few milliseconds of difference between the two as a provider
+difference.
+
+Timing is optional end to end. A custom `Provider` that does not report it is valid, and
+consumers must treat every field as possibly absent. Failed calls carry no timing today:
+the error-path `agent_call_end` has `duration` only.
+
+**Subclassing caveat.** `OpenAICompatibleProvider.parseSSEStream` takes the timing recorder
+as an optional trailing parameter, so that overriding it is not a compile break. The cost is
+a third state beyond present-or-absent: an override written against the older three-parameter
+signature type-checks and runs, but never records body-read waits, so its streams report
+`wireMs === ttfbMs` — a plausible-looking number missing the entire body-transfer component.
+Accept and forward the trailing parameter if you override that method.
+
 ### Retry backoff — worst case
 
 The reactive retry does up to **2 retries (3 attempts total)** on `429`/`503`/`529`.

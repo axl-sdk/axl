@@ -18,6 +18,7 @@ import {
 } from './openai.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
+import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
@@ -202,6 +203,7 @@ export class OpenAIResponsesProvider implements Provider {
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, false);
 
+    const recorder = new CallTimingRecorder();
     const res = await fetchWithRetry(
       `${this.baseUrl}/responses`,
       {
@@ -210,7 +212,7 @@ export class OpenAIResponsesProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, timing: recorder.observer },
     );
 
     if (!res.ok) {
@@ -226,7 +228,10 @@ export class OpenAIResponsesProvider implements Provider {
     }
 
     const json = (await res.json()) as ResponsesAPIResponse;
-    return this.parseResponse(json, this.requestModel(body, options.model), body);
+    return withChatTiming(
+      recorder,
+      this.parseResponse(json, this.requestModel(body, options.model), body),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -237,6 +242,7 @@ export class OpenAIResponsesProvider implements Provider {
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, true);
 
+    const recorder = new CallTimingRecorder();
     const res = await fetchWithRetry(
       `${this.baseUrl}/responses`,
       {
@@ -245,7 +251,7 @@ export class OpenAIResponsesProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, timing: recorder.observer },
     );
 
     if (!res.ok) {
@@ -264,7 +270,10 @@ export class OpenAIResponsesProvider implements Provider {
       throw new Error('OpenAI Responses stream has no body');
     }
 
-    yield* this.parseSSEStream(res.body, this.requestModel(body, options.model), body);
+    yield* withCallTiming(
+      recorder,
+      this.parseSSEStream(res.body, this.requestModel(body, options.model), body, recorder),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -549,6 +558,7 @@ export class OpenAIResponsesProvider implements Provider {
     body: ReadableStream<Uint8Array>,
     model: string,
     request?: Record<string, unknown>,
+    timing?: CallTimingRecorder,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -561,7 +571,7 @@ export class OpenAIResponsesProvider implements Provider {
 
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await (timing ? timing.read(reader) : reader.read());
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });

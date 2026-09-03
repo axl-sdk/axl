@@ -13,6 +13,7 @@ import type {
 } from './types.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
+import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
@@ -764,6 +765,7 @@ export class GeminiProvider implements Provider {
     this.assertSafeGemini3Continuation(messages, pricingContext.model);
     const headers = this.buildHeaders(await this.resolveKey());
 
+    const recorder = new CallTimingRecorder();
     const res = await fetchWithRetry(
       `${this.baseUrl}/models/${pricingContext.model}:generateContent`,
       {
@@ -772,7 +774,7 @@ export class GeminiProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, timing: recorder.observer },
     );
 
     if (!res.ok) {
@@ -788,7 +790,7 @@ export class GeminiProvider implements Provider {
     }
 
     const json = (await res.json()) as GeminiResponse;
-    return this.parseResponse(json, pricingContext);
+    return withChatTiming(recorder, this.parseResponse(json, pricingContext));
   }
 
   // ---------------------------------------------------------------------------
@@ -805,6 +807,7 @@ export class GeminiProvider implements Provider {
     this.assertSafeGemini3Continuation(messages, pricingContext.model);
     const headers = this.buildHeaders(await this.resolveKey());
 
+    const recorder = new CallTimingRecorder();
     const res = await fetchWithRetry(
       `${this.baseUrl}/models/${pricingContext.model}:streamGenerateContent?alt=sse`,
       {
@@ -813,7 +816,7 @@ export class GeminiProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, timing: recorder.observer },
     );
 
     if (!res.ok) {
@@ -832,7 +835,7 @@ export class GeminiProvider implements Provider {
       throw new Error('Gemini stream response has no body');
     }
 
-    yield* this.parseSSEStream(res.body, pricingContext);
+    yield* withCallTiming(recorder, this.parseSSEStream(res.body, pricingContext, recorder));
   }
 
   // ---------------------------------------------------------------------------
@@ -848,10 +851,11 @@ export class GeminiProvider implements Provider {
     this.assertSafeInteractionOptions(options);
     const body = this.buildInteractionRequestBody(messages, options, false);
     const headers = this.buildHeaders(await this.resolveKey());
+    const recorder = new CallTimingRecorder();
     const res = await fetchWithRetry(
       `${this.baseUrl}/interactions`,
       { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, timing: recorder.observer },
     );
     if (!res.ok) {
       const errorBody = await res.text();
@@ -863,7 +867,10 @@ export class GeminiProvider implements Provider {
         body: errorBody,
       });
     }
-    return this.parseInteractionResponse((await res.json()) as GeminiInteractionResponse);
+    return withChatTiming(
+      recorder,
+      this.parseInteractionResponse((await res.json()) as GeminiInteractionResponse),
+    );
   }
 
   private async *streamInteraction(
@@ -873,10 +880,11 @@ export class GeminiProvider implements Provider {
     this.assertSafeInteractionOptions(options);
     const body = this.buildInteractionRequestBody(messages, options, true);
     const headers = this.buildHeaders(await this.resolveKey());
+    const recorder = new CallTimingRecorder();
     const res = await fetchWithRetry(
       `${this.baseUrl}/interactions?alt=sse`,
       { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, timing: recorder.observer },
     );
     if (!res.ok) {
       const errorBody = await res.text();
@@ -889,7 +897,10 @@ export class GeminiProvider implements Provider {
       });
     }
     if (!res.body) throw new Error('Gemini Interactions stream has no body');
-    yield* this.parseInteractionSSEStream(res.body, res.headers);
+    yield* withCallTiming(
+      recorder,
+      this.parseInteractionSSEStream(res.body, res.headers, recorder),
+    );
   }
 
   private buildInteractionRequestBody(
@@ -1082,6 +1093,7 @@ export class GeminiProvider implements Provider {
   private async *parseInteractionSSEStream(
     body: ReadableStream<Uint8Array>,
     responseHeaders: Headers,
+    timing?: CallTimingRecorder,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -1092,7 +1104,7 @@ export class GeminiProvider implements Provider {
     let completed = false;
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await (timing ? timing.read(reader) : reader.read());
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
@@ -1775,6 +1787,7 @@ export class GeminiProvider implements Provider {
   private async *parseSSEStream(
     body: ReadableStream<Uint8Array>,
     pricingContext: GeminiPricingContext,
+    timing?: CallTimingRecorder,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -1790,7 +1803,7 @@ export class GeminiProvider implements Provider {
 
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await (timing ? timing.read(reader) : reader.read());
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });

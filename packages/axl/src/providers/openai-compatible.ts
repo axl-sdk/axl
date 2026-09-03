@@ -16,6 +16,7 @@ import {
   type ApiKeySource,
 } from './types.js';
 import { fetchWithRetry } from './retry.js';
+import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { isBuiltinTablePricingEligible } from './builtin-table-pricing.js';
@@ -582,6 +583,7 @@ export class OpenAICompatibleProvider implements Provider {
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, false);
 
+    const recorder = new CallTimingRecorder();
     const res = await fetchWithRetry(
       `${this.baseUrl}/chat/completions`,
       {
@@ -590,7 +592,7 @@ export class OpenAICompatibleProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, timing: recorder.observer },
     );
 
     if (!res.ok) {
@@ -605,13 +607,17 @@ export class OpenAICompatibleProvider implements Provider {
     }
 
     const json = (await res.json()) as OpenAIChatResponse;
-    return this.parseResponse(json, this.requestModel(body, options.model), body);
+    return withChatTiming(
+      recorder,
+      this.parseResponse(json, this.requestModel(body, options.model), body),
+    );
   }
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, true);
 
+    const recorder = new CallTimingRecorder();
     const res = await fetchWithRetry(
       `${this.baseUrl}/chat/completions`,
       {
@@ -620,7 +626,7 @@ export class OpenAICompatibleProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, timing: recorder.observer },
     );
 
     if (!res.ok) {
@@ -637,7 +643,10 @@ export class OpenAICompatibleProvider implements Provider {
       throw new Error(`${this.profile.label ?? this.profile.name} stream response has no body`);
     }
 
-    yield* this.parseSSEStream(res.body, this.requestModel(body, options.model), body);
+    yield* withCallTiming(
+      recorder,
+      this.parseSSEStream(res.body, this.requestModel(body, options.model), body, recorder),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -973,6 +982,12 @@ export class OpenAICompatibleProvider implements Provider {
     body: ReadableStream<Uint8Array>,
     model: string,
     request?: Record<string, unknown>,
+    /**
+     * Optional and trailing on purpose: this method is `protected` on a
+     * publicly exported class, so a required parameter would be a compile
+     * break for any downstream subclass that overrides it.
+     */
+    timing?: CallTimingRecorder,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -1045,7 +1060,7 @@ export class OpenAICompatibleProvider implements Provider {
 
     try {
       for (;;) {
-        const { done, value } = await reader.read();
+        const { done, value } = await (timing ? timing.read(reader) : reader.read());
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });

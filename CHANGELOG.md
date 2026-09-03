@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-call latency breakdown (`CallTiming`) on provider responses and
+  `agent_call_end`.** Under an opt-in `rateLimit`, `agent_call_end.duration`
+  conflates the SDK's own queue wait, provider 429 backoff, and real model
+  latency, so a latency comparison across models or an eval run under fan-out
+  measures the queue as much as the provider. All four built-in chat adapters
+  (`anthropic`, `openai`/OpenAI-compatible presets, `openai-responses`,
+  `gemini`) now report `timing` on `chat()` (`ProviderResponse.timing`) and on
+  the terminal `done` chunk of `stream()`, and the runtime copies it onto
+  `agent_call_end.timing` on the success path: `queuedMs` (Axl's own governor,
+  `0` without one), `attempts` / `retryMs` (failed attempts and their backoff),
+  `ttfbMs` (dispatch → headers), `firstTokenMs` (dispatch → first content
+  delta, streaming only), and `wireMs` (provider time; on a stream it counts
+  only time spent awaiting body reads, so event fan-out and slow `ctx.events`
+  consumers are excluded). `duration` is unchanged and still brackets the whole
+  turn. The block is optional end to end — a custom `Provider` that omits it
+  stays valid and consumers must treat every field as possibly absent — and the
+  error path carries no timing. `fetchWithRetry` gains an optional passive
+  `timing: { onDispatch, onComplete }` observer with no change to its return
+  type. See [api-reference.md#calltiming](docs/api-reference.md#calltiming),
+  [providers.md](docs/providers.md#rate-limiting-opt-in) and
+  [observability.md](docs/observability.md#per-call-timing).
+  `runtime.trackExecution()` rolls the block up per model on a new optional
+  `modelTiming` return field (keyed like `metadata.modelCallCounts`; `calls`
+  counts only the timed calls; `firstTokenMs` carries its own `firstTokenCalls`
+  denominator; absent when nothing reported timing), and
+  `MockProvider` responses accept a `timing` block that surfaces on
+  `ProviderResponse.timing` and on the streamed `done` chunk, so tests can drive
+  the whole path deterministically.
+- **`TimeoutError` explains where a timed-out ask's budget went.** When at least
+  one completed turn of the ask reported provider `timing`, the message appends
+  `(elapsed Nms: queued Nms, retries Nms, wire Nms, other Nms)` and a readonly
+  `breakdown` property (`TimeoutBreakdown`) carries the same numbers, so a
+  timeout consumed by self-imposed pacing is diagnosable without parsing prose.
+  The existing `ctx.ask() exceeded timeout of Nms` prefix is preserved verbatim.
+  With no instrumented turn the message is byte-identical to before and
+  `breakdown` is `undefined` — an all-zero breakdown would falsely blame tools
+  and gates on an uninstrumented provider.
 - **`promptCache` option — opt-in Anthropic prompt caching of the stable prefix.**
   `AgentConfig.promptCache` / `AskOptions.promptCache` (AskOptions wins). On
   Anthropic the adapter renders `system` as ordered blocks with one `cache_control`

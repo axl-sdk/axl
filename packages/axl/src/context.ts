@@ -19,6 +19,7 @@ import type {
   ChatMessage,
   ToolCallMessage,
   ProviderResponse,
+  CallTiming,
   AgentCallInfo,
   AgentCallParams,
   ValidateResult,
@@ -1957,6 +1958,11 @@ export class WorkflowContext<TInput = unknown> {
     const maxTurns = agent._config.maxTurns ?? 25;
     const timeoutMs = parseDuration(agent._config.timeout ?? '60s');
     const startTime = Date.now();
+    // Per-ask latency attribution, summed over completed turns. `turns` counts
+    // only turns whose provider actually reported timing — zero means the
+    // provider is uninstrumented, and the TimeoutError message stays bare
+    // rather than blaming the remainder on tools and gates.
+    const timingTotals = { turns: 0, queuedMs: 0, retryMs: 0, wireMs: 0 };
 
     // Streaming + validate is supported as of the unified event model
     // (spec §4.1). With pipeline events landing in PR 2, retry boundaries
@@ -1993,8 +1999,24 @@ export class WorkflowContext<TInput = unknown> {
       this.currentSignal?.throwIfAborted();
 
       // Timeout check
-      if (Date.now() - startTime > timeoutMs) {
-        throw new TimeoutError('ctx.ask()', timeoutMs);
+      const elapsedMs = Date.now() - startTime;
+      if (elapsedMs > timeoutMs) {
+        throw new TimeoutError(
+          'ctx.ask()',
+          timeoutMs,
+          timingTotals.turns > 0
+            ? {
+                elapsedMs,
+                queuedMs: timingTotals.queuedMs,
+                retryMs: timingTotals.retryMs,
+                wireMs: timingTotals.wireMs,
+                otherMs: Math.max(
+                  0,
+                  elapsedMs - timingTotals.queuedMs - timingTotals.retryMs - timingTotals.wireMs,
+                ),
+              }
+            : undefined,
+        );
       }
 
       turns++;
@@ -2181,6 +2203,11 @@ export class WorkflowContext<TInput = unknown> {
             { id: string; name: string; arguments: string }
           >();
           let streamProviderMetadata: Record<string, unknown> | undefined;
+          // Kept in its own local, independent of `usage`: a provider can
+          // report timing on a stream that reports no usage at all (a $0 local
+          // model, a usage-omitting gateway), and that call still deserves a
+          // latency breakdown.
+          let streamTiming: CallTiming | undefined;
 
           let thinkingContent = '';
 
@@ -2271,6 +2298,7 @@ export class WorkflowContext<TInput = unknown> {
               if (chunk.arguments) buffer.arguments += chunk.arguments;
             } else if (chunk.type === 'done') {
               streamProviderMetadata = chunk.providerMetadata;
+              streamTiming = chunk.timing;
               // Usage and cost info from done chunk if available
               if (chunk.usage) {
                 response = {
@@ -2306,6 +2334,9 @@ export class WorkflowContext<TInput = unknown> {
           }
           if (streamProviderMetadata) {
             response.providerMetadata = streamProviderMetadata;
+          }
+          if (streamTiming) {
+            response.timing = streamTiming;
           }
           if (thinkingContent) {
             response.thinking_content = thinkingContent;
@@ -2397,6 +2428,16 @@ export class WorkflowContext<TInput = unknown> {
         this._accumulateBudgetCost(response.cost);
       }
 
+      // Accumulate this completed turn's latency attribution for a possible
+      // TimeoutError on a later turn. Per-turn sums only — nothing aggregates
+      // timing across parallel asks, where a sum would exceed wall clock.
+      if (response.timing) {
+        timingTotals.turns += 1;
+        timingTotals.queuedMs += response.timing.queuedMs;
+        timingTotals.retryMs += response.timing.retryMs;
+        timingTotals.wireMs += response.timing.wireMs;
+      }
+
       // Snapshot of what we actually sent the provider this turn (excluding the
       // new assistant message that's about to be appended). Consumers can use
       // this to reconstruct the model's exact view on any given turn.
@@ -2418,6 +2459,8 @@ export class WorkflowContext<TInput = unknown> {
             }
           : undefined,
         duration: Date.now() - turnStart,
+        // Additive beside `duration`, which keeps its turn-wall-clock meaning.
+        ...(response.timing ? { timing: response.timing } : {}),
         data: {
           response: response.content,
           ...(response.thinking_content ? { thinking: response.thinking_content } : {}),

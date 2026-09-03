@@ -249,11 +249,44 @@ export class NoConsensus extends AxlError {
   }
 }
 
+/**
+ * Where a timed-out ask's elapsed budget went, summed over the turns that
+ * completed before the timeout fired. Present only when at least one of those
+ * turns reported provider `timing` — an all-zero breakdown on an uninstrumented
+ * provider would falsely blame tools and gates.
+ */
+export type TimeoutBreakdown = {
+  /** Wall clock consumed by the operation when it timed out. */
+  elapsedMs: number;
+  /** Sum of `CallTiming.queuedMs` — self-imposed rate-limiter wait. */
+  queuedMs: number;
+  /** Sum of `CallTiming.retryMs` — failed provider attempts and their backoff. */
+  retryMs: number;
+  /** Sum of `CallTiming.wireMs` — provider time. */
+  wireMs: number;
+  /** `elapsedMs` minus the three sums: tools, gates, and runtime work. */
+  otherMs: number;
+};
+
 /** Thrown when an operation exceeds its timeout */
 export class TimeoutError extends AxlError {
-  constructor(operation: string, timeoutMs: number) {
-    super('TIMEOUT', `${operation} exceeded timeout of ${timeoutMs}ms`);
+  /** Latency attribution for the timed-out operation, when measurable. */
+  readonly breakdown?: TimeoutBreakdown;
+
+  constructor(operation: string, timeoutMs: number, breakdown?: TimeoutBreakdown) {
+    // The prefix is verbatim what it has always been — consumers match on it.
+    // The attribution clause is appended, never substituted.
+    super(
+      'TIMEOUT',
+      `${operation} exceeded timeout of ${timeoutMs}ms` +
+        (breakdown
+          ? ` (elapsed ${breakdown.elapsedMs}ms: queued ${breakdown.queuedMs}ms, ` +
+            `retries ${breakdown.retryMs}ms, wire ${breakdown.wireMs}ms, ` +
+            `other ${breakdown.otherMs}ms)`
+          : ''),
+    );
     this.name = 'TimeoutError';
+    if (breakdown) this.breakdown = breakdown;
   }
 }
 

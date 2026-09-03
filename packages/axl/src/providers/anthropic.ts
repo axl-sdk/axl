@@ -13,6 +13,7 @@ import type {
 } from './types.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
+import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
@@ -887,6 +888,7 @@ export class AnthropicProvider implements Provider {
     const body = this.buildRequestBody(messages, options, false);
     const pricingContext = pricingContextFromBody(body);
 
+    const recorder = new CallTimingRecorder();
     const res = await fetchWithRetry(
       `${this.baseUrl}/messages`,
       {
@@ -895,7 +897,7 @@ export class AnthropicProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, timing: recorder.observer },
     );
 
     if (!res.ok) {
@@ -911,7 +913,7 @@ export class AnthropicProvider implements Provider {
     }
 
     const json = (await res.json()) as AnthropicMessageResponse;
-    return this.parseResponse(json, pricingContext);
+    return withChatTiming(recorder, this.parseResponse(json, pricingContext));
   }
 
   // ---------------------------------------------------------------------------
@@ -926,6 +928,7 @@ export class AnthropicProvider implements Provider {
     const body = this.buildRequestBody(messages, options, true);
     const pricingContext = pricingContextFromBody(body);
 
+    const recorder = new CallTimingRecorder();
     const res = await fetchWithRetry(
       `${this.baseUrl}/messages`,
       {
@@ -934,7 +937,7 @@ export class AnthropicProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, timing: recorder.observer },
     );
 
     if (!res.ok) {
@@ -953,7 +956,10 @@ export class AnthropicProvider implements Provider {
       throw new Error('Anthropic stream response has no body');
     }
 
-    yield* this.parseSSEStream(res.body, pricingContext, res.headers);
+    yield* withCallTiming(
+      recorder,
+      this.parseSSEStream(res.body, pricingContext, res.headers, recorder),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -1335,6 +1341,7 @@ export class AnthropicProvider implements Provider {
     body: ReadableStream<Uint8Array>,
     pricingContext: AnthropicPricingContext,
     responseHeaders: Headers,
+    timing?: CallTimingRecorder,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -1379,7 +1386,7 @@ export class AnthropicProvider implements Provider {
 
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await (timing ? timing.read(reader) : reader.read());
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });

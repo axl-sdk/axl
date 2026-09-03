@@ -197,6 +197,38 @@ The same unpriced condition is surfaced on the budget rail. A [`ctx.budget()`](a
 
 ⚠️ **Honesty, not enforcement.** `unpriced` reports that `totalCost` is a lower bound — it does **not** make the limit enforceable. The enforcement rail only ever sees *measured* cost, so a cost limit (including `hard_stop`) **cannot trip on unpriced spend** (e.g. unpriced/self-hosted/Bedrock models). A `hard_stop` budget pointed at an unpriced model will run unbounded by dollars. Token-denominated budgets are the planned mechanism for governing unpriced models; until then, treat `unpriced: true` as "the limit could not be enforced for part of this block." To restore enforceable cost limits, register pricing for the model so calls carry a usable cost.
 
+### Per-call timing
+
+`agent_call_end.duration` is the whole turn's wall clock. Under an opt-in
+[`rateLimit`](providers.md#rate-limiting-opt-in) that number folds three unrelated things
+together — the SDK's own queue wait, the provider's 429 backoff, and the model's actual
+latency — so it cannot answer "was the model slow, or was I pacing myself?".
+
+The built-in chat adapters answer that with a `timing` block beside `duration`:
+
+```typescript
+runtime.on('trace', (event) => {
+  if (event.type !== 'agent_call_end' || !event.timing) return;
+  const { queuedMs, retryMs, wireMs, firstTokenMs } = event.timing;
+  console.log(`${event.model}: queue ${queuedMs}ms, retries ${retryMs}ms, wire ${wireMs}ms`);
+  if (firstTokenMs !== undefined) console.log(`  first token at ${firstTokenMs}ms`);
+});
+```
+
+`duration` is unchanged and still brackets the whole turn; `timing` is additive and
+optional. It is absent on the error path, and absent for any custom `Provider` that does
+not report it — so branch on its presence rather than defaulting the fields to zero.
+Nothing in core sums `timing` across the calls of one ask: across parallel branches a sum
+would exceed wall clock, which is why aggregation belongs to whoever knows the shape of
+the fan-out. Field definitions and the streaming caveats are in
+[api-reference.md → `CallTiming`](api-reference.md#calltiming) and
+[providers.md → What you can observe](providers.md#what-you-can-observe).
+
+A `ctx.ask()` that times out uses the same numbers: when at least one completed turn
+reported timing, `TimeoutError.message` appends `(elapsed …: queued …, retries …, wire …,
+other …)` and `TimeoutError.breakdown` carries the figures programmatically, so a budget
+consumed by self-imposed pacing is visible without guessing.
+
 ### Failure surfacing — `ask_end` vs. `error`
 
 Ask-internal failures (gate retries exhausted, `ctx.verify` failure, handler throw) surface via `ask_end({ outcome: { ok: false, error } })` only — **not** the workflow-level `error` event. The workflow-level `error` is reserved for failures with no `ask_end` available (top-level workflow throws before any ask runs, infrastructure / abort errors). Consumers narrow on `outcome.ok`:

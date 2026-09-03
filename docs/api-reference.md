@@ -315,7 +315,9 @@ const ctx = runtime.createContext({
 
 ### `runtime.trackExecution(fn, options?)`
 
-Track cost and execution metadata across any runtime operations within `fn`. Returns `{ result, cost, unpriced, metadata, traces? }` where `unpriced` is `true` when any tracked call was unpriced (making `cost` a **lower bound** — the aggregate counterpart of `ExecutionInfo.unpriced`), and `metadata` includes `models` (unique model URIs), `modelCallCounts`, `tokens` (input/output/reasoning sums — agent calls only, not embedder tokens), `agentCalls` count, `workflows` (insertion-ordered unique names), and `workflowCallCounts`. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
+Track cost and execution metadata across any runtime operations within `fn`. Returns `{ result, cost, unpriced, modelTiming?, metadata, traces? }` where `unpriced` is `true` when any tracked call was unpriced (making `cost` a **lower bound** — the aggregate counterpart of `ExecutionInfo.unpriced`), and `metadata` includes `models` (unique model URIs), `modelCallCounts`, `tokens` (input/output/reasoning sums — agent calls only, not embedder tokens), `agentCalls` count, `workflows` (insertion-ordered unique names), and `workflowCallCounts`. Uses `AsyncLocalStorage` for per-call scoping — correct with concurrent calls. Works with both `createContext()` and `execute()` inside `fn`.
+
+**`modelTiming`** rolls up [`CallTiming`](#calltiming) from `agent_call_end` per model, keyed exactly like `metadata.modelCallCounts`: `Record<model, { calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }>`. It is **absent** unless at least one tracked call reported timing, so "no instrumentation" stays distinguishable from "zero milliseconds". `calls` counts only the **timed** calls, which can be fewer than that model's `modelCallCounts` entry (a custom provider that returns no `timing`, or a failed call — the error path carries none), so divide the sums by `calls`, never by the call count. `firstTokenMs` is streaming-only, is summed across just the calls that reported it, and carries its own denominator in `firstTokenCalls` (the two are present or absent together) — dividing it by `calls` would report a first-token latency no call achieved on a model that mixes streamed and non-streamed calls. Sums are per call, so `wireMs` across concurrent calls can exceed the wall clock of `fn`.
 
 **Note on `metadata.tokens`:** narrowly scoped to agent prompt/completion/reasoning tokens. Embedder tokens from semantic memory ops are deliberately not summed in (different pricing, different model). Consumers who want embedder token counts should subscribe to `runtime.on('trace', ...)` and read `data.usage.tokens` on `memory_remember` / `memory_recall` events.
 
@@ -1607,6 +1609,31 @@ const runtime3 = new AxlRuntime({
 
 > **Scope:** caps request *concurrency*, not token throughput (TPM) — a permit releases at response headers. Governs **chat calls only** (memory embedder calls are not governed in this version) and is **per provider instance / process** (not shared across processes on the same key). Full caveats in [providers.md → Rate limiting](providers.md#rate-limiting-opt-in).
 
+### `CallTiming`
+
+Per-call latency breakdown. Reported by all four built-in chat adapters on
+`ProviderResponse.timing` (from `chat()`), on the terminal `done` stream chunk (from
+`stream()`), and copied onto `agent_call_end.timing`. Exported from `@axlsdk/axl`.
+
+Every field is a non-negative millisecond count derived from `Date.now()` deltas — the same
+clock as `duration`. The whole block is optional: a custom `Provider` that omits it stays
+valid, so treat every field as possibly absent.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `queuedMs` | `number` | Time parked in Axl's own opt-in `RateLimiter` (concurrency cap plus `minIntervalMs` spacing) before the request was allowed out. `0` when the provider has no `rateLimit`. Self-imposed wait, not provider latency |
+| `attempts` | `number` | `fetch` attempts made for this call, including the final one (≥ 1) |
+| `retryMs` | `number` | First attempt's dispatch → final attempt's dispatch: failed attempts plus their backoff sleeps. `0` for a single attempt |
+| `ttfbMs` | `number` | Final dispatch → response headers |
+| `firstTokenMs` | `number?` | Final dispatch → first `text_delta`/`thinking_delta`. **Streaming only**, and absent on a stream that ends without a content delta. The model-discriminating figure — headers arrive at roughly one round trip regardless of model, first token does not |
+| `wireMs` | `number` | Time attributable to the provider. `chat()`: final dispatch → response body parsed. `stream()`: `ttfbMs` plus the cumulative time spent *awaiting* body reads, so runtime work between reads (event fan-out, tool-call buffering, a slow `ctx.events` consumer) is excluded by construction |
+
+`agent_call_end.duration` is unchanged and still measures the whole turn's wall clock,
+queue and retries included. `timing` sits beside it; it does not replace it. Nothing in core
+sums `timing` across the calls of one ask — a sum across parallel branches would exceed wall
+clock. See [providers.md → Rate limiting](providers.md#rate-limiting-opt-in) for what
+`queuedMs` does and does not bound under streaming.
+
 ### MCP server configuration
 
 Each `config.mcp.servers` entry (`McpServerConfig`) accepts:
@@ -1808,6 +1835,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `cost` | `number?` | Cost in USD for this step. Required on `agent_call_end` and `ask_end` (narrowing). **`ask_end.cost` is a per-ask rollup — see double-counting note below** |
 | `tokens` | `{ input?, output?, reasoning? }?` | Token usage from the provider (on `agent_call_end` events). Maps from `ProviderResponse.usage` |
 | `duration` | `number?` | Duration in ms (set on `_end` variants) |
+| `timing` | `CallTiming?` | Per-call latency breakdown on `agent_call_end`, when the provider reported one. Additive beside `duration` — see [`CallTiming`](#calltiming) |
 | `data` | event-specific | Variant-specific payload — narrow via `type` |
 | `timestamp` | `number` | Event timestamp (ms) |
 
@@ -1834,7 +1862,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `ask_start` | `AskScoped` | `prompt: string` | Top of every `ctx.ask()` |
 | `ask_end` | `AskScoped` | `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration` | Every `ctx.ask()` exit. Ask-internal failures surface here, NOT via the workflow-level `error` event |
 | `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number`, `data: AgentCallStartData` | Before each LLM call (one per loop turn) |
-| `agent_call_end` | `AskScoped` | `agent: string`, `model: string`, `cost: number`, `duration: number`, `data: AgentCallEndData` | After each LLM call returns |
+| `agent_call_end` | `AskScoped` | `agent: string`, `model: string`, `cost: number`, `duration: number`, `timing?: CallTiming`, `data: AgentCallEndData` | After each LLM call returns. `timing` is present on the success path when the provider reported it; never on the error path |
 | `token` | `AskScoped` | `data: string` | Streaming text chunk. **Stream-only** — never persisted to `ExecutionInfo.events` |
 | `tool_call_rejected` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallRejectedData` | Provider request rejected before execution starts; no start/end pair |
 | `tool_call_start` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallStartDataV2` | After availability, JSON, and local argument validation succeeds |
@@ -2055,7 +2083,7 @@ All errors extend `AxlError`.
 | `ValidationError` | `ctx.ask()`, `ctx.verify()` | Post-schema business rule validation failed after all retries. Includes `.lastOutput`, `.reason`, `.retries` |
 | `QuorumNotMet` | `ctx.spawn()`, `ctx.map()` | Fewer tasks succeeded than the required quorum. Includes `.results` |
 | `NoConsensus` | `ctx.vote()` | No successful results to vote on, unanimous vote failed, or invalid strategy/option combination |
-| `TimeoutError` | `ctx.ask()` | Agent exceeded its configured `timeout` |
+| `TimeoutError` | `ctx.ask()` | Agent exceeded its configured `timeout`. When at least one completed turn reported provider `timing`, the message appends `(elapsed Nms: queued Nms, retries Nms, wire Nms, other Nms)` and `.breakdown` (`TimeoutBreakdown`) carries the same numbers. With no instrumented turn, the message is the bare prefix and `.breakdown` is `undefined` |
 | `MaxTurnsError` | `ctx.ask()` | Agent exceeded its configured `maxTurns` |
 | `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy. Includes `.limit`, `.spent`, `.policy` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
@@ -2067,6 +2095,26 @@ All errors extend `AxlError`.
 | `AxlError` / `PENDING_DECISION_NOT_FOUND` | `runtime.resolveDecision()` | No active or persisted pending request exists, or another concurrent resolution already won |
 | `AxlError` / `CROSS_PROCESS_RESUME_UNSUPPORTED` | `runtime.resolveDecision()` | A persisted request exists but its in-process continuation owner is gone. Fails before deleting the request or starting side effects |
 | `AxlError` / `CONCURRENT_HUMAN_DECISION_UNSUPPORTED` | `ctx.awaitHuman()` | A second execution-keyed wait would overwrite the first. Both waits are cancelled; request-scoped concurrent approvals are deferred to the durable replay design |
+
+### `TimeoutBreakdown` (`TimeoutError.breakdown`)
+
+Where a timed-out `ctx.ask()`'s elapsed budget went, summed over the turns that completed
+before the timeout fired. Exported from `@axlsdk/axl`.
+
+**Present only when at least one completed turn reported provider [`timing`](#calltiming).**
+Otherwise `.breakdown` is `undefined` and the message is the bare prefix — an all-zero
+breakdown would blame tools and gates for a budget the provider simply never measured.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `elapsedMs` | `number` | Wall clock consumed by the ask when it timed out |
+| `queuedMs` | `number` | Sum of `CallTiming.queuedMs` — self-imposed rate-limiter wait |
+| `retryMs` | `number` | Sum of `CallTiming.retryMs` — failed provider attempts and their backoff |
+| `wireMs` | `number` | Sum of `CallTiming.wireMs` — provider time |
+| `otherMs` | `number` | `elapsedMs` minus the three sums: tools, gates, runtime work, response-body download, and any async `apiKey` callback. Clamped at `0` |
+
+Every completed turn of the ask contributes, gate-retry turns (schema / validate / guardrail)
+included, since each is a separate provider call. A turn that threw contributes nothing.
 
 ### `ProviderError` fields
 
@@ -2166,6 +2214,7 @@ Per-item result from an eval run. `scores` provides quick numeric access; `score
 | `scorerCost` | `number?` | Total scorer cost for this item (sum of all `scoreDetails[*].cost`) |
 | `scoreDetails` | `Record<string, ScorerDetail>?` | Rich per-scorer data — includes `metadata` (e.g., LLM reasoning), per-scorer `duration`, and `cost` |
 | `metadata` | `Record<string, unknown>?` | Execution metadata forwarded from the runtime (e.g., `models`, `tokens`, `agentCalls`) |
+| `timing` | `Record<string, ItemModelTiming>?` | Per-model provider-call latency for this item, rolled up from `agent_call_end.timing`. Keyed by the full model URI (`openai:gpt-4o`), the same key as `metadata.modelCallCounts`. `ItemModelTiming` is `{ calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }` — sums in ms across the item's **timed** calls. `firstTokenMs` is streaming-only and its denominator is `firstTokenCalls`, not `calls`, so a model mixing streamed and non-streamed calls still averages exactly. Populated on both the default and the `captureTraces` path; **absent** when the item made no timed provider call (no ask, an uninstrumented custom provider, or a runtime without `trackExecution`). Distinct from `duration`, which is unchanged workflow wall clock. Exported from `@axlsdk/eval` |
 | `traces` | `AxlEvent[]?` | Per-item events. Populated only when the eval was run with `{ captureTraces: true }`. Includes events on the failure path (recovered from the `axlCapturedTraces` side-channel on thrown errors) |
 
 ### `EvalResult`
@@ -2213,9 +2262,27 @@ Aggregate statistics across all items.
 | `count` | `number` | Total items |
 | `failures` | `number` | Items where the workflow threw an error |
 | `scorers` | `Record<string, { mean, min, max, p50, p95, scored?, failed?, skipped? }>` | Per-scorer aggregate stats (all score values 0-1). `scored` is the number of items that produced a valid numeric score — the sample size `mean` actually covers; `failed` is the number whose scorer **ran and failed** (threw / out-of-range); `skipped` is the number whose `applies` predicate returned `false` (deliberately not run). Neither a skipped nor a cancelled scorer is in `scored`/`failed`, so `scored + failed` is the honest "attempted" count and the failure rate excludes skips. A non-zero `failed` means `mean` rests on a thinned sample. All optional (absent on pre-0.18.0 artifacts → recompute from `items`) |
-| `timing` | `{ mean, min, max, p50, p95 }?` | Per-item duration statistics in ms |
+| `timing` | `{ mean, min, max, p50, p95 }?` | Per-item **wall-clock** duration statistics in ms. Unchanged by the per-model rollup below — it still covers the whole workflow, queue and all |
+| `modelTiming` | `Record<string, ModelTimingStats>?` | Per-model provider-latency stats, present only when at least one item reported timing. Read alongside `timing`, never instead of it. `ModelTimingStats` is exported from `@axlsdk/eval` and holds **two different kinds of average** — see the note below |
 | `degraded` | `DegradedScorer[]?` | Present only when `EvalConfig.failOnScorerErrorRate` is set **and** one or more scorers exceeded tolerance. Each entry is `{ scorer, rate, limit, type, scored, failed }`. `runEval` sets this and returns normally (it never throws); the CLI turns a non-empty `degraded` into a non-zero exit |
 | `DegradedScorer` | `{ scorer: string; rate: number; limit: number; type: 'llm' \| 'deterministic'; scored: number; failed: number }` | One scorer that tripped the failure-rate gate. `rate = failed / (scored + failed)`; `limit` is the tolerance exceeded (`0` for deterministic). Exported from `@axlsdk/eval` |
+
+#### `ModelTimingStats`
+
+Per-model provider latency on `EvalSummary.modelTiming`. It carries two kinds of average, because they answer different questions and disagree whenever items make unequal numbers of calls.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `calls` | `number` | Total **timed** provider calls for this model across every item. The denominator of the three `mean*Ms` fields |
+| `meanWireMs` | `number` | Exact call-weighted mean provider time per call, in ms |
+| `meanQueuedMs` | `number` | Exact call-weighted mean wait on Axl's own rate limiter, in ms |
+| `meanRetryMs` | `number` | Exact call-weighted mean retry time (failed attempts + backoff), in ms. A model the provider throttled hard on the day of the run shows it here, which is what keeps `meanWireMs` an honest comparison |
+| `meanFirstTokenMs` | `number?` | Exact mean time to the first content delta, over `firstTokenCalls`. **Absent** when no call reported one (a non-streaming run) — never `0`. This is the model-discriminating figure, since response headers arrive at roughly one round trip regardless of model |
+| `firstTokenCalls` | `number?` | Timed calls that reported a first token — the denominator of `meanFirstTokenMs`, present exactly when it is. It is separate from `calls` because a model can mix streamed and non-streamed calls |
+| `wireMs` | `{ mean, min, max, p50, p95 }` | **Distribution whose sample is one value per item**, not per call: each item's sum divided by that item's `calls`. A ten-call item counts once, exactly like `summary.timing`, which makes the spread comparable to it |
+| `queuedMs` | `{ mean, min, max, p50, p95 }` | Same per-item sampling, for queue wait |
+
+> **`wireMs.mean` is not a per-call average.** With two items where one makes 1 call at 100 ms and the other makes 99 calls at 1000 ms, `wireMs.mean` is 550 ms while `meanWireMs` is 991 ms. Compare models on `meanWireMs`; use the distributions for spread. The CLI prints only the call-weighted figures for this reason.
 
 ### `Scorer`
 

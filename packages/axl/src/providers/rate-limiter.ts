@@ -10,11 +10,14 @@
  * shared API key can storm a provider's rate limit; a governor smooths that.
  *
  * ## Scope & caveats (v1)
- * - **Caps request concurrency, not token throughput (TPM).** Streaming `chat()`
- *   releases the permit at *headers* (the adapter gets the `Response` from
- *   `fetchWithRetry`, then iterates the body separately), so a slow stream does
- *   NOT hold a permit for its whole lifetime. Non-streaming `chat()` holds the
- *   permit through `res.json()`. Neither bounds tokens/min.
+ * - **Caps request concurrency, not token throughput (TPM).** The permit is
+ *   released at response *headers* on BOTH transports: `fetchWithRetry`
+ *   releases in its `finally` as it returns the `Response`, and every adapter
+ *   reads the body only afterwards — so `res.json()` and stream iteration alike
+ *   run outside the permit. A slow stream therefore does not hold a permit for
+ *   its whole lifetime. Non-streaming calls still hold it across generation in
+ *   practice, because a provider sends no headers until the completion is
+ *   finished. Neither bounds tokens/min.
  * - **Per provider instance.** Providers are singletons per (runtime, provider
  *   type), so one governor governs all calls through that adapter — but NOT
  *   embedder calls (the embedder is constructed outside the registry) and NOT

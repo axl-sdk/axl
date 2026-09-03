@@ -3697,3 +3697,47 @@ describe('GeminiProvider', () => {
     });
   });
 });
+
+describe('gate-retry continuation on models without terminal model prefill', () => {
+  const attempt = {
+    role: 'assistant' as const,
+    content: '{"value": 1}',
+    providerMetadata: { geminiParts: [{ text: '{"value": 1}', thoughtSignature: 'sig-1' }] },
+  };
+
+  it('accepts [system, user, assistant(attempt), user(feedback)] on gemini-3.6-flash', async () => {
+    const fetchMock = mockFetch({
+      json: () => Promise.resolve(makeGeminiResponse('{"value": 2}')),
+    });
+    const provider = new GeminiProvider({ apiKey: 'my-key' });
+    await provider.chat(
+      [
+        { role: 'system', content: 'Return JSON.' },
+        { role: 'user', content: 'go' },
+        attempt,
+        { role: 'user', content: 'Your previous response failed validation: must not be 1.' },
+      ],
+      { model: 'gemini-3.6-flash' },
+    );
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const roles = (body.contents ?? body.input ?? []).map((c: any) => c.role);
+    expect(roles.at(-1)).toBe('user');
+    expect(roles).toContain('model');
+  });
+
+  it('rejects the pre-fix shape [system, user, assistant(attempt), system(feedback)]', async () => {
+    mockFetch({ json: () => Promise.resolve(makeGeminiResponse('x')) });
+    const provider = new GeminiProvider({ apiKey: 'my-key' });
+    await expect(
+      provider.chat(
+        [
+          { role: 'system', content: 'Return JSON.' },
+          { role: 'user', content: 'go' },
+          attempt,
+          { role: 'system', content: 'Your response failed validation.' },
+        ],
+        { model: 'gemini-3.6-flash' },
+      ),
+    ).rejects.toThrow('does not support a terminal assistant/model prefill');
+  });
+});

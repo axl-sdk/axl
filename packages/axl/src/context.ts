@@ -450,6 +450,13 @@ function extractBalanced(
  * schema_check, and validate retry paths — keeps the exact message shape in
  * one place so fixes (e.g. preserving providerMetadata for Gemini) apply to
  * all three gates at once.
+ *
+ * The feedback is a `user` turn, never `system`: every adapter hoists system
+ * messages into a top-level instruction field, so a system-role correction
+ * would leave the request ending on the model's own rejected attempt — a
+ * prefill on Anthropic, and a hard throw on Gemini models that reject a
+ * terminal model turn. A user turn lands after the attempt where the model
+ * weighs it, and keeps the request ending on a user message.
  */
 function appendRetryMessages(
   messages: ChatMessage[],
@@ -462,7 +469,7 @@ function appendRetryMessages(
     content,
     ...(providerMetadata ? { providerMetadata } : {}),
   });
-  messages.push({ role: 'system', content: feedbackMessage });
+  messages.push({ role: 'user', content: feedbackMessage });
 }
 
 function estimateMessagesTokens(messages: ChatMessage[]): { tokens: number; unmeasured: boolean } {
@@ -2711,7 +2718,7 @@ export class WorkflowContext<TInput = unknown> {
         const validateMaxAttempts = maxValidateRetries + 1;
         let validateFeedback: string | undefined;
         if (!validateResult.valid && validateRetries < maxValidateRetries) {
-          validateFeedback = `Your response parsed correctly but failed validation: ${validateResult.reason ?? 'Validation failed'}. Previous attempts are visible above. Please fix and try again.`;
+          validateFeedback = `Your previous response failed validation: ${validateResult.reason ?? 'Validation failed'}. Return a corrected response that satisfies the required schema and this rule.`;
         }
 
         this.emitEvent({

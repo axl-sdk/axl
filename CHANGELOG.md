@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Gate-retry feedback is now a user turn.** Guardrail, schema, and `validate`
+  retries appended the corrective feedback as a `system` message. Every
+  provider adapter hoists system messages out of the conversation, so the
+  request the model received on a retry ended on its own rejected attempt with
+  the correction buried at the tail of the system prompt — an assistant prefill
+  on Anthropic, and a hard "does not support a terminal assistant/model
+  prefill" throw on Gemini models that reject a terminal model turn (every
+  validation retry on those models failed). Feedback is now appended as a
+  `user` turn after the assistant attempt. The `validate` feedback text no
+  longer affirms the rejected output ("parsed correctly") or points at content
+  the model cannot see ("visible above"). `trace.level: 'full'` message
+  snapshots reflect the new shape; `pipeline`, `guardrail`, `schema_check`, and
+  `validate` events are unchanged.
+
 ## [0.22.2] - 2026-09-02
 
 ### Changed

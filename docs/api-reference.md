@@ -406,7 +406,7 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 
 **Returns:** `Promise<T>` — parsed output if `schema` is provided, otherwise `string`.
 
-**Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a system message explaining the error. On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
+**Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a **user** message explaining the error (a user turn, not a system message: providers hoist system messages out of the conversation, which would leave the request ending on the rejected attempt). On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
 
 **Streaming + validate:** As of 0.16.0, `validate` and token streaming (via `runtime.stream()`) coexist — validate runs against the buffered response after streaming completes. (Pre-0.16.0 this combination threw `INVALID_CONFIG`.) For structured output, the typed result is still only available after the full response arrives.
 
@@ -1043,11 +1043,11 @@ const safe = agent({
 
 | Policy | Behavior |
 |--------|----------|
-| `'retry'` | Append the LLM's blocked output (as an assistant message) and the block reason (as a system correction prompt) to the conversation, then re-call the LLM so it can self-correct. Only applies to **output** guardrails — input guardrails always throw since the prompt is user-supplied |
+| `'retry'` | Append the LLM's blocked output (as an assistant message) and the block reason (as a user correction turn) to the conversation, then re-call the LLM so it can self-correct. Only applies to **output** guardrails — input guardrails always throw since the prompt is user-supplied |
 | `'throw'` | Throw a `GuardrailError` immediately |
 | `(reason, ctx) => string` | Custom function that receives the block reason and returns a fallback response (does not retry the LLM) |
 
-**Retry mechanics:** On each retry, the LLM's blocked response is appended to the conversation as an assistant message, followed by a system message: *"Your previous response was blocked by a safety guardrail: {reason}. Please provide a different response that complies with the guidelines."* These messages **accumulate** across retries — if the guardrail blocks twice, the LLM sees both failed attempts and both correction prompts before its third try, giving it increasing context about what to avoid. All retry messages are ephemeral — they exist only within the `ctx.ask()` call and are **not** persisted to session history. Only the final successful response is recorded in the session, so subsequent turns never see the blocked attempts.
+**Retry mechanics:** On each retry, the LLM's blocked response is appended to the conversation as an assistant message, followed by a user message: *"Your previous response was blocked by a safety guardrail: {reason}. Please provide a different response that complies with the guidelines."* These messages **accumulate** across retries — if the guardrail blocks twice, the LLM sees both failed attempts and both correction prompts before its third try, giving it increasing context about what to avoid. All retry messages are ephemeral — they exist only within the `ctx.ask()` call and are **not** persisted to session history. Only the final successful response is recorded in the session, so subsequent turns never see the blocked attempts.
 
 Schema retries and validate retries use the same accumulating pattern — see [Validate](#validate) and the [Output Pipeline](#output-pipeline) for the full flow.
 
@@ -1113,7 +1113,7 @@ type ValidateResult = { valid: boolean; reason?: string };
 | `validate` | `OutputValidator<T>` | — | Validation function. Receives the schema-parsed object. `T` is inferred from `schema` |
 | `validateRetries` | `number` | `2` | Maximum retries before throwing `ValidationError` |
 
-**Retry mechanics:** The LLM's failed response and the validation error are appended to the conversation history as assistant + system messages. Context **accumulates** across retries, so the LLM sees all previous failed attempts and can reason about what to fix. The validation `reason` is fed back in the system message: *"Your response parsed correctly but failed validation: {reason}."* If the validator throws an exception, it's treated as a validation failure — the error message is fed back and the retry counter is incremented.
+**Retry mechanics:** The LLM's failed response and the validation error are appended to the conversation history as assistant + user messages. Context **accumulates** across retries, so the LLM sees all previous failed attempts and can reason about what to fix. The validation `reason` is fed back in the user message: *"Your previous response failed validation: {reason}. Return a corrected response that satisfies the required schema and this rule."* If the validator throws an exception, it's treated as a validation failure — the error message is fed back and the retry counter is incremented.
 
 On retry, the new LLM response goes through the **full output pipeline** again (guardrail → schema → validate). See [Output Pipeline](#output-pipeline) below.
 

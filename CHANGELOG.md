@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`gemini-3.7-flash` and `gemini-3.8-flash` had no pricing.** Both were
+  already supported for requests (effort mapping, multimodal input) but were
+  missing from the rate table, so `response.cost` was `undefined` for the two
+  newest Flash models. Both are now priced at $0.75 / $0.075 cached / $3.75.
+- **`gemini-3.6-flash` was priced ~2x too high.** It moved onto the same Flash
+  promotional rate ($0.75 / $3.75, announced through 2026-12-31); the table still
+  carried the pre-promotion $1.50 / $7.50.
+- **`gemini-3-flash-preview` is no longer priced.** It has dropped off Google's
+  published pricing page while remaining callable, so its usage is now reported
+  with `cost: undefined` instead of a stale, unverifiable rate. Requests to it
+  are unaffected.
 - **Claude Sonnet 5 was overpriced 50% from September 1, 2026.** The rate table
   encoded Anthropic's *announced* increase from the introductory $2/$10 to
   $3/$15 as a forward-dated gate, so every `claude-sonnet-5` cost estimate

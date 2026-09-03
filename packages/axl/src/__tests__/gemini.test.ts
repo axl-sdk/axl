@@ -683,8 +683,8 @@ describe('GeminiProvider', () => {
         model: 'gemini-3.5-flash-lite',
       });
 
-      // $1.50/M input + (10 candidate + 20 thought) * $7.50/M output.
-      expect(response.cost).toBeCloseTo(0.000375, 8);
+      // $0.75/M input + (10 candidate + 20 thought) * $3.75/M output.
+      expect(response.cost).toBeCloseTo(0.0001875, 8);
       expect(response.usage).toEqual({
         prompt_tokens: 100,
         completion_tokens: 10,
@@ -1002,6 +1002,57 @@ describe('GeminiProvider', () => {
       expect(response.cost).toBeCloseTo(0.25001, 8);
     });
 
+    it.each(['gemini-3.7-flash', 'gemini-3.8-flash'])(
+      'prices %s at the current Flash promotional rate',
+      async (model) => {
+        mockFetch({
+          json: () =>
+            Promise.resolve({
+              ...makeGeminiResponse('Hi', {
+                promptTokenCount: 100,
+                candidatesTokenCount: 10,
+                thoughtsTokenCount: 20,
+                totalTokenCount: 130,
+              }),
+              modelVersion: model,
+            }),
+        });
+
+        const response = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+          model,
+        });
+
+        // $0.75/M input + (10 candidate + 20 thought) * $3.75/M output.
+        expect(response.cost).toBeCloseTo(100 * 0.75e-6 + 30 * 3.75e-6, 10);
+      },
+    );
+
+    it('leaves gemini-3-flash-preview unpriced rather than billing an unverifiable rate', async () => {
+      mockFetch({
+        json: () =>
+          Promise.resolve({
+            ...makeGeminiResponse('Hi', {
+              promptTokenCount: 100,
+              candidatesTokenCount: 10,
+              totalTokenCount: 110,
+            }),
+            modelVersion: 'gemini-3-flash-preview',
+          }),
+      });
+
+      const response = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3-flash-preview',
+      });
+
+      // Still a supported model -- usage is reported, cost is unknown.
+      expect(response.cost).toBeUndefined();
+      expect(response.usage).toMatchObject({
+        prompt_tokens: 100,
+        completion_tokens: 10,
+        total_tokens: 110,
+      });
+    });
+
     it('uses providerOptions.model for URL/capabilities/pricing but omits it from the body', async () => {
       const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
       const response = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
@@ -1014,7 +1065,7 @@ describe('GeminiProvider', () => {
       const body = JSON.parse(fetchMock.mock.calls[0][1].body);
       expect(body.model).toBeUndefined();
       expect(body.generationConfig?.temperature).toBeUndefined();
-      expect(response.cost).toBeCloseTo(0.0000525, 8);
+      expect(response.cost).toBeCloseTo(0.00002625, 8);
     });
 
     it('validates Gemini usage totals and exposes valid tool-use usage without pricing it', async () => {
@@ -2479,7 +2530,7 @@ describe('GeminiProvider', () => {
         total_tokens: 130,
         reasoning_tokens: 20,
       });
-      expect(done.cost).toBeCloseTo(0.000375, 8);
+      expect(done.cost).toBeCloseTo(0.0001875, 8);
     });
 
     it('leaves streamed usage unpriced when candidate count is omitted', async () => {

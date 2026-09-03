@@ -108,6 +108,7 @@ these lifecycle dates with a runtime allowlist: arbitrary IDs remain pass-throug
 
 ```
 google:gemini-3.8-flash              # Current image-capable fast model
+google:gemini-3.7-flash              # Previous fast model (GA)
 google:gemini-3.6-flash              # Earlier fast model (GA)
 google:gemini-3.5-flash              # Previous fast model (GA)
 google:gemini-3.5-flash-lite         # Low-cost model (GA)
@@ -123,8 +124,9 @@ First-party lifecycle migrations: `gemini-3-pro-preview` shut down March 9, 2026
 (`gemini-3.1-pro-preview` replacement); `gemini-3.1-flash-lite-preview` shut down
 May 25, 2026 (`gemini-3.1-flash-lite`, with `gemini-3.5-flash-lite` now preferred);
 and Gemini 2.0 Flash/Flash-Lite shut down June 1, 2026 (use `gemini-3.6-flash` /
-`gemini-3.1-flash-lite`). `gemini-3-flash-preview` remains available, but Google
-recommends `gemini-3.6-flash`. See [Gemini deprecations](https://ai.google.dev/gemini-api/docs/deprecations).
+`gemini-3.1-flash-lite`). `gemini-3-flash-preview` remains available and callable, but it no longer appears
+on Google's pricing page, so Axl reports its usage with **no cost** rather than
+billing a rate it cannot verify; Google recommends `gemini-3.8-flash` instead. See [Gemini deprecations](https://ai.google.dev/gemini-api/docs/deprecations).
 
 Gemini [requires every `functionResponse.response` to be a JSON
 object](https://ai.google.dev/api/generate-content#FunctionResponse). Axl parses canonical

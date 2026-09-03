@@ -169,6 +169,11 @@ describe('Context Window Management', () => {
 
     // The newest turn must survive summarization.
     expect(actualCall.some((m: any) => m.content === newestBeforeAsk)).toBe(true);
+
+    // ...and the retained tail must start on a user turn: providers reject a
+    // request whose first non-system message is an assistant reply.
+    const firstNonSystem = actualCall.find((m: any) => m.role !== 'system');
+    expect(firstNonSystem.role).toBe('user');
   });
 
   it('does not summarize when no maxContext is set', async () => {
@@ -189,6 +194,39 @@ describe('Context Window Management', () => {
     const messages = provider.calls[0].messages;
     // system + 50 history messages + 1 user prompt = 52
     expect(messages.length).toBe(52);
+  });
+
+  it('regenerates a stale summary rather than pinning the first one forever', async () => {
+    // With a cached summary and a tight budget, the cached branch must be able
+    // to decline and fall through to regeneration. If it always returns early,
+    // every turn accumulated after the first summary becomes permanently
+    // invisible to the model.
+    const longHistory = generateHistory(20, 200);
+    const provider = new TestProvider([
+      { content: 'Summary A.' },
+      { content: 'First response.' },
+      { content: 'Summary B.' },
+      { content: 'Second response.' },
+    ]);
+    const agentWithSmallContext = agent({
+      model: 'test:test-model',
+      system: 'You are a test agent',
+      maxContext: 500,
+    });
+
+    const ctx = createTestContext(provider, { sessionHistory: longHistory });
+    await ctx.ask(agentWithSmallContext, 'First question');
+    const callsAfterFirst = provider.calls.length;
+
+    await ctx.ask(agentWithSmallContext, 'Second question');
+
+    // The second ask must summarize again, not silently reuse a stale summary
+    // that omits everything said since.
+    const summaryCalls = provider.calls.filter((c: any) =>
+      String(c.messages[0]?.content).includes('Summarize'),
+    );
+    expect(summaryCalls.length).toBeGreaterThan(1);
+    expect(provider.calls.length).toBeGreaterThan(callsAfterFirst + 1);
   });
 
   it('caches summary across calls in the same session', async () => {

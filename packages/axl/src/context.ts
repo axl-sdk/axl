@@ -3292,8 +3292,11 @@ export class WorkflowContext<TInput = unknown> {
         splitIdx = i;
       }
 
-      // As below: never return a summary with no current turn attached.
-      if (splitIdx === history.length) splitIdx = history.length - 1;
+      // No clamp here on purpose. `splitIdx === history.length` means not even
+      // the newest message fits beside this summary, and the correct response
+      // is to fall through and regenerate a summary that covers the turns
+      // added since — clamping instead would make this branch total and pin
+      // the first summary forever, silently hiding everything after it.
       if (splitIdx < history.length) {
         return [summaryMsg, ...history.slice(splitIdx)];
       }
@@ -3322,7 +3325,13 @@ export class WorkflowContext<TInput = unknown> {
     // keeps its existing behavior (summarize it, which also replaces media
     // with safe placeholders) rather than forwarding a message we already
     // estimated cannot fit.
-    if (splitIdx === history.length && history.length > 1) splitIdx = history.length - 1;
+    if (splitIdx === history.length && history.length > 1) {
+      splitIdx = history.length - 1;
+      // Providers require the first non-system message to be a user turn, so a
+      // retained tail that starts on the assistant reply would be rejected.
+      // Pull in its preceding user turn to keep the pair intact.
+      if (history[splitIdx].role === 'assistant' && splitIdx > 0) splitIdx -= 1;
+    }
 
     // If nothing to summarize (all messages are "recent", or only the newest
     // message remains and it is retained unconditionally), just return all.

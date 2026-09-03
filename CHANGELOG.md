@@ -36,9 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped** — including the newest one the next reply depends on. The cached
   summary could never be reused in that state either, so each ask paid a fresh
   summarization call and overwrote the persisted `summaryCache`. Summarization
-  now always retains the newest turn, and an unsatisfiable context budget emits
-  a `log` warning naming the agent, its `maxContext`, and the overhead breakdown
-  instead of silently discarding history.
+  now always retains the newest turn — together with its preceding user turn
+  when the newest is an assistant reply, so the request never begins on an
+  assistant message — and an unsatisfiable context budget emits a `log` warning
+  naming the agent, its `maxContext`, and the overhead breakdown instead of
+  silently discarding history. A cached summary that no longer leaves room for
+  the newest turn is regenerated rather than reused, so turns added since the
+  previous summary cannot become permanently invisible to the model.
 
 - **`gemini-3.7-flash` and `gemini-3.8-flash` had no pricing.** Both were
   already supported for requests (effort mapping, multimodal input) but were

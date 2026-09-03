@@ -106,6 +106,89 @@ export type ScorerDetail = {
   skipped?: boolean;
 };
 
+/**
+ * Provider-call latency sums for one model within one eval item, rolled up from
+ * the `timing` block on `agent_call_end` (see `CallTiming` in `@axlsdk/axl`).
+ *
+ * The point of the split is that `EvalItem.duration` is wall clock for the whole
+ * workflow — tools, gates, the SDK's own rate-limiter queue and all — so it
+ * cannot be compared across models or across runs with different fan-out.
+ * `wireMs` is the provider's time; `queuedMs` is the SDK's self-imposed pacing;
+ * `retryMs` is failed attempts and their backoff.
+ *
+ * Keyed by the effective model URI (`openai:gpt-4o`), the same key
+ * `metadata.modelCallCounts` uses, so the two can be joined.
+ */
+export type ItemModelTiming = {
+  /** Provider calls that REPORTED timing. May be lower than this model's
+   *  `modelCallCounts` entry — an uninstrumented custom provider and the error
+   *  path both contribute a call with no timing. Divide the sums by this, never
+   *  by the call count. */
+  calls: number;
+  /** Sum of `CallTiming.queuedMs` — waiting on the SDK's own rate limiter. */
+  queuedMs: number;
+  /** Sum of `CallTiming.retryMs` — failed attempts plus their backoff. */
+  retryMs: number;
+  /** Sum of `CallTiming.wireMs` — time attributable to the provider. Across
+   *  concurrent calls this can exceed the item's `duration`; that is expected. */
+  wireMs: number;
+  /** Sum of `CallTiming.firstTokenMs` over the STREAMING calls that reported
+   *  one. Absent when no call did, so a non-streaming model reports no
+   *  misleading `0`. Its denominator is `firstTokenCalls`, NOT `calls`. */
+  firstTokenMs?: number;
+  /** Timed calls that reported a `firstTokenMs`. Present exactly when
+   *  `firstTokenMs` is. It exists because a model can mix streamed and
+   *  non-streamed calls, and dividing the first-token sum by `calls` would then
+   *  report a latency no call ever achieved. */
+  firstTokenCalls?: number;
+};
+
+/** Distribution shape shared by the wall-clock and per-model timing stats. */
+type TimingStats = { mean: number; min: number; max: number; p50: number; p95: number };
+
+/**
+ * Per-model latency stats across a run, on `EvalSummary.modelTiming`.
+ *
+ * Two different averages live here, and they answer different questions:
+ *
+ * - **`meanWireMs` / `meanQueuedMs` / `meanRetryMs` / `meanFirstTokenMs` are
+ *   exact call-weighted means** — the sum over every timed call divided by the
+ *   number of those calls. This is the figure to compare across models, and the
+ *   one the CLI prints.
+ * - **`wireMs` / `queuedMs` are distributions whose sample is one value per
+ *   ITEM**, not per call: each item's sum is divided by that item's `calls` and
+ *   the stats run over those per-item means. An item that makes ten calls counts
+ *   once, exactly like the existing wall-clock `summary.timing`, which makes the
+ *   spread comparable to it — but it means `wireMs.mean` will differ from
+ *   `meanWireMs` whenever items have unequal call counts. Do not read
+ *   `wireMs.mean` as a per-call average.
+ */
+export type ModelTimingStats = {
+  /** Total timed provider calls for this model across every item. The
+   *  denominator of `meanWireMs`, `meanQueuedMs` and `meanRetryMs`. */
+  calls: number;
+  /** Exact call-weighted mean wire latency in ms — provider time per call. */
+  meanWireMs: number;
+  /** Exact call-weighted mean queue wait in ms — the SDK's own rate limiter. */
+  meanQueuedMs: number;
+  /** Exact call-weighted mean retry time in ms — failed attempts and backoff.
+   *  A model throttled hard on the day of the run shows it here, which is what
+   *  keeps `meanWireMs` an honest model comparison. */
+  meanRetryMs: number;
+  /** Exact mean time to first content delta in ms, over `firstTokenCalls`.
+   *  Absent when no call reported one (a non-streaming run). This is the
+   *  model-discriminating latency figure — response headers arrive at roughly
+   *  one round trip regardless of model. */
+  meanFirstTokenMs?: number;
+  /** Timed calls that reported a `firstTokenMs` — the denominator of
+   *  `meanFirstTokenMs`. Present exactly when `meanFirstTokenMs` is. */
+  firstTokenCalls?: number;
+  /** Distribution of PER-ITEM mean wire latency (ms). See the note above. */
+  wireMs: TimingStats;
+  /** Distribution of PER-ITEM mean queue wait (ms). See the note above. */
+  queuedMs: TimingStats;
+};
+
 export type EvalItem = {
   input: unknown;
   annotations?: unknown;
@@ -121,6 +204,12 @@ export type EvalItem = {
   scoreDetails?: Record<string, ScorerDetail>;
   /** Execution metadata forwarded from the runtime (models, tokens, agentCalls, etc). */
   metadata?: Record<string, unknown>;
+  /** Per-model provider-call latency for this item, rolled up from
+   *  `agent_call_end.timing`. Absent when the item made no timed provider call
+   *  — an item with no ask, an uninstrumented custom provider, or a runtime
+   *  without `trackExecution`. Distinct from `duration` (workflow wall clock),
+   *  which is unchanged. */
+  timing?: Record<string, ItemModelTiming>;
   /** Trace events captured during this item's execution. Only populated when
    *  `runEval` was called with `{ captureTraces: true }`. Verbose-mode
    *  `agent_call_start.data.messages` snapshots are stripped to keep memory bounded;
@@ -164,6 +253,8 @@ export type EvalSummary = {
       skipped?: number;
     }
   >;
+  /** Wall-clock stats over per-item `duration`. Unchanged by the per-model
+   *  timing rollup — this still measures the whole workflow, queue and all. */
   timing?: {
     mean: number;
     min: number;
@@ -171,6 +262,9 @@ export type EvalSummary = {
     p50: number;
     p95: number;
   };
+  /** Per-model provider-latency stats, present only when at least one item
+   *  reported timing. Read alongside `timing`, never instead of it. */
+  modelTiming?: Record<string, ModelTimingStats>;
   /**
    * Populated by `runEval` ONLY when `EvalConfig.failOnScorerErrorRate` is set
    * and one or more scorers exceeded tolerance. `runEval` never throws on this

@@ -37,6 +37,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MockProvider` responses accept a `timing` block that surfaces on
   `ProviderResponse.timing` and on the streamed `done` chunk, so tests can drive
   the whole path deterministically.
+- **`axl-eval` reports provider latency per model, separate from wall clock.**
+  `EvalItem.duration` and `summary.timing` measure the entire workflow — tools,
+  gates, and the SDK's own rate-limiter queue — so under `concurrency` fan-out
+  against a `maxConcurrent` cap they describe your pacing more than the model.
+  Each item now also carries `timing[model] = { calls, queuedMs, retryMs,
+  wireMs, firstTokenMs?, firstTokenCalls? }`, and the run carries
+  `summary.modelTiming[model]` with exact call-weighted `meanWireMs`,
+  `meanQueuedMs`, `meanRetryMs` and `meanFirstTokenMs?` — so a model throttled
+  hard on the day of the run shows it in `meanRetryMs` instead of silently
+  inflating `meanWireMs`, and `meanFirstTokenMs` (the figure that actually
+  discriminates between models) is reported rather than left to the caller.
+  `firstTokenMs` carries its own denominator because a model can mix streamed
+  and non-streamed calls. `summary.modelTiming` also keeps `wireMs`/`queuedMs`
+  distributions whose sample is one value per item, matching the existing
+  wall-clock stats — their `mean` is therefore NOT a per-call average and is
+  documented as such. The CLI prints one line per model under the `Timing` row,
+  in milliseconds and showing only the call-weighted figures. Both the default
+  and the `captureTraces` path populate it. `EvalItem.duration` and
+  `summary.timing` are
+  unchanged, and so is everything else on the default path: cost, `unpriced`,
+  `metadata`, and budget enforcement still come from the workflow's own return
+  value alone. A runtime without `trackExecution` (a hand-rolled or duck-typed
+  stub) reports no timing and is otherwise unaffected. New exported types
+  `ItemModelTiming` and `ModelTimingStats`. See
+  [testing.md](docs/testing.md#comparing-model-latency-in-an-eval).
 - **`TimeoutError` explains where a timed-out ask's budget went.** When at least
   one completed turn of the ask reported provider `timing`, the message appends
   `(elapsed Nms: queued Nms, retries Nms, wire Nms, other Nms)` and a readonly

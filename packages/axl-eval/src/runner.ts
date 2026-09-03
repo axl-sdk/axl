@@ -5,6 +5,7 @@ import type { DegradedScorer } from './types.js';
 import {
   computeStats,
   mapWithConcurrency,
+  round,
   scorerCounts,
   evaluateScorerTolerance,
 } from './utils.js';
@@ -173,6 +174,7 @@ export async function runEval(
         evalItem.cost = extractUserCost(tracked.result) ?? tracked.cost;
         if (tracked.unpriced) evalItem.unpriced = true;
         evalItem.metadata = extractUserMetadata(tracked.result) ?? tracked.metadata;
+        if (tracked.modelTiming) evalItem.timing = tracked.modelTiming;
         if (tracked.traces && tracked.traces.length > 0) {
           evalItem.traces = tracked.traces;
         }
@@ -180,12 +182,42 @@ export async function runEval(
           totalCost += evalItem.cost;
         }
       } else {
-        const result = await executeWorkflow(item.input, runtime);
+        // Default path. We wrap in trackExecution ONLY to read the per-model
+        // timing rollup — nothing else about this branch changes. `cost`,
+        // `unpriced` and `metadata` deliberately keep coming from the user's
+        // return value alone, exactly as before: falling back to tracked cost
+        // here would newly populate `metadata.models`, and would let a plain
+        // run with a `budget` abort mid-run. That is its own decision.
+        //
+        // Guarded like the `resolveProvider` check above, because a hand-rolled
+        // or duck-typed runtime (the suite's `{} as AxlRuntime`) has no
+        // `trackExecution`; such a runtime simply reports no timing.
+        //
+        // Cost: one extra `trace` listener per in-flight item (so at most
+        // `concurrency` of them, not one per item in the dataset). Each listener
+        // begins with an O(1) `Set` miss on the event's `executionId` and
+        // returns immediately for anything outside its own scope, so a streaming
+        // item emitting thousands of `token` events pays a hash lookup per
+        // event, not a walk. The `captureTraces` path already ran this way at
+        // the same concurrency.
+        let trackedTiming: EvalItem['timing'];
+        let result: Awaited<ReturnType<typeof executeWorkflow>>;
+        if (typeof runtime.trackExecution === 'function') {
+          const tracked = await runtime.trackExecution(
+            async () => executeWorkflow(item.input, runtime),
+            { captureTraces: false },
+          );
+          result = tracked.result;
+          trackedTiming = tracked.modelTiming;
+        } else {
+          result = await executeWorkflow(item.input, runtime);
+        }
         evalItem.duration = Date.now() - itemStart;
         evalItem.output = result.output;
         evalItem.cost = extractUserCost(result);
         const meta = extractUserMetadata(result);
         if (meta) evalItem.metadata = meta;
+        if (trackedTiming) evalItem.timing = trackedTiming;
         if (evalItem.cost != null) {
           totalCost += evalItem.cost;
         }
@@ -282,6 +314,84 @@ export async function runEval(
   const durations = evalItems.filter((i) => !i.error && i.duration != null).map((i) => i.duration!);
   const timing = durations.length > 0 ? computeStats(durations) : undefined;
 
+  // Per-model provider latency, in two forms that answer different questions.
+  //
+  // The `mean*Ms` figures are EXACT call-weighted means: total ms over total
+  // calls. They are what a model comparison needs and what the CLI prints.
+  // The `wireMs`/`queuedMs` distributions sample one value per ITEM (that item's
+  // mean per call) so their spread is comparable to the wall-clock `timing`
+  // stats above — but that makes their `mean` differ from the call-weighted one
+  // whenever items have unequal call counts, which is why both are kept and
+  // labelled rather than one being presented as the other.
+  //
+  // `firstTokenMs` carries its own denominator: a model can mix streamed and
+  // non-streamed calls, and dividing by `calls` would report a first-token
+  // latency no call achieved.
+  const perModelSamples = new Map<
+    string,
+    {
+      calls: number;
+      wireSum: number;
+      queuedSum: number;
+      retrySum: number;
+      firstTokenSum: number;
+      firstTokenCalls: number;
+      wire: number[];
+      queued: number[];
+    }
+  >();
+  for (const item of evalItems) {
+    if (item.error || !item.timing) continue;
+    for (const [model, t] of Object.entries(item.timing)) {
+      let sample = perModelSamples.get(model);
+      if (!sample) {
+        sample = {
+          calls: 0,
+          wireSum: 0,
+          queuedSum: 0,
+          retrySum: 0,
+          firstTokenSum: 0,
+          firstTokenCalls: 0,
+          wire: [],
+          queued: [],
+        };
+        perModelSamples.set(model, sample);
+      }
+      sample.calls += t.calls;
+      sample.wireSum += t.wireMs;
+      sample.queuedSum += t.queuedMs;
+      sample.retrySum += t.retryMs;
+      if (t.firstTokenMs != null && t.firstTokenCalls != null) {
+        sample.firstTokenSum += t.firstTokenMs;
+        sample.firstTokenCalls += t.firstTokenCalls;
+      }
+      sample.wire.push(t.wireMs / t.calls);
+      sample.queued.push(t.queuedMs / t.calls);
+    }
+  }
+  const modelTiming =
+    perModelSamples.size > 0
+      ? Object.fromEntries(
+          [...perModelSamples.entries()].map(([model, s]) => [
+            model,
+            {
+              calls: s.calls,
+              meanWireMs: round(s.wireSum / s.calls),
+              meanQueuedMs: round(s.queuedSum / s.calls),
+              meanRetryMs: round(s.retrySum / s.calls),
+              ...(s.firstTokenCalls > 0
+                ? {
+                    meanFirstTokenMs: round(s.firstTokenSum / s.firstTokenCalls),
+                    firstTokenCalls: s.firstTokenCalls,
+                  }
+                : {}),
+              wireMs: computeStats(s.wire),
+              queuedMs: computeStats(s.queued),
+            },
+          ]),
+        )
+      : undefined;
+
   // Aggregate per-model LLM call counts across all items
   const totalModelCalls = new Map<string, number>();
   for (const item of evalItems) {
@@ -370,6 +480,7 @@ export async function runEval(
       failures,
       scorers: scorerStats,
       timing,
+      ...(modelTiming ? { modelTiming } : {}),
       ...(degraded ? { degraded } : {}),
     },
   };

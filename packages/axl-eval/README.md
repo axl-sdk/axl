@@ -427,7 +427,8 @@ console.log(results.summary.scorers['quality'].failed); // 2  (scorer ran and th
 console.log(results.summary.scorers['quality'].skipped); // 0  (items the applies predicate skipped)
 console.log(results.summary.count);                     // 50 items
 console.log(results.summary.failures);                  // 2 workflow errors
-console.log(results.summary.timing);                    // { mean, min, max, p50, p95 } in ms
+console.log(results.summary.timing);                    // { mean, min, max, p50, p95 } in ms — WORKFLOW wall clock
+console.log(results.summary.modelTiming);               // per model: { calls, meanWireMs, meanQueuedMs, meanRetryMs, meanFirstTokenMs? } — PROVIDER latency, exact per-call means
 console.log(results.totalCost);                          // 0.42 (workflow + scorer LLM costs)
 console.log(results.metadata.models);                    // ["openai:gpt-4o"] (sorted by usage)
 console.log(results.metadata.modelCounts);               // { "openai:gpt-4o": 48, "openai:gpt-4o-mini": 2 } (total LLM calls per model)
@@ -437,7 +438,8 @@ for (const item of results.items) {
   if (item.error) continue;                              // workflow threw
 
   // Timing and cost
-  console.log(item.duration);                            // workflow execution ms
+  console.log(item.duration);                            // workflow execution ms (tools, gates, queue and all)
+  console.log(item.timing);                              // per model: { calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? } sums — absent if nothing was timed
   console.log(item.cost);                                // workflow LLM cost
   console.log(item.scorerCost);                          // total scorer cost for this item
 
@@ -829,8 +831,9 @@ const comparison = evalCompare(baselineRuns, candidateRuns);
 |------|-------------|
 | `EvalConfig` | Eval definition (workflow, dataset, scorers, concurrency, scorerConcurrency, budget) |
 | `EvalResult` | Full eval output (items, summary, cost, duration) |
-| `EvalItem` | Per-item result (input, output, scores, scoreDetails, metadata, traces?) |
-| `EvalSummary` | Aggregate statistics (count, failures, per-scorer stats incl. `scored`/`failed`/`skipped`, timing) |
+| `EvalItem` | Per-item result (input, output, scores, scoreDetails, metadata, traces?, `timing?`) |
+| `EvalSummary` | Aggregate statistics (count, failures, per-scorer stats incl. `scored`/`failed`/`skipped`, wall-clock `timing`, per-model `modelTiming?`) |
+| `ItemModelTiming` / `ModelTimingStats` | Per-model provider latency on `EvalItem.timing` / `EvalSummary.modelTiming`. Compare models on the exact call-weighted `meanWireMs` / `meanFirstTokenMs`; `meanQueuedMs` is Axl's own rate-limiter wait and `meanRetryMs` is the provider's throttling, so neither distorts the comparison. The `wireMs`/`queuedMs` distributions sample once per item, so their `mean` is not a per-call average. Absent when nothing reported timing |
 | `EvalComparison` | Comparison output (scorer deltas, CI, pRegression/pImprovement, n, per-side `runCount` / `partial?`, regressions, improvements). Both sides truncate to `min(baseline.length, candidate.length)` so means align with the paired bootstrap CI's sample |
 | `EvalComparisonPartial` | `{ completed, attempted }` set on a comparison side when the pooled run count is less than the original batch's planned count |
 | `EvalCompareOptions` | Options for `evalCompare()` (`thresholds`) |

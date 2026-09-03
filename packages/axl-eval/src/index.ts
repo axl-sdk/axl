@@ -37,6 +37,8 @@ export type {
   EvalRegression,
   EvalImprovement,
   ScorerDetail,
+  ItemModelTiming,
+  ModelTimingStats,
   DegradedScorer,
   EvalProgressEvent,
   RunEvalOptions,

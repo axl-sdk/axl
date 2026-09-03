@@ -69,6 +69,21 @@ const provider = MockProvider.sequence([
 ]);
 ```
 
+### Deterministic provider timing
+
+A mock response accepts an optional `timing` block ([`CallTiming`](./api-reference.md#calltiming)). `chat()` returns it on `ProviderResponse.timing` and `stream()` carries it on the terminal `done` chunk, so `agent_call_end.timing`, the `TimeoutError` breakdown, and the eval per-model rollup all become exact integers instead of measured deltas — no real clocks, no real transport.
+
+```typescript
+const provider = MockProvider.sequence([
+  {
+    content: 'done',
+    timing: { queuedMs: 40, attempts: 1, retryMs: 0, ttfbMs: 12, wireMs: 90 },
+  },
+]);
+```
+
+Omit `timing` and the mock behaves exactly like an uninstrumented custom provider: the key is absent from the response and from the `done` chunk, and no `agent_call_end` carries one. Use that to test the "provider reports nothing" path — asserting absence is how you keep a `0` from being mistaken for a real measurement. `sequence()` copies the block per call, so a consumer that mutates what it received cannot corrupt a later call's fixture. `fn()` can vary it by `callIndex`, and `replay()` preserves whatever the recorded response carried.
+
 ### Model Parameters in Tests
 
 All model parameters — including `effort`, `temperature`, `maxTokens`, `toolChoice`, and `stop` — are passed through to MockProvider and recorded in test assertions. MockProvider ignores these parameters (it returns pre-configured responses), but they are captured in `agentCalls()` and `traceLog()` so you can verify your agent configuration:
@@ -358,6 +373,34 @@ Testing and [evaluation](../packages/axl-eval/README.md) are complementary but d
 - **Evaluation** uses real LLM calls, runs on demand during prompt iteration, costs money, and measures semantic output quality with scoring functions ("is this workout plan actually good?").
 
 Use testing to verify your workflow works correctly. Use evaluation to verify your prompts produce quality outputs — and to catch regressions when you change them.
+
+### Comparing model latency in an eval
+
+`EvalItem.duration` and `summary.timing` are wall clock for the whole workflow: tools, gates, and the SDK's own rate-limiter queue are all in there. Under `concurrency` fan-out against a `rateLimit.maxConcurrent` cap, that number says more about your pacing than about the model, so it cannot carry a model comparison.
+
+`runEval` therefore also rolls up per-model provider latency from `agent_call_end.timing`, on the default path as well as under `captureTraces`. Each item gets `item.timing[model] = { calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }`, and the run gets `summary.modelTiming[model]`.
+
+Compare models on the four exact call-weighted means:
+
+| Field | What it isolates |
+|---|---|
+| `meanWireMs` | The provider's own time per call |
+| `meanFirstTokenMs` | Time to the first content delta. The figure that actually discriminates between models, since headers arrive at roughly one round trip regardless of model. Absent on a non-streaming run rather than `0` |
+| `meanQueuedMs` | Wait on **your** rate limiter, not the provider's |
+| `meanRetryMs` | Failed attempts and backoff — the provider's throttling that day, kept out of `meanWireMs` |
+
+The CLI prints exactly these, one line per model under the `Timing` row, in ms:
+
+```
+  Timing        1.20s     1.10s     1.90s
+    openai:gpt-4o  wire 412ms · first token 180ms · queued 38ms · retries 0ms  (48 calls, mean per call)
+```
+
+`summary.modelTiming` also carries `wireMs` and `queuedMs` **distributions** (`mean/min/max/p50/p95`) for spread. Those sample **one value per item** (that item's mean per call) to match the wall-clock stats, so a ten-call item does not outweigh nine single-call items — which also means their `mean` is not a per-call average and will differ from `meanWireMs` under uneven fan-out. Compare on the `mean*Ms` fields; reach for the distributions when you want the shape.
+
+`calls` counts only the calls that actually reported timing — a custom provider that returns no `timing` and the error path both contribute none — so an item, or a whole run, can legitimately have no `timing` key at all. `firstTokenMs` keeps its own denominator in `firstTokenCalls`, because a model that mixes streamed and non-streamed calls would otherwise average to a first-token latency no call achieved. A runtime without `trackExecution` (a hand-rolled or duck-typed stub) reports no timing and is otherwise unaffected: cost, budget, and metadata behavior on the default path are unchanged.
+
+To exercise the rollup deterministically, give `MockProvider` a `timing` block (see above) rather than relying on real latency.
 
 ## Live provider gates
 

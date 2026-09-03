@@ -6,7 +6,7 @@ import { agent } from '../agent.js';
 import { tool } from '../tool.js';
 import { Session } from '../session.js';
 import { AxlStream } from '../stream.js';
-import type { AxlEvent } from '../types.js';
+import type { AxlEvent, CallTiming } from '../types.js';
 
 // ── Mock Provider ────────────────────────────────────────────────────────
 
@@ -2214,6 +2214,162 @@ describe('trackExecution()', () => {
     expect(metadata.models).toEqual([]);
     expect(metadata.agentCalls).toBe(0);
     expect(metadata.tokens).toEqual({ input: 0, output: 0, reasoning: 0 });
+  });
+
+  // ── modelTiming rollup (R-T6) ─────────────────────────────────────────
+
+  /** Provider whose per-call `timing` block is scripted, so the rollup's sums
+   *  are exact integers rather than measured deltas. */
+  function timedProvider(responses: Array<{ content: string; timing?: CallTiming }>): {
+    name: string;
+    chat: (m: unknown[], o: unknown) => Promise<unknown>;
+  } {
+    let i = 0;
+    return {
+      name: 'test',
+      chat: async () => {
+        const resp = responses[Math.min(i++, responses.length - 1)];
+        return {
+          content: resp.content,
+          usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+          cost: 0,
+          ...(resp.timing ? { timing: resp.timing } : {}),
+        };
+      },
+    };
+  }
+
+  function timedRuntime(responses: Array<{ content: string; timing?: CallTiming }>): AxlRuntime {
+    const runtime = new AxlRuntime({ defaultProvider: 'test' });
+    runtime.registerProvider('test', timedProvider(responses) as never);
+    return runtime;
+  }
+
+  it('sums agent_call_end timing per model, keyed like modelCallCounts', async () => {
+    const runtime = timedRuntime([
+      { content: 'a1', timing: { queuedMs: 10, attempts: 1, retryMs: 0, ttfbMs: 3, wireMs: 30 } },
+      { content: 'a2', timing: { queuedMs: 20, attempts: 2, retryMs: 100, ttfbMs: 4, wireMs: 40 } },
+      { content: 'b1', timing: { queuedMs: 5, attempts: 1, retryMs: 0, ttfbMs: 2, wireMs: 70 } },
+    ]);
+    const agentA = agent({ name: 'a', model: 'test:model-a', system: 'A' });
+    const agentB = agent({ name: 'b', model: 'test:model-b', system: 'B' });
+
+    const tracked = await runtime.trackExecution(async () => {
+      const ctx = runtime.createContext();
+      await ctx.ask(agentA, 'one');
+      await ctx.ask(agentA, 'two');
+      return ctx.ask(agentB, 'three');
+    });
+
+    expect(tracked.modelTiming).toEqual({
+      'test:model-a': { calls: 2, queuedMs: 30, retryMs: 100, wireMs: 70 },
+      'test:model-b': { calls: 1, queuedMs: 5, retryMs: 0, wireMs: 70 },
+    });
+    // Same key space as the call counts — that is what makes a per-model join work.
+    expect(Object.keys(tracked.modelTiming!)).toEqual(
+      Object.keys(tracked.metadata.modelCallCounts!),
+    );
+  });
+
+  it('omits modelTiming entirely when no call reported timing', async () => {
+    const runtime = timedRuntime([{ content: 'plain' }]);
+    const testAgent = agent({ name: 'plain', model: 'test:model-a', system: 'A' });
+
+    const tracked = await runtime.trackExecution(async () => {
+      const ctx = runtime.createContext();
+      return ctx.ask(testAgent, 'hi');
+    });
+
+    // Absence, not `{}` — "nothing was instrumented" must stay distinguishable
+    // from "everything took zero ms".
+    expect('modelTiming' in tracked).toBe(false);
+    expect(tracked.metadata.modelCallCounts).toEqual({ 'test:model-a': 1 });
+  });
+
+  it('counts only timed calls, and omits firstTokenMs when no call reported one', async () => {
+    const runtime = timedRuntime([
+      { content: 'timed', timing: { queuedMs: 7, attempts: 1, retryMs: 0, ttfbMs: 1, wireMs: 11 } },
+      { content: 'untimed' },
+    ]);
+    const testAgent = agent({ name: 'mixed', model: 'test:model-a', system: 'A' });
+
+    const tracked = await runtime.trackExecution(async () => {
+      const ctx = runtime.createContext();
+      await ctx.ask(testAgent, 'one');
+      return ctx.ask(testAgent, 'two');
+    });
+
+    // Two provider calls, one of them timed: `calls` tracks the timed subset so
+    // a mean over the sums is not deflated by the uninstrumented call.
+    expect(tracked.metadata.modelCallCounts).toEqual({ 'test:model-a': 2 });
+    expect(tracked.modelTiming).toEqual({
+      'test:model-a': { calls: 1, queuedMs: 7, retryMs: 0, wireMs: 11 },
+    });
+    expect('firstTokenMs' in tracked.modelTiming!['test:model-a']).toBe(false);
+    expect('firstTokenCalls' in tracked.modelTiming!['test:model-a']).toBe(false);
+  });
+
+  it('sums firstTokenMs across only the calls that reported it', async () => {
+    const runtime = timedRuntime([
+      {
+        content: 'streamed',
+        timing: {
+          queuedMs: 0,
+          attempts: 1,
+          retryMs: 0,
+          ttfbMs: 10,
+          firstTokenMs: 25,
+          wireMs: 60,
+        },
+      },
+      {
+        content: 'chatted',
+        timing: { queuedMs: 0, attempts: 1, retryMs: 0, ttfbMs: 8, wireMs: 40 },
+      },
+    ]);
+    const testAgent = agent({ name: 'mixed', model: 'test:model-a', system: 'A' });
+
+    const tracked = await runtime.trackExecution(async () => {
+      const ctx = runtime.createContext();
+      await ctx.ask(testAgent, 'one');
+      return ctx.ask(testAgent, 'two');
+    });
+
+    // Two timed calls, only one of which streamed. `firstTokenCalls` is 1, not
+    // 2 — dividing the 25ms by `calls` would report a first-token latency of
+    // 12.5ms for a model that never delivered one that fast.
+    expect(tracked.modelTiming).toEqual({
+      'test:model-a': {
+        calls: 2,
+        queuedMs: 0,
+        retryMs: 0,
+        wireMs: 100,
+        firstTokenMs: 25,
+        firstTokenCalls: 1,
+      },
+    });
+  });
+
+  it('scopes modelTiming per concurrent trackExecution call', async () => {
+    const runtime = timedRuntime([
+      { content: 'x', timing: { queuedMs: 1, attempts: 1, retryMs: 0, ttfbMs: 1, wireMs: 100 } },
+    ]);
+    const agentA = agent({ name: 'a', model: 'test:model-a', system: 'A' });
+    const agentB = agent({ name: 'b', model: 'test:model-b', system: 'B' });
+
+    const [r1, r2] = await Promise.all([
+      runtime.trackExecution(async () => {
+        const ctx = runtime.createContext();
+        return ctx.ask(agentA, 'one');
+      }),
+      runtime.trackExecution(async () => {
+        const ctx = runtime.createContext();
+        return ctx.ask(agentB, 'two');
+      }),
+    ]);
+
+    expect(Object.keys(r1.modelTiming!)).toEqual(['test:model-a']);
+    expect(Object.keys(r2.modelTiming!)).toEqual(['test:model-b']);
   });
 
   it('cleans up listener when fn throws', async () => {

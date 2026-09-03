@@ -875,6 +875,58 @@ Providers charge less for tokens served from cache. The rates differ by provider
 
 Only documented snapshot forms inherit a base model's price. An arbitrary suffix does not.
 
+#### Prompt caching
+
+**OpenAI and Gemini cache automatically** above a per-model minimum (OpenAI: 1,024
+tokens on GPT-5.6+, 2,048 earlier; Gemini: 2,048 on 2.5, 4,096 on 3.x). Axl sends nothing extra; nothing is needed.
+
+**Anthropic caches only when asked**, so Axl exposes an opt-in:
+
+```typescript
+const a = agent({ model: 'anthropic:claude-sonnet-5', system: BIG_PROMPT, tools, promptCache: true });
+await ctx.ask(a, input, { promptCache: false }); // per-call override
+```
+
+With `promptCache: true` the adapter renders `system` as ordered blocks and places a
+single `cache_control` breakpoint on the **first** block — the agent's own prompt.
+Anthropic caches the prefix in the order tools → system → messages, so that one
+breakpoint also covers the tool definitions. Everything after it stays uncached on
+purpose: the rolling conversation summary and handoff headers the runtime injects as
+later system messages, the JSON-mode instruction, and the user turn. A call carrying a
+large one-shot document therefore reads the prefix at the cache rate and writes nothing
+new. An agent with no system prompt of its own anchors on the last tool instead. The
+runtime marks the system messages it synthesizes — the rolling summary and the handoff
+header — with `origin: 'runtime'`, and the adapter never anchors on those: they are
+small and change per turn, so a breakpoint there would sit below the model's minimum.
+A system message *you* seed into `sessionHistory` carries no such mark, so an agent
+without its own `system` will anchor on it — it is your content and stable by your
+contract, which is the right call.
+
+**Why it is off by default.** Cache writes bill at 1.25x input. If your `system` is a
+function of `ctx.metadata` and changes every call, every request is a cold write with
+no read — a silent ~25% increase on the largest part of the prompt, and Axl cannot
+detect that statically. Turn it on when the agent's prompt and tool set are stable
+across calls; that is the shape of every agentic loop.
+
+**Minimum cacheable prefix** (below it Anthropic silently ignores the breakpoint):
+512 tokens on Fable 5.1 / Mythos 5.1 / Opus 5 / Fable 5 / Mythos 5; 1,024 on Opus 4.8,
+Sonnet 5, Sonnet 4.6, Sonnet 4.5; **4,096 on Haiku 4.5**.
+
+**Diagnostic.** With `promptCache` on, Axl watches consecutive calls on one context and
+emits one `log` warning naming the agent in either of two shapes: writes with no reads
+(the prefix changes per call), or no cache activity at all — neither writes nor reads —
+which is what a prefix below the model's minimum looks like, since Anthropic then
+silently ignores the breakpoint. Only adapters that declare the optional
+`realizesPromptCache()` capability — the built-in Anthropic adapter today — receive these
+warnings; `MockProvider` does not declare it, so they do not fire in mock-based tests. (Scope is one `WorkflowContext`; a
+`Session` builds a fresh context per turn, so churn across session turns is not observed.)
+
+**Interaction with `providerOptions`.** If `providerOptions` supplies a top-level
+`cache_control` (Anthropic's automatic mode), or its own `system` or `tools`, the caller
+owns the prefix and Axl adds no breakpoint of its own — otherwise the shallow merge would
+either discard Axl's breakpoint or stack a second one beside the caller's. Verified live
+2026-09-03; see `docs/verification/`.
+
 #### Anthropic — observable cache-read and write TTLs
 
 | Operation | Multiplier |

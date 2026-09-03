@@ -82,6 +82,12 @@ export type ChatOptions = {
    *  'none' disables thinking/reasoning (Gemini 3.x: maps to minimal).
    *  Omit to use provider defaults. */
   effort?: Effort;
+  /** Opt in to provider prompt caching of the stable request prefix (system
+   *  prompt + tool definitions). Anthropic requires an explicit `cache_control`
+   *  breakpoint; OpenAI and Gemini cache automatically, so this is a no-op
+   *  there. Off by default: a prefix that changes every call (a system prompt
+   *  built from `ctx.metadata`) pays the cache-write premium with no reads. */
+  promptCache?: boolean;
   /** Precise thinking token budget (advanced). When set alongside `effort`, overrides the
    *  thinking/reasoning allocation. On Anthropic 4.6, `effort` still controls output quality
    *  independently. On all other providers, `thinkingBudget` fully overrides `effort` for
@@ -173,6 +179,17 @@ export interface Provider {
    *    JSON instruction instead (e.g. Anthropic).
    */
   nativeStructuredOutputSupport?(model: string): 'schema' | 'downgraded' | 'lossy' | 'unsupported';
+
+  /**
+   * Whether this adapter realizes `ChatOptions.promptCache` for this model --
+   * i.e. actually places a cache breakpoint on the request. The runtime only
+   * emits the promptCache diagnostics (cold writes with no reads; no cache
+   * activity at all) for adapters that declare this, because on providers
+   * that cache automatically the absence of cache fields is not a signal.
+   * Adapters that omit this method opt out; the built-in Anthropic adapter is
+   * the only one that declares it today.
+   */
+  realizesPromptCache?(model: string): boolean;
 
   /**
    * How this provider resolved the unified `effort` knob for this request.

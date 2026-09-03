@@ -323,6 +323,32 @@ describe('Context Window Management', () => {
     expect(firstNonSystem.role).toBe('user');
   });
 
+  it('keeps the agent system prompt first and injected system messages after it', async () => {
+    // The Anthropic adapter places its prompt-cache breakpoint on the FIRST
+    // system block on the strength of this ordering: the agent's own prompt is
+    // pushed before history, and the rolling summary is appended later as a
+    // separate system message. If either moved, a summarizing session would
+    // re-write the cache every turn.
+    const longHistory = generateHistory(40, 200);
+    const provider = new TestProvider([{ content: 'Summary.' }, { content: 'Response.' }]);
+    const ctx = createTestContext(provider, { sessionHistory: longHistory });
+    await ctx.ask(
+      agent({ model: 'test:test-model', system: 'AGENT PROMPT', maxContext: 500 }),
+      'Question',
+    );
+
+    const sent = provider.calls[provider.calls.length - 1].messages;
+    const systemIdx = sent
+      .map((m: any, i: number) => (m.role === 'system' ? i : -1))
+      .filter((i: number) => i >= 0);
+    expect(systemIdx.length).toBeGreaterThanOrEqual(2);
+    expect(sent[systemIdx[0]].content).toBe('AGENT PROMPT');
+    expect(sent[systemIdx[0]].origin).toBeUndefined();
+    expect(String(sent[systemIdx[1]].content)).toContain('Summary of earlier conversation');
+    // The runtime marks what it synthesizes so adapters never anchor on it.
+    expect(sent[systemIdx[1]].origin).toBe('runtime');
+  });
+
   it('caches summary across calls in the same session', async () => {
     const longHistory = generateHistory(100, 200);
 

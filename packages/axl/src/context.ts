@@ -497,6 +497,10 @@ function describeValue(value: unknown): string {
   return `a value of type ${typeof value}`;
 }
 
+/** Consecutive cache writes with no reads before the promptCache warning fires. Two
+ *  in a row on one context is already a strong signal the prefix is not stable. */
+const PROMPT_CACHE_COLD_WRITE_WARN_AFTER = 2;
+
 /**
  * Index of the nearest `user` turn at or after `from`, or `undefined` when the
  * remaining history has none.
@@ -826,6 +830,13 @@ export class WorkflowContext<TInput = unknown> {
   private readonly workflowLifecycleState: WorkflowLifecycleState;
   private signal?: AbortSignal;
   private summaryCache?: string;
+  /** Consecutive provider calls with promptCache on that wrote to the cache
+   *  without reading from it (prefix changes per call), and consecutive calls
+   *  with no cache activity at all (prefix below the model's minimum, which
+   *  Anthropic silently ignores). Either reports once per context. */
+  private promptCacheColdWrites = 0;
+  private promptCacheInactive = 0;
+  private promptCacheWarned = false;
   private workflowName?: string;
   private mcpManager?: McpManager;
   private spanManager?: SpanManager;
@@ -1886,6 +1897,7 @@ export class WorkflowContext<TInput = unknown> {
       if (handoffContext.length > 0) {
         messages.push({
           role: 'system',
+          origin: 'runtime',
           content:
             'The following is the conversation history from the previous agent that handed off to you:',
         });
@@ -2032,6 +2044,7 @@ export class WorkflowContext<TInput = unknown> {
         effort: options?.effort ?? agent._config.effort,
         thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
         includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
+        promptCache: options?.promptCache ?? agent._config.promptCache,
         toolChoice: options?.toolChoice ?? agent._config.toolChoice,
         stop: options?.stop ?? agent._config.stop,
         providerOptions,
@@ -2328,6 +2341,55 @@ export class WorkflowContext<TInput = unknown> {
       // Capture usage for span instrumentation (per-call, not per-instance)
       if (usageCapture && response.usage) {
         usageCapture.value = response.usage;
+      }
+
+      // promptCache is opt-in precisely because a prefix that changes every
+      // call is written at 1.25x and never read. Axl cannot detect that
+      // statically, but it can see it happen: consecutive cold writes with no
+      // reads on one context. Report it once so the operator can turn the
+      // option off for that agent. Scope is this WorkflowContext -- a
+      // Session builds a fresh context per turn, so cross-turn churn is not
+      // observed here.
+      // Only adapters that actually place a breakpoint can make the absence
+      // of cache fields meaningful; providers that cache automatically report
+      // nothing below their minimums. Adapters declare that via the optional
+      // `realizesPromptCache` capability, like `nativeStructuredOutputSupport`.
+      if (
+        chatOptions.promptCache &&
+        provider.realizesPromptCache?.(model) === true &&
+        response.usage &&
+        !this.promptCacheWarned
+      ) {
+        const wrote = (response.usage.cache_write_tokens ?? 0) > 0;
+        const read = (response.usage.cached_tokens ?? 0) > 0;
+        if (read) {
+          this.promptCacheColdWrites = 0;
+          this.promptCacheInactive = 0;
+        } else if (wrote) {
+          this.promptCacheColdWrites += 1;
+          this.promptCacheInactive = 0;
+        } else {
+          this.promptCacheInactive += 1;
+        }
+        let warning: string | undefined;
+        if (this.promptCacheColdWrites >= PROMPT_CACHE_COLD_WRITE_WARN_AFTER) {
+          warning =
+            `Agent '${agent._name}' has promptCache on, but its prefix was written to the ` +
+            `cache ${this.promptCacheColdWrites} times in a row with no cache reads. Each ` +
+            `write bills 1.25x input. If this agent's system prompt or tool set changes ` +
+            `per call, set promptCache: false for it.`;
+        } else if (this.promptCacheInactive >= PROMPT_CACHE_COLD_WRITE_WARN_AFTER) {
+          warning =
+            `Agent '${agent._name}' has promptCache on, but ${this.promptCacheInactive} ` +
+            `calls in a row showed no cache writes or reads. Anthropic silently ignores a ` +
+            `breakpoint below the model's minimum cacheable length (4,096 tokens on Haiku ` +
+            `4.5; 1,024 or 512 on others) -- the system prompt plus tools may be too short ` +
+            `to cache on this model, or the provider may not support prompt caching.`;
+        }
+        if (warning) {
+          this.promptCacheWarned = true;
+          this.emitEvent({ type: 'log', agent: agent._name, data: { warning } });
+        }
       }
 
       // Track cost
@@ -3299,6 +3361,7 @@ export class WorkflowContext<TInput = unknown> {
     if (this.summaryCache) {
       const summaryMsg: ChatMessage = {
         role: 'system',
+        origin: 'runtime',
         content: `Summary of earlier conversation:\n${this.summaryCache}`,
       };
       const summaryTokens = estimateTokens(summarizeModelInput(summaryMsg.content)) + 4;
@@ -3422,6 +3485,7 @@ export class WorkflowContext<TInput = unknown> {
 
     const summaryMsg: ChatMessage = {
       role: 'system',
+      origin: 'runtime',
       content: `Summary of earlier conversation:\n${summaryResponse.content}`,
     };
 

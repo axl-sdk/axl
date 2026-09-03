@@ -148,6 +148,127 @@ describe('Configurable Model Parameters', () => {
     });
   });
 
+  describe('promptCache precedence', () => {
+    it('passes the agent-level opt-in to the provider', async () => {
+      const provider = new TestProvider([{ content: 'hello' }]);
+      const ctx = createTestContext(provider);
+      await ctx.ask(agent({ model: 'test:m', system: 'sys', promptCache: true }), 'hi');
+      expect(provider.calls[0].options.promptCache).toBe(true);
+    });
+
+    it('lets AskOptions override the agent-level value in both directions', async () => {
+      const provider = new TestProvider([{ content: 'a' }, { content: 'b' }]);
+      const ctx = createTestContext(provider);
+      const on = agent({ model: 'test:m', system: 'sys', promptCache: true });
+      const off = agent({ model: 'test:m', system: 'sys', promptCache: false });
+      await ctx.ask(on, 'hi', { promptCache: false });
+      await ctx.ask(off, 'hi', { promptCache: true });
+      expect(provider.calls[0].options.promptCache).toBe(false);
+      expect(provider.calls[1].options.promptCache).toBe(true);
+    });
+
+    it('falls back to the agent-level value when AskOptions omits it', async () => {
+      const provider = new TestProvider([{ content: 'hello' }]);
+      const ctx = createTestContext(provider);
+      await ctx.ask(agent({ model: 'test:m', system: 'sys', promptCache: true }), 'hi', {
+        effort: 'low',
+      });
+      expect(provider.calls[0].options.promptCache).toBe(true);
+    });
+  });
+
+  describe('promptCache cold-write diagnostic', () => {
+    class UsageProvider {
+      readonly name = 'test';
+      private i = 0;
+      constructor(
+        private readonly usages: Array<Record<string, number>>,
+        private readonly realizes: boolean = true,
+      ) {}
+      realizesPromptCache(): boolean {
+        return this.realizes;
+      }
+      async chat() {
+        const u = this.usages[Math.min(this.i++, this.usages.length - 1)];
+        return {
+          content: 'ok',
+          usage: { prompt_tokens: 100, completion_tokens: 1, total_tokens: 101, ...u },
+          cost: 0.001,
+        };
+      }
+      async *stream() {
+        const r = await this.chat();
+        yield { type: 'done' as const, usage: r.usage };
+      }
+    }
+    const warningsFrom = (onTrace: ReturnType<typeof vi.fn>) =>
+      onTrace.mock.calls
+        .map(([e]: any[]) => e?.data?.warning)
+        .filter((w: unknown): w is string => typeof w === 'string' && w.includes('promptCache'));
+
+    it('warns once after consecutive cache writes with no reads', async () => {
+      const provider = new UsageProvider([{ cache_write_tokens: 900 }]);
+      const onTrace = vi.fn();
+      const ctx = createTestContext(provider as any, { onTrace });
+      const a = agent({ model: 'test:m', system: 'sys', promptCache: true });
+      await ctx.ask(a, 'one');
+      await ctx.ask(a, 'two');
+      await ctx.ask(a, 'three');
+      const warnings = warningsFrom(onTrace);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('no cache reads');
+    });
+
+    it('warns once when promptCache is on but no cache activity ever appears', async () => {
+      // Neither writes nor reads: the shape of a prefix below the model's
+      // cacheable minimum, which Anthropic silently ignores.
+      const provider = new UsageProvider([{}]);
+      const onTrace = vi.fn();
+      const ctx = createTestContext(provider as any, { onTrace });
+      const a = agent({ model: 'test:m', system: 'short', promptCache: true });
+      await ctx.ask(a, 'one');
+      await ctx.ask(a, 'two');
+      await ctx.ask(a, 'three');
+      const warnings = warningsFrom(onTrace);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('no cache writes or reads');
+    });
+
+    it('stays silent on adapters that do not declare realizesPromptCache', async () => {
+      // Providers that cache automatically report no cache fields below their
+      // minimums; promptCache is a documented no-op there, so the floor advice
+      // must never fire. Adapters opt in through the capability, not by name.
+      const provider = new UsageProvider([{}], false);
+      const onTrace = vi.fn();
+      const ctx = createTestContext(provider as any, { onTrace });
+      const a = agent({ model: 'test:m', system: 'short', promptCache: true });
+      await ctx.ask(a, 'one');
+      await ctx.ask(a, 'two');
+      await ctx.ask(a, 'three');
+      expect(warningsFrom(onTrace)).toHaveLength(0);
+    });
+
+    it('stays silent when writes are followed by reads, and when promptCache is off', async () => {
+      const cached = new UsageProvider([{ cache_write_tokens: 900 }, { cached_tokens: 900 }]);
+      const onTrace = vi.fn();
+      const ctx = createTestContext(cached as any, { onTrace });
+      const a = agent({ model: 'test:m', system: 'sys', promptCache: true });
+      await ctx.ask(a, 'one');
+      await ctx.ask(a, 'two');
+      await ctx.ask(a, 'three');
+      expect(warningsFrom(onTrace)).toHaveLength(0);
+
+      const off = new UsageProvider([{ cache_write_tokens: 900 }]);
+      const onTrace2 = vi.fn();
+      const ctx2 = createTestContext(off as any, { onTrace: onTrace2 });
+      const b = agent({ model: 'test:m', system: 'sys' });
+      await ctx2.ask(b, 'one');
+      await ctx2.ask(b, 'two');
+      await ctx2.ask(b, 'three');
+      expect(warningsFrom(onTrace2)).toHaveLength(0);
+    });
+  });
+
   describe('onAgentCallComplete captures parameters', () => {
     it('reports resolved parameters in the callback', async () => {
       const provider = new TestProvider([{ content: 'hello' }]);

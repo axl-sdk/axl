@@ -195,6 +195,7 @@ const myAgent = agent({
 | `maxTokens` | `number` | `4096` | Maximum tokens in the LLM response |
 | `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'`. Exact model and endpoint capabilities determine whether a tier is sent, clamped, or omitted. GPT-5.6 supports native `'max'` on Responses; Chat sends `'xhigh'` and reports the clamp via a `provider_diagnostic` event. Claude 5 supports native `'max'`; earlier families keep their documented caps |
 | `thinkingBudget` | `number` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. Set to `0` to disable thinking while keeping effort |
+| `promptCache` | `boolean` | `false` | Opt in to caching the agent's stable prefix (system prompt + tool definitions). Anthropic: one `cache_control` breakpoint on the first system block, so runtime-injected summaries and the user turn are never cached. OpenAI and Gemini cache automatically — no-op there. Off by default because a prefix that changes every call (a `system` built from `ctx.metadata`) pays the write premium with no reads. See [providers.md#prompt-caching](providers.md#prompt-caching) |
 | `includeThoughts` | `boolean` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini |
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool |
 | `stop` | `string[]` | — | Stop sequences — generation stops when any sequence is encountered. Not supported by the `openai-responses` provider (silently ignored) |
@@ -398,6 +399,7 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 | `maxTokens` | `number` | agent config or `4096` | Override max tokens for this call |
 | `effort` | `Effort` | agent config | Override effort level for this call |
 | `thinkingBudget` | `number` | agent config | Override thinking budget for this call |
+| `promptCache` | `boolean` | agent config | Override prompt caching of the stable prefix for this call |
 | `includeThoughts` | `boolean` | agent config | Override includeThoughts for this call |
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | agent config | Override tool choice for this call |
 | `stop` | `string[]` | agent config | Override stop sequences for this call |

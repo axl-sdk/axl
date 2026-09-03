@@ -2715,6 +2715,211 @@ describe('AnthropicProvider', () => {
 // Effort provenance (B8) — Anthropic
 // ═══════════════════════════════════════════════════════════════════════════
 
+describe('AnthropicProvider prompt caching (promptCache)', () => {
+  const response = {
+    id: 'msg-c',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'ok' }],
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 1, output_tokens: 1 },
+  };
+  const send = async (
+    messages: Array<{ role: 'system' | 'user'; content: string }>,
+    options: Record<string, unknown>,
+  ): Promise<Record<string, any>> => {
+    const fetchMock = mockFetch({ json: () => Promise.resolve(response) });
+    await new AnthropicProvider().chat(
+      messages as any,
+      {
+        model: 'claude-sonnet-4-6',
+        maxTokens: 16,
+        ...options,
+      } as any,
+    );
+    return JSON.parse(fetchMock.mock.calls[0][1].body);
+  };
+  const tools = [
+    {
+      type: 'function' as const,
+      function: { name: 'a', description: 'A', parameters: { type: 'object', properties: {} } },
+    },
+    {
+      type: 'function' as const,
+      function: { name: 'b', description: 'B', parameters: { type: 'object', properties: {} } },
+    },
+  ];
+
+  it('off (default): system stays a joined string and nothing carries cache_control', async () => {
+    const body = await send(
+      [
+        { role: 'system', content: 'AGENT' },
+        { role: 'system', content: 'Summary of earlier conversation:\nS' },
+        { role: 'user', content: 'hi' },
+      ],
+      { tools },
+    );
+    expect(body.system).toBe('AGENT\n\nSummary of earlier conversation:\nS');
+    expect(JSON.stringify(body)).not.toContain('cache_control');
+  });
+
+  it('on: system becomes ordered blocks with the breakpoint on the FIRST block only', async () => {
+    const body = await send(
+      [
+        { role: 'system', content: 'AGENT' },
+        { role: 'system', content: 'Summary of earlier conversation:\nS' },
+        { role: 'user', content: 'hi' },
+      ],
+      { promptCache: true, tools },
+    );
+    expect(body.system).toEqual([
+      { type: 'text', text: 'AGENT', cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: 'Summary of earlier conversation:\nS' },
+    ]);
+    // Tools are covered by the system breakpoint (prefix order tools -> system),
+    // so they carry no breakpoint of their own.
+    expect(body.tools.every((t: any) => t.cache_control === undefined)).toBe(true);
+  });
+
+  it('on: the JSON-mode instruction is appended as an uncached trailing block', async () => {
+    const body = await send(
+      [
+        { role: 'system', content: 'AGENT' },
+        { role: 'user', content: 'hi' },
+      ],
+      {
+        promptCache: true,
+        responseFormat: { type: 'json_object' },
+      },
+    );
+    expect(body.system).toHaveLength(2);
+    expect(body.system[0]).toMatchObject({ text: 'AGENT', cache_control: { type: 'ephemeral' } });
+    expect(body.system[1].cache_control).toBeUndefined();
+    expect(body.system[1].text).toContain('valid JSON');
+  });
+
+  it('on with tools but no system prompt: the breakpoint anchors on the last tool', async () => {
+    const body = await send([{ role: 'user', content: 'hi' }], { promptCache: true, tools });
+    expect(body.system).toBeUndefined();
+    expect(body.tools[0].cache_control).toBeUndefined();
+    expect(body.tools[1].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('on: a runtime-synthesized summary that is the FIRST system message is never the anchor', async () => {
+    // With no agent system prompt, summarizeHistory returns the summary as the
+    // first element, so it is both messages[0] and systemMessages[0]. Position
+    // cannot tell it apart from an agent prompt; provenance can.
+    const body = await send(
+      [
+        { role: 'system', origin: 'runtime', content: 'Summary of earlier conversation:\nS' },
+        { role: 'user', content: 'hi' },
+      ] as any,
+      { promptCache: true, tools },
+    );
+    expect(typeof body.system).toBe('string');
+    expect(body.tools[1].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('on: a runtime handoff header as the only system message is never the anchor', async () => {
+    const body = await send(
+      [
+        {
+          role: 'system',
+          origin: 'runtime',
+          content:
+            'The following is the conversation history from the previous agent that handed off to you:',
+        },
+        { role: 'user', content: 'hi' },
+      ] as any,
+      { promptCache: true, tools },
+    );
+    expect(typeof body.system).toBe('string');
+    expect(body.tools[1].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('on: an agent prompt followed by a runtime summary anchors on the agent prompt only', async () => {
+    const body = await send(
+      [
+        { role: 'system', content: 'AGENT' },
+        { role: 'system', origin: 'runtime', content: 'Summary of earlier conversation:\nS' },
+        { role: 'user', content: 'hi' },
+      ] as any,
+      { promptCache: true },
+    );
+    expect(body.system).toEqual([
+      { type: 'text', text: 'AGENT', cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: 'Summary of earlier conversation:\nS' },
+    ]);
+  });
+
+  it('on, no agent prompt, runtime summary after history: anchors on the last tool', async () => {
+    // Same provenance rule at a different position: the synthesized summary is
+    // not the first message here, but it is still the first SYSTEM message and
+    // still carries origin: 'runtime', so the tool set remains the prefix.
+    const body = await send(
+      [
+        { role: 'user', content: 'earlier' },
+        { role: 'system', origin: 'runtime', content: 'Summary of earlier conversation:\nS' },
+        { role: 'user', content: 'hi' },
+      ] as any,
+      { promptCache: true, tools },
+    );
+    expect(typeof body.system).toBe('string'); // injected text stays uncached, unchanged shape
+    expect(body.tools[0].cache_control).toBeUndefined();
+    expect(body.tools[1].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('on with neither system nor tools: no breakpoint and no error', async () => {
+    const body = await send([{ role: 'user', content: 'hi' }], { promptCache: true });
+    expect(body.system).toBeUndefined();
+    expect(body.tools).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain('cache_control');
+  });
+
+  it('steps aside when providerOptions replaces system: no Axl breakpoint remains', async () => {
+    const body = await send(
+      [
+        { role: 'system', content: 'AGENT' },
+        { role: 'user', content: 'hi' },
+      ],
+      {
+        promptCache: true,
+        providerOptions: { system: 'USER OVERRIDE' },
+      },
+    );
+    expect(body.system).toBe('USER OVERRIDE');
+    expect(JSON.stringify(body)).not.toContain('cache_control');
+  });
+
+  it('steps aside when providerOptions sets a top-level cache_control (automatic mode)', async () => {
+    // Otherwise the request would carry two breakpoints: ours on system[0] and
+    // the caller's automatic one, which moves to the last block and re-enables
+    // whole-prompt caching the first-block strategy exists to avoid.
+    const body = await send(
+      [
+        { role: 'system', content: 'AGENT' },
+        { role: 'user', content: 'hi' },
+      ],
+      { promptCache: true, tools, providerOptions: { cache_control: { type: 'ephemeral' } } },
+    );
+    expect(body.cache_control).toEqual({ type: 'ephemeral' });
+    expect(typeof body.system).toBe('string'); // not re-rendered as blocks
+    expect(body.tools.every((t: any) => t.cache_control === undefined)).toBe(true);
+  });
+
+  it('steps aside when providerOptions replaces tools, even with no system prompt', async () => {
+    const body = await send([{ role: 'user', content: 'hi' }], {
+      promptCache: true,
+      tools,
+      providerOptions: {
+        tools: [{ name: 'x', description: 'X', input_schema: { type: 'object' } }],
+      },
+    });
+    expect(body.tools).toHaveLength(1);
+    expect(JSON.stringify(body)).not.toContain('cache_control');
+  });
+});
+
 describe('AnthropicProvider.effortResolution', () => {
   const response = {
     id: 'msg-effort',

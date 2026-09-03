@@ -1,4 +1,5 @@
 import type {
+  EffortResolution,
   Provider,
   ChatOptions,
   ChatMessage,
@@ -337,20 +338,14 @@ function budgetToClaudeEffort(budget: number): Exclude<Effort, 'none'> {
   return 'max';
 }
 
-const warnedFableDisable = new Set<string>();
-function warnFableDisable(model: string): void {
-  if (warnedFableDisable.has(model)) return;
-  warnedFableDisable.add(model);
-  console.warn(
-    `[axl] thinking cannot be disabled on Anthropic ${model}; using adaptive thinking at effort 'low'.`,
-  );
-}
-
 type ClaudeThinkingConfig = {
   thinking?: Record<string, unknown>;
   outputConfig?: Record<string, unknown>;
   manualBudget?: number;
   stripTemperature: boolean;
+  /** Set when the requested unified effort could not be honored verbatim.
+   *  Reported through `effortResolution`; never part of the request body. */
+  clamp?: { effective: string; cause: string };
 };
 
 /** Resolve every portable thinking control to one valid Anthropic request shape. */
@@ -383,11 +378,14 @@ function resolveClaudeThinking(
 
     if (resolved.thinkingDisabled) {
       if (capability.thinking === 'adaptive-always-on') {
-        warnFableDisable(model);
         return {
           thinking: { type: 'adaptive' },
           outputConfig: { effort: 'low' },
           stripTemperature: true,
+          clamp: {
+            effective: 'low',
+            cause: `thinking cannot be disabled on Anthropic ${model}; using adaptive thinking at effort 'low'`,
+          },
         };
       }
       if (
@@ -460,6 +458,21 @@ function resolveClaudeThinking(
       thinking: { type: 'enabled', budget_tokens: budget },
       manualBudget: budget,
       stripTemperature: true,
+      // Legacy models take `budget_tokens`, not an effort level, and have no
+      // `effortLevels` — so `clampAnthropicEffort` folds 'max'/'xhigh' down to
+      // the 'high' tier and the request silently carries that tier's budget.
+      // Report it: an unreported budget-tier downgrade is exactly the silent
+      // clamp this capability exists to expose.
+      clamp:
+        activeEffort === resolved.activeEffort
+          ? undefined
+          : {
+              effective: activeEffort,
+              cause:
+                `Anthropic ${model} takes thinking budget_tokens rather than an effort level, ` +
+                `and its ceiling tier is '${activeEffort}'; effort '${resolved.activeEffort}' ` +
+                `sends budget_tokens ${budget}`,
+            },
     };
   }
   return { stripTemperature: capability.stripTemperature ?? false };
@@ -671,6 +684,38 @@ function mergeAnthropicUsage(
  */
 export class AnthropicProvider implements Provider {
   readonly name = 'anthropic';
+
+  /** Report a clamped `effort`. Anthropic clamps to each model's supported
+   *  `output_config.effort` levels, and models that always think fall back to
+   *  adaptive `'low'` when asked to disable thinking. Only reported when the
+   *  effective level is what the request body actually carries; an explicit
+   *  `thinkingBudget` is documented to override `effort`, so it is not a clamp. */
+  effortResolution(
+    options: Pick<
+      ChatOptions,
+      'model' | 'effort' | 'thinkingBudget' | 'includeThoughts' | 'providerOptions'
+    >,
+  ): EffortResolution | undefined {
+    const resolved = resolveThinkingOptions(options);
+    if (resolved.effort === undefined || resolved.hasBudgetOverride) return undefined;
+    const model =
+      typeof options.providerOptions?.model === 'string'
+        ? options.providerOptions.model
+        : options.model;
+    const config = resolveClaudeThinking(model, resolved);
+    const wireEffort =
+      typeof config.outputConfig?.effort === 'string' ? config.outputConfig.effort : undefined;
+    const effective = config.clamp?.effective ?? wireEffort;
+    if (effective === undefined || effective === resolved.effort) return undefined;
+    return {
+      requested: resolved.effort,
+      effective,
+      clamped: true,
+      cause:
+        config.clamp?.cause ??
+        `Anthropic ${model} does not support effort '${resolved.effort}'; using '${effective}'`,
+    };
+  }
 
   inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
     return model.trim().length > 0

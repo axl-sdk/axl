@@ -1,4 +1,5 @@
 import type {
+  EffortResolution,
   Provider,
   ChatOptions,
   ChatMessage,
@@ -8,6 +9,7 @@ import type {
   ToolCallMessage,
   ProviderInputValidationRequest,
   ProviderInputValidationResult,
+  ResolvedThinkingOptions,
 } from './types.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
@@ -474,15 +476,116 @@ function minThinkingLevel(model: string): string {
   return GEMINI_3X_MIN_THINKING_LEVEL.get(model) ?? 'minimal';
 }
 
-/** Warn once per model that effort: 'none' cannot fully disable thinking on Gemini 3.x. */
-const _warned3xEffortNone = new Set<string>();
-function warnGemini3xEffortNone(model: string): void {
-  if (_warned3xEffortNone.has(model)) return;
-  _warned3xEffortNone.add(model);
-  console.warn(
-    `[axl] effort: 'none' on Gemini 3.x (${model}) maps to the model's minimum thinking level ` +
-      `('${minThinkingLevel(model)}'), not fully disabled. Gemini 3.x models cannot disable thinking entirely.`,
-  );
+/**
+ * Endpoint-neutral resolution of Gemini's thinking controls.
+ *
+ * Gemini has two request shapes with different native fields for the SAME
+ * portable knobs: the Interactions endpoint always speaks `thinking_level`
+ * (even for 2.x), while `generateContent` speaks `thinkingConfig.thinkingLevel`
+ * on 3.x and `thinkingConfig.thinkingBudget` on 2.x. This carries the rendering
+ * for both so the mapping lives in exactly one place — including for
+ * `effortResolution`, which must report what the request builders will send.
+ */
+type GeminiThinkingResolution = {
+  /** `generation_config.thinking_level` for the Interactions endpoint. */
+  interactionLevel: string | undefined;
+  /** `thinkingConfig.thinkingLevel` for `generateContent` (3.x models). */
+  thinkingLevel: string | undefined;
+  /** `thinkingConfig.thinkingBudget` for `generateContent` (2.x models). */
+  thinkingBudget: number | undefined;
+  /** Whether `generateContent` attaches `includeThoughts` to the config. */
+  attachThoughts: boolean;
+  /** Set only when the unified effort could not be honored as requested. */
+  clamp?: { effective: string; cause: string };
+};
+
+/**
+ * Map the portable thinking knobs onto Gemini's native controls. Pure; the
+ * single source of truth for both request builders and `effortResolution`.
+ *
+ * Clamps reported (R7a): only where the *unified* effort cannot be honored —
+ * 3.x `'none'` (thinking cannot be disabled at all, so the model's minimum
+ * level is sent) and 3.x `'xhigh'`/`'max'` (3.x caps at `'high'`). A 2.x model
+ * disabling thinking honors the request exactly and is not a clamp.
+ */
+function resolveGeminiThinking(
+  model: string,
+  resolved: ResolvedThinkingOptions,
+): GeminiThinkingResolution {
+  const is3x = isGemini3x(model);
+
+  if (resolved.thinkingDisabled) {
+    const minLevel = minThinkingLevel(model);
+    if (is3x) {
+      return {
+        interactionLevel: minLevel,
+        thinkingLevel: minLevel,
+        thinkingBudget: undefined,
+        attachThoughts: false,
+        // A `thinkingBudget: 0` disable has no unified effort to report against;
+        // only an explicit `effort: 'none'` is a clamp of a requested value.
+        clamp:
+          resolved.effort === 'none'
+            ? {
+                effective: minLevel,
+                cause: `Gemini 3.x models cannot disable thinking; using the model minimum thinking level '${minLevel}'`,
+              }
+            : undefined,
+      };
+    }
+    return {
+      interactionLevel: 'minimal',
+      thinkingLevel: undefined,
+      thinkingBudget: 0,
+      attachThoughts: false,
+    };
+  }
+
+  if (resolved.hasBudgetOverride) {
+    const budget = resolved.thinkingBudget!;
+    const level = budgetToThinkingLevel(budget);
+    return {
+      interactionLevel: level,
+      thinkingLevel: is3x ? level : undefined,
+      thinkingBudget: is3x ? undefined : budget,
+      attachThoughts: resolved.includeThoughts,
+    };
+  }
+
+  if (resolved.activeEffort) {
+    const effort = resolved.activeEffort;
+    const budget = THINKING_BUDGETS[effort] ?? 5000;
+    if (is3x) {
+      const level = THINKING_LEVELS[effort] ?? 'medium';
+      return {
+        interactionLevel: level,
+        thinkingLevel: level,
+        thinkingBudget: undefined,
+        attachThoughts: resolved.includeThoughts,
+        clamp:
+          level === effort
+            ? undefined
+            : {
+                effective: level,
+                cause: `Gemini 3.x thinking levels cap at 'high'; effort '${effort}' maps to '${level}'`,
+              },
+      };
+    }
+    return {
+      interactionLevel: budgetToThinkingLevel(budget),
+      thinkingLevel: undefined,
+      // 2.5 Pro supports a higher max budget (32768) than other 2.5 models (24576).
+      thinkingBudget: effort === 'max' && model === 'gemini-2.5-pro' ? 32768 : budget,
+      attachThoughts: resolved.includeThoughts,
+    };
+  }
+
+  return {
+    interactionLevel: undefined,
+    thinkingLevel: undefined,
+    thinkingBudget: undefined,
+    attachThoughts: resolved.includeThoughts,
+  };
 }
 
 /**
@@ -577,6 +680,29 @@ export class GeminiProvider implements Provider {
    *  derived schema can lose constraints — lossy, not faithful. */
   nativeStructuredOutputSupport(): 'lossy' {
     return 'lossy';
+  }
+
+  /** Report a clamped `effort` (R7a). Gemini 3.x cannot disable thinking and
+   *  caps at `'high'`, so `'none'`, `'xhigh'` and `'max'` are not honored
+   *  verbatim there. Everything else — including 2.x disabled thinking — is
+   *  sent as asked, so there is nothing to report. */
+  effortResolution(
+    options: Pick<
+      ChatOptions,
+      'model' | 'effort' | 'thinkingBudget' | 'includeThoughts' | 'providerOptions'
+    >,
+  ): EffortResolution | undefined {
+    const resolved = resolveThinkingOptions(options);
+    if (resolved.effort === undefined) return undefined;
+    const clamp = resolveGeminiThinking(this.requestModel(options), resolved).clamp;
+    return clamp
+      ? {
+          requested: resolved.effort,
+          effective: clamp.effective,
+          clamped: true,
+          cause: clamp.cause,
+        }
+      : undefined;
   }
 
   private baseUrl: string;
@@ -800,14 +926,10 @@ export class GeminiProvider implements Provider {
           : { allowed_tools: { mode: 'any', tools: [options.toolChoice.function.name] } };
     }
     const thinking = resolveThinkingOptions(options);
-    if (thinking.thinkingDisabled) {
-      generationConfig.thinking_level = isGemini3x(model) ? minThinkingLevel(model) : 'minimal';
-    } else if (thinking.hasBudgetOverride) {
-      generationConfig.thinking_level = budgetToThinkingLevel(thinking.thinkingBudget!);
-    } else if (thinking.activeEffort) {
-      generationConfig.thinking_level = isGemini3x(model)
-        ? (THINKING_LEVELS[thinking.activeEffort] ?? 'medium')
-        : budgetToThinkingLevel(THINKING_BUDGETS[thinking.activeEffort] ?? 5000);
+    // The Interactions endpoint is always level-based, even for 2.x.
+    const thinkingPlan = resolveGeminiThinking(model, thinking);
+    if (thinkingPlan.interactionLevel !== undefined) {
+      generationConfig.thinking_level = thinkingPlan.interactionLevel;
     }
     if (thinking.includeThoughts) generationConfig.thinking_summaries = 'auto';
     if (Object.keys(generationConfig).length) body.generation_config = generationConfig;
@@ -1166,7 +1288,7 @@ export class GeminiProvider implements Provider {
     };
   }
 
-  private requestModel(options: ChatOptions): string {
+  private requestModel(options: Pick<ChatOptions, 'model' | 'providerOptions'>): string {
     return typeof options.providerOptions?.model === 'string'
       ? options.providerOptions.model
       : options.model;
@@ -1363,58 +1485,23 @@ export class GeminiProvider implements Provider {
       body.generationConfig = generationConfig;
     }
 
-    // Map effort/thinkingBudget/includeThoughts to Gemini's thinkingConfig
-    const {
-      effort,
-      thinkingBudget,
-      includeThoughts,
-      thinkingDisabled,
-      activeEffort,
-      hasBudgetOverride,
-    } = resolveThinkingOptions(options);
-
-    if (thinkingDisabled) {
-      // effort: 'none' or thinkingBudget: 0 → minimize thinking
-      if (isGemini3x(requestModel)) {
-        if (effort === 'none') {
-          warnGemini3xEffortNone(requestModel);
-        }
-        generationConfig.thinkingConfig = { thinkingLevel: minThinkingLevel(requestModel) };
-      } else {
-        generationConfig.thinkingConfig = { thinkingBudget: 0 };
-      }
-      if (!body.generationConfig) body.generationConfig = generationConfig;
-    } else if (hasBudgetOverride) {
-      // Explicit budget takes precedence over effort
-      const config: Record<string, unknown> = {};
-      if (isGemini3x(requestModel)) {
-        config.thinkingLevel = budgetToThinkingLevel(thinkingBudget!);
-      } else {
-        config.thinkingBudget = thinkingBudget!;
-      }
-      if (includeThoughts) config.includeThoughts = true;
-      generationConfig.thinkingConfig = config;
-      if (!body.generationConfig) body.generationConfig = generationConfig;
-    } else if (activeEffort) {
-      const config: Record<string, unknown> = {};
-      if (isGemini3x(requestModel)) {
-        config.thinkingLevel = THINKING_LEVELS[activeEffort] ?? 'medium';
-      } else {
-        // 2.5 Pro supports a higher max budget (32768) than other 2.5 models (24576)
-        if (activeEffort === 'max' && requestModel === 'gemini-2.5-pro') {
-          config.thinkingBudget = 32768;
-        } else {
-          config.thinkingBudget = THINKING_BUDGETS[activeEffort] ?? 5000;
-        }
-      }
-      if (includeThoughts) config.includeThoughts = true;
-      generationConfig.thinkingConfig = config;
-      if (!body.generationConfig) body.generationConfig = generationConfig;
-    } else if (includeThoughts) {
-      generationConfig.thinkingConfig = { includeThoughts: true };
+    // Map effort/thinkingBudget/includeThoughts to Gemini's thinkingConfig.
+    // `generateContent` is level-based on 3.x and budget-based on 2.x; the
+    // shared resolver decides which, so both endpoints stay in step.
+    const thinkingPlan = resolveGeminiThinking(requestModel, resolveThinkingOptions(options));
+    const thinkingConfig: Record<string, unknown> = {};
+    if (thinkingPlan.thinkingLevel !== undefined) {
+      thinkingConfig.thinkingLevel = thinkingPlan.thinkingLevel;
+    }
+    if (thinkingPlan.thinkingBudget !== undefined) {
+      thinkingConfig.thinkingBudget = thinkingPlan.thinkingBudget;
+    }
+    if (thinkingPlan.attachThoughts) thinkingConfig.includeThoughts = true;
+    // No effort, no budget, no includeThoughts → no thinkingConfig (provider defaults)
+    if (Object.keys(thinkingConfig).length > 0) {
+      generationConfig.thinkingConfig = thinkingConfig;
       if (!body.generationConfig) body.generationConfig = generationConfig;
     }
-    // No effort, no budget, no includeThoughts → no thinkingConfig (provider defaults)
 
     // Map toolChoice to Gemini's toolConfig.functionCallingConfig
     if (options.toolChoice !== undefined) {

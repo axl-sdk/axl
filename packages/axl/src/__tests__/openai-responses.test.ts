@@ -1794,3 +1794,45 @@ describe('OpenAIResponsesProvider', () => {
     });
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Effort provenance (B8) — OpenAI Responses
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('OpenAIResponsesProvider.effortResolution', () => {
+  const response = {
+    id: 'resp-effort',
+    output: [{ type: 'message', content: [{ type: 'output_text', text: 'ok' }] }],
+    usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+  };
+
+  it.each([
+    ['gpt-5', 'none', 'minimal'],
+    ['gpt-5.1', 'xhigh', 'high'],
+  ] as const)('reports and sends %s effort %s as %s', async (model, effort, effective) => {
+    const provider = new OpenAIResponsesProvider();
+    expect(provider.effortResolution({ model, effort })).toMatchObject({
+      requested: effort,
+      effective,
+      clamped: true,
+    });
+
+    const fetchMock = mockFetch({ json: () => Promise.resolve(response) });
+    await provider.chat([{ role: 'user', content: 'Hello' }], { model, maxTokens: 1024, effort });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.reasoning.effort).toBe(effective);
+  });
+
+  it('honors the native max tier that Chat Completions caps', async () => {
+    const provider = new OpenAIResponsesProvider();
+    expect(provider.effortResolution({ model: 'gpt-5.6', effort: 'max' })).toBeUndefined();
+
+    const fetchMock = mockFetch({ json: () => Promise.resolve(response) });
+    await provider.chat([{ role: 'user', content: 'Hello' }], {
+      model: 'gpt-5.6',
+      maxTokens: 1024,
+      effort: 'max',
+    });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).reasoning.effort).toBe('max');
+  });
+});

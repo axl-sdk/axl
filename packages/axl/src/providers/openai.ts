@@ -1,4 +1,11 @@
-import type { Effort, ApiKeySource, ResolvedThinkingOptions } from './types.js';
+import type {
+  ChatOptions,
+  Effort,
+  EffortResolution,
+  ApiKeySource,
+  ResolvedThinkingOptions,
+} from './types.js';
+import { resolveThinkingOptions } from './types.js';
 import type { RateLimitConfig } from './rate-limiter.js';
 import {
   OpenAICompatibleProvider,
@@ -571,8 +578,6 @@ export function resolveOpenAIReasoningEffort(
   return resolved.thinkingDisabled ? clampReasoningEffort(model, 'none') : undefined;
 }
 
-const warnedChatMaxDowngrades = new Set<string>();
-
 /**
  * Chat Completions currently caps GPT-5.6 at `xhigh`; the distinct `max`
  * tier is accepted by Responses. Keep the endpoint difference local so the
@@ -583,17 +588,41 @@ export function resolveOpenAIChatReasoningEffort(
   resolved: ResolvedThinkingOptions,
 ): ReasoningEffort | undefined {
   const effort = resolveOpenAIReasoningEffort(model, resolved);
-  if (effort !== 'max') return effort;
+  return effort === 'max' ? 'xhigh' : effort;
+}
 
-  if (resolved.activeEffort === 'max' && !warnedChatMaxDowngrades.has(model)) {
-    warnedChatMaxDowngrades.add(model);
-    console.warn(
-      `[axl] OpenAI Chat Completions does not accept effort "max" for ${model}; ` +
-        'using "xhigh". Use the OpenAI Responses provider for native "max".',
-    );
-  }
-
-  return 'xhigh';
+/**
+ * Shared `Provider.effortResolution` body for both OpenAI endpoints: compare the
+ * unified effort against the `reasoning_effort` the request actually carries.
+ * Every OpenAI clamp (`'max'`→`'xhigh'` on Chat, `'none'`→`'minimal'` on
+ * pre-5.1 models, `'xhigh'`→`'high'` below gpt-5.2, gpt-5-pro's `'high'`-only
+ * floor) shows up as a difference, so no clamp list is duplicated here.
+ *
+ * An explicit `thinkingBudget` is documented to override `effort`, and a model
+ * without reasoning support ignores the knob entirely — neither is reported.
+ */
+export function resolveOpenAIEffortResolution(
+  options: Pick<
+    ChatOptions,
+    'model' | 'effort' | 'thinkingBudget' | 'includeThoughts' | 'providerOptions'
+  >,
+  resolveWireEffort: (model: string, resolved: ResolvedThinkingOptions) => string | undefined,
+  endpoint: string,
+): EffortResolution | undefined {
+  const resolved = resolveThinkingOptions(options);
+  if (resolved.effort === undefined || resolved.hasBudgetOverride) return undefined;
+  const model =
+    typeof options.providerOptions?.model === 'string'
+      ? options.providerOptions.model
+      : options.model;
+  const effective = resolveWireEffort(model, resolved);
+  if (effective === undefined || effective === resolved.effort) return undefined;
+  return {
+    requested: resolved.effort,
+    effective,
+    clamped: true,
+    cause: `${endpoint} does not accept reasoning effort '${resolved.effort}' for ${model}; using '${effective}'`,
+  };
 }
 
 /**
@@ -643,6 +672,21 @@ export class OpenAIProvider extends OpenAICompatibleProvider {
     } = {},
   ) {
     super({ profile: OPENAI_PROFILE, ...options });
+  }
+
+  /** Report a clamped `effort` — Chat Completions caps `'max'` at `'xhigh'` and
+   *  rejects `'none'` before gpt-5.1 (clamped to `'minimal'`). */
+  effortResolution(
+    options: Pick<
+      ChatOptions,
+      'model' | 'effort' | 'thinkingBudget' | 'includeThoughts' | 'providerOptions'
+    >,
+  ): EffortResolution | undefined {
+    return resolveOpenAIEffortResolution(
+      options,
+      resolveOpenAIChatReasoningEffort,
+      'OpenAI Chat Completions',
+    );
   }
 
   protected override computeCost(

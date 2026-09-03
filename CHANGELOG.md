@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.3] - 2026-09-03
+
+### Added
+
+- **`retryFeedback` hook on `AskOptions` and `DelegateOptions`.** One hook across
+  the guardrail, schema, and `validate` gates decides what the model is told when
+  an attempt is rejected. It receives the stage, the rejected output, the gate's
+  reason and error, the parsed value (validate only, typed from `schema`), and
+  the default text. Return a string to replace the default, nothing to keep it,
+  or `{ retry: false }` to stop retrying with the gate's usual typed error; a
+  thrown error propagates. It runs only while a retry remains and after the
+  gate's own event, so `guardrail` / `schema_check` / `validate` events keep the
+  default text and `pipeline(failed).reason` carries what was sent. Forwarded on
+  delegate and handoffs like `validate`. New types `RetryFeedbackHook<T>`,
+  `RetryFeedbackInfo<T>`, `RetryFeedbackResult`. See
+  [api-reference.md#custom-retry-feedback](docs/api-reference.md#custom-retry-feedback).
+- **`provider_diagnostic` event reports clamped `effort`.** When an adapter has
+  to send a different reasoning level than requested (Gemini 3.x cannot disable
+  thinking and caps at `'high'`; OpenAI Chat caps `'max'` at `'xhigh'`; some
+  Anthropic models always think, and legacy budget models cap at the `'high'`
+  tier), the runtime emits one `provider_diagnostic { kind: 'effort_clamped' }`
+  event per ask, before its first `agent_call_start`, with `requested`, the
+  provider-native `effective` level, and a `cause`. `agent_call_start` still
+  reports the requested effort; join by `askId`. Providers opt in via the
+  optional `Provider.effortResolution()` capability (types `EffortResolution`,
+  `ProviderDiagnosticData`); `MockProvider.withEffortResolution()` drives it in
+  tests. **`provider_diagnostic` is a new member of `AxlEvent['type']`**: an
+  exhaustive `switch` over event types gains a case. See
+  [observability.md#provider-diagnostics](docs/observability.md#provider-diagnostics).
+
+### Changed
+
+- **Clamp warnings moved from adapters to the runtime.** The once-per-process
+  `console.warn`s in the Gemini, Anthropic, and OpenAI Chat adapters are gone;
+  the runtime warns once per distinct clamp and honors
+  `AxlConfig.diagnostics.silent` / `AXL_DIAGNOSTICS_SILENT`. Request bodies are
+  unchanged. Calling an adapter directly no longer logs a clamp warning; use
+  `Provider.effortResolution()`.
+
+### Fixed
+
+- **Gate-retry feedback is delivered as a user turn.** Guardrail, schema, and
+  `validate` retries appended the correction as a `system` message. Adapters
+  hoist system messages out of the conversation, so the model saw a request
+  ending on its own rejected attempt: an assistant prefill on Anthropic, and a
+  hard "does not support a terminal assistant/model prefill" throw on Gemini
+  models that reject a terminal model turn, which failed every validation retry
+  there. Feedback is now a `user` turn after the assistant attempt. The
+  `validate` and schema feedback texts were rewritten to ask for a corrected
+  response without affirming the rejected output or pointing at content the
+  model cannot see. `trace.level: 'full'` message snapshots reflect the new
+  shape; gate and `pipeline` events keep their shape and carry the new text.
+
 ## [0.22.2] - 2026-09-02
 
 ### Changed
@@ -1199,7 +1252,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.22.2...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.22.3...HEAD
+[0.22.3]: https://github.com/axl-sdk/axl/compare/v0.22.2...v0.22.3
 [0.22.2]: https://github.com/axl-sdk/axl/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/axl-sdk/axl/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/axl-sdk/axl/compare/v0.21.1...v0.22.0

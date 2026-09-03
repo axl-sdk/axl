@@ -575,17 +575,16 @@ describe('OpenAIProvider', () => {
         expect(getRequestBody(fetchMock).reasoning_effort).toBe('xhigh');
       }
 
-      expect(warn).toHaveBeenCalledTimes(4);
-      for (const model of ['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
-        expect(warn).toHaveBeenCalledWith(expect.stringContaining(`for ${model};`));
-      }
+      // The max→xhigh downgrade is reported through `effortResolution` (see the
+      // effortResolution suite) and surfaced by the runtime, not warned here.
+      expect(warn).not.toHaveBeenCalled();
 
       await new OpenAIProvider().chat([{ role: 'user', content: 'Hello again' }], {
         model: 'gpt-5.6-luna',
         maxTokens: 1024,
         effort: 'max',
       });
-      expect(warn).toHaveBeenCalledTimes(4);
+      expect(warn).not.toHaveBeenCalled();
 
       const fetchMock = mockFetch({
         json: () =>
@@ -603,7 +602,7 @@ describe('OpenAIProvider', () => {
       });
 
       expect(getRequestBody(fetchMock).reasoning_effort).toBe('xhigh');
-      expect(warn).toHaveBeenCalledTimes(4);
+      expect(warn).not.toHaveBeenCalled();
       warn.mockRestore();
     });
 
@@ -1490,5 +1489,62 @@ describe('direct OpenAI Standard estimator', () => {
         request: { tools: [{ type: 'web_search' }] },
       }),
     ).toBeUndefined();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Effort provenance (B8) — OpenAI Chat Completions
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('OpenAIProvider.effortResolution', () => {
+  const chatResponse = {
+    id: 'resp-effort',
+    choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+  };
+
+  // Each clamping row is paired with the wire value the same request carries.
+  it.each([
+    ['gpt-5.6', 'max', 'xhigh'],
+    ['gpt-5', 'none', 'minimal'],
+    ['gpt-5.1', 'xhigh', 'high'],
+    ['gpt-5-pro', 'low', 'high'],
+  ] as const)('reports and sends %s effort %s as %s', async (model, effort, effective) => {
+    const provider = new OpenAIProvider();
+    const resolution = provider.effortResolution({ model, effort });
+    expect(resolution).toMatchObject({ requested: effort, effective, clamped: true });
+    expect(resolution!.cause).toBeTruthy();
+
+    const fetchMock = mockFetch({ json: () => Promise.resolve(chatResponse) });
+    await provider.chat([{ role: 'user', content: 'Hello' }], { model, maxTokens: 1024, effort });
+    expect(getRequestBody(fetchMock).reasoning_effort).toBe(effective);
+  });
+
+  it.each([
+    ['gpt-5.1', 'high'],
+    ['gpt-5.1', 'none'],
+    ['gpt-5.4', 'xhigh'],
+    // Non-reasoning models ignore the knob entirely — nothing to report.
+    ['gpt-4o', 'high'],
+  ] as const)('reports nothing for honored %s effort %s', (model, effort) => {
+    expect(new OpenAIProvider().effortResolution({ model, effort })).toBeUndefined();
+  });
+
+  it('reports nothing without an effort, or when thinkingBudget overrides it', () => {
+    const provider = new OpenAIProvider();
+    expect(provider.effortResolution({ model: 'gpt-5.6' })).toBeUndefined();
+    expect(
+      provider.effortResolution({ model: 'gpt-5.6', effort: 'max', thinkingBudget: 2000 }),
+    ).toBeUndefined();
+  });
+
+  it('resolves against the providerOptions model override', () => {
+    expect(
+      new OpenAIProvider().effortResolution({
+        model: 'gpt-5.1',
+        effort: 'none',
+        providerOptions: { model: 'gpt-5' },
+      }),
+    ).toMatchObject({ effective: 'minimal', clamped: true });
   });
 });

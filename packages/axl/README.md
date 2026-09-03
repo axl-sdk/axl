@@ -604,7 +604,7 @@ const safe = agent({
 });
 ```
 
-When `onBlock` is `'retry'`, the LLM's blocked output is appended to the conversation (as an assistant message) along with a system message containing the block reason, then the LLM is re-called so it can self-correct. These messages **accumulate** across retries — if the guardrail blocks multiple times, the LLM sees all prior failed attempts and corrections before its next try. All retry messages are ephemeral — they are **not** persisted to session history, so subsequent session turns never see the blocked attempts. Schema retries and validate retries use the same accumulating pattern. Input guardrails always throw since the prompt is user-supplied. Throws `GuardrailError` if retries are exhausted or `onBlock` is `'throw'`.
+When `onBlock` is `'retry'`, the LLM's blocked output is appended to the conversation (as an assistant message) along with a user message containing the block reason, then the LLM is re-called so it can self-correct. These messages **accumulate** across retries — if the guardrail blocks multiple times, the LLM sees all prior failed attempts and corrections before its next try. All retry messages are ephemeral — they are **not** persisted to session history, so subsequent session turns never see the blocked attempts. Schema retries and validate retries use the same accumulating pattern. Input guardrails always throw since the prompt is user-supplied. Throws `GuardrailError` if retries are exhausted or `onBlock` is `'throw'`.
 
 For **business rule validation** on the parsed typed object (not raw text), use `validate` on `ctx.ask()`:
 

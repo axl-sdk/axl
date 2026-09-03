@@ -279,7 +279,7 @@ describe('validate (post-schema business rule validation)', () => {
         ),
       ).toBe(true);
       expect(
-        secondCall.some((m) => m.role === 'system' && m.content.includes('value 1 is too low')),
+        secondCall.some((m) => m.role === 'user' && m.content.includes('value 1 is too low')),
       ).toBe(true);
 
       // Third call should see both failures
@@ -291,7 +291,7 @@ describe('validate (post-schema business rule validation)', () => {
         thirdCall.some((m) => m.role === 'assistant' && m.content === JSON.stringify({ value: 2 })),
       ).toBe(true);
       expect(
-        thirdCall.some((m) => m.role === 'system' && m.content.includes('value 2 is too low')),
+        thirdCall.some((m) => m.role === 'user' && m.content.includes('value 2 is too low')),
       ).toBe(true);
     });
   });
@@ -342,7 +342,7 @@ describe('validate (post-schema business rule validation)', () => {
       const secondCall = messagesReceived[1];
       expect(secondCall.some((m) => m.role === 'assistant' && m.content === 'not json')).toBe(true);
       expect(
-        secondCall.some((m) => m.role === 'system' && m.content.includes('not valid JSON')),
+        secondCall.some((m) => m.role === 'user' && m.content.includes('not valid JSON')),
       ).toBe(true);
 
       // Third call should see both failures
@@ -848,7 +848,7 @@ describe('validate (post-schema business rule validation)', () => {
       const secondCall = messagesReceived[1];
       expect(
         secondCall.some(
-          (m) => m.role === 'system' && m.content.includes('Validator error: DB timeout'),
+          (m) => m.role === 'user' && m.content.includes('Validator error: DB timeout'),
         ),
       ).toBe(true);
     });

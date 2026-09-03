@@ -22,6 +22,8 @@ import type {
   AgentCallInfo,
   AgentCallParams,
   ValidateResult,
+  RetryFeedbackHook,
+  RetryFeedbackInfo,
   VerifyRetry,
   ObservationStatus,
 } from './types.js';
@@ -62,6 +64,7 @@ import { redactHistoricalEvent } from './redaction.js';
 import {
   detectDroppedRefinements,
   warnSchemaDiagnosticOnce,
+  warnDiagnosticOnce,
   DEFAULT_SCHEMA_OVERSIZED_TOKENS,
 } from './schema-diagnostics.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
@@ -450,6 +453,13 @@ function extractBalanced(
  * schema_check, and validate retry paths — keeps the exact message shape in
  * one place so fixes (e.g. preserving providerMetadata for Gemini) apply to
  * all three gates at once.
+ *
+ * The feedback is a `user` turn, never `system`: every adapter hoists system
+ * messages into a top-level instruction field, so a system-role correction
+ * would leave the request ending on the model's own rejected attempt — a
+ * prefill on Anthropic, and a hard throw on Gemini models that reject a
+ * terminal model turn. A user turn lands after the attempt where the model
+ * weighs it, and keeps the request ending on a user message.
  */
 function appendRetryMessages(
   messages: ChatMessage[],
@@ -462,7 +472,29 @@ function appendRetryMessages(
     content,
     ...(providerMetadata ? { providerMetadata } : {}),
   });
-  messages.push({ role: 'system', content: feedbackMessage });
+  messages.push({ role: 'user', content: feedbackMessage });
+}
+
+/** `{ retry: false }` — the only object form a `retryFeedback` hook may return. */
+function isRetryAbort(value: unknown): value is { retry: false } {
+  return (
+    typeof value === 'object' && value !== null && (value as { retry?: unknown }).retry === false
+  );
+}
+
+/** Name an off-contract value for an error message without stringifying user objects
+ *  (whose `toString` may throw or dump secrets). Keys only, never values. */
+function describeValue(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return `an array of length ${value.length}`;
+  if (typeof value === 'object') {
+    const keys = Object.keys(value);
+    return keys.length > 0 ? `an object with keys [${keys.join(', ')}]` : 'an empty object';
+  }
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return `the ${typeof value} ${JSON.stringify(value)}`;
+  }
+  return `a value of type ${typeof value}`;
 }
 
 function estimateMessagesTokens(messages: ChatMessage[]): { tokens: number; unmeasured: boolean } {
@@ -1797,6 +1829,11 @@ export class WorkflowContext<TInput = unknown> {
       model,
     });
 
+    // Provider capability diagnostics — once per ask, beside the schema ones and
+    // before the turn loop, so a clamp is reported exactly once no matter how
+    // many provider round trips the tool loop makes.
+    this.emitProviderDiagnostics(agent, options, { provider, model, providerOptions });
+
     // If this agent was reached via handoff, include the source agent's conversation
     if (handoffMessages && handoffMessages.length > 0) {
       // Inject handoff context as a system message summarizing the source agent's work,
@@ -2362,6 +2399,10 @@ export class WorkflowContext<TInput = unknown> {
                     metadata: options.metadata,
                     validate: options.validate,
                     validateRetries: options.validateRetries,
+                    // This seam serves both callers of a handoff: a plain `ctx.ask()` on an
+                    // agent with `handoffs`, and the routed `ctx.delegate()` path, whose
+                    // terminal ask is the handoff target. The hook travels like `validate`.
+                    retryFeedback: options.retryFeedback,
                   }
                 : undefined;
               // Execute the target's ask frame. Wraps `executeAgentCall`
@@ -2555,13 +2596,18 @@ export class WorkflowContext<TInput = unknown> {
         const attempt = guardrailOutputRetries + 1;
         const maxAttempts = maxGuardrailRetries + 1;
         const onBlock = guardrails.onBlock ?? 'throw';
+        // One reason string for the feedback template, the hook's `info.reason`, and every
+        // throw on this path, so a hook branching on `info.reason` sees exactly what the
+        // caller will catch. The event and span keep the raw `outputResult.reason`: a trace
+        // must not report a reason the guardrail never gave.
+        const blockReason = outputResult.reason ?? 'Output blocked by guardrail';
         let feedbackMessage: string | undefined;
         if (
           outputResult.block &&
           onBlock === 'retry' &&
           guardrailOutputRetries < maxGuardrailRetries
         ) {
-          feedbackMessage = `Your previous response was blocked by a safety guardrail: ${outputResult.reason ?? 'Output blocked'}. Please provide a different response that complies with the guidelines.`;
+          feedbackMessage = `Your previous response was blocked by a safety guardrail: ${blockReason}. Please provide a different response that complies with the guidelines.`;
         }
 
         this.emitEvent({
@@ -2586,31 +2632,47 @@ export class WorkflowContext<TInput = unknown> {
 
         if (outputResult.block) {
           if (feedbackMessage) {
-            this.emitEvent({
-              type: 'pipeline',
-              agent: agent._name,
-              status: 'failed',
+            // Hook runs after the `guardrail` event (which keeps carrying the default text)
+            // and before `pipeline(failed)`, whose reason is what the model actually sees.
+            const decision = await this.resolveRetryFeedback(options?.retryFeedback, {
               stage: 'guardrail',
-              attempt: guardrailOutputRetries + 1,
-              maxAttempts: maxGuardrailRetries + 1,
-              reason: feedbackMessage,
+              attempt,
+              maxAttempts,
+              output: content,
+              reason: blockReason,
+              defaultMessage: feedbackMessage,
             });
-            guardrailOutputRetries++;
-            appendRetryMessages(
-              currentMessages,
-              content,
-              feedbackMessage,
-              response.providerMetadata,
-            );
-            pendingRetryReason = 'guardrail';
-            continue; // Re-enter the while loop for another LLM turn
+            if (decision.retry) {
+              this.emitEvent({
+                type: 'pipeline',
+                agent: agent._name,
+                status: 'failed',
+                stage: 'guardrail',
+                attempt,
+                maxAttempts,
+                reason: decision.message,
+              });
+              guardrailOutputRetries++;
+              appendRetryMessages(
+                currentMessages,
+                content,
+                decision.message,
+                response.providerMetadata,
+              );
+              pendingRetryReason = 'guardrail';
+              continue; // Re-enter the while loop for another LLM turn
+            }
+            // `{ retry: false }`: same terminal error as retry exhaustion on this path.
+            // A cancellation that landed while an async hook awaited is the truer cause.
+            this.currentSignal?.throwIfAborted();
+            throw new GuardrailError('output', blockReason);
           }
           if (typeof onBlock === 'function') {
-            return onBlock(outputResult.reason ?? 'Output blocked by guardrail', {
+            return onBlock(blockReason, {
               metadata: this.metadata,
             });
           }
-          throw new GuardrailError('output', outputResult.reason ?? 'Output blocked by guardrail');
+          throw new GuardrailError('output', blockReason);
         }
       }
 
@@ -2632,7 +2694,10 @@ export class WorkflowContext<TInput = unknown> {
           schemaErr = err;
           schemaReason = err instanceof Error ? err.message : String(err);
           if (schemaRetries < maxSchemaRetries) {
-            schemaFeedback = `Your response was not valid JSON or did not match the required schema: ${schemaReason}. Please fix and try again.`;
+            // Name the whole deliverable, not "fix": the rejected attempt is now the
+            // immediately preceding assistant turn, and "fix and try again" reads as an
+            // invitation to emit a patch of it rather than a complete replacement object.
+            schemaFeedback = `Your response was not valid JSON or did not match the required schema: ${schemaReason}. Return a corrected response that matches the required schema.`;
           }
         }
 
@@ -2656,24 +2721,38 @@ export class WorkflowContext<TInput = unknown> {
 
         if (!schemaValid) {
           if (schemaFeedback) {
-            this.emitEvent({
-              type: 'pipeline',
-              agent: agent._name,
-              status: 'failed',
+            const decision = await this.resolveRetryFeedback(options.retryFeedback, {
               stage: 'schema',
-              attempt: schemaRetries + 1,
-              maxAttempts: (options.retries ?? 3) + 1,
-              reason: schemaFeedback,
+              attempt: schemaAttempt,
+              maxAttempts: schemaMaxAttempts,
+              output: content,
+              reason: schemaReason ?? 'Schema parse failed',
+              ...(schemaErr !== undefined ? { error: schemaErr } : {}),
+              defaultMessage: schemaFeedback,
             });
-            schemaRetries++;
-            appendRetryMessages(
-              currentMessages,
-              content,
-              schemaFeedback,
-              response.providerMetadata,
-            );
-            pendingRetryReason = 'schema';
-            continue; // Re-enter the while loop for another LLM turn
+            if (decision.retry) {
+              this.emitEvent({
+                type: 'pipeline',
+                agent: agent._name,
+                status: 'failed',
+                stage: 'schema',
+                attempt: schemaAttempt,
+                maxAttempts: schemaMaxAttempts,
+                reason: decision.message,
+              });
+              schemaRetries++;
+              appendRetryMessages(
+                currentMessages,
+                content,
+                decision.message,
+                response.providerMetadata,
+              );
+              pendingRetryReason = 'schema';
+              continue; // Re-enter the while loop for another LLM turn
+            }
+            // `{ retry: false }`: fall through to the same `VerifyError` as exhaustion.
+            // A cancellation that landed while an async hook awaited is the truer cause.
+            this.currentSignal?.throwIfAborted();
           }
           const zodErr =
             schemaErr instanceof ZodError
@@ -2696,12 +2775,15 @@ export class WorkflowContext<TInput = unknown> {
         // Wrap user-supplied validator in try/catch — treat exceptions as validation failures
         // so they get the same retry semantics instead of crashing the pipeline.
         let validateResult: ValidateResult;
+        // Retained for `RetryFeedbackInfo.error` so a hook can diagnose a validator crash.
+        let validateErr: unknown;
         try {
           validateResult = await options.validate(validated, {
             metadata: this.metadata,
           });
         } catch (err) {
           rethrowEventStreamOverflow(err);
+          validateErr = err;
           const reason = err instanceof Error ? err.message : String(err);
           validateResult = { valid: false, reason: `Validator error: ${reason}` };
         }
@@ -2711,7 +2793,7 @@ export class WorkflowContext<TInput = unknown> {
         const validateMaxAttempts = maxValidateRetries + 1;
         let validateFeedback: string | undefined;
         if (!validateResult.valid && validateRetries < maxValidateRetries) {
-          validateFeedback = `Your response parsed correctly but failed validation: ${validateResult.reason ?? 'Validation failed'}. Previous attempts are visible above. Please fix and try again.`;
+          validateFeedback = `Your previous response failed validation: ${validateResult.reason ?? 'Validation failed'}. Return a corrected response that satisfies the required schema and this rule.`;
         }
 
         this.emitEvent({
@@ -2734,24 +2816,39 @@ export class WorkflowContext<TInput = unknown> {
 
         if (!validateResult.valid) {
           if (validateFeedback) {
-            this.emitEvent({
-              type: 'pipeline',
-              agent: agent._name,
-              status: 'failed',
+            const decision = await this.resolveRetryFeedback(options.retryFeedback, {
               stage: 'validate',
-              attempt: validateRetries + 1,
-              maxAttempts: (options.validateRetries ?? 2) + 1,
-              reason: validateFeedback,
+              attempt: validateAttempt,
+              maxAttempts: validateMaxAttempts,
+              output: content,
+              parsed: validated,
+              reason: validateResult.reason ?? 'Validation failed',
+              ...(validateErr !== undefined ? { error: validateErr } : {}),
+              defaultMessage: validateFeedback,
             });
-            validateRetries++;
-            appendRetryMessages(
-              currentMessages,
-              content,
-              validateFeedback,
-              response.providerMetadata,
-            );
-            pendingRetryReason = 'validate';
-            continue; // Re-enter the while loop — goes through all gates again
+            if (decision.retry) {
+              this.emitEvent({
+                type: 'pipeline',
+                agent: agent._name,
+                status: 'failed',
+                stage: 'validate',
+                attempt: validateAttempt,
+                maxAttempts: validateMaxAttempts,
+                reason: decision.message,
+              });
+              validateRetries++;
+              appendRetryMessages(
+                currentMessages,
+                content,
+                decision.message,
+                response.providerMetadata,
+              );
+              pendingRetryReason = 'validate';
+              continue; // Re-enter the while loop — goes through all gates again
+            }
+            // `{ retry: false }`: fall through to the same `ValidationError` as exhaustion.
+            // A cancellation that landed while an async hook awaited is the truer cause.
+            this.currentSignal?.throwIfAborted();
           }
           throw new ValidationError(
             validated,
@@ -2777,6 +2874,36 @@ export class WorkflowContext<TInput = unknown> {
     }
 
     throw new MaxTurnsError('ctx.ask()', maxTurns);
+  }
+
+  /**
+   * Resolve the corrective feedback text for one rejected attempt, giving an optional
+   * caller-supplied `retryFeedback` hook the chance to replace it or to stop retrying.
+   *
+   * Called by all three output gates, only while a retry is still permitted (never on the
+   * exhausting attempt) and only after the gate's own event has been emitted, so a hook that
+   * throws or aborts can never erase the evidence that the gate rejected. A non-empty string
+   * replaces `defaultMessage` verbatim; `undefined` / `''` keeps it; `{ retry: false }` asks
+   * the gate to throw its typed terminal error. Hook exceptions propagate — a bug in caller
+   * code is not a model failure and must not be retried into silence, and neither is a
+   * return value outside the contract: an unrecognized shape throws instead of silently
+   * degrading to the default text, which would hide the defect behind extra token spend.
+   */
+  private async resolveRetryFeedback(
+    hook: RetryFeedbackHook | undefined,
+    info: RetryFeedbackInfo,
+  ): Promise<{ retry: true; message: string } | { retry: false }> {
+    if (!hook) return { retry: true, message: info.defaultMessage };
+    const result = await hook(info, { metadata: this.metadata });
+    // A `void` hook (used for logging or inspection only) lands here alongside `''`.
+    if (result === undefined || result === '') {
+      return { retry: true, message: info.defaultMessage };
+    }
+    if (typeof result === 'string') return { retry: true, message: result };
+    if (isRetryAbort(result)) return { retry: false };
+    throw new TypeError(
+      `retryFeedback must return a string, undefined, or { retry: false }; received ${describeValue(result)}.`,
+    );
   }
 
   /**
@@ -2990,6 +3117,78 @@ export class WorkflowContext<TInput = unknown> {
         );
       }
     }
+  }
+
+  /**
+   * Emit a `provider_diagnostic` when the resolved provider reports that it
+   * could not honor the unified `effort` verbatim (P3/R6/R7).
+   *
+   * The adapter only *resolves* — it returns the requested and effective levels
+   * from the same pure resolver its request builder uses. The runtime decides
+   * how to surface that, because only the runtime can see the event bus and
+   * `AxlConfig.diagnostics.silent` (adapters receive `ProviderConfig` only).
+   *
+   * Called once per ask, so a tool loop with N provider round trips still emits
+   * one event; the `console.warn` dedupes once per process per distinct clamp.
+   * A throwing `effortResolution` is a provider bug and propagates.
+   */
+  private emitProviderDiagnostics(
+    agent: Agent,
+    options: AskOptions<unknown> | undefined,
+    ctx: { provider: Provider; model: string; providerOptions?: Record<string, unknown> },
+  ): void {
+    if (!ctx.provider.effortResolution) return;
+    // Build exactly the knobs the per-turn `chatOptions` will carry, so the
+    // adapter resolves against the request that is actually sent.
+    const resolution = ctx.provider.effortResolution({
+      model: ctx.model,
+      effort: options?.effort ?? agent._config.effort,
+      thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
+      includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
+      providerOptions: ctx.providerOptions,
+    });
+    if (!resolution?.clamped) return;
+    // A clamp report that cannot name what was actually sent is a broken adapter,
+    // not a diagnostic: emitting it would put `effective: undefined` on a typed
+    // event and warn "clamped to ''". Fail loudly for the same reason a throwing
+    // `effortResolution` propagates.
+    if (
+      typeof resolution.effective !== 'string' ||
+      resolution.effective.length === 0 ||
+      typeof resolution.requested !== 'string' ||
+      resolution.requested.length === 0
+    ) {
+      throw new TypeError(
+        `Provider '${ctx.provider.name ?? 'unknown'}' returned a malformed EffortResolution for ` +
+          `model '${ctx.model}': 'requested' and 'effective' must be non-empty strings when ` +
+          `'clamped' is true. Received ${JSON.stringify(resolution)}.`,
+      );
+    }
+
+    const cause = resolution.cause ?? `effort '${resolution.requested}' is not supported as asked`;
+    this.emitEvent({
+      type: 'provider_diagnostic',
+      agent: agent._name,
+      data: {
+        kind: 'effort_clamped',
+        ...(ctx.provider.name ? { provider: ctx.provider.name } : {}),
+        model: ctx.model,
+        requested: resolution.requested,
+        effective: resolution.effective,
+        cause,
+      },
+    });
+    warnDiagnosticOnce(
+      // One warning per distinct clamp, not per ask: the same clamp across 500
+      // asks is one process-level surprise, while a different requested/effective
+      // pair is a genuinely new one.
+      `effort_clamped\0${ctx.provider.name ?? ''}\0${ctx.model}\0${resolution.requested}\0${resolution.effective}`,
+      `effort '${resolution.requested}' was clamped to '${resolution.effective}' on ` +
+        `${ctx.provider.name ? `${ctx.provider.name} ` : ''}${ctx.model} — ${cause}. ` +
+        `A 'provider_diagnostic' event carries the same detail per ask.`,
+      this.config.diagnostics?.silent,
+      'docs/observability.md#provider-diagnostics',
+    );
   }
 
   private buildToolDefs(
@@ -4614,6 +4813,7 @@ export class WorkflowContext<TInput = unknown> {
         metadata: options?.metadata,
         validate: options?.validate,
         validateRetries: options?.validateRetries,
+        retryFeedback: options?.retryFeedback,
       });
     }
 
@@ -4679,6 +4879,7 @@ export class WorkflowContext<TInput = unknown> {
       metadata: options?.metadata,
       validate: options?.validate,
       validateRetries: options?.validateRetries,
+      retryFeedback: options?.retryFeedback,
     });
   }
 

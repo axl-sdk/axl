@@ -193,7 +193,7 @@ const myAgent = agent({
 | `mcpTools` | `string[]` | — | Whitelist: only expose these specific MCP tools |
 | `temperature` | `number` | provider default | LLM sampling temperature |
 | `maxTokens` | `number` | `4096` | Maximum tokens in the LLM response |
-| `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'`. Exact model and endpoint capabilities determine whether a tier is sent, clamped, or omitted. GPT-5.6 supports native `'max'` on Responses; Chat warns once per exact model and sends `'xhigh'`. Claude 5 supports native `'max'`; earlier families keep their documented caps |
+| `effort` | `Effort` | — | Unified effort level: `'none'` \| `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'`. Exact model and endpoint capabilities determine whether a tier is sent, clamped, or omitted. GPT-5.6 supports native `'max'` on Responses; Chat sends `'xhigh'` and reports the clamp via a `provider_diagnostic` event. Claude 5 supports native `'max'`; earlier families keep their documented caps |
 | `thinkingBudget` | `number` | — | Explicit thinking token budget (advanced). Overrides effort-based allocation. Set to `0` to disable thinking while keeping effort |
 | `includeThoughts` | `boolean` | — | Return reasoning summaries in responses. Supported on OpenAI Responses API and Gemini |
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | — | Tool choice strategy: `'auto'` lets the model decide, `'none'` forbids tool use, `'required'` forces at least one tool call, or specify a function name to force a specific tool |
@@ -392,6 +392,7 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 | `retries` | `number` | `3` | Number of schema validation retries |
 | `validate` | `OutputValidator<T>` | — | Post-schema business rule validation. Receives the parsed typed object. Only runs when `schema` is set. See [Validate](#validate) |
 | `validateRetries` | `number` | `2` | Maximum retries for `validate` failures |
+| `retryFeedback` | `RetryFeedbackHook` | — | Rewrite (or abort) the corrective turn the model sees when the guardrail, schema, or validate gate rejects an attempt. See [Custom retry feedback](#custom-retry-feedback) |
 | `metadata` | `Record<string, unknown>` | — | Merged with workflow metadata and passed to dynamic `model`/`system` selector functions |
 | `temperature` | `number` | agent config | Override sampling temperature for this call |
 | `maxTokens` | `number` | agent config or `4096` | Override max tokens for this call |
@@ -406,7 +407,7 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 
 **Returns:** `Promise<T>` — parsed output if `schema` is provided, otherwise `string`.
 
-**Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a system message explaining the error. On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
+**Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a **user** message explaining the error (a user turn, not a system message: providers hoist system messages out of the conversation, which would leave the request ending on the rejected attempt). On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. Supply `retryFeedback` to write that user message yourself, or to stop retrying — see [Custom retry feedback](#custom-retry-feedback). See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
 
 **Streaming + validate:** As of 0.16.0, `validate` and token streaming (via `runtime.stream()`) coexist — validate runs against the buffered response after streaming completes. (Pre-0.16.0 this combination threw `INVALID_CONFIG`.) For structured output, the typed result is still only available after the full response arrives.
 
@@ -452,6 +453,7 @@ Select the best agent from a list of candidates and invoke it. Creates a tempora
 | `options.retries` | `number` | Retries for structured output validation |
 | `options.validate` | `OutputValidator<T>` | Post-schema business rule validation. Forwarded to the final `ctx.ask()` call |
 | `options.validateRetries` | `number` | Maximum retries for validate failures (default: 2) |
+| `options.retryFeedback` | `RetryFeedbackHook` | Custom gate-retry feedback. Forwarded to the final `ctx.ask()` call on both the single-candidate and the routed path. See [Custom retry feedback](#custom-retry-feedback) |
 | `options.routerInput` | `'full' \| 'text'` | `'full'` (default) routes ordered evidence; `'text'` routes `inputText(prompt)` only |
 
 **Returns:** `Promise<T>` — the selected agent's response.
@@ -702,7 +704,7 @@ const wf = workflow({
 |--------|------|-------------|
 | `[Symbol.asyncIterator]` | `AsyncIterator<AxlEvent>` | Iterate every event in emission order via `for await` |
 | `.text` | `AsyncIterable<string>` | Root-only token chunks (chat-bubble view) |
-| `.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only — `ask_*`, `agent_call_*`, `tool_call_*` (including `tool_call_rejected`), `tool_approval`, `handoff_start`, `handoff_return`, `delegate`, `pipeline`, `verify`, `schema_diagnostic`, `workflow_*`, `checkpoint_save`, `checkpoint_replay`, `await_human`, `await_human_resolved`. Skips per-token chatter and progressive `partial_object` emissions. Identical to `AxlStream.lifecycle` (single source of truth: `LIFECYCLE_TYPES` in `event-stream.ts`) |
+| `.lifecycle` | `AsyncIterable<AxlEvent>` | Structural events only — `ask_*`, `agent_call_*`, `tool_call_*` (including `tool_call_rejected`), `tool_approval`, `handoff_start`, `handoff_return`, `delegate`, `pipeline`, `verify`, `schema_diagnostic`, `provider_diagnostic`, `workflow_*`, `checkpoint_save`, `checkpoint_replay`, `await_human`, `await_human_resolved`. Skips per-token chatter and progressive `partial_object` emissions. Identical to `AxlStream.lifecycle` (single source of truth: `LIFECYCLE_TYPES` in `event-stream.ts`) |
 | `.textByAsk` | `AsyncIterable<{ askId, agent?, text }>` | Per-ask token chunks for split-pane UIs |
 | `.partialObjects` | `AsyncIterable<CoalescedPartialObject>` (`{ askId, agent?, object, attempt }`) | **Coalescing view** — yields the latest `partial_object` payload per `askId`. `attempt` is the 1-indexed attempt number; on schema/validate/guardrail retry, the runtime emits `pipeline(failed)` and the view drops any undrained pending value for the affected ask, so attempt-N snapshots cannot leak across the retry boundary. Listener-based: does NOT race with the main iterator; running both concurrently each receive every event. Memory bounded by `O(active asks)`, not `O(events emitted)` |
 | `.stringStream(opts?)` | `AsyncIterable<StringStreamEvent>` (`{ askId, agent?, path, delta, accumulated, attempt }`) | **Streaming view** over `string_delta` events with optional `{ path?, askId? }` filters. `delta` contains all new chars for that ask/path since this subscriber's previous yield (slow subscribers may receive several provider chunks coalesced); `accumulated` is canonical text-so-far. Late subscribers seed through the same bounded queue. Listener-based: does NOT race with the main iterator. Each subscriber is bounded by `EventStreamOptions`: pending updates coalesce per ask/path, and distinct fields use the configured overflow policy. Per-ask state clears on `pipeline(failed)` and `ask_end` |
@@ -1043,11 +1045,11 @@ const safe = agent({
 
 | Policy | Behavior |
 |--------|----------|
-| `'retry'` | Append the LLM's blocked output (as an assistant message) and the block reason (as a system correction prompt) to the conversation, then re-call the LLM so it can self-correct. Only applies to **output** guardrails — input guardrails always throw since the prompt is user-supplied |
+| `'retry'` | Append the LLM's blocked output (as an assistant message) and the block reason (as a user correction turn) to the conversation, then re-call the LLM so it can self-correct. Only applies to **output** guardrails — input guardrails always throw since the prompt is user-supplied |
 | `'throw'` | Throw a `GuardrailError` immediately |
 | `(reason, ctx) => string` | Custom function that receives the block reason and returns a fallback response (does not retry the LLM) |
 
-**Retry mechanics:** On each retry, the LLM's blocked response is appended to the conversation as an assistant message, followed by a system message: *"Your previous response was blocked by a safety guardrail: {reason}. Please provide a different response that complies with the guidelines."* These messages **accumulate** across retries — if the guardrail blocks twice, the LLM sees both failed attempts and both correction prompts before its third try, giving it increasing context about what to avoid. All retry messages are ephemeral — they exist only within the `ctx.ask()` call and are **not** persisted to session history. Only the final successful response is recorded in the session, so subsequent turns never see the blocked attempts.
+**Retry mechanics:** On each retry, the LLM's blocked response is appended to the conversation as an assistant message, followed by a user message: *"Your previous response was blocked by a safety guardrail: {reason}. Please provide a different response that complies with the guidelines."* These messages **accumulate** across retries — if the guardrail blocks twice, the LLM sees both failed attempts and both correction prompts before its third try, giving it increasing context about what to avoid. All retry messages are ephemeral — they exist only within the `ctx.ask()` call and are **not** persisted to session history. Only the final successful response is recorded in the session, so subsequent turns never see the blocked attempts.
 
 Schema retries and validate retries use the same accumulating pattern — see [Validate](#validate) and the [Output Pipeline](#output-pipeline) for the full flow.
 
@@ -1113,7 +1115,7 @@ type ValidateResult = { valid: boolean; reason?: string };
 | `validate` | `OutputValidator<T>` | — | Validation function. Receives the schema-parsed object. `T` is inferred from `schema` |
 | `validateRetries` | `number` | `2` | Maximum retries before throwing `ValidationError` |
 
-**Retry mechanics:** The LLM's failed response and the validation error are appended to the conversation history as assistant + system messages. Context **accumulates** across retries, so the LLM sees all previous failed attempts and can reason about what to fix. The validation `reason` is fed back in the system message: *"Your response parsed correctly but failed validation: {reason}."* If the validator throws an exception, it's treated as a validation failure — the error message is fed back and the retry counter is incremented.
+**Retry mechanics:** The LLM's failed response and the validation error are appended to the conversation history as assistant + user messages. Context **accumulates** across retries, so the LLM sees all previous failed attempts and can reason about what to fix. The validation `reason` is fed back in the user message: *"Your previous response failed validation: {reason}. Return a corrected response that satisfies the required schema and this rule."* If the validator throws an exception, it's treated as a validation failure — the error message is fed back and the retry counter is incremented.
 
 On retry, the new LLM response goes through the **full output pipeline** again (guardrail → schema → validate). See [Output Pipeline](#output-pipeline) below.
 
@@ -1138,6 +1140,59 @@ LLM response (raw string)
 Retry counts refer to **retries only** — the initial LLM call does not count. With the defaults (guardrail: 2, schema: 3, validate: 2), the worst case is `1 + 2 + 3 + 2 = 8` total LLM calls: 1 initial call plus up to 7 retries across all gates.
 
 Retries are **additive, not multiplicative** — each gate has its own counter that only increments when *that gate* fails. A response that passes gate 1 but fails gate 2 only increments the gate 2 counter. Counters are persistent across the entire `ctx.ask()` call and do not reset when a different gate fails. The `maxTurns` limit (default 25) provides a hard ceiling on total LLM calls regardless of gate failures.
+
+### Custom retry feedback
+
+`AskOptions.retryFeedback` (also `DelegateOptions.retryFeedback`) is one hook across all three gates. It runs when a gate has just rejected an attempt and a retry is still permitted, and it decides what the model is told:
+
+```ts
+type RetryFeedbackInfo<T = unknown> = {
+  stage: 'schema' | 'validate' | 'guardrail';
+  attempt: number;          // 1-based index of the attempt just rejected
+  maxAttempts: number;      // retries + 1 for that gate
+  output: string;           // the raw rejected model output
+  parsed?: T;               // the schema-valid object — `stage: 'validate'` only
+  reason: string;           // the gate's own reason
+  error?: unknown;          // the ZodError or the raw parse error (e.g. SyntaxError) for
+                            // schema; the validator's thrown error for validate
+  defaultMessage: string;   // what Axl would send if the hook did not intervene
+};
+
+type RetryFeedbackResult = string | undefined | { retry: false };
+
+type RetryFeedbackHook<T = unknown> = (
+  info: RetryFeedbackInfo<T>,
+  ctx: { metadata: Record<string, unknown> },
+) => RetryFeedbackResult | void | Promise<RetryFeedbackResult | void>;
+```
+
+`T` is inferred from `schema`, so `info.parsed` is the typed object at the validate stage.
+
+```ts
+const order = await ctx.ask(extractor, invoiceText, {
+  schema: OrderSchema,
+  retryFeedback: (info) =>
+    info.stage === 'schema' && classifyShape(info.output) === 'wrapped-in-prose'
+      ? 'Return only the JSON object, with no surrounding prose.'
+      : undefined, // fall back to Axl's default text
+});
+```
+
+Return values:
+
+- **Non-empty string** — sent to the model verbatim as the corrective user turn, and recorded as `pipeline(failed).reason`. Compose with `info.defaultMessage` to add to the default instead of replacing it.
+- **`undefined`, `''`, or no return value** — Axl's default text is used. A hook used only for logging needs no return.
+- **`{ retry: false }`** — stop retrying now. The gate throws the same typed error it throws on exhaustion, with the same payload (`GuardrailError`, `VerifyError`, `ValidationError`), and no further provider call is made.
+- **Thrown error** — propagates out of `ctx.ask()` unchanged; no further provider call is made. Unlike `validate`, hook exceptions are not turned into validation failures.
+- Any other value throws a `TypeError`.
+
+Notes:
+
+- The hook runs only while a retry remains. On the exhausting attempt the gate throws without consulting it.
+- The gate events (`guardrail`, `schema_check`, `validate`) always carry the default text in `feedbackMessage`. The text actually sent is `pipeline(failed).reason`.
+- `ctx.metadata` is the workflow metadata, the same object `validate` receives. Per-call `AskOptions.metadata` is not merged in.
+
+**Supported on:** `ctx.ask()` and `ctx.delegate()`. Like [`validate`](#validate), it is forwarded to the final agent call on delegate and on handoffs. Not available on `AgentConfig`; not applicable to `ctx.verify()` (its feedback goes to your code, not the model) or `ctx.race()` (which discards failures).
 
 ---
 
@@ -1791,6 +1846,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `string_delta` | `AskScoped` | `attempt: number`, `data: StringDeltaData` (`{ path: string, delta: string }`) | Per-chunk character-level deltas inside string VALUES of progressive structured output. Same gating as `partial_object` (schema set, no tools, root is `ZodObject`). **Important:** `handoffs: [...]` configured on an agent registers as tools internally, so a router agent never emits `string_delta` — only the handoff target (or any leaf agent with no tools and a schema) does. `path` is an RFC 6901 JSON Pointer to the string field (`/summary`, `/sources/0/title`); `delta` is the unescaped chars added in this chunk. Designed for chat-style typewriter rendering of long string fields — see `AxlStream.stringStream` / `AxlEventBus.stringStream` view helpers below. Stream-only; never persisted to `ExecutionInfo.events` |
 | `verify` | `AskScoped` | `data: VerifyData` | `ctx.verify()` completes (pass or fail) |
 | `schema_diagnostic` | `AskScoped` | `data: SchemaDiagnosticData` (`kind`-discriminated) | A silent structured-output cliff was detected (oversized appended/tool schema, dropped `.refine()`s, streaming disabled, or `schemaPrompt:'none'` with no guidance). One per ask per cliff. Threshold + silencing via `AxlConfig.diagnostics`. See [observability.md#schema-diagnostics](./observability.md#schema-diagnostics) |
+| `provider_diagnostic` | `AskScoped` | `data: ProviderDiagnosticData` (`kind`-discriminated) | The resolved provider could not honor a portable request knob verbatim. First kind: `effort_clamped` (`requested`, provider-native `effective`, `cause`, `model`, `provider?`). One per ask, emitted before the ask's first `agent_call_start`; `agent_call_start` keeps reporting the *requested* effort. Silencing via `AxlConfig.diagnostics` suppresses only the paired `console.warn`. See [observability.md#provider-diagnostics](./observability.md#provider-diagnostics) |
 | `guardrail` / `schema_check` / `validate` | `Partial<AskScoped>` | `data: GuardrailData/SchemaCheckData/ValidateData` | Per-gate retry events emitted alongside `pipeline` |
 | `log` | `Partial<AskScoped>` | `data: unknown` | `ctx.log()` user event |
 | `memory_remember` / `memory_recall` / `memory_forget` | `Partial<AskScoped>` | `data: MemoryEventData` | Memory ops audit |

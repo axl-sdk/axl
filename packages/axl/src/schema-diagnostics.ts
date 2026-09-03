@@ -8,10 +8,11 @@ import type { z } from 'zod';
  *  1. `detectDroppedRefinements` — find `.refine()`/`.superRefine()` checks that
  *     `z.toJSONSchema` silently drops, so we can tell the user (the model never
  *     sees the rule, then `.parse` rejects → wasted retries).
- *  2. `warnSchemaDiagnosticOnce` — the process-level, deduped `console.warn`
- *     mirror of the shipped budget-unpriced precedent, so the high-value cliffs
- *     reach the median consumer (who never wires up `ctx.events` and runs with
- *     the trace console off by default).
+ *  2. `warnDiagnosticOnce` (aliased `warnSchemaDiagnosticOnce`) — the
+ *     process-level, deduped `console.warn` mirror of the shipped
+ *     budget-unpriced precedent, so the high-value cliffs reach the median
+ *     consumer (who never wires up `ctx.events` and runs with the trace console
+ *     off by default). Shared with the runtime's `provider_diagnostic` warning.
  */
 
 /** Default token threshold for the `prompt_schema_oversized` diagnostic.
@@ -153,16 +154,31 @@ const warnedDiagnosticKeys = new Set<string>();
  * Silenceable via `AxlConfig.diagnostics.silent` (passed as `silent`) or
  * `AXL_DIAGNOSTICS_SILENT=true`.
  */
-export function warnSchemaDiagnosticOnce(key: string, message: string, silent?: boolean): void {
+export function warnDiagnosticOnce(
+  key: string,
+  message: string,
+  silent?: boolean,
+  docs: string = DOCS_URL,
+): void {
   if (silent || process.env.AXL_DIAGNOSTICS_SILENT === 'true') return;
   if (warnedDiagnosticKeys.has(key)) return;
   if (warnedDiagnosticKeys.size >= MAX_WARNED_KEYS) warnedDiagnosticKeys.clear();
   warnedDiagnosticKeys.add(key);
-  console.warn(`[axl] ${message} See ${DOCS_URL}.`);
+  console.warn(`[axl] ${message} See ${docs}.`);
 }
+
+/** Historical name for {@link warnDiagnosticOnce}, kept so the schema-diagnostic
+ *  call sites (and their tests) read the same as before. The memo is shared:
+ *  every runtime diagnostic warning dedupes through the same key space. */
+export const warnSchemaDiagnosticOnce = warnDiagnosticOnce;
 
 /** Test-only: clear the one-time-warn memo so dedup behavior can be asserted in
  *  isolation. Not part of the public barrel. */
 export function __resetSchemaDiagnosticWarnings(): void {
   warnedDiagnosticKeys.clear();
 }
+
+/** Test-only alias of {@link __resetSchemaDiagnosticWarnings} for callers that
+ *  reset the shared memo for a non-schema diagnostic. Not part of the public
+ *  barrel. */
+export const __resetDiagnosticWarnings = __resetSchemaDiagnosticWarnings;

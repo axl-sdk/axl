@@ -125,6 +125,10 @@ export type AskOptions<T = unknown> = {
   validate?: OutputValidator<T>;
   /** Maximum retries for validate failures (default: 2). */
   validateRetries?: number;
+  /** Rewrite the corrective feedback the model sees when the guardrail, schema, or validate
+   *  gate rejects an attempt — or abort the retry with `{ retry: false }`. See
+   *  `RetryFeedbackHook`. */
+  retryFeedback?: RetryFeedbackHook<T>;
   /** Per-call metadata passed to dynamic model/system selector functions. */
   metadata?: Record<string, unknown>;
   /** Override temperature for this call. */
@@ -167,6 +171,9 @@ export type DelegateOptions<T = unknown> = {
   validate?: OutputValidator<T>;
   /** Maximum retries for validate failures (default: 2). Passed through to the final `ctx.ask()` call. */
   validateRetries?: number;
+  /** Custom gate-retry feedback. Passed through to the final `ctx.ask()` call on both the
+   *  single-candidate and the routed path. See `RetryFeedbackHook`. */
+  retryFeedback?: RetryFeedbackHook<T>;
 };
 
 /** Race options */
@@ -231,6 +238,9 @@ export const AXL_EVENT_TYPES = [
   // structured-output cliffs (oversized appended schema, dropped refinements,
   // streaming disabled, zero-guidance `schemaPrompt:'none'`).
   'schema_diagnostic',
+  // Provider capability diagnostics — the resolved provider could not honor a
+  // portable request knob verbatim (first kind: a clamped `effort`).
+  'provider_diagnostic',
   // Observability
   'log',
   'memory_remember',
@@ -629,6 +639,35 @@ export type SchemaDiagnosticData =
       provider?: string;
       support: 'downgraded' | 'lossy' | 'unsupported';
     };
+
+/**
+ * Data for the `provider_diagnostic` event — a `kind`-discriminated payload
+ * (like `SchemaDiagnosticData`) reporting that the resolved provider could not
+ * honor a portable request knob verbatim.
+ *
+ *  - `effort_clamped` — the adapter clamped the unified `effort` to what the
+ *    model actually accepts (Gemini 3.x cannot disable thinking; OpenAI Chat
+ *    Completions caps `'max'` at `'xhigh'`; Anthropic models that always think
+ *    fall back to adaptive `'low'`). `requested` is the unified value the caller
+ *    asked for; `effective` is the provider-native level actually sent, which is
+ *    deliberately a free string because not every native level maps back onto
+ *    `Effort`. One per ask, emitted before the first `agent_call_start` — join it
+ *    to `agent_call_start` (which keeps reporting the *requested* effort) by
+ *    `askId` for full provenance.
+ *
+ * The union is `kind`-discriminated so later provider cliffs can join without a
+ * new event type.
+ */
+export type ProviderDiagnosticData = {
+  kind: 'effort_clamped';
+  /** Provider name (`provider.name`), when the adapter exposes one. */
+  provider?: string;
+  /** The model the request is actually sent to (after any `providerOptions.model`). */
+  model: string;
+  requested: Effort;
+  effective: string;
+  cause: string;
+};
 
 /** Data shape for legacy `guardrail` events. Replaced by `pipeline` in PR 2. */
 export type GuardrailData = {
@@ -1032,6 +1071,9 @@ type LegacyAxlEventPayloadV1 =
   // ── Schema capability diagnostics (spec 22, Problem E) ──────────────────
   | (AxlEventBase & AskScoped & { type: 'schema_diagnostic'; data: SchemaDiagnosticData })
 
+  // ── Provider capability diagnostics ─────────────────────────────────────
+  | (AxlEventBase & AskScoped & { type: 'provider_diagnostic'; data: ProviderDiagnosticData })
+
   // ── Legacy gate events (collapsed into `pipeline` in PR 2) ──────────────
   | (AxlEventBase & Partial<AskScoped> & { type: 'guardrail'; data?: GuardrailData })
   | (AxlEventBase & Partial<AskScoped> & { type: 'schema_check'; data?: SchemaCheckData })
@@ -1233,6 +1275,45 @@ export type OutputValidator<T = unknown> = (
   output: T,
   ctx: { metadata: Record<string, unknown> },
 ) => ValidateResult | Promise<ValidateResult>;
+
+/** What a rejecting output gate tells a `retryFeedback` hook about the attempt it is
+ *  about to retry. One shape for all three gates — `stage` discriminates. */
+export type RetryFeedbackInfo<T = unknown> = {
+  /** Which gate rejected: JSON/Zod parse, post-schema `validate`, or output guardrail. */
+  stage: 'schema' | 'validate' | 'guardrail';
+  /** 1-based index of the attempt that was just rejected. */
+  attempt: number;
+  /** Total attempts this gate allows (`retries` + 1). */
+  maxAttempts: number;
+  /** Raw model output that was rejected. */
+  output: string;
+  /** The parsed, schema-valid object, typed by the ask's `schema`. Present only for
+   *  `stage: 'validate'` — the other gates run before or without a parsed value. */
+  parsed?: T;
+  /** The gate's own reason (Zod message, `ValidateResult.reason`, guardrail reason). */
+  reason: string;
+  /** The `ZodError` (or non-Zod parse error) for `schema`; the validator's thrown error for
+   *  `validate` when it threw. Absent for `guardrail` and for a clean `validate` rejection. */
+  error?: unknown;
+  /** The feedback text the runtime would send if the hook did not intervene. */
+  defaultMessage: string;
+};
+
+/** A non-empty string replaces `defaultMessage` verbatim; `undefined` (or `''`) keeps it;
+ *  `{ retry: false }` stops retrying and makes the gate throw its typed terminal error. */
+export type RetryFeedbackResult = string | undefined | { retry: false };
+
+/** Rewrites (or aborts) the corrective turn the model sees after an output gate rejects an
+ *  attempt. Runs only while a retry is still permitted — never on the exhausting attempt —
+ *  and after the gate's own event is emitted. Exceptions propagate to the caller.
+ *
+ *  `void` is accepted alongside `RetryFeedbackResult` so a hook used purely for logging or
+ *  inspection — a block body that never returns — type-checks; it keeps the default text.
+ *  Any other return value is a contract violation and throws a `TypeError`. */
+export type RetryFeedbackHook<T = unknown> = (
+  info: RetryFeedbackInfo<T>,
+  ctx: { metadata: Record<string, unknown> },
+) => RetryFeedbackResult | void | Promise<RetryFeedbackResult | void>;
 
 /** Execution info */
 export type ExecutionInfoV1 = {

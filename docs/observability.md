@@ -505,9 +505,11 @@ releases.
 
 Three common symptoms and what to look for in traces:
 
-**"My agent cost 3× what I expected."** Filter for `agent_call_end` events and check the `data.turn` field — if you see `turn: 2`, `turn: 3`, etc., the tool-calling loop ran multiple iterations. Check `data.retryReason` on those calls to see whether it was a schema, validate, or guardrail retry. Check the preceding `schema_check` / `validate` / `guardrail` event for the exact failure reason and `feedbackMessage` that was sent back to the LLM.
+**"My agent cost 3× what I expected."** Filter for `agent_call_end` events and check the `data.turn` field — if you see `turn: 2`, `turn: 3`, etc., the tool-calling loop ran multiple iterations. Check `data.retryReason` on those calls to see whether it was a schema, validate, or guardrail retry. Check the preceding `schema_check` / `validate` / `guardrail` event for the exact failure reason and the `feedbackMessage` Axl composed.
 
-**"My structured output keeps failing."** Filter for `schema_check` events with `valid: false`. The `reason` field has the Zod parse error; the `feedbackMessage` is the exact message the model saw on its next attempt. If the feedback isn't clear enough to help the model correct itself, that's a prompt/schema design problem, not a retry-count problem.
+**"My structured output keeps failing."** Filter for `schema_check` events with `valid: false`. The `reason` field has the Zod parse error; the `feedbackMessage` is Axl's default corrective text. If the feedback isn't clear enough to help the model correct itself, that's a prompt/schema design problem, not a retry-count problem.
+
+> **With a `retryFeedback` hook,** the gate events still show Axl's default text; the text the model received is `pipeline(failed).reason`. See [Custom retry feedback](api-reference.md#custom-retry-feedback).
 
 **"Why did my agent respond that way?"** Enable `trace.level: 'full'` and check the `data.messages` array on the relevant `agent_call_start` — it has the exact request conversation (system prompt, history, tool results, retry feedback) immediately before the provider call. Request-side `system` and `params`, plus response-side `thinking`, are visible in default mode without needing verbose; `retryReason` is mirrored on both start and end.
 
@@ -586,6 +588,35 @@ defineConfig({
 
 Set `AXL_DIAGNOSTICS_SILENT=true` to silence the warns process-wide without a
 config change. The structured events always fire regardless.
+
+### Provider diagnostics
+
+Not every model accepts every [`effort`](providers.md#effort) level. When the resolved
+provider has to send a different level than you asked for, the runtime emits one
+`provider_diagnostic` event per ask, before that ask's first `agent_call_start`, plus a
+deduped `console.warn`:
+
+| `data.kind` | Fires when | Fields |
+|---|---|---|
+| `effort_clamped` | The provider sent a different native level than the requested `effort` | `requested`, `effective` (provider-native string), `cause`, `model`, `provider?` |
+
+```ts
+for await (const event of stream.lifecycle) {
+  if (event.type === 'provider_diagnostic' && event.data.kind === 'effort_clamped') {
+    // e.g. requested 'none', effective 'minimal' on gemini-3.6-flash
+    record(event.askId, event.data.requested, event.data.effective);
+  }
+}
+```
+
+- No event means the effort was sent as requested (or the provider does not implement the
+  optional `Provider.effortResolution()` capability).
+- `agent_call_start` keeps reporting the *requested* effort; join the two by `askId`.
+- The warning is deduped per distinct clamp and silenced by `AxlConfig.diagnostics.silent`
+  or `AXL_DIAGNOSTICS_SILENT=true`. The event is never silenced.
+- Redaction passes the event through unchanged; it carries no prompt or response content.
+- A provider whose `effortResolution()` throws or reports a malformed clamp fails the ask
+  with that error.
 
 ### PII and redaction
 

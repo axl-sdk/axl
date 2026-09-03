@@ -78,7 +78,8 @@ but never inherit exact pricing or GPT-5.6-specific capabilities.
 ## Anthropic
 
 ```
-anthropic:claude-fable-5        # Highest-capability Claude 5; thinking always on
+anthropic:claude-fable-5-1      # Highest-capability Claude; thinking always on
+anthropic:claude-fable-5        # Previous Fable; thinking always on
 anthropic:claude-opus-5         # Claude 5 flagship; thinking on by default
 anthropic:claude-sonnet-5       # Claude 5 balanced; thinking on by default
 anthropic:claude-opus-4-8       # Previous flagship
@@ -89,6 +90,11 @@ anthropic:claude-sonnet-4-5     # Balanced
 anthropic:claude-haiku-4-5      # Fast and affordable
 anthropic:claude-opus-4-5       # Previous gen
 ```
+
+`claude-mythos-5-1` and `claude-mythos-5` are priced but have no capability entry:
+they are limited-availability models whose per-model thinking semantics are not
+published, so Axl passes their requests through unmodified rather than inferring a
+request shape it cannot verify. Their cost is still reported.
 
 `claude-opus-4-1` is deprecated on Anthropic-operated APIs and retires August 5,
 2026; migrate to `claude-opus-4-8`. Claude Opus 4, Sonnet 4, Sonnet 3.7,

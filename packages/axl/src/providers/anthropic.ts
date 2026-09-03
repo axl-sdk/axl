@@ -76,7 +76,8 @@ function hasAnthropicProviderFileImage(messages: readonly ChatMessage[]): boolea
 
 // ---------------------------------------------------------------------------
 // Exact Anthropic model capabilities and Standard text pricing. Reviewed
-// 2026-08-03 against https://platform.claude.com/docs/en/about-claude/pricing.
+// 2026-09-03 against https://platform.claude.com/docs/en/about-claude/pricing
+// and .../build-with-claude/effort for the per-model effort levels.
 //
 // Modern IDs intentionally use exact matching. A future sibling can still pass
 // through to Anthropic, but it must not inherit request semantics or a price.
@@ -98,6 +99,12 @@ type ClaudeCapability = {
 };
 
 const CLAUDE_CAPABILITIES: Record<string, ClaudeCapability> = {
+  'claude-fable-5-1': {
+    thinking: 'adaptive-always-on',
+    effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    manualBudget: false,
+    stripTemperature: true,
+  },
   'claude-fable-5': {
     thinking: 'adaptive-always-on',
     effortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
@@ -198,10 +205,28 @@ function resolveClaudeCapability(model: string): ClaudeCapability | undefined {
   );
 }
 
-type AnthropicRate = { input: number; output: number };
+type AnthropicRate = {
+  input: number;
+  output: number;
+  /**
+   * Cache-hit price as a fraction of base input. 0.1x on every model except
+   * Claude Fable 5.1 / Mythos 5.1, which read cache at 0.025x.
+   */
+  cacheReadMultiplier?: number;
+};
+
+/** Cache-read multiplier when a rate does not override it. */
+const DEFAULT_CACHE_READ_MULTIPLIER = 0.1;
 
 const ANTHROPIC_RATES: Record<string, AnthropicRate> = {
+  'claude-fable-5-1': { input: 10e-6, output: 50e-6, cacheReadMultiplier: 0.025 },
   'claude-fable-5': { input: 10e-6, output: 50e-6 },
+  // Limited availability (Glasswing). Priced from the public pricing table; no
+  // CLAUDE_CAPABILITIES entry, because their thinking semantics are not
+  // documented per-model and an unverified capability would send the wrong
+  // request shape. Unknown IDs pass through unmodified, which is the safe side.
+  'claude-mythos-5-1': { input: 10e-6, output: 50e-6, cacheReadMultiplier: 0.025 },
+  'claude-mythos-5': { input: 10e-6, output: 50e-6 },
   'claude-opus-5': { input: 5e-6, output: 25e-6 },
   'claude-sonnet-5': { input: 2e-6, output: 10e-6 },
   'claude-opus-4-8': { input: 5e-6, output: 25e-6 },
@@ -301,9 +326,10 @@ export function estimateAnthropicCost(
   }
 
   const { input, output } = rate;
+  const cacheReadRate = input * (rate.cacheReadMultiplier ?? DEFAULT_CACHE_READ_MULTIPLIER);
   return (
     usage.inputTokens * input +
-    cacheRead * input * 0.1 +
+    cacheRead * cacheReadRate +
     cacheWrite5m * input * 1.25 +
     cacheWrite1h * input * 2 +
     usage.outputTokens * output

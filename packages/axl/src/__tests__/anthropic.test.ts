@@ -1311,6 +1311,7 @@ describe('AnthropicProvider', () => {
     it('resolves every Claude 5 portable-thinking control to a valid request body', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const models = [
+        ['claude-fable-5-1', false],
         ['claude-fable-5', false],
         ['claude-opus-5', true],
         ['claude-sonnet-5', true],
@@ -1739,6 +1740,26 @@ describe('AnthropicProvider', () => {
       expect(
         estimateAnthropicCost('claude-sonnet-5', { inputTokens: 100, outputTokens: 50 }),
       ).toBeCloseTo(0.0007, 10);
+      // Fable 5.1 and Mythos 5.1 read cache at 0.025x base input, not 0.1x.
+      for (const model of ['claude-fable-5-1', 'claude-mythos-5-1']) {
+        expect(
+          estimateAnthropicCost(model, {
+            inputTokens: 100,
+            outputTokens: 50,
+            cacheReadTokens: 1000,
+          }),
+        ).toBeCloseTo(100 * 10e-6 + 1000 * 10e-6 * 0.025 + 50 * 50e-6, 10);
+      }
+      // Fable 5 and Mythos 5 keep the standard 0.1x cache-read multiplier.
+      for (const model of ['claude-fable-5', 'claude-mythos-5']) {
+        expect(
+          estimateAnthropicCost(model, {
+            inputTokens: 100,
+            outputTokens: 50,
+            cacheReadTokens: 1000,
+          }),
+        ).toBeCloseTo(100 * 10e-6 + 1000 * 10e-6 * 0.1 + 50 * 50e-6, 10);
+      }
       expect(
         estimateAnthropicCost('claude-opus-5', {
           inputTokens: 100,

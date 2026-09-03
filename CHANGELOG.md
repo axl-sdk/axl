@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Claude Fable 5.1 (`claude-fable-5-1`) capabilities and pricing.** Adaptive
+  always-on thinking with all five effort levels (thinking cannot be disabled;
+  `effort: 'none'` clamps to `'low'` and reports a `provider_diagnostic`), priced
+  at $10/$50. `claude-mythos-5-1` and `claude-mythos-5` are priced at the same
+  rates but intentionally have **no** capability entry: they are
+  limited-availability models with no published per-model thinking semantics, so
+  their requests pass through unmodified rather than carrying an inferred shape.
+- **Per-model cache-read multipliers on Anthropic.** Cache hits are 0.1x base
+  input on every model except Claude Fable 5.1 and Mythos 5.1, which read cache
+  at **0.025x**. `estimateAnthropicCost` previously hardcoded 0.1x, which would
+  have overpriced Fable 5.1 cache reads 4x.
+
 ### Fixed
 
 - **Claude Sonnet 5 was overpriced 50% from September 1, 2026.** The rate table

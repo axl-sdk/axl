@@ -126,7 +126,10 @@ May 25, 2026 (`gemini-3.1-flash-lite`, with `gemini-3.5-flash-lite` now preferre
 and Gemini 2.0 Flash/Flash-Lite shut down June 1, 2026 (use `gemini-3.6-flash` /
 `gemini-3.1-flash-lite`). `gemini-3-flash-preview` remains available and callable, but it no longer appears
 on Google's pricing page, so Axl reports its usage with **no cost** rather than
-billing a rate it cannot verify; Google recommends `gemini-3.8-flash` instead. See [Gemini deprecations](https://ai.google.dev/gemini-api/docs/deprecations).
+billing a rate it cannot verify; Google recommends `gemini-3.8-flash` instead.
+Because unpriced spend is reported but not enforced, a `ctx.budget()` cost limit
+will not trip on this model — the budget flags `unpriced` instead. Pin a priced
+model if you need a hard cost cap. See [Gemini deprecations](https://ai.google.dev/gemini-api/docs/deprecations).
 
 Gemini [requires every `functionResponse.response` to be a JSON
 object](https://ai.google.dev/api/generate-content#FunctionResponse). Axl parses canonical
@@ -657,7 +660,7 @@ Third-party providers that omit `Provider.effortResolution()` report nothing.
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
 - **OpenAI GPT-5.x Chat Completions**: Uses `system`, strips temperature when reasoning is active, and supports parallel tool calls. The compatibility baseline maps GPT-5.2+ `'max'` to `'xhigh'`, reported through a `provider_diagnostic` event. Earlier families retain their lower caps.
 - **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'` and omit `temperature` because that family rejects it even when reasoning uses the provider default. Older models keep their documented clamps. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
-- **Anthropic Claude 5**: Fable 5 always reasons; Opus 5 and Sonnet 5 reason by default. All three accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are preserved in `providerMetadata` for tool continuations. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a different fallback model served the call, Axl fails before persisting history or estimating cost.
+- **Anthropic Claude 5**: Fable 5.1 and Fable 5 always reason; Opus 5 and Sonnet 5 reason by default. All four accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are preserved in `providerMetadata` for tool continuations. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a different fallback model served the call, Axl fails before persisting history or estimating cost.
 - **Anthropic Opus 4.8**: Supports adaptive thinking and native `'xhigh'`/`'max'`.
 - **Anthropic Opus 4.7**: Same adaptive-thinking behavior as 4.6. Additionally supports `effort: 'xhigh'` as a first-class tier between `'high'` and `'max'`, sent as `output_config.effort: 'xhigh'`. Same pricing as Opus 4.6 ($5/$25 per 1M tokens).
 - **Anthropic 4.6** (Opus 4.6, Sonnet 4.6): `effort` enables adaptive thinking (`thinking: { type: "adaptive" }` + `output_config: { effort }`). Temperature stripped when thinking active. `thinkingBudget: 0` + `effort` sends only `output_config.effort` (no thinking block, temperature allowed). `effort: 'xhigh'` clamps to `'high'` (4.6 doesn't expose a distinct xhigh tier).
@@ -873,9 +876,14 @@ Only documented snapshot forms inherit a base model's price. An arbitrary suffix
 
 | Operation | Multiplier |
 |-----------|-----------|
-| Cache read (hit) | **10%** of input rate |
+| Cache read (hit) | **10%** of input rate — but **2.5%** on Claude Fable 5.1 and Mythos 5.1 |
 | Cache write — 5-minute TTL (default) | **125%** of input rate |
 | Cache write — 1-hour TTL | **200%** of input rate |
+
+The cache-read multiplier is per-model (`cacheReadMultiplier` on the rate row in
+`providers/anthropic.ts`), defaulting to 10%. Cache-write multipliers are uniform
+across models. Check the source rather than assuming 10% when sizing a
+cache-heavy workload on the Fable/Mythos 5.1 line.
 
 Axl reads the 5-minute and 1-hour creation buckets when Anthropic provides them and prices
 each at the correct multiplier. It also exposes their sum as `usage.cache_write_tokens`.

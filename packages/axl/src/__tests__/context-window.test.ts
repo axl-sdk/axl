@@ -274,6 +274,31 @@ describe('Context Window Management', () => {
     expect(firstNonSystem.role).toBe('user');
   });
 
+  it('summarizes a two-message history rather than forwarding it raw', async () => {
+    // [user, assistant] that does not fit has no anchor above index 0, so it is
+    // summarized in full. Returning it unchanged would forward content already
+    // judged not to fit and skip the summarizeModelInput pass that replaces
+    // media with safe placeholders.
+    const history: ChatMessage[] = [
+      { role: 'user', content: `q: ${'x'.repeat(400)}` },
+      { role: 'assistant', content: `a: ${'x'.repeat(400)}` },
+    ];
+    const provider = new TestProvider([{ content: 'Summary.' }, { content: 'Response.' }]);
+    const ctx = createTestContext(provider, { sessionHistory: history });
+    await ctx.ask(
+      agent({ model: 'test:test-model', system: 'You are a test agent', maxContext: 500 }),
+      'Next question',
+    );
+
+    const actualCall = provider.calls[provider.calls.length - 1].messages;
+    // Neither raw turn survives; a summary stands in for both.
+    expect(actualCall.some((m: any) => String(m.content).startsWith('q: '))).toBe(false);
+    expect(actualCall.some((m: any) => String(m.content).startsWith('a: '))).toBe(false);
+    expect(
+      actualCall.some((m: any) => String(m.content).includes('Summary of earlier conversation')),
+    ).toBe(true);
+  });
+
   it('caches summary across calls in the same session', async () => {
     const longHistory = generateHistory(100, 200);
 

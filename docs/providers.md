@@ -907,6 +907,11 @@ across calls; that is the shape of every agentic loop.
 512 tokens on Fable 5.1 / Mythos 5.1 / Opus 5 / Fable 5 / Mythos 5; 1,024 on Opus 4.8,
 Sonnet 5, Sonnet 4.6, Sonnet 4.5; **4,096 on Haiku 4.5**.
 
+**Diagnostic.** If `promptCache` is on and two consecutive calls on one context write to
+the cache without ever reading from it, Axl emits one `log` warning naming the agent —
+the signature of a prefix that changes per call. (Scope is one `WorkflowContext`; a
+`Session` builds a fresh context per turn, so churn across session turns is not observed.)
+
 Explicit block-level breakpoints via `providerOptions` still merge last and win.
 Verified live 2026-09-03; see `docs/verification/`.
 

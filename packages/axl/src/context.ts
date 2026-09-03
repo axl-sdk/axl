@@ -497,6 +497,10 @@ function describeValue(value: unknown): string {
   return `a value of type ${typeof value}`;
 }
 
+/** Consecutive cache writes with no reads before the promptCache warning fires. Two
+ *  in a row on one context is already a strong signal the prefix is not stable. */
+const PROMPT_CACHE_COLD_WRITE_WARN_AFTER = 2;
+
 /**
  * Index of the nearest `user` turn at or after `from`, or `undefined` when the
  * remaining history has none.
@@ -826,6 +830,10 @@ export class WorkflowContext<TInput = unknown> {
   private readonly workflowLifecycleState: WorkflowLifecycleState;
   private signal?: AbortSignal;
   private summaryCache?: string;
+  /** Consecutive provider calls with promptCache on that wrote to the cache
+   *  without reading from it. Reset by any read; reported once per context. */
+  private promptCacheColdWrites = 0;
+  private promptCacheWarned = false;
   private workflowName?: string;
   private mcpManager?: McpManager;
   private spanManager?: SpanManager;
@@ -2329,6 +2337,37 @@ export class WorkflowContext<TInput = unknown> {
       // Capture usage for span instrumentation (per-call, not per-instance)
       if (usageCapture && response.usage) {
         usageCapture.value = response.usage;
+      }
+
+      // promptCache is opt-in precisely because a prefix that changes every
+      // call is written at 1.25x and never read. Axl cannot detect that
+      // statically, but it can see it happen: consecutive cold writes with no
+      // reads on one context. Report it once so the operator can turn the
+      // option off for that agent. Scope is this WorkflowContext -- a
+      // Session builds a fresh context per turn, so cross-turn churn is not
+      // observed here.
+      if (chatOptions.promptCache && response.usage) {
+        const wrote = (response.usage.cache_write_tokens ?? 0) > 0;
+        const read = (response.usage.cached_tokens ?? 0) > 0;
+        if (read) this.promptCacheColdWrites = 0;
+        else if (wrote) this.promptCacheColdWrites += 1;
+        if (
+          this.promptCacheColdWrites >= PROMPT_CACHE_COLD_WRITE_WARN_AFTER &&
+          !this.promptCacheWarned
+        ) {
+          this.promptCacheWarned = true;
+          this.emitEvent({
+            type: 'log',
+            agent: agent._name,
+            data: {
+              warning:
+                `Agent '${agent._name}' has promptCache on, but its prefix was written to the ` +
+                `cache ${this.promptCacheColdWrites} times in a row with no cache reads. Each ` +
+                `write bills 1.25x input. If this agent's system prompt or tool set changes ` +
+                `per call, set promptCache: false for it.`,
+            },
+          });
+        }
       }
 
       // Track cost

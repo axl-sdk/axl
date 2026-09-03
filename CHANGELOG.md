@@ -20,7 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would pay Anthropic's 1.25x write premium with no reads. With it off, requests are
   byte-identical to before. Live-verified on `claude-sonnet-4-6`: repeat calls read
   1,618 cached tokens at ~1/10 the cost, and a 2,000-token unique user turn wrote
-  nothing. See [providers.md#prompt-caching](docs/providers.md#prompt-caching).
+  nothing. When it is on and two consecutive calls on one context write to the
+  cache without reading, one `log` warning names the agent — the signature of a
+  per-call-changing prefix. See
+  [providers.md#prompt-caching](docs/providers.md#prompt-caching).
 
 ### Added
 

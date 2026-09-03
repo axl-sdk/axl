@@ -149,13 +149,6 @@ describe('Configurable Model Parameters', () => {
   });
 
   describe('promptCache precedence', () => {
-    it('is off by default and reaches the provider as undefined', async () => {
-      const provider = new TestProvider([{ content: 'hello' }]);
-      const ctx = createTestContext(provider);
-      await ctx.ask(agent({ model: 'test:m', system: 'sys' }), 'hi');
-      expect(provider.calls[0].options.promptCache).toBeUndefined();
-    });
-
     it('passes the agent-level opt-in to the provider', async () => {
       const provider = new TestProvider([{ content: 'hello' }]);
       const ctx = createTestContext(provider);
@@ -218,6 +211,21 @@ describe('Configurable Model Parameters', () => {
       const warnings = warningsFrom(onTrace);
       expect(warnings).toHaveLength(1);
       expect(warnings[0]).toContain('no cache reads');
+    });
+
+    it('warns once when promptCache is on but no cache activity ever appears', async () => {
+      // Neither writes nor reads: the shape of a prefix below the model's
+      // cacheable minimum, which Anthropic silently ignores.
+      const provider = new UsageProvider([{}]);
+      const onTrace = vi.fn();
+      const ctx = createTestContext(provider as any, { onTrace });
+      const a = agent({ model: 'test:m', system: 'short', promptCache: true });
+      await ctx.ask(a, 'one');
+      await ctx.ask(a, 'two');
+      await ctx.ask(a, 'three');
+      const warnings = warningsFrom(onTrace);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('no cache writes or reads');
     });
 
     it('stays silent when writes are followed by reads, and when promptCache is off', async () => {

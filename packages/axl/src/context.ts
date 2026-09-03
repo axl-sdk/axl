@@ -831,8 +831,11 @@ export class WorkflowContext<TInput = unknown> {
   private signal?: AbortSignal;
   private summaryCache?: string;
   /** Consecutive provider calls with promptCache on that wrote to the cache
-   *  without reading from it. Reset by any read; reported once per context. */
+   *  without reading from it (prefix changes per call), and consecutive calls
+   *  with no cache activity at all (prefix below the model's minimum, which
+   *  Anthropic silently ignores). Either reports once per context. */
   private promptCacheColdWrites = 0;
+  private promptCacheInactive = 0;
   private promptCacheWarned = false;
   private workflowName?: string;
   private mcpManager?: McpManager;
@@ -2346,27 +2349,36 @@ export class WorkflowContext<TInput = unknown> {
       // option off for that agent. Scope is this WorkflowContext -- a
       // Session builds a fresh context per turn, so cross-turn churn is not
       // observed here.
-      if (chatOptions.promptCache && response.usage) {
+      if (chatOptions.promptCache && response.usage && !this.promptCacheWarned) {
         const wrote = (response.usage.cache_write_tokens ?? 0) > 0;
         const read = (response.usage.cached_tokens ?? 0) > 0;
-        if (read) this.promptCacheColdWrites = 0;
-        else if (wrote) this.promptCacheColdWrites += 1;
-        if (
-          this.promptCacheColdWrites >= PROMPT_CACHE_COLD_WRITE_WARN_AFTER &&
-          !this.promptCacheWarned
-        ) {
+        if (read) {
+          this.promptCacheColdWrites = 0;
+          this.promptCacheInactive = 0;
+        } else if (wrote) {
+          this.promptCacheColdWrites += 1;
+          this.promptCacheInactive = 0;
+        } else {
+          this.promptCacheInactive += 1;
+        }
+        let warning: string | undefined;
+        if (this.promptCacheColdWrites >= PROMPT_CACHE_COLD_WRITE_WARN_AFTER) {
+          warning =
+            `Agent '${agent._name}' has promptCache on, but its prefix was written to the ` +
+            `cache ${this.promptCacheColdWrites} times in a row with no cache reads. Each ` +
+            `write bills 1.25x input. If this agent's system prompt or tool set changes ` +
+            `per call, set promptCache: false for it.`;
+        } else if (this.promptCacheInactive >= PROMPT_CACHE_COLD_WRITE_WARN_AFTER) {
+          warning =
+            `Agent '${agent._name}' has promptCache on, but ${this.promptCacheInactive} ` +
+            `calls in a row showed no cache writes or reads. Anthropic silently ignores a ` +
+            `breakpoint below the model's minimum cacheable length (4,096 tokens on Haiku ` +
+            `4.5; 1,024 or 512 on others) -- the system prompt plus tools may be too short ` +
+            `to cache on this model, or the provider may not support prompt caching.`;
+        }
+        if (warning) {
           this.promptCacheWarned = true;
-          this.emitEvent({
-            type: 'log',
-            agent: agent._name,
-            data: {
-              warning:
-                `Agent '${agent._name}' has promptCache on, but its prefix was written to the ` +
-                `cache ${this.promptCacheColdWrites} times in a row with no cache reads. Each ` +
-                `write bills 1.25x input. If this agent's system prompt or tool set changes ` +
-                `per call, set promptCache: false for it.`,
-            },
-          });
+          this.emitEvent({ type: 'log', agent: agent._name, data: { warning } });
         }
       }
 

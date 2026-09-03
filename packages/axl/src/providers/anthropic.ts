@@ -198,12 +198,12 @@ function resolveClaudeCapability(model: string): ClaudeCapability | undefined {
   );
 }
 
-type AnthropicRate = { input: number; output: number; sonnet5Intro?: boolean };
+type AnthropicRate = { input: number; output: number };
 
 const ANTHROPIC_RATES: Record<string, AnthropicRate> = {
   'claude-fable-5': { input: 10e-6, output: 50e-6 },
   'claude-opus-5': { input: 5e-6, output: 25e-6 },
-  'claude-sonnet-5': { input: 3e-6, output: 15e-6, sonnet5Intro: true },
+  'claude-sonnet-5': { input: 2e-6, output: 10e-6 },
   'claude-opus-4-8': { input: 5e-6, output: 25e-6 },
   'claude-opus-4-7': { input: 5e-6, output: 25e-6 },
   'claude-opus-4-6': { input: 5e-6, output: 25e-6 },
@@ -256,13 +256,17 @@ function anthropicStreamErrorStatus(type: string | undefined): number {
 }
 
 /**
- * Price an observable Standard Anthropic text call. `now` is injectable so
- * Sonnet 5's announced rate transition is deterministic in pure tests.
+ * Price an observable Standard Anthropic text call.
+ *
+ * Rates are the currently published price only. We deliberately do not encode
+ * announced future transitions: Sonnet 5's scheduled 2026-09-01 increase to
+ * $3/$15 was cancelled and $2/$10 became the standard price, so a forward-dated
+ * gate silently overcharged for every call made after the date it predicted.
+ * Re-verify against the pricing page instead (see the dated review comment above).
  */
 export function estimateAnthropicCost(
   model: string | undefined,
   usage: AnthropicPriceUsage,
-  now: Date = new Date(),
 ): number | undefined {
   if (!model || !isValidTokenCount(usage.inputTokens) || !isValidTokenCount(usage.outputTokens)) {
     return undefined;
@@ -296,10 +300,7 @@ export function estimateAnthropicCost(
     return undefined;
   }
 
-  const { input, output } =
-    rate.sonnet5Intro && now < new Date('2026-09-01T00:00:00Z')
-      ? { input: 2e-6, output: 10e-6 }
-      : rate;
+  const { input, output } = rate;
   return (
     usage.inputTokens * input +
     cacheRead * input * 0.1 +

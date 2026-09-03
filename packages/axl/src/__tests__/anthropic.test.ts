@@ -1705,7 +1705,7 @@ describe('AnthropicProvider', () => {
       }
     });
 
-    it('prices Claude 5 exact models, TTL cache buckets, and Sonnet 5 date boundaries', () => {
+    it('prices Claude 5 exact models and TTL cache buckets', () => {
       expect(
         estimateAnthropicCost('claude-fable-5', { inputTokens: 100, outputTokens: 50 }),
       ).toBeCloseTo(0.0035, 10);
@@ -1734,20 +1734,11 @@ describe('AnthropicProvider', () => {
       expect(
         estimateAnthropicCost('claude-opus-4', { inputTokens: 1, outputTokens: 1 }),
       ).toBeUndefined();
+      // Sonnet 5 is $2/$10: the announced 2026-09-01 increase to $3/$15 was
+      // cancelled, so the rate is flat and must not vary with the clock.
       expect(
-        estimateAnthropicCost(
-          'claude-sonnet-5',
-          { inputTokens: 100, outputTokens: 50 },
-          new Date('2026-08-31T23:59:59Z'),
-        ),
+        estimateAnthropicCost('claude-sonnet-5', { inputTokens: 100, outputTokens: 50 }),
       ).toBeCloseTo(0.0007, 10);
-      expect(
-        estimateAnthropicCost(
-          'claude-sonnet-5',
-          { inputTokens: 100, outputTokens: 50 },
-          new Date('2026-09-01T00:00:00Z'),
-        ),
-      ).toBeCloseTo(0.00105, 10);
       expect(
         estimateAnthropicCost('claude-opus-5', {
           inputTokens: 100,

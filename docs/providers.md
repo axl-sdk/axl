@@ -841,8 +841,11 @@ and effective returned model IDs. If a model or required billing dimension is un
 treat a paid model as free. OpenRouter and xAI prefer provider-reported totals; local runtimes
 are the only built-ins that deliberately return zero.
 
-Claude Sonnet 5 uses Anthropic's introductory rate through August 31, 2026, then switches to
-the announced standard rate on September 1 without requiring an SDK update.
+Rate tables hold the **currently published** price and never a scheduled future one. Announced
+transitions get cancelled — Claude Sonnet 5's introductory $2/$10 was set to rise to $3/$15 on
+September 1, 2026, then became the standard price instead — and a forward-dated gate in the SDK
+silently overcharges from the moment its predicted date arrives. Promotional rates are recorded
+at their current value with a dated review note, not as an expiry the code enforces.
 
 ### Prompt caching rates
 
@@ -958,4 +961,10 @@ frontier family is current:
 - Add unit fixtures, run both live integration gates, and save a dated result under
   `docs/verification/`, including any credential-gated gaps.
 
-Recheck Claude Sonnet 5 on or before its September 1, 2026 price transition.
+Promotional rates currently in effect, to re-verify (record the then-current value; do not
+encode the expiry as a code-side transition):
+
+| Model | Promotional rate | Announced through |
+|-------|------------------|-------------------|
+| `gpt-5.6-sol` | $4 / $20 (cache write $5) | at least November 21, 2026 |
+| `gemini-3.6-flash`, `gemini-3.7-flash`, `gemini-3.8-flash` | $0.75 / $3.75 | December 31, 2026 |

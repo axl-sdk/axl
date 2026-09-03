@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Claude Sonnet 5 was overpriced 50% from September 1, 2026.** The rate table
+  encoded Anthropic's *announced* increase from the introductory $2/$10 to
+  $3/$15 as a forward-dated gate, so every `claude-sonnet-5` cost estimate
+  switched to $3/$15 once that date arrived. Anthropic cancelled the increase and
+  $2/$10 is now the standard price. `estimateAnthropicCost` no longer takes a
+  `now` argument and no rate varies with the clock: tables hold only the
+  currently published price. See
+  [providers.md#cost-estimation](docs/providers.md#cost-estimation).
+
 ## [0.22.3] - 2026-09-03
 
 ### Added

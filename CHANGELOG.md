@@ -7,84 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.3] - 2026-09-03
+
 ### Added
 
 - **`retryFeedback` hook on `AskOptions` and `DelegateOptions`.** One hook across
-  all three output gates lets a caller write the corrective turn the model sees
-  when guardrail, schema, or `validate` rejects an attempt — a domain classifier
-  can now reach the retry, where previously only `validate` could contribute a
-  `reason` and the schema gate exposed nothing. `info.stage` discriminates the
-  gate and carries the rejected output, the gate's reason, the `ZodError` or the
-  validator's thrown error, the parsed value (validate only), and the default
-  text so the hook can decorate instead of replace. Returning a non-empty string
-  replaces the default; `undefined` or `''` keeps it; `{ retry: false }` stops
-  retrying and throws the gate's usual typed error (`GuardrailError`,
-  `VerifyError`, `ValidationError`) with the same payload as on exhaustion; a
-  thrown exception propagates and is never retried into silence. The hook runs
-  only while a retry is still permitted and always after the gate's own event,
-  which keeps carrying the default text, so an aborting or throwing hook cannot
-  erase the record that the gate rejected. A return value outside the contract
-  throws a `TypeError` rather than silently falling back to the default. The
-  workflow `ctx.metadata` is passed through for multi-tenant callers, exactly as
-  `validate` receives it; per-call `AskOptions.metadata` is not merged in. The
-  hook is forwarded to the terminal ask on both `ctx.delegate()` paths and on
-  handoffs, like `validate`. New exported types `RetryFeedbackHook<T>`,
-  `RetryFeedbackInfo<T>`, and `RetryFeedbackResult`; `T` is inferred from
-  `schema`, so `info.parsed` is typed at the validate stage.
-- **Clamped `effort` is now reported: the `provider_diagnostic` event.** Adapters
-  clamp the unified `effort` to what each model actually accepts (Gemini 3.x
-  cannot disable thinking and caps at `'high'`; OpenAI Chat Completions caps
-  `'max'` at `'xhigh'` and pre-5.1 `'none'` at `'minimal'`; some Anthropic models
-  always think and fall back to adaptive `'low'`, and the legacy Anthropic
-  `budget_tokens` families fold `'xhigh'`/`'max'` into the `'high'` tier's
-  budget). That clamp was previously
-  invisible to run provenance — `agent_call_start` reported only the requested
-  value — so a trace could record `effort: 'none'` for a request that thought.
-  The runtime now emits one `provider_diagnostic { kind: 'effort_clamped' }`
-  event per ask (before that ask's first `agent_call_start`) carrying
-  `requested`, the provider-native `effective` level, and a `cause`.
-  `agent_call_start` still reports the **requested** effort; join the two by
-  `askId`. Providers opt in through a new optional
-  `Provider.effortResolution()` capability method (exported types
-  `EffortResolution`, `ProviderDiagnosticData`), so a third-party adapter that
-  omits it simply reports nothing. An adapter that implements the method and then
-  throws — or reports `clamped: true` without a non-empty `requested`/`effective`
-  pair (a `TypeError` naming the provider) — fails the ask rather than being
-  swallowed. `MockProvider.withEffortResolution()` drives the path in tests.
-  **`provider_diagnostic` is a new member of the `AxlEvent['type']` union** — a
-  consumer with an exhaustive `switch` over event types gains a case. It is
-  included in `AXL_EVENT_TYPES`, the `.lifecycle` view, and the redaction table
-  (pass-through: the event carries provider capability metadata only, never
-  application content).
+  the guardrail, schema, and `validate` gates decides what the model is told when
+  an attempt is rejected. It receives the stage, the rejected output, the gate's
+  reason and error, the parsed value (validate only, typed from `schema`), and
+  the default text. Return a string to replace the default, nothing to keep it,
+  or `{ retry: false }` to stop retrying with the gate's usual typed error; a
+  thrown error propagates. It runs only while a retry remains and after the
+  gate's own event, so `guardrail` / `schema_check` / `validate` events keep the
+  default text and `pipeline(failed).reason` carries what was sent. Forwarded on
+  delegate and handoffs like `validate`. New types `RetryFeedbackHook<T>`,
+  `RetryFeedbackInfo<T>`, `RetryFeedbackResult`. See
+  [api-reference.md#custom-retry-feedback](docs/api-reference.md#custom-retry-feedback).
+- **`provider_diagnostic` event reports clamped `effort`.** When an adapter has
+  to send a different reasoning level than requested (Gemini 3.x cannot disable
+  thinking and caps at `'high'`; OpenAI Chat caps `'max'` at `'xhigh'`; some
+  Anthropic models always think, and legacy budget models cap at the `'high'`
+  tier), the runtime emits one `provider_diagnostic { kind: 'effort_clamped' }`
+  event per ask, before its first `agent_call_start`, with `requested`, the
+  provider-native `effective` level, and a `cause`. `agent_call_start` still
+  reports the requested effort; join by `askId`. Providers opt in via the
+  optional `Provider.effortResolution()` capability (types `EffortResolution`,
+  `ProviderDiagnosticData`); `MockProvider.withEffortResolution()` drives it in
+  tests. **`provider_diagnostic` is a new member of `AxlEvent['type']`**: an
+  exhaustive `switch` over event types gains a case. See
+  [observability.md#provider-diagnostics](docs/observability.md#provider-diagnostics).
 
 ### Changed
 
-- **Clamp warnings moved from the adapters to the runtime.** The three
-  once-per-process `console.warn`s inside the Gemini, Anthropic, and OpenAI Chat
-  adapters are removed; the runtime now warns instead — deduped per distinct
-  clamp and honoring `AxlConfig.diagnostics.silent` /
-  `AXL_DIAGNOSTICS_SILENT`, which adapters could not see. Request bodies are
-  byte-identical. Code that calls an adapter directly, without a runtime, no
-  longer gets a clamp warning; use `Provider.effortResolution()` for that.
+- **Clamp warnings moved from adapters to the runtime.** The once-per-process
+  `console.warn`s in the Gemini, Anthropic, and OpenAI Chat adapters are gone;
+  the runtime warns once per distinct clamp and honors
+  `AxlConfig.diagnostics.silent` / `AXL_DIAGNOSTICS_SILENT`. Request bodies are
+  unchanged. Calling an adapter directly no longer logs a clamp warning; use
+  `Provider.effortResolution()`.
 
 ### Fixed
 
-- **Gate-retry feedback is now a user turn.** Guardrail, schema, and `validate`
-  retries appended the corrective feedback as a `system` message. Every
-  provider adapter hoists system messages out of the conversation, so the
-  request the model received on a retry ended on its own rejected attempt with
-  the correction buried at the tail of the system prompt — an assistant prefill
-  on Anthropic, and a hard "does not support a terminal assistant/model
-  prefill" throw on Gemini models that reject a terminal model turn (every
-  validation retry on those models failed). Feedback is now appended as a
-  `user` turn after the assistant attempt. The `validate` feedback text no
-  longer affirms the rejected output ("parsed correctly") or points at content
-  the model cannot see ("visible above"), and the schema feedback now asks for a
-  corrected response that matches the schema rather than to "fix and try again",
-  which read as an invitation to patch the attempt now sitting directly above it.
-  `trace.level: 'full'` message snapshots reflect the new shape. The `pipeline`,
-  `guardrail`, `schema_check`, and `validate` events keep their existing
-  **shape**; the feedback **text** they carry changed with the templates.
+- **Gate-retry feedback is delivered as a user turn.** Guardrail, schema, and
+  `validate` retries appended the correction as a `system` message. Adapters
+  hoist system messages out of the conversation, so the model saw a request
+  ending on its own rejected attempt: an assistant prefill on Anthropic, and a
+  hard "does not support a terminal assistant/model prefill" throw on Gemini
+  models that reject a terminal model turn, which failed every validation retry
+  there. Feedback is now a `user` turn after the assistant attempt. The
+  `validate` and schema feedback texts were rewritten to ask for a corrected
+  response without affirming the rejected output or pointing at content the
+  model cannot see. `trace.level: 'full'` message snapshots reflect the new
+  shape; gate and `pipeline` events keep their shape and carry the new text.
 
 ## [0.22.2] - 2026-09-02
 
@@ -1278,7 +1252,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.22.2...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.22.3...HEAD
+[0.22.3]: https://github.com/axl-sdk/axl/compare/v0.22.2...v0.22.3
 [0.22.2]: https://github.com/axl-sdk/axl/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/axl-sdk/axl/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/axl-sdk/axl/compare/v0.21.1...v0.22.0

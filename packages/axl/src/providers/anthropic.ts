@@ -1001,7 +1001,23 @@ export class AnthropicProvider implements Provider {
       stream,
     };
 
-    if (systemText) {
+    // Prompt caching is opt-in (see ChatOptions.promptCache). When on, `system`
+    // is sent as ordered text blocks with the cache breakpoint on the FIRST
+    // block only. The runtime always pushes the agent's own system prompt
+    // first and appends mutating system messages after it (the rolling
+    // conversation summary, handoff headers), so a breakpoint on the last
+    // block would re-write the cache on every summarizing turn. Anthropic
+    // caches the prefix in the order tools -> system -> messages, so this one
+    // breakpoint also covers the tool definitions. When off, the request is
+    // byte-identical to the uncached shape.
+    const promptCache = options.promptCache === true;
+    if (promptCache && systemMessages.length > 0) {
+      body.system = systemMessages.map((m, index) => ({
+        type: 'text',
+        text: typeof m.content === 'string' ? m.content : '',
+        ...(index === 0 ? { cache_control: { type: 'ephemeral' } } : {}),
+      }));
+    } else if (systemText) {
       body.system = systemText;
     }
 
@@ -1010,7 +1026,16 @@ export class AnthropicProvider implements Provider {
     }
 
     if (options.tools && options.tools.length > 0) {
-      body.tools = options.tools.map((t) => this.mapToolDefinition(t));
+      const tools = options.tools.map((t) => this.mapToolDefinition(t));
+      // With no system prompt there is no system block to anchor the cache on,
+      // so the stable prefix is the tool set alone: mark its last definition.
+      if (promptCache && systemMessages.length === 0) {
+        tools[tools.length - 1] = {
+          ...tools[tools.length - 1],
+          cache_control: { type: 'ephemeral' },
+        };
+      }
+      body.tools = tools;
     }
 
     if (options.toolChoice !== undefined) {
@@ -1040,7 +1065,13 @@ export class AnthropicProvider implements Provider {
     if (options.responseFormat && options.responseFormat.type !== 'text') {
       const jsonInstruction =
         'You must respond with valid JSON only. No markdown fences, no extra text.';
-      body.system = body.system ? `${body.system}\n\n${jsonInstruction}` : jsonInstruction;
+      if (Array.isArray(body.system)) {
+        // Block form: append after the cached first block so it never
+        // participates in the breakpoint.
+        body.system = [...body.system, { type: 'text', text: jsonInstruction }];
+      } else {
+        body.system = body.system ? `${body.system}\n\n${jsonInstruction}` : jsonInstruction;
+      }
     }
 
     if (options.providerOptions) {
@@ -1534,6 +1565,9 @@ type AnthropicMessage = {
 };
 
 type AnthropicToolDef = {
+  /** Prompt-cache breakpoint on the tool set; only set when `promptCache` is on and
+   *  there is no system block to anchor on. */
+  cache_control?: { type: 'ephemeral' };
   name: string;
   description: string;
   input_schema: Record<string, unknown>;

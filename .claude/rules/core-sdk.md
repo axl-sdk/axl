@@ -40,6 +40,9 @@ runs sessions, and owns execution history + cost tracking.
   `hard_stop` **cannot enforce** on it (the enforcement path never sees the unknown cost).
 - New cross-provider model params go on `ChatOptions` (configurable on `AgentConfig`,
   overridable per-call on `AskOptions`; precedence AskOptions > AgentConfig > defaults).
-  `docs/api-reference.md` is authoritative for the exact defaults.
+  `docs/api-reference.md` is authoritative for the exact defaults. A portable knob must
+  express **provider-neutral intent** that each adapter realizes or no-ops (`effort`,
+  `includeThoughts`, `promptCache`); a field that only one provider's wire format
+  understands is not a knob — it goes through `providerOptions` or the provider's profile.
 - Imports use the `.js` extension even from `.ts`; verify no circular import before
   adding one.

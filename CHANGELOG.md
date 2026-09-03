@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`promptCache` option — opt-in Anthropic prompt caching of the stable prefix.**
+  `AgentConfig.promptCache` / `AskOptions.promptCache` (AskOptions wins). On
+  Anthropic the adapter renders `system` as ordered blocks with one `cache_control`
+  breakpoint on the first block — the agent's own prompt — so the tool definitions
+  are covered too, while runtime-injected summaries, handoff headers, the JSON-mode
+  instruction and the user turn stay uncached. A large one-shot user document is
+  therefore never written to cache. OpenAI and Gemini cache automatically, so the
+  flag is a no-op there. **Off by default:** a system prompt that changes every call
+  would pay Anthropic's 1.25x write premium with no reads. With it off, requests are
+  byte-identical to before. Live-verified on `claude-sonnet-4-6`: repeat calls read
+  1,618 cached tokens at ~1/10 the cost, and a 2,000-token unique user turn wrote
+  nothing. See [providers.md#prompt-caching](docs/providers.md#prompt-caching).
+
+### Added
+
 - **Claude Fable 5.1 (`claude-fable-5-1`) capabilities and pricing.** Adaptive
   always-on thinking with all five effort levels (thinking cannot be disabled;
   `effort: 'none'` clamps to `'low'` and reports a `provider_diagnostic`), priced

@@ -875,6 +875,41 @@ Providers charge less for tokens served from cache. The rates differ by provider
 
 Only documented snapshot forms inherit a base model's price. An arbitrary suffix does not.
 
+#### Prompt caching
+
+**OpenAI and Gemini cache automatically** above a per-model minimum (OpenAI: 1,024
+tokens on GPT-5.6+, 2,048 earlier; Gemini: 2,048 on 2.5, 4,096 on 3.x). Axl sends
+nothing extra and needs to.
+
+**Anthropic caches only when asked**, so Axl exposes an opt-in:
+
+```typescript
+const a = agent({ model: 'anthropic:claude-sonnet-5', system: BIG_PROMPT, tools, promptCache: true });
+await ctx.ask(a, input, { promptCache: false }); // per-call override
+```
+
+With `promptCache: true` the adapter renders `system` as ordered blocks and places a
+single `cache_control` breakpoint on the **first** block — the agent's own prompt.
+Anthropic caches the prefix in the order tools → system → messages, so that one
+breakpoint also covers the tool definitions. Everything after it stays uncached on
+purpose: the rolling conversation summary and handoff headers the runtime injects as
+later system messages, the JSON-mode instruction, and the user turn. A call carrying a
+large one-shot document therefore reads the prefix at the cache rate and writes nothing
+new. With no system prompt the breakpoint anchors on the last tool instead.
+
+**Why it is off by default.** Cache writes bill at 1.25x input. If your `system` is a
+function of `ctx.metadata` and changes every call, every request is a cold write with
+no read — a silent ~25% increase on the largest part of the prompt, and Axl cannot
+detect that statically. Turn it on when the agent's prompt and tool set are stable
+across calls; that is the shape of every agentic loop.
+
+**Minimum cacheable prefix** (below it Anthropic silently ignores the breakpoint):
+512 tokens on Fable 5.1 / Mythos 5.1 / Opus 5 / Fable 5 / Mythos 5; 1,024 on Opus 4.8,
+Sonnet 5, Sonnet 4.6, Sonnet 4.5; **4,096 on Haiku 4.5**.
+
+Explicit block-level breakpoints via `providerOptions` still merge last and win.
+Verified live 2026-09-03; see `docs/verification/`.
+
 #### Anthropic — observable cache-read and write TTLs
 
 | Operation | Multiplier |

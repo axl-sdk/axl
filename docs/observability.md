@@ -587,6 +587,47 @@ defineConfig({
 Set `AXL_DIAGNOSTICS_SILENT=true` to silence the warns process-wide without a
 config change. The structured events always fire regardless.
 
+### Provider diagnostics
+
+The unified [`effort`](providers.md) knob is portable, but not every model
+accepts every level: Gemini 3.x cannot disable thinking at all, OpenAI Chat
+Completions caps `'max'` at `'xhigh'`, and some Anthropic models always think.
+The adapters have always clamped to what the model accepts — silently, so run
+provenance recorded `effort: 'none'` for a request that actually thought.
+
+`provider_diagnostic` makes the clamp first-class. It is `AskScoped`, carries a
+`kind`-discriminated `data`, and fires **once per ask** (not once per provider
+call in a tool loop), **before** the ask's first `agent_call_start`:
+
+| `data.kind` | Fires when | `console.warn`? |
+|---|---|---|
+| `effort_clamped` | The resolved provider could not honor the requested `effort` and sent a different native level (`data.requested`, `data.effective`, `data.cause`, `data.model`, `data.provider?`) | Yes |
+
+```ts
+for await (const event of stream.lifecycle) {
+  if (event.type === 'provider_diagnostic' && event.data.kind === 'effort_clamped') {
+    // e.g. requested 'none', effective 'minimal' on gemini-3.6-flash
+    record(event.askId, event.data.requested, event.data.effective);
+  }
+}
+```
+
+Notes:
+- **Silence means honored.** No event ⇒ the effort was sent as asked (or the
+  adapter does not implement the optional `Provider.effortResolution` capability,
+  which third-party providers may omit).
+- `data.effective` is a provider-**native** level string (`'minimal'`,
+  `'xhigh'`, `'low'`, …), not an `Effort`, because not every native level maps
+  back onto the unified union.
+- `agent_call_start` keeps reporting the **requested** effort — it describes what
+  the runtime asked for. Join the two by `askId` for full provenance.
+- The `console.warn` follows the same rules as the schema diagnostics above:
+  deduped per distinct clamp for the life of the process, silenced by
+  `AxlConfig.diagnostics.silent` or `AXL_DIAGNOSTICS_SILENT=true` — neither of
+  which suppresses the event.
+- Redaction passes the event through unchanged: it carries provider capability
+  metadata only, never prompt or response content.
+
 ### PII and redaction
 
 `config.trace.redact` is an **observability-boundary filter** that scrubs user/LLM content everywhere it would otherwise flow to observability consumers. The mental model: "what can the observability layer see?". Under `redact: true`, structural metadata (workflow names, agent names, tool names, cost/token metrics, durations, status, roles, keys, IDs, `askId`/`parentAskId`/`depth`) stays visible — but any field that carries prompt/response/user/LLM content is replaced with `'[redacted]'`.

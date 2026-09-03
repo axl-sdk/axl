@@ -1372,9 +1372,9 @@ describe('AnthropicProvider', () => {
         const opusConflict = await request('claude-opus-5', { effort: 'xhigh', thinkingBudget: 0 });
         expect(opusConflict.thinking).toEqual({ type: 'adaptive' });
         expect(opusConflict.output_config).toEqual({ effort: 'xhigh' });
-        expect(
-          warn.mock.calls.filter(([message]) => String(message).includes('claude-fable-5')),
-        ).toHaveLength(1);
+        // The 'cannot disable thinking' fallback above is reported through
+        // `effortResolution` (see the effortResolution suite), not a console.warn.
+        expect(warn).not.toHaveBeenCalled();
       } finally {
         warn.mockRestore();
       }
@@ -2696,5 +2696,79 @@ describe('AnthropicProvider', () => {
         expect(noFileFetch.mock.calls[0][1].headers['anthropic-beta']).toBeUndefined();
       }
     });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Effort provenance (B8) — Anthropic
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('AnthropicProvider.effortResolution', () => {
+  const response = {
+    id: 'msg-effort',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'ok' }],
+    stop_reason: 'end_turn',
+    usage: { input_tokens: 1, output_tokens: 1 },
+  };
+
+  it('reports the adaptive low fallback on a model that cannot disable thinking', async () => {
+    const provider = new AnthropicProvider();
+    const resolution = provider.effortResolution({ model: 'claude-fable-5', effort: 'none' });
+    expect(resolution).toMatchObject({ requested: 'none', effective: 'low', clamped: true });
+    expect(resolution!.cause).toContain('cannot be disabled');
+
+    // Pairing: the request body carries that same effective level.
+    const fetchMock = mockFetch({ json: () => Promise.resolve(response) });
+    await provider.chat([{ role: 'user', content: 'Hello' }], {
+      model: 'claude-fable-5',
+      maxTokens: 1024,
+      effort: 'none',
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.thinking).toEqual({ type: 'adaptive' });
+    expect(body.output_config).toEqual({ effort: 'low' });
+  });
+
+  it('reports an effort level the model does not support', async () => {
+    const provider = new AnthropicProvider();
+    const resolution = provider.effortResolution({ model: 'claude-opus-4-5', effort: 'max' });
+    expect(resolution).toMatchObject({ requested: 'max', effective: 'high', clamped: true });
+
+    const fetchMock = mockFetch({ json: () => Promise.resolve(response) });
+    await provider.chat([{ role: 'user', content: 'Hello' }], {
+      model: 'claude-opus-4-5',
+      maxTokens: 1024,
+      effort: 'max',
+    });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).output_config).toEqual({ effort: 'high' });
+  });
+
+  it.each([
+    ['claude-opus-5', 'none'],
+    ['claude-opus-5', 'xhigh'],
+    ['claude-sonnet-5', 'high'],
+  ] as const)('reports nothing for honored %s effort %s', (model, effort) => {
+    expect(new AnthropicProvider().effortResolution({ model, effort })).toBeUndefined();
+  });
+
+  it('reports nothing without an effort, for an unknown model, or under a budget override', () => {
+    const provider = new AnthropicProvider();
+    expect(provider.effortResolution({ model: 'claude-fable-5' })).toBeUndefined();
+    expect(provider.effortResolution({ model: 'claude-unknown-9', effort: 'max' })).toBeUndefined();
+    expect(
+      provider.effortResolution({ model: 'claude-fable-5', effort: 'none', thinkingBudget: 2000 }),
+    ).toBeUndefined();
+  });
+
+  it('resolves against the providerOptions model override', () => {
+    expect(
+      new AnthropicProvider().effortResolution({
+        model: 'claude-opus-5',
+        effort: 'none',
+        providerOptions: { model: 'claude-fable-5' },
+      }),
+    ).toMatchObject({ effective: 'low', clamped: true });
   });
 });

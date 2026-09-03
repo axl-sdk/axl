@@ -151,6 +151,7 @@ export type {
   GuardrailData,
   SchemaCheckData,
   SchemaDiagnosticData,
+  ProviderDiagnosticData,
   ValidateData,
   StringDeltaData,
   AskOptions,
@@ -271,6 +272,7 @@ export type {
   InputModalitySupport,
   ProviderInputValidationRequest,
   ProviderInputValidationResult,
+  EffortResolution,
 } from './providers/types.js';
 export type {
   TranscriptionProvider,

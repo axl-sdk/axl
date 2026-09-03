@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
+import { agent, workflow } from '@axlsdk/axl';
 import { MockProvider } from '../mock-provider.js';
+import { AxlTestRuntime } from '../test-runtime.js';
 
 // ── MockProvider.sequence() ──────────────────────────────────────────────────
 
@@ -613,5 +615,54 @@ describe('MockProvider .name', () => {
   it('has the name "mock"', () => {
     const provider = MockProvider.echo();
     expect(provider.name).toBe('mock');
+  });
+});
+
+// ── MockProvider.withEffortResolution() ──────────────────────────────────────
+
+describe('MockProvider.withEffortResolution()', () => {
+  const EffortAgent = agent({ name: 'effort-agent', model: 'mock:model-x' });
+  const EffortWorkflow = workflow({
+    name: 'effort-workflow',
+    input: z.object({}).strict(),
+    handler: async (ctx) => ctx.ask(EffortAgent, 'hi', { effort: 'none' }),
+  });
+
+  function run(provider: MockProvider) {
+    const runtime = new AxlTestRuntime();
+    runtime.register(EffortWorkflow);
+    runtime.mockProvider('mock', provider);
+    return runtime;
+  }
+
+  it('drives the runtime provider_diagnostic path', async () => {
+    const provider = MockProvider.echo().withEffortResolution({
+      requested: 'none',
+      effective: 'minimal',
+      clamped: true,
+      cause: 'this model cannot disable thinking',
+    });
+    const runtime = run(provider);
+
+    await runtime.execute(EffortWorkflow.name, {});
+
+    const diagnostics = runtime.traceLog().filter((e) => e.type === 'provider_diagnostic');
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0].data).toEqual({
+      kind: 'effort_clamped',
+      provider: 'mock',
+      model: 'model-x',
+      requested: 'none',
+      effective: 'minimal',
+      cause: 'this model cannot disable thinking',
+    });
+  });
+
+  it('emits nothing when the mock reports no effort resolution', async () => {
+    const runtime = run(MockProvider.echo());
+
+    await runtime.execute(EffortWorkflow.name, {});
+
+    expect(runtime.traceLog().filter((e) => e.type === 'provider_diagnostic')).toHaveLength(0);
   });
 });

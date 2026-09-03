@@ -93,6 +93,16 @@ function assertExhaustive(ev: AxlEvent): string {
           return _exhaustiveDiag;
         }
       }
+    case 'provider_diagnostic':
+      // Narrow on the discriminated `kind` to verify the two-level union shape.
+      switch (ev.data.kind) {
+        case 'effort_clamped':
+          return `${ev.data.requested}->${ev.data.effective}`;
+        default: {
+          const _exhaustiveProviderDiag: never = ev.data.kind;
+          return _exhaustiveProviderDiag;
+        }
+      }
     case 'log':
       return 'log';
     case 'memory_remember':

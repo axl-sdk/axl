@@ -66,6 +66,15 @@ const provider = MockProvider.fn(() => ({
   usage: { prompt_tokens: 120, completion_tokens: 200, total_tokens: 320 },
   cost: 0.005,
 }));
+
+// Report a clamped `effort`, so the runtime emits a `provider_diagnostic`
+// event (and its deduped warn) exactly as a real adapter would.
+const provider = MockProvider.echo().withEffortResolution({
+  requested: 'none',
+  effective: 'minimal',
+  clamped: true,
+  cause: 'this model cannot disable thinking',
+});
 ```
 
 MockProvider also supports tool call simulation:

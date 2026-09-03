@@ -238,6 +238,9 @@ export const AXL_EVENT_TYPES = [
   // structured-output cliffs (oversized appended schema, dropped refinements,
   // streaming disabled, zero-guidance `schemaPrompt:'none'`).
   'schema_diagnostic',
+  // Provider capability diagnostics — the resolved provider could not honor a
+  // portable request knob verbatim (first kind: a clamped `effort`).
+  'provider_diagnostic',
   // Observability
   'log',
   'memory_remember',
@@ -636,6 +639,35 @@ export type SchemaDiagnosticData =
       provider?: string;
       support: 'downgraded' | 'lossy' | 'unsupported';
     };
+
+/**
+ * Data for the `provider_diagnostic` event — a `kind`-discriminated payload
+ * (like `SchemaDiagnosticData`) reporting that the resolved provider could not
+ * honor a portable request knob verbatim.
+ *
+ *  - `effort_clamped` — the adapter clamped the unified `effort` to what the
+ *    model actually accepts (Gemini 3.x cannot disable thinking; OpenAI Chat
+ *    Completions caps `'max'` at `'xhigh'`; Anthropic models that always think
+ *    fall back to adaptive `'low'`). `requested` is the unified value the caller
+ *    asked for; `effective` is the provider-native level actually sent, which is
+ *    deliberately a free string because not every native level maps back onto
+ *    `Effort`. One per ask, emitted before the first `agent_call_start` — join it
+ *    to `agent_call_start` (which keeps reporting the *requested* effort) by
+ *    `askId` for full provenance.
+ *
+ * The union is `kind`-discriminated so later provider cliffs can join without a
+ * new event type.
+ */
+export type ProviderDiagnosticData = {
+  kind: 'effort_clamped';
+  /** Provider name (`provider.name`), when the adapter exposes one. */
+  provider?: string;
+  /** The model the request is actually sent to (after any `providerOptions.model`). */
+  model: string;
+  requested: Effort;
+  effective: string;
+  cause: string;
+};
 
 /** Data shape for legacy `guardrail` events. Replaced by `pipeline` in PR 2. */
 export type GuardrailData = {
@@ -1038,6 +1070,9 @@ type LegacyAxlEventPayloadV1 =
 
   // ── Schema capability diagnostics (spec 22, Problem E) ──────────────────
   | (AxlEventBase & AskScoped & { type: 'schema_diagnostic'; data: SchemaDiagnosticData })
+
+  // ── Provider capability diagnostics ─────────────────────────────────────
+  | (AxlEventBase & AskScoped & { type: 'provider_diagnostic'; data: ProviderDiagnosticData })
 
   // ── Legacy gate events (collapsed into `pipeline` in PR 2) ──────────────
   | (AxlEventBase & Partial<AskScoped> & { type: 'guardrail'; data?: GuardrailData })

@@ -71,8 +71,8 @@ openai:gpt-3.5-turbo            # Legacy
 
 OpenAI's o-series uses the `developer` role, strips `temperature`, and supports `effort`.
 GPT-5.x uses `system` and supports the same portable option. Exact GPT-5.6 Chat requests with
-`effort: 'max'` warn once per model and use `xhigh`; choose `openai-responses:` for native
-`max`. For compatibility, unknown GPT-5-shaped IDs retain the older baseline request mapping,
+`effort: 'max'` use `xhigh` and report the clamp through a `provider_diagnostic`
+event; choose `openai-responses:` for native `max`. For compatibility, unknown GPT-5-shaped IDs retain the older baseline request mapping,
 but never inherit exact pricing or GPT-5.6-specific capabilities.
 
 ## Anthropic
@@ -534,7 +534,7 @@ const solution = await ctx.ask(reasoner, problem, { effort: 'low' });
 
 ### `effort`
 
-The `effort` parameter provides a unified way to control reasoning depth across all providers. Values: `'none'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`. Exact model and endpoint capabilities decide whether a tier is sent, clamped, or omitted. GPT-5.6 accepts native `'max'` on Responses; Chat Completions currently warns once per exact model and caps it to `'xhigh'`. Claude 5 accepts native `'max'`; older families retain their documented caps.
+The `effort` parameter provides a unified way to control reasoning depth across all providers. Values: `'none'` | `'low'` | `'medium'` | `'high'` | `'xhigh'` | `'max'`. Exact model and endpoint capabilities decide whether a tier is sent, clamped, or omitted. GPT-5.6 accepts native `'max'` on Responses; Chat Completions caps it to `'xhigh'`. Every clamp is reported through a `provider_diagnostic` event — see [Seeing a clamp at runtime](#seeing-a-clamp-at-runtime). Claude 5 accepts native `'max'`; older families retain their documented caps.
 
 ```typescript
 // Most users — just effort:
@@ -624,10 +624,29 @@ Gemini 3.7/3.8 Flash, which do not support `'minimal'`.
 
 \* OpenAI doesn't support explicit token budgets. `thinkingBudget` is mapped to nearest effort: ≤1024 → `low`, ≤8192 → `medium`, >8192 → `high`.
 
+#### Seeing a clamp at runtime
+
+Every clamp in the table above is reported, not silent. When the resolved
+provider cannot honor the requested `effort`, the runtime emits one
+`provider_diagnostic { kind: 'effort_clamped' }` event per ask — carrying
+`requested`, the provider-native `effective` level, and a `cause` — plus a
+deduped `console.warn`. Adapters expose this through the optional
+`Provider.effortResolution()` capability; the runtime owns the event and the
+warning, so a third-party adapter that omits the method simply reports nothing.
+
+Currently reported: **Gemini 3.x** `'none'` (→ model minimum) and
+`'xhigh'`/`'max'` (→ `'high'`); **OpenAI Chat Completions** `'max'` (→ `'xhigh'`),
+pre-5.1 `'none'` (→ `'minimal'`), sub-5.2 `'xhigh'` (→ `'high'`), and
+`gpt-5-pro` (always `'high'`); **OpenAI Responses** the same minus the `'max'`
+cap; **Anthropic** any effort outside a model's supported `output_config.effort`
+levels, and models that cannot disable thinking (`'none'` → adaptive `'low'`).
+An explicit `thinkingBudget` documented to override `effort` is not a clamp.
+See [observability.md#provider-diagnostics](observability.md#provider-diagnostics).
+
 #### Provider-specific behavior
 
 - **OpenAI o-series** (o1/o3/o4-mini): Uses `developer` role instead of `system`, strips temperature, sends `reasoning_effort`. `effort: 'none'` sends `reasoning_effort: 'minimal'` (o-series doesn't support `'none'`). `effort: 'max'` sends `'high'` (o-series doesn't support `'xhigh'`).
-- **OpenAI GPT-5.x Chat Completions**: Uses `system`, strips temperature when reasoning is active, and supports parallel tool calls. The compatibility baseline maps GPT-5.2+ `'max'` to `'xhigh'`; exact GPT-5.6 IDs also emit a once-per-model warning. Earlier families retain their lower caps.
+- **OpenAI GPT-5.x Chat Completions**: Uses `system`, strips temperature when reasoning is active, and supports parallel tool calls. The compatibility baseline maps GPT-5.2+ `'max'` to `'xhigh'`, reported through a `provider_diagnostic` event. Earlier families retain their lower caps.
 - **OpenAI Responses API**: Uses `reasoning: { effort }`; exact GPT-5.6 IDs accept native `'max'` and omit `temperature` because that family rejects it even when reasoning uses the provider default. Older models keep their documented clamps. `includeThoughts: true` enables reasoning summaries (`reasoning: { summary: 'detailed' }`). Reasoning context is automatically round-tripped via `providerMetadata.openaiReasoningItems`.
 - **Anthropic Claude 5**: Fable 5 always reasons; Opus 5 and Sonnet 5 reason by default. All three accept the full active effort vocabulary through adaptive thinking. Opaque thinking blocks are preserved in `providerMetadata` for tool continuations. Axl does not request beta fast-mode or model-fallback headers; if Anthropic reports that a different fallback model served the call, Axl fails before persisting history or estimating cost.
 - **Anthropic Opus 4.8**: Supports adaptive thinking and native `'xhigh'`/`'max'`.

@@ -26,6 +26,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   erase the record that the gate rejected. `ctx.metadata` is passed through for
   multi-tenant callers. New exported types `RetryFeedbackHook`,
   `RetryFeedbackInfo`, and `RetryFeedbackResult`.
+- **Clamped `effort` is now reported: the `provider_diagnostic` event.** Adapters
+  clamp the unified `effort` to what each model actually accepts (Gemini 3.x
+  cannot disable thinking and caps at `'high'`; OpenAI Chat Completions caps
+  `'max'` at `'xhigh'` and pre-5.1 `'none'` at `'minimal'`; some Anthropic models
+  always think and fall back to adaptive `'low'`). That clamp was previously
+  invisible to run provenance — `agent_call_start` reported only the requested
+  value — so a trace could record `effort: 'none'` for a request that thought.
+  The runtime now emits one `provider_diagnostic { kind: 'effort_clamped' }`
+  event per ask (before that ask's first `agent_call_start`) carrying
+  `requested`, the provider-native `effective` level, and a `cause`.
+  `agent_call_start` still reports the **requested** effort; join the two by
+  `askId`. Providers opt in through a new optional
+  `Provider.effortResolution()` capability method (exported types
+  `EffortResolution`, `ProviderDiagnosticData`), so a third-party adapter that
+  omits it simply reports nothing. `MockProvider.withEffortResolution()` drives
+  the path in tests.
+  **`provider_diagnostic` is a new member of the `AxlEvent['type']` union** — a
+  consumer with an exhaustive `switch` over event types gains a case. It is
+  included in `AXL_EVENT_TYPES`, the `.lifecycle` view, and the redaction table
+  (pass-through: the event carries provider capability metadata only, never
+  application content).
+
+### Changed
+
+- **Clamp warnings moved from the adapters to the runtime.** The three
+  once-per-process `console.warn`s inside the Gemini, Anthropic, and OpenAI Chat
+  adapters are removed; the runtime now warns instead — deduped per distinct
+  clamp and honoring `AxlConfig.diagnostics.silent` /
+  `AXL_DIAGNOSTICS_SILENT`, which adapters could not see. Request bodies are
+  byte-identical. Code that calls an adapter directly, without a runtime, no
+  longer gets a clamp warning; use `Provider.effortResolution()` for that.
 
 ### Fixed
 

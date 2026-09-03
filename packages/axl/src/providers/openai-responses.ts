@@ -1,4 +1,5 @@
 import type {
+  EffortResolution,
   Provider,
   ChatOptions,
   ChatMessage,
@@ -13,6 +14,7 @@ import {
   supportsReasoningEffort,
   supportsMaxReasoningEffort,
   resolveOpenAIReasoningEffort,
+  resolveOpenAIEffortResolution,
 } from './openai.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
 import { fetchWithRetry } from './retry.js';
@@ -75,6 +77,18 @@ export class OpenAIResponsesProvider implements Provider {
     return model.trim().length > 0
       ? { image: { sources: ['url', 'bytes', 'base64', 'provider-file'] } }
       : {};
+  }
+
+  /** Report a clamped `effort`. Responses accepts the native `'max'` tier that
+   *  Chat Completions caps, but still clamps `'none'` before gpt-5.1, `'xhigh'`
+   *  below gpt-5.2, and everything to `'high'` on gpt-5-pro. */
+  effortResolution(
+    options: Pick<
+      ChatOptions,
+      'model' | 'effort' | 'thinkingBudget' | 'includeThoughts' | 'providerOptions'
+    >,
+  ): EffortResolution | undefined {
+    return resolveOpenAIEffortResolution(options, resolveOpenAIReasoningEffort, 'OpenAI Responses');
   }
 
   validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {

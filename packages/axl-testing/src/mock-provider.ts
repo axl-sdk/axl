@@ -12,6 +12,7 @@ import type {
   Provider,
   ProviderInputValidationRequest,
   ProviderInputValidationResult,
+  EffortResolution,
 } from '@axlsdk/axl';
 import { inputText, UnsupportedModelInputError } from '@axlsdk/axl';
 
@@ -166,6 +167,46 @@ export class MockProvider implements Provider {
    *  Set via `provider.chunkDelayMs = 50` after construction. Not part of
    *  any factory's surface to keep the test API minimal. */
   chunkDelayMs = 0;
+
+  /** How this mock reports the unified `effort` it was asked for. Undefined (the
+   *  default) means the mock implements no `effortResolution` at all, so the
+   *  runtime emits no `provider_diagnostic`. Set it with
+   *  {@link MockProvider.withEffortResolution} to drive the clamp-reporting path. */
+  effortResolution?: (
+    options: Pick<
+      ChatOptions,
+      'model' | 'effort' | 'thinkingBudget' | 'includeThoughts' | 'providerOptions'
+    >,
+  ) => EffortResolution | undefined;
+
+  /**
+   * Make this mock report an effort clamp, so a test can exercise the runtime's
+   * `provider_diagnostic` path without a real adapter. Pass a fixed
+   * {@link EffortResolution} or a function of the request knobs.
+   *
+   * ```ts
+   * const provider = MockProvider.echo().withEffortResolution({
+   *   requested: 'none',
+   *   effective: 'minimal',
+   *   clamped: true,
+   *   cause: 'this model cannot disable thinking',
+   * });
+   * ```
+   */
+  withEffortResolution(
+    resolution:
+      | EffortResolution
+      | undefined
+      | ((
+          options: Pick<
+            ChatOptions,
+            'model' | 'effort' | 'thinkingBudget' | 'includeThoughts' | 'providerOptions'
+          >,
+        ) => EffortResolution | undefined),
+  ): this {
+    this.effortResolution = typeof resolution === 'function' ? resolution : () => resolution;
+    return this;
+  }
 
   private constructor(
     private responseFn: (

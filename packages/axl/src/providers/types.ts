@@ -173,7 +173,53 @@ export interface Provider {
    *    JSON instruction instead (e.g. Anthropic).
    */
   nativeStructuredOutputSupport?(model: string): 'schema' | 'downgraded' | 'lossy' | 'unsupported';
+
+  /**
+   * How this provider resolved the unified `effort` knob for this request.
+   *
+   * Adapters clamp `effort` to what each model actually accepts (Gemini 3.x
+   * cannot disable thinking; OpenAI Chat Completions caps `'max'` at `'xhigh'`;
+   * Anthropic models that always think fall back to adaptive `'low'`). That
+   * clamp used to be invisible to run provenance. The runtime calls this once
+   * per ask, right after provider resolution, and emits a
+   * `provider_diagnostic { kind: 'effort_clamped' }` event plus a deduped
+   * `console.warn` when `clamped` is true — the adapter only *reports*, the
+   * runtime decides how to surface it (only the runtime can see
+   * `AxlConfig.diagnostics.silent`).
+   *
+   * The adapter applies its own `providerOptions.model` override before
+   * resolving, so the report describes the model actually sent.
+   *
+   * Optional, and optional to answer: return `undefined` when there is nothing
+   * to report (no effort requested, the model is unknown, or the effort is
+   * honored verbatim). An adapter MAY also report an honored resolution with
+   * `clamped: false`; the runtime stays silent for those.
+   */
+  effortResolution?(
+    options: Pick<
+      ChatOptions,
+      'model' | 'effort' | 'thinkingBudget' | 'includeThoughts' | 'providerOptions'
+    >,
+  ): EffortResolution | undefined;
 }
+
+/**
+ * An adapter's report of how it resolved the unified `effort` for one request.
+ *
+ * `effective` is a provider-NATIVE level string rather than an `Effort` because
+ * not every effective value maps back onto the unified union (Gemini's
+ * `'minimal'`, OpenAI's `'minimal'`, Anthropic's adaptive `'low'`).
+ */
+export type EffortResolution = {
+  /** The unified effort the caller asked for. */
+  requested: Effort;
+  /** The provider-native level actually sent (e.g. `'minimal'`, `'xhigh'`, `'low'`). */
+  effective: string;
+  /** True when `effective` is not what `requested` asked for. */
+  clamped: boolean;
+  /** Human-readable reason, surfaced verbatim on the diagnostic event. */
+  cause?: string;
+};
 
 /**
  * Alias for Provider. Used for backward compatibility with index.ts exports.

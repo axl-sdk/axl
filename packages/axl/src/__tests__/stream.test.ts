@@ -895,6 +895,9 @@ describe('AxlStream', () => {
       // Schema capability diagnostics — low-frequency, structural (once per ask),
       // and the whole point (J7) is that they were invisible; surface them.
       schema_diagnostic: 'lifecycle',
+      // Provider capability diagnostics — same rationale: once per ask, structural,
+      // and previously invisible (a clamped effort only reached console.warn).
+      provider_diagnostic: 'lifecycle',
       // Durable-execution checkpoints — structural points in the timeline.
       checkpoint_save: 'lifecycle',
       checkpoint_replay: 'lifecycle',
@@ -1037,6 +1040,18 @@ describe('AxlStream', () => {
         schema_diagnostic: {
           type: 'schema_diagnostic',
           data: { kind: 'streaming_disabled', rootType: 'ZodUnion', cause: 'non-object' },
+          ...ASK_,
+        },
+        provider_diagnostic: {
+          type: 'provider_diagnostic',
+          data: {
+            kind: 'effort_clamped',
+            provider: 'gemini',
+            model: 'gemini-3.6-flash',
+            requested: 'none',
+            effective: 'minimal',
+            cause: 'cannot disable thinking',
+          },
           ...ASK_,
         },
         log: { type: 'log', data: { event: 'x' } },

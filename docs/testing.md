@@ -227,6 +227,32 @@ Two behaviors to test around, both driven purely by MockProvider:
 - **`streaming_disabled` is observer-gated** — it only fires when streaming is active (allocate `ctx.events` *before* the ask). A plain `runtime.execute()` with no observer emits nothing.
 - **`native_output_unsupported` depends on the provider's capability tier.** `MockProvider` does **not** implement `nativeStructuredOutputSupport`, so the runtime treats it as `'schema'` (fully supported) — meaning the diagnostic will **not** fire under a plain mock even with `nativeStructuredOutput: true`. To test the `downgraded`/`lossy`/`unsupported` paths, give your mock the method: `Object.assign(provider, { nativeStructuredOutputSupport: () => 'unsupported' })`. The real per-provider tiers are exercised in the live tier (`pnpm test:integration`, `integration-structured-output.test.ts`) — a green MockProvider run does **not** prove a real provider honors `json_schema`.
 
+### Provider diagnostics (clamped `effort`)
+
+`provider_diagnostic` events are emitted by the **runtime**, from what the
+resolved provider reports through the optional `Provider.effortResolution()`
+capability. `MockProvider` implements no resolution by default (so no event
+fires); `withEffortResolution()` makes it report one:
+
+```typescript
+const provider = MockProvider.echo().withEffortResolution({
+  requested: 'none',
+  effective: 'minimal',
+  clamped: true,
+  cause: 'this model cannot disable thinking',
+});
+runtime.mockProvider('mock', provider);
+
+await runtime.execute('my-workflow', {});
+const diags = runtime.traceLog().filter((e) => e.type === 'provider_diagnostic');
+expect(diags).toHaveLength(1); // one per ask, even across a multi-turn tool loop
+```
+
+Pass a function instead of an object to vary the report by model/effort. A green
+mock run proves the runtime plumbing, **not** that a real adapter clamps the way
+you expect — the per-adapter mappings are unit-tested against their request
+bodies in `packages/axl/src/__tests__/{gemini,openai,anthropic}.test.ts`.
+
 ## AxlTestRuntime
 
 `AxlTestRuntime` supports the **full `ctx.*` primitive set** — `ask`, `spawn`, `vote`, `verify`, `budget`, `race`, `parallel`, `map`, `awaitHuman`, `checkpoint`, and `log` — so that workflows under test exercise the same code paths as production.

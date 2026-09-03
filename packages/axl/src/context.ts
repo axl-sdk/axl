@@ -64,6 +64,7 @@ import { redactHistoricalEvent } from './redaction.js';
 import {
   detectDroppedRefinements,
   warnSchemaDiagnosticOnce,
+  warnDiagnosticOnce,
   DEFAULT_SCHEMA_OVERSIZED_TOKENS,
 } from './schema-diagnostics.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
@@ -1806,6 +1807,11 @@ export class WorkflowContext<TInput = unknown> {
       model,
     });
 
+    // Provider capability diagnostics — once per ask, beside the schema ones and
+    // before the turn loop, so a clamp is reported exactly once no matter how
+    // many provider round trips the tool loop makes.
+    this.emitProviderDiagnostics(agent, options, { provider, model, providerOptions });
+
     // If this agent was reached via handoff, include the source agent's conversation
     if (handoffMessages && handoffMessages.length > 0) {
       // Inject handoff context as a system message summarizing the source agent's work,
@@ -3073,6 +3079,62 @@ export class WorkflowContext<TInput = unknown> {
         );
       }
     }
+  }
+
+  /**
+   * Emit a `provider_diagnostic` when the resolved provider reports that it
+   * could not honor the unified `effort` verbatim (P3/R6/R7).
+   *
+   * The adapter only *resolves* — it returns the requested and effective levels
+   * from the same pure resolver its request builder uses. The runtime decides
+   * how to surface that, because only the runtime can see the event bus and
+   * `AxlConfig.diagnostics.silent` (adapters receive `ProviderConfig` only).
+   *
+   * Called once per ask, so a tool loop with N provider round trips still emits
+   * one event; the `console.warn` dedupes once per process per distinct clamp.
+   * A throwing `effortResolution` is a provider bug and propagates.
+   */
+  private emitProviderDiagnostics(
+    agent: Agent,
+    options: AskOptions<unknown> | undefined,
+    ctx: { provider: Provider; model: string; providerOptions?: Record<string, unknown> },
+  ): void {
+    if (!ctx.provider.effortResolution) return;
+    // Build exactly the knobs the per-turn `chatOptions` will carry, so the
+    // adapter resolves against the request that is actually sent.
+    const resolution = ctx.provider.effortResolution({
+      model: ctx.model,
+      effort: options?.effort ?? agent._config.effort,
+      thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
+      includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
+      providerOptions: ctx.providerOptions,
+    });
+    if (!resolution?.clamped) return;
+
+    const cause = resolution.cause ?? `effort '${resolution.requested}' is not supported as asked`;
+    this.emitEvent({
+      type: 'provider_diagnostic',
+      agent: agent._name,
+      data: {
+        kind: 'effort_clamped',
+        ...(ctx.provider.name ? { provider: ctx.provider.name } : {}),
+        model: ctx.model,
+        requested: resolution.requested,
+        effective: resolution.effective,
+        cause,
+      },
+    });
+    warnDiagnosticOnce(
+      // One warning per distinct clamp, not per ask: the same clamp across 500
+      // asks is one process-level surprise, while a different requested/effective
+      // pair is a genuinely new one.
+      `effort_clamped\0${ctx.provider.name ?? ''}\0${ctx.model}\0${resolution.requested}\0${resolution.effective}`,
+      `effort '${resolution.requested}' was clamped to '${resolution.effective}' on ` +
+        `${ctx.provider.name ? `${ctx.provider.name} ` : ''}${ctx.model} — ${cause}. ` +
+        `A 'provider_diagnostic' event carries the same detail per ask.`,
+      this.config.diagnostics?.silent,
+      'docs/observability.md#provider-diagnostics',
+    );
   }
 
   private buildToolDefs(

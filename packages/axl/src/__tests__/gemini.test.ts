@@ -3741,3 +3741,125 @@ describe('gate-retry continuation on models without terminal model prefill', () 
     ).rejects.toThrow('does not support a terminal assistant/model prefill');
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Effort provenance (B8) + the shared thinking resolver used by both endpoints
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('GeminiProvider.effortResolution', () => {
+  // Constructed per test: the API key is only in the environment inside the hooks.
+  const provider = (): GeminiProvider => new GeminiProvider();
+
+  it.each([
+    ['gemini-3.6-flash', 'none', 'minimal'],
+    ['gemini-3.1-pro-preview', 'none', 'low'],
+    ['gemini-3.6-flash', 'xhigh', 'high'],
+    ['gemini-3.6-flash', 'max', 'high'],
+  ] as const)('reports %s effort %s as clamped to %s', (model, effort, effective) => {
+    const resolution = provider().effortResolution({ model, effort });
+    expect(resolution).toMatchObject({ requested: effort, effective, clamped: true });
+    expect(resolution!.cause).toBeTruthy();
+  });
+
+  it.each([
+    ['gemini-3.6-flash', 'high'],
+    ['gemini-3.6-flash', 'low'],
+    // 2.x honors a disable exactly (thinkingBudget: 0), so it is not a clamp.
+    ['gemini-2.5-flash', 'none'],
+    ['gemini-2.5-flash', 'max'],
+  ] as const)('reports nothing for honored %s effort %s', (model, effort) => {
+    expect(provider().effortResolution({ model, effort })).toBeUndefined();
+  });
+
+  it('reports nothing when no effort was requested', () => {
+    expect(provider().effortResolution({ model: 'gemini-3.6-flash' })).toBeUndefined();
+    expect(
+      provider().effortResolution({ model: 'gemini-3.6-flash', thinkingBudget: 0 }),
+    ).toBeUndefined();
+  });
+
+  it('resolves against the providerOptions model override', () => {
+    expect(
+      provider().effortResolution({
+        model: 'gemini-2.5-flash',
+        effort: 'none',
+        providerOptions: { model: 'gemini-3.6-flash' },
+      }),
+    ).toMatchObject({ effective: 'minimal', clamped: true });
+  });
+
+  // B8 pairing: the reported effective level is what the wire actually carries.
+  it.each([
+    ['gemini-3.6-flash', 'none', 'minimal'],
+    ['gemini-3.6-flash', 'max', 'high'],
+    ['gemini-3.1-pro-preview', 'none', 'low'],
+  ] as const)(
+    'sends the reported effective level for %s effort %s',
+    async (model, effort, effective) => {
+      const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+      await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], { model, effort });
+      expect(
+        JSON.parse(fetchMock.mock.calls[0][1].body).generationConfig.thinkingConfig,
+      ).toMatchObject({ thinkingLevel: effective });
+      expect(provider().effortResolution({ model, effort })!.effective).toBe(effective);
+    },
+  );
+});
+
+describe('Gemini thinking mapping is shared by both request builders', () => {
+  /** Fire the plain `generateContent` path and return its thinking config. */
+  async function generateContentThinking(
+    options: Record<string, unknown>,
+  ): Promise<Record<string, unknown> | undefined> {
+    const fetchMock = mockFetch({ json: () => Promise.resolve(makeGeminiResponse('Hi')) });
+    await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], options as never);
+    return JSON.parse(fetchMock.mock.calls[0][1].body).generationConfig?.thinkingConfig;
+  }
+
+  /** Fire the rich-image Interactions path and return its thinking level. */
+  async function interactionThinkingLevel(
+    options: Record<string, unknown>,
+  ): Promise<unknown | undefined> {
+    const fetchMock = mockFetch({
+      json: () => Promise.resolve({ status: 'completed', steps: [] }),
+    });
+    await new GeminiProvider().chat(
+      [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'read' },
+            {
+              type: 'image',
+              source: { type: 'bytes', data: new Uint8Array([1]), mediaType: 'image/png' },
+            },
+          ],
+        },
+      ],
+      options as never,
+    );
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toContain('/interactions');
+    return JSON.parse(opts.body).generation_config?.thinking_level;
+  }
+
+  // Rows freeze the mapping BOTH builders had before the resolver was extracted:
+  // `generateContent` is level-based on 3.x and budget-based on 2.x, while
+  // Interactions is always level-based.
+  it.each([
+    ['gemini-3.6-flash', { effort: 'none' }, { thinkingLevel: 'minimal' }, 'minimal'],
+    ['gemini-3.6-flash', { effort: 'low' }, { thinkingLevel: 'low' }, 'low'],
+    ['gemini-3.6-flash', { effort: 'high' }, { thinkingLevel: 'high' }, 'high'],
+    ['gemini-3.6-flash', { thinkingBudget: 2000 }, { thinkingLevel: 'medium' }, 'medium'],
+    ['gemini-2.5-flash', { effort: 'none' }, { thinkingBudget: 0 }, 'minimal'],
+    ['gemini-2.5-flash', { effort: 'low' }, { thinkingBudget: 1024 }, 'low'],
+    ['gemini-2.5-flash', { effort: 'high' }, { thinkingBudget: 10000 }, 'high'],
+    ['gemini-2.5-flash', { thinkingBudget: 2000 }, { thinkingBudget: 2000 }, 'medium'],
+  ] as const)(
+    '%s %o keeps both endpoints in step',
+    async (model, controls, expectedConfig, expectedLevel) => {
+      expect(await generateContentThinking({ model, ...controls })).toEqual(expectedConfig);
+      expect(await interactionThinkingLevel({ model, ...controls })).toBe(expectedLevel);
+    },
+  );
+});

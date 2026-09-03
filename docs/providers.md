@@ -895,7 +895,9 @@ breakpoint also covers the tool definitions. Everything after it stays uncached 
 purpose: the rolling conversation summary and handoff headers the runtime injects as
 later system messages, the JSON-mode instruction, and the user turn. A call carrying a
 large one-shot document therefore reads the prefix at the cache rate and writes nothing
-new. With no system prompt the breakpoint anchors on the last tool instead.
+new. An agent with no system prompt of its own anchors on the last tool instead —
+runtime-injected system text (a summary or handoff header) is never used as the anchor,
+because it is small and changes per turn.
 
 **Why it is off by default.** Cache writes bill at 1.25x input. If your `system` is a
 function of `ctx.metadata` and changes every call, every request is a cold write with

@@ -26,9 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cache_control`, `system`, or `tools`, Axl adds no breakpoint of its own — the
   caller owns the prefix. See
   [providers.md#prompt-caching](docs/providers.md#prompt-caching).
-
-### Added
-
 - **Claude Fable 5.1 (`claude-fable-5-1`) capabilities and pricing.** Adaptive
   always-on thinking with all five effort levels (thinking cannot be disabled;
   `effort: 'none'` clamps to `'low'` and reports a `provider_diagnostic`), priced

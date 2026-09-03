@@ -2816,6 +2816,24 @@ describe('AnthropicProvider.effortResolution', () => {
     ).toBeUndefined();
   });
 
+  it('reports that a priced-but-uncharacterized model dropped the requested effort', () => {
+    const provider = new AnthropicProvider();
+    // Mythos is priced (so Axl claims support) but has no capability entry, so
+    // no reasoning control reaches the wire. That must be visible, not silent.
+    for (const model of ['claude-mythos-5-1', 'claude-mythos-5']) {
+      const resolution = provider.effortResolution({ model, effort: 'max' });
+      expect(resolution).toMatchObject({
+        requested: 'max',
+        effective: 'unset',
+        clamped: true,
+      });
+      expect(resolution!.cause).toContain('no capability entry');
+    }
+
+    // An unpriced pass-through ID stays silent: Axl claims nothing about it.
+    expect(provider.effortResolution({ model: 'claude-unknown-9', effort: 'max' })).toBeUndefined();
+  });
+
   it('resolves against the providerOptions model override', () => {
     expect(
       new AnthropicProvider().effortResolution({

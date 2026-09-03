@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rates but intentionally have **no** capability entry: they are
   limited-availability models with no published per-model thinking semantics, so
   their requests pass through unmodified rather than carrying an inferred shape.
+  Because Axl prices them, it also now reports that pass-through: requesting an
+  `effort` on a **priced** model with no capability entry emits
+  `provider_diagnostic { kind: 'effort_clamped', effective: 'unset' }` so the
+  dropped knob is visible rather than silently billed at full rate. Unpriced
+  pass-through IDs stay silent as before. No new event type or `kind` value.
 - **Per-model cache-read multipliers on Anthropic.** Cache hits are 0.1x base
   input on every model except Claude Fable 5.1 and Mythos 5.1, which read cache
   at **0.025x**. `estimateAnthropicCost` previously hardcoded 0.1x, which would

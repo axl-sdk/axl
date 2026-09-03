@@ -94,7 +94,10 @@ anthropic:claude-opus-4-5       # Previous gen
 `claude-mythos-5-1` and `claude-mythos-5` are priced but have no capability entry:
 they are limited-availability models whose per-model thinking semantics are not
 published, so Axl passes their requests through unmodified rather than inferring a
-request shape it cannot verify. Their cost is still reported.
+request shape it cannot verify. Their cost is still reported. Because Axl prices
+them, requesting an `effort` on them emits a `provider_diagnostic` with
+`effective: 'unset'` — the knob is dropped, and you are told. Arbitrary unpriced
+IDs remain silent pass-through.
 
 `claude-opus-4-1` is deprecated on Anthropic-operated APIs and retires August 5,
 2026; migrate to `claude-opus-4-8`. Claude Opus 4, Sonnet 4, Sonnet 3.7,

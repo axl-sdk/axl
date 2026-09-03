@@ -729,6 +729,27 @@ export class AnthropicProvider implements Provider {
       typeof options.providerOptions?.model === 'string'
         ? options.providerOptions.model
         : options.model;
+    // A model with no capability entry passes through untouched: no `thinking`
+    // and no `output_config` are sent, so the requested effort silently has no
+    // effect. For an arbitrary pass-through ID that silence is deliberate --
+    // Axl makes no claim about a model it does not know.
+    //
+    // But a model Axl *prices* is one it claims to support, and dropping its
+    // primary reasoning knob without a word contradicts that claim: Claude
+    // Mythos would bill at $10/$50 while the caller believed their effort
+    // applied. Report the mismatch for priced-but-uncharacterized models only,
+    // leaving unpriced pass-through IDs as quiet as before.
+    if (ANTHROPIC_RATES[model] && !resolveClaudeCapability(model)) {
+      return {
+        requested: resolved.effort,
+        effective: 'unset',
+        clamped: true,
+        cause:
+          `Axl has no capability entry for Anthropic ${model}, so no reasoning control was ` +
+          `sent and effort '${resolved.effort}' had no effect`,
+      };
+    }
+
     const config = resolveClaudeThinking(model, resolved);
     const wireEffort =
       typeof config.outputConfig?.effort === 'string' ? config.outputConfig.effort : undefined;

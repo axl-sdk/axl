@@ -38,6 +38,15 @@ const provider = MockProvider.sequence([
   { content: 'Hello world', chunks: ['Hel', 'lo ', 'world'] },
 ]);
 
+// Deterministic provider timing. An optional `timing` block (`CallTiming`)
+// is returned on `ProviderResponse.timing` and on the streamed `done` chunk,
+// so `agent_call_end.timing`, the `TimeoutError` breakdown, and the eval
+// per-model rollup get exact integers instead of measured deltas. Omit it and
+// the mock looks like an uninstrumented provider — the key is absent, not zero.
+const provider = MockProvider.sequence([
+  { content: 'Hi', timing: { queuedMs: 40, attempts: 1, retryMs: 0, ttfbMs: 12, wireMs: 90 } },
+]);
+
 // Chunked mode — convenience over `sequence()`. Takes plain content
 // strings and splits each into fixed-size chunks (default 4 chars ≈
 // 1 token). Use to exercise partial-JSON parsing, structural-boundary

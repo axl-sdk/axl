@@ -57,7 +57,6 @@ import {
 import type { ModelInput } from './input.js';
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
-import { FALLBACK_TOKENS_PER_CHAR, TokenRatioCalibrator } from './token-calibration.js';
 import { StreamingWalker } from './streaming-walker.js';
 import { COST_BEARING_LEAF_TYPES, hasPositiveBillableWork, isUsableCost } from './event-utils.js';
 import { AxlEventBus, type EventStreamOptions } from './event-stream.js';
@@ -369,16 +368,9 @@ function renderSchemaForPrompt(schema: z.ZodType): string {
   return rendered;
 }
 
-/**
- * Estimate the token cost of `text` at a given density (tokens per character).
- *
- * `tokensPerChar` defaults to the cold-start constant; context-window callers
- * pass the per-model ratio calibrated from provider-reported usage, because a
- * fixed constant misestimates dense content and newer tokenizers. See
- * `token-calibration.ts`.
- */
-function estimateTokens(text: string, tokensPerChar = FALLBACK_TOKENS_PER_CHAR): number {
-  return Math.ceil(text.length * tokensPerChar);
+/** Simple token estimator: ~4 chars per token. Good enough for context management. */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
 }
 
 /**
@@ -505,32 +497,24 @@ function describeValue(value: unknown): string {
   return `a value of type ${typeof value}`;
 }
 
-function estimateMessagesTokens(
-  messages: ChatMessage[],
-  tokensPerChar = FALLBACK_TOKENS_PER_CHAR,
-): { tokens: number; chars: number; unmeasured: boolean } {
+function estimateMessagesTokens(messages: ChatMessage[]): { tokens: number; unmeasured: boolean } {
   let total = 0;
-  let chars = 0;
   let unmeasured = false;
   for (const msg of messages) {
     // Media has no portable token estimate. Count only its text projection;
     // placeholders are for summary prompts, never a synthetic media estimate.
-    const text = inputText(msg.content);
-    chars += text.length;
-    total += estimateTokens(text, tokensPerChar);
+    total += estimateTokens(inputText(msg.content));
     if (typeof msg.content !== 'string') {
       unmeasured ||= msg.content.some((part) => part.type === 'image');
     }
     if (msg.tool_calls) {
       for (const tc of msg.tool_calls) {
-        const call = tc.function.name + tc.function.arguments;
-        chars += call.length;
-        total += estimateTokens(call, tokensPerChar);
+        total += estimateTokens(tc.function.name + tc.function.arguments);
       }
     }
     total += 4; // per-message overhead (role, separators)
   }
-  return { tokens: total, chars, unmeasured };
+  return { tokens: total, unmeasured };
 }
 
 /** Providers receive a disposable view: a mutating custom adapter cannot alter
@@ -781,9 +765,6 @@ export class WorkflowContext<TInput = unknown> {
   private providerRegistry: ProviderRegistry;
   private transcriptionProviderRegistry?: TranscriptionProviderRegistry;
   private sessionHistory: ChatMessage[];
-  /** Token density observed from this run's own provider-reported usage.
-   *  Informs the context-window threshold only, never cost. */
-  private readonly tokenCalibrator = new TokenRatioCalibrator();
   private onTrace?: (event: AxlEvent) => void;
   private pendingDecisions?: Map<string, PendingDecisionResolver>;
   private readonly awaitHumanClaims: Map<string, AbortController>;
@@ -1758,19 +1739,14 @@ export class WorkflowContext<TInput = unknown> {
 
     // Include session history (with context window management)
     const maxContext = agent._config.maxContext;
-    // Rendered once per ask, and only where it is needed: this is the sole
-    // place the tool definitions are serialized for measurement, so agents
-    // without maxContext never pay for it.
-    const renderedToolDefs = maxContext && toolDefs.length > 0 ? JSON.stringify(toolDefs) : '';
     if (maxContext && sessionHistory.length > 0) {
       const reserveTokens = this.config.contextManagement?.reserveTokens ?? 2000;
-      const tokensPerChar = this.tokenCalibrator.tokensPerChar(model);
-      const systemTokens = systemPrompt ? estimateTokens(systemPrompt, tokensPerChar) : 0;
-      const toolTokens = renderedToolDefs ? estimateTokens(renderedToolDefs, tokensPerChar) : 0;
+      const systemTokens = systemPrompt ? estimateTokens(systemPrompt) : 0;
+      const toolTokens = toolDefs.length > 0 ? estimateTokens(JSON.stringify(toolDefs)) : 0;
       const overhead = systemTokens + toolTokens + reserveTokens;
       const availableForHistory = maxContext - overhead;
 
-      const historyEstimate = estimateMessagesTokens(sessionHistory, tokensPerChar);
+      const historyEstimate = estimateMessagesTokens(sessionHistory);
       if (historyEstimate.unmeasured) {
         this.emitEvent({
           type: 'log',
@@ -1787,7 +1763,6 @@ export class WorkflowContext<TInput = unknown> {
           model,
           sessionHistory,
           availableForHistory,
-          tokensPerChar,
         );
         for (const msg of summarizedMessages) {
           messages.push(msg);
@@ -1938,18 +1913,6 @@ export class WorkflowContext<TInput = unknown> {
     // (refused to run a valid configuration).
 
     const currentMessages = [...messages];
-    // Token density is calibrated from the first turn only: it is the one whose
-    // character count we can pair exactly with a reported prompt token count,
-    // and later turns of a tool loop grow the prompt past what was measured.
-    // Only the maxContext path consumes the ratio, so only it measures. A
-    // prompt carrying media bills tokens with no character footprint, so those
-    // turns stay uncalibrated rather than skewing the ratio for text.
-    const firstTurnMeasure = maxContext ? estimateMessagesTokens(currentMessages) : undefined;
-    const calibrationSample =
-      firstTurnMeasure && !firstTurnMeasure.unmeasured && !richRequest
-        ? { model, chars: firstTurnMeasure.chars + renderedToolDefs.length }
-        : undefined;
-    let calibrated = false;
     let turns = 0;
     let guardrailOutputRetries = 0;
     let schemaRetries = 0;
@@ -2323,21 +2286,6 @@ export class WorkflowContext<TInput = unknown> {
       // Capture usage for span instrumentation (per-call, not per-instance)
       if (usageCapture && response.usage) {
         usageCapture.value = response.usage;
-      }
-
-      // Calibrate this model's token density against the count the provider
-      // just billed, so the next context-window check predicts from measured
-      // data instead of a constant (see token-calibration.ts). Only the
-      // maxContext path measures a full character count, and only that path
-      // consumes the ratio, so calibration is scoped to it. Cost never uses
-      // this — it comes from provider-reported tokens only.
-      if (calibrationSample && !calibrated && response.usage?.prompt_tokens) {
-        calibrated = true;
-        this.tokenCalibrator.observe(
-          calibrationSample.model,
-          calibrationSample.chars,
-          response.usage.prompt_tokens,
-        );
       }
 
       // Track cost
@@ -3304,9 +3252,6 @@ export class WorkflowContext<TInput = unknown> {
     model: string,
     history: ChatMessage[],
     availableTokens: number,
-    /** Must match the density that produced `availableTokens`, or the split
-     *  point is computed against a different budget than the threshold. */
-    tokensPerChar: number,
   ): Promise<ChatMessage[]> {
     // If we have a cached summary and the history hasn't grown much, reuse it
     if (this.summaryCache) {
@@ -3314,16 +3259,14 @@ export class WorkflowContext<TInput = unknown> {
         role: 'system',
         content: `Summary of earlier conversation:\n${this.summaryCache}`,
       };
-      const summaryTokens =
-        estimateTokens(summarizeModelInput(summaryMsg.content), tokensPerChar) + 4;
+      const summaryTokens = estimateTokens(summarizeModelInput(summaryMsg.content)) + 4;
       const remaining = availableTokens - summaryTokens;
 
       // Find how many recent messages fit
       let recentTokens = 0;
       let splitIdx = history.length;
       for (let i = history.length - 1; i >= 0; i--) {
-        const msgTokens =
-          estimateTokens(summarizeModelInput(history[i].content), tokensPerChar) + 4;
+        const msgTokens = estimateTokens(summarizeModelInput(history[i].content)) + 4;
         if (recentTokens + msgTokens > remaining) break;
         recentTokens += msgTokens;
         splitIdx = i;
@@ -3341,7 +3284,7 @@ export class WorkflowContext<TInput = unknown> {
     const targetRecent = Math.floor(availableTokens * 0.6); // 60% for recent messages
 
     for (let i = history.length - 1; i >= 0; i--) {
-      const msgTokens = estimateTokens(summarizeModelInput(history[i].content), tokensPerChar) + 4;
+      const msgTokens = estimateTokens(summarizeModelInput(history[i].content)) + 4;
       if (recentTokens + msgTokens > targetRecent) break;
       recentTokens += msgTokens;
       splitIdx = i;

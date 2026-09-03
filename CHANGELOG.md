@@ -21,23 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at **0.025x**. `estimateAnthropicCost` previously hardcoded 0.1x, which would
   have overpriced Fable 5.1 cache reads 4x.
 
-### Changed
-
-- **Context-window estimation now calibrates against reported usage.** The
-  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
-  flat ~4 characters per token, which under-estimates dense content (minified
-  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
-  roughly 30% more tokens for the same text — leaving history unsummarized until
-  the provider rejected the request. Axl now compares the characters it sent
-  against each response's reported prompt tokens and estimates from that
-  per-model density, smoothed across turns. Turns carrying media are skipped and
-  implausible ratios discarded; the first ask still uses the old constant.
-  Scoped to one run and to agents that set `maxContext`. **Agents with a
-  `maxContext` may now summarize at a different point than before** — closer to
-  the real limit. Cost is unaffected: it has always come from reported tokens.
-  See
-  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
-
 ### Fixed
 
 - **`gemini-3.7-flash` and `gemini-3.8-flash` had no pricing.** Both were

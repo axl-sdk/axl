@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`retryFeedback` hook on `AskOptions` and `DelegateOptions`.** One hook across
+  all three output gates lets a caller write the corrective turn the model sees
+  when guardrail, schema, or `validate` rejects an attempt — a domain classifier
+  can now reach the retry, where previously only `validate` could contribute a
+  `reason` and the schema gate exposed nothing. `info.stage` discriminates the
+  gate and carries the rejected output, the gate's reason, the `ZodError` or the
+  validator's thrown error, the parsed value (validate only), and the default
+  text so the hook can decorate instead of replace. Returning a non-empty string
+  replaces the default; `undefined` or `''` keeps it; `{ retry: false }` stops
+  retrying and throws the gate's usual typed error (`GuardrailError`,
+  `VerifyError`, `ValidationError`) with the same payload as on exhaustion; a
+  thrown exception propagates and is never retried into silence. The hook runs
+  only while a retry is still permitted and always after the gate's own event,
+  which keeps carrying the default text, so an aborting or throwing hook cannot
+  erase the record that the gate rejected. `ctx.metadata` is passed through for
+  multi-tenant callers. New exported types `RetryFeedbackHook`,
+  `RetryFeedbackInfo`, and `RetryFeedbackResult`.
+
 ### Fixed
 
 - **Gate-retry feedback is now a user turn.** Guardrail, schema, and `validate`

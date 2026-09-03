@@ -22,6 +22,8 @@ import type {
   AgentCallInfo,
   AgentCallParams,
   ValidateResult,
+  RetryFeedbackHook,
+  RetryFeedbackInfo,
   VerifyRetry,
   ObservationStatus,
 } from './types.js';
@@ -2369,6 +2371,9 @@ export class WorkflowContext<TInput = unknown> {
                     metadata: options.metadata,
                     validate: options.validate,
                     validateRetries: options.validateRetries,
+                    // The routed `ctx.delegate()` path reaches its terminal ask through a
+                    // handoff, so the hook must travel here too (AC5).
+                    retryFeedback: options.retryFeedback,
                   }
                 : undefined;
               // Execute the target's ask frame. Wraps `executeAgentCall`
@@ -2593,24 +2598,41 @@ export class WorkflowContext<TInput = unknown> {
 
         if (outputResult.block) {
           if (feedbackMessage) {
-            this.emitEvent({
-              type: 'pipeline',
-              agent: agent._name,
-              status: 'failed',
+            // Hook runs after the `guardrail` event (which keeps carrying the default text)
+            // and before `pipeline(failed)`, whose reason is what the model actually sees.
+            const decision = await this.resolveRetryFeedback(options?.retryFeedback, {
               stage: 'guardrail',
-              attempt: guardrailOutputRetries + 1,
-              maxAttempts: maxGuardrailRetries + 1,
-              reason: feedbackMessage,
+              attempt,
+              maxAttempts,
+              output: content,
+              reason: outputResult.reason ?? 'Output blocked',
+              defaultMessage: feedbackMessage,
             });
-            guardrailOutputRetries++;
-            appendRetryMessages(
-              currentMessages,
-              content,
-              feedbackMessage,
-              response.providerMetadata,
+            if (decision.retry) {
+              this.emitEvent({
+                type: 'pipeline',
+                agent: agent._name,
+                status: 'failed',
+                stage: 'guardrail',
+                attempt: guardrailOutputRetries + 1,
+                maxAttempts: maxGuardrailRetries + 1,
+                reason: decision.message,
+              });
+              guardrailOutputRetries++;
+              appendRetryMessages(
+                currentMessages,
+                content,
+                decision.message,
+                response.providerMetadata,
+              );
+              pendingRetryReason = 'guardrail';
+              continue; // Re-enter the while loop for another LLM turn
+            }
+            // `{ retry: false }`: same terminal error as retry exhaustion on this path.
+            throw new GuardrailError(
+              'output',
+              outputResult.reason ?? 'Output blocked by guardrail',
             );
-            pendingRetryReason = 'guardrail';
-            continue; // Re-enter the while loop for another LLM turn
           }
           if (typeof onBlock === 'function') {
             return onBlock(outputResult.reason ?? 'Output blocked by guardrail', {
@@ -2663,24 +2685,36 @@ export class WorkflowContext<TInput = unknown> {
 
         if (!schemaValid) {
           if (schemaFeedback) {
-            this.emitEvent({
-              type: 'pipeline',
-              agent: agent._name,
-              status: 'failed',
+            const decision = await this.resolveRetryFeedback(options.retryFeedback, {
               stage: 'schema',
-              attempt: schemaRetries + 1,
-              maxAttempts: (options.retries ?? 3) + 1,
-              reason: schemaFeedback,
+              attempt: schemaAttempt,
+              maxAttempts: schemaMaxAttempts,
+              output: content,
+              reason: schemaReason ?? 'Schema parse failed',
+              ...(schemaErr !== undefined ? { error: schemaErr } : {}),
+              defaultMessage: schemaFeedback,
             });
-            schemaRetries++;
-            appendRetryMessages(
-              currentMessages,
-              content,
-              schemaFeedback,
-              response.providerMetadata,
-            );
-            pendingRetryReason = 'schema';
-            continue; // Re-enter the while loop for another LLM turn
+            if (decision.retry) {
+              this.emitEvent({
+                type: 'pipeline',
+                agent: agent._name,
+                status: 'failed',
+                stage: 'schema',
+                attempt: schemaRetries + 1,
+                maxAttempts: (options.retries ?? 3) + 1,
+                reason: decision.message,
+              });
+              schemaRetries++;
+              appendRetryMessages(
+                currentMessages,
+                content,
+                decision.message,
+                response.providerMetadata,
+              );
+              pendingRetryReason = 'schema';
+              continue; // Re-enter the while loop for another LLM turn
+            }
+            // `{ retry: false }`: fall through to the same `VerifyError` as exhaustion.
           }
           const zodErr =
             schemaErr instanceof ZodError
@@ -2703,12 +2737,15 @@ export class WorkflowContext<TInput = unknown> {
         // Wrap user-supplied validator in try/catch — treat exceptions as validation failures
         // so they get the same retry semantics instead of crashing the pipeline.
         let validateResult: ValidateResult;
+        // Retained for `RetryFeedbackInfo.error` so a hook can diagnose a validator crash.
+        let validateErr: unknown;
         try {
           validateResult = await options.validate(validated, {
             metadata: this.metadata,
           });
         } catch (err) {
           rethrowEventStreamOverflow(err);
+          validateErr = err;
           const reason = err instanceof Error ? err.message : String(err);
           validateResult = { valid: false, reason: `Validator error: ${reason}` };
         }
@@ -2741,24 +2778,37 @@ export class WorkflowContext<TInput = unknown> {
 
         if (!validateResult.valid) {
           if (validateFeedback) {
-            this.emitEvent({
-              type: 'pipeline',
-              agent: agent._name,
-              status: 'failed',
+            const decision = await this.resolveRetryFeedback(options.retryFeedback, {
               stage: 'validate',
-              attempt: validateRetries + 1,
-              maxAttempts: (options.validateRetries ?? 2) + 1,
-              reason: validateFeedback,
+              attempt: validateAttempt,
+              maxAttempts: validateMaxAttempts,
+              output: content,
+              parsed: validated,
+              reason: validateResult.reason ?? 'Validation failed',
+              ...(validateErr !== undefined ? { error: validateErr } : {}),
+              defaultMessage: validateFeedback,
             });
-            validateRetries++;
-            appendRetryMessages(
-              currentMessages,
-              content,
-              validateFeedback,
-              response.providerMetadata,
-            );
-            pendingRetryReason = 'validate';
-            continue; // Re-enter the while loop — goes through all gates again
+            if (decision.retry) {
+              this.emitEvent({
+                type: 'pipeline',
+                agent: agent._name,
+                status: 'failed',
+                stage: 'validate',
+                attempt: validateRetries + 1,
+                maxAttempts: (options.validateRetries ?? 2) + 1,
+                reason: decision.message,
+              });
+              validateRetries++;
+              appendRetryMessages(
+                currentMessages,
+                content,
+                decision.message,
+                response.providerMetadata,
+              );
+              pendingRetryReason = 'validate';
+              continue; // Re-enter the while loop — goes through all gates again
+            }
+            // `{ retry: false }`: fall through to the same `ValidationError` as exhaustion.
           }
           throw new ValidationError(
             validated,
@@ -2784,6 +2834,32 @@ export class WorkflowContext<TInput = unknown> {
     }
 
     throw new MaxTurnsError('ctx.ask()', maxTurns);
+  }
+
+  /**
+   * Resolve the corrective feedback text for one rejected attempt, giving an optional
+   * caller-supplied `retryFeedback` hook the chance to replace it or to stop retrying.
+   *
+   * Called by all three output gates, only while a retry is still permitted (never on the
+   * exhausting attempt) and only after the gate's own event has been emitted, so a hook that
+   * throws or aborts can never erase the evidence that the gate rejected. A non-empty string
+   * replaces `defaultMessage` verbatim; `undefined` / `''` keeps it; `{ retry: false }` asks
+   * the gate to throw its typed terminal error. Hook exceptions propagate — a bug in caller
+   * code is not a model failure and must not be retried into silence.
+   */
+  private async resolveRetryFeedback(
+    hook: RetryFeedbackHook | undefined,
+    info: RetryFeedbackInfo,
+  ): Promise<{ retry: true; message: string } | { retry: false }> {
+    if (!hook) return { retry: true, message: info.defaultMessage };
+    const result = await hook(info, { metadata: this.metadata });
+    if (typeof result === 'object' && result !== null && result.retry === false) {
+      return { retry: false };
+    }
+    if (typeof result === 'string' && result.length > 0) {
+      return { retry: true, message: result };
+    }
+    return { retry: true, message: info.defaultMessage };
   }
 
   /**
@@ -4621,6 +4697,7 @@ export class WorkflowContext<TInput = unknown> {
         metadata: options?.metadata,
         validate: options?.validate,
         validateRetries: options?.validateRetries,
+        retryFeedback: options?.retryFeedback,
       });
     }
 
@@ -4686,6 +4763,7 @@ export class WorkflowContext<TInput = unknown> {
       metadata: options?.metadata,
       validate: options?.validate,
       validateRetries: options?.validateRetries,
+      retryFeedback: options?.retryFeedback,
     });
   }
 

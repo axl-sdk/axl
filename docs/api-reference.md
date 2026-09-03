@@ -392,6 +392,7 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 | `retries` | `number` | `3` | Number of schema validation retries |
 | `validate` | `OutputValidator<T>` | — | Post-schema business rule validation. Receives the parsed typed object. Only runs when `schema` is set. See [Validate](#validate) |
 | `validateRetries` | `number` | `2` | Maximum retries for `validate` failures |
+| `retryFeedback` | `RetryFeedbackHook` | — | Rewrite (or abort) the corrective turn the model sees when the guardrail, schema, or validate gate rejects an attempt. See [Custom retry feedback](#custom-retry-feedback) |
 | `metadata` | `Record<string, unknown>` | — | Merged with workflow metadata and passed to dynamic `model`/`system` selector functions |
 | `temperature` | `number` | agent config | Override sampling temperature for this call |
 | `maxTokens` | `number` | agent config or `4096` | Override max tokens for this call |
@@ -406,7 +407,7 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 
 **Returns:** `Promise<T>` — parsed output if `schema` is provided, otherwise `string`.
 
-**Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a **user** message explaining the error (a user turn, not a system message: providers hoist system messages out of the conversation, which would leave the request ending on the rejected attempt). On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
+**Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a **user** message explaining the error (a user turn, not a system message: providers hoist system messages out of the conversation, which would leave the request ending on the rejected attempt). On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. Supply `retryFeedback` to write that user message yourself, or to stop retrying — see [Custom retry feedback](#custom-retry-feedback). See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
 
 **Streaming + validate:** As of 0.16.0, `validate` and token streaming (via `runtime.stream()`) coexist — validate runs against the buffered response after streaming completes. (Pre-0.16.0 this combination threw `INVALID_CONFIG`.) For structured output, the typed result is still only available after the full response arrives.
 
@@ -452,6 +453,7 @@ Select the best agent from a list of candidates and invoke it. Creates a tempora
 | `options.retries` | `number` | Retries for structured output validation |
 | `options.validate` | `OutputValidator<T>` | Post-schema business rule validation. Forwarded to the final `ctx.ask()` call |
 | `options.validateRetries` | `number` | Maximum retries for validate failures (default: 2) |
+| `options.retryFeedback` | `RetryFeedbackHook` | Custom gate-retry feedback. Forwarded to the final `ctx.ask()` call on both the single-candidate and the routed path. See [Custom retry feedback](#custom-retry-feedback) |
 | `options.routerInput` | `'full' \| 'text'` | `'full'` (default) routes ordered evidence; `'text'` routes `inputText(prompt)` only |
 
 **Returns:** `Promise<T>` — the selected agent's response.
@@ -1138,6 +1140,52 @@ LLM response (raw string)
 Retry counts refer to **retries only** — the initial LLM call does not count. With the defaults (guardrail: 2, schema: 3, validate: 2), the worst case is `1 + 2 + 3 + 2 = 8` total LLM calls: 1 initial call plus up to 7 retries across all gates.
 
 Retries are **additive, not multiplicative** — each gate has its own counter that only increments when *that gate* fails. A response that passes gate 1 but fails gate 2 only increments the gate 2 counter. Counters are persistent across the entire `ctx.ask()` call and do not reset when a different gate fails. The `maxTurns` limit (default 25) provides a hard ceiling on total LLM calls regardless of gate failures.
+
+### Custom retry feedback
+
+`AskOptions.retryFeedback` (also `DelegateOptions.retryFeedback`) is one hook across all three gates. It runs when a gate has just rejected an attempt and a retry is still permitted, and it decides what the model is told:
+
+```ts
+type RetryFeedbackInfo = {
+  stage: 'schema' | 'validate' | 'guardrail';
+  attempt: number;          // 1-based index of the attempt just rejected
+  maxAttempts: number;      // retries + 1 for that gate
+  output: string;           // the raw rejected model output
+  parsed?: unknown;         // the schema-valid object — `stage: 'validate'` only
+  reason: string;           // the gate's own reason
+  error?: unknown;          // ZodError (schema) or the validator's thrown error (validate)
+  defaultMessage: string;   // what Axl would send if the hook did not intervene
+};
+
+type RetryFeedbackResult = string | undefined | { retry: false };
+
+type RetryFeedbackHook = (
+  info: RetryFeedbackInfo,
+  ctx: { metadata: Record<string, unknown> },
+) => RetryFeedbackResult | Promise<RetryFeedbackResult>;
+```
+
+```ts
+const order = await ctx.ask(extractor, invoiceText, {
+  schema: OrderSchema,
+  retryFeedback: (info) =>
+    info.stage === 'schema' && classifyShape(info.output) === 'wrapped-in-prose'
+      ? 'Return only the JSON object, with no surrounding prose.'
+      : undefined, // fall back to Axl's default text
+});
+```
+
+Semantics:
+
+- **A non-empty string** replaces `defaultMessage` verbatim as the user turn the model receives, and becomes `pipeline(failed).reason`. Decorate rather than replace by composing with `info.defaultMessage`.
+- **`undefined` or `''`** keeps the default text.
+- **`{ retry: false }`** stops retrying: the gate immediately throws the same typed error it would throw on exhaustion, with the same payload (`GuardrailError`, `VerifyError` with the raw output and Zod error, or `ValidationError` with the last parsed value). No further provider call is made.
+- **A thrown exception propagates** out of `ctx.ask()` unchanged, and no further provider call is made. Unlike `validate`, whose exceptions become validation failures, a broken feedback hook is caller-code breakage, not a model failure, and is never retried into silence.
+- The hook is **never called on the exhausting attempt** — when no retry is left, the gate throws without consulting it.
+- The legacy gate events (`guardrail`, `schema_check`, `validate`) are emitted **before** the hook runs and always carry `defaultMessage` in `feedbackMessage`, so a hook that throws or aborts can never erase the record that the gate rejected. Only `pipeline(failed).reason` and the appended user turn carry the final text.
+- `ctx.metadata` (merged with per-call `metadata`) is passed as the second argument, mirroring `OutputValidator`, so multi-tenant callers can scope the feedback they generate.
+
+The hook is ask-scoped: it is not available on `AgentConfig`, and it does not apply to `ctx.verify()` (whose retry feedback goes to caller code, not to the model) or `ctx.race()` (which discards failures rather than retrying).
 
 ---
 

@@ -125,6 +125,10 @@ export type AskOptions<T = unknown> = {
   validate?: OutputValidator<T>;
   /** Maximum retries for validate failures (default: 2). */
   validateRetries?: number;
+  /** Rewrite the corrective feedback the model sees when the guardrail, schema, or validate
+   *  gate rejects an attempt — or abort the retry with `{ retry: false }`. See
+   *  `RetryFeedbackHook`. */
+  retryFeedback?: RetryFeedbackHook;
   /** Per-call metadata passed to dynamic model/system selector functions. */
   metadata?: Record<string, unknown>;
   /** Override temperature for this call. */
@@ -167,6 +171,9 @@ export type DelegateOptions<T = unknown> = {
   validate?: OutputValidator<T>;
   /** Maximum retries for validate failures (default: 2). Passed through to the final `ctx.ask()` call. */
   validateRetries?: number;
+  /** Custom gate-retry feedback. Passed through to the final `ctx.ask()` call on both the
+   *  single-candidate and the routed path. See `RetryFeedbackHook`. */
+  retryFeedback?: RetryFeedbackHook;
 };
 
 /** Race options */
@@ -1233,6 +1240,40 @@ export type OutputValidator<T = unknown> = (
   output: T,
   ctx: { metadata: Record<string, unknown> },
 ) => ValidateResult | Promise<ValidateResult>;
+
+/** What a rejecting output gate tells a `retryFeedback` hook about the attempt it is
+ *  about to retry. One shape for all three gates — `stage` discriminates. */
+export type RetryFeedbackInfo = {
+  /** Which gate rejected: JSON/Zod parse, post-schema `validate`, or output guardrail. */
+  stage: 'schema' | 'validate' | 'guardrail';
+  /** 1-based index of the attempt that was just rejected. */
+  attempt: number;
+  /** Total attempts this gate allows (`retries` + 1). */
+  maxAttempts: number;
+  /** Raw model output that was rejected. */
+  output: string;
+  /** The parsed, schema-valid object. Present only for `stage: 'validate'`. */
+  parsed?: unknown;
+  /** The gate's own reason (Zod message, `ValidateResult.reason`, guardrail reason). */
+  reason: string;
+  /** The `ZodError` (or non-Zod parse error) for `schema`; the validator's thrown error for
+   *  `validate` when it threw. Absent for `guardrail` and for a clean `validate` rejection. */
+  error?: unknown;
+  /** The feedback text the runtime would send if the hook did not intervene. */
+  defaultMessage: string;
+};
+
+/** A non-empty string replaces `defaultMessage` verbatim; `undefined` (or `''`) keeps it;
+ *  `{ retry: false }` stops retrying and makes the gate throw its typed terminal error. */
+export type RetryFeedbackResult = string | undefined | { retry: false };
+
+/** Rewrites (or aborts) the corrective turn the model sees after an output gate rejects an
+ *  attempt. Runs only while a retry is still permitted — never on the exhausting attempt —
+ *  and after the gate's own event is emitted. Exceptions propagate to the caller. */
+export type RetryFeedbackHook = (
+  info: RetryFeedbackInfo,
+  ctx: { metadata: Record<string, unknown> },
+) => RetryFeedbackResult | Promise<RetryFeedbackResult>;
 
 /** Execution info */
 export type ExecutionInfoV1 = {

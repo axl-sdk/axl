@@ -176,6 +176,9 @@ export type {
   GuardrailsConfig,
   ValidateResult,
   OutputValidator,
+  RetryFeedbackInfo,
+  RetryFeedbackResult,
+  RetryFeedbackHook,
   HandoffRecord,
   AgentCallInfo,
 } from './types.js';

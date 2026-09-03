@@ -1021,7 +1021,16 @@ export class AnthropicProvider implements Provider {
         'system' in options.providerOptions ||
         'tools' in options.providerOptions);
     const promptCache = options.promptCache === true && !callerOwnsPrefix;
-    if (promptCache && systemMessages.length > 0) {
+    // The agent's own system prompt, when it has one, is always the FIRST
+    // message the runtime builds; injected system messages (rolling summary,
+    // handoff header) are appended later. So a system block is a valid anchor
+    // only when messages[0] is a system message. An agent without a system
+    // prompt can still have injected system text -- small, and different every
+    // summarizing turn -- which must not become the breakpoint: it would sit
+    // below the model's cacheable minimum and stop caching entirely. In that
+    // case the stable prefix is the tool set (see below).
+    const anchorOnSystem = promptCache && messages[0]?.role === 'system';
+    if (anchorOnSystem) {
       body.system = systemMessages.map((m, index) => ({
         type: 'text',
         text: typeof m.content === 'string' ? m.content : '',
@@ -1037,9 +1046,10 @@ export class AnthropicProvider implements Provider {
 
     if (options.tools && options.tools.length > 0) {
       const tools = options.tools.map((t) => this.mapToolDefinition(t));
-      // With no system prompt there is no system block to anchor the cache on,
-      // so the stable prefix is the tool set alone: mark its last definition.
-      if (promptCache && systemMessages.length === 0) {
+      // With no agent system prompt there is no stable system block to anchor
+      // on (any system text present is runtime-injected and mutating), so the
+      // stable prefix is the tool set alone: mark its last definition.
+      if (promptCache && !anchorOnSystem) {
         tools[tools.length - 1] = {
           ...tools[tools.length - 1],
           cache_control: { type: 'ephemeral' },

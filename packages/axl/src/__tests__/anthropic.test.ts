@@ -2805,6 +2805,25 @@ describe('AnthropicProvider prompt caching (promptCache)', () => {
     expect(body.tools[1].cache_control).toEqual({ type: 'ephemeral' });
   });
 
+  it('on, no agent prompt, but an injected summary: anchors on the last tool, not the summary', async () => {
+    // The runtime appends the rolling summary as a system message even when
+    // the agent has no system prompt of its own. It is small and changes every
+    // summarizing turn, so anchoring on it would fall below the cacheable
+    // minimum and silently stop caching. The agent prompt is always
+    // messages[0] when present; here it is not, so the tool set is the prefix.
+    const body = await send(
+      [
+        { role: 'user', content: 'earlier' },
+        { role: 'system', content: 'Summary of earlier conversation:\nS' },
+        { role: 'user', content: 'hi' },
+      ],
+      { promptCache: true, tools },
+    );
+    expect(typeof body.system).toBe('string'); // injected text stays uncached, unchanged shape
+    expect(body.tools[0].cache_control).toBeUndefined();
+    expect(body.tools[1].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
   it('on with neither system nor tools: no breakpoint and no error', async () => {
     const body = await send([{ role: 'user', content: 'hi' }], { promptCache: true });
     expect(body.system).toBeUndefined();

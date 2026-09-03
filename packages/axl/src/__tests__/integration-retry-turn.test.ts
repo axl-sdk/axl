@@ -62,13 +62,20 @@ for (const m of MATRIX) {
       expect(pipeline).toContain('failed');
       expect(pipeline.at(-1)).toBe('committed');
       const calls = events.filter((e) => e.type === 'agent_call_end');
+      // `agent_call_end.cost` is `undefined` for a model the pricing table does not carry.
+      // Summing with `?? 0` would report a pricing-table miss as genuinely free spend.
+      const unpriced = calls.filter((e) => (e as { cost?: number }).cost === undefined).length;
       const cost = calls.reduce((sum, e) => sum + ((e as { cost?: number }).cost ?? 0), 0);
+      const costLabel =
+        unpriced === 0
+          ? `$${cost.toFixed(5)}`
+          : `$${cost.toFixed(5)}+unpriced(${unpriced}/${calls.length} calls have no price)`;
       const stages = events
         .filter((e) => e.type === 'pipeline')
         .map((e) => `${(e as { stage: string }).stage}:${e.status}`);
 
       console.log(
-        `[live ${m.uri}] attempts=${JSON.stringify(attempts)} calls=${calls.length} cost=$${cost.toFixed(5)} pipeline=${stages.join(',')}`,
+        `[live ${m.uri}] attempts=${JSON.stringify(attempts)} calls=${calls.length} cost=${costLabel} pipeline=${stages.join(',')}`,
       );
     }, 120_000);
   });

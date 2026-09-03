@@ -475,6 +475,28 @@ function appendRetryMessages(
   messages.push({ role: 'user', content: feedbackMessage });
 }
 
+/** `{ retry: false }` — the only object form a `retryFeedback` hook may return. */
+function isRetryAbort(value: unknown): value is { retry: false } {
+  return (
+    typeof value === 'object' && value !== null && (value as { retry?: unknown }).retry === false
+  );
+}
+
+/** Name an off-contract value for an error message without stringifying user objects
+ *  (whose `toString` may throw or dump secrets). Keys only, never values. */
+function describeValue(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return `an array of length ${value.length}`;
+  if (typeof value === 'object') {
+    const keys = Object.keys(value);
+    return keys.length > 0 ? `an object with keys [${keys.join(', ')}]` : 'an empty object';
+  }
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return `the ${typeof value} ${JSON.stringify(value)}`;
+  }
+  return `a value of type ${typeof value}`;
+}
+
 function estimateMessagesTokens(messages: ChatMessage[]): { tokens: number; unmeasured: boolean } {
   let total = 0;
   let unmeasured = false;
@@ -2377,8 +2399,9 @@ export class WorkflowContext<TInput = unknown> {
                     metadata: options.metadata,
                     validate: options.validate,
                     validateRetries: options.validateRetries,
-                    // The routed `ctx.delegate()` path reaches its terminal ask through a
-                    // handoff, so the hook must travel here too (AC5).
+                    // This seam serves both callers of a handoff: a plain `ctx.ask()` on an
+                    // agent with `handoffs`, and the routed `ctx.delegate()` path, whose
+                    // terminal ask is the handoff target. The hook travels like `validate`.
                     retryFeedback: options.retryFeedback,
                   }
                 : undefined;
@@ -2573,13 +2596,18 @@ export class WorkflowContext<TInput = unknown> {
         const attempt = guardrailOutputRetries + 1;
         const maxAttempts = maxGuardrailRetries + 1;
         const onBlock = guardrails.onBlock ?? 'throw';
+        // One reason string for the feedback template, the hook's `info.reason`, and every
+        // throw on this path, so a hook branching on `info.reason` sees exactly what the
+        // caller will catch. The event and span keep the raw `outputResult.reason`: a trace
+        // must not report a reason the guardrail never gave.
+        const blockReason = outputResult.reason ?? 'Output blocked by guardrail';
         let feedbackMessage: string | undefined;
         if (
           outputResult.block &&
           onBlock === 'retry' &&
           guardrailOutputRetries < maxGuardrailRetries
         ) {
-          feedbackMessage = `Your previous response was blocked by a safety guardrail: ${outputResult.reason ?? 'Output blocked'}. Please provide a different response that complies with the guidelines.`;
+          feedbackMessage = `Your previous response was blocked by a safety guardrail: ${blockReason}. Please provide a different response that complies with the guidelines.`;
         }
 
         this.emitEvent({
@@ -2611,7 +2639,7 @@ export class WorkflowContext<TInput = unknown> {
               attempt,
               maxAttempts,
               output: content,
-              reason: outputResult.reason ?? 'Output blocked',
+              reason: blockReason,
               defaultMessage: feedbackMessage,
             });
             if (decision.retry) {
@@ -2620,8 +2648,8 @@ export class WorkflowContext<TInput = unknown> {
                 agent: agent._name,
                 status: 'failed',
                 stage: 'guardrail',
-                attempt: guardrailOutputRetries + 1,
-                maxAttempts: maxGuardrailRetries + 1,
+                attempt,
+                maxAttempts,
                 reason: decision.message,
               });
               guardrailOutputRetries++;
@@ -2635,17 +2663,16 @@ export class WorkflowContext<TInput = unknown> {
               continue; // Re-enter the while loop for another LLM turn
             }
             // `{ retry: false }`: same terminal error as retry exhaustion on this path.
-            throw new GuardrailError(
-              'output',
-              outputResult.reason ?? 'Output blocked by guardrail',
-            );
+            // A cancellation that landed while an async hook awaited is the truer cause.
+            this.currentSignal?.throwIfAborted();
+            throw new GuardrailError('output', blockReason);
           }
           if (typeof onBlock === 'function') {
-            return onBlock(outputResult.reason ?? 'Output blocked by guardrail', {
+            return onBlock(blockReason, {
               metadata: this.metadata,
             });
           }
-          throw new GuardrailError('output', outputResult.reason ?? 'Output blocked by guardrail');
+          throw new GuardrailError('output', blockReason);
         }
       }
 
@@ -2667,7 +2694,10 @@ export class WorkflowContext<TInput = unknown> {
           schemaErr = err;
           schemaReason = err instanceof Error ? err.message : String(err);
           if (schemaRetries < maxSchemaRetries) {
-            schemaFeedback = `Your response was not valid JSON or did not match the required schema: ${schemaReason}. Please fix and try again.`;
+            // Name the whole deliverable, not "fix": the rejected attempt is now the
+            // immediately preceding assistant turn, and "fix and try again" reads as an
+            // invitation to emit a patch of it rather than a complete replacement object.
+            schemaFeedback = `Your response was not valid JSON or did not match the required schema: ${schemaReason}. Return a corrected response that matches the required schema.`;
           }
         }
 
@@ -2706,8 +2736,8 @@ export class WorkflowContext<TInput = unknown> {
                 agent: agent._name,
                 status: 'failed',
                 stage: 'schema',
-                attempt: schemaRetries + 1,
-                maxAttempts: (options.retries ?? 3) + 1,
+                attempt: schemaAttempt,
+                maxAttempts: schemaMaxAttempts,
                 reason: decision.message,
               });
               schemaRetries++;
@@ -2721,6 +2751,8 @@ export class WorkflowContext<TInput = unknown> {
               continue; // Re-enter the while loop for another LLM turn
             }
             // `{ retry: false }`: fall through to the same `VerifyError` as exhaustion.
+            // A cancellation that landed while an async hook awaited is the truer cause.
+            this.currentSignal?.throwIfAborted();
           }
           const zodErr =
             schemaErr instanceof ZodError
@@ -2800,8 +2832,8 @@ export class WorkflowContext<TInput = unknown> {
                 agent: agent._name,
                 status: 'failed',
                 stage: 'validate',
-                attempt: validateRetries + 1,
-                maxAttempts: (options.validateRetries ?? 2) + 1,
+                attempt: validateAttempt,
+                maxAttempts: validateMaxAttempts,
                 reason: decision.message,
               });
               validateRetries++;
@@ -2815,6 +2847,8 @@ export class WorkflowContext<TInput = unknown> {
               continue; // Re-enter the while loop — goes through all gates again
             }
             // `{ retry: false }`: fall through to the same `ValidationError` as exhaustion.
+            // A cancellation that landed while an async hook awaited is the truer cause.
+            this.currentSignal?.throwIfAborted();
           }
           throw new ValidationError(
             validated,
@@ -2851,7 +2885,9 @@ export class WorkflowContext<TInput = unknown> {
    * throws or aborts can never erase the evidence that the gate rejected. A non-empty string
    * replaces `defaultMessage` verbatim; `undefined` / `''` keeps it; `{ retry: false }` asks
    * the gate to throw its typed terminal error. Hook exceptions propagate — a bug in caller
-   * code is not a model failure and must not be retried into silence.
+   * code is not a model failure and must not be retried into silence, and neither is a
+   * return value outside the contract: an unrecognized shape throws instead of silently
+   * degrading to the default text, which would hide the defect behind extra token spend.
    */
   private async resolveRetryFeedback(
     hook: RetryFeedbackHook | undefined,
@@ -2859,13 +2895,15 @@ export class WorkflowContext<TInput = unknown> {
   ): Promise<{ retry: true; message: string } | { retry: false }> {
     if (!hook) return { retry: true, message: info.defaultMessage };
     const result = await hook(info, { metadata: this.metadata });
-    if (typeof result === 'object' && result !== null && result.retry === false) {
-      return { retry: false };
+    // A `void` hook (used for logging or inspection only) lands here alongside `''`.
+    if (result === undefined || result === '') {
+      return { retry: true, message: info.defaultMessage };
     }
-    if (typeof result === 'string' && result.length > 0) {
-      return { retry: true, message: result };
-    }
-    return { retry: true, message: info.defaultMessage };
+    if (typeof result === 'string') return { retry: true, message: result };
+    if (isRetryAbort(result)) return { retry: false };
+    throw new TypeError(
+      `retryFeedback must return a string, undefined, or { retry: false }; received ${describeValue(result)}.`,
+    );
   }
 
   /**

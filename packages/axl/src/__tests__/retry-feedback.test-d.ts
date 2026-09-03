@@ -35,6 +35,41 @@ const delegateOptions: DelegateOptions<{ x: number }> = {
 };
 void delegateOptions;
 
+// A hook used only for logging or inspection never returns a value. A block-bodied arrow
+// infers `void`, which is not assignable to `RetryFeedbackResult` — so the hook's return
+// type must admit `void` or partial adoption does not compile at all.
+const loggingOnly: AskOptions<{ x: number }> = {
+  schema: z.object({ x: z.number() }),
+  retryFeedback: (info) => {
+    void info.output;
+  },
+};
+void loggingOnly;
+
+const asyncLoggingOnly: AskOptions<{ x: number }> = {
+  schema: z.object({ x: z.number() }),
+  retryFeedback: async (info) => {
+    await Promise.resolve(info.stage);
+  },
+};
+void asyncLoggingOnly;
+
+// `parsed` is typed by the ask's schema at the validate stage, so a consumer reads the
+// object's own fields without casting at exactly the point the type is known.
+const typedParsed: AskOptions<{ x: number }> = {
+  schema: z.object({ x: z.number() }),
+  retryFeedback: (info) => {
+    if (info.stage === 'validate' && info.parsed) {
+      const x: number = info.parsed.x;
+      // @ts-expect-error `parsed` is the schema's type, not `any` — unknown fields fail.
+      void info.parsed.notOnTheSchema;
+      return `x was ${x}`;
+    }
+    return undefined;
+  },
+};
+void typedParsed;
+
 // --- Rejected everywhere else ----------------------------------------------
 const agentConfig: AgentConfig = {
   model: 'openai:gpt-4o',

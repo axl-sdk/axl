@@ -23,9 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thrown exception propagates and is never retried into silence. The hook runs
   only while a retry is still permitted and always after the gate's own event,
   which keeps carrying the default text, so an aborting or throwing hook cannot
-  erase the record that the gate rejected. `ctx.metadata` is passed through for
-  multi-tenant callers. New exported types `RetryFeedbackHook`,
-  `RetryFeedbackInfo`, and `RetryFeedbackResult`.
+  erase the record that the gate rejected. A return value outside the contract
+  throws a `TypeError` rather than silently falling back to the default. The
+  workflow `ctx.metadata` is passed through for multi-tenant callers, exactly as
+  `validate` receives it; per-call `AskOptions.metadata` is not merged in. The
+  hook is forwarded to the terminal ask on both `ctx.delegate()` paths and on
+  handoffs, like `validate`. New exported types `RetryFeedbackHook<T>`,
+  `RetryFeedbackInfo<T>`, and `RetryFeedbackResult`; `T` is inferred from
+  `schema`, so `info.parsed` is typed at the validate stage.
 - **Clamped `effort` is now reported: the `provider_diagnostic` event.** Adapters
   clamp the unified `effort` to what each model actually accepts (Gemini 3.x
   cannot disable thinking and caps at `'high'`; OpenAI Chat Completions caps
@@ -70,9 +75,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation retry on those models failed). Feedback is now appended as a
   `user` turn after the assistant attempt. The `validate` feedback text no
   longer affirms the rejected output ("parsed correctly") or points at content
-  the model cannot see ("visible above"). `trace.level: 'full'` message
-  snapshots reflect the new shape; `pipeline`, `guardrail`, `schema_check`, and
-  `validate` events are unchanged.
+  the model cannot see ("visible above"), and the schema feedback now asks for a
+  corrected response that matches the schema rather than to "fix and try again",
+  which read as an invitation to patch the attempt now sitting directly above it.
+  `trace.level: 'full'` message snapshots reflect the new shape. The `pipeline`,
+  `guardrail`, `schema_check`, and `validate` events keep their existing
+  **shape**; the feedback **text** they carry changed with the templates.
 
 ## [0.22.2] - 2026-09-02
 

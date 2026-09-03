@@ -10,13 +10,24 @@ export type SequenceProvider = Provider & {
 };
 
 /**
+ * One response in a `createSequenceProvider` sequence: bare text, or an object carrying
+ * tool calls and/or the `providerMetadata` a real adapter would return (Gemini thought
+ * signatures, Anthropic thinking blocks) so tests can assert it survives onto later turns.
+ */
+export type SequenceResponse =
+  | string
+  | {
+      content?: string;
+      tool_calls?: ToolCallMessage[];
+      providerMetadata?: Record<string, unknown>;
+    };
+
+/**
  * Create a mock provider from a sequence of responses.
- * Each response is either a string (text) or an object with tool_calls.
+ * Each response is either a string (text) or an object with tool_calls/providerMetadata.
  * Tracks all calls in the `calls` array for assertions.
  */
-export function createSequenceProvider(
-  responses: Array<string | { content?: string; tool_calls: ToolCallMessage[] }>,
-): SequenceProvider {
+export function createSequenceProvider(responses: SequenceResponse[]): SequenceProvider {
   let callIndex = 0;
   const calls: Array<{ messages: unknown[]; options: unknown }> = [];
   return {
@@ -35,7 +46,8 @@ export function createSequenceProvider(
       }
       return {
         content: item.content ?? '',
-        tool_calls: item.tool_calls,
+        ...(item.tool_calls ? { tool_calls: item.tool_calls } : {}),
+        ...(item.providerMetadata ? { providerMetadata: item.providerMetadata } : {}),
         usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
         cost: 0.001,
       } as ProviderResponse;

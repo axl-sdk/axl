@@ -3720,9 +3720,17 @@ describe('gate-retry continuation on models without terminal model prefill', () 
       { model: 'gemini-3.6-flash' },
     );
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-    const roles = (body.contents ?? body.input ?? []).map((c: any) => c.role);
+    const contents = body.contents ?? body.input ?? [];
+    const roles = contents.map((c: any) => c.role);
+    // The attempt must sit immediately before the correcting user turn: that ordering is
+    // what makes the request end on `user` and pass the terminal-prefill guard.
     expect(roles.at(-1)).toBe('user');
-    expect(roles).toContain('model');
+    expect(roles.at(-2)).toBe('model');
+    // The thought signature rides the attempt into the request body. Replaying it is the
+    // entire reason the rejected attempt stays in the history as its own model turn.
+    const modelTurn = contents.at(-2);
+    expect(JSON.stringify(modelTurn)).toContain('sig-1');
+    expect(modelTurn.parts.some((p: any) => p.text === '{"value": 1}')).toBe(true);
   });
 
   it('rejects the pre-fix shape [system, user, assistant(attempt), system(feedback)]', async () => {

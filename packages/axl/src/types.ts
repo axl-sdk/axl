@@ -128,7 +128,7 @@ export type AskOptions<T = unknown> = {
   /** Rewrite the corrective feedback the model sees when the guardrail, schema, or validate
    *  gate rejects an attempt — or abort the retry with `{ retry: false }`. See
    *  `RetryFeedbackHook`. */
-  retryFeedback?: RetryFeedbackHook;
+  retryFeedback?: RetryFeedbackHook<T>;
   /** Per-call metadata passed to dynamic model/system selector functions. */
   metadata?: Record<string, unknown>;
   /** Override temperature for this call. */
@@ -173,7 +173,7 @@ export type DelegateOptions<T = unknown> = {
   validateRetries?: number;
   /** Custom gate-retry feedback. Passed through to the final `ctx.ask()` call on both the
    *  single-candidate and the routed path. See `RetryFeedbackHook`. */
-  retryFeedback?: RetryFeedbackHook;
+  retryFeedback?: RetryFeedbackHook<T>;
 };
 
 /** Race options */
@@ -1278,7 +1278,7 @@ export type OutputValidator<T = unknown> = (
 
 /** What a rejecting output gate tells a `retryFeedback` hook about the attempt it is
  *  about to retry. One shape for all three gates — `stage` discriminates. */
-export type RetryFeedbackInfo = {
+export type RetryFeedbackInfo<T = unknown> = {
   /** Which gate rejected: JSON/Zod parse, post-schema `validate`, or output guardrail. */
   stage: 'schema' | 'validate' | 'guardrail';
   /** 1-based index of the attempt that was just rejected. */
@@ -1287,8 +1287,9 @@ export type RetryFeedbackInfo = {
   maxAttempts: number;
   /** Raw model output that was rejected. */
   output: string;
-  /** The parsed, schema-valid object. Present only for `stage: 'validate'`. */
-  parsed?: unknown;
+  /** The parsed, schema-valid object, typed by the ask's `schema`. Present only for
+   *  `stage: 'validate'` — the other gates run before or without a parsed value. */
+  parsed?: T;
   /** The gate's own reason (Zod message, `ValidateResult.reason`, guardrail reason). */
   reason: string;
   /** The `ZodError` (or non-Zod parse error) for `schema`; the validator's thrown error for
@@ -1304,11 +1305,15 @@ export type RetryFeedbackResult = string | undefined | { retry: false };
 
 /** Rewrites (or aborts) the corrective turn the model sees after an output gate rejects an
  *  attempt. Runs only while a retry is still permitted — never on the exhausting attempt —
- *  and after the gate's own event is emitted. Exceptions propagate to the caller. */
-export type RetryFeedbackHook = (
-  info: RetryFeedbackInfo,
+ *  and after the gate's own event is emitted. Exceptions propagate to the caller.
+ *
+ *  `void` is accepted alongside `RetryFeedbackResult` so a hook used purely for logging or
+ *  inspection — a block body that never returns — type-checks; it keeps the default text.
+ *  Any other return value is a contract violation and throws a `TypeError`. */
+export type RetryFeedbackHook<T = unknown> = (
+  info: RetryFeedbackInfo<T>,
   ctx: { metadata: Record<string, unknown> },
-) => RetryFeedbackResult | Promise<RetryFeedbackResult>;
+) => RetryFeedbackResult | void | Promise<RetryFeedbackResult | void>;
 
 /** Execution info */
 export type ExecutionInfoV1 = {

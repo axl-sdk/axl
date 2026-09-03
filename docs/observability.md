@@ -505,9 +505,11 @@ releases.
 
 Three common symptoms and what to look for in traces:
 
-**"My agent cost 3× what I expected."** Filter for `agent_call_end` events and check the `data.turn` field — if you see `turn: 2`, `turn: 3`, etc., the tool-calling loop ran multiple iterations. Check `data.retryReason` on those calls to see whether it was a schema, validate, or guardrail retry. Check the preceding `schema_check` / `validate` / `guardrail` event for the exact failure reason and `feedbackMessage` that was sent back to the LLM.
+**"My agent cost 3× what I expected."** Filter for `agent_call_end` events and check the `data.turn` field — if you see `turn: 2`, `turn: 3`, etc., the tool-calling loop ran multiple iterations. Check `data.retryReason` on those calls to see whether it was a schema, validate, or guardrail retry. Check the preceding `schema_check` / `validate` / `guardrail` event for the exact failure reason and the `feedbackMessage` Axl composed.
 
-**"My structured output keeps failing."** Filter for `schema_check` events with `valid: false`. The `reason` field has the Zod parse error; the `feedbackMessage` is the exact message the model saw on its next attempt. If the feedback isn't clear enough to help the model correct itself, that's a prompt/schema design problem, not a retry-count problem.
+**"My structured output keeps failing."** Filter for `schema_check` events with `valid: false`. The `reason` field has the Zod parse error; the `feedbackMessage` is Axl's default corrective text. If the feedback isn't clear enough to help the model correct itself, that's a prompt/schema design problem, not a retry-count problem.
+
+> **Reading the message the model actually saw.** The gate events always carry Axl's default text. When the ask supplies a [`retryFeedback`](api-reference.md#custom-retry-feedback) hook, the hook's text — not `feedbackMessage` — is what was sent, and it appears on the matching `pipeline` event with `status: 'failed'` as `reason`. Read `pipeline(failed).reason` whenever a hook may be in play, or you will tune text the model never received.
 
 **"Why did my agent respond that way?"** Enable `trace.level: 'full'` and check the `data.messages` array on the relevant `agent_call_start` — it has the exact request conversation (system prompt, history, tool results, retry feedback) immediately before the provider call. Request-side `system` and `params`, plus response-side `thinking`, are visible in default mode without needing verbose; `retryReason` is mirrored on both start and end.
 

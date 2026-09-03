@@ -116,6 +116,23 @@ describe('retryFeedback — replacing the feedback text', () => {
     expect(retryTurn(provider, 1).startsWith(SCHEMA_DEFAULT_PREFIX)).toBe(true);
   });
 
+  it('a hook that returns nothing at all (logging only) keeps the default feedback', async () => {
+    const seen: string[] = [];
+    const provider = createSequenceProvider(['not-json', '{"x":1}']);
+    const { ctx } = createTestCtx({ provider });
+
+    const result = await ctx.ask(jsonAgent(), 'go', {
+      schema: Xs,
+      retryFeedback: (info) => {
+        seen.push(info.stage);
+      },
+    });
+
+    expect(result).toEqual({ x: 1 });
+    expect(seen).toEqual(['schema']);
+    expect(retryTurn(provider, 1).startsWith(SCHEMA_DEFAULT_PREFIX)).toBe(true);
+  });
+
   it('a whitespace-only string is a genuine override, not an empty return', async () => {
     const provider = createSequenceProvider(['not-json', '{"x":1}']);
     const { ctx } = createTestCtx({ provider });
@@ -189,7 +206,7 @@ describe('retryFeedback — the info payload', () => {
     expect(info.error).toBeInstanceOf(errorType);
     expect(info.reason).toBe((info.error as Error).message);
     expect(info.defaultMessage).toBe(
-      `Your response was not valid JSON or did not match the required schema: ${info.reason}. Please fix and try again.`,
+      `Your response was not valid JSON or did not match the required schema: ${info.reason}. Return a corrected response that matches the required schema.`,
     );
   });
 
@@ -297,7 +314,7 @@ describe('retryFeedback — the info payload', () => {
     // on its own.
     expect(hookMetadata).toEqual(validateMetadata);
     expect(hookMetadata).toEqual({ tenant: 'acme' });
-    expect(hookMetadata).not.toEqual({ plan: 'pro' });
+    expect(hookMetadata).not.toHaveProperty('plan');
   });
 });
 
@@ -432,6 +449,26 @@ describe('retryFeedback — { retry: false } throws the gate error as on exhaust
     expect(failedReasons(traces)).toEqual([]);
   });
 
+  it('reports the cancellation, not the gate error, when the ask was aborted mid-hook', async () => {
+    const cancelled = new Error('cancelled');
+    const controller = new AbortController();
+    const provider = createSequenceProvider(['not-json', '{"x":1}']);
+    const { ctx } = createTestCtx({ provider, signal: controller.signal });
+
+    const err = await ctx
+      .ask(jsonAgent(), 'go', {
+        schema: Xs,
+        retryFeedback: async () => {
+          controller.abort(cancelled);
+          return { retry: false as const };
+        },
+      })
+      .catch((e: unknown) => e);
+
+    expect(err).toBe(cancelled);
+    expect(err).not.toBeInstanceOf(VerifyError);
+  });
+
   it('A8(c): guardrail throws GuardrailError carrying the guardrail reason, not the feedback text', async () => {
     const provider = createSequenceProvider(['blocked', 'fine']);
     const { ctx, traces } = createTestCtx({ provider });
@@ -446,6 +483,46 @@ describe('retryFeedback — { retry: false } throws the gate error as on exhaust
     expect(provider.calls).toHaveLength(1);
     expect(gateEvents(traces, 'guardrail')).toHaveLength(1);
     expect(failedReasons(traces)).toEqual([]);
+  });
+});
+
+describe('retryFeedback — off-contract returns fail loudly', () => {
+  it.each([
+    ['a number', 42],
+    ['an object without `retry: false`', { message: 'coach the model' }],
+    ['{ retry: true }', { retry: true }],
+    ['null', null],
+  ])('rejects with a TypeError naming %s', async (_label, value) => {
+    const provider = createSequenceProvider(['not-json', '{"x":1}']);
+    const { ctx } = createTestCtx({ provider });
+
+    const err = await ctx
+      .ask(jsonAgent(), 'go', {
+        schema: Xs,
+        // A JavaScript caller has no compiler to stop this; silently using the default
+        // would hide the defect behind extra token spend.
+        retryFeedback: () => value as unknown as string,
+      })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(TypeError);
+    expect((err as TypeError).message).toContain('retryFeedback must return');
+    expect(provider.calls).toHaveLength(1);
+  });
+
+  it('names the received shape without stringifying its values', async () => {
+    const provider = createSequenceProvider(['not-json', '{"x":1}']);
+    const { ctx } = createTestCtx({ provider });
+
+    const err = await ctx
+      .ask(jsonAgent(), 'go', {
+        schema: Xs,
+        retryFeedback: () => ({ apiKey: 'sk-secret' }) as unknown as string,
+      })
+      .catch((e: unknown) => e);
+
+    expect((err as TypeError).message).toContain('an object with keys [apiKey]');
+    expect((err as TypeError).message).not.toContain('sk-secret');
   });
 });
 

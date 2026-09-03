@@ -1146,24 +1146,27 @@ Retries are **additive, not multiplicative** — each gate has its own counter t
 `AskOptions.retryFeedback` (also `DelegateOptions.retryFeedback`) is one hook across all three gates. It runs when a gate has just rejected an attempt and a retry is still permitted, and it decides what the model is told:
 
 ```ts
-type RetryFeedbackInfo = {
+type RetryFeedbackInfo<T = unknown> = {
   stage: 'schema' | 'validate' | 'guardrail';
   attempt: number;          // 1-based index of the attempt just rejected
   maxAttempts: number;      // retries + 1 for that gate
   output: string;           // the raw rejected model output
-  parsed?: unknown;         // the schema-valid object — `stage: 'validate'` only
+  parsed?: T;               // the schema-valid object — `stage: 'validate'` only
   reason: string;           // the gate's own reason
-  error?: unknown;          // ZodError (schema) or the validator's thrown error (validate)
+  error?: unknown;          // the ZodError or the raw parse error (e.g. SyntaxError) for
+                            // schema; the validator's thrown error for validate
   defaultMessage: string;   // what Axl would send if the hook did not intervene
 };
 
 type RetryFeedbackResult = string | undefined | { retry: false };
 
-type RetryFeedbackHook = (
-  info: RetryFeedbackInfo,
+type RetryFeedbackHook<T = unknown> = (
+  info: RetryFeedbackInfo<T>,
   ctx: { metadata: Record<string, unknown> },
-) => RetryFeedbackResult | Promise<RetryFeedbackResult>;
+) => RetryFeedbackResult | void | Promise<RetryFeedbackResult | void>;
 ```
+
+`T` is inferred from `schema`, so `info.parsed` is the typed object at the validate stage.
 
 ```ts
 const order = await ctx.ask(extractor, invoiceText, {
@@ -1178,12 +1181,15 @@ const order = await ctx.ask(extractor, invoiceText, {
 Semantics:
 
 - **A non-empty string** replaces `defaultMessage` verbatim as the user turn the model receives, and becomes `pipeline(failed).reason`. Decorate rather than replace by composing with `info.defaultMessage`.
-- **`undefined` or `''`** keeps the default text.
+- **`undefined` or `''`** keeps the default text. A hook that returns nothing at all — used purely for logging or inspection — is the same case, which is why the return type admits `void`.
 - **`{ retry: false }`** stops retrying: the gate immediately throws the same typed error it would throw on exhaustion, with the same payload (`GuardrailError`, `VerifyError` with the raw output and Zod error, or `ValidationError` with the last parsed value). No further provider call is made.
 - **A thrown exception propagates** out of `ctx.ask()` unchanged, and no further provider call is made. Unlike `validate`, whose exceptions become validation failures, a broken feedback hook is caller-code breakage, not a model failure, and is never retried into silence.
 - The hook is **never called on the exhausting attempt** — when no retry is left, the gate throws without consulting it.
 - The legacy gate events (`guardrail`, `schema_check`, `validate`) are emitted **before** the hook runs and always carry `defaultMessage` in `feedbackMessage`, so a hook that throws or aborts can never erase the record that the gate rejected. Only `pipeline(failed).reason` and the appended user turn carry the final text.
-- `ctx.metadata` (merged with per-call `metadata`) is passed as the second argument, mirroring `OutputValidator`, so multi-tenant callers can scope the feedback they generate.
+- **Any other return value throws a `TypeError`** naming the shape received. TypeScript rules these out, but a JavaScript caller returning `{ message: '…' }` or `{ retry: true }` would otherwise get the default text with no signal at all.
+- The second argument is the **workflow** `ctx.metadata`, exactly what `OutputValidator` receives. Per-call `AskOptions.metadata` is **not** merged in — it is merged only for dynamic `model` / `system` selectors — so scope multi-tenant feedback on the context metadata, not on per-call metadata.
+
+**Supported on:** `ctx.ask()` and `ctx.delegate()`. On delegate and handoffs, `retryFeedback` is forwarded to the final agent call, exactly like [`validate`](#validate) — including a plain `ctx.ask()` on an agent with `handoffs`, where the hook travels to the handoff target's ask.
 
 The hook is ask-scoped: it is not available on `AgentConfig`, and it does not apply to `ctx.verify()` (whose retry feedback goes to caller code, not to the model) or `ctx.race()` (which discards failures rather than retrying).
 

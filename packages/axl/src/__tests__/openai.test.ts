@@ -1315,7 +1315,7 @@ describe('direct OpenAI Standard estimator', () => {
   });
 
   it('recognizes only exact aliases and documented snapshots', () => {
-    expect(estimateDirectOpenAICost('gpt-5.6', usage(100))).toBeCloseTo(800e-6, 12);
+    expect(estimateDirectOpenAICost('gpt-5.6', usage(100))).toBeCloseTo(600e-6, 12);
     expect(estimateDirectOpenAICost('gpt-4o-2024-05-13', usage(100))).toBeCloseTo(650e-6, 12);
     expect(estimateDirectOpenAICost('gpt-3.5-turbo-1106', usage(100))).toBeCloseTo(120e-6, 12);
     expect(estimateDirectOpenAICost('gpt-4o-2024-05-14', usage(100))).toBeUndefined();
@@ -1426,15 +1426,15 @@ describe('direct OpenAI Standard estimator', () => {
 
   it('changes full-request rates strictly above the long-context boundary', () => {
     expect(estimateDirectOpenAICost('gpt-5.6-sol', usage(271_999, 1))).toBeCloseTo(
-      (271_999 * 5 + 30) / 1_000_000,
+      (271_999 * 4 + 20) / 1_000_000,
       12,
     );
     expect(estimateDirectOpenAICost('gpt-5.6-sol', usage(272_000, 1))).toBeCloseTo(
-      (272_000 * 5 + 30) / 1_000_000,
+      (272_000 * 4 + 20) / 1_000_000,
       12,
     );
     expect(estimateDirectOpenAICost('gpt-5.6-sol', usage(272_001, 1))).toBeCloseTo(
-      (272_001 * 10 + 45) / 1_000_000,
+      (272_001 * 8 + 30) / 1_000_000,
       12,
     );
     expect(estimateDirectOpenAICost('gpt-5.4', usage(272_001, 1))).toBeCloseTo(

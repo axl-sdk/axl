@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published pricing page while remaining callable, so its usage is now reported
   with `cost: undefined` instead of a stale, unverifiable rate. Requests to it
   are unaffected.
+- **`gpt-5.6` / `gpt-5.6-sol` was priced above its current rate.** The catalog
+  held $5 / $0.50 cached / $6.25 cache write / $30, but Sol is on a promotional
+  $4 / $0.40 / $5 / $20 (announced as running at least through 2026-11-21), so
+  output was overestimated 50%. The long-context tier derives from the short row
+  and moves with it. `gpt-5.6-terra` and `gpt-5.6-luna` were already correct.
 - **Claude Sonnet 5 was overpriced 50% from September 1, 2026.** The rate table
   encoded Anthropic's *announced* increase from the introductory $2/$10 to
   $3/$15 as a forward-dated gate, so every `claude-sonnet-5` cost estimate

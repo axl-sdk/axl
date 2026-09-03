@@ -916,7 +916,9 @@ Sonnet 5, Sonnet 4.6, Sonnet 4.5; **4,096 on Haiku 4.5**.
 emits one `log` warning naming the agent in either of two shapes: writes with no reads
 (the prefix changes per call), or no cache activity at all — neither writes nor reads —
 which is what a prefix below the model's minimum looks like, since Anthropic then
-silently ignores the breakpoint. (Scope is one `WorkflowContext`; a
+silently ignores the breakpoint. Only adapters that declare the optional
+`realizesPromptCache()` capability — the built-in Anthropic adapter today — receive these
+warnings; `MockProvider` does not declare it, so they do not fire in mock-based tests. (Scope is one `WorkflowContext`; a
 `Session` builds a fresh context per turn, so churn across session turns is not observed.)
 
 **Interaction with `providerOptions`.** If `providerOptions` supplies a top-level

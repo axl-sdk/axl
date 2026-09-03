@@ -181,6 +181,17 @@ export interface Provider {
   nativeStructuredOutputSupport?(model: string): 'schema' | 'downgraded' | 'lossy' | 'unsupported';
 
   /**
+   * Whether this adapter realizes `ChatOptions.promptCache` for this model --
+   * i.e. actually places a cache breakpoint on the request. The runtime only
+   * emits the promptCache diagnostics (cold writes with no reads; no cache
+   * activity at all) for adapters that declare this, because on providers
+   * that cache automatically the absence of cache fields is not a signal.
+   * Adapters that omit this method opt out; the built-in Anthropic adapter is
+   * the only one that declares it today.
+   */
+  realizesPromptCache?(model: string): boolean;
+
+  /**
    * How this provider resolved the unified `effort` knob for this request.
    *
    * Adapters clamp `effort` to what each model actually accepts (Gemini 3.x

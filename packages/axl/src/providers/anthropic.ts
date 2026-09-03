@@ -825,6 +825,11 @@ export class AnthropicProvider implements Provider {
 
   /** Anthropic ignores native `json_schema` structurally — Axl uses a system
    *  prompt JSON instruction + client-side Zod validation (see buildRequest). */
+  /** The only built-in adapter that honors `promptCache` (see buildBody). */
+  realizesPromptCache(): boolean {
+    return true;
+  }
+
   nativeStructuredOutputSupport(): 'unsupported' {
     return 'unsupported';
   }

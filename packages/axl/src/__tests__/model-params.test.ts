@@ -179,11 +179,15 @@ describe('Configurable Model Parameters', () => {
 
   describe('promptCache cold-write diagnostic', () => {
     class UsageProvider {
+      readonly name = 'test';
       private i = 0;
       constructor(
         private readonly usages: Array<Record<string, number>>,
-        readonly name: string = 'anthropic',
+        private readonly realizes: boolean = true,
       ) {}
+      realizesPromptCache(): boolean {
+        return this.realizes;
+      }
       async chat() {
         const u = this.usages[Math.min(this.i++, this.usages.length - 1)];
         return {
@@ -230,20 +234,18 @@ describe('Configurable Model Parameters', () => {
       expect(warnings[0]).toContain('no cache writes or reads');
     });
 
-    it('stays silent on providers that do not realize promptCache', async () => {
-      // OpenAI and Gemini cache automatically and report no cache fields below
-      // their minimums; promptCache is a documented no-op there, so the
-      // Anthropic-worded floor advice must never fire for them.
-      for (const name of ['openai', 'google', 'test']) {
-        const provider = new UsageProvider([{}], name);
-        const onTrace = vi.fn();
-        const ctx = createTestContext(provider as any, { onTrace });
-        const a = agent({ model: 'test:m', system: 'short', promptCache: true });
-        await ctx.ask(a, 'one');
-        await ctx.ask(a, 'two');
-        await ctx.ask(a, 'three');
-        expect(warningsFrom(onTrace)).toHaveLength(0);
-      }
+    it('stays silent on adapters that do not declare realizesPromptCache', async () => {
+      // Providers that cache automatically report no cache fields below their
+      // minimums; promptCache is a documented no-op there, so the floor advice
+      // must never fire. Adapters opt in through the capability, not by name.
+      const provider = new UsageProvider([{}], false);
+      const onTrace = vi.fn();
+      const ctx = createTestContext(provider as any, { onTrace });
+      const a = agent({ model: 'test:m', system: 'short', promptCache: true });
+      await ctx.ask(a, 'one');
+      await ctx.ask(a, 'two');
+      await ctx.ask(a, 'three');
+      expect(warningsFrom(onTrace)).toHaveLength(0);
     });
 
     it('stays silent when writes are followed by reads, and when promptCache is off', async () => {

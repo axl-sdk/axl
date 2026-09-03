@@ -21,6 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at **0.025x**. `estimateAnthropicCost` previously hardcoded 0.1x, which would
   have overpriced Fable 5.1 cache reads 4x.
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **`gemini-3.7-flash` and `gemini-3.8-flash` had no pricing.** Both were
@@ -87,6 +104,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. Calling an adapter directly no longer logs a clamp warning; use
   `Provider.effortResolution()`.
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **Gate-retry feedback is delivered as a user turn.** Guardrail, schema, and
@@ -147,6 +181,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now creates a GitHub Release and Announcements discussion from the canonical
   versioned changelog section, with an extraction contract checked in CI.
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **Lint is clean.** Eval Zod-error recognition now uses a structural type guard,
@@ -175,6 +226,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of life in March 2026, so CI and all published package engine declarations
   now target supported Node.js 22 and 24 releases.
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **Inline media is bounded before allocation.** Ordered image inputs accept at
@@ -194,6 +262,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upload through Gemini Files and use a `google` provider-file reference.
 
 ## [0.21.1] - 2026-08-28
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -237,6 +322,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to attach in production without `verifyUpgrade`. Deployments whose host
   independently authenticates raw upgrades must explicitly set
   `dangerouslyAllowUnauthenticatedWebSockets: true`.
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -346,6 +448,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   abort-ignoring continuation no longer hangs the entire workflow forever and
   instead marks the trace incomplete.
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **Tool boundaries fail closed on hostile edge shapes.** Provider tool
@@ -386,6 +505,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Configured tool mocks honor model-output policy.** `AxlTestRuntime.mockTool()` still bypasses the configured handler, schema, approval, retry, and hooks, but a matching configured local tool now deliberately supplies its `sensitive` and `toModelOutput` policy so tests shape model context the same way as production. Unconfigured overrides retain legacy serialization.
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -475,6 +611,23 @@ cliffs.
   `.transform()`/`.pipe()` in the schema (pure, runs inside `.parse`, no extra
   LLM turn) and `ctx.verify` (LLM-in-the-loop). See `docs/use-cases.md`.
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 - **Groq `json_schema` support is now per-model.** `nativeStructuredOutput` on
   Groq's `llama`/`gemma`/etc models used to send a `response_format: json_schema`
@@ -491,6 +644,23 @@ cliffs.
   `eventCostContribution()` or null-guard optional `response.cost`.
 
 ## [0.18.2] - 2026-05-31
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 - **Typed scorers compile again under `strict` (regression from 0.18.1).** The `applies?` field added to `Scorer` / `ScorerConfig` in 0.18.1 was declared as a function-valued **property**, whose parameters `strictFunctionTypes` checks contravariantly. That broke assignability of a concretely-typed `Scorer<…, TInput, TAnnotations>` to the `Scorer<unknown, unknown, unknown>[]` element type of `EvalConfig.scorers` — so any scorer built with concrete generics failed to typecheck when passed to `defineEval`, whether or not it used `applies`. `applies` is now declared with **method syntax** (like `score`), which TS checks bivariantly, restoring 0.18.0 assignability. Runtime behavior is unchanged and the public `ScorerApplies` type alias stays (for authoring/documentation). A `*.test-d.ts` guard, compiled by the `typecheck` CI gate, now locks the assignment in. (0.18.1's "Purely additive" note was incorrect for typed scorers under `strict`.)
@@ -547,6 +717,23 @@ A small Gemini-focused release: ship pricing for the new `gemini-3.5-flash` GA m
 ### Added
 - **`google:gemini-3.5-flash` pricing.** Adds the GA identifier to `GEMINI_PRICING` at $1.50 input / $9.00 output per 1M tokens (cached input $0.15/1M — the standard 10% of input rate, no special-casing needed). The 3.x code paths (`isGemini3x` regex `^gemini-3[.-]`, `thinkingLevel` mapping, `minThinkingLevel`) already covered the model — this release adds pricing only. Versioned identifiers (`gemini-3.5-flash-001`-style) resolve to the same rate via the existing longest-prefix matcher.
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 - **Gemini provider now round-trips `functionCall.id` end-to-end for Gemini 3.x models.** Per Google's function-calling docs, Gemini 3 always returns a unique `id` on every `functionCall` and requires it back in the matching `functionResponse` so the model can correlate results to calls. Previously Axl generated a synthetic id (`call_N`) on incoming and built `functionResponse` without `id`, which could cause `gemini-3.5-flash` (and other 3.x models) to misattribute results in turns that issued parallel tool calls. The fix is asymmetric — the assistant-side round-trip via `providerMetadata.geminiParts` already preserved the id verbatim; only the incoming-id capture and outbound `functionResponse` build needed updating. Gemini 2.x behavior is unchanged: when no native `functionCall.id` has been observed in the conversation, the outbound `functionResponse` omits the `id` field (bit-for-bit identical payload to before).
 
@@ -583,6 +770,23 @@ Production-grade state layer: **crash-survival** for in-flight traces, **GDPR de
 ### Changed
 - **`RedisStore.listExecutions` / `listEvalResults` are now O(log N).** Each save dual-writes the id into a timestamp-scored sorted set; reads use a `ZRANGE` + single `MGET` instead of `SMEMBERS` + N round-trips — flat regardless of history size. A one-time lazy backfill builds the index on startup; for six-figure installs, pass `skipMigration: true` and call `backfillExecutionIndex()` / `backfillEvalIndex()` during a maintenance window. Signatures unchanged.
 - **All `RedisStore` multi-key writes are atomic** via `MULTI/EXEC`, so a crash mid-write can't leave half-committed state (an indexed id with no data blob, a session that lists but reads empty).
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 - **`ctx.awaitHuman()` now wakes on signal abort.** A workflow paused on `awaitHuman` used to hang forever when its execution was aborted (including via `deleteExecution` on the same id); the promise now races the signal and rejects with `AbortError`.
@@ -632,6 +836,23 @@ for await (const e of stream.stringStream({ path: '/summary' })) {
 
 ## [0.17.4] - 2026-05-04
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **Studio aggregator no longer crashes on a malformed stored execution.** When `runtime.getExecutions()` / `runtime.getExecution()` loaded an `ExecutionInfo` from a `StateStore` where `events` was missing, `null`, or otherwise non-array (custom store implementations, schema drift, partial deserialization), Studio's `TraceAggregator.rebuild()` threw `TypeError: exec.events is not iterable` at startup — and because all four aggregators boot under `Promise.all`, a single bad row took down the Cost Dashboard, Trace Stats, Workflow Stats, and Eval Trends panels together. The same crash was reachable from `GET /api/executions/:id` and the redaction layer, which both iterate `events`. Fix is at the runtime boundary: `getExecutions()` and `getExecution()` now coerce non-array `events` to `[]` before returning, restoring the `events: AxlEvent[]` type contract for every consumer. One `console.warn` per offending `executionId` (deduped) flags the bad row so operators can investigate the underlying store. Built-in `SQLiteStore` was already safe; `RedisStore` and custom stores were the exposed paths.
@@ -652,6 +873,23 @@ Iterate workflow events from inside the handler, between `ctx.ask()` calls. See 
 - **Multi-agent sessions stamp the originating agent** on each assistant message (`ChatMessage.agent`), surfaced as a clickable badge in Studio's Session Manager. Backward compatible; never sent on outbound provider payloads.
 - **`runtime.on('session_lock_contended', ...)`** to observe when concurrent calls queue on one session id.
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 - **Concurrent `session.send()` calls no longer lose messages** — `send` / `stream` / `end` / `fork` serialize per session id. `fork` acquires both source and target locks (deadlock-free) and refuses to overwrite existing history without `{ overwrite: true }`. (Cross-process locking is not provided — see the Sessions → Concurrency docs.)
 - **A throwing `ctx.events` listener no longer crashes the workflow** — listener exceptions are caught and logged.
@@ -666,11 +904,45 @@ Iterate workflow events from inside the handler, between `ctx.ask()` calls. See 
 
 ## [0.17.2] - 2026-04-30
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **`@axlsdk/eval` / `@axlsdk/studio`: register tsx's CJS hook alongside the ESM hook.** When a `.ts` eval (or config) file lived in a CJS-typed package and its import chain reached a CJS workspace dep that did `require('./helper.ts')` transitively, the load failed with `ES Module ... cycle` / `Unknown file extension '.ts'`. Cause: 0.17.0 switched to `tsx/esm/api`'s `register()` for chained `.ts` imports, but only the ESM hook was registered — `require()` calls have their own resolution path and bypass it, falling through to Node's `require(esm)` machinery, which can't bridge to a `.ts` file with no CJS handler. `ensureTsxRegistered()` in `@axlsdk/axl`'s shared `cli-internals` now also registers `tsx/cjs/api`, mirroring what tsx's own CLI does. The `--conditions` caveat about CJS chains is unchanged — that's about Node's `module.register()` being ESM-only for *resolution* hooks, which is independent of which file extensions tsx can transform.
 
 ## [0.17.1] - 2026-04-30
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -694,6 +966,23 @@ The headline fix: when `tsx` loaded a `.ts` eval from a CJS package, the `execut
 - **`axl-eval`: glob expansion** (`'evals/**/*.eval.ts'`, quoted) for Windows / non-expanding shells.
 - **`EvalExecuteWorkflow` exported from `@axlsdk/axl`** — one source of truth for a shape that was inlined (and had drifted) four times.
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 - **Symmetric ESM/CJS interop for named exports** via a shared `pickExport(mod, key)` helper, so future named exports resolve consistently.
 - **`--conditions development` now transforms chained `.ts` imports** (switched to a one-time `register()`). Caveat: `--conditions` is ESM-only — `require()` chains in CJS packages bypass the hook (use `"type": "module"` or `.mts`).
@@ -705,6 +994,23 @@ The headline fix: when `tsx` loaded a `.ts` eval from a CJS package, the `execut
 ### Added
 - **Studio: system theme detection with auto / light / dark toggle** in the sidebar footer — respects the OS scheme by default, persists to `localStorage`, syncs across tabs, and applies the resolved theme before the bundle loads to avoid a flash.
 - **Studio: `ResizableSplit` stacks vertically on narrow containers** (via `ResizeObserver`) instead of crushing both panes — affects workflow runner, playground, tool inspector, session manager, and trace explorer on phone-sized viewports.
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 - **Studio: responsive layout for narrow viewports** — sidebar auto-collapses below 768px (until the user toggles, which then locks in), stat cards and badges clip cleanly instead of overflowing, wide tables scroll horizontally, and panel chrome tightens below `sm`. The sidebar `matchMedia` listener no longer stomps an explicit user toggle.
@@ -740,6 +1046,23 @@ See [`docs/migration/unified-event-model.md`](docs/migration/unified-event-model
 - **Testing:** `MockProvider.chunked(contents, chunkSize?)` and `MockProvider.sequence({ chunks })` for streaming / partial-JSON tests; `AxlTestRuntime` accepts `{ config }` for trace parity.
 - **Studio:** live `AskTree` (the new default Workflow Runner timeline) + `AskDetails` / `RetryIndicator` / `PartialObjectRenderer`; Cost Dashboard retry-overhead breakdown by `retryReason`; Trace Explorer depth indentation + failure-row highlighting; `GET /api/executions/:id?since={step}` paginated tail; strict `AxlEvent` client types via type-only imports.
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 - **`AxlStream.fullText` no longer leaks retried-attempt tokens** — committed on `pipeline(committed)`, discarded on `pipeline(failed)` / `ask_end({ok:false})`. With the leak fixed at source, **`validate` + streaming now coexist** (was a hard error in 0.15.x).
 - **Ask-failure invariant hardened** — `ctx.ask()` always emits `ask_end` regardless of exit path (pinned by tests across guardrail block, MaxTurns, Timeout, provider throw, budget). `workflow_end` is idempotent (first-wins); a throwing `onAgentCallComplete` hook no longer corrupts `ask_end.outcome`.
@@ -771,6 +1094,23 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 - **Three-layer redaction** (emit / REST / WS) with a full set of non-mutating `redact*` helpers, `redactErrorMessage` (allow-lists structural error names that carry no user input), and multi-tenant `filterTraceEvent` + `verifyUpgrade` metadata. `formatCost` gains tiered precision so embedder costs don't collapse to `$0.0000`. Eval items keep a stable `Item N` label when scrubbed.
 - **Studio testing scaffolding** — React Testing Library + per-file jsdom opt-in, with regression suites seeded for the shared components.
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 - **`CostData.byWorkflow` was always empty in production** — the aggregator's early-return short-circuited `workflow_start` events, and `emitTrace` only stamped `workflow` on start/end events. Both fixed; cost now buckets by workflow.
 - **`OpenAIEmbedder` now uses `fetchWithRetry`** — a transient 429/503/529 on the embeddings endpoint was previously fatal.
@@ -792,11 +1132,45 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 ### Changed
 - **Studio: panel titles normalized to `{Noun} {Verb}`** ("Workflows" → "Workflow Runner", "Evals" → "Eval Runner"); `readOnly` block list uses precise regex (compare allowed; import / run / rescore blocked).
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 - **Studio: `POST /api/evals/compare` is now ID-based** (`{ baselineId, candidateId }`, resolved server-side), dropping the wire payload from ~150KB to ~100B so it no longer hits host body-parser limits behind NestJS/Express. Allowed in `readOnly` mode (pure computation).
 - **Studio: unified panel-header typography** (fixing a nested-`truncate` inline-flow bug), plus a batch of `CommandPicker` fixes (offscreen flip, arrow-nav reset, Tab / ⌘K handling, `aria-activedescendant`/`aria-selected`) and a run-count stepper double-commit race.
 
 ## [0.13.8] - 2026-04-12
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -813,6 +1187,23 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 
 ### Changed
 - **Eval:** `evalCompare()` rounds to 3 decimals (was 2); `rescore()` strips `runGroupId`/`runIndex` so rescored results are independent.
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 - **Testing:** `MockProvider.fn()` / `.sequence()` now respect handler-provided `usage`/`cost` instead of overwriting them with defaults.
@@ -835,6 +1226,23 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 ### Changed
 
 - **Studio:** Score colors simplified from 5-tier to 3-tier system: `>=0.8` green, `>=0.5` amber, `<0.5` red
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -875,12 +1283,46 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 
 ## [0.13.3] - 2026-04-01
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **Core:** `extractJson()` fast path no longer returns trailing text after JSON — content like `{"score": 0.7}\nI hope this helps!` is now correctly extracted
 - **Eval:** Scorer returning `NaN`, `Infinity`, or `-Infinity` is now treated as an error (`null` score) instead of being stored as a valid score that pollutes summary statistics
 
 ## [0.13.2] - 2026-04-01
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -932,6 +1374,23 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 
 - **Core:** `AxlRuntime.getExecutions()` is now async (returns `Promise<ExecutionInfo[]>` instead of `ExecutionInfo[]`). This is a breaking change for callers that used it synchronously
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **Studio:** Eval Runner history tab now persists across page navigation and refresh — backed by server-side storage via the runtime instead of client-only React state
@@ -939,11 +1398,45 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 
 ## [0.11.6] - 2026-03-30
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **Studio:** Eval Runner results renderer crashed with `Cannot read properties of undefined (reading 'toFixed')`. The panel's local types assumed `summary` was `Record<string, {mean, min, max, count}>` but the real `EvalResult` from `@axlsdk/eval` has `summary: { count, failures, scorers: Record<string, {mean, min, max, p50, p95}> }`. Now correctly reads `summary.scorers`, displays p50/p95 columns, shows run metadata (count, failures, duration, cost), and aligns the comparison view to `EvalComparison`
 
 ## [0.11.5] - 2026-03-30
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -951,11 +1444,45 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 
 ## [0.11.4] - 2026-03-30
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **Studio:** Eval lazy loader (`createEvalLoader`) now works in the CJS bundle. `import.meta.url` is `undefined` in tsup's CJS output (stubbed as `{}`), so `tsImport()` received an invalid `parentURL`. Falls back to `pathToFileURL(__filename).href` — same class of fix as the 0.10.4 `fileURLToPath` issue, but in the eval loading path
 
 ## [0.11.3] - 2026-03-30
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -963,11 +1490,45 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 
 ## [0.11.2] - 2026-03-30
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **Eval CLI & Studio:** Eval file module resolution now unwraps the CJS double-default (`mod.default.default`) the same way config loading does. Previously, eval files compiled from TypeScript to CJS (e.g., `.js` files in CJS-default projects) would fail validation because the double-wrapped default wasn't unwrapped
 
 ## [0.11.1] - 2026-03-30
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -990,6 +1551,23 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 
 - **Breaking: `runEval()` signature** (`@axlsdk/eval`): `runtime` and `provider` are now required positional parameters. `runtime` is typed as `AxlRuntime` instead of `unknown`
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - Contexts from `createContext()` now emit trace events to the runtime `EventEmitter` — previously `createContext()` was "lightweight" and skipped trace wiring, causing cost to show as $0.00 for eval files using `runtime.createContext()` + `ctx.ask()`
@@ -999,11 +1577,45 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 
 ## [0.10.4] - 2026-03-22
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **CJS bundle of `@axlsdk/studio/middleware`** no longer throws `TypeError` on `fileURLToPath(undefined)`. tsup replaces `import.meta` with an empty object in CJS, so the `import.meta.dirname ?? dirname(fileURLToPath(import.meta.url))` pattern broke. Added `__dirname` fallback between the two, matching the pattern already used in `cli.ts`
 
 ## [0.10.3] - 2026-03-22
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -1020,6 +1632,23 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 ### Added
 
 - **Lazy eval loading on Studio middleware** (`evals` option on `createStudioMiddleware`): Dynamically import eval files on first access to eval endpoints, not at startup. Eval files are standalone entry points that can import from any module without creating circular deps in the static module graph. Supports glob patterns (`'evals/*.eval.ts'`), explicit file paths, recursive globs (`'evals/**/*.eval.ts'`), and monorepo import conditions. Eval names are the file's cwd-relative path (`evals/api/accuracy.eval.ts` → `"evals/api/accuracy"`), completely stable regardless of what other files or patterns exist. `@axlsdk/eval` can remain a `devDependency` — bundlers can't see dynamic `import()` calls. Lazy-loaded evals coexist with evals registered directly via `runtime.registerEval()`
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -1040,6 +1669,23 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 - **`cors` option** on `createServer()`: Conditional CORS (false for embedded middleware where host framework owns CORS policy)
 - **Client-side basePath support**: `api.ts`, `ws.ts`, and `App.tsx` read `window.__AXL_STUDIO_BASE__` for API prefix, WebSocket URL, and React Router basename
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **Client WebSocket wildcard matching**: `trace:*` subscriptions now correctly receive events sent with actual channel names (e.g., `trace:abc123`). Previously, the `WsClient.onmessage` handler only did exact-match lookups, so wildcard listeners were never invoked — the Trace Explorer's live event feed silently fell back to polling
@@ -1057,6 +1703,23 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 - **Vite `base: './'`**: Asset references in built HTML are now relative, enabling the SPA to work at any mount point when combined with the `<base>` tag injection
 
 ## [0.9.1] - 2026-03-19
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -1087,6 +1750,23 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 
 ## [0.7.6] - 2026-03-18
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - OpenAI cached token pricing now uses per-model multipliers instead of a flat 50%: gpt-4o era = 50%, gpt-4.1/o3/o4 era = 25%, gpt-5 era = 10%
@@ -1095,11 +1775,45 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 
 ## [0.7.5] - 2026-03-18
 
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
+
 ### Fixed
 
 - **Studio CLI:** Pass Hono app instance to `createNodeWebSocket()` instead of `undefined` — fixes WebSocket upgrade crash (`TypeError: Cannot read properties of undefined (reading 'request')`)
 
 ## [0.7.4] - 2026-03-17
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -1107,6 +1821,23 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 - **Studio CLI:** ESM-forcing resolve hook no longer fires for `.mts`/`.cts` files (fix from 0.7.3 now properly tested)
 
 ## [0.7.3] - 2026-03-17
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -1128,6 +1859,23 @@ Headline: **cost attribution for semantic memory** (embedder spend now rides the
 - **Studio CLI:** Default config recommendation changed from `axl.config.ts` to `axl.config.mts` for guaranteed ESM semantics
 
 ## [0.7.1] - 2026-03-17
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 
@@ -1185,6 +1933,23 @@ const runtime = new AxlRuntime({ state: { store } });
 - Dynamic handoffs function now receives merged per-call metadata, consistent with `resolveModel` and `resolveSystem`
 - Schema validation retries no longer append invalid assistant responses to session history
 - Token pricing prefix matching uses pre-sorted longest-first keys across all providers
+
+### Changed
+
+- **Context-window estimation now calibrates against reported usage.** The
+  ask-level compaction threshold (`AgentConfig.maxContext`) previously assumed a
+  flat ~4 characters per token, which under-estimates dense content (minified
+  JSON, code, CJK) and newer tokenizers — Claude Opus 4.7 and later produce
+  roughly 30% more tokens for the same text — leaving history unsummarized until
+  the provider rejected the request. Axl now compares the characters it sent
+  against each response's reported prompt tokens and estimates from that
+  per-model density, smoothed across turns. Turns carrying media are skipped and
+  implausible ratios discarded; the first ask still uses the old constant.
+  Scoped to one run and to agents that set `maxContext`. **Agents with a
+  `maxContext` may now summarize at a different point than before** — closer to
+  the real limit. Cost is unaffected: it has always come from reported tokens.
+  See
+  [api-reference.md#how-the-ask-level-threshold-is-estimated](docs/api-reference.md#how-the-ask-level-threshold-is-estimated).
 
 ### Fixed
 

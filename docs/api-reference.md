@@ -1367,6 +1367,33 @@ Two independent summarization paths exist:
 
 Both can fire in the same `send()`.
 
+#### How the ask-level threshold is estimated
+
+`maxContext` is compared against an *estimate*, because the token count of a
+prompt is not knowable before sending it. That estimate is calibrated from the
+token counts providers actually report:
+
+- The first ask against a model uses a cold-start assumption of ~4 characters
+  per token.
+- After each ask whose prompt was fully measurable, Axl compares the characters
+  it sent against that response's reported prompt tokens and folds the result
+  into a per-model density, smoothed so one atypical turn cannot swing the
+  threshold. Subsequent asks in the same run estimate from the measured value.
+- Turns whose prompt carried media are skipped: those tokens have no character
+  footprint, so they do not describe text density. Implausible ratios are
+  discarded rather than applied.
+
+This matters because a fixed constant is wrong in a workload-dependent
+direction — dense content (minified JSON, source code, CJK) runs far closer to
+1-2 characters per token, and newer tokenizers shift the ratio again (Claude
+Opus 4.7 and later produce roughly 30% more tokens for the same text than
+earlier Claude models). Under-estimating is the harmful direction: history stays
+unsummarized until the provider rejects the request.
+
+Calibration is scoped to a single run and to agents that set `maxContext`, and
+it only ever moves the compaction threshold. **Cost is never estimated this
+way** — it is computed from provider-reported token counts.
+
 ---
 
 ## AxlStream

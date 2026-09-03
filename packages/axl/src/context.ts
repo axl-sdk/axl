@@ -2032,6 +2032,7 @@ export class WorkflowContext<TInput = unknown> {
         effort: options?.effort ?? agent._config.effort,
         thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
         includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
+        promptCache: options?.promptCache ?? agent._config.promptCache,
         toolChoice: options?.toolChoice ?? agent._config.toolChoice,
         stop: options?.stop ?? agent._config.stop,
         providerOptions,

@@ -148,6 +148,42 @@ describe('Configurable Model Parameters', () => {
     });
   });
 
+  describe('promptCache precedence', () => {
+    it('is off by default and reaches the provider as undefined', async () => {
+      const provider = new TestProvider([{ content: 'hello' }]);
+      const ctx = createTestContext(provider);
+      await ctx.ask(agent({ model: 'test:m', system: 'sys' }), 'hi');
+      expect(provider.calls[0].options.promptCache).toBeUndefined();
+    });
+
+    it('passes the agent-level opt-in to the provider', async () => {
+      const provider = new TestProvider([{ content: 'hello' }]);
+      const ctx = createTestContext(provider);
+      await ctx.ask(agent({ model: 'test:m', system: 'sys', promptCache: true }), 'hi');
+      expect(provider.calls[0].options.promptCache).toBe(true);
+    });
+
+    it('lets AskOptions override the agent-level value in both directions', async () => {
+      const provider = new TestProvider([{ content: 'a' }, { content: 'b' }]);
+      const ctx = createTestContext(provider);
+      const on = agent({ model: 'test:m', system: 'sys', promptCache: true });
+      const off = agent({ model: 'test:m', system: 'sys', promptCache: false });
+      await ctx.ask(on, 'hi', { promptCache: false });
+      await ctx.ask(off, 'hi', { promptCache: true });
+      expect(provider.calls[0].options.promptCache).toBe(false);
+      expect(provider.calls[1].options.promptCache).toBe(true);
+    });
+
+    it('falls back to the agent-level value when AskOptions omits it', async () => {
+      const provider = new TestProvider([{ content: 'hello' }]);
+      const ctx = createTestContext(provider);
+      await ctx.ask(agent({ model: 'test:m', system: 'sys', promptCache: true }), 'hi', {
+        effort: 'low',
+      });
+      expect(provider.calls[0].options.promptCache).toBe(true);
+    });
+  });
+
   describe('onAgentCallComplete captures parameters', () => {
     it('reports resolved parameters in the callback', async () => {
       const provider = new TestProvider([{ content: 'hello' }]);

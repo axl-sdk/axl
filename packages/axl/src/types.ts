@@ -141,6 +141,8 @@ export type AskOptions<T = unknown> = {
   thinkingBudget?: number;
   /** Show reasoning summaries in responses. */
   includeThoughts?: boolean;
+  /** Override prompt caching of the stable prefix for this call. */
+  promptCache?: boolean;
   /** Tool choice strategy for this call. */
   toolChoice?: ToolChoice;
   /** Stop sequences for this call. */

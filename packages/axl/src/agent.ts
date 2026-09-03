@@ -34,6 +34,9 @@ export type AgentConfig = {
   includeThoughts?: boolean;
   toolChoice?: ToolChoice;
   stop?: string[];
+  /** Opt in to prompt caching of this agent's stable prefix (system prompt +
+   *  tools). Only Anthropic needs it; off by default. See `docs/providers.md`. */
+  promptCache?: boolean;
   /** Provider-specific options merged into API requests. Not portable across providers. */
   providerOptions?: Record<string, unknown>;
   /** Default rendering of a `ctx.ask` output schema into this agent's prompt.

@@ -1768,8 +1768,8 @@ export class WorkflowContext<TInput = unknown> {
       // can ever fit and every ask will summarize. That is a misconfiguration
       // (usually maxContext below contextManagement.reserveTokens, or an
       // oversized system prompt / tool set), not a condition to absorb
-      // silently: summarization still runs and still keeps the newest turn,
-      // but the operator is told why history is being discarded every time.
+      // silently: summarization still runs, but the operator is told why
+      // history is being condensed on every ask.
       if (availableForHistory <= 0) {
         this.emitEvent({
           type: 'log',
@@ -1777,9 +1777,9 @@ export class WorkflowContext<TInput = unknown> {
             warning:
               `Agent '${agent._name}' maxContext (${maxContext}) is at or below its fixed ` +
               `overhead (${overhead} = system ${systemTokens} + tools ${toolTokens} + reserve ` +
-              `${reserveTokens}); no session history can fit, so every ask summarizes and ` +
-              `retains only the most recent exchange (a single-message history is summarized ` +
-              `in full). The current input is always sent. Raise maxContext or lower ` +
+              `${reserveTokens}); no session history can fit, so every ask summarizes, ` +
+              `retaining at most the most recent exchange and sometimes none of it verbatim. ` +
+              `The current input is always sent. Raise maxContext or lower ` +
               `contextManagement.reserveTokens.`,
           },
         });

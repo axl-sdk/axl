@@ -38,6 +38,9 @@ function getDone(chunks: StreamChunk[]): Extract<StreamChunk, { type: 'done' }> 
  * Sonnet needs 1,024 (Haiku 4.5 needs 4,096 and is therefore not used for cache
  * tests). ~2,300 tokens, ~9 KB.
  */
+/** Per-run salt so cache tests start cold every run (Anthropic caches per exact prefix). */
+const saltedRun = (): string => `Test run ${Date.now()}-${Math.random().toString(36).slice(2, 8)}.`;
+
 const CACHE_ELIGIBLE_SYSTEM =
   'You are a helpful assistant. ' +
   (
@@ -390,8 +393,10 @@ describe.skipIf(!hasAnthropic)('Pricing Integration: Anthropic', () => {
     // (1,024 on Sonnet 4.6) -- that is the assertion that proves the feature is
     // wired. Reads on the second call depend on the cache still being warm, so
     // they are asserted when present and must then lower the cost.
+    // A per-run salt makes the prefix unique, so the first call is always a
+    // cold WRITE and the second -- inside the 5-minute TTL -- always a READ.
     const longMessages: ChatMessage[] = [
-      { role: 'system', content: CACHE_ELIGIBLE_SYSTEM },
+      { role: 'system', content: `${saltedRun()}\n${CACHE_ELIGIBLE_SYSTEM}` },
       { role: 'user', content: 'Say hi.' },
     ];
     const cacheOpts = { model: 'claude-sonnet-4-6', maxTokens: 10, promptCache: true };
@@ -399,15 +404,14 @@ describe.skipIf(!hasAnthropic)('Pricing Integration: Anthropic', () => {
     const first = await provider.chat(longMessages, cacheOpts);
     expect(first.cost).toBeGreaterThan(0);
     expect(first.usage!.prompt_tokens).toBeGreaterThan(1024);
-    const firstCached = first.usage!.cached_tokens ?? 0;
-    // Either we wrote the prefix now, or a previous run left it warm and we read it.
-    expect((first.usage!.cache_write_tokens ?? 0) + firstCached).toBeGreaterThan(1000);
+    expect(first.usage!.cache_write_tokens).toBeGreaterThan(1000);
+    expect(first.usage!.cached_tokens ?? 0).toBe(0);
 
     const second = await provider.chat(longMessages, cacheOpts);
     expect(second.cost).toBeGreaterThan(0);
     expect(second.usage!.cached_tokens).toBeGreaterThan(1000);
     expect(second.usage!.cached_tokens).toBeLessThanOrEqual(second.usage!.prompt_tokens);
-    if (!firstCached) expect(second.cost!).toBeLessThan(first.cost!);
+    expect(second.cost!).toBeLessThan(first.cost!);
   }, 60_000);
 
   it('chat() without promptCache never writes to or reads from the cache', async () => {
@@ -422,21 +426,22 @@ describe.skipIf(!hasAnthropic)('Pricing Integration: Anthropic', () => {
 
   it('stream() with promptCache reports cache reads on a repeated long prompt', async () => {
     const longMessages: ChatMessage[] = [
-      { role: 'system', content: CACHE_ELIGIBLE_SYSTEM },
+      { role: 'system', content: `${saltedRun()}\n${CACHE_ELIGIBLE_SYSTEM}` },
       { role: 'user', content: 'Say hi.' },
     ];
     const cacheOpts = { model: 'claude-sonnet-4-6', maxTokens: 10, promptCache: true };
 
-    // Seed (write, or read if a previous run left it warm)
-    await collectChunks(provider.stream(longMessages, cacheOpts));
+    // Salted prefix: the seed is a cold write on the streaming path.
+    const seed = getDone(await collectChunks(provider.stream(longMessages, cacheOpts)))!;
+    expect(seed.cost).toBeGreaterThan(0);
+    expect(seed.usage!.cache_write_tokens).toBeGreaterThan(1000);
 
-    const chunks = await collectChunks(provider.stream(longMessages, cacheOpts));
-    const done = getDone(chunks)!;
-
+    const done = getDone(await collectChunks(provider.stream(longMessages, cacheOpts)))!;
     expect(done.cost).toBeGreaterThan(0);
     expect(done.usage!.prompt_tokens).toBeGreaterThan(1024);
     expect(done.usage!.cached_tokens).toBeGreaterThan(1000);
     expect(done.usage!.cached_tokens).toBeLessThanOrEqual(done.usage!.prompt_tokens);
+    expect(done.cost!).toBeLessThan(seed.cost!);
   }, 60_000);
 
   it('Sonnet 5 accepts default and effort requests with observable thinking metadata', async () => {

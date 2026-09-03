@@ -2350,7 +2350,16 @@ export class WorkflowContext<TInput = unknown> {
       // option off for that agent. Scope is this WorkflowContext -- a
       // Session builds a fresh context per turn, so cross-turn churn is not
       // observed here.
-      if (chatOptions.promptCache && response.usage && !this.promptCacheWarned) {
+      // Only the Anthropic adapter realizes promptCache today (OpenAI and Gemini
+      // cache automatically and report nothing below their minimums), so the
+      // absence of cache fields is only a signal on Anthropic. Widen this gate
+      // when another adapter starts honoring the option.
+      if (
+        chatOptions.promptCache &&
+        provider.name === 'anthropic' &&
+        response.usage &&
+        !this.promptCacheWarned
+      ) {
         const wrote = (response.usage.cache_write_tokens ?? 0) > 0;
         const read = (response.usage.cached_tokens ?? 0) > 0;
         if (read) {

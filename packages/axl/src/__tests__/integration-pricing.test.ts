@@ -38,15 +38,15 @@ function getDone(chunks: StreamChunk[]): Extract<StreamChunk, { type: 'done' }> 
  * Sonnet needs 1,024 (Haiku 4.5 needs 4,096 and is therefore not used for cache
  * tests). ~2,300 tokens, ~9 KB.
  */
-/** Per-run salt so cache tests start cold every run (Anthropic caches per exact prefix). */
-const saltedRun = (): string => `Test run ${Date.now()}-${Math.random().toString(36).slice(2, 8)}.`;
-
 const CACHE_ELIGIBLE_SYSTEM =
   'You are a helpful assistant. ' +
   (
     'The following is important context that you should keep in mind when answering. ' +
     'Always respond accurately and concisely. '
   ).repeat(105);
+
+/** Per-run salt so cache tests start cold every run (Anthropic caches per exact prefix). */
+const saltedRun = (): string => `Test run ${Date.now()}-${Math.random().toString(36).slice(2, 8)}.`;
 
 // ---------------------------------------------------------------------------
 // OpenAI Chat Completions

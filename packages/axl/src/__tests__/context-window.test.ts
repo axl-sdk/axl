@@ -130,6 +130,47 @@ describe('Context Window Management', () => {
     expect(actualCallMessages.length).toBeLessThan(longHistory.length);
   });
 
+  it('retains the newest turn when overhead alone exceeds maxContext', async () => {
+    // reserveTokens defaults to 2000, so a maxContext below it leaves a
+    // negative history budget. Nothing can "fit", but dropping the entire
+    // conversation is never the right answer: the newest turn is the one the
+    // next reply depends on.
+    const longHistory = generateHistory(20, 200);
+    const provider = new TestProvider([
+      { content: 'Summary: earlier topics.' },
+      { content: 'Here is my response.' },
+    ]);
+
+    const agentWithTinyContext = agent({
+      model: 'test:test-model',
+      system: 'You are a test agent',
+      maxContext: 500, // below the 2000-token reserve => negative budget
+    });
+
+    // Captured before the ask: the ask appends its own assistant reply to
+    // sessionHistory, so this array's tail changes underneath us.
+    const newestBeforeAsk = longHistory[longHistory.length - 1].content;
+
+    const onTrace = vi.fn();
+    const ctx = createTestContext(provider, { sessionHistory: longHistory, onTrace });
+    await ctx.ask(agentWithTinyContext, 'What were we talking about?');
+
+    // The unsatisfiable configuration is reported, not absorbed silently.
+    const warnings = onTrace.mock.calls
+      .map(([event]: any[]) => event?.data?.warning)
+      .filter((w: unknown): w is string => typeof w === 'string');
+    expect(warnings.some((w) => w.includes('is at or below its fixed overhead'))).toBe(true);
+
+    const actualCall = provider.calls[provider.calls.length - 1].messages;
+    const summaryMsg = actualCall.find(
+      (m: any) => m.role === 'system' && m.content.includes('Summary of earlier conversation'),
+    );
+    expect(summaryMsg).toBeDefined();
+
+    // The newest turn must survive summarization.
+    expect(actualCall.some((m: any) => m.content === newestBeforeAsk)).toBe(true);
+  });
+
   it('does not summarize when no maxContext is set', async () => {
     const longHistory = generateHistory(50, 200);
     const provider = new TestProvider([{ content: 'response' }]);

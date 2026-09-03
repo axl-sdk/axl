@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Context summarization could discard the entire conversation.** When an
+  agent's fixed overhead (system prompt + tool definitions +
+  `contextManagement.reserveTokens`, which defaults to 2000) met or exceeded its
+  `maxContext`, the history budget went non-positive, no message could "fit",
+  and `summarizeHistory` returned a lone summary message with **every real turn
+  dropped** — including the newest one the next reply depends on. The cached
+  summary could never be reused in that state either, so each ask paid a fresh
+  summarization call and overwrote the persisted `summaryCache`. Summarization
+  now always retains the newest turn, and an unsatisfiable context budget emits
+  a `log` warning naming the agent, its `maxContext`, and the overhead breakdown
+  instead of silently discarding history.
+
 - **`gemini-3.7-flash` and `gemini-3.8-flash` had no pricing.** Both were
   already supported for requests (effort mapping, multimodal input) but were
   missing from the rate table, so `response.cost` was `undefined` for the two
@@ -33,7 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`gemini-3-flash-preview` is no longer priced.** It has dropped off Google's
   published pricing page while remaining callable, so its usage is now reported
   with `cost: undefined` instead of a stale, unverifiable rate. Requests to it
-  are unaffected.
+  are unaffected, but **cost enforcement changes**: per the existing unpriced
+  contract, `ctx.budget()` cannot enforce a cost limit on spend it cannot price,
+  so a `maxCost` cap no longer trips on this model. The spend is still surfaced —
+  the budget reports `unpriced: true` and warns once per scope — but if you
+  relied on a hard cost cap here, pin a priced model such as
+  `gemini-3.8-flash`.
 - **`gpt-5.6` / `gpt-5.6-sol` was priced above its current rate.** The catalog
   held $5 / $0.50 cached / $6.25 cache write / $30, but Sol is on a promotional
   $4 / $0.40 / $5 / $20 (announced as running at least through 2026-11-21), so

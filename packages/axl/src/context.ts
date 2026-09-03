@@ -1746,6 +1746,26 @@ export class WorkflowContext<TInput = unknown> {
       const overhead = systemTokens + toolTokens + reserveTokens;
       const availableForHistory = maxContext - overhead;
 
+      // The fixed overhead alone meets or exceeds maxContext, so no history
+      // can ever fit and every ask will summarize. That is a misconfiguration
+      // (usually maxContext below contextManagement.reserveTokens, or an
+      // oversized system prompt / tool set), not a condition to absorb
+      // silently: summarization still runs and still keeps the newest turn,
+      // but the operator is told why history is being discarded every time.
+      if (availableForHistory <= 0) {
+        this.emitEvent({
+          type: 'log',
+          data: {
+            warning:
+              `Agent '${agent._name}' maxContext (${maxContext}) is at or below its fixed ` +
+              `overhead (${overhead} = system ${systemTokens} + tools ${toolTokens} + reserve ` +
+              `${reserveTokens}); no session history can fit, so every ask summarizes and only ` +
+              `the newest turn is retained. Raise maxContext or lower ` +
+              `contextManagement.reserveTokens.`,
+          },
+        });
+      }
+
       const historyEstimate = estimateMessagesTokens(sessionHistory);
       if (historyEstimate.unmeasured) {
         this.emitEvent({
@@ -3272,6 +3292,8 @@ export class WorkflowContext<TInput = unknown> {
         splitIdx = i;
       }
 
+      // As below: never return a summary with no current turn attached.
+      if (splitIdx === history.length) splitIdx = history.length - 1;
       if (splitIdx < history.length) {
         return [summaryMsg, ...history.slice(splitIdx)];
       }
@@ -3290,7 +3312,20 @@ export class WorkflowContext<TInput = unknown> {
       splitIdx = i;
     }
 
-    // If nothing to summarize (all messages are "recent"), just return all
+    // Nothing fit the recent budget. That happens when the fixed overhead
+    // (system prompt, tool defs, reserve) already meets or exceeds maxContext,
+    // leaving `availableTokens` non-positive. Summarizing *everything* would
+    // hand the model a summary with no current turn, so keep the newest
+    // message regardless of budget — it is what the next reply depends on.
+    // Restricted to histories with something to lose: with a single message
+    // there is no earlier context a summary could stand in for, so that case
+    // keeps its existing behavior (summarize it, which also replaces media
+    // with safe placeholders) rather than forwarding a message we already
+    // estimated cannot fit.
+    if (splitIdx === history.length && history.length > 1) splitIdx = history.length - 1;
+
+    // If nothing to summarize (all messages are "recent", or only the newest
+    // message remains and it is retained unconditionally), just return all.
     if (splitIdx === 0) return history;
 
     const oldMessages = history.slice(0, splitIdx);

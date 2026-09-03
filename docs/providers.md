@@ -898,6 +898,9 @@ new. An agent with no system prompt of its own anchors on the last tool instead.
 runtime marks the system messages it synthesizes — the rolling summary and the handoff
 header — with `origin: 'runtime'`, and the adapter never anchors on those: they are
 small and change per turn, so a breakpoint there would sit below the model's minimum.
+A system message *you* seed into `sessionHistory` carries no such mark, so an agent
+without its own `system` will anchor on it — it is your content and stable by your
+contract, which is the right call.
 
 **Why it is off by default.** Cache writes bill at 1.25x input. If your `system` is a
 function of `ctx.metadata` and changes every call, every request is a cold write with

@@ -840,7 +840,10 @@ describe('CallTiming — mid-stream error frame (openai-compatible)', () => {
     expect(t, 'a truncated stream still carries timing').toBeDefined();
     expectWindow(t!.ttfbMs, TTFB_WINDOW, 'truncated ttfbMs');
     expectWindow(t!.firstTokenMs, FIRST_TOKEN_WINDOW, 'truncated firstTokenMs');
-    expect(t!.wireMs).toBeGreaterThanOrEqual(t!.firstTokenMs!);
+    // Do not order wireMs against firstTokenMs here. Stream wire time sums
+    // only body-read waits, while first-token time is dispatch-to-token wall
+    // time and can include scheduler/processing gaps. They may differ by a
+    // millisecond under load without violating either metric's contract.
     expectValueDomain(t!);
   });
 });

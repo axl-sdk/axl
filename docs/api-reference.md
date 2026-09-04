@@ -201,7 +201,8 @@ const myAgent = agent({
 | `stop` | `string[]` | — | Stop sequences — generation stops when any sequence is encountered. Not supported by the `openai-responses` provider (silently ignored) |
 | `providerOptions` | `Record<string, unknown>` | — | Provider-specific options shallow-merged into the raw API request body via `Object.assign`. Not portable across providers. See [shallow merge caveat](providers.md#provideroptions) |
 | `maxTurns` | `number` | `25` | Maximum tool-call loop iterations before throwing `MaxTurnsError`. **A "turn" in axl is one provider call inside a single `ctx.ask()`** — not a user↔assistant exchange. Schema/validate/guardrail retries also consume turns. See [Sessions → Turns vs. Exchanges](#turns-vs-exchanges) |
-| `timeout` | `string` | none | Duration string (e.g., `'30s'`, `'5m'`, `'1h'`). Throws `TimeoutError` when exceeded |
+| `timeout` | `string` | `defaults.timeout`, else `'60s'` | Graceful overall between-turn budget. The in-flight provider turn and ordinary tool finish; after expiry Axl refuses the next turn or retry with `TimeoutError`. `awaitHuman` wait time is excluded; other tool work, limiter queueing, and retry backoff count. Not an in-flight request deadline. |
+| `stallTimeout` | `string` | `defaults.stallTimeout`, else unset | Opt-in hard provider-request stall limit. See [Ask deadlines, cancellation, and stalled requests](#ask-deadlines-cancellation-and-stalled-requests). |
 | `maxContext` | `number` | — | Estimated token limit for context window management |
 | `version` | `string` | — | Prompt version label attached to trace events |
 | `guardrails` | `GuardrailsConfig` | — | Input/output validation (see [Guardrails](#guardrails)) |
@@ -278,7 +279,7 @@ console.log(ctx.totalCost); // accumulated cost from all agent calls
 |--------|------|---------|-------------|
 | `metadata` | `Record<string, unknown>` | `{}` | Metadata passed to the context |
 | `budget` | `string` | — | Cost budget (e.g., `'$0.50'`). Enforced via `finish_and_stop` policy |
-| `signal` | `AbortSignal` | — | Abort signal for cancellation/timeouts |
+| `signal` | `AbortSignal` | — | Context-wide hard cancellation signal. It aborts in-flight provider work and is inherited by nested asks. Use an ask-local signal for one request. |
 | `sessionHistory` | `ChatMessage[]` | — | Prior conversation history for multi-turn testing |
 | `awaitHumanHandler` | `(options) => Promise<HumanDecision>` | — | Handler for tool approval requests. Required when the agent uses tools with `requireApproval` — without it, the call throws a clear error |
 | `events` | `EventStreamOptions` | `{ maxQueued: 10_000, onOverflow: 'drop-oldest-non-terminal' }` | Configures the iterator-queue cap and overflow policy on the lazy `ctx.events` bus. See [`EventStreamOptions`](#eventstreamoptions) |
@@ -293,15 +294,12 @@ console.log(ctx.totalCost); // accumulated cost from all agent calls
 
 **When to use vs. workflows:** Use `createContext()` when you want to call agents without registering a workflow — eval files, one-off scripts, tests, API endpoints. Use `runtime.execute()` when you want execution lifecycle tracking (status, duration, history in Studio's executions panel).
 
-**Budget and timeout:**
+**Budget and context-wide hard cancellation:**
 
 ```typescript
-const controller = new AbortController();
-setTimeout(() => controller.abort(), 30_000);
-
 const ctx = runtime.createContext({
   budget: '$1.00',
-  signal: controller.signal,
+  signal: AbortSignal.timeout(30_000),
 });
 ```
 
@@ -407,14 +405,51 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | agent config | Override tool choice for this call |
 | `stop` | `string[]` | agent config | Override stop sequences for this call |
 | `providerOptions` | `Record<string, unknown>` | agent config | Override provider-specific options for this call. Shallow-merged; see [caveat](providers.md#provideroptions) |
+| `timeout` | `string` | agent config → `defaults.timeout` → `'60s'` | Override the graceful overall between-turn budget. The current provider turn and ordinary tool work are allowed to finish; `awaitHuman` wait is excluded. |
+| `stallTimeout` | `string` | agent config → `defaults.stallTimeout` → unset | Opt-in hard limit for a provider request that makes no progress. Streaming resets the idle clock on every chunk; non-streaming uses a dispatch-to-completion limit. |
+| `signal` | `AbortSignal` | — | Per-ask hard cancellation/deadline. Composed with the context/branch signal; first abort wins and nested asks inherit it. |
 
-**Precedence:** Per-call `AskOptions` > agent-level `AgentConfig` > internal defaults.
+**Precedence:** For `timeout` and `stallTimeout`, per-call `AskOptions` > agent-level
+`AgentConfig` > `defaults` config > built-in (`'60s'` / unset). Other options use the
+applicable per-call, agent, and internal defaults.
 
 **Returns:** `Promise<T>` — parsed output if `schema` is provided, otherwise `string`.
 
 **Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a **user** message explaining the error (a user turn, not a system message: providers hoist system messages out of the conversation, which would leave the request ending on the rejected attempt). On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. Supply `retryFeedback` to write that user message yourself, or to stop retrying — see [Custom retry feedback](#custom-retry-feedback). See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
 
 **Streaming + validate:** As of 0.16.0, `validate` and token streaming (via `runtime.stream()`) coexist — validate runs against the buffered response after streaming completes. (Pre-0.16.0 this combination threw `INVALID_CONFIG`.) For structured output, the typed result is still only available after the full response arrives.
+
+#### Ask deadlines, cancellation, and stalled requests
+
+These controls deliberately cover different failure modes:
+
+| Need | Use | Behavior |
+|---|---|---|
+| Let active work finish but stop more turns | `timeout` | Graceful 60-second default; checked between provider turns and retries. It excludes only time spent in `awaitHuman`. |
+| Stop a stuck provider request | `stallTimeout` | Opt-in. On streams, aborts after an idle gap with no chunk (every chunk resets it); on non-stream calls, aborts if dispatch-to-completion exceeds it. It covers provider work only, never tools or `awaitHuman`. Start with `'120s'` unless your provider/model evidence supports a different idle window; this is guidance, not an SDK default. |
+| Enforce a strict wall-clock SLA or cancel now | `signal` | Hard-aborts an in-flight request and discards any partial response. Use `AbortSignal.timeout()` for a deadline. |
+
+```typescript
+// One interactive request must not outlive the HTTP request budget.
+const answer = await ctx.ask(supportAgent, question, {
+  signal: AbortSignal.timeout(15_000),
+});
+```
+
+`signal` is composed with a context or branch signal without mutating either scope: the
+first signal to abort supplies its exact `reason`, sibling asks on the same context remain
+unaffected, and asks nested through an agent tool inherit the ask signal. A pre-aborted signal
+prevents dispatch. External abort reasons are rethrown unchanged; they are not rewritten as
+Axl timeout errors.
+
+`stallTimeout` is distinct from a strict SLA. Built-in adapters arm its timer only when a
+transport attempt is actually dispatched, reset it for every streamed chunk (including
+non-text chunks), and disarm it during Axl retry backoff; an opt-in rate-limiter queue is not
+treated as a provider stall. A custom `Provider` that does not report dispatch lifecycle uses
+the conservative provider-method-entry fallback. A stall throws `StallTimeoutError`, which
+extends `TimeoutError`; its message names the agent. A graceful `timeout` also names the
+agent. In both hard-abort cases (`signal` or `stallTimeout`), partial streamed output is
+discarded rather than returned.
 
 ---
 
@@ -2086,7 +2121,8 @@ All errors extend `AxlError`.
 | `ValidationError` | `ctx.ask()`, `ctx.verify()` | Post-schema business rule validation failed after all retries. Includes `.lastOutput`, `.reason`, `.retries` |
 | `QuorumNotMet` | `ctx.spawn()`, `ctx.map()` | Fewer tasks succeeded than the required quorum. Includes `.results` |
 | `NoConsensus` | `ctx.vote()` | No successful results to vote on, unanimous vote failed, or invalid strategy/option combination |
-| `TimeoutError` | `ctx.ask()` | Agent exceeded its configured `timeout`. When at least one completed turn reported provider `timing`, the message appends `(elapsed Nms: queued Nms, retries Nms, wire Nms, other Nms)` and `.breakdown` (`TimeoutBreakdown`) carries the same numbers. With no instrumented turn, the message is the bare prefix and `.breakdown` is `undefined` |
+| `TimeoutError` | `ctx.ask()` | Graceful between-turn `timeout` expired. The message names the agent. When at least one completed turn reported provider `timing`, it appends `(elapsed Nms: queued Nms, retries Nms, wire Nms, other Nms)` and `.breakdown` (`TimeoutBreakdown`) carries the same numbers. With no instrumented turn, the message is the bare prefix plus agent name and `.breakdown` is `undefined` |
+| `StallTimeoutError` | `ctx.ask()` | A dispatched provider request exceeded `stallTimeout` without streaming progress (or exceeded the non-stream dispatch-to-completion limit). Extends `TimeoutError`, names the agent, and is distinguishable with `instanceof StallTimeoutError`. |
 | `MaxTurnsError` | `ctx.ask()` | Agent exceeded its configured `maxTurns` |
 | `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy. Includes `.limit`, `.spent`, `.policy` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |

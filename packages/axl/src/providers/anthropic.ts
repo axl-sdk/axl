@@ -712,6 +712,7 @@ function mergeAnthropicUsage(
  */
 export class AnthropicProvider implements Provider {
   readonly name = 'anthropic';
+  readonly reportsRequestLifecycle = true as const;
 
   /** Report a clamped `effort`. Anthropic clamps to each model's supported
    *  `output_config.effort` levels, and models that always think fall back to
@@ -888,7 +889,7 @@ export class AnthropicProvider implements Provider {
     const body = this.buildRequestBody(messages, options, false);
     const pricingContext = pricingContextFromBody(body);
 
-    const recorder = new CallTimingRecorder();
+    const recorder = new CallTimingRecorder(options.requestLifecycle);
     const res = await fetchWithRetry(
       `${this.baseUrl}/messages`,
       {
@@ -929,7 +930,7 @@ export class AnthropicProvider implements Provider {
     const body = this.buildRequestBody(messages, options, true);
     const pricingContext = pricingContextFromBody(body);
 
-    const recorder = new CallTimingRecorder();
+    const recorder = new CallTimingRecorder(options.requestLifecycle);
     const res = await fetchWithRetry(
       `${this.baseUrl}/messages`,
       {

@@ -73,6 +73,7 @@ function responseImageParts(parts: readonly InputContentPart[]): Array<Record<st
  */
 export class OpenAIResponsesProvider implements Provider {
   readonly name = 'openai-responses';
+  readonly reportsRequestLifecycle = true as const;
 
   inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
     return model.trim().length > 0
@@ -203,7 +204,7 @@ export class OpenAIResponsesProvider implements Provider {
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, false);
 
-    const recorder = new CallTimingRecorder();
+    const recorder = new CallTimingRecorder(options.requestLifecycle);
     const res = await fetchWithRetry(
       `${this.baseUrl}/responses`,
       {
@@ -243,7 +244,7 @@ export class OpenAIResponsesProvider implements Provider {
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, true);
 
-    const recorder = new CallTimingRecorder();
+    const recorder = new CallTimingRecorder(options.requestLifecycle);
     const res = await fetchWithRetry(
       `${this.baseUrl}/responses`,
       {

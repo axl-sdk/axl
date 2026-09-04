@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Three distinct `ctx.ask()` time controls.** `timeout` is now documented and consistently
+  resolved as a graceful between-turn budget (Ask > Agent > Defaults > 60 seconds), excluding
+  only `awaitHuman` wait. New opt-in `stallTimeout` aborts a dispatched provider request that
+  stops making progress (`StallTimeoutError extends TimeoutError`); built-in adapters start it
+  after limiter queueing, reset it on every stream chunk, and pause it for SDK retry backoff.
+  New per-ask `signal` composes with context/branch cancellation first-wins, preserves the
+  caller's exact abort reason, is sibling-local, and is inherited by nested asks. Partial
+  responses from hard aborts are discarded. See [API reference](docs/api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
+
 ## [0.23.0] - 2026-09-03
 
 ### Added

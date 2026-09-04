@@ -34,6 +34,7 @@ import {
   QuorumNotMet,
   NoConsensus,
   TimeoutError,
+  StallTimeoutError,
   MaxTurnsError,
   BudgetExceededError,
   GuardrailError,
@@ -99,6 +100,18 @@ import {
  * without mutating shared state on the WorkflowContext instance.
  */
 const signalStorage = new AsyncLocalStorage<AbortSignal>();
+
+/** Active graceful ask budgets in this async branch. `awaitHuman` pauses all
+ * enclosing budgets so a nested human gate cannot consume a parent's budget. */
+type AskTimeoutTracker = { humanWaitMs: number };
+const timeoutTrackerStorage = new AsyncLocalStorage<AskTimeoutTracker[]>();
+
+function composeAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const active = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (active.length === 0) return undefined;
+  if (active.length === 1) return active[0];
+  return AbortSignal.any(active);
+}
 
 type BranchDrainState = {
   pending: Set<Promise<unknown>>;
@@ -1401,227 +1414,265 @@ export class WorkflowContext<TInput = unknown> {
     const promptText = inputText(normalizedInput);
     const inputDescriptor = describeModelInput(normalizedInput);
     const agentName = agent._name;
-    return this._checkpoint(
-      this._autoCheckpointName('ask', agentName),
-      async () => {
-        // Allocate the ask frame BEFORE entering askStorage.run so the
-        // emitEvent calls inside the run() callback see the new frame in ALS.
-        const parentFrame = askStorage.getStore();
-        const askId = randomUUID();
-        const depth = (parentFrame?.depth ?? -1) + 1;
-        // Nested asks inherit the parent frame's counter; top-level asks
-        // share the WorkflowContext's instance-level `stepRefRoot` so all
-        // top-level asks (including concurrent ones from spawn / parallel /
-        // race) share a single monotonic counter. Spec §3.7.
-        const stepRef = parentFrame?.stepRef ?? this.stepRefRoot;
-        const frame: AskFrame = {
-          askId,
-          parentAskId: parentFrame?.askId,
-          depth,
-          agent: agent._name,
-          stepRef,
-          askCost: { value: 0 },
-          askUnpriced: false,
-        };
-
-        return askStorage.run(frame, async () => {
-          const askStart = Date.now();
-          this.emitEvent({
-            type: 'ask_start',
-            prompt: promptText,
-            ...(inputDescriptor ? { input: inputDescriptor } : {}),
-          });
-
-          // `costBefore` snapshots the global budget so we can pass the per-ask
-          // cost delta to onAgentCallComplete (legacy callback that reports the
-          // whole-tree spend). `frame.askCost` is the spec-correct, this-ask-only
-          // figure used on `ask_end` (decision 10).
-          const costBefore = this.budgetContext?.totalCost ?? 0;
-          const unpricedCountBefore = this.budgetContext?.unpricedCount ?? 0;
-          const resolveCtx = options?.metadata
-            ? { metadata: { ...this.metadata, ...options.metadata } }
-            : { metadata: this.metadata };
-
-          // Use a mutable container to capture usage from executeAgentCall
-          // without relying on an instance property (which is racy under
-          // concurrent calls).
-          const usageCapture: {
-            value?: {
-              prompt_tokens: number;
-              completion_tokens: number;
-              total_tokens: number;
-              cached_tokens?: number;
-              cache_write_tokens?: number;
-            };
-            modelUri?: string;
-            /** Last completed turn's provider timing, for span attributes. */
-            timing?: CallTiming;
-          } = {};
-
-          const doCall = async () => {
-            const result = await this.executeAgentCall(
-              agent,
-              normalizedInput,
-              options as AskOptions<unknown>,
-              undefined,
-              usageCapture,
-              normalizedHistory,
-            );
-            return result as T;
+    // Ask-local cancellation must never mutate the context's signal: sibling
+    // asks retain their original signal, while nested asks inherit this ALS
+    // scope. `AbortSignal.any` preserves the winning reason identity.
+    const askSignal = composeAbortSignals(this.currentSignal, options?.signal);
+    const runAsk = () =>
+      this._checkpoint(
+        this._autoCheckpointName('ask', agentName),
+        async () => {
+          // Allocate the ask frame BEFORE entering askStorage.run so the
+          // emitEvent calls inside the run() callback see the new frame in ALS.
+          const parentFrame = askStorage.getStore();
+          const askId = randomUUID();
+          const depth = (parentFrame?.depth ?? -1) + 1;
+          // Nested asks inherit the parent frame's counter; top-level asks
+          // share the WorkflowContext's instance-level `stepRefRoot` so all
+          // top-level asks (including concurrent ones from spawn / parallel /
+          // race) share a single monotonic counter. Spec §3.7.
+          const stepRef = parentFrame?.stepRef ?? this.stepRefRoot;
+          const frame: AskFrame = {
+            askId,
+            parentAskId: parentFrame?.askId,
+            depth,
+            agent: agent._name,
+            stepRef,
+            askCost: { value: 0 },
+            askUnpriced: false,
           };
 
-          // Spec decision 9 invariant: every `ask_start` has a matching
-          // `ask_end`. Capture either outcome, emit the terminal once, then
-          // rethrow the captured failure. Current catches (gate exhaustion,
-          // budget, abort) and future failure paths between `ask_start` and
-          // the success emit therefore surface as `ask_end`. The workflow-
-          // level `error` event is reserved for failures with no ask_end;
-          // consumers must never see both for the same failure.
-          let outcome: { ok: true; result: T } | { ok: false; error: string } | undefined;
-          let askFailure: unknown;
-          let askFailed = false;
-          let result: T | undefined;
-          try {
-            result = this.spanManager
-              ? await this.spanManager.withSpanAsync(
-                  'axl.agent.ask',
-                  {
-                    'axl.agent.name': agent._name,
-                    'axl.agent.model': agent.resolveModel(resolveCtx),
-                  },
-                  async (span) => {
-                    const r = await doCall();
-                    if (usageCapture.modelUri) {
-                      span.setAttribute('axl.agent.model', usageCapture.modelUri);
-                    }
-                    const costAfter = this.budgetContext?.totalCost ?? 0;
-                    span.setAttribute('axl.agent.cost', costAfter - costBefore);
-                    span.setAttribute('axl.agent.duration', Date.now() - askStart);
-                    // `axl.agent.duration` is ask wall clock; these split the
-                    // last provider call's share of it. Set only when the
-                    // provider instrumented the call — an uninstrumented
-                    // adapter must not look like a zero-latency one.
-                    if (usageCapture.timing) {
-                      const t = usageCapture.timing;
-                      span.setAttribute('axl.agent.queued_ms', t.queuedMs);
-                      span.setAttribute('axl.agent.retry_ms', t.retryMs);
-                      span.setAttribute('axl.agent.attempts', t.attempts);
-                      span.setAttribute('axl.agent.ttfb_ms', t.ttfbMs);
-                      span.setAttribute('axl.agent.wire_ms', t.wireMs);
-                      if (t.firstTokenMs !== undefined) {
-                        span.setAttribute('axl.agent.first_token_ms', t.firstTokenMs);
-                      }
-                    }
-                    if (usageCapture.value) {
-                      span.setAttribute(
-                        'axl.agent.prompt_tokens',
-                        usageCapture.value.prompt_tokens,
-                      );
-                      span.setAttribute(
-                        'axl.agent.completion_tokens',
-                        usageCapture.value.completion_tokens,
-                      );
-                      if (usageCapture.value.cached_tokens)
-                        span.setAttribute(
-                          'axl.agent.cached_tokens',
-                          usageCapture.value.cached_tokens,
-                        );
-                      if (usageCapture.value.cache_write_tokens)
-                        span.setAttribute(
-                          'axl.agent.cache_write_tokens',
-                          usageCapture.value.cache_write_tokens,
-                        );
-                    }
-                    return r;
-                  },
-                )
-              : await doCall();
-            outcome = { ok: true, result };
-
-            // Success path: invoke the legacy onAgentCallComplete hook.
-            // Isolate consumer bugs (mirror the onTrace pattern at
-            // emitEvent): a hook throw is post-success observability —
-            // the agent's run already succeeded, so we must NOT
-            // overwrite the outcome to ok:false. Swallow + console.error
-            // so reliability dashboards keyed off ask_end.outcome aren't
-            // poisoned by hook bugs.
-            const costAfter = this.budgetContext?.totalCost ?? 0;
-            const unpricedCountAfter = this.budgetContext?.unpricedCount ?? 0;
-            if (this.onAgentCallComplete) {
-              try {
-                this.onAgentCallComplete({
-                  agent: agent._name,
-                  prompt: promptText,
-                  ...(inputDescriptor ? { input: inputDescriptor } : {}),
-                  response: typeof result === 'string' ? result : JSON.stringify(result),
-                  model: usageCapture.modelUri ?? agent.resolveModel(resolveCtx),
-                  cost: costAfter - costBefore,
-                  unpriced: frame.askUnpriced || unpricedCountAfter > unpricedCountBefore,
-                  duration: Date.now() - askStart,
-                  promptVersion: agent._config.version,
-                  temperature: options?.temperature ?? agent._config.temperature,
-                  maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
-                  effort: options?.effort ?? agent._config.effort,
-                  thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
-                  includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
-                  toolChoice: options?.toolChoice ?? agent._config.toolChoice,
-                  stop: options?.stop ?? agent._config.stop,
-                  providerOptions: options?.providerOptions ?? agent._config.providerOptions,
-                });
-              } catch (hookErr) {
-                console.error(
-                  '[axl] onAgentCallComplete hook threw; ask outcome unchanged:',
-                  hookErr instanceof Error ? hookErr.message : String(hookErr),
-                );
-              }
-            }
-          } catch (err) {
-            askFailed = true;
-            askFailure = err;
-            if (richAsk) this.recordRichFailure(err);
-            outcome = {
-              ok: false,
-              error: this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
-            };
-          }
-
-          // Defensive: `outcome` is always set by either the success or catch
-          // branch above. The fallback makes a future internal control-flow
-          // bug explicit without dropping ask_end.
-          let terminalFailure: unknown;
-          let terminalFailed = false;
-          try {
+          return askStorage.run(frame, async () => {
+            const askStart = Date.now();
             this.emitEvent({
-              type: 'ask_end',
-              outcome:
-                outcome ??
-                ({
-                  ok: false,
-                  error: 'ask_end emitted without outcome — internal bug',
-                } as const),
-              cost: frame.askCost.value,
-              ...(frame.askUnpriced ? { unpriced: true } : {}),
-              duration: Date.now() - askStart,
+              type: 'ask_start',
+              prompt: promptText,
+              ...(inputDescriptor ? { input: inputDescriptor } : {}),
             });
-          } catch (error) {
-            terminalFailed = true;
-            terminalFailure = isEventStreamOverflowError(error)
-              ? preserveErrorCause(error, askFailure)
-              : error;
-          }
 
-          // Strict overflow takes precedence over an in-flight ask failure so
-          // recovery boundaries cannot hide an incomplete terminal trace.
-          if (terminalFailed) throw terminalFailure;
-          if (askFailed) throw askFailure;
-          return result as T;
-        });
-      },
-      { agent: agentName },
-    );
+            // `costBefore` snapshots the global budget so we can pass the per-ask
+            // cost delta to onAgentCallComplete (legacy callback that reports the
+            // whole-tree spend). `frame.askCost` is the spec-correct, this-ask-only
+            // figure used on `ask_end` (decision 10).
+            const costBefore = this.budgetContext?.totalCost ?? 0;
+            const unpricedCountBefore = this.budgetContext?.unpricedCount ?? 0;
+            const resolveCtx = options?.metadata
+              ? { metadata: { ...this.metadata, ...options.metadata } }
+              : { metadata: this.metadata };
+
+            // Use a mutable container to capture usage from executeAgentCall
+            // without relying on an instance property (which is racy under
+            // concurrent calls).
+            const usageCapture: {
+              value?: {
+                prompt_tokens: number;
+                completion_tokens: number;
+                total_tokens: number;
+                cached_tokens?: number;
+                cache_write_tokens?: number;
+              };
+              modelUri?: string;
+              /** Last completed turn's provider timing, for span attributes. */
+              timing?: CallTiming;
+            } = {};
+
+            const doCall = async () => {
+              const result = await this.executeAgentCall(
+                agent,
+                normalizedInput,
+                options as AskOptions<unknown>,
+                undefined,
+                usageCapture,
+                normalizedHistory,
+              );
+              return result as T;
+            };
+
+            // Spec decision 9 invariant: every `ask_start` has a matching
+            // `ask_end`. Capture either outcome, emit the terminal once, then
+            // rethrow the captured failure. Current catches (gate exhaustion,
+            // budget, abort) and future failure paths between `ask_start` and
+            // the success emit therefore surface as `ask_end`. The workflow-
+            // level `error` event is reserved for failures with no ask_end;
+            // consumers must never see both for the same failure.
+            let outcome: { ok: true; result: T } | { ok: false; error: string } | undefined;
+            let askFailure: unknown;
+            let askFailed = false;
+            let result: T | undefined;
+            try {
+              result = this.spanManager
+                ? await this.spanManager.withSpanAsync(
+                    'axl.agent.ask',
+                    {
+                      'axl.agent.name': agent._name,
+                      'axl.agent.model': agent.resolveModel(resolveCtx),
+                    },
+                    async (span) => {
+                      const r = await doCall();
+                      if (usageCapture.modelUri) {
+                        span.setAttribute('axl.agent.model', usageCapture.modelUri);
+                      }
+                      const costAfter = this.budgetContext?.totalCost ?? 0;
+                      span.setAttribute('axl.agent.cost', costAfter - costBefore);
+                      span.setAttribute('axl.agent.duration', Date.now() - askStart);
+                      // `axl.agent.duration` is ask wall clock; these split the
+                      // last provider call's share of it. Set only when the
+                      // provider instrumented the call — an uninstrumented
+                      // adapter must not look like a zero-latency one.
+                      if (usageCapture.timing) {
+                        const t = usageCapture.timing;
+                        span.setAttribute('axl.agent.queued_ms', t.queuedMs);
+                        span.setAttribute('axl.agent.retry_ms', t.retryMs);
+                        span.setAttribute('axl.agent.attempts', t.attempts);
+                        span.setAttribute('axl.agent.ttfb_ms', t.ttfbMs);
+                        span.setAttribute('axl.agent.wire_ms', t.wireMs);
+                        if (t.firstTokenMs !== undefined) {
+                          span.setAttribute('axl.agent.first_token_ms', t.firstTokenMs);
+                        }
+                      }
+                      if (usageCapture.value) {
+                        span.setAttribute(
+                          'axl.agent.prompt_tokens',
+                          usageCapture.value.prompt_tokens,
+                        );
+                        span.setAttribute(
+                          'axl.agent.completion_tokens',
+                          usageCapture.value.completion_tokens,
+                        );
+                        if (usageCapture.value.cached_tokens)
+                          span.setAttribute(
+                            'axl.agent.cached_tokens',
+                            usageCapture.value.cached_tokens,
+                          );
+                        if (usageCapture.value.cache_write_tokens)
+                          span.setAttribute(
+                            'axl.agent.cache_write_tokens',
+                            usageCapture.value.cache_write_tokens,
+                          );
+                      }
+                      return r;
+                    },
+                  )
+                : await doCall();
+              outcome = { ok: true, result };
+
+              // Success path: invoke the legacy onAgentCallComplete hook.
+              // Isolate consumer bugs (mirror the onTrace pattern at
+              // emitEvent): a hook throw is post-success observability —
+              // the agent's run already succeeded, so we must NOT
+              // overwrite the outcome to ok:false. Swallow + console.error
+              // so reliability dashboards keyed off ask_end.outcome aren't
+              // poisoned by hook bugs.
+              const costAfter = this.budgetContext?.totalCost ?? 0;
+              const unpricedCountAfter = this.budgetContext?.unpricedCount ?? 0;
+              if (this.onAgentCallComplete) {
+                try {
+                  this.onAgentCallComplete({
+                    agent: agent._name,
+                    prompt: promptText,
+                    ...(inputDescriptor ? { input: inputDescriptor } : {}),
+                    response: typeof result === 'string' ? result : JSON.stringify(result),
+                    model: usageCapture.modelUri ?? agent.resolveModel(resolveCtx),
+                    cost: costAfter - costBefore,
+                    unpriced: frame.askUnpriced || unpricedCountAfter > unpricedCountBefore,
+                    duration: Date.now() - askStart,
+                    promptVersion: agent._config.version,
+                    temperature: options?.temperature ?? agent._config.temperature,
+                    maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
+                    effort: options?.effort ?? agent._config.effort,
+                    thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
+                    includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
+                    toolChoice: options?.toolChoice ?? agent._config.toolChoice,
+                    stop: options?.stop ?? agent._config.stop,
+                    providerOptions: options?.providerOptions ?? agent._config.providerOptions,
+                  });
+                } catch (hookErr) {
+                  console.error(
+                    '[axl] onAgentCallComplete hook threw; ask outcome unchanged:',
+                    hookErr instanceof Error ? hookErr.message : String(hookErr),
+                  );
+                }
+              }
+            } catch (err) {
+              askFailed = true;
+              askFailure = err;
+              if (richAsk) this.recordRichFailure(err);
+              outcome = {
+                ok: false,
+                error: this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
+              };
+            }
+
+            // Defensive: `outcome` is always set by either the success or catch
+            // branch above. The fallback makes a future internal control-flow
+            // bug explicit without dropping ask_end.
+            let terminalFailure: unknown;
+            let terminalFailed = false;
+            try {
+              this.emitEvent({
+                type: 'ask_end',
+                outcome:
+                  outcome ??
+                  ({
+                    ok: false,
+                    error: 'ask_end emitted without outcome — internal bug',
+                  } as const),
+                cost: frame.askCost.value,
+                ...(frame.askUnpriced ? { unpriced: true } : {}),
+                duration: Date.now() - askStart,
+              });
+            } catch (error) {
+              terminalFailed = true;
+              terminalFailure = isEventStreamOverflowError(error)
+                ? preserveErrorCause(error, askFailure)
+                : error;
+            }
+
+            // Strict overflow takes precedence over an in-flight ask failure so
+            // recovery boundaries cannot hide an incomplete terminal trace.
+            if (terminalFailed) throw terminalFailure;
+            if (askFailed) throw askFailure;
+            return result as T;
+          });
+        },
+        { agent: agentName },
+      );
+    return askSignal ? signalStorage.run(askSignal, runAsk) : runAsk();
   }
 
   private async executeAgentCall(
+    agent: Agent,
+    input: ModelInput,
+    options?: AskOptions<unknown>,
+    handoffMessages?: ChatMessage[],
+    usageCapture?: {
+      value?: {
+        prompt_tokens: number;
+        completion_tokens: number;
+        total_tokens: number;
+        cached_tokens?: number;
+        cache_write_tokens?: number;
+      };
+      modelUri?: string;
+      timing?: CallTiming;
+    },
+    sessionHistory: ChatMessage[] = normalizeSessionHistory(this.sessionHistory),
+  ): Promise<unknown> {
+    const tracker: AskTimeoutTracker = { humanWaitMs: 0 };
+    const enclosing = timeoutTrackerStorage.getStore() ?? [];
+    return timeoutTrackerStorage.run([...enclosing, tracker], () =>
+      this.executeAgentCallImpl(
+        agent,
+        input,
+        options,
+        handoffMessages,
+        usageCapture,
+        sessionHistory,
+      ),
+    );
+  }
+
+  private async executeAgentCallImpl(
     agent: Agent,
     input: ModelInput,
     options?: AskOptions<unknown>,
@@ -1974,8 +2025,14 @@ export class WorkflowContext<TInput = unknown> {
     }
 
     const maxTurns = agent._config.maxTurns ?? 25;
-    const timeoutMs = parseDuration(agent._config.timeout ?? '60s');
+    const timeoutMs = parseDuration(
+      options?.timeout ?? agent._config.timeout ?? this.config.defaults?.timeout ?? '60s',
+    );
+    const stallTimeout =
+      options?.stallTimeout ?? agent._config.stallTimeout ?? this.config.defaults?.stallTimeout;
+    const stallTimeoutMs = stallTimeout === undefined ? undefined : parseDuration(stallTimeout);
     const startTime = Date.now();
+    const timeoutTracker = timeoutTrackerStorage.getStore()?.at(-1);
     // Per-ask latency attribution, summed over completed turns. `turns` counts
     // only turns whose provider actually reported timing — zero means the
     // provider is uninstrumented, and the TimeoutError message stays bare
@@ -2017,7 +2074,7 @@ export class WorkflowContext<TInput = unknown> {
       this.currentSignal?.throwIfAborted();
 
       // Timeout check
-      const elapsedMs = Date.now() - startTime;
+      const elapsedMs = Date.now() - startTime - (timeoutTracker?.humanWaitMs ?? 0);
       if (elapsedMs > timeoutMs) {
         throw new TimeoutError(
           'ctx.ask()',
@@ -2034,6 +2091,7 @@ export class WorkflowContext<TInput = unknown> {
                 ),
               }
             : undefined,
+          agent._name,
         );
       }
 
@@ -2089,6 +2147,41 @@ export class WorkflowContext<TInput = unknown> {
         stop: options?.stop ?? agent._config.stop,
         providerOptions,
         signal: this.currentSignal,
+      };
+
+      // A stall is scoped to exactly one provider turn. Built-in adapters arm
+      // it at actual fetch dispatch; custom providers retain the conservative
+      // provider-entry fallback to preserve the public Provider contract.
+      const requestSignal = chatOptions.signal;
+      const stallController = stallTimeoutMs === undefined ? undefined : new AbortController();
+      const stallReason =
+        stallController === undefined
+          ? undefined
+          : new DOMException('Provider request stalled', 'StallTimeout');
+      let stallTimer: ReturnType<typeof setTimeout> | undefined;
+      const clearStallTimer = () => {
+        if (stallTimer !== undefined) {
+          clearTimeout(stallTimer);
+          stallTimer = undefined;
+        }
+      };
+      const armStallTimer = () => {
+        if (!stallController || !stallReason || stallTimeoutMs === undefined) return;
+        clearStallTimer();
+        if (stallController.signal.aborted) return;
+        stallTimer = setTimeout(() => stallController.abort(stallReason), stallTimeoutMs);
+      };
+      if (stallController) {
+        chatOptions.signal = composeAbortSignals(requestSignal, stallController.signal);
+        chatOptions.requestLifecycle = {
+          onDispatch: armStallTimer,
+          onRetry: clearStallTimer,
+        };
+      }
+      const throwIfRequestStalled = () => {
+        if (stallReason !== undefined && chatOptions.signal?.reason === stallReason) {
+          throw new StallTimeoutError('ctx.ask()', stallTimeoutMs!, agent._name);
+        }
       };
 
       // If schema requested and no tools, use JSON mode. With
@@ -2264,10 +2357,20 @@ export class WorkflowContext<TInput = unknown> {
               })
             : undefined;
 
+          // Custom providers do not expose an exact fetch-dispatch hook, so
+          // their conservative fallback begins at provider entry.
+          if (stallController && provider.reportsRequestLifecycle !== true) armStallTimer();
           for await (const chunk of provider.stream(
             cloneMessagesForProvider(currentMessages),
             chatOptions,
           )) {
+            // A provider may ignore the private stall signal and still yield
+            // late. External cancellation deliberately remains accounted for
+            // below, before the normal continuation gate stops the branch.
+            throwIfRequestStalled();
+            // Every protocol chunk is progress. Tool-call and usage-only chunks
+            // are just as important as text for a streaming request.
+            if (stallController) armStallTimer();
             if (chunk.type === 'text_delta') {
               content += chunk.content;
               // Emit a `token` AxlEvent so wire consumers (AxlStream) and
@@ -2328,6 +2431,9 @@ export class WorkflowContext<TInput = unknown> {
               }
             }
           }
+          // Also reject a provider that ignores the private stall abort and
+          // terminates without yielding another chunk after the deadline.
+          throwIfRequestStalled();
 
           // Convert tool call buffers to ToolCallMessage format
           for (const buffer of toolCallBuffers.values()) {
@@ -2360,16 +2466,26 @@ export class WorkflowContext<TInput = unknown> {
             response.thinking_content = thinkingContent;
           }
         } else {
+          if (stallController && provider.reportsRequestLifecycle !== true) armStallTimer();
           response = await provider.chat(cloneMessagesForProvider(currentMessages), chatOptions);
+          // Do not accept a late non-stream result after the private stall
+          // abort. Ignored external cancellation retains cost below.
+          throwIfRequestStalled();
         }
       } catch (err) {
-        if (richRequest) this.recordRichFailure(err);
+        // The composed signal's reason is the only reliable first-wins
+        // discriminator: an external signal can race this private controller.
+        const callError =
+          stallReason !== undefined && chatOptions.signal?.reason === stallReason
+            ? new StallTimeoutError('ctx.ask()', stallTimeoutMs!, agent._name)
+            : err;
+        if (richRequest) this.recordRichFailure(callError);
         // A failed call is still a measured call whenever the provider
         // answered: any non-2xx carries the same `timing` block a success
         // would, so a latency dashboard doesn't go blind exactly when the
         // provider starts misbehaving. Absent for a network-level failure
         // (no response) and for any non-`ProviderError` throw.
-        const failureTiming = err instanceof ProviderError ? err.timing : undefined;
+        const failureTiming = callError instanceof ProviderError ? callError.timing : undefined;
         // Emit the paired `agent_call_end` before rethrowing. Empty response,
         // error message in `data.error`. No usage/cost — provider didn't
         // deliver one. `duration` reflects time-to-failure.
@@ -2385,14 +2501,17 @@ export class WorkflowContext<TInput = unknown> {
             response: '',
             turn: turns,
             ...(retryReason ? { retryReason } : {}),
-            error: this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
+            error:
+              this._observerErrorProjection(callError)?.message ?? legacyErrorMessage(callError),
             // Enrich with typed-error metadata when available. `body` is
             // deliberately NOT emitted — it's redaction-eligible (see
             // docs/security.md). `data.error` already carries the message.
-            ...providerErrorEventMetadata(err, richRequest),
+            ...providerErrorEventMetadata(callError, richRequest),
           },
         });
-        throw err;
+        throw callError;
+      } finally {
+        clearStallTimer();
       }
 
       // Capture usage for span instrumentation (per-call, not per-instance)
@@ -4409,22 +4528,29 @@ export class WorkflowContext<TInput = unknown> {
   // ── ctx.awaitHuman() ──────────────────────────────────────────────────
 
   async awaitHuman(options: AwaitHumanOptions): Promise<HumanDecision> {
-    if (this.spanManager) {
-      return this.spanManager.withSpanAsync(
-        'axl.ctx.awaitHuman',
-        {
-          'axl.awaitHuman.channel': options.channel,
-        },
-        async (span) => {
-          const start = Date.now();
-          const result = await this._awaitHumanImpl(options);
-          span.setAttribute('axl.awaitHuman.wait_duration', Date.now() - start);
-          span.setAttribute('axl.awaitHuman.approved', result.approved);
-          return result;
-        },
-      );
+    const trackers = timeoutTrackerStorage.getStore();
+    const startedAt = Date.now();
+    try {
+      if (this.spanManager) {
+        return await this.spanManager.withSpanAsync(
+          'axl.ctx.awaitHuman',
+          {
+            'axl.awaitHuman.channel': options.channel,
+          },
+          async (span) => {
+            const start = Date.now();
+            const result = await this._awaitHumanImpl(options);
+            span.setAttribute('axl.awaitHuman.wait_duration', Date.now() - start);
+            span.setAttribute('axl.awaitHuman.approved', result.approved);
+            return result;
+          },
+        );
+      }
+      return await this._awaitHumanImpl(options);
+    } finally {
+      const humanWaitMs = Date.now() - startedAt;
+      for (const tracker of trackers ?? []) tracker.humanWaitMs += humanWaitMs;
     }
-    return this._awaitHumanImpl(options);
   }
 
   private async _awaitHumanImpl(options: AwaitHumanOptions): Promise<HumanDecision> {

@@ -47,6 +47,7 @@ export type AgentConfig = {
   nativeStructuredOutput?: boolean;
   maxTurns?: number;
   timeout?: string;
+  stallTimeout?: string;
   maxContext?: number;
   version?: string;
   guardrails?: GuardrailsConfig;

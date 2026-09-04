@@ -109,6 +109,7 @@ export type StateConfig = {
 /** Global defaults */
 export type DefaultsConfig = {
   timeout?: string;
+  stallTimeout?: string;
   maxRetries?: number;
   budgetPolicy?: 'finish_and_stop' | 'hard_stop' | 'warn';
 };

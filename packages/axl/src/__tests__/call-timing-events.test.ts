@@ -361,14 +361,14 @@ describe('TimeoutError breakdown (AC-5)', () => {
     expect((err as TimeoutError).message).toContain('wire 20ms');
   });
 
-  it('UNINSTRUMENTED: stays byte-identical to the historical message', async () => {
+  it('UNINSTRUMENTED: keeps the historical prefix, names the agent, and omits attribution', async () => {
     // An all-zero breakdown would blame tools and gates for a budget the
     // provider simply never measured. Say nothing instead.
     const { ctx } = createTestCtx({ provider: slowLoopingProvider() });
 
     const err = await ctx.ask(timedAgent(), 'hi').catch((e: unknown) => e);
     expect(err).toBeInstanceOf(TimeoutError);
-    expect((err as TimeoutError).message).toBe('ctx.ask() exceeded timeout of 50ms');
+    expect((err as TimeoutError).message).toBe("ctx.ask() exceeded timeout of 50ms for agent 'a'");
     expect((err as TimeoutError).breakdown).toBeUndefined();
   });
 });

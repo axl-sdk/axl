@@ -193,6 +193,7 @@ export {
   QuorumNotMet,
   NoConsensus,
   TimeoutError,
+  StallTimeoutError,
   MaxTurnsError,
   BudgetExceededError,
   GuardrailError,

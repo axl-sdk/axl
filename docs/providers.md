@@ -484,6 +484,24 @@ What that means differs by transport, because headers mean different things:
 Either way, time spent downloading or draining a body lands in `agent_call_end.duration`
 and in the `other` remainder of a `TimeoutError` breakdown, never in `queuedMs`.
 
+#### Stalled requests and cancellation
+
+`ctx.ask(..., { stallTimeout })` is an opt-in request-level anti-hang control, not a
+rate-limiter deadline. Built-in adapters start its timer at actual `fetch` dispatch, after a
+governor grant, reset it for each streaming chunk, and disarm it during SDK retry backoff.
+Thus queue wait and backoff cannot be mislabeled as a provider stall. For a non-streaming
+request the same window runs from dispatch through completion. A silent request throws
+`StallTimeoutError` (a `TimeoutError` subtype); any partial streamed result is discarded.
+
+Use an ask or context `signal` for a strict total SLA instead. Provider transports receive the
+composed signal; the first context, branch, or ask signal to abort wins and its exact external
+reason propagates unchanged. Custom providers should pass `ChatOptions.signal` to their
+transport. They may optionally report `requestLifecycle.onDispatch` / `.onRetry` to obtain the
+same precise stall timing as built-ins; without that internal lifecycle callback, Axl starts
+the opt-in stall timer conservatively when the provider method is entered. Full public
+semantics and the `AbortSignal.timeout()` recipe are in the
+[API reference](api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
+
 **Not every millisecond lands in a bucket.** An `apiKey` callback is awaited *before* the
 request enters the transport, deliberately, so a slow token refresh does not hold a rate
 limiter permit — which also means its time is in no `CallTiming` bucket. It shows up in

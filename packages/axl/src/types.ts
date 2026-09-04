@@ -149,6 +149,12 @@ export type AskOptions<T = unknown> = {
   stop?: string[];
   /** Provider-specific options merged into API requests. Not portable across providers. */
   providerOptions?: Record<string, unknown>;
+  /** Graceful overall budget for this ask. The in-flight provider turn is allowed to finish. */
+  timeout?: string;
+  /** Abort an in-flight provider request that makes no streaming progress. Unset by default. */
+  stallTimeout?: string;
+  /** Per-ask hard cancellation signal. It is composed with the context signal and inherited by nested asks. */
+  signal?: AbortSignal;
 };
 
 /** Delegate options */

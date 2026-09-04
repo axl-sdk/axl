@@ -80,6 +80,13 @@ export type ChatOptions = {
   responseFormat?: ResponseFormat;
   stop?: string[];
   signal?: AbortSignal;
+  /** @internal Runtime observer for the actual adapter transport lifecycle. */
+  requestLifecycle?: {
+    /** The request was actually dispatched, after limiter queue and retry backoff. */
+    onDispatch?(): void;
+    /** A retryable response was received; SDK retry backoff is about to begin. */
+    onRetry?(): void;
+  };
   /** How hard should the model try? Primary param for cost/quality tradeoff.
    *  'none' disables thinking/reasoning (Gemini 3.x: maps to minimal).
    *  Omit to use provider defaults. */
@@ -150,6 +157,8 @@ export type StreamChunk =
 export interface Provider {
   /** Human-readable name for the provider (e.g. "openai", "anthropic") */
   readonly name?: string;
+  /** @internal Built-in adapters set this when `ChatOptions.requestLifecycle` reports fetch dispatch. */
+  readonly reportsRequestLifecycle?: true;
   /** Coarse, model-aware input metadata for UI/documentation. */
   inputCapabilities?(model: string): InputModalitySupport;
   /** Authoritative request-scoped rich-input validation. Omission means text-only. */

@@ -612,6 +612,7 @@ function resolveGeminiThinking(
  */
 export class GeminiProvider implements Provider {
   readonly name = 'google';
+  readonly reportsRequestLifecycle = true as const;
 
   inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
     // Interactions accepts inline data and Gemini Files URIs. Axl never
@@ -765,7 +766,7 @@ export class GeminiProvider implements Provider {
     this.assertSafeGemini3Continuation(messages, pricingContext.model);
     const headers = this.buildHeaders(await this.resolveKey());
 
-    const recorder = new CallTimingRecorder();
+    const recorder = new CallTimingRecorder(options.requestLifecycle);
     const res = await fetchWithRetry(
       `${this.baseUrl}/models/${pricingContext.model}:generateContent`,
       {
@@ -808,7 +809,7 @@ export class GeminiProvider implements Provider {
     this.assertSafeGemini3Continuation(messages, pricingContext.model);
     const headers = this.buildHeaders(await this.resolveKey());
 
-    const recorder = new CallTimingRecorder();
+    const recorder = new CallTimingRecorder(options.requestLifecycle);
     const res = await fetchWithRetry(
       `${this.baseUrl}/models/${pricingContext.model}:streamGenerateContent?alt=sse`,
       {
@@ -853,7 +854,7 @@ export class GeminiProvider implements Provider {
     this.assertSafeInteractionOptions(options);
     const body = this.buildInteractionRequestBody(messages, options, false);
     const headers = this.buildHeaders(await this.resolveKey());
-    const recorder = new CallTimingRecorder();
+    const recorder = new CallTimingRecorder(options.requestLifecycle);
     const res = await fetchWithRetry(
       `${this.baseUrl}/interactions`,
       { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },
@@ -883,7 +884,7 @@ export class GeminiProvider implements Provider {
     this.assertSafeInteractionOptions(options);
     const body = this.buildInteractionRequestBody(messages, options, true);
     const headers = this.buildHeaders(await this.resolveKey());
-    const recorder = new CallTimingRecorder();
+    const recorder = new CallTimingRecorder(options.requestLifecycle);
     const res = await fetchWithRetry(
       `${this.baseUrl}/interactions?alt=sse`,
       { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },

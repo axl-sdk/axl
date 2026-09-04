@@ -69,6 +69,15 @@ const provider = MockProvider.sequence([
 ]);
 ```
 
+### Cancellation and timeout fixtures
+
+`MockProvider` honors `ChatOptions.signal` on both `chat()` and `stream()`: a pre-aborted
+signal prevents the fixture from running, and an abort while an asynchronous fixture or
+configured response delay is pending rejects with the signal's exact reason. This makes
+`ctx.ask(..., { signal: AbortSignal.timeout(...) })` and
+`stallTimeout` behavior testable without a real provider; it does not certify a vendor's
+network abort behavior. See the [API reference](./api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
+
 ### Deterministic provider timing
 
 A mock response accepts an optional `timing` block ([`CallTiming`](./api-reference.md#calltiming)). `chat()` returns it on `ProviderResponse.timing` and `stream()` carries it on the terminal `done` chunk, so `agent_call_end.timing`, the `TimeoutError` breakdown, and the eval per-model rollup all become exact integers instead of measured deltas — no real clocks, no real transport.

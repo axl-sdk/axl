@@ -41,6 +41,23 @@ const HandleSupport = workflow({
 
 25 lines for a production-ready support agent with tool access, type safety, and streaming.
 
+## Interactive request deadline
+
+An HTTP request needs a hard ceiling even while a provider call is in flight. Keep that
+strict SLA separate from the agent's graceful `timeout` budget:
+
+```typescript
+const reply = await ctx.ask(SupportBot, ctx.input.message, {
+  signal: AbortSignal.timeout(15_000),
+  stallTimeout: '120s', // optional anti-hang guard; not a global default
+});
+```
+
+The signal aborts this ask (and any nested asks) without cancelling a sibling ask on the
+same context. The exact abort reason is propagated. `stallTimeout` instead detects a silent
+provider request, resets on every stream chunk, and throws `StallTimeoutError`; it is not a
+total-SLA timer. See [Ask deadlines](./api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
+
 ## Rich application results with compact model context
 
 A tool can return actions and bulky host data for UI rendering without copying all of it into the next model request. `toModelOutput` is an explicit allowlist over the successful post-hook result:

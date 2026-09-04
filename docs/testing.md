@@ -403,7 +403,7 @@ Compare models on these four per-call distributions:
 
 | Field | What it isolates |
 |---|---|
-| `wireMs` | The provider's own time per call |
+| `wireMs` | The provider's own time per call. On streams with content it is always at least `firstTokenMs`, while post-yield consumer pauses are excluded |
 | `firstTokenMs` | Time to the first content delta. The figure that actually discriminates between models, since headers arrive at roughly one round trip regardless of model. Absent on a non-streaming run rather than `0` |
 | `queuedMs` | Wait on **your** rate limiter, not the provider's |
 | `retryMs` | Failed attempts and backoff — the provider's throttling that day, kept out of `wireMs` |

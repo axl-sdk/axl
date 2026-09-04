@@ -1502,18 +1502,19 @@ export type CallTiming = {
   /** Final dispatch → response headers. Time to first byte. */
   ttfbMs: number;
   /**
-   * Final dispatch → first `text_delta`/`thinking_delta`. Streaming only, and
-   * absent on a stream that ends without any content delta. This is the
-   * model-discriminating figure: headers arrive at roughly one round trip
-   * regardless of model, first token does not.
+   * Final dispatch → first `text_delta`/`thinking_delta`, excluding consumer
+   * suspension after an earlier non-content chunk. Streaming only, and absent
+   * on a stream that ends without any content delta. This is the model-
+   * discriminating figure: headers arrive at roughly one round trip regardless
+   * of model, first token does not.
    */
   firstTokenMs?: number;
   /**
    * Time attributable to the provider. For `chat()`, final dispatch → response
-   * body parsed. For `stream()`, `ttfbMs` plus the cumulative time spent
-   * *awaiting* body reads — time the runtime spends between reads (event
-   * fan-out, tool-call buffering, a slow `ctx.events` consumer) is excluded by
-   * construction, so two models stay comparable under different listener loads.
+   * body parsed. For `stream()`, `ttfbMs` plus cumulative body-read waits,
+   * floored at `firstTokenMs` when content arrives. Parsing needed to deliver
+   * first content is included; consumer suspension between yielded chunks is
+   * excluded, so two models stay comparable under different listener loads.
    */
   wireMs: number;
 };

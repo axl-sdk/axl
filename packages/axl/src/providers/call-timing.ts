@@ -4,9 +4,10 @@
  * `done` stream chunk.
  *
  * Lives here rather than inline in each adapter because the two non-obvious
- * rules — streamed `wireMs` counts only time spent *awaiting* body reads, and
- * EVERY terminal `done` path must carry timing including the usage-less
- * fallbacks — are exactly the ones that rot when copied four times.
+ * rules — streamed `wireMs` excludes time between body reads while still
+ * covering first-content delivery, and EVERY terminal `done` path must carry
+ * timing including the usage-less fallbacks — are exactly the ones that rot
+ * when copied four times.
  */
 
 import type { CallTiming } from '../types.js';
@@ -24,6 +25,8 @@ import type { FetchTiming, FetchWithRetryOptions } from './retry.js';
 export class CallTimingRecorder {
   private fetchTiming: FetchTiming | undefined;
   private firstTokenAt: number | undefined;
+  /** Consumer suspension after pre-content chunks (for example, tool deltas). */
+  private preFirstTokenConsumerMs = 0;
   /** Cumulative time awaiting `reader.read()`, i.e. transport, not consumer. */
   private readWaitMs = 0;
 
@@ -67,6 +70,13 @@ export class CallTimingRecorder {
     this.firstTokenAt ??= Date.now();
   }
 
+  /** Exclude backpressure after a pre-content yield from first-content latency. */
+  recordPreFirstTokenConsumerPause(startedAt: number): void {
+    if (this.firstTokenAt === undefined) {
+      this.preFirstTokenConsumerMs += Math.max(0, Date.now() - startedAt);
+    }
+  }
+
   /**
    * Timing for a non-streaming call. Call once the response body is parsed.
    *
@@ -91,15 +101,20 @@ export class CallTimingRecorder {
     const t = this.fetchTiming;
     if (!t) return undefined;
     const ttfbMs = Math.max(0, t.headersAt - t.dispatchedAt);
+    const firstTokenMs =
+      this.firstTokenAt !== undefined
+        ? Math.max(0, this.firstTokenAt - t.dispatchedAt - this.preFirstTokenConsumerMs)
+        : undefined;
     return {
       queuedMs: t.queuedMs,
       attempts: t.attempts,
       retryMs: t.retryMs,
       ttfbMs,
-      ...(this.firstTokenAt !== undefined
-        ? { firstTokenMs: Math.max(0, this.firstTokenAt - t.dispatchedAt) }
-        : {}),
-      wireMs: ttfbMs + this.readWaitMs,
+      ...(firstTokenMs !== undefined ? { firstTokenMs } : {}),
+      // Parsing and generator scheduling can happen after the first read has
+      // settled. Include that pre-first-token gap so the public relationship
+      // stays intuitive, without charging pauses after any chunk is yielded.
+      wireMs: Math.max(ttfbMs + this.readWaitMs, firstTokenMs ?? 0),
     };
   }
 }
@@ -122,7 +137,9 @@ export async function* withCallTiming(
       const timing = recorder.streamTiming();
       yield timing ? { ...chunk, timing } : chunk;
     } else {
+      const yieldedAt = Date.now();
       yield chunk;
+      recorder.recordPreFirstTokenConsumerPause(yieldedAt);
     }
   }
 }

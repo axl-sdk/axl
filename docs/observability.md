@@ -228,6 +228,8 @@ would exceed wall clock, so aggregation belongs to whoever knows the shape of th
 (the eval does it per model). Field definitions: [api-reference.md →
 `CallTiming`](api-reference.md#calltiming); what `queuedMs` can and cannot tell you under
 streaming: [providers.md → What you can observe](providers.md#what-you-can-observe).
+On a stream that delivers content, `wireMs >= firstTokenMs`: first-content parsing is part
+of delivery, while time a consumer spends paused after a yielded delta is not.
 
 A `ctx.ask()` that times out uses the same numbers: when at least one completed turn
 reported timing, `TimeoutError.message` appends `(elapsed …: queued …, retries …, wire …,

@@ -54,6 +54,23 @@ describe('CostAggregator', () => {
     expect(data.byWorkflow.wf.unpricedCalls).toBe(1);
   });
 
+  it('counts an explicitly unknown stalled call without tokens or cost', () => {
+    aggregator.onTrace({
+      type: 'agent_call_end',
+      agent: 'stalled-agent',
+      model: 'stalled-model',
+      workflow: 'stalled-workflow',
+      unpriced: true,
+    });
+
+    const data = aggregator.getData();
+    expect(data.totalCost).toBe(0);
+    expect(data.unpricedCalls).toBe(1);
+    expect(data.byAgent['stalled-agent'].unpricedCalls).toBe(1);
+    expect(data.byModel['stalled-model'].unpricedCalls).toBe(1);
+    expect(data.byWorkflow['stalled-workflow'].unpricedCalls).toBe(1);
+  });
+
   it('getData returns breakdown by agent, model, and workflow', () => {
     aggregator.onTrace({
       type: 'agent_call_end',

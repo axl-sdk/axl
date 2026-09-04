@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only `awaitHuman` wait. New opt-in `stallTimeout` aborts a dispatched provider request that
   stops making progress (`StallTimeoutError extends TimeoutError`); built-in adapters start it
   after limiter queueing, reset it on every stream chunk, and pause it for SDK retry backoff.
+  Runtime settlement does not depend on provider cooperation: a custom provider or stream
+  iterator that ignores cancellation still releases the caller at the stall boundary. Any such
+  abandoned work can finish or be billed later and cannot update already-terminal accounting;
+  dispatched stalled calls mark the resulting event, ask, budget, and execution totals unpriced.
   New per-ask `signal` composes with context/branch cancellation first-wins, preserves the
   caller's exact abort reason, is sibling-local, and is inherited by nested asks. Partial
   responses from hard aborts are discarded. See [API reference](docs/api-reference.md#ask-deadlines-cancellation-and-stalled-requests).

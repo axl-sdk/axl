@@ -114,6 +114,7 @@ type AskTimeoutTracker = {
   humanWaitStartedAt?: number;
 };
 const timeoutTrackerStorage = new AsyncLocalStorage<AskTimeoutTracker[]>();
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 function composeAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
   const active = signals.filter((signal): signal is AbortSignal => signal !== undefined);
@@ -286,8 +287,8 @@ type AskFrame = {
    */
   askCost: { value: number };
   /**
-   * True when a cost-bearing leaf in THIS frame did measurable work (returned
-   * usage/tokens) but had no usable cost (unpriced model / pricing-table miss).
+   * True when a cost-bearing leaf in THIS frame has unknown cost, either
+   * explicitly or because it returned usage/tokens without a usable price.
    * Set in `emitEvent` alongside the cost rollup. Read by `ask_end` to surface
    * `unpriced`, so an ask's `cost` (which silently omits the unknown component)
    * is shown as a lower bound rather than a misleading exact figure.
@@ -2087,6 +2088,11 @@ export class WorkflowContext<TInput = unknown> {
     const stallTimeout =
       options?.stallTimeout ?? agent._config.stallTimeout ?? this.config.defaults?.stallTimeout;
     const stallTimeoutMs = stallTimeout === undefined ? undefined : parseDuration(stallTimeout);
+    if (stallTimeoutMs !== undefined && stallTimeoutMs > MAX_TIMER_DELAY_MS) {
+      throw new RangeError(
+        `stallTimeout exceeds the maximum supported timer duration of ${MAX_TIMER_DELAY_MS}ms`,
+      );
+    }
     const startTime = Date.now();
     const timeoutTracker = timeoutTrackerStorage.getStore()?.at(-1);
     // Per-ask latency attribution, summed over completed turns. `turns` counts
@@ -2219,6 +2225,7 @@ export class WorkflowContext<TInput = unknown> {
           : new DOMException('Provider request stalled', 'StallTimeout');
       let stallTimer: ReturnType<typeof setTimeout> | undefined;
       let providerCallActive = true;
+      let requestDispatched = false;
       const clearStallTimer = () => {
         if (stallTimer !== undefined) {
           clearTimeout(stallTimer);
@@ -2228,6 +2235,7 @@ export class WorkflowContext<TInput = unknown> {
       const armStallTimer = () => {
         if (!providerCallActive || !stallController || !stallReason || stallTimeoutMs === undefined)
           return;
+        requestDispatched = true;
         clearStallTimer();
         if (stallController.signal.aborted) return;
         stallTimer = setTimeout(() => stallController.abort(stallReason), stallTimeoutMs);
@@ -2239,13 +2247,20 @@ export class WorkflowContext<TInput = unknown> {
           onRetry: clearStallTimer,
         };
       }
+      // Runtime settlement deliberately excludes requestSignal: it can be an
+      // internal race/quorum branch cancellation, whose provider work must be
+      // allowed to drain for late cost accounting. Public cancellation and a
+      // stall are caller-facing hard bounds, so race them even when a custom
+      // provider ignores ChatOptions.signal.
+      const providerSettlementSignal = composeAbortSignals(
+        hardRequestSignal,
+        stallController?.signal,
+      );
       const throwIfRequestStalled = () => {
-        if (stallReason !== undefined && chatOptions.signal?.reason === stallReason) {
+        if (stallReason !== undefined && providerSettlementSignal?.reason === stallReason) {
           throw new StallTimeoutError('ctx.ask()', stallTimeoutMs!, agent._name);
         }
       };
-      const requestIsStalled = () =>
-        stallReason !== undefined && chatOptions.signal?.reason === stallReason;
 
       // If schema requested and no tools, use JSON mode. With
       // `nativeStructuredOutput`, derive the provider schema from the SAME Zod
@@ -2432,15 +2447,10 @@ export class WorkflowContext<TInput = unknown> {
             while (true) {
               const next = await raceWithAbortSignal(
                 Promise.resolve(iterator.next()),
-                hardRequestSignal,
+                providerSettlementSignal,
               );
               if (next.done) break;
               const chunk = next.value;
-              // A terminal done chunk can carry accounting even after a
-              // non-cooperative stream ignored the private stall abort. No
-              // other late content is projected to the caller or trace.
-              const stalledBeforeChunk = requestIsStalled();
-              if (stalledBeforeChunk && chunk.type !== 'done') throwIfRequestStalled();
               // Every protocol chunk is progress. Tool-call and usage-only chunks
               // are just as important as text for a streaming request.
               if (stallController) armStallTimer();
@@ -2502,7 +2512,6 @@ export class WorkflowContext<TInput = unknown> {
                   timing: chunk.timing,
                 };
               }
-              if (stalledBeforeChunk) throwIfRequestStalled();
             }
           } catch (error) {
             if (iterator.return) {
@@ -2554,24 +2563,19 @@ export class WorkflowContext<TInput = unknown> {
           if (stallController && provider.reportsRequestLifecycle !== true) armStallTimer();
           response = await raceWithAbortSignal(
             provider.chat(cloneMessagesForProvider(currentMessages), chatOptions),
-            hardRequestSignal,
+            providerSettlementSignal,
           );
-          // Do not accept a late non-stream result after the private stall
-          // abort. A hard external signal instead wins its runtime race before
-          // a non-cooperative provider can supply later accounting.
+          // Defensive against a provider promise and timer settling in the
+          // same turn: the composed settlement signal is the first-wins source.
           throwIfRequestStalled();
         }
       } catch (err) {
         // The composed signal's reason is the only reliable first-wins
         // discriminator: an external signal can race this private controller.
         const callError =
-          stallReason !== undefined && chatOptions.signal?.reason === stallReason
+          stallReason !== undefined && providerSettlementSignal?.reason === stallReason
             ? new StallTimeoutError('ctx.ask()', stallTimeoutMs!, agent._name)
             : err;
-        const lateResponse = callError instanceof StallTimeoutError ? response : undefined;
-        if (lateResponse?.cost) this._accumulateBudgetCost(lateResponse.cost);
-        if (usageCapture && lateResponse?.usage) usageCapture.value = lateResponse.usage;
-        if (usageCapture && lateResponse?.timing) usageCapture.timing = lateResponse.timing;
         if (richRequest) this.recordRichFailure(callError);
         // A failed call is still a measured call whenever the provider
         // answered: any non-2xx carries the same `timing` block a success
@@ -2587,23 +2591,16 @@ export class WorkflowContext<TInput = unknown> {
           agent: agent._name,
           model: effectiveModelUri,
           promptVersion: agent._config.version,
-          cost: lateResponse?.cost,
-          tokens: lateResponse?.usage
-            ? {
-                input: lateResponse.usage.prompt_tokens,
-                output: lateResponse.usage.completion_tokens,
-                reasoning: lateResponse.usage.reasoning_tokens,
-                cached: lateResponse.usage.cached_tokens,
-                cacheWrite: lateResponse.usage.cache_write_tokens,
-              }
-            : undefined,
+          // A dispatched request abandoned at the runtime boundary may still
+          // be billed even though a non-cooperative provider supplied no
+          // usage. Preserve budget honesty by marking the known total as a
+          // lower bound rather than presenting an exact $0.
+          ...(callError instanceof StallTimeoutError && requestDispatched
+            ? { unpriced: true }
+            : {}),
           duration: Date.now() - turnStart,
           // Top-level beside `duration`, exactly as on the success path.
-          ...(lateResponse?.timing
-            ? { timing: lateResponse.timing }
-            : failureTiming
-              ? { timing: failureTiming }
-              : {}),
+          ...(failureTiming ? { timing: failureTiming } : {}),
           data: {
             response: '',
             turn: turns,
@@ -5736,10 +5733,10 @@ export class WorkflowContext<TInput = unknown> {
     if ((COST_BEARING_LEAF_TYPES as readonly string[]).includes(partial.type as string)) {
       // Classify the leaf ONCE, then feed two independent accumulators: the per-ask
       // frame rollup (ALS-scoped) AND the budget rail (instance-scoped). A
-      // cost-bearing leaf that did measurable work (POSITIVE token count) but
-      // produced no usable cost = an unpriced model / pricing-table miss. The
-      // positive-token signal distinguishes this from a failed call (no tokens) AND
-      // from a no-usage streamed call (zero tokens). Budget detection is NOT gated on
+      // cost-bearing leaf has unknown cost when it explicitly says so, or when
+      // positive billable work has no usable price. The positive-work fallback
+      // distinguishes an ordinary failed/no-usage call from an unpriced model.
+      // Budget detection is NOT gated on
       // `frame`: a direct `ctx.budget(() => ctx.recall(...))` emits a cost-bearing
       // leaf with no ask frame, and the budget must still see it.
       // This is the canonical inline form of `isUnpricedLeaf` (event-utils):
@@ -5751,18 +5748,19 @@ export class WorkflowContext<TInput = unknown> {
       const usable = isUsableCost(cost);
       const unpriced =
         !usable &&
-        hasPositiveBillableWork(
-          partial as {
-            tokens?: {
-              input?: number;
-              output?: number;
-              reasoning?: number;
-              cached?: number;
-              cacheWrite?: number;
-            };
-            data?: { usage?: { audioSeconds?: number; totalTokens?: number } };
-          },
-        );
+        ((partial as { unpriced?: boolean }).unpriced === true ||
+          hasPositiveBillableWork(
+            partial as {
+              tokens?: {
+                input?: number;
+                output?: number;
+                reasoning?: number;
+                cached?: number;
+                cacheWrite?: number;
+              };
+              data?: { usage?: { audioSeconds?: number; totalTokens?: number } };
+            },
+          ));
       if (frame) {
         if (usable) frame.askCost.value += cost;
         else if (unpriced) frame.askUnpriced = true;
@@ -5784,8 +5782,8 @@ export class WorkflowContext<TInput = unknown> {
           // interleaving under JS's cooperative single-threaded model.
           this.budgetContext.unpricedWarned = true;
           console.warn(
-            "Budget honesty: unpriced work detected — this budget's cost limit is a " +
-              'lower bound and is NOT enforced on unpriced models. ' +
+            "Budget honesty: unknown-cost work detected — this budget's cost limit is a " +
+              'lower bound and is NOT enforced on unknown spend. ' +
               'See docs/observability.md#budget-honesty.',
           );
         }

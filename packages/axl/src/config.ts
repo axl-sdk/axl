@@ -174,18 +174,27 @@ export function parseDuration(duration: string): number {
   const value = parseFloat(match[1]);
   const unit = match[2];
 
+  let milliseconds: number;
   switch (unit) {
     case 'ms':
-      return value;
+      milliseconds = value;
+      break;
     case 's':
-      return value * 1000;
+      milliseconds = value * 1000;
+      break;
     case 'm':
-      return value * 60_000;
+      milliseconds = value * 60_000;
+      break;
     case 'h':
-      return value * 3_600_000;
+      milliseconds = value * 3_600_000;
+      break;
     default:
       throw new Error(`Unknown duration unit: "${unit}"`);
   }
+  if (!Number.isFinite(milliseconds)) {
+    throw new Error(`Duration is too large: "${duration}"`);
+  }
+  return milliseconds;
 }
 
 /** Parse cost strings like "$5.00" to number */

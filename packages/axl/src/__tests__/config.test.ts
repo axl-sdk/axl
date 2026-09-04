@@ -41,6 +41,10 @@ describe('parseDuration()', () => {
   it('throws on missing value', () => {
     expect(() => parseDuration('ms')).toThrow('Invalid duration format');
   });
+
+  it('throws when the numeric duration overflows to Infinity', () => {
+    expect(() => parseDuration(`${'9'.repeat(400)}h`)).toThrow('Duration is too large');
+  });
 });
 
 describe('parseCost()', () => {

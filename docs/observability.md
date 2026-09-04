@@ -174,7 +174,7 @@ for (const event of info.events) {
 
 `ask_end.cost` is the **per-ask rollup** of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). If you sum `event.cost` across every event you observe, you'll double-count.
 
-**Unknown cost (`ask_end.unpriced`).** When an ask used a model with no usable per-call price (a pricing-table miss, or a provider that doesn't report cost), the unpriced call's `cost` is `undefined` — it contributes nothing to the rollup, so `ask_end.cost` becomes a **lower bound** and `ask_end.unpriced` is `true`. A *failed* call (which carries no usage) is NOT flagged. Treat `unpriced` asks as "at least `cost`", not exact (Studio renders them `≥ $X`). `agent_call_end.cost` is `number | undefined` for the same reason.
+**Unknown cost (`ask_end.unpriced`).** When an ask used a model with no usable per-call price (a pricing-table miss, or a provider that doesn't report cost), or abandoned a dispatched stalled call without usage, the call's `cost` is `undefined` — it contributes nothing to the rollup, so `ask_end.cost` becomes a **lower bound** and `ask_end.unpriced` is `true`. An ordinary *failed* call (which carries no usage and was not abandoned at a stall boundary) is NOT flagged. Treat `unpriced` asks as "at least `cost`", not exact (Studio renders them `≥ $X`). `agent_call_end.cost` is `number | undefined` for the same reason.
 
 **Execution-level aggregate (`ExecutionInfo.unpriced`).** To answer "is this execution's `totalCost` exact?" without scanning the timeline, read `ExecutionInfo.unpriced` (from `runtime.execute()` / `getExecutions()` / recovered streams) — `true` when any cost-bearing call was unpriced. The same flag is on `runtime.trackExecution().unpriced` and `AxlTestRuntime.unpriced()`. All three derive from the exported `isUnpricedLeaf(event)` discriminator (the single source of truth shared with the per-ask rollup and Studio's `CostData.unpricedCalls`).
 
@@ -193,9 +193,9 @@ The whole-execution total is `ExecutionInfo.totalCost`. Axl's built-in `runtime.
 
 ### Budget honesty
 
-The same unpriced condition is surfaced on the budget rail. A [`ctx.budget()`](api-reference.md#ctxbudgetoptions-fn) block whose calls ran an unpriced model returns `BudgetResult.unpriced === true` (and `ctx.getBudgetStatus().unpriced` is `true` mid-block); inner budgets propagate the flag to their parent. When this happens Axl logs a **one-time `console.warn` per budget block**.
+The same unknown-cost condition is surfaced on the budget rail. A [`ctx.budget()`](api-reference.md#ctxbudgetoptions-fn) block whose calls include unknown-cost work returns `BudgetResult.unpriced === true` (and `ctx.getBudgetStatus().unpriced` is `true` mid-block); inner budgets propagate the flag to their parent. When this happens Axl logs a **one-time `console.warn` per budget block**.
 
-⚠️ **Honesty, not enforcement.** `unpriced` reports that `totalCost` is a lower bound — it does **not** make the limit enforceable. The enforcement rail only ever sees *measured* cost, so a cost limit (including `hard_stop`) **cannot trip on unpriced spend** (e.g. unpriced/self-hosted/Bedrock models). A `hard_stop` budget pointed at an unpriced model will run unbounded by dollars. Token-denominated budgets are the planned mechanism for governing unpriced models; until then, treat `unpriced: true` as "the limit could not be enforced for part of this block." To restore enforceable cost limits, register pricing for the model so calls carry a usable cost.
+⚠️ **Honesty, not enforcement.** `unpriced` reports that `totalCost` is a lower bound — it does **not** make the limit enforceable. The enforcement rail only ever sees *measured* cost, so a cost limit (including `hard_stop`) **cannot trip on unknown spend** (e.g. unpriced/self-hosted/Bedrock models or abandoned non-cooperative work). Treat `unpriced: true` as "the limit could not be enforced for part of this block." Register pricing where applicable and use provider-side limits for abandoned work.
 
 ### Per-call timing
 

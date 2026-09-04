@@ -78,6 +78,23 @@ const openAIResponse = {
 };
 
 describe('ctx.ask timeout and deadline contract (spec 23)', () => {
+  it('rejects a stallTimeout above the platform timer limit before dispatch', async () => {
+    let calls = 0;
+    const provider = {
+      name: 'controlled',
+      chat: async () => {
+        calls++;
+        return { content: 'must not dispatch', usage };
+      },
+      stream: async function* () {},
+    };
+
+    await expect(
+      context(provider).ask(baseAgent({ stallTimeout: '2147483648ms' }), 'go'),
+    ).rejects.toThrow('stallTimeout exceeds the maximum supported timer duration');
+    expect(calls).toBe(0);
+  });
+
   it('T1: finishes an in-flight turn/tool but refuses its next turn after graceful timeout', async () => {
     vi.useFakeTimers();
     try {
@@ -265,24 +282,18 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
     }
   });
 
-  it('T7: a provider that returns late despite its aborted request signal still fails as StallTimeoutError', async () => {
+  it('T7: promptly stalls a non-stream provider that ignores its request signal', async () => {
     vi.useFakeTimers();
     try {
       const provider = {
         name: 'controlled',
-        chat: async () => {
-          await wait(100); // Intentionally ignores ChatOptions.signal.
-          return { content: 'late success must not escape', usage };
-        },
+        chat: () => new Promise<never>(() => {}),
         stream: async function* () {},
       };
       const ask = context(provider).ask(baseAgent({ stallTimeout: '50ms' }), 'go');
-      const outcome = ask.then(
-        (value) => ({ value }),
-        (error: unknown) => ({ error }),
-      );
-      await vi.advanceTimersByTimeAsync(101);
-      expect((await outcome).error).toBeInstanceOf(StallTimeoutError);
+      const stalled = expect(ask).rejects.toBeInstanceOf(StallTimeoutError);
+      await vi.advanceTimersByTimeAsync(51);
+      await stalled;
     } finally {
       vi.useRealTimers();
     }
@@ -935,7 +946,7 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
     }
   });
 
-  it('repair R3: a late abort-ignoring non-stream response retains usage, cost, and timing exactly once', async () => {
+  it('owner hardening: settles a stall before a late response and does not rewrite terminal accounting', async () => {
     vi.useFakeTimers();
     try {
       const events: Array<Record<string, unknown>> = [];
@@ -956,28 +967,36 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
         onTrace: (event: unknown) => events.push(event as Record<string, unknown>),
       });
       let activeBudgetCost: number | undefined;
+      let activeBudgetUnpriced: boolean | undefined;
       const ask = ctx.budget({ cost: '$1' }, async () => {
         try {
           return await ctx.ask(baseAgent({ stallTimeout: '50ms' }), 'go');
         } catch (error) {
           activeBudgetCost = ctx.totalCost;
+          activeBudgetUnpriced = ctx.getBudgetStatus().unpriced;
           throw error;
         }
       });
       const stalled = expect(ask).rejects.toBeInstanceOf(StallTimeoutError);
-      await vi.advanceTimersByTimeAsync(101);
+      await vi.advanceTimersByTimeAsync(51);
       await stalled;
       const ends = events.filter((event) => event.type === 'agent_call_end');
       expect(ends).toHaveLength(1);
-      expect(ends[0]).toMatchObject({
-        cost: 0.42,
-        tokens: { input: 1, output: 1 },
-        timing: { wireMs: 100 },
-      });
+      expect(ends[0]).not.toHaveProperty('cost');
+      expect(ends[0]).not.toHaveProperty('tokens');
+      expect(ends[0]).not.toHaveProperty('timing');
+      expect(ends[0]).toMatchObject({ unpriced: true });
       const askEnds = events.filter((event) => event.type === 'ask_end');
       expect(askEnds).toHaveLength(1);
-      expect(askEnds[0]).toMatchObject({ cost: 0.42 });
-      expect(activeBudgetCost).toBe(0.42);
+      expect(askEnds[0]).toMatchObject({ cost: 0, unpriced: true });
+      expect(activeBudgetCost).toBe(0);
+      expect(activeBudgetUnpriced).toBe(true);
+
+      // The provider may still finish, but terminal events and budgets are
+      // immutable once the caller has been released.
+      await vi.advanceTimersByTimeAsync(50);
+      expect(events.filter((event) => event.type === 'agent_call_end')).toHaveLength(1);
+      expect(ctx.totalCost).toBe(0);
     } finally {
       vi.useRealTimers();
     }
@@ -1013,40 +1032,30 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
     }
   });
 
-  it('repair R3: a late stream terminal done retains its accounting before surfacing StallTimeoutError', async () => {
+  it('owner hardening: promptly stalls and closes a stream whose next() never settles', async () => {
     vi.useFakeTimers();
     try {
-      const events: Array<Record<string, unknown>> = [];
-      const firstChunk = deferred<void>();
+      let returnCalls = 0;
       const provider = {
         name: 'controlled',
         chat: async () => ({ content: '', usage }),
-        stream: async function* () {
-          yield { type: 'text_delta' as const, content: 'partial' };
-          firstChunk.resolve();
-          await wait(100); // Intentionally ignores the runtime's abort signal.
-          yield {
-            type: 'done' as const,
-            usage,
-            cost: 0.24,
-            timing: { queuedMs: 1, attempts: 1, retryMs: 0, ttfbMs: 2, wireMs: 100 },
-          };
-        },
+        stream: () => ({
+          [Symbol.asyncIterator]() {
+            return {
+              next: () => new Promise<never>(() => {}),
+              return: async () => {
+                returnCalls++;
+                return { done: true as const, value: undefined };
+              },
+            };
+          },
+        }),
       };
-      const ask = streamingContext(provider, {
-        onTrace: (event: unknown) => events.push(event as Record<string, unknown>),
-      }).ask(baseAgent({ stallTimeout: '50ms' }), 'go');
+      const ask = streamingContext(provider).ask(baseAgent({ stallTimeout: '50ms' }), 'go');
       const stalled = expect(ask).rejects.toBeInstanceOf(StallTimeoutError);
-      await firstChunk.promise;
-      await vi.advanceTimersByTimeAsync(101);
+      await vi.advanceTimersByTimeAsync(51);
       await stalled;
-      const ends = events.filter((event) => event.type === 'agent_call_end');
-      expect(ends).toHaveLength(1);
-      expect(ends[0]).toMatchObject({
-        cost: 0.24,
-        tokens: { input: 1, output: 1 },
-        timing: { wireMs: 100 },
-      });
+      expect(returnCalls).toBe(1);
     } finally {
       vi.useRealTimers();
     }

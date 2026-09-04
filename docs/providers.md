@@ -502,10 +502,11 @@ not part of the custom `Provider` contract. Full public semantics and the
 `AbortSignal.timeout()` recipe are in the
 [API reference](api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
 
-If custom provider work ignores the supplied signal, Axl still settles a hard caller deadline
-promptly and observes a later rejection. The abandoned work may nevertheless finish or be billed;
-because the ask has already emitted its terminal events, later usage cannot be retroactively added
-to that ask's event or budget totals. Always forward the signal to the underlying transport.
+If custom provider work ignores the supplied signal, Axl still settles a hard caller deadline or
+stall promptly and observes a later rejection. The abandoned work may nevertheless finish or be
+billed; because the ask has already emitted its terminal events, later usage cannot be
+retroactively added to that ask's event or budget totals. A dispatched stalled call marks those
+totals `unpriced` (lower bounds). Always forward the signal to the underlying transport.
 
 **Not every millisecond lands in a bucket.** An `apiKey` callback is awaited *before* the
 request enters the transport, deliberately, so a slow token refresh does not hold a rate

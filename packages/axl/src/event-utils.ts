@@ -30,9 +30,9 @@ const COST_LEAF_SET: ReadonlySet<string> = new Set(COST_BEARING_LEAF_TYPES);
 
 /**
  * True when an event reports a POSITIVE token count — i.e. it did measurable,
- * billable work. This is the discriminator the unpriced-cost signal (T2.5) uses:
- * a cost-bearing leaf with positive tokens but no usable cost is an unpriced
- * model / pricing-table miss, whereas a failed call (no usage) or a no-usage
+ * billable work. This is one discriminator the unpriced-cost signal uses:
+ * a cost-bearing leaf with positive tokens but no usable cost is unknown-cost
+ * work, whereas a failed call (no usage) or a no-usage
  * streamed `done` (zero tokens) is NOT "unpriced". Used by the core ask-cost
  * rollup AND the Studio aggregators, so the per-ask flag and the dashboard count
  * stay in lockstep.
@@ -136,16 +136,17 @@ export function isCostBearingLeaf(event: HistoricalAxlEvent): boolean {
 
 /**
  * True when the event is the "unpriced lower-bound" signal: a cost-bearing leaf
- * that did measurable, billable work (POSITIVE tokens) but produced no usable
- * cost (an unpriced model / pricing-table miss). This is the SINGLE source of
- * truth for that discriminator — the core ask-cost rollup, the runtime's
+ * that either explicitly reports unknown cost (for example, an abandoned
+ * dispatched request) or did measurable, billable work (POSITIVE tokens) but
+ * produced no usable cost (an unpriced model / pricing-table miss). This is the
+ * SINGLE source of truth for that discriminator — the core ask-cost rollup, the runtime's
  * `ExecutionInfo.unpriced` / `trackExecution().unpriced` aggregation, and
  * Studio's `unpricedCalls` count + cost reducer ALL route through it, so they
  * cannot drift.
  *
- * It is the conjunction of the three primitives:
- *   `isCostBearingLeaf` ∧ `!isUsableCost(cost)` ∧ `hasPositiveTokens`.
- * The positive-token term is what distinguishes an unpriced model from a FAILED
+ * It is the conjunction of the first two primitives and either uncertainty signal:
+ *   `isCostBearingLeaf` ∧ `!isUsableCost(cost)` ∧ (`unpriced === true` ∨ `hasPositiveTokens`).
+ * The positive-token term is what distinguishes ordinary unpriced work from a FAILED
  * call (no usage) or a no-usage streamed `done` (zero tokens) — neither is
  * "unpriced". An `ask_end` rollup carries a numeric cost, and `tool_call_end`
  * carries no tokens, so both are naturally excluded.
@@ -156,6 +157,7 @@ export function isCostBearingLeaf(event: HistoricalAxlEvent): boolean {
 export function isUnpricedLeaf(event: {
   type?: string;
   cost?: unknown;
+  unpriced?: boolean;
   tokens?: {
     input?: number;
     output?: number;
@@ -168,7 +170,7 @@ export function isUnpricedLeaf(event: {
     event.type !== undefined &&
     COST_LEAF_SET.has(event.type) &&
     !isUsableCost(event.cost) &&
-    hasPositiveBillableWork(event)
+    (event.unpriced === true || hasPositiveBillableWork(event))
   );
 }
 

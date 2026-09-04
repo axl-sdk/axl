@@ -952,9 +952,18 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
         },
         stream: async function* () {},
       };
-      const ask = context(provider, {
+      const ctx = context(provider, {
         onTrace: (event: unknown) => events.push(event as Record<string, unknown>),
-      }).ask(baseAgent({ stallTimeout: '50ms' }), 'go');
+      });
+      let activeBudgetCost: number | undefined;
+      const ask = ctx.budget({ cost: '$1' }, async () => {
+        try {
+          return await ctx.ask(baseAgent({ stallTimeout: '50ms' }), 'go');
+        } catch (error) {
+          activeBudgetCost = ctx.totalCost;
+          throw error;
+        }
+      });
       const stalled = expect(ask).rejects.toBeInstanceOf(StallTimeoutError);
       await vi.advanceTimersByTimeAsync(101);
       await stalled;
@@ -965,6 +974,40 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
         tokens: { input: 1, output: 1 },
         timing: { wireMs: 100 },
       });
+      const askEnds = events.filter((event) => event.type === 'ask_end');
+      expect(askEnds).toHaveLength(1);
+      expect(askEnds[0]).toMatchObject({ cost: 0.42 });
+      expect(activeBudgetCost).toBe(0.42);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('repair R6: abrupt stall exit closes a non-cooperative stream iterator', async () => {
+    vi.useFakeTimers();
+    try {
+      const firstChunk = deferred<void>();
+      const cleaned = deferred<void>();
+      const provider = {
+        name: 'controlled',
+        chat: async () => ({ content: '', usage }),
+        stream: async function* () {
+          try {
+            yield { type: 'text_delta' as const, content: 'first' };
+            firstChunk.resolve();
+            await wait(100);
+            yield { type: 'text_delta' as const, content: 'late' };
+          } finally {
+            cleaned.resolve();
+          }
+        },
+      };
+      const ask = streamingContext(provider).ask(baseAgent({ stallTimeout: '50ms' }), 'go');
+      const stalled = expect(ask).rejects.toBeInstanceOf(StallTimeoutError);
+      await firstChunk.promise;
+      await vi.advanceTimersByTimeAsync(101);
+      await stalled;
+      await cleaned.promise;
     } finally {
       vi.useRealTimers();
     }

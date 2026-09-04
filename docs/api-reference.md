@@ -442,6 +442,12 @@ unaffected, and asks nested through an agent tool inherit the ask signal. A pre-
 prevents dispatch. External abort reasons are rethrown unchanged; they are not rewritten as
 Axl timeout errors.
 
+The runtime settles that hard cancellation even if custom provider work ignores its signal.
+Such non-cooperative work may still finish or be billed after the ask's terminal events, so its
+late usage cannot be included in the already-emitted ask/budget totals. Custom providers must
+forward `ChatOptions.signal` to their transport; provider-side usage controls remain the backstop
+for abandoned work.
+
 `stallTimeout` is distinct from a strict SLA. Built-in adapters arm its timer only when a
 transport attempt is actually dispatched, reset it for every streamed chunk (including
 non-text chunks), and disarm it during Axl retry backoff; an opt-in rate-limiter queue is not

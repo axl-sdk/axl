@@ -2505,12 +2505,13 @@ export class WorkflowContext<TInput = unknown> {
               if (stalledBeforeChunk) throwIfRequestStalled();
             }
           } catch (error) {
-            if (requestSignal?.aborted && iterator.return) {
+            if (iterator.return) {
               try {
                 void Promise.resolve(iterator.return(undefined)).catch(() => {});
               } catch {
-                // Cancellation already won. Iterator cleanup is best-effort,
-                // but any async rejection is still observed above.
+                // The original provider/abort/stall failure already won.
+                // Iterator cleanup is best-effort, but any async rejection is
+                // still observed above.
               }
             }
             throw error;
@@ -2556,7 +2557,8 @@ export class WorkflowContext<TInput = unknown> {
             hardRequestSignal,
           );
           // Do not accept a late non-stream result after the private stall
-          // abort. Ignored external cancellation retains cost below.
+          // abort. A hard external signal instead wins its runtime race before
+          // a non-cooperative provider can supply later accounting.
           throwIfRequestStalled();
         }
       } catch (err) {

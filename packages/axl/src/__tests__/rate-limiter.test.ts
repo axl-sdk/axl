@@ -42,8 +42,9 @@ describe('RateLimiter', () => {
   it('rejects a pre-aborted signal without taking a permit', async () => {
     const rl = new RateLimiter({ maxConcurrent: 2 });
     const ac = new AbortController();
-    ac.abort();
-    await expect(rl.acquire(ac.signal)).rejects.toMatchObject({ name: 'AbortError' });
+    const reason = new Error('pre-aborted limiter identity');
+    ac.abort(reason);
+    await expect(rl.acquire(ac.signal)).rejects.toBe(reason);
     // No permit leaked: two fresh acquires (cap 2) both resolve immediately.
     await expect(Promise.all([rl.acquire(), rl.acquire()])).resolves.toBeDefined();
   });
@@ -57,8 +58,9 @@ describe('RateLimiter', () => {
     const after = rl.acquire().then(() => {
       afterGranted = true;
     }); // queued behind
-    ac.abort();
-    await expect(aborted).rejects.toMatchObject({ name: 'AbortError' });
+    const reason = new Error('queued limiter identity');
+    ac.abort(reason);
+    await expect(aborted).rejects.toBe(reason);
     expect(afterGranted).toBe(false); // still waiting on the held permit
     rl.release(); // → should grant `after`, not the aborted (removed) waiter
     await after;

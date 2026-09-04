@@ -104,6 +104,60 @@ function cloneOptions(options: ChatOptions): ChatOptions {
   };
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw signal.reason;
+}
+
+async function awaitWithSignal<T>(
+  value: PromiseLike<T> | T,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (!signal) return await value;
+  throwIfAborted(signal);
+
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(value).then(
+      (result) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(result);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function abortableDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (ms <= 0) {
+    throwIfAborted(signal);
+    return;
+  }
+  if (!signal) {
+    await new Promise<void>((resolve) => setTimeout(resolve, ms));
+    return;
+  }
+  throwIfAborted(signal);
+
+  await new Promise<void>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
+      timer = undefined;
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+      signal.removeEventListener('abort', onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 function richParts(input: ModelInput): readonly InputContentPart[] {
   return typeof input === 'string' ? [] : input;
 }
@@ -224,8 +278,13 @@ export class MockProvider implements Provider {
     // Each consumer gets independent ownership: a handler can inspect or mutate
     // its copy without changing the durable assertion record (including bytes).
     const recordedMessages = cloneMessages(messages);
+    const callIndex = this._calls.length;
     this._calls.push({ messages: recordedMessages, options: cloneOptions(options) });
-    return await this.responseFn(cloneMessages(messages), this._calls.length - 1);
+    throwIfAborted(options.signal);
+    const response = Promise.resolve().then(() =>
+      this.responseFn(cloneMessages(messages), callIndex),
+    );
+    return await awaitWithSignal(response, options.signal);
   }
 
   inputCapabilities(_model: string): { image: { sources: readonly InputMediaSource['type'][] } } {
@@ -278,6 +337,7 @@ export class MockProvider implements Provider {
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
     const callIndex = this._calls.length;
     const response = await this.chat(messages, options);
+    throwIfAborted(options.signal);
     const chunks = this.chunkSequence?.[callIndex];
     if (chunks && chunks.length > 0) {
       // Sanity guard — if a caller passes chunks AND content, they MUST
@@ -291,16 +351,19 @@ export class MockProvider implements Provider {
         );
       }
       for (let i = 0; i < chunks.length; i++) {
+        throwIfAborted(options.signal);
         yield { type: 'text_delta', content: chunks[i] };
         if (this.chunkDelayMs > 0 && i < chunks.length - 1) {
-          await new Promise((resolve) => setTimeout(resolve, this.chunkDelayMs));
+          await abortableDelay(this.chunkDelayMs, options.signal);
         }
       }
     } else if (response.content) {
+      throwIfAborted(options.signal);
       yield { type: 'text_delta', content: response.content };
     }
     if (response.tool_calls) {
       for (const tc of response.tool_calls) {
+        throwIfAborted(options.signal);
         yield {
           type: 'tool_call_delta',
           id: tc.id,
@@ -309,6 +372,7 @@ export class MockProvider implements Provider {
         };
       }
     }
+    throwIfAborted(options.signal);
     yield {
       type: 'done',
       usage: response.usage,

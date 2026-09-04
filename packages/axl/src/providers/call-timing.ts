@@ -27,8 +27,20 @@ export class CallTimingRecorder {
   /** Cumulative time awaiting `reader.read()`, i.e. transport, not consumer. */
   private readWaitMs = 0;
 
+  constructor(
+    private readonly requestLifecycle?: NonNullable<
+      import('./types.js').ChatOptions['requestLifecycle']
+    >,
+  ) {}
+
   /** Pass as `timing` in the `fetchWithRetry` options object. */
   readonly observer: NonNullable<FetchWithRetryOptions['timing']> = {
+    onDispatch: () => {
+      this.requestLifecycle?.onDispatch?.();
+    },
+    onRetry: () => {
+      this.requestLifecycle?.onRetry?.();
+    },
     onComplete: (timing: FetchTiming) => {
       this.fetchTiming = timing;
     },

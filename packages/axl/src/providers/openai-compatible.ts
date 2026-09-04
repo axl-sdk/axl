@@ -460,6 +460,7 @@ export type OpenAICompatibleOptions = {
  */
 export class OpenAICompatibleProvider implements Provider {
   readonly name: string;
+  readonly reportsRequestLifecycle = true as const;
 
   inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
     return this.name === 'openrouter' && model.trim().length > 0
@@ -583,7 +584,7 @@ export class OpenAICompatibleProvider implements Provider {
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, false);
 
-    const recorder = new CallTimingRecorder();
+    const recorder = new CallTimingRecorder(options.requestLifecycle);
     const res = await fetchWithRetry(
       `${this.baseUrl}/chat/completions`,
       {
@@ -618,7 +619,7 @@ export class OpenAICompatibleProvider implements Provider {
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, true);
 
-    const recorder = new CallTimingRecorder();
+    const recorder = new CallTimingRecorder(options.requestLifecycle);
     const res = await fetchWithRetry(
       `${this.baseUrl}/chat/completions`,
       {

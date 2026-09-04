@@ -119,6 +119,8 @@ export type FetchWithRetryOptions = {
      * actually leaves — after the governor grant and after any backoff sleep.
      */
     onDispatch?(attempt: number, at: number): void;
+    /** Fired after a retryable response and before the SDK's backoff sleep. */
+    onRetry?(attempt: number, at: number): void;
     /**
      * Fired exactly once, immediately before the final `Response` is returned
      * (OK, non-retryable, aborted-mid-retry, or retries exhausted). It does NOT
@@ -220,6 +222,7 @@ export async function fetchWithRetry(
             message: err instanceof Error ? err.message : String(err),
           });
         }
+        observer?.onRetry?.(attempt + 1, Date.now());
         await sleep(jitter(BASE_DELAY_MS * 2 ** attempt), init?.signal ?? undefined);
         continue;
       }
@@ -248,6 +251,7 @@ export async function fetchWithRetry(
           ? Math.min(retryAfterMs, MAX_BACKOFF_MS)
           : BASE_DELAY_MS * 2 ** attempt;
 
+      observer?.onRetry?.(attempt + 1, Date.now());
       await sleep(jitter(baseDelay), init?.signal ?? undefined);
     }
   } finally {

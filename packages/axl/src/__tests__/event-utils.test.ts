@@ -215,6 +215,11 @@ describe('isUnpricedLeaf', () => {
     );
   });
 
+  it('is TRUE for an explicitly unknown abandoned call without tokens', () => {
+    expect(isUnpricedLeaf(ev({ type: 'agent_call_end', unpriced: true }))).toBe(true);
+    expect(isUnpricedLeaf(ev({ type: 'agent_call_end', unpriced: true, cost: 0 }))).toBe(false);
+  });
+
   it('is FALSE for a non-usable cost (NaN/Infinity/negative) with NO tokens', () => {
     // Non-finite cost alone is not enough — without positive tokens it is a
     // failed/empty call, not unpriced work.

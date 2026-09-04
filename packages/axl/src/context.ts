@@ -34,6 +34,7 @@ import {
   QuorumNotMet,
   NoConsensus,
   TimeoutError,
+  StallTimeoutError,
   MaxTurnsError,
   BudgetExceededError,
   GuardrailError,
@@ -99,6 +100,64 @@ import {
  * without mutating shared state on the WorkflowContext instance.
  */
 const signalStorage = new AsyncLocalStorage<AbortSignal>();
+/** User/context/per-ask cancellation that must settle a provider wait even
+ * when provider-owned work ignores its signal. Internal race/spawn/map
+ * cancellation is deliberately excluded so branch draining can retain late
+ * accounting from non-cooperative losers. */
+const hardSignalStorage = new AsyncLocalStorage<AbortSignal>();
+
+/** Active graceful ask budgets in this async branch. `awaitHuman` pauses all
+ * enclosing budgets so a nested human gate cannot consume a parent's budget. */
+type AskTimeoutTracker = {
+  humanWaitMs: number;
+  activeHumanWaits: number;
+  humanWaitStartedAt?: number;
+};
+const timeoutTrackerStorage = new AsyncLocalStorage<AskTimeoutTracker[]>();
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function composeAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const active = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (active.length === 0) return undefined;
+  if (active.length === 1) return active[0];
+  return AbortSignal.any(active);
+}
+
+/** Settle at the runtime boundary even when provider-owned work ignores its signal. */
+function raceWithAbortSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    // The provider promise was already created. Observe a synchronous/early
+    // rejection before returning the winning exact signal reason.
+    void promise.catch(() => {});
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(signal.reason));
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
+function pausedHumanWaitMs(tracker: AskTimeoutTracker, now = Date.now()): number {
+  return (
+    tracker.humanWaitMs +
+    (tracker.activeHumanWaits > 0 && tracker.humanWaitStartedAt !== undefined
+      ? now - tracker.humanWaitStartedAt
+      : 0)
+  );
+}
 
 type BranchDrainState = {
   pending: Set<Promise<unknown>>;
@@ -228,8 +287,8 @@ type AskFrame = {
    */
   askCost: { value: number };
   /**
-   * True when a cost-bearing leaf in THIS frame did measurable work (returned
-   * usage/tokens) but had no usable cost (unpriced model / pricing-table miss).
+   * True when a cost-bearing leaf in THIS frame has unknown cost, either
+   * explicitly or because it returned usage/tokens without a usable price.
    * Set in `emitEvent` alongside the cost rollup. Read by `ask_end` to surface
    * `unpriced`, so an ask's `cost` (which silently omits the unknown component)
    * is shown as a lower bound rather than a misleading exact figure.
@@ -1377,7 +1436,13 @@ export class WorkflowContext<TInput = unknown> {
         tool_call_id: parsed.callId,
       });
     }
-    if (settlement.abortError !== undefined) throw settlement.abortError;
+    if (settlement.abortError !== undefined) {
+      // Tool settlement keeps an AbortError-shaped projection for lifecycle
+      // events. The caller-facing cancellation contract is stronger: the
+      // winning signal reason itself must escape unchanged.
+      signal?.throwIfAborted();
+      throw settlement.abortError;
+    }
   }
 
   // ── ctx.ask() ─────────────────────────────────────────────────────────
@@ -1401,227 +1466,270 @@ export class WorkflowContext<TInput = unknown> {
     const promptText = inputText(normalizedInput);
     const inputDescriptor = describeModelInput(normalizedInput);
     const agentName = agent._name;
-    return this._checkpoint(
-      this._autoCheckpointName('ask', agentName),
-      async () => {
-        // Allocate the ask frame BEFORE entering askStorage.run so the
-        // emitEvent calls inside the run() callback see the new frame in ALS.
-        const parentFrame = askStorage.getStore();
-        const askId = randomUUID();
-        const depth = (parentFrame?.depth ?? -1) + 1;
-        // Nested asks inherit the parent frame's counter; top-level asks
-        // share the WorkflowContext's instance-level `stepRefRoot` so all
-        // top-level asks (including concurrent ones from spawn / parallel /
-        // race) share a single monotonic counter. Spec §3.7.
-        const stepRef = parentFrame?.stepRef ?? this.stepRefRoot;
-        const frame: AskFrame = {
-          askId,
-          parentAskId: parentFrame?.askId,
-          depth,
-          agent: agent._name,
-          stepRef,
-          askCost: { value: 0 },
-          askUnpriced: false,
-        };
-
-        return askStorage.run(frame, async () => {
-          const askStart = Date.now();
-          this.emitEvent({
-            type: 'ask_start',
-            prompt: promptText,
-            ...(inputDescriptor ? { input: inputDescriptor } : {}),
-          });
-
-          // `costBefore` snapshots the global budget so we can pass the per-ask
-          // cost delta to onAgentCallComplete (legacy callback that reports the
-          // whole-tree spend). `frame.askCost` is the spec-correct, this-ask-only
-          // figure used on `ask_end` (decision 10).
-          const costBefore = this.budgetContext?.totalCost ?? 0;
-          const unpricedCountBefore = this.budgetContext?.unpricedCount ?? 0;
-          const resolveCtx = options?.metadata
-            ? { metadata: { ...this.metadata, ...options.metadata } }
-            : { metadata: this.metadata };
-
-          // Use a mutable container to capture usage from executeAgentCall
-          // without relying on an instance property (which is racy under
-          // concurrent calls).
-          const usageCapture: {
-            value?: {
-              prompt_tokens: number;
-              completion_tokens: number;
-              total_tokens: number;
-              cached_tokens?: number;
-              cache_write_tokens?: number;
-            };
-            modelUri?: string;
-            /** Last completed turn's provider timing, for span attributes. */
-            timing?: CallTiming;
-          } = {};
-
-          const doCall = async () => {
-            const result = await this.executeAgentCall(
-              agent,
-              normalizedInput,
-              options as AskOptions<unknown>,
-              undefined,
-              usageCapture,
-              normalizedHistory,
-            );
-            return result as T;
+    // Ask-local cancellation must never mutate the context's signal: sibling
+    // asks retain their original signal, while nested asks inherit this ALS
+    // scope. `AbortSignal.any` preserves the winning reason identity.
+    const inheritedHardSignal = hardSignalStorage.getStore() ?? this.signal;
+    const hardAskSignal = composeAbortSignals(inheritedHardSignal, options?.signal);
+    const askSignal = composeAbortSignals(this.currentSignal, options?.signal);
+    const runAsk = () =>
+      this._checkpoint(
+        this._autoCheckpointName('ask', agentName),
+        async () => {
+          // Allocate the ask frame BEFORE entering askStorage.run so the
+          // emitEvent calls inside the run() callback see the new frame in ALS.
+          const parentFrame = askStorage.getStore();
+          const askId = randomUUID();
+          const depth = (parentFrame?.depth ?? -1) + 1;
+          // Nested asks inherit the parent frame's counter; top-level asks
+          // share the WorkflowContext's instance-level `stepRefRoot` so all
+          // top-level asks (including concurrent ones from spawn / parallel /
+          // race) share a single monotonic counter. Spec §3.7.
+          const stepRef = parentFrame?.stepRef ?? this.stepRefRoot;
+          const frame: AskFrame = {
+            askId,
+            parentAskId: parentFrame?.askId,
+            depth,
+            agent: agent._name,
+            stepRef,
+            askCost: { value: 0 },
+            askUnpriced: false,
           };
 
-          // Spec decision 9 invariant: every `ask_start` has a matching
-          // `ask_end`. Capture either outcome, emit the terminal once, then
-          // rethrow the captured failure. Current catches (gate exhaustion,
-          // budget, abort) and future failure paths between `ask_start` and
-          // the success emit therefore surface as `ask_end`. The workflow-
-          // level `error` event is reserved for failures with no ask_end;
-          // consumers must never see both for the same failure.
-          let outcome: { ok: true; result: T } | { ok: false; error: string } | undefined;
-          let askFailure: unknown;
-          let askFailed = false;
-          let result: T | undefined;
-          try {
-            result = this.spanManager
-              ? await this.spanManager.withSpanAsync(
-                  'axl.agent.ask',
-                  {
-                    'axl.agent.name': agent._name,
-                    'axl.agent.model': agent.resolveModel(resolveCtx),
-                  },
-                  async (span) => {
-                    const r = await doCall();
-                    if (usageCapture.modelUri) {
-                      span.setAttribute('axl.agent.model', usageCapture.modelUri);
-                    }
-                    const costAfter = this.budgetContext?.totalCost ?? 0;
-                    span.setAttribute('axl.agent.cost', costAfter - costBefore);
-                    span.setAttribute('axl.agent.duration', Date.now() - askStart);
-                    // `axl.agent.duration` is ask wall clock; these split the
-                    // last provider call's share of it. Set only when the
-                    // provider instrumented the call — an uninstrumented
-                    // adapter must not look like a zero-latency one.
-                    if (usageCapture.timing) {
-                      const t = usageCapture.timing;
-                      span.setAttribute('axl.agent.queued_ms', t.queuedMs);
-                      span.setAttribute('axl.agent.retry_ms', t.retryMs);
-                      span.setAttribute('axl.agent.attempts', t.attempts);
-                      span.setAttribute('axl.agent.ttfb_ms', t.ttfbMs);
-                      span.setAttribute('axl.agent.wire_ms', t.wireMs);
-                      if (t.firstTokenMs !== undefined) {
-                        span.setAttribute('axl.agent.first_token_ms', t.firstTokenMs);
-                      }
-                    }
-                    if (usageCapture.value) {
-                      span.setAttribute(
-                        'axl.agent.prompt_tokens',
-                        usageCapture.value.prompt_tokens,
-                      );
-                      span.setAttribute(
-                        'axl.agent.completion_tokens',
-                        usageCapture.value.completion_tokens,
-                      );
-                      if (usageCapture.value.cached_tokens)
-                        span.setAttribute(
-                          'axl.agent.cached_tokens',
-                          usageCapture.value.cached_tokens,
-                        );
-                      if (usageCapture.value.cache_write_tokens)
-                        span.setAttribute(
-                          'axl.agent.cache_write_tokens',
-                          usageCapture.value.cache_write_tokens,
-                        );
-                    }
-                    return r;
-                  },
-                )
-              : await doCall();
-            outcome = { ok: true, result };
-
-            // Success path: invoke the legacy onAgentCallComplete hook.
-            // Isolate consumer bugs (mirror the onTrace pattern at
-            // emitEvent): a hook throw is post-success observability —
-            // the agent's run already succeeded, so we must NOT
-            // overwrite the outcome to ok:false. Swallow + console.error
-            // so reliability dashboards keyed off ask_end.outcome aren't
-            // poisoned by hook bugs.
-            const costAfter = this.budgetContext?.totalCost ?? 0;
-            const unpricedCountAfter = this.budgetContext?.unpricedCount ?? 0;
-            if (this.onAgentCallComplete) {
-              try {
-                this.onAgentCallComplete({
-                  agent: agent._name,
-                  prompt: promptText,
-                  ...(inputDescriptor ? { input: inputDescriptor } : {}),
-                  response: typeof result === 'string' ? result : JSON.stringify(result),
-                  model: usageCapture.modelUri ?? agent.resolveModel(resolveCtx),
-                  cost: costAfter - costBefore,
-                  unpriced: frame.askUnpriced || unpricedCountAfter > unpricedCountBefore,
-                  duration: Date.now() - askStart,
-                  promptVersion: agent._config.version,
-                  temperature: options?.temperature ?? agent._config.temperature,
-                  maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
-                  effort: options?.effort ?? agent._config.effort,
-                  thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
-                  includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
-                  toolChoice: options?.toolChoice ?? agent._config.toolChoice,
-                  stop: options?.stop ?? agent._config.stop,
-                  providerOptions: options?.providerOptions ?? agent._config.providerOptions,
-                });
-              } catch (hookErr) {
-                console.error(
-                  '[axl] onAgentCallComplete hook threw; ask outcome unchanged:',
-                  hookErr instanceof Error ? hookErr.message : String(hookErr),
-                );
-              }
-            }
-          } catch (err) {
-            askFailed = true;
-            askFailure = err;
-            if (richAsk) this.recordRichFailure(err);
-            outcome = {
-              ok: false,
-              error: this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
-            };
-          }
-
-          // Defensive: `outcome` is always set by either the success or catch
-          // branch above. The fallback makes a future internal control-flow
-          // bug explicit without dropping ask_end.
-          let terminalFailure: unknown;
-          let terminalFailed = false;
-          try {
+          return askStorage.run(frame, async () => {
+            const askStart = Date.now();
             this.emitEvent({
-              type: 'ask_end',
-              outcome:
-                outcome ??
-                ({
-                  ok: false,
-                  error: 'ask_end emitted without outcome — internal bug',
-                } as const),
-              cost: frame.askCost.value,
-              ...(frame.askUnpriced ? { unpriced: true } : {}),
-              duration: Date.now() - askStart,
+              type: 'ask_start',
+              prompt: promptText,
+              ...(inputDescriptor ? { input: inputDescriptor } : {}),
             });
-          } catch (error) {
-            terminalFailed = true;
-            terminalFailure = isEventStreamOverflowError(error)
-              ? preserveErrorCause(error, askFailure)
-              : error;
-          }
 
-          // Strict overflow takes precedence over an in-flight ask failure so
-          // recovery boundaries cannot hide an incomplete terminal trace.
-          if (terminalFailed) throw terminalFailure;
-          if (askFailed) throw askFailure;
-          return result as T;
-        });
-      },
-      { agent: agentName },
-    );
+            // `costBefore` snapshots the global budget so we can pass the per-ask
+            // cost delta to onAgentCallComplete (legacy callback that reports the
+            // whole-tree spend). `frame.askCost` is the spec-correct, this-ask-only
+            // figure used on `ask_end` (decision 10).
+            const costBefore = this.budgetContext?.totalCost ?? 0;
+            const unpricedCountBefore = this.budgetContext?.unpricedCount ?? 0;
+            const resolveCtx = options?.metadata
+              ? { metadata: { ...this.metadata, ...options.metadata } }
+              : { metadata: this.metadata };
+
+            // Use a mutable container to capture usage from executeAgentCall
+            // without relying on an instance property (which is racy under
+            // concurrent calls).
+            const usageCapture: {
+              value?: {
+                prompt_tokens: number;
+                completion_tokens: number;
+                total_tokens: number;
+                cached_tokens?: number;
+                cache_write_tokens?: number;
+              };
+              modelUri?: string;
+              /** Last completed turn's provider timing, for span attributes. */
+              timing?: CallTiming;
+            } = {};
+
+            const doCall = async () => {
+              const result = await this.executeAgentCall(
+                agent,
+                normalizedInput,
+                options as AskOptions<unknown>,
+                undefined,
+                usageCapture,
+                normalizedHistory,
+              );
+              return result as T;
+            };
+
+            // Spec decision 9 invariant: every `ask_start` has a matching
+            // `ask_end`. Capture either outcome, emit the terminal once, then
+            // rethrow the captured failure. Current catches (gate exhaustion,
+            // budget, abort) and future failure paths between `ask_start` and
+            // the success emit therefore surface as `ask_end`. The workflow-
+            // level `error` event is reserved for failures with no ask_end;
+            // consumers must never see both for the same failure.
+            let outcome: { ok: true; result: T } | { ok: false; error: string } | undefined;
+            let askFailure: unknown;
+            let askFailed = false;
+            let result: T | undefined;
+            try {
+              result = this.spanManager
+                ? await this.spanManager.withSpanAsync(
+                    'axl.agent.ask',
+                    {
+                      'axl.agent.name': agent._name,
+                      'axl.agent.model': agent.resolveModel(resolveCtx),
+                    },
+                    async (span) => {
+                      const r = await doCall();
+                      if (usageCapture.modelUri) {
+                        span.setAttribute('axl.agent.model', usageCapture.modelUri);
+                      }
+                      const costAfter = this.budgetContext?.totalCost ?? 0;
+                      span.setAttribute('axl.agent.cost', costAfter - costBefore);
+                      span.setAttribute('axl.agent.duration', Date.now() - askStart);
+                      // `axl.agent.duration` is ask wall clock; these split the
+                      // last provider call's share of it. Set only when the
+                      // provider instrumented the call — an uninstrumented
+                      // adapter must not look like a zero-latency one.
+                      if (usageCapture.timing) {
+                        const t = usageCapture.timing;
+                        span.setAttribute('axl.agent.queued_ms', t.queuedMs);
+                        span.setAttribute('axl.agent.retry_ms', t.retryMs);
+                        span.setAttribute('axl.agent.attempts', t.attempts);
+                        span.setAttribute('axl.agent.ttfb_ms', t.ttfbMs);
+                        span.setAttribute('axl.agent.wire_ms', t.wireMs);
+                        if (t.firstTokenMs !== undefined) {
+                          span.setAttribute('axl.agent.first_token_ms', t.firstTokenMs);
+                        }
+                      }
+                      if (usageCapture.value) {
+                        span.setAttribute(
+                          'axl.agent.prompt_tokens',
+                          usageCapture.value.prompt_tokens,
+                        );
+                        span.setAttribute(
+                          'axl.agent.completion_tokens',
+                          usageCapture.value.completion_tokens,
+                        );
+                        if (usageCapture.value.cached_tokens)
+                          span.setAttribute(
+                            'axl.agent.cached_tokens',
+                            usageCapture.value.cached_tokens,
+                          );
+                        if (usageCapture.value.cache_write_tokens)
+                          span.setAttribute(
+                            'axl.agent.cache_write_tokens',
+                            usageCapture.value.cache_write_tokens,
+                          );
+                      }
+                      return r;
+                    },
+                  )
+                : await doCall();
+              outcome = { ok: true, result };
+
+              // Success path: invoke the legacy onAgentCallComplete hook.
+              // Isolate consumer bugs (mirror the onTrace pattern at
+              // emitEvent): a hook throw is post-success observability —
+              // the agent's run already succeeded, so we must NOT
+              // overwrite the outcome to ok:false. Swallow + console.error
+              // so reliability dashboards keyed off ask_end.outcome aren't
+              // poisoned by hook bugs.
+              const costAfter = this.budgetContext?.totalCost ?? 0;
+              const unpricedCountAfter = this.budgetContext?.unpricedCount ?? 0;
+              if (this.onAgentCallComplete) {
+                try {
+                  this.onAgentCallComplete({
+                    agent: agent._name,
+                    prompt: promptText,
+                    ...(inputDescriptor ? { input: inputDescriptor } : {}),
+                    response: typeof result === 'string' ? result : JSON.stringify(result),
+                    model: usageCapture.modelUri ?? agent.resolveModel(resolveCtx),
+                    cost: costAfter - costBefore,
+                    unpriced: frame.askUnpriced || unpricedCountAfter > unpricedCountBefore,
+                    duration: Date.now() - askStart,
+                    promptVersion: agent._config.version,
+                    temperature: options?.temperature ?? agent._config.temperature,
+                    maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
+                    effort: options?.effort ?? agent._config.effort,
+                    thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
+                    includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
+                    toolChoice: options?.toolChoice ?? agent._config.toolChoice,
+                    stop: options?.stop ?? agent._config.stop,
+                    providerOptions: options?.providerOptions ?? agent._config.providerOptions,
+                  });
+                } catch (hookErr) {
+                  console.error(
+                    '[axl] onAgentCallComplete hook threw; ask outcome unchanged:',
+                    hookErr instanceof Error ? hookErr.message : String(hookErr),
+                  );
+                }
+              }
+            } catch (err) {
+              askFailed = true;
+              askFailure = err;
+              if (richAsk) this.recordRichFailure(err);
+              outcome = {
+                ok: false,
+                error: this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
+              };
+            }
+
+            // Defensive: `outcome` is always set by either the success or catch
+            // branch above. The fallback makes a future internal control-flow
+            // bug explicit without dropping ask_end.
+            let terminalFailure: unknown;
+            let terminalFailed = false;
+            try {
+              this.emitEvent({
+                type: 'ask_end',
+                outcome:
+                  outcome ??
+                  ({
+                    ok: false,
+                    error: 'ask_end emitted without outcome — internal bug',
+                  } as const),
+                cost: frame.askCost.value,
+                ...(frame.askUnpriced ? { unpriced: true } : {}),
+                duration: Date.now() - askStart,
+              });
+            } catch (error) {
+              terminalFailed = true;
+              terminalFailure = isEventStreamOverflowError(error)
+                ? preserveErrorCause(error, askFailure)
+                : error;
+            }
+
+            // Strict overflow takes precedence over an in-flight ask failure so
+            // recovery boundaries cannot hide an incomplete terminal trace.
+            if (terminalFailed) throw terminalFailure;
+            if (askFailed) throw askFailure;
+            return result as T;
+          });
+        },
+        { agent: agentName },
+      );
+    const runWithAskSignal = () => (askSignal ? signalStorage.run(askSignal, runAsk) : runAsk());
+    return hardAskSignal
+      ? hardSignalStorage.run(hardAskSignal, runWithAskSignal)
+      : runWithAskSignal();
   }
 
   private async executeAgentCall(
+    agent: Agent,
+    input: ModelInput,
+    options?: AskOptions<unknown>,
+    handoffMessages?: ChatMessage[],
+    usageCapture?: {
+      value?: {
+        prompt_tokens: number;
+        completion_tokens: number;
+        total_tokens: number;
+        cached_tokens?: number;
+        cache_write_tokens?: number;
+      };
+      modelUri?: string;
+      timing?: CallTiming;
+    },
+    sessionHistory: ChatMessage[] = normalizeSessionHistory(this.sessionHistory),
+  ): Promise<unknown> {
+    const tracker: AskTimeoutTracker = { humanWaitMs: 0, activeHumanWaits: 0 };
+    const enclosing = timeoutTrackerStorage.getStore() ?? [];
+    return timeoutTrackerStorage.run([...enclosing, tracker], () =>
+      this.executeAgentCallImpl(
+        agent,
+        input,
+        options,
+        handoffMessages,
+        usageCapture,
+        sessionHistory,
+      ),
+    );
+  }
+
+  private async executeAgentCallImpl(
     agent: Agent,
     input: ModelInput,
     options?: AskOptions<unknown>,
@@ -1974,8 +2082,19 @@ export class WorkflowContext<TInput = unknown> {
     }
 
     const maxTurns = agent._config.maxTurns ?? 25;
-    const timeoutMs = parseDuration(agent._config.timeout ?? '60s');
+    const timeoutMs = parseDuration(
+      options?.timeout ?? agent._config.timeout ?? this.config.defaults?.timeout ?? '60s',
+    );
+    const stallTimeout =
+      options?.stallTimeout ?? agent._config.stallTimeout ?? this.config.defaults?.stallTimeout;
+    const stallTimeoutMs = stallTimeout === undefined ? undefined : parseDuration(stallTimeout);
+    if (stallTimeoutMs !== undefined && stallTimeoutMs > MAX_TIMER_DELAY_MS) {
+      throw new RangeError(
+        `stallTimeout exceeds the maximum supported timer duration of ${MAX_TIMER_DELAY_MS}ms`,
+      );
+    }
     const startTime = Date.now();
+    const timeoutTracker = timeoutTrackerStorage.getStore()?.at(-1);
     // Per-ask latency attribution, summed over completed turns. `turns` counts
     // only turns whose provider actually reported timing — zero means the
     // provider is uninstrumented, and the TimeoutError message stays bare
@@ -2017,7 +2136,9 @@ export class WorkflowContext<TInput = unknown> {
       this.currentSignal?.throwIfAborted();
 
       // Timeout check
-      const elapsedMs = Date.now() - startTime;
+      const now = Date.now();
+      const elapsedMs =
+        now - startTime - (timeoutTracker ? pausedHumanWaitMs(timeoutTracker, now) : 0);
       if (elapsedMs > timeoutMs) {
         throw new TimeoutError(
           'ctx.ask()',
@@ -2034,6 +2155,7 @@ export class WorkflowContext<TInput = unknown> {
                 ),
               }
             : undefined,
+          agent._name,
         );
       }
 
@@ -2089,6 +2211,55 @@ export class WorkflowContext<TInput = unknown> {
         stop: options?.stop ?? agent._config.stop,
         providerOptions,
         signal: this.currentSignal,
+      };
+
+      // A stall is scoped to exactly one provider turn. Built-in adapters arm
+      // it at actual fetch dispatch; custom providers retain the conservative
+      // provider-entry fallback to preserve the public Provider contract.
+      const requestSignal = chatOptions.signal;
+      const hardRequestSignal = hardSignalStorage.getStore() ?? this.signal;
+      const stallController = stallTimeoutMs === undefined ? undefined : new AbortController();
+      const stallReason =
+        stallController === undefined
+          ? undefined
+          : new DOMException('Provider request stalled', 'StallTimeout');
+      let stallTimer: ReturnType<typeof setTimeout> | undefined;
+      let providerCallActive = true;
+      let requestDispatched = false;
+      const clearStallTimer = () => {
+        if (stallTimer !== undefined) {
+          clearTimeout(stallTimer);
+          stallTimer = undefined;
+        }
+      };
+      const armStallTimer = () => {
+        if (!providerCallActive || !stallController || !stallReason || stallTimeoutMs === undefined)
+          return;
+        requestDispatched = true;
+        clearStallTimer();
+        if (stallController.signal.aborted) return;
+        stallTimer = setTimeout(() => stallController.abort(stallReason), stallTimeoutMs);
+      };
+      if (stallController) {
+        chatOptions.signal = composeAbortSignals(requestSignal, stallController.signal);
+        chatOptions.requestLifecycle = {
+          onDispatch: armStallTimer,
+          onRetry: clearStallTimer,
+        };
+      }
+      // Runtime settlement deliberately excludes requestSignal: it can be an
+      // internal race/quorum branch cancellation, whose provider work must be
+      // allowed to drain for late cost accounting. Public cancellation and a
+      // stall are caller-facing hard bounds, so race them even when a custom
+      // provider ignores ChatOptions.signal.
+      const providerSettlementSignal = composeAbortSignals(
+        hardRequestSignal,
+        stallController?.signal,
+      );
+      const throwIfRequestStalled = () => {
+        if (stallReason !== undefined && providerSettlementSignal?.reason === stallReason) {
+          throw new StallTimeoutError('ctx.ask()', stallTimeoutMs!, agent._name);
+        }
       };
 
       // If schema requested and no tools, use JSON mode. With
@@ -2187,7 +2358,7 @@ export class WorkflowContext<TInput = unknown> {
         },
       });
 
-      let response: ProviderResponse;
+      let response!: ProviderResponse;
 
       // Provider call wrapped so any throw still emits a paired
       // `agent_call_end` — consumers (Studio waterfall, cost rollup, AsyncLocalStorage
@@ -2264,70 +2435,99 @@ export class WorkflowContext<TInput = unknown> {
               })
             : undefined;
 
-          for await (const chunk of provider.stream(
+          // Custom providers do not expose an exact fetch-dispatch hook, so
+          // their conservative fallback begins at provider entry.
+          if (stallController && provider.reportsRequestLifecycle !== true) armStallTimer();
+          const providerStream = provider.stream(
             cloneMessagesForProvider(currentMessages),
             chatOptions,
-          )) {
-            if (chunk.type === 'text_delta') {
-              content += chunk.content;
-              // Emit a `token` AxlEvent so wire consumers (AxlStream) and
-              // trace listeners both see it. Stream-only — `runtime.execute`'s
-              // onTrace skips persisting tokens to ExecutionInfo.events.
-              this.emitEvent({ type: 'token', data: chunk.content });
-              if (walker) {
-                // Walker drives both `string_delta` (via the onStringDelta
-                // callback above) and structural-boundary detection (via
-                // `consumeBoundary()` below). Order within a chunk:
-                // string_delta events fire first (from inside processChunk),
-                // then partial_object on boundary — so a consumer subscribed
-                // to both sees deltas land before the snapshot reflecting
-                // them, matching natural read order.
-                walker.processChunk(chunk.content);
-                if (walker.consumeBoundary()) {
-                  let parsed: unknown;
-                  try {
-                    parsed = parsePartialJson(extractJson(content));
-                  } catch {
-                    // Mid-document malformed (not just truncation) — skip
-                    // this delta. The next structural boundary outside a
-                    // string will get another shot once the model writes
-                    // valid syntax.
-                    parsed = undefined;
-                  }
-                  if (parsed !== undefined) {
-                    this.emitEvent({
-                      type: 'partial_object',
-                      agent: agent._name,
-                      attempt: currentAttempt,
-                      data: { object: parsed },
-                    });
+          );
+          const iterator = providerStream[Symbol.asyncIterator]();
+          try {
+            while (true) {
+              const next = await raceWithAbortSignal(
+                Promise.resolve(iterator.next()),
+                providerSettlementSignal,
+              );
+              if (next.done) break;
+              const chunk = next.value;
+              // Every protocol chunk is progress. Tool-call and usage-only chunks
+              // are just as important as text for a streaming request.
+              if (stallController) armStallTimer();
+              if (chunk.type === 'text_delta') {
+                content += chunk.content;
+                // Emit a `token` AxlEvent so wire consumers (AxlStream) and
+                // trace listeners both see it. Stream-only — `runtime.execute`'s
+                // onTrace skips persisting tokens to ExecutionInfo.events.
+                this.emitEvent({ type: 'token', data: chunk.content });
+                if (walker) {
+                  // Walker drives both `string_delta` (via the onStringDelta
+                  // callback above) and structural-boundary detection (via
+                  // `consumeBoundary()` below). Order within a chunk:
+                  // string_delta events fire first (from inside processChunk),
+                  // then partial_object on boundary — so a consumer subscribed
+                  // to both sees deltas land before the snapshot reflecting
+                  // them, matching natural read order.
+                  walker.processChunk(chunk.content);
+                  if (walker.consumeBoundary()) {
+                    let parsed: unknown;
+                    try {
+                      parsed = parsePartialJson(extractJson(content));
+                    } catch {
+                      // Mid-document malformed (not just truncation) — skip
+                      // this delta. The next structural boundary outside a
+                      // string will get another shot once the model writes
+                      // valid syntax.
+                      parsed = undefined;
+                    }
+                    if (parsed !== undefined) {
+                      this.emitEvent({
+                        type: 'partial_object',
+                        agent: agent._name,
+                        attempt: currentAttempt,
+                        data: { object: parsed },
+                      });
+                    }
                   }
                 }
-              }
-            } else if (chunk.type === 'thinking_delta') {
-              thinkingContent += chunk.content;
-            } else if (chunk.type === 'tool_call_delta') {
-              let buffer = toolCallBuffers.get(chunk.id);
-              if (!buffer) {
-                buffer = { id: chunk.id, name: '', arguments: '' };
-                toolCallBuffers.set(chunk.id, buffer);
-              }
-              if (chunk.name) buffer.name = chunk.name;
-              if (chunk.arguments) buffer.arguments += chunk.arguments;
-            } else if (chunk.type === 'done') {
-              streamProviderMetadata = chunk.providerMetadata;
-              streamTiming = chunk.timing;
-              // Usage and cost info from done chunk if available
-              if (chunk.usage) {
+              } else if (chunk.type === 'thinking_delta') {
+                thinkingContent += chunk.content;
+              } else if (chunk.type === 'tool_call_delta') {
+                let buffer = toolCallBuffers.get(chunk.id);
+                if (!buffer) {
+                  buffer = { id: chunk.id, name: '', arguments: '' };
+                  toolCallBuffers.set(chunk.id, buffer);
+                }
+                if (chunk.name) buffer.name = chunk.name;
+                if (chunk.arguments) buffer.arguments += chunk.arguments;
+              } else if (chunk.type === 'done') {
+                streamProviderMetadata = chunk.providerMetadata;
+                streamTiming = chunk.timing;
                 response = {
                   content,
                   tool_calls: undefined,
                   usage: chunk.usage,
                   cost: chunk.cost,
+                  providerMetadata: chunk.providerMetadata,
+                  timing: chunk.timing,
                 };
               }
             }
+          } catch (error) {
+            if (iterator.return) {
+              try {
+                void Promise.resolve(iterator.return(undefined)).catch(() => {});
+              } catch {
+                // The original provider/abort/stall failure already won.
+                // Iterator cleanup is best-effort, but any async rejection is
+                // still observed above.
+              }
+            }
+            throw error;
           }
+          // Also reject a provider that ignores the private stall abort and
+          // terminates without yielding another chunk after the deadline.
+          throwIfRequestStalled();
 
           // Convert tool call buffers to ToolCallMessage format
           for (const buffer of toolCallBuffers.values()) {
@@ -2360,16 +2560,29 @@ export class WorkflowContext<TInput = unknown> {
             response.thinking_content = thinkingContent;
           }
         } else {
-          response = await provider.chat(cloneMessagesForProvider(currentMessages), chatOptions);
+          if (stallController && provider.reportsRequestLifecycle !== true) armStallTimer();
+          response = await raceWithAbortSignal(
+            provider.chat(cloneMessagesForProvider(currentMessages), chatOptions),
+            providerSettlementSignal,
+          );
+          // Defensive against a provider promise and timer settling in the
+          // same turn: the composed settlement signal is the first-wins source.
+          throwIfRequestStalled();
         }
       } catch (err) {
-        if (richRequest) this.recordRichFailure(err);
+        // The composed signal's reason is the only reliable first-wins
+        // discriminator: an external signal can race this private controller.
+        const callError =
+          stallReason !== undefined && providerSettlementSignal?.reason === stallReason
+            ? new StallTimeoutError('ctx.ask()', stallTimeoutMs!, agent._name)
+            : err;
+        if (richRequest) this.recordRichFailure(callError);
         // A failed call is still a measured call whenever the provider
         // answered: any non-2xx carries the same `timing` block a success
         // would, so a latency dashboard doesn't go blind exactly when the
         // provider starts misbehaving. Absent for a network-level failure
         // (no response) and for any non-`ProviderError` throw.
-        const failureTiming = err instanceof ProviderError ? err.timing : undefined;
+        const failureTiming = callError instanceof ProviderError ? callError.timing : undefined;
         // Emit the paired `agent_call_end` before rethrowing. Empty response,
         // error message in `data.error`. No usage/cost — provider didn't
         // deliver one. `duration` reflects time-to-failure.
@@ -2378,6 +2591,13 @@ export class WorkflowContext<TInput = unknown> {
           agent: agent._name,
           model: effectiveModelUri,
           promptVersion: agent._config.version,
+          // A dispatched request abandoned at the runtime boundary may still
+          // be billed even though a non-cooperative provider supplied no
+          // usage. Preserve budget honesty by marking the known total as a
+          // lower bound rather than presenting an exact $0.
+          ...(callError instanceof StallTimeoutError && requestDispatched
+            ? { unpriced: true }
+            : {}),
           duration: Date.now() - turnStart,
           // Top-level beside `duration`, exactly as on the success path.
           ...(failureTiming ? { timing: failureTiming } : {}),
@@ -2385,14 +2605,18 @@ export class WorkflowContext<TInput = unknown> {
             response: '',
             turn: turns,
             ...(retryReason ? { retryReason } : {}),
-            error: this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
+            error:
+              this._observerErrorProjection(callError)?.message ?? legacyErrorMessage(callError),
             // Enrich with typed-error metadata when available. `body` is
             // deliberately NOT emitted — it's redaction-eligible (see
             // docs/security.md). `data.error` already carries the message.
-            ...providerErrorEventMetadata(err, richRequest),
+            ...providerErrorEventMetadata(callError, richRequest),
           },
         });
-        throw err;
+        throw callError;
+      } finally {
+        providerCallActive = false;
+        clearStallTimer();
       }
 
       // Capture usage for span instrumentation (per-call, not per-instance)
@@ -4409,47 +4633,53 @@ export class WorkflowContext<TInput = unknown> {
   // ── ctx.awaitHuman() ──────────────────────────────────────────────────
 
   async awaitHuman(options: AwaitHumanOptions): Promise<HumanDecision> {
-    if (this.spanManager) {
-      return this.spanManager.withSpanAsync(
-        'axl.ctx.awaitHuman',
-        {
-          'axl.awaitHuman.channel': options.channel,
-        },
-        async (span) => {
-          const start = Date.now();
-          const result = await this._awaitHumanImpl(options);
-          span.setAttribute('axl.awaitHuman.wait_duration', Date.now() - start);
-          span.setAttribute('axl.awaitHuman.approved', result.approved);
-          return result;
-        },
-      );
+    const trackers = timeoutTrackerStorage.getStore();
+    const startedAt = Date.now();
+    for (const tracker of trackers ?? []) {
+      if (tracker.activeHumanWaits++ === 0) tracker.humanWaitStartedAt = startedAt;
     }
-    return this._awaitHumanImpl(options);
+    try {
+      if (this.spanManager) {
+        return await this.spanManager.withSpanAsync(
+          'axl.ctx.awaitHuman',
+          {
+            'axl.awaitHuman.channel': options.channel,
+          },
+          async (span) => {
+            const start = Date.now();
+            const result = await this._awaitHumanImpl(options);
+            span.setAttribute('axl.awaitHuman.wait_duration', Date.now() - start);
+            span.setAttribute('axl.awaitHuman.approved', result.approved);
+            return result;
+          },
+        );
+      }
+      return await this._awaitHumanImpl(options);
+    } finally {
+      const finishedAt = Date.now();
+      for (const tracker of trackers ?? []) {
+        tracker.activeHumanWaits--;
+        if (tracker.activeHumanWaits === 0 && tracker.humanWaitStartedAt !== undefined) {
+          tracker.humanWaitMs += finishedAt - tracker.humanWaitStartedAt;
+          tracker.humanWaitStartedAt = undefined;
+        }
+      }
+    }
   }
 
   private async _awaitHumanImpl(options: AwaitHumanOptions): Promise<HumanDecision> {
     const branchSignal = this.currentSignal;
-    const makeAbortError = (reason: unknown): Error => {
-      if (typeof DOMException !== 'undefined') {
-        return new DOMException(
-          typeof reason === 'string' ? reason : 'awaitHuman aborted',
-          'AbortError',
-        );
-      }
-      const err = new Error(typeof reason === 'string' ? reason : 'awaitHuman aborted');
-      err.name = 'AbortError';
-      return err;
-    };
     const awaitWithAbort = async <T>(promise: Promise<T>, signal = branchSignal): Promise<T> => {
       if (!signal) return promise;
-      if (signal.aborted) throw makeAbortError(signal.reason);
+      signal.throwIfAborted();
       let onAbort: (() => void) | undefined;
       try {
         return await Promise.race([
           promise,
           new Promise<never>((_, reject) => {
-            onAbort = () => reject(makeAbortError(signal.reason));
+            onAbort = () => reject(signal.reason);
             signal.addEventListener('abort', onAbort, { once: true });
+            if (signal.aborted) onAbort();
           }),
         ]);
       } finally {
@@ -4458,7 +4688,7 @@ export class WorkflowContext<TInput = unknown> {
     };
 
     if (this.awaitHumanHandler) {
-      if (branchSignal?.aborted) throw makeAbortError(branchSignal.reason);
+      branchSignal?.throwIfAborted();
       // Emit `await_human` BEFORE invoking the handler so consumers see the
       // start/end pair regardless of which approval path is taken
       // (synchronous handler vs runtime-mediated pendingDecisions).
@@ -4466,7 +4696,7 @@ export class WorkflowContext<TInput = unknown> {
         type: 'await_human',
         data: { channel: options.channel, prompt: options.prompt },
       });
-      if (branchSignal?.aborted) throw makeAbortError(branchSignal.reason);
+      branchSignal?.throwIfAborted();
       const decision = parseHumanDecision(
         await awaitWithAbort(Promise.resolve(this.awaitHumanHandler(options))),
       );
@@ -4542,12 +4772,12 @@ export class WorkflowContext<TInput = unknown> {
       // still blocked. Cancellation invalidates publication, so they must not
       // wait indefinitely for the normal audit-readiness path.
       markReady();
-      rejectDecision(makeAbortError(signal.reason));
+      rejectDecision(signal.reason);
     };
     signal.addEventListener('abort', abortListener, { once: true });
     let decision: HumanDecision;
     try {
-      if (signal.aborted) throw makeAbortError(signal.reason);
+      signal.throwIfAborted();
       if (this.stateStore) {
         // A store may durably write and then reject because its acknowledgement
         // was lost. Treat every attempted save as possibly committed and run
@@ -4561,7 +4791,7 @@ export class WorkflowContext<TInput = unknown> {
           createdAt: new Date().toISOString(),
         });
       }
-      if (signal.aborted) throw makeAbortError(signal.reason);
+      signal.throwIfAborted();
 
       // Publication order is deliberate: persistence first, then the
       // in-process resolver, then the externally observable audit event, then
@@ -5503,10 +5733,10 @@ export class WorkflowContext<TInput = unknown> {
     if ((COST_BEARING_LEAF_TYPES as readonly string[]).includes(partial.type as string)) {
       // Classify the leaf ONCE, then feed two independent accumulators: the per-ask
       // frame rollup (ALS-scoped) AND the budget rail (instance-scoped). A
-      // cost-bearing leaf that did measurable work (POSITIVE token count) but
-      // produced no usable cost = an unpriced model / pricing-table miss. The
-      // positive-token signal distinguishes this from a failed call (no tokens) AND
-      // from a no-usage streamed call (zero tokens). Budget detection is NOT gated on
+      // cost-bearing leaf has unknown cost when it explicitly says so, or when
+      // positive billable work has no usable price. The positive-work fallback
+      // distinguishes an ordinary failed/no-usage call from an unpriced model.
+      // Budget detection is NOT gated on
       // `frame`: a direct `ctx.budget(() => ctx.recall(...))` emits a cost-bearing
       // leaf with no ask frame, and the budget must still see it.
       // This is the canonical inline form of `isUnpricedLeaf` (event-utils):
@@ -5518,18 +5748,19 @@ export class WorkflowContext<TInput = unknown> {
       const usable = isUsableCost(cost);
       const unpriced =
         !usable &&
-        hasPositiveBillableWork(
-          partial as {
-            tokens?: {
-              input?: number;
-              output?: number;
-              reasoning?: number;
-              cached?: number;
-              cacheWrite?: number;
-            };
-            data?: { usage?: { audioSeconds?: number; totalTokens?: number } };
-          },
-        );
+        ((partial as { unpriced?: boolean }).unpriced === true ||
+          hasPositiveBillableWork(
+            partial as {
+              tokens?: {
+                input?: number;
+                output?: number;
+                reasoning?: number;
+                cached?: number;
+                cacheWrite?: number;
+              };
+              data?: { usage?: { audioSeconds?: number; totalTokens?: number } };
+            },
+          ));
       if (frame) {
         if (usable) frame.askCost.value += cost;
         else if (unpriced) frame.askUnpriced = true;
@@ -5551,8 +5782,8 @@ export class WorkflowContext<TInput = unknown> {
           // interleaving under JS's cooperative single-threaded model.
           this.budgetContext.unpricedWarned = true;
           console.warn(
-            "Budget honesty: unpriced work detected — this budget's cost limit is a " +
-              'lower bound and is NOT enforced on unpriced models. ' +
+            "Budget honesty: unknown-cost work detected — this budget's cost limit is a " +
+              'lower bound and is NOT enforced on unknown spend. ' +
               'See docs/observability.md#budget-honesty.',
           );
         }

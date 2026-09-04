@@ -384,7 +384,7 @@ describe('child context', () => {
       spanManager,
     });
 
-    await expect(ctx.ask(outer, 'go')).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(ctx.ask(outer, 'go')).rejects.toBe('cancel nested ask');
     expect(calls).toBe(2);
     expect(controller.signal).toMatchObject({ aborted: true, reason: 'cancel nested ask' });
     expect(traces.filter((event) => event.type === 'ask_start')).toHaveLength(2);

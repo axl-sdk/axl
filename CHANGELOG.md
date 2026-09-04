@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-09-04
+
+### Added
+
+- **Three distinct `ctx.ask()` time controls.** `timeout` is now documented and consistently
+  resolved as a graceful between-turn budget (Ask > Agent > Defaults > 60 seconds), excluding
+  only `awaitHuman` wait. New opt-in `stallTimeout` aborts a dispatched provider request that
+  stops making progress (`StallTimeoutError extends TimeoutError`); built-in adapters start it
+  after limiter queueing, reset it on every stream chunk, and pause it for SDK retry backoff.
+  Runtime settlement does not depend on provider cooperation: a custom provider or stream
+  iterator that ignores cancellation still releases the caller at the stall boundary. Any such
+  abandoned work can finish or be billed later and cannot update already-terminal accounting;
+  dispatched stalled calls mark the resulting event, ask, budget, and execution totals unpriced.
+  New per-ask `signal` composes with context/branch cancellation first-wins, preserves the
+  caller's exact abort reason, is sibling-local, and is inherited by nested asks. Partial
+  responses from hard aborts are discarded. See [API reference](docs/api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
+
 ## [0.23.0] - 2026-09-03
 
 ### Added
@@ -1426,7 +1443,9 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.22.3...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.23.1...HEAD
+[0.23.1]: https://github.com/axl-sdk/axl/compare/v0.23.0...v0.23.1
+[0.23.0]: https://github.com/axl-sdk/axl/compare/v0.22.3...v0.23.0
 [0.22.3]: https://github.com/axl-sdk/axl/compare/v0.22.2...v0.22.3
 [0.22.2]: https://github.com/axl-sdk/axl/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/axl-sdk/axl/compare/v0.22.0...v0.22.1

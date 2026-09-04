@@ -140,6 +140,11 @@ second callback declares model capabilities. Inline bytes, provider options,
 and results are defensively copied; recorded requests omit `AbortSignal`, while
 the fixture callback receives the original signal so cancellation is testable.
 
+Separately, `MockProvider.chat()` and `.stream()` honor `ChatOptions.signal`:
+pre-abort prevents fixture work and an in-flight abort rejects with the exact reason. This supports
+deterministic tests of ask-local `signal` and `stallTimeout`; it is not a
+certification of a real provider's network-abort behavior.
+
 ### `MockTool`
 
 Create a mock tool to intercept and record calls:

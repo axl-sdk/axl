@@ -201,7 +201,8 @@ const myAgent = agent({
 | `stop` | `string[]` | — | Stop sequences — generation stops when any sequence is encountered. Not supported by the `openai-responses` provider (silently ignored) |
 | `providerOptions` | `Record<string, unknown>` | — | Provider-specific options shallow-merged into the raw API request body via `Object.assign`. Not portable across providers. See [shallow merge caveat](providers.md#provideroptions) |
 | `maxTurns` | `number` | `25` | Maximum tool-call loop iterations before throwing `MaxTurnsError`. **A "turn" in axl is one provider call inside a single `ctx.ask()`** — not a user↔assistant exchange. Schema/validate/guardrail retries also consume turns. See [Sessions → Turns vs. Exchanges](#turns-vs-exchanges) |
-| `timeout` | `string` | none | Duration string (e.g., `'30s'`, `'5m'`, `'1h'`). Throws `TimeoutError` when exceeded |
+| `timeout` | `string` | `defaults.timeout`, else `'60s'` | Graceful overall between-turn budget. The in-flight provider turn and ordinary tool finish; after expiry Axl refuses the next turn or retry with `TimeoutError`. `awaitHuman` wait time is excluded; other tool work, limiter queueing, and retry backoff count. Not an in-flight request deadline. |
+| `stallTimeout` | `string` | `defaults.stallTimeout`, else unset | Opt-in hard provider-request stall limit. See [Ask deadlines, cancellation, and stalled requests](#ask-deadlines-cancellation-and-stalled-requests). |
 | `maxContext` | `number` | — | Estimated token limit for context window management |
 | `version` | `string` | — | Prompt version label attached to trace events |
 | `guardrails` | `GuardrailsConfig` | — | Input/output validation (see [Guardrails](#guardrails)) |
@@ -278,7 +279,7 @@ console.log(ctx.totalCost); // accumulated cost from all agent calls
 |--------|------|---------|-------------|
 | `metadata` | `Record<string, unknown>` | `{}` | Metadata passed to the context |
 | `budget` | `string` | — | Cost budget (e.g., `'$0.50'`). Enforced via `finish_and_stop` policy |
-| `signal` | `AbortSignal` | — | Abort signal for cancellation/timeouts |
+| `signal` | `AbortSignal` | — | Context-wide hard cancellation signal. It aborts in-flight provider work and is inherited by nested asks. Use an ask-local signal for one request. |
 | `sessionHistory` | `ChatMessage[]` | — | Prior conversation history for multi-turn testing |
 | `awaitHumanHandler` | `(options) => Promise<HumanDecision>` | — | Handler for tool approval requests. Required when the agent uses tools with `requireApproval` — without it, the call throws a clear error |
 | `events` | `EventStreamOptions` | `{ maxQueued: 10_000, onOverflow: 'drop-oldest-non-terminal' }` | Configures the iterator-queue cap and overflow policy on the lazy `ctx.events` bus. See [`EventStreamOptions`](#eventstreamoptions) |
@@ -293,15 +294,12 @@ console.log(ctx.totalCost); // accumulated cost from all agent calls
 
 **When to use vs. workflows:** Use `createContext()` when you want to call agents without registering a workflow — eval files, one-off scripts, tests, API endpoints. Use `runtime.execute()` when you want execution lifecycle tracking (status, duration, history in Studio's executions panel).
 
-**Budget and timeout:**
+**Budget and context-wide hard cancellation:**
 
 ```typescript
-const controller = new AbortController();
-setTimeout(() => controller.abort(), 30_000);
-
 const ctx = runtime.createContext({
   budget: '$1.00',
-  signal: controller.signal,
+  signal: AbortSignal.timeout(30_000),
 });
 ```
 
@@ -407,14 +405,77 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 | `toolChoice` | `'auto' \| 'none' \| 'required' \| { type: 'function', function: { name } }` | agent config | Override tool choice for this call |
 | `stop` | `string[]` | agent config | Override stop sequences for this call |
 | `providerOptions` | `Record<string, unknown>` | agent config | Override provider-specific options for this call. Shallow-merged; see [caveat](providers.md#provideroptions) |
+| `timeout` | `string` | agent config → `defaults.timeout` → `'60s'` | Override the graceful overall between-turn budget. The current provider turn and ordinary tool work are allowed to finish; `awaitHuman` wait is excluded. |
+| `stallTimeout` | `string` | agent config → `defaults.stallTimeout` → unset | Opt-in hard limit for a provider request that makes no progress. Streaming resets the idle clock on every chunk; non-streaming uses a dispatch-to-completion limit. |
+| `signal` | `AbortSignal` | — | Per-ask hard cancellation/deadline. Composed with the context/branch signal; first abort wins and nested asks inherit it. |
 
-**Precedence:** Per-call `AskOptions` > agent-level `AgentConfig` > internal defaults.
+**Precedence:** For `timeout` and `stallTimeout`, per-call `AskOptions` > agent-level
+`AgentConfig` > `defaults` config > built-in (`'60s'` / unset). Other options use the
+applicable per-call, agent, and internal defaults.
 
 **Returns:** `Promise<T>` — parsed output if `schema` is provided, otherwise `string`.
 
 **Retry mechanics:** All output retries (guardrail, schema, validate) use **accumulating context** — the LLM's failed response is appended as an assistant message, followed by a **user** message explaining the error (a user turn, not a system message: providers hoist system messages out of the conversation, which would leave the request ending on the rejected attempt). On subsequent retries, the LLM sees all prior failed attempts, giving it increasing context for self-correction. Failed responses are **not** persisted to session history; only the final successful response is recorded. Supply `retryFeedback` to write that user message yourself, or to stop retrying — see [Custom retry feedback](#custom-retry-feedback). See the [Output Pipeline](#output-pipeline) for the full gate-by-gate flow.
 
 **Streaming + validate:** As of 0.16.0, `validate` and token streaming (via `runtime.stream()`) coexist — validate runs against the buffered response after streaming completes. (Pre-0.16.0 this combination threw `INVALID_CONFIG`.) For structured output, the typed result is still only available after the full response arrives.
+
+#### Ask deadlines, cancellation, and stalled requests
+
+These controls deliberately cover different failure modes:
+
+| Need | Use | Behavior |
+|---|---|---|
+| Let active work finish but stop more turns | `timeout` | Graceful 60-second default; checked between provider turns and retries. It excludes only time spent in `awaitHuman`. |
+| Stop a stuck provider request | `stallTimeout` | Opt-in. On streams, aborts after an idle gap with no chunk (every chunk resets it); on non-stream calls, aborts if dispatch-to-completion exceeds it. It covers provider work only, never tools or `awaitHuman`. Start with `'120s'` unless your provider/model evidence supports a different idle window; this is guidance, not an SDK default. |
+| Enforce a strict wall-clock SLA or cancel now | `signal` | Hard-aborts an in-flight request and discards any partial response. Use `AbortSignal.timeout()` for a deadline. |
+
+```typescript
+// One interactive request must not outlive the HTTP request budget.
+const answer = await ctx.ask(supportAgent, question, {
+  signal: AbortSignal.timeout(15_000),
+});
+```
+
+For long-running work where progress matters more than total duration:
+
+```typescript
+import { StallTimeoutError } from '@axlsdk/axl';
+
+try {
+  const report = await ctx.ask(researchAgent, topic, {
+    stallTimeout: '120s',
+  });
+} catch (error) {
+  if (error instanceof StallTimeoutError) {
+    console.warn('Provider stopped progressing; retry or fail over.');
+  } else {
+    throw error; // Includes the exact caller-owned abort reason.
+  }
+}
+```
+
+`signal` is composed with a context or branch signal without mutating either scope: the
+first signal to abort supplies its exact `reason`, sibling asks on the same context remain
+unaffected, and asks nested through an agent tool inherit the ask signal. A pre-aborted signal
+prevents dispatch. External abort reasons are rethrown unchanged; they are not rewritten as
+Axl timeout errors.
+
+The runtime settles hard cancellation and stalls even if custom provider work ignores its signal.
+Such non-cooperative work may still finish or be billed after the ask's terminal events, so its
+late usage cannot be included in the already-emitted ask/budget totals. A dispatched stalled
+call therefore marks its `agent_call_end` and owning `ask_end` as `unpriced`, making cost and
+budget totals explicit lower bounds.
+
+##### Advanced provider timing
+
+Built-in adapters arm the stall timer only when a transport attempt is actually dispatched,
+reset it for every streamed chunk (including
+non-text chunks), and disarm it during Axl retry backoff; an opt-in rate-limiter queue is not
+treated as a provider stall. A custom `Provider` that does not report dispatch lifecycle uses
+the conservative provider-method-entry fallback. Custom providers must forward
+`ChatOptions.signal` to their transport; provider-side usage controls remain the backstop for
+abandoned work. Stall durations above the platform timer maximum (`2147483647ms`, about 24.8
+days) are rejected before dispatch.
 
 ---
 
@@ -637,8 +698,8 @@ if (result.budgetExceeded) {
 
 **Returns:** `BudgetResult<T>`: `{ value: T | null, budgetExceeded: boolean, totalCost: number, unpriced: boolean }`
 
-- **`unpriced`** — `true` when the block ran a model with no usable per-call cost (unpriced model / pricing-table miss) that did measurable work. `totalCost` is then a **lower bound** (the unknown component is omitted). The same condition is readable mid-block via [`ctx.getBudgetStatus().unpriced`](#ctxgetbudgetstatus), and Axl logs a one-time `console.warn` per budget block when it happens.
-- ⚠️ **`unpriced` is observability only — cost limits / `hard_stop` are NOT enforced on unpriced spend.** The enforcement rail never sees the unknown cost, so a `hard_stop` budget does **not** govern unpriced models (e.g. Bedrock, self-hosted). Token-denominated budgets are the planned fix for governing unpriced spend. Until then, treat `unpriced: true` as "this limit could not be enforced for part of this block."
+- **`unpriced`** — `true` when the block included work with unknown cost, such as an unpriced model or a dispatched stalled call abandoned without usage. `totalCost` is then a **lower bound** (the unknown component is omitted). The same condition is readable mid-block via [`ctx.getBudgetStatus().unpriced`](#ctxgetbudgetstatus), and Axl logs a one-time `console.warn` per budget block when it happens.
+- ⚠️ **`unpriced` is observability only — cost limits / `hard_stop` are NOT enforced on unknown spend.** The enforcement rail never sees that cost, so a `hard_stop` budget does **not** govern unpriced models (e.g. Bedrock, self-hosted) or abandoned non-cooperative work. Treat `unpriced: true` as "this limit could not be enforced for part of this block."
 
 **Nesting:** Budget blocks can be nested. Inner budgets roll their costs — **and their `unpriced` lower-bound flag** — up to the parent.
 
@@ -650,7 +711,7 @@ Returns the live status of the active budget block, or `null` outside any block:
 
 Read-only getter returning the total cost accumulated by agent calls in this context. Inside a `ctx.budget()` block, returns only that block's accumulated cost; after the block completes, the nested cost is rolled up into the parent total.
 
-> **Unpriced models → lower bound.** A call to an unpriced model (pricing-table miss / a provider that reports no per-call cost) contributes `undefined` cost, which counts as nothing — so `ctx.totalCost` (and `ExecutionInfo.totalCost`, `ctx.budget()` accounting) **understate** total spend when unpriced models run. Detect it via: `ExecutionInfo.unpriced` (the execution-level aggregate from `runtime.execute()` / `getExecutions()`), `runtime.trackExecution().unpriced`, the owning `ask_end.unpriced`, `BudgetResult.unpriced` / `ctx.getBudgetStatus().unpriced` for a `ctx.budget()` block, and the Studio Cost Dashboard's `CostData.unpricedCalls`. Because the unknown component is invisible to the budget rail, a `ctx.budget()` cost limit / `hard_stop` **cannot enforce on unpriced spend** — it only reports it.
+> **Unknown cost → lower bound.** A call to an unpriced model (pricing-table miss / a provider that reports no per-call cost), or a dispatched stalled call abandoned without usage, contributes no numeric cost — so `ctx.totalCost` (and `ExecutionInfo.totalCost`, `ctx.budget()` accounting) may **understate** total spend. Detect it via: `ExecutionInfo.unpriced` (the execution-level aggregate from `runtime.execute()` / `getExecutions()`), `runtime.trackExecution().unpriced`, the owning `ask_end.unpriced`, `BudgetResult.unpriced` / `ctx.getBudgetStatus().unpriced` for a `ctx.budget()` block, and the Studio Cost Dashboard's `CostData.unpricedCalls`. Because the unknown component is invisible to the budget rail, a `ctx.budget()` cost limit / `hard_stop` **cannot enforce on unknown spend** — it only reports it.
 
 ```typescript
 const ctx = runtime.createContext();
@@ -860,7 +921,7 @@ contradictory branch fields fail with `AxlError` code
 
 **Resolution:** The host app resolves decisions via `runtime.getPendingDecisions()` and `runtime.resolveDecision(executionId, decision)`. See [Security > Approval Gates](./security.md#approval-gates).
 
-**Cancellation:** If the execution is aborted while suspended at `awaitHuman` — via `runtime.abort(id)`, `runtime.deleteExecution(id)`, an external `options.signal`, or a budget hard-stop — the awaitHuman Promise rejects with `AbortError` and the workflow unwinds. The request becomes non-resolvable immediately; its cleanup record remains discoverable until persisted compensation finishes so a later total delete can join the barrier before sweeping the store. If compensation fails, the original error retains a non-enumerable `cleanupError`, the durable request remains visible for retry or total deletion, and the runtime emits `decision_cleanup_failed`.
+**Cancellation:** If the execution is aborted while suspended at `awaitHuman` — via `runtime.abort(id)`, `runtime.deleteExecution(id)`, an external `options.signal`, or a budget hard-stop — the awaitHuman Promise rejects with the signal's exact `reason` and the workflow unwinds. SDK-initiated aborts use the platform's default `AbortError`; a caller-supplied reason is not rewritten. The request becomes non-resolvable immediately; its cleanup record remains discoverable until persisted compensation finishes so a later total delete can join the barrier before sweeping the store. If compensation fails, the original error retains a non-enumerable `cleanupError`, the durable request remains visible for retry or total deletion, and the runtime emits `decision_cleanup_failed`.
 
 ---
 
@@ -1481,7 +1542,7 @@ Completed and failed executions are automatically persisted to the state store (
 | `eventSchemaVersion` | `2` | Required on live/current `ExecutionInfo`; selects the v2 event reducer without scanning `events` |
 | `events` | `AxlEvent[]` | All events for this execution. Renamed from `steps` in 0.16.0; `SQLiteStore` auto-migrates the `execution_history.steps` column to `events` on first open |
 | `totalCost` | `number` | Accumulated cost in USD. A **lower bound** when `unpriced` is `true` |
-| `unpriced` | `boolean \| undefined` | `true` when any cost-bearing call in the execution did billable work but had no usable cost (unpriced model / pricing-table miss) — `totalCost` is then a lower bound. `false` when every call was priced. The aggregate counterpart of `ask_end.unpriced` / `BudgetResult.unpriced` — read this instead of scanning `events`. `undefined` only on executions recorded before this field existed |
+| `unpriced` | `boolean \| undefined` | `true` when any cost-bearing call in the execution had unknown cost, including an unpriced model or a dispatched stalled call abandoned without usage — `totalCost` is then a lower bound. `false` when every call had known cost. The aggregate counterpart of `ask_end.unpriced` / `BudgetResult.unpriced` — read this instead of scanning `events`. `undefined` only on executions recorded before this field existed |
 | `startedAt` | `number` | Start timestamp (ms) |
 | `completedAt` | `number \| undefined` | Completion timestamp (ms) |
 | `duration` | `number` | Duration in ms |
@@ -1835,7 +1896,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `tool` | `string?` | Tool name (on tool-related events) |
 | `model` | `string?` | Model URI (on agent-related events) |
 | `promptVersion` | `string?` | Agent version (on agent-related events) |
-| `cost` | `number?` | Cost in USD for this step. Required on `agent_call_end` and `ask_end` (narrowing). **`ask_end.cost` is a per-ask rollup — see double-counting note below** |
+| `cost` | `number?` | Known cost in USD for this step. `ask_end.cost` is always the known per-ask rollup; `agent_call_end.cost` may be absent on failures or unknown-cost calls. **See the double-counting note below.** |
 | `tokens` | `{ input?, output?, reasoning? }?` | Token usage from the provider (on `agent_call_end` events). Maps from `ProviderResponse.usage` |
 | `duration` | `number?` | Duration in ms (set on `_end` variants) |
 | `timing` | `CallTiming?` | Per-call latency breakdown on `agent_call_end`, when the provider reported one — on the error path too, whenever the provider returned a response. Additive beside `duration` — see [`CallTiming`](#calltiming) |
@@ -1865,7 +1926,7 @@ import type { AxlEvent, AxlEventType, AxlEventOf, AskScoped } from '@axlsdk/axl'
 | `ask_start` | `AskScoped` | `prompt: string` | Top of every `ctx.ask()` |
 | `ask_end` | `AskScoped` | `outcome: { ok: true, result } \| { ok: false, error }`, `cost`, `duration` | Every `ctx.ask()` exit. Ask-internal failures surface here, NOT via the workflow-level `error` event |
 | `agent_call_start` | `AskScoped` | `agent: string`, `model: string`, `turn: number`, `data: AgentCallStartData` | Before each LLM call (one per loop turn) |
-| `agent_call_end` | `AskScoped` | `agent: string`, `model: string`, `cost: number`, `duration: number`, `timing?: CallTiming`, `data: AgentCallEndData` | After each LLM call returns. `timing` is present whenever the provider reported one — including the error path, when the provider returned a response (a non-2xx, or a mid-stream failure). It is absent when there was nothing to measure: a connection-level failure, an abort, or a non-provider throw. `status` is not a proxy for this — see [`ProviderError` fields](#providererror-fields) |
+| `agent_call_end` | `AskScoped` | `agent: string`, `model: string`, `cost?: number`, `unpriced?: boolean`, `duration: number`, `timing?: CallTiming`, `data: AgentCallEndData` | After each LLM call settles. `unpriced` marks an explicit unknown-cost lower bound, including a dispatched stalled request abandoned without usage. `timing` is present whenever the provider reported one — including the error path, when the provider returned a response (a non-2xx, or a mid-stream failure). It is absent when there was nothing to measure: a connection-level failure, an abort, or a non-provider throw. `status` is not a proxy for this — see [`ProviderError` fields](#providererror-fields) |
 | `token` | `AskScoped` | `data: string` | Streaming text chunk. **Stream-only** — never persisted to `ExecutionInfo.events` |
 | `tool_call_rejected` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallRejectedData` | Provider request rejected before execution starts; no start/end pair |
 | `tool_call_start` | `AskScoped` | `tool: string`, `callId: string`, `data: ToolCallStartDataV2` | After availability, JSON, and local argument validation succeeds |
@@ -1898,7 +1959,7 @@ import { eventCostContribution } from '@axlsdk/axl';
 const total = info.events.reduce((sum, e) => sum + eventCostContribution(e), 0);
 ```
 
-Also exported: `isCostBearingLeaf(event: AxlEvent): boolean` (takes an event, checks its `type` against the leaf set — pass the event, not the type string), `isUnpricedLeaf(event): boolean` (the single source of truth for the unpriced signal — `true` when a cost-bearing leaf did billable work but had no usable cost; drives `ExecutionInfo.unpriced` / `trackExecution().unpriced` / Studio's `unpricedCalls`), `COST_BEARING_LEAF_TYPES` (the canonical `as const` tuple: `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall`, `transcription_end`), and `isRootLevel(event: AxlEvent): boolean` (true when `depth === 0` or undefined — used for root-only token filtering).
+Also exported: `isCostBearingLeaf(event: AxlEvent): boolean` (takes an event, checks its `type` against the leaf set — pass the event, not the type string), `isUnpricedLeaf(event): boolean` (the single source of truth for the lower-bound signal — `true` when a cost-bearing leaf explicitly marks unknown cost or did billable work without usable cost; drives `ExecutionInfo.unpriced` / `trackExecution().unpriced` / Studio's `unpricedCalls`), `COST_BEARING_LEAF_TYPES` (the canonical `as const` tuple: `agent_call_end`, `tool_call_end`, `memory_remember`, `memory_recall`, `transcription_end`), and `isRootLevel(event: AxlEvent): boolean` (true when `depth === 0` or undefined — used for root-only token filtering).
 
 **`parsePartialJson(text: string): unknown`** — tolerant JSON parser used internally for `partial_object` streaming. Recovers from truncated input (unclosed strings/objects/arrays) and is hardened against deeply-nested input via a 256-depth cap (returns `null` on overflow). Exported from `@axlsdk/axl` for consumers building their own progressive-render pipelines that need to share Axl's truncation-recovery and stack-overflow guard rails. Zero dependencies.
 
@@ -2086,7 +2147,8 @@ All errors extend `AxlError`.
 | `ValidationError` | `ctx.ask()`, `ctx.verify()` | Post-schema business rule validation failed after all retries. Includes `.lastOutput`, `.reason`, `.retries` |
 | `QuorumNotMet` | `ctx.spawn()`, `ctx.map()` | Fewer tasks succeeded than the required quorum. Includes `.results` |
 | `NoConsensus` | `ctx.vote()` | No successful results to vote on, unanimous vote failed, or invalid strategy/option combination |
-| `TimeoutError` | `ctx.ask()` | Agent exceeded its configured `timeout`. When at least one completed turn reported provider `timing`, the message appends `(elapsed Nms: queued Nms, retries Nms, wire Nms, other Nms)` and `.breakdown` (`TimeoutBreakdown`) carries the same numbers. With no instrumented turn, the message is the bare prefix and `.breakdown` is `undefined` |
+| `TimeoutError` | `ctx.ask()` | Graceful between-turn `timeout` expired. The message names the agent. When at least one completed turn reported provider `timing`, it appends `(elapsed Nms: queued Nms, retries Nms, wire Nms, other Nms)` and `.breakdown` (`TimeoutBreakdown`) carries the same numbers. With no instrumented turn, the message is the bare prefix plus agent name and `.breakdown` is `undefined` |
+| `StallTimeoutError` | `ctx.ask()` | A dispatched provider request exceeded `stallTimeout` without streaming progress (or exceeded the non-stream dispatch-to-completion limit). Extends `TimeoutError`, names the agent, and is distinguishable with `instanceof StallTimeoutError`. |
 | `MaxTurnsError` | `ctx.ask()` | Agent exceeded its configured `maxTurns` |
 | `BudgetExceededError` | `ctx.budget()` | Budget exceeded with `hard_stop` policy. Includes `.limit`, `.spent`, `.policy` |
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |

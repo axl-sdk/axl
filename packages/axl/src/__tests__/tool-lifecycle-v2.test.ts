@@ -1095,9 +1095,15 @@ describe('v2 tool lifecycle integration', () => {
             : async () => ({ approved: true }),
       });
 
-      await expect(harness.ctx.ask(harness.testAgent, scenario.label)).rejects.toMatchObject({
-        name: 'AbortError',
-      });
+      const rejection = await harness.ctx.ask(harness.testAgent, scenario.label).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      if (controller.signal.aborted) {
+        expect(rejection, scenario.label).toBe(controller.signal.reason);
+      } else {
+        expect(rejection, scenario.label).toMatchObject({ name: 'AbortError' });
+      }
 
       expect(harness.provider.calls, scenario.label).toHaveLength(1);
       expect(laterHandler, scenario.label).not.toHaveBeenCalled();

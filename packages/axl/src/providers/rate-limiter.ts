@@ -57,11 +57,6 @@ export type RateLimitConfig = {
   acquireTimeoutMs?: number;
 };
 
-/** Create an AbortError whose `.name` matches the `'AbortError'` narrowing used elsewhere. */
-function abortError(): Error {
-  return Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
-}
-
 type Waiter = {
   resolve: () => void;
   reject: (err: unknown) => void;
@@ -143,13 +138,13 @@ export class RateLimiter {
    * With `acquireTimeoutMs`, a waiter that sits in the queue too long rejects.
    */
   acquire(signal?: AbortSignal): Promise<void> {
-    if (signal?.aborted) return Promise.reject(abortError());
+    if (signal?.aborted) return Promise.reject(signal.reason);
 
     return new Promise<void>((resolve, reject) => {
       const waiter: Waiter = { resolve, reject, signal };
 
       if (signal) {
-        waiter.onAbort = () => this.settleWaiter(waiter, abortError());
+        waiter.onAbort = () => this.settleWaiter(waiter, signal.reason);
         signal.addEventListener('abort', waiter.onAbort, { once: true });
       }
       if (this.acquireTimeoutMs != null) {
@@ -229,7 +224,7 @@ export class RateLimiter {
   }
 
   /** Reject a still-queued waiter (abort or timeout) and remove it cleanly. */
-  private settleWaiter(waiter: Waiter, err: Error): void {
+  private settleWaiter(waiter: Waiter, err: unknown): void {
     if (waiter.settled) return; // already granted/settled — nothing to do
     waiter.settled = true;
     const idx = this.queue.indexOf(waiter);

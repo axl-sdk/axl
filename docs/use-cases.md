@@ -41,6 +41,32 @@ const HandleSupport = workflow({
 
 25 lines for a production-ready support agent with tool access, type safety, and streaming.
 
+## Interactive request deadline
+
+An HTTP request needs a hard ceiling even while a provider call is in flight. Keep that
+strict SLA separate from the agent's graceful `timeout` budget:
+
+```typescript
+const reply = await ctx.ask(SupportBot, ctx.input.message, {
+  signal: AbortSignal.timeout(15_000),
+});
+```
+
+The signal aborts this ask (and any nested asks) without cancelling a sibling ask on the
+same context. Its exact abort reason is propagated.
+
+For batch or long-running generation where healthy streams may exceed a fixed deadline, use an
+idle guard instead:
+
+```typescript
+const report = await ctx.ask(ResearchBot, topic, {
+  stallTimeout: '120s', // optional; resets on every streamed chunk
+});
+```
+
+`stallTimeout` throws `StallTimeoutError` when a provider stops progressing; it is not a total-SLA
+timer. See [Ask deadlines](./api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
+
 ## Rich application results with compact model context
 
 A tool can return actions and bulky host data for UI rendering without copying all of it into the next model request. `toModelOutput` is an explicit allowlist over the successful post-hook result:
@@ -559,7 +585,7 @@ app.delete('/users/:id/data', async (req, res) => {
 - Pending `awaitHuman` decision
 - In-memory abort controller, resolver closure, streamable-set membership
 
-If the execution is still in flight, the workflow is **aborted** and marked to skip persist on `workflow_end` — no resurrection. A workflow paused at `ctx.awaitHuman()` correctly wakes (rejects with `AbortError`); previously it would hang forever.
+If the execution is still in flight, the workflow is **aborted** and marked to skip persist on `workflow_end` — no resurrection. A workflow paused at `ctx.awaitHuman()` correctly wakes (rejects with the signal's exact reason; SDK-initiated aborts use the default `AbortError`); previously it would hang forever.
 
 **Internal metadata keys are stripped before persistence.** `sessionHistory` and `sessionId` in `options.metadata` are consumed by the runtime as control-plane channels but filtered out of the persisted `ExecutionInfo.metadata`. So the queryable surface stays a clean tag bag.
 

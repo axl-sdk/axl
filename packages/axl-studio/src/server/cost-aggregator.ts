@@ -42,6 +42,7 @@ export class CostAggregator {
     model?: string;
     workflow?: string;
     cost?: number;
+    unpriced?: boolean;
     tokens?: { input?: number; output?: number; reasoning?: number };
     data?: unknown;
   }): void {
@@ -71,8 +72,8 @@ export class CostAggregator {
     const cost = Number.isFinite(event.cost) ? event.cost! : 0;
     const tokens = event.tokens ?? {};
 
-    // Unpriced leaf: a cost-bearing LLM/embedder call that did measurable work
-    // (POSITIVE tokens) but had no usable cost. Uses the core `isUnpricedLeaf`
+    // Unknown-cost leaf: explicitly marked (for example, an abandoned stalled
+    // request) or measurable work without usable cost. Uses `isUnpricedLeaf`
     // discriminator so the dashboard count stays in lockstep with the SDK's
     // `ExecutionInfo.unpriced` / `ask_end.unpriced` (ask_end carries a numeric
     // cost and tool_call_end has no tokens, so both are excluded).

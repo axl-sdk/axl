@@ -484,12 +484,37 @@ What that means differs by transport, because headers mean different things:
 Either way, time spent downloading or draining a body lands in `agent_call_end.duration`
 and in the `other` remainder of a `TimeoutError` breakdown, never in `queuedMs`.
 
+#### Stalled requests and cancellation
+
+`ctx.ask(..., { stallTimeout })` is an opt-in request-level anti-hang control, not a
+rate-limiter deadline. Built-in adapters start its timer at actual `fetch` dispatch, after a
+governor grant, reset it for each streaming chunk, and disarm it during SDK retry backoff.
+Thus queue wait and backoff cannot be mislabeled as a provider stall. For a non-streaming
+request the same window runs from dispatch through completion. A silent request throws
+`StallTimeoutError` (a `TimeoutError` subtype); any partial streamed result is discarded.
+
+Use an ask or context `signal` for a strict total SLA instead. Provider transports receive the
+composed signal; the first context, branch, or ask signal to abort wins and its exact external
+reason propagates unchanged. Custom providers should pass `ChatOptions.signal` to their
+transport. Axl starts a custom provider's opt-in stall timer conservatively when its method is
+entered; precise dispatch/retry lifecycle reporting is an internal built-in-adapter capability,
+not part of the custom `Provider` contract. Full public semantics and the
+`AbortSignal.timeout()` recipe are in the
+[API reference](api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
+
+If custom provider work ignores the supplied signal, Axl still settles a hard caller deadline or
+stall promptly and observes a later rejection. The abandoned work may nevertheless finish or be
+billed; because the ask has already emitted its terminal events, later usage cannot be
+retroactively added to that ask's event or budget totals. A dispatched stalled call marks those
+totals `unpriced` (lower bounds). Always forward the signal to the underlying transport.
+
 **Not every millisecond lands in a bucket.** An `apiKey` callback is awaited *before* the
 request enters the transport, deliberately, so a slow token refresh does not hold a rate
 limiter permit — which also means its time is in no `CallTiming` bucket. It shows up in
-`agent_call_end.duration` and in the `other` remainder of a `TimeoutError` breakdown. If you
-use an async credential source, cache the token in your callback rather than refreshing per
-request.
+`agent_call_end.duration` and in the `other` remainder of a `TimeoutError` breakdown. A hard
+ask/context signal still settles the caller promptly if that callback is non-cooperative; Axl
+observes the abandoned promise so a later rejection is handled. If you use an async credential
+source, cache the token in your callback rather than refreshing per request.
 
 **`chat()` and `stream()` do not measure `wireMs` over quite the same interval.** For
 `chat()` the clock stops once the parsed response is in hand, so response parsing and cost

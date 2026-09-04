@@ -11,11 +11,10 @@ export type BudgetResult<T> = {
   budgetExceeded: boolean;
   totalCost: number;
   /**
-   * True when the block ran a model with no usable cost (unpriced / pricing-table
-   * miss) that did measurable work. `totalCost` is then a LOWER BOUND — the unknown
-   * component is omitted. NOTE: this is observability only; cost limits / `hard_stop`
-   * are NOT enforced on unpriced spend (the enforcement rail never sees it). Token
-   * budgets are the future fix for governing unpriced models.
+   * True when the block included work with no usable cost (for example, an
+   * unpriced model or an abandoned dispatched call). `totalCost` is then a LOWER
+   * BOUND — the unknown component is omitted. Cost limits / `hard_stop` are NOT
+   * enforced on unknown spend because the enforcement rail never sees it.
    */
   unpriced: boolean;
 };
@@ -149,6 +148,12 @@ export type AskOptions<T = unknown> = {
   stop?: string[];
   /** Provider-specific options merged into API requests. Not portable across providers. */
   providerOptions?: Record<string, unknown>;
+  /** Graceful overall budget for this ask. The in-flight provider turn is allowed to finish. */
+  timeout?: string;
+  /** Abort an in-flight provider request that makes no streaming progress. Unset by default. */
+  stallTimeout?: string;
+  /** Per-ask hard cancellation signal. It is composed with the context signal and inherited by nested asks. */
+  signal?: AbortSignal;
 };
 
 /** Delegate options */
@@ -826,7 +831,7 @@ export type AxlEventBase = {
    *     `memory_recall`): the authoritative charge for this single
    *     provider call / tool invocation / embedder call. Summing these
    *     across an execution gives the spend — a LOWER BOUND when any call
-   *     used an unpriced model (its `cost` is `undefined` and contributes
+   *     included unknown-cost work (its `cost` is `undefined` and contributes
    *     nothing; the owning `ask_end` sets `unpriced: true`).
    *
    *   - **Per-ask rollup** (`ask_end`): the SUM of leaf costs emitted
@@ -908,11 +913,10 @@ type LegacyAxlEventPayloadV1 =
         /** Sum of `agent_call_end.cost` + `tool_call_end.cost` WITHIN THIS ASK,
          *  excluding nested asks. Nested asks contribute to their own ask_end. */
         cost: number;
-        /** True when a cost-bearing leaf in this ask did measurable work but had
-         *  no usable cost (unpriced model / pricing-table miss). When set, `cost`
+        /** True when a cost-bearing leaf in this ask had no usable cost. When set, `cost`
          *  is a LOWER BOUND — the unknown component is not included. Absent ⇒
          *  `cost` is exact. Surfaced so dashboards don't render a misleading
-         *  exact `$0.00` for an ask that used an unpriced model. */
+         *  exact `$0.00` for an ask with unknown-cost work. */
         unpriced?: boolean;
         duration: number;
       })
@@ -936,6 +940,10 @@ type LegacyAxlEventPayloadV1 =
         /** Authoritative turn-level cost. `undefined` for an unpriced model
          *  (pricing-table miss) and absent on the error path (no usage). */
         cost?: number;
+        /** Explicit lower-bound marker when a dispatched request was abandoned
+         *  without usage/cost (for example, a non-cooperative stalled provider).
+         *  The work may still be billed after this terminal event. */
+        unpriced?: boolean;
         duration: number;
         tokens?: {
           input?: number;
@@ -1332,12 +1340,12 @@ export type ExecutionInfoV1 = {
    *  here (stream-only); aggregate `tokens: { input, output, reasoning? }`
    *  on `agent_call_end` is the persisted token representation. */
   events: LegacyAxlEventV1[];
-  /** Total spend for the execution. A LOWER BOUND when an unpriced model ran
+  /** Total known spend for the execution. A LOWER BOUND when unknown-cost work ran
    *  (those calls contribute nothing) — read {@link ExecutionInfo.unpriced} to
    *  know whether it's exact, rather than scanning the event timeline. */
   totalCost: number;
-  /** True when any cost-bearing leaf in this execution did billable work but had
-   *  no usable cost (unpriced model / pricing-table miss): `totalCost` is then a
+  /** True when any cost-bearing leaf in this execution had no usable cost:
+   *  `totalCost` is then a
    *  LOWER BOUND, not exact. `false` means every cost-bearing call was priced.
    *  The aggregate counterpart of `ask_end.unpriced` / `BudgetResult.unpriced`,
    *  computed via `isUnpricedLeaf`. `undefined` only on executions recorded

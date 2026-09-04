@@ -273,7 +273,7 @@ export class TimeoutError extends AxlError {
   /** Latency attribution for the timed-out operation, when measurable. */
   readonly breakdown?: TimeoutBreakdown;
 
-  constructor(operation: string, timeoutMs: number, breakdown?: TimeoutBreakdown) {
+  constructor(operation: string, timeoutMs: number, breakdown?: TimeoutBreakdown, agent?: string) {
     // The prefix is verbatim what it has always been — consumers match on it.
     // The attribution clause is appended, never substituted.
     super(
@@ -283,10 +283,22 @@ export class TimeoutError extends AxlError {
           ? ` (elapsed ${breakdown.elapsedMs}ms: queued ${breakdown.queuedMs}ms, ` +
             `retries ${breakdown.retryMs}ms, wire ${breakdown.wireMs}ms, ` +
             `other ${breakdown.otherMs}ms)`
-          : ''),
+          : '') +
+        (agent ? ` for agent '${agent}'` : ''),
     );
     this.name = 'TimeoutError';
     if (breakdown) this.breakdown = breakdown;
+  }
+}
+
+/** Thrown when a dispatched provider request stops making progress. */
+export class StallTimeoutError extends TimeoutError {
+  constructor(operation: string, timeoutMs: number, agent?: string) {
+    super(operation, timeoutMs, undefined, agent);
+    this.name = 'StallTimeoutError';
+    this.message =
+      `${operation} provider request stalled for ${timeoutMs}ms` +
+      (agent ? ` for agent '${agent}'` : '');
   }
 }
 

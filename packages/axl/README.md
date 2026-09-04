@@ -229,6 +229,34 @@ const dynamicAgent = agent({
 });
 ```
 
+#### Ask deadlines
+
+`timeout` is a graceful between-turn budget (default `'60s'`): the current provider
+turn and ordinary tool work finish, but Axl will not start another turn after it expires.
+Time spent in `awaitHuman` is excluded. For a strict request SLA, pass an ask-local signal:
+
+```typescript
+const answer = await ctx.ask(researcher, question, {
+  signal: AbortSignal.timeout(15_000), // hard wall-clock deadline
+});
+```
+
+For long-running work without a short wall-clock SLA, use `stallTimeout` as an opt-in
+anti-hang guard (`'120s'` is conservative starting guidance, not an SDK default):
+
+```typescript
+const answer = await ctx.ask(researcher, question, {
+  stallTimeout: '120s', // reset whenever a streamed chunk arrives
+});
+```
+
+`signal` aborts in-flight work and preserves its exact reason. `stallTimeout` throws
+`StallTimeoutError` (a `TimeoutError` subtype). Both discard partial streamed output. If you
+combine them, make the strict deadline longer than the stall window when you want either control
+to be able to fire. See the
+[API reference](../../docs/api-reference.md#ask-deadlines-cancellation-and-stalled-requests)
+for precedence, nested asks, and provider timing details.
+
 #### Dynamic Handoffs
 
 `handoffs` accepts a static array or a function for runtime-conditional routing:
@@ -768,6 +796,7 @@ import {
   QuorumNotMet, // Quorum threshold not reached
   NoConsensus, // Vote could not reach consensus
   TimeoutError, // Operation exceeded timeout
+  StallTimeoutError, // Provider request stopped making progress
   MaxTurnsError, // Agent exceeded max tool-calling turns
   BudgetExceededError, // Budget limit exceeded
   GuardrailError, // Guardrail blocked input or output

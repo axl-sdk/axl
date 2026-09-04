@@ -24,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caller's exact abort reason, is sibling-local, and is inherited by nested asks. Partial
   responses from hard aborts are discarded. See [API reference](docs/api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
 
+### Fixed
+
+- **Streaming timing now preserves `wireMs >= firstTokenMs`.** First-content parsing and
+  generator scheduling can finish just after the corresponding body-read wait, previously
+  allowing an immediately truncated stream to report `wireMs` one millisecond below
+  `firstTokenMs`. `wireMs` now includes that pre-first-content delivery gap while still
+  excluding time a consumer spends paused after any yielded chunk, including a tool delta
+  that precedes first content.
+
 ## [0.23.0] - 2026-09-03
 
 ### Added

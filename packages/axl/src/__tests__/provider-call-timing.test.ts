@@ -4,6 +4,7 @@ import { OpenAIProvider } from '../providers/openai.js';
 import { OpenAIResponsesProvider } from '../providers/openai-responses.js';
 import { GeminiProvider } from '../providers/gemini.js';
 import { ProviderError } from '../providers/errors.js';
+import { CallTimingRecorder, withCallTiming } from '../providers/call-timing.js';
 import type { CallTiming, Provider, StreamChunk } from '../providers/types.js';
 import { expectWindow } from './helpers.js';
 
@@ -41,6 +42,7 @@ const WIRE_WINDOW: [number, number] = [H + F + B - 60, H + F + B + 90]; // 210..
 const originalFetch = globalThis.fetch;
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  vi.restoreAllMocks();
 });
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -622,6 +624,55 @@ describe('CallTiming — abandoned stream still releases the reader', () => {
   });
 });
 
+describe('CallTiming — stream ordering invariants', () => {
+  it('includes a deterministic pre-first-content processing gap in wireMs', () => {
+    const recorder = new CallTimingRecorder();
+    recorder.observer.onComplete({
+      queuedMs: 0,
+      attempts: 1,
+      retryMs: 0,
+      dispatchedAt: 1_000,
+      headersAt: 1_010,
+    });
+    vi.spyOn(Date, 'now').mockReturnValue(1_050);
+
+    recorder.markFirstToken();
+
+    expect(recorder.streamTiming()).toMatchObject({ firstTokenMs: 50, wireMs: 50 });
+  });
+
+  it('excludes consumer suspension after a tool delta before first content', async () => {
+    let now = 1_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const recorder = new CallTimingRecorder();
+    recorder.observer.onComplete({
+      queuedMs: 0,
+      attempts: 1,
+      retryMs: 0,
+      dispatchedAt: 1_000,
+      headersAt: 1_010,
+    });
+    now = 1_010;
+
+    async function* source(): AsyncGenerator<StreamChunk> {
+      yield { type: 'tool_call_delta', id: 'call-1', name: 'lookup' };
+      yield { type: 'text_delta', content: 'ready' };
+      yield { type: 'done' };
+    }
+
+    const stream = withCallTiming(recorder, source());
+    expect(await stream.next()).toMatchObject({ value: { type: 'tool_call_delta' } });
+    now += 500; // the consumer holds the iterator before requesting more
+    expect(await stream.next()).toMatchObject({ value: { type: 'text_delta' } });
+    const done = await stream.next();
+
+    expect(done.value).toMatchObject({
+      type: 'done',
+      timing: { ttfbMs: 10, firstTokenMs: 10, wireMs: 10 },
+    });
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Error-path timing. A failed call is the case an operator most wants measured
 // — "is the provider slow or is it throttling me?" is asked about failures far
@@ -840,10 +891,9 @@ describe('CallTiming — mid-stream error frame (openai-compatible)', () => {
     expect(t, 'a truncated stream still carries timing').toBeDefined();
     expectWindow(t!.ttfbMs, TTFB_WINDOW, 'truncated ttfbMs');
     expectWindow(t!.firstTokenMs, FIRST_TOKEN_WINDOW, 'truncated firstTokenMs');
-    // Do not order wireMs against firstTokenMs here. Stream wire time sums
-    // only body-read waits, while first-token time is dispatch-to-token wall
-    // time and can include scheduler/processing gaps. They may differ by a
-    // millisecond under load without violating either metric's contract.
+    // Delivering first content is necessarily part of provider-attributable
+    // stream time, including the small parse/scheduling gap after a body read.
+    expect(t!.wireMs).toBeGreaterThanOrEqual(t!.firstTokenMs!);
     expectValueDomain(t!);
   });
 });

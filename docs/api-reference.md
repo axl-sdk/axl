@@ -1689,8 +1689,8 @@ valid, so treat every field as possibly absent.
 | `attempts` | `number` | `fetch` attempts made for this call, including the final one (≥ 1) |
 | `retryMs` | `number` | First attempt's dispatch → final attempt's dispatch: failed attempts plus their backoff sleeps. `0` for a single attempt |
 | `ttfbMs` | `number` | Final dispatch → response headers |
-| `firstTokenMs` | `number?` | Final dispatch → first `text_delta`/`thinking_delta`. **Streaming only**, and absent on a stream that ends without a content delta. The model-discriminating figure — headers arrive at roughly one round trip regardless of model, first token does not |
-| `wireMs` | `number` | Time attributable to the provider. `chat()`: final dispatch → response body parsed. `stream()`: `ttfbMs` plus the cumulative time spent *awaiting* body reads, so runtime work between reads (event fan-out, tool-call buffering, a slow `ctx.events` consumer) is excluded by construction |
+| `firstTokenMs` | `number?` | Final dispatch → first `text_delta`/`thinking_delta`, excluding consumer suspension after an earlier non-content chunk such as a tool delta. **Streaming only**, and absent on a stream that ends without a content delta. The model-discriminating figure — headers arrive at roughly one round trip regardless of model, first token does not |
+| `wireMs` | `number` | Time attributable to the provider. `chat()`: final dispatch → response body parsed. `stream()`: `ttfbMs` plus cumulative body-read waits, floored at `firstTokenMs` when content arrives. Thus `wireMs >= firstTokenMs`; parsing needed to deliver the first delta is included, while pauses after a yielded delta (event fan-out, tool-call buffering, a slow `ctx.events` consumer) remain excluded |
 
 `agent_call_end.duration` is unchanged and still measures the whole turn's wall clock,
 queue and retries included. `timing` sits beside it; it does not replace it. Nothing in core

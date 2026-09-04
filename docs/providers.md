@@ -459,11 +459,13 @@ reference: [api-reference.md → `CallTiming`](api-reference.md#calltiming).
   backoff sleeps land here, not in `wireMs`, so a provider having a bad throttling day
   does not silently inflate its measured latency.
 - **`ttfbMs` and `firstTokenMs`** — response headers and, on a stream, the first content
-  delta. Headers land at roughly one round trip on any model; first token is the figure
-  that actually separates a fast model from a slow one.
-- **`wireMs`** — provider time. On a stream it counts only time spent *awaiting* body
-  reads, so a heavy `ctx.events` consumer or a busy trace listener does not get charged to
-  the model.
+  delta. Consumer suspension after an earlier tool delta is excluded. Headers land at
+  roughly one round trip on any model; first token is the figure that actually separates a
+  fast model from a slow one.
+- **`wireMs`** — provider time. On a stream it counts body-read waits and is floored at
+  `firstTokenMs`, so delivering first content is always included. A heavy `ctx.events`
+  consumer or busy trace listener still does not get charged for pauses after a yielded
+  delta.
 
 **The permit releases at response headers, on both transports**, which shapes what
 `queuedMs` can and cannot tell you. `fetchWithRetry` releases in a `finally` as it returns
@@ -518,10 +520,10 @@ source, cache the token in your callback rather than refreshing per request.
 
 **`chat()` and `stream()` do not measure `wireMs` over quite the same interval.** For
 `chat()` the clock stops once the parsed response is in hand, so response parsing and cost
-estimation are inside the figure; for `stream()` it is the sum of body-read waits and
-nothing else. Both are honest measures of "time attributable to the provider" for their own
-transport, but do not read a few milliseconds of difference between the two as a provider
-difference.
+estimation are inside the figure; for `stream()` it is the sum of body-read waits, floored
+at first-content delivery when present. Both are honest measures of "time attributable to
+the provider" for their own transport, but do not read a few milliseconds of difference
+between the two as a provider difference.
 
 Timing is optional end to end. A custom `Provider` that does not report it is valid, and
 consumers must treat every field as possibly absent.

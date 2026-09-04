@@ -106,6 +106,90 @@ export type ScorerDetail = {
   skipped?: boolean;
 };
 
+/**
+ * Provider-call latency sums for one model within one eval item, rolled up from
+ * the `timing` block on `agent_call_end` (see `CallTiming` in `@axlsdk/axl`).
+ *
+ * The point of the split is that `EvalItem.duration` is wall clock for the whole
+ * workflow — tools, gates, the SDK's own rate-limiter queue and all — so it
+ * cannot be compared across models or across runs with different fan-out.
+ * `wireMs` is the provider's time; `queuedMs` is the SDK's self-imposed pacing;
+ * `retryMs` is failed attempts and their backoff.
+ *
+ * Keyed by the effective model URI (`openai:gpt-4o`), the same key
+ * `metadata.modelCallCounts` uses, so the two can be joined.
+ */
+export type ItemModelTiming = {
+  /** Provider calls that REPORTED timing. May be lower than this model's
+   *  `modelCallCounts` entry — an uninstrumented custom provider and the error
+   *  path both contribute a call with no timing. Divide the sums by this, never
+   *  by the call count. */
+  calls: number;
+  /** Sum of `CallTiming.queuedMs` — waiting on the SDK's own rate limiter. */
+  queuedMs: number;
+  /** Sum of `CallTiming.retryMs` — failed attempts plus their backoff. */
+  retryMs: number;
+  /** Sum of `CallTiming.wireMs` — time attributable to the provider. Across
+   *  concurrent calls this can exceed the item's `duration`; that is expected. */
+  wireMs: number;
+  /** Sum of `CallTiming.firstTokenMs` over the STREAMING calls that reported
+   *  one. Absent when no call did, so a non-streaming model reports no
+   *  misleading `0`. Its denominator is `firstTokenCalls`, NOT `calls`. */
+  firstTokenMs?: number;
+  /** Timed calls that reported a `firstTokenMs`. Present exactly when
+   *  `firstTokenMs` is. It exists because a model can mix streamed and
+   *  non-streamed calls, and dividing the first-token sum by `calls` would then
+   *  report a latency no call ever achieved. */
+  firstTokenCalls?: number;
+};
+
+/** Distribution shape shared by the wall-clock and per-model timing stats. */
+type TimingStats = { mean: number; min: number; max: number; p50: number; p95: number };
+
+/**
+ * Per-model latency stats across a run, on `EvalSummary.modelTiming`.
+ *
+ * Every field here is a distribution over **per-call** values, pooled across all
+ * of the run's successful items — the same population `calls` counts. One
+ * provider call is one sample, so an item that makes ten calls weighs ten times
+ * an item that makes one. That is the right weighting for a model comparison:
+ * these numbers describe the model's latency, not the item's.
+ *
+ * This is deliberately a different weighting from the wall-clock
+ * `EvalSummary.timing`, which samples once per item because it describes the
+ * workflow. Read them side by side; do not expect them to agree.
+ */
+export type ModelTimingStats = {
+  /** Total SUCCESSFUL timed provider calls for this model across every item —
+   *  the sample size behind every distribution below. May be lower than this
+   *  model's total call count: an uninstrumented provider reports no timing, and
+   *  a failed call is excluded even when it does report one, so these stats
+   *  describe answers rather than a blend of answers and failures. */
+  calls: number;
+  /** Per-call wire latency (ms) — time attributable to the provider. The
+   *  primary model-comparison figure alongside `firstTokenMs`. */
+  wireMs: TimingStats;
+  /** Per-call queue wait (ms) in Axl's own rate limiter. Self-imposed wait, so
+   *  it never distorts a comparison of the models themselves. */
+  queuedMs: TimingStats;
+  /** Per-call retry time (ms) — failed attempts and their backoff. A model
+   *  throttled hard on the day of the run shows it here, which is what keeps
+   *  `wireMs` an honest comparison. */
+  retryMs: TimingStats;
+  /** Per-call time to first content delta (ms), over the STREAMING calls that
+   *  reported one — non-streaming calls are excluded from the sample rather
+   *  than entered as `0`. Absent when no call reported one. This is the
+   *  model-discriminating figure: response headers arrive at roughly one round
+   *  trip regardless of model, first token does not. */
+  firstTokenMs?: TimingStats;
+  /** How many calls that `firstTokenMs` sample covers. It earns its place
+   *  because a `TimingStats` carries no sample size, so on a model that mixes
+   *  streamed and non-streamed calls there is otherwise no way to tell a
+   *  first-token figure drawn from one call apart from one drawn from all of
+   *  them. Present exactly when `firstTokenMs` is. */
+  firstTokenCalls?: number;
+};
+
 export type EvalItem = {
   input: unknown;
   annotations?: unknown;
@@ -121,6 +205,20 @@ export type EvalItem = {
   scoreDetails?: Record<string, ScorerDetail>;
   /** Execution metadata forwarded from the runtime (models, tokens, agentCalls, etc). */
   metadata?: Record<string, unknown>;
+  /** Per-model provider-call latency for this item, rolled up from
+   *  `agent_call_end.timing`. Absent when the item made no timed provider call
+   *  — an item with no ask, an uninstrumented custom provider, or a runtime
+   *  without `trackExecution`. Distinct from `duration` (workflow wall clock),
+   *  which is unchanged.
+   *
+   *  These are per-item SUMS, kept compact so a persisted artifact stays small.
+   *  `summary.modelTiming` is NOT derived from them — it is computed from the
+   *  raw per-call blocks while the run is in memory, so its percentiles are
+   *  real per-call percentiles rather than percentiles of item means. A
+   *  consumer holding only a saved artifact can therefore recover per-item
+   *  sums and per-model totals from `item.timing`, but not the distribution.
+   *  (`rescore` already reports no timing stats at all, so nothing regresses.) */
+  timing?: Record<string, ItemModelTiming>;
   /** Trace events captured during this item's execution. Only populated when
    *  `runEval` was called with `{ captureTraces: true }`. Verbose-mode
    *  `agent_call_start.data.messages` snapshots are stripped to keep memory bounded;
@@ -164,6 +262,8 @@ export type EvalSummary = {
       skipped?: number;
     }
   >;
+  /** Wall-clock stats over per-item `duration`. Unchanged by the per-model
+   *  timing rollup — this still measures the whole workflow, queue and all. */
   timing?: {
     mean: number;
     min: number;
@@ -171,6 +271,9 @@ export type EvalSummary = {
     p50: number;
     p95: number;
   };
+  /** Per-model provider-latency stats, present only when at least one item
+   *  reported timing. Read alongside `timing`, never instead of it. */
+  modelTiming?: Record<string, ModelTimingStats>;
   /**
    * Populated by `runEval` ONLY when `EvalConfig.failOnScorerErrorRate` is set
    * and one or more scorers exceeded tolerance. `runEval` never throws on this

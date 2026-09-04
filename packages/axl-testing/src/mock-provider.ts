@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import type {
+  CallTiming,
   ChatMessage,
   ChatOptions,
   InputContentPart,
@@ -308,7 +309,20 @@ export class MockProvider implements Provider {
         };
       }
     }
-    yield { type: 'done', usage: response.usage, providerMetadata: response.providerMetadata };
+    yield {
+      type: 'done',
+      usage: response.usage,
+      // Forwarded like `chat()` does. Without it a streamed mock ask reported no
+      // cost at all, so `ctx.budget` and every cost assertion silently saw zero
+      // on the streaming path while the same fixture priced correctly on the
+      // non-streaming one — a mock that disagrees with itself between paths.
+      cost: response.cost,
+      providerMetadata: response.providerMetadata,
+      // Conditional spread, not `timing: response.timing` — a mock response with
+      // no timing must produce a `done` chunk with NO `timing` key at all, so a
+      // consumer's `'timing' in chunk` check reads the same as a real adapter's.
+      ...(response.timing ? { timing: response.timing } : {}),
+    };
   }
 
   static sequence(
@@ -318,6 +332,12 @@ export class MockProvider implements Provider {
       providerMetadata?: Record<string, unknown>;
       usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
       cost?: number;
+      /** Deterministic provider-call timing, surfaced on `ProviderResponse.timing`
+       *  and on the streamed terminal `done` chunk. Lets a test drive
+       *  `agent_call_end.timing`, the `TimeoutError` breakdown, and the eval
+       *  per-model rollup without real clocks or a real transport. Omit it and
+       *  the mock behaves exactly like an uninstrumented custom provider. */
+      timing?: CallTiming;
       /** When set, `stream()` yields one `text_delta` per entry instead
        *  of one big delta with the full content. Use to exercise
        *  partial-JSON parsing, structural-boundary throttling, and
@@ -339,6 +359,10 @@ export class MockProvider implements Provider {
         providerMetadata: resp.providerMetadata,
         usage: resp.usage ?? { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
         cost: resp.cost ?? 0,
+        // Copied, not shared: the caller keeps ownership of the fixture, so a
+        // consumer that mutates the returned block cannot corrupt a later call's
+        // expectation (same rule the message/options clones follow).
+        ...(resp.timing ? { timing: { ...resp.timing } } : {}),
       };
     });
     provider.chunkSequence = responses.map((r) => r.chunks);
@@ -404,6 +428,8 @@ export class MockProvider implements Provider {
           providerMetadata?: Record<string, unknown>;
           usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
           cost?: number;
+          /** Per-call timing — see the `timing` note on {@link MockProvider.sequence}. */
+          timing?: CallTiming;
         }
       | Promise<{
           content: string;
@@ -411,6 +437,8 @@ export class MockProvider implements Provider {
           providerMetadata?: Record<string, unknown>;
           usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
           cost?: number;
+          /** Per-call timing — see the `timing` note on {@link MockProvider.sequence}. */
+          timing?: CallTiming;
         }>,
   ): MockProvider {
     return new MockProvider(async (messages, callIndex) => {

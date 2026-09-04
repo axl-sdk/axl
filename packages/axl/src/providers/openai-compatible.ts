@@ -16,6 +16,7 @@ import {
   type ApiKeySource,
 } from './types.js';
 import { fetchWithRetry } from './retry.js';
+import { CallTimingRecorder, withCallTiming, withChatTiming } from './call-timing.js';
 import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { isBuiltinTablePricingEligible } from './builtin-table-pricing.js';
@@ -582,6 +583,7 @@ export class OpenAICompatibleProvider implements Provider {
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, false);
 
+    const recorder = new CallTimingRecorder();
     const res = await fetchWithRetry(
       `${this.baseUrl}/chat/completions`,
       {
@@ -590,7 +592,7 @@ export class OpenAICompatibleProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, timing: recorder.observer },
     );
 
     if (!res.ok) {
@@ -601,17 +603,22 @@ export class OpenAICompatibleProvider implements Provider {
         headers: res.headers,
         message: this.extractErrorMessage(errorBody, res.status),
         body: errorBody,
+        timing: recorder.chatTiming(),
       });
     }
 
     const json = (await res.json()) as OpenAIChatResponse;
-    return this.parseResponse(json, this.requestModel(body, options.model), body);
+    return withChatTiming(
+      recorder,
+      this.parseResponse(json, this.requestModel(body, options.model), body),
+    );
   }
 
   async *stream(messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> {
     const headers = this.buildHeaders(await this.resolveKey());
     const body = this.buildRequestBody(messages, options, true);
 
+    const recorder = new CallTimingRecorder();
     const res = await fetchWithRetry(
       `${this.baseUrl}/chat/completions`,
       {
@@ -620,7 +627,7 @@ export class OpenAICompatibleProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name },
+      { governor: this.governor, provider: this.name, timing: recorder.observer },
     );
 
     if (!res.ok) {
@@ -631,13 +638,17 @@ export class OpenAICompatibleProvider implements Provider {
         headers: res.headers,
         message: this.extractErrorMessage(errorBody, res.status),
         body: errorBody,
+        timing: recorder.chatTiming(),
       });
     }
     if (!res.body) {
       throw new Error(`${this.profile.label ?? this.profile.name} stream response has no body`);
     }
 
-    yield* this.parseSSEStream(res.body, this.requestModel(body, options.model), body);
+    yield* withCallTiming(
+      recorder,
+      this.parseSSEStream(res.body, this.requestModel(body, options.model), body, recorder),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -969,10 +980,25 @@ export class OpenAICompatibleProvider implements Provider {
   // SSE streaming
   // ---------------------------------------------------------------------------
 
-  protected async *parseSSEStream(
+  /**
+   * PRIVATE, and deliberately not an extension point. It was `protected`, but
+   * nothing in or out of this repo overrides it, and `protected` could not
+   * carry the guarantee it appeared to: TypeScript checks an override for
+   * assignability, and a function type with fewer parameters is assignable to
+   * one with more — so an override that simply dropped the recorder still
+   * compiled and then reported `wireMs === ttfbMs` for the whole subclass. Its
+   * type is not exported from the barrel either, so a subclass author could not
+   * name what they were required to accept.
+   *
+   * A provider with a different wire format implements `Provider` (see
+   * docs/providers.md); an OpenAI-compatible one adds a `ProviderProfile`.
+   * Neither needs to reach in here.
+   */
+  private async *parseSSEStream(
     body: ReadableStream<Uint8Array>,
     model: string,
-    request?: Record<string, unknown>,
+    request: Record<string, unknown> | undefined,
+    timing: CallTimingRecorder,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -1045,7 +1071,7 @@ export class OpenAICompatibleProvider implements Provider {
 
     try {
       for (;;) {
-        const { done, value } = await reader.read();
+        const { done, value } = await timing.read(reader);
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
@@ -1081,12 +1107,17 @@ export class OpenAICompatibleProvider implements Provider {
               typeof parsed.error.message === 'string'
                 ? parsed.error.message
                 : `${this.profile.label ?? this.profile.name} stream error`;
+            // Mid-stream failure: headers and body bytes already arrived, so
+            // stream semantics apply. `status: 0` here means "the provider gave
+            // us no HTTP status to map", NOT "no response" — timing presence
+            // keys off the response, not off the status.
             throw new ProviderError({
               provider: this.name,
               status: 0,
               retryable: false,
               message,
               body: JSON.stringify(parsed.error),
+              timing: timing.streamTiming(),
             });
           }
 
@@ -1179,11 +1210,15 @@ export class OpenAICompatibleProvider implements Provider {
         if (flushed.thinking) yield { type: 'thinking_delta', content: flushed.thinking };
       }
       yield* flushPendingToolCalls();
+      // A truncated stream is the case where timing matters most: `firstTokenMs`
+      // and `wireMs` are what separate a provider that hung AFTER first token
+      // from one that never produced one.
       throw new ProviderError({
         provider: this.name,
         status: 0,
         retryable: true,
         message: `${this.profile.label ?? this.profile.name} stream ended before [DONE]`,
+        timing: timing.streamTiming(),
       });
     } finally {
       reader.releaseLock();

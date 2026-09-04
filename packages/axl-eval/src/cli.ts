@@ -22,6 +22,7 @@ import {
 } from './cli-utils.js';
 import { validateEvalConfig } from './cli-validate.js';
 import { parseEvalArgs, envInt } from './cli-args.js';
+import { formatModelTimingLines } from './cli-format.js';
 import { scorerCounts } from './utils.js';
 
 /**
@@ -527,6 +528,14 @@ function formatTable(result: EvalResult): string {
       `  ${'Timing'.padEnd(maxNameLen)}  ${(t.mean / 1000).toFixed(2).padStart(colWidth)}s ${(t.p50 / 1000).toFixed(2).padStart(colWidth)}s ${(t.p95 / 1000).toFixed(2).padStart(colWidth)}s`,
     );
   }
+
+  // Per-model provider latency, indented under the wall-clock Timing row. All
+  // four buckets are shown because their separation is the point: `wire` is the
+  // provider, `queued` is the SDK's own rate limiter, `retries` is the
+  // provider's throttling that day, and `first token` is the figure that
+  // actually discriminates between models. See `formatModelTimingLines` for why
+  // these are the call-weighted means and not the per-item distributions.
+  lines.push(...formatModelTimingLines(result.summary.modelTiming, maxNameLen));
 
   const durationSec = (result.duration / 1000).toFixed(1);
   const costStr = result.totalCost > 0 ? `$${result.totalCost.toFixed(2)}` : '$0.00';

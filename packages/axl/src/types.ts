@@ -944,6 +944,12 @@ type LegacyAxlEventPayloadV1 =
           cached?: number;
           cacheWrite?: number;
         };
+        /** Per-call latency breakdown when the provider reported one. Additive
+         *  beside `duration`, which keeps its turn-wall-clock meaning (queue,
+         *  retries, gates and all). Present on the error path too when the
+         *  provider returned a response (any non-2xx); absent when the call
+         *  never reached one (network failure, abort, non-provider throw). */
+        timing?: CallTiming;
         /** Response-side payload — response text, thinking. */
         data: AgentCallEndData;
       })
@@ -1458,6 +1464,52 @@ export type ToolCallMessage = {
   };
 };
 
+/**
+ * Per-call latency breakdown, reported by adapters that route through
+ * `fetchWithRetry`. Every figure is a non-negative integer count of
+ * milliseconds derived from `Date.now()` deltas — the same clock
+ * `agent_call_end.duration` uses.
+ *
+ * Entirely optional and additive: a custom `Provider` that omits `timing` stays
+ * valid, and consumers must treat every field as possibly absent.
+ *
+ * The buckets separate the three things that `duration` conflates — the SDK's
+ * own pacing, the provider's throttling, and the model's actual latency:
+ */
+export type CallTiming = {
+  /**
+   * Time parked in Axl's own opt-in `RateLimiter` (concurrency cap plus
+   * `minIntervalMs` spacing) before the request was allowed out. `0` when the
+   * provider has no `rateLimit` configured. This is self-imposed wait, not
+   * provider latency.
+   */
+  queuedMs: number;
+  /** `fetch` attempts made for this call, including the final one (≥ 1). */
+  attempts: number;
+  /**
+   * First attempt's dispatch → final attempt's dispatch, i.e. everything spent
+   * on failed attempts and their backoff sleeps. `0` for a single attempt.
+   */
+  retryMs: number;
+  /** Final dispatch → response headers. Time to first byte. */
+  ttfbMs: number;
+  /**
+   * Final dispatch → first `text_delta`/`thinking_delta`. Streaming only, and
+   * absent on a stream that ends without any content delta. This is the
+   * model-discriminating figure: headers arrive at roughly one round trip
+   * regardless of model, first token does not.
+   */
+  firstTokenMs?: number;
+  /**
+   * Time attributable to the provider. For `chat()`, final dispatch → response
+   * body parsed. For `stream()`, `ttfbMs` plus the cumulative time spent
+   * *awaiting* body reads — time the runtime spends between reads (event
+   * fan-out, tool-call buffering, a slow `ctx.events` consumer) is excluded by
+   * construction, so two models stay comparable under different listener loads.
+   */
+  wireMs: number;
+};
+
 /** Provider response */
 export type ProviderResponse = {
   content: string;
@@ -1475,4 +1527,6 @@ export type ProviderResponse = {
   cost?: number;
   /** Provider-specific opaque metadata that needs to round-trip through conversation history. */
   providerMetadata?: Record<string, unknown>;
+  /** Per-call latency breakdown. Absent on providers that don't instrument it. */
+  timing?: CallTiming;
 };

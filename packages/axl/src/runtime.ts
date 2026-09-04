@@ -38,6 +38,7 @@ import type {
   AwaitHumanOptions,
   ChatMessage,
   HandoffRecord,
+  CallTiming,
 } from './types.js';
 import { AxlError, preserveErrorCause } from './errors.js';
 import {
@@ -2383,13 +2384,65 @@ export class AxlRuntime extends EventEmitter {
    */
   async trackExecution<T>(
     fn: () => Promise<T>,
-    options?: { captureTraces?: boolean },
+    options?: { captureTraces?: boolean; captureTimingSamples?: boolean },
   ): Promise<{
     result: T;
     cost: number;
     /** True when any tracked call was unpriced — `cost` is then a LOWER BOUND.
      *  Aggregate counterpart of `ExecutionInfo.unpriced`, via `isUnpricedLeaf`. */
     unpriced: boolean;
+    /**
+     * Per-model sums of `agent_call_end.timing`, keyed by the same effective
+     * model URI as `metadata.modelCallCounts`. Present only when at least one
+     * tracked call reported timing, so absence means "nothing was instrumented"
+     * rather than "everything took zero ms".
+     *
+     * `calls` counts the SUCCESSFUL timed calls only — it can be lower than the
+     * same model's `modelCallCounts` entry when a provider omits `timing` or a
+     * call failed. Divide a sum by `calls`, never by `modelCallCounts`.
+     *
+     * Failed calls are excluded even though they now report timing: a non-2xx
+     * response is a measured round trip, but a rollup blending answers with
+     * failures describes neither, and a fast 429 would improve a model's
+     * apparent latency. The failures stay on the events themselves.
+     *
+     * `firstTokenMs` is streaming-only and is summed across the calls that
+     * reported it; it is omitted entirely when no call did, so a non-streaming
+     * model never reports a misleading `0`. Its denominator is `firstTokenCalls`,
+     * NOT `calls` — the two travel together and are present or absent together,
+     * so a mixed streaming/non-streaming model still yields an exact mean.
+     *
+     * Sums are per-call totals, so `wireMs` across concurrent calls can exceed
+     * the wall clock of `fn` — that is expected under fan-out and is why
+     * nothing in the core sums timing at the ask level.
+     *
+     * `samples` carries the raw per-call `CallTiming` blocks behind the sums, in
+     * `agent_call_end` order, so a caller that needs a DISTRIBUTION (percentiles,
+     * min/max) rather than a mean can compute one over real per-call values. It
+     * is the same data the sums were built from — `samples.length === calls` —
+     * and is deliberately not something callers should persist per item: the
+     * sums are the compact form, `samples` is the working form.
+     *
+     * It is **opt-in** via `captureTimingSamples` and the key is absent
+     * otherwise. Retaining it is O(calls) in memory for the lifetime of `fn`,
+     * which no caller should pay for a figure it never reads — the sums alone
+     * are O(models).
+     */
+    modelTiming?: Record<
+      string,
+      {
+        calls: number;
+        queuedMs: number;
+        retryMs: number;
+        wireMs: number;
+        firstTokenMs?: number;
+        /** Timed calls that reported a `firstTokenMs` — the denominator for it. */
+        firstTokenCalls?: number;
+        /** The per-call blocks the sums were built from, in event order.
+         *  `length === calls`. Present only under `captureTimingSamples`. */
+        samples?: CallTiming[];
+      }
+    >;
     traces?: AxlEvent[];
     metadata: {
       models: string[];
@@ -2419,6 +2472,22 @@ export class AxlRuntime extends EventEmitter {
     };
 
     const modelCalls = new Map<string, number>();
+    const modelTiming = new Map<
+      string,
+      {
+        calls: number;
+        queuedMs: number;
+        retryMs: number;
+        wireMs: number;
+        firstTokenMs?: number;
+        firstTokenCalls?: number;
+        samples?: CallTiming[];
+      }
+    >();
+    // Opt-in: retaining every block is O(calls), and only a caller building a
+    // distribution (axl-eval's `summary.modelTiming`) reads them. `trackCost`
+    // and the internal eval-history wrapper discard `modelTiming` entirely.
+    const captureTimingSamples = options?.captureTimingSamples === true;
     // Insertion-ordered Map: first time we see a workflow it gets added at
     // the end, so iteration order is "first-seen first" — which for nested
     // workflow calls puts the outermost workflow first.
@@ -2442,6 +2511,46 @@ export class AxlRuntime extends EventEmitter {
           tokens.input += event.tokens.input ?? 0;
           tokens.output += event.tokens.output ?? 0;
           tokens.reasoning += event.tokens.reasoning ?? 0;
+        }
+        // Latency rollup, same key as modelCallCounts. Only timed calls enter a
+        // bucket, so an uninstrumented provider adds nothing rather than
+        // contributing zeros that would deflate a mean.
+        //
+        // SUCCESSFUL calls only — see the `modelTiming` JSDoc for why. `data.error`
+        // is set on the error-path `agent_call_end` and never on the success
+        // path, so it is the discriminator.
+        const failed = event.data?.error != null;
+        if (event.model && event.timing && !failed) {
+          const t = event.timing;
+          let bucket = modelTiming.get(event.model);
+          if (!bucket) {
+            bucket = {
+              calls: 0,
+              queuedMs: 0,
+              retryMs: 0,
+              wireMs: 0,
+              ...(captureTimingSamples ? { samples: [] } : {}),
+            };
+            modelTiming.set(event.model, bucket);
+          }
+          bucket.calls++;
+          // Keep the raw block alongside the sums when asked. A consumer that
+          // needs a real per-call distribution (axl-eval's
+          // `summary.modelTiming`) can't recover one from sums, and re-deriving
+          // it from `captureTraces` would force it to buffer whole events.
+          bucket.samples?.push(t);
+          bucket.queuedMs += t.queuedMs;
+          bucket.retryMs += t.retryMs;
+          bucket.wireMs += t.wireMs;
+          // Streaming-only: sum it only across the calls that reported it, and
+          // leave the key off when none did. `firstTokenCalls` rides along as
+          // its own denominator so a model mixing streamed and non-streamed
+          // calls still yields an exact mean — dividing by `calls` would
+          // under-report it.
+          if (t.firstTokenMs != null) {
+            bucket.firstTokenMs = (bucket.firstTokenMs ?? 0) + t.firstTokenMs;
+            bucket.firstTokenCalls = (bucket.firstTokenCalls ?? 0) + 1;
+          }
         }
       }
       // Both `runtime.execute()` and `runtime.stream()` now emit workflow_start
@@ -2498,6 +2607,7 @@ export class AxlRuntime extends EventEmitter {
         result,
         cost: scope.totalCost,
         unpriced,
+        ...(modelTiming.size > 0 ? { modelTiming: Object.fromEntries(modelTiming) } : {}),
         ...(capturedTraces ? { traces: capturedTraces } : {}),
         metadata: {
           models: [...modelCalls.keys()],

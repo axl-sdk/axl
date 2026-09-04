@@ -49,6 +49,26 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * Transport-level timing for one {@link fetchWithRetry} call, reported to
+ * `FetchWithRetryOptions.timing.onComplete` on the return path.
+ *
+ * All figures are `Date.now()` deltas / epoch stamps in milliseconds — the same
+ * clock `agent_call_end.duration` uses.
+ */
+export type FetchTiming = {
+  /** Time spent waiting on the SDK's own governor. `0` when no governor is set. */
+  queuedMs: number;
+  /** Total `fetch` attempts made, including the successful/final one (≥ 1). */
+  attempts: number;
+  /** First attempt's dispatch → final attempt's dispatch. `0` for a single attempt. */
+  retryMs: number;
+  /** Epoch ms at which the FINAL attempt's `fetch` was issued. */
+  dispatchedAt: number;
+  /** Epoch ms at which the final attempt's response headers arrived. */
+  headersAt: number;
+};
+
 /** Options for {@link fetchWithRetry}. */
 export type FetchWithRetryOptions = {
   /** Max retries on a retryable status (default 2 → 3 total attempts). */
@@ -79,6 +99,39 @@ export type FetchWithRetryOptions = {
    * `ProviderError{ status: 0 }` thrown. Defaults to `'unknown'`.
    */
   provider?: string;
+  /**
+   * Optional out-of-band latency observer. Observing changes nothing: omitting
+   * this leaves behavior byte-identical, and neither callback's return value is
+   * read.
+   *
+   * A CALLBACK MUST NOT THROW. Both are invoked inside the fetch loop and
+   * neither is wrapped, so a throw propagates to the caller exactly as a
+   * throwing `governor.observe()` does — the permit is still released by the
+   * `finally`, but a throw from `onComplete` turns a returned `Response` into a
+   * thrown error whose body is never consumed or cancelled. Propagating rather
+   * than swallowing is deliberate and matches this seam's existing stance;
+   * observers own their own error handling.
+   */
+  timing?: {
+    /**
+     * Fired at each attempt's `fetch` start, `attempt` 1-indexed. A stall clock
+     * (Spec 23 `stallTimeout`) arms here, since this is the moment the request
+     * actually leaves — after the governor grant and after any backoff sleep.
+     */
+    onDispatch?(attempt: number, at: number): void;
+    /**
+     * Fired exactly once, immediately before the final `Response` is returned
+     * (OK, non-retryable, aborted-mid-retry, or retries exhausted). It does NOT
+     * fire when the call throws — a normalized network failure or a propagated
+     * abort loses its timing by design.
+     *
+     * It means "the transport returned a `Response`", NOT "the call succeeded".
+     * A 4xx/5xx return fires it too, and the adapter then throws a
+     * `ProviderError` and discards the figures. Never treat it as a success
+     * signal.
+     */
+    onComplete?(timing: FetchTiming): void;
+  };
 };
 
 /**
@@ -114,18 +167,40 @@ export async function fetchWithRetry(
   const maxRetries = opts?.maxRetries ?? MAX_RETRIES;
   const governor = opts?.governor;
   const provider = opts?.provider ?? 'unknown';
+  const observer = opts?.timing;
 
   let acquired = false;
+  // Self-imposed wait only. Without a governor there is nothing to wait on, so
+  // `queuedMs` stays 0 rather than absorbing unrelated setup time.
+  let queuedMs = 0;
   if (governor) {
+    const acquireStart = Date.now();
     // May reject (pre-aborted signal / acquireTimeoutMs) — propagate as the call
     // failure, BEFORE setting `acquired`, so `finally` never over-releases.
     await governor.acquire(init?.signal ?? undefined);
     acquired = true;
+    queuedMs = Date.now() - acquireStart;
   }
+
+  let firstDispatchedAt = 0;
+  let dispatchedAt = 0;
+  let headersAt = 0;
+  const reportComplete = (attempts: number): void => {
+    observer?.onComplete?.({
+      queuedMs,
+      attempts,
+      retryMs: dispatchedAt - firstDispatchedAt,
+      dispatchedAt,
+      headersAt,
+    });
+  };
 
   try {
     for (let attempt = 0; ; attempt++) {
       let res: Response;
+      dispatchedAt = Date.now();
+      if (attempt === 0) firstDispatchedAt = dispatchedAt;
+      observer?.onDispatch?.(attempt + 1, dispatchedAt);
       try {
         // Never re-send provider request bodies or credentials to a redirect
         // target. A provider must be configured with its final endpoint.
@@ -148,15 +223,18 @@ export async function fetchWithRetry(
         await sleep(jitter(BASE_DELAY_MS * 2 ** attempt), init?.signal ?? undefined);
         continue;
       }
+      headersAt = Date.now();
       governor?.observe(res);
 
       // Return immediately if OK, non-retryable, or out of retries
       if (res.ok || !RETRYABLE_STATUS_CODES.has(res.status) || attempt >= maxRetries) {
+        reportComplete(attempt + 1);
         return res;
       }
 
       // Don't retry if aborted
       if (init?.signal?.aborted) {
+        reportComplete(attempt + 1);
         return res;
       }
 

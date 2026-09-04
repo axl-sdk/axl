@@ -197,6 +197,43 @@ The same unpriced condition is surfaced on the budget rail. A [`ctx.budget()`](a
 
 ⚠️ **Honesty, not enforcement.** `unpriced` reports that `totalCost` is a lower bound — it does **not** make the limit enforceable. The enforcement rail only ever sees *measured* cost, so a cost limit (including `hard_stop`) **cannot trip on unpriced spend** (e.g. unpriced/self-hosted/Bedrock models). A `hard_stop` budget pointed at an unpriced model will run unbounded by dollars. Token-denominated budgets are the planned mechanism for governing unpriced models; until then, treat `unpriced: true` as "the limit could not be enforced for part of this block." To restore enforceable cost limits, register pricing for the model so calls carry a usable cost.
 
+### Per-call timing
+
+`agent_call_end.duration` is the whole turn's wall clock. Under an opt-in
+[`rateLimit`](providers.md#rate-limiting-opt-in) that number folds three unrelated things
+together — the SDK's own queue wait, the provider's 429 backoff, and the model's actual
+latency — so it cannot answer "was the model slow, or was I pacing myself?".
+
+The built-in chat adapters answer that with a `timing` block beside `duration`:
+
+```typescript
+runtime.on('trace', (event) => {
+  if (event.type !== 'agent_call_end' || !event.timing) return;
+  const { queuedMs, retryMs, wireMs, firstTokenMs } = event.timing;
+  // Failed calls carry timing too (whenever the provider returned a response),
+  // so a 429 storm or a slow-then-500 is as measurable as a success.
+  const outcome = event.data.error ? `FAILED ${event.data.status ?? ''}` : 'ok';
+  console.log(`${event.model} ${outcome}: queue ${queuedMs}ms, retries ${retryMs}ms, wire ${wireMs}ms`);
+  if (firstTokenMs !== undefined) console.log(`  first token at ${firstTokenMs}ms`);
+});
+```
+
+`duration` is unchanged and still brackets the whole turn; `timing` is additive and
+optional — absent (the key itself) only when no response was received: a connection-level
+failure, an abort, or a custom `Provider` that does not report it. Branch on its presence
+rather than defaulting fields to zero, and note that `data.status` is not a proxy for that
+presence: a mid-stream failure carries `status: 0` (no HTTP status to map) *and* timing.
+Nothing in core sums `timing` across the calls of one ask; across parallel branches a sum
+would exceed wall clock, so aggregation belongs to whoever knows the shape of the fan-out
+(the eval does it per model). Field definitions: [api-reference.md →
+`CallTiming`](api-reference.md#calltiming); what `queuedMs` can and cannot tell you under
+streaming: [providers.md → What you can observe](providers.md#what-you-can-observe).
+
+A `ctx.ask()` that times out uses the same numbers: when at least one completed turn
+reported timing, `TimeoutError.message` appends `(elapsed …: queued …, retries …, wire …,
+other …)` and `TimeoutError.breakdown` carries the figures programmatically, so a budget
+consumed by self-imposed pacing is visible without guessing.
+
 ### Failure surfacing — `ask_end` vs. `error`
 
 Ask-internal failures (gate retries exhausted, `ctx.verify` failure, handler throw) surface via `ask_end({ outcome: { ok: false, error } })` only — **not** the workflow-level `error` event. The workflow-level `error` is reserved for failures with no `ask_end` available (top-level workflow throws before any ask runs, infrastructure / abort errors). Consumers narrow on `outcome.ok`:
@@ -734,7 +771,7 @@ Every `ctx.*` primitive emits a span. Spans nest naturally: a workflow span cont
 | Span Name | Key Attributes |
 |-----------|------------|
 | `axl.workflow.execute` | `axl.workflow.name`, `axl.workflow.duration`, `axl.workflow.cost` |
-| `axl.agent.ask` | `axl.agent.name`, `axl.agent.model`, `axl.agent.prompt_tokens`, `axl.agent.completion_tokens`, `axl.agent.cost` |
+| `axl.agent.ask` | `axl.agent.name`, `axl.agent.model`, `axl.agent.prompt_tokens`, `axl.agent.completion_tokens`, `axl.agent.cost`, `axl.agent.duration`, and — when the last provider call of the ask reported [`timing`](api-reference.md#calltiming) — `axl.agent.queued_ms`, `axl.agent.retry_ms`, `axl.agent.attempts`, `axl.agent.ttfb_ms`, `axl.agent.wire_ms`, `axl.agent.first_token_ms` (streaming only) |
 | `axl.tool.call` | `axl.tool.name`, `axl.tool.duration`, `axl.tool.outcome`, `axl.tool.success`, `axl.tool.phase` (failed/cancelled) |
 | `axl.ctx.spawn` | `axl.spawn.count`, `axl.spawn.quorum`, `axl.spawn.completed` |
 | `axl.ctx.race` | `axl.race.participants`, `axl.race.winner` |

@@ -24,7 +24,8 @@ changelog remains the canonical release record; the GitHub Release is its public
 subscriber-friendly presentation.
 
 **Get explicit approval before bumping versions or starting release mutations.** Never
-commit, push, tag, merge, or publish without it.
+push, tag, merge, or publish without it. (Ordinary feature-branch commits need no
+approval — see `CLAUDE.md`; this gate is for the release bump itself.)
 
 1. Bump the version in all four `packages/*/package.json` together.
 2. Move `CHANGELOG.md` `[Unreleased]` → the new version (Keep a Changelog format).

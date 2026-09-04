@@ -1508,6 +1508,9 @@ describe('OpenAIResponsesProvider', () => {
           // Terra: 6 ordinary @ $2, 4 cache writes @ $2.50, 5 output @ $12 per MTok.
           cost: expect.closeTo(0.000082, 8),
           providerMetadata: undefined,
+          // Every terminal `done` carries the per-call latency block; the
+          // figures themselves are pinned in provider-call-timing.test.ts.
+          timing: expect.objectContaining({ queuedMs: 0, attempts: 1, retryMs: 0 }),
         },
       ]);
     });

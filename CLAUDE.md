@@ -78,7 +78,9 @@ Run from the repo root. Per-area detail: `.claude/rules/testing.md` and the pack
   payloads. Exact newest-model certification is the separate, paid
   `pnpm test:integration:frontier` gate.
 - **Never commit gitignored paths** (`.internal/**`); no `git add -f`.
-- **Never commit, push, or tag without explicit approval.**
+- **Commit verified, logical chunks by default** on a feature branch (conventional
+  commits; never directly on `main`). **Never push, tag, merge, or publish without
+  explicit approval.**
 - **Releases are changelog-backed and tag-triggered.** After npm trusted publishing
   succeeds, the publish workflow creates the GitHub Release and an Announcements
   discussion from the matching versioned `CHANGELOG.md` section. Follow

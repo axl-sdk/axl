@@ -10,13 +10,15 @@ import type { ModelTimingStats } from './types.js';
  * Render the per-model provider-latency rows that sit under the wall-clock
  * `Timing` row.
  *
- * Every printed figure is an **exact call-weighted mean** (`meanWireMs` and
- * friends), never the per-item-sampled `wireMs`/`queuedMs` distributions. That
- * distinction matters: with two items where one makes 1 call at 100ms and the
- * other makes 99 at 1000ms, the per-item mean is 550ms while the true per-call
- * mean is 991ms. Printing the per-item figure beside a call count would invite
- * the reader to divide one by the other and pick the wrong model. The
- * distributions stay available on the JSON artifact for anyone who wants spread.
+ * Every figure is per PROVIDER CALL — the whole `modelTiming` surface is now
+ * one kind of average, so there is nothing here a reader can accidentally
+ * divide by the call count and get wrong.
+ *
+ * `wire` and `first token` carry a `mean/p95` pair because those are the two
+ * model-comparison figures and a tail matters for both. `queued` and `retries`
+ * print a mean only: they describe Axl's own limiter and the provider's
+ * throttling on the day of the run, so a p95 would lengthen every row without
+ * changing a model choice. The full distributions stay on the JSON artifact.
  *
  * Units are milliseconds and every number is suffixed, because these are
  * routinely sub-second and the `Timing` row above renders seconds — an
@@ -34,12 +36,14 @@ export function formatModelTimingLines(
 ): string[] {
   if (!modelTiming) return [];
   return Object.entries(modelTiming).map(([model, t]) => {
-    const parts = [`wire ${formatMs(t.meanWireMs)}`];
-    if (t.meanFirstTokenMs != null) parts.push(`first token ${formatMs(t.meanFirstTokenMs)}`);
-    parts.push(`queued ${formatMs(t.meanQueuedMs)}`);
-    parts.push(`retries ${formatMs(t.meanRetryMs)}`);
+    const parts = [`wire ${formatMs(t.wireMs.mean)}/${formatMs(t.wireMs.p95)}`];
+    if (t.firstTokenMs) {
+      parts.push(`first token ${formatMs(t.firstTokenMs.mean)}/${formatMs(t.firstTokenMs.p95)}`);
+    }
+    parts.push(`queued ${formatMs(t.queuedMs.mean)}`);
+    parts.push(`retries ${formatMs(t.retryMs.mean)}`);
     const calls = `${t.calls} call${t.calls === 1 ? '' : 's'}`;
-    return `    ${model.padEnd(Math.max(nameWidth - 2, 0))}  ${parts.join(' · ')}  (${calls}, mean per call)`;
+    return `    ${model.padEnd(Math.max(nameWidth - 2, 0))}  ${parts.join(' · ')}  (${calls}, mean/p95 per call)`;
   });
 }
 

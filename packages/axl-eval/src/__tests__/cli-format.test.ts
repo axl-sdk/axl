@@ -2,15 +2,13 @@ import { describe, it, expect } from 'vitest';
 import { formatModelTimingLines } from '../cli-format.js';
 import type { ModelTimingStats } from '../types.js';
 
-/** A model whose per-item distribution diverges sharply from its call-weighted
- *  mean — the shape that made the original rendering misleading. */
+/** A model with a long tail: most calls are slow, one was fast. Per-call
+ *  sampling gives a mean of 910ms and a p95 of 1000ms — the pair the row prints. */
 const UNEVEN: ModelTimingStats = {
   calls: 10,
-  meanWireMs: 910,
-  meanQueuedMs: 38,
-  meanRetryMs: 0,
-  wireMs: { mean: 550, min: 100, max: 1000, p50: 1000, p95: 1000 },
+  wireMs: { mean: 910, min: 100, max: 1000, p50: 1000, p95: 1000 },
   queuedMs: { mean: 38, min: 38, max: 38, p50: 38, p95: 38 },
+  retryMs: { mean: 0, min: 0, max: 0, p50: 0, p95: 0 },
 };
 
 describe('formatModelTimingLines()', () => {
@@ -19,15 +17,13 @@ describe('formatModelTimingLines()', () => {
     expect(formatModelTimingLines({}, 8)).toEqual([]);
   });
 
-  it('prints the call-weighted mean, never the per-item distribution', () => {
+  it('pairs the per-call mean with the p95 so a tail is visible', () => {
     const [line] = formatModelTimingLines({ 'openai:gpt-4o': UNEVEN }, 8);
 
-    // 910 is the true per-call mean; 550 is the per-item-sampled one. Printing
-    // 550 beside "10 calls" invites dividing one by the other and choosing the
-    // wrong model, which is the whole reason both figures exist separately.
-    expect(line).toContain('wire 910ms');
-    expect(line).not.toContain('550');
-    expect(line).toContain('(10 calls, mean per call)');
+    // Every figure on the row is per call, so the count can be read beside them
+    // without inviting a wrong division.
+    expect(line).toContain('wire 910ms/1000ms');
+    expect(line).toContain('(10 calls, mean/p95 per call)');
   });
 
   it('labels every figure with its unit so it cannot be read as seconds', () => {
@@ -36,21 +32,30 @@ describe('formatModelTimingLines()', () => {
     // The wall-clock Timing row directly above renders seconds. Sub-second
     // per-call latencies would collapse to "0.0s" there, so these must be ms
     // and must say so.
-    expect(line).toMatch(/wire 910ms/);
+    expect(line).toMatch(/wire 910ms\/1000ms/);
     expect(line).toMatch(/queued 38ms/);
     expect(line).toMatch(/retries 0ms/);
     expect(line).not.toMatch(/\d+\.\ds/);
   });
 
+  it('prints queued and retries as a mean only, keeping the row readable', () => {
+    // These describe Axl's own limiter and the provider's throttling, not the
+    // model, so a p95 would lengthen every row without changing a model choice.
+    const [line] = formatModelTimingLines({ 'openai:gpt-4o': UNEVEN }, 8);
+    expect(line).toContain('queued 38ms ·');
+    expect(line).not.toContain('queued 38ms/');
+    expect(line).not.toContain('retries 0ms/');
+  });
+
   it('shows first-token latency only when a call actually streamed one', () => {
     const streamed: ModelTimingStats = {
       ...UNEVEN,
-      meanFirstTokenMs: 180,
+      firstTokenMs: { mean: 180, min: 90, max: 400, p50: 170, p95: 400 },
       firstTokenCalls: 10,
     };
 
     expect(formatModelTimingLines({ 'openai:gpt-4o': streamed }, 8)[0]).toContain(
-      'first token 180ms',
+      'first token 180ms/400ms',
     );
     // A non-streaming model must show no first-token figure at all — a `0ms`
     // would read as an instantly-responding model in a J2 comparison.
@@ -58,7 +63,10 @@ describe('formatModelTimingLines()', () => {
   });
 
   it('surfaces retry time so provider throttling is visible', () => {
-    const throttled: ModelTimingStats = { ...UNEVEN, meanRetryMs: 2400 };
+    const throttled: ModelTimingStats = {
+      ...UNEVEN,
+      retryMs: { mean: 2400, min: 0, max: 9000, p50: 1200, p95: 9000 },
+    };
     expect(formatModelTimingLines({ 'anthropic:claude': throttled }, 8)[0]).toContain(
       'retries 2400ms',
     );
@@ -82,7 +90,7 @@ describe('formatModelTimingLines()', () => {
   it('singularizes a one-call model', () => {
     const single: ModelTimingStats = { ...UNEVEN, calls: 1 };
     expect(formatModelTimingLines({ 'openai:gpt-4o': single }, 8)[0]).toContain(
-      '(1 call, mean per call)',
+      '(1 call, mean/p95 per call)',
     );
   });
 

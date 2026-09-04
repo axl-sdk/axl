@@ -1,16 +1,31 @@
-import type { AxlRuntime } from '@axlsdk/axl';
-import type { EvalConfig, EvalResult, EvalItem, EvalSummary, RunEvalOptions } from './types.js';
+import type { AxlRuntime, CallTiming } from '@axlsdk/axl';
+import type {
+  EvalConfig,
+  EvalResult,
+  EvalItem,
+  EvalSummary,
+  ItemModelTiming,
+  ModelTimingStats,
+  RunEvalOptions,
+} from './types.js';
 import type { ScorerContext } from './scorer.js';
 import type { DegradedScorer } from './types.js';
 import {
   computeStats,
   mapWithConcurrency,
-  round,
   scorerCounts,
   evaluateScorerTolerance,
 } from './utils.js';
 import { scoreItem } from './score-item.js';
 import { randomUUID } from 'node:crypto';
+
+/** The `modelTiming` rollup `AxlRuntime.trackExecution` returns — sums plus the
+ *  raw `samples` array. Derived from the runtime's own signature so a removed
+ *  field is a type error here; `absorbTiming` copies fields explicitly so an
+ *  ADDED core field cannot silently widen the persisted `item.timing`. */
+type TrackedModelTiming = NonNullable<
+  Awaited<ReturnType<AxlRuntime['trackExecution']>>['modelTiming']
+>;
 
 function parseCost(cost: string): number {
   const match = cost.match(/^\$?([\d.]+)$/);
@@ -123,6 +138,49 @@ export async function runEval(
   let totalCost = 0;
   let budgetExceeded = false;
 
+  // Run-level per-call latency samples, keyed by effective model URI. Filled
+  // synchronously from each item's `trackExecution` result and never persisted:
+  // `summary.modelTiming` needs real per-call values to produce a real
+  // distribution, while `item.timing` keeps only the compact sums. Items run
+  // concurrently, but each append is a synchronous push, so no interleaving is
+  // possible; sample ORDER across items is arbitrary and irrelevant to stats.
+  const runCallSamples = new Map<string, CallTiming[]>();
+  /**
+   * Split a `trackExecution` timing rollup into the compact per-item sums that
+   * get persisted and the raw per-call blocks that feed `summary.modelTiming`.
+   * Both branches of the item loop go through here so the two paths can't drift.
+   */
+  function absorbTiming(rollup: TrackedModelTiming | undefined, evalItem: EvalItem): void {
+    if (!rollup) return;
+    const perItem: Record<string, ItemModelTiming> = {};
+    for (const [model, bucket] of Object.entries(rollup)) {
+      // Explicit field copy, not a rest spread: a rest spread would carry any
+      // future core-side field straight into every persisted eval artifact.
+      const sums: ItemModelTiming = {
+        calls: bucket.calls,
+        queuedMs: bucket.queuedMs,
+        retryMs: bucket.retryMs,
+        wireMs: bucket.wireMs,
+        ...(bucket.firstTokenMs !== undefined && bucket.firstTokenCalls !== undefined
+          ? { firstTokenMs: bucket.firstTokenMs, firstTokenCalls: bucket.firstTokenCalls }
+          : {}),
+      };
+      perItem[model] = sums;
+      // `samples` is opt-in on the core side and both call sites below request
+      // it, so it is never actually absent here — but it is typed optional and
+      // is treated that way rather than asserted, so a future caller that omits
+      // the flag degrades to "no distribution" instead of throwing.
+      const samples = bucket.samples;
+      if (!samples) continue;
+      // Appended one at a time rather than by spread: a long-running item can
+      // hold thousands of calls, and `push(...arr)` passes them as arguments.
+      const pooled = runCallSamples.get(model) ?? [];
+      for (const sample of samples) pooled.push(sample);
+      runCallSamples.set(model, pooled);
+    }
+    evalItem.timing = perItem;
+  }
+
   async function processItem(item: (typeof items)[0], itemIndex: number): Promise<void> {
     if (options?.signal?.aborted) {
       evalItems[itemIndex] = {
@@ -163,7 +221,7 @@ export async function runEval(
       if (options?.captureTraces) {
         const tracked = await runtime.trackExecution(
           async () => executeWorkflow(item.input, runtime),
-          { captureTraces: true },
+          { captureTraces: true, captureTimingSamples: true },
         );
         evalItem.duration = Date.now() - itemStart;
         evalItem.output = tracked.result.output;
@@ -174,7 +232,7 @@ export async function runEval(
         evalItem.cost = extractUserCost(tracked.result) ?? tracked.cost;
         if (tracked.unpriced) evalItem.unpriced = true;
         evalItem.metadata = extractUserMetadata(tracked.result) ?? tracked.metadata;
-        if (tracked.modelTiming) evalItem.timing = tracked.modelTiming;
+        absorbTiming(tracked.modelTiming, evalItem);
         if (tracked.traces && tracked.traces.length > 0) {
           evalItem.traces = tracked.traces;
         }
@@ -200,12 +258,14 @@ export async function runEval(
         // item emitting thousands of `token` events pays a hash lookup per
         // event, not a walk. The `captureTraces` path already ran this way at
         // the same concurrency.
-        let trackedTiming: EvalItem['timing'];
+        let trackedTiming: TrackedModelTiming | undefined;
         let result: Awaited<ReturnType<typeof executeWorkflow>>;
         if (typeof runtime.trackExecution === 'function') {
+          // `captureTimingSamples` is what makes `summary.modelTiming` a real
+          // per-call distribution; the sums alone could only yield a mean.
           const tracked = await runtime.trackExecution(
             async () => executeWorkflow(item.input, runtime),
-            { captureTraces: false },
+            { captureTraces: false, captureTimingSamples: true },
           );
           result = tracked.result;
           trackedTiming = tracked.modelTiming;
@@ -217,7 +277,7 @@ export async function runEval(
         evalItem.cost = extractUserCost(result);
         const meta = extractUserMetadata(result);
         if (meta) evalItem.metadata = meta;
-        if (trackedTiming) evalItem.timing = trackedTiming;
+        absorbTiming(trackedTiming, evalItem);
         if (evalItem.cost != null) {
           totalCost += evalItem.cost;
         }
@@ -314,81 +374,35 @@ export async function runEval(
   const durations = evalItems.filter((i) => !i.error && i.duration != null).map((i) => i.duration!);
   const timing = durations.length > 0 ? computeStats(durations) : undefined;
 
-  // Per-model provider latency, in two forms that answer different questions.
+  // Per-model provider latency: one distribution per field, every sample a real
+  // provider call. A ten-call item contributes ten samples, so `wireMs.mean` is
+  // the exact call-weighted mean and `wireMs.p95` is a genuine call percentile.
   //
-  // The `mean*Ms` figures are EXACT call-weighted means: total ms over total
-  // calls. They are what a model comparison needs and what the CLI prints.
-  // The `wireMs`/`queuedMs` distributions sample one value per ITEM (that item's
-  // mean per call) so their spread is comparable to the wall-clock `timing`
-  // stats above — but that makes their `mean` differ from the call-weighted one
-  // whenever items have unequal call counts, which is why both are kept and
-  // labelled rather than one being presented as the other.
+  // This is why the raw `CallTiming` blocks are pooled during the run instead of
+  // being re-derived from `item.timing`: per-item sums can yield a mean, but no
+  // percentile that describes calls rather than items.
   //
-  // `firstTokenMs` carries its own denominator: a model can mix streamed and
-  // non-streamed calls, and dividing by `calls` would report a first-token
-  // latency no call achieved.
-  const perModelSamples = new Map<
-    string,
-    {
-      calls: number;
-      wireSum: number;
-      queuedSum: number;
-      retrySum: number;
-      firstTokenSum: number;
-      firstTokenCalls: number;
-      wire: number[];
-      queued: number[];
-    }
-  >();
-  for (const item of evalItems) {
-    if (item.error || !item.timing) continue;
-    for (const [model, t] of Object.entries(item.timing)) {
-      let sample = perModelSamples.get(model);
-      if (!sample) {
-        sample = {
-          calls: 0,
-          wireSum: 0,
-          queuedSum: 0,
-          retrySum: 0,
-          firstTokenSum: 0,
-          firstTokenCalls: 0,
-          wire: [],
-          queued: [],
-        };
-        perModelSamples.set(model, sample);
-      }
-      sample.calls += t.calls;
-      sample.wireSum += t.wireMs;
-      sample.queuedSum += t.queuedMs;
-      sample.retrySum += t.retryMs;
-      if (t.firstTokenMs != null && t.firstTokenCalls != null) {
-        sample.firstTokenSum += t.firstTokenMs;
-        sample.firstTokenCalls += t.firstTokenCalls;
-      }
-      sample.wire.push(t.wireMs / t.calls);
-      sample.queued.push(t.queuedMs / t.calls);
-    }
-  }
-  const modelTiming =
-    perModelSamples.size > 0
+  // `firstTokenMs` runs over the streaming calls only — a non-streaming call is
+  // excluded from the sample rather than entered as `0`, which would report a
+  // first-token latency no call achieved.
+  const modelTiming: Record<string, ModelTimingStats> | undefined =
+    runCallSamples.size > 0
       ? Object.fromEntries(
-          [...perModelSamples.entries()].map(([model, s]) => [
-            model,
-            {
-              calls: s.calls,
-              meanWireMs: round(s.wireSum / s.calls),
-              meanQueuedMs: round(s.queuedSum / s.calls),
-              meanRetryMs: round(s.retrySum / s.calls),
-              ...(s.firstTokenCalls > 0
-                ? {
-                    meanFirstTokenMs: round(s.firstTokenSum / s.firstTokenCalls),
-                    firstTokenCalls: s.firstTokenCalls,
-                  }
+          [...runCallSamples.entries()].map(([model, samples]) => {
+            const firstToken = samples
+              .map((s) => s.firstTokenMs)
+              .filter((v): v is number => v != null);
+            const stats: ModelTimingStats = {
+              calls: samples.length,
+              wireMs: computeStats(samples.map((s) => s.wireMs)),
+              queuedMs: computeStats(samples.map((s) => s.queuedMs)),
+              retryMs: computeStats(samples.map((s) => s.retryMs)),
+              ...(firstToken.length > 0
+                ? { firstTokenMs: computeStats(firstToken), firstTokenCalls: firstToken.length }
                 : {}),
-              wireMs: computeStats(s.wire),
-              queuedMs: computeStats(s.queued),
-            },
-          ]),
+            };
+            return [model, stats];
+          }),
         )
       : undefined;
 

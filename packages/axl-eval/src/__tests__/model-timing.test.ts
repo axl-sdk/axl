@@ -143,8 +143,9 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
       { workflow: 'w', dataset: oneItemDataset(5), scorers: [passScorer], concurrency: 1 },
       async (input, rt) => {
         const ctx = rt.createContext();
-        // Item q0 makes two A calls; every item makes one A and one B call. The
-        // distributions sample the per-item MEAN, so A stays at 40, not 80.
+        // Item q0 makes two A calls; every item makes one A and one B call.
+        // Every A call has the same scripted timing, so the uneven fan-out shows
+        // up in `calls` (6, not 5) while the distribution stays flat.
         await ctx.ask(agentA, 'one');
         if ((input as { q: string }).q === 'q0') await ctx.ask(agentA, 'two');
         await ctx.ask(agentB, 'three');
@@ -156,28 +157,24 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
     expect(result.summary.modelTiming).toEqual({
       [A]: {
         calls: 6,
-        meanWireMs: 40,
-        meanQueuedMs: 10,
-        // Retry time reaches the summary, so a model throttled on the day of the
-        // run is visible instead of being invisibly folded away.
-        meanRetryMs: 60,
-        meanFirstTokenMs: 25,
-        firstTokenCalls: 6,
         wireMs: { mean: 40, min: 40, max: 40, p50: 40, p95: 40 },
         queuedMs: { mean: 10, min: 10, max: 10, p50: 10, p95: 10 },
+        // Retry time reaches the summary, so a model throttled on the day of the
+        // run is visible instead of being invisibly folded away.
+        retryMs: { mean: 60, min: 60, max: 60, p50: 60, p95: 60 },
+        firstTokenMs: { mean: 25, min: 25, max: 25, p50: 25, p95: 25 },
+        firstTokenCalls: 6,
       },
       [B]: {
         calls: 5,
-        meanWireMs: 200,
-        meanQueuedMs: 100,
-        meanRetryMs: 0,
         wireMs: { mean: 200, min: 200, max: 200, p50: 200, p95: 200 },
         queuedMs: { mean: 100, min: 100, max: 100, p50: 100, p95: 100 },
+        retryMs: { mean: 0, min: 0, max: 0, p50: 0, p95: 0 },
       },
     });
     // B never streamed: absence, not a `0` that would look like an instant
     // first token in a model comparison.
-    expect('meanFirstTokenMs' in result.summary.modelTiming![B]).toBe(false);
+    expect('firstTokenMs' in result.summary.modelTiming![B]).toBe(false);
     expect('firstTokenCalls' in result.summary.modelTiming![B]).toBe(false);
 
     // The wall-clock stats keep their old meaning: they are derived from
@@ -189,11 +186,12 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
     expect(result.summary.timing!.max).toBe(Math.max(...durations));
   });
 
-  it('reports an exact call-weighted mean that survives uneven fan-out', async () => {
+  it('samples the distribution per call, not per item, under uneven fan-out', async () => {
     // The reviewer's worked example. Item q0 makes 1 call at 100ms; item q1
-    // makes 9 calls at 1000ms. Per-item sampling averages 100 and 1000 to 550;
-    // the true per-call mean is 9100/10 = 910. A CLI or consumer that reads the
-    // distribution's mean as a per-call figure picks the wrong model here.
+    // makes 9 calls at 1000ms. Per-ITEM sampling would average 100 and 1000 to
+    // 550 and report a p50 of 550 — a figure no call achieved. Per-CALL sampling
+    // gives 9100/10 = 910 with a p50 of 1000, because 9 of the 10 calls were
+    // slow. This assertion is what pins the weighting.
     const runtime = new AxlRuntime({ defaultProvider: 'test' });
     let callIndex = 0;
     runtime.registerProvider('test', {
@@ -222,10 +220,21 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
 
     const stats = result.summary.modelTiming![A];
     expect(stats.calls).toBe(10);
-    expect(stats.meanWireMs).toBe(910);
-    // Both figures are kept, and they genuinely differ — which is exactly why
-    // only the call-weighted one may be printed next to a call count.
-    expect(stats.wireMs.mean).toBe(550);
+    expect(stats.wireMs.mean).toBe(910);
+    expect(stats.wireMs.p50).toBe(1000);
+    expect(stats.wireMs.min).toBe(100);
+    expect(stats.wireMs.max).toBe(1000);
+    // The per-item mean-of-means, which the old surface also reported. Nothing
+    // on `modelTiming` may equal it any more.
+    expect(stats.wireMs.mean).not.toBe(550);
+    // The item keeps its compact sums, and carries no raw samples — those live
+    // only in memory during the run.
+    expect(result.items[1].timing![A]).toEqual({
+      calls: 9,
+      queuedMs: 0,
+      retryMs: 0,
+      wireMs: 9000,
+    });
   });
 
   // E4 — the regression guard for the reversed plan §4.5 decision.
@@ -294,8 +303,23 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
     expect(result.items[0].timing).toEqual({
       [A]: { calls: 2, queuedMs: 0, retryMs: 0, wireMs: 100, firstTokenMs: 25, firstTokenCalls: 1 },
     });
-    expect(result.summary.modelTiming![A].meanFirstTokenMs).toBe(25);
+    // The first-token distribution runs over the ONE streamed call, not over
+    // both: entering the non-streamed call as a `0` would halve the mean and
+    // report a min of 0.
+    expect(result.summary.modelTiming![A].calls).toBe(2);
+    expect(result.summary.modelTiming![A].firstTokenMs).toEqual({
+      mean: 25,
+      min: 25,
+      max: 25,
+      p50: 25,
+      p95: 25,
+    });
     expect(result.summary.modelTiming![A].firstTokenCalls).toBe(1);
+    // `firstTokenCalls` is the only thing distinguishing this from a model
+    // where every call streamed — a TimingStats carries no sample size.
+    expect(result.summary.modelTiming![A].firstTokenCalls).not.toBe(
+      result.summary.modelTiming![A].calls,
+    );
   });
 
   it('leaves an errored item out of item.timing and out of the summary sample', async () => {

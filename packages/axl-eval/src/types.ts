@@ -149,44 +149,45 @@ type TimingStats = { mean: number; min: number; max: number; p50: number; p95: n
 /**
  * Per-model latency stats across a run, on `EvalSummary.modelTiming`.
  *
- * Two different averages live here, and they answer different questions:
+ * Every field here is a distribution over **per-call** values, pooled across all
+ * of the run's successful items — the same population `calls` counts. One
+ * provider call is one sample, so an item that makes ten calls weighs ten times
+ * an item that makes one. That is the right weighting for a model comparison:
+ * these numbers describe the model's latency, not the item's.
  *
- * - **`meanWireMs` / `meanQueuedMs` / `meanRetryMs` / `meanFirstTokenMs` are
- *   exact call-weighted means** — the sum over every timed call divided by the
- *   number of those calls. This is the figure to compare across models, and the
- *   one the CLI prints.
- * - **`wireMs` / `queuedMs` are distributions whose sample is one value per
- *   ITEM**, not per call: each item's sum is divided by that item's `calls` and
- *   the stats run over those per-item means. An item that makes ten calls counts
- *   once, exactly like the existing wall-clock `summary.timing`, which makes the
- *   spread comparable to it — but it means `wireMs.mean` will differ from
- *   `meanWireMs` whenever items have unequal call counts. Do not read
- *   `wireMs.mean` as a per-call average.
+ * This is deliberately a different weighting from the wall-clock
+ * `EvalSummary.timing`, which samples once per item because it describes the
+ * workflow. Read them side by side; do not expect them to agree.
  */
 export type ModelTimingStats = {
-  /** Total timed provider calls for this model across every item. The
-   *  denominator of `meanWireMs`, `meanQueuedMs` and `meanRetryMs`. */
+  /** Total SUCCESSFUL timed provider calls for this model across every item —
+   *  the sample size behind every distribution below. May be lower than this
+   *  model's total call count: an uninstrumented provider reports no timing, and
+   *  a failed call is excluded even when it does report one, so these stats
+   *  describe answers rather than a blend of answers and failures. */
   calls: number;
-  /** Exact call-weighted mean wire latency in ms — provider time per call. */
-  meanWireMs: number;
-  /** Exact call-weighted mean queue wait in ms — the SDK's own rate limiter. */
-  meanQueuedMs: number;
-  /** Exact call-weighted mean retry time in ms — failed attempts and backoff.
-   *  A model throttled hard on the day of the run shows it here, which is what
-   *  keeps `meanWireMs` an honest model comparison. */
-  meanRetryMs: number;
-  /** Exact mean time to first content delta in ms, over `firstTokenCalls`.
-   *  Absent when no call reported one (a non-streaming run). This is the
-   *  model-discriminating latency figure — response headers arrive at roughly
-   *  one round trip regardless of model. */
-  meanFirstTokenMs?: number;
-  /** Timed calls that reported a `firstTokenMs` — the denominator of
-   *  `meanFirstTokenMs`. Present exactly when `meanFirstTokenMs` is. */
-  firstTokenCalls?: number;
-  /** Distribution of PER-ITEM mean wire latency (ms). See the note above. */
+  /** Per-call wire latency (ms) — time attributable to the provider. The
+   *  primary model-comparison figure alongside `firstTokenMs`. */
   wireMs: TimingStats;
-  /** Distribution of PER-ITEM mean queue wait (ms). See the note above. */
+  /** Per-call queue wait (ms) in Axl's own rate limiter. Self-imposed wait, so
+   *  it never distorts a comparison of the models themselves. */
   queuedMs: TimingStats;
+  /** Per-call retry time (ms) — failed attempts and their backoff. A model
+   *  throttled hard on the day of the run shows it here, which is what keeps
+   *  `wireMs` an honest comparison. */
+  retryMs: TimingStats;
+  /** Per-call time to first content delta (ms), over the STREAMING calls that
+   *  reported one — non-streaming calls are excluded from the sample rather
+   *  than entered as `0`. Absent when no call reported one. This is the
+   *  model-discriminating figure: response headers arrive at roughly one round
+   *  trip regardless of model, first token does not. */
+  firstTokenMs?: TimingStats;
+  /** How many calls that `firstTokenMs` sample covers. It earns its place
+   *  because a `TimingStats` carries no sample size, so on a model that mixes
+   *  streamed and non-streamed calls there is otherwise no way to tell a
+   *  first-token figure drawn from one call apart from one drawn from all of
+   *  them. Present exactly when `firstTokenMs` is. */
+  firstTokenCalls?: number;
 };
 
 export type EvalItem = {
@@ -208,7 +209,15 @@ export type EvalItem = {
    *  `agent_call_end.timing`. Absent when the item made no timed provider call
    *  — an item with no ask, an uninstrumented custom provider, or a runtime
    *  without `trackExecution`. Distinct from `duration` (workflow wall clock),
-   *  which is unchanged. */
+   *  which is unchanged.
+   *
+   *  These are per-item SUMS, kept compact so a persisted artifact stays small.
+   *  `summary.modelTiming` is NOT derived from them — it is computed from the
+   *  raw per-call blocks while the run is in memory, so its percentiles are
+   *  real per-call percentiles rather than percentiles of item means. A
+   *  consumer holding only a saved artifact can therefore recover per-item
+   *  sums and per-model totals from `item.timing`, but not the distribution.
+   *  (`rescore` already reports no timing stats at all, so nothing regresses.) */
   timing?: Record<string, ItemModelTiming>;
   /** Trace events captured during this item's execution. Only populated when
    *  `runEval` was called with `{ captureTraces: true }`. Verbose-mode

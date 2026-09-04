@@ -406,7 +406,7 @@ const data = await ctx.ask(myAgent, 'Extract the user profile', {
 | `stop` | `string[]` | agent config | Override stop sequences for this call |
 | `providerOptions` | `Record<string, unknown>` | agent config | Override provider-specific options for this call. Shallow-merged; see [caveat](providers.md#provideroptions) |
 | `timeout` | `string` | agent config → `defaults.timeout` → `'60s'` | Override the graceful overall between-turn budget. The current provider turn and ordinary tool work are allowed to finish; `awaitHuman` wait is excluded. |
-| `stallTimeout` | `string` | agent config → `defaults.stallTimeout` → unset | Opt-in hard limit for a provider request that makes no progress. Streaming resets the idle clock on every chunk; non-streaming uses a dispatch-to-completion limit. Values above the platform timer maximum (`2147483647ms`, about 24.8 days) are rejected before dispatch. |
+| `stallTimeout` | `string` | agent config → `defaults.stallTimeout` → unset | Opt-in hard limit for a provider request that makes no progress. Streaming resets the idle clock on every chunk; non-streaming uses a dispatch-to-completion limit. |
 | `signal` | `AbortSignal` | — | Per-ask hard cancellation/deadline. Composed with the context/branch signal; first abort wins and nested asks inherit it. |
 
 **Precedence:** For `timeout` and `stallTimeout`, per-call `AskOptions` > agent-level
@@ -436,6 +436,24 @@ const answer = await ctx.ask(supportAgent, question, {
 });
 ```
 
+For long-running work where progress matters more than total duration:
+
+```typescript
+import { StallTimeoutError } from '@axlsdk/axl';
+
+try {
+  const report = await ctx.ask(researchAgent, topic, {
+    stallTimeout: '120s',
+  });
+} catch (error) {
+  if (error instanceof StallTimeoutError) {
+    console.warn('Provider stopped progressing; retry or fail over.');
+  } else {
+    throw error; // Includes the exact caller-owned abort reason.
+  }
+}
+```
+
 `signal` is composed with a context or branch signal without mutating either scope: the
 first signal to abort supplies its exact `reason`, sibling asks on the same context remain
 unaffected, and asks nested through an agent tool inherit the ask signal. A pre-aborted signal
@@ -446,18 +464,18 @@ The runtime settles hard cancellation and stalls even if custom provider work ig
 Such non-cooperative work may still finish or be billed after the ask's terminal events, so its
 late usage cannot be included in the already-emitted ask/budget totals. A dispatched stalled
 call therefore marks its `agent_call_end` and owning `ask_end` as `unpriced`, making cost and
-budget totals explicit lower bounds. Custom providers must
-forward `ChatOptions.signal` to their transport; provider-side usage controls remain the backstop
-for abandoned work.
+budget totals explicit lower bounds.
 
-`stallTimeout` is distinct from a strict SLA. Built-in adapters arm its timer only when a
-transport attempt is actually dispatched, reset it for every streamed chunk (including
+##### Advanced provider timing
+
+Built-in adapters arm the stall timer only when a transport attempt is actually dispatched,
+reset it for every streamed chunk (including
 non-text chunks), and disarm it during Axl retry backoff; an opt-in rate-limiter queue is not
 treated as a provider stall. A custom `Provider` that does not report dispatch lifecycle uses
-the conservative provider-method-entry fallback. A stall throws `StallTimeoutError`, which
-extends `TimeoutError`; its message names the agent. A graceful `timeout` also names the
-agent. In both hard-abort cases (`signal` or `stallTimeout`), partial streamed output is
-discarded rather than returned.
+the conservative provider-method-entry fallback. Custom providers must forward
+`ChatOptions.signal` to their transport; provider-side usage controls remain the backstop for
+abandoned work. Stall durations above the platform timer maximum (`2147483647ms`, about 24.8
+days) are rejected before dispatch.
 
 ---
 
@@ -680,7 +698,7 @@ if (result.budgetExceeded) {
 
 **Returns:** `BudgetResult<T>`: `{ value: T | null, budgetExceeded: boolean, totalCost: number, unpriced: boolean }`
 
-- **`unpriced`** — `true` when the block ran a model with no usable per-call cost (unpriced model / pricing-table miss) that did measurable work. `totalCost` is then a **lower bound** (the unknown component is omitted). The same condition is readable mid-block via [`ctx.getBudgetStatus().unpriced`](#ctxgetbudgetstatus), and Axl logs a one-time `console.warn` per budget block when it happens.
+- **`unpriced`** — `true` when the block included work with unknown cost, such as an unpriced model or a dispatched stalled call abandoned without usage. `totalCost` is then a **lower bound** (the unknown component is omitted). The same condition is readable mid-block via [`ctx.getBudgetStatus().unpriced`](#ctxgetbudgetstatus), and Axl logs a one-time `console.warn` per budget block when it happens.
 - ⚠️ **`unpriced` is observability only — cost limits / `hard_stop` are NOT enforced on unknown spend.** The enforcement rail never sees that cost, so a `hard_stop` budget does **not** govern unpriced models (e.g. Bedrock, self-hosted) or abandoned non-cooperative work. Treat `unpriced: true` as "this limit could not be enforced for part of this block."
 
 **Nesting:** Budget blocks can be nested. Inner budgets roll their costs — **and their `unpriced` lower-bound flag** — up to the parent.
@@ -693,7 +711,7 @@ Returns the live status of the active budget block, or `null` outside any block:
 
 Read-only getter returning the total cost accumulated by agent calls in this context. Inside a `ctx.budget()` block, returns only that block's accumulated cost; after the block completes, the nested cost is rolled up into the parent total.
 
-> **Unknown cost → lower bound.** A call to an unpriced model (pricing-table miss / a provider that reports no per-call cost), or a dispatched stalled call abandoned without usage, contributes no numeric cost — so `ctx.totalCost` (and `ExecutionInfo.totalCost`, `ctx.budget()` accounting) may **understate** total spend. Detect it via: `ExecutionInfo.unpriced` (the execution-level aggregate from `runtime.execute()` / `getExecutions()`), `runtime.trackExecution().unpriced`, the owning `ask_end.unpriced`, `BudgetResult.unpriced` / `ctx.getBudgetStatus().unpriced` for a `ctx.budget()` block, and the Studio Cost Dashboard's `CostData.unpricedCalls`. Because the unknown component is invisible to the budget rail, a `ctx.budget()` cost limit / `hard_stop` **cannot enforce on unpriced spend** — it only reports it.
+> **Unknown cost → lower bound.** A call to an unpriced model (pricing-table miss / a provider that reports no per-call cost), or a dispatched stalled call abandoned without usage, contributes no numeric cost — so `ctx.totalCost` (and `ExecutionInfo.totalCost`, `ctx.budget()` accounting) may **understate** total spend. Detect it via: `ExecutionInfo.unpriced` (the execution-level aggregate from `runtime.execute()` / `getExecutions()`), `runtime.trackExecution().unpriced`, the owning `ask_end.unpriced`, `BudgetResult.unpriced` / `ctx.getBudgetStatus().unpriced` for a `ctx.budget()` block, and the Studio Cost Dashboard's `CostData.unpricedCalls`. Because the unknown component is invisible to the budget rail, a `ctx.budget()` cost limit / `hard_stop` **cannot enforce on unknown spend** — it only reports it.
 
 ```typescript
 const ctx = runtime.createContext();
@@ -1524,7 +1542,7 @@ Completed and failed executions are automatically persisted to the state store (
 | `eventSchemaVersion` | `2` | Required on live/current `ExecutionInfo`; selects the v2 event reducer without scanning `events` |
 | `events` | `AxlEvent[]` | All events for this execution. Renamed from `steps` in 0.16.0; `SQLiteStore` auto-migrates the `execution_history.steps` column to `events` on first open |
 | `totalCost` | `number` | Accumulated cost in USD. A **lower bound** when `unpriced` is `true` |
-| `unpriced` | `boolean \| undefined` | `true` when any cost-bearing call in the execution did billable work but had no usable cost (unpriced model / pricing-table miss) — `totalCost` is then a lower bound. `false` when every call was priced. The aggregate counterpart of `ask_end.unpriced` / `BudgetResult.unpriced` — read this instead of scanning `events`. `undefined` only on executions recorded before this field existed |
+| `unpriced` | `boolean \| undefined` | `true` when any cost-bearing call in the execution had unknown cost, including an unpriced model or a dispatched stalled call abandoned without usage — `totalCost` is then a lower bound. `false` when every call had known cost. The aggregate counterpart of `ask_end.unpriced` / `BudgetResult.unpriced` — read this instead of scanning `events`. `undefined` only on executions recorded before this field existed |
 | `startedAt` | `number` | Start timestamp (ms) |
 | `completedAt` | `number \| undefined` | Completion timestamp (ms) |
 | `duration` | `number` | Duration in ms |

@@ -49,14 +49,23 @@ strict SLA separate from the agent's graceful `timeout` budget:
 ```typescript
 const reply = await ctx.ask(SupportBot, ctx.input.message, {
   signal: AbortSignal.timeout(15_000),
-  stallTimeout: '120s', // optional anti-hang guard; not a global default
 });
 ```
 
 The signal aborts this ask (and any nested asks) without cancelling a sibling ask on the
-same context. The exact abort reason is propagated. `stallTimeout` instead detects a silent
-provider request, resets on every stream chunk, and throws `StallTimeoutError`; it is not a
-total-SLA timer. See [Ask deadlines](./api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
+same context. Its exact abort reason is propagated.
+
+For batch or long-running generation where healthy streams may exceed a fixed deadline, use an
+idle guard instead:
+
+```typescript
+const report = await ctx.ask(ResearchBot, topic, {
+  stallTimeout: '120s', // optional; resets on every streamed chunk
+});
+```
+
+`stallTimeout` throws `StallTimeoutError` when a provider stops progressing; it is not a total-SLA
+timer. See [Ask deadlines](./api-reference.md#ask-deadlines-cancellation-and-stalled-requests).
 
 ## Rich application results with compact model context
 

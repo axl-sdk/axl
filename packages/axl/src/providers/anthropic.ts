@@ -909,6 +909,7 @@ export class AnthropicProvider implements Provider {
         headers: res.headers,
         message,
         body: errorBody,
+        timing: recorder.chatTiming(),
       });
     }
 
@@ -949,6 +950,7 @@ export class AnthropicProvider implements Provider {
         headers: res.headers,
         message,
         body: errorBody,
+        timing: recorder.chatTiming(),
       });
     }
 
@@ -1341,7 +1343,7 @@ export class AnthropicProvider implements Provider {
     body: ReadableStream<Uint8Array>,
     pricingContext: AnthropicPricingContext,
     responseHeaders: Headers,
-    timing?: CallTimingRecorder,
+    timing: CallTimingRecorder,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -1386,7 +1388,7 @@ export class AnthropicProvider implements Provider {
 
     try {
       while (true) {
-        const { done, value } = await (timing ? timing.read(reader) : reader.read());
+        const { done, value } = await timing.read(reader);
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
@@ -1410,11 +1412,14 @@ export class AnthropicProvider implements Provider {
           switch (event.type) {
             case 'error': {
               const status = anthropicStreamErrorStatus(event.error?.type);
+              // Mid-stream failure: headers and some body already arrived, so
+              // stream semantics (read waits, first token) are the honest read.
               throw buildProviderError({
                 provider: this.name,
                 status,
                 headers: responseHeaders,
                 message: event.error?.message ?? 'Anthropic stream failed',
+                timing: timing.streamTiming(),
               });
             }
 

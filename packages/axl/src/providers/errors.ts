@@ -22,6 +22,7 @@
  */
 
 import { AxlError } from '../errors.js';
+import type { CallTiming } from '../types.js';
 
 /**
  * Error thrown by provider adapters on any non-2xx HTTP response, and by
@@ -48,6 +49,16 @@ export class ProviderError extends AxlError {
    * and is redaction-eligible). See `docs/security.md`.
    */
   readonly body?: string;
+  /**
+   * Per-call latency breakdown for the failed call, when the transport reached
+   * the provider and a `Response` came back (any non-2xx, streamed or not).
+   * Absent — the KEY itself, not `undefined` — when there is nothing to
+   * report: a network-level failure (`status: 0`) never got a response, and a
+   * custom transport may not instrument timing at all. `declare` keeps the
+   * property from being defined as `undefined` under `useDefineForClassFields`,
+   * so `'timing' in err` distinguishes "not measured" from "measured as zero".
+   */
+  declare readonly timing?: CallTiming;
 
   constructor(args: {
     provider: string;
@@ -57,6 +68,7 @@ export class ProviderError extends AxlError {
     retryAfterMs?: number;
     requestId?: string;
     body?: string;
+    timing?: CallTiming;
   }) {
     // Message passed VERBATIM — no prefix. Existing `.message` assertions on
     // adapter `extractErrorMessage` output must not break.
@@ -68,6 +80,8 @@ export class ProviderError extends AxlError {
     this.retryAfterMs = args.retryAfterMs;
     this.requestId = args.requestId;
     this.body = args.body;
+    // Conditional on purpose — see the `timing` field doc.
+    if (args.timing) this.timing = args.timing;
   }
 }
 
@@ -152,6 +166,10 @@ function extractRequestId(headers: Headers): string | undefined {
  * network failure). Classifies `retryable` via {@link isRetryableStatus} and,
  * when `headers` are present, extracts `retryAfterMs` ({@link parseRetryAfter})
  * and `requestId`.
+ *
+ * Pass `timing` at an adapter's `!res.ok` site (from the call's
+ * `CallTimingRecorder`) so a failed call is as measurable as a successful one.
+ * Omit it where no response was received.
  */
 export function buildProviderError(args: {
   provider: string;
@@ -159,6 +177,7 @@ export function buildProviderError(args: {
   headers?: Headers;
   message: string;
   body?: string;
+  timing?: CallTiming;
 }): ProviderError {
   return new ProviderError({
     provider: args.provider,
@@ -168,5 +187,6 @@ export function buildProviderError(args: {
     retryAfterMs: args.headers ? parseRetryAfter(args.headers) : undefined,
     requestId: args.headers ? extractRequestId(args.headers) : undefined,
     body: args.body,
+    timing: args.timing,
   });
 }

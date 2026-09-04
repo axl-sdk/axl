@@ -224,6 +224,7 @@ export class OpenAIResponsesProvider implements Provider {
         headers: res.headers,
         message,
         body: errorBody,
+        timing: recorder.chatTiming(),
       });
     }
 
@@ -263,6 +264,7 @@ export class OpenAIResponsesProvider implements Provider {
         headers: res.headers,
         message,
         body: errorBody,
+        timing: recorder.chatTiming(),
       });
     }
 
@@ -557,8 +559,8 @@ export class OpenAIResponsesProvider implements Provider {
   private async *parseSSEStream(
     body: ReadableStream<Uint8Array>,
     model: string,
-    request?: Record<string, unknown>,
-    timing?: CallTimingRecorder,
+    request: Record<string, unknown> | undefined,
+    timing: CallTimingRecorder,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -571,7 +573,7 @@ export class OpenAIResponsesProvider implements Provider {
 
     try {
       while (true) {
-        const { done, value } = await (timing ? timing.read(reader) : reader.read());
+        const { done, value } = await timing.read(reader);
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
@@ -596,7 +598,14 @@ export class OpenAIResponsesProvider implements Provider {
               continue;
             }
 
-            const chunk = this.handleStreamEvent(eventType, data, model, callIdMap, request);
+            const chunk = this.handleStreamEvent(
+              eventType,
+              data,
+              model,
+              callIdMap,
+              request,
+              timing,
+            );
             if (chunk) {
               yield chunk;
               // If done, exit
@@ -620,7 +629,9 @@ export class OpenAIResponsesProvider implements Provider {
     data: ResponsesStreamEventData,
     model: string,
     callIdMap: Map<number, string>,
-    request?: Record<string, unknown>,
+    request: Record<string, unknown> | undefined,
+    /** Needed only by the `response.failed` branch, which throws mid-stream. */
+    timing: CallTimingRecorder,
   ): StreamChunk | null {
     switch (eventType) {
       case 'response.output_text.delta':
@@ -690,11 +701,14 @@ export class OpenAIResponsesProvider implements Provider {
           data.response?.error?.message ??
           data.response?.status_details?.error?.message ??
           'Unknown error';
+        // Mid-stream failure — see the note in openai-compatible.ts: `status: 0`
+        // means "no HTTP status to map", not "no response".
         throw new ProviderError({
           provider: this.name,
           status: 0,
           retryable: false,
           message: `OpenAI Responses API error: ${errorMsg}`,
+          timing: timing.streamTiming(),
         });
       }
 

@@ -786,6 +786,7 @@ export class GeminiProvider implements Provider {
         headers: res.headers,
         message,
         body: errorBody,
+        timing: recorder.chatTiming(),
       });
     }
 
@@ -828,6 +829,7 @@ export class GeminiProvider implements Provider {
         headers: res.headers,
         message,
         body: errorBody,
+        timing: recorder.chatTiming(),
       });
     }
 
@@ -865,6 +867,7 @@ export class GeminiProvider implements Provider {
         headers: res.headers,
         message: this.extractErrorMessage(errorBody, res.status),
         body: errorBody,
+        timing: recorder.chatTiming(),
       });
     }
     return withChatTiming(
@@ -894,6 +897,7 @@ export class GeminiProvider implements Provider {
         headers: res.headers,
         message: this.extractErrorMessage(errorBody, res.status),
         body: errorBody,
+        timing: recorder.chatTiming(),
       });
     }
     if (!res.body) throw new Error('Gemini Interactions stream has no body');
@@ -1093,7 +1097,7 @@ export class GeminiProvider implements Provider {
   private async *parseInteractionSSEStream(
     body: ReadableStream<Uint8Array>,
     responseHeaders: Headers,
-    timing?: CallTimingRecorder,
+    timing: CallTimingRecorder,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -1104,7 +1108,7 @@ export class GeminiProvider implements Provider {
     let completed = false;
     try {
       while (true) {
-        const { done, value } = await (timing ? timing.read(reader) : reader.read());
+        const { done, value } = await timing.read(reader);
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
@@ -1122,19 +1126,25 @@ export class GeminiProvider implements Provider {
           if (event.event_type === 'error') {
             const status = geminiInteractionErrorStatus(event.error?.code);
             const message = event.error?.message ?? 'Gemini Interactions stream failed';
+            // Mid-stream failure: headers and some body already arrived, so
+            // stream semantics (read waits, first token) are the honest read.
             if (status !== undefined) {
               throw buildProviderError({
                 provider: this.name,
                 status,
                 headers: responseHeaders,
                 message,
+                timing: timing.streamTiming(),
               });
             }
+            // Unmappable provider error code, but the response is real and
+            // partly consumed — same rule as every other mid-stream frame.
             throw new ProviderError({
               provider: this.name,
               status: 0,
               retryable: false,
               message,
+              timing: timing.streamTiming(),
             });
           }
           if (event.event_type === 'step.start' && event.step) {
@@ -1787,7 +1797,7 @@ export class GeminiProvider implements Provider {
   private async *parseSSEStream(
     body: ReadableStream<Uint8Array>,
     pricingContext: GeminiPricingContext,
-    timing?: CallTimingRecorder,
+    timing: CallTimingRecorder,
   ): AsyncGenerator<StreamChunk> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -1803,7 +1813,7 @@ export class GeminiProvider implements Provider {
 
     try {
       while (true) {
-        const { done, value } = await (timing ? timing.read(reader) : reader.read());
+        const { done, value } = await timing.read(reader);
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });

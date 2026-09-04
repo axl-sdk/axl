@@ -946,7 +946,9 @@ type LegacyAxlEventPayloadV1 =
         };
         /** Per-call latency breakdown when the provider reported one. Additive
          *  beside `duration`, which keeps its turn-wall-clock meaning (queue,
-         *  retries, gates and all). Absent on the error path. */
+         *  retries, gates and all). Present on the error path too when the
+         *  provider returned a response (any non-2xx); absent when the call
+         *  never reached one (network failure, abort, non-provider throw). */
         timing?: CallTiming;
         /** Response-side payload — response text, thinking. */
         data: AgentCallEndData;

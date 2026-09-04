@@ -8,6 +8,7 @@ import { createTestCtx } from './helpers.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import type { Provider, ProviderResponse, StreamChunk } from '../providers/types.js';
 import type { AxlEvent, CallTiming } from '../types.js';
+import { ProviderError } from '../providers/errors.js';
 
 // ---------------------------------------------------------------------------
 // AC-4 — the runtime copies a provider's CallTiming onto agent_call_end, on
@@ -62,11 +63,11 @@ function streamProvider(opts: { timing?: CallTiming; withUsage: boolean }): Prov
   };
 }
 
-function throwingProvider(): Provider {
+function throwingProvider(err: () => unknown = () => new Error('provider exploded')): Provider {
   return {
     name: 'mock',
     async chat(): Promise<ProviderResponse> {
-      throw new Error('provider exploded');
+      throw err();
     },
     // The error-path test uses the non-streaming transport; this satisfies the
     // Provider interface without a yield-less generator.
@@ -147,16 +148,69 @@ describe('agent_call_end.timing (AC-4)', () => {
     expect(end.data.response).toBe('ok');
   });
 
-  it('omits the timing key on the error path', async () => {
+  it('omits the timing key when the throw carries no measurement', async () => {
+    // A non-provider throw measured nothing. A half-filled block here
+    // (wireMs: 0) would let a dashboard chart a fake zero-latency call.
     const { ctx, traces } = createTestCtx({ provider: throwingProvider() });
     await expect(ctx.ask(plain(), 'hi')).rejects.toThrow('provider exploded');
 
     const [end] = callEnds(traces);
     expect(end.data.error).toBeDefined();
     expect(end.duration).toBeGreaterThanOrEqual(0);
-    // A half-filled block here (wireMs: 0) would let a dashboard chart a fake
-    // zero-latency call. v1 non-goal, held by asserting absence.
     expect('timing' in end).toBe(false);
+  });
+
+  it('HEADLINE: copies ProviderError.timing onto the error-path agent_call_end', async () => {
+    // The failure case is the one an operator most wants measured. A 500 that
+    // took 4.2s of queue and 1.1s of backoff is invisible if the error path
+    // reports only `duration`, which conflates all three.
+    const { ctx, traces } = createTestCtx({
+      provider: throwingProvider(
+        () =>
+          new ProviderError({
+            provider: 'mock',
+            status: 500,
+            retryable: true,
+            message: 'internal error',
+            timing: TIMING,
+          }),
+      ),
+    });
+
+    await expect(ctx.ask(plain(), 'hi')).rejects.toThrow('internal error');
+
+    const [end] = callEnds(traces);
+    expect(end.timing).toEqual(TIMING);
+    // Top-level beside `duration`, exactly as on the success path — not nested
+    // in `data` with the other ProviderError metadata.
+    expect(end.duration).toBeGreaterThanOrEqual(0);
+    expect(end.data.status).toBe(500);
+    expect(end.data.retryable).toBe(true);
+    // No fabricated usage or cost: the call still delivered neither.
+    expect(end.tokens).toBeUndefined();
+    expect(end.cost).toBeUndefined();
+  });
+
+  it('a network-failure ProviderError still produces no timing KEY', async () => {
+    // `status: 0` means no response was ever received, so nothing was measured.
+    // The distinction has to survive to the event: absent key, not zeros.
+    const { ctx, traces } = createTestCtx({
+      provider: throwingProvider(
+        () =>
+          new ProviderError({
+            provider: 'mock',
+            status: 0,
+            retryable: true,
+            message: 'fetch failed',
+          }),
+      ),
+    });
+
+    await expect(ctx.ask(plain(), 'hi')).rejects.toThrow('fetch failed');
+
+    const [end] = callEnds(traces);
+    expect('timing' in end).toBe(false);
+    expect(end.data.status).toBe(0);
   });
 
   it('gives each gate-retry turn its own timing', async () => {

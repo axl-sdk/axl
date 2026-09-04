@@ -3,6 +3,7 @@ import { AnthropicProvider } from '../providers/anthropic.js';
 import { OpenAIProvider } from '../providers/openai.js';
 import { OpenAIResponsesProvider } from '../providers/openai-responses.js';
 import { GeminiProvider } from '../providers/gemini.js';
+import { ProviderError } from '../providers/errors.js';
 import type { CallTiming, Provider, StreamChunk } from '../providers/types.js';
 import { expectWindow } from './helpers.js';
 
@@ -618,5 +619,228 @@ describe('CallTiming — abandoned stream still releases the reader', () => {
     // and the socket leaks.
     expect(releaseLock).toHaveBeenCalled();
     expect(source.locked).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Error-path timing. A failed call is the case an operator most wants measured
+// — "is the provider slow or is it throttling me?" is asked about failures far
+// more often than about successes. Every adapter's non-2xx throw site now
+// carries the same block a success would, on both transports.
+//
+// The discriminating property is not merely "a timing block exists": it is that
+// the block is REAL. The mocks below delay headers by H and the error body by a
+// further F + B, so a throw site that reused a zero-filled block, or stopped the
+// clock at dispatch, lands outside both windows.
+// ---------------------------------------------------------------------------
+
+/** Non-2xx whose headers land after H and whose error body resolves F + B later. */
+function mockErrorFetch(status: number, body = '{"error":{"message":"boom"}}') {
+  globalThis.fetch = (async () => {
+    await sleep(H);
+    return {
+      ok: false,
+      status,
+      headers: new Headers(),
+      text: async () => {
+        await sleep(F + B);
+        return body;
+      },
+      json: async () => JSON.parse(body) as unknown,
+    };
+  }) as unknown as typeof fetch;
+}
+
+async function caught(fn: () => Promise<unknown>): Promise<ProviderError> {
+  const err = await fn().then(
+    () => undefined,
+    (e: unknown) => e,
+  );
+  expect(err, 'expected the call to throw').toBeInstanceOf(ProviderError);
+  return err as ProviderError;
+}
+
+for (const c of CASES) {
+  describe(`CallTiming — error path (${c.name})`, () => {
+    it('chat() attaches timing to the thrown ProviderError', async () => {
+      mockErrorFetch(500);
+      const err = await caught(() => c.make().chat(messages, { model: c.model }));
+
+      expect(err.status).toBe(500);
+      const t = err.timing;
+      expect(t, 'a 500 with a response carries timing').toBeDefined();
+      expect(t!.attempts).toBe(1);
+      expect(t!.queuedMs).toBe(0);
+      expect(t!.retryMs).toBe(0);
+      expectWindow(t!.ttfbMs, TTFB_WINDOW, 'error ttfbMs');
+      expectWindow(t!.wireMs, WIRE_WINDOW, 'error wireMs');
+      // A zero-filled or dispatch-anchored block would collapse these two.
+      expect(t!.wireMs - t!.ttfbMs).toBeGreaterThan(100);
+      expectValueDomain(t!);
+      // The rest of the typed error is untouched by the addition.
+      expect(err.retryable).toBe(true);
+      expect(err.body).toContain('boom');
+    });
+
+    it('stream() attaches timing to the pre-body ProviderError', async () => {
+      // Headers have arrived and no body will be streamed, so the streaming
+      // throw site reports chat semantics: dispatch → now.
+      mockErrorFetch(500);
+      const err = await caught(() => drain(c.make().stream(messages, { model: c.model })));
+
+      const t = err.timing;
+      expect(t, 'a failed stream carries timing too').toBeDefined();
+      expectWindow(t!.ttfbMs, TTFB_WINDOW, 'error ttfbMs (stream)');
+      expectWindow(t!.wireMs, WIRE_WINDOW, 'error wireMs (stream)');
+      // Nothing streamed, so there is no first token to report.
+      expect('firstTokenMs' in t!).toBe(false);
+      expectValueDomain(t!);
+    });
+  });
+}
+
+describe('CallTiming — error path, exhausted retries', () => {
+  const RETRY_AFTER_MS = 200;
+
+  it('reports every attempt and the accumulated backoff on a 429 storm', async () => {
+    let n = 0;
+    globalThis.fetch = (async () => {
+      n++;
+      return {
+        ok: false,
+        status: 429,
+        headers: new Headers({ 'retry-after': '0.2' }),
+        text: async () => '{"error":{"message":"rate limited"}}',
+        json: async () => ({}),
+      };
+    }) as unknown as typeof fetch;
+
+    const err = await caught(() =>
+      new OpenAIProvider({ apiKey: 'k' }).chat(messages, { model: 'gpt-4o' }),
+    );
+
+    expect(err.status).toBe(429);
+    expect(n).toBe(3); // transport default: 2 retries, 3 attempts
+    const t = err.timing!;
+    expect(t.attempts).toBe(3);
+    // Two jittered (±25%) Retry-After sleeps. An implementation reporting only
+    // the final attempt would land near 0 here — this is the figure that makes
+    // "the provider is throttling me" legible from a failure.
+    expectWindow(
+      t.retryMs,
+      [RETRY_AFTER_MS * 0.75 * 2 - 60, RETRY_AFTER_MS * 1.25 * 2 + 250],
+      'retryMs across exhausted retries',
+    );
+    // ttfb/wire stay anchored on the FINAL attempt, so the backoff is not in
+    // them — the same separation the success path guarantees.
+    expect(t.ttfbMs).toBeLessThan(t.retryMs);
+    expectValueDomain(t);
+  });
+
+  it('a network failure carries NO timing key at all', async () => {
+    // `fetch` rejects: there is no Response, so nothing was measured. The KEY
+    // must be absent — `timing: undefined` would survive a JSON round-trip as
+    // a present-but-null field and read as "measured, and it was nothing".
+    globalThis.fetch = (async () => {
+      throw new TypeError('fetch failed');
+    }) as unknown as typeof fetch;
+
+    const err = await caught(() =>
+      new OpenAIProvider({ apiKey: 'k' }).chat(messages, { model: 'gpt-4o' }),
+    );
+
+    expect(err.status).toBe(0);
+    expect(err.message).toBe('fetch failed');
+    expect('timing' in err).toBe(false);
+    expect(err.timing).toBeUndefined();
+  }, 15_000);
+});
+
+// ---------------------------------------------------------------------------
+// Mid-stream provider errors. A provider that opens a 200 stream and then sends
+// an SSE `error` frame is a failure with a *response* — so it falls under the
+// same contract as a non-2xx: timing present. Unlike the pre-body throws above,
+// content may already have flowed, so these sites report STREAM semantics
+// (read-wait `wireMs`, and a real `firstTokenMs`).
+// ---------------------------------------------------------------------------
+
+describe('CallTiming — mid-stream error frame (anthropic)', () => {
+  it('carries stream-semantics timing on the thrown ProviderError', async () => {
+    mockStreamFetch([
+      {
+        delayMs: F,
+        text: sse({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'hel' } }),
+      },
+      {
+        delayMs: B,
+        text: sse({ type: 'error', error: { type: 'overloaded_error', message: 'overloaded' } }),
+      },
+    ]);
+
+    const err = await caught(() =>
+      drain(new AnthropicProvider({ apiKey: 'k' }).stream(messages, { model: 'claude-sonnet-4' })),
+    );
+
+    expect(err.status).toBe(529);
+    expect(err.message).toBe('overloaded');
+    const t = err.timing;
+    expect(t, 'a mid-stream error frame carries timing').toBeDefined();
+    expect(t!.attempts).toBe(1);
+    expectWindow(t!.ttfbMs, TTFB_WINDOW, 'mid-stream ttfbMs');
+    // The discriminating figure: a delta really did arrive before the error, so
+    // firstTokenMs must be present and land in its own disjoint window. A site
+    // reusing `chatTiming()` here would omit it entirely, and a zero-filled
+    // block would land below the window.
+    expectWindow(t!.firstTokenMs, FIRST_TOKEN_WINDOW, 'mid-stream firstTokenMs');
+    expectWindow(t!.wireMs, WIRE_WINDOW, 'mid-stream wireMs');
+    expect(t!.firstTokenMs!).toBeLessThan(t!.wireMs);
+    expectValueDomain(t!);
+  });
+});
+
+describe('CallTiming — mid-stream error frame (openai-compatible)', () => {
+  // These two sites stamp `status: 0` because OpenAI's stream error payloads
+  // carry no HTTP status to map. That is NOT the "no response" case: headers and
+  // body bytes arrived and tokens streamed, so timing is present. Presence keys
+  // off the response, not off the status — the property these two cases pin.
+
+  it('carries stream-semantics timing on an SSE error frame', async () => {
+    mockStreamFetch([
+      { delayMs: F, text: sse({ choices: [{ delta: { content: 'hel' } }] }) },
+      { delayMs: B, text: sse({ error: { message: 'upstream exploded', type: 'server_error' } }) },
+    ]);
+
+    const err = await caught(() =>
+      drain(new OpenAIProvider({ apiKey: 'k' }).stream(messages, { model: 'gpt-4o' })),
+    );
+
+    expect(err.message).toBe('upstream exploded');
+    expect(err.status).toBe(0);
+    const t = err.timing;
+    expect(t, 'a status-0 mid-stream frame still carries timing').toBeDefined();
+    expectWindow(t!.ttfbMs, TTFB_WINDOW, 'mid-stream ttfbMs');
+    expectWindow(t!.firstTokenMs, FIRST_TOKEN_WINDOW, 'mid-stream firstTokenMs');
+    expectWindow(t!.wireMs, WIRE_WINDOW, 'mid-stream wireMs');
+    expectValueDomain(t!);
+  });
+
+  it('carries timing on a stream truncated before [DONE]', async () => {
+    // The figure that matters here: a provider that hung AFTER first token must
+    // be distinguishable from one that never produced a token at all. Only
+    // `firstTokenMs` separates them, and it exists solely because the error
+    // carries timing.
+    mockStreamFetch([{ delayMs: F, text: sse({ choices: [{ delta: { content: 'hel' } }] }) }]);
+
+    const err = await caught(() =>
+      drain(new OpenAIProvider({ apiKey: 'k' }).stream(messages, { model: 'gpt-4o' })),
+    );
+
+    expect(err.message).toContain('stream ended before [DONE]');
+    const t = err.timing;
+    expect(t, 'a truncated stream still carries timing').toBeDefined();
+    expectWindow(t!.ttfbMs, TTFB_WINDOW, 'truncated ttfbMs');
+    expectWindow(t!.firstTokenMs, FIRST_TOKEN_WINDOW, 'truncated firstTokenMs');
+    expect(t!.wireMs).toBeGreaterThanOrEqual(t!.firstTokenMs!);
+    expectValueDomain(t!);
   });
 });

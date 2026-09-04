@@ -24,37 +24,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only time spent awaiting body reads, so event fan-out and slow `ctx.events`
   consumers are excluded). `duration` is unchanged and still brackets the whole
   turn. The block is optional end to end — a custom `Provider` that omits it
-  stays valid and consumers must treat every field as possibly absent — and the
-  error path carries no timing. `fetchWithRetry` gains an optional passive
+  stays valid and consumers must treat every field as possibly absent.
+  A **failed** call is measured too, on one rule — present whenever the provider
+  returned a response. Every adapter attaches the block to the `ProviderError` it
+  throws at a non-2xx response (both transports) and at every mid-stream failure
+  (an SSE `error` frame, or a stream truncated before its terminal event), and
+  the runtime copies it onto the error-path `agent_call_end` beside `duration` —
+  so a 429 storm shows its `attempts`/`retryMs` instead of going dark, and a
+  stream that hung after first token is distinguishable from one that never
+  produced a token. `status: 0` is not the discriminator: it means "no HTTP
+  status to map", so branch on the presence of `timing`, never on the status. Timing is absent (the
+  key itself) when there was no response to measure: a network failure
+  (`ProviderError` with `status: 0`), an abort, or a non-provider throw.
+  When OpenTelemetry is enabled the `axl.agent.ask` span also carries
+  `axl.agent.queued_ms`, `axl.agent.retry_ms`, `axl.agent.attempts`,
+  `axl.agent.ttfb_ms`, `axl.agent.wire_ms` and `axl.agent.first_token_ms`
+  (streaming only), set only when the call reported timing.
+  `fetchWithRetry` gains an optional passive
   `timing: { onDispatch, onComplete }` observer with no change to its return
   type. See [api-reference.md#calltiming](docs/api-reference.md#calltiming),
   [providers.md](docs/providers.md#rate-limiting-opt-in) and
   [observability.md](docs/observability.md#per-call-timing).
   `runtime.trackExecution()` rolls the block up per model on a new optional
   `modelTiming` return field (keyed like `metadata.modelCallCounts`; `calls`
-  counts only the timed calls; `firstTokenMs` carries its own `firstTokenCalls`
-  denominator; absent when nothing reported timing), and
-  `MockProvider` responses accept a `timing` block that surfaces on
-  `ProviderResponse.timing` and on the streamed `done` chunk, so tests can drive
-  the whole path deterministically.
+  counts only the SUCCESSFUL timed calls; `firstTokenMs` carries its own
+  `firstTokenCalls` denominator; absent when nothing reported timing). A failed
+  call is deliberately excluded even though its `agent_call_end` now carries
+  `timing`: a rollup blending answers with failures describes neither, and a
+  fast 429 would improve a model's apparent latency. Failure latency stays
+  readable on the events themselves. Each bucket also carries
+  `samples: CallTiming[]` — the raw per-call blocks behind the sums, in event
+  order — under a new opt-in `captureTimingSamples` option, because sums yield a
+  mean but no percentile that describes calls. `axl-eval` builds its per-model
+  distributions from it; every other caller keeps paying only for the sums. `MockProvider`
+  responses accept a `timing` block that surfaces on `ProviderResponse.timing`
+  and on the streamed `done` chunk, so tests can drive the whole path
+  deterministically, and `MockProvider.stream()` now also forwards the fixture
+  `cost` on that `done` chunk so a streamed mock ask prices identically to a
+  non-streamed one. A test that streams a mock with a non-zero `cost` under a
+  `ctx.budget` or an eval `budget` now sees that cost and can newly stop or
+  fail — previously streamed mock asks silently cost `$0`.
 - **`axl-eval` reports provider latency per model, separate from wall clock.**
   `EvalItem.duration` and `summary.timing` measure the entire workflow — tools,
   gates, and the SDK's own rate-limiter queue — so under `concurrency` fan-out
   against a `maxConcurrent` cap they describe your pacing more than the model.
   Each item now also carries `timing[model] = { calls, queuedMs, retryMs,
-  wireMs, firstTokenMs?, firstTokenCalls? }`, and the run carries
-  `summary.modelTiming[model]` with exact call-weighted `meanWireMs`,
-  `meanQueuedMs`, `meanRetryMs` and `meanFirstTokenMs?` — so a model throttled
-  hard on the day of the run shows it in `meanRetryMs` instead of silently
-  inflating `meanWireMs`, and `meanFirstTokenMs` (the figure that actually
-  discriminates between models) is reported rather than left to the caller.
-  `firstTokenMs` carries its own denominator because a model can mix streamed
-  and non-streamed calls. `summary.modelTiming` also keeps `wireMs`/`queuedMs`
-  distributions whose sample is one value per item, matching the existing
-  wall-clock stats — their `mean` is therefore NOT a per-call average and is
-  documented as such. The CLI prints one line per model under the `Timing` row,
-  in milliseconds and showing only the call-weighted figures. Both the default
-  and the `captureTraces` path populate it. `EvalItem.duration` and
+  wireMs, firstTokenMs?, firstTokenCalls? }` — compact per-item sums, so a
+  persisted artifact does not grow with call count — and the run carries
+  `summary.modelTiming[model] = { calls, wireMs, queuedMs, retryMs,
+  firstTokenMs?, firstTokenCalls? }`, where every field is a
+  `{ mean, min, max, p50, p95 }` distribution over PER-CALL values. One provider
+  call is one sample, so a ten-call item weighs ten times a one-call item and a
+  `p95` is a genuine call percentile. That is deliberately a different weighting
+  from the wall-clock `summary.timing`, which samples once per item because it
+  describes the workflow. The summary is computed from raw per-call blocks held
+  in memory during the run, not from `item.timing`. A model throttled hard on
+  the day of the run shows it in `retryMs` instead of silently inflating
+  `wireMs`, and `firstTokenMs` — the figure that actually discriminates between
+  models — runs over the streaming calls only, with `firstTokenCalls` giving the
+  sample size a distribution cannot carry on its own. The CLI prints one line
+  per model under the `Timing` row, in milliseconds, pairing `mean/p95` for
+  `wire` and `first token` and a mean for `queued` and `retries`. Both the
+  default and the `captureTraces` path populate it. `EvalItem.duration` and
   `summary.timing` are
   unchanged, and so is everything else on the default path: cost, `unpriced`,
   `metadata`, and budget enforcement still come from the workflow's own return
@@ -111,6 +142,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   input on every model except Claude Fable 5.1 and Mythos 5.1, which read cache
   at **0.025x**. `estimateAnthropicCost` previously hardcoded 0.1x, which would
   have overpriced Fable 5.1 cache reads 4x.
+
+### Changed
+
+- **Breaking (0.x minor bump): `OpenAICompatibleProvider.parseSSEStream` is now
+  `private` and is no longer an override point.** It was `protected`, but `protected` could not
+  carry the guarantee it implied — TypeScript checks an override for assignability, so a
+  subclass that simply dropped the timing recorder still compiled and then reported
+  `wireMs === ttfbMs` for every stream, and the recorder's type was never exported from
+  the barrel for a subclass to name. A provider with a different wire format implements
+  `Provider`; an OpenAI-compatible one adds a `ProviderProfile`.
 
 ### Fixed
 

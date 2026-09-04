@@ -55,7 +55,13 @@ export class CallTimingRecorder {
     this.firstTokenAt ??= Date.now();
   }
 
-  /** Timing for a non-streaming call. Call once the response body is parsed. */
+  /**
+   * Timing for a non-streaming call. Call once the response body is parsed.
+   *
+   * Also the right reading at an adapter's `!res.ok` throw site on BOTH
+   * transports: headers have arrived, no body will be streamed, so
+   * dispatch → now is the whole of what the provider cost us.
+   */
   chatTiming(): CallTiming | undefined {
     const t = this.fetchTiming;
     if (!t) return undefined;

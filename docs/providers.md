@@ -499,15 +499,22 @@ transport, but do not read a few milliseconds of difference between the two as a
 difference.
 
 Timing is optional end to end. A custom `Provider` that does not report it is valid, and
-consumers must treat every field as possibly absent. Failed calls carry no timing today:
-the error-path `agent_call_end` has `duration` only.
+consumers must treat every field as possibly absent.
 
-**Subclassing caveat.** `OpenAICompatibleProvider.parseSSEStream` takes the timing recorder
-as an optional trailing parameter, so that overriding it is not a compile break. The cost is
-a third state beyond present-or-absent: an override written against the older three-parameter
-signature type-checks and runs, but never records body-read waits, so its streams report
-`wireMs === ttfbMs` — a plausible-looking number missing the entire body-transfer component.
-Accept and forward the trailing parameter if you override that method.
+**Failed calls are measured too.** The rule is simply *present whenever the provider
+returned a response*. Every built-in adapter attaches the block to the `ProviderError` it
+throws — at a non-2xx on either transport, and at every mid-stream failure (an SSE `error`
+frame, or a stream that ends before its terminal event), where it reports stream semantics
+and so can carry a real `firstTokenMs`. The runtime copies it onto the error-path
+`agent_call_end` beside `duration`. So a 429 storm shows its `retryMs` and `attempts`, a
+slow-then-500 provider shows its `ttfbMs`, and a stream that hung after first token is
+distinguishable from one that never produced a token.
+
+Timing is absent — the key itself, not `undefined` — only when there was no response to
+measure: a connection-level failure, an abort, or any non-provider throw. **`status: 0` is
+not the discriminator.** It means "no HTTP status to map", which covers both a connection
+failure (no timing) and a mid-stream error frame whose payload carried no status (timing
+present). Branch on the presence of `timing`, never on the status.
 
 ### Retry backoff — worst case
 

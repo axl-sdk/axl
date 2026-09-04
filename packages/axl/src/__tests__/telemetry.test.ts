@@ -280,6 +280,98 @@ describe('OTelSpanManager', () => {
     expect(handoffSpan!.attributes['axl.handoff.duration']).toBeDefined();
   });
 
+  // -------------------------------------------------------------------------
+  // Per-call latency on the ask span. `axl.agent.duration` is ask wall clock;
+  // these attributes split the provider call's share of it, so a trace can say
+  // "the model was slow" apart from "I was pacing myself".
+  // -------------------------------------------------------------------------
+
+  const TIMING = {
+    queuedMs: 4200,
+    attempts: 2,
+    retryMs: 1100,
+    ttfbMs: 300,
+    firstTokenMs: 850,
+    wireMs: 2400,
+  };
+
+  function timedProvider(timing?: typeof TIMING) {
+    return {
+      name: 'mock',
+      chat: async () => ({
+        content: 'answer',
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        cost: 0.001,
+        ...(timing ? { timing } : {}),
+      }),
+      stream: async function* () {
+        yield { type: 'done' as const };
+      },
+    };
+  }
+
+  async function askWithSpan(prov: ReturnType<typeof timedProvider>) {
+    const registry = new ProviderRegistry();
+    registry.registerInstance('mock', prov);
+    const ctx = new WorkflowContext({
+      input: 'test',
+      executionId: randomUUID(),
+      config: {},
+      providerRegistry: registry,
+      spanManager: manager,
+    });
+    await ctx.ask(agent({ name: 'timed', model: 'mock:test', system: 's' }), 'go');
+    const span = exporter
+      .getFinishedSpans()
+      .find((s) => s.name === 'axl.agent.ask' && s.attributes['axl.agent.name'] === 'timed');
+    expect(span, 'no axl.agent.ask span was exported').toBeDefined();
+    return span!;
+  }
+
+  it('sets per-call timing attributes on axl.agent.ask', async () => {
+    const span = await askWithSpan(timedProvider(TIMING));
+
+    expect(span.attributes['axl.agent.queued_ms']).toBe(TIMING.queuedMs);
+    expect(span.attributes['axl.agent.retry_ms']).toBe(TIMING.retryMs);
+    expect(span.attributes['axl.agent.attempts']).toBe(TIMING.attempts);
+    expect(span.attributes['axl.agent.ttfb_ms']).toBe(TIMING.ttfbMs);
+    expect(span.attributes['axl.agent.wire_ms']).toBe(TIMING.wireMs);
+    expect(span.attributes['axl.agent.first_token_ms']).toBe(TIMING.firstTokenMs);
+    // Additive: the pre-existing ask-level attributes are unchanged.
+    expect(span.attributes['axl.agent.duration']).toBeDefined();
+    expect(span.attributes['axl.agent.prompt_tokens']).toBe(10);
+  });
+
+  it('omits first_token_ms when the call reported none', async () => {
+    // A non-streamed call has no content delta to time. Zero would read as an
+    // instantaneous first token, which no call achieved.
+    const noFirstToken: typeof TIMING = { ...TIMING };
+    delete (noFirstToken as { firstTokenMs?: number }).firstTokenMs;
+    const span = await askWithSpan(timedProvider(noFirstToken));
+
+    expect(span.attributes['axl.agent.wire_ms']).toBe(TIMING.wireMs);
+    expect('axl.agent.first_token_ms' in span.attributes).toBe(false);
+  });
+
+  it('sets NO timing attributes for an uninstrumented provider', async () => {
+    // The whole point of the presence check: an adapter that never measured
+    // must not appear on a latency dashboard as a zero-latency call.
+    const span = await askWithSpan(timedProvider());
+
+    for (const key of [
+      'axl.agent.queued_ms',
+      'axl.agent.retry_ms',
+      'axl.agent.attempts',
+      'axl.agent.ttfb_ms',
+      'axl.agent.wire_ms',
+      'axl.agent.first_token_ms',
+    ]) {
+      expect(key in span.attributes, `${key} must be absent`).toBe(false);
+    }
+    // The ask still ran and still reports its wall clock.
+    expect(span.attributes['axl.agent.duration']).toBeDefined();
+  });
+
   it('createSpanManager returns OTelSpanManager when enabled', async () => {
     const { createSpanManager } = await import('../telemetry/index.js');
     const mgr = await createSpanManager({

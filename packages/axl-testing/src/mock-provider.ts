@@ -312,6 +312,11 @@ export class MockProvider implements Provider {
     yield {
       type: 'done',
       usage: response.usage,
+      // Forwarded like `chat()` does. Without it a streamed mock ask reported no
+      // cost at all, so `ctx.budget` and every cost assertion silently saw zero
+      // on the streaming path while the same fixture priced correctly on the
+      // non-streaming one — a mock that disagrees with itself between paths.
+      cost: response.cost,
       providerMetadata: response.providerMetadata,
       // Conditional spread, not `timing: response.timing` — a mock response with
       // no timing must produce a `done` chunk with NO `timing` key at all, so a

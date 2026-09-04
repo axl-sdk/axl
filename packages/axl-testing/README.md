@@ -30,6 +30,9 @@ const provider = MockProvider.sequence([
   { content: 'Hello!', usage: { prompt_tokens: 50, completion_tokens: 100, total_tokens: 150 }, cost: 0.003 },
   { content: 'World!' }, // uses defaults
 ]);
+// `cost` reports identically on both paths: `chat()` returns it on the response,
+// `stream()` carries it on the terminal `done` chunk. So a streamed ask feeds
+// `agent_call_end.cost`, `runtime.totalCost()` and `ctx.budget` the same figure.
 
 // Per-response streaming chunks. Each response can carry an optional
 // `chunks?: string[]` that drives the streaming path one delta per chunk.

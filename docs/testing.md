@@ -84,6 +84,16 @@ const provider = MockProvider.sequence([
 
 Omit `timing` and the mock behaves exactly like an uninstrumented custom provider: the key is absent from the response and from the `done` chunk, and no `agent_call_end` carries one. Use that to test the "provider reports nothing" path — asserting absence is how you keep a `0` from being mistaken for a real measurement. `sequence()` copies the block per call, so a consumer that mutates what it received cannot corrupt a later call's fixture. `fn()` can vary it by `callIndex`, and `replay()` preserves whatever the recorded response carried.
 
+### Cost in a streamed mock ask
+
+A fixture `cost` reports the same whether the ask streams or not: `chat()` returns it on `ProviderResponse.cost` and `stream()` carries it on the terminal `done` chunk. So `agent_call_end.cost`, `runtime.totalCost()`, and `ctx.budget` enforcement all see a priced mock on the streaming path.
+
+```typescript
+runtime.mockProvider('openai', MockProvider.sequence([{ content: 'a', cost: 0.5 }]));
+```
+
+Streaming activates whenever an observer is present, so a workflow that touches `ctx.events` streams every ask. Before `0.22.x` the streamed `done` chunk omitted `cost` entirely, which made a streaming budget test pass vacuously — it never accumulated anything to enforce against. If you have a streaming test that pinned a `$0` total or a budget that was never expected to trip, re-check it: the number it sees now is the real one.
+
 ### Model Parameters in Tests
 
 All model parameters — including `effort`, `temperature`, `maxTokens`, `toolChoice`, and `stop` — are passed through to MockProvider and recorded in test assertions. MockProvider ignores these parameters (it returns pre-configured responses), but they are captured in `agentCalls()` and `traceLog()` so you can verify your agent configuration:
@@ -380,25 +390,29 @@ Use testing to verify your workflow works correctly. Use evaluation to verify yo
 
 `runEval` therefore also rolls up per-model provider latency from `agent_call_end.timing`, on the default path as well as under `captureTraces`. Each item gets `item.timing[model] = { calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }`, and the run gets `summary.modelTiming[model]`.
 
-Compare models on the four exact call-weighted means:
+Compare models on these four per-call distributions:
 
 | Field | What it isolates |
 |---|---|
-| `meanWireMs` | The provider's own time per call |
-| `meanFirstTokenMs` | Time to the first content delta. The figure that actually discriminates between models, since headers arrive at roughly one round trip regardless of model. Absent on a non-streaming run rather than `0` |
-| `meanQueuedMs` | Wait on **your** rate limiter, not the provider's |
-| `meanRetryMs` | Failed attempts and backoff — the provider's throttling that day, kept out of `meanWireMs` |
+| `wireMs` | The provider's own time per call |
+| `firstTokenMs` | Time to the first content delta. The figure that actually discriminates between models, since headers arrive at roughly one round trip regardless of model. Absent on a non-streaming run rather than `0` |
+| `queuedMs` | Wait on **your** rate limiter, not the provider's |
+| `retryMs` | Failed attempts and backoff — the provider's throttling that day, kept out of `wireMs` |
 
-The CLI prints exactly these, one line per model under the `Timing` row, in ms:
+Each is a `{ mean, min, max, p50, p95 }` over **per-call** values pooled across every successful item, so one provider call is one sample and `calls` is the sample size. An item that makes ten calls weighs ten times an item that makes one. That is the right weighting for judging a model — and deliberately different from the wall-clock `summary.timing`, which samples once per item because it describes the workflow. Read the two side by side; do not expect them to agree.
+
+`firstTokenMs` runs over the streaming calls only, and `firstTokenCalls` says how many that was — a distribution carries no sample size of its own, so without it a model mixing streamed and non-streamed calls gives no way to tell a first-token figure drawn from one call from one drawn from all of them.
+
+The CLI prints a `mean/p95` pair for the two model-comparison figures and a mean for the other two, one line per model under the `Timing` row, in ms:
 
 ```
   Timing        1.20s     1.10s     1.90s
-    openai:gpt-4o  wire 412ms · first token 180ms · queued 38ms · retries 0ms  (48 calls, mean per call)
+    openai:gpt-4o  wire 412ms/980ms · first token 180ms/410ms · queued 38ms · retries 0ms  (48 calls, mean/p95 per call)
 ```
 
-`summary.modelTiming` also carries `wireMs` and `queuedMs` **distributions** (`mean/min/max/p50/p95`) for spread. Those sample **one value per item** (that item's mean per call) to match the wall-clock stats, so a ten-call item does not outweigh nine single-call items — which also means their `mean` is not a per-call average and will differ from `meanWireMs` under uneven fan-out. Compare on the `mean*Ms` fields; reach for the distributions when you want the shape.
+`item.timing` stays the compact per-item **sums** so a persisted eval artifact does not grow with call count. `summary.modelTiming` is not derived from it — the raw per-call blocks are pooled while the run is in memory, which is what makes its percentiles real per-call percentiles. A consumer holding only a saved artifact can recover totals from `item.timing`, but not the distribution.
 
-`calls` counts only the calls that actually reported timing — a custom provider that returns no `timing` and the error path both contribute none — so an item, or a whole run, can legitimately have no `timing` key at all. `firstTokenMs` keeps its own denominator in `firstTokenCalls`, because a model that mixes streamed and non-streamed calls would otherwise average to a first-token latency no call achieved. A runtime without `trackExecution` (a hand-rolled or duck-typed stub) reports no timing and is otherwise unaffected: cost, budget, and metadata behavior on the default path are unchanged.
+`calls` counts only the **successful** calls that reported timing, so an item, or a whole run, can legitimately have no `timing` key at all. A custom provider that returns no `timing` contributes nothing, and a failed call is excluded even though a non-2xx response does carry timing on its `agent_call_end`: a rollup blending answers with failures describes neither, and a fast 429 would flatter the model. Read the events for failure latency. Cost, budget, and metadata behavior on the default path are unchanged by the rollup.
 
 To exercise the rollup deterministically, give `MockProvider` a `timing` block (see above) rather than relying on real latency.
 

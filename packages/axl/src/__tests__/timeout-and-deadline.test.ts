@@ -4,6 +4,7 @@ import { agent } from '../agent.js';
 import { WorkflowContext } from '../context.js';
 import { StallTimeoutError, TimeoutError } from '../errors.js';
 import { ProviderRegistry } from '../providers/registry.js';
+import { OpenAIProvider } from '../providers/openai.js';
 import { tool } from '../tool.js';
 
 /**
@@ -48,6 +49,7 @@ function context(provider: object, options: Record<string, unknown> = {}) {
     providerRegistry: registry,
     awaitHumanHandler: options.awaitHumanHandler as never,
     signal: options.signal as AbortSignal | undefined,
+    onTrace: options.onTrace as never,
   });
   return ctx;
 }
@@ -67,6 +69,13 @@ const baseAgent = (overrides: Record<string, unknown> = {}) =>
     system: 'test',
     ...overrides,
   } as never);
+
+const openAIResponse = {
+  choices: [
+    { message: { role: 'assistant', content: 'built-in response' }, finish_reason: 'stop' },
+  ],
+  usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+};
 
 describe('ctx.ask timeout and deadline contract (spec 23)', () => {
   it('T1: finishes an in-flight turn/tool but refuses its next turn after graceful timeout', async () => {
@@ -612,6 +621,473 @@ describe('ctx.ask timeout and deadline contract (spec 23)', () => {
       const askTimedOut = expect(askTimeout).rejects.toBeInstanceOf(TimeoutError);
       await vi.advanceTimersByTimeAsync(101);
       await askTimedOut;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('repair R1: preserves the exact caller reason through a tool cancellation', async () => {
+    const toolEntered = deferred<void>();
+    const never = deferred<string>();
+    const provider = {
+      name: 'controlled',
+      chat: async () => ({
+        content: '',
+        tool_calls: [
+          { id: 'block', type: 'function', function: { name: 'block', arguments: '{}' } },
+        ],
+        usage,
+      }),
+      stream: async function* () {},
+    };
+    const block = tool({
+      name: 'block',
+      description: 'blocks until cancellation',
+      input: z.object({}),
+      handler: async () => {
+        toolEntered.resolve();
+        return never.promise;
+      },
+    });
+    const controller = new AbortController();
+    const reason = new Error('tool cancellation identity');
+    const ask = context(provider).ask(baseAgent({ tools: [block] }), 'go', {
+      signal: controller.signal,
+    });
+    await toolEntered.promise;
+    controller.abort(reason);
+    // Release the handler too: the current broken implementation only notices
+    // cancellation after the handler settles, which still gives this test a
+    // deterministic assertion instead of leaving a live promise behind.
+    never.resolve('late tool completion');
+    await expect(ask).rejects.toBe(reason);
+  });
+
+  it('repair R1: preserves the exact caller reason through handler-backed awaitHuman', async () => {
+    const humanEntered = deferred<void>();
+    const never = deferred<{ approved: boolean }>();
+    const provider = {
+      name: 'controlled',
+      chat: async () => ({
+        content: '',
+        tool_calls: [
+          { id: 'human', type: 'function', function: { name: 'human', arguments: '{}' } },
+        ],
+        usage,
+      }),
+      stream: async function* () {},
+    };
+    const human = tool({
+      name: 'human',
+      description: 'wait for a human',
+      input: z.object({}),
+      handler: async (_input, toolCtx) =>
+        toolCtx.awaitHuman({ channel: 'ops', prompt: 'approve?' }),
+    });
+    const controller = new AbortController();
+    const reason = new Error('human cancellation identity');
+    const ask = context(provider, {
+      awaitHumanHandler: async () => {
+        humanEntered.resolve();
+        return never.promise;
+      },
+    }).ask(baseAgent({ tools: [human] }), 'go', { signal: controller.signal });
+    await humanEntered.promise;
+    controller.abort(reason);
+    never.resolve({ approved: true });
+    await expect(ask).rejects.toBe(reason);
+  });
+
+  it('repair R4: overlapping handler-backed human waits cannot create extra timeout credit', async () => {
+    vi.useFakeTimers();
+    try {
+      let call = 0;
+      const provider = {
+        name: 'controlled',
+        chat: async () => {
+          call++;
+          if (call === 1) {
+            return {
+              content: '',
+              tool_calls: [
+                {
+                  id: 'parallel',
+                  type: 'function',
+                  function: { name: 'parallel_humans', arguments: '{}' },
+                },
+              ],
+              usage,
+            };
+          }
+          return { content: 'after concurrent humans', usage };
+        },
+        stream: async function* () {},
+      };
+      const parallelHumans = tool({
+        name: 'parallel_humans',
+        description: 'two independent approvals',
+        input: z.object({}),
+        handler: async (_input, toolCtx) => {
+          await Promise.all([
+            toolCtx.awaitHuman({ channel: 'ops', prompt: 'one?' }),
+            toolCtx.awaitHuman({ channel: 'ops', prompt: 'two?' }),
+          ]);
+          // Ordinary tool work still counts. With union accounting this leaves
+          // 110ms of chargeable time; summing both 75ms waits incorrectly
+          // creates enough credit for the second provider turn.
+          await wait(110);
+          return 'approved';
+        },
+      });
+      const ask = context(provider, {
+        awaitHumanHandler: async () => {
+          await wait(75);
+          return { approved: true };
+        },
+      }).ask(baseAgent({ timeout: '100ms', tools: [parallelHumans] }), 'go');
+      const result = expect(ask).rejects.toBeInstanceOf(TimeoutError);
+      await vi.advanceTimersByTimeAsync(186);
+      await result;
+      expect(call).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('repair R4: overlapping parent and nested human waits pause the parent clock only once', async () => {
+    vi.useFakeTimers();
+    try {
+      let outerCalls = 0;
+      let innerCalls = 0;
+      const innerHuman = tool({
+        name: 'inner_human',
+        description: 'nested approval',
+        input: z.object({}),
+        handler: async (_input, toolCtx) =>
+          toolCtx.awaitHuman({ channel: 'ops', prompt: 'nested?' }),
+      });
+      const innerAgent = agent({
+        name: 'inner',
+        model: 'controlled:inner',
+        system: 'test',
+        tools: [innerHuman],
+      });
+      const outerTool = tool({
+        name: 'outer_parallel',
+        description: 'parent and nested approvals',
+        input: z.object({}),
+        handler: async (_input, toolCtx) => {
+          await Promise.all([
+            toolCtx.awaitHuman({ channel: 'ops', prompt: 'parent?' }),
+            toolCtx.ask(innerAgent, 'nested'),
+          ]);
+          await wait(110);
+          return 'done';
+        },
+      });
+      const provider = {
+        name: 'controlled',
+        chat: async (_messages: unknown, options: { model: string }) => {
+          if (options.model === 'inner') {
+            innerCalls++;
+            return innerCalls === 1
+              ? {
+                  content: '',
+                  tool_calls: [
+                    {
+                      id: 'inner-human',
+                      type: 'function',
+                      function: { name: 'inner_human', arguments: '{}' },
+                    },
+                  ],
+                  usage,
+                }
+              : { content: 'nested complete', usage };
+          }
+          outerCalls++;
+          return {
+            content: '',
+            tool_calls: [
+              {
+                id: 'outer-parallel',
+                type: 'function',
+                function: { name: 'outer_parallel', arguments: '{}' },
+              },
+            ],
+            usage,
+          };
+        },
+        stream: async function* () {},
+      };
+      const ask = context(provider, {
+        awaitHumanHandler: async () => {
+          await wait(75);
+          return { approved: true };
+        },
+      }).ask(baseAgent({ timeout: '100ms', tools: [outerTool] }), 'go');
+      const result = expect(ask).rejects.toBeInstanceOf(TimeoutError);
+      await vi.advanceTimersByTimeAsync(186);
+      await result;
+      expect(outerCalls).toBe(1);
+      expect(innerCalls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('repair R2: runtime settles a cancellation even when an adapter is still resolving its async API key', async () => {
+    const keyEntered = deferred<void>();
+    const neverKey = deferred<string>();
+    const provider = new OpenAIProvider({
+      apiKey: async () => {
+        keyEntered.resolve();
+        return neverKey.promise;
+      },
+    });
+    const controller = new AbortController();
+    const reason = new Error('credential callback cancellation');
+    const ask = context(provider).ask(
+      agent({ name: 'built-in', model: 'controlled:gpt-4o', system: 'test' }),
+      'go',
+      { signal: controller.signal },
+    );
+    await keyEntered.promise;
+    controller.abort(reason);
+    await expect(ask).rejects.toBe(reason);
+  }, 1_000);
+
+  it('repair R2: runtime settles a cancellation while a streaming iterator never yields or observes signal', async () => {
+    const entered = deferred<void>();
+    const provider = {
+      name: 'controlled',
+      chat: async () => ({ content: 'unused', usage }),
+      stream: () => {
+        entered.resolve();
+        return {
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+          next: () => new Promise<never>(() => {}),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const reason = new Error('silent iterator cancellation');
+    const ask = streamingContext(provider).ask(baseAgent(), 'go', { signal: controller.signal });
+    await entered.promise;
+    controller.abort(reason);
+    await expect(ask).rejects.toBe(reason);
+  }, 1_000);
+
+  it('repair R6: a real built-in adapter keeps limiter queue time outside stallTimeout and reports it', async () => {
+    vi.useFakeTimers();
+    const originalFetch = globalThis.fetch;
+    try {
+      const firstFetchEntered = deferred<void>();
+      const releaseFirst = deferred<void>();
+      let fetches = 0;
+      globalThis.fetch = (async () => {
+        if (fetches++ === 0) {
+          firstFetchEntered.resolve();
+          await releaseFirst.promise;
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => openAIResponse,
+          text: async () => '',
+        };
+      }) as typeof fetch;
+      const provider = new OpenAIProvider({ apiKey: 'test-key', rateLimit: { maxConcurrent: 1 } });
+      const events: Array<Record<string, unknown>> = [];
+      const ctx = context(provider, {
+        onTrace: (event: unknown) => events.push(event as Record<string, unknown>),
+      });
+      const first = ctx.ask(
+        agent({ name: 'built-in', model: 'controlled:gpt-4o', system: 'test' }),
+        'one',
+      );
+      await firstFetchEntered.promise;
+      const second = ctx.ask(
+        agent({
+          name: 'built-in-two',
+          model: 'controlled:gpt-4o',
+          system: 'test',
+          stallTimeout: '50ms',
+        }),
+        'two',
+      );
+      await vi.advanceTimersByTimeAsync(100);
+      releaseFirst.resolve();
+      await expect(first).resolves.toBe('built-in response');
+      await expect(second).resolves.toBe('built-in response');
+      // This is the full ctx.ask → built-in adapter path: the queue wait is
+      // both excluded from the stall clock and retained in event timing.
+      expect(fetches).toBe(2);
+      const secondEnd = events.find(
+        (event) => event.type === 'agent_call_end' && event.agent === 'built-in-two',
+      );
+      expect(secondEnd).toMatchObject({ timing: { queuedMs: 100 } });
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it('repair R3: a late abort-ignoring non-stream response retains usage, cost, and timing exactly once', async () => {
+    vi.useFakeTimers();
+    try {
+      const events: Array<Record<string, unknown>> = [];
+      const provider = {
+        name: 'controlled',
+        chat: async () => {
+          await wait(100);
+          return {
+            content: 'late',
+            usage,
+            cost: 0.42,
+            timing: { queuedMs: 3, attempts: 1, retryMs: 0, ttfbMs: 4, wireMs: 100 },
+          };
+        },
+        stream: async function* () {},
+      };
+      const ask = context(provider, {
+        onTrace: (event: unknown) => events.push(event as Record<string, unknown>),
+      }).ask(baseAgent({ stallTimeout: '50ms' }), 'go');
+      const stalled = expect(ask).rejects.toBeInstanceOf(StallTimeoutError);
+      await vi.advanceTimersByTimeAsync(101);
+      await stalled;
+      const ends = events.filter((event) => event.type === 'agent_call_end');
+      expect(ends).toHaveLength(1);
+      expect(ends[0]).toMatchObject({
+        cost: 0.42,
+        tokens: { input: 1, output: 1 },
+        timing: { wireMs: 100 },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('repair R3: a late stream terminal done retains its accounting before surfacing StallTimeoutError', async () => {
+    vi.useFakeTimers();
+    try {
+      const events: Array<Record<string, unknown>> = [];
+      const firstChunk = deferred<void>();
+      const provider = {
+        name: 'controlled',
+        chat: async () => ({ content: '', usage }),
+        stream: async function* () {
+          yield { type: 'text_delta' as const, content: 'partial' };
+          firstChunk.resolve();
+          await wait(100); // Intentionally ignores the runtime's abort signal.
+          yield {
+            type: 'done' as const,
+            usage,
+            cost: 0.24,
+            timing: { queuedMs: 1, attempts: 1, retryMs: 0, ttfbMs: 2, wireMs: 100 },
+          };
+        },
+      };
+      const ask = streamingContext(provider, {
+        onTrace: (event: unknown) => events.push(event as Record<string, unknown>),
+      }).ask(baseAgent({ stallTimeout: '50ms' }), 'go');
+      const stalled = expect(ask).rejects.toBeInstanceOf(StallTimeoutError);
+      await firstChunk.promise;
+      await vi.advanceTimersByTimeAsync(101);
+      await stalled;
+      const ends = events.filter((event) => event.type === 'agent_call_end');
+      expect(ends).toHaveLength(1);
+      expect(ends[0]).toMatchObject({
+        cost: 0.24,
+        tokens: { input: 1, output: 1 },
+        timing: { wireMs: 100 },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('repair R6: a built-in retry backoff disarms stallTimeout until the next fetch dispatch', async () => {
+    vi.useFakeTimers();
+    const originalFetch = globalThis.fetch;
+    try {
+      let calls = 0;
+      let secondSignal: AbortSignal | undefined;
+      globalThis.fetch = (async (_url, init) => {
+        calls++;
+        if (calls === 1) {
+          return {
+            ok: false,
+            status: 503,
+            headers: new Headers(),
+            text: async () => 'retry later',
+          };
+        }
+        secondSignal = init?.signal ?? undefined;
+        return abortableWait(secondSignal);
+      }) as typeof fetch;
+      const provider = new OpenAIProvider({ apiKey: 'test-key' });
+      const ask = context(provider).ask(
+        agent({
+          name: 'built-in',
+          model: 'controlled:gpt-4o',
+          system: 'test',
+          stallTimeout: '50ms',
+        }),
+        'go',
+      );
+      const stalled = ask.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(calls).toBe(1); // retry backoff is deliberately longer than the stall window.
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(calls).toBe(2);
+      await vi.advanceTimersByTimeAsync(51);
+      await expect(stalled).resolves.toBeInstanceOf(StallTimeoutError);
+      expect(secondSignal?.aborted).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+      vi.useRealTimers();
+    }
+  });
+
+  it('repair R6: stall timers cannot contaminate a later clock after provider failure or external abort', async () => {
+    vi.useFakeTimers();
+    try {
+      let failedSignal: AbortSignal | undefined;
+      const failedProvider = {
+        name: 'controlled',
+        chat: async (_messages: unknown, options: { signal?: AbortSignal }) => {
+          failedSignal = options.signal;
+          throw new Error('provider failed before stall');
+        },
+        stream: async function* () {},
+      };
+      await expect(
+        context(failedProvider).ask(baseAgent({ stallTimeout: '50ms' }), 'go'),
+      ).rejects.toThrow('provider failed before stall');
+      await vi.advanceTimersByTimeAsync(100);
+      expect(failedSignal?.aborted).toBe(false);
+
+      let cancelledSignal: AbortSignal | undefined;
+      const cancelledProvider = {
+        name: 'controlled',
+        chat: async (_messages: unknown, options: { signal?: AbortSignal }) => {
+          cancelledSignal = options.signal;
+          return abortableWait(options.signal);
+        },
+        stream: async function* () {},
+      };
+      const controller = new AbortController();
+      const reason = new Error('external cleanup');
+      const cancelled = context(cancelledProvider).ask(baseAgent({ stallTimeout: '50ms' }), 'go', {
+        signal: controller.signal,
+      });
+      controller.abort(reason);
+      await expect(cancelled).rejects.toBe(reason);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(cancelledSignal?.reason).toBe(reason);
     } finally {
       vi.useRealTimers();
     }

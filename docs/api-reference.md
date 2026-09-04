@@ -895,7 +895,7 @@ contradictory branch fields fail with `AxlError` code
 
 **Resolution:** The host app resolves decisions via `runtime.getPendingDecisions()` and `runtime.resolveDecision(executionId, decision)`. See [Security > Approval Gates](./security.md#approval-gates).
 
-**Cancellation:** If the execution is aborted while suspended at `awaitHuman` — via `runtime.abort(id)`, `runtime.deleteExecution(id)`, an external `options.signal`, or a budget hard-stop — the awaitHuman Promise rejects with `AbortError` and the workflow unwinds. The request becomes non-resolvable immediately; its cleanup record remains discoverable until persisted compensation finishes so a later total delete can join the barrier before sweeping the store. If compensation fails, the original error retains a non-enumerable `cleanupError`, the durable request remains visible for retry or total deletion, and the runtime emits `decision_cleanup_failed`.
+**Cancellation:** If the execution is aborted while suspended at `awaitHuman` — via `runtime.abort(id)`, `runtime.deleteExecution(id)`, an external `options.signal`, or a budget hard-stop — the awaitHuman Promise rejects with the signal's exact `reason` and the workflow unwinds. SDK-initiated aborts use the platform's default `AbortError`; a caller-supplied reason is not rewritten. The request becomes non-resolvable immediately; its cleanup record remains discoverable until persisted compensation finishes so a later total delete can join the barrier before sweeping the store. If compensation fails, the original error retains a non-enumerable `cleanupError`, the durable request remains visible for retry or total deletion, and the runtime emits `decision_cleanup_failed`.
 
 ---
 

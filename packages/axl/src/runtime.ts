@@ -565,11 +565,12 @@ function forwardAbortSignal(
 ): () => void {
   if (!external) return () => {};
   if (external.aborted) {
-    internal.abort();
+    internal.abort(external.reason);
     return () => {};
   }
-  const onAbort = () => internal.abort();
+  const onAbort = () => internal.abort(external.reason);
   external.addEventListener('abort', onAbort, { once: true });
+  if (external.aborted) onAbort();
   return () => external.removeEventListener('abort', onAbort);
 }
 

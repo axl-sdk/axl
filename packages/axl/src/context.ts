@@ -100,10 +100,19 @@ import {
  * without mutating shared state on the WorkflowContext instance.
  */
 const signalStorage = new AsyncLocalStorage<AbortSignal>();
+/** User/context/per-ask cancellation that must settle a provider wait even
+ * when provider-owned work ignores its signal. Internal race/spawn/map
+ * cancellation is deliberately excluded so branch draining can retain late
+ * accounting from non-cooperative losers. */
+const hardSignalStorage = new AsyncLocalStorage<AbortSignal>();
 
 /** Active graceful ask budgets in this async branch. `awaitHuman` pauses all
  * enclosing budgets so a nested human gate cannot consume a parent's budget. */
-type AskTimeoutTracker = { humanWaitMs: number };
+type AskTimeoutTracker = {
+  humanWaitMs: number;
+  activeHumanWaits: number;
+  humanWaitStartedAt?: number;
+};
 const timeoutTrackerStorage = new AsyncLocalStorage<AskTimeoutTracker[]>();
 
 function composeAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
@@ -111,6 +120,42 @@ function composeAbortSignals(...signals: Array<AbortSignal | undefined>): AbortS
   if (active.length === 0) return undefined;
   if (active.length === 1) return active[0];
   return AbortSignal.any(active);
+}
+
+/** Settle at the runtime boundary even when provider-owned work ignores its signal. */
+function raceWithAbortSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    // The provider promise was already created. Observe a synchronous/early
+    // rejection before returning the winning exact signal reason.
+    void promise.catch(() => {});
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(signal.reason));
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
+}
+
+function pausedHumanWaitMs(tracker: AskTimeoutTracker, now = Date.now()): number {
+  return (
+    tracker.humanWaitMs +
+    (tracker.activeHumanWaits > 0 && tracker.humanWaitStartedAt !== undefined
+      ? now - tracker.humanWaitStartedAt
+      : 0)
+  );
 }
 
 type BranchDrainState = {
@@ -1390,7 +1435,13 @@ export class WorkflowContext<TInput = unknown> {
         tool_call_id: parsed.callId,
       });
     }
-    if (settlement.abortError !== undefined) throw settlement.abortError;
+    if (settlement.abortError !== undefined) {
+      // Tool settlement keeps an AbortError-shaped projection for lifecycle
+      // events. The caller-facing cancellation contract is stronger: the
+      // winning signal reason itself must escape unchanged.
+      signal?.throwIfAborted();
+      throw settlement.abortError;
+    }
   }
 
   // ── ctx.ask() ─────────────────────────────────────────────────────────
@@ -1417,6 +1468,8 @@ export class WorkflowContext<TInput = unknown> {
     // Ask-local cancellation must never mutate the context's signal: sibling
     // asks retain their original signal, while nested asks inherit this ALS
     // scope. `AbortSignal.any` preserves the winning reason identity.
+    const inheritedHardSignal = hardSignalStorage.getStore() ?? this.signal;
+    const hardAskSignal = composeAbortSignals(inheritedHardSignal, options?.signal);
     const askSignal = composeAbortSignals(this.currentSignal, options?.signal);
     const runAsk = () =>
       this._checkpoint(
@@ -1637,7 +1690,10 @@ export class WorkflowContext<TInput = unknown> {
         },
         { agent: agentName },
       );
-    return askSignal ? signalStorage.run(askSignal, runAsk) : runAsk();
+    const runWithAskSignal = () => (askSignal ? signalStorage.run(askSignal, runAsk) : runAsk());
+    return hardAskSignal
+      ? hardSignalStorage.run(hardAskSignal, runWithAskSignal)
+      : runWithAskSignal();
   }
 
   private async executeAgentCall(
@@ -1658,7 +1714,7 @@ export class WorkflowContext<TInput = unknown> {
     },
     sessionHistory: ChatMessage[] = normalizeSessionHistory(this.sessionHistory),
   ): Promise<unknown> {
-    const tracker: AskTimeoutTracker = { humanWaitMs: 0 };
+    const tracker: AskTimeoutTracker = { humanWaitMs: 0, activeHumanWaits: 0 };
     const enclosing = timeoutTrackerStorage.getStore() ?? [];
     return timeoutTrackerStorage.run([...enclosing, tracker], () =>
       this.executeAgentCallImpl(
@@ -2074,7 +2130,9 @@ export class WorkflowContext<TInput = unknown> {
       this.currentSignal?.throwIfAborted();
 
       // Timeout check
-      const elapsedMs = Date.now() - startTime - (timeoutTracker?.humanWaitMs ?? 0);
+      const now = Date.now();
+      const elapsedMs =
+        now - startTime - (timeoutTracker ? pausedHumanWaitMs(timeoutTracker, now) : 0);
       if (elapsedMs > timeoutMs) {
         throw new TimeoutError(
           'ctx.ask()',
@@ -2153,12 +2211,14 @@ export class WorkflowContext<TInput = unknown> {
       // it at actual fetch dispatch; custom providers retain the conservative
       // provider-entry fallback to preserve the public Provider contract.
       const requestSignal = chatOptions.signal;
+      const hardRequestSignal = hardSignalStorage.getStore() ?? this.signal;
       const stallController = stallTimeoutMs === undefined ? undefined : new AbortController();
       const stallReason =
         stallController === undefined
           ? undefined
           : new DOMException('Provider request stalled', 'StallTimeout');
       let stallTimer: ReturnType<typeof setTimeout> | undefined;
+      let providerCallActive = true;
       const clearStallTimer = () => {
         if (stallTimer !== undefined) {
           clearTimeout(stallTimer);
@@ -2166,7 +2226,8 @@ export class WorkflowContext<TInput = unknown> {
         }
       };
       const armStallTimer = () => {
-        if (!stallController || !stallReason || stallTimeoutMs === undefined) return;
+        if (!providerCallActive || !stallController || !stallReason || stallTimeoutMs === undefined)
+          return;
         clearStallTimer();
         if (stallController.signal.aborted) return;
         stallTimer = setTimeout(() => stallController.abort(stallReason), stallTimeoutMs);
@@ -2183,6 +2244,8 @@ export class WorkflowContext<TInput = unknown> {
           throw new StallTimeoutError('ctx.ask()', stallTimeoutMs!, agent._name);
         }
       };
+      const requestIsStalled = () =>
+        stallReason !== undefined && chatOptions.signal?.reason === stallReason;
 
       // If schema requested and no tools, use JSON mode. With
       // `nativeStructuredOutput`, derive the provider schema from the SAME Zod
@@ -2280,7 +2343,7 @@ export class WorkflowContext<TInput = unknown> {
         },
       });
 
-      let response: ProviderResponse;
+      let response!: ProviderResponse;
 
       // Provider call wrapped so any throw still emits a paired
       // `agent_call_end` — consumers (Studio waterfall, cost rollup, AsyncLocalStorage
@@ -2360,76 +2423,97 @@ export class WorkflowContext<TInput = unknown> {
           // Custom providers do not expose an exact fetch-dispatch hook, so
           // their conservative fallback begins at provider entry.
           if (stallController && provider.reportsRequestLifecycle !== true) armStallTimer();
-          for await (const chunk of provider.stream(
+          const providerStream = provider.stream(
             cloneMessagesForProvider(currentMessages),
             chatOptions,
-          )) {
-            // A provider may ignore the private stall signal and still yield
-            // late. External cancellation deliberately remains accounted for
-            // below, before the normal continuation gate stops the branch.
-            throwIfRequestStalled();
-            // Every protocol chunk is progress. Tool-call and usage-only chunks
-            // are just as important as text for a streaming request.
-            if (stallController) armStallTimer();
-            if (chunk.type === 'text_delta') {
-              content += chunk.content;
-              // Emit a `token` AxlEvent so wire consumers (AxlStream) and
-              // trace listeners both see it. Stream-only — `runtime.execute`'s
-              // onTrace skips persisting tokens to ExecutionInfo.events.
-              this.emitEvent({ type: 'token', data: chunk.content });
-              if (walker) {
-                // Walker drives both `string_delta` (via the onStringDelta
-                // callback above) and structural-boundary detection (via
-                // `consumeBoundary()` below). Order within a chunk:
-                // string_delta events fire first (from inside processChunk),
-                // then partial_object on boundary — so a consumer subscribed
-                // to both sees deltas land before the snapshot reflecting
-                // them, matching natural read order.
-                walker.processChunk(chunk.content);
-                if (walker.consumeBoundary()) {
-                  let parsed: unknown;
-                  try {
-                    parsed = parsePartialJson(extractJson(content));
-                  } catch {
-                    // Mid-document malformed (not just truncation) — skip
-                    // this delta. The next structural boundary outside a
-                    // string will get another shot once the model writes
-                    // valid syntax.
-                    parsed = undefined;
-                  }
-                  if (parsed !== undefined) {
-                    this.emitEvent({
-                      type: 'partial_object',
-                      agent: agent._name,
-                      attempt: currentAttempt,
-                      data: { object: parsed },
-                    });
+          );
+          const iterator = providerStream[Symbol.asyncIterator]();
+          try {
+            while (true) {
+              const next = await raceWithAbortSignal(
+                Promise.resolve(iterator.next()),
+                hardRequestSignal,
+              );
+              if (next.done) break;
+              const chunk = next.value;
+              // A terminal done chunk can carry accounting even after a
+              // non-cooperative stream ignored the private stall abort. No
+              // other late content is projected to the caller or trace.
+              const stalledBeforeChunk = requestIsStalled();
+              if (stalledBeforeChunk && chunk.type !== 'done') throwIfRequestStalled();
+              // Every protocol chunk is progress. Tool-call and usage-only chunks
+              // are just as important as text for a streaming request.
+              if (stallController) armStallTimer();
+              if (chunk.type === 'text_delta') {
+                content += chunk.content;
+                // Emit a `token` AxlEvent so wire consumers (AxlStream) and
+                // trace listeners both see it. Stream-only — `runtime.execute`'s
+                // onTrace skips persisting tokens to ExecutionInfo.events.
+                this.emitEvent({ type: 'token', data: chunk.content });
+                if (walker) {
+                  // Walker drives both `string_delta` (via the onStringDelta
+                  // callback above) and structural-boundary detection (via
+                  // `consumeBoundary()` below). Order within a chunk:
+                  // string_delta events fire first (from inside processChunk),
+                  // then partial_object on boundary — so a consumer subscribed
+                  // to both sees deltas land before the snapshot reflecting
+                  // them, matching natural read order.
+                  walker.processChunk(chunk.content);
+                  if (walker.consumeBoundary()) {
+                    let parsed: unknown;
+                    try {
+                      parsed = parsePartialJson(extractJson(content));
+                    } catch {
+                      // Mid-document malformed (not just truncation) — skip
+                      // this delta. The next structural boundary outside a
+                      // string will get another shot once the model writes
+                      // valid syntax.
+                      parsed = undefined;
+                    }
+                    if (parsed !== undefined) {
+                      this.emitEvent({
+                        type: 'partial_object',
+                        agent: agent._name,
+                        attempt: currentAttempt,
+                        data: { object: parsed },
+                      });
+                    }
                   }
                 }
-              }
-            } else if (chunk.type === 'thinking_delta') {
-              thinkingContent += chunk.content;
-            } else if (chunk.type === 'tool_call_delta') {
-              let buffer = toolCallBuffers.get(chunk.id);
-              if (!buffer) {
-                buffer = { id: chunk.id, name: '', arguments: '' };
-                toolCallBuffers.set(chunk.id, buffer);
-              }
-              if (chunk.name) buffer.name = chunk.name;
-              if (chunk.arguments) buffer.arguments += chunk.arguments;
-            } else if (chunk.type === 'done') {
-              streamProviderMetadata = chunk.providerMetadata;
-              streamTiming = chunk.timing;
-              // Usage and cost info from done chunk if available
-              if (chunk.usage) {
+              } else if (chunk.type === 'thinking_delta') {
+                thinkingContent += chunk.content;
+              } else if (chunk.type === 'tool_call_delta') {
+                let buffer = toolCallBuffers.get(chunk.id);
+                if (!buffer) {
+                  buffer = { id: chunk.id, name: '', arguments: '' };
+                  toolCallBuffers.set(chunk.id, buffer);
+                }
+                if (chunk.name) buffer.name = chunk.name;
+                if (chunk.arguments) buffer.arguments += chunk.arguments;
+              } else if (chunk.type === 'done') {
+                streamProviderMetadata = chunk.providerMetadata;
+                streamTiming = chunk.timing;
                 response = {
                   content,
                   tool_calls: undefined,
                   usage: chunk.usage,
                   cost: chunk.cost,
+                  providerMetadata: chunk.providerMetadata,
+                  timing: chunk.timing,
                 };
               }
+              if (stalledBeforeChunk) throwIfRequestStalled();
             }
+          } catch (error) {
+            if (requestSignal?.aborted && iterator.return) {
+              try {
+                void Promise.resolve(iterator.return(undefined)).catch(() => {});
+              } catch {
+                // Cancellation already won. Iterator cleanup is best-effort,
+                // but any async rejection is still observed above.
+              }
+            }
+            throw error;
           }
           // Also reject a provider that ignores the private stall abort and
           // terminates without yielding another chunk after the deadline.
@@ -2467,7 +2551,10 @@ export class WorkflowContext<TInput = unknown> {
           }
         } else {
           if (stallController && provider.reportsRequestLifecycle !== true) armStallTimer();
-          response = await provider.chat(cloneMessagesForProvider(currentMessages), chatOptions);
+          response = await raceWithAbortSignal(
+            provider.chat(cloneMessagesForProvider(currentMessages), chatOptions),
+            hardRequestSignal,
+          );
           // Do not accept a late non-stream result after the private stall
           // abort. Ignored external cancellation retains cost below.
           throwIfRequestStalled();
@@ -2479,6 +2566,10 @@ export class WorkflowContext<TInput = unknown> {
           stallReason !== undefined && chatOptions.signal?.reason === stallReason
             ? new StallTimeoutError('ctx.ask()', stallTimeoutMs!, agent._name)
             : err;
+        const lateResponse = callError instanceof StallTimeoutError ? response : undefined;
+        if (lateResponse?.cost) this._accumulateBudgetCost(lateResponse.cost);
+        if (usageCapture && lateResponse?.usage) usageCapture.value = lateResponse.usage;
+        if (usageCapture && lateResponse?.timing) usageCapture.timing = lateResponse.timing;
         if (richRequest) this.recordRichFailure(callError);
         // A failed call is still a measured call whenever the provider
         // answered: any non-2xx carries the same `timing` block a success
@@ -2494,9 +2585,23 @@ export class WorkflowContext<TInput = unknown> {
           agent: agent._name,
           model: effectiveModelUri,
           promptVersion: agent._config.version,
+          cost: lateResponse?.cost,
+          tokens: lateResponse?.usage
+            ? {
+                input: lateResponse.usage.prompt_tokens,
+                output: lateResponse.usage.completion_tokens,
+                reasoning: lateResponse.usage.reasoning_tokens,
+                cached: lateResponse.usage.cached_tokens,
+                cacheWrite: lateResponse.usage.cache_write_tokens,
+              }
+            : undefined,
           duration: Date.now() - turnStart,
           // Top-level beside `duration`, exactly as on the success path.
-          ...(failureTiming ? { timing: failureTiming } : {}),
+          ...(lateResponse?.timing
+            ? { timing: lateResponse.timing }
+            : failureTiming
+              ? { timing: failureTiming }
+              : {}),
           data: {
             response: '',
             turn: turns,
@@ -2511,6 +2616,7 @@ export class WorkflowContext<TInput = unknown> {
         });
         throw callError;
       } finally {
+        providerCallActive = false;
         clearStallTimer();
       }
 
@@ -4530,6 +4636,9 @@ export class WorkflowContext<TInput = unknown> {
   async awaitHuman(options: AwaitHumanOptions): Promise<HumanDecision> {
     const trackers = timeoutTrackerStorage.getStore();
     const startedAt = Date.now();
+    for (const tracker of trackers ?? []) {
+      if (tracker.activeHumanWaits++ === 0) tracker.humanWaitStartedAt = startedAt;
+    }
     try {
       if (this.spanManager) {
         return await this.spanManager.withSpanAsync(
@@ -4548,34 +4657,30 @@ export class WorkflowContext<TInput = unknown> {
       }
       return await this._awaitHumanImpl(options);
     } finally {
-      const humanWaitMs = Date.now() - startedAt;
-      for (const tracker of trackers ?? []) tracker.humanWaitMs += humanWaitMs;
+      const finishedAt = Date.now();
+      for (const tracker of trackers ?? []) {
+        tracker.activeHumanWaits--;
+        if (tracker.activeHumanWaits === 0 && tracker.humanWaitStartedAt !== undefined) {
+          tracker.humanWaitMs += finishedAt - tracker.humanWaitStartedAt;
+          tracker.humanWaitStartedAt = undefined;
+        }
+      }
     }
   }
 
   private async _awaitHumanImpl(options: AwaitHumanOptions): Promise<HumanDecision> {
     const branchSignal = this.currentSignal;
-    const makeAbortError = (reason: unknown): Error => {
-      if (typeof DOMException !== 'undefined') {
-        return new DOMException(
-          typeof reason === 'string' ? reason : 'awaitHuman aborted',
-          'AbortError',
-        );
-      }
-      const err = new Error(typeof reason === 'string' ? reason : 'awaitHuman aborted');
-      err.name = 'AbortError';
-      return err;
-    };
     const awaitWithAbort = async <T>(promise: Promise<T>, signal = branchSignal): Promise<T> => {
       if (!signal) return promise;
-      if (signal.aborted) throw makeAbortError(signal.reason);
+      signal.throwIfAborted();
       let onAbort: (() => void) | undefined;
       try {
         return await Promise.race([
           promise,
           new Promise<never>((_, reject) => {
-            onAbort = () => reject(makeAbortError(signal.reason));
+            onAbort = () => reject(signal.reason);
             signal.addEventListener('abort', onAbort, { once: true });
+            if (signal.aborted) onAbort();
           }),
         ]);
       } finally {
@@ -4584,7 +4689,7 @@ export class WorkflowContext<TInput = unknown> {
     };
 
     if (this.awaitHumanHandler) {
-      if (branchSignal?.aborted) throw makeAbortError(branchSignal.reason);
+      branchSignal?.throwIfAborted();
       // Emit `await_human` BEFORE invoking the handler so consumers see the
       // start/end pair regardless of which approval path is taken
       // (synchronous handler vs runtime-mediated pendingDecisions).
@@ -4592,7 +4697,7 @@ export class WorkflowContext<TInput = unknown> {
         type: 'await_human',
         data: { channel: options.channel, prompt: options.prompt },
       });
-      if (branchSignal?.aborted) throw makeAbortError(branchSignal.reason);
+      branchSignal?.throwIfAborted();
       const decision = parseHumanDecision(
         await awaitWithAbort(Promise.resolve(this.awaitHumanHandler(options))),
       );
@@ -4668,12 +4773,12 @@ export class WorkflowContext<TInput = unknown> {
       // still blocked. Cancellation invalidates publication, so they must not
       // wait indefinitely for the normal audit-readiness path.
       markReady();
-      rejectDecision(makeAbortError(signal.reason));
+      rejectDecision(signal.reason);
     };
     signal.addEventListener('abort', abortListener, { once: true });
     let decision: HumanDecision;
     try {
-      if (signal.aborted) throw makeAbortError(signal.reason);
+      signal.throwIfAborted();
       if (this.stateStore) {
         // A store may durably write and then reject because its acknowledgement
         // was lost. Treat every attempted save as possibly committed and run
@@ -4687,7 +4792,7 @@ export class WorkflowContext<TInput = unknown> {
           createdAt: new Date().toISOString(),
         });
       }
-      if (signal.aborted) throw makeAbortError(signal.reason);
+      signal.throwIfAborted();
 
       // Publication order is deliberate: persistence first, then the
       // in-process resolver, then the externally observable audit event, then

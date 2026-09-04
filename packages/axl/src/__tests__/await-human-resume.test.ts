@@ -1030,15 +1030,19 @@ describe('awaitHuman in-process suspension', () => {
 
     await waitForPendingDecision(runtime);
 
-    // External abort — should wake the awaitHuman call
-    controller.abort();
+    // External abort — should wake the awaitHuman call and keep the caller's
+    // identity. `awaitHuman` has both persisted and in-memory suspension
+    // paths, so an AbortError-shaped replacement here breaks workflow callers
+    // that use a sentinel error to classify cancellation.
+    const exactReason = new Error('persisted awaitHuman cancellation identity');
+    controller.abort(exactReason);
 
     await expect(
       Promise.race([
         resultPromise,
         new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), 1000)),
       ]),
-    ).rejects.toThrow();
+    ).rejects.toBe(exactReason);
   });
 
   it('awaitHuman fast-path: aborted signal at entry skips in-memory resolver registration', async () => {

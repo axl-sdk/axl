@@ -576,7 +576,7 @@ app.delete('/users/:id/data', async (req, res) => {
 - Pending `awaitHuman` decision
 - In-memory abort controller, resolver closure, streamable-set membership
 
-If the execution is still in flight, the workflow is **aborted** and marked to skip persist on `workflow_end` — no resurrection. A workflow paused at `ctx.awaitHuman()` correctly wakes (rejects with `AbortError`); previously it would hang forever.
+If the execution is still in flight, the workflow is **aborted** and marked to skip persist on `workflow_end` — no resurrection. A workflow paused at `ctx.awaitHuman()` correctly wakes (rejects with the signal's exact reason; SDK-initiated aborts use the default `AbortError`); previously it would hang forever.
 
 **Internal metadata keys are stripped before persistence.** `sessionHistory` and `sessionId` in `options.metadata` are consumed by the runtime as control-plane channels but filtered out of the persisted `ExecutionInfo.metadata`. So the queryable surface stays a clean tag bag.
 

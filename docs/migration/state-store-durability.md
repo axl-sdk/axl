@@ -151,7 +151,7 @@ Without TTLs, every save accumulates forever and Redis eventually OOMs. Categori
 
 ### 5. `ctx.awaitHuman()` wakes on signal abort
 
-A workflow paused at `ctx.awaitHuman()` previously had no abort listener — `runtime.deleteExecution(id)` on such a workflow would clean up the runtime's bookkeeping but the workflow Promise would hang forever. Now both persisted and handler-backed approval paths race the current branch signal: a fast-path check for already-aborted, then a listener that marks the request non-resolvable and rejects with `AbortError`. The cleanup record remains discoverable until compensation finishes. This also prevents a losing race branch from resuming workflow-side effects after terminal finalization.
+A workflow paused at `ctx.awaitHuman()` previously had no abort listener — `runtime.deleteExecution(id)` on such a workflow would clean up the runtime's bookkeeping but the workflow Promise would hang forever. Now both persisted and handler-backed approval paths race the current branch signal: a fast-path check for already-aborted, then a listener that marks the request non-resolvable and rejects with the signal's exact reason (the default is `AbortError`). The cleanup record remains discoverable until compensation finishes. This also prevents a losing race branch from resuming workflow-side effects after terminal finalization.
 
 Pending decisions still use `executionId` as their key. Concurrent `awaitHuman()` calls in one execution are therefore rejected with `CONCURRENT_HUMAN_DECISION_UNSUPPORTED`; both sibling waits are cancelled and any persisted row is compensated. Supporting them requires request-scoped decision IDs as part of the future durable replay protocol.
 

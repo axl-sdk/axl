@@ -9,6 +9,7 @@ import type {
   ToolCallMessage,
   ProviderInputValidationRequest,
   ProviderInputValidationResult,
+  InputModalitySupport,
   ResolvedThinkingOptions,
 } from './types.js';
 import { resolveThinkingOptions, resolveApiKey, type ApiKeySource } from './types.js';
@@ -18,15 +19,19 @@ import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
+import type { RecordedAudioSource } from '../transcription.js';
 import { UnsupportedModelInputError } from '../errors.js';
-import { firstRichPart, type RichModality } from './rich-input.js';
+import { firstRichPart } from './rich-input.js';
 
 function hasRichGeminiMessages(messages: readonly ChatMessage[]): boolean {
   return messages.some((message) => Array.isArray(message.content));
 }
 
-function geminiImageBase64(
-  source: Extract<InputMediaSource, { type: 'bytes' | 'base64' }>,
+/** Inline media is carried as base64 in both the image and audio Interactions
+ *  parts, so one encoder serves both modalities. Caller base64 passes through
+ *  verbatim — never re-encoded. */
+function geminiInlineBase64(
+  source: Extract<InputMediaSource | RecordedAudioSource, { type: 'bytes' | 'base64' }>,
 ): string {
   return source.type === 'base64'
     ? source.data
@@ -46,14 +51,54 @@ function geminiInteractionContent(
       continue;
     }
     if (part.type === 'audio') {
-      // Unreachable through the runtime gate and `validateInput`; a builder-level
-      // guard keeps audio from silently rendering as an image block.
+      // Google's audio understanding guide carries recordings in the same shape
+      // family as images: inline base64 or a Gemini Files URI, with the caller's
+      // `mime_type` passed through unchanged. There is no wire `format` token and
+      // no media-type table here — Gemini accepts the IANA type directly and
+      // rejects what it cannot decode, which Axl surfaces as a `ProviderError`.
+      const { source: audioSource } = part;
+      if (audioSource.type === 'provider-file') {
+        if (audioSource.provider !== 'google') {
+          throw new UnsupportedModelInputError({
+            provider: 'google',
+            model,
+            modality: 'audio',
+            source: 'provider-file',
+          });
+        }
+        if (!audioSource.mediaType) {
+          throw new UnsupportedModelInputError({
+            provider: 'google',
+            model,
+            modality: 'audio',
+            source: 'provider-file',
+            feature: 'Interactions URI audio mediaType',
+          });
+        }
+        content.push({
+          type: 'audio',
+          uri: audioSource.reference,
+          mime_type: audioSource.mediaType,
+        });
+      } else {
+        content.push({
+          type: 'audio',
+          data: geminiInlineBase64(audioSource),
+          mime_type: audioSource.mediaType,
+        });
+      }
+      if (part.label) content.push({ type: 'text', text: `[Audio: ${part.label}]` });
+      continue;
+    }
+    if (part.type !== 'image') {
+      // A future `InputContentPart` variant must fail loudly rather than fall
+      // through to the image mapping below and be billed as a mislabelled block.
+      const unmapped: never = part;
       throw new UnsupportedModelInputError({
         provider: 'google',
         model,
-        modality: 'audio',
-        source: part.source.type,
-        feature: 'audio input',
+        modality: (unmapped as { type: string }).type,
+        feature: 'this input modality',
       });
     }
     const { source } = part;
@@ -92,7 +137,11 @@ function geminiInteractionContent(
         feature: 'direct URL image input; pass bytes/base64 or a Gemini provider-file',
       });
     } else {
-      content.push({ type: 'image', data: geminiImageBase64(source), mime_type: source.mediaType });
+      content.push({
+        type: 'image',
+        data: geminiInlineBase64(source),
+        mime_type: source.mediaType,
+      });
     }
     if (part.label) content.push({ type: 'text', text: `[Image: ${part.label}]` });
   }
@@ -626,34 +675,51 @@ export class GeminiProvider implements Provider {
   readonly name = 'google';
   readonly reportsRequestLifecycle = true as const;
 
-  inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
-    // Interactions accepts inline data and Gemini Files URIs. Axl never
-    // retrieves caller URLs or creates hidden image uploads.
+  inputCapabilities(model: string): InputModalitySupport {
+    // Interactions accepts inline data and Gemini Files URIs for both images and
+    // recorded audio. Axl never retrieves caller URLs or creates hidden uploads,
+    // and `RecordedAudioSource` makes an audio URL unrepresentable.
     return model.trim().length > 0
-      ? { image: { sources: ['bytes', 'base64', 'provider-file'] } }
+      ? {
+          image: { sources: ['bytes', 'base64', 'provider-file'] },
+          audio: { sources: ['bytes', 'base64', 'provider-file'] },
+        }
       : {};
   }
 
   validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
     const modelOverride = request.providerOptions?.model;
     const effectiveModel = typeof modelOverride === 'string' ? modelOverride : request.model;
-    const failWith = (modality: RichModality, source?: string, feature?: string): never => {
+    // The reported modality is derived from the offending part, never hardcoded.
+    const fail = (source?: string, feature?: string): never => {
       throw new UnsupportedModelInputError({
         provider: this.name,
         model: effectiveModel || request.model,
-        modality,
+        modality: firstRichPart(request.input, request.history)?.type ?? 'image',
         ...(source ? { source } : {}),
         ...(feature ? { feature } : {}),
       });
     };
-    // The reported modality is derived from the offending part, never hardcoded.
-    const fail = (source?: string, feature?: string): never =>
-      failWith(firstRichPart(request.input, request.history)?.type ?? 'image', source, feature);
-    // This adapter maps no audio transport. The runtime gate already fails
-    // closed because `inputCapabilities` declares no `audio`; rejecting here
-    // too keeps the adapter authoritative on its own wire format.
-    const audioPart = firstRichPart(request.input, request.history, 'audio');
-    if (audioPart) failWith('audio', audioPart.source.type, 'audio input');
+    // Audio follows exactly the image rules: inline data needs nothing extra, and
+    // a provider-file reference must be Gemini's own and must declare its media
+    // type, because the Interactions URI part carries no inferable one. `url` is
+    // unrepresentable on `RecordedAudioSource`, so there is no branch for it.
+    const checkPart = (part: InputContentPart): void => {
+      if (part.type === 'audio') {
+        if (part.source.type === 'provider-file' && part.source.provider !== this.name)
+          fail('provider-file');
+        if (part.source.type === 'provider-file' && !part.source.mediaType)
+          fail('provider-file', 'Interactions URI audio mediaType');
+        return;
+      }
+      if (part.type !== 'image') return;
+      if (part.source.type === 'url')
+        fail('url', 'direct URL image input; pass bytes/base64 or a Gemini provider-file');
+      if (part.source.type === 'provider-file' && part.source.provider !== this.name)
+        fail('provider-file');
+      if (part.source.type === 'provider-file' && !part.source.mediaType)
+        fail('provider-file', 'Interactions URI image mediaType');
+    };
     if (
       request.providerOptions &&
       'model' in request.providerOptions &&
@@ -679,26 +745,10 @@ export class GeminiProvider implements Provider {
     for (const message of request.history) {
       if (!Array.isArray(message.content)) continue;
       if (message.role !== 'user') fail(undefined, 'rich non-user history');
-      for (const part of message.content) {
-        if (part.type !== 'image') continue;
-        if (part.source.type === 'url')
-          fail('url', 'direct URL image input; pass bytes/base64 or a Gemini provider-file');
-        if (part.source.type === 'provider-file' && part.source.provider !== this.name)
-          fail('provider-file');
-        if (part.source.type === 'provider-file' && !part.source.mediaType)
-          fail('provider-file', 'Interactions URI image mediaType');
-      }
+      for (const part of message.content) checkPart(part);
     }
     if (Array.isArray(request.input)) {
-      for (const part of request.input) {
-        if (part.type !== 'image') continue;
-        if (part.source.type === 'url')
-          fail('url', 'direct URL image input; pass bytes/base64 or a Gemini provider-file');
-        if (part.source.type === 'provider-file' && part.source.provider !== this.name)
-          fail('provider-file');
-        if (part.source.type === 'provider-file' && !part.source.mediaType)
-          fail('provider-file', 'Interactions URI image mediaType');
-      }
+      for (const part of request.input) checkPart(part);
     }
     return { effectiveModel };
   }
@@ -1107,7 +1157,13 @@ export class GeminiProvider implements Provider {
       thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length ? toolCalls : undefined,
       usage,
-      // Interactions returns modality usage but no authoritative monetary cost.
+      // Interactions returns modality usage but no authoritative monetary cost,
+      // and `normalizeInteractionUsage` deliberately produces no `pricingUsage`,
+      // so `estimateGeminiCost` (a text-only rate table) is unreachable on this
+      // transport. Every rich ask — audio included — routes here, so an
+      // audio-bearing call reports tokens with no cost and the runtime marks it
+      // unpriced (R-A11). Gemini bills audio at a different rate than text; a
+      // per-modality estimator waits on proof that the wire reports the split.
       cost: undefined,
       providerMetadata: json.steps?.length
         ? { geminiInteractionSteps: json.steps.filter(isGeminiInteractionStep) }

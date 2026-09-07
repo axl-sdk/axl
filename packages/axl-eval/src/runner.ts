@@ -94,6 +94,23 @@ function extractUserMetadata(
   return meta as Record<string, unknown>;
 }
 
+/** Keep explicit list overrides authoritative for the count-array fallback. */
+function mergeMetadata(
+  tracked: Record<string, unknown> | undefined,
+  user: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const merged = { ...tracked, ...user };
+  for (const [list, counts] of [
+    ['models', 'modelCallCounts'],
+    ['workflows', 'workflowCallCounts'],
+  ]) {
+    if (user && Object.hasOwn(user, list) && !Object.hasOwn(user, counts)) {
+      delete merged[counts];
+    }
+  }
+  return merged;
+}
+
 export async function runEval(
   config: EvalConfig,
   executeWorkflow: (
@@ -225,13 +242,14 @@ export async function runEval(
         );
         evalItem.duration = Date.now() - itemStart;
         evalItem.output = tracked.result.output;
-        // Prefer user-returned cost/metadata; fall back to tracked values.
+        // Explicit user fields override tracked defaults; annotations must not
+        // discard unrelated accounting. Metadata merging is shallow.
         // Type-guarded so a non-number cost (e.g. `{ cost: 'free' }`) or a
         // non-object metadata (e.g. an array or scalar) doesn't silently
         // corrupt downstream math or shape expectations.
         evalItem.cost = extractUserCost(tracked.result) ?? tracked.cost;
         if (tracked.unpriced) evalItem.unpriced = true;
-        evalItem.metadata = extractUserMetadata(tracked.result) ?? tracked.metadata;
+        evalItem.metadata = mergeMetadata(tracked.metadata, extractUserMetadata(tracked.result));
         absorbTiming(tracked.modelTiming, evalItem);
         if (tracked.traces && tracked.traces.length > 0) {
           evalItem.traces = tracked.traces;
@@ -240,12 +258,9 @@ export async function runEval(
           totalCost += evalItem.cost;
         }
       } else {
-        // Default path. We wrap in trackExecution ONLY to read the per-model
-        // timing rollup — nothing else about this branch changes. `cost`,
-        // `unpriced` and `metadata` deliberately keep coming from the user's
-        // return value alone, exactly as before: falling back to tracked cost
-        // here would newly populate `metadata.models`, and would let a plain
-        // run with a `budget` abort mid-run. That is its own decision.
+        // Collect metadata and timing independently of trace capture. Cost and
+        // unpriced retain their existing callback-only semantics on this path:
+        // a tracked-cost fallback would change when budgeted runs abort.
         //
         // Guarded like the `resolveProvider` check above, because a hand-rolled
         // or duck-typed runtime (the suite's `{} as AxlRuntime`) has no
@@ -259,6 +274,7 @@ export async function runEval(
         // event, not a walk. The `captureTraces` path already ran this way at
         // the same concurrency.
         let trackedTiming: TrackedModelTiming | undefined;
+        let trackedMetadata: Record<string, unknown> | undefined;
         let result: Awaited<ReturnType<typeof executeWorkflow>>;
         if (typeof runtime.trackExecution === 'function') {
           // `captureTimingSamples` is what makes `summary.modelTiming` a real
@@ -269,6 +285,7 @@ export async function runEval(
           );
           result = tracked.result;
           trackedTiming = tracked.modelTiming;
+          trackedMetadata = tracked.metadata;
         } else {
           result = await executeWorkflow(item.input, runtime);
         }
@@ -276,7 +293,7 @@ export async function runEval(
         evalItem.output = result.output;
         evalItem.cost = extractUserCost(result);
         const meta = extractUserMetadata(result);
-        if (meta) evalItem.metadata = meta;
+        if (trackedMetadata || meta) evalItem.metadata = mergeMetadata(trackedMetadata, meta);
         absorbTiming(trackedTiming, evalItem);
         if (evalItem.cost != null) {
           totalCost += evalItem.cost;

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Eval item annotations now preserve omitted runtime accounting fields and their
+  model/workflow roll-ups across direct, CLI, and registered evals. Metadata is
+  collected independently of trace capture and shallow-merged with valid user
+  metadata; explicit user keys still override tracked values. Cost behavior is unchanged.
+
 ## [0.23.1] - 2026-09-04
 
 ### Added

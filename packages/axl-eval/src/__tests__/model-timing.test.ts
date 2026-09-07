@@ -9,7 +9,7 @@ import { runEval } from '../runner.js';
 // Frozen behavioral matrix group E (R-T6 / AC-6): per-model provider-call
 // latency rolls up from `agent_call_end.timing` onto `item.timing` and
 // `summary.modelTiming`, on BOTH the plain and the captureTraces path, without
-// changing anything about cost, budget or metadata.
+// changing cost or budget behavior.
 
 /**
  * Provider whose per-call `timing` is scripted per model, so every asserted sum
@@ -238,7 +238,7 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
   });
 
   // E4 — the regression guard for the reversed plan §4.5 decision.
-  it('populates item.timing on the plain path without touching cost, unpriced or metadata', async () => {
+  it('populates timing and metadata on the plain path without touching cost or unpriced', async () => {
     const runtime = runtimeWith({
       [BARE_A]: { queuedMs: 10, attempts: 1, retryMs: 0, ttfbMs: 3, wireMs: 30 },
     });
@@ -249,8 +249,7 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
         async (_input, r) => {
           const ctx = r.createContext();
           await ctx.ask(agentA, 'one');
-          // A user-returned cost is authoritative on this path, and nothing
-          // else may be filled in behind it.
+          // A user-returned cost remains authoritative on this path.
           return { output: 'out', cost: 0.25 };
         },
         rt,
@@ -260,14 +259,13 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
     const item = result.items[0];
 
     expect(item.timing).toEqual({ [A]: { calls: 1, queuedMs: 10, retryMs: 0, wireMs: 30 } });
-    // Pre-feature shape, pinned: user cost only, no tracked-cost fallback, no
-    // runtime-derived metadata, no unpriced flag, no captured traces.
+    // Metadata tracking does not change cost fallback or trace capture.
     expect(item.cost).toBe(0.25);
     expect(result.totalCost).toBeCloseTo(0.25);
     expect('unpriced' in item).toBe(false);
-    expect('metadata' in item).toBe(false);
+    expect(item.metadata?.modelCallCounts).toEqual({ [A]: 1 });
     expect('traces' in item).toBe(false);
-    expect(result.metadata.models).toBeUndefined();
+    expect(result.metadata.models).toEqual([A]);
   });
 
   it('carries firstTokenMs and its own denominator onto item.timing', async () => {

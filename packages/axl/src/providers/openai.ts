@@ -13,6 +13,7 @@ import {
   type PricingTable,
   type ReasoningEmit,
 } from './openai-compatible.js';
+import { OPENAI_CHAT_AUDIO_FORMATS } from './audio-format.js';
 import type { ProviderResponse } from '../types.js';
 
 // ---------------------------------------------------------------------------
@@ -279,6 +280,13 @@ function isTextContentPart(value: unknown, type: 'text' | 'input_text'): boolean
  * Direct catalog pricing only covers text requests. Reject content shapes we
  * cannot fully classify rather than silently applying text rates to image,
  * audio, or future multimodal inputs supplied through providerOptions.
+ *
+ * This is why an `input_audio` part leaves the call UNPRICED rather than priced
+ * at text rates: any non-`text` content part makes the message unmodeled. A
+ * modality-aware estimator (`prompt_tokens_details.audio_tokens` × the audio
+ * rate) is deliberately not added until live evidence proves those fields
+ * populate — reporting a confidently wrong low number is worse than reporting
+ * nothing, and `$0` is never reported for an unknown cost.
  */
 function hasUnmodeledDirectOpenAIContent(request: Record<string, unknown>): boolean {
   if ('messages' in request) {
@@ -655,6 +663,14 @@ export const OPENAI_PROFILE: ProviderProfile = {
   envBaseUrl: 'OPENAI_BASE_URL',
   pricing: { kind: 'table', table: OPENAI_PRICING, match: 'exact' },
   reasoning: { emit: openaiReasoningEmit, capture: 'none' },
+  capabilities: {
+    // Chat Completions carries recorded audio via `input_audio` (wav/mp3 only).
+    // Images are deliberately NOT declared: the Responses API serves images, and
+    // Chat-Completions image pricing is unmodeled here (fork F4).
+    inputModalities: {
+      audio: { sources: ['bytes', 'base64'], formats: OPENAI_CHAT_AUDIO_FORMATS },
+    },
+  },
   roleFor: (role, model) => (role === 'system' && isOSeriesModel(model) ? 'developer' : role),
   maxTokensField: 'max_completion_tokens',
   parallelToolCalls: (model) => !isOSeriesModel(model),

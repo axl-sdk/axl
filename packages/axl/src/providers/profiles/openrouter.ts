@@ -1,4 +1,5 @@
 import { reasoningObjectEmit, type ProviderProfile } from '../openai-compatible.js';
+import { OPENROUTER_AUDIO_FORMATS } from '../audio-format.js';
 
 /**
  * OpenRouter — one key fronts 300+ models across vendors.
@@ -29,6 +30,14 @@ export const OPENROUTER_PROFILE: ProviderProfile = {
     ),
     capture: 'reasoning_details',
     roundTrip: 'on-tool-call-turns',
+  },
+  capabilities: {
+    // Images: `image_url` data URLs or remote URLs. Audio: `input_audio`, which
+    // OpenRouter documents as base64-only — bytes are encoded by the engine.
+    inputModalities: {
+      image: { sources: ['url', 'bytes', 'base64'] },
+      audio: { sources: ['bytes', 'base64'], formats: OPENROUTER_AUDIO_FORMATS },
+    },
   },
   // OpenRouter normalizes to max_tokens across its backends.
   maxTokensField: 'max_tokens',

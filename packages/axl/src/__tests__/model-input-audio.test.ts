@@ -17,7 +17,6 @@ import { OpenAIProvider } from '../providers/openai.js';
 import { OpenAICompatibleProvider } from '../providers/openai-compatible.js';
 import { OpenAIResponsesProvider } from '../providers/openai-responses.js';
 import { GROQ_PROFILE } from '../providers/profiles/groq.js';
-import { OPENROUTER_PROFILE } from '../providers/profiles/openrouter.js';
 import { ProviderRegistry } from '../providers/registry.js';
 import type {
   InputModalitySupport,
@@ -250,13 +249,11 @@ describe('audio fails closed without a declared provider capability (J6)', () =>
   const shippedAdapters: Array<[string, () => Provider, string]> = [
     ['anthropic', () => new AnthropicProvider({ apiKey: 'test-key' }), 'claude-test'],
     ['openai-responses', () => new OpenAIResponsesProvider({ apiKey: 'test-key' }), 'gpt-test'],
-    ['openai', () => new OpenAIProvider({ apiKey: 'test-key' }), 'gpt-test'],
-    [
-      'openrouter',
-      () => new OpenAICompatibleProvider({ profile: OPENROUTER_PROFILE, apiKey: 'test-key' }),
-      'vendor/model',
-    ],
     ['google', () => new GeminiProvider({ apiKey: 'test-key' }), 'gemini-test'],
+    // `openai:` and `openrouter:` declare audio as of Phase 2a; their positive
+    // and negative audio behavior lives in `compatible-engine-audio.test.ts`.
+    // `groq` stays here as the compatible-engine profile that declares NO audio
+    // — proof the gate is profile-driven, not engine-wide.
     [
       'groq',
       () => new OpenAICompatibleProvider({ profile: GROQ_PROFILE, apiKey: 'test-key' }),

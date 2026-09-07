@@ -1,30 +1,57 @@
 import { Hono } from 'hono';
-import type { ChatMessage, ModelInputDescriptor } from '@axlsdk/axl';
+import type {
+  ChatMessage,
+  InputMediaSource,
+  ModelInputDescriptor,
+  RecordedAudioSource,
+} from '@axlsdk/axl';
 import type { StudioEnv, SessionSummary } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import { redactSessionHistory, redactStreamEvent, redactValue } from '../redact.js';
+
+/** Structural, Studio-safe fields shared by every media source kind.
+ *
+ * URLs, provider-file references, and labels are intentionally NOT included —
+ * for audio exactly as for image: this is a Studio-safe descriptor, not a
+ * replay payload. */
+function mediaFields<S extends InputMediaSource | RecordedAudioSource>(
+  source: S,
+): { source: S['type']; mediaType?: string; bytes?: number } {
+  const bytes =
+    source.type === 'bytes'
+      ? source.data.byteLength
+      : source.type === 'base64'
+        ? Math.floor((source.data.length * 3) / 4) -
+          (source.data.endsWith('==') ? 2 : source.data.endsWith('=') ? 1 : 0)
+        : undefined;
+  return {
+    source: source.type,
+    ...(source.mediaType ? { mediaType: source.mediaType } : {}),
+    ...(bytes !== undefined ? { bytes } : {}),
+  };
+}
 
 function describeStudioInput(content: ChatMessage['content']): ModelInputDescriptor | undefined {
   if (typeof content === 'string') return undefined;
   return {
     parts: content.map((part) => {
-      if (part.type === 'text') return { type: 'text' as const, characters: part.text.length };
-      const { source } = part;
-      const bytes =
-        source.type === 'bytes'
-          ? source.data.byteLength
-          : source.type === 'base64'
-            ? Math.floor((source.data.length * 3) / 4) -
-              (source.data.endsWith('==') ? 2 : source.data.endsWith('=') ? 1 : 0)
-            : undefined;
-      return {
-        type: 'image' as const,
-        source: source.type,
-        ...(source.mediaType ? { mediaType: source.mediaType } : {}),
-        ...(bytes !== undefined ? { bytes } : {}),
-        // URLs, provider-file references, and labels are intentionally not
-        // included: this is a Studio-safe descriptor, not a replay payload.
-      };
+      // Exhaustive over the input part types. The `never` assignment in the
+      // default arm makes the next modality a compile error here rather than
+      // a silent mislabel — audio used to fall into the image branch.
+      switch (part.type) {
+        case 'text':
+          return { type: 'text' as const, characters: part.text.length };
+        case 'image':
+          return { type: 'image' as const, ...mediaFields(part.source) };
+        case 'audio':
+          return { type: 'audio' as const, ...mediaFields(part.source) };
+        default: {
+          const unreachable: never = part;
+          throw new Error(
+            `unsupported model input part: ${String((unreachable as { type: unknown }).type)}`,
+          );
+        }
+      }
     }),
   };
 }

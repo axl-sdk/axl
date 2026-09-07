@@ -5,7 +5,7 @@ export type { Tool, ToolConfig, ToolHooks, ToolModelOutput, RetryPolicy } from '
 export { agent } from './agent.js';
 export type { Agent, AgentConfig, HandoffDescriptor } from './agent.js';
 
-export { inputText, MAX_INLINE_MODEL_INPUT_BYTES } from './input.js';
+export { inputText, summarizeModelInput, MAX_INLINE_MODEL_INPUT_BYTES } from './input.js';
 export type {
   ModelInput,
   InputContentPart,

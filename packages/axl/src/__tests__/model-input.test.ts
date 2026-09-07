@@ -772,6 +772,21 @@ describe('ModelInput', () => {
     expect(provider.calls).toHaveLength(0);
   });
 
+  it('rejects an audio part before the image-era validator that declares no audio capability', async () => {
+    const provider = new InputProvider();
+    const error = await context(provider)
+      .ask(agent({ model: 'input:vision', system: 'inspect' }), [
+        { type: 'audio', source: { type: 'base64', data: 'AQID', mediaType: 'audio/wav' } },
+      ])
+      .catch((err: unknown) => err);
+    // `validateInput` is authoritative for images only; audio is opt-in via
+    // `inputCapabilities`, which this pre-audio double does not implement.
+    expect(error).toBeInstanceOf(UnsupportedModelInputError);
+    expect((error as UnsupportedModelInputError).modality).toBe('audio');
+    expect(provider.validations).toHaveLength(0);
+    expect(provider.calls).toHaveLength(0);
+  });
+
   it('rejects unsupported oversized rich history before summary or target calls', async () => {
     let calls = 0;
     const provider: Provider = {

@@ -93,4 +93,28 @@ describe('AxlTestRuntime rich image input', () => {
     );
     expect(provider.calls).toHaveLength(0);
   });
+
+  it('still reports the image modality for an image-only rejection (R-A3)', async () => {
+    const foreignFileWorkflow = workflow({
+      name: 'foreign-provider-file-workflow',
+      input: z.object({}).strict(),
+      handler: async (ctx) =>
+        ctx.ask(ImageAgent, [
+          {
+            type: 'image',
+            source: { type: 'provider-file', provider: 'not-mock', reference: 'file_1' },
+          },
+        ]),
+    });
+    const runtime = new AxlTestRuntime();
+    const provider = MockProvider.echo();
+    runtime.register(foreignFileWorkflow);
+    runtime.mockProvider('mock', provider);
+
+    const error = await runtime.execute(foreignFileWorkflow.name, {}).catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(UnsupportedModelInputError);
+    expect((error as UnsupportedModelInputError).modality).toBe('image');
+    expect((error as UnsupportedModelInputError).source).toBe('provider-file');
+    expect(provider.calls).toHaveLength(0);
+  });
 });

@@ -19,6 +19,7 @@ import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import { UnsupportedModelInputError } from '../errors.js';
+import { firstRichPart, type RichModality } from './rich-input.js';
 
 function hasRichGeminiMessages(messages: readonly ChatMessage[]): boolean {
   return messages.some((message) => Array.isArray(message.content));
@@ -43,6 +44,17 @@ function geminiInteractionContent(
     if (part.type === 'text') {
       content.push({ type: 'text', text: part.text });
       continue;
+    }
+    if (part.type === 'audio') {
+      // Unreachable through the runtime gate and `validateInput`; a builder-level
+      // guard keeps audio from silently rendering as an image block.
+      throw new UnsupportedModelInputError({
+        provider: 'google',
+        model,
+        modality: 'audio',
+        source: part.source.type,
+        feature: 'audio input',
+      });
     }
     const { source } = part;
     if (source.type === 'provider-file') {
@@ -625,15 +637,23 @@ export class GeminiProvider implements Provider {
   validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
     const modelOverride = request.providerOptions?.model;
     const effectiveModel = typeof modelOverride === 'string' ? modelOverride : request.model;
-    const fail = (source?: string, feature?: string): never => {
+    const failWith = (modality: RichModality, source?: string, feature?: string): never => {
       throw new UnsupportedModelInputError({
         provider: this.name,
         model: effectiveModel || request.model,
-        modality: 'image',
+        modality,
         ...(source ? { source } : {}),
         ...(feature ? { feature } : {}),
       });
     };
+    // The reported modality is derived from the offending part, never hardcoded.
+    const fail = (source?: string, feature?: string): never =>
+      failWith(firstRichPart(request.input, request.history)?.type ?? 'image', source, feature);
+    // This adapter maps no audio transport. The runtime gate already fails
+    // closed because `inputCapabilities` declares no `audio`; rejecting here
+    // too keeps the adapter authoritative on its own wire format.
+    const audioPart = firstRichPart(request.input, request.history, 'audio');
+    if (audioPart) failWith('audio', audioPart.source.type, 'audio input');
     if (
       request.providerOptions &&
       'model' in request.providerOptions &&

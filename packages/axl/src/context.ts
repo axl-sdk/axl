@@ -71,6 +71,7 @@ import {
 } from './schema-diagnostics.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
 import { ProviderError } from './providers/errors.js';
+import { firstRichPart } from './providers/rich-input.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import type { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
 import type { TranscriptionProviderRequest } from './providers/transcription-types.js';
@@ -644,17 +645,6 @@ function normalizeSessionHistory(messages: ChatMessage[]): ChatMessage[] {
 
 function hasRichMessage(messages: readonly ChatMessage[]): boolean {
   return messages.some((message) => typeof message.content !== 'string');
-}
-
-function firstImageSource(
-  input: ModelInput,
-  history: readonly ChatMessage[],
-): 'bytes' | 'base64' | 'url' | 'provider-file' | undefined {
-  const find = (value: ModelInput) =>
-    typeof value === 'string'
-      ? undefined
-      : value.find((part) => part.type === 'image')?.source.type;
-  return find(input) ?? history.map((message) => find(message.content)).find(Boolean);
 }
 
 function appendHandoffInstruction(
@@ -1779,20 +1769,39 @@ export class WorkflowContext<TInput = unknown> {
     // summarization, guardrail callback, diagnostics, or provider dispatch.
     const richRequest = typeof input !== 'string' || hasRichMessage(sessionHistory);
     if (richRequest) {
+      const richPart = firstRichPart(input, sessionHistory);
+      // A rich request always has a rich part; the fallback only satisfies the
+      // type and preserves the historical image-era default.
+      const modality = richPart?.type ?? 'image';
+      const source = richPart?.source.type;
       if (providerOptions && ('messages' in providerOptions || 'input' in providerOptions)) {
         throw new UnsupportedModelInputError({
           provider: provider.name ?? modelUri.split(':', 1)[0],
           model,
-          modality: 'image',
+          modality,
           feature: 'raw input-container providerOptions',
         });
       }
-      const source = firstImageSource(input, sessionHistory);
+      // Audio is opt-in per provider+model and is never inferred from provider
+      // family, image support, or transcription support. Unlike images,
+      // `validateInput` is not the authoritative audio gate: a provider that
+      // predates audio validates only images, so audio must fail closed here —
+      // before validation, handoff resolution, summarization, guardrails, or
+      // any provider request.
+      const audioPart = firstRichPart(input, sessionHistory, 'audio');
+      if (audioPart && !provider.inputCapabilities?.(model)?.audio) {
+        throw new UnsupportedModelInputError({
+          provider: provider.name ?? modelUri.split(':', 1)[0],
+          model,
+          modality: 'audio',
+          source: audioPart.source.type,
+        });
+      }
       if (!provider.validateInput) {
         throw new UnsupportedModelInputError({
           provider: provider.name ?? modelUri.split(':', 1)[0],
           model,
-          modality: 'image',
+          modality,
           ...(source ? { source } : {}),
         });
       }
@@ -1818,7 +1827,7 @@ export class WorkflowContext<TInput = unknown> {
         throw new UnsupportedModelInputError({
           provider: provider.name ?? modelUri.split(':', 1)[0],
           model,
-          modality: 'image',
+          modality,
           ...(source ? { source } : {}),
         });
       }

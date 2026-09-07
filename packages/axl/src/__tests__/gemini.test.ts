@@ -3738,11 +3738,14 @@ describe('GeminiProvider', () => {
         }),
       ).toEqual({ effectiveModel: 'future-gemini-model' });
       expect(() => provider.validateInput(request('  '))).toThrow('image input for this model');
+      // Interactions carries both modalities from the same three sources.
       expect(provider.inputCapabilities('gemini-3.8-flash')).toEqual({
         image: { sources: ['bytes', 'base64', 'provider-file'] },
+        audio: { sources: ['bytes', 'base64', 'provider-file'] },
       });
       expect(provider.inputCapabilities('future-gemini-model')).toEqual({
         image: { sources: ['bytes', 'base64', 'provider-file'] },
+        audio: { sources: ['bytes', 'base64', 'provider-file'] },
       });
       expect(provider.inputCapabilities('  ')).toEqual({});
     });

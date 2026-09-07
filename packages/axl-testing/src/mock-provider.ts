@@ -258,6 +258,21 @@ export class MockProvider implements Provider {
    * });
    * ```
    */
+  withEffortResolution(
+    resolution:
+      | EffortResolution
+      | undefined
+      | ((
+          options: Pick<
+            ChatOptions,
+            'model' | 'effort' | 'thinkingBudget' | 'includeThoughts' | 'providerOptions'
+          >,
+        ) => EffortResolution | undefined),
+  ): this {
+    this.effortResolution = typeof resolution === 'function' ? resolution : () => resolution;
+    return this;
+  }
+
   /** Rich input modalities this mock accepts. Both are on by default so an
    *  audio-bearing ask needs no configuration and offline audio tests keep
    *  parity with image tests. Narrow it with
@@ -279,21 +294,6 @@ export class MockProvider implements Provider {
    */
   withInputModalities(modalities: readonly MockInputModality[]): this {
     this.inputModalities = [...modalities];
-    return this;
-  }
-
-  withEffortResolution(
-    resolution:
-      | EffortResolution
-      | undefined
-      | ((
-          options: Pick<
-            ChatOptions,
-            'model' | 'effort' | 'thinkingBudget' | 'includeThoughts' | 'providerOptions'
-          >,
-        ) => EffortResolution | undefined),
-  ): this {
-    this.effortResolution = typeof resolution === 'function' ? resolution : () => resolution;
     return this;
   }
 

@@ -31,7 +31,9 @@ describe('AxlTestRuntime rich image input', () => {
     runtime.register(RichInputWorkflow);
     runtime.mockProvider('mock', provider);
 
-    await expect(runtime.execute(RichInputWorkflow.name, {})).resolves.toBe('before\nafter');
+    await expect(runtime.execute(RichInputWorkflow.name, {})).resolves.toBe(
+      'before\n[image image/png]\nafter',
+    );
 
     expect(provider.calls).toHaveLength(1);
     expect(provider.calls[0].messages.at(-1)?.content).toEqual([

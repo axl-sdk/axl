@@ -26,46 +26,37 @@ function cloneValue(value: unknown): unknown {
   return value;
 }
 
+function cloneMediaSource<S extends InputMediaSource>(source: S): S {
+  const media: InputMediaSource = source;
+  switch (media.type) {
+    case 'bytes':
+      return { type: 'bytes', data: media.data.slice(), mediaType: media.mediaType } as S;
+    case 'url':
+      return {
+        type: 'url',
+        url: media.url,
+        ...(media.mediaType ? { mediaType: media.mediaType } : {}),
+      } as S;
+    case 'base64':
+      return { type: 'base64', data: media.data, mediaType: media.mediaType } as S;
+    case 'provider-file':
+      return {
+        type: 'provider-file',
+        provider: media.provider,
+        reference: media.reference,
+        ...(media.mediaType ? { mediaType: media.mediaType } : {}),
+      } as S;
+  }
+}
+
 function cloneModelInput(input: ModelInput): ModelInput {
   if (typeof input === 'string') return input;
   return input.map((part): InputContentPart => {
     if (part.type === 'text') return { type: 'text', text: part.text };
-    const { source } = part;
-    switch (source.type) {
-      case 'bytes':
-        return {
-          type: 'image',
-          source: { type: 'bytes', data: source.data.slice(), mediaType: source.mediaType },
-          ...(part.label ? { label: part.label } : {}),
-        };
-      case 'url':
-        return {
-          type: 'image',
-          source: {
-            type: 'url',
-            url: source.url,
-            ...(source.mediaType ? { mediaType: source.mediaType } : {}),
-          },
-          ...(part.label ? { label: part.label } : {}),
-        };
-      case 'base64':
-        return {
-          type: 'image',
-          source: { type: 'base64', data: source.data, mediaType: source.mediaType },
-          ...(part.label ? { label: part.label } : {}),
-        };
-      case 'provider-file':
-        return {
-          type: 'image',
-          source: {
-            type: 'provider-file',
-            provider: source.provider,
-            reference: source.reference,
-            ...(source.mediaType ? { mediaType: source.mediaType } : {}),
-          },
-          ...(part.label ? { label: part.label } : {}),
-        };
-    }
+    const label = part.label ? { label: part.label } : {};
+    return part.type === 'audio'
+      ? { type: 'audio', source: cloneMediaSource(part.source), ...label }
+      : { type: 'image', source: cloneMediaSource(part.source), ...label };
   });
 }
 
@@ -160,6 +151,12 @@ async function abortableDelay(ms: number, signal: AbortSignal | undefined): Prom
 
 function richParts(input: ModelInput): readonly InputContentPart[] {
   return typeof input === 'string' ? [] : input;
+}
+
+type NonTextPart = Exclude<InputContentPart, { type: 'text' }>;
+
+function firstNonTextPart(input: ModelInput): NonTextPart | undefined {
+  return richParts(input).find((part): part is NonTextPart => part.type !== 'text');
 }
 
 function randomAlphanumeric(length: number): string {
@@ -296,11 +293,17 @@ export class MockProvider implements Provider {
       typeof request.providerOptions?.model === 'string'
         ? request.providerOptions.model
         : request.model;
+    // The reported modality follows the offending part, never a hardcoded 'image'.
+    const offending =
+      firstNonTextPart(request.input) ??
+      request.history
+        .map((message) => firstNonTextPart(message.content))
+        .find((part) => part !== undefined);
     const fail = (source?: string, feature?: string): never => {
       throw new UnsupportedModelInputError({
         provider: this.name,
         model: effectiveModel || request.model,
-        modality: 'image',
+        modality: offending?.type ?? 'image',
         ...(source ? { source } : {}),
         ...(feature ? { feature } : {}),
       });
@@ -314,7 +317,7 @@ export class MockProvider implements Provider {
       if (message.role !== 'user') fail(undefined, 'rich non-user history');
       for (const part of richParts(message.content)) {
         if (
-          part.type === 'image' &&
+          part.type !== 'text' &&
           part.source.type === 'provider-file' &&
           part.source.provider !== this.name
         ) {
@@ -324,7 +327,7 @@ export class MockProvider implements Provider {
     }
     for (const part of richParts(request.input)) {
       if (
-        part.type === 'image' &&
+        part.type !== 'text' &&
         part.source.type === 'provider-file' &&
         part.source.provider !== this.name
       ) {

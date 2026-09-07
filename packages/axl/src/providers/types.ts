@@ -1,5 +1,6 @@
 import type { CallTiming, ChatMessage, ProviderResponse, ToolCallMessage } from '../types.js';
 import type { InputMediaSource, ModelInput } from '../input.js';
+import type { RecordedAudioSource } from '../transcription.js';
 
 // Re-export for convenience. `CallTiming` is defined in `../types.js` beside
 // `ProviderResponse` (which also carries it) — defining it here would make
@@ -8,6 +9,9 @@ export type { CallTiming, ChatMessage, ProviderResponse, ToolCallMessage };
 
 export type InputModalitySupport = {
   image?: { sources: readonly InputMediaSource['type'][] };
+  /** Declaring `audio` is the sole way a provider opts in to general recorded
+   * audio input; the runtime fails closed before validation without it. */
+  audio?: { sources: readonly RecordedAudioSource['type'][] };
 };
 
 export type ProviderInputValidationRequest = {

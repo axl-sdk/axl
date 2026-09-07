@@ -1677,6 +1677,127 @@ describe('runEval: captureTraces', () => {
     return { runtime, wf };
   }
 
+  it.each([false, true])(
+    'preserves accounting with annotations and nested tracking (captureTraces=%s)',
+    async (captureTraces) => {
+      const { runtime } = await buildTracingRuntime();
+      for (const metadata of [undefined, {}, { category: 'billing' }]) {
+        const result = await runEval(
+          { workflow: 'configured', dataset: testDataset, scorers: [], concurrency: 3 },
+          async (input, rt) => {
+            // Mirrors CLI/registered custom executor wrappers, including their
+            // metadata fallback and nested tracking scope.
+            const tracked = await rt.trackExecution(() => rt.execute('ask', input));
+            return {
+              output: tracked.result,
+              cost: tracked.cost,
+              metadata: metadata ?? tracked.metadata,
+            };
+          },
+          runtime,
+          { captureTraces },
+        );
+        expect(result.summary.failures).toBe(0);
+        for (const item of result.items) {
+          expect(item.metadata).toMatchObject({
+            models: ['mock:test'],
+            modelCallCounts: { 'mock:test': 1 },
+            tokens: { input: 1, output: 1, reasoning: 0 },
+            agentCalls: 1,
+            workflows: ['ask'],
+            workflowCallCounts: { ask: 1 },
+            ...metadata,
+          });
+        }
+        expect(result.metadata.modelCounts).toEqual({ 'mock:test': 3 });
+        expect(result.metadata.workflowCounts).toEqual({ ask: 3 });
+        expect(result.totalCost).toBeCloseTo(0.006);
+      }
+    },
+  );
+
+  it.each([false, true])(
+    'keeps explicit metadata overrides shallow (captureTraces=%s)',
+    async (captureTraces) => {
+      const { runtime } = await buildTracingRuntime();
+      const metadata = Object.freeze({ agentCalls: 9, tokens: Object.freeze({ input: 99 }) });
+      const result = await runEval(
+        { workflow: 'ask', dataset: testDataset, scorers: [] },
+        async (input, rt) => ({ output: await rt.execute('ask', input), metadata }),
+        runtime,
+        { captureTraces },
+      );
+      for (const item of result.items) {
+        expect(item.metadata?.agentCalls).toBe(9);
+        expect(item.metadata?.tokens).toEqual({ input: 99 });
+        expect(item.metadata?.modelCallCounts).toEqual({ 'mock:test': 1 });
+        expect(item.metadata).not.toBe(metadata);
+      }
+    },
+  );
+
+  it.each([false, true])(
+    'ignores invalid annotations without losing accounting (captureTraces=%s)',
+    async (captureTraces) => {
+      const { runtime } = await buildTracingRuntime();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        for (const metadata of [null, [], 'invalid', new Date()]) {
+          const result = await runEval(
+            { workflow: 'ask', dataset: testDataset, scorers: [] },
+            async (input, rt) => ({
+              output: await rt.execute('ask', input),
+              metadata: metadata as any,
+            }),
+            runtime,
+            { captureTraces },
+          );
+          expect(result.summary.failures).toBe(0);
+          expect(result.metadata.modelCounts).toEqual({ 'mock:test': 3 });
+          expect(result.items[0].metadata?.agentCalls).toBe(1);
+        }
+        expect(warn).toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    'honors list overrides in run roll-ups (captureTraces=%s)',
+    async (captureTraces) => {
+      const { runtime } = await buildTracingRuntime();
+      for (const explicitCounts of [false, true]) {
+        const result = await runEval(
+          { workflow: 'ask', dataset: testDataset, scorers: [] },
+          async (input, rt) => ({
+            output: await rt.execute('ask', input),
+            metadata: {
+              models: ['external:model'],
+              workflows: ['external-workflow'],
+              ...(explicitCounts
+                ? {
+                    modelCallCounts: { 'external:model': 2 },
+                    workflowCallCounts: { 'external-workflow': 2 },
+                  }
+                : {}),
+            },
+          }),
+          runtime,
+          { captureTraces },
+        );
+        expect(result.summary.failures).toBe(0);
+        expect(result.metadata.models).toEqual(['external:model']);
+        expect(result.metadata.workflows).toEqual(['external-workflow']);
+        expect(result.metadata.modelCounts).toEqual({ 'external:model': explicitCounts ? 6 : 3 });
+        expect(result.metadata.workflowCounts).toEqual({
+          'external-workflow': explicitCounts ? 6 : 3,
+        });
+        expect(result.items[0].metadata?.tokens).toEqual({ input: 1, output: 1, reasoning: 0 });
+      }
+    },
+  );
+
   it('captures per-item trace events when captureTraces is true', async () => {
     const { runtime } = await buildTracingRuntime();
     const result = await runEval(

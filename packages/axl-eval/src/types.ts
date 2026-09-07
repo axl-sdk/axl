@@ -203,7 +203,7 @@ export type EvalItem = {
   unpriced?: boolean;
   scorerCost?: number;
   scoreDetails?: Record<string, ScorerDetail>;
-  /** Execution metadata forwarded from the runtime (models, tokens, agentCalls, etc). */
+  /** Tracked metadata merged with user keys (user wins; list-only overrides clear paired counts). */
   metadata?: Record<string, unknown>;
   /** Per-model provider-call latency for this item, rolled up from
    *  `agent_call_end.timing`. Absent when the item made no timed provider call

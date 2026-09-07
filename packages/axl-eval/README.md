@@ -383,6 +383,13 @@ const results = await runEval(
 
 **Trust-boundary validation on workflow returns.** When your `executeWorkflow` callback returns `{ output, cost, metadata }`, the runner validates the untrusted fields before trusting them: `cost` must be a non-negative finite number, `metadata` must be a plain object (`Date`, `Map`, `Set`, class instances are rejected). Invalid values trigger a `console.warn` and fall back to trace-derived values from `runtime.trackExecution()`. A buggy workflow returning `{ cost: 'free' }` no longer silently NaN-poisons `totalCost`.
 
+**Additive item metadata.** Returning `{ output, metadata: { category: 'billing' } }`
+preserves tracked models, tokens, agent calls, and workflow attribution, with or without
+trace capture. User keys override tracked defaults; nested objects are replaced wholesale.
+An explicit `models` or `workflows` list without corresponding call counts removes the
+inherited count map so run totals use the list fallback. Supply both list and counts for
+exact custom accounting. See the [metadata contract](../../docs/api-reference.md#evalitem).
+
 ### Studio
 
 Eval files can be lazy-loaded by the Studio middleware for the Eval Runner panel:

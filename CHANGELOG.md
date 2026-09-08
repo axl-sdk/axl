@@ -52,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ModelInputDescriptor` gains an `audio` part variant; its `locator` can only
   come from a provider-file reference.
 - `axl.input.audio` span attribute on the `axl.model_input` event.
-- Live certification rows `GA1`–`GA9` (plus `GA2-text`) in
+- Live certification rows `GA1`–`GA12` (plus `GA2-text`) in
   `packages/axl/src/__tests__/integration-general-audio.test.ts`, double-gated
   behind `AXL_MULTIMODAL_LIVE=1` + `AXL_GENERAL_AUDIO_LIVE=1` (`GA2` additionally
   behind `AXL_GENERAL_AUDIO_OPENAI_TOOL_LIVE=1`).

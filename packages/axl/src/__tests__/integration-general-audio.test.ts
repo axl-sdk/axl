@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { agent } from '../agent.js';
@@ -1232,3 +1235,254 @@ describe('general audio local: gating', () => {
     expect(new Set(TONE_SENTINEL).size).toBeGreaterThan(8);
   });
 });
+
+// ---------------------------------------------------------------------------
+// GA10 — OpenRouter audio + structured output. Until this row passes, the
+// capability table says the composition is uncertified on openrouter:.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!RUN || !process.env.OPENROUTER_API_KEY)(
+  `general audio live [GA10]: OpenRouter structured audio ${OPENROUTER_AUDIO_MODEL}`,
+  () => {
+    it('[GA10] returns a schema-valid object from speech audio', async () => {
+      await observeWire(async (calls) => {
+        const { context, events } = liveContext();
+        const listener = agent({
+          model: `openrouter:${OPENROUTER_AUDIO_MODEL}`,
+          system: 'Return only the requested JSON object.',
+        });
+        const result = await context.ask(listener, callInput('Summarise this recording.'), {
+          maxTokens: 200,
+          schema: CALL_SUMMARY_SCHEMA,
+          retries: 0,
+        });
+
+        expect(CALL_SUMMARY_SCHEMA.safeParse(result).success).toBe(true);
+        const model = modelCalls(calls);
+        expect(model).toHaveLength(1);
+        expect(compatibleUserContent(model[0])[0]).toEqual({
+          type: 'input_audio',
+          input_audio: { data: RECORDED_CALL_BASE64, format: 'mp3' },
+        });
+        assertSentinelAbsentFromEvents(events, RECORDED_CALL_SENTINEL);
+        const terminal = assertHonestTerminal(events);
+        evidence('GA10', {
+          model: `openrouter:${OPENROUTER_AUDIO_MODEL}`,
+          cost: terminal.cost,
+          unpriced: terminal.unpriced,
+          reportedUsageCost: reportedCost(model[0]) ?? 'absent',
+          tokens: rawUsage(model[0]),
+          answer: result,
+        });
+      });
+    });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// GA11 — google: audio as a caller-owned Gemini Files reference. The row
+// uploads the tone WAV itself (Axl never uploads), asks with a provider-file
+// source, and deletes the file afterwards. The model request must carry the
+// URI and never the bytes.
+// ---------------------------------------------------------------------------
+
+const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com';
+
+type GeminiUploadedFile = { name: string; uri: string; state?: string };
+
+async function uploadGeminiFile(bytes: Uint8Array, mimeType: string, key: string) {
+  const start = await fetch(`${GEMINI_API_BASE}/upload/v1beta/files`, {
+    method: 'POST',
+    headers: {
+      'x-goog-api-key': key,
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': String(bytes.byteLength),
+      'X-Goog-Upload-Header-Content-Type': mimeType,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ file: { display_name: 'axl-ga11' } }),
+  });
+  if (!start.ok) throw new Error(`upload start ${start.status}: ${await start.text()}`);
+  const uploadUrl = start.headers.get('x-goog-upload-url');
+  if (!uploadUrl) throw new Error('upload start returned no upload URL');
+  const finalize = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'X-Goog-Upload-Command': 'upload, finalize',
+      'X-Goog-Upload-Offset': '0',
+      'Content-Length': String(bytes.byteLength),
+    },
+    body: bytes,
+  });
+  if (!finalize.ok) throw new Error(`upload finalize ${finalize.status}: ${await finalize.text()}`);
+  let file = ((await finalize.json()) as { file: GeminiUploadedFile }).file;
+  for (let attempt = 0; attempt < 20 && file.state === 'PROCESSING'; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const poll = await fetch(`${GEMINI_API_BASE}/v1beta/${file.name}`, {
+      headers: { 'x-goog-api-key': key },
+    });
+    file = (await poll.json()) as GeminiUploadedFile;
+  }
+  if (file.state !== 'ACTIVE') throw new Error(`uploaded file state ${file.state}`);
+  return file;
+}
+
+async function deleteGeminiFile(name: string, key: string): Promise<void> {
+  await fetch(`${GEMINI_API_BASE}/v1beta/${name}`, {
+    method: 'DELETE',
+    headers: { 'x-goog-api-key': key },
+  }).catch(() => undefined);
+}
+
+describe.skipIf(!RUN || !GOOGLE_KEY)(
+  `general audio live [GA11]: Gemini Files reference ${GEMINI_AUDIO_MODEL}`,
+  () => {
+    it('[GA11] sends a caller-owned Gemini Files audio URI, never the bytes', async () => {
+      const file = await uploadGeminiFile(TONE_WAV_BYTES, 'audio/wav', GOOGLE_KEY!);
+      try {
+        await observeWire(async (calls) => {
+          const { context, events } = liveContext();
+          const listener = agent({
+            model: `google:${GEMINI_AUDIO_MODEL}`,
+            system: 'Answer in one short sentence.',
+          });
+          const input: readonly InputContentPart[] = [
+            {
+              type: 'audio',
+              source: {
+                type: 'provider-file',
+                provider: 'google',
+                reference: file.uri,
+                mediaType: 'audio/wav',
+              },
+            },
+            { type: 'text', text: TONE_QUESTION },
+          ];
+          const result = await context.ask(listener, input, {
+            maxTokens: 400,
+            effort: GEMINI_EFFORT,
+          });
+
+          expect(result.trim().length).toBeGreaterThan(0);
+          const model = modelCalls(calls);
+          expect(model).toHaveLength(1);
+          expect(geminiUserContent(model[0])[0]).toEqual({
+            type: 'audio',
+            uri: file.uri,
+            mime_type: 'audio/wav',
+          });
+          // The bytes went to the Files API in application code, not to the model.
+          expect(model[0].rawRequest).not.toContain(TONE_SENTINEL);
+          assertSentinelAbsentFromEvents(events, TONE_SENTINEL);
+          const terminal = assertHonestTerminal(events);
+          evidence('GA11', {
+            model: `google:${GEMINI_AUDIO_MODEL}`,
+            cost: terminal.cost,
+            unpriced: terminal.unpriced,
+            tokens: rawUsage(model[0]),
+            answer: result,
+          });
+        });
+      } finally {
+        await deleteGeminiFile(file.name, GOOGLE_KEY!);
+      }
+    });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// GA12 — every OpenRouter format token beyond wav/mp3 on the wire. Fixtures
+// are transcoded from the generated tone WAV with ffmpeg at test time (no new
+// binary assets); the block is skipped when ffmpeg is not installed.
+// ---------------------------------------------------------------------------
+
+const FFMPEG_AVAILABLE = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' }).status === 0;
+
+type FormatFixture = {
+  mediaType: string;
+  format: string;
+  /** ffmpeg output args, or `null` for a container-less slice of the WAV. */
+  ffmpeg: readonly string[] | null;
+};
+
+const OPENROUTER_FORMAT_FIXTURES: readonly FormatFixture[] = [
+  { mediaType: 'audio/aiff', format: 'aiff', ffmpeg: ['-f', 'aiff'] },
+  { mediaType: 'audio/aac', format: 'aac', ffmpeg: ['-c:a', 'aac', '-f', 'adts'] },
+  // ffmpeg's built-in Vorbis encoder is stereo-only; upmix the mono tone.
+  {
+    mediaType: 'audio/ogg',
+    format: 'ogg',
+    ffmpeg: ['-ac', '2', '-c:a', 'vorbis', '-strict', '-2', '-f', 'ogg'],
+  },
+  { mediaType: 'audio/flac', format: 'flac', ffmpeg: ['-f', 'flac'] },
+  { mediaType: 'audio/mp4', format: 'm4a', ffmpeg: ['-c:a', 'aac', '-f', 'ipod'] },
+  // audio/l16 is headerless 16-bit PCM: the WAV data chunk as-is.
+  { mediaType: 'audio/l16', format: 'pcm16', ffmpeg: null },
+];
+
+function transcodeTone(fixture: FormatFixture): Uint8Array {
+  if (!fixture.ffmpeg) return TONE_WAV_BYTES.slice(44);
+  const dir = mkdtempSync(join(tmpdir(), 'axl-ga12-'));
+  const source = join(dir, 'tone.wav');
+  const target = join(dir, `tone.${fixture.format}`);
+  writeFileSync(source, TONE_WAV_BYTES);
+  const run = spawnSync('ffmpeg', [
+    '-y',
+    '-loglevel',
+    'error',
+    '-i',
+    source,
+    ...fixture.ffmpeg,
+    target,
+  ]);
+  if (run.status !== 0) throw new Error(`ffmpeg failed for ${fixture.format}: ${run.stderr}`);
+  return new Uint8Array(readFileSync(target));
+}
+
+describe.skipIf(!RUN || !process.env.OPENROUTER_API_KEY || !FFMPEG_AVAILABLE)(
+  `general audio live [GA12]: OpenRouter format tokens ${OPENROUTER_AUDIO_MODEL}`,
+  () => {
+    it.each(OPENROUTER_FORMAT_FIXTURES.map((fixture) => [fixture.format, fixture] as const))(
+      '[GA12-%s] sends the media type as that format token and gets a text answer',
+      async (_format, fixture) => {
+        const bytes = transcodeTone(fixture);
+        const encoded = Buffer.from(bytes).toString('base64');
+        await observeWire(async (calls) => {
+          const { context, events } = liveContext();
+          const listener = agent({
+            model: `openrouter:${OPENROUTER_AUDIO_MODEL}`,
+            system: 'Answer in one short sentence.',
+          });
+          const result = await context.ask(
+            listener,
+            [
+              {
+                type: 'audio',
+                source: { type: 'bytes', data: bytes, mediaType: fixture.mediaType },
+              },
+              { type: 'text', text: TONE_QUESTION },
+            ],
+            { maxTokens: 100 },
+          );
+
+          expect(result.trim().length).toBeGreaterThan(0);
+          const model = modelCalls(calls);
+          expect(model).toHaveLength(1);
+          expect(compatibleUserContent(model[0])[0]).toEqual({
+            type: 'input_audio',
+            input_audio: { data: encoded, format: fixture.format },
+          });
+          const terminal = assertHonestTerminal(events);
+          evidence(`GA12-${fixture.format}`, {
+            model: `openrouter:${OPENROUTER_AUDIO_MODEL}`,
+            bytes: bytes.byteLength,
+            cost: terminal.cost,
+            unpriced: terminal.unpriced,
+            answer: result,
+          });
+        });
+      },
+    );
+  },
+);

@@ -544,7 +544,7 @@ attempt can still be processed and billed upstream. It certifies Axl transport,
 not a model allowlist or the whole OpenRouter catalog. See the dated
 [OpenRouter catalog evidence](./verification/openrouter-catalog-multimodal-2026-09-02.md).
 
-### General recorded-audio input rows (GA1–GA9)
+### General recorded-audio input rows (GA1–GA12)
 
 Direct audio parts in `ModelInput` have their own suite and their own arming
 flag. Rows are **double-gated**: a provider key alone never spends, and
@@ -581,6 +581,14 @@ AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vi
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA8\]'
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA8-OR\]'
 
+# openrouter: audio + structured output; google: audio as a caller-owned Gemini
+# Files URI (the row uploads and deletes the file itself); every OpenRouter
+# format token beyond wav/mp3 (fixtures transcoded from the tone WAV with
+# ffmpeg at test time — the block skips without ffmpeg; six requests).
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA10\]'
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA11\]'
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA12-'
+
 # GA5 (fail-closed providers) and GA7 (unmappable media type) are local: no key,
 # zero fetches, always run.
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA5\]|\[GA7\]'
@@ -588,9 +596,9 @@ AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vi
 
 | Row | Provider URI | Key |
 | --- | --- | --- |
-| GA1, GA3, GA4, GA8, GA9 | `google:` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
+| GA1, GA3, GA4, GA8, GA9, GA11 | `google:` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
 | GA2, GA2-text, GA4-openai | `openai:` | `OPENAI_API_KEY` (GA2 also `AXL_GENERAL_AUDIO_OPENAI_TOOL_LIVE=1`) |
-| GA1-OR, GA6, GA6-tool, GA8-OR | `openrouter:` | `OPENROUTER_API_KEY` |
+| GA1-OR, GA6, GA6-tool, GA8-OR, GA10, GA12-* | `openrouter:` | `OPENROUTER_API_KEY` (GA12 also needs `ffmpeg` on PATH) |
 | GA5, GA7 | local | none |
 
 Models are env-overridable representative defaults, never allowlists:

@@ -189,6 +189,43 @@ The request body is the same shape OpenRouter accepted in GA6-tool; the
 failure is on the provider side, so the row stays armed separately and no
 `openai:` tool composition is advertised.
 
+### GA10 — structured output from speech audio (`openrouter:`)
+
+Same schema as GA4. One request carrying `input_audio` plus the schema; the
+reply parsed and validated. Cost `0.0002931` (`usage.cost`), `audio_tokens: 200`.
+
+Answer: `{ "summary": "This is a recording of a person speaking two sentences.",
+"speakerCount": 1 }`
+
+### GA11 — audio as a caller-owned Gemini Files reference (`google:`)
+
+The row uploaded the tone WAV through the Files API in application code,
+asked with a `provider-file` source (`provider: 'google'`, the returned
+`file.uri`, `mediaType: 'audio/wav'`), and deleted the file afterwards. The
+Interactions request carried `{ type: 'audio', uri, mime_type: 'audio/wav' }`
+and **no bytes**: the tone sentinel was absent from the model request and from
+every event. Usage `input_tokens_by_modality: [{ text: 20 }, { audio: 75 }]`,
+`unpriced: true`.
+
+Answer: *"This is a steady electronic beep with a constant pitch that does not
+change."* (The model processed the file as audio; it did not report the rise.
+Acoustic accuracy is not an Axl property.)
+
+### GA12 — every OpenRouter format token beyond `wav`/`mp3`
+
+Fixtures were transcoded from the tone WAV with ffmpeg at test time; `pcm16`
+is the WAV data chunk with no header. Each row is one request; the wire
+`format` token was asserted per row and every row got a text answer.
+
+| media type | token | bytes | cost |
+| --- | --- | --- | --- |
+| `audio/aiff` | `aiff` | 96054 | 0.0001104 |
+| `audio/aac` | `aac` | 11015 | 0.0001479 |
+| `audio/ogg` | `ogg` | 6780 | 0.0001154 |
+| `audio/flac` | `flac` | 19852 | 0.0001329 |
+| `audio/mp4` | `m4a` | 11677 | 0.0001554 |
+| `audio/l16` | `pcm16` | 96000 | 0.000065 |
+
 ## Rows not run
 
 None. Every row in the suite ran on 2026-09-08.
@@ -197,8 +234,8 @@ None. Every row in the suite ran on 2026-09-08.
 
 | Adapter | Advertised (passing row) | Not advertised |
 | --- | --- | --- |
-| `google:` | text answer from speech and non-speech (GA1), tool continuation (GA3), structured output (GA4), streaming (GA8), history re-send (GA9) | — |
-| `openrouter:` | text answer (GA1-OR, GA6), tool continuation (GA6-tool), streaming (GA8-OR) | structured output (no row) |
+| `google:` | text answer from speech and non-speech (GA1), tool continuation (GA3), structured output (GA4), streaming (GA8), history re-send (GA9), Gemini Files `provider-file` source (GA11) | — |
+| `openrouter:` | text answer (GA1-OR, GA6), tool continuation (GA6-tool), streaming (GA8-OR), structured output (GA10), all eight format tokens on the wire (GA12) | — |
 | `openai:` | single-turn text answer with audio (GA2-text) | tool continuation (provider 500), structured output (provider 400) |
 
 `providerMetadata` leak evidence remains indirect: passing rows assert that no

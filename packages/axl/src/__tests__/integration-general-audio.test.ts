@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { agent } from '../agent.js';
 import { WorkflowContext } from '../context.js';
 import { UnsupportedModelInputError } from '../errors.js';
+import { ProviderError } from '../providers/errors.js';
 import type { InputContentPart } from '../input.js';
 import { AnthropicProvider } from '../providers/anthropic.js';
 import { OpenAIProvider } from '../providers/openai.js';
@@ -20,7 +21,7 @@ import type {
   StreamChunk,
 } from '../providers/types.js';
 import { tool } from '../tool.js';
-import type { AxlEvent } from '../types.js';
+import type { AxlEvent, ChatMessage } from '../types.js';
 
 // ---------------------------------------------------------------------------
 // General audio input (Phase 4 / plan §7) live certification, rows GA1–GA8.
@@ -190,8 +191,15 @@ const lookupAccount = tool({
   handler: ({ name }) => `Account for ${name}: status active, plan pro, no open tickets.`,
 });
 
+// The speech fixture reads neutral sample sentences and names nobody, so the
+// instruction supplies a fallback name: the row certifies the continuation
+// transport, not the model's willingness to invent a caller.
+// Gemini 3.x clamps 'none' to its minimum; 2.x models reject the mapped
+// 'minimal' level, so the effort is overridable for cross-family probes.
+const GEMINI_EFFORT = (process.env.GEMINI_AUDIO_EFFORT ?? 'none') as 'none' | 'low';
+
 const TOOL_SYSTEM =
-  'Call lookup_account once with a name you hear in the recording, then answer in one short sentence.';
+  'You must call lookup_account exactly once before answering. Use a name spoken in the recording; if no name is spoken, use the name "caller". Then answer in one short sentence.';
 
 // ── Wire capture ────────────────────────────────────────────────────────
 
@@ -245,16 +253,32 @@ async function observeWire<T>(fn: (calls: readonly CapturedCall[]) => Promise<T>
   };
   try {
     return await fn(calls);
+  } catch (error) {
+    // Redacted wire dump so a failing paid row is diagnosable from its log
+    // alone; `brief` strips fixture bytes and long base64 runs first.
+    for (const [index, call] of calls.entries()) {
+      console.info(
+        `[wire ${index}] ${call.method} ${call.path}\n  request=${brief(call.requestBody, 1200)}\n  response=${brief(call.responseBody, 600)}`,
+      );
+    }
+    throw error;
   } finally {
     globalThis.fetch = original;
   }
 }
 
 const MODEL_PATHS = ['/chat/completions', '/v1beta/interactions'];
+// String-only Gemini asks (the streaming rows' text control) stay on
+// `generateContent`; rich asks use Interactions.
+const GEMINI_GENERATE_CONTENT = /:(stream)?generateContent$/i;
 
 /** The model requests among the captured calls — the budgeted unit per row. */
 function modelCalls(calls: readonly CapturedCall[]): readonly CapturedCall[] {
-  return calls.filter((call) => MODEL_PATHS.some((path) => call.path.endsWith(path)));
+  return calls.filter(
+    (call) =>
+      MODEL_PATHS.some((path) => call.path.endsWith(path)) ||
+      GEMINI_GENERATE_CONTENT.test(call.path),
+  );
 }
 
 /** A fetch replacement that fails the test on any request at all. */
@@ -372,9 +396,12 @@ function assertNoNewEventTypes(
   audioEvents: readonly AxlEvent[],
   controlEvents: readonly AxlEvent[],
 ): void {
+  const control = new Set(controlEvents.map((event) => event.type));
+  console.info(
+    `[events] audio=${[...new Set(audioEvents.map((event) => event.type))].join(',')} control=${[...control].join(',')}`,
+  );
   expect(audioEvents.some((event) => event.type === 'token')).toBe(true);
   expect(controlEvents.some((event) => event.type === 'token')).toBe(true);
-  const control = new Set(controlEvents.map((event) => event.type));
   const unexpected = [...new Set(audioEvents.map((event) => event.type))].filter(
     (type) => !control.has(type),
   );
@@ -419,13 +446,17 @@ function evidence(id: string, fields: Record<string, unknown>): void {
 
 // ── Context ─────────────────────────────────────────────────────────────
 
-function liveContext(registry: ProviderRegistry = new ProviderRegistry()) {
+function liveContext(
+  registry: ProviderRegistry = new ProviderRegistry(),
+  sessionHistory?: ChatMessage[],
+) {
   const events: AxlEvent[] = [];
   const context = new WorkflowContext({
     input: 'general-audio',
     executionId: `general-audio-${randomUUID()}`,
     config: {},
     providerRegistry: registry,
+    ...(sessionHistory ? { sessionHistory } : {}),
     transcriptionProviderRegistry: new TranscriptionProviderRegistry(),
     onTrace: (event) => events.push(event),
   });
@@ -528,7 +559,17 @@ describe.skipIf(!RUN || !process.env.OPENROUTER_API_KEY)(
 // placeholder substitution, or a dropped part all fail here.
 // ---------------------------------------------------------------------------
 
-describe.skipIf(!RUN || !process.env.OPENAI_API_KEY)(
+// 2026-09-08: gpt-audio-1.5 accepted the first turn (tool call returned, usage
+// reported `prompt_tokens_details.audio_tokens`) but answered every
+// continuation with HTTP 500 `model_error` "The model produced invalid
+// content" — five attempts, including `parallel_tool_calls:false` and
+// `modalities:['text']` variants. The wire shape matches the Chat Completions
+// tool-continuation contract, so this is recorded as a provider-side failure:
+// the row stays a certification gate, separately armed so the routine lane is
+// not red on a composition Axl does not advertise.
+const OPENAI_AUDIO_TOOL_RUN = RUN && process.env.AXL_GENERAL_AUDIO_OPENAI_TOOL_LIVE === '1';
+
+describe.skipIf(!OPENAI_AUDIO_TOOL_RUN || !process.env.OPENAI_API_KEY)(
   `general audio live [GA2]: OpenAI Chat Completions ${OPENAI_AUDIO_MODEL}`,
   () => {
     it('[GA2] keeps the speech input_audio identical across a tool continuation', async () => {
@@ -585,6 +626,48 @@ describe.skipIf(!RUN || !process.env.OPENAI_API_KEY)(
 );
 
 describe.skipIf(!RUN || !GOOGLE_KEY)(
+  `general audio live [GA9]: Gemini Interactions ${GEMINI_AUDIO_MODEL}`,
+  () => {
+    it('[GA9] re-sends an audio user turn as application history on a later ask', async () => {
+      await observeWire(async (calls) => {
+        const { context } = liveContext();
+        const listener = agent({
+          model: `google:${GEMINI_AUDIO_MODEL}`,
+          system: 'Answer in one short sentence.',
+        });
+        const first = await context.ask(listener, callInput('What is this recording?'), {
+          maxTokens: 400,
+          effort: GEMINI_EFFORT,
+        });
+        const history = [
+          { role: 'user' as const, content: callInput('What is this recording?') },
+          { role: 'assistant' as const, content: first },
+        ];
+        // Session history is a context-construction input, not an ask
+        // option: a later turn in the same application session carries the
+        // earlier audio user turn in the context it is asked through.
+        const { context: later } = liveContext(undefined, history);
+        const second = await later.ask(listener, 'How many speakers were there?', {
+          maxTokens: 400,
+          effort: GEMINI_EFFORT,
+        });
+        const model = modelCalls(calls);
+        expect(model).toHaveLength(2);
+        // The history-borne audio part is re-sent verbatim, at index 0 of the
+        // first user_input step, and the provider accepts it.
+        expect(geminiUserContent(model[1])[0]).toEqual({
+          type: 'audio',
+          data: RECORDED_CALL_BASE64,
+          mime_type: 'audio/mpeg',
+        });
+        expect(second.trim().length).toBeGreaterThan(0);
+        evidence('GA9', { model: `google:${GEMINI_AUDIO_MODEL}`, first, second });
+      });
+    });
+  },
+);
+
+describe.skipIf(!RUN || !GOOGLE_KEY)(
   `general audio live [GA3]: Gemini Interactions ${GEMINI_AUDIO_MODEL}`,
   () => {
     it('[GA3] keeps the speech audio part identical across a stateless tool continuation', async () => {
@@ -599,7 +682,9 @@ describe.skipIf(!RUN || !GOOGLE_KEY)(
         const result = await context.ask(
           listener,
           callInput('Look up the account for the caller, then summarise the call.'),
-          { maxTokens: 200, effort: 'none' },
+          // Gemini 3.x cannot disable thinking and its thought tokens count
+          // against max_output_tokens; 200 ended the interaction `incomplete`.
+          { maxTokens: 800, effort: GEMINI_EFFORT },
         );
 
         expect(result.trim().length).toBeGreaterThan(0);
@@ -695,20 +780,34 @@ describe.skipIf(!RUN || !process.env.OPENAI_API_KEY)(
   () => {
     // Optional second lane. Only a passing row lets `openai:` audio+structured
     // enter the advertised capability table (plan §3).
-    it('[GA4-openai] returns a schema-valid object from speech audio', async () => {
+    it('[GA4-openai] surfaces the provider rejection of structured output with speech audio', async () => {
       await observeWire(async (calls) => {
         const { context, events } = liveContext();
         const listener = agent({
           model: `openai:${OPENAI_AUDIO_MODEL}`,
           system: 'Return only the requested JSON object.',
         });
-        const result = await context.ask(listener, callInput('Summarise this recording.'), {
-          maxTokens: 200,
-          schema: CALL_SUMMARY_SCHEMA,
-          retries: 0,
-        });
-
-        expect(CALL_SUMMARY_SCHEMA.safeParse(result).success).toBe(true);
+        // 2026-09-08: gpt-audio-1.5 rejects both of Axl's structured modes —
+        // `json_object` (default) and native `json_schema` — with HTTP 400
+        // "'response_format' of type '…' is not supported with this model". The
+        // row therefore certifies the *rejection*: a typed ProviderError, no
+        // silent downgrade, no dropped audio. Audio+structured is not
+        // advertised for `openai:`.
+        const error = await context
+          .ask(listener, callInput('Summarise this recording.'), {
+            maxTokens: 200,
+            schema: CALL_SUMMARY_SCHEMA,
+            nativeStructuredOutput: true,
+            retries: 0,
+          })
+          .then(
+            () => undefined,
+            (err: unknown) => err,
+          );
+        expect(error).toBeInstanceOf(ProviderError);
+        expect((error as ProviderError).status).toBe(400);
+        expect((error as Error).message).toContain('response_format');
+        expect((error as Error).message).not.toContain(RECORDED_CALL_SENTINEL);
         const model = modelCalls(calls);
         expect(model).toHaveLength(1);
         expect(compatibleUserContent(model[0])[0]).toEqual({
@@ -716,14 +815,9 @@ describe.skipIf(!RUN || !process.env.OPENAI_API_KEY)(
           input_audio: { data: RECORDED_CALL_BASE64, format: 'mp3' },
         });
         assertSentinelAbsentFromEvents(events, RECORDED_CALL_SENTINEL);
-        const terminal = assertHonestTerminal(events);
-
         evidence('GA4-openai', {
           model: `openai:${OPENAI_AUDIO_MODEL}`,
-          cost: terminal.cost,
-          unpriced: terminal.unpriced,
-          tokens: rawUsage(model[0]),
-          answer: result,
+          rejected: brief((error as Error).message),
         });
       });
     });

@@ -31,7 +31,8 @@ const MOCK_MODALITY_SOURCES = {
 } as const;
 
 function cloneValue(value: unknown): unknown {
-  if (value instanceof Uint8Array) return value.slice();
+  // A Node Buffer's `slice()` aliases; `new Uint8Array` always copies.
+  if (value instanceof Uint8Array) return new Uint8Array(value);
   if (Array.isArray(value)) return value.map(cloneValue);
   if (value && typeof value === 'object') {
     return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneValue(item)]));
@@ -43,7 +44,7 @@ function cloneMediaSource<S extends InputMediaSource>(source: S): S {
   const media: InputMediaSource = source;
   switch (media.type) {
     case 'bytes':
-      return { type: 'bytes', data: media.data.slice(), mediaType: media.mediaType } as S;
+      return { type: 'bytes', data: new Uint8Array(media.data), mediaType: media.mediaType } as S;
     case 'url':
       return {
         type: 'url',

@@ -154,6 +154,20 @@ describe('normalizeModelInput — audio parts (J1/J2)', () => {
     ]);
   });
 
+  it.each(['audio', 'image'] as const)(
+    'copies a Node Buffer %s source into a detached Uint8Array on normalization',
+    (type) => {
+      const mediaType = type === 'audio' ? 'audio/wav' : 'image/png';
+      const caller = Buffer.from([1, 2, 3, 4]);
+      const [part] = normalizeModelInput([
+        { type, source: { type: 'bytes', data: caller, mediaType } },
+      ]) as Array<{ source: { data: Uint8Array } }>;
+      caller.fill(0);
+      expect(Array.from(part.source.data)).toEqual([1, 2, 3, 4]);
+      expect(Buffer.isBuffer(part.source.data)).toBe(false);
+    },
+  );
+
   it('shares one 25 MiB inline budget across images and audio', () => {
     expect(() => normalizeModelInput([imageBytes(20 * MIB)])).not.toThrow();
     expect(() => normalizeModelInput([audioBytes(6 * MIB)])).not.toThrow();

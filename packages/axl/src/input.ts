@@ -133,9 +133,11 @@ function cloneMediaSource<K extends InputMediaSource['type']>(
         invalid(`part ${index}.source.data must be a non-empty Uint8Array`);
       // Enforce the aggregate bound before taking the ownership copy.
       reserveInlineBytes(raw.data.byteLength);
+      // `new Uint8Array(view)` always allocates; a Node `Buffer` (what
+      // `readFileSync` returns) overrides `slice()` to alias its pooled memory.
       clone = {
         type: 'bytes',
-        data: raw.data.slice(),
+        data: new Uint8Array(raw.data),
         mediaType: mediaType(raw.mediaType, `part ${index}.source.mediaType`),
       };
       break;

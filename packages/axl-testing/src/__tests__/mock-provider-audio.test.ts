@@ -425,6 +425,31 @@ describe('audio source kinds survive the ask round trip', () => {
     ]);
   });
 
+  it('AB-02 (Buffer): a Node Buffer caller value is copied, not aliased', async () => {
+    // `readFileSync` returns a Buffer, whose `slice()` shares memory. The
+    // record must be a detached copy for the most common way users load audio.
+    const callerBytes = Buffer.from([1, 2, 3]);
+    const provider = MockProvider.sequence([{ content: 'ok' }]);
+    const { run } = askWith(
+      provider,
+      [{ type: 'audio', source: { type: 'bytes', data: callerBytes, mediaType: 'audio/wav' } }],
+      'ab02-buffer-ownership',
+    );
+    await run();
+
+    callerBytes.fill(255);
+
+    const recorded = provider.calls[0].messages.at(-1)?.content;
+    expect(recorded).toEqual([
+      {
+        type: 'audio',
+        source: { type: 'bytes', data: new Uint8Array([1, 2, 3]), mediaType: 'audio/wav' },
+      },
+    ]);
+    const data = (recorded as Array<{ source: { data: Uint8Array } }>)[0].source.data;
+    expect(Buffer.isBuffer(data)).toBe(false);
+  });
+
   it('AB-07: audio-only input resolves, while an empty part array is invalid', async () => {
     const provider = MockProvider.sequence([{ content: 'a siren' }]);
     const audioOnly = askWith(provider, [audioBytesPart([1, 2, 3])], 'ab07-audio-only');

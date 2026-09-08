@@ -48,7 +48,7 @@ describe('HandleSupport workflow', () => {
 |------|-------|-------------|
 | `MockProvider.sequence([...])` | Ordered responses | Returns responses in order. Fails if more calls than responses. Each response accepts an optional `chunks?: string[]` to drive the streaming path one delta per chunk (must satisfy `chunks.join('') === content`). |
 | `MockProvider.chunked(contents, chunkSize?)` | Partial-content streaming | Convenience over `sequence()`: takes plain content strings and splits each into fixed-size chunks (default 4 chars ≈ 1 token). Use to exercise partial-JSON parsing, structural-boundary throttling, and cross-attempt token retention. |
-| `MockProvider.echo()` | Parrot mode | Returns the user prompt back as the response. Useful for testing plumbing. |
+| `MockProvider.echo()` | Parrot mode | Returns the last user prompt back as the response. Projected through the core's `summarizeModelInput`, so media parts echo as their deterministic placeholder (`[image image/png]`, `[audio audio/wav]`) rather than disappearing. Useful for testing plumbing. |
 | `MockProvider.json(schema)` | Schema-conforming | Generates random valid JSON matching the given Zod schema. Useful for fuzz testing `verify`. |
 | `MockProvider.replay(file)` | Recorded sessions | Replays a recorded session from a JSON file. See snapshot testing below. |
 | `MockProvider.fn(handler)` | Custom logic | Custom response function receiving `(messages, callIndex)`. Returns `{ content, tool_calls? }`. |
@@ -287,6 +287,30 @@ mock run proves the runtime plumbing, **not** that a real adapter clamps the way
 you expect — the per-adapter mappings are unit-tested against their request
 bodies in `packages/axl/src/__tests__/{gemini,openai,anthropic}.test.ts`.
 
+### Rich input modalities (`withInputModalities`)
+
+`MockProvider` declares **both** rich input modalities by default — `image` and
+`audio` — so it accepts whatever the SDK accepts and no existing test changes
+behavior. Restrict it to make the runtime's fail-closed path testable offline:
+
+```typescript
+const provider = MockProvider.echo().withInputModalities(['image']);
+runtime.mockProvider('mock', provider);
+
+// An audio part now throws `UnsupportedModelInputError` with
+// `modality: 'audio'` BEFORE the call is recorded, so `provider.calls` is empty.
+await expect(
+  runtime.execute('audio-workflow', {}),
+).rejects.toMatchObject({ code: 'UNSUPPORTED_MODEL_INPUT', modality: 'audio' });
+expect(provider.calls).toHaveLength(0);
+```
+
+Pass `[]` to declare no rich modality at all. The mock declares `url`, `bytes`,
+`base64`, and `provider-file` sources for images and `bytes`, `base64`, and
+`provider-file` for audio — audio has no URL source anywhere in Axl.
+`MockTranscriptionProvider` is unaffected: `ctx.transcribe()` is a separate
+product and is never a fallback for a rejected audio part.
+
 ## AxlTestRuntime
 
 `AxlTestRuntime` supports the **full `ctx.*` primitive set** — `ask`, `spawn`, `vote`, `verify`, `budget`, `race`, `parallel`, `map`, `awaitHuman`, `checkpoint`, and `log` — so that workflows under test exercise the same code paths as production.
@@ -519,6 +543,59 @@ transport failures can raise that ceiling to six attempts, and an ambiguous
 attempt can still be processed and billed upstream. It certifies Axl transport,
 not a model allowlist or the whole OpenRouter catalog. See the dated
 [OpenRouter catalog evidence](./verification/openrouter-catalog-multimodal-2026-09-02.md).
+
+### General recorded-audio input rows (GA1–GA8)
+
+Direct audio parts in `ModelInput` have their own suite and their own arming
+flag. Rows are **double-gated**: a provider key alone never spends, and
+`AXL_MULTIMODAL_LIVE=1` alone does not run them either — `AXL_GENERAL_AUDIO_LIVE=1`
+must also be set. `AXL_DISABLE_LIVE_INTEGRATION=1` remains the absolute kill
+switch. Run one row at a time with its ID as the `-t` selector:
+
+```bash
+# Lighthouse: non-speech WAV understanding. GA1 is the native Gemini row;
+# GA1-OR is the OpenRouter route that is actually certified today.
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA1\]'
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA1-OR\]'
+
+# Speech audio through a tool continuation (two logical requests each).
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA2\]'
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA3\]'
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA6-tool\]'
+
+# Audio plus structured output.
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA4\]'
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA4-openai\]'
+
+# Base64 speech answer, and streaming.
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA6\]'
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA8\]'
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA8-OR\]'
+
+# GA5 (fail-closed providers) and GA7 (unmappable media type) are local: no key,
+# zero fetches, always run.
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA5\]|\[GA7\]'
+```
+
+| Row | Provider URI | Key |
+| --- | --- | --- |
+| GA1, GA3, GA4, GA8 | `google:` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
+| GA2, GA4-openai | `openai:` | `OPENAI_API_KEY` |
+| GA1-OR, GA6, GA6-tool, GA8-OR | `openrouter:` | `OPENROUTER_API_KEY` |
+| GA5, GA7 | local | none |
+
+Models are env-overridable representative defaults, never allowlists:
+`GEMINI_AUDIO_MODEL`, `OPENAI_AUDIO_MODEL`, `OPENROUTER_AUDIO_MODEL`. Each paid
+row makes one logical model request (two for `GA2`, `GA3`, and `GA6-tool`) with
+`maxTokens` at most 200 and an audio fixture of roughly ten seconds or less; the
+`fetchWithRetry` policy allows up to three HTTP attempts per logical request, so
+the per-row transport-attempt ceiling is 3 (6 for the continuation rows). That is
+not a spend cap — an upstream may process a request whose client result failed.
+Fixtures are the checked-in `recorded-call.mp3.b64` speech excerpt and an
+in-test generated PCM WAV tone; no new binary asset was added.
+
+Dated results, including which rows have **not** been run and why, are in
+[`docs/verification/general-audio-lighthouse-2026-09-08.md`](./verification/general-audio-lighthouse-2026-09-08.md).
 
 ### Completed-file transcription lighthouse
 

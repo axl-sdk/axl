@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **General recorded-audio input.** `InputContentPart` gains an audio member,
+  `InputAudioPart` (`{ type: 'audio', source: RecordedAudioSource, label? }`), so
+  a chat model can reason directly about a finite recording — speech *and*
+  non-speech sound. Sources are `bytes | base64 | provider-file`; an audio URL is
+  unrepresentable by construction because the part reuses the same
+  `RecordedAudioSource` union `ctx.transcribe()` accepts. This is usable in this
+  release: audio parts are reachable through the barrel-exported
+  `InputContentPart` and are accepted at runtime on the adapters below. The
+  `InputAudioPart` *name* is exported as documentation, not as an availability
+  gate.
+  Transport ships on `openai:` (Chat Completions `input_audio`, `wav | mp3`,
+  bytes/base64), `openrouter:` (`input_audio` with a wider closed format table,
+  bytes/base64), `google:` (Interactions `{ type: 'audio', data | uri,
+  mime_type }`, bytes/base64/provider-file), and `MockProvider`. Ordered audio
+  survives retries, schema and guardrail recovery, tool continuations, delegate,
+  handoff, and streaming, exactly like an image. `anthropic:`,
+  `openai-responses:`, and every other OpenAI-compatible preset reject an audio
+  part with a zero-request `UnsupportedModelInputError` (`modality: 'audio'`) and
+  never fall back to transcription.
+  **Only `openrouter:` is live-certified today** — for a text answer from speech
+  and non-speech audio, a tool continuation, and streaming; audio plus structured
+  output is certified nowhere and advertised nowhere. `openai:` and `google:`
+  audio is implemented but uncertified pending provider keys. See
+  [`docs/verification/general-audio-lighthouse-2026-09-08.md`](docs/verification/general-audio-lighthouse-2026-09-08.md)
+  and [`docs/multimodal-input.md`](docs/multimodal-input.md#general-recorded-audio-input).
+- `InputModalitySupport.audio` on `Provider.inputCapabilities` — declaring it is
+  the sole audio opt-in. The runtime fails closed for audio *before*
+  `validateInput`, and re-checks the capability if a validator substitutes a
+  different effective model. Image preflight is unchanged.
+- `CapabilityFlags.inputModalities` and the `ProfileInputModalities` type on the
+  OpenAI-compatible engine, so a profile declares rich-input support explicitly
+  instead of the engine branching on the provider's name.
+- `summarizeModelInput` is exported from the core barrel: the context-safe
+  projection rendering media as `[image <mediaType>]` / `[audio <mediaType>]`.
+- `MockProvider.withInputModalities(['image' | 'audio'][])` — restrict the rich
+  modalities the mock declares, so a provider that does not support a modality
+  can be exercised offline. Both are declared by default.
+- `ModelInputDescriptor` gains an `audio` part variant; its `locator` can only
+  come from a provider-file reference.
+- `axl.input.audio` span attribute on the `axl.model_input` event.
+- Live certification rows `GA1`–`GA8` in
+  `packages/axl/src/__tests__/integration-general-audio.test.ts`, double-gated
+  behind `AXL_MULTIMODAL_LIVE=1` + `AXL_GENERAL_AUDIO_LIVE=1`.
+
+### Changed
+
+- **`InputContentPart` is widened with the audio member.** This is additive for
+  *producers* — no existing code can construct an audio part, and the runtime
+  guarantees audio never reaches a provider that did not opt in. It is **not**
+  compile-time safe for *consumers*: any code that branches over
+  `InputContentPart` or `ModelInputDescriptor` with a non-exhaustive `else`
+  (`if (part.type === 'text') … else /* image */ …`) will now silently label
+  audio as image. Switch exhaustively over `part.type`. Every in-repo projection,
+  including the three Studio sites, was made exhaustive with a `never` arm in
+  this change. Released as a patch under the 0.x rule.
+- **`MockProvider.echo()` projects media parts instead of dropping them.** It now
+  returns `summarizeModelInput(...)` rather than `inputText(...)`, so a prompt of
+  `['before', image, 'after']` echoes `'before\n[image image/png]\nafter'` where
+  it previously echoed `'before\nafter'`. Tests asserting on `echo()` output with
+  media in the prompt need updating. One projection is shared with the runtime's
+  context summarizer so echo and context estimates cannot disagree.
+- `inputCapabilities()` now returns an `audio` key on `google:`, `openai:`,
+  `openrouter:`, and `MockProvider`. A consumer asserting on that object with
+  `toEqual` will need the new key.
+- `UnsupportedModelInputError.modality` reports the **offending** part's modality
+  rather than a hardcoded value, so a mixed input whose audio part is rejected
+  reports `'audio'` and one whose image part is rejected reports `'image'`.
+- Three user-visible message strings changed:
+  `Inline image data must not exceed 25 MiB total; use a URL or provider-file
+  source where supported` → `Inline media data must not exceed 25 MiB total; use
+  a provider-file source, or a URL for images, where supported`;
+  `Uint8Array image input cannot be persisted in session history` →
+  `Uint8Array media input cannot be persisted in session history`; and
+  `part N.type must be 'text' or 'image'` →
+  `part N.type must be 'text', 'image', or 'audio'`.
+- The persisted-session-history bytes guard is now type-agnostic over every
+  non-text part instead of an image-specific branch.
+- `axl.input.source.*` and `axl.input.inline_bytes` span attributes now count
+  **all** non-text parts, so an audio-bearing ask is not reported as carrying
+  zero media bytes. `axl.input.images` stays image-only for existing consumers.
+- `estimateMessagesTokens` treats audio history as unmeasured media exactly like
+  images, so audio is never counted as zero context and the unmeasured-context
+  warning still fires.
+- Audio-bearing `openai:` and `google:` calls are **unpriced by design**: no
+  verified modality-aware estimator exists and text-table rates are never applied
+  to audio tokens. `openrouter:` continues to use its authoritative response
+  `usage.cost`.
+
 ## [0.23.2] - 2026-09-07
 
 ### Fixed

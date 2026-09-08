@@ -586,7 +586,8 @@ AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vi
 
 Models are env-overridable representative defaults, never allowlists:
 `GEMINI_AUDIO_MODEL`, `OPENAI_AUDIO_MODEL`, `OPENROUTER_AUDIO_MODEL`. Each paid
-row makes one logical model request (two for `GA2`, `GA3`, and `GA6-tool`) with
+row makes one logical model request (two for `GA2`, `GA3`, `GA6-tool`, and the
+streaming rows `GA8`/`GA8-OR`, which add a text-only control ask) with
 `maxTokens` at most 200 and an audio fixture of roughly ten seconds or less; the
 `fetchWithRetry` policy allows up to three HTTP attempts per logical request, so
 the per-row transport-attempt ceiling is 3 (6 for the continuation rows). That is

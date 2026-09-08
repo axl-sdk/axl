@@ -6,7 +6,6 @@ import { agent } from '../agent.js';
 import { WorkflowContext } from '../context.js';
 import { UnsupportedModelInputError } from '../errors.js';
 import type { InputContentPart } from '../input.js';
-import { AXL_EVENT_TYPES } from '../types.js';
 import { AnthropicProvider } from '../providers/anthropic.js';
 import { OpenAIProvider } from '../providers/openai.js';
 import { OpenAICompatibleProvider } from '../providers/openai-compatible.js';
@@ -155,6 +154,8 @@ const RECORDED_CALL_SENTINEL = RECORDED_CALL_BASE64.slice(0, 128);
 const FIXTURE_BASE64 = [TONE_WAV_BASE64, RECORDED_CALL_BASE64] as const;
 
 const TONE_QUESTION = 'Describe this sound in one sentence. Does the pitch change?';
+/** Text-only control for the streaming rows' event-type comparison. */
+const CONTROL_QUESTION = 'In one short sentence, what is two plus two?';
 const CALL_QUESTION = 'What is this call about?';
 
 function toneInput(): readonly InputContentPart[] {
@@ -360,16 +361,22 @@ function assertNoStrayAudioEcho(value: unknown, sentinel: string): void {
 }
 
 /** Streaming rows: only the ordinary lifecycle types, and nothing audio-shaped. */
-// Every discriminator the runtime already emits today. The row asserts that an
-// audio ask introduces no *new* event type; `AXL_EVENT_TYPES` is the canonical
-// list, so a hand-written subset would fail on ordinary lifecycle events such
-// as `pipeline`.
-const ORDINARY_EVENT_TYPES: ReadonlySet<string> = new Set(AXL_EVENT_TYPES);
-
-function assertOrdinaryStreamingEvents(events: readonly AxlEvent[]): void {
-  expect(events.some((event) => event.type === 'token')).toBe(true);
-  const unexpected = [...new Set(events.map((event) => event.type))].filter(
-    (type) => !ORDINARY_EVENT_TYPES.has(type),
+/**
+ * The audio ask must introduce no event type that an equivalent text-only
+ * streaming ask on the same route does not already emit. Comparing against a
+ * same-row control (rather than the canonical `AXL_EVENT_TYPES` list, which
+ * would make the check a tautology) is what makes a new audio-specific event
+ * observable.
+ */
+function assertNoNewEventTypes(
+  audioEvents: readonly AxlEvent[],
+  controlEvents: readonly AxlEvent[],
+): void {
+  expect(audioEvents.some((event) => event.type === 'token')).toBe(true);
+  expect(controlEvents.some((event) => event.type === 'token')).toBe(true);
+  const control = new Set(controlEvents.map((event) => event.type));
+  const unexpected = [...new Set(audioEvents.map((event) => event.type))].filter(
+    (type) => !control.has(type),
   );
   // A new audio-specific event type would be a public surface change that this
   // plan explicitly does not ship: audio rides the ordinary text path.
@@ -957,19 +964,27 @@ describe.skipIf(!RUN || !GOOGLE_KEY)(
           model: `google:${GEMINI_AUDIO_MODEL}`,
           system: 'Answer in one short sentence.',
         });
+        // Text-only control on the same route: the event-type comparison below
+        // is only meaningful against what an ordinary streaming ask emits.
+        const control = liveContext();
+        void control.context.events;
+        await control.context.ask(listener, CONTROL_QUESTION, { maxTokens: 50, effort: 'none' });
+        control.context.disposeEvents();
         const result = await context.ask(listener, toneInput(), { maxTokens: 200, effort: 'none' });
         context.disposeEvents();
 
         expect(result.trim().length).toBeGreaterThan(0);
+        // Two model requests: the text-only control, then the audio ask.
         const model = modelCalls(calls);
-        expect(model).toHaveLength(1);
-        expect(geminiUserContent(model[0])[0]).toEqual({
+        expect(model).toHaveLength(2);
+        expect(model[0].rawRequest).not.toContain(TONE_SENTINEL);
+        expect(geminiUserContent(model[1])[0]).toEqual({
           type: 'audio',
           data: TONE_WAV_BASE64,
           mime_type: 'audio/wav',
         });
-        expect(model[0].rawRequest).toContain(TONE_SENTINEL);
-        assertOrdinaryStreamingEvents(events);
+        expect(model[1].rawRequest).toContain(TONE_SENTINEL);
+        assertNoNewEventTypes(events, control.events);
         assertSentinelAbsentFromEvents(events, TONE_SENTINEL);
         const terminal = assertHonestTerminal(events);
 
@@ -996,18 +1011,24 @@ describe.skipIf(!RUN || !process.env.OPENROUTER_API_KEY)(
           model: `openrouter:${OPENROUTER_AUDIO_MODEL}`,
           system: 'Answer in one short sentence.',
         });
+        const control = liveContext();
+        void control.context.events;
+        await control.context.ask(listener, CONTROL_QUESTION, { maxTokens: 50 });
+        control.context.disposeEvents();
         const result = await context.ask(listener, toneBase64Input(), { maxTokens: 200 });
         context.disposeEvents();
 
         expect(result.trim().length).toBeGreaterThan(0);
+        // Two model requests: the text-only control, then the audio ask.
         const model = modelCalls(calls);
-        expect(model).toHaveLength(1);
-        expect(compatibleUserContent(model[0])[0]).toEqual({
+        expect(model).toHaveLength(2);
+        expect(model[0].rawRequest).not.toContain(TONE_SENTINEL);
+        expect(compatibleUserContent(model[1])[0]).toEqual({
           type: 'input_audio',
           input_audio: { data: TONE_WAV_BASE64, format: 'wav' },
         });
-        expect(model[0].rawRequest).toContain(TONE_SENTINEL);
-        assertOrdinaryStreamingEvents(events);
+        expect(model[1].rawRequest).toContain(TONE_SENTINEL);
+        assertNoNewEventTypes(events, control.events);
         assertSentinelAbsentFromEvents(events, TONE_SENTINEL);
         const terminal = assertHonestTerminal(events);
 

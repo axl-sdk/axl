@@ -84,13 +84,15 @@ Answer: *"The caller's account is active with a pro plan and no open tickets."*
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA8-OR\]'
 ```
 
-The streamed audio ask produced ordinary text deltas only (3 token events). The
-observed event-type set was checked against the canonical exported
-`AXL_EVENT_TYPES`: **no new chunk or event type** appeared for an audio-bearing
-call. The base64 sentinel was present in the captured request body (positive
-control) and absent from every event. Reported cost `0.0001179`.
+The row first streams a text-only control ask on the same route, then the
+audio ask (two logical requests). The audio ask produced ordinary text deltas
+only, and its event-type set was a subset of the control's: **no new chunk or
+event type** appeared for an audio-bearing call. The base64 sentinel was
+present in the captured audio request body (positive control), absent from the
+control request, and absent from every event. Reported audio-ask cost
+`0.0001229` (an earlier run without the control: `0.0001179`).
 
-Answer: *"This sound is a constant sine wave tone with an unchanging pitch."*
+Answer: *"This sound is a continuous sine wave that does not change in pitch."*
 
 ### GA5 and GA7 — local, zero-fetch rows
 
@@ -144,7 +146,9 @@ whose client result was failed or ambiguous. Every paid row caps `maxTokens` at
 ## Harness note
 
 `GA8-OR` initially failed because the suite's streaming event-type allowlist was
-hand-written and did not include the ordinary `pipeline` event. The allowlist
-now compares against the exported `AXL_EVENT_TYPES` constant instead of a
-hand-maintained list (commit `693c1fa`), so the assertion tests "no *new* event
-type for audio" rather than "no event outside a list someone typed".
+hand-written and did not include the ordinary `pipeline` event. Comparing
+against the exported `AXL_EVENT_TYPES` constant (commit `693c1fa`) removed the
+failure but made the check a tautology, since every event type the runtime can
+emit is in that list by construction. The rows now compare the audio ask's
+event types against a text-only control ask streamed on the same route in the
+same row, so a new audio-specific event type would be observable.

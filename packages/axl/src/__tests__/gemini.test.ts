@@ -3273,6 +3273,23 @@ describe('GeminiProvider', () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
+    it('rejects a tool result whose function name cannot be resolved instead of sending an empty name', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve({ status: 'completed', steps: [] }),
+      });
+      await expect(
+        new GeminiProvider().chat(
+          [
+            { role: 'user', content: [geminiFileImage()] },
+            { role: 'assistant', content: 'calling' },
+            { role: 'tool', tool_call_id: 'call_orphan', content: '{"ok":true}' },
+          ],
+          { model: 'gemini-3.7-flash' },
+        ),
+      ).rejects.toThrow(/call 'call_orphan' has no function name/);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
     it('faithfully accumulates rich Interactions stream steps for tool continuation', async () => {
       const encoder = new TextEncoder();
       const events = [

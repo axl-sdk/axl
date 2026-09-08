@@ -20,7 +20,7 @@ import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import type { RecordedAudioSource } from '../transcription.js';
-import { UnsupportedModelInputError } from '../errors.js';
+import { InvalidModelInputError, UnsupportedModelInputError } from '../errors.js';
 import { firstRichPart, type RichModality } from './rich-input.js';
 
 function hasRichGeminiMessages(messages: readonly ChatMessage[]): boolean {
@@ -1141,9 +1141,17 @@ export class GeminiProvider implements Provider {
         }
       } else if (message.role === 'tool') {
         const callId = message.tool_call_id ?? '';
+        const name = functionNames.get(callId) ?? message.name;
+        if (!name) {
+          // Interactions rejects the request anyway, with a bare 400; naming
+          // the orphaned call here is the actionable version of that failure.
+          throw new InvalidModelInputError(
+            `Gemini Interactions tool result for call '${callId}' has no function name: no preceding function_call carries that id and the tool message has no 'name'`,
+          );
+        }
         steps.push({
           type: 'function_result',
-          name: functionNames.get(callId) ?? message.name ?? '',
+          name,
           call_id: callId,
           result: [
             { type: 'text', text: typeof message.content === 'string' ? message.content : '' },

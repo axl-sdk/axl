@@ -113,13 +113,17 @@ function interactionUsage(over: Record<string, unknown> = {}): Record<string, un
 function interactionReply(
   usage: Record<string, unknown> | undefined,
   over: Record<string, unknown> = {},
+  headers?: HeadersInit,
 ): Response {
-  return jsonResponse({
-    status: 'completed',
-    steps: [{ type: 'model_output', content: [{ type: 'text', text: 'A rising tone.' }] }],
-    ...(usage ? { usage } : {}),
-    ...over,
-  });
+  return new Response(
+    JSON.stringify({
+      status: 'completed',
+      steps: [{ type: 'model_output', content: [{ type: 'text', text: 'A rising tone.' }] }],
+      ...(usage ? { usage } : {}),
+      ...over,
+    }),
+    { status: 200, headers },
+  );
 }
 
 function sseResponse(lines: string[]): Response {
@@ -135,7 +139,11 @@ function sseResponse(lines: string[]): Response {
   );
 }
 
-type AskResult = { cost: number | undefined; usage: ProviderResponse['usage'] };
+type AskResult = {
+  cost: number | undefined;
+  usage: ProviderResponse['usage'];
+  requestBody: Record<string, unknown>;
+};
 
 /** One rich (Interactions) ask through the real adapter and a stubbed wire. */
 async function askAudio(
@@ -145,10 +153,13 @@ async function askAudio(
     baseUrl?: string;
     providerOptions?: Record<string, unknown>;
     responseOver?: Record<string, unknown>;
+    responseHeaders?: HeadersInit;
     input?: readonly unknown[];
   } = {},
 ): Promise<AskResult> {
-  mockFetch(interactionReply(usage, options.responseOver));
+  const fetchMock = mockFetch(
+    interactionReply(usage, options.responseOver, options.responseHeaders),
+  );
   const provider = new GeminiProvider({
     apiKey: 'test-key',
     ...(options.baseUrl !== undefined ? { baseUrl: options.baseUrl } : {}),
@@ -160,7 +171,12 @@ async function askAudio(
     model: options.model ?? SPLIT_MODEL,
     ...(options.providerOptions ? { providerOptions: options.providerOptions } : {}),
   });
-  return { cost: response.cost, usage: response.usage };
+  const rawBody = fetchMock.mock.calls[0]?.[1]?.body;
+  return {
+    cost: response.cost,
+    usage: response.usage,
+    requestBody: typeof rawBody === 'string' ? JSON.parse(rawBody) : {},
+  };
 }
 
 function googleRuntime(): AxlRuntime {
@@ -435,15 +451,90 @@ describe('gemini pricing preconditions report unknown, never zero', () => {
     expect(cost).toBeUndefined();
   });
 
-  it('T055: a non-standard service tier is unpriced', async () => {
+  it.each(['priority', 'flex', 'future-tier'])(
+    'T055: request service_tier %s is emitted and unpriced',
+    async (serviceTier) => {
+      const { cost, requestBody } = await askAudio(interactionUsage(), {
+        providerOptions: { service_tier: serviceTier },
+        responseOver: { service_tier: 'standard' },
+      });
+      expect(requestBody.service_tier).toBe(serviceTier);
+      expect(cost).toBeUndefined();
+    },
+  );
+
+  it('a Standard request conflicting with a nonstandard response is unpriced', async () => {
     const { cost } = await askAudio(interactionUsage(), {
-      providerOptions: { service_tier: 'SERVICE_TIER_PRIORITY' },
+      providerOptions: { service_tier: 'standard' },
+      responseOver: { service_tier: 'priority' },
     });
     expect(cost).toBeUndefined();
   });
 
   it('a non-standard tier echoed on the response is unpriced', async () => {
     const { cost } = await askAudio(interactionUsage({ service_tier: 'SERVICE_TIER_FLEX' }));
+    expect(cost).toBeUndefined();
+  });
+
+  it('a top-level non-standard Interactions response tier is unpriced', async () => {
+    const { cost, usage } = await askAudio(interactionUsage(), {
+      responseOver: { service_tier: 'priority' },
+    });
+    expect(cost).toBeUndefined();
+    expect(usage?.prompt_tokens).toBe(GA1.input);
+  });
+
+  it.each([
+    ['top-level Standard with legacy flex', 'SERVICE_TIER_STANDARD', 'flex'],
+    ['top-level priority with legacy Standard', 'priority', 'SERVICE_TIER_STANDARD'],
+  ])(
+    '%s is unpriced because conflicting response evidence fails closed',
+    async (_label, top, legacy) => {
+      const { cost } = await askAudio(interactionUsage({ service_tier: legacy }), {
+        responseOver: { service_tier: top },
+      });
+      expect(cost).toBeUndefined();
+    },
+  );
+
+  it('a top-level Standard tier remains priced when all response evidence agrees', async () => {
+    const { cost } = await askAudio(interactionUsage({ service_tier: 'SERVICE_TIER_STANDARD' }), {
+      responseOver: { service_tier: 'standard' },
+    });
+    expect(cost).toBeCloseTo(GA1_EXPECTED, 14);
+  });
+
+  it('an absent response tier header is neutral', async () => {
+    const { cost } = await askAudio(interactionUsage());
+    expect(cost).toBeCloseTo(GA1_EXPECTED, 14);
+  });
+
+  it('a Standard response tier header remains priced', async () => {
+    const { cost } = await askAudio(interactionUsage(), {
+      responseHeaders: { 'x-gemini-service-tier': 'standard' },
+    });
+    expect(cost).toBeCloseTo(GA1_EXPECTED, 14);
+  });
+
+  it('a nonstandard response tier header overrides a Standard body conservatively', async () => {
+    const { cost, usage } = await askAudio(
+      interactionUsage({ service_tier: 'SERVICE_TIER_STANDARD' }),
+      {
+        responseOver: { service_tier: 'standard' },
+        responseHeaders: { 'x-gemini-service-tier': 'priority' },
+      },
+    );
+    expect(cost).toBeUndefined();
+    expect(usage?.prompt_tokens).toBe(GA1.input);
+  });
+
+  it('a nonstandard conservative serviceTier alias cannot be hidden by Standard service_tier', async () => {
+    const { cost } = await askAudio(interactionUsage(), {
+      providerOptions: {
+        service_tier: 'standard',
+        serviceTier: 'SERVICE_TIER_PRIORITY',
+      },
+    });
     expect(cost).toBeUndefined();
   });
 
@@ -638,8 +729,16 @@ describe('gemini audio usage normalization', () => {
 // ── Streaming parity (T060, T077) ───────────────────────────────────────
 
 describe('gemini Interactions streaming', () => {
-  async function streamDone(usage: Record<string, unknown> | undefined) {
+  async function streamDone(
+    usage: Record<string, unknown> | undefined,
+    options: {
+      lifecycleEvents?: Record<string, unknown>[];
+      completedInteraction?: Record<string, unknown>;
+      responseHeaders?: HeadersInit;
+    } = {},
+  ) {
     const events = [
+      ...(options.lifecycleEvents ?? []),
       {
         event_type: 'step.start',
         index: 0,
@@ -653,10 +752,20 @@ describe('gemini Interactions streaming', () => {
       { event_type: 'step.stop', index: 0 },
       {
         event_type: 'interaction.completed',
-        interaction: { status: 'completed', ...(usage ? { usage } : {}) },
+        interaction: {
+          status: 'completed',
+          ...(usage ? { usage } : {}),
+          ...options.completedInteraction,
+        },
       },
     ];
-    mockFetch(sseResponse(events.map((event) => `data: ${JSON.stringify(event)}`)));
+    const response = sseResponse(events.map((event) => `data: ${JSON.stringify(event)}`));
+    if (options.responseHeaders) {
+      for (const [name, value] of new Headers(options.responseHeaders)) {
+        response.headers.set(name, value);
+      }
+    }
+    mockFetch(response);
     const provider = new GeminiProvider({ apiKey: 'test-key' });
     const chunks = [];
     for await (const chunk of provider.stream([{ role: 'user', content: AUDIO_INPUT as never }], {
@@ -685,6 +794,56 @@ describe('gemini Interactions streaming', () => {
     const done = await streamDone(undefined);
     expect(done.cost).toBeUndefined();
     expect(done.usage).toBeUndefined();
+  });
+
+  it.each([
+    [
+      'created nonstandard then completed Standard',
+      [{ event_type: 'interaction.created', interaction: { service_tier: 'priority' } }],
+      { service_tier: 'standard' },
+    ],
+    [
+      'created Standard then completed nonstandard',
+      [{ event_type: 'interaction.created', interaction: { service_tier: 'standard' } }],
+      { service_tier: 'flex' },
+    ],
+    [
+      'an intermediate lifecycle event reports an unknown tier',
+      [{ event_type: 'interaction.in_progress', interaction: { service_tier: 'future-tier' } }],
+      { service_tier: 'SERVICE_TIER_STANDARD' },
+    ],
+  ])(
+    '%s remains unpriced for the whole stream',
+    async (_label, lifecycleEvents, completedInteraction) => {
+      const done = await streamDone(interactionUsage(), {
+        lifecycleEvents,
+        completedInteraction,
+      });
+      expect(done.cost).toBeUndefined();
+      expect(done.usage?.prompt_tokens).toBe(GA1.input);
+    },
+  );
+
+  it('a streamed Standard tier remains priced', async () => {
+    const done = await streamDone(interactionUsage(), {
+      lifecycleEvents: [
+        { event_type: 'interaction.created', interaction: { service_tier: 'standard' } },
+      ],
+      completedInteraction: { service_tier: 'SERVICE_TIER_STANDARD' },
+      responseHeaders: { 'x-gemini-service-tier': 'standard' },
+    });
+    expect(done.cost).toBeCloseTo(GA1_EXPECTED, 14);
+  });
+
+  it('a nonstandard stream response header cannot be erased by Standard lifecycle bodies', async () => {
+    const done = await streamDone(interactionUsage(), {
+      lifecycleEvents: [
+        { event_type: 'interaction.created', interaction: { service_tier: 'standard' } },
+      ],
+      completedInteraction: { service_tier: 'SERVICE_TIER_STANDARD' },
+      responseHeaders: { 'x-gemini-service-tier': 'priority' },
+    });
+    expect(done.cost).toBeUndefined();
   });
 
   it('L2: a dropped non-text model_output DELTA unprices exactly as the non-stream body does', async () => {

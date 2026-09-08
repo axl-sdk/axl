@@ -256,6 +256,17 @@ unknown modality (`video`, documents, anything new), non-zero server-side tool
 tokens, cached tokens reported alongside audio tokens, a non-text reply part, a
 non-Standard tier, a non-canonical base URL, or a server-side cache reference.
 
+Gemini Interactions accepts Google's documented top-level `service_tier`
+through `providerOptions`. Omission and `null` retain Standard pricing;
+`standard` and Google's Standard enum spellings are also recognized. Any
+explicit non-Standard or unknown request value leaves cost `undefined`, even if
+Google downgrades the request. On responses, Axl checks the documented
+top-level `service_tier`, the `x-gemini-service-tier` response header, and the
+legacy defensive `usage.service_tier` location. A non-Standard, unknown, or
+conflicting value in any location leaves the call unpriced. Streaming latches
+that evidence across every interaction lifecycle event, so a later Standard or
+missing value cannot erase an earlier non-Standard tier.
+
 Cached-plus-audio is unpriced for the same reason as on OpenAI: Google does not
 document whether `total_cached_tokens` can include audio tokens, and an
 implicit cache hit needs nothing in the request, so the estimator cannot detect

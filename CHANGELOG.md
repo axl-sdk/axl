@@ -149,6 +149,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Gemini Interactions now honors response service tiers when estimating cost.**
+  Top-level response tiers, the `x-gemini-service-tier` header, and streaming
+  lifecycle events are checked together. Any non-standard, unknown, or
+  conflicting evidence leaves cost unknown while preserving token usage.
+  Non-standard requests remain unpriced even when Google reports a Standard
+  downgrade. Standard calls keep their existing estimates.
+
 - **Session workflows no longer send the current user input twice by default.**
   When a workflow passes the same current input to `ctx.ask()`, the model sees
   it once while persisted history remains unchanged. Matching includes the

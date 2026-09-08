@@ -310,3 +310,39 @@ audio fixtures are roughly ten seconds or less.
   routes to `generateContent`, not Interactions; the model-call matcher now
   recognises both.
 - `GA3` first ended `incomplete` at `maxTokens: 200` because of thought tokens.
+
+## V5 image billing and V3 service-tier follow-up
+
+**Closed 2026-09-08.** Both rows used exactly `google:gemini-3.7-flash` through Interactions, one HTTP attempt each, with `store: false`, `effort: 'low'`, and `maxTokens: 400`. The tests import this checkout's source directly. Google returned no invoice cost; the priced value below is Axl's published-rate estimate.
+
+| Row | Request / returned tier | Input tokens | Output / thought tokens | Total tokens | Axl cost (USD) |
+| --- | --- | --- | --- | --- | --- |
+| V5 image | Standard / top-level `standard` | 1,089 image + 13 text = 1,102 | 1 / 140 | 1,243 | 0.00135525 estimated |
+| V3 tier | Priority / top-level `priority` | 9 text | 1 / 93 | 103 | `undefined` (unpriced) |
+
+Both responses reported zero cached and server-side tool-use tokens. Neither returned `x-gemini-service-tier`; the documented top-level body field supplied the actual tier evidence. V5 answered `Invisible` for the tiny PNG fixture; V3 answered `ready`. These are transport/accounting observations, not image-understanding quality claims.
+
+### V5 — published image rate and observed usage
+
+The current [Google pricing page](https://ai.google.dev/gemini-api/docs/pricing#gemini-3.7-flash) publishes one Standard input rate for `gemini-3.7-flash`: $0.75 per million input tokens through 2026-12-31, with $3.75 per million output tokens including thoughts. No different image-input rate is published for this row, so no separate image rate was added. The live row verified a positive image bucket, and the estimator matched `1102 × 0.75e-6 + (1 + 140) × 3.75e-6 = 0.00135525`.
+
+### V3 — service-tier location
+
+The [Interactions schema](https://ai.google.dev/api/interactions-api) defines `service_tier` at the top level of both request and response resources. The request reader already used that real field. The discovered bug was on the response side: Axl read `usage.service_tier` and missed the documented top-level tier. A regression fixture with top-level `priority` produced a Standard-rate estimate of $0.0002485 before the fix.
+
+The adapter now combines top-level response tier, the documented [`x-gemini-service-tier` header](https://ai.google.dev/gemini-api/docs/priority-inference), and the old usage location as defensive evidence. Streaming retains invalid evidence across lifecycle frames. Any explicit non-standard, unknown, or conflicting evidence leaves cost undefined while keeping usage. Explicit non-standard requests remain unpriced even after a reported Standard downgrade.
+
+V3 required a recognized actual response tier and observed `priority`, with no downgrade. Missing, unknown, or conflicting response evidence would fail verification. The absence of a numeric Axl cost is the intended result; Standard pricing was not applied to this Priority call. Actual Google charges were not observed. SSE tier parsing and header/downgrade handling are fixture-tested, not live-certified by this non-streaming row.
+
+### Reproduction and bounds
+
+Each row requires `GOOGLE_API_KEY` or `GEMINI_API_KEY` and its explicit flag. Run separately:
+
+```bash
+AXL_GEMINI_BILLING_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-gemini-billing.test.ts -t 'V5 uses'
+AXL_GEMINI_BILLING_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-gemini-billing.test.ts -t 'V3 emits'
+```
+
+The recorded run selected this exact file once, executing its seven offline harness tests followed by V5 and V3, with no reruns. `AXL_DISABLE_LIVE_INTEGRATION=1` overrides the gate. Each live row makes one logical call with a 55-second abort and at most three transport attempts. Sanitized per-attempt request/status/header/usage evidence survives failure; credentials and inline media are excluded.
+
+V5 and V3 satisfy the owner's prerequisites for the separate N1 no-audio-rate pricing expansion.

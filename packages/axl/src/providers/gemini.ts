@@ -372,6 +372,38 @@ function isDefinitiveStandardGeminiResponseTier(value: unknown): boolean {
   );
 }
 
+type GeminiResponseTierEvidence = {
+  reportsTier: boolean;
+  hasDefinitiveStandardTier: boolean;
+  hasInvalidTier: boolean;
+};
+
+function recordGeminiResponseTier(evidence: GeminiResponseTierEvidence, value: unknown): void {
+  if (value === undefined) return;
+  evidence.reportsTier = true;
+  if (isDefinitiveStandardGeminiResponseTier(value)) {
+    evidence.hasDefinitiveStandardTier = true;
+  } else {
+    // Fail closed permanently for the call. Later Standard or missing evidence
+    // cannot erase an earlier explicit nonstandard/unknown tier.
+    evidence.hasInvalidTier = true;
+  }
+}
+
+function geminiResponseTierEvidence(
+  responseHeaders?: Headers,
+  ...values: unknown[]
+): GeminiResponseTierEvidence {
+  const evidence: GeminiResponseTierEvidence = {
+    reportsTier: false,
+    hasDefinitiveStandardTier: false,
+    hasInvalidTier: false,
+  };
+  recordGeminiResponseTier(evidence, responseHeaders?.get('x-gemini-service-tier') ?? undefined);
+  for (const value of values) recordGeminiResponseTier(evidence, value);
+  return evidence;
+}
+
 /** Interactions string codes mapped from Google's current standard API error table. */
 function geminiInteractionErrorStatus(code: string | number | undefined): number | undefined {
   if (typeof code === 'number' && Number.isInteger(code) && code >= 100 && code <= 599) {
@@ -1024,6 +1056,7 @@ export class GeminiProvider implements Provider {
       this.parseInteractionResponse(
         (await res.json()) as GeminiInteractionResponse,
         pricingContext,
+        res.headers,
       ),
     );
   }
@@ -1239,6 +1272,7 @@ export class GeminiProvider implements Provider {
   private parseInteractionResponse(
     json: GeminiInteractionResponse,
     pricingContext: GeminiPricingContext,
+    responseHeaders: Headers,
   ): ProviderResponse {
     let content = '';
     let thinkingContent = '';
@@ -1264,7 +1298,11 @@ export class GeminiProvider implements Provider {
       cost: this.interactionCost({
         normalized,
         steps: json.steps,
-        responseServiceTier: json.usage?.service_tier,
+        responseTierEvidence: geminiResponseTierEvidence(
+          responseHeaders,
+          json.service_tier,
+          json.usage?.service_tier,
+        ),
         effectiveModel: typeof json.model === 'string' ? json.model : pricingContext.model,
         pricingContext,
         // The whole body is in hand: every part is on `json.steps`, so there
@@ -1285,7 +1323,7 @@ export class GeminiProvider implements Provider {
   private interactionCost(call: {
     normalized: NormalizedGeminiUsage | undefined;
     steps: readonly GeminiInteractionStep[] | undefined;
-    responseServiceTier: unknown;
+    responseTierEvidence: GeminiResponseTierEvidence;
     effectiveModel: string;
     pricingContext: GeminiPricingContext;
     /**
@@ -1296,20 +1334,14 @@ export class GeminiProvider implements Provider {
      */
     unmodeledOutput: boolean;
   }): number | undefined {
-    const { normalized, steps, responseServiceTier, effectiveModel, pricingContext } = call;
+    const { normalized, steps, responseTierEvidence, effectiveModel, pricingContext } = call;
     if (!normalized?.pricingUsage || normalized.hasUnmodeledBilledUsage) return undefined;
     if (call.unmodeledOutput || !this.isTextOnlyInteractionOutput(steps)) return undefined;
-    // The Interactions response carries no service-tier echo today, so the
-    // request-level tier (the only way to select one) is authoritative here.
-    // Should the wire start reporting one, a non-standard value unprices the
-    // call exactly as it does on `generateContent`.
-    const reportsTier = responseServiceTier !== undefined;
-    const standardTier = isDefinitiveStandardGeminiResponseTier(responseServiceTier);
     if (
       !isEligibleGeminiPricing(
         pricingContext,
-        !reportsTier || standardTier,
-        reportsTier && !standardTier,
+        !responseTierEvidence.reportsTier || responseTierEvidence.hasDefinitiveStandardTier,
+        responseTierEvidence.hasInvalidTier,
       )
     ) {
       return undefined;
@@ -1349,6 +1381,7 @@ export class GeminiProvider implements Provider {
     const argumentBuffers = new Map<number, string>();
     const stopped = new Set<number>();
     let completed = false;
+    const responseTierEvidence = geminiResponseTierEvidence(responseHeaders);
     // True once a frame carried model output this parser could not put on a
     // step. Non-text `step.start` parts ARE preserved (the step is cloned
     // whole), so those are already caught by `isTextOnlyInteractionOutput`;
@@ -1371,6 +1404,11 @@ export class GeminiProvider implements Provider {
           } catch {
             continue;
           }
+          // Any interaction lifecycle frame may carry the documented
+          // top-level tier. Retain the legacy usage location defensively too;
+          // conflicting or unknown evidence latches the call unpriced.
+          recordGeminiResponseTier(responseTierEvidence, event.interaction?.service_tier);
+          recordGeminiResponseTier(responseTierEvidence, event.interaction?.usage?.service_tier);
           if (event.event_type === 'error') {
             const status = geminiInteractionErrorStatus(event.error?.code);
             const message = event.error?.message ?? 'Gemini Interactions stream failed';
@@ -1522,7 +1560,7 @@ export class GeminiProvider implements Provider {
               cost: this.interactionCost({
                 normalized,
                 steps: orderedSteps,
-                responseServiceTier: event.interaction?.usage?.service_tier,
+                responseTierEvidence,
                 effectiveModel:
                   typeof event.interaction?.model === 'string'
                     ? event.interaction.model
@@ -1595,7 +1633,9 @@ export class GeminiProvider implements Provider {
       model: typeof body.model === 'string' ? body.model : fallbackModel,
       serviceTier: body.service_tier ?? body.serviceTier,
       eligibleRequest:
-        this.baseUrl === CANONICAL_GEMINI_BASE_URL && this.isModeledInteractionRequest(body),
+        this.baseUrl === CANONICAL_GEMINI_BASE_URL &&
+        isStandardGeminiRequestTier(body.serviceTier) &&
+        this.isModeledInteractionRequest(body),
     };
   }
 
@@ -2293,6 +2333,7 @@ type GeminiInteractionUsage = {
 type GeminiInteractionResponse = {
   model?: string;
   status?: string;
+  service_tier?: unknown;
   steps?: GeminiInteractionStep[];
   usage?: GeminiInteractionUsage;
 };

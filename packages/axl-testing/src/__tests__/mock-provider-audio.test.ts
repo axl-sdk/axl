@@ -260,6 +260,32 @@ describe('audio never leaks through the AxlTestRuntime observability surface', (
   });
 });
 
+// ── Review fix wave: the rejected part owns the reported modality ──────────
+
+describe('MockProvider reports the offending part, not the first rich part', () => {
+  it('reports audio when a supported image leads and the audio provider-file is foreign', async () => {
+    const provider = MockProvider.echo();
+    const { run } = askWith(
+      provider,
+      [
+        { type: 'image', source: { type: 'base64', data: SENTINEL, mediaType: 'image/png' } },
+        {
+          type: 'audio',
+          source: { type: 'provider-file', provider: 'not-mock', reference: 'file_1' },
+        },
+      ],
+      'fix-offending-modality',
+    );
+
+    const error = (await run().catch((err: unknown) => err)) as UnsupportedModelInputError;
+    expect(error).toBeInstanceOf(UnsupportedModelInputError);
+    // Deriving from the leading rich part would report the (supported) image.
+    expect(error.modality).toBe('audio');
+    expect(error.source).toBe('provider-file');
+    expect(provider.calls).toHaveLength(0);
+  });
+});
+
 // ── AT-06: image rejections keep the frozen image triple ───────────────────
 
 describe('MockProvider image rejections are unchanged', () => {

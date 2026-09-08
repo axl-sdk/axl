@@ -337,21 +337,25 @@ export class MockProvider implements Provider {
       typeof request.providerOptions?.model === 'string'
         ? request.providerOptions.model
         : request.model;
-    // The reported modality follows the offending part, never a hardcoded 'image'.
+    const failWith = (modality: string, source?: string, feature?: string): never => {
+      throw new UnsupportedModelInputError({
+        provider: this.name,
+        model: effectiveModel || request.model,
+        modality,
+        ...(source ? { source } : {}),
+        ...(feature ? { feature } : {}),
+      });
+    };
+    // Request-level rejections are not about one part, so they report the
+    // request's leading rich modality. A rejection OF a part always reports
+    // that part's own type — see the provider-file checks below.
     const offending =
       firstNonTextPart(request.input) ??
       request.history
         .map((message) => firstNonTextPart(message.content))
         .find((part) => part !== undefined);
-    const fail = (source?: string, feature?: string, modality?: string): never => {
-      throw new UnsupportedModelInputError({
-        provider: this.name,
-        model: effectiveModel || request.model,
-        modality: modality ?? offending?.type ?? 'image',
-        ...(source ? { source } : {}),
-        ...(feature ? { feature } : {}),
-      });
-    };
+    const fail = (source?: string, feature?: string): never =>
+      failWith(offending?.type ?? 'image', source, feature);
 
     // Configured-modality gate first: a modality this mock does not declare must
     // be rejected on its own terms, reporting the offending part's own modality
@@ -364,7 +368,7 @@ export class MockProvider implements Provider {
         part.type !== 'text' && !this.inputModalities.includes(part.type),
     );
     if (unsupported) {
-      fail(unsupported.source.type, `${unsupported.type} input`, unsupported.type);
+      failWith(unsupported.type, unsupported.source.type, `${unsupported.type} input`);
     }
 
     if (request.providerOptions && 'input' in request.providerOptions) {
@@ -379,7 +383,7 @@ export class MockProvider implements Provider {
           part.source.type === 'provider-file' &&
           part.source.provider !== this.name
         ) {
-          fail('provider-file');
+          failWith(part.type, 'provider-file');
         }
       }
     }
@@ -389,7 +393,7 @@ export class MockProvider implements Provider {
         part.source.type === 'provider-file' &&
         part.source.provider !== this.name
       ) {
-        fail('provider-file');
+        failWith(part.type, 'provider-file');
       }
     }
     return { effectiveModel };

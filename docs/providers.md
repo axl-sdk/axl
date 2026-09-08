@@ -81,11 +81,22 @@ type. Axl sends no `modalities` field, so the response stays text.
 Live-certified on `gpt-audio-1.5` for a **single-turn text answer** only. The
 tool continuation failed on the provider side (`500`, five runs) and
 `response_format` is rejected (`400`), so neither composition is advertised;
-see the dated general-audio record under `docs/verification/`. Audio-bearing
-Chat Completions calls are **unpriced** — `hasUnmodeledDirectOpenAIContent`
-unprices any non-text content part. The provider reports
-`prompt_tokens_details.audio_tokens`, but Axl carries no verified audio rates,
-so a text-table rate is never applied to audio tokens.
+see the dated general-audio record under `docs/verification/`.
+
+Audio-bearing Chat Completions calls are **priced** on a model that carries a
+verified audio rate (`gpt-audio-1.5`, `gpt-audio`). The prompt splits into
+disjoint buckets — cached, cache-write, audio
+(`prompt_tokens_details.audio_tokens`), and the ordinary text remainder — and
+each bills at its own published rate; the completion splits the same way via
+`completion_tokens_details.audio_tokens`. A text-table rate is never applied to
+audio tokens. Every bucket needs a rate for the call to price at all, so the
+result is `undefined` (never `0`) when: the model carries no audio rate, an
+audio-bearing request comes back with no audio count (missing ≠ zero), any
+count is malformed, the buckets contradict the totals, an image or unknown
+content part is present anywhere in the request, or the prompt crosses the
+model's long-context threshold while carrying audio (no long-context audio rate
+is published). Estimates are not retroactive: executions recorded before this
+landed stay `unpriced`.
 
 **Images remain rejected on `openai:`.** Adding audio did not add images: use
 `openai-responses:` for vision. Chat Completions image pricing is unmodeled.
@@ -208,11 +219,27 @@ typed `ProviderError` rather than a local guess.
 Live-certified on `gemini-3.7-flash` for a text answer from speech and
 non-speech audio, a stateless tool continuation, structured output, streaming,
 and an audio turn re-sent from application history; see the dated general-audio
-record under `docs/verification/`. Interactions responses carry no cost, so an
-audio-bearing Gemini call is **unpriced** — Gemini bills audio at a different
-rate than text. The wire reports `input_tokens_by_modality`, but
-`normalizeInteractionUsage` folds it into `prompt_tokens` and Axl carries no
-verified audio rates, so nothing is priced from it.
+record under `docs/verification/`.
+
+Interactions responses carry no authoritative cost, but they DO report
+`input_tokens_by_modality`, so Axl estimates from it: audio tokens bill at the
+model's audio rate, text and image tokens at its input rate, cached tokens at
+its cached rate (deducted from the non-audio modalities only), and output plus
+thought tokens at its output rate. `normalizeInteractionUsage` still folds the
+split into `prompt_tokens` for existing consumers and additionally exposes
+`usage.audio_input_tokens`.
+
+Pricing engages only on a model row that carries a verified audio rate
+(`gemini-2.5-flash`, `gemini-3.7-flash` today). **Behavior change:** because
+the estimator is not gated on `audio > 0`, a *text-* or *image-only* rich
+Interactions call on such a model is now priced too — its image tokens bill at
+the input rate, never at the audio rate. Everything else stays `undefined`
+(never `0`): a model with no audio rate, a missing breakdown, a breakdown that
+does not sum to the reported input total, an unknown modality (`video`,
+documents, anything new), non-zero server-side tool tokens, cached tokens
+exceeding the non-audio portion, a non-text reply part, a non-Standard tier, a
+non-canonical base URL, or a server-side cache reference. Estimates are not
+retroactive.
 
 ### Completed-file transcription
 
@@ -1128,12 +1155,27 @@ billable modalities/tools are left unpriced.
 
 A call is not priced from the text table merely because it carried media. Axl
 reports a cost only when the provider returns an authoritative total or a
-verified modality-aware estimator exists. Today no audio estimator exists, so
-audio-bearing `openai:` and `google:` calls report usage with **no cost** and set
-the normal `unpriced` / lower-bound signals; `openrouter:` reports its
-authoritative `usage.cost`. Because unpriced spend is reported but not
-enforceable, a `ctx.budget()` cost limit cannot trip on an unpriced audio call —
-it flags `unpriced` instead.
+verified modality-aware estimator exists.
+
+A modality-aware **audio** estimator now exists for `openai:` Chat Completions
+and `google:` Interactions: audio tokens bill from a per-model audio row, never
+from the text row, and a call whose every billed bucket has a published rate
+reports an exact number that `ctx.budget()` can enforce on. `openrouter:` is
+unchanged and still reports its authoritative `usage.cost`; an OpenRouter call
+without one stays unpriced rather than estimated. Images on `openai:` Chat
+Completions remain unmodeled, and a model with no audio rate stays unpriced.
+See the per-adapter sections above for each estimator's exact formula and
+precondition list.
+
+Where a precondition fails the call is still reported with usage and **no
+cost**, setting the normal `unpriced` / lower-bound signals. Because unpriced
+spend is reported but not enforceable, a `ctx.budget()` cost limit cannot trip
+on an unpriced audio call — it flags `unpriced` instead.
+
+Both estimators expose the per-modality prompt split as
+`usage.audio_input_tokens` (and `usage.audio_output_tokens` where the provider
+reports it), including on the OpenRouter lane where it is observability only.
+The fields are **absent, never `0`**, when the provider reported no split.
 
 ### Custom providers
 

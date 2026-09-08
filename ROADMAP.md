@@ -32,6 +32,15 @@
   `openai:` for a single-turn text answer (its tool continuation and
   structured output fail provider-side and are recorded, not advertised).
 
+- **Modality-aware audio cost estimation** — Audio-bearing `openai:` Chat
+  Completions and `google:` Interactions calls are priced from the
+  per-modality usage both providers report, with audio tokens billed from a
+  per-model audio rate row and never from the text row, so `ctx.budget()`
+  enforces on audio spend. A bucket without a published rate, or counts that
+  do not reconcile, keep the call `undefined` rather than reporting a
+  confidently wrong number. Normalized usage exposes
+  `audio_input_tokens` / `audio_output_tokens`.
+
 - **OpenTelemetry** — Automatic span emission for every `ctx.*` primitive with cost-per-span attribution
 - **Memory Primitives** — `ctx.remember()`, `ctx.recall()`, `ctx.forget()` with session/global scope and semantic vector search
 - **Agent Guardrails** — Input/output validation at the agent boundary with retry, throw, or custom policies
@@ -260,13 +269,13 @@ completed-file transcription. The following are intentionally tracked as
 separate future product surfaces, not implied by today's `ModelInput` or
 `ctx.transcribe()` contracts:
 
-- **Modality-aware audio cost estimation** — General audio understanding is
-  implemented and natively certified (see Complete, above). Audio-bearing
-  `openai:` and `google:` calls are still unpriced by design; the live rows
-  proved both providers report audio input tokens separately, so the remaining
-  work is verified per-model audio rates plus an estimator on the pricing rail
-  (a consequential seam needing its own adversarial review). Audio URLs, audio
-  output, realtime voice, and a Studio audio picker stay out of scope.
+- **Remaining audio surfaces** — Modality-aware audio cost estimation is
+  implemented (see Complete, above). Audio URLs, audio output as a product,
+  realtime voice, and a Studio audio picker stay out of scope. A long-context
+  audio rate and an OpenAI cached-audio rate are unpriced until first-party
+  prices are published; a modality token breakdown on `AxlEventBase.tokens`
+  (and the Studio cost bucketing it would enable) is a separate additive
+  observability decision.
 - **Documents, video, and generated media** — New input and output content
   types with their own limits, provider mappings, observation rules, and live
   evidence. Multimodal tool results belong here as an explicit output contract,

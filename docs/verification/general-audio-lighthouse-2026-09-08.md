@@ -241,14 +241,23 @@ None. Every row in the suite ran on 2026-09-08.
 `providerMetadata` leak evidence remains indirect: passing rows assert that no
 base64 appears anywhere in observed response bodies or events.
 
-## Usage evidence for a future modality-aware estimator
+## Usage evidence for the modality-aware estimator
 
 All three lanes report audio input tokens separately: OpenAI
 `prompt_tokens_details.audio_tokens` / `text_tokens`, Gemini
 `input_tokens_by_modality`, OpenRouter `prompt_tokens_details.audio_tokens`.
-Axl still prices none of them: `openai:` and `google:` audio calls remain
-unpriced by design until verified per-model audio rates exist. See the
-accounting section of [`docs/multimodal-input.md`](../multimodal-input.md).
+
+**Addendum (2026-09-08, same day):** this evidence was the last precondition
+for a modality-aware estimator, and one shipped on the back of it. Audio-bearing
+`openai:` Chat Completions and `google:` Interactions calls on a model carrying
+a verified audio rate are now priced — audio tokens from their own rate row,
+never the text row — and stay unpriced whenever a billed bucket has no
+published rate or the reported counts do not reconcile. OpenRouter is
+unchanged. The usage vectors recorded above are the fixtures the offline
+estimator tests replay, and the live rows here now assert the estimate equals
+the formula applied to the captured wire usage. See the accounting section of
+[`docs/multimodal-input.md`](../multimodal-input.md) and
+[`docs/providers.md`](../providers.md#rich-input-calls).
 
 ## Request and retry ceilings
 

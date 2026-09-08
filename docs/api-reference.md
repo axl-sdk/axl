@@ -1903,10 +1903,24 @@ ollama/vllm/lmstudio/llamacpp/sglang) are profiles; build your own by cloning on
 
 **Provider usage** — `ProviderResponse.usage` and terminal stream chunks expose
 `prompt_tokens`, `completion_tokens`, `total_tokens`, and optional `reasoning_tokens`,
-`cached_tokens`, and `cache_write_tokens`. Anthropic cache creation is included in
+`cached_tokens`, `cache_write_tokens`, `audio_input_tokens`, and `audio_output_tokens`.
+Anthropic cache creation is included in
 `cache_write_tokens`; when the response provides 5-minute and 1-hour TTL buckets, Axl prices
 each bucket at its actual multiplier. Aggregate-only cache-write usage remains observable but
 is deliberately unpriced.
+
+`audio_input_tokens` / `audio_output_tokens` are the audio share of
+`prompt_tokens` / `completion_tokens`, populated on every lane that reports the
+split — `openai:` and `openrouter:` from `prompt_tokens_details.audio_tokens` /
+`completion_tokens_details.audio_tokens`, `google:` Interactions from
+`input_tokens_by_modality`. Both fields are **absent, never `0`**, when the
+provider reported no split or reported an unusable count, so a consumer can
+distinguish "no audio" from "not reported"; `prompt_tokens` remains the folded
+total. Both usage shapes carry them identically, so a streaming consumer sees
+the same fields as `chat()`. `AxlEventBase.tokens` is deliberately NOT widened
+with a modality bucket. The public `PricingTable` type is unchanged: audio
+rates live on the built-in `openai:` and `google:` catalogs only, so a
+third-party profile cannot declare one.
 
 **`ReasoningProfile`** — `{ emit: ReasoningEmit; capture: ReasoningCapture; roundTrip?: ReasoningRoundTrip }`.
 - `capture`: `'none'` · `'reasoning_content'` · `'reasoning'` · `'reasoning_details'` · `'think_tags'` (inline `<think>`).

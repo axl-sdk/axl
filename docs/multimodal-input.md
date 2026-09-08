@@ -282,15 +282,22 @@ schema — is the provider's decision and arrives as `ProviderError`.
 
 ### Accounting
 
-Audio-bearing calls on `openai:` and `google:` are **unpriced by design**. There
-is no modality-aware estimator: applying the text pricing table to audio tokens
-would silently under-report by an order of magnitude. The live rows proved that
-both providers *do* report audio input tokens separately (OpenAI
+Audio-bearing calls on `openai:` and `google:` are **priced by a modality-aware
+estimator** on models that carry a verified per-model audio rate. Audio tokens
+bill from their own rate row — applying the text pricing table to them would
+silently under-report by an order of magnitude — and the remaining text, image,
+cached, and output buckets bill at their own rates. The counts come from the
+per-modality usage both providers report (OpenAI
 `prompt_tokens_details.audio_tokens` / `text_tokens`, Gemini
-`input_tokens_by_modality`), so an estimator is now possible, but it needs
-verified per-model audio rates that Axl does not carry. Until then those calls
-set the normal `unpriced` / lower-bound signals rather than a wrong number or
-`$0` — and a `ctx.budget()` cost limit cannot trip on them.
+`input_tokens_by_modality`), which the live rows certified.
+
+A call is priced only when every bucket it billed has a published rate and the
+reported counts reconcile. Otherwise it sets the normal `unpriced` /
+lower-bound signals rather than a wrong number or `$0` — and a `ctx.budget()`
+cost limit cannot trip on it. `docs/providers.md` lists each estimator's exact
+formula and full precondition set. Normalized usage now also carries
+`audio_input_tokens` (and `audio_output_tokens` where reported), absent rather
+than `0` when the provider reported no split.
 
 OpenRouter remains the exception: its response `usage.cost` is authoritative and
 is used as reported. The live rows observed OpenRouter reporting

@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Modality-aware audio cost estimation.** Audio-bearing `openai:` Chat
+  Completions and `google:` Interactions calls are now **priced** instead of
+  unpriced, so `ctx.budget()` can enforce a cost limit on audio work and cost
+  dashboards show an exact number rather than a `≥ $X` lower bound. Audio
+  tokens bill from a per-model audio rate row, never from the text row: the
+  prompt splits into disjoint cached / cache-write / audio / text buckets and
+  each bills at its own published rate, with output plus (on Gemini) thought
+  tokens at the output rate. Rates are carried for `gpt-audio-1.5`,
+  `gpt-audio`, `gemini-2.5-flash`, and `gemini-3.7-flash` (reviewed 2026-09-08
+  against the first-party pricing pages; the announced 2027 Gemini increase is
+  deliberately not encoded). A call whose every billed bucket lacks a
+  published rate — or whose reported counts do not reconcile — stays
+  `undefined`, never `0`: an unrated model, a missing audio count on an
+  audio-bearing request (missing is not zero), an unknown Gemini modality,
+  server-side tool tokens, cached tokens exceeding the non-audio portion, a
+  non-text reply, a non-Standard tier, a non-canonical base URL, or a
+  long-context crossing that carries audio. `openrouter:` is unchanged
+  (`usage.cost` stays authoritative), images on `openai:` Chat Completions stay
+  unmodeled, text-only pricing is byte-identical, and `MockProvider` is
+  untouched.
+  **This is not retroactive:** executions recorded before this release keep
+  `unpriced: true` for audio work, so anyone diffing historical against new
+  executions sees a step change at the release boundary.
+  **Behavior change beyond audio:** because the Gemini estimator is not gated
+  on `audio > 0`, a text- or image-only rich Interactions call on a model that
+  carries an audio rate is now priced too, with image tokens billed at the
+  input rate. See
+  [`docs/providers.md`](docs/providers.md#rich-input-calls).
+- `ProviderResponse.usage` and terminal stream chunks gain optional
+  `audio_input_tokens` / `audio_output_tokens` — the audio share of
+  `prompt_tokens` / `completion_tokens`, populated on `openai:`,
+  `openrouter:` (observability only), and `google:` Interactions. Both fields
+  are **absent, never `0`**, when the provider reported no split or an
+  unusable count, and `prompt_tokens` remains the folded total. The two usage
+  shapes stay in field parity, so streaming consumers see the same fields as
+  `chat()`. `AxlEventBase.tokens` and the public `PricingTable` type are
+  deliberately unchanged.
 - **General recorded-audio input.** `InputContentPart` gains an audio member,
   `InputAudioPart` (`{ type: 'audio', source: RecordedAudioSource, label? }`), so
   a chat model can reason directly about a finite recording — speech *and*

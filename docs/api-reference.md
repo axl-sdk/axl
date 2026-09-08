@@ -1899,7 +1899,7 @@ ollama/vllm/lmstudio/llamacpp/sglang) are profiles; build your own by cloning on
 | `parallelToolCalls` | `PerModel<boolean>` | off | Send `parallel_tool_calls: true` when tools are present |
 | `requestDefaults` | `Record<string,unknown>` | — | Static body fields merged before `providerOptions` |
 
-**`PricingSource`** — `{ kind: 'table'; table: PricingTable; match?: 'prefix' | 'exact' }` · `{ kind: 'from-response' }` (provider returns `usage.cost`) · `{ kind: 'zero' }` (local) · `{ kind: 'unknown' }`. Custom tables default to prefix matching for compatibility; built-in current catalogs use exact matching. A table miss yields `cost: undefined`, never `0`.
+**`PricingSource`** — `{ kind: 'table'; table: PricingTable; match?: 'prefix' | 'exact' }` · `{ kind: 'from-response' }` (provider returns `usage.cost`) · `{ kind: 'zero' }` (local) · `{ kind: 'unknown' }`. Custom tables default to prefix matching for compatibility; built-in current catalogs use exact matching. A table miss yields `cost: undefined`, never `0`. A `PricingTable` cannot express an audio rate, so a table-priced profile also yields `undefined` on a call whose usage reports a non-zero `audio_input_tokens` rather than billing those tokens at its text input rate.
 
 **Provider usage** — `ProviderResponse.usage` and terminal stream chunks expose
 `prompt_tokens`, `completion_tokens`, `total_tokens`, and optional `reasoning_tokens`,
@@ -1912,8 +1912,9 @@ is deliberately unpriced.
 `audio_input_tokens` / `audio_output_tokens` are the audio share of
 `prompt_tokens` / `completion_tokens`, populated on every lane that reports the
 split — `openai:` and `openrouter:` from `prompt_tokens_details.audio_tokens` /
-`completion_tokens_details.audio_tokens`, `google:` Interactions from
-`input_tokens_by_modality`. Both fields are **absent, never `0`**, when the
+`completion_tokens_details.audio_tokens`, `openai-responses:` from
+`input_tokens_details.audio_tokens` / `output_tokens_details.audio_tokens`, and
+`google:` Interactions from `input_tokens_by_modality`. Both fields are **absent, never `0`**, when the
 provider reported no split or reported an unusable count, so a consumer can
 distinguish "no audio" from "not reported"; `prompt_tokens` remains the folded
 total. Both usage shapes carry them identically, so a streaming consumer sees

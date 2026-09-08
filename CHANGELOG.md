@@ -23,12 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published rate — or whose reported counts do not reconcile — stays
   `undefined`, never `0`: an unrated model, a missing audio count on an
   audio-bearing request (missing is not zero), an unknown Gemini modality,
-  server-side tool tokens, cached tokens exceeding the non-audio portion, a
-  non-text reply, a non-Standard tier, a non-canonical base URL, or a
-  long-context crossing that carries audio. `openrouter:` is unchanged
+  server-side tool tokens, cached tokens co-occurring with audio tokens (the
+  providers do not document whether the two buckets overlap), a Gemini
+  `total_tokens` that does not reconcile with its parts, a non-text reply, a
+  non-Standard tier, a non-canonical base URL, or a long-context crossing that
+  carries audio. A custom `ProviderProfile` using `pricing: { kind: 'table' }`
+  is likewise unpriced on a call that billed audio tokens, since a
+  `PricingTable` cannot express an audio rate. `openrouter:` is unchanged
   (`usage.cost` stays authoritative), images on `openai:` Chat Completions stay
-  unmodeled, text-only pricing is byte-identical, and `MockProvider` is
-  untouched.
+  unmodeled, and `MockProvider` is untouched. Text-only pricing is unchanged,
+  **with one exception**: a text call whose usage nonetheless reports audio
+  tokens, on a model with no published audio rate, is now unpriced rather than
+  billed at the text rate — usage is authoritative, so a reported audio bucket
+  means real audio billing at a price Axl does not know.
   **This is not retroactive:** executions recorded before this release keep
   `unpriced: true` for audio work, so anyone diffing historical against new
   executions sees a step change at the release boundary.

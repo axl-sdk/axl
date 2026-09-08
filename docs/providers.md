@@ -93,10 +93,24 @@ audio tokens. Every bucket needs a rate for the call to price at all, so the
 result is `undefined` (never `0`) when: the model carries no audio rate, an
 audio-bearing request comes back with no audio count (missing ≠ zero), any
 count is malformed, the buckets contradict the totals, an image or unknown
-content part is present anywhere in the request, or the prompt crosses the
-model's long-context threshold while carrying audio (no long-context audio rate
-is published). Estimates are not retroactive: executions recorded before this
-landed stay `unpriced`.
+content part is present anywhere in the request, cached or cache-write tokens
+are reported alongside audio tokens, or the prompt crosses the model's
+long-context threshold while carrying audio.
+
+The last two are deliberate conservatism, not oversights. No long-context audio
+rate is published, and neither is a cached-input rate for the audio models — nor
+does OpenAI document whether `cached_tokens` can *include* audio tokens, which
+is what the four-bucket subtraction assumes. Since prompt caching engages
+automatically above a token threshold that seconds of speech cross, expect a
+long multi-turn audio session to report `unpriced` rather than a number that
+might bill cached audio at the wrong rate.
+
+The same usage-authoritative rule applies to a text-only call: if usage reports
+audio tokens on a model with no published audio rate, the call is unpriced
+rather than billed at the text rate. Estimates are not retroactive: executions
+recorded before this landed stay `unpriced`. `openai-responses:` normalizes the
+same two usage fields, so the rule holds identically on both OpenAI transports
+(that transport still rejects audio input before dispatch).
 
 **Images remain rejected on `openai:`.** Adding audio did not add images: use
 `openai-responses:` for vision. Chat Completions image pricing is unmodeled.
@@ -235,11 +249,18 @@ the estimator is not gated on `audio > 0`, a *text-* or *image-only* rich
 Interactions call on such a model is now priced too — its image tokens bill at
 the input rate, never at the audio rate. Everything else stays `undefined`
 (never `0`): a model with no audio rate, a missing breakdown, a breakdown that
-does not sum to the reported input total, an unknown modality (`video`,
-documents, anything new), non-zero server-side tool tokens, cached tokens
-exceeding the non-audio portion, a non-text reply part, a non-Standard tier, a
-non-canonical base URL, or a server-side cache reference. Estimates are not
-retroactive.
+does not sum to the reported input total, a `total_tokens` that does not equal
+`input + output + thoughts + tool-use` (that identity is what proves the output
+count excludes thoughts, so without it thoughts could be billed twice), an
+unknown modality (`video`, documents, anything new), non-zero server-side tool
+tokens, cached tokens reported alongside audio tokens, a non-text reply part, a
+non-Standard tier, a non-canonical base URL, or a server-side cache reference.
+
+Cached-plus-audio is unpriced for the same reason as on OpenAI: Google does not
+document whether `total_cached_tokens` can include audio tokens, and an
+implicit cache hit needs nothing in the request, so the estimator cannot detect
+the overlap. Streaming and non-streaming agree exactly, including on a reply
+part the stream could not reconstruct. Estimates are not retroactive.
 
 ### Completed-file transcription
 
@@ -1166,6 +1187,13 @@ without one stays unpriced rather than estimated. Images on `openai:` Chat
 Completions remain unmodeled, and a model with no audio rate stays unpriced.
 See the per-adapter sections above for each estimator's exact formula and
 precondition list.
+
+A custom `ProviderProfile` on the generic engine is **not** covered by either
+estimator. `pricing: { kind: 'table' }` cannot express an audio rate — the
+public `PricingTable` tuple is deliberately unchanged — so a table-priced
+profile that declares audio input reports `undefined` on any call whose usage
+billed audio tokens, rather than pricing those tokens at its text input rate.
+A reported audio count of `0` still prices normally.
 
 Where a precondition fails the call is still reported with usage and **no
 cost**, setting the normal `unpriced` / lower-bound signals. Because unpriced

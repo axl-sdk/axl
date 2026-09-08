@@ -10,7 +10,10 @@ Use the existing workstream plan's progress section or execution log. Without a
 workstream, keep concise session notes. Do not create a telemetry system or a
 separate report for each small task. Record meaningful chunks and review waves,
 not every command. At the start, note the accepted outcome, expected critical
-path, routing rationale, and any user-specified time or spend constraints.
+path, routing rationale, and any user-specified time or spend constraints. Give
+bounded reviews and discovery an expected time budget. At that budget, request
+confirmed findings and limitations or justify a targeted extension for a concrete
+unresolved risk; elapsed time alone never establishes a clean review.
 
 For each meaningful assignment, capture:
 

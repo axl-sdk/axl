@@ -347,6 +347,16 @@ function sortedKeys(table: PricingTable): string[] {
 }
 
 /**
+ * A provider-reported token count, or `undefined` when the wire value is not a
+ * usable one. JSON can carry anything here (`null`, `"80"`, `-1`, `12.5`,
+ * `1e18`), and a bad count must never reach pricing, `ctx.totalCost`, or a span
+ * attribute — so it is dropped rather than coerced.
+ */
+function reportedTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+/**
  * Look up per-token pricing by exact match, then longest-prefix match (for
  * versioned snapshots like `gpt-4o-2024-05-13`). Returns `undefined` on a miss —
  * callers MUST treat that as "unknown cost", never as free.
@@ -955,6 +965,12 @@ export class OpenAICompatibleProvider implements Provider {
 
   private toUsage(raw: OpenAIUsage | undefined): ProviderResponse['usage'] {
     if (!raw) return undefined;
+    // The audio split is spread conditionally: a consumer must be able to tell
+    // "the provider reported no audio" (field absent) from "the provider
+    // reported zero audio tokens" (field present, `0`), and a malformed count
+    // is dropped rather than propagated into pricing or a span attribute.
+    const audioInput = reportedTokenCount(raw.prompt_tokens_details?.audio_tokens);
+    const audioOutput = reportedTokenCount(raw.completion_tokens_details?.audio_tokens);
     return {
       prompt_tokens: raw.prompt_tokens,
       completion_tokens: raw.completion_tokens,
@@ -965,6 +981,8 @@ export class OpenAICompatibleProvider implements Provider {
       // generic table estimator; its split is validated before pricing.
       cached_tokens: raw.prompt_cache_hit_tokens ?? raw.prompt_tokens_details?.cached_tokens,
       cache_write_tokens: raw.prompt_tokens_details?.cache_write_tokens,
+      ...(audioInput !== undefined ? { audio_input_tokens: audioInput } : {}),
+      ...(audioOutput !== undefined ? { audio_output_tokens: audioOutput } : {}),
     };
   }
 
@@ -1378,8 +1396,12 @@ type OpenAIUsage = {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
-  completion_tokens_details?: { reasoning_tokens?: number };
-  prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
+  completion_tokens_details?: { reasoning_tokens?: number; audio_tokens?: unknown };
+  prompt_tokens_details?: {
+    cached_tokens?: number;
+    cache_write_tokens?: number;
+    audio_tokens?: unknown;
+  };
   /** OpenRouter / Vercel Gateway: per-call cost in USD. */
   cost?: number;
   /** xAI: exact billed USD cost in ten-billionths of a dollar. */

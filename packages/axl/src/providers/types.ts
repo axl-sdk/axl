@@ -142,6 +142,15 @@ export type StreamChunk =
         cached_tokens?: number;
         /** Tokens written to a provider prompt cache during this call, when reported. */
         cache_write_tokens?: number;
+        /**
+         * Audio tokens counted inside `prompt_tokens`, when the provider reports
+         * the per-modality split. Absent — never `0` — when unreported. Kept in
+         * field parity with `ProviderResponse.usage` so a streaming consumer
+         * never loses the split.
+         */
+        audio_input_tokens?: number;
+        /** Audio tokens counted inside `completion_tokens`, when reported. */
+        audio_output_tokens?: number;
       };
       /** Estimated cost in USD for this call, computed the same way as ProviderResponse.cost. */
       cost?: number;

@@ -6,6 +6,7 @@ import { agent } from '../agent.js';
 import { WorkflowContext } from '../context.js';
 import { UnsupportedModelInputError } from '../errors.js';
 import type { InputContentPart } from '../input.js';
+import { AXL_EVENT_TYPES } from '../types.js';
 import { AnthropicProvider } from '../providers/anthropic.js';
 import { OpenAIProvider } from '../providers/openai.js';
 import { OpenAICompatibleProvider } from '../providers/openai-compatible.js';
@@ -359,23 +360,11 @@ function assertNoStrayAudioEcho(value: unknown, sentinel: string): void {
 }
 
 /** Streaming rows: only the ordinary lifecycle types, and nothing audio-shaped. */
-const ORDINARY_EVENT_TYPES = new Set([
-  'workflow_start',
-  'workflow_end',
-  'ask_start',
-  'ask_end',
-  'agent_call_start',
-  'agent_call_end',
-  'token',
-  'thinking',
-  'partial_object',
-  'tool_call_start',
-  'tool_call_end',
-  'log',
-  'checkpoint',
-  'usage',
-  'error',
-]);
+// Every discriminator the runtime already emits today. The row asserts that an
+// audio ask introduces no *new* event type; `AXL_EVENT_TYPES` is the canonical
+// list, so a hand-written subset would fail on ordinary lifecycle events such
+// as `pipeline`.
+const ORDINARY_EVENT_TYPES: ReadonlySet<string> = new Set(AXL_EVENT_TYPES);
 
 function assertOrdinaryStreamingEvents(events: readonly AxlEvent[]): void {
   expect(events.some((event) => event.type === 'token')).toBe(true);

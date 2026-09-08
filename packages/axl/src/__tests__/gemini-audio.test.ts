@@ -17,7 +17,7 @@ import { tool } from '../tool.js';
 import { workflow } from '../workflow.js';
 import { UnsupportedModelInputError } from '../errors.js';
 import { isUnpricedLeaf } from '../event-utils.js';
-import { GOOGLE_IMAGE_BODY, GOOGLE_STRING_BODY } from './rich-input-baselines.test.js';
+import { GOOGLE_IMAGE_BODY, GOOGLE_STRING_BODY } from './fixtures/rich-input-baselines.js';
 
 const originalFetch = globalThis.fetch;
 

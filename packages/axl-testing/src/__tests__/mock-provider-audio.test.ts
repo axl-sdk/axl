@@ -264,7 +264,7 @@ describe('audio never leaks through the AxlTestRuntime observability surface', (
 
 describe('MockProvider image rejections are unchanged', () => {
   it('AT-06: a mismatched image provider-file still yields the frozen image triple', async () => {
-    // Frozen in packages/axl/src/__tests__/rich-input-baselines.test.ts as
+    // Frozen in packages/axl/src/__tests__/fixtures/rich-input-baselines.ts as
     // IMAGE_REJECTION_TRIPLES.mockMismatchedProviderFile. Duplicated as a
     // literal because that fixture is not exported across packages.
     const provider = MockProvider.echo();

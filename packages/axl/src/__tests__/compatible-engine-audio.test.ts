@@ -36,7 +36,7 @@ import {
   OPENAI_STRING_BODY,
   OPENROUTER_IMAGE_BODY,
   OPENROUTER_STRING_BODY,
-} from './rich-input-baselines.test.js';
+} from './fixtures/rich-input-baselines.js';
 
 const originalFetch = globalThis.fetch;
 

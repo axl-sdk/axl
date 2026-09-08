@@ -3409,6 +3409,9 @@ describe('GeminiProvider', () => {
         ...done.providerMetadata.geminiInteractionSteps,
         {
           type: 'function_result',
+          // Interactions rejects a continuation whose function_result lacks the
+          // function name (live 400 "Invalid input received", 2026-09-08).
+          name: 'inspect',
           call_id: 'call_1',
           result: [{ type: 'text', text: '{"ok":true}' }],
         },

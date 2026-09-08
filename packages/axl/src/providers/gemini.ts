@@ -1105,6 +1105,10 @@ export class GeminiProvider implements Provider {
 
   private mapInteractionInput(messages: ChatMessage[], model: string): GeminiInteractionStep[] {
     const steps: GeminiInteractionStep[] = [];
+    // Interactions requires `name` on every `function_result` (alongside
+    // `call_id`); the tool message only carries the call id, so the name is
+    // resolved from the `function_call` step that produced it.
+    const functionNames = new Map<string, string>();
     for (const message of messages) {
       if (message.role === 'user') {
         steps.push({
@@ -1116,6 +1120,10 @@ export class GeminiProvider implements Provider {
       } else if (message.role === 'assistant') {
         const nativeSteps = message.providerMetadata?.geminiInteractionSteps;
         if (Array.isArray(nativeSteps) && nativeSteps.every(isGeminiInteractionStep)) {
+          for (const step of nativeSteps) {
+            if (step.type === 'function_call' && typeof step.id === 'string' && step.name)
+              functionNames.set(step.id, step.name);
+          }
           steps.push(...nativeSteps);
           continue;
         }
@@ -1123,6 +1131,7 @@ export class GeminiProvider implements Provider {
           steps.push({ type: 'model_output', content: [{ type: 'text', text: message.content }] });
         }
         for (const call of message.tool_calls ?? []) {
+          functionNames.set(call.id, call.function.name);
           steps.push({
             type: 'function_call',
             id: call.id,
@@ -1131,9 +1140,11 @@ export class GeminiProvider implements Provider {
           });
         }
       } else if (message.role === 'tool') {
+        const callId = message.tool_call_id ?? '';
         steps.push({
           type: 'function_result',
-          call_id: message.tool_call_id ?? '',
+          name: functionNames.get(callId) ?? message.name ?? '',
+          call_id: callId,
           result: [
             { type: 'text', text: typeof message.content === 'string' ? message.content : '' },
           ],

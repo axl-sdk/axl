@@ -1,43 +1,9 @@
 import type { ChatMessage, HandoffRecord } from './types.js';
-import { normalizeModelInput, summarizeModelInput } from './input.js';
-import type { ModelInput } from './input.js';
+import { clearSessionInput, prepareSessionInput, registerSessionInput } from './session-input.js';
 import type { StateStore } from './state/types.js';
 import type { AxlRuntime } from './runtime.js';
 import type { AxlStream } from './stream.js';
 import type { EventStreamOptions } from './event-stream.js';
-
-const MODEL_INPUT_PART_TYPES: ReadonlySet<unknown> = new Set(['text', 'image', 'audio']);
-
-/** A workflow input shaped like ordered `ModelInput` parts. Any other
- *  non-string input is an application object and is recorded as JSON. */
-function isModelInputParts(input: unknown): input is readonly unknown[] {
-  return (
-    Array.isArray(input) &&
-    input.length > 0 &&
-    input.every(
-      (part) =>
-        typeof part === 'object' &&
-        part !== null &&
-        MODEL_INPUT_PART_TYPES.has((part as { type?: unknown }).type),
-    )
-  );
-}
-
-/**
- * The persisted `user` turn for a session input. Media is per-call evidence,
- * never session state: a rich input is recorded through the same
- * context-safe projection the runtime uses everywhere else
- * (`[audio audio/wav] question`), so inline base64 can never be stored or
- * re-sent as text on later turns, and `Uint8Array` media cannot reach a store.
- * Validation runs first so a malformed part fails here, before the workflow.
- */
-function sessionUserTurn(input: unknown): string {
-  if (typeof input === 'string') return input;
-  if (isModelInputParts(input)) {
-    return summarizeModelInput(normalizeModelInput(input as unknown as ModelInput));
-  }
-  return JSON.stringify(input);
-}
 
 /** Options for configuring a session. */
 export type SessionOptions = {
@@ -50,6 +16,8 @@ export type SessionOptions = {
     /** Model URI to use for summarization (e.g., 'openai:gpt-4o-mini'). Required when summarize is true. */
     summaryModel?: string;
   };
+  /** Whether an identical current session input is sent to the model once. Default: true. */
+  deduplicateInput?: boolean;
   /** Whether to persist session history to the state store. Default: true. */
   persist?: boolean;
 };
@@ -108,9 +76,13 @@ export class Session {
     events: EventStreamOptions | undefined,
   ): Promise<unknown> {
     const { history, metadata } = await this.prepareHistory(input);
-    const result = await this.runtime.execute(workflowName, input, { metadata, signal, events });
-    await this.commitHistory(history, result);
-    return result;
+    try {
+      const result = await this.runtime.execute(workflowName, input, { metadata, signal, events });
+      await this.commitHistory(history, result);
+      return result;
+    } finally {
+      clearSessionInput(history);
+    }
   }
 
   /** Read history + summary, apply maxMessages limit (with optional
@@ -124,6 +96,7 @@ export class Session {
     history: ChatMessage[];
     metadata: Record<string, unknown>;
   }> {
+    const preparedInput = prepareSessionInput(input);
     const history = await this.store.getSession(this.sessionId);
     let cachedSummary = (await this.store.getSessionMeta(this.sessionId, 'summaryCache')) as
       | string
@@ -155,7 +128,11 @@ export class Session {
       history.push(...trimmed);
     }
 
-    history.push({ role: 'user', content: sessionUserTurn(input) });
+    const userMessage: ChatMessage = { role: 'user', content: preparedInput.content };
+    history.push(userMessage);
+    if (this.options.deduplicateInput !== false && preparedInput.normalizedInput !== undefined) {
+      registerSessionInput(history, userMessage, preparedInput.normalizedInput);
+    }
 
     const metadata: Record<string, unknown> = {
       sessionId: this.sessionId,
@@ -237,7 +214,7 @@ export class Session {
     signal: AbortSignal | undefined,
     events: EventStreamOptions | undefined,
   ): Promise<void> {
-    let history: ChatMessage[];
+    let history: ChatMessage[] | undefined;
     let axlStream: AxlStream;
     try {
       const prepared = await this.prepareHistory(input);
@@ -248,6 +225,7 @@ export class Session {
         events,
       });
     } catch (err) {
+      if (history) clearSessionInput(history);
       rejectReady(err);
       throw err;
     }
@@ -261,18 +239,22 @@ export class Session {
     // `error`; using it instead of `on('done'|'error', ...)` avoids any
     // listener-vs-sync-emit ordering risk. Save only on success — an
     // errored stream has no committed result.
-    const completion = axlStream.promise.then(
-      (result) =>
-        this.commitHistory(history, result).catch((err) => {
-          this.runtime.emit('error', {
-            type: 'session_history_save_failed',
-            sessionId: this.sessionId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }),
-      () => undefined,
-    );
-    await completion;
+    try {
+      const completion = axlStream.promise.then(
+        (result) =>
+          this.commitHistory(history!, result).catch((err) => {
+            this.runtime.emit('error', {
+              type: 'session_history_save_failed',
+              sessionId: this.sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }),
+        () => undefined,
+      );
+      await completion;
+    } finally {
+      clearSessionInput(history!);
+    }
   }
 
   async history(): Promise<ChatMessage[]> {

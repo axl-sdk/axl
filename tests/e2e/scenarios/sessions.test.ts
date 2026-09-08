@@ -1,10 +1,53 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { agent, workflow } from '@axlsdk/axl';
+import { agent, workflow, type ModelInput } from '@axlsdk/axl';
 import { MockProvider } from '@axlsdk/testing';
 import { createTestRuntime } from '../helpers/setup.js';
 
 describe('Sessions E2E', () => {
+  it('deduplicates only the current matching input across fresh handles and rich requests', async () => {
+    const provider = MockProvider.fn((_messages, callIndex) => ({ content: `reply-${callIndex}` }));
+    const { runtime } = createTestRuntime(provider);
+    const a = agent({ name: 'dedup-agent', model: 'mock:test' });
+    runtime.register(
+      workflow({
+        name: 'dedup-wf',
+        input: z.any(),
+        handler: (ctx) => ctx.ask(a, ctx.input as ModelInput),
+      }),
+    );
+
+    await runtime.session('dedup-default').send('dedup-wf', 'same');
+    await runtime.session('dedup-default').send('dedup-wf', 'same');
+    expect(provider.calls[0]?.messages).toEqual([{ role: 'user', content: 'same' }]);
+    expect(provider.calls[1]?.messages.filter((message) => message.role === 'user')).toEqual([
+      { role: 'user', content: 'same' },
+      { role: 'user', content: 'same' },
+    ]);
+
+    await runtime.session('dedup-disabled', { deduplicateInput: false }).send('dedup-wf', 'legacy');
+    expect(provider.calls[2]?.messages).toEqual([
+      { role: 'user', content: 'legacy' },
+      { role: 'user', content: 'legacy' },
+    ]);
+
+    const rich = [
+      { type: 'text', text: 'inspect' },
+      {
+        type: 'image',
+        source: { type: 'base64', data: 'AQID', mediaType: 'image/png' },
+      },
+    ] as const;
+    const richSession = runtime.session('dedup-rich');
+    await richSession.send('dedup-wf', rich);
+    expect(provider.calls[3]?.messages).toEqual([{ role: 'user', content: rich }]);
+    expect((await richSession.history())[0]).toEqual({
+      role: 'user',
+      content: 'inspect\n[image image/png]',
+    });
+    await runtime.shutdown();
+  });
+
   it('multi-turn: session.send() preserves conversation history', async () => {
     const provider = MockProvider.fn((_msgs, callIndex) => ({
       content: callIndex === 0 ? 'response-1' : 'response-2',

@@ -57,6 +57,7 @@ import {
   summarizeModelInput,
 } from './input.js';
 import type { ModelInput } from './input.js';
+import { sessionHistoryForAsk } from './session-input.js';
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
 import { StreamingWalker } from './streaming-walker.js';
@@ -1443,7 +1444,8 @@ export class WorkflowContext<TInput = unknown> {
     // Take ownership before any checkpoint/state work can await. Never derive a
     // descriptor or text projection from raw caller data.
     const normalizedInput = normalizeModelInput(prompt);
-    const normalizedHistory = normalizeSessionHistory(this.sessionHistory);
+    const sessionHistorySnapshot = sessionHistoryForAsk(this.sessionHistory, normalizedInput);
+    const normalizedHistory = normalizeSessionHistory(sessionHistorySnapshot);
     const delegateInputHolder = agent as Agent & { _delegateOriginalInput?: ModelInput };
     if (delegateInputHolder._delegateOriginalInput !== undefined) {
       delegateInputHolder._delegateOriginalInput = normalizeModelInput(

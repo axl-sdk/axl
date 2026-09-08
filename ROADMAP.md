@@ -46,6 +46,12 @@
 - **Agent Guardrails** — Input/output validation at the agent boundary with retry, throw, or custom policies
 - **Gate-Retry Feedback Control** — Guardrail, schema, and `validate` retries deliver the correction as a user turn after the rejected attempt (works on every provider, including Gemini models that reject a terminal model turn); a single `retryFeedback` hook on `AskOptions` / `DelegateOptions` lets callers rewrite that turn or stop retrying with the gate's typed error. See [api-reference.md#custom-retry-feedback](docs/api-reference.md#custom-retry-feedback).
 - **Session Options** — Configurable history limits, summarization, and persistence
+- **Session current-input deduplication** — `Session.send()` and `stream()`
+  recognize only the exact current user turn they just recorded, so a workflow
+  that forwards the same normalized input to `ctx.ask()` sends it once while
+  persisted history remains canonical. Rich inputs match by ordered structure,
+  repeated later turns remain distinct, and `deduplicateInput: false` preserves
+  the legacy request shape.
 - **Tool Middleware** — Approval gates (`requireApproval`) and lifecycle hooks (`before`/`after`)
 - **Model-Facing Tool Output Projection** — Opt-in synchronous `toModelOutput` allowlists the successful post-hook tool result sent to the model while preserving the complete host-observable result. Strict JSON-compatible validation fails closed, `sensitive` takes precedence, configured `AxlTestRuntime.mockTool()` overrides inherit projection policy, and direct/MCP/handoff paths remain unchanged.
 - **Agent Handoffs** — Oneway and roundtrip modes with descriptions, OTel spans, and session history
@@ -66,18 +72,6 @@
 #### Strict-mode native structured output
 
 `nativeStructuredOutput` currently sends OpenAI a **non-strict** `json_schema` (schema-as-guidance, not hard constrained decoding), because a Zod-derived schema isn't automatically OpenAI-strict-compliant (strict requires every property in `required` — optionals modeled as nullable — and `additionalProperties: false` on every object). Planned: an opt-in transform that rewrites the derived schema into the provider's strict subset and sets `strict: true`, so `nativeStructuredOutput` engages real constrained decoding where the provider supports it. Needs live-API iteration per provider; client-side Zod validation remains the guarantee in the meantime.
-
-#### Session user turn sent twice
-
-`Session.send()` records the workflow input as the persisted `user` turn, and
-the workflow then usually passes the same text to `ctx.ask()`, so the model
-sees that prompt twice on every session turn (history has never alternated;
-`ctx.ask` only appends). This predates the audio work and applies to every
-session-based workflow: it doubles the prompt's input tokens and makes traces
-read oddly. Planned: skip appending the ask prompt when it equals the user
-turn the session just recorded, with a documented opt-out. Decided-by-owner
-2026-09-08 as a follow-up, not folded into the audio workstream because it
-changes what every session workflow sends.
 
 #### Configurable Session Summarization
 

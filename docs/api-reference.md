@@ -1494,6 +1494,7 @@ const session = runtime.session('user-123', {
     summarize: true,
     summaryModel: 'openai-responses:gpt-5-mini',
   },
+  deduplicateInput: true,
   persist: true,
 });
 
@@ -1507,6 +1508,7 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 | `history.maxMessages` | `number` | — | Keep the last N messages. Older messages are trimmed (or summarized if `summarize` is `true`) |
 | `history.summarize` | `boolean` | `false` | When `true` and `maxMessages` is exceeded, summarize old messages instead of dropping them |
 | `history.summaryModel` | `string` | — | Model URI for summarization (e.g., `'openai:gpt-4o-mini'`). **Required** when `summarize` is `true` |
+| `deduplicateInput` | `boolean` | `true` | Send the current session input once when the workflow passes that same normalized input to `ctx.ask()`. Set to `false` to preserve the legacy duplicate request |
 | `persist` | `boolean` | `true` | Save session history to the state store. When `false`, history exists only in memory for the session lifetime |
 
 ### Session Methods
@@ -1523,6 +1525,8 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 ### What's stored
 
 A session's persisted state is a flat `ChatMessage[]` of `user` and `assistant` turns, keyed by `sessionId` in the configured `StateStore`. The persisted `user` turn is the workflow input: a string as-is, an ordered `ModelInput` as its context-safe text projection (`question\n[audio audio/wav]`, the same rendering `summarizeModelInput` produces), and any other application object as JSON. An array counts as `ModelInput` only when it is non-empty and every element carries a `type` of `text`, `image`, or `audio`; any other array (including `[]`) is an application value and is persisted as JSON. Media is per-call evidence, never session state, so inline base64 is never persisted or re-sent as text on later turns, and a malformed part fails with `InvalidModelInputError` before the workflow runs. Summarization caches and handoff history are stored alongside as session metadata. The `Session` object itself holds no message cache — every `send()`/`stream()` reads history from the store, mutates it during execution, and writes it back. Calling `runtime.session(id)` does not pre-load anything and does not check whether the id exists.
+
+By default, the request sent by `ctx.ask()` contains a matching current session input once. When the just-recorded current turn is still unchanged at the end of history and the ask input has the same normalized structure, `ctx.ask()` omits that one turn from its request-local history snapshot before appending the normal ask content. Rich inputs compare their ordered parts and media source data, not their lossy text projection. Application objects match only when the ask is exactly their `JSON.stringify(...)` string. Equal inputs on later `send()` calls remain distinct, as do a second sequential ask after an assistant reply, whitespace/case changes, and manually supplied `sessionHistory`. Child contexts still start with empty history. `deduplicateInput: false` restores the prior request shape without changing what the session persists.
 
 ### Sharing semantics
 

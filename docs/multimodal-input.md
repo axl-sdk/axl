@@ -69,6 +69,13 @@ does not automatically attach it to later `Session` turns — the next turn's
 request carries no media part. When a `Session` receives a rich `ModelInput`
 as the workflow input, it records the `user` turn as the text projection
 (`question\n[audio audio/wav]`), never as JSON carrying the inline media.
+When the workflow passes that same ordered input to its first `ctx.ask()`, the
+default `SessionOptions.deduplicateInput: true` removes only the just-recorded
+projection from the request-local history copy. The model receives the rich
+parts once, while the session still persists one safe projected user turn and
+the assistant reply. Matching compares the normalized parts and media data,
+not the projection, so two images or recordings with the same placeholder do
+not collapse. Set `deduplicateInput: false` for the legacy duplicate request.
 Application-created JSON-compatible rich user history can be persisted; inline `Uint8Array` media (image *or* audio) cannot be
 silently persisted and fails loudly with `Uint8Array media input cannot be
 persisted in session history`. The guard is type-agnostic over every non-text
@@ -109,6 +116,12 @@ projection and keep descriptors separately. Redaction removes user text, URLs,
 labels, and provider-file references while retaining provider/model metadata and
 structural source kind/count/size information. Treat unredacted URL locators as
 sensitive application data.
+
+This model-input boundary does not sanitize arbitrary workflow values. In a
+full unredacted trace, `workflow_start.data.input` remains the workflow's raw
+input by design; use `trace.redact` when that host-level lifecycle value must be
+hidden. Session history and the `ask_start` / `agent_call_start` model-input
+snapshots keep the media-safe behavior described above.
 
 ## Image capabilities
 

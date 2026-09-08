@@ -147,6 +147,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to audio tokens. `openrouter:` continues to use its authoritative response
   `usage.cost`.
 
+### Fixed
+
+- **Session workflows no longer send the current user input twice by default.**
+  When a workflow passes the same current input to `ctx.ask()`, the model sees
+  it once while persisted history remains unchanged. Matching includes the
+  full ordered rich input, so media is preserved and later equal turns remain
+  distinct. Set `SessionOptions.deduplicateInput: false` to retain the legacy
+  duplicate provider request.
+
 ## [0.23.2] - 2026-09-07
 
 ### Fixed

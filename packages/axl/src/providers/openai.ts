@@ -548,6 +548,14 @@ export function estimateDirectOpenAICost(
   ) {
     return undefined;
   }
+  // The DECISION is settled: the audio rate is never applied to cached or
+  // cache-write tokens. What is NOT settled is whether OpenAI's
+  // `cached_tokens` can include audio tokens — the pricing page says nothing,
+  // and prompt caching engages automatically above a token threshold that
+  // seconds of speech cross. The bucket subtraction below is a partition only
+  // if the two never overlap, so any co-occurrence is unpriced until a live
+  // probe settles it (plan §9 L1 / V2), matching the long-context branch.
+  if (audioInput > 0 && cached + cacheWrite > 0) return undefined;
   const crossesLongContext =
     entry.long !== undefined &&
     entry.contextBoundary !== undefined &&

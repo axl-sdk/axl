@@ -14,7 +14,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { agent } from '../agent.js';
 import { isUnpricedLeaf } from '../event-utils.js';
+import { OPENAI_CHAT_AUDIO_FORMATS } from '../providers/audio-format.js';
+import { OpenAICompatibleProvider, type ProviderProfile } from '../providers/openai-compatible.js';
 import { OpenAIProvider, estimateDirectOpenAICost } from '../providers/openai.js';
+import { OpenAIResponsesProvider } from '../providers/openai-responses.js';
 import { AxlRuntime } from '../runtime.js';
 import type { AxlEvent, ProviderResponse } from '../types.js';
 import { workflow } from '../workflow.js';
@@ -248,6 +251,43 @@ describe('openai audio preconditions report unknown, never zero', () => {
       }),
     );
     expect(cost).toBeUndefined();
+  });
+
+  it('L1: audio tokens co-occurring with cached tokens are unpriced', () => {
+    // The four-bucket subtraction is a partition only if cached tokens are
+    // never audio tokens, and OpenAI publishes no statement either way while
+    // caching engages automatically above a token threshold seconds of speech
+    // cross. This row pins the outcome so that adding a `cachedInput` rate to
+    // an audio model later cannot silently start pricing a possibly-cached
+    // audio token at the non-audio cached rate.
+    expect(
+      estimateDirectOpenAICost(AUDIO_MODEL, {
+        prompt_tokens: GA2.prompt,
+        completion_tokens: GA2.completion,
+        total_tokens: GA2.prompt + GA2.completion,
+        audio_input_tokens: GA2.audio,
+        cached_tokens: 10,
+      }),
+    ).toBeUndefined();
+    expect(
+      estimateDirectOpenAICost(AUDIO_MODEL, {
+        prompt_tokens: GA2.prompt,
+        completion_tokens: GA2.completion,
+        total_tokens: GA2.prompt + GA2.completion,
+        audio_input_tokens: GA2.audio,
+        cache_write_tokens: 10,
+      }),
+    ).toBeUndefined();
+    // Negative control: zero cached tokens alongside audio still prices.
+    expect(
+      estimateDirectOpenAICost(AUDIO_MODEL, {
+        prompt_tokens: GA2.prompt,
+        completion_tokens: GA2.completion,
+        total_tokens: GA2.prompt + GA2.completion,
+        audio_input_tokens: GA2.audio,
+        cached_tokens: 0,
+      }),
+    ).toBeCloseTo(GA2_EXPECTED, 12);
   });
 
   it('G2: audio + cached exceeding the prompt total is unpriced', () => {
@@ -629,5 +669,174 @@ describe('openai audio budget enforcement', () => {
     );
     // A turn-1 audio count reused for turn 2 would make these equal.
     expect(first.cost).not.toBeCloseTo(second.cost!, 12);
+  });
+});
+
+// ── M2: the generic table branch must not bill audio at the text rate ────
+
+describe('generic table pricing refuses to price audio tokens', () => {
+  /** A third-party-shaped profile: declares audio input AND table pricing. */
+  const AUDIO_TABLE_PROFILE: ProviderProfile = {
+    name: 'selfhosted-audio',
+    label: 'Self-hosted audio gateway',
+    defaultBaseUrl: 'https://gateway.example.com/v1',
+    envApiKey: 'SELFHOSTED_API_KEY',
+    pricing: { kind: 'table', table: { 'my-audio-model': [2.5e-6, 10e-6, 0.5] }, match: 'exact' },
+    reasoning: { emit: () => ({}), capture: 'none' },
+    capabilities: {
+      inputModalities: {
+        audio: { sources: ['bytes', 'base64'], formats: OPENAI_CHAT_AUDIO_FORMATS },
+      },
+    },
+  };
+
+  async function askTableProfile(usage: Record<string, unknown>): Promise<number | undefined> {
+    mockFetch(
+      jsonResponse({
+        choices: [{ message: { content: 'a phone call' }, finish_reason: 'stop' }],
+        usage,
+      }),
+    );
+    const provider = new OpenAICompatibleProvider({
+      profile: AUDIO_TABLE_PROFILE,
+      apiKey: 'test-key',
+    });
+    const response = await provider.chat([{ role: 'user', content: AUDIO_INPUT as never }], {
+      model: 'my-audio-model',
+    });
+    return response.cost;
+  }
+
+  it('M2: an audio-billing call on a table-priced profile is unpriced, not 10x under', async () => {
+    // `PricingTable` cannot express an audio rate, so the table's `input` rate
+    // is not the price of these tokens. 107 × $2.50/1M is 10.7x under the
+    // true cost — and `ctx.budget()` would enforce confidently against it.
+    const cost = await askTableProfile({
+      prompt_tokens: GA2.prompt,
+      completion_tokens: GA2.completion,
+      total_tokens: GA2.prompt + GA2.completion,
+      prompt_tokens_details: { audio_tokens: GA2.audio },
+    });
+    expect(cost).toBeUndefined();
+    expect(cost).not.toBeCloseTo(GA2_ALL_TEXT_RATES, 12);
+  });
+
+  it('M2: a reported zero audio bucket still prices from the table', async () => {
+    const cost = await askTableProfile({
+      prompt_tokens: GA2.prompt,
+      completion_tokens: GA2.completion,
+      total_tokens: GA2.prompt + GA2.completion,
+      prompt_tokens_details: { audio_tokens: 0 },
+    });
+    expect(cost).toBeCloseTo(GA2_ALL_TEXT_RATES, 12);
+  });
+
+  it('M2: a text call with no audio detail is unaffected', async () => {
+    const cost = await askTableProfile({
+      prompt_tokens: GA2.prompt,
+      completion_tokens: GA2.completion,
+      total_tokens: GA2.prompt + GA2.completion,
+    });
+    expect(cost).toBeCloseTo(GA2_ALL_TEXT_RATES, 12);
+  });
+});
+
+// ── L4: openai-responses maps the audio split on both paths ─────────────
+
+describe('openai-responses audio usage mapping', () => {
+  const RESPONSES_MODEL = 'gpt-5.2';
+  const TEXT_ONLY_USAGE = { input_tokens: 107, output_tokens: 12, total_tokens: 119 };
+
+  function responsesReply(usage: Record<string, unknown>): Response {
+    return jsonResponse({
+      id: 'resp_1',
+      model: RESPONSES_MODEL,
+      status: 'completed',
+      output: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'a phone call' }],
+        },
+      ],
+      usage,
+    });
+  }
+
+  async function askResponses(usage: Record<string, unknown>) {
+    mockFetch(responsesReply(usage));
+    const provider = new OpenAIResponsesProvider({ apiKey: 'test-key' });
+    return provider.chat([{ role: 'user', content: 'Describe the weather.' }], {
+      model: RESPONSES_MODEL,
+    });
+  }
+
+  it('L4: maps input_tokens_details.audio_tokens onto usage.audio_input_tokens', async () => {
+    const response = await askResponses({
+      ...TEXT_ONLY_USAGE,
+      input_tokens_details: { audio_tokens: 9 },
+      output_tokens_details: { audio_tokens: 4 },
+    });
+    expect(response.usage?.audio_input_tokens).toBe(9);
+    expect(response.usage?.audio_output_tokens).toBe(4);
+  });
+
+  it('L4: the D1 guard fires on this transport too', async () => {
+    // Without the mapping, `estimateDirectOpenAICost` sees no audio bucket and
+    // prices all 107 prompt tokens at the text rate — the exact invariant
+    // violation D1 closes on the Chat Completions lane.
+    const response = await askResponses({
+      ...TEXT_ONLY_USAGE,
+      input_tokens_details: { audio_tokens: 9 },
+    });
+    expect(response.cost).toBeUndefined();
+    expect(response.cost).not.toBeCloseTo(107 * 1.75e-6 + 12 * 14e-6, 12);
+  });
+
+  it('L4: a text-only Responses call still prices exactly as before', async () => {
+    const response = await askResponses(TEXT_ONLY_USAGE);
+    expect(response.cost).toBeCloseTo(107 * 1.75e-6 + 12 * 14e-6, 12);
+    expect('audio_input_tokens' in (response.usage ?? {})).toBe(false);
+  });
+
+  it('L4: an unusable audio count is omitted, not propagated', async () => {
+    const response = await askResponses({
+      ...TEXT_ONLY_USAGE,
+      input_tokens_details: { audio_tokens: -1 },
+    });
+    expect('audio_input_tokens' in (response.usage ?? {})).toBe(false);
+    expect(response.cost).toBeCloseTo(107 * 1.75e-6 + 12 * 14e-6, 12);
+  });
+
+  it('L4: the streaming path maps the same fields as chat()', async () => {
+    const usage = {
+      ...TEXT_ONLY_USAGE,
+      input_tokens_details: { audio_tokens: 9 },
+      output_tokens_details: { audio_tokens: 4 },
+    };
+    mockFetch(
+      sseResponse([
+        'event: response.output_text.delta',
+        `data: ${JSON.stringify({ delta: 'a phone call' })}`,
+        'event: response.completed',
+        `data: ${JSON.stringify({
+          response: { id: 'resp_1', model: RESPONSES_MODEL, status: 'completed', usage },
+        })}`,
+      ]),
+    );
+    const provider = new OpenAIResponsesProvider({ apiKey: 'test-key' });
+    const chunks = [];
+    for await (const chunk of provider.stream(
+      [{ role: 'user', content: 'Describe the weather.' }],
+      { model: RESPONSES_MODEL },
+    )) {
+      chunks.push(chunk);
+    }
+    const done = chunks.find((chunk) => chunk.type === 'done');
+    if (done?.type !== 'done') throw new Error('no done chunk');
+    const nonStreaming = await askResponses(usage);
+    expect(done.usage).toEqual(nonStreaming.usage);
+    expect(done.cost).toBe(nonStreaming.cost);
+    expect(done.usage?.audio_input_tokens).toBe(9);
   });
 });

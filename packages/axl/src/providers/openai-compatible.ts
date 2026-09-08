@@ -352,7 +352,7 @@ function sortedKeys(table: PricingTable): string[] {
  * `1e18`), and a bad count must never reach pricing, `ctx.totalCost`, or a span
  * attribute — so it is dropped rather than coerced.
  */
-function reportedTokenCount(value: unknown): number | undefined {
+export function reportedTokenCount(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
@@ -1023,6 +1023,18 @@ export class OpenAICompatibleProvider implements Provider {
           ? reportedCost
           : undefined;
       case 'table': {
+        // `PricingTable` cannot express an audio rate — the public tuple shape
+        // is deliberately unchanged — so a call that billed audio tokens is
+        // UNKNOWN, not cheap. Pricing `prompt_tokens` wholesale at the text
+        // input rate here would under-report an audio call by an order of
+        // magnitude, and `ctx.budget()` would then enforce confidently against
+        // it, which is strictly worse than the unpriced lower bound. Reachable
+        // through a custom profile that declares audio input alongside table
+        // pricing; a reported `0` still prices, and no built-in table profile
+        // declares audio today (`openrouter` is `from-response`).
+        if (typeof usage.audio_input_tokens === 'number' && usage.audio_input_tokens > 0) {
+          return undefined;
+        }
         if (
           !isBuiltinTablePricingEligible(this.profile, {
             baseUrl: this.baseUrl,

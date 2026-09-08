@@ -11,6 +11,7 @@ export type {
   InputContentPart,
   InputTextPart,
   InputImagePart,
+  InputAudioPart,
   InputMediaSource,
   ModelInputDescriptor,
 } from './input.js';

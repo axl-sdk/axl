@@ -28,10 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `openai-responses:`, and every other OpenAI-compatible preset reject an audio
   part with a zero-request `UnsupportedModelInputError` (`modality: 'audio'`) and
   never fall back to transcription.
-  **Only `openrouter:` is live-certified today** — for a text answer from speech
-  and non-speech audio, a tool continuation, and streaming; audio plus structured
-  output is certified nowhere and advertised nowhere. `openai:` and `google:`
-  audio is implemented but uncertified pending provider keys. See
+  **Live-certified compositions:** `google:` for a text answer from speech and
+  non-speech audio, a stateless tool continuation, structured output,
+  streaming, and an audio turn re-sent from application session history;
+  `openrouter:` for a text answer, a tool continuation, and streaming;
+  `openai:` for a single-turn text answer only — `gpt-audio-1.5` failed the
+  tool continuation provider-side (`500`) and rejects `response_format`
+  (`400`), so those compositions are recorded, not advertised. See
   [`docs/verification/general-audio-lighthouse-2026-09-08.md`](docs/verification/general-audio-lighthouse-2026-09-08.md)
   and [`docs/multimodal-input.md`](docs/multimodal-input.md#general-recorded-audio-input).
 - `InputModalitySupport.audio` on `Provider.inputCapabilities` — declaring it is
@@ -49,9 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ModelInputDescriptor` gains an `audio` part variant; its `locator` can only
   come from a provider-file reference.
 - `axl.input.audio` span attribute on the `axl.model_input` event.
-- Live certification rows `GA1`–`GA8` in
+- Live certification rows `GA1`–`GA9` in
   `packages/axl/src/__tests__/integration-general-audio.test.ts`, double-gated
-  behind `AXL_MULTIMODAL_LIVE=1` + `AXL_GENERAL_AUDIO_LIVE=1`.
+  behind `AXL_MULTIMODAL_LIVE=1` + `AXL_GENERAL_AUDIO_LIVE=1` (`GA2` additionally
+  behind `AXL_GENERAL_AUDIO_OPENAI_TOOL_LIVE=1`).
 
 ### Changed
 
@@ -101,6 +105,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Gemini Interactions tool continuations no longer fail with `400 Invalid
+  input received`.** The stateless (`store: false`) continuation omitted the
+  required `name` on each `function_result` step. The adapter now remembers
+  every `function_call`'s name by `call_id` and echoes it on the matching
+  result. Pre-existing; it affected every Interactions tool round-trip, not
+  only audio-bearing ones.
 - Eval item annotations now preserve omitted runtime accounting fields and their
   model/workflow roll-ups across direct, CLI, and registered evals. Metadata is
   collected independently of trace capture and shallow-merged with valid user

@@ -219,17 +219,17 @@ composition; an upstream rejection surfaces as a typed `ProviderError`.
 | Provider URI | Transport | Sources | Live-certified compositions |
 | --- | --- | --- | --- |
 | `openrouter:` | Chat Completions `input_audio` (`{ data, format }`) | Bytes, base64. OpenRouter documents base64 only; the engine encodes your bytes for you | Text answer from speech **and** non-speech audio; tool call plus continuation; streaming. **Not** structured output — that composition is uncertified and unadvertised |
-| `openai:` | Chat Completions `input_audio`, `format ∈ {wav, mp3}` | Bytes, base64 | **None.** Transport is implemented but not yet live-certified — rows `GA2` and `GA4-openai` are pending provider keys |
-| `google:` | Gemini Interactions `{ type: 'audio', data \| uri, mime_type }`, `store: false` | Bytes, base64, `provider-file` scoped to `google` | **None.** Transport is implemented but not yet live-certified — rows `GA1`, `GA3`, `GA4`, and `GA8` are pending provider keys |
+| `openai:` | Chat Completions `input_audio`, `format ∈ {wav, mp3}` | Bytes, base64 | Single-turn text answer from speech audio. **Not** tool continuation (`gpt-audio-1.5` answered the continuation with a provider `500` five times) and **not** structured output (`response_format` is rejected with `400`) — both are provider-side and recorded, not advertised |
+| `google:` | Gemini Interactions `{ type: 'audio', data \| uri, mime_type }`, `store: false` | Bytes, base64, `provider-file` scoped to `google` | Text answer from speech **and** non-speech audio; tool call plus stateless continuation; structured output; streaming; an audio user turn re-sent from application session history |
 | `anthropic:` | — | — | Unsupported. The Claude Messages API defines no audio content block; an audio part is a zero-request `UnsupportedModelInputError` |
 | `openai-responses:` | — | — | Unsupported. OpenAI documents chat audio input on Chat Completions only |
 | `azure:`, `xai:`, `deepseek:`, `mistral:`, `groq:`, `bedrock:`, self-hosted presets, custom profiles | — | — | Unsupported. A compatible profile that declares no audio in its `inputModalities` rejects before dispatch |
 
-Only OpenRouter is certified today; see the dated
-[general-audio evidence](./verification/general-audio-lighthouse-2026-09-08.md),
-which also records exactly which rows have not been run and why. Nothing in this
-table is a model allowlist: any nonblank model ID is accepted for a transport
-Axl can map.
+Every row ran on 2026-09-08; see the dated
+[general-audio evidence](./verification/general-audio-lighthouse-2026-09-08.md)
+for the models, answers, usage, and the two `openai:` provider rejections.
+Nothing in this table is a model allowlist: any nonblank model ID is accepted
+for a transport Axl can map.
 
 Images remain **rejected** on `openai:` Chat Completions. Adding audio there did
 not add images: `openai-responses:` is the image path for OpenAI, and Chat
@@ -272,11 +272,13 @@ schema — is the provider's decision and arrives as `ProviderError`.
 
 Audio-bearing calls on `openai:` and `google:` are **unpriced by design**. There
 is no modality-aware estimator: applying the text pricing table to audio tokens
-would silently under-report by an order of magnitude, and Axl does not capture
-`prompt_tokens_details.audio_tokens` in `ProviderResponse.usage` today. Gemini
-Interactions responses report no cost at all. Those calls therefore set the
-normal `unpriced` / lower-bound signals rather than a wrong number or `$0` — and
-a `ctx.budget()` cost limit cannot trip on them.
+would silently under-report by an order of magnitude. The live rows proved that
+both providers *do* report audio input tokens separately (OpenAI
+`prompt_tokens_details.audio_tokens` / `text_tokens`, Gemini
+`input_tokens_by_modality`), so an estimator is now possible, but it needs
+verified per-model audio rates that Axl does not carry. Until then those calls
+set the normal `unpriced` / lower-bound signals rather than a wrong number or
+`$0` — and a `ctx.budget()` cost limit cannot trip on them.
 
 OpenRouter remains the exception: its response `usage.cost` is authoritative and
 is used as reported. The live rows observed OpenRouter reporting
@@ -285,8 +287,8 @@ observation, not something Axl prices from.
 
 ### Recipe: ask about a non-speech recording
 
-The certified route today is `openrouter:`. Read the file yourself and pass the
-bytes; Axl never fetches, uploads, or hosts your recording.
+`google:` and `openrouter:` are both certified for this. Read the file yourself
+and pass the bytes; Axl never fetches, uploads, or hosts your recording.
 
 ```ts
 import { readFileSync } from 'node:fs';

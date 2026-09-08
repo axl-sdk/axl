@@ -78,12 +78,14 @@ media type through a closed table — `audio/wav`, `audio/x-wav`, `audio/wave`,
 `audio/mpeg`, `audio/mp3`. Anything else is rejected locally, naming the media
 type. Axl sends no `modalities` field, so the response stays text.
 
-The transport is implemented but **not yet live-certified**: rows `GA2` and
-`GA4-openai` are pending provider keys, so no composition is advertised for
-`openai:` audio today. Audio-bearing Chat Completions calls are **unpriced** —
-`hasUnmodeledDirectOpenAIContent` already unprices any non-text content part,
-and Axl captures no `prompt_tokens_details.audio_tokens` to estimate from, so a
-text-table rate is never applied to audio tokens.
+Live-certified on `gpt-audio-1.5` for a **single-turn text answer** only. The
+tool continuation failed on the provider side (`500`, five runs) and
+`response_format` is rejected (`400`), so neither composition is advertised;
+see the dated general-audio record under `docs/verification/`. Audio-bearing
+Chat Completions calls are **unpriced** — `hasUnmodeledDirectOpenAIContent`
+unprices any non-text content part. The provider reports
+`prompt_tokens_details.audio_tokens`, but Axl carries no verified audio rates,
+so a text-table rate is never applied to audio tokens.
 
 **Images remain rejected on `openai:`.** Adding audio did not add images: use
 `openai-responses:` for vision. Chat Completions image pricing is unmodeled.
@@ -303,7 +305,8 @@ a wider closed format table (`wav`, `mp3`, `aiff`, `aac`, `ogg`, `flac`, `m4a`,
 IANA media type distinguishes it from `pcm16`). OpenRouter documents base64-only
 audio; pass bytes and the engine encodes them for you. Its response `usage.cost`
 stays authoritative, so OpenRouter audio calls are priced from the response
-rather than unpriced. It is the one live-certified audio lane today — see the
+rather than unpriced. Certified for a text answer, a tool continuation, and
+streaming — see the
 [general-audio evidence](./verification/general-audio-lighthouse-2026-09-08.md).
 
 Configure each like any provider (`apiKey` / `baseUrl` / `authHeader` / `rateLimit` under its

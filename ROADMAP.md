@@ -26,10 +26,11 @@
   ordered audio preserved through retries, tool continuations, delegate,
   handoff, and streaming. Transport ships on `openai:` Chat Completions,
   `openrouter:`, `google:` Interactions, and `MockProvider`; every other
-  provider fails closed with zero requests. `openrouter:` is live-certified for
-  a text answer, a tool continuation, and streaming; the native `openai:` and
-  `google:` rows and audio-plus-structured-output remain uncertified and
-  unadvertised.
+  provider fails closed with zero requests. Live-certified: `google:` for a
+  text answer, tool continuation, structured output, streaming, and history
+  re-send; `openrouter:` for a text answer, tool continuation, and streaming;
+  `openai:` for a single-turn text answer (its tool continuation and
+  structured output fail provider-side and are recorded, not advertised).
 
 - **OpenTelemetry** — Automatic span emission for every `ctx.*` primitive with cost-per-span attribution
 - **Memory Primitives** — `ctx.remember()`, `ctx.recall()`, `ctx.forget()` with session/global scope and semantic vector search
@@ -247,12 +248,13 @@ completed-file transcription. The following are intentionally tracked as
 separate future product surfaces, not implied by today's `ModelInput` or
 `ctx.transcribe()` contracts:
 
-- **Native general-audio certification** — General audio understanding is
-  implemented (see Complete, above). What remains is live certification of the
-  native `openai:` and `google:` lanes and of audio plus structured output on
-  any adapter; each provider/model composition is advertised only after its own
-  passing row. Audio URLs, audio output, realtime voice, and a Studio audio
-  picker stay out of scope.
+- **Modality-aware audio cost estimation** — General audio understanding is
+  implemented and natively certified (see Complete, above). Audio-bearing
+  `openai:` and `google:` calls are still unpriced by design; the live rows
+  proved both providers report audio input tokens separately, so the remaining
+  work is verified per-model audio rates plus an estimator on the pricing rail
+  (a consequential seam needing its own adversarial review). Audio URLs, audio
+  output, realtime voice, and a Studio audio picker stay out of scope.
 - **Documents, video, and generated media** — New input and output content
   types with their own limits, provider mappings, observation rules, and live
   evidence. Multimodal tool results belong here as an explicit output contract,

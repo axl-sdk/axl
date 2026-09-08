@@ -544,7 +544,7 @@ attempt can still be processed and billed upstream. It certifies Axl transport,
 not a model allowlist or the whole OpenRouter catalog. See the dated
 [OpenRouter catalog evidence](./verification/openrouter-catalog-multimodal-2026-09-02.md).
 
-### General recorded-audio input rows (GA1–GA8)
+### General recorded-audio input rows (GA1–GA9)
 
 Direct audio parts in `ModelInput` have their own suite and their own arming
 flag. Rows are **double-gated**: a provider key alone never spends, and
@@ -554,18 +554,24 @@ switch. Run one row at a time with its ID as the `-t` selector:
 
 ```bash
 # Lighthouse: non-speech WAV understanding. GA1 is the native Gemini row;
-# GA1-OR is the OpenRouter route that is actually certified today.
+# GA1-OR is the OpenRouter route.
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA1\]'
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA1-OR\]'
 
 # Speech audio through a tool continuation (two logical requests each).
-AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA2\]'
+# GA2 needs a third flag: gpt-audio-1.5 answers the continuation with a
+# provider-side 500 today, so the row is armed separately from the suite.
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 AXL_GENERAL_AUDIO_OPENAI_TOOL_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA2\]'
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA3\]'
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA6-tool\]'
 
-# Audio plus structured output.
+# Audio plus structured output. GA4-openai certifies the provider's typed
+# rejection (gpt-audio-1.5 does not accept response_format).
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA4\]'
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA4-openai\]'
+
+# An audio user turn re-sent from application session history (two asks).
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA9\]'
 
 # Base64 speech answer, and streaming.
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA6\]'
@@ -579,23 +585,26 @@ AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vi
 
 | Row | Provider URI | Key |
 | --- | --- | --- |
-| GA1, GA3, GA4, GA8 | `google:` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
-| GA2, GA4-openai | `openai:` | `OPENAI_API_KEY` |
+| GA1, GA3, GA4, GA8, GA9 | `google:` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
+| GA2, GA4-openai | `openai:` | `OPENAI_API_KEY` (GA2 also `AXL_GENERAL_AUDIO_OPENAI_TOOL_LIVE=1`) |
 | GA1-OR, GA6, GA6-tool, GA8-OR | `openrouter:` | `OPENROUTER_API_KEY` |
 | GA5, GA7 | local | none |
 
 Models are env-overridable representative defaults, never allowlists:
-`GEMINI_AUDIO_MODEL`, `OPENAI_AUDIO_MODEL`, `OPENROUTER_AUDIO_MODEL`. Each paid
-row makes one logical model request (two for `GA2`, `GA3`, `GA6-tool`, and the
-streaming rows `GA8`/`GA8-OR`, which add a text-only control ask) with
-`maxTokens` at most 200 and an audio fixture of roughly ten seconds or less; the
+`GEMINI_AUDIO_MODEL`, `OPENAI_AUDIO_MODEL`, `OPENROUTER_AUDIO_MODEL`, plus
+`GEMINI_AUDIO_EFFORT` (`none` | `low`; Gemini 3.x clamps `none` to `low`). Each
+paid row makes one logical model request (two for `GA2`, `GA3`, `GA6-tool`,
+`GA9`, and the streaming rows `GA8`/`GA8-OR`, which add a text-only control
+ask) with `maxTokens` at most 200 on OpenAI and OpenRouter rows and 400–800 on
+Gemini rows (thought tokens count against the cap) and an audio fixture of
+roughly ten seconds or less; the
 `fetchWithRetry` policy allows up to three HTTP attempts per logical request, so
 the per-row transport-attempt ceiling is 3 (6 for the continuation rows). That is
 not a spend cap — an upstream may process a request whose client result failed.
 Fixtures are the checked-in `recorded-call.mp3.b64` speech excerpt and an
 in-test generated PCM WAV tone; no new binary asset was added.
 
-Dated results, including which rows have **not** been run and why, are in
+Dated results, including the two `openai:` provider rejections, are in
 [`docs/verification/general-audio-lighthouse-2026-09-08.md`](./verification/general-audio-lighthouse-2026-09-08.md).
 
 ### Completed-file transcription lighthouse

@@ -1,11 +1,11 @@
 # General recorded-audio input evidence
 
 **Date:** 2026-09-08<br>
-**Status:** Partially certified — the OpenRouter lane passed every advertised
-composition; the native `openai:` and `google:` lanes are implemented but
-**not** live-certified in this environment (no keys).
+**Status:** Certified on `google:` and `openrouter:`; `openai:` certified for a
+single-turn text answer only. Two `openai:` compositions were run and are
+recorded as **provider rejections**, not Axl transport gaps.
 
-This record covers the general-audio input rows `GA1`–`GA8` in
+This record covers the general-audio input rows `GA1`–`GA9` in
 `packages/axl/src/__tests__/integration-general-audio.test.ts`. It supplements,
 and does not change, the
 [2026-08-31 multimodal lighthouse](./multimodal-input-lighthouse-2026-08-31.md)
@@ -14,141 +14,211 @@ No selected model in this record is a supported-model allowlist.
 
 Live rows are **double-gated**: `AXL_MULTIMODAL_LIVE=1` *and*
 `AXL_GENERAL_AUDIO_LIVE=1`, plus that row's provider key. A key alone never
-spends. `AXL_DISABLE_LIVE_INTEGRATION=1` overrides both.
+spends. `AXL_DISABLE_LIVE_INTEGRATION=1` overrides both. `GA2` needs a third
+flag, `AXL_GENERAL_AUDIO_OPENAI_TOOL_LIVE=1`, because it fails on the provider
+side today (below).
 
-## Environment
+## Environment and models
 
-Only `OPENROUTER_API_KEY` was present. `OPENAI_API_KEY`, `GOOGLE_API_KEY` /
-`GEMINI_API_KEY`, and `ANTHROPIC_API_KEY` were absent, so the `openai:` and
-`google:` rows could not be run here and remain open for the owner. The plan's
-E1 fallback route (`openrouter:`) therefore carried the non-speech lighthouse.
+`GOOGLE_API_KEY`, `OPENAI_API_KEY`, and `OPENROUTER_API_KEY` were present.
+Models (each env-overridable, none an allowlist):
 
-Model for every OpenRouter row below: `openrouter:google/gemini-2.5-flash`
-(override with `OPENROUTER_AUDIO_MODEL`).
+| Lane | Model | Override |
+| --- | --- | --- |
+| `google:` | `gemini-3.7-flash` (Interactions, `store: false`) | `GEMINI_AUDIO_MODEL`, `GEMINI_AUDIO_EFFORT` |
+| `openai:` | `gpt-audio-1.5` (Chat Completions) | `OPENAI_AUDIO_MODEL` |
+| `openrouter:` | `google/gemini-2.5-flash` | `OPENROUTER_AUDIO_MODEL` |
+
+Gemini 3.x cannot disable thinking, so `effort: 'none'` is clamped to `'low'`
+(a `provider_diagnostic` event says so) and thought tokens count against
+`max_output_tokens`; the Gemini rows therefore use `maxTokens` 400–800 rather
+than 200.
 
 ## Rows that passed
 
-### GA1-OR — non-speech understanding through `input_audio` (lighthouse)
+Every command below has the form
 
 ```bash
-AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA1-OR\]'
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[<ROW>\]'
 ```
 
-An in-test generated ~3 s 16 kHz mono PCM WAV (220 → 1200 Hz sweep) was passed
-as `Uint8Array` bytes; the engine base64-encoded it and emitted
-`input_audio` with `format: 'wav'`. Reported cost `0.0001204`
-(`usage.cost`, authoritative), `unpriced: false`, usage
-`prompt_tokens: 93, completion_tokens: 16`, with
+### GA1 — non-speech understanding on the Gemini lighthouse (`google:`)
+
+The in-test generated ~3 s 16 kHz mono PCM WAV (220 → 1200 Hz sweep) was
+passed as `Uint8Array` bytes and emitted as an Interactions
+`{ type: 'audio', data, mime_type: 'audio/wav' }` step. `cost: 0`,
+`unpriced: true` (Interactions reports no cost). Usage reported
+`input_tokens_by_modality: [{ audio: 75 }, { text: 20 }]`, 55 thought tokens,
+12 output tokens. The response echoed no audio.
+
+Answer: *"The sound is a smooth electronic tone whose pitch steadily rises."*
+
+The model both processed the input **as audio** and detected the frequency
+rise. The lighthouse claim remains "a chat model reasons directly about a
+non-speech recording"; acoustic accuracy is a model property Axl does not
+advertise.
+
+### GA1-OR — non-speech understanding through OpenRouter `input_audio`
+
+Same WAV, emitted as `input_audio` with `format: 'wav'`. Reported cost
+`0.0001204` (`usage.cost`, authoritative), `unpriced: false`,
+`prompt_tokens: 93, completion_tokens: 16`,
 `prompt_tokens_details.audio_tokens: 75`.
 
 Answer: *"This sound is a continuous, high-pitched sine wave whose pitch remains
-constant."*
+constant."* The model identified a sine tone (which a transcription detour
+cannot produce) but did **not** detect the rise.
 
-**Read this honestly.** The model demonstrably processed the input **as audio** —
-it identified a sine tone, which a transcription detour cannot produce from a
-non-speech recording. It did **not** detect the frequency rise. The lighthouse
-claim this row supports is "a chat model reasons directly about a non-speech
-recording", not "the model reports pitch change accurately". Acoustic-detail
-accuracy is a model property, not an Axl transport property, and Axl advertises
-neither.
+### GA3 — speech audio identical across a stateless tool continuation (`google:`)
 
-### GA6 — base64 speech audio → text answer
+The audio-bearing ask defined one local tool under a system prompt requiring
+exactly one call. Two `interactions` requests were made; the continuation
+echoed the model's thought and `function_call` steps and carried an audio step
+**deep-equal to the first request's, at the same index**. Usage
+`input_tokens_by_modality: [{ audio: 200 }, { text: 113 }]`; `unpriced: true`.
 
-```bash
-AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA6\]'
-```
+Answer: *"The caller recited standard phonetically balanced test sentences
+about a birch canoe and gluing a sheet to a blue background."*
 
-The checked-in `recorded-call.mp3.b64` speech fixture was passed as a base64
-source and emitted with `format: 'mp3'`. Reported cost `0.0002286`,
-`unpriced: false`, `audio_tokens: 200`.
+This row first failed with a bare 400 *"Invalid input received"* on the
+continuation. Root cause: the adapter omitted `name` on the `function_result`
+step, which Interactions requires. That was a pre-existing defect on every
+`store: false` tool continuation, not an audio one; fixed in the same change
+and covered by an offline `gemini.test.ts` expectation that fails without it.
+
+### GA4 — structured output from speech audio (`google:`)
+
+Schema `{ summary: string, speakerCount: number }`. The Interactions request
+carried the audio step plus the response schema; the reply parsed and
+validated. Usage `input_tokens_by_modality: [{ audio: 200 }, { text: 79 }]`.
+
+Answer: `{ "summary": "A speaker reads aloud short sample sentences describing a
+canoe sliding on planks and attaching a sheet to a dark blue background.",
+"speakerCount": 1 }`
+
+### GA6 — base64 speech audio → text answer (`openrouter:`)
+
+`recorded-call.mp3.b64` as a base64 source, emitted with `format: 'mp3'`.
+Cost `0.0002286`, `unpriced: false`, `audio_tokens: 200`.
 
 Answer: *"This is a request to transcribe speech into text."*
 
-### GA6-tool — audio survives a tool continuation
+### GA6-tool — audio survives a tool continuation (`openrouter:`)
 
-```bash
-AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA6-tool\]'
-```
-
-The audio-bearing ask defined one local tool. The model called it, and the
-continuation request carried an `input_audio` object **deep-equal to the first
-request's, at the same content index** — no re-encoding, no placeholder text, no
-drop. Total ask cost `0.0004918` across two requests (the second reported
-`0.0002631`).
+The continuation carried an `input_audio` object deep-equal to the first
+request's at the same index. Total ask cost `0.0004918` across two requests.
 
 Answer: *"The caller's account is active with a pro plan and no open tickets."*
 
-### GA8-OR — streaming with audio input
+### GA8 and GA8-OR — streaming with audio input
 
-```bash
-AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA8-OR\]'
-```
+Each row streams a text-only control ask on the same route, then the audio ask
+(two logical requests). Both produced ordinary text deltas only, and the audio
+ask's event-type set was **identical** to the control's:
+`ask_start, provider_diagnostic, pipeline, agent_call_start, token,
+agent_call_end, ask_end`. The base64 sentinel was present in the audio request
+body, absent from the control request, and absent from every event.
 
-The row first streams a text-only control ask on the same route, then the
-audio ask (two logical requests). The audio ask produced ordinary text deltas
-only, and its event-type set was a subset of the control's: **no new chunk or
-event type** appeared for an audio-bearing call. The base64 sentinel was
-present in the captured audio request body (positive control), absent from the
-control request, and absent from every event. Reported audio-ask cost
-`0.0001229` (an earlier run without the control: `0.0001179`).
+- GA8 (`google:`, `streamGenerateContent` control vs Interactions audio):
+  *"This is the sound of a slide whistle with a rising pitch."*
+- GA8-OR: cost `0.0001229`; *"This sound is a continuous sine wave that does
+  not change in pitch."*
 
-Answer: *"This sound is a continuous sine wave that does not change in pitch."*
+### GA9 — audio user turn re-sent as application session history (`google:`)
+
+A first ask carried the speech MP3. A second context was constructed with
+`sessionHistory` holding that audio user turn and the assistant answer, then
+asked a plain string. The second Interactions request carried the history
+audio step **verbatim at index 0** of its first `user_input` step, and the
+provider accepted it.
+
+First: *"This recording is a speech test featuring a woman reading standardized
+Harvard sentences."* Second: *"There was only one speaker."*
 
 ### GA5 and GA7 — local, zero-fetch rows
 
-```bash
-AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA5\]'
-AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA7\]'
+`anthropic:`, `openai-responses:`, and a provider whose `inputCapabilities`
+omits `audio` each threw `UnsupportedModelInputError` (`modality: 'audio'`)
+with **zero fetches** and no transcription fallback; `audio/x-unknown` was
+rejected locally, naming the media type. Neither row needs a key.
+
+## `openai:` rows — what was observed
+
+### GA4-openai — structured output is rejected by the provider
+
+`gpt-audio-1.5` rejects both `response_format: json_schema` and `json_object`:
+
+```
+OpenAI API error (400): Invalid parameter: 'response_format' of type 'json_schema' is not supported with this model.
 ```
 
-GA5 passed: `anthropic:`, `openai-responses:`, and a provider whose
-`inputCapabilities` omits `audio` each threw `UnsupportedModelInputError`
-(`UNSUPPORTED_MODEL_INPUT`) with `modality: 'audio'` and **zero fetches**, with
-no transcription fallback. GA7 passed: an unmappable media type
-(`audio/x-unknown`) was rejected locally, naming the media type, with zero
-fetches. Neither row needs a key and both always run.
+The row now certifies the **rejection**: exactly one Chat Completions request
+carrying `input_audio`, a typed `ProviderError` with `status: 400` whose message
+names `response_format`, and no base64 in the error. Audio plus structured
+output is therefore advertised on no adapter.
 
-## Rows NOT run, and why
+### GA2 — first turn certified, tool continuation fails provider-side
 
-| Row | Provider | Why not run |
+The first request (audio + one tool) succeeded: the model returned a tool call
+and usage reported `prompt_tokens: 186`,
+`prompt_tokens_details: { audio_tokens: 80, text_tokens: 106 }`. That is the
+first live proof that OpenAI reports per-modality audio usage on this path.
+
+The continuation (assistant tool call + tool result + the original
+`input_audio` message) failed **five consecutive times** with
+
+```
+OpenAI API error (500): The model produced invalid content. Consider modifying your prompt if you are seeing this error persistently.
+```
+
+including with `parallel_tool_calls: false` and `modalities: ['text']`. A
+text-only control on the same model is impossible: the API answers *"This
+model requires that either input content or output modality contain audio."*
+The request body is the same shape OpenRouter accepted in GA6-tool; the
+failure is on the provider side, so the row stays armed separately and no
+`openai:` tool composition is advertised.
+
+## Rows not run
+
+None. Every row in the suite ran on 2026-09-08.
+
+## Consequence for the public contract
+
+| Adapter | Advertised (passing row) | Not advertised |
 | --- | --- | --- |
-| GA1 | `google:` | No `GOOGLE_API_KEY` / `GEMINI_API_KEY` in this environment |
-| GA2 | `openai:` | No `OPENAI_API_KEY` |
-| GA3 | `google:` | No key |
-| GA4 | `google:` | No key |
-| GA4-openai | `openai:` | No key |
-| GA8 | `google:` | No key |
+| `google:` | text answer from speech and non-speech (GA1), tool continuation (GA3), structured output (GA4), streaming (GA8), history re-send (GA9) | — |
+| `openrouter:` | text answer (GA1-OR, GA6), tool continuation (GA6-tool), streaming (GA8-OR) | structured output (no row) |
+| `openai:` | single-turn text answer with audio (GA2 first turn) | tool continuation (provider 500), structured output (provider 400) |
 
-Consequence for the public contract: `openai:` and `google:` audio transport is
-**implemented but not live-certified**. Per the plan's rule that no
-provider/composition is advertised without a passing live row,
-[`docs/multimodal-input.md`](../multimodal-input.md) advertises **no**
-compositions for those two adapters and says so explicitly. Only the OpenRouter
-lane is certified for a text answer (speech and non-speech), tool continuation,
-and streaming. Structured output with audio (`GA4`) is uncertified on **every**
-adapter and is therefore advertised nowhere.
+`providerMetadata` leak evidence remains indirect: passing rows assert that no
+base64 appears anywhere in observed response bodies or events.
 
-`providerMetadata` leak evidence on OpenRouter is indirect: the passing rows
-assert that no base64 appears anywhere in the observed response body or events,
-rather than enumerating a provider-echo field.
+## Usage evidence for a future modality-aware estimator
+
+All three lanes report audio input tokens separately: OpenAI
+`prompt_tokens_details.audio_tokens` / `text_tokens`, Gemini
+`input_tokens_by_modality`, OpenRouter `prompt_tokens_details.audio_tokens`.
+Axl still prices none of them: `openai:` and `google:` audio calls remain
+unpriced by design until verified per-model audio rates exist. See the
+accounting section of [`docs/multimodal-input.md`](../multimodal-input.md).
 
 ## Request and retry ceilings
 
-The normal successful path is one logical chat request per row, except
-`GA6-tool`, which is two (initial tool call plus continuation). `fetchWithRetry`
-can make up to three HTTP attempts per logical request for eligible transport,
-`429`, `503`, or `529` failures, so the transport-attempt ceiling is 3 per row
-and 6 for `GA6-tool`. As in the earlier records, that is an attempt ceiling and
-**not** a paid-call or spend ceiling: an upstream can process and bill a request
-whose client result was failed or ambiguous. Every paid row caps `maxTokens` at
-200 and uses audio fixtures of roughly ten seconds or less.
+One logical chat request per row, except the continuation rows (`GA2`, `GA3`,
+`GA6-tool`), the streaming rows (`GA8`, `GA8-OR`, text-only control first), and
+`GA9` (two asks), which are two. `fetchWithRetry` can make up to three HTTP
+attempts per logical request for eligible transport, `429`, `503`, or `529`
+failures; `500` is not retried, so GA2's five failures were five separate armed
+runs. That is an attempt ceiling and **not** a paid-call or spend ceiling.
+`maxTokens` is 200 on OpenAI and OpenRouter rows and 400–800 on Gemini rows;
+audio fixtures are roughly ten seconds or less.
 
-## Harness note
+## Harness notes
 
-`GA8-OR` initially failed because the suite's streaming event-type allowlist was
-hand-written and did not include the ordinary `pipeline` event. Comparing
-against the exported `AXL_EVENT_TYPES` constant (commit `693c1fa`) removed the
-failure but made the check a tautology, since every event type the runtime can
-emit is in that list by construction. The rows now compare the audio ask's
-event types against a text-only control ask streamed on the same route in the
-same row, so a new audio-specific event type would be observable.
+- `GA8-OR` initially failed on a hand-written event allowlist; comparing
+  against `AXL_EVENT_TYPES` made the check a tautology. The rows now compare
+  against a text-only control streamed on the same route.
+- `GA8` on `google:` initially failed because the control ask (a plain string)
+  routes to `generateContent`, not Interactions; the model-call matcher now
+  recognises both.
+- `GA3` first ended `incomplete` at `maxTokens: 200` because of thought tokens.

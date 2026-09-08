@@ -54,7 +54,8 @@ import type { AxlEvent, ChatMessage } from '../types.js';
 // Row → selector → key:
 //   [GA1]        google:      GOOGLE_API_KEY / GEMINI_API_KEY
 //   [GA1-OR]     openrouter:  OPENROUTER_API_KEY   (E1 fallback lighthouse)
-//   [GA2]        openai:      OPENAI_API_KEY
+//   [GA2]        openai:      OPENAI_API_KEY       (+ AXL_GENERAL_AUDIO_OPENAI_TOOL_LIVE=1)
+//   [GA2-text]   openai:      OPENAI_API_KEY
 //   [GA3]        google:      GOOGLE_API_KEY / GEMINI_API_KEY
 //   [GA4]        google:      GOOGLE_API_KEY / GEMINI_API_KEY
 //   [GA4-openai] openai:      OPENAI_API_KEY       (optional second lane)
@@ -765,6 +766,46 @@ describe.skipIf(!RUN || !GOOGLE_KEY)(
 
         evidence('GA4', {
           model: `google:${GEMINI_AUDIO_MODEL}`,
+          cost: terminal.cost,
+          unpriced: terminal.unpriced,
+          tokens: rawUsage(model[0]),
+          answer: result,
+        });
+      });
+    });
+  },
+);
+
+describe.skipIf(!RUN || !process.env.OPENAI_API_KEY)(
+  `general audio live [GA2-text]: OpenAI Chat Completions ${OPENAI_AUDIO_MODEL}`,
+  () => {
+    // The single-turn composition openai: advertises. GA2 (tool continuation)
+    // fails provider-side today, so this row is the passing evidence behind
+    // the capability-table entry, not a subset of GA2.
+    it('[GA2-text] answers a question about speech audio in one request', async () => {
+      await observeWire(async (calls) => {
+        const { context, events } = liveContext();
+        const listener = agent({
+          model: `openai:${OPENAI_AUDIO_MODEL}`,
+          system: 'Answer in one short sentence.',
+        });
+        const result = await context.ask(listener, callInput(CALL_QUESTION), { maxTokens: 200 });
+
+        expect(result.trim().length).toBeGreaterThan(0);
+        const model = modelCalls(calls);
+        expect(model).toHaveLength(1);
+        expect(compatibleUserContent(model[0])[0]).toEqual({
+          type: 'input_audio',
+          input_audio: { data: RECORDED_CALL_BASE64, format: 'mp3' },
+        });
+        expect(model[0].rawRequest).toContain(RECORDED_CALL_SENTINEL);
+        assertSentinelAbsentFromEvents(events, RECORDED_CALL_SENTINEL);
+        assertNoStrayAudioEcho(model[0].responseBody, RECORDED_CALL_SENTINEL);
+        const terminal = assertHonestTerminal(events);
+        // Audio-bearing openai: calls are unpriced by design (no audio rates).
+        expect(terminal.unpriced).toBe(true);
+        evidence('GA2-text', {
+          model: `openai:${OPENAI_AUDIO_MODEL}`,
           cost: terminal.cost,
           unpriced: terminal.unpriced,
           tokens: rawUsage(model[0]),

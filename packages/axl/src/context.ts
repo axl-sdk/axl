@@ -5347,6 +5347,13 @@ export class WorkflowContext<TInput = unknown> {
     });
 
     const routerInput = options?.routerInput === 'text' ? inputText(prompt) : prompt;
+    if (routerInput === '') {
+      // A media-only input has no text projection; routing on an empty user
+      // turn would be a blind pick (and some providers reject empty content).
+      throw new InvalidModelInputError(
+        "delegate routerInput 'text' requires at least one text part; the input is media-only — route on the full input or add a text part",
+      );
+    }
     (routerAgent as Agent & { _delegateOriginalInput?: ModelInput })._delegateOriginalInput =
       prompt;
     return this.ask(routerAgent, routerInput, {

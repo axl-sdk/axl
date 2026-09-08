@@ -318,6 +318,32 @@ describe('audio fails closed without a declared provider capability (J6)', () =>
   });
 });
 
+describe('delegate routerInput text with a media-only input (ROUTE-04)', () => {
+  it('rejects before any router or delegate request instead of routing on an empty turn', async () => {
+    const provider = new CapabilityProvider({ audio: { sources: ['base64'] } });
+    const fetchMock = forbidFetch();
+    const traces: AxlEvent[] = [];
+    const ctx = contextFor('capability', provider, {}, traces);
+    const candidates = [
+      agent({ name: 'a', model: 'capability:any', system: 'a' }),
+      agent({ name: 'b', model: 'capability:any', system: 'b' }),
+    ];
+    const error = await ctx
+      .delegate(
+        candidates,
+        [{ type: 'audio', source: { type: 'base64', data: 'AQID', mediaType: 'audio/wav' } }],
+        { routerInput: 'text' },
+      )
+      .catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(InvalidModelInputError);
+    expect((error as Error).message).toContain('media-only');
+    expect(provider.chatCalls).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(traces.filter((event) => event.type === 'agent_call_start')).toHaveLength(0);
+  });
+});
+
 describe('image-only rejections keep reporting the image modality (R-A3)', () => {
   const imageRejectors: Array<[string, () => Provider, string]> = [
     ['openai', () => new OpenAIProvider({ apiKey: 'test-key' }), 'gpt-test'],

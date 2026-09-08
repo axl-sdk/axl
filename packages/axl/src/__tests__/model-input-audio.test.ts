@@ -5,6 +5,7 @@ import type { WorkflowContextInit } from '../context.js';
 import { InvalidModelInputError, UnsupportedModelInputError } from '../errors.js';
 import {
   describeModelInput,
+  inputText,
   normalizeModelInput,
   summarizeModelInput,
   type InputAudioPart,
@@ -26,6 +27,7 @@ import type {
   StreamChunk,
 } from '../providers/types.js';
 import { redactEvent, REDACTED } from '../redaction.js';
+import type { SpanManager } from '../telemetry/types.js';
 import type { AxlEvent, ChatMessage } from '../types.js';
 
 const MIB = 1024 * 1024;
@@ -543,5 +545,180 @@ describe('audio parts survive the ordered-input contract (J2)', () => {
     const content = provider.sent[0].at(-1)?.content as readonly InputContentPart[];
     expect(content).toEqual([...audioInput]);
     expect((content[0] as InputAudioPart).type).toBe('audio');
+  });
+});
+
+// ── Review fix wave: core-side audio parity ────────────────────────────────
+
+/** Captures every span event the ask emits, with its attribute bag. */
+function capturingSpanManager(
+  events: Array<{ name: string; attributes: Record<string, unknown> }>,
+): SpanManager {
+  return {
+    async withSpanAsync(_name, _attributes, fn) {
+      return fn({
+        setAttribute: () => {},
+        addEvent: () => {},
+        setStatus: () => {},
+        end: () => {},
+      });
+    },
+    addEventToActiveSpan: (name, attributes) => {
+      events.push({ name, attributes: { ...attributes } });
+    },
+    shutdown: async () => {},
+  };
+}
+
+describe('axl.model_input span attributes count audio (R-A11)', () => {
+  const audioCapable = () =>
+    new CapabilityProvider({
+      image: { sources: ['bytes', 'base64'] },
+      audio: { sources: ['bytes', 'base64'] },
+    });
+
+  it('reports an audio-only ask as audio parts with real inline bytes', async () => {
+    const events: Array<{ name: string; attributes: Record<string, unknown> }> = [];
+    await contextFor('capability', audioCapable(), {
+      spanManager: capturingSpanManager(events),
+    }).ask(agent({ model: 'capability:any', system: 'listen' }), audioInput);
+
+    const attributes = events.find((event) => event.name === 'axl.model_input')?.attributes;
+    expect(attributes).toEqual({
+      'axl.input.parts': 2,
+      'axl.input.images': 0,
+      'axl.input.audio': 1,
+      'axl.input.source.bytes': 0,
+      'axl.input.source.base64': 1,
+      'axl.input.source.url': 0,
+      'axl.input.source.provider_file': 0,
+      // 'AQID' decodes to three bytes — an image-only filter reported 0 here.
+      'axl.input.inline_bytes': 3,
+    });
+  });
+
+  it('counts both modalities and their combined inline bytes on a mixed ask', async () => {
+    const events: Array<{ name: string; attributes: Record<string, unknown> }> = [];
+    await contextFor('capability', audioCapable(), {
+      spanManager: capturingSpanManager(events),
+    }).ask(agent({ model: 'capability:any', system: 'inspect' }), [
+      imageBytes(3),
+      { type: 'audio', source: { type: 'base64', data: 'AQID', mediaType: 'audio/wav' } },
+    ]);
+
+    const attributes = events.find((event) => event.name === 'axl.model_input')?.attributes;
+    expect(attributes).toEqual({
+      'axl.input.parts': 2,
+      'axl.input.images': 1,
+      'axl.input.audio': 1,
+      'axl.input.source.bytes': 1,
+      'axl.input.source.base64': 1,
+      'axl.input.source.url': 0,
+      'axl.input.source.provider_file': 0,
+      'axl.input.inline_bytes': 6,
+    });
+  });
+});
+
+describe("audio capability is re-checked on the validator's effective model", () => {
+  /** Declares audio for exactly one model and swaps in another at validation. */
+  class SubstitutingProvider extends LegacyValidatingProvider {
+    override readonly name = 'substituting';
+
+    inputCapabilities(model: string): InputModalitySupport {
+      return model === 'audio-ok'
+        ? { image: { sources: ['base64'] }, audio: { sources: ['base64'] } }
+        : { image: { sources: ['base64'] } };
+    }
+
+    override validateInput(request: ProviderInputValidationRequest): { effectiveModel: string } {
+      this.validations++;
+      const override = request.providerOptions?.model;
+      return { effectiveModel: typeof override === 'string' ? override : request.model };
+    }
+  }
+
+  it('rejects audio when the effective model does not declare it, with zero dispatch', async () => {
+    const provider = new SubstitutingProvider();
+    const fetchMock = forbidFetch();
+    const error = await contextFor('substituting', provider)
+      .ask(agent({ model: 'substituting:audio-ok', system: 'listen' }), audioInput, {
+        providerOptions: { model: 'text-only' },
+      })
+      .catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(UnsupportedModelInputError);
+    expect((error as UnsupportedModelInputError).modality).toBe('audio');
+    expect((error as UnsupportedModelInputError).source).toBe('base64');
+    expect((error as Error).message).toContain('text-only');
+    expect(provider.chatCalls).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('dispatches when the effective model does declare audio', async () => {
+    const provider = new SubstitutingProvider();
+    await contextFor('substituting', provider).ask(
+      agent({ model: 'substituting:audio-ok', system: 'listen' }),
+      audioInput,
+      { providerOptions: { model: 'audio-ok' } },
+    );
+    expect(provider.chatCalls).toBe(1);
+  });
+});
+
+describe('audio-bearing rejections and projections carry the audio modality (AB-22, AB-08, AB-04)', () => {
+  it.each(['messages', 'input'])(
+    'AB-22: a raw %s container override on an audio ask reports modality audio',
+    async (key) => {
+      const provider = new CapabilityProvider({ audio: { sources: ['base64'] } });
+      const fetchMock = forbidFetch();
+      const error = await contextFor('capability', provider)
+        .ask(agent({ model: 'capability:any', system: 'listen' }), audioInput, {
+          providerOptions: { [key]: [] },
+        })
+        .catch((err: unknown) => err);
+
+      expect(error).toBeInstanceOf(UnsupportedModelInputError);
+      // A hardcoded 'image' here would contradict an audio-only request.
+      expect((error as UnsupportedModelInputError).modality).toBe('audio');
+      expect((error as Error).message).toContain('raw input-container providerOptions');
+      expect(provider.validations).toBe(0);
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('AB-08: the text projection keeps ordered text and drops audio entirely', () => {
+    expect(
+      inputText([
+        { type: 'audio', source: { type: 'base64', data: 'AQID', mediaType: 'audio/wav' } },
+        { type: 'text', text: 'a' },
+        { type: 'text', text: 'b' },
+      ]),
+    ).toBe('a\nb');
+  });
+
+  it('AB-04: the shared inline budget rejects audio-first order too, and names the remedy', () => {
+    expect(() => normalizeModelInput([audioBytes(20 * MIB), imageBytes(6 * MIB)])).toThrow(
+      InvalidModelInputError,
+    );
+    // Audio has no URL source, so the advice cannot offer one unconditionally.
+    expect(() => normalizeModelInput([audioBytes(20 * MIB), imageBytes(6 * MIB)])).toThrow(
+      'use a provider-file source, or a URL for images, where supported',
+    );
+  });
+
+  it('accepts a label on a media part and ignores one on a text part', () => {
+    expect(normalizeModelInput([{ type: 'text', text: 'hi', label: '' }] as never)).toEqual([
+      { type: 'text', text: 'hi' },
+    ]);
+    expect(() =>
+      normalizeModelInput([
+        {
+          type: 'audio',
+          label: '',
+          source: { type: 'base64', data: 'AQID', mediaType: 'audio/wav' },
+        },
+      ] as never),
+    ).toThrow('part 0.label must be a non-empty string');
   });
 });

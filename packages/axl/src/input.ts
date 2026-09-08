@@ -88,7 +88,7 @@ function decodedBase64Bytes(value: string): number {
 }
 
 const INLINE_MEDIA_LIMIT_MESSAGE =
-  'Inline media data must not exceed 25 MiB total; use a URL or provider-file source where supported';
+  'Inline media data must not exceed 25 MiB total; use a provider-file source, or a URL for images, where supported';
 
 const IMAGE_SOURCE_TYPES = ['url', 'bytes', 'base64', 'provider-file'] as const;
 const AUDIO_SOURCE_TYPES = ['bytes', 'base64', 'provider-file'] as const;
@@ -184,7 +184,10 @@ export function normalizeModelInput(input: ModelInput): ModelInput {
 
   return input.map((part, index): InputContentPart => {
     if (!part || typeof part !== 'object') invalid(`ModelInput part ${index} must be an object`);
-    const label =
+    // `label` belongs to the media parts only: a text part has no label field
+    // in `InputTextPart`, and the normalized text part drops one, so
+    // validating it there would reject an input that normalizes fine.
+    const mediaLabel = () =>
       part.label === undefined ? {} : { label: nonEmptyString(part.label, `part ${index}.label`) };
     switch (part.type) {
       case 'text':
@@ -193,13 +196,13 @@ export function normalizeModelInput(input: ModelInput): ModelInput {
         return {
           type: 'image',
           source: cloneMediaSource(part.source, index, IMAGE_SOURCE_TYPES, reserveInlineBytes),
-          ...label,
+          ...mediaLabel(),
         };
       case 'audio':
         return {
           type: 'audio',
           source: cloneMediaSource(part.source, index, AUDIO_SOURCE_TYPES, reserveInlineBytes),
-          ...label,
+          ...mediaLabel(),
         };
       default:
         invalid(`part ${index}.type must be 'text', 'image', or 'audio'`);

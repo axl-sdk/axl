@@ -243,6 +243,7 @@ export {
 export type {
   ProviderProfile,
   CapabilityFlags,
+  ProfileInputModalities,
   PricingSource,
   PricingTable,
   ReasoningProfile,

@@ -243,13 +243,14 @@ thought tokens at its output rate. `normalizeInteractionUsage` still folds the
 split into `prompt_tokens` for existing consumers and additionally exposes
 `usage.audio_input_tokens`.
 
-Pricing engages only on a model row that carries a verified audio rate
-(`gemini-2.5-flash`, `gemini-3.7-flash` today). **Behavior change:** because
-the estimator is not gated on `audio > 0`, a *text-* or *image-only* rich
-Interactions call on such a model is now priced too — its image tokens bill at
-the input rate, never at the audio rate. Everything else stays `undefined`
-(never `0`): a model with no audio rate, a missing breakdown, a breakdown that
-does not sum to the reported input total, a `total_tokens` that does not equal
+Positive audio pricing engages only on a model row that carries a verified
+audio rate (`gemini-2.5-flash`, `gemini-3.7-flash` today). A reconciled
+text- or image-only Interactions call does not require an audio rate: it uses
+the model row's ordinary input, cached-input, and output rates. This includes
+catalog rows such as `gemini-2.5-pro` and `gemini-3.8-flash`; image tokens bill
+at the input rate, never at an audio rate. Everything else stays `undefined`
+(never `0`): positive audio on a model with no audio rate, a missing breakdown,
+a breakdown that does not sum to the reported input total, a `total_tokens` that does not equal
 `input + output + thoughts + tool-use` (that identity is what proves the output
 count excludes thoughts, so without it thoughts could be billed twice), an
 unknown modality (`video`, documents, anything new), non-zero server-side tool

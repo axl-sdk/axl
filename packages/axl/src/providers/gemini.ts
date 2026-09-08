@@ -270,9 +270,10 @@ type GeminiRate = {
   longContext?: { input: number; cached: number; output: number };
   /**
    * Per-token audio INPUT rate. Absent ⇒ this model's audio price is unknown,
-   * so a call whose usage reports a per-modality split stays unpriced. Audio
-   * tokens are never billed at `input`, and text/image tokens are never billed
-   * at this rate — on 2.5 Flash the two differ by more than 3x.
+   * so a call whose usage reports positive audio tokens stays unpriced. A
+   * reconciled text/image-only split still uses `input`. Audio tokens are never
+   * billed at `input`, and text/image tokens are never billed at this rate — on
+   * 2.5 Flash the two differ by more than 3x.
    *
    * Reviewed 2026-09-08 against https://ai.google.dev/gemini-api/docs/pricing:
    * Gemini 3.7 Flash publishes ONE input price ($0.75 / 1M through
@@ -325,9 +326,9 @@ type GeminiPriceUsage = {
   cachedTokens?: number;
   /**
    * Validated per-modality input split, reported only by the Interactions
-   * transport. Present ⇒ pricing REQUIRES a verified `audioInput` rate on the
-   * model row (even when `audioTokens` is 0), so a rich call on a model whose
-   * audio price is unknown never prices. `audioTokens + nonAudioTokens` always
+   * transport. A positive `audioTokens` bucket requires a verified
+   * `audioInput` rate; a zero/absent audio bucket uses the ordinary input rate
+   * for its known text/image tokens. `audioTokens + nonAudioTokens` always
    * equals `inputTokens`.
    */
   modalities?: { audioTokens: number; nonAudioTokens: number };
@@ -484,10 +485,10 @@ function estimateGeminiCost(model: string, usage: GeminiPriceUsage): number | un
   const split = usage.modalities;
   const audio = split?.audioTokens ?? 0;
   if (split !== undefined) {
-    // A split is only priceable against a verified audio rate — even when the
-    // audio bucket is empty, since its presence is what makes the non-audio
-    // buckets attributable at all.
-    if (pricing.audioInput === undefined) return undefined;
+    // A positive audio bucket requires a verified audio rate. A reconciled
+    // text/image-only split uses the model's ordinary input rate and does not
+    // depend on an unrelated audio catalog field.
+    if (audio > 0 && pricing.audioInput === undefined) return undefined;
     if (
       !isValidTokenCount(audio) ||
       !isValidTokenCount(split.nonAudioTokens) ||

@@ -304,6 +304,12 @@ per-modality usage both providers report (OpenAI
 `prompt_tokens_details.audio_tokens` / `text_tokens`, Gemini
 `input_tokens_by_modality`), which the live rows certified.
 
+Gemini Interactions text/image-only calls do not require an audio rate on the
+model's catalog row. With a complete reconciled modality breakdown, zero audio
+usage uses the existing input, cached-input, and output rates, including the
+model's long-context tier where applicable. Positive audio usage still requires
+a verified audio rate. This expands pricing without rewriting stored executions.
+
 A call is priced only when every bucket it billed has a published rate and the
 reported counts reconcile. Otherwise it sets the normal `unpriced` /
 lower-bound signals rather than a wrong number or `$0` — and a `ctx.budget()`

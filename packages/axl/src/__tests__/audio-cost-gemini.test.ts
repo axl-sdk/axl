@@ -2,8 +2,8 @@
  * Modality-aware audio cost estimation — `google:` Gemini Interactions.
  *
  * Frozen matrix rows implemented here: T038–T058, T060–T063, T073, T074,
- * T077 (google half), T082-shaped budget enforcement. Rows deliberately not
- * implemented, with reasons, are in the workstream's implementation report.
+ * T077 (google half), T082-shaped budget enforcement, and N1 no-audio pricing
+ * across catalog rows that do not carry an audio rate.
  *
  * The discriminating model is `gemini-2.5-flash`, whose published AUDIO input
  * rate ($1.00 / 1M) is more than 3x its text/image rate ($0.30 / 1M): an
@@ -36,8 +36,18 @@ const RATES = {
 } as const;
 
 const SPLIT_MODEL = 'gemini-2.5-flash';
-/** No `audioInput` rate: a rich Interactions call on it must stay unpriced. */
+/** No `audioInput` rate: positive audio stays unpriced; text/image can price. */
 const UNRATED_MODEL = 'gemini-2.5-pro';
+
+const NO_AUDIO_RATES = {
+  'gemini-2.5-pro': {
+    input: 1.25e-6,
+    cached: 0.125e-6,
+    output: 10e-6,
+    longContext: { input: 2.5e-6, cached: 0.25e-6, output: 15e-6 },
+  },
+  'gemini-3.8-flash': { input: 0.75e-6, cached: 0.075e-6, output: 3.75e-6 },
+} as const;
 
 /** GA1's live usage vector (verification record 2026-09-08). */
 const GA1 = { audio: 75, text: 20, input: 95, output: 12, thought: 55 } as const;
@@ -183,6 +193,22 @@ function googleRuntime(): AxlRuntime {
   const runtime = new AxlRuntime();
   runtime.registerProvider('google', new GeminiProvider({ apiKey: 'test-key' }));
   return runtime;
+}
+
+type NoAudioModel = keyof typeof NO_AUDIO_RATES;
+
+function expectedNoAudioCost(
+  model: NoAudioModel,
+  vector: { input: number; output: number; thought?: number; cached?: number; long?: boolean },
+): number {
+  const modelRate = NO_AUDIO_RATES[model];
+  const rate = vector.long && 'longContext' in modelRate ? modelRate.longContext : modelRate;
+  const cached = vector.cached ?? 0;
+  return (
+    (vector.input - cached) * rate.input +
+    cached * rate.cached +
+    (vector.output + (vector.thought ?? 0)) * rate.output
+  );
 }
 
 // ── The per-modality formula (T038, T039, T041, T051, T052) ─────────────
@@ -351,6 +377,116 @@ describe('gemini cached tokens', () => {
     // input` guard is retained as defense in depth for a future relaxation.
     const { cost } = await askAudio(interactionUsage({ total_cached_tokens: 30 }));
     expect(cost).toBeUndefined();
+  });
+});
+
+// ── No-audio Interactions pricing on catalog rows without audio rates ───
+
+describe('gemini no-audio pricing does not require an audio catalog rate', () => {
+  const cases = [
+    {
+      label: 'image-only',
+      modalities: [{ modality: 'image', tokens: GA1.input }],
+      input: [
+        {
+          type: 'image' as const,
+          source: { type: 'base64' as const, data: SENTINEL, mediaType: 'image/png' },
+        },
+      ],
+    },
+    {
+      label: 'text-only parts',
+      modalities: [{ modality: 'text', tokens: GA1.input }],
+      input: [{ type: 'text' as const, text: 'Price this Interactions call.' }],
+    },
+    {
+      label: 'explicit zero audio',
+      modalities: [
+        { modality: 'audio', tokens: 0 },
+        { modality: 'text', tokens: GA1.input },
+      ],
+      input: [{ type: 'text' as const, text: 'Price this zero-audio split.' }],
+    },
+  ];
+
+  for (const model of Object.keys(NO_AUDIO_RATES) as NoAudioModel[]) {
+    it.each(cases)(
+      `${model}: $label uses ordinary input pricing`,
+      async ({ label, modalities, input }) => {
+        const { cost, usage } = await askAudio(
+          interactionUsage({ input_tokens_by_modality: modalities }),
+          { model, input },
+        );
+        expect(cost).toBeCloseTo(
+          expectedNoAudioCost(model, {
+            input: GA1.input,
+            output: GA1.output,
+            thought: GA1.thought,
+          }),
+          14,
+        );
+        expect(usage?.prompt_tokens).toBe(GA1.input);
+        if (label === 'explicit zero audio') expect(usage?.audio_input_tokens).toBe(0);
+        else expect('audio_input_tokens' in (usage ?? {})).toBe(false);
+      },
+    );
+  }
+
+  it.each(Object.keys(NO_AUDIO_RATES) as NoAudioModel[])(
+    '%s remains unpriced when the reconciled split contains positive audio',
+    async (model) => {
+      const { cost, usage } = await askAudio(interactionUsage(), { model });
+      expect(cost).toBeUndefined();
+      expect(usage?.audio_input_tokens).toBe(GA1.audio);
+    },
+  );
+
+  it('gemini-2.5-pro applies cached pricing to a reconciled image/text-only split', async () => {
+    const input = 100;
+    const cached = 25;
+    const output = 10;
+    const thought = 5;
+    const { cost } = await askAudio(
+      interactionUsage({
+        total_input_tokens: input,
+        total_output_tokens: output,
+        total_thought_tokens: thought,
+        total_cached_tokens: cached,
+        total_tokens: input + output + thought,
+        input_tokens_by_modality: [
+          { modality: 'image', tokens: 60 },
+          { modality: 'text', tokens: 40 },
+        ],
+      }),
+      { model: 'gemini-2.5-pro', input: [{ type: 'text' as const, text: 'Cached.' }] },
+    );
+    expect(cost).toBeCloseTo(
+      expectedNoAudioCost('gemini-2.5-pro', { input, cached, output, thought }),
+      14,
+    );
+  });
+
+  it('gemini-2.5-pro applies long-context rates above 200k without audio', async () => {
+    const input = 200_001;
+    const output = 2;
+    const thought = 1;
+    const { cost } = await askAudio(
+      interactionUsage({
+        total_input_tokens: input,
+        total_output_tokens: output,
+        total_thought_tokens: thought,
+        total_tokens: input + output + thought,
+        input_tokens_by_modality: [
+          { modality: 'image', tokens: 100_000 },
+          { modality: 'text', tokens: 100_001 },
+        ],
+      }),
+      { model: 'gemini-2.5-pro', input: [{ type: 'text' as const, text: 'Long.' }] },
+    );
+    expect(cost).toBeCloseTo(
+      expectedNoAudioCost('gemini-2.5-pro', { input, output, thought, long: true }),
+      14,
+    );
   });
 });
 
@@ -735,6 +871,8 @@ describe('gemini Interactions streaming', () => {
       lifecycleEvents?: Record<string, unknown>[];
       completedInteraction?: Record<string, unknown>;
       responseHeaders?: HeadersInit;
+      model?: string;
+      input?: readonly unknown[];
     } = {},
   ) {
     const events = [
@@ -768,9 +906,10 @@ describe('gemini Interactions streaming', () => {
     mockFetch(response);
     const provider = new GeminiProvider({ apiKey: 'test-key' });
     const chunks = [];
-    for await (const chunk of provider.stream([{ role: 'user', content: AUDIO_INPUT as never }], {
-      model: SPLIT_MODEL,
-    })) {
+    for await (const chunk of provider.stream(
+      [{ role: 'user', content: (options.input ?? AUDIO_INPUT) as never }],
+      { model: options.model ?? SPLIT_MODEL },
+    )) {
       chunks.push(chunk);
     }
     // The stream really did stream: a done-only chunk list would make the
@@ -788,6 +927,28 @@ describe('gemini Interactions streaming', () => {
     expect(done.cost).toBe(nonStreaming.cost);
     expect(done.usage?.audio_input_tokens).toBe(GA1.audio);
     expect(done.usage).toEqual(nonStreaming.usage);
+  });
+
+  it('N1: blocking and streaming costs match on an audio-unrated image row', async () => {
+    const usage = interactionUsage({
+      input_tokens_by_modality: [{ modality: 'image', tokens: GA1.input }],
+    });
+    const input = [
+      {
+        type: 'image' as const,
+        source: { type: 'base64' as const, data: SENTINEL, mediaType: 'image/png' },
+      },
+    ];
+    const done = await streamDone(usage, { model: UNRATED_MODEL, input });
+    const blocking = await askAudio(usage, { model: UNRATED_MODEL, input });
+    const expected = expectedNoAudioCost('gemini-2.5-pro', {
+      input: GA1.input,
+      output: GA1.output,
+      thought: GA1.thought,
+    });
+    expect(done.cost).toBeCloseTo(expected, 14);
+    expect(done.cost).toBe(blocking.cost);
+    expect(done.usage).toEqual(blocking.usage);
   });
 
   it('a stream reporting no usage is unpriced', async () => {
@@ -1086,6 +1247,61 @@ describe('gemini audio budget enforcement', () => {
     expect(fetchMock.mock.calls.length).toBeLessThan(3);
     expect(result.totalCost).toBeCloseTo(GA1_EXPECTED * completed.length, 12);
     for (const callEnd of events.filter((event) => event.type === 'agent_call_end')) {
+      expect(isUnpricedLeaf(callEnd)).toBe(false);
+    }
+    await runtime.shutdown();
+  });
+
+  it('N1: runtime rollups and budget enforce a priced text-parts Interactions call', async () => {
+    const usage = interactionUsage({
+      input_tokens_by_modality: [{ modality: 'text', tokens: GA1.input }],
+    });
+    const expected = expectedNoAudioCost('gemini-2.5-pro', {
+      input: GA1.input,
+      output: GA1.output,
+      thought: GA1.thought,
+    });
+    const fetchMock = mockFetch(
+      interactionReply(usage),
+      interactionReply(usage),
+      interactionReply(usage),
+    );
+    const runtime = googleRuntime();
+    const events: AxlEvent[] = [];
+    runtime.on('trace', (event) => events.push(event));
+    const completed: number[] = [];
+    runtime.register(
+      workflow({
+        name: 'gemini-no-audio-budget',
+        input: z.object({}),
+        handler: (ctx) =>
+          ctx.budget({ cost: `$${(expected * 1.5).toFixed(9)}` }, async () => {
+            for (let turn = 0; turn < 3; turn++) {
+              await ctx.ask(agent({ model: 'google:gemini-2.5-pro' }), [
+                { type: 'text', text: 'Use Interactions.' },
+              ]);
+              completed.push(turn);
+            }
+            return 'never';
+          }),
+      }),
+    );
+
+    const result = (await runtime.execute('gemini-no-audio-budget', {})) as {
+      budgetExceeded: boolean;
+      unpriced: boolean;
+      totalCost: number;
+    };
+    expect(result.budgetExceeded).toBe(true);
+    expect(result.unpriced).toBe(false);
+    expect(completed.length).toBeGreaterThan(0);
+    expect(completed.length).toBeLessThan(3);
+    expect(fetchMock).toHaveBeenCalledTimes(completed.length);
+    expect(result.totalCost).toBeCloseTo(expected * completed.length, 14);
+    const callEnds = events.filter((event) => event.type === 'agent_call_end');
+    expect(callEnds).toHaveLength(completed.length);
+    for (const callEnd of callEnds) {
+      expect(callEnd.cost).toBeCloseTo(expected, 14);
       expect(isUnpricedLeaf(callEnd)).toBe(false);
     }
     await runtime.shutdown();

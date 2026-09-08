@@ -346,3 +346,7 @@ AXL_GEMINI_BILLING_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vit
 The recorded run selected this exact file once, executing its seven offline harness tests followed by V5 and V3, with no reruns. `AXL_DISABLE_LIVE_INTEGRATION=1` overrides the gate. Each live row makes one logical call with a 55-second abort and at most three transport attempts. Sanitized per-attempt request/status/header/usage evidence survives failure; credentials and inline media are excluded.
 
 V5 and V3 satisfy the owner's prerequisites for the separate N1 no-audio-rate pricing expansion.
+
+### N1 — pricing expansion after V5/V3
+
+With both live prerequisites closed, the estimator now requires an audio rate only for positive reported audio tokens. Reconciled text/image input on known catalog rows without an audio rate can therefore price. Offline regressions cover `gemini-2.5-pro` and `gemini-3.8-flash`, explicit zero audio, cached input, long context, positive-audio rejection, and blocking/streaming adapter cost parity and blocking runtime cost/budget propagation. This expansion adds no rates and does not rewrite historical executions. No additional paid call was needed: V5/V3 verify the unchanged provider boundaries; the changed audio-rate precondition is deterministic.

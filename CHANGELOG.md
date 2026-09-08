@@ -19,10 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokens at the output rate. Rates are carried for `gpt-audio-1.5`,
   `gpt-audio`, `gemini-2.5-flash`, and `gemini-3.7-flash` (reviewed 2026-09-08
   against the first-party pricing pages; the announced 2027 Gemini increase is
-  deliberately not encoded). A call whose every billed bucket lacks a
+  deliberately not encoded). A call with any billed bucket lacking a
   published rate — or whose reported counts do not reconcile — stays
-  `undefined`, never `0`: an unrated model, a missing audio count on an
-  audio-bearing request (missing is not zero), an unknown Gemini modality,
+  `undefined`, never `0`: an audio-bearing call on a model without an audio
+  rate, a missing audio count on an audio-bearing request (missing is not
+  zero), an unknown Gemini modality,
   server-side tool tokens, cached tokens co-occurring with audio tokens (the
   providers do not document whether the two buckets overlap), a Gemini
   `total_tokens` that does not reconcile with its parts, a non-text reply, a
@@ -39,11 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **This is not retroactive:** executions recorded before this release keep
   `unpriced: true` for audio work, so anyone diffing historical against new
   executions sees a step change at the release boundary.
-  **Behavior change beyond audio:** because the Gemini estimator is not gated
-  on `audio > 0`, a text- or image-only rich Interactions call on a model that
-  carries an audio rate is now priced too, with image tokens billed at the
-  input rate. See
-  [`docs/providers.md`](docs/providers.md#rich-input-calls).
+  Reconciled text- and image-only Gemini Interactions calls use ordinary
+  catalog rates, independent of audio-rate availability; see the pricing
+  expansion below and [`docs/providers.md`](docs/providers.md#rich-input-calls).
 - `ProviderResponse.usage` and terminal stream chunks gain optional
   `audio_input_tokens` / `audio_output_tokens` — the audio share of
   `prompt_tokens` / `completion_tokens`, populated on `openai:`,
@@ -146,6 +145,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verified modality-aware estimator exists and text-table rates are never applied
   to audio tokens. `openrouter:` continues to use its authoritative response
   `usage.cost`.
+
+### Changed
+
+- **Gemini Interactions now prices known text/image usage on models without an
+  audio rate.** A verified audio rate is required only when audio tokens are
+  positive. Reconciled text/image calls, including cached and long-context
+  calls, use the existing catalog rates; positive audio without a rate and
+  all other unsupported billing cases remain unpriced. Previously recorded
+  executions are not rewritten.
 
 ### Fixed
 

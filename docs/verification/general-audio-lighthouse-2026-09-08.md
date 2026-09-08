@@ -259,6 +259,37 @@ the formula applied to the captured wire usage. See the accounting section of
 [`docs/multimodal-input.md`](../multimodal-input.md) and
 [`docs/providers.md`](../providers.md#rich-input-calls).
 
+Priced re-run after the estimator and its review fix wave (`60efc9b`), each
+value the formula applied to the captured wire usage:
+
+| Row | Lane | Cost | `unpriced` |
+| --- | --- | --- | --- |
+| GA2-text | `openai:gpt-audio-1.5` | 0.0028675 | false |
+| GA1 | `google:gemini-3.7-flash` | 0.00042375 | false |
+| GA3 | `google:gemini-3.7-flash` | 0.001128 | false |
+| GA4 | `google:gemini-3.7-flash` | 0.00031425 | false |
+| GA11 | `google:gemini-3.7-flash` (Files URI) | 0.00042 | false |
+| GA1-OR | `openrouter:google/gemini-2.5-flash` | 0.0001054 (`usage.cost`) | false |
+
+`GA2` still fails on the provider-side 500 recorded above (three further
+attempts on 2026-09-08 after the fix wave, none retried by Axl); it is not a
+regression, since no estimator commit touches request building.
+
+Two cache probes were run over raw HTTP with the same long prompt sent twice,
+three seconds apart. `openai:gpt-audio-1.5` with a 120 s WAV (1200 audio
+tokens, 1218 prompt tokens) reported `cached_tokens: 0` both times.
+`google:gemini-2.5-flash` Interactions with a 50 s WAV (1601 audio tokens,
+1609 input tokens) reported `total_cached_tokens: 0` both times and satisfied
+`total_tokens = input + output + thought` on both responses. Neither lane
+produced a cache hit on an audio-dominant prompt, so a cached-audio overlap
+remains unobserved and the estimators unprice any call that reports both
+cached and audio tokens until a probe shows how the buckets relate.
+
+The `openai-responses:` pricing rows in `integration-pricing.test.ts` were run
+live after the fix wave (six passed) and now assert that both audio usage
+fields are absent on text-only calls, so the Responses lane's audio mapping
+cannot silently move priced text traffic to unpriced.
+
 ## Request and retry ceilings
 
 One logical chat request per row, except the continuation rows (`GA2`, `GA3`,

@@ -435,6 +435,119 @@ function rawUsage(call: CapturedCall | undefined): unknown {
   return body?.usage ?? body?.usage_metadata ?? body?.usageMetadata;
 }
 
+// ── Cost formula (plan §2 A6) ───────────────────────────────────────────
+
+/**
+ * Published per-token rates for the two default audio-lane models, so a live
+ * row can assert the EXACT estimate rather than "some positive number".
+ * Reviewed 2026-09-08 against the OpenAI and Google pricing pages — the same
+ * citations the adapter catalogs carry. This is deliberately an independent
+ * copy: importing the private catalogs would make the assertion a tautology.
+ *
+ * A model override via `OPENAI_AUDIO_MODEL` / `GEMINI_AUDIO_MODEL` skips the
+ * exact-formula check and keeps the "priced, not unpriced" assertion.
+ */
+const LIVE_RATES: Record<
+  string,
+  { input: number; cached: number; output: number; audioInput: number; audioOutput?: number }
+> = {
+  'gemini-3.7-flash': {
+    input: 0.75e-6,
+    cached: 0.075e-6,
+    output: 3.75e-6,
+    audioInput: 0.75e-6,
+  },
+  'gpt-audio-1.5': {
+    input: 2.5e-6,
+    cached: 0,
+    output: 10e-6,
+    audioInput: 32e-6,
+    audioOutput: 64e-6,
+  },
+};
+
+const COST_TOLERANCE = 1e-9;
+
+/**
+ * Assert the ask's terminal cost equals the modality formula applied to the
+ * captured wire usage of a single-call Gemini Interactions row.
+ *
+ * `(nonAudio − cached) × input + cached × cachedRate + audio × audioInput +
+ *  (output + thought) × output`
+ */
+function assertGeminiInteractionCost(terminal: Terminal, usage: unknown, model: string): void {
+  expect(terminal.unpriced).toBe(false);
+  expect(terminal.cost).toBeGreaterThan(0);
+  const rates = LIVE_RATES[model];
+  if (!rates) {
+    console.info(`[cost] ${model} is not in the row's rate table; exact formula not asserted`);
+    return;
+  }
+  const wire = usage as {
+    total_input_tokens?: number;
+    total_output_tokens?: number;
+    total_thought_tokens?: number;
+    total_cached_tokens?: number;
+    input_tokens_by_modality?: Array<{ modality?: string; tokens?: number }>;
+  };
+  const breakdown = wire.input_tokens_by_modality ?? [];
+  expect(breakdown.length).toBeGreaterThan(0);
+  const audio = breakdown
+    .filter((entry) => entry.modality?.toLowerCase() === 'audio')
+    .reduce((sum, entry) => sum + (entry.tokens ?? 0), 0);
+  const total = breakdown.reduce((sum, entry) => sum + (entry.tokens ?? 0), 0);
+  // The estimator's own precondition: the split must reconcile with the total.
+  expect(total).toBe(wire.total_input_tokens);
+  const cached = wire.total_cached_tokens ?? 0;
+  const expected =
+    (total - audio - cached) * rates.input +
+    cached * rates.cached +
+    audio * rates.audioInput +
+    ((wire.total_output_tokens ?? 0) + (wire.total_thought_tokens ?? 0)) * rates.output;
+  console.info(
+    `[cost] ${model} audio=${audio} nonAudio=${total - audio} expected=${expected} actual=${terminal.cost}`,
+  );
+  expect(Math.abs(terminal.cost - expected)).toBeLessThan(COST_TOLERANCE);
+}
+
+/**
+ * Same, for a single-call OpenAI Chat Completions row:
+ * `(prompt − audio − cached) × input + cached × cachedRate + audio × audioInput
+ *  + (completion − audioOut) × output + audioOut × audioOutput`
+ */
+function assertOpenAIAudioCost(terminal: Terminal, usage: unknown, model: string): void {
+  expect(terminal.unpriced).toBe(false);
+  expect(terminal.cost).toBeGreaterThan(0);
+  const rates = LIVE_RATES[model];
+  if (!rates) {
+    console.info(`[cost] ${model} is not in the row's rate table; exact formula not asserted`);
+    return;
+  }
+  const wire = usage as {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    prompt_tokens_details?: { audio_tokens?: number; cached_tokens?: number };
+    completion_tokens_details?: { audio_tokens?: number };
+  };
+  const prompt = wire.prompt_tokens ?? 0;
+  const completion = wire.completion_tokens ?? 0;
+  const audio = wire.prompt_tokens_details?.audio_tokens ?? 0;
+  const cached = wire.prompt_tokens_details?.cached_tokens ?? 0;
+  const audioOut = wire.completion_tokens_details?.audio_tokens ?? 0;
+  // The row's premise: the provider really reports the audio split.
+  expect(audio).toBeGreaterThan(0);
+  const expected =
+    (prompt - audio - cached) * rates.input +
+    cached * rates.cached +
+    audio * rates.audioInput +
+    (completion - audioOut) * rates.output +
+    audioOut * (rates.audioOutput ?? 0);
+  console.info(
+    `[cost] ${model} audio=${audio} text=${prompt - audio} expected=${expected} actual=${terminal.cost}`,
+  );
+  expect(Math.abs(terminal.cost - expected)).toBeLessThan(COST_TOLERANCE);
+}
+
 /** OpenRouter reports a per-request `cost` inside `usage`. */
 function reportedCost(call: CapturedCall | undefined): number | undefined {
   const usage = rawUsage(call) as { cost?: unknown } | undefined;
@@ -496,6 +609,8 @@ describe.skipIf(!RUN || !GOOGLE_KEY)(
         expect(model[0].rawRequest).toContain(TONE_SENTINEL);
         assertSentinelAbsentFromEvents(events, TONE_SENTINEL);
         const terminal = assertHonestTerminal(events);
+        // A6: priced from `input_tokens_by_modality`, thoughts at the output rate.
+        assertGeminiInteractionCost(terminal, rawUsage(model[0]), GEMINI_AUDIO_MODEL);
 
         evidence('GA1', {
           model: `google:${GEMINI_AUDIO_MODEL}`,
@@ -714,6 +829,10 @@ describe.skipIf(!RUN || !GOOGLE_KEY)(
         assertSentinelAbsentFromEvents(events, RECORDED_CALL_SENTINEL);
         assertNoStrayAudioEcho(model[1].requestBody, RECORDED_CALL_SENTINEL);
         const terminal = assertHonestTerminal(events);
+        // Two provider calls: `ask_end.cost` is their SUM, so the exact
+        // per-call formula is asserted on the single-call rows (GA1/GA4/GA11).
+        expect(terminal.unpriced).toBe(false);
+        expect(terminal.cost).toBeGreaterThan(0);
 
         evidence('GA3', {
           model: `google:${GEMINI_AUDIO_MODEL}`,
@@ -766,6 +885,7 @@ describe.skipIf(!RUN || !GOOGLE_KEY)(
         });
         assertSentinelAbsentFromEvents(events, RECORDED_CALL_SENTINEL);
         const terminal = assertHonestTerminal(events);
+        assertGeminiInteractionCost(terminal, rawUsage(model[0]), GEMINI_AUDIO_MODEL);
 
         evidence('GA4', {
           model: `google:${GEMINI_AUDIO_MODEL}`,
@@ -805,8 +925,8 @@ describe.skipIf(!RUN || !process.env.OPENAI_API_KEY)(
         assertSentinelAbsentFromEvents(events, RECORDED_CALL_SENTINEL);
         assertNoStrayAudioEcho(model[0].responseBody, RECORDED_CALL_SENTINEL);
         const terminal = assertHonestTerminal(events);
-        // Audio-bearing openai: calls are unpriced by design (no audio rates).
-        expect(terminal.unpriced).toBe(true);
+        // A6: the modality-aware estimator prices this row exactly.
+        assertOpenAIAudioCost(terminal, rawUsage(model[0]), OPENAI_AUDIO_MODEL);
         evidence('GA2-text', {
           model: `openai:${OPENAI_AUDIO_MODEL}`,
           cost: terminal.cost,
@@ -1376,6 +1496,7 @@ describe.skipIf(!RUN || !GOOGLE_KEY)(
           expect(model[0].rawRequest).not.toContain(TONE_SENTINEL);
           assertSentinelAbsentFromEvents(events, TONE_SENTINEL);
           const terminal = assertHonestTerminal(events);
+          assertGeminiInteractionCost(terminal, rawUsage(model[0]), GEMINI_AUDIO_MODEL);
           evidence('GA11', {
             model: `google:${GEMINI_AUDIO_MODEL}`,
             cost: terminal.cost,

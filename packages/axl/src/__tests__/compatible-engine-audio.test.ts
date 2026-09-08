@@ -740,18 +740,23 @@ describe('AE-16(c) openrouter model slugs', () => {
 // ── AE-17 / AE-19: accounting ───────────────────────────────────────────
 
 describe('AE-17 openai audio calls are unpriced, never $0', () => {
-  async function run(input: ModelInput): Promise<{
+  // `gpt-4o` carries no audio rate, so an audio-bearing ask on it stays
+  // unpriced even after the modality-aware estimator landed: an audio token
+  // billed at ~13x the text rate must never be priced from the text row.
+  async function run(
+    input: ModelInput,
+    usage: Record<string, unknown> = {
+      prompt_tokens_details: { audio_tokens: 9 },
+      completion_tokens_details: { audio_tokens: 0 },
+    },
+  ): Promise<{
     events: AxlEvent[];
     executions: Awaited<ReturnType<AxlRuntime['getExecutions']>>;
   }> {
     mockFetch(
       jsonResponse({
         choices: [{ message: { content: 'a siren' }, finish_reason: 'stop' }],
-        usage: {
-          ...USAGE,
-          prompt_tokens_details: { audio_tokens: 9 },
-          completion_tokens_details: { audio_tokens: 0 },
-        },
+        usage: { ...USAGE, ...usage },
       }),
     );
     const runtime = openAIRuntime();
@@ -780,13 +785,36 @@ describe('AE-17 openai audio calls are unpriced, never $0', () => {
 
   it('negative control: the same model prices a string-only ask normally', async () => {
     // Proves the unpriced signal is audio-specific, not a broken pricing table.
-    const { events, executions } = await run('What is happening in this recording?');
+    // The usage body carries no audio detail, which is what a text-only call on
+    // a text model actually reports.
+    const { events, executions } = await run('What is happening in this recording?', {});
     const callEnd = events.find((e) => e.type === 'agent_call_end')!;
 
     expect(typeof callEnd.cost).toBe('number');
     expect(callEnd.cost).toBeGreaterThan(0);
     expect(isUnpricedLeaf(callEnd)).toBe(false);
     expect(executions[0].unpriced).toBe(false);
+  });
+
+  it('a reported audio bucket unprices a text ask on a model with no audio rate', async () => {
+    // Usage is authoritative: `gpt-4o` reporting real audio tokens means real
+    // audio billing, and there is no published rate for it — so the honest
+    // answer is "unknown", not the text-rate total for all 107 tokens.
+    const { events } = await run('What is happening in this recording?', {
+      prompt_tokens_details: { audio_tokens: 9 },
+    });
+    const callEnd = events.find((e) => e.type === 'agent_call_end')!;
+
+    expect(callEnd.cost).toBeUndefined();
+    expect(isUnpricedLeaf(callEnd)).toBe(true);
+  });
+
+  it('reports the provider audio split on normalized usage', async () => {
+    const { events } = await run(AUDIO_INPUT);
+    const callEnd = events.find((e) => e.type === 'agent_call_end')!;
+    // The tokens really were reported — the call is unpriced for want of a
+    // rate, not for want of a count.
+    expect(callEnd.tokens).toEqual({ input: USAGE.prompt_tokens, output: USAGE.completion_tokens });
   });
 });
 

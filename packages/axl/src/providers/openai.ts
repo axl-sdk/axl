@@ -49,6 +49,18 @@ type OpenAIRates = {
   output: number;
 };
 
+/**
+ * Per-token audio rates. Audio tokens are billed from their own row and are
+ * NEVER folded into the text `input`/`output` rates — on the audio models the
+ * two differ by an order of magnitude. `output` is present only for a model
+ * whose audio replies have a published price; without it, a response carrying
+ * audio output tokens is unpriced rather than billed at the text output rate.
+ */
+type OpenAIAudioRates = {
+  input: number;
+  output?: number;
+};
+
 type DirectOpenAIModel = {
   /** Every catalog id is explicit; aliases never imply snapshot pricing. */
   aliases: readonly string[];
@@ -56,6 +68,8 @@ type DirectOpenAIModel = {
   short: OpenAIRates;
   long?: OpenAIRates;
   contextBoundary?: number;
+  /** Absent ⇒ this model's audio price is unknown, so audio work is unpriced. */
+  audio?: OpenAIAudioRates;
 };
 
 const M = 1_000_000;
@@ -116,6 +130,26 @@ const DIRECT_OPENAI_CATALOG: readonly DirectOpenAIModel[] = [
       output: 1.2 / M,
     }),
     contextBoundary: LONG_CONTEXT_BOUNDARY,
+  },
+  // Audio-capable models. Audio rates reviewed 2026-09-08 against
+  // https://developers.openai.com/api/docs/pricing (no version stamp on the
+  // page): `gpt-audio-1.5` and `gpt-audio` both list Text $2.50 in / $10.00
+  // out and Audio $32.00 in / $64.00 out per 1M tokens, with no cached-input
+  // row — hence no `cachedInput` here, which makes a cache-hit report unpriced
+  // rather than silently billed at the full input rate. Only these exact ids
+  // are listed: no snapshot id is published for either, and inventing one
+  // would price an unknown model.
+  {
+    aliases: ['gpt-audio-1.5'],
+    snapshotBase: 'gpt-audio-1.5',
+    short: { input: 2.5 / M, output: 10 / M },
+    audio: { input: 32 / M, output: 64 / M },
+  },
+  {
+    aliases: ['gpt-audio'],
+    snapshotBase: 'gpt-audio',
+    short: { input: 2.5 / M, output: 10 / M },
+    audio: { input: 32 / M, output: 64 / M },
   },
   // Existing direct models retain literal current Standard rows. These flat
   // rows keep native pricing aligned with the compatibility wrapper while the
@@ -276,38 +310,62 @@ function isTextContentPart(value: unknown, type: 'text' | 'input_text'): boolean
   );
 }
 
+function isChatAudioContentPart(value: unknown): boolean {
+  if (value === null || typeof value !== 'object') return false;
+  const part = value as { type?: unknown; input_audio?: unknown };
+  return (
+    part.type === 'input_audio' && part.input_audio !== null && typeof part.input_audio === 'object'
+  );
+}
+
 /**
- * Direct catalog pricing only covers text requests. Reject content shapes we
- * cannot fully classify rather than silently applying text rates to image,
- * audio, or future multimodal inputs supplied through providerOptions.
+ * How faithfully the direct catalog can price this request's content.
  *
- * This is why an `input_audio` part leaves the call UNPRICED rather than priced
- * at text rates: any non-`text` content part makes the message unmodeled. A
- * modality-aware estimator (`prompt_tokens_details.audio_tokens` × the audio
- * rate) is deliberately not added until live evidence proves those fields
- * populate — reporting a confidently wrong low number is worse than reporting
- * nothing, and `$0` is never reported for an unknown cost.
+ * - `text` — every content part is text, so the text rows price it exactly.
+ * - `audio` — every non-text part is a Chat Completions `input_audio` part, so
+ *   the call prices from `prompt_tokens_details.audio_tokens` × the model's
+ *   audio row. The provider MUST report that count: a missing one is unknown,
+ *   never zero, and audio tokens are never billed at the text rate.
+ * - `unmodeled` — an image, an unknown part, or a malformed shape. Unpriced.
+ *
+ * Classification spans the WHOLE request (rich session history and tool
+ * continuations included), because every message in it is billed.
  */
-function hasUnmodeledDirectOpenAIContent(request: Record<string, unknown>): boolean {
+type DirectOpenAIContentClass = 'text' | 'audio' | 'unmodeled';
+
+function classifyDirectOpenAIContent(
+  request: Record<string, unknown> | undefined,
+): DirectOpenAIContentClass {
+  // The pure estimator is also used without a captured request context in
+  // unit-level callers. There is no content shape to classify in that case.
+  if (!request) return 'text';
+
   if ('messages' in request) {
-    if (!Array.isArray(request.messages)) return true;
+    if (!Array.isArray(request.messages)) return 'unmodeled';
+    let carriesAudio = false;
     for (const message of request.messages) {
-      if (message === null || typeof message !== 'object') return true;
+      if (message === null || typeof message !== 'object') return 'unmodeled';
       const content = (message as { content?: unknown }).content;
       if (content === undefined || content === null || typeof content === 'string') continue;
-      if (!Array.isArray(content) || content.some((part) => !isTextContentPart(part, 'text'))) {
-        return true;
+      if (!Array.isArray(content)) return 'unmodeled';
+      for (const part of content) {
+        if (isTextContentPart(part, 'text')) continue;
+        if (isChatAudioContentPart(part)) {
+          carriesAudio = true;
+          continue;
+        }
+        return 'unmodeled';
       }
     }
-    return false;
+    return carriesAudio ? 'audio' : 'text';
   }
 
   if ('input' in request) {
     const input = request.input;
-    if (typeof input === 'string') return false;
-    if (!Array.isArray(input)) return true;
+    if (typeof input === 'string') return 'text';
+    if (!Array.isArray(input)) return 'unmodeled';
     for (const item of input) {
-      if (item === null || typeof item !== 'object') return true;
+      if (item === null || typeof item !== 'object') return 'unmodeled';
       const typed = item as {
         type?: unknown;
         content?: unknown;
@@ -322,7 +380,9 @@ function hasUnmodeledDirectOpenAIContent(request: Record<string, unknown>): bool
             !Array.isArray(content) ||
             content.some((part) => !isTextContentPart(part, 'input_text'))
           ) {
-            return true;
+            // The Responses transport rejects audio before dispatch, so an
+            // audio part here is not a priceable shape — it is unmodeled.
+            return 'unmodeled';
           }
           break;
         }
@@ -335,35 +395,35 @@ function hasUnmodeledDirectOpenAIContent(request: Record<string, unknown>): bool
             !Array.isArray(output) ||
             output.some((part) => !isTextContentPart(part, 'input_text'))
           ) {
-            return true;
+            return 'unmodeled';
           }
           break;
         }
         case 'custom_tool_call':
-          if (typeof typed.input !== 'string') return true;
+          if (typeof typed.input !== 'string') return 'unmodeled';
           break;
         case 'custom_tool_call_output':
-          if (typeof typed.output !== 'string') return true;
+          if (typeof typed.output !== 'string') return 'unmodeled';
           break;
         case 'reasoning':
           break;
         default:
-          return true;
+          return 'unmodeled';
       }
     }
-    return false;
+    return 'text';
   }
 
-  // The pure estimator is also used without a captured request context in
-  // unit-level callers. There is no content shape to classify in that case.
-  return false;
+  return 'text';
 }
 
-function isEligibleDirectOpenAIContext(context: DirectOpenAIPricingContext | undefined): boolean {
+function isEligibleDirectOpenAIContext(
+  context: DirectOpenAIPricingContext | undefined,
+  entry: DirectOpenAIModel,
+): boolean {
   const request = context?.request;
   const response = context?.response;
   if (context?.baseUrl !== undefined && context.baseUrl !== CANONICAL_OPENAI_BASE_URL) return false;
-  if (request && hasUnmodeledDirectOpenAIContent(request)) return false;
   const tier =
     response?.service_tier ??
     response?.serviceTier ??
@@ -395,13 +455,22 @@ function isEligibleDirectOpenAIContext(context: DirectOpenAIPricingContext | und
   ) {
     return false;
   }
+  // Spoken output is representable only for a model with a published audio
+  // OUTPUT rate; otherwise the reply's audio tokens have no price and the call
+  // must stay unpriced rather than be billed at the text output rate.
+  const audioOutputRated = entry.audio?.output !== undefined;
   if (
-    (request?.modalities !== undefined &&
-      (!Array.isArray(request.modalities) ||
-        request.modalities.length === 0 ||
-        request.modalities.some((modality) => modality !== 'text'))) ||
-    ['audio', 'image_generation', 'web_search_options'].some((key) => request?.[key] !== undefined)
+    request?.modalities !== undefined &&
+    (!Array.isArray(request.modalities) ||
+      request.modalities.length === 0 ||
+      request.modalities.some(
+        (modality) => modality !== 'text' && !(modality === 'audio' && audioOutputRated),
+      ))
   ) {
+    return false;
+  }
+  if (request?.audio !== undefined && !audioOutputRated) return false;
+  if (['image_generation', 'web_search_options'].some((key) => request?.[key] !== undefined)) {
     return false;
   }
   if (
@@ -425,44 +494,84 @@ export type DirectOpenAIPricingContext = {
   response?: { service_tier?: unknown; serviceTier?: unknown };
 };
 
-/** Internal native OpenAI estimator; undefined means deliberately unpriced. */
+/**
+ * Internal native OpenAI estimator; undefined means deliberately unpriced.
+ *
+ * Audio-aware. The prompt splits into four disjoint buckets —
+ * `cached + cacheWrite + audio + ordinary = prompt_tokens` — and the completion
+ * splits into audio and text. Every bucket needs a published rate for the call
+ * to price at all: a missing rate, a missing count on an audio-bearing request,
+ * or an arithmetic contradiction yields `undefined`, never a partial number and
+ * never `0`.
+ */
 export function estimateDirectOpenAICost(
   model: string,
   usage: NonNullable<ProviderResponse['usage']>,
   context?: DirectOpenAIPricingContext,
 ): number | undefined {
-  if (!isEligibleDirectOpenAIContext(context)) return undefined;
   const entry = directOpenAIModel(model);
   if (!entry) return undefined;
-  const { prompt_tokens, completion_tokens, cached_tokens, cache_write_tokens } = usage;
+  const content = classifyDirectOpenAIContent(context?.request);
+  if (content === 'unmodeled') return undefined;
+  if (!isEligibleDirectOpenAIContext(context, entry)) return undefined;
+  const {
+    prompt_tokens,
+    completion_tokens,
+    cached_tokens,
+    cache_write_tokens,
+    audio_input_tokens,
+    audio_output_tokens,
+  } = usage;
+  // An audio-bearing request must come back with a usable audio prompt-token
+  // count. A missing or malformed one (`toUsage` omits those) is UNKNOWN, not
+  // zero — pricing it as pure text would silently under-report by ~13x.
+  if (content === 'audio' && audio_input_tokens === undefined) return undefined;
   const cached = cached_tokens ?? 0;
   const cacheWrite = cache_write_tokens ?? 0;
+  // Usage is authoritative: a provider that reports audio tokens for a request
+  // Axl classified as text still prices from the audio row (or stays unpriced
+  // when the model has none), rather than being billed at the text rate.
+  const audioInput = audio_input_tokens ?? 0;
+  const audioOutput = audio_output_tokens ?? 0;
   if (
-    ![prompt_tokens, completion_tokens, cached, cacheWrite].every(
+    ![prompt_tokens, completion_tokens, cached, cacheWrite, audioInput, audioOutput].every(
       (count) => Number.isSafeInteger(count) && count >= 0,
     ) ||
-    cached + cacheWrite > prompt_tokens
+    cached + cacheWrite + audioInput > prompt_tokens ||
+    audioOutput > completion_tokens
   ) {
     return undefined;
   }
-  const rates =
+  if (
+    (audioInput > 0 && entry.audio === undefined) ||
+    (audioOutput > 0 && entry.audio?.output === undefined)
+  ) {
+    return undefined;
+  }
+  const crossesLongContext =
     entry.long !== undefined &&
     entry.contextBoundary !== undefined &&
-    prompt_tokens > entry.contextBoundary
-      ? entry.long
-      : entry.short;
+    prompt_tokens > entry.contextBoundary;
+  // No long-context AUDIO rate is published for any model. A crossing that
+  // carries audio is therefore unpriced rather than billed at the short-context
+  // audio rate; relaxing this later is cheaper than under-reporting now.
+  if (crossesLongContext && (audioInput > 0 || audioOutput > 0)) return undefined;
+  const rates = crossesLongContext ? entry.long! : entry.short;
   if (
     (cached > 0 && rates.cachedInput === undefined) ||
     (cacheWrite > 0 && rates.cacheWrite === undefined)
   ) {
     return undefined;
   }
-  const ordinary = prompt_tokens - cached - cacheWrite;
+  const ordinary = prompt_tokens - cached - cacheWrite - audioInput;
+  const textOutput = completion_tokens - audioOutput;
   return (
     ordinary * rates.input +
     cached * (rates.cachedInput ?? 0) +
     cacheWrite * (rates.cacheWrite ?? 0) +
-    completion_tokens * rates.output
+    audioInput * (entry.audio?.input ?? 0) +
+    textOutput * rates.output +
+    audioOutput * (entry.audio?.output ?? 0)
   );
 }
 

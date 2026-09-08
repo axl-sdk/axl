@@ -55,6 +55,17 @@ function responseImageParts(
         feature: 'audio input',
       });
     }
+    if (part.type !== 'image') {
+      // A future `InputContentPart` variant must fail loudly rather than fall
+      // through to the image mapping below and be billed as a mislabelled block.
+      const unmapped: never = part;
+      throw new UnsupportedModelInputError({
+        provider: 'openai-responses',
+        model,
+        modality: (unmapped as { type: string }).type,
+        feature: 'this input modality',
+      });
+    }
     const { source } = part;
     if (source.type === 'provider-file') {
       if (source.provider !== 'openai-responses') {

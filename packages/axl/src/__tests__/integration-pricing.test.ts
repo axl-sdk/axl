@@ -206,6 +206,15 @@ describe.skipIf(!hasOpenAI)('Pricing Integration: OpenAI Responses API', () => {
     expect(response.usage!.total_tokens).toBe(
       response.usage!.prompt_tokens + response.usage!.completion_tokens,
     );
+
+    // R3: the audio split is ABSENT, never `0`, on a text-only call. The
+    // Responses lane maps `input_tokens_details.audio_tokens` /
+    // `output_tokens_details.audio_tokens` through `reportedTokenCount`; a
+    // reported `0` here would be indistinguishable from a real zero-audio
+    // call and would keep the estimator's usage-authoritative guard from
+    // recognizing "no audio was billed".
+    expect(response.usage!.audio_input_tokens).toBeUndefined();
+    expect(response.usage!.audio_output_tokens).toBeUndefined();
   }, 30_000);
 
   it('stream() done chunk contains cost and well-shaped usage', async () => {
@@ -222,6 +231,11 @@ describe.skipIf(!hasOpenAI)('Pricing Integration: OpenAI Responses API', () => {
     expect(done!.usage!.total_tokens).toBe(
       done!.usage!.prompt_tokens + done!.usage!.completion_tokens,
     );
+
+    // R3, streaming half: the same absence on the `response.completed` lane,
+    // which shares `toResponsesUsage` with `chat()`.
+    expect(done!.usage!.audio_input_tokens).toBeUndefined();
+    expect(done!.usage!.audio_output_tokens).toBeUndefined();
   }, 30_000);
 
   it('stream() cost is consistent with chat() cost for equivalent requests', async () => {

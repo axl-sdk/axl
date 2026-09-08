@@ -744,6 +744,91 @@ describe('gemini Interactions streaming', () => {
     expect(done.cost).toBeCloseTo(GA1_EXPECTED, 14);
   });
 
+  it('R2: a dropped unknown THOUGHT delta unprices exactly as the non-stream body does', async () => {
+    // Same hole as L2 on the other inspected step type: non-streaming reads
+    // the whole `summary` array and unprices a non-text part in it, so a
+    // thought delta the parser silently drops must unprice too, or streaming
+    // prices a reply that non-streaming refuses to price.
+    const events = [
+      { event_type: 'step.start', index: 0, step: { type: 'model_output', content: [] } },
+      { event_type: 'step.delta', index: 0, delta: { type: 'text', text: 'A rising tone.' } },
+      { event_type: 'step.stop', index: 0 },
+      { event_type: 'step.start', index: 1, step: { type: 'thought', summary: [] } },
+      {
+        event_type: 'step.delta',
+        index: 1,
+        delta: { type: 'thought_inline_data', mime_type: 'image/png', data: SENTINEL },
+      },
+      { event_type: 'step.stop', index: 1 },
+      {
+        event_type: 'interaction.completed',
+        interaction: { status: 'completed', usage: interactionUsage() },
+      },
+    ];
+    mockFetch(sseResponse(events.map((event) => `data: ${JSON.stringify(event)}`)));
+    const provider = new GeminiProvider({ apiKey: 'test-key' });
+    const chunks = [];
+    for await (const chunk of provider.stream([{ role: 'user', content: AUDIO_INPUT as never }], {
+      model: SPLIT_MODEL,
+    })) {
+      chunks.push(chunk);
+    }
+    // Not vacuous: the stream really did deliver content.
+    expect(chunks.some((chunk) => chunk.type === 'text_delta')).toBe(true);
+    const done = chunks.find((chunk) => chunk.type === 'done');
+    if (done?.type !== 'done') throw new Error('no done chunk');
+
+    // The equivalent non-streaming body, where the part IS on `json.steps`.
+    const nonStreaming = await askAudio(interactionUsage(), {
+      responseOver: {
+        steps: [
+          { type: 'model_output', content: [{ type: 'text', text: 'A rising tone.' }] },
+          {
+            type: 'thought',
+            summary: [{ type: 'thought_inline_data', mime_type: 'image/png', data: SENTINEL }],
+          },
+        ],
+      },
+    });
+
+    expect(done.cost).toBeUndefined();
+    expect(nonStreaming.cost).toBeUndefined();
+    expect(done.cost).toBe(nonStreaming.cost);
+    expect(done.cost).not.toBeCloseTo(GA1_EXPECTED, 14);
+  });
+
+  it('R2: a recognized thought_summary delta still prices', async () => {
+    // Negative control: an ordinary thinking stream must stay priced.
+    const events = [
+      { event_type: 'step.start', index: 0, step: { type: 'model_output', content: [] } },
+      { event_type: 'step.delta', index: 0, delta: { type: 'text', text: 'A rising tone.' } },
+      { event_type: 'step.stop', index: 0 },
+      { event_type: 'step.start', index: 1, step: { type: 'thought', summary: [] } },
+      {
+        event_type: 'step.delta',
+        index: 1,
+        delta: { type: 'thought_summary', content: { type: 'text', text: 'Listening.' } },
+      },
+      { event_type: 'step.stop', index: 1 },
+      {
+        event_type: 'interaction.completed',
+        interaction: { status: 'completed', usage: interactionUsage() },
+      },
+    ];
+    mockFetch(sseResponse(events.map((event) => `data: ${JSON.stringify(event)}`)));
+    const provider = new GeminiProvider({ apiKey: 'test-key' });
+    const chunks = [];
+    for await (const chunk of provider.stream([{ role: 'user', content: AUDIO_INPUT as never }], {
+      model: SPLIT_MODEL,
+    })) {
+      chunks.push(chunk);
+    }
+    expect(chunks.some((chunk) => chunk.type === 'thinking_delta')).toBe(true);
+    const done = chunks.find((chunk) => chunk.type === 'done');
+    if (done?.type !== 'done') throw new Error('no done chunk');
+    expect(done.cost).toBeCloseTo(GA1_EXPECTED, 14);
+  });
+
   it('a streamed non-text reply part is unpriced', async () => {
     const events = [
       {

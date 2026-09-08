@@ -1191,9 +1191,9 @@ precondition list.
 A custom `ProviderProfile` on the generic engine is **not** covered by either
 estimator. `pricing: { kind: 'table' }` cannot express an audio rate — the
 public `PricingTable` tuple is deliberately unchanged — so a table-priced
-profile that declares audio input reports `undefined` on any call whose usage
-billed audio tokens, rather than pricing those tokens at its text input rate.
-A reported audio count of `0` still prices normally.
+profile that declares audio reports `undefined` on any call whose usage billed
+audio tokens — input or output — rather than pricing those tokens at its text
+input or output rate. A reported audio count of `0` still prices normally.
 
 Where a precondition fails the call is still reported with usage and **no
 cost**, setting the normal `unpriced` / lower-bound signals. Because unpriced

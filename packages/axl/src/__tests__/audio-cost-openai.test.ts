@@ -731,6 +731,29 @@ describe('generic table pricing refuses to price audio tokens', () => {
     expect(cost).toBeCloseTo(GA2_ALL_TEXT_RATES, 12);
   });
 
+  it('R1: an audio OUTPUT bucket is unpriced too — the table has no audio output rate', async () => {
+    // The output half of the same hole: pricing spoken output at the table's
+    // text `output` rate under-reports it just as badly as the input side.
+    const cost = await askTableProfile({
+      prompt_tokens: GA2.prompt,
+      completion_tokens: GA2.completion,
+      total_tokens: GA2.prompt + GA2.completion,
+      completion_tokens_details: { audio_tokens: 9 },
+    });
+    expect(cost).toBeUndefined();
+    expect(cost).not.toBeCloseTo(GA2_ALL_TEXT_RATES, 12);
+  });
+
+  it('R1: a reported zero audio OUTPUT bucket still prices from the table', async () => {
+    const cost = await askTableProfile({
+      prompt_tokens: GA2.prompt,
+      completion_tokens: GA2.completion,
+      total_tokens: GA2.prompt + GA2.completion,
+      completion_tokens_details: { audio_tokens: 0 },
+    });
+    expect(cost).toBeCloseTo(GA2_ALL_TEXT_RATES, 12);
+  });
+
   it('M2: a text call with no audio detail is unaffected', async () => {
     const cost = await askTableProfile({
       prompt_tokens: GA2.prompt,

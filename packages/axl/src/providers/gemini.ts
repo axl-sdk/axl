@@ -1437,6 +1437,19 @@ export class GeminiProvider implements Provider {
               unmodeledOutput = true;
             }
             if (
+              step.type === 'thought' &&
+              !(delta.type === 'thought_summary' && !!delta.content) &&
+              !(delta.type === 'thought_signature' && typeof delta.signature === 'string')
+            ) {
+              // Same complement for `thought` steps. Non-streaming reads the
+              // whole `summary` array and unprices a non-text part in it; a
+              // dropped thought delta would leave the accumulated step looking
+              // text-only, so streaming would price a call non-streaming does
+              // not. An appended non-text `content` is still caught by the
+              // terminal `isTextOnlyInteractionOutput` check.
+              unmodeledOutput = true;
+            }
+            if (
               delta.type === 'text' &&
               typeof delta.text === 'string' &&
               step.type === 'model_output'

@@ -1028,11 +1028,15 @@ export class OpenAICompatibleProvider implements Provider {
         // UNKNOWN, not cheap. Pricing `prompt_tokens` wholesale at the text
         // input rate here would under-report an audio call by an order of
         // magnitude, and `ctx.budget()` would then enforce confidently against
-        // it, which is strictly worse than the unpriced lower bound. Reachable
-        // through a custom profile that declares audio input alongside table
-        // pricing; a reported `0` still prices, and no built-in table profile
-        // declares audio today (`openrouter` is `from-response`).
-        if (typeof usage.audio_input_tokens === 'number' && usage.audio_input_tokens > 0) {
+        // it, which is strictly worse than the unpriced lower bound. The same
+        // holds for audio OUTPUT tokens against the table's text output rate.
+        // Reachable through a custom profile that declares audio alongside
+        // table pricing; a reported `0` still prices, and no built-in table
+        // profile declares audio today (`openrouter` is `from-response`).
+        if (
+          (typeof usage.audio_input_tokens === 'number' && usage.audio_input_tokens > 0) ||
+          (typeof usage.audio_output_tokens === 'number' && usage.audio_output_tokens > 0)
+        ) {
           return undefined;
         }
         if (

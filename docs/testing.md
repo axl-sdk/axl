@@ -610,6 +610,21 @@ in-test generated PCM WAV tone; no new binary asset was added.
 Dated results, including the two `openai:` provider rejections, are in
 [`docs/verification/general-audio-lighthouse-2026-09-08.md`](./verification/general-audio-lighthouse-2026-09-08.md).
 
+### Redis store gate
+
+`RedisStore` has a `REDIS_URL`-gated suite (`redis-integration.test.ts`) that
+is skipped by default. The repo-root `docker-compose.yml` starts an isolated
+Redis (project `axl`, host port 6381, no persistence) that will not collide
+with another project's Redis on 6379/6380:
+
+```bash
+docker compose up -d redis
+REDIS_URL=redis://localhost:6381 pnpm --filter @axlsdk/axl exec vitest run src/__tests__/redis-integration.test.ts
+docker compose down
+```
+
+Each suite uses its own `keyPrefix`, so a shared Redis is never flushed.
+
 ### Completed-file transcription lighthouse
 
 Transcription uses a separate flag. Provider keys and `AXL_MULTIMODAL_LIVE=1`

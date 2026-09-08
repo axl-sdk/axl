@@ -103,6 +103,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Refined development-agent routing, added budget implementation and debugging roles, and made plan leads accountable for orchestration timing, rework, and evidence-backed process improvements.
+
 - **`InputContentPart` is widened with the audio member.** This is additive for
   *producers* — no existing code can construct an audio part, and the runtime
   guarantees audio never reaches a provider that did not opt in. It is **not**

@@ -27,7 +27,7 @@ integration tests over code reading. Use `repo-explorer` for bounded source
 mapping, `routine-implementer` for mechanical test additions or clear fixes, and
 `implementer` when the harness or fix needs judgment. Keep new product
 scope and architecture with the lead. Route unclear, intermittent,
-provider-specific, concurrency, or twice-failed bugs to `deep-debugger`.
+provider-specific, concurrency, or stagnant diagnosis of bugs to `deep-debugger`.
 
 Emit `scenario | expected behavior | status | evidence | gap`.
 

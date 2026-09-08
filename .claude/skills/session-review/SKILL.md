@@ -11,13 +11,14 @@ judgment.
 ## Pin scope
 
 Resolve the session base and head and define one concrete diff. Pass that exact
-range and relevant plan documents to every reviewer.
+range, raw requirements, and relevant plan documents to every reviewer. Avoid
+persuasive implementation rationale that could anchor independent judgment.
 
 ## Choose the review wave
 
 Use the smallest wave that covers the risk deeply. A comprehensive session
 review always needs at least two independent perspectives; single-reviewer
-coverage is for low-risk milestone checks inside `/tackle-plan`.
+coverage is for ordinary milestone checks inside `/tackle-plan`.
 
 - **Small, low-risk:** two `pragmatic-code-reviewer` agents with disjoint
   correctness/journey and boundary/test/edge-case charters.
@@ -47,8 +48,9 @@ evidence.
    with `/live-api-verification`. If live verification changes code, rerun the
    affected targeted checks before continuing.
 5. Re-pin the final net diff and the review-fix delta, then run at least one
-   focused independent regression review. Use a premium reviewer when the fixes
-   touch a consequential seam. If that pass requires material fixes, repeat
+   focused independent regression review. Use a premium reviewer for new consequential behavior, changed invariants,
+   or unresolved consequential risk. Narrow fixes on an already premium-reviewed
+   seam may use a pragmatic re-check when behavior and invariants are unchanged. If that pass requires material fixes, repeat
    steps 4–5 on the new final diff.
 6. Commit only after the final-diff review is clean. Keep unrelated fixes in
    separate logical commits.

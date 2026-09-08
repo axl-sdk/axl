@@ -23,7 +23,7 @@ spawning another when its context remains relevant.
 ## Establish done
 
 Turn the plan into explicit acceptance criteria and affected developer journeys
-before implementation. Treat an uncovered journey as unfinished work. Continue
+before implementation. Treat an uncovered accepted journey as unfinished work. Continue
 through research, implementation, testing, repair, and review; stop only for a
 genuine product fork, irreversible action, or missing authority. Never push,
 publish, or deploy without explicit approval.
@@ -42,6 +42,15 @@ partially implemented plan remains active, or moves to `paused/` with a reason
 and resume condition. Keep the active index in `.internal/plans/README.md`
 aligned with lifecycle moves.
 
+Newly discovered journeys outside accepted scope are proposed decisions, not
+implicit implementation obligations.
+
+## Monitor orchestration
+
+Read `.claude/skills/tackle-plan/references/orchestration-accountability.md`
+at the start. The lead owns its lightweight execution record, milestone
+assessment, and bounded process adjustments throughout the work.
+
 ## Route work by cost and risk
 
 - **Discovery:** `repo-explorer` (Sonnet/low) for bounded read-only questions.
@@ -59,7 +68,7 @@ aligned with lifecycle moves.
   `adversarial-code-reviewer` (Opus/high) pass on the consolidated seam diff.
 - **Debug escalation:** `deep-debugger` (Opus/high) for unclear or intermittent
   bugs, concurrency and provider-specific discrepancies, cross-package
-  lifecycle failures, or a chunk an implementer has failed twice.
+  lifecycle failures, or stagnant diagnosis.
 - **Lead-only:** unresolved architecture, meaningful product decisions, breaking
   public API policy, provider/model support policy, security or tenant policy,
   destructive migrations, and irreversible actions.
@@ -68,13 +77,20 @@ Do not delegate because a slot exists. The chunk must repay context and review
 overhead. Parallelize only disjoint scopes, core/shared types first, under
 `.claude/rules/parallel-agents.md`; isolate concurrent writers in worktrees.
 
+Give workers complete owned chunks, relevant contracts, and executable acceptance
+criteria. Allow local engineering judgment within settled behavior and invariants;
+do not implement the solution twice through overly prescriptive handoffs. Escalate
+after two repetitions of the same ineffective approach without new evidence,
+not after two productive red/green test iterations. Return unresolved policy or
+contracts outside the grant promptly; normal investigation stays with the worker.
+
 ## Implement and verify
 
 - Before designing or changing Axl-owned runtime prompts, model-facing schema
   rendering or guidance, retry feedback, routing instructions, built-in tool
   descriptions, or LLM scorers, load and follow `/prompt-iteration`.
 - For bugs, establish the behavior-focused failing test first when feasible.
-- For new features, have `behavioral-test-analyst` freeze a discriminating
+- For substantive new behavior or changed contracts, have `behavioral-test-analyst` freeze a discriminating
   matrix from acceptance criteria and public behavior, then give it to a fresh
   `routine-implementer` for mechanical tests or `implementer` when the
   harness needs judgment. The root owns coverage judgment and product questions.
@@ -88,7 +104,7 @@ overhead. Parallelize only disjoint scopes, core/shared types first, under
 Review only a quiescent tree after overlapping implementers have landed. Batch
 one review round's findings into a coherent fix wave, commit it, and review the
 consolidated delta once. A fix-only wave on an already premium-reviewed seam
-gets a pragmatic re-check; use a fresh premium pass only for new seam behavior
+gets a pragmatic re-check; use a fresh premium pass only for new seam behavior, changed invariants,
 or a concrete escalated question.
 
 Resume the idle implementer that built a seam for related fixes, and resume the
@@ -101,16 +117,21 @@ status, diff, and owned files. If review or new evidence changes the design,
 update the plan first and derive every remaining implementation brief from the
 current plan rather than an earlier handoff.
 
-- **Small, low-risk diff:** one `pragmatic-code-reviewer` with a composite
-  correctness, architecture, and tests charter.
-- **Moderate or user-facing diff:** two pragmatic reviewers with disjoint
-  correctness/journey and architecture/boundary/test charters.
-- **High-risk diff:** those ordinary lanes plus one focused
-  `adversarial-code-reviewer` for provider wire behavior, state/data loss,
-  streaming/redaction, security, concurrency, usage/cost, lifecycle, or public
-  API compatibility.
-- Add another premium pass only for a concrete unresolved high-consequence
-  question, never as a generic duplicate.
+- **Ordinary milestone:** one `pragmatic-code-reviewer` with a composite
+  correctness, journeys, architecture, and tests charter.
+- **Distinct failure surfaces:** add an independent reviewer only when a separate
+  meaningful charter warrants it; user-facing work alone is not a second-review rule.
+- **Consequential seams:** require one focused `adversarial-code-reviewer` for
+  provider wire behavior, state/data loss, streaming/redaction, security,
+  concurrency, usage/cost, lifecycle, or public API compatibility.
+- Add another premium pass only for a concrete unresolved high-consequence question.
+  Stronger models alone do not establish equivalent review coverage. Explicit
+  comprehensive session review still requires at least two perspectives.
+
+Brief reviewers with raw requirements, the concrete diff, and verification
+artifacts, without a persuasive account of why the implementation is correct.
+Explicitly prohibit edits and artifact-writing commands; confirm the review wave
+did not mutate the working tree before accepting findings or committing.
 
 De-duplicate and verify findings. Record `REAL BUG`, `NOT A BUG`,
 `NEEDS-LIVE-API-VERIFICATION`, or `ESCALATE-ADVERSARIAL`; fix confirmed defects

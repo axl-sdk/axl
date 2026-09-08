@@ -1,6 +1,6 @@
 ---
 name: 'implementer'
-description: 'Default Opus/medium implementer for settled Axl work needing engineering judgment or cross-file tracing. It may also own a consequential public, provider, streaming, state, concurrency, or usage seam only under an explicit five-part grant and mandatory consolidated adversarial review. Send mechanical work to routine-implementer and unclear or twice-failed work to deep-debugger.'
+description: 'Default Opus/medium implementer for settled Axl work needing engineering judgment or cross-file tracing. It may also own a consequential public, provider, streaming, state, concurrency, or usage seam only under an explicit five-part grant and mandatory consolidated adversarial review. Send mechanical work to routine-implementer and unclear work or stagnant diagnosis to deep-debugger.'
 model: opus
 effort: medium
 color: red

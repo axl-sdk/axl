@@ -88,37 +88,57 @@ Run from the repo root. Per-area detail: `.claude/rules/testing.md` and the pack
 
 ## Agent routing
 
-The project roles are cost- and risk-tiered. Codex uses `repo-explorer`
-(Luna/medium) for bounded discovery, `routine-implementer` (Luna default effort)
-for highly specified pattern work, `balanced-implementer` (Terra/medium) for
-moderate implementation, `behavioral-test-analyst` (Terra/high) for blind
-scenario and test design, `boundary-implementer` (Terra/high) for settled
-consequential seams, `pragmatic-code-reviewer` (Terra/high) for ordinary review,
-and `adversarial-code-reviewer` (Sol/high) only for consequential risk. Use
-Sol/medium to lead orchestrated plan and review work; raise lead effort only
-when architecture or conflicting evidence makes the lead the primary reasoner.
+Route by uncertainty, consequence, and critical-path latency. Codex defaults:
+
+| Role | Model / effort | Assignment |
+| --- | --- | --- |
+| Root lead | Sol / medium | Settled execution, including long plans |
+| Root lead, primary reasoner | Astra / medium | Unresolved architecture, contracts, conflicting evidence, or consequential interactions |
+| `repo-explorer` | Luna / medium | Bounded read-only discovery |
+| `routine-implementer` | Luna / high | Highly specified patterned work |
+| `budget-implementer` | Luna / max | Optional settled moderate work with executable checks and scheduling slack |
+| `balanced-implementer` | Sol / medium | Settled moderate work, especially on the critical path |
+| `boundary-implementer` | Sol / high | Settled consequential seams under a five-part grant |
+| `behavioral-test-analyst` | Sol / high | Blind behavioral scenarios and discriminating test design |
+| `pragmatic-code-reviewer` | Sol / high | Ordinary substantive review |
+| `adversarial-code-reviewer` | Astra / high | Focused consequential-risk review |
+| `deep-debugger` | Astra / medium | Uncertain root causes and stalled diagnosis |
+
+Role TOML files under `.codex/agents/` configure workers; this table records routing
+intent. Root model selection belongs to the host, not the skill. Preserve explicit
+user choices, verify resolved settings when exposed, and report unknown settings
+honestly. A running session may retain older role definitions. Check available
+roles before dispatch: skip the optional budget lane if unavailable; keep uncertain
+diagnosis with the lead if the debugger is unavailable. Use a fresh session to
+load updated role definitions; do not claim file edits reconfigured live agents.
+Raise root or debugger effort only for a concrete unresolved reasoning
+problem. Plan length alone does not warrant a stronger lead. Terra remains a
+candidate for measured recurring workloads, not an automatic escalation rung.
+Benchmark rankings motivate these defaults; accepted repo results must validate them.
 
 Claude uses Sonnet/low for exploration and routine patterned work. Opus/medium
 handles settled implementation and pragmatic review; Opus/high handles blind
 behavioral analysis, hard debugging, and premium adversarial review. Claude's
-single `implementer` role covers both moderate work and consequential seams,
-but seam work still requires the explicit five-part grant and mandatory
-consolidated premium review. Codex retains separate balanced and boundary roles
-because those roles use different effort tiers. `deep-debugger` is the Claude
-escalation lane when uncertainty itself is the work, not for settled
-implementation. Fable is the preferred Claude lead for long-horizon
-orchestration, with Opus as the economical alternative; lead at medium effort
-and raise it only for consequential synthesis or adjudication.
+single `implementer` covers moderate work and consequential seams; Codex separates
+balanced and boundary roles. Claude uses Fable for demanding orchestration and
+Opus as the economical alternative, at medium effort unless consequential
+synthesis warrants more. Preserve Claude model choices independently of Codex
+benchmark results. On both platforms, `deep-debugger` owns uncertain diagnosis;
+unresolved architecture and product policy remain with the lead.
 
-Do not delegate merely because a slot exists. Consequential implementation
-receives only settled five-part grants: Claude routes that mode through
-`implementer`, while Codex routes it through `boundary-implementer`. Require one
-focused premium review of the consolidated seam diff after the tree is
-quiescent. Review waves scale from one pragmatic reviewer on a small milestone
-to two ordinary lanes plus one focused premium pass on a high-risk diff. Resume
-the same implementer or reviewer for a related fix or re-check while its context
-is current; never resume across implementation/review or behavioral-analysis
-independence boundaries.
+Do not delegate merely because a slot exists. Give workers whole owned chunks
+and local engineering discretion within settled behavior and invariants. A
+consequential implementation grant must include design, invariants, acceptance
+criteria, owned files, and verification; require one focused premium review of
+the consolidated quiescent seam diff. Start ordinary milestone review with one
+composite reviewer and add independent charters for distinct meaningful failure
+surfaces. Explicit comprehensive session review retains at least two perspectives.
+Resume relevant agents for related work without crossing implementation/review or
+blind behavioral-analysis independence boundaries. Escalate stagnant diagnosis
+(two repetitions of the same ineffective approach without new evidence), not
+productive test failures. Return unresolved policy or contracts outside a grant
+promptly. The `tackle-plan` lead records orchestration outcomes and adjusts routing
+within authorized scope using its shared accountability reference.
 
 Read-only role configuration is defense in depth, not a portable hard boundary:
 the host's permission profile may override a role's `sandbox_mode`. Discovery,
@@ -133,7 +153,7 @@ through `.agents/skills`, which points to `.codex/skills`. The Codex directory
 links `live-api-verification` and `prompt-iteration` back here individually, so
 their Axl knowledge still has one source. The four orchestration workflows are
 native Codex
-variants because they name Codex agents and choose Terra/Sol tiers; keep the two
+variants because they name Codex agents and choose Codex model tiers; keep the two
 platform variants aligned on outcomes, not implementation details.
 
 The five orchestration and live-verification workflows are explicit-invoke

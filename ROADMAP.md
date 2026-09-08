@@ -17,8 +17,19 @@
   non-chat finite-recording operation with OpenAI, Gemini Interactions/Files,
   and catalog-capable OpenRouter STT adapters; paired safe lifecycle events,
   cleanup status, mock coverage, and an explicit transcript-to-agent recipe.
-  OpenRouter model/route capability remains authoritative; general audio
-  understanding and realtime voice remain separate work.
+  OpenRouter model/route capability remains authoritative; transcription is
+  never a hidden fallback for general audio understanding, and realtime voice
+  remains separate work.
+
+- **General recorded-audio input** — `InputAudioPart` puts a finite recording
+  directly in front of a chat model for speech *and* non-speech reasoning, with
+  ordered audio preserved through retries, tool continuations, delegate,
+  handoff, and streaming. Transport ships on `openai:` Chat Completions,
+  `openrouter:`, `google:` Interactions, and `MockProvider`; every other
+  provider fails closed with zero requests. `openrouter:` is live-certified for
+  a text answer, a tool continuation, and streaming; the native `openai:` and
+  `google:` rows and audio-plus-structured-output remain uncertified and
+  unadvertised.
 
 - **OpenTelemetry** — Automatic span emission for every `ctx.*` primitive with cost-per-span attribution
 - **Memory Primitives** — `ctx.remember()`, `ctx.recall()`, `ctx.forget()` with session/global scope and semantic vector search
@@ -231,14 +242,17 @@ Items we're tracking but not actively planning. These would move to Planned base
 
 #### Multimodal Extensions
 
-Axl currently supports ordered image input and completed-file transcription.
-The following are intentionally tracked as separate future product surfaces,
-not implied by today's `ModelInput` or `ctx.transcribe()` contracts:
+Axl currently supports ordered image input, general recorded-audio input, and
+completed-file transcription. The following are intentionally tracked as
+separate future product surfaces, not implied by today's `ModelInput` or
+`ctx.transcribe()` contracts:
 
-- **General audio understanding** — Direct audio parts for speech and
-  non-speech reasoning, with independent proof for ordinary responses, tool
-  continuations, and structured output. Each provider/model combination must
-  be certified; transcription must never become a hidden fallback.
+- **Native general-audio certification** — General audio understanding is
+  implemented (see Complete, above). What remains is live certification of the
+  native `openai:` and `google:` lanes and of audio plus structured output on
+  any adapter; each provider/model composition is advertised only after its own
+  passing row. Audio URLs, audio output, realtime voice, and a Studio audio
+  picker stay out of scope.
 - **Documents, video, and generated media** — New input and output content
   types with their own limits, provider mappings, observation rules, and live
   evidence. Multimodal tool results belong here as an explicit output contract,

@@ -1522,7 +1522,7 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 
 ### What's stored
 
-A session's persisted state is a flat `ChatMessage[]` of `user` and `assistant` turns, keyed by `sessionId` in the configured `StateStore`. Summarization caches and handoff history are stored alongside as session metadata. The `Session` object itself holds no message cache — every `send()`/`stream()` reads history from the store, mutates it during execution, and writes it back. Calling `runtime.session(id)` does not pre-load anything and does not check whether the id exists.
+A session's persisted state is a flat `ChatMessage[]` of `user` and `assistant` turns, keyed by `sessionId` in the configured `StateStore`. The persisted `user` turn is the workflow input: a string as-is, an ordered `ModelInput` (text/image/audio parts) as its context-safe text projection (`question\n[audio audio/wav]`, the same rendering `summarizeModelInput` produces), and any other application object as JSON. Media is per-call evidence, never session state, so inline base64 is never persisted or re-sent as text on later turns, and a malformed part fails with `InvalidModelInputError` before the workflow runs. Summarization caches and handoff history are stored alongside as session metadata. The `Session` object itself holds no message cache — every `send()`/`stream()` reads history from the store, mutates it during execution, and writes it back. Calling `runtime.session(id)` does not pre-load anything and does not check whether the id exists.
 
 ### Sharing semantics
 

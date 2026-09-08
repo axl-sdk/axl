@@ -352,10 +352,16 @@ function isValidTokenCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
+/**
+ * An absent tier is the standard on-demand request, and `null` counts as
+ * absent deliberately — a caller who writes `service_tier: null` through
+ * `providerOptions` is clearing the field, not selecting a tier. Any value
+ * present is accepted only if it names the standard tier, in the SAME
+ * vocabulary the response-side check accepts: the two must not disagree, or a
+ * tier Axl reads as standard coming back would have unpriced going out.
+ */
 function isStandardGeminiRequestTier(value: unknown): boolean {
-  return (
-    value === undefined || value === 'SERVICE_TIER_UNSPECIFIED' || value === 'SERVICE_TIER_STANDARD'
-  );
+  return value === undefined || value === null || isDefinitiveStandardGeminiResponseTier(value);
 }
 
 function isDefinitiveStandardGeminiResponseTier(value: unknown): boolean {
@@ -454,13 +460,20 @@ function estimateGeminiCost(model: string, usage: GeminiPriceUsage): number | un
       !isValidTokenCount(audio) ||
       !isValidTokenCount(split.nonAudioTokens) ||
       audio + split.nonAudioTokens !== usage.inputTokens ||
-      // Cached tokens are deducted from the non-audio modalities only; Google
-      // publishes no cached-audio rate, so an overlap that would drive the
-      // non-audio bucket negative is a precondition failure, not a clamp.
       cached + audio > usage.inputTokens
     ) {
       return undefined;
     }
+    // The DECISION is settled: the audio rate is never applied to cached
+    // tokens, and cached tokens come out of the non-audio modalities only.
+    // What is NOT settled is whether Google's `total_cached_tokens` can
+    // include audio tokens — no published statement either way, and an
+    // implicit cache hit needs nothing in the request, so the estimator
+    // cannot detect the overlap. Treating a partial overlap as disjoint would
+    // bill cached audio at the cheap non-audio cached rate, so any co-occurrence
+    // is unpriced until a live probe settles it (plan §9 L1 / V2) — the same
+    // conservatism the long-context branch below applies.
+    if (audio > 0 && cached > 0) return undefined;
   }
 
   const crossesLongContext = usage.inputTokens > 200_000 && pricing.longContext !== undefined;
@@ -1248,13 +1261,16 @@ export class GeminiProvider implements Provider {
       thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length ? toolCalls : undefined,
       usage: normalized?.usage,
-      cost: this.interactionCost(
+      cost: this.interactionCost({
         normalized,
-        json.steps,
-        json.usage?.service_tier,
-        typeof json.model === 'string' ? json.model : pricingContext.model,
+        steps: json.steps,
+        responseServiceTier: json.usage?.service_tier,
+        effectiveModel: typeof json.model === 'string' ? json.model : pricingContext.model,
         pricingContext,
-      ),
+        // The whole body is in hand: every part is on `json.steps`, so there
+        // is nothing this path could have failed to materialize.
+        unmodeledOutput: false,
+      }),
       providerMetadata: json.steps?.length
         ? { geminiInteractionSteps: json.steps.filter(isGeminiInteractionStep) }
         : undefined,
@@ -1266,15 +1282,23 @@ export class GeminiProvider implements Provider {
    * fails. Streaming and non-streaming share this one body, so identical usage
    * always produces an identical number on both paths.
    */
-  private interactionCost(
-    normalized: NormalizedGeminiUsage | undefined,
-    steps: readonly GeminiInteractionStep[] | undefined,
-    responseServiceTier: unknown,
-    effectiveModel: string,
-    pricingContext: GeminiPricingContext,
-  ): number | undefined {
+  private interactionCost(call: {
+    normalized: NormalizedGeminiUsage | undefined;
+    steps: readonly GeminiInteractionStep[] | undefined;
+    responseServiceTier: unknown;
+    effectiveModel: string;
+    pricingContext: GeminiPricingContext;
+    /**
+     * Set by the streaming path when a frame carried model output it could not
+     * materialize onto a step. `isTextOnlyInteractionOutput` can only judge
+     * parts that reached `step.content`, so without this a dropped non-text
+     * delta would price where the identical non-streaming body is unpriced.
+     */
+    unmodeledOutput: boolean;
+  }): number | undefined {
+    const { normalized, steps, responseServiceTier, effectiveModel, pricingContext } = call;
     if (!normalized?.pricingUsage || normalized.hasUnmodeledBilledUsage) return undefined;
-    if (!this.isTextOnlyInteractionOutput(steps)) return undefined;
+    if (call.unmodeledOutput || !this.isTextOnlyInteractionOutput(steps)) return undefined;
     // The Interactions response carries no service-tier echo today, so the
     // request-level tier (the only way to select one) is authoritative here.
     // Should the wire start reporting one, a non-standard value unprices the
@@ -1325,6 +1349,11 @@ export class GeminiProvider implements Provider {
     const argumentBuffers = new Map<number, string>();
     const stopped = new Set<number>();
     let completed = false;
+    // True once a frame carried model output this parser could not put on a
+    // step. Non-text `step.start` parts ARE preserved (the step is cloned
+    // whole), so those are already caught by `isTextOnlyInteractionOutput`;
+    // this covers the deltas, which are otherwise silently dropped.
+    let unmodeledOutput = false;
     try {
       while (true) {
         const { done, value } = await timing.read(reader);
@@ -1373,6 +1402,7 @@ export class GeminiProvider implements Provider {
             }
             const step = cloneInteractionStep(event.step);
             steps.set(index, step);
+            if (!this.isTextOnlyInteractionOutput([step])) unmodeledOutput = true;
             if (step.type === 'model_output') {
               for (const text of interactionTextChunks(step.content)) {
                 yield { type: 'text_delta', content: text };
@@ -1397,6 +1427,15 @@ export class GeminiProvider implements Provider {
             const step = steps.get(index);
             if (!step)
               throw new Error('Gemini Interactions stream delta arrived before step.start');
+            if (
+              step.type === 'model_output' &&
+              !(delta.type === 'text' && typeof delta.text === 'string')
+            ) {
+              // Exactly the complement of the model_output branch below: any
+              // delta it cannot append is content the terminal `done` never
+              // sees, so the call must be unpriced rather than priced as text.
+              unmodeledOutput = true;
+            }
             if (
               delta.type === 'text' &&
               typeof delta.text === 'string' &&
@@ -1467,15 +1506,17 @@ export class GeminiProvider implements Provider {
             yield {
               type: 'done',
               usage: normalized?.usage,
-              cost: this.interactionCost(
+              cost: this.interactionCost({
                 normalized,
-                orderedSteps,
-                event.interaction?.usage?.service_tier,
-                typeof event.interaction?.model === 'string'
-                  ? event.interaction.model
-                  : pricingContext.model,
+                steps: orderedSteps,
+                responseServiceTier: event.interaction?.usage?.service_tier,
+                effectiveModel:
+                  typeof event.interaction?.model === 'string'
+                    ? event.interaction.model
+                    : pricingContext.model,
                 pricingContext,
-              ),
+                unmodeledOutput,
+              }),
               providerMetadata: steps.size ? { geminiInteractionSteps: orderedSteps } : undefined,
             };
             return;
@@ -2388,10 +2429,15 @@ function reportedGeminiAudioTokens(raw: unknown, totalInputTokens: number): numb
  * plus thought tokens: Google bills thoughts at the output rate, which is what
  * the `generateContent` estimator already does.
  *
- * Unlike `generateContent`, no `total_tokens === input + output + thoughts`
- * reconciliation is applied here: that identity is unverified on this
- * transport, and asserting it would unprice live traffic on a guess. The
- * modality sum vs. `total_input_tokens` check IS wire-verified (2026-09-08).
+ * Both wire-verified reconciliations (2026-09-08 live rows GA1/GA2/GA3/GA4)
+ * are enforced before anything is priced: the modality breakdown must sum to
+ * `total_input_tokens`, and `total_tokens` must equal
+ * `input + output + thoughts + toolUse` — which is what proves
+ * `total_output_tokens` EXCLUDES thoughts. Without the second check, a
+ * provider that made the output count thought-inclusive would have its
+ * thoughts billed twice at the output rate, silently over-reporting (an ~80%
+ * over-report on the GA1 shape) and tripping a `hard_stop` on spend that never
+ * happened. `generateContent` proves the same identity per response.
  */
 function normalizeInteractionUsage(
   usage: GeminiInteractionUsage | undefined,
@@ -2417,6 +2463,16 @@ function normalizeInteractionUsage(
   const audioInputTokens = reportedGeminiAudioTokens(usage.input_tokens_by_modality, inputTokens);
   const modalities = foldGeminiModalities(usage.input_tokens_by_modality, inputTokens);
   const billedOutputTokens = safeTokenSum(usage.total_output_tokens, thinking ?? 0);
+  const reportedTotal = safeTokenSum(
+    inputTokens,
+    usage.total_output_tokens,
+    thinking ?? 0,
+    toolUse ?? 0,
+  );
+  // A pricing precondition only: a mismatch still reports usage, because the
+  // counts are real billable work even when their relationship is not the one
+  // this estimator can price.
+  const reconciles = reportedTotal !== undefined && usage.total_tokens === reportedTotal;
   return {
     usage: {
       prompt_tokens: inputTokens,
@@ -2426,7 +2482,7 @@ function normalizeInteractionUsage(
       ...(thinking ? { reasoning_tokens: thinking } : {}),
       ...(audioInputTokens !== undefined ? { audio_input_tokens: audioInputTokens } : {}),
     },
-    ...(modalities !== undefined && billedOutputTokens !== undefined
+    ...(modalities !== undefined && billedOutputTokens !== undefined && reconciles
       ? {
           pricingUsage: {
             inputTokens,

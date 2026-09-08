@@ -736,6 +736,33 @@ describe('GeminiProvider', () => {
       expect(response.cost).toBeUndefined();
     });
 
+    it('prices a lowercase `standard` request tier — same vocabulary as the response check', async () => {
+      // The request-side and response-side tier checks must accept the same
+      // names: a value Axl reads as standard coming back would otherwise
+      // unprice going out, which is surprising rather than fail-safe.
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            ...makeGeminiResponse('Hi'),
+            modelVersion: 'gemini-3.6-flash',
+            usageMetadata: {
+              promptTokenCount: 10,
+              candidatesTokenCount: 5,
+              totalTokenCount: 15,
+              serviceTier: 'standard',
+            },
+          }),
+      });
+
+      const response = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+        providerOptions: { serviceTier: 'standard' },
+      });
+
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body).serviceTier).toBe('standard');
+      expect(response.cost).toBeCloseTo(10 * 0.75e-6 + 5 * 3.75e-6, 12);
+    });
+
     it('leaves Flex and Priority calls unpriced', async () => {
       const fetchMock = mockFetch({
         json: () =>

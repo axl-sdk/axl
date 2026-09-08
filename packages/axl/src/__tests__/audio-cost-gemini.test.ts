@@ -275,10 +275,16 @@ describe('gemini per-modality pricing formula', () => {
 
 // ── Cached tokens (T053, T054) ──────────────────────────────────────────
 
-describe('gemini cached tokens are deducted from the non-audio modalities only', () => {
-  it('T053: cached bills at the cached rate, taken out of text/image', async () => {
+describe('gemini cached tokens', () => {
+  it('L1: any co-occurrence of cached and audio tokens is unpriced', async () => {
+    // The bucket subtraction is a partition only if cached tokens are never
+    // audio tokens, and Google publishes no statement either way. Rather than
+    // bill a possibly-cached audio token at the cheap non-audio cached rate,
+    // the call is unpriced until a live probe settles the overlap.
     const { cost } = await askAudio(interactionUsage({ total_cached_tokens: 15 }));
-    expect(cost).toBeCloseTo(
+    expect(cost).toBeUndefined();
+    // Specifically NOT the number a disjoint-partition implementation reports.
+    expect(cost).not.toBeCloseTo(
       expectedCost(SPLIT_MODEL, {
         audio: GA1.audio,
         nonAudio: GA1.text,
@@ -288,31 +294,47 @@ describe('gemini cached tokens are deducted from the non-audio modalities only',
       }),
       14,
     );
-    // Deducting the cached tokens from the AUDIO bucket instead would be
-    // cheaper by 15 × ($1.00 − $0.30)/1M — this number rules that out.
+  });
+
+  it('T053: with no audio tokens, cached bills at the cached rate out of the non-audio bucket', async () => {
+    // The positive control L1 leaves reachable: it still pins that cached
+    // tokens are deducted from the text/image bucket and billed at the cached
+    // rate, rather than being billed twice or at the input rate.
+    const { cost } = await askAudio(
+      interactionUsage({
+        input_tokens_by_modality: [{ modality: 'text', tokens: GA1.input }],
+        total_cached_tokens: 15,
+      }),
+    );
+    expect(cost).toBeCloseTo(
+      expectedCost(SPLIT_MODEL, {
+        audio: 0,
+        nonAudio: GA1.input,
+        output: GA1.output,
+        thought: GA1.thought,
+        cached: 15,
+      }),
+      14,
+    );
+    // Billing the cached tokens at the input rate too would be dearer by
+    // 15 × ($0.30 − $0.03)/1M.
     expect(cost).not.toBeCloseTo(
-      (GA1.text - 0) * RATES[SPLIT_MODEL].input +
-        15 * RATES[SPLIT_MODEL].cached +
-        (GA1.audio - 15) * RATES[SPLIT_MODEL].audio +
-        (GA1.output + GA1.thought) * RATES[SPLIT_MODEL].output,
+      expectedCost(SPLIT_MODEL, {
+        audio: 0,
+        nonAudio: GA1.input,
+        output: GA1.output,
+        thought: GA1.thought,
+      }),
       14,
     );
   });
 
   it('T054: cached exceeding the non-audio portion is unpriced, never clamped', async () => {
-    // 30 cached > 20 non-audio tokens: the text term would go negative.
+    // 30 cached > 20 non-audio tokens: the text term would go negative. L1's
+    // stricter rule now subsumes this case; the deeper `cached + audio >
+    // input` guard is retained as defense in depth for a future relaxation.
     const { cost } = await askAudio(interactionUsage({ total_cached_tokens: 30 }));
     expect(cost).toBeUndefined();
-  });
-
-  it('cached equal to the non-audio portion prices with a zero text term', async () => {
-    const { cost } = await askAudio(interactionUsage({ total_cached_tokens: GA1.text }));
-    expect(cost).toBeCloseTo(
-      GA1.text * RATES[SPLIT_MODEL].cached +
-        GA1.audio * RATES[SPLIT_MODEL].audio +
-        (GA1.output + GA1.thought) * RATES[SPLIT_MODEL].output,
-      14,
-    );
   });
 });
 
@@ -472,6 +494,80 @@ describe('gemini pricing preconditions report unknown, never zero', () => {
     expect(cost).toBeUndefined();
   });
 
+  it('M1: a total_tokens identity mismatch is unpriced but still reports usage', async () => {
+    // A thought-INCLUSIVE `total_output_tokens` (94 = 14 + 80) with the same
+    // 189 total. Without the reconciliation the estimator adds the 80 thought
+    // tokens a second time at the output rate — an ~80% over-report with no
+    // `unpriced` signal, which would trip a `hard_stop` on spend that never
+    // happened. The identity is what proves the output count excludes
+    // thoughts, and it held on all four 2026-09-08 live rows.
+    const { cost, usage } = await askAudio(
+      interactionUsage({
+        total_input_tokens: 95,
+        total_output_tokens: 94,
+        total_thought_tokens: 80,
+        total_tokens: 189,
+        input_tokens_by_modality: [
+          { modality: 'audio', tokens: 75 },
+          { modality: 'text', tokens: 20 },
+        ],
+      }),
+    );
+    expect(cost).toBeUndefined();
+    // Specifically NOT the double-counted number.
+    expect(cost).not.toBeCloseTo(
+      expectedCost(SPLIT_MODEL, { audio: 75, nonAudio: 20, output: 94, thought: 80 }),
+      14,
+    );
+    // Observability is unaffected: the counts are real billable work.
+    expect(usage?.prompt_tokens).toBe(95);
+    expect(usage?.completion_tokens).toBe(94);
+    expect(usage?.reasoning_tokens).toBe(80);
+    expect(usage?.audio_input_tokens).toBe(75);
+  });
+
+  it('M1: the reconciling equivalent of that vector DOES price', async () => {
+    // Negative control: same shape, output count excluding thoughts.
+    const { cost } = await askAudio(
+      interactionUsage({
+        total_input_tokens: 95,
+        total_output_tokens: 14,
+        total_thought_tokens: 80,
+        total_tokens: 189,
+        input_tokens_by_modality: [
+          { modality: 'audio', tokens: 75 },
+          { modality: 'text', tokens: 20 },
+        ],
+      }),
+    );
+    expect(cost).toBeCloseTo(
+      expectedCost(SPLIT_MODEL, { audio: 75, nonAudio: 20, output: 14, thought: 80 }),
+      14,
+    );
+  });
+
+  it('M1: server-side tool tokens count toward the identity', async () => {
+    // `total_tool_use_tokens` is non-zero, so the call is unpriced anyway —
+    // but the identity must include the term, or a future relaxation of the
+    // tool-token rule would silently break the reconciliation.
+    const { cost } = await askAudio(interactionUsage({ total_tool_use_tokens: 7 }));
+    expect(cost).toBeUndefined();
+  });
+
+  it('N2: a lowercase `standard` request tier prices', async () => {
+    const { cost } = await askAudio(interactionUsage(), {
+      providerOptions: { service_tier: 'standard' },
+    });
+    expect(cost).toBeCloseTo(GA1_EXPECTED, 14);
+  });
+
+  it('N2: an explicit null request tier is treated as absent', async () => {
+    const { cost } = await askAudio(interactionUsage(), {
+      providerOptions: { service_tier: null },
+    });
+    expect(cost).toBeCloseTo(GA1_EXPECTED, 14);
+  });
+
   it('T062 (plan G1): an image-only rich call on an audio-rated model IS priced', async () => {
     // Accepted behavior change, documented in docs/providers.md: with a valid
     // breakdown, text/image tokens bill at the input rate. Audio-gating the
@@ -589,6 +685,63 @@ describe('gemini Interactions streaming', () => {
     const done = await streamDone(undefined);
     expect(done.cost).toBeUndefined();
     expect(done.usage).toBeUndefined();
+  });
+
+  it('L2: a dropped non-text model_output DELTA unprices exactly as the non-stream body does', async () => {
+    // A delta the parser cannot append to `step.content` is content the
+    // terminal `done` never sees, so `isTextOnlyInteractionOutput` alone would
+    // see text and price a reply that the identical non-streaming body
+    // unprices — breaking the "streaming and non-streaming compute identical
+    // cost for identical usage" invariant.
+    const events = [
+      { event_type: 'step.start', index: 0, step: { type: 'model_output', content: [] } },
+      { event_type: 'step.delta', index: 0, delta: { type: 'text', text: 'A rising tone.' } },
+      {
+        event_type: 'step.delta',
+        index: 0,
+        delta: { type: 'inline_data', mime_type: 'image/png', data: SENTINEL },
+      },
+      { event_type: 'step.stop', index: 0 },
+      {
+        event_type: 'interaction.completed',
+        interaction: { status: 'completed', usage: interactionUsage() },
+      },
+    ];
+    mockFetch(sseResponse(events.map((event) => `data: ${JSON.stringify(event)}`)));
+    const provider = new GeminiProvider({ apiKey: 'test-key' });
+    let streamedCost: number | undefined = 1;
+    for await (const chunk of provider.stream([{ role: 'user', content: AUDIO_INPUT as never }], {
+      model: SPLIT_MODEL,
+    })) {
+      if (chunk.type === 'done') streamedCost = chunk.cost;
+    }
+
+    // The equivalent non-streaming body, where the part IS on `json.steps`.
+    const nonStreaming = await askAudio(interactionUsage(), {
+      responseOver: {
+        steps: [
+          {
+            type: 'model_output',
+            content: [
+              { type: 'text', text: 'A rising tone.' },
+              { type: 'inline_data', mime_type: 'image/png', data: SENTINEL },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(streamedCost).toBeUndefined();
+    expect(nonStreaming.cost).toBeUndefined();
+    expect(streamedCost).toBe(nonStreaming.cost);
+    // And not the priced number a text-only reconstruction would report.
+    expect(streamedCost).not.toBeCloseTo(GA1_EXPECTED, 14);
+  });
+
+  it('L2: a text-only stream is unaffected by the flag', async () => {
+    // Negative control: the flag must not unprice an ordinary reply.
+    const done = await streamDone(interactionUsage());
+    expect(done.cost).toBeCloseTo(GA1_EXPECTED, 14);
   });
 
   it('a streamed non-text reply part is unpriced', async () => {

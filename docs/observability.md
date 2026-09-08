@@ -174,7 +174,26 @@ for (const event of info.events) {
 
 `ask_end.cost` is the **per-ask rollup** of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). If you sum `event.cost` across every event you observe, you'll double-count.
 
-**Unknown cost (`ask_end.unpriced`).** When an ask used a model with no usable per-call price (a pricing-table miss, or a provider that doesn't report cost), or abandoned a dispatched stalled call without usage, the call's `cost` is `undefined` — it contributes nothing to the rollup, so `ask_end.cost` becomes a **lower bound** and `ask_end.unpriced` is `true`. An ordinary *failed* call (which carries no usage and was not abandoned at a stall boundary) is NOT flagged. Treat `unpriced` asks as "at least `cost`", not exact (Studio renders them `≥ $X`). `agent_call_end.cost` is `number | undefined` for the same reason.
+**Rich input descriptors.** `ask_start`, `agent_call_start`, and completion
+callbacks carry a bounded `ModelInputDescriptor` whose parts are `text`,
+`image`, or `audio`. An audio part is labelled as audio, carries its source kind,
+media type, and known inline byte count, and carries a `locator` only for a
+provider-file reference (audio has no URL source). Bytes and base64 never appear.
+`trace.redact` scrubs `locator` and `label` and keeps the structural fields.
+Span attributes on `axl.model_input` follow the same rule: `axl.input.images`
+stays image-only for existing consumers, `axl.input.audio` is the new audio
+count, and `axl.input.source.*` plus `axl.input.inline_bytes` count **every**
+media part — so an audio-bearing ask is never reported as carrying zero media
+bytes.
+
+**Media is never zero context.** Context estimation projects rich input through
+`summarizeModelInput`, which renders media as `[image <mediaType>]` /
+`[audio <mediaType>]`. Duration is not measurable before dispatch, so history
+containing media marks the estimate as unmeasured and warns that the provider
+will enforce its own context limit — rather than silently counting the media as
+free.
+
+**Unknown cost (`ask_end.unpriced`).** When an ask used a model with no usable per-call price (a pricing-table miss, or a provider that doesn't report cost), or abandoned a dispatched stalled call without usage, the call's `cost` is `undefined` — it contributes nothing to the rollup, so `ask_end.cost` becomes a **lower bound** and `ask_end.unpriced` is `true`. An ordinary *failed* call (which carries no usage and was not abandoned at a stall boundary) is NOT flagged. Treat `unpriced` asks as "at least `cost`", not exact (Studio renders them `≥ $X`). `agent_call_end.cost` is `number | undefined` for the same reason. Audio-bearing `openai:` and `google:` calls are unpriced **by design**: no verified modality-aware estimator exists, and applying the text table to audio tokens would silently under-report. `openrouter:` reports an authoritative `usage.cost` and stays priced.
 
 **Execution-level aggregate (`ExecutionInfo.unpriced`).** To answer "is this execution's `totalCost` exact?" without scanning the timeline, read `ExecutionInfo.unpriced` (from `runtime.execute()` / `getExecutions()` / recovered streams) — `true` when any cost-bearing call was unpriced. The same flag is on `runtime.trackExecution().unpriced` and `AxlTestRuntime.unpriced()`. All three derive from the exported `isUnpricedLeaf(event)` discriminator (the single source of truth shared with the per-ask rollup and Studio's `CostData.unpricedCalls`).
 

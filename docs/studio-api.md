@@ -20,7 +20,7 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `GET /api/tools/:name` | Tool detail |
 | `POST /api/tools/:name/test` | Test a tool with `{ input: {...} }` |
 | `GET /api/sessions` | List sessions |
-| `GET /api/sessions/:id` | Read session history and handoff history |
+| `GET /api/sessions/:id` | Read session history and handoff history. Rich user turns are projected to a bounded descriptor whose parts are `{ type: 'text', characters }`, `{ type: 'image', source, mediaType?, bytes? }`, or `{ type: 'audio', source, mediaType?, bytes? }`. The Studio payload deliberately carries **no** `locator` or `label` for either modality — it is a Studio-safe descriptor, not a replay payload — and never inline bytes or base64 |
 | `POST /api/sessions/:id/send` | Send one session message. Body: `{ workflow: string, message: string }`. Returns the workflow result |
 | `POST /api/sessions/:id/stream` | Start a session message. Body: `{ workflow: string, message: string }`. Broadcasts `AxlEvent`s on the returned `execution:{executionId}` channel |
 | `GET /api/executions` | List executions |
@@ -204,6 +204,10 @@ In the examples below, `authenticateStudioHttp`, `authenticateStudioHono`, and
 They are required security boundaries, not SDK helpers.
 
 Studio's API uses small request bodies — the eval comparison flow sends history IDs (~100 bytes), not full result payloads — so the default body limits in Express, NestJS, Fastify, and Koa (typically 100KB) are sufficient for normal use.
+
+Studio **renders** audio descriptors in the Session Manager and trace views and
+labels them as audio; it offers no audio picker, upload, or attachment surface.
+Studio media composition remains a deferred product surface.
 
 The Playground's optional local image attachment is the small exception: Studio accepts one
 PNG, JPEG, WebP, or GIF per run, capped at 5 MiB decoded. Base64 plus its JSON envelope is

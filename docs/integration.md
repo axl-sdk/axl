@@ -124,6 +124,23 @@ process.on('SIGINT', shutdown);
 
 `runtime.shutdown()` aborts in-flight executions, drains the streaming flusher, **awaits all in-flight `persistExecution` chains**, and closes the store connection. Skipping it causes workflows aborted by shutdown to lose their canonical rows (the detached save races the connection close).
 
+### Persisting rich session history
+
+Session history is normally text. An application may deliberately construct
+JSON-compatible rich **user** turns — text, image, and audio parts — and persist
+them; base64 and provider-file sources round-trip through the memory, SQLite,
+and Redis stores unchanged. Two rules are enforced on the way in:
+
+- Rich content on a non-user role is rejected.
+- An inline `Uint8Array` source is rejected with `InvalidModelInputError`
+  (`Uint8Array media input cannot be persisted in session history`). Owned bytes
+  are per-call evidence and are never silently serialized into a store. The
+  check is type-agnostic over every non-text part, so it covers image and audio
+  identically. Encode to base64 yourself if you intend to persist the media.
+
+Axl never auto-retains an attachment across `Session` turns; persisted rich
+history is something your application chose to write.
+
 ### Per-tenant metadata and right-to-be-forgotten
 
 ```ts

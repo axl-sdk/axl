@@ -69,6 +69,25 @@ openai:gpt-4                    # Legacy
 openai:gpt-3.5-turbo            # Legacy
 ```
 
+### Recorded-audio input on Chat Completions
+
+`openai:` carries an ordered `InputAudioPart` as Chat Completions
+`{ type: 'input_audio', input_audio: { data, format } }` from a bytes or base64
+source. `format` is the documented `wav | mp3` enum, resolved from the part's
+media type through a closed table — `audio/wav`, `audio/x-wav`, `audio/wave`,
+`audio/mpeg`, `audio/mp3`. Anything else is rejected locally, naming the media
+type. Axl sends no `modalities` field, so the response stays text.
+
+The transport is implemented but **not yet live-certified**: rows `GA2` and
+`GA4-openai` are pending provider keys, so no composition is advertised for
+`openai:` audio today. Audio-bearing Chat Completions calls are **unpriced** —
+`hasUnmodeledDirectOpenAIContent` already unprices any non-text content part,
+and Axl captures no `prompt_tokens_details.audio_tokens` to estimate from, so a
+text-table rate is never applied to audio tokens.
+
+**Images remain rejected on `openai:`.** Adding audio did not add images: use
+`openai-responses:` for vision. Chat Completions image pricing is unmodeled.
+
 OpenAI's o-series uses the `developer` role, strips `temperature`, and supports `effort`.
 GPT-5.x uses `system` and supports the same portable option. Exact GPT-5.6 Chat requests with
 `effort: 'max'` use `xhigh` and report the clamp through a `provider_diagnostic`
@@ -76,6 +95,12 @@ event; choose `openai-responses:` for native `max`. For compatibility, unknown G
 but never inherit exact pricing or GPT-5.6-specific capabilities.
 
 ## Anthropic
+
+Anthropic accepts image input through native content blocks. It has **no audio
+content block** in the current Messages API, so an `InputAudioPart` on
+`anthropic:` is a zero-request `UnsupportedModelInputError` with
+`modality: 'audio'`. The same holds for `openai-responses:`, where OpenAI
+documents text and image inputs only. Neither ever falls back to transcription.
 
 ```
 anthropic:claude-fable-5-1      # Highest-capability Claude; thinking always on
@@ -159,6 +184,23 @@ Gemini Files and supply the returned URI as a `google` provider-file. Axl does
 not host-fetch or silently upload chat images. See
 [Multimodal model input](./multimodal-input.md) for source rules and the
 cross-provider table.
+
+### Recorded-audio input on Interactions
+
+The same Interactions transport carries an ordered `InputAudioPart` as
+`{ type: 'audio', data, mime_type }` for inline bytes/base64 or
+`{ type: 'audio', uri, mime_type }` for a caller-owned Gemini Files reference
+(`provider: 'google'`, and an explicit `mediaType` is required for the URI form).
+There is no wire `format` token and therefore no closed table: Gemini takes a
+`mime_type`, which Axl passes through unchanged. Google's total inline request
+cap (20 MB at time of writing) is the provider's, and exceeding it surfaces as a
+typed `ProviderError` rather than a local guess.
+
+The transport is implemented but **not yet live-certified**: rows `GA1`, `GA3`,
+`GA4`, and `GA8` are pending provider keys, so no composition is advertised for
+`google:` audio today. Interactions responses carry no cost, so an audio-bearing
+Gemini call is **unpriced** — Gemini bills audio at a different rate than text
+and `normalizeInteractionUsage` reports no per-modality breakdown to price from.
 
 ### Completed-file transcription
 
@@ -244,6 +286,25 @@ ollama:llama3                          # local — no key, $0
 vllm:meta-llama/Llama-3.3-70B-Instruct
 lmstudio:<model>  ·  llamacpp:<model>  ·  sglang:<model>
 ```
+
+Rich input on this engine is **profile-driven**, never name-driven: a preset
+declares `capabilities.inputModalities` (see
+[`ProfileInputModalities`](./api-reference.md#provider-profiles)) or it rejects
+rich parts locally before dispatch. Today `openrouter:` declares image (URL,
+bytes, base64) plus audio (bytes, base64) and the native OpenAI profile declares
+audio only. Every other built-in preset — `azure:`, `xai:`, `deepseek:`,
+`mistral:`, `groq:`, `bedrock:`, and the self-hosted profiles — declares none,
+so an image or audio part there is a zero-request
+`UnsupportedModelInputError`. A blank effective model declares nothing.
+
+`openrouter:` maps audio to the same `input_audio` wire shape as `openai:` with
+a wider closed format table (`wav`, `mp3`, `aiff`, `aac`, `ogg`, `flac`, `m4a`,
+`pcm16`; OpenRouter's documented `pcm24` is deliberately unmapped because no
+IANA media type distinguishes it from `pcm16`). OpenRouter documents base64-only
+audio; pass bytes and the engine encodes them for you. Its response `usage.cost`
+stays authoritative, so OpenRouter audio calls are priced from the response
+rather than unpriced. It is the one live-certified audio lane today — see the
+[general-audio evidence](./verification/general-audio-lighthouse-2026-09-08.md).
 
 Configure each like any provider (`apiKey` / `baseUrl` / `authHeader` / `rateLimit` under its
 name), or rely on its env vars. Most presets read `<PRESET>_API_KEY` and
@@ -1049,6 +1110,17 @@ TTL mix cannot be reconstructed safely.
 Current known Gemini rows carry explicit cached-input rates. A separate per-hour storage fee
 applies and is not reflected in Axl's per-call estimate. Non-Standard tiers and unmodeled
 billable modalities/tools are left unpriced.
+
+### Rich-input calls
+
+A call is not priced from the text table merely because it carried media. Axl
+reports a cost only when the provider returns an authoritative total or a
+verified modality-aware estimator exists. Today no audio estimator exists, so
+audio-bearing `openai:` and `google:` calls report usage with **no cost** and set
+the normal `unpriced` / lower-bound signals; `openrouter:` reports its
+authoritative `usage.cost`. Because unpriced spend is reported but not
+enforceable, a `ctx.budget()` cost limit cannot trip on an unpriced audio call —
+it flags `unpriced` instead.
 
 ### Custom providers
 

@@ -64,6 +64,23 @@ describe('Session with rich ModelInput', () => {
     },
   );
 
+  it('accepts Uint8Array audio as a Session input: the bytes reach the model once and are never persisted', async () => {
+    const { runtime, store, sent } = makeRuntime();
+    const session = runtime.session('s-bytes');
+    const bytes = new Uint8Array([82, 73, 70, 70]);
+    await session.send('wf', [
+      { type: 'text', text: 'what is this' },
+      { type: 'audio', source: { type: 'bytes', data: bytes, mediaType: 'audio/wav' } },
+    ]);
+    expect((await store.getSession('s-bytes'))[0]).toEqual({
+      role: 'user',
+      content: 'what is this\n[audio audio/wav]',
+    });
+    const dispatched = sent[0].find((message) => typeof message.content !== 'string');
+    expect(dispatched).toBeDefined();
+    await runtime.shutdown();
+  });
+
   it('fails loudly on a malformed part before the workflow runs', async () => {
     const { runtime, sent } = makeRuntime();
     const session = runtime.session('s2');

@@ -3273,6 +3273,59 @@ describe('GeminiProvider', () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
+    it('pairs function results to calls by id — repeated names and out-of-order results resolve correctly', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve({ status: 'completed', steps: [] }),
+      });
+      await new GeminiProvider().chat(
+        [
+          { role: 'user', content: [geminiFileImage()] },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              { id: 'c1', type: 'function', function: { name: 'lookup', arguments: '{"n":1}' } },
+              { id: 'c2', type: 'function', function: { name: 'lookup', arguments: '{"n":2}' } },
+            ],
+          },
+          { role: 'tool', tool_call_id: 'c2', content: 'second' },
+          { role: 'tool', tool_call_id: 'c1', content: 'first' },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              { id: 'c3', type: 'function', function: { name: 'other', arguments: '{}' } },
+            ],
+          },
+          { role: 'tool', tool_call_id: 'c3', content: 'third' },
+        ],
+        { model: 'gemini-3.7-flash' },
+      );
+      const results = JSON.parse(fetchMock.mock.calls[0][1].body).input.filter(
+        (step: { type: string }) => step.type === 'function_result',
+      );
+      expect(results).toEqual([
+        {
+          type: 'function_result',
+          name: 'lookup',
+          call_id: 'c2',
+          result: [{ type: 'text', text: 'second' }],
+        },
+        {
+          type: 'function_result',
+          name: 'lookup',
+          call_id: 'c1',
+          result: [{ type: 'text', text: 'first' }],
+        },
+        {
+          type: 'function_result',
+          name: 'other',
+          call_id: 'c3',
+          result: [{ type: 'text', text: 'third' }],
+        },
+      ]);
+    });
+
     it('rejects a tool result whose function name cannot be resolved instead of sending an empty name', async () => {
       const fetchMock = mockFetch({
         json: () => Promise.resolve({ status: 'completed', steps: [] }),

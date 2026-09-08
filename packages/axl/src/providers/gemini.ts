@@ -21,7 +21,7 @@ import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import type { RecordedAudioSource } from '../transcription.js';
 import { UnsupportedModelInputError } from '../errors.js';
-import { firstRichPart } from './rich-input.js';
+import { firstRichPart, type RichModality } from './rich-input.js';
 
 function hasRichGeminiMessages(messages: readonly ChatMessage[]): boolean {
   return messages.some((message) => Array.isArray(message.content));
@@ -690,16 +690,20 @@ export class GeminiProvider implements Provider {
   validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
     const modelOverride = request.providerOptions?.model;
     const effectiveModel = typeof modelOverride === 'string' ? modelOverride : request.model;
-    // The reported modality is derived from the offending part, never hardcoded.
-    const fail = (source?: string, feature?: string): never => {
+    const failWith = (modality: RichModality, source?: string, feature?: string): never => {
       throw new UnsupportedModelInputError({
         provider: this.name,
         model: effectiveModel || request.model,
-        modality: firstRichPart(request.input, request.history)?.type ?? 'image',
+        modality,
         ...(source ? { source } : {}),
         ...(feature ? { feature } : {}),
       });
     };
+    // Request-level rejections are not about one part, so they report the
+    // request's leading rich modality. Per-part rejections must instead report
+    // the OFFENDING part's own type — see `checkPart`.
+    const fail = (source?: string, feature?: string): never =>
+      failWith(firstRichPart(request.input, request.history)?.type ?? 'image', source, feature);
     // Audio follows exactly the image rules: inline data needs nothing extra, and
     // a provider-file reference must be Gemini's own and must declare its media
     // type, because the Interactions URI part carries no inferable one. `url` is
@@ -707,18 +711,22 @@ export class GeminiProvider implements Provider {
     const checkPart = (part: InputContentPart): void => {
       if (part.type === 'audio') {
         if (part.source.type === 'provider-file' && part.source.provider !== this.name)
-          fail('provider-file');
+          failWith('audio', 'provider-file');
         if (part.source.type === 'provider-file' && !part.source.mediaType)
-          fail('provider-file', 'Interactions URI audio mediaType');
+          failWith('audio', 'provider-file', 'Interactions URI audio mediaType');
         return;
       }
       if (part.type !== 'image') return;
       if (part.source.type === 'url')
-        fail('url', 'direct URL image input; pass bytes/base64 or a Gemini provider-file');
+        failWith(
+          'image',
+          'url',
+          'direct URL image input; pass bytes/base64 or a Gemini provider-file',
+        );
       if (part.source.type === 'provider-file' && part.source.provider !== this.name)
-        fail('provider-file');
+        failWith('image', 'provider-file');
       if (part.source.type === 'provider-file' && !part.source.mediaType)
-        fail('provider-file', 'Interactions URI image mediaType');
+        failWith('image', 'provider-file', 'Interactions URI image mediaType');
     };
     if (
       request.providerOptions &&

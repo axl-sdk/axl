@@ -43,6 +43,12 @@ export type ProfileInputModalities = {
   };
 };
 
+/** Feature text for a media type this profile's closed table cannot map.
+ * A missing media type is named as missing — never rendered as `'undefined'`. */
+function unmappableMediaTypeFeature(mediaType: string | undefined): string {
+  return mediaType === undefined ? 'audio media type (missing)' : `audio media type '${mediaType}'`;
+}
+
 function compatibleInlineBase64(
   source: Extract<InputMediaSource | RecordedAudioSource, { type: 'bytes' | 'base64' }>,
 ): string {
@@ -93,7 +99,7 @@ export function compatibleRichParts(
       }
       const format = resolveAudioFormat(audio.formats, source.mediaType);
       if (format === undefined) {
-        throw reject('audio', source.type, `audio media type '${source.mediaType}'`);
+        throw reject('audio', source.type, unmappableMediaTypeFeature(source.mediaType));
       }
       content.push({
         type: 'input_audio',
@@ -102,6 +108,17 @@ export function compatibleRichParts(
       });
       if (part.label) content.push({ type: 'text', text: `[Audio: ${part.label}]` });
       continue;
+    }
+    if (part.type !== 'image') {
+      // A future `InputContentPart` variant must fail loudly rather than fall
+      // through to the image mapping below and be sent as a mislabelled block.
+      const unmapped: never = part;
+      throw new UnsupportedModelInputError({
+        provider,
+        model,
+        modality: (unmapped as { type: string }).type,
+        feature: 'this input modality',
+      });
     }
     const { source } = part;
     const image = modalities.image;
@@ -592,7 +609,9 @@ export class OpenAICompatibleProvider implements Provider {
     // rejected with the same triple the engine reported before audio existed.
     const imagePart = firstRichPart(request.input, request.history, 'image');
     if (!modalities.image && (!audioPart || imagePart)) {
-      fail(undefined, 'image input for this model');
+      // The offending part is an image (or, with no rich part reachable here,
+      // the historical image-era default for a blank effective model).
+      failWith('image', undefined, 'image input for this model');
     }
     if (request.providerOptions && 'messages' in request.providerOptions) {
       fail(undefined, 'raw messages providerOptions');
@@ -624,7 +643,7 @@ export class OpenAICompatibleProvider implements Provider {
         const source = part.source;
         if (!audio.sources.includes(source.type)) failWith('audio', source.type);
         if (resolveAudioFormat(audio.formats, source.mediaType) === undefined) {
-          failWith('audio', source.type, `audio media type '${String(source.mediaType)}'`);
+          failWith('audio', source.type, unmappableMediaTypeFeature(source.mediaType));
         }
       }
     }
@@ -865,15 +884,16 @@ export class OpenAICompatibleProvider implements Provider {
 
   protected formatMessage(msg: ChatMessage, model: string): Record<string, unknown> {
     const modalities = this.inputModalities(model);
-    const carriesRichInput = Boolean(modalities.image ?? modalities.audio);
     const out: Record<string, unknown> = {
       role: this.profile.roleFor ? this.profile.roleFor(msg.role, model) : msg.role,
       // History user turns go through the same builder as the caller's input,
       // so a rich part is reproduced identically in every continuation request.
-      content:
-        Array.isArray(msg.content) && carriesRichInput
-          ? compatibleRichParts(msg.content, model, modalities, this.name)
-          : msg.content,
+      // Array content is routed UNCONDITIONALLY: a profile that declares no
+      // modality has the builder reject every rich part (and pass text through)
+      // rather than emitting raw `InputContentPart` objects on the wire.
+      content: Array.isArray(msg.content)
+        ? compatibleRichParts(msg.content, model, modalities, this.name)
+        : msg.content,
     };
     if (msg.name && (this.profile.capabilities?.emitsMessageName ?? true)) out.name = msg.name;
     if (msg.tool_calls) out.tool_calls = msg.tool_calls;

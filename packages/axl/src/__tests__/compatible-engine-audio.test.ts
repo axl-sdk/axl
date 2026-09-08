@@ -26,6 +26,7 @@ import {
   type ProfileInputModalities,
 } from '../providers/openai-compatible.js';
 import { OPENAI_CHAT_AUDIO_FORMATS, OPENROUTER_AUDIO_FORMATS } from '../providers/audio-format.js';
+import { GROQ_PROFILE } from '../providers/profiles/groq.js';
 import { OPENROUTER_PROFILE } from '../providers/profiles/openrouter.js';
 import { AxlRuntime } from '../runtime.js';
 import { tool } from '../tool.js';
@@ -992,5 +993,104 @@ describe('AE-22 images stay off openai: (fork F4)', () => {
         'openrouter',
       ),
     ).toThrow(/audio input/);
+  });
+});
+
+// ── Review fix wave: builder routing, offending-part modality, media type ──
+
+/** Exposes the engine's protected `formatMessage` so the wire content a profile
+ * produces can be asserted without a dispatch the gate would reject first. */
+class ExposedCompatibleProvider extends OpenAICompatibleProvider {
+  formatOne(message: ChatMessage, model: string): Record<string, unknown> {
+    return this.formatMessage(message, model);
+  }
+}
+
+describe('array content is routed through the rich-part builder unconditionally', () => {
+  const groq = () => new ExposedCompatibleProvider({ profile: GROQ_PROFILE, apiKey: 'test-key' });
+
+  it('refuses audio on a profile that declares no modality at all', () => {
+    // `groq` declares neither image nor audio. Skipping the builder for such a
+    // profile would put raw `InputContentPart` objects — base64 and all — into
+    // the request body instead of failing.
+    const message: ChatMessage = { role: 'user', content: [...AUDIO_INPUT] };
+    expect(() => groq().formatOne(message, 'llama-test')).toThrow(UnsupportedModelInputError);
+    try {
+      groq().formatOne(message, 'llama-test');
+    } catch (err) {
+      expect((err as UnsupportedModelInputError).modality).toBe('audio');
+      expect((err as Error).message).not.toContain(SENTINEL);
+    }
+  });
+
+  it('still passes text parts through on a profile that declares no modality', () => {
+    const formatted = groq().formatOne(
+      { role: 'user', content: [{ type: 'text', text: 'plain words' }] },
+      'llama-test',
+    );
+    expect(formatted.content).toEqual([{ type: 'text', text: 'plain words' }]);
+  });
+});
+
+describe('a mixed-modality rejection reports the offending part, not the first one', () => {
+  it('reports image (not audio) when only the image part is unsupported on openai:', async () => {
+    const fetchMock = forbidFetch();
+    const runtime = openAIRuntime();
+    const error = await askOnce(runtime, 'openai-audio-then-image', 'openai:gpt-4o', [
+      ...AUDIO_INPUT,
+      { type: 'image', source: { type: 'base64', data: 'AQID', mediaType: 'image/png' } },
+    ]).catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(UnsupportedModelInputError);
+    expect((error as UnsupportedModelInputError).modality).toBe('image');
+    expect((error as Error).message).toContain('image input for this model');
+    expect(fetchMock).not.toHaveBeenCalled();
+    await runtime.shutdown();
+  });
+});
+
+describe('an unmappable audio media type is never rendered as the string "undefined"', () => {
+  it('names a missing media type as missing', () => {
+    // A profile may legitimately accept a provider-file audio source, where the
+    // media type is optional on the part. `validateInput` then reaches the
+    // format table with `undefined`.
+    const provider = new OpenAICompatibleProvider({
+      profile: {
+        ...OPENROUTER_PROFILE,
+        capabilities: {
+          ...OPENROUTER_PROFILE.capabilities,
+          inputModalities: {
+            audio: {
+              sources: ['provider-file', 'base64'],
+              formats: OPENROUTER_AUDIO_FORMATS,
+            },
+          },
+        },
+      },
+      apiKey: 'test-key',
+    });
+    const error = (() => {
+      try {
+        provider.validateInput({
+          model: 'vendor/audio',
+          input: [
+            {
+              type: 'audio',
+              source: { type: 'provider-file', provider: 'openrouter', reference: 'files/a' },
+            },
+          ],
+          history: [],
+          stream: false,
+          hasTools: false,
+          responseMode: 'text',
+        });
+      } catch (err) {
+        return err;
+      }
+    })();
+
+    expect(error).toBeInstanceOf(UnsupportedModelInputError);
+    expect((error as Error).message).toContain('audio media type (missing)');
+    expect((error as Error).message).not.toContain('undefined');
   });
 });

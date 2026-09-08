@@ -12,6 +12,7 @@ import {
   type ModelInput,
 } from '../input.js';
 import { AnthropicProvider } from '../providers/anthropic.js';
+import { GeminiProvider } from '../providers/gemini.js';
 import { OpenAIProvider } from '../providers/openai.js';
 import { OpenAICompatibleProvider } from '../providers/openai-compatible.js';
 import { OpenAIResponsesProvider } from '../providers/openai-responses.js';
@@ -350,6 +351,54 @@ describe('image-only rejections keep reporting the image modality (R-A3)', () =>
     expect(error).toBeInstanceOf(UnsupportedModelInputError);
     expect((error as UnsupportedModelInputError).modality).toBe('image');
     expect((error as UnsupportedModelInputError).source).toBe('base64');
+  });
+});
+
+describe('a mixed-modality rejection reports the offending part (R-A3b)', () => {
+  it('reports image when the image part is the unsupported one on google:', async () => {
+    const fetchMock = forbidFetch();
+    const error = await contextFor('google', new GeminiProvider({ apiKey: 'test-key' }))
+      .ask(agent({ model: 'google:gemini-2.5-flash', system: 'listen' }), [
+        { type: 'audio', source: { type: 'base64', data: 'AQID', mediaType: 'audio/wav' } },
+        { type: 'image', source: { type: 'url', url: 'https://example.test/pixel.png' } },
+      ])
+      .catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(UnsupportedModelInputError);
+    // Deriving the modality from the FIRST rich part would say 'audio' here,
+    // which contradicts the `url` source and the direct-URL-image feature.
+    expect((error as UnsupportedModelInputError).modality).toBe('image');
+    expect((error as UnsupportedModelInputError).source).toBe('url');
+    expect((error as Error).message).toContain('direct URL image input');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('reports audio when the audio part is the unsupported one on google:', async () => {
+    const fetchMock = forbidFetch();
+    const error = await contextFor('google', new GeminiProvider({ apiKey: 'test-key' }))
+      .ask(agent({ model: 'google:gemini-2.5-flash', system: 'listen' }), [
+        {
+          type: 'image',
+          source: { type: 'bytes', data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' },
+        },
+        {
+          type: 'audio',
+          source: {
+            type: 'provider-file',
+            provider: 'openai',
+            reference: 'files/foreign',
+            mediaType: 'audio/wav',
+          },
+        },
+      ])
+      .catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(UnsupportedModelInputError);
+    // The leading rich part is the (perfectly supported) image.
+    expect((error as UnsupportedModelInputError).modality).toBe('audio');
+    expect((error as UnsupportedModelInputError).source).toBe('provider-file');
+    expect((error as Error).message).not.toContain('files/foreign');
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

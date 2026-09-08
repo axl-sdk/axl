@@ -34,7 +34,10 @@ function base64FromSource(source: Extract<InputMediaSource, { type: 'bytes' | 'b
       );
 }
 
-function responseImageParts(parts: readonly InputContentPart[]): Array<Record<string, unknown>> {
+function responseImageParts(
+  parts: readonly InputContentPart[],
+  model: string,
+): Array<Record<string, unknown>> {
   const mapped: Array<Record<string, unknown>> = [];
   for (const part of parts) {
     if (part.type === 'text') {
@@ -46,7 +49,7 @@ function responseImageParts(parts: readonly InputContentPart[]): Array<Record<st
       // guard keeps audio from silently rendering as an image block.
       throw new UnsupportedModelInputError({
         provider: 'openai-responses',
-        model: 'unknown',
+        model,
         modality: 'audio',
         source: part.source.type,
         feature: 'audio input',
@@ -57,7 +60,7 @@ function responseImageParts(parts: readonly InputContentPart[]): Array<Record<st
       if (source.provider !== 'openai-responses') {
         throw new UnsupportedModelInputError({
           provider: 'openai-responses',
-          model: 'unknown',
+          model,
           modality: 'image',
           source: 'provider-file',
         });
@@ -117,9 +120,11 @@ export class OpenAIResponsesProvider implements Provider {
         ...(feature ? { feature } : {}),
       });
     };
-    // The reported modality is derived from the offending part, never hardcoded.
-    const fail = (source?: string, feature?: string): never =>
-      failWith(firstRichPart(request.input, request.history)?.type ?? 'image', source, feature);
+    // Every audio-bearing request is already rejected below, so the only rich
+    // modality that can reach a later rejection here is `image`. Per-part
+    // rejections therefore report `'image'` because that is the offending
+    // part's own type, not because it is a historical default.
+    const fail = (source?: string, feature?: string): never => failWith('image', source, feature);
     // This adapter maps no audio transport. The runtime gate already fails
     // closed because `inputCapabilities` declares no `audio`; rejecting here
     // too keeps the adapter authoritative on its own wire format.
@@ -334,7 +339,7 @@ export class OpenAIResponsesProvider implements Provider {
 
     const body: Record<string, unknown> = {
       model: effectiveModel,
-      input: this.buildInput(nonSystemMessages),
+      input: this.buildInput(nonSystemMessages, effectiveModel),
       store: false,
       stream,
     };
@@ -401,7 +406,7 @@ export class OpenAIResponsesProvider implements Provider {
   // Internal: message → input mapping
   // ---------------------------------------------------------------------------
 
-  private buildInput(messages: ChatMessage[]): ResponsesInputItem[] {
+  private buildInput(messages: ChatMessage[], model: string): ResponsesInputItem[] {
     const input: ResponsesInputItem[] = [];
 
     for (const msg of messages) {
@@ -446,7 +451,8 @@ export class OpenAIResponsesProvider implements Provider {
         input.push({
           type: 'message',
           role: msg.role,
-          content: typeof msg.content === 'string' ? msg.content : responseImageParts(msg.content),
+          content:
+            typeof msg.content === 'string' ? msg.content : responseImageParts(msg.content, model),
         });
       }
     }

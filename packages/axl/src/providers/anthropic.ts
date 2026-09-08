@@ -29,7 +29,10 @@ function anthropicBase64(source: Extract<InputMediaSource, { type: 'bytes' | 'ba
       );
 }
 
-function anthropicImageBlocks(parts: readonly InputContentPart[]): AnthropicContentBlock[] {
+function anthropicImageBlocks(
+  parts: readonly InputContentPart[],
+  model: string,
+): AnthropicContentBlock[] {
   const blocks: AnthropicContentBlock[] = [];
   for (const part of parts) {
     if (part.type === 'text') {
@@ -41,7 +44,7 @@ function anthropicImageBlocks(parts: readonly InputContentPart[]): AnthropicCont
       // guard keeps audio from silently rendering as an image block.
       throw new UnsupportedModelInputError({
         provider: 'anthropic',
-        model: 'unknown',
+        model,
         modality: 'audio',
         source: part.source.type,
         feature: 'audio input',
@@ -52,7 +55,7 @@ function anthropicImageBlocks(parts: readonly InputContentPart[]): AnthropicCont
       if (source.provider !== 'anthropic') {
         throw new UnsupportedModelInputError({
           provider: 'anthropic',
-          model: 'unknown',
+          model,
           modality: 'image',
           source: 'provider-file',
         });
@@ -797,9 +800,11 @@ export class AnthropicProvider implements Provider {
         ...(feature ? { feature } : {}),
       });
     };
-    // The reported modality is derived from the offending part, never hardcoded.
-    const fail = (source?: string, feature?: string): never =>
-      failWith(firstRichPart(request.input, request.history)?.type ?? 'image', source, feature);
+    // Every audio-bearing request is already rejected below, so the only rich
+    // modality that can reach a later rejection here is `image`. Per-part
+    // rejections therefore report `'image'` because that is the offending
+    // part's own type, not because it is a historical default.
+    const fail = (source?: string, feature?: string): never => failWith('image', source, feature);
     // This adapter maps no audio transport. The runtime gate already fails
     // closed because `inputCapabilities` declares no `audio`; rejecting here
     // too keeps the adapter authoritative on its own wire format.
@@ -1030,7 +1035,7 @@ export class AnthropicProvider implements Provider {
 
     const body: Record<string, unknown> = {
       model: effectiveModel,
-      messages: this.mapMessages(nonSystemMessages),
+      messages: this.mapMessages(nonSystemMessages, effectiveModel),
       max_tokens: options.maxTokens ?? 4096,
       stream,
     };
@@ -1141,7 +1146,7 @@ export class AnthropicProvider implements Provider {
    * - assistant messages with tool_calls -> assistant with tool_use content blocks
    * - tool messages (tool results) -> user messages with tool_result content blocks
    */
-  private mapMessages(messages: ChatMessage[]): AnthropicMessage[] {
+  private mapMessages(messages: ChatMessage[], model: string): AnthropicMessage[] {
     const result: AnthropicMessage[] = [];
 
     for (const msg of messages) {
@@ -1200,7 +1205,9 @@ export class AnthropicProvider implements Provider {
         result.push({
           role: 'user',
           content:
-            typeof msg.content === 'string' ? msg.content : anthropicImageBlocks(msg.content),
+            typeof msg.content === 'string'
+              ? msg.content
+              : anthropicImageBlocks(msg.content, model),
         });
       }
       // system messages already handled at top level

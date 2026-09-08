@@ -522,7 +522,7 @@ Select the best agent from a list of candidates and invoke it. Creates a tempora
 | `options.validate` | `OutputValidator<T>` | Post-schema business rule validation. Forwarded to the final `ctx.ask()` call |
 | `options.validateRetries` | `number` | Maximum retries for validate failures (default: 2) |
 | `options.retryFeedback` | `RetryFeedbackHook` | Custom gate-retry feedback. Forwarded to the final `ctx.ask()` call on both the single-candidate and the routed path. See [Custom retry feedback](#custom-retry-feedback) |
-| `options.routerInput` | `'full' \| 'text'` | `'full'` (default) routes ordered evidence; `'text'` routes `inputText(prompt)` only |
+| `options.routerInput` | `'full' \| 'text'` | `'full'` (default) routes ordered evidence; `'text'` routes `inputText(prompt)` only — a media-only input has no text projection and throws `InvalidModelInputError` |
 
 **Returns:** `Promise<T>` — the selected agent's response.
 
@@ -1522,7 +1522,7 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 
 ### What's stored
 
-A session's persisted state is a flat `ChatMessage[]` of `user` and `assistant` turns, keyed by `sessionId` in the configured `StateStore`. The persisted `user` turn is the workflow input: a string as-is, an ordered `ModelInput` (text/image/audio parts) as its context-safe text projection (`question\n[audio audio/wav]`, the same rendering `summarizeModelInput` produces), and any other application object as JSON. Media is per-call evidence, never session state, so inline base64 is never persisted or re-sent as text on later turns, and a malformed part fails with `InvalidModelInputError` before the workflow runs. Summarization caches and handoff history are stored alongside as session metadata. The `Session` object itself holds no message cache — every `send()`/`stream()` reads history from the store, mutates it during execution, and writes it back. Calling `runtime.session(id)` does not pre-load anything and does not check whether the id exists.
+A session's persisted state is a flat `ChatMessage[]` of `user` and `assistant` turns, keyed by `sessionId` in the configured `StateStore`. The persisted `user` turn is the workflow input: a string as-is, an ordered `ModelInput` as its context-safe text projection (`question\n[audio audio/wav]`, the same rendering `summarizeModelInput` produces), and any other application object as JSON. An array counts as `ModelInput` only when it is non-empty and every element carries a `type` of `text`, `image`, or `audio`; any other array (including `[]`) is an application value and is persisted as JSON. Media is per-call evidence, never session state, so inline base64 is never persisted or re-sent as text on later turns, and a malformed part fails with `InvalidModelInputError` before the workflow runs. Summarization caches and handoff history are stored alongside as session metadata. The `Session` object itself holds no message cache — every `send()`/`stream()` reads history from the store, mutates it during execution, and writes it back. Calling `runtime.session(id)` does not pre-load anything and does not check whether the id exists.
 
 ### Sharing semantics
 

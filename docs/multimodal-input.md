@@ -77,7 +77,8 @@ including audio — as unmeasured rather than treating it as free context.
 
 `ctx.delegate()` forwards the full ordered evidence to the **router** by
 default, so an audio-bearing delegate needs the router's provider to declare
-audio as well. Pass `routerInput: 'text'` to route only the text projection and
+audio as well. Pass `routerInput: 'text'` to route only the text projection (a
+media-only input has none, and is rejected with `InvalidModelInputError`) and
 keep the audio on the selected delegate.
 
 Context summarization sees `[image <mediaType>]` / `[audio <mediaType>]`
@@ -127,7 +128,13 @@ an upstream capability rejection surfaces through `ctx.ask()` as a typed
 
 Axl accepts at most 25 MiB of decoded inline media across one **logical input**
 — images and audio share the single bound. The bound is checked before bytes are
-copied or base64 is decoded. URL and provider-file sources do not count toward it
+copied or base64 is decoded, and it is checked before the audio capability
+gate, so an oversized part on an unsupported provider reports the size first.
+Every `bytes` source (image or audio, plain `Uint8Array` or Node `Buffer`) is
+copied into a fresh `Uint8Array` when the ask takes ownership; mutating the
+caller's buffer or array afterwards never changes what is sent. That copy is
+per ask: fanning one 25 MiB recording across `ctx.map` over ten items holds ten
+copies for the duration of those asks. URL and provider-file sources do not count toward it
 because Axl does not load their contents; upstream request, media-count, and
 model limits still apply. Callers can import `MAX_INLINE_MODEL_INPUT_BYTES` when
 preflighting their own inputs.
@@ -213,8 +220,11 @@ array is not.
 Audio support is a per-provider opt-in, never inferred from provider family,
 image support, or transcription support. A provider whose `inputCapabilities`
 omits `audio` rejects an audio part with `UnsupportedModelInputError`
-(`modality: 'audio'`) **before** any target request, summary-provider request,
-upload, or transcription — zero requests, and no fallback. As with images, the
+(`modality: 'audio'`) **before** any target request, before the context
+summarization an oversized history would otherwise trigger, and before any
+upload or transcription — zero requests, and no fallback. The gate is on the
+**target** provider only: a summary model receives the `[audio <mediaType>]`
+projection, never media, so it does not need to declare audio. As with images, the
 selected model decides whether it actually supports audio and the requested
 composition; an upstream rejection surfaces as a typed `ProviderError`.
 
@@ -330,7 +340,9 @@ it does not promise a given model hears every acoustic detail.
 - Not a file-management API. A `provider-file` source is an opaque reference you
   already own; Axl does not upload, list, download, retain, or delete it.
 - Not durable session state. Audio is per-call evidence and is never
-  auto-retained across `Session` turns.
+  auto-retained across `Session` turns. `ctx.awaitHuman()` suspends in-process
+  and keeps the in-flight ask's media in memory; Axl does not claim a durable
+  media-bearing resume across a process restart.
 - Not video or documents.
 - Not a Studio media picker. Studio **renders** the bounded audio descriptor in
   the Session Manager and trace views; it offers no audio upload or attachment

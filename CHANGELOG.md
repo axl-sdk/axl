@@ -105,6 +105,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Node `Buffer` passed as a `bytes` media source is now copied, not
+  aliased.** `Buffer.prototype.slice()` shares memory, so the ownership copy
+  the runtime takes on normalization (and the `MockProvider` call record) was a
+  view over the caller's buffer for the most common input path,
+  `readFileSync`. Both now allocate a fresh `Uint8Array`. Images and audio.
+- **`ctx.delegate({ routerInput: 'text' })` on a media-only input throws
+  `InvalidModelInputError`** instead of routing on an empty user turn.
 - **`Session.send()` / `stream()` no longer persist a rich `ModelInput` as
   JSON.** A workflow input made of text/image/audio parts was recorded as a
   JSON string — inline base64 included — which bypassed the inline media cap

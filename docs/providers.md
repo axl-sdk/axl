@@ -179,7 +179,14 @@ image input accepts any nonblank `google:` model ID and currently uses the
 [Interactions API](https://ai.google.dev/gemini-api/docs/interactions-overview)
 with `store: false`. It is stateless: Axl sends application-owned history and
 does not use `previous_interaction_id`, background execution, or raw transport
-overrides. Google remains authoritative for whether the selected model supports
+overrides. A tool continuation therefore re-sends the model's own prior steps
+(thoughts, `function_call`s) from `providerMetadata` and pairs every tool
+result to its call **by `call_id`**, never by name, so two calls that share a
+function name and results that arrive out of order both resolve correctly.
+Each `function_result` carries the function's `name` (Interactions rejects a
+result without one with a bare `400`); a tool message whose id matches no
+prior call and that carries no `name` of its own throws `InvalidModelInputError`
+naming the call id before any request. Google remains authoritative for whether the selected model supports
 Interactions and image input. Direct HTTP image URLs are not sent as Gemini
 file URIs: applications must pass bytes/base64 or explicitly upload through
 Gemini Files and supply the returned URI as a `google` provider-file. Axl does
@@ -198,11 +205,14 @@ There is no wire `format` token and therefore no closed table: Gemini takes a
 cap (20 MB at time of writing) is the provider's, and exceeding it surfaces as a
 typed `ProviderError` rather than a local guess.
 
-The transport is implemented but **not yet live-certified**: rows `GA1`, `GA3`,
-`GA4`, and `GA8` are pending provider keys, so no composition is advertised for
-`google:` audio today. Interactions responses carry no cost, so an audio-bearing
-Gemini call is **unpriced** — Gemini bills audio at a different rate than text
-and `normalizeInteractionUsage` reports no per-modality breakdown to price from.
+Live-certified on `gemini-3.7-flash` for a text answer from speech and
+non-speech audio, a stateless tool continuation, structured output, streaming,
+and an audio turn re-sent from application history; see the dated general-audio
+record under `docs/verification/`. Interactions responses carry no cost, so an
+audio-bearing Gemini call is **unpriced** — Gemini bills audio at a different
+rate than text. The wire reports `input_tokens_by_modality`, but
+`normalizeInteractionUsage` folds it into `prompt_tokens` and Axl carries no
+verified audio rates, so nothing is priced from it.
 
 ### Completed-file transcription
 

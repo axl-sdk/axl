@@ -58,6 +58,18 @@
 
 `nativeStructuredOutput` currently sends OpenAI a **non-strict** `json_schema` (schema-as-guidance, not hard constrained decoding), because a Zod-derived schema isn't automatically OpenAI-strict-compliant (strict requires every property in `required` — optionals modeled as nullable — and `additionalProperties: false` on every object). Planned: an opt-in transform that rewrites the derived schema into the provider's strict subset and sets `strict: true`, so `nativeStructuredOutput` engages real constrained decoding where the provider supports it. Needs live-API iteration per provider; client-side Zod validation remains the guarantee in the meantime.
 
+#### Session user turn sent twice
+
+`Session.send()` records the workflow input as the persisted `user` turn, and
+the workflow then usually passes the same text to `ctx.ask()`, so the model
+sees that prompt twice on every session turn (history has never alternated;
+`ctx.ask` only appends). This predates the audio work and applies to every
+session-based workflow: it doubles the prompt's input tokens and makes traces
+read oddly. Planned: skip appending the ask prompt when it equals the user
+turn the session just recorded, with a documented opt-out. Decided-by-owner
+2026-09-08 as a follow-up, not folded into the audio workstream because it
+changes what every session workflow sends.
+
 #### Configurable Session Summarization
 
 The session summarization system (triggered when `maxMessages` is exceeded with `summarize: true`) currently uses a hardcoded prompt and a fixed `maxTokens: 1024` limit. Planned improvements:

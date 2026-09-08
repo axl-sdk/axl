@@ -52,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ModelInputDescriptor` gains an `audio` part variant; its `locator` can only
   come from a provider-file reference.
 - `axl.input.audio` span attribute on the `axl.model_input` event.
-- Live certification rows `GA1`–`GA9` in
+- Live certification rows `GA1`–`GA9` (plus `GA2-text`) in
   `packages/axl/src/__tests__/integration-general-audio.test.ts`, double-gated
   behind `AXL_MULTIMODAL_LIVE=1` + `AXL_GENERAL_AUDIO_LIVE=1` (`GA2` additionally
   behind `AXL_GENERAL_AUDIO_OPENAI_TOOL_LIVE=1`).
@@ -105,12 +105,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Session.send()` / `stream()` no longer persist a rich `ModelInput` as
+  JSON.** A workflow input made of text/image/audio parts was recorded as a
+  JSON string — inline base64 included — which bypassed the inline media cap
+  and was re-sent to the model as *text* on every later turn. The `user` turn
+  is now the context-safe projection (`question\n[audio audio/wav]`); media
+  stays per-call evidence, and a malformed part fails with
+  `InvalidModelInputError` before the workflow runs. Application objects are
+  still recorded as JSON.
 - **Gemini Interactions tool continuations no longer fail with `400 Invalid
   input received`.** The stateless (`store: false`) continuation omitted the
   required `name` on each `function_result` step. The adapter now remembers
   every `function_call`'s name by `call_id` and echoes it on the matching
-  result. Pre-existing; it affected every Interactions tool round-trip, not
-  only audio-bearing ones.
+  result; a tool result whose name cannot be resolved (application history
+  with no matching call and no `name`) throws `InvalidModelInputError` naming
+  the call id instead of sending an empty name for the provider to reject.
+  Pre-existing; it affected every Interactions tool round-trip, not only
+  audio-bearing ones.
 - Eval item annotations now preserve omitted runtime accounting fields and their
   model/workflow roll-ups across direct, CLI, and registered evals. Metadata is
   collected independently of trace capture and shallow-merged with valid user

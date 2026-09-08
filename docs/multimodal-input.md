@@ -66,8 +66,10 @@ keep the original input for that one ask.
 
 An attachment is **per-call evidence**, not session state. A successful ask
 does not automatically attach it to later `Session` turns — the next turn's
-request carries no media part. Application-created JSON-compatible rich user
-history can be persisted; inline `Uint8Array` media (image *or* audio) cannot be
+request carries no media part. When a `Session` receives a rich `ModelInput`
+as the workflow input, it records the `user` turn as the text projection
+(`question\n[audio audio/wav]`), never as JSON carrying the inline media.
+Application-created JSON-compatible rich user history can be persisted; inline `Uint8Array` media (image *or* audio) cannot be
 silently persisted and fails loudly with `Uint8Array media input cannot be
 persisted in session history`. The guard is type-agnostic over every non-text
 part, not a per-modality list. Context estimates count text and mark media —
@@ -219,7 +221,7 @@ composition; an upstream rejection surfaces as a typed `ProviderError`.
 | Provider URI | Transport | Sources | Live-certified compositions |
 | --- | --- | --- | --- |
 | `openrouter:` | Chat Completions `input_audio` (`{ data, format }`) | Bytes, base64. OpenRouter documents base64 only; the engine encodes your bytes for you | Text answer from speech **and** non-speech audio; tool call plus continuation; streaming. **Not** structured output — that composition is uncertified and unadvertised |
-| `openai:` | Chat Completions `input_audio`, `format ∈ {wav, mp3}` | Bytes, base64 | Single-turn text answer from speech audio. **Not** tool continuation (`gpt-audio-1.5` answered the continuation with a provider `500` five times) and **not** structured output (`response_format` is rejected with `400`) — both are provider-side and recorded, not advertised |
+| `openai:` | Chat Completions `input_audio`, `format ∈ {wav, mp3}` | Bytes, base64 | Single-turn text answer from speech audio (`GA2-text`). **Not** tool continuation (`gpt-audio-1.5` answered the continuation with a provider `500` five times) and **not** structured output (`response_format` is rejected with `400`) — both are provider-side and recorded, not advertised |
 | `google:` | Gemini Interactions `{ type: 'audio', data \| uri, mime_type }`, `store: false` | Bytes, base64, `provider-file` scoped to `google` | Text answer from speech **and** non-speech audio; tool call plus stateless continuation; structured output; streaming; an audio user turn re-sent from application session history |
 | `anthropic:` | — | — | Unsupported. The Claude Messages API defines no audio content block; an audio part is a zero-request `UnsupportedModelInputError` |
 | `openai-responses:` | — | — | Unsupported. OpenAI documents chat audio input on Chat Completions only |

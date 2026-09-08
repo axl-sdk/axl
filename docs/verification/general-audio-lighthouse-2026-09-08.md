@@ -144,6 +144,17 @@ rejected locally, naming the media type. Neither row needs a key.
 
 ## `openai:` rows — what was observed
 
+### GA2-text — single-turn text answer from speech audio (passes)
+
+One Chat Completions request carrying `input_audio` (`format: 'mp3'`);
+`unpriced: true` by design. Usage `prompt_tokens: 107`,
+`prompt_tokens_details: { audio_tokens: 80, text_tokens: 27 }`. No base64 in
+the response body or any event. This is the passing row behind the `openai:`
+capability-table entry.
+
+Answer: *"It sounds like you're describing phrases used to test typing or
+speech clarity."*
+
 ### GA4-openai — structured output is rejected by the provider
 
 `gpt-audio-1.5` rejects both `response_format: json_schema` and `json_object`:
@@ -188,7 +199,7 @@ None. Every row in the suite ran on 2026-09-08.
 | --- | --- | --- |
 | `google:` | text answer from speech and non-speech (GA1), tool continuation (GA3), structured output (GA4), streaming (GA8), history re-send (GA9) | — |
 | `openrouter:` | text answer (GA1-OR, GA6), tool continuation (GA6-tool), streaming (GA8-OR) | structured output (no row) |
-| `openai:` | single-turn text answer with audio (GA2 first turn) | tool continuation (provider 500), structured output (provider 400) |
+| `openai:` | single-turn text answer with audio (GA2-text) | tool continuation (provider 500), structured output (provider 400) |
 
 `providerMetadata` leak evidence remains indirect: passing rows assert that no
 base64 appears anywhere in observed response bodies or events.

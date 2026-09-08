@@ -558,6 +558,9 @@ switch. Run one row at a time with its ID as the `-t` selector:
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA1\]'
 AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA1-OR\]'
 
+# openai: single-turn text answer from speech audio (the advertised composition).
+AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vitest run --config vitest.integration.config.ts src/__tests__/integration-general-audio.test.ts -t '\[GA2-text\]'
+
 # Speech audio through a tool continuation (two logical requests each).
 # GA2 needs a third flag: gpt-audio-1.5 answers the continuation with a
 # provider-side 500 today, so the row is armed separately from the suite.
@@ -586,7 +589,7 @@ AXL_MULTIMODAL_LIVE=1 AXL_GENERAL_AUDIO_LIVE=1 pnpm --filter @axlsdk/axl exec vi
 | Row | Provider URI | Key |
 | --- | --- | --- |
 | GA1, GA3, GA4, GA8, GA9 | `google:` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
-| GA2, GA4-openai | `openai:` | `OPENAI_API_KEY` (GA2 also `AXL_GENERAL_AUDIO_OPENAI_TOOL_LIVE=1`) |
+| GA2, GA2-text, GA4-openai | `openai:` | `OPENAI_API_KEY` (GA2 also `AXL_GENERAL_AUDIO_OPENAI_TOOL_LIVE=1`) |
 | GA1-OR, GA6, GA6-tool, GA8-OR | `openrouter:` | `OPENROUTER_API_KEY` |
 | GA5, GA7 | local | none |
 

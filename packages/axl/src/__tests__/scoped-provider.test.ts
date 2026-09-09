@@ -283,3 +283,38 @@ describe('I5: the facade rethrows the original value', () => {
     expect(outcome.accounting.reasons).toEqual({ usage_missing: 1 });
   });
 });
+
+describe('I10: an adapter that throws synchronously from stream() settles its operation', () => {
+  it('does not leave an opened operation behind for the scope to abandon', async () => {
+    // A non-generator `stream` that validates eagerly throws on the CALL, not
+    // on the first `next()`. The operation is already open at that point and
+    // nothing later can settle it, because the generator is finished.
+    const boom = new Error('stream() rejected its arguments');
+    const eager: Provider = {
+      name: 'eager',
+      async chat() {
+        return { content: 'unused' };
+      },
+      stream(): AsyncGenerator<StreamChunk> {
+        throw boom;
+      },
+    };
+    const runtime = runtimeWith(eager);
+    const facade = runtime.resolveProvider('eager:m').provider;
+
+    const outcome = await runtime.trackOutcome(async () => {
+      const iterator = facade.stream([], { model: 'm' });
+      await iterator.next();
+      return null;
+    });
+
+    expect(outcome.status).toBe('rejected');
+    if (outcome.status === 'rejected') expect(outcome.error).toBe(boom);
+    // `usage_missing`, not `abandoned`: it reached a terminal state at the
+    // throw rather than being swept up at finalization.
+    expect(outcome.accounting.reasons).toEqual({ usage_missing: 1 });
+    expect(outcome.accounting.operations.unknown).toBe(1);
+    expect(outcome.accounting.operations.total).toBe(1);
+    expect(outcome.accounting.completeness).toBe('incomplete');
+  });
+});

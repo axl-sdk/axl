@@ -14,7 +14,8 @@ import { workflow } from '../workflow.js';
 import { agent } from '../agent.js';
 import { tool } from '../tool.js';
 import { AxlError } from '../errors.js';
-import type { Accounting } from '../accounting.js';
+import { AdmissionController, type Accounting } from '../accounting.js';
+import type { ChatMessage, ChatOptions, Provider, StreamChunk } from '../providers/types.js';
 import {
   deferred,
   registerAskWorkflow,
@@ -546,5 +547,108 @@ describe('I12: the core package never depends on @axlsdk/eval', () => {
     };
     await walk(root);
     expect(offenders).toEqual([]);
+  });
+});
+
+describe('I2/I9: abandonment is per scope, not a verdict forced onto ancestors', () => {
+  it('lets a still-open parent receive the settlement a finished child gave up on', async () => {
+    // The eval shape: an item scope returns while one of its calls is still in
+    // flight, inside a run scope that stays open long enough to see the real
+    // charge. Forcing the child's `abandoned` verdict upward would drop a real
+    // charge from a live budget — the one place a measured cost would be
+    // knowingly discarded.
+    const gate = deferred();
+    const held: Provider = {
+      name: 'held',
+      async chat(_messages: ChatMessage[], _options: ChatOptions) {
+        await gate.promise;
+        return {
+          content: 'ok',
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          cost: 0.75,
+        };
+      },
+      // eslint-disable-next-line require-yield
+      async *stream(): AsyncGenerator<StreamChunk> {
+        throw new Error('unused');
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'held' });
+    runtime.registerProvider('held', held);
+    const facade = runtime.resolveProvider('held:m').provider;
+    const admission = new AdmissionController({ limit: 100 });
+
+    let childAccounting!: Accounting;
+    let inFlight!: Promise<unknown>;
+
+    const parent = await runtime.trackOutcome(
+      async () => {
+        const child = await runtime.trackOutcome(async () => {
+          // Deliberately un-awaited, so the child scope finalizes first.
+          inFlight = facade.chat([], { model: 'm' });
+          return 'child-done';
+        });
+        childAccounting = child.accounting;
+        gate.resolve();
+        await inFlight;
+        return 'parent-done';
+      },
+      { admission },
+    );
+
+    // The child stopped waiting and says so, without inventing a charge.
+    expect(childAccounting.completeness).toBe('incomplete');
+    expect(childAccounting.reasons).toEqual({ abandoned: 1 });
+    expect(childAccounting.knownCost).toBe(0);
+    expectOperationIdentity(childAccounting);
+
+    // The parent was still open, so it got the real number — exactly once.
+    expect(parent.accounting.knownCost).toBeCloseTo(0.75, 10);
+    expect(parent.accounting.completeness).toBe('complete');
+    expect(parent.accounting.operations.settled).toBe(1);
+    expect(parent.accounting.operations.unknown).toBe(0);
+    expect(parent.accounting.operations.total).toBe(1);
+    expectOperationIdentity(parent.accounting);
+
+    // And so did the budget the parent is enforcing.
+    expect(admission.knownSpend).toBeCloseTo(0.75, 10);
+  });
+
+  it('ignores a settlement that arrives after every scope has finalized', async () => {
+    // Nothing is left to record it, and in particular a live controller must
+    // not be charged by an operation whose every scope has already reported.
+    const gate = deferred();
+    const held: Provider = {
+      name: 'late',
+      async chat() {
+        await gate.promise;
+        return { content: 'ok', cost: 0.5 };
+      },
+      // eslint-disable-next-line require-yield
+      async *stream(): AsyncGenerator<StreamChunk> {
+        throw new Error('unused');
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'late' });
+    runtime.registerProvider('late', held);
+    const facade = runtime.resolveProvider('late:m').provider;
+
+    const lateAdmission = new AdmissionController({ limit: 100 });
+    let inFlight!: Promise<unknown>;
+    const outcome = await runtime.trackOutcome(
+      async () => {
+        inFlight = facade.chat([], { model: 'm' });
+        return null;
+      },
+      { admission: lateAdmission },
+    );
+
+    expect(outcome.accounting.reasons).toEqual({ abandoned: 1 });
+    expect(lateAdmission.knownSpend).toBe(0);
+
+    gate.resolve();
+    await inFlight;
+
+    expect(lateAdmission.knownSpend).toBe(0);
   });
 });

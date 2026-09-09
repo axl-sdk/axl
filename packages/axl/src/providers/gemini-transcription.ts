@@ -286,7 +286,6 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
         governor: this.governor,
         provider: this.name,
         maxRetries: 0,
-        admission: currentDispatchAdmission(),
       },
     );
     if (!start.ok) {
@@ -343,7 +342,6 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
         governor: this.governor,
         provider: this.name,
         maxRetries: 0,
-        admission: currentDispatchAdmission(),
       },
     );
     if (!finalize.ok) {
@@ -393,7 +391,6 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
           governor: this.governor,
           provider: this.name,
           maxRetries: 0,
-          admission: currentDispatchAdmission(),
         },
       );
       if (!res.ok) {
@@ -537,7 +534,6 @@ export class GeminiTranscriptionProvider implements TranscriptionProvider {
           governor: this.governor,
           provider: this.name,
           maxRetries: 0,
-          admission: currentDispatchAdmission(),
         },
       );
       return res.ok ? 'deleted' : 'failed';

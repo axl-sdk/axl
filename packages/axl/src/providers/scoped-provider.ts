@@ -166,9 +166,16 @@ export function createScopedProvider(raw: Provider): Provider {
           try {
             start();
           } catch (error) {
-            // Admission denied before dispatch: nothing to close, nothing to
-            // settle beyond the retraction `openOperation` already recorded.
             finished = true;
+            // Two throws reach here. An admission denial from `openOperation`
+            // leaves `handle` undefined and has already recorded the
+            // retraction, so this is a no-op. An adapter whose `stream()`
+            // throws synchronously (a non-generator implementation that
+            // validates eagerly) leaves an OPENED operation that nothing can
+            // ever settle, since `finished` blocks every later call — settle it
+            // here rather than letting the scope report it as `abandoned` at
+            // finalization.
+            settleUnresolved();
             throw error;
           }
         }

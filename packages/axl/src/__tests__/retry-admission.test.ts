@@ -23,6 +23,7 @@ import { agent } from '../agent.js';
 import { OpenAICompatibleProvider } from '../providers/openai-compatible.js';
 import { OPENROUTER_PROFILE } from '../providers/profiles/openrouter.js';
 import { OpenAIEmbedder } from '../memory/embedder-openai.js';
+import { GeminiTranscriptionProvider } from '../providers/gemini-transcription.js';
 import { MemoryManager } from '../memory/manager.js';
 import { deferred } from './accounting-helpers.js';
 
@@ -239,6 +240,57 @@ describe('I7: a queued built-in chat request is not dispatched after closure', (
     expect(outcome.accounting.operations.byKind).toEqual({ chat: 1, external: 1 });
     expect(outcome.accounting.reasons).toEqual({});
   });
+  it('does NOT retract an operation whose earlier attempt already dispatched', async () => {
+    // The dangerous case: attempt 1 left the process and may well have been
+    // billed, then the budget closed during the backoff. Retracting here would
+    // erase a real, possibly-charged operation and let the scope claim it
+    // measured everything.
+    const admission = new AdmissionController({ limit: 1 });
+    const provider = compatibleProvider();
+    const runtime = new AxlRuntime({ defaultProvider: 'openrouter' });
+    runtime.registerProvider('openrouter', provider);
+    const facade = runtime.resolveProvider('openrouter:m').provider;
+
+    const firstDispatched = deferred();
+    let fetches = 0;
+    globalThis.fetch = vi.fn(async () => {
+      fetches += 1;
+      firstDispatched.resolve();
+      // Retryable, so the transport sleeps and tries again.
+      return { ok: false, status: 429, headers: new Headers(), text: async () => 'slow down' };
+    }) as never;
+
+    let chatError: unknown;
+    const outcome = await runtime.trackOutcome(
+      async () => {
+        const call = facade.chat([], { model: 'm' }).catch((error: unknown) => {
+          chatError = error;
+        });
+        await firstDispatched.promise;
+        // A sibling settles and closes the budget while attempt 2 is backing off.
+        await externalOperation({ name: 'sibling' }, async (report) => {
+          report.setCost(1);
+        });
+        await vi.advanceTimersByTimeAsync(5000);
+        await call;
+        return null;
+      },
+      { admission },
+    );
+
+    expect(fetches).toBe(1);
+    expect(chatError).toBeInstanceOf(AdmissionDeniedError);
+    // The dispatched call is UNKNOWN, not denied: we cannot prove it was free.
+    expect(outcome.accounting.operations.unknown).toBe(1);
+    expect(outcome.accounting.reasons).toEqual({ usage_missing: 1 });
+    expect(outcome.accounting.operations.denied).toBe(0);
+    expect(outcome.accounting.completeness).toBe('incomplete');
+    // The identity still holds, and the chat is still counted as an operation.
+    expect(outcome.accounting.operations.total).toBe(2);
+    expect(outcome.accounting.operations.settled).toBe(1);
+    expect(outcome.accounting.operations.byKind).toEqual({ chat: 1, external: 1 });
+    expect(outcome.accounting.knownCost).toBe(1);
+  });
 });
 
 describe('I7: embedding and transcription transports honor the same hook', () => {
@@ -317,6 +369,72 @@ describe('I7: embedding and transcription transports honor the same hook', () =>
     expect(sawDenial).toBe(true);
     // A budget stop must stay tellable from a vendor failure.
     expect(sawWrapper).toBe(false);
+  });
+  it('still deletes an uploaded file when the billable request is denied', async () => {
+    // Dispatch admission gates BILLABLE requests. Gating the Files API upload
+    // and its cleanup DELETE would turn a budget stop into orphaned audio
+    // sitting on the vendor's storage for its whole retention window.
+    const admission = new AdmissionController({ limit: 1 });
+    const runtime = new AxlRuntime();
+    runtime.registerTranscriptionProvider(
+      'geminivoice',
+      new GeminiTranscriptionProvider({ apiKey: 'key' }) as never,
+    );
+    runtime.register(
+      workflow({
+        name: 'transcribe-upload',
+        input: z.any(),
+        handler: async (ctx) =>
+          ctx.transcribe({
+            model: 'geminivoice:gemini-3.5-transcribe',
+            audio: { type: 'bytes', data: new Uint8Array([1, 2, 3]), mediaType: 'audio/wav' },
+          } as never),
+      }),
+    );
+
+    const seen: Array<[string, string | undefined]> = [];
+    globalThis.fetch = vi.fn(async (url: unknown, init?: RequestInit) => {
+      seen.push([String(url), init?.method]);
+      if (seen.length === 1) {
+        return new Response('', {
+          status: 200,
+          headers: { 'x-goog-upload-url': 'https://generativelanguage.googleapis.com/session' },
+        });
+      }
+      if (seen.length === 2) {
+        // The upload is finalized — the file now exists and must be cleaned up.
+        // The budget closes right here, before the billable request.
+        await externalOperation({ name: 'sibling' }, async (report) => {
+          report.setCost(1);
+        });
+        return new Response(
+          JSON.stringify({
+            file: {
+              name: 'files/orphan-candidate',
+              uri: 'https://files.test/orphan-candidate',
+              mimeType: 'audio/wav',
+              state: 'ACTIVE',
+            },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(null, { status: 204 });
+    }) as never;
+
+    const outcome = await runtime.trackOutcome(() => runtime.execute('transcribe-upload', {}), {
+      admission,
+    });
+
+    expect(outcome.status).toBe('rejected');
+    expect(outcome.error).toBeInstanceOf(AdmissionDeniedError);
+    // The billable `interactions` request never left; the DELETE still did.
+    expect(seen).toEqual([
+      ['https://generativelanguage.googleapis.com/upload/v1beta/files', 'POST'],
+      ['https://generativelanguage.googleapis.com/session', 'POST'],
+      ['https://generativelanguage.googleapis.com/v1beta/files/orphan-candidate', 'DELETE'],
+    ]);
+    expect((outcome.error as { cleanupStatus?: string }).cleanupStatus).toBe('deleted');
   });
 });
 

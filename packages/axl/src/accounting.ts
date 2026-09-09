@@ -409,12 +409,13 @@ class AccountingScope {
   finalize(): void {
     if (this.finalized) return;
     for (const op of [...this.openOps.values()]) {
-      // Propagates upward too, so an ancestor that is still open learns the
-      // operation is unresolved rather than silently dropping it.
-      settleOperationUp(this, op, {
-        outcome: 'unknown',
-        reason: op.kind === 'external' ? 'external_unreported' : 'abandoned',
-      });
+      // LOCAL only. This scope stops here and reports the operation unresolved,
+      // but an ancestor that is still open has not given up on it: the real
+      // settlement, if it ever arrives, still reaches those ancestors and their
+      // controllers. Forcing `abandoned` upward would drop a real charge from a
+      // live budget. Once every scope has finalized, a late settlement finds
+      // nothing to record and is ignored.
+      this.recordUnknown(op, op.kind === 'external' ? 'external_unreported' : 'abandoned');
     }
     this.finalized = true;
   }
@@ -467,16 +468,17 @@ export function runWithDispatchAdmission<T>(
   return dispatchAdmissionStorage.run(admission, fn);
 }
 
-/** @internal `true` when an accounting scope is active on this async context. */
-export function hasAccountingScope(): boolean {
-  return accountingStorage.getStore() !== undefined;
-}
-
 /**
  * Walk the scope chain from `start` and apply one terminal recording per scope,
- * deduped by operation id. Stops at the first scope that already saw the
- * operation or has finalized — everything above it is reached through that
- * scope, so there is nothing left to record.
+ * deduped by operation id.
+ *
+ * A scope that already recorded a terminal for this operation — because it saw
+ * one, or because it finalized while the operation was still in flight and
+ * abandoned it locally — is SKIPPED rather than ending the walk. Abandonment is
+ * per scope: a child that gave up on an operation must not force the same
+ * verdict onto an ancestor that is still open and can still receive the real
+ * settlement. For those ancestors this walk is the operation's first terminal,
+ * so nothing is replaced and nothing is double counted.
  */
 function settleOperationUp(
   start: AccountingScope,
@@ -496,7 +498,10 @@ function settleOperationUp(
   const chargedControllers = new Set<AdmissionController>();
   let scope: AccountingScope | undefined = start;
   while (scope) {
-    if (scope.isFinalized || scope.hasSeen(op.id)) return;
+    if (scope.isFinalized || scope.hasSeen(op.id)) {
+      scope = scope.parent;
+      continue;
+    }
     switch (outcome.outcome) {
       case 'settled':
         scope.recordSettled(op, outcome.cost, outcome.provenance, outcome.usage);
@@ -583,9 +588,12 @@ export function openOperation(descriptor: OperationDescriptor): OperationHandle 
   const denier = denyingController(scope);
   if (denier) {
     // A denied operation is never opened, so it contributes to `denied` only.
+    // Same termination rule as the open walk below: a finalized scope ends it,
+    // so no ancestor can accumulate a `denied` count for an operation it would
+    // never have counted in `total`.
     let s: AccountingScope | undefined = scope;
-    while (s) {
-      if (!s.isFinalized) s.recordDenied();
+    while (s && !s.isFinalized) {
+      s.recordDenied();
       s = s.parent;
     }
     throw admissionDenied(denier.controller, descriptor);
@@ -618,9 +626,17 @@ export function openOperation(descriptor: OperationDescriptor): OperationHandle 
       beforeDispatch(_attempt: number): void {
         const closed = denyingController(scope);
         if (!closed) return;
-        // Retract before throwing: the request never leaves, so it must not
-        // remain an opened operation, and it invents no charge.
-        finish({ outcome: 'retracted' });
+        if (op.dispatched) {
+          // A RETRY attempt: an earlier attempt already left the process and
+          // may well have been billed. Retracting here would erase a real
+          // operation and let the scope claim `complete`. It is unresolved
+          // work, which is exactly `usage_missing`.
+          finish({ outcome: 'unknown', reason: 'usage_missing' });
+        } else {
+          // Nothing ever left, so the operation is retracted: no charge, no
+          // reason, no incompleteness.
+          finish({ outcome: 'retracted' });
+        }
         throw admissionDenied(closed.controller, descriptor);
       },
     },
@@ -734,14 +750,16 @@ export async function externalOperation<T>(
   if (!handle) {
     let reportedOutside = false;
     return fn({
+      // Same checks in the same order as the in-scope report below, so a
+      // caller's bug reads identically with and without a scope.
       setCost(amountUsd: number): void {
-        validateReportedCost(amountUsd);
         if (reportedOutside) {
           throw new AxlError(
             'INVALID_COST_REPORT',
             'report.setCost() was already called for this external operation.',
           );
         }
+        validateReportedCost(amountUsd);
         reportedOutside = true;
       },
     });

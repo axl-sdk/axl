@@ -72,6 +72,36 @@ describe('parseEvalArgs()', () => {
   });
 });
 
+describe('--budget', () => {
+  it('captures the raw value without interpreting it', () => {
+    // Parsing belongs to `parseBudget`, which both runEval and rescore call —
+    // one rejection message, one place to change the accepted syntax. The arg
+    // parser must not quietly normalize (or accept) anything on its own.
+    expect(parseEvalArgs(['evals/a.eval.ts', '--budget', '$1.50']).budget).toBe('$1.50');
+    expect(parseEvalArgs(['evals/a.eval.ts', '--budget', '0.50']).budget).toBe('0.50');
+    expect(parseEvalArgs(['evals/a.eval.ts', '--budget', 'not-a-budget']).budget).toBe(
+      'not-a-budget',
+    );
+  });
+
+  it('is absent when the flag is not passed', () => {
+    expect(parseEvalArgs(['evals/a.eval.ts']).budget).toBeUndefined();
+  });
+
+  it('consumes its value rather than leaving it as a path', () => {
+    // The failure this guards: `--budget` missing from VALUE_FLAGS would leave
+    // `$1` in `paths`, and the CLI would try to run an eval file called "$1".
+    const parsed = parseEvalArgs(['evals/a.eval.ts', '--budget', '$1', 'evals/b.eval.ts']);
+    expect(parsed.paths).toEqual(['evals/a.eval.ts', 'evals/b.eval.ts']);
+    expect(parsed.budget).toBe('$1');
+  });
+
+  it('is a known flag, so it does not trip the unknown-flag guard', () => {
+    expect(KNOWN_FLAGS.has('--budget')).toBe(true);
+    expect(VALUE_FLAGS.has('--budget')).toBe(true);
+  });
+});
+
 describe('envInt()', () => {
   it('reads a positive integer', () => {
     process.env.AXL_EVAL_CONCURRENCY = '8';

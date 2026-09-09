@@ -51,13 +51,32 @@ function summaryWith(
   };
 }
 
+/**
+ * `EvalSummaryTable` now takes the whole result — its accounting footer needs
+ * the run, not just a number. These fixtures carry no `accounting` block, so
+ * they exercise the legacy (`unverified`) reading path.
+ */
+function resultWith(summary: EvalResultData['summary'], items: EvalItem[]): EvalResultData {
+  return {
+    id: 'r1',
+    dataset: 'ds',
+    timestamp: '2026-09-09T00:00:00.000Z',
+    totalCost: 0,
+    duration: 100,
+    items,
+    summary,
+  };
+}
+
 describe('EvalSummaryTable failure badge', () => {
   it('shows the thinned-sample badge when a scorer ran and failed', () => {
     render(
       <EvalSummaryTable
-        summary={summaryWith(2, 1)}
-        items={[okItem('1', 0.9), okItem('2', 0.9), failedItem('3')]}
-        totalCost={0}
+        result={resultWith(summaryWith(2, 1), [
+          okItem('1', 0.9),
+          okItem('2', 0.9),
+          failedItem('3'),
+        ])}
       />,
     );
     expect(screen.getByText(/2\/3 scored, 1 failed/)).toBeInTheDocument();
@@ -66,9 +85,7 @@ describe('EvalSummaryTable failure badge', () => {
   it('shows no badge when nothing failed', () => {
     render(
       <EvalSummaryTable
-        summary={summaryWith(2, 0)}
-        items={[okItem('1', 0.9), okItem('2', 0.9)]}
-        totalCost={0}
+        result={resultWith(summaryWith(2, 0), [okItem('1', 0.9), okItem('2', 0.9)])}
       />,
     );
     expect(screen.queryByText(/failed/)).not.toBeInTheDocument();
@@ -79,9 +96,11 @@ describe('EvalSummaryTable failure badge', () => {
     // still carries the duration discriminator on the items.
     render(
       <EvalSummaryTable
-        summary={summaryWith(undefined, undefined)}
-        items={[okItem('1', 0.9), failedItem('2'), failedItem('3')]}
-        totalCost={0}
+        result={resultWith(summaryWith(undefined, undefined), [
+          okItem('1', 0.9),
+          failedItem('2'),
+          failedItem('3'),
+        ])}
       />,
     );
     expect(screen.getByText(/1\/3 scored, 2 failed/)).toBeInTheDocument();
@@ -104,9 +123,11 @@ describe('EvalSummaryTable skipped (N/A) chip', () => {
   it('shows the N/A chip when a scorer skipped some items via applies', () => {
     render(
       <EvalSummaryTable
-        summary={summaryWith(2, 0, 1)}
-        items={[okItem('1', 0.9), okItem('2', 0.9), skippedItem('3')]}
-        totalCost={0}
+        result={resultWith(summaryWith(2, 0, 1), [
+          okItem('1', 0.9),
+          okItem('2', 0.9),
+          skippedItem('3'),
+        ])}
       />,
     );
     expect(screen.getByText(/N\/A: 1/)).toBeInTheDocument();
@@ -117,9 +138,7 @@ describe('EvalSummaryTable skipped (N/A) chip', () => {
   it('shows no N/A chip when nothing was skipped', () => {
     render(
       <EvalSummaryTable
-        summary={summaryWith(2, 0, 0)}
-        items={[okItem('1', 0.9), okItem('2', 0.9)]}
-        totalCost={0}
+        result={resultWith(summaryWith(2, 0, 0), [okItem('1', 0.9), okItem('2', 0.9)])}
       />,
     );
     expect(screen.queryByText(/N\/A:/)).not.toBeInTheDocument();
@@ -130,9 +149,11 @@ describe('EvalSummaryTable skipped (N/A) chip', () => {
     // the skipped marker on the items.
     render(
       <EvalSummaryTable
-        summary={summaryWith(undefined, undefined, undefined)}
-        items={[okItem('1', 0.9), skippedItem('2'), skippedItem('3')]}
-        totalCost={0}
+        result={resultWith(summaryWith(undefined, undefined, undefined), [
+          okItem('1', 0.9),
+          skippedItem('2'),
+          skippedItem('3'),
+        ])}
       />,
     );
     expect(screen.getByText(/N\/A: 2/)).toBeInTheDocument();

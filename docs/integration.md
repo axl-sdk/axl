@@ -212,10 +212,20 @@ An artifact is only ever published behind its history row:
    expiry
 
 If step 3 throws, the artifact is rolled back rather than left as an orphan
-pointing at a row that never existed. `runtime.deleteEvalResult(id)` runs the
-mirror image: the artifact is marked `delete_pending` **before** the row is
-removed, so a storage failure surfaces to the caller with an intent the next
-sweep finishes — never a silent half-delete reported as success.
+pointing at a row that never existed. A result may only commit or delete an
+artifact whose manifest names **that result** as its owner, so a rescore that
+degraded while naming its source — or a hand-edited import — can never rewrite
+or destroy another run's evidence. When step 4 finds nothing to commit, the
+stored row is corrected to `diagnostics.status: 'unavailable'` rather than
+published claiming evidence that is not there.
+
+`runtime.deleteEvalResult(id)` runs the mirror image: the history row is removed
+**first**, and only then is the artifact marked `delete_pending` and deleted. A
+storage failure surfaces to the caller; a crash between the two steps is covered
+by reclamation, which already reclaims a committed artifact whose owning row is
+gone. (Recording the intent first would have the sweeper destroy, within a
+minute, the evidence of a result the caller was just told had *not* been
+deleted.)
 
 ### Reclamation
 
@@ -225,6 +235,11 @@ holds the process open; stopped by `runtime.shutdown()`). It removes:
 - artifacts marked `delete_pending`
 - committed artifacts whose owning row is gone or whose expiry has passed
 - staged artifacts whose writer lease expired — a crashed run
+
+The lease is held for the **writer's lifetime**, renewed on a timer the runtime
+owns and stopped at finalize or rollback — not renewed by writing. A run that
+exhausts its capture byte bound early, or that waits on a tool or a human for
+longer than a lease, therefore keeps its artifact.
 
 A staged artifact whose lease is **live** is never touched, so a sweep cannot
 race a running eval. A writer that died mid-run reads back as `interrupted`

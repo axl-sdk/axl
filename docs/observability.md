@@ -838,6 +838,12 @@ One JSONL line per phase of a model call, `v: 1`:
 | `attempt` | An additional **transport** attempt for the same logical call (a 429 retry is not an output repair) |
 | `end` | The response, or the error |
 
+An `end` record for a **stream** also carries a `termination` string when the
+stream did not simply finish — the consumer broke out of the loop, aborted it,
+the stream stopped without a `done` chunk, or it threw mid-iteration. Without
+it a sealed stream and a call that genuinely never came back are
+indistinguishable, since both leave a `start` with no response.
+
 Every record carries the identity needed to place it: `operationId`, `kind`,
 `provider`, `model`, `transportAttempts`, plus `executionId` / `askId` /
 `parentAskId` / `turn`, the `caseIndex` and `scorer` of the eval scope it ran

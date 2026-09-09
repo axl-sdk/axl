@@ -838,6 +838,8 @@ export class AxlRuntime extends EventEmitter {
   private artifactStore?: DiagnosticArtifactStore;
   private artifactLeaseMs = DEFAULT_ARTIFACT_LEASE_MS;
   private artifactSweepTimer?: ReturnType<typeof setInterval>;
+  /** Lease-renewal timers for artifacts currently being written, by id. */
+  private readonly artifactRenewals = new Map<string, ReturnType<typeof setInterval>>();
 
   constructor(config?: AxlConfig) {
     super();
@@ -981,19 +983,34 @@ export class AxlRuntime extends EventEmitter {
     const store = this.requireArtifactStore();
     const leaseMs = this.artifactLeaseMs;
     const staged = await store.stage(owner, { leaseMs });
-    let nextRenewal = Date.now() + leaseMs / 2;
+    // The lease belongs to the WRITER's lifetime, not to its write rate.
+    // Renewing from inside `append` looks equivalent and is not: a run that
+    // exhausts `maxRunBytes` at minute two stops appending forever, and a run
+    // waiting on a tool or a human approval may not call a provider for longer
+    // than a lease. Either way the sweeper would delete a live run's evidence
+    // and the run would then fail to finalize the artifact it had been filling.
+    const timer = setInterval(
+      () => {
+        void staged.renewLease().catch(() => undefined);
+      },
+      Math.max(1, Math.floor(leaseMs / 2)),
+    );
+    timer.unref?.();
+    this.artifactRenewals.set(staged.artifactId, timer);
     return {
       artifactId: staged.artifactId,
       sink: {
-        append: async (line: string) => {
-          await store.append(staged.artifactId, line);
-          if (Date.now() >= nextRenewal) {
-            nextRenewal = Date.now() + leaseMs / 2;
-            await staged.renewLease();
-          }
-        },
+        append: (line: string) => store.append(staged.artifactId, line),
       },
     };
+  }
+
+  /** Stop renewing a lease once the writer is done with the artifact. */
+  private stopArtifactRenewal(artifactId: string): void {
+    const timer = this.artifactRenewals.get(artifactId);
+    if (!timer) return;
+    clearInterval(timer);
+    this.artifactRenewals.delete(artifactId);
   }
 
   /** Seal a staged artifact's manifest. Called before the history row is saved. */
@@ -1002,11 +1019,16 @@ export class AxlRuntime extends EventEmitter {
     status: ArtifactStatus,
     reason?: string,
   ): Promise<ArtifactManifest> {
+    // Stop renewing FIRST: a renewal landing after the finalized manifest is
+    // exactly the write the store's serializer exists to order, and there is
+    // nothing left to keep alive.
+    this.stopArtifactRenewal(artifactId);
     return this.requireArtifactStore().finalize(artifactId, status, reason);
   }
 
   /** Discard a staged artifact whose owner will never be written. */
   async rollbackDiagnosticArtifact(artifactId: string): Promise<void> {
+    this.stopArtifactRenewal(artifactId);
     await this.requireArtifactStore().rollback(artifactId);
   }
 
@@ -1043,7 +1065,12 @@ export class AxlRuntime extends EventEmitter {
     const opened = await this.artifactStore.open(artifactId);
     if (!opened) return undefined;
     const { manifest } = opened;
-    if (manifest.state === 'delete_pending') return undefined;
+    // §12.1: only a committed artifact is readable here. A staged one has no
+    // owner row yet (or never will), and a delete_pending one is on its way
+    // out. The CLI's standalone bundle is deliberately not on this path — it
+    // reads through `getDiagnosticArtifactStore()` because it has no history
+    // row to resolve through.
+    if (manifest.state !== 'committed') return undefined;
     if (manifest.expiresAt !== undefined && manifest.expiresAt <= Date.now()) return undefined;
     const retention = await this.stateStore.getEvalRetention?.(manifest.owner.id);
     if (retention && !retention.exists) return undefined;
@@ -1093,7 +1120,53 @@ export class AxlRuntime extends EventEmitter {
   private artifactIdOf(data: unknown): string | undefined {
     const diagnostics = (data as { diagnostics?: { artifactId?: unknown } } | undefined)
       ?.diagnostics;
-    return typeof diagnostics?.artifactId === 'string' ? diagnostics.artifactId : undefined;
+    if (typeof diagnostics?.artifactId !== 'string') return undefined;
+    return diagnostics.artifactId === '' ? undefined : diagnostics.artifactId;
+  }
+
+  /**
+   * Rewrite an entry's diagnostics to say plainly that its evidence is gone.
+   *
+   * Mutates the entry in place on purpose: the caller usually holds the same
+   * `EvalResult` object it is about to return to a user, and a result that
+   * claims `complete` while storage has nothing is the failure being fixed.
+   * The dangling id is cleared too — `''` is the sentinel every lifecycle path
+   * already skips.
+   */
+  private downgradeDiagnostics(entry: EvalHistoryEntry): void {
+    const data = entry.data as { diagnostics?: Record<string, unknown> } | undefined;
+    if (!data?.diagnostics) return;
+    if (data.diagnostics.artifactId === '' && data.diagnostics.status === 'unavailable') return;
+    data.diagnostics = {
+      ...data.diagnostics,
+      artifactId: '',
+      status: 'unavailable',
+      reason: 'the captured-request artifact for this result is no longer available',
+    };
+  }
+
+  /**
+   * The artifact id `ownerId` actually owns, or `undefined`.
+   *
+   * `diagnostics.artifactId` is data on a result object, and a result can carry
+   * an id that belongs to a DIFFERENT run — a rescore that degraded while
+   * naming its source, or an imported blob. Committing or deleting on the
+   * strength of that field alone lets one entry rewrite or destroy another
+   * entry's evidence, so ownership is confirmed against the manifest before
+   * any lifecycle write.
+   */
+  private async ownedArtifactId(
+    artifactId: string | undefined,
+    ownerId: string,
+  ): Promise<string | undefined> {
+    if (!artifactId || !this.artifactStore) return undefined;
+    try {
+      const opened = await this.artifactStore.open(artifactId);
+      if (!opened) return undefined;
+      return opened.manifest.owner.id === ownerId ? artifactId : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -2161,6 +2234,8 @@ export class AxlRuntime extends EventEmitter {
 
     // Stop the artifact sweeper before anything else touches the state store —
     // a sweep that fires mid-teardown would query a closing connection.
+    for (const timer of this.artifactRenewals.values()) clearInterval(timer);
+    this.artifactRenewals.clear();
     if (this.artifactSweepTimer) {
       clearInterval(this.artifactSweepTimer);
       this.artifactSweepTimer = undefined;
@@ -2393,7 +2468,13 @@ export class AxlRuntime extends EventEmitter {
 
   /** Save an eval result to history. */
   async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
-    const artifactId = this.artifactIdOf(entry.data);
+    // Only an artifact this entry OWNS may be committed against it. A result
+    // carrying someone else's id — a degraded rescore naming its source, an
+    // imported blob — would otherwise rewrite that artifact's retention.
+    const artifactId = await this.ownedArtifactId(this.artifactIdOf(entry.data), entry.id);
+    // A pointer to an artifact that is already gone (swept, or removed out of
+    // band) must not be persisted as if it were readable.
+    if (!artifactId) this.downgradeDiagnostics(entry);
 
     // Add to in-memory cache (newest first)
     this.evalHistory.unshift(entry);
@@ -2419,9 +2500,16 @@ export class AxlRuntime extends EventEmitter {
     // bytes it owns.
     if (artifactId && this.artifactStore) {
       const retention = await this.stateStore.getEvalRetention?.(entry.id);
-      await this.artifactStore.commit(artifactId, {
+      const committed = await this.artifactStore.commit(artifactId, {
         ...(retention?.expiresAt !== undefined ? { expiresAt: retention.expiresAt } : {}),
       });
+      if (!committed.ok) {
+        // The artifact vanished between the ownership check and the commit.
+        // The row is already stored, so correct it in place rather than leaving
+        // a published result promising evidence it cannot serve.
+        this.downgradeDiagnostics(entry);
+        await this.stateStore.saveEvalResult?.(entry).catch(() => undefined);
+      }
     }
 
     // Emit for live aggregation (e.g., Studio eval trends)
@@ -2557,19 +2645,20 @@ export class AxlRuntime extends EventEmitter {
     const evalName = existing?.eval;
     const artifactId = this.artifactIdOf(existing?.data);
 
-    // Record the deletion intent BEFORE the history row goes away. Once the row
-    // is gone the artifact is unreachable through any public path, so if the
-    // process dies between the two steps the intent is the only thing that can
-    // tell reconciliation to finish the job — the caller is never asked to
-    // re-supply a blob it just deleted.
-    if (artifactId && this.artifactStore) {
-      await this.artifactStore.markDeletePending(artifactId);
-    }
+    // Confirmed ownership only: a result carrying another run's artifact id
+    // must not be able to delete that run's evidence.
+    const ownedArtifactId = await this.ownedArtifactId(artifactId, id);
 
     const beforeLength = this.evalHistory.length;
     this.evalHistory = this.evalHistory.filter((e) => e.id !== id);
     const removedFromMemory = this.evalHistory.length < beforeLength;
 
+    // The row goes FIRST, then the deletion intent. Writing the intent first
+    // looked safer and is not: a row delete that then fails leaves an intent
+    // the sweeper honours within a minute, destroying the evidence of a result
+    // the caller was just told had NOT been deleted. Crash-safety in the other
+    // direction is already covered — reconciliation reclaims any committed
+    // artifact whose owner row is gone.
     let removedFromStore = false;
     if (this.stateStore.deleteEvalResult) {
       removedFromStore = await this.stateStore.deleteEvalResult(id);
@@ -2577,10 +2666,12 @@ export class AxlRuntime extends EventEmitter {
 
     // The bytes are part of the delete, not an afterthought: this method reports
     // success only once they are gone. A failure here surfaces to the caller
-    // with the `delete_pending` intent still on disk, so a retry or the next
+    // with the `delete_pending` intent recorded, so a retry or the next
     // reconciliation sweep completes it.
-    if (artifactId && this.artifactStore) {
-      await this.artifactStore.delete(artifactId);
+    if (ownedArtifactId && this.artifactStore) {
+      this.stopArtifactRenewal(ownedArtifactId);
+      await this.artifactStore.markDeletePending(ownedArtifactId);
+      await this.artifactStore.delete(ownedArtifactId);
     }
 
     const removed = removedFromMemory || removedFromStore;

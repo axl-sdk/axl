@@ -130,6 +130,15 @@ export type CapturedRequestRecord = {
   request?: CapturedRequest;
   response?: CapturedResponse;
   error?: CapturedError;
+  /**
+   * Why an operation ended without a response, when it ended deliberately.
+   *
+   * A stream closed by a stall timeout, a consumer `break`, or an adapter that
+   * simply stopped yielding is NOT a call that never came back. Without this
+   * the two are indistinguishable, and `start_only` — the status reserved for a
+   * genuinely hung call — stops discriminating.
+   */
+  termination?: string;
   correction?: CapturedCorrection;
   captured: {
     fidelity: 'runtime_request';
@@ -352,6 +361,19 @@ export class RequestCaptureChannel {
     this.stoppedPromise = new Promise<void>((resolve) => {
       this.stoppedSignal = resolve;
     });
+  }
+
+  /**
+   * Report a capture-side failure from outside the channel.
+   *
+   * The producers on the provider path (request projection, redaction, record
+   * assembly) can throw on inputs that are perfectly legal for a provider call
+   * — a `json_schema.schema` holding a function, a content part whose `type` no
+   * adapter recognizes. None of that may fail the call, so those sites catch
+   * and report here: capture stops and says why, and nothing else changes.
+   */
+  fail(reason: string): void {
+    this.stop('unavailable', reason);
   }
 
   /** Stop capturing for the rest of the run and remember why. */

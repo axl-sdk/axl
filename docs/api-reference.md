@@ -1872,7 +1872,7 @@ Storage for [captured requests](observability.md#captured-requests-opt-in), conf
 | `root` | `string?` | — | Directory for the built-in `FileDiagnosticArtifactStore`. One of `root` or `store` is required for capture |
 | `store` | `DiagnosticArtifactStore?` | — | A custom store. Takes precedence over `root` |
 | `sweepIntervalMs` | `number` | `60_000` | Reclamation cadence. The timer is `unref`'d and cleared by `runtime.shutdown()` |
-| `leaseMs` | `number` | `300_000` | How long a writer's lease survives without renewal before its staged artifact is treated as abandoned. Renewed automatically while a run writes |
+| `leaseMs` | `number` | `300_000` | How long a writer's lease survives without renewal before its staged artifact is treated as abandoned. Renewed automatically on a timer for as long as the writer holds the artifact, whether or not it is still writing; stopped at finalize/rollback |
 
 | Method | Returns | Description |
 |--------|---------|-------------|
@@ -1881,7 +1881,7 @@ Storage for [captured requests](observability.md#captured-requests-opt-in), conf
 | `finalizeDiagnosticArtifact(id, status, reason?)` | `Promise<ArtifactManifest>` | Declare what the writer managed to capture |
 | `rollbackDiagnosticArtifact(id)` | `Promise<void>` | Discard a staged artifact whose history row never landed |
 | `copyDiagnosticArtifact(sourceId, owner, options?)` | `Promise<{ artifactId, truncated } \| undefined>` | Copy records under a new owner, bounded by `maxBytes`, preserving original operation ids |
-| `openDiagnosticArtifact(id)` | `Promise<{ manifest, lines } \| undefined>` | Read an artifact. Returns `undefined` when it is pending deletion, logically expired, or its owning history row is gone |
+| `openDiagnosticArtifact(id)` | `Promise<{ manifest, lines } \| undefined>` | Read a **committed** artifact. Returns `undefined` when it is still staged, pending deletion, logically expired, or its owning history row is gone. Read a not-yet-committed artifact through `getDiagnosticArtifactStore()` instead |
 | `reconcileDiagnosticArtifacts()` | `Promise<{ removed: string[] }>` | Run a reclamation pass by hand (also runs at startup and on the sweep timer) |
 
 Lifecycle, retention and reclamation rules: [integration.md](integration.md#diagnostic-artifact-storage).

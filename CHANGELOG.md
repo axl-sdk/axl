@@ -115,18 +115,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   byte counts, redaction), while `EvalItem.diagnostics` and
   `ScorerDetail.diagnostics` point at the operations they own. Capture is
   **off** by default and never changes what a run costs: a failing, bounded or
-  redacted capture leaves `accounting` byte-identical. Records are bounded per
-  record, per run and per pending queue, written through a queue that never
-  delays a provider call, and redacted before they are written whenever
-  `trace.redact` is on. A call that never returned leaves a `start` record with
-  no `end` — the one you most want to read.
+  redacted capture leaves `accounting` byte-identical. Every capture entry point
+  is total — an unserializable schema or an unrecognized content part degrades
+  the diagnostics rail to `status: 'unavailable'` with a reason and leaves the
+  run's accounting, admission, retries and returned value untouched. Records are
+  bounded per record, per run and per pending queue, written through a queue
+  that never delays a provider call, and redacted before they are written
+  whenever `trace.redact` is on. A call that never returned leaves a `start`
+  record with no `end` — the one you most want to read; a stream that was closed
+  early, aborted, ended without a `done` chunk, or threw mid-iteration is
+  instead sealed with an `end` record carrying an explicit `termination`, so the
+  two cases stay distinguishable.
 - **Diagnostic artifact store.** `diagnostics.artifacts` configures where
   captured requests live: `root` for the built-in `FileDiagnosticArtifactStore`,
   or a custom `store` implementing `DiagnosticArtifactStore`. Artifacts follow
   the eval history row that owns them — staged while the run writes, committed
   only after the row is saved (rolled back if that save fails), deleted with
   `deleteEvalResult`, and reclaimed by a startup pass plus a periodic sweep for
-  anything orphaned, expired or abandoned by a dead writer. Expiry mirrors the
+  anything orphaned, expired or abandoned by a dead writer. A row may only
+  commit or delete an artifact whose manifest names **it** as the owner, so one
+  result can never rewrite or destroy another's evidence; `commit`,
+  `markDeletePending` and `refreshExpiry` report an artifact that has already
+  gone (`{ ok: false, reason: 'missing' }`) instead of succeeding silently, and
+  a result whose artifact vanished is stored as `unavailable` rather than
+  published claiming evidence it cannot serve. The writer's lease is renewed on
+  a timer for as long as it holds the artifact — not by writing — so a run that
+  exhausted its capture bound early, or that is waiting on a tool or a human,
+  keeps its records. `runtime.openDiagnosticArtifact` serves only committed
+  artifacts. Expiry mirrors the
   owning row: `StateStore.getEvalRetention` is implemented by the Memory, SQLite
   and Redis stores (the last from `PTTL`), and a custom store without it is
   refused **at configuration time** rather than mid-run. An interrupted writer's

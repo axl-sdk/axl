@@ -724,3 +724,189 @@ describe('A12 — bounded, private, failure-tolerant capture', () => {
     expect(broken.status.status).toBe('unavailable');
   });
 });
+
+// ── Capture failure is contained (adversarial review H1, M4) ─────────
+
+/**
+ * The frozen guarantee is that accounting is byte-identical with capture on,
+ * off, truncated or failing. `RequestCaptureChannel.write()` was already total;
+ * these pin the rest of the path, where a projection failure sits between an
+ * OPENED accounting operation and the provider call.
+ *
+ * Both inputs below are inside the public contract: `ResponseFormat.json_schema.schema`
+ * is typed `unknown`, and a content part's `type` is not validated before it
+ * reaches an adapter.
+ */
+describe('capture failures never reach the run', () => {
+  /** A provider that answers, and remembers exactly what it was asked. */
+  function recordingProvider(): Provider & { calls: ChatOptions[] } {
+    const calls: ChatOptions[] = [];
+    return {
+      name: 'scripted',
+      calls,
+      async chat(_messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> {
+        calls.push(options);
+        return {
+          content: 'answer',
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          cost: 0.25,
+        };
+      },
+    } as Provider & { calls: ChatOptions[] };
+  }
+
+  function providerRuntime(): {
+    runtime: AxlRuntime;
+    provider: Provider & { calls: ChatOptions[] };
+  } {
+    const provider = recordingProvider();
+    const runtime = new AxlRuntime({ defaultProvider: 'scripted', trace: { enabled: false } });
+    runtime.registerProvider('scripted', provider);
+    return { runtime, provider };
+  }
+
+  /** Ask once through the facade, with whatever hostile options the test supplies. */
+  async function ask(
+    runtime: AxlRuntime,
+    options: Partial<ChatOptions>,
+  ): Promise<ProviderResponse> {
+    const { provider } = runtime.resolveProvider('scripted:m');
+    return provider.chat([{ role: 'user', content: 'go' }], {
+      model: 'scripted:m',
+      ...options,
+    } as ChatOptions);
+  }
+
+  it('a non-cloneable responseFormat schema does not fail the call or move the numbers', async () => {
+    // A schema object carrying a function: `structuredClone` raises DataCloneError.
+    const hostile = {
+      type: 'json_schema',
+      json_schema: { name: 'answer', schema: { validate() {} } },
+    } as unknown as ChatOptions['responseFormat'];
+
+    const off = providerRuntime();
+    const baseline = await off.runtime.trackOutcome(() =>
+      ask(off.runtime, { responseFormat: hostile }),
+    );
+
+    const on = providerRuntime();
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    const outcome = await on.runtime.trackOutcome(
+      () => ask(on.runtime, { responseFormat: hostile }),
+      {
+        capture: channel,
+      },
+    );
+    const status = await channel.close();
+
+    // The provider was called and its answer was returned, unchanged.
+    expect(outcome.status).toBe('fulfilled');
+    expect((outcome as { value: ProviderResponse }).value.content).toBe('answer');
+    expect(on.provider.calls).toHaveLength(1);
+    // And the numbers are the same as the capture-off run, to the byte.
+    expect(outcome.accounting).toEqual(baseline.accounting);
+    // The loss is reported on the diagnostics rail, where it belongs.
+    expect(status.status).toBe('unavailable');
+    expect(status.reason).toBeTruthy();
+  });
+
+  it('an unrecognized content part does not fail the call or move the numbers', async () => {
+    const messages = [
+      { role: 'user', content: [{ type: 'video', url: 'x' }] },
+    ] as unknown as ChatMessage[];
+
+    const off = providerRuntime();
+    const baseline = await off.runtime.trackOutcome(() =>
+      off.runtime.resolveProvider('scripted:m').provider.chat(messages, { model: 'scripted:m' }),
+    );
+
+    const on = providerRuntime();
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    const outcome = await on.runtime.trackOutcome(
+      () =>
+        on.runtime.resolveProvider('scripted:m').provider.chat(messages, { model: 'scripted:m' }),
+      { capture: channel },
+    );
+    const status = await channel.close();
+
+    expect(outcome.status).toBe('fulfilled');
+    expect(on.provider.calls).toHaveLength(1);
+    expect(outcome.accounting).toEqual(baseline.accounting);
+    expect(status.status).toBe('unavailable');
+  });
+
+  it('a projection failure on the RESPONSE does not turn a success into a failure', async () => {
+    // A response whose `timing` getter throws — snapshotResponse touches it.
+    const provider = {
+      name: 'scripted',
+      async chat(): Promise<ProviderResponse> {
+        const response = { content: 'answer', cost: 0.1 } as ProviderResponse;
+        Object.defineProperty(response, 'timing', {
+          get() {
+            throw new Error('hostile getter');
+          },
+          enumerable: true,
+        });
+        return response;
+      },
+    } as Provider;
+    const runtime = new AxlRuntime({ defaultProvider: 'scripted', trace: { enabled: false } });
+    runtime.registerProvider('scripted', provider);
+
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    const outcome = await runtime.trackOutcome(
+      () =>
+        runtime.resolveProvider('scripted:m').provider.chat([{ role: 'user', content: 'go' }], {
+          model: 'scripted:m',
+        }),
+      { capture: channel },
+    );
+    await channel.close();
+
+    // Converting a paid, successful provider response into a run failure is the
+    // bug: the charge is real either way.
+    expect(outcome.status).toBe('fulfilled');
+    expect(outcome.accounting.knownCost).toBeCloseTo(0.1, 10);
+  });
+
+  it('M4 a stream closed early is sealed with a termination reason, not left start_only', async () => {
+    const provider = {
+      name: 'scripted',
+      async *stream(): AsyncGenerator<StreamChunk> {
+        yield { type: 'token', content: 'a' } as StreamChunk;
+        yield { type: 'token', content: 'b' } as StreamChunk;
+        // Never reaches a `done` chunk: the consumer breaks first.
+        yield { type: 'token', content: 'c' } as StreamChunk;
+      },
+    } as unknown as Provider;
+    const runtime = new AxlRuntime({ defaultProvider: 'scripted', trace: { enabled: false } });
+    runtime.registerProvider('scripted', provider);
+
+    const sink = new CollectingSink();
+    const channel = channelWith(sink);
+    await runtime.trackOutcome(
+      async () => {
+        const iterator = runtime.resolveProvider('scripted:m').provider.stream!(
+          [{ role: 'user', content: 'go' }],
+          { model: 'scripted:m' },
+        );
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        for await (const chunk of iterator) break; // stall-timeout / caller break
+      },
+      { capture: channel },
+    );
+    await channel.close();
+
+    const records = sink.records();
+    const ends = phase(records, 'end');
+    // Without an end record the ref stays `start_only` — the label reserved for
+    // a call that never came back, which makes a deliberate close and a hung
+    // call indistinguishable to whoever is triaging stalls.
+    expect(ends).toHaveLength(1);
+    expect(ends[0].termination).toBeTruthy();
+    expect(channel.operations()[0].status).toBe('recorded');
+  });
+});

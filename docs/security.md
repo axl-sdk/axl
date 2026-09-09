@@ -393,6 +393,38 @@ runtime wrote itself.
 A declared `accounting` block on an imported result is likewise not taken on
 trust — see [studio-api.md](studio-api.md#imported-accounting-validation).
 
+## The budget settlement channel is a process-global symbol
+
+`AdmissionController` receives settled spend through a property keyed by
+`Symbol.for('axl.accounting.recordSpend')` — a key in the **cross-realm symbol
+registry**, not a module-private `Symbol()`.
+
+That is deliberate, and the reason is dual copies rather than convenience:
+`@axlsdk/axl` legitimately loads twice in one process (an ESM app whose eval run
+dynamically imports `@axlsdk/eval`, which resolves its own copy of the core, is
+the ordinary case). A module-private symbol would make a controller built by
+copy A invisible to the settlement walk in copy B, and spend would then stop
+reaching the budget **silently** — the failure mode a cost rail must not have.
+
+The security consequence is worth stating plainly:
+
+- Any code running **in the same process** can compute that key and therefore
+  read or write a controller's settlement channel. It is an in-process
+  integrity surface, not a sandbox boundary — the same trust level as anything
+  else that can reach into your objects (monkey-patching `fetch`, replacing a
+  provider adapter, mutating a config). Axl offers no protection against
+  hostile code inside the process, here or anywhere else.
+- Nothing crosses a process, a realm boundary, or the wire. The symbol names a
+  channel between object references that already share a heap; it is never
+  serialized, never sent to a provider, and never persisted.
+- The practical rule is unchanged: **do not run untrusted code in the process
+  that owns your budgets**. Untrusted evaluation belongs in its own process
+  with its own cost ceiling.
+
+Budget enforcement itself remains honest rather than absolute — it is a
+threshold, not a reservation, and it cannot enforce on spend it cannot price.
+See [observability.md → Budget honesty](observability.md#budget-honesty).
+
 ## Multi-Tenant Deployments (Studio Middleware)
 
 When `@axlsdk/studio/middleware` is mounted inside a multi-tenant application, two hooks scope what each connection can see:

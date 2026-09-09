@@ -20,6 +20,7 @@ import path from 'node:path';
 import { AxlRuntime } from '../runtime.js';
 import { AxlError } from '../errors.js';
 import { FileDiagnosticArtifactStore } from '../diagnostics/artifact-store.js';
+import { RequestCaptureChannel } from '../diagnostics/capture.js';
 import type {
   ArtifactManifest,
   ArtifactOwner,
@@ -277,8 +278,12 @@ describe('A13 — save, delete and reconciliation', () => {
     const runtime = artifactRuntime({ leaseMs: 1 });
     const live = await stagedResult(runtime, 'run-live');
     await runtime.saveEvalResult({ id: 'run-live', eval: 'e', timestamp: 1, data: live.data });
-    // A crash between staging and commit.
-    const orphan = await runtime.stageDiagnosticArtifact({ kind: 'eval', id: 'run-orphan' });
+    // A crash between staging and commit. Staged through the STORE, not the
+    // runtime: a writer that died took its lease-renewal timer with it, and
+    // staging through the runtime would model a writer that is still alive.
+    const orphan = await runtime
+      .getDiagnosticArtifactStore()!
+      .stage({ kind: 'eval', id: 'run-orphan' }, { leaseMs: 1 });
     await new Promise((resolve) => setTimeout(resolve, 5));
 
     const { removed } = await runtime.reconcileDiagnosticArtifacts();
@@ -452,5 +457,180 @@ describe('manifest durability', () => {
     expect(await readFile(path.join(root, good.artifactId, 'manifest.json'), 'utf-8')).toContain(
       good.artifactId,
     );
+  });
+});
+
+// ── Adversarial review: H3, H2, M3, M5, L2 ───────────────────────────
+
+describe('a live writer keeps its lease without writing (H3)', () => {
+  /**
+   * Real time, deliberately. The renewal is a timer the runtime owns and the
+   * whole point of the case is that it fires with nobody calling `append` or
+   * `renewLease`; a fake clock would have to be installed around the real
+   * filesystem I/O the renewal itself performs. A short lease keeps the wait
+   * to a few hundred milliseconds.
+   */
+  it('survives a sweep after it stops appending, and still finalizes with its bytes', async () => {
+    const leaseMs = 150;
+    const runtime = artifactRuntime({ leaseMs });
+    const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id: 'run-long' });
+
+    // A run that hit `maxRunBytes` early: the channel stops writing, so nothing
+    // ever calls `append` again — but the run itself keeps going for far longer
+    // than a lease before it can finalize.
+    const channel = new RequestCaptureChannel({ sink: staged.sink, maxRunBytes: 700 });
+    for (let i = 0; i < 20; i++) {
+      channel.write({
+        v: 1,
+        phase: 'start',
+        operationId: `op_${i}`,
+        kind: 'chat',
+        transportAttempts: 1,
+        provider: 'mock',
+        model: 'mock:m',
+        captured: { fidelity: 'runtime_request', redacted: false, truncated: false, omitted: [] },
+      });
+    }
+    const status = await channel.close();
+    expect(status.status).toBe('truncated');
+    expect(status.records).toBeGreaterThan(0);
+
+    // Several lease periods pass with no appends at all. The lease must be held
+    // by the WRITER's lifetime, not by its write rate.
+    await new Promise((resolve) => setTimeout(resolve, leaseMs * 4));
+
+    const { removed } = await runtime.reconcileDiagnosticArtifacts();
+
+    // Sweeping here destroys evidence a live run is still holding, and the run
+    // then cannot even finalize the artifact it had been filling.
+    expect(removed).toEqual([]);
+    const manifest = await runtime.finalizeDiagnosticArtifact(staged.artifactId, 'truncated');
+    expect(manifest.status).toBe('truncated');
+    expect(manifest.records).toBe(status.records);
+    expect(manifest.bytes).toBeGreaterThan(0);
+    await runtime.shutdown();
+  });
+
+  it('stops renewing once the artifact is finalized', async () => {
+    const leaseMs = 150;
+    const runtime = artifactRuntime({ leaseMs });
+    const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id: 'run-done' });
+    await staged.sink.append('{"v":1}');
+    await runtime.finalizeDiagnosticArtifact(staged.artifactId, 'complete');
+
+    // Finalized and never saved: an orphan now, and a renewal timer that
+    // outlived its writer would keep it alive forever.
+    await new Promise((resolve) => setTimeout(resolve, leaseMs * 4));
+
+    const { removed } = await runtime.reconcileDiagnosticArtifacts();
+    expect(removed).toContain(staged.artifactId);
+    await runtime.shutdown();
+  });
+});
+
+describe('an entry may only act on the artifact it owns (H2)', () => {
+  it("refuses to commit or delete another run's artifact", async () => {
+    const runtime = artifactRuntime();
+    const source = await stagedResult(runtime, 'run-source');
+    await runtime.saveEvalResult({
+      id: 'run-source',
+      eval: 'e',
+      timestamp: 1,
+      data: source.data,
+    });
+
+    // A second result naming the FIRST result's artifact — the shape a degraded
+    // rescore or a hand-edited import produces.
+    const impostor = {
+      id: 'run-impostor',
+      totalCost: 0,
+      items: [],
+      diagnostics: { artifactId: source.artifactId, status: 'complete' },
+    };
+    await runtime.saveEvalResult({
+      id: 'run-impostor',
+      eval: 'e',
+      timestamp: 2,
+      data: impostor,
+    });
+
+    // The impostor's stored pointer is corrected rather than honoured.
+    expect(impostor.diagnostics.artifactId).toBe('');
+    expect(impostor.diagnostics.status).toBe('unavailable');
+
+    expect(await runtime.deleteEvalResult('run-impostor')).toBe(true);
+
+    // The source's evidence is untouched — deleting one result must never
+    // destroy another's.
+    const store = runtime.getDiagnosticArtifactStore()!;
+    expect(await store.open(source.artifactId)).toBeDefined();
+    expect(await runtime.openDiagnosticArtifact(source.artifactId)).toBeDefined();
+    await runtime.shutdown();
+  });
+});
+
+describe('a failed row delete leaves no deletion intent (M3)', () => {
+  it('keeps the artifact when the history row could not be removed', async () => {
+    const store = new MemoryStore() as MemoryStore & {
+      deleteEvalResult(id: string): Promise<boolean>;
+    };
+    const runtime = artifactRuntime({ store });
+    const saved = await stagedResult(runtime, 'run-keep');
+    await runtime.saveEvalResult({ id: 'run-keep', eval: 'e', timestamp: 1, data: saved.data });
+    store.deleteEvalResult = async () => {
+      throw new Error('state store unreachable');
+    };
+
+    await expect(runtime.deleteEvalResult('run-keep')).rejects.toThrow('unreachable');
+
+    // The caller was told the delete failed. A `delete_pending` intent written
+    // before the row would have the sweeper destroy the evidence anyway.
+    const artifacts = runtime.getDiagnosticArtifactStore()!;
+    const manifest = (await artifacts.list()).find((m) => m.artifactId === saved.artifactId)!;
+    expect(manifest.state).toBe('committed');
+    const { removed } = await runtime.reconcileDiagnosticArtifacts();
+    expect(removed).not.toContain(saved.artifactId);
+    await runtime.shutdown();
+  });
+});
+
+describe('a vanished artifact is reported, not published (M5)', () => {
+  it('downgrades the stored result when the artifact is already gone', async () => {
+    const runtime = artifactRuntime();
+    const staged = await stagedResult(runtime, 'run-gone');
+    // Swept, or removed out of band, between finalize and save.
+    await runtime.getDiagnosticArtifactStore()!.delete(staged.artifactId);
+
+    await runtime.saveEvalResult({ id: 'run-gone', eval: 'e', timestamp: 1, data: staged.data });
+
+    const stored = (await runtime.getEvalHistory()).find((e) => e.id === 'run-gone')!;
+    const diagnostics = (stored.data as { diagnostics: Record<string, unknown> }).diagnostics;
+    // Persisting `complete` with a dangling id is the fail-quietly bug.
+    expect(diagnostics.status).toBe('unavailable');
+    expect(diagnostics.artifactId).toBe('');
+    expect(diagnostics.reason).toBeTruthy();
+    await runtime.shutdown();
+  });
+
+  it('reports a missing artifact from commit, markDeletePending and refreshExpiry', async () => {
+    const store = new FileDiagnosticArtifactStore({ root });
+    expect(await store.commit('art_nope', {})).toEqual({ ok: false, reason: 'missing' });
+    expect(await store.markDeletePending('art_nope')).toEqual({ ok: false, reason: 'missing' });
+    expect(await store.refreshExpiry('art_nope', 1)).toEqual({ ok: false, reason: 'missing' });
+  });
+});
+
+describe('only a committed artifact is readable through the runtime (L2)', () => {
+  it('refuses a staged artifact', async () => {
+    const runtime = artifactRuntime();
+    const staged = await stagedResult(runtime, 'run-staged');
+
+    // Finalized but never saved: no history row owns it yet, so nothing may
+    // serve it through an ownership-checked path.
+    expect(await runtime.openDiagnosticArtifact(staged.artifactId)).toBeUndefined();
+    // The store itself still reads it — that is how the CLI writes a standalone
+    // sidecar for a run it never persisted.
+    expect(await runtime.getDiagnosticArtifactStore()!.open(staged.artifactId)).toBeDefined();
+    await runtime.shutdown();
   });
 });

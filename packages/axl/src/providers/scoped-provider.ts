@@ -105,7 +105,32 @@ function beginCapture(
 ): CaptureRecorder | undefined {
   const channel = currentCaptureChannel();
   if (!channel) return undefined;
-  return new CaptureRecorder(channel, raw.name ?? 'unknown', kind, operationId, messages, options);
+  try {
+    return new CaptureRecorder(
+      channel,
+      raw.name ?? 'unknown',
+      kind,
+      operationId,
+      messages,
+      options,
+    );
+  } catch (error) {
+    // This sits between an OPENED accounting operation and the provider call.
+    // A throw here would fail a call that was about to succeed and leave the
+    // operation to be finalized as `abandoned` — the one outcome the
+    // "identical with capture on or off" guarantee forbids. The projection
+    // inputs are not ours to validate: `json_schema.schema` is typed `unknown`,
+    // and a message rehydrated from an older session may carry a content part
+    // no current adapter names.
+    channel.fail(`request could not be captured: ${describeCaptureFailure(error)}`);
+    return undefined;
+  }
+}
+
+/** A capture-side failure reason. Never serializes the thrown value itself. */
+function describeCaptureFailure(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  return typeof error === 'string' ? error : Object.prototype.toString.call(error);
 }
 
 class CaptureRecorder {
@@ -171,33 +196,55 @@ class CaptureRecorder {
     this.channel.write(this.channel.redact ? redactCapturedRequest(record) : record);
   }
 
+  /**
+   * Run one capture step, absorbing any failure into the channel.
+   *
+   * Every public entry point on this class is called from inside the provider
+   * call path — one of them from inside an adapter's own retry loop — so none
+   * of them may throw. `RequestCaptureChannel.write()` is already total for the
+   * same reason; this extends that discipline to the producers.
+   */
+  private guarded(what: string, step: () => void): void {
+    try {
+      step();
+    } catch (error) {
+      this.ended = true;
+      this.channel.fail(`${what} could not be captured: ${describeCaptureFailure(error)}`);
+    }
+  }
+
   /** A transport attempt beyond the first: the SAME operation, retried. */
   markDispatch(): void {
     this.attempts += 1;
     if (this.attempts <= 1) return;
-    this.emit({ phase: 'attempt', transportAttempts: this.attempts });
-    this.channel.noteOperation({
-      operationId: this.operationId,
-      kind: this.kind,
-      attempt: this.attempts,
-      status: 'start_only',
+    this.guarded('a transport attempt', () => {
+      this.emit({ phase: 'attempt', transportAttempts: this.attempts });
+      this.channel.noteOperation({
+        operationId: this.operationId,
+        kind: this.kind,
+        attempt: this.attempts,
+        status: 'start_only',
+      });
     });
   }
 
-  end(outcome: { response?: ProviderResponse; error?: unknown }): void {
+  end(outcome: { response?: ProviderResponse; error?: unknown; termination?: string }): void {
     if (this.ended) return;
     this.ended = true;
-    this.emit({
-      phase: 'end',
-      transportAttempts: Math.max(1, this.attempts),
-      ...(outcome.response ? { response: snapshotResponse(outcome.response) } : {}),
-      ...('error' in outcome ? { error: snapshotError(outcome.error) } : {}),
-    });
-    this.channel.noteOperation({
-      operationId: this.operationId,
-      kind: this.kind,
-      attempt: Math.max(1, this.attempts),
-      status: 'recorded',
+    this.guarded('a response', () => {
+      this.emit({
+        phase: 'end',
+        transportAttempts: Math.max(1, this.attempts),
+        ...(outcome.response ? { response: snapshotResponse(outcome.response) } : {}),
+        ...('error' in outcome ? { error: snapshotError(outcome.error) } : {}),
+        ...(outcome.termination !== undefined ? { termination: outcome.termination } : {}),
+      });
+      this.channel.noteOperation({
+        operationId: this.operationId,
+        kind: this.kind,
+        attempt: Math.max(1, this.attempts),
+        status: 'recorded',
+      });
     });
   }
 }
@@ -275,11 +322,18 @@ export function createScopedProvider(raw: Provider): Provider {
      * Terminal without a `done` chunk — a throw, an early `return()`, or a
      * stream that just ended. All are dispatched work whose charge we could not
      * establish. No-op once the `done` chunk already settled the operation.
+     *
+     * The record is sealed on the SAME paths that settle the operation, with
+     * the reason it ended. A stall-timeout close and a call that never came
+     * back are different findings, and `start_only` only stays meaningful if
+     * the deliberate closes are labelled as such.
      */
-    const settleUnresolved = (): void => {
+    const settleUnresolved = (termination: string, error?: unknown): void => {
       if (settled) return;
       settled = true;
       handle?.settleFailure();
+      if (error !== undefined) recorder?.end({ error, termination });
+      else recorder?.end({ termination });
     };
 
     // Deferred to the first `next()`: the admission check, the operation and
@@ -320,8 +374,7 @@ export function createScopedProvider(raw: Provider): Provider {
             // ever settle, since `finished` blocks every later call — settle it
             // here rather than letting the scope report it as `abandoned` at
             // finalization.
-            settleUnresolved();
-            recorder?.end({ error });
+            settleUnresolved('stream failed to start', error);
             throw error;
           }
         }
@@ -329,7 +382,7 @@ export function createScopedProvider(raw: Provider): Provider {
           const result = await inner!.next();
           if (result.done === true) {
             finished = true;
-            settleUnresolved();
+            settleUnresolved('stream ended without a done chunk');
             return result;
           }
           if (result.value.type === 'done') {
@@ -355,21 +408,22 @@ export function createScopedProvider(raw: Provider): Provider {
           return result;
         } catch (error) {
           finished = true;
-          settleUnresolved();
-          recorder?.end({ error });
+          settleUnresolved('stream threw mid-iteration', error);
           throw error;
         }
       },
       async return(value?: unknown): Promise<IteratorResult<StreamChunk>> {
         finished = true;
-        settleUnresolved();
+        // The runtime's stall-timeout close and a consumer `break` both land
+        // here.
+        settleUnresolved('stream closed by the consumer');
         // `return` is optional on a plain async iterator.
         if (inner?.return) return inner.return(value as never);
         return { value: value as never, done: true };
       },
       async throw(error?: unknown): Promise<IteratorResult<StreamChunk>> {
         finished = true;
-        settleUnresolved();
+        settleUnresolved('stream aborted by the consumer', error);
         if (inner?.throw) return inner.throw(error);
         throw error;
       },

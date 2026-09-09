@@ -112,6 +112,19 @@ export type OpenedArtifact = {
  * caller never supplies a path or a URL, which is what keeps an imported
  * artifact reference from naming an arbitrary file.
  */
+/**
+ * The outcome of a manifest write that can legitimately find nothing to write.
+ *
+ * `commit`, `markDeletePending` and `refreshExpiry` all name an artifact that a
+ * sweep, an operator, or a crashed sibling process may have already removed.
+ * Returning success in that case is how a history row gets published pointing
+ * at bytes that are not there, still claiming `status: 'complete'` — so the
+ * absence is reported instead of swallowed.
+ */
+export type ArtifactWriteResult =
+  | { ok: true; manifest: ArtifactManifest }
+  | { ok: false; reason: 'missing' };
+
 export interface DiagnosticArtifactStore {
   /** Reserve a new artifact id for `owner`, held by a lease of `leaseMs`. */
   stage(owner: ArtifactOwner, opts: { leaseMs: number }): Promise<StagedArtifact>;
@@ -120,7 +133,7 @@ export interface DiagnosticArtifactStore {
   /** Seal the record stream and record how complete it is. */
   finalize(artifactId: string, status: ArtifactStatus, reason?: string): Promise<ArtifactManifest>;
   /** Promote a finalized artifact to `committed` once its owner row exists. */
-  commit(artifactId: string, opts: { expiresAt?: number }): Promise<void>;
+  commit(artifactId: string, opts: { expiresAt?: number }): Promise<ArtifactWriteResult>;
   /** Discard a staged artifact entirely (its owner row was never written). */
   rollback(artifactId: string): Promise<void>;
   /** Read a committed (or interrupted) artifact, or `undefined` if absent. */
@@ -131,14 +144,14 @@ export interface DiagnosticArtifactStore {
     owner: ArtifactOwner,
     opts: { maxBytes: number; leaseMs: number },
   ): Promise<{ artifactId: string; truncated: boolean } | undefined>;
-  /** Record an idempotent deletion intent before the owner row is removed. */
-  markDeletePending(artifactId: string): Promise<void>;
+  /** Record an idempotent deletion intent. Reports an artifact already gone. */
+  markDeletePending(artifactId: string): Promise<ArtifactWriteResult>;
   /** Physically remove an artifact. Idempotent. */
   delete(artifactId: string): Promise<void>;
   /** Every manifest the store holds. */
   list(): Promise<ArtifactManifest[]>;
   /** Rewrite an artifact's logical expiry (its owner row was re-saved). */
-  refreshExpiry(artifactId: string, expiresAt: number | undefined): Promise<void>;
+  refreshExpiry(artifactId: string, expiresAt: number | undefined): Promise<ArtifactWriteResult>;
 }
 
 const MANIFEST_FILE = 'manifest.json';
@@ -206,15 +219,44 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
     await rename(temp, path.join(dir, MANIFEST_FILE));
   }
 
+  /**
+   * Run `work` after everything already queued for this artifact.
+   *
+   * EVERY write to an artifact goes through here — record appends and manifest
+   * mutations alike — because a manifest mutation is a read-modify-write and
+   * two of them interleave badly. The concrete race: the lease renewal reads a
+   * pre-finalize manifest, `finalize` writes `complete/137 records`, and the
+   * renewal's rename lands last and restores `interrupted/0`. `finalize`
+   * returned its in-memory object, so the result would claim 137 records while
+   * the artifact on disk claimed none.
+   */
+  private serialize<T>(artifactId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.writeChains.get(artifactId) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(work);
+    // The chain tracks ORDER, not success: a failed step must not poison every
+    // later one, so the stored link swallows the rejection while the returned
+    // promise keeps it.
+    this.writeChains.set(
+      artifactId,
+      next.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return next;
+  }
+
   private async mutate(
     artifactId: string,
     change: (manifest: ArtifactManifest) => ArtifactManifest,
   ): Promise<ArtifactManifest | undefined> {
-    const manifest = await this.readManifest(artifactId);
-    if (!manifest) return undefined;
-    const next = change(manifest);
-    await this.writeManifest(next);
-    return next;
+    return this.serialize(artifactId, async () => {
+      const manifest = await this.readManifest(artifactId);
+      if (!manifest) return undefined;
+      const next = change(manifest);
+      await this.writeManifest(next);
+      return next;
+    });
   }
 
   async stage(owner: ArtifactOwner, opts: { leaseMs: number }): Promise<StagedArtifact> {
@@ -244,18 +286,13 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
 
   async append(artifactId: string, line: string): Promise<void> {
     const file = path.join(this.dir(artifactId), RECORDS_FILE);
-    const previous = this.writeChains.get(artifactId) ?? Promise.resolve();
-    const next = previous
-      .catch(() => undefined)
-      .then(async () => {
-        await appendFile(file, `${line}\n`, 'utf-8');
-        const counter = this.counters.get(artifactId) ?? { records: 0, bytes: 0 };
-        counter.records += 1;
-        counter.bytes += Buffer.byteLength(line, 'utf-8');
-        this.counters.set(artifactId, counter);
-      });
-    this.writeChains.set(artifactId, next);
-    await next;
+    await this.serialize(artifactId, async () => {
+      await appendFile(file, `${line}\n`, 'utf-8');
+      const counter = this.counters.get(artifactId) ?? { records: 0, bytes: 0 };
+      counter.records += 1;
+      counter.bytes += Buffer.byteLength(line, 'utf-8');
+      this.counters.set(artifactId, counter);
+    });
   }
 
   async finalize(
@@ -263,14 +300,14 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
     status: ArtifactStatus,
     reason?: string,
   ): Promise<ArtifactManifest> {
-    await this.writeChains.get(artifactId)?.catch(() => undefined);
-    const counter = this.counters.get(artifactId) ?? { records: 0, bytes: 0 };
+    // No explicit wait for pending appends: `mutate` queues behind them on the
+    // same chain, so the counters this reads are the finished ones.
     const finalized = await this.mutate(artifactId, (m) => ({
       ...m,
       status,
       ...(reason !== undefined ? { reason } : {}),
-      records: counter.records,
-      bytes: counter.bytes,
+      records: this.counters.get(artifactId)?.records ?? 0,
+      bytes: this.counters.get(artifactId)?.bytes ?? 0,
     }));
     if (!finalized) {
       throw new AxlError(
@@ -281,8 +318,8 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
     return finalized;
   }
 
-  async commit(artifactId: string, opts: { expiresAt?: number }): Promise<void> {
-    await this.mutate(artifactId, (m) => {
+  async commit(artifactId: string, opts: { expiresAt?: number }): Promise<ArtifactWriteResult> {
+    const committed = await this.mutate(artifactId, (m) => {
       const next: ArtifactManifest = {
         ...m,
         state: 'committed',
@@ -295,6 +332,9 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
     });
     this.writeChains.delete(artifactId);
     this.counters.delete(artifactId);
+    // A silent no-op here is how a history row ends up published with a
+    // dangling `artifactId` still claiming `status: 'complete'`.
+    return committed ? { ok: true, manifest: committed } : { ok: false, reason: 'missing' };
   }
 
   async rollback(artifactId: string): Promise<void> {
@@ -364,8 +404,9 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
     return { artifactId: staged.artifactId, truncated };
   }
 
-  async markDeletePending(artifactId: string): Promise<void> {
-    await this.mutate(artifactId, (m) => ({ ...m, state: 'delete_pending' }));
+  async markDeletePending(artifactId: string): Promise<ArtifactWriteResult> {
+    const marked = await this.mutate(artifactId, (m) => ({ ...m, state: 'delete_pending' }));
+    return marked ? { ok: true, manifest: marked } : { ok: false, reason: 'missing' };
   }
 
   async delete(artifactId: string): Promise<void> {
@@ -398,12 +439,16 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
     return manifests;
   }
 
-  async refreshExpiry(artifactId: string, expiresAt: number | undefined): Promise<void> {
-    await this.mutate(artifactId, (m) => {
+  async refreshExpiry(
+    artifactId: string,
+    expiresAt: number | undefined,
+  ): Promise<ArtifactWriteResult> {
+    const refreshed = await this.mutate(artifactId, (m) => {
       const next = { ...m };
       if (expiresAt !== undefined) next.expiresAt = expiresAt;
       else delete next.expiresAt;
       return next;
     });
+    return refreshed ? { ok: true, manifest: refreshed } : { ok: false, reason: 'missing' };
   }
 }

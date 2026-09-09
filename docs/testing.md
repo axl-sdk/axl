@@ -444,6 +444,33 @@ Two consequences worth knowing before you assert on a number:
   your callback returned is preserved on `item.callerReport` rather than becoming a total.
   Use a real `AxlRuntime` (with `MockProvider` registered) whenever a test asserts a cost.
 
+**Spend that Axl cannot see must be reported, not returned.** A scorer or tool that calls a
+vendor API directly (a hosted grader, a search API, an embedding service) is invisible to the
+runtime, and a `cost` returned from a scorer on an instrumented runtime is kept for inspection
+only — it is never added to `knownCost`, because a total assembled from self-reported numbers
+is not measurement. Wrap the external call instead:
+
+```ts
+import { externalOperation } from '@axlsdk/axl';
+
+const graded = scorer({
+  name: 'vendor-grade',
+  description: 'Grades with a hosted vendor grader',
+  async score(output) {
+    return externalOperation({ name: 'vendor-grade' }, async (report) => {
+      const res = await callVendor(output);
+      report.setCost(res.usd); // counted, and lands in accounting.breakdown.external
+      return res.score;
+    });
+  },
+});
+```
+
+An external operation that never calls `report.setCost` is counted as
+`reasons.external_unreported`, so the run reports "incomplete" rather than quietly
+under-reporting. Inside a workflow the `ctx.withExternalOperation` form is equivalent — see
+[`externalOperation`](./api-reference.md#externaloperationdescriptor-fn--ctxwithexternaloperationdescriptor-fn).
+
 To stop a run at a spend threshold, set `EvalConfig.budget` (or pass `--budget`). It is a
 threshold, not a reservation: cases already in flight are allowed to settle, so
 `accounting.budget.knownOvershoot` reports how far past the limit they carried the run.

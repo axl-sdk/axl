@@ -161,6 +161,24 @@ The same applies to a scorer that returns `{ score, cost }`: it lands on
 `scoreDetails[name].cost` only when nothing was measured for that scorer on an
 uninstrumented runtime, and is never summed into a total.
 
+**If a scorer or tool really does spend money Axl cannot see** — a hosted grader, a vendor
+search or embedding API — report it instead of returning it, and it is counted:
+
+```ts
+import { externalOperation } from '@axlsdk/axl';
+
+// In a scorer (no ctx). Inside a workflow use ctx.withExternalOperation(...).
+return externalOperation({ name: 'vendor-grade' }, async (report) => {
+  const res = await callVendor(output);
+  report.setCost(res.usd); // joins knownCost and accounting.breakdown.external
+  return res.score;
+});
+```
+
+Admission is checked before `fn` runs, so an external operation obeys `budget` like any
+other paid call, and forgetting `setCost` marks the scope incomplete with
+`reasons.external_unreported` rather than reading as free.
+
 Reserved diagnostic metadata keys (`models`, `modelCallCounts`, `workflows`,
 `workflowCallCounts`, `tokens`, `agentCalls`) returned by a callback no longer override
 the runtime's own; they are kept under `EvalItem.callerReport.metadata`.
@@ -179,6 +197,12 @@ per scorer on `ScorerDetail.outcome`. `EvalSummary.coverage` counts both populat
 includes budget-stopped cases. **Gate CI on `summary.coverage` instead**: only it
 separates "the workflow broke" from "we stopped paying". The `axl-eval` CLI already
 does, and prints a distinct `[axl-eval] BUDGET STOPPED …` line before exiting non-zero.
+
+The stop is reported from coverage, not from the budget's own status: a run whose spend
+lands exactly on the limit with every case and scorer completed exits **0**, because
+nothing was refused — closed admission with no refused work is a coincidence of arithmetic,
+not a truncated run. `axl-eval rescore --budget` reports and exits by the same rule, after
+writing the partial artifact so the scores that were produced are kept.
 
 ### 4. `budget` stops a run at a threshold
 
@@ -201,3 +225,9 @@ to certify a cost comparison whose inputs are unverified, incomplete, of differi
 or which covered different amounts of work — `comparison.cost.certified` is `false` and
 `.reason` says why, while both raw totals are still shown. `deltaPercent` is `null`
 rather than `Infinity` when the baseline was free.
+
+**The structural identities hold only for live records.** On a `complete` or `incomplete`
+record, `provenance` sums to `knownCost` and `breakdown` splits it. A synthesized
+`unverified` record carries only the single total the old artifact recorded, with a zeroed
+breakdown and provenance — those zeros mean "no split available", not "the split is zero".
+Render them as unknown rather than charting a legacy run as 100% generation.

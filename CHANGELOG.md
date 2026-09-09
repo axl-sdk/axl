@@ -80,7 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EvalComparison.cost` gains `certified` plus a `reason` — a cost comparison is
   refused when either side is unverified or incomplete, the scopes differ, or the
   two sides covered different amounts of work, with both raw totals still shown.
-  `deltaPercent` is `null` rather than `Infinity` when the baseline was free.
+  The `cost` block is emitted whenever either side carries accounting, including
+  when both totals are `$0`, and the scope check covers **every** run on a side
+  so a mixed run/rescore aggregate cannot certify. `deltaPercent` is `null`
+  rather than `Infinity` when the baseline was free.
 - **Studio presents measured eval spend, not bare totals.** Every eval view —
   summary, history, item list and detail, compare, trends and the multi-run
   aggregate — renders known spend through one badge that carries its
@@ -151,8 +154,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime's own and are kept under `callerReport.metadata`. An uninstrumented
   runtime (`{} as AxlRuntime`) now yields `incomplete` accounting with
   `reasons.uninstrumented` and a `totalCost` of `0`.
-- **Breaking: `axl-eval` exits non-zero on a budget stop**, printing a distinct
-  `[axl-eval] BUDGET STOPPED …` line first. A budget stop is deliberately not
+- **Breaking: `axl-eval` exits non-zero when a budget refused work**, printing a
+  distinct `[axl-eval] BUDGET STOPPED …` line first. The exit is driven by
+  coverage, not by the controller's status: a run whose spend lands exactly on
+  the limit with every case and scorer completed refused nothing and exits `0`.
+  `axl-eval rescore --budget` reports and exits by the same rule, after writing
+  the partial artifact. A budget stop is deliberately not
   counted as a model failure in the wipeout/degraded logic, and the summary
   prints known spend with a completeness label (e.g.
   `Cost: $1.50 (incomplete: 1 unpriced_model)`) plus budget and coverage rows.

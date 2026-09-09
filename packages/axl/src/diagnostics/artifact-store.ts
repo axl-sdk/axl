@@ -130,8 +130,19 @@ export interface DiagnosticArtifactStore {
   stage(owner: ArtifactOwner, opts: { leaseMs: number }): Promise<StagedArtifact>;
   /** Append one already-encoded JSONL record. The caller pre-bounds its size. */
   append(artifactId: string, line: string): Promise<void>;
-  /** Seal the record stream and record how complete it is. */
-  finalize(artifactId: string, status: ArtifactStatus, reason?: string): Promise<ArtifactManifest>;
+  /**
+   * Seal the record stream and record how complete it is.
+   *
+   * `redaction` is what the WRITER applied. The store cannot infer it — the
+   * records arrive already scrubbed — and a manifest that says `'none'` over
+   * redacted bytes is the kind of quiet dishonesty a compliance reader acts on.
+   */
+  finalize(
+    artifactId: string,
+    status: ArtifactStatus,
+    reason?: string,
+    redaction?: 'applied' | 'none',
+  ): Promise<ArtifactManifest>;
   /** Promote a finalized artifact to `committed` once its owner row exists. */
   commit(artifactId: string, opts: { expiresAt?: number }): Promise<ArtifactWriteResult>;
   /** Discard a staged artifact entirely (its owner row was never written). */
@@ -307,6 +318,7 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
     artifactId: string,
     status: ArtifactStatus,
     reason?: string,
+    redaction?: 'applied' | 'none',
   ): Promise<ArtifactManifest> {
     // No explicit wait for pending appends: `mutate` queues behind them on the
     // same chain, so the counters this reads are the finished ones.
@@ -314,6 +326,7 @@ export class FileDiagnosticArtifactStore implements DiagnosticArtifactStore {
       ...m,
       status,
       ...(reason !== undefined ? { reason } : {}),
+      ...(redaction !== undefined ? { redaction } : {}),
       records: this.counters.get(artifactId)?.records ?? 0,
       bytes: this.counters.get(artifactId)?.bytes ?? 0,
     }));

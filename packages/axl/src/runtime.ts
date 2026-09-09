@@ -1032,12 +1032,13 @@ export class AxlRuntime extends EventEmitter {
     artifactId: string,
     status: ArtifactStatus,
     reason?: string,
+    redaction?: 'applied' | 'none',
   ): Promise<ArtifactManifest> {
     // Stop renewing FIRST: a renewal landing after the finalized manifest is
     // exactly the write the store's serializer exists to order, and there is
     // nothing left to keep alive.
     this.stopArtifactRenewal(artifactId);
-    return this.requireArtifactStore().finalize(artifactId, status, reason);
+    return this.requireArtifactStore().finalize(artifactId, status, reason, redaction);
   }
 
   /** Discard a staged artifact whose owner will never be written. */

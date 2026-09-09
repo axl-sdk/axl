@@ -170,6 +170,7 @@ async function finishCapture(
       capture.artifactId,
       truncatedByCopy ? 'truncated' : status.status,
       truncatedByCopy ? capture.copyTruncated : status.reason,
+      status.redaction,
     );
     return toDiagnosticManifest(manifest);
   } catch {

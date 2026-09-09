@@ -146,7 +146,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — correlated to the case they scored — into the same artifact its source
   records were copied into, with one `maxRunBytes` budget covering both halves,
   and every degraded rescore reports `artifactId: ''` rather than naming the
-  source run's artifact. Expiry mirrors the
+  source run's artifact. A manifest's `redaction` now reports what the writer
+  actually applied — a run captured under `trace.redact` reads back as
+  `applied`, and an imported bundle is described by its own records rather than
+  by the importing deployment's setting. Expiry mirrors the
   owning row: `StateStore.getEvalRetention` is implemented by the Memory, SQLite
   and Redis stores (the last from `PTTL`), and a custom store without it is
   refused **at configuration time** rather than mid-run. An interrupted writer's

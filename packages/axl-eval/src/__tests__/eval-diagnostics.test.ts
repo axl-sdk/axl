@@ -287,6 +287,46 @@ describe('rescore copies evidence without inventing it', () => {
   });
 });
 
+describe('a manifest says whether its own bytes are scrubbed', () => {
+  it('reports `applied` for a run captured under compliance mode', async () => {
+    const provider = new ScriptedProvider([{ cost: 0.01, content: 'answer' }], { name: 'mock' });
+    const runtime = new AxlRuntime({
+      defaultProvider: 'mock',
+      trace: { enabled: false, redact: true },
+      diagnostics: { artifacts: { root, sweepIntervalMs: 3_600_000 } },
+    });
+    runtime.registerProvider('mock', provider);
+
+    const result = await runEval(
+      { workflow: 'w', dataset: ds(1), scorers: [pass] } satisfies EvalConfig,
+      askExecute(),
+      runtime,
+      { captureRequests: true },
+    );
+
+    // The store never sees anything but already-scrubbed bytes, so only the
+    // writer can say. A manifest reporting `none` over redacted records tells a
+    // compliance reader the opposite of the truth.
+    expect(result.diagnostics!.redaction).toBe('applied');
+    const records = await readRecords(runtime, result.diagnostics!.artifactId);
+    expect(records.every((r) => r.captured.redacted)).toBe(true);
+    await runtime.shutdown();
+  });
+
+  it('reports `none` when redaction is off', async () => {
+    const runtime = captureRuntime(4);
+    const result = await runEval(
+      { workflow: 'w', dataset: ds(1), scorers: [pass] } satisfies EvalConfig,
+      askExecute(),
+      runtime,
+      { captureRequests: true },
+    );
+
+    expect(result.diagnostics!.redaction).toBe('none');
+    await runtime.shutdown();
+  });
+});
+
 // ── Rescore capture (M1) and degrade ownership (H2) ──────────────────
 
 describe('a rescore records the judging it actually performs (M1)', () => {

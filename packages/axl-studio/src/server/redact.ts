@@ -430,7 +430,28 @@ export function redactRecordLine(line: string, redact: boolean): string {
   try {
     parsed = JSON.parse(line) as CapturedRequestRecord;
   } catch {
-    return JSON.stringify({ v: 1, captured: { redacted: true, unparseable: true } });
+    // A line that will not parse still has to leave the door as a VALID record:
+    // this stream is re-importable, and `validateRequestSidecar` rejects the
+    // whole bundle over one line missing `operationId` or a known `phase`. A
+    // stub that says plainly it stands in for something unreadable keeps the
+    // rest of the artifact importable.
+    const stub: CapturedRequestRecord = {
+      v: 1,
+      phase: 'end',
+      operationId: 'unknown',
+      kind: 'chat',
+      transportAttempts: 1,
+      provider: 'unknown',
+      model: 'unknown',
+      termination: 'the stored record could not be parsed',
+      captured: {
+        fidelity: 'runtime_request',
+        redacted: true,
+        truncated: true,
+        omitted: ['record'],
+      },
+    };
+    return JSON.stringify(stub);
   }
   return JSON.stringify(redactCapturedRequest(parsed));
 }

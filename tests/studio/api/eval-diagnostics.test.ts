@@ -352,6 +352,95 @@ describe('imported accounting is validated before it is trusted', () => {
 
 // ── Redaction (M4 + A16.16 structural fields) ────────────────────────
 
+describe('what a delivered artifact says about itself (L1, L7)', () => {
+  it("reports the imported records' own redaction, not this deployment's setting", async () => {
+    // A bundle exported from a compliance-mode deployment, imported here where
+    // redaction is off. The bytes are scrubbed; nothing about this server
+    // changes that.
+    const redactedRecords = RECORDS.map((r) => ({
+      ...r,
+      captured: { ...r.captured, redacted: true },
+    }));
+    const { app } = createTestServer(undefined, { artifactsRoot: root });
+
+    const res = await importResult(app, {
+      result: resultWithAccounting(),
+      requests: sidecar(redactedRecords),
+    });
+    const { data } = await readJson(res);
+
+    const manifest = await readJson(await app.request(`/api/evals/${data.id}/diagnostics`));
+    // Telling a compliance reader these records are unredacted, when every one
+    // of them says otherwise, is the failure: they act on this field.
+    expect(manifest.data.redaction).toBe('applied');
+  });
+
+  it('reports raw imported records as unredacted', async () => {
+    const { app } = createTestServer(undefined, { artifactsRoot: root, redact: true });
+
+    const res = await importResult(app, {
+      result: resultWithAccounting(),
+      requests: sidecar(RECORDS),
+    });
+    const { data } = await readJson(res);
+
+    const manifest = await readJson(await app.request(`/api/evals/${data.id}/diagnostics`));
+    // The opposite error, and the worse one: this deployment redacts on
+    // delivery, but the stored bytes are raw and the manifest must say so.
+    expect(manifest.data.redaction).toBe('none');
+  });
+
+  it('emits a valid record for a stored line that cannot be parsed', async () => {
+    const { app, runtime } = createTestServer(undefined, { artifactsRoot: root, redact: true });
+
+    const res = await importResult(app, {
+      result: resultWithAccounting(),
+      requests: sidecar(RECORDS),
+    });
+    const { data } = await readJson(res);
+    const histBody = await readJson(await app.request('/api/evals/history'));
+    const artifactId = histBody.data.find((e: { id: string }) => e.id === data.id).data.diagnostics
+      .artifactId;
+
+    // Half a line on disk: a crash mid-append, a truncated restore.
+    const store = runtime.getDiagnosticArtifactStore()!;
+    await store.append(artifactId, '{"v":1,"operationId":"op_2"');
+
+    const text = await (await app.request(`/api/evals/${data.id}/diagnostics/records`)).text();
+    const lines = text
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const stub = lines[lines.length - 1];
+    // This stream is re-importable. A placeholder missing `operationId` or a
+    // known `phase` makes `validateRequestSidecar` reject the WHOLE bundle over
+    // one unreadable line.
+    expect(stub.operationId).toBeTruthy();
+    expect(stub.phase).toBe('end');
+    expect(stub.v).toBe(1);
+    const again = await importResult(app, { result: resultWithAccounting(), requests: text });
+    expect(again.status).toBe(200);
+  });
+
+  it('stops reading the artifact when the consumer walks away (L6)', async () => {
+    const { app } = createTestServer(undefined, { artifactsRoot: root });
+
+    const res = await importResult(app, {
+      result: resultWithAccounting(),
+      requests: sidecar(RECORDS),
+    });
+    const { data } = await readJson(res);
+
+    const stream = (await app.request(`/api/evals/${data.id}/diagnostics/records`)).body!;
+    const reader = stream.getReader();
+    await reader.read();
+    // A closed tab, an aborted fetch. Without a `cancel()` the route keeps
+    // pulling lines for nobody and enqueues into a controller that is gone,
+    // which throws where nothing is waiting to catch it.
+    await expect(reader.cancel()).resolves.toBeUndefined();
+  });
+});
+
 describe('redact mode', () => {
   it('masks unmeasured item metadata while keeping the measured keys', async () => {
     const { app } = createTestServer(undefined, { artifactsRoot: root, redact: true });

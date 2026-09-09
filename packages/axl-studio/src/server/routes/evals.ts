@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 import type { StudioEnv } from '../types.js';
 import type { ConnectionManager } from '../ws/connection-manager.js';
 import type { DegradedScorer, EvalResult, Scorer } from '@axlsdk/eval';
+import type { CapturedRequestRecord } from '@axlsdk/axl';
 import {
   redactEvalHistoryList,
   redactEvalResult,
@@ -470,17 +471,35 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     // Streamed as JSONL rather than buffered into a JSON array: an artifact is
     // allowed to be 16 MiB and materializing that as one string to serialize is
     // how a diagnostics read takes the server down.
+    //
+    // The reader is held explicitly rather than driven by `for await`, because a
+    // consumer that vanishes mid-artifact (a closed tab, an aborted fetch) has
+    // to end the underlying read too. Without `cancel()` the loop keeps pulling
+    // lines off the disk for a stream nobody is attached to and enqueues into a
+    // closed controller, which throws where nothing is waiting to catch it.
+    let cancelled = false;
+    const lines = opened.lines[Symbol.asyncIterator]();
     return new Response(
       new ReadableStream<Uint8Array>({
         async start(controller) {
           const encoder = new TextEncoder();
           try {
-            for await (const line of opened.lines) {
-              controller.enqueue(encoder.encode(`${redactRecordLine(line, redactOn)}\n`));
+            for (;;) {
+              const next = await lines.next();
+              if (next.done || cancelled) break;
+              controller.enqueue(encoder.encode(`${redactRecordLine(next.value, redactOn)}\n`));
             }
+            if (!cancelled) controller.close();
+          } catch (error) {
+            if (!cancelled) controller.error(error);
           } finally {
-            controller.close();
+            // Release the artifact's file handle. Abandoning it would hold a
+            // descriptor open for as long as the process lives.
+            await lines.return?.().catch(() => undefined);
           }
+        },
+        cancel() {
+          cancelled = true;
         },
       }),
       {
@@ -921,11 +940,29 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     try {
       const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id: ownerId });
       let bytes = 0;
+      // The bytes arrive already scrubbed or not; this deployment's own
+      // `trace.redact` says nothing about them. Reading it off the records is
+      // the only honest source — a manifest that claimed `'none'` over redacted
+      // records would tell a compliance reader the opposite of the truth, and
+      // one that claimed `'applied'` over raw ones is worse.
+      let allRedacted = lines.length > 0;
       for (const line of lines) {
         await staged.sink.append(line);
         bytes += Buffer.byteLength(line, 'utf-8');
+        if (allRedacted) {
+          try {
+            allRedacted = (JSON.parse(line) as CapturedRequestRecord).captured?.redacted === true;
+          } catch {
+            allRedacted = false;
+          }
+        }
       }
-      const manifest = await runtime.finalizeDiagnosticArtifact(staged.artifactId, 'complete');
+      const manifest = await runtime.finalizeDiagnosticArtifact(
+        staged.artifactId,
+        'complete',
+        undefined,
+        allRedacted ? 'applied' : 'none',
+      );
       return {
         version: 1,
         artifactId: manifest.artifactId,

@@ -884,6 +884,10 @@ apply (all UTF-8 bytes, all overridable via `captureRequests: { … }`):
 | `maxRunBytes` | 16 MiB | Capture stops for the run; status `truncated` with a reason |
 | `maxQueueBytes` | 1 MiB | Capture stops rather than buffering behind a slow sink |
 
+A rescore shares one `maxRunBytes` budget across both halves of its artifact —
+the source records it copied in and the judge calls it makes — so the artifact
+never grows to twice the bound you asked for.
+
 Writes are queued, never awaited by the provider path. A sink that throws stops
 capture with status `unavailable`. In every one of these cases the run
 completes normally and the numbers are unaffected — `EvalResult.diagnostics`

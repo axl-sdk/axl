@@ -188,6 +188,10 @@ async function finishCapture(
       capture.artifactId,
       status.status,
       status.reason,
+      // What the channel ACTUALLY applied. The store sees only scrubbed bytes
+      // and cannot tell, so a manifest without this reports every compliance-
+      // mode artifact as unredacted.
+      status.redaction,
     );
   } catch {
     return undefined;

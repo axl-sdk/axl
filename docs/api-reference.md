@@ -1878,9 +1878,9 @@ Storage for [captured requests](observability.md#captured-requests-opt-in), conf
 |--------|---------|-------------|
 | `getDiagnosticArtifactStore()` | `DiagnosticArtifactStore \| undefined` | The configured store, or `undefined` when capture is not configured |
 | `stageDiagnosticArtifact(owner)` | `Promise<{ artifactId, sink }>` | Take a lease and open a bounded sink. Throws `AxlError('DIAGNOSTICS_UNAVAILABLE')` when capture is not configured |
-| `finalizeDiagnosticArtifact(id, status, reason?)` | `Promise<ArtifactManifest>` | Declare what the writer managed to capture |
+| `finalizeDiagnosticArtifact(id, status, reason?, redaction?)` | `Promise<ArtifactManifest>` | Declare what the writer managed to capture. `redaction` is what the WRITER applied — the store only ever sees already-scrubbed bytes and cannot infer it |
 | `rollbackDiagnosticArtifact(id)` | `Promise<void>` | Discard a staged artifact whose history row never landed |
-| `copyDiagnosticArtifact(sourceId, owner, options?)` | `Promise<{ artifactId, truncated } \| undefined>` | Copy records under a new owner, bounded by `maxBytes`, preserving original operation ids |
+| `copyDiagnosticArtifact(sourceId, owner, options?)` | `Promise<{ artifactId, truncated, bytes, sink } \| undefined>` | Copy records under a new owner, bounded by `maxBytes`, preserving original operation ids. The copy comes back **staged** and lease-held with a `sink`, so the new owner keeps writing its own calls into the same artifact |
 | `openDiagnosticArtifact(id)` | `Promise<{ manifest, lines } \| undefined>` | Read a **committed** artifact. Returns `undefined` when it is still staged, pending deletion, logically expired, or its owning history row is gone. Read a not-yet-committed artifact through `getDiagnosticArtifactStore()` instead |
 | `reconcileDiagnosticArtifacts()` | `Promise<{ removed: string[] }>` | Run a reclamation pass by hand (also runs at startup and on the sweep timer) |
 

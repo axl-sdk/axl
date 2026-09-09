@@ -31,6 +31,7 @@ export type {
   EvalTrendData,
   EvalTrendRun,
   EvalTrendEntry,
+  EvalTrendCompleteness,
   WorkflowStatsData,
   TraceStatsData,
 } from './reducers.js';

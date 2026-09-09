@@ -187,11 +187,29 @@ export function reduceCost(acc: CostData, event: HistoricalAxlEvent): CostData {
 
 // ── Eval trends reducer (EvalHistoryEntry → EvalTrendData) ────────────
 
+/**
+ * How complete a trend point's spend figure is. Mirrors `@axlsdk/axl`'s
+ * `AccountingCompleteness` — restated here rather than imported so the
+ * aggregate reducers stay free of an optional peer dependency.
+ */
+export type EvalTrendCompleteness = 'complete' | 'incomplete' | 'unverified';
+
 export type EvalTrendRun = {
   timestamp: number;
   id: string;
   scores: Record<string, number>;
+  /** Known spend for this run — `accounting.knownCost`, or the legacy
+   *  `totalCost` when the artifact predates accounting. Read it WITH
+   *  `completeness`; alone it claims a precision the run may not have. */
   cost: number;
+  /**
+   * Whether that figure is measured (`complete`), a lower bound
+   * (`incomplete`), or repeated from an artifact that carried no accounting
+   * (`unverified`). Three enum values per run, so the payload stays bounded.
+   */
+  completeness: EvalTrendCompleteness;
+  /** `true` when this run's budget closed — it is short by design, not broken. */
+  budgetStopped?: boolean;
   /** Primary model for this run (first entry of `metadata.models`). Undefined
    *  when the run has no recorded models (e.g., legacy data or test harnesses). */
   model?: string;
@@ -218,6 +236,14 @@ export type EvalTrendEntry = {
   scoreMean: Record<string, number>;
   scoreStd: Record<string, number>;
   costTotal: number;
+  /**
+   * The WORST completeness of every run folded into `costTotal` — including
+   * runs already evicted by the `MAX_EVAL_RUNS` cap, since `costTotal` counts
+   * them too. A window holding one legacy run is `'unverified'` as a whole.
+   */
+  costCompleteness: EvalTrendCompleteness;
+  /** Runs in this window whose budget closed. */
+  budgetStoppedRuns: number;
   runCount: number;
 };
 
@@ -225,10 +251,55 @@ export type EvalTrendData = {
   byEval: Record<string, EvalTrendEntry>;
   totalRuns: number;
   totalCost: number;
+  /** Worst completeness across every eval in the window. `totalCost` is never
+   *  presented as certified without it. */
+  totalCostCompleteness: EvalTrendCompleteness;
 };
 
 export function emptyEvalTrendData(): EvalTrendData {
-  return { byEval: {}, totalRuns: 0, totalCost: 0 };
+  // An empty window is vacuously complete: no run contributed an unknown.
+  return { byEval: {}, totalRuns: 0, totalCost: 0, totalCostCompleteness: 'complete' };
+}
+
+/** The worse of two completeness values (`unverified` > `incomplete` > `complete`). */
+function worse(a: EvalTrendCompleteness, b: EvalTrendCompleteness): EvalTrendCompleteness {
+  if (a === 'unverified' || b === 'unverified') return 'unverified';
+  if (a === 'incomplete' || b === 'incomplete') return 'incomplete';
+  return 'complete';
+}
+
+/**
+ * Read a persisted eval blob's accounting.
+ *
+ * An entry with no `accounting` block predates measured spend: its `totalCost`
+ * is repeated as known spend but reported `'unverified'` and NEVER upgraded to
+ * `'complete'`. Summing such a run into a trend line as if it were measured is
+ * exactly how a chart comes to imply a precision the data never had.
+ */
+function extractAccounting(data: unknown): {
+  cost: number;
+  completeness: EvalTrendCompleteness;
+  budgetStopped: boolean;
+} {
+  const result = (data ?? {}) as Record<string, unknown>;
+  const accounting = result.accounting as
+    | { knownCost?: unknown; completeness?: unknown; budget?: { status?: unknown } }
+    | undefined;
+  if (!accounting || typeof accounting !== 'object') {
+    return { cost: extractCost(data), completeness: 'unverified', budgetStopped: false };
+  }
+  const completeness =
+    accounting.completeness === 'complete' || accounting.completeness === 'incomplete'
+      ? accounting.completeness
+      : 'unverified';
+  const knownCost = Number.isFinite(accounting.knownCost)
+    ? (accounting.knownCost as number)
+    : extractCost(data);
+  return {
+    cost: knownCost,
+    completeness,
+    budgetStopped: accounting.budget?.status === 'closed',
+  };
 }
 
 /** Extract per-scorer aggregate score from an EvalHistoryEntry's data blob.
@@ -322,7 +393,7 @@ function computeScoreStats(runs: EvalTrendRun[]): {
 
 export function reduceEvalTrends(acc: EvalTrendData, entry: EvalHistoryEntry): EvalTrendData {
   const scores = extractScores(entry.data);
-  const cost = extractCost(entry.data);
+  const { cost, completeness, budgetStopped } = extractAccounting(entry.data);
   const model = extractModel(entry.data);
   const duration = extractDuration(entry.data);
   // Forward multi-run identity fields (`runGroupId`, `batchAttempted`) so
@@ -342,6 +413,8 @@ export function reduceEvalTrends(acc: EvalTrendData, entry: EvalHistoryEntry): E
     id: entry.id,
     scores,
     cost,
+    completeness,
+    ...(budgetStopped ? { budgetStopped: true } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(duration !== undefined ? { duration } : {}),
     ...(runGroupId !== undefined ? { runGroupId } : {}),
@@ -365,12 +438,18 @@ export function reduceEvalTrends(acc: EvalTrendData, entry: EvalHistoryEntry): E
       ? prev.latestScores
       : scores;
 
+  // Completeness folds onto the RUNNING total, not over the capped `runs`
+  // array: `costTotal` keeps counting runs the cap has evicted, so recomputing
+  // the flag from the visible window would quietly re-certify a total that
+  // still contains an unverified run.
   byEval[entry.eval] = {
     runs,
     latestScores,
     scoreMean: mean,
     scoreStd: std,
     costTotal: (prev?.costTotal ?? 0) + cost,
+    costCompleteness: worse(prev?.costCompleteness ?? 'complete', completeness),
+    budgetStoppedRuns: (prev?.budgetStoppedRuns ?? 0) + (budgetStopped ? 1 : 0),
     runCount: (prev?.runCount ?? 0) + 1,
   };
 
@@ -378,6 +457,7 @@ export function reduceEvalTrends(acc: EvalTrendData, entry: EvalHistoryEntry): E
     byEval,
     totalRuns: acc.totalRuns + 1,
     totalCost: acc.totalCost + cost,
+    totalCostCompleteness: worse(acc.totalCostCompleteness ?? 'complete', completeness),
   };
 }
 

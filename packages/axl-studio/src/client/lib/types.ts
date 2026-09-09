@@ -331,6 +331,12 @@ export type AggregateBroadcast<T> = {
   updatedAt: number;
 };
 
+/**
+ * How complete a trend point's spend figure is. Mirrors the server's
+ * `EvalTrendCompleteness` (and `@axlsdk/axl`'s `AccountingCompleteness`).
+ */
+export type EvalTrendCompleteness = 'complete' | 'incomplete' | 'unverified';
+
 /** Eval trend data from GET /api/eval-trends */
 export type EvalTrendData = {
   byEval: Record<
@@ -340,7 +346,14 @@ export type EvalTrendData = {
         timestamp: number;
         id: string;
         scores: Record<string, number>;
+        /** Known spend. Read WITH `completeness` — never on its own. */
         cost: number;
+        /** Whether that figure is measured, a lower bound, or repeated from a
+         *  pre-accounting artifact. Absent on payloads from an older server;
+         *  treat absence as `'unverified'`, the conservative reading. */
+        completeness?: EvalTrendCompleteness;
+        /** `true` when this run's budget closed — short by design, not broken. */
+        budgetStopped?: boolean;
         /** Primary model (first of `metadata.models`). Undefined for legacy runs. */
         model?: string;
         /** Total run duration in ms. */
@@ -357,11 +370,18 @@ export type EvalTrendData = {
       scoreMean: Record<string, number>;
       scoreStd: Record<string, number>;
       costTotal: number;
+      /** Worst completeness of every run folded into `costTotal`, including
+       *  runs the server's window cap has already evicted. */
+      costCompleteness?: EvalTrendCompleteness;
+      /** Runs in this window whose budget closed. */
+      budgetStoppedRuns?: number;
       runCount: number;
     }
   >;
   totalRuns: number;
   totalCost: number;
+  /** Worst completeness across every eval in the window. */
+  totalCostCompleteness?: EvalTrendCompleteness;
 };
 
 /** Workflow stats from GET /api/workflow-stats */

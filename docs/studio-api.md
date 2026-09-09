@@ -28,7 +28,7 @@ Studio exposes a REST API that the SPA consumes. You can also call these directl
 | `POST /api/executions/:id/abort` | Abort a running execution (signal-driven; wakes paused `ctx.awaitHuman`) |
 | `DELETE /api/executions/:id` | Delete an execution from history (GDPR scrub). Calls `runtime.deleteExecution` AND scrubs the WS replay buffer for `execution:{id}`. Returns `{ id, deleted: true }` or 404. Blocked in readOnly |
 | `GET /api/costs?window=24h\|7d\|30d\|all` | Aggregated cost data for a time window (default `7d`). `?windows=all` returns all four windows at once for debugging |
-| `GET /api/eval-trends?window=` | Per-eval score trends (latest, mean, std), cost totals, recent runs with `model`/`duration` |
+| `GET /api/eval-trends?window=` | Per-eval score trends (latest, mean, std), known-spend totals with a conservative `completeness` flag, budget-stopped run counts, recent runs with `model`/`duration`. Payload shape: [Eval trend spend and completeness](#eval-trend-spend-and-completeness) |
 | `GET /api/workflow-stats?window=` | Per-workflow totals, completed/failed counts, p50/p95/avg duration, failure rate |
 | `GET /api/trace-stats?window=` | Event-type distribution, version-separated tool lifecycle counts, and retry breakdown by agent |
 | `GET /api/memory/:scope/:key` | Read memory entry |
@@ -85,6 +85,50 @@ The v1 bucket stays separate because a legacy end does not encode the v2
 terminal status. Additional v2 starts, rejections, and terminal events change
 trace counts only. Cost and billing still fold cost-bearing model/embedder
 events, so the expanded tool lifecycle does not add spend.
+
+### Eval trend spend and completeness
+
+`GET /api/eval-trends?window=` (and the `eval-trends` WS channel, which carries
+the same state) reports spend alongside how complete that spend figure is.
+A total on its own is not a fact: `$0.00` from a fully priced run and `$0.00`
+from a run whose model had no price are opposite claims, and a window holding
+one pre-accounting artifact cannot be summed into a certified number.
+
+```typescript
+type EvalTrendCompleteness = 'complete' | 'incomplete' | 'unverified';
+
+{
+  byEval: Record<string, {
+    runs: Array<{
+      timestamp: number; id: string; scores: Record<string, number>;
+      cost: number;                        // EvalResult.accounting.knownCost
+      completeness: EvalTrendCompleteness; // how to read `cost`
+      budgetStopped?: boolean;             // this run's budget closed
+      model?: string; duration?: number;
+      runGroupId?: string; batchAttempted?: number;
+    }>;
+    latestScores: Record<string, number>;
+    scoreMean: Record<string, number>;
+    scoreStd: Record<string, number>;
+    costTotal: number;
+    costCompleteness: EvalTrendCompleteness; // worst of every run in the window
+    budgetStoppedRuns: number;
+    runCount: number;
+  }>;
+  totalRuns: number;
+  totalCost: number;
+  totalCostCompleteness: EvalTrendCompleteness; // worst across every eval
+}
+```
+
+`completeness` mirrors core's `AccountingCompleteness`. A history entry with no
+`accounting` block predates measured spend: its `totalCost` is repeated as
+`cost` but reported `unverified`, and it is never upgraded to `complete`.
+The two window-level flags take the **worst** completeness of every run folded
+into their totals — including runs the 50-run window cap has already evicted
+from `runs`, since `costTotal` still counts them. One legacy or unpriced run
+therefore makes the whole window uncertifiable, which is what stops a trend
+chart from implying a precision the data never had.
 
 ## WebSocket
 

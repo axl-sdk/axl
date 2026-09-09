@@ -1,10 +1,127 @@
 // ── Types matching @axlsdk/eval's EvalResult shape ───────────────
 
+import { aggregateAccounting, readAccounting } from './accounting';
+
+/**
+ * How complete a spend figure is. Mirrors `@axlsdk/axl`'s
+ * `AccountingCompleteness`. `'unverified'` is what a reader reports for an
+ * artifact that carries no accounting at all (pre-0.24) — it is never produced
+ * by a live run, and an absent record is never upgraded to `'complete'`.
+ */
+export type AccountingCompleteness = 'complete' | 'incomplete' | 'unverified';
+
+/** Why an operation contributed no usable cost. Mirrors `AccountingReason`. */
+export type AccountingReason =
+  | 'unpriced_model'
+  | 'usage_missing'
+  | 'abandoned'
+  | 'external_unreported'
+  | 'uninstrumented';
+
+export type OperationKind = 'chat' | 'stream' | 'embedding' | 'transcription' | 'tool' | 'external';
+
+export type CostProvenance =
+  | 'provider_reported'
+  | 'price_table_estimate'
+  | 'adapter_reported'
+  | 'caller_reported';
+
+export type AccountingUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  cachedTokens: number;
+  cacheWriteTokens: number;
+  audioSeconds: number;
+};
+
+/**
+ * Client-side mirror of `@axlsdk/axl`'s `Accounting`. Read it through
+ * `readAccounting()` / `readItemAccounting()` in `./accounting`, never by
+ * reaching for a bare `totalCost`.
+ */
+export type Accounting = {
+  version: 1;
+  currency: 'USD';
+  /** Sum of settled, usable, disjoint charges. Never includes caller aggregates. */
+  knownCost: number;
+  completeness: AccountingCompleteness;
+  /** Reason → count of operations carrying it. Empty when complete. */
+  reasons: Partial<Record<AccountingReason, number>>;
+  usage: AccountingUsage;
+  operations: {
+    total: number;
+    settled: number;
+    unknown: number;
+    denied: number;
+    byKind: Partial<Record<OperationKind, number>>;
+  };
+  /** `knownCost` split by purpose. */
+  breakdown: { generation: number; judging: number; external: number };
+  provenance: Partial<Record<CostProvenance, number>>;
+};
+
+/** The run budget's terminal state. Mirrors `@axlsdk/eval`'s `EvalBudgetStatus`. */
+export type EvalBudgetStatus = {
+  limit: number;
+  status: 'open' | 'closed';
+  knownSpend: number;
+  /** `max(0, knownSpend - limit)`. Work already dispatched when the limit was
+   *  crossed still settles, so a run can legitimately end above its limit. */
+  knownOvershoot: number;
+  /** Which scheduling decision first observed the closure. */
+  closedBy?: 'case' | 'scorer' | 'operation';
+};
+
+/** A run's authoritative accounting. Mirrors `@axlsdk/eval`'s `EvalAccounting`. */
+export type EvalAccounting = Accounting & {
+  scope: 'run' | 'rescore';
+  budget?: EvalBudgetStatus;
+  /** Rescore provenance: the source run and its unmodified generation
+   *  accounting, or `null` when the source was a legacy artifact. */
+  source?: { runId: string; generation: Accounting | null };
+  /** Legacy caller-reported values seen during the run. Inspection only —
+   *  never summed into `knownCost`. */
+  callerReported?: { costItems: number; costTotal: number; metadataItems: number };
+};
+
+/**
+ * How one dataset item ended. The four non-`completed` values are deliberately
+ * not interchangeable — a model failure, a caller cancellation, a case the
+ * budget never started and a case the budget stopped mid-flight are four
+ * different facts about the run.
+ */
+export type EvalItemOutcome =
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'budget_skipped'
+  | 'budget_interrupted';
+
+/** How one scorer ended for one item. A `budget_skipped` judge is NOT a zero. */
+export type ScorerOutcome =
+  | 'scored'
+  | 'failed'
+  | 'skipped'
+  | 'cancelled'
+  | 'budget_skipped'
+  | 'budget_interrupted';
+
+/** Per-outcome counts for a run. Every key is present, including zeros. */
+export type EvalCoverage = {
+  items: Record<EvalItemOutcome, number>;
+  scorers: Record<string, Record<ScorerOutcome, number>>;
+};
+
 export type ScorerDetail = {
   score: number | null;
   metadata?: Record<string, unknown>;
   duration?: number;
   cost?: number;
+  /** How this scorer ended for this item. Absent only on pre-0.24 artifacts. */
+  outcome?: ScorerOutcome;
+  /** This scorer's own operations for this item. Absent on pre-0.24 artifacts. */
+  accounting?: Accounting;
   /**
    * `true` when the scorer's `applies` predicate returned `false` for this
    * item, so the scorer was deliberately skipped (NOT run). Mirrors the server
@@ -22,8 +139,23 @@ export type EvalItem = {
   scorerErrors?: string[];
   scores: Record<string, number | null>;
   duration?: number;
+  /** Compatibility view of `accounting.breakdown.generation`. On a pre-0.24
+   *  artifact this is whatever the caller reported instead — read it through
+   *  `readItemAccounting()`, which labels that case `'unverified'`. */
   cost?: number;
+  /** True when `cost` is a lower bound because this item used unpriced work. */
+  unpriced?: boolean;
+  /** Compatibility view of `accounting.breakdown.judging`. */
   scorerCost?: number;
+  /** How this item ended. Absent only on pre-0.24 artifacts. */
+  outcome?: EvalItemOutcome;
+  /** Generation AND judging spend for this item; `breakdown` splits them. */
+  accounting?: Accounting;
+  /**
+   * What the `executeWorkflow` callback claimed, kept for inspection and never
+   * used as a measurement. Rendered as "caller-reported (not counted)".
+   */
+  callerReport?: { cost?: number; metadata?: Record<string, unknown> };
   scoreDetails?: Record<string, ScorerDetail>;
   metadata?: Record<string, unknown>;
   /** Per-item trace events (populated when runEval was called with `captureTraces: true`). */
@@ -99,6 +231,17 @@ export type MultiRunAggregate = {
     }
   >;
   timing?: { mean: number; std: number };
+  /**
+   * The group's UNIONED accounting — conservative over every run, not run[0]'s.
+   * Built by `buildMultiRunResult` through the same rules as the server's
+   * `aggregateAccounting`, so a group containing one legacy run reads
+   * `'unverified'` as a whole and one incomplete run makes the group
+   * `'incomplete'`.
+   */
+  accounting?: EvalAccounting;
+  /** Runs in the group whose budget closed. A budget-stopped group is short by
+   *  design, not broken — surfaced separately from failures. */
+  budgetStoppedRuns?: number;
 };
 
 export type EvalResultData = {
@@ -120,12 +263,31 @@ export type EvalResultData = {
    */
   workflow?: string;
   timestamp: string;
+  /**
+   * Compatibility view of `accounting.knownCost`. NEVER render this directly —
+   * a bare figure claims a precision the run may not have. Go through
+   * `readAccounting()` and a `<SpendBadge>` so the completeness travels with
+   * the number.
+   */
   totalCost: number;
+  /** True when `totalCost` is a lower bound (`accounting.completeness !== 'complete'`). */
+  unpriced?: boolean;
+  /** The authoritative record `totalCost` is derived from. Absent on pre-0.24
+   *  artifacts, which `readAccounting()` reports as `'unverified'`. */
+  accounting?: EvalAccounting;
   duration: number;
   items: EvalItem[];
   summary: {
     count: number;
+    /**
+     * Items carrying an `error` string. UNCHANGED legacy meaning — it therefore
+     * still counts budget-stopped and cancelled items. Read `coverage` to tell
+     * a model failure from a budget stop; the UI labels this "with errors" and
+     * explains the overlap rather than calling it "failed".
+     */
     failures: number;
+    /** Per-outcome counts for items and each scorer. Absent on pre-0.24 artifacts. */
+    coverage?: EvalCoverage;
     scorers: Record<string, ScorerStats>;
     timing?: {
       mean: number;
@@ -246,7 +408,18 @@ export type ComparisonResult = {
     baselineTotal: number;
     candidateTotal: number;
     delta: number;
-    deltaPercent: number;
+    /** `null` when the baseline total is 0 — a percentage change from zero is
+     *  not a number. Rendered as `n/a`, never as `0%` or `Infinity`. */
+    deltaPercent: number | null;
+    /**
+     * `true` only when the two sides are comparable AS SPEND: both accountings
+     * `complete`, same `scope`, same case/scorer coverage. Optional so a
+     * pre-0.24 server response still types; absence is treated as NOT
+     * certified, because a cheaper partial run must never read as a saving.
+     */
+    certified?: boolean;
+    /** Why certification was refused. Present exactly when `certified` is false. */
+    reason?: string;
   };
   summary: string;
 };
@@ -321,11 +494,23 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
       }
     }
   }
+  // Union the group's accounting CONSERVATIVELY through the same rules the
+  // server's `aggregateAccounting` uses: sums of known spend, unions of
+  // reasons, and the worst completeness of any run. Spreading `...first`
+  // below would otherwise hand the group run[0]'s flags — reporting a group
+  // as complete because its first run happened to be, and hiding a legacy or
+  // budget-truncated sibling inside a confident-looking total.
+  const groupAccounting = aggregateGroupAccounting(allRuns);
+  const budgetStoppedRuns = allRuns.filter(
+    (r) => readAccounting(r).budget?.status === 'closed',
+  ).length;
   const aggregate: MultiRunAggregate = {
     runGroupId: (first.metadata?.runGroupId as string) ?? '',
     runCount: allRuns.length,
     workflows: aggWorkflows.length > 0 ? aggWorkflows : undefined,
     scorers: aggScorers,
+    accounting: groupAccounting,
+    ...(budgetStoppedRuns > 0 ? { budgetStoppedRuns } : {}),
   };
   // Derive partial-batch state from `metadata.batchAttempted` (stamped on
   // each persisted run by the server's run endpoint) when fewer runs are
@@ -366,10 +551,18 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
   // higher `rate` (a scorer can degrade in several runs), and count how many
   // runs flagged it (`runsAffected`) so the banner can say "(in N runs)".
   const aggDegraded = unionDegraded(allRuns);
+  const groupCoverage = unionCoverage(allRuns);
   return {
     ...first,
+    // Override the spread run[0] spend fields with the group union — see
+    // `groupAccounting` above. `totalCost` stays the compatibility view of
+    // `accounting.knownCost`, so the two can never disagree.
+    accounting: groupAccounting,
+    totalCost: groupAccounting.knownCost,
+    ...(groupAccounting.completeness !== 'complete' ? { unpriced: true as const } : {}),
     summary: {
       ...first.summary,
+      ...(groupCoverage ? { coverage: groupCoverage } : {}),
       ...(aggDegraded.length > 0 ? { degraded: aggDegraded } : {}),
     },
     _multiRun: {
@@ -392,6 +585,55 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
  * flagged that scorer. Returns `[]` when no run degraded. Defensive — reads
  * each run through `getResultDegraded` so malformed entries are dropped.
  */
+const ITEM_OUTCOMES: EvalItemOutcome[] = [
+  'completed',
+  'failed',
+  'cancelled',
+  'budget_skipped',
+  'budget_interrupted',
+];
+const SCORER_OUTCOMES: ScorerOutcome[] = [
+  'scored',
+  'failed',
+  'skipped',
+  'cancelled',
+  'budget_skipped',
+  'budget_interrupted',
+];
+
+function zeroScorerCoverage(): Record<ScorerOutcome, number> {
+  return Object.fromEntries(SCORER_OUTCOMES.map((o) => [o, 0])) as Record<ScorerOutcome, number>;
+}
+
+/**
+ * Sum per-outcome counts across a multi-run group.
+ *
+ * Returns `undefined` when NO run carries a coverage block, so a group of
+ * pre-0.24 artifacts renders no counters rather than a fabricated row of zeros
+ * (which would claim "0 budget-skipped" about runs that never recorded it).
+ * A mixed group sums the runs that do have coverage; the group's accounting
+ * completeness — `'unverified'` in that case — is what says the counts are
+ * partial.
+ */
+function unionCoverage(allRuns: EvalResultData[]): EvalCoverage | undefined {
+  const withCoverage = allRuns.filter((r) => r.summary?.coverage);
+  if (withCoverage.length === 0) return undefined;
+  const items = Object.fromEntries(ITEM_OUTCOMES.map((o) => [o, 0])) as Record<
+    EvalItemOutcome,
+    number
+  >;
+  const scorers: Record<string, Record<ScorerOutcome, number>> = {};
+  for (const run of withCoverage) {
+    const coverage = run.summary!.coverage!;
+    for (const outcome of ITEM_OUTCOMES) items[outcome] += coverage.items?.[outcome] ?? 0;
+    for (const [name, counts] of Object.entries(coverage.scorers ?? {})) {
+      const target = (scorers[name] ??= zeroScorerCoverage());
+      for (const outcome of SCORER_OUTCOMES) target[outcome] += counts?.[outcome] ?? 0;
+    }
+  }
+  return { items, scorers };
+}
+
 function unionDegraded(allRuns: EvalResultData[]): DegradedScorer[] {
   const byScorer = new Map<string, DegradedScorer & { runsAffected: number }>();
   for (const run of allRuns) {
@@ -696,7 +938,22 @@ export function aggregateGroupTokens(results: EvalResultData[]): TokenCounts {
   return totals;
 }
 
-/** Aggregate total cost across multiple results. */
-export function aggregateGroupCost(results: EvalResultData[]): number {
-  return results.reduce((sum, r) => sum + r.totalCost, 0);
+/**
+ * Aggregate spend across several results, conservatively.
+ *
+ * The only supported way to total a group's cost: it returns an
+ * `EvalAccounting`, so the caller cannot render the number without also having
+ * its completeness to hand. A plain `sum(totalCost)` helper deliberately no
+ * longer exists — that shape is what let a group of one measured and one
+ * legacy run display a confident total.
+ *
+ * `scope` is `'rescore'` only when EVERY run was a rescore; a mixed group is
+ * reported as `'run'` and is uncertifiable on scope anyway. `budget` is not
+ * unioned — a budget is per run, and `MultiRunAggregate.budgetStoppedRuns`
+ * carries the group-level fact instead.
+ */
+export function aggregateGroupAccounting(results: EvalResultData[]): EvalAccounting {
+  const perRun = results.map(readAccounting);
+  const scope = perRun.length > 0 && perRun.every((a) => a.scope === 'rescore') ? 'rescore' : 'run';
+  return { ...aggregateAccounting(perRun), scope };
 }

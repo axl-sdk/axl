@@ -81,6 +81,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused when either side is unverified or incomplete, the scopes differ, or the
   two sides covered different amounts of work, with both raw totals still shown.
   `deltaPercent` is `null` rather than `Infinity` when the baseline was free.
+- **Studio presents measured eval spend, not bare totals.** Every eval view —
+  summary, history, item list and detail, compare, trends and the multi-run
+  aggregate — renders known spend through one badge that carries its
+  completeness (`complete`, `incomplete: 2 unpriced_model`, or
+  `unverified (legacy)`), in wording parallel to the `axl-eval` CLI. An unknown
+  `$0` is no longer hidden, and a pre-0.24 artifact is never shown as complete.
+  Runs with a budget get a dedicated outcome row (limit, status, known spend,
+  overshoot, `closedBy`) and a "budget stopped" badge in history, so a
+  truncated run reads as truncated rather than as a wall of model failures;
+  `summary.failures` stays visible with its legacy meaning spelled out.
+  Item and scorer outcomes each render distinctly — a judge the budget skipped
+  shows as "not run (budget)" instead of a zero — and per-item generation and
+  judging spend are shown separately, with any `callerReport` labelled
+  "caller-reported (not counted)". The compare view states whether the cost
+  comparison is certified and why not, and shows an uncertified delta
+  descriptively instead of as a saving. Multi-run groups and trend windows
+  union accounting conservatively: one legacy or incomplete run makes the whole
+  group or window uncertifiable rather than inheriting the first run's flags.
+- **`GET /api/eval-trends` carries spend completeness.** Each trend point gains
+  `completeness` and `budgetStopped`; each eval gains `costCompleteness` and
+  `budgetStoppedRuns`; the payload gains `totalCostCompleteness`. See
+  [docs/studio-api.md](docs/studio-api.md#eval-trend-spend-and-completeness).
 
 ### Changed
 

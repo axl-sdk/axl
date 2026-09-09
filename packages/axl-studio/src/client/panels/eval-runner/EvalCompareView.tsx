@@ -12,8 +12,9 @@ import {
   getResultWorkflows,
   formatModelName,
   aggregateGroupTokens,
-  aggregateGroupCost,
+  aggregateGroupAccounting,
 } from './types';
+import { SpendBadge } from './SpendBadge';
 
 function Tooltip({ text, children }: { text: string; children: React.ReactNode }) {
   return (
@@ -40,14 +41,20 @@ function DeltaCell({
   percent,
   invert,
   format,
+  /** Suppress the verdict colouring — used for an uncertified cost delta,
+   *  which is a raw difference, not a saving or a regression. */
+  muted,
 }: {
   value: number;
-  percent: number;
+  /** `null` when the baseline is 0: a change from zero has no percentage, and
+   *  the cell renders `n/a` rather than `0%` or `Infinity%`. */
+  percent: number | null;
   invert?: boolean;
   format?: (v: number) => string;
+  muted?: boolean;
 }) {
-  const isPositive = invert ? value < 0 : value > 0;
-  const isNegative = invert ? value > 0 : value < 0;
+  const isPositive = !muted && (invert ? value < 0 : value > 0);
+  const isNegative = !muted && (invert ? value > 0 : value < 0);
 
   const colorClass = isPositive
     ? 'text-emerald-600 dark:text-emerald-400'
@@ -59,7 +66,7 @@ function DeltaCell({
     ? `${value > 0 ? '+' : value < 0 ? '-' : ''}${format(Math.abs(value))}`
     : `${value > 0 ? '+' : ''}${Math.abs(value) < 100 ? value.toFixed(3) : value.toFixed(0)}`;
 
-  const percentStr = `${percent > 0 ? '+' : ''}${percent.toFixed(1)}%`;
+  const percentStr = percent == null ? 'n/a' : `${percent > 0 ? '+' : ''}${percent.toFixed(1)}%`;
 
   return (
     <td className={cn('px-3 py-2.5 text-right', colorClass)}>
@@ -185,6 +192,15 @@ export function EvalCompareView({
   const significantCount = sortedScorerEntries.filter(([, s]) => s.significant === true).length;
   const regressionCount = compareResult.regressions.length;
   const improvementCount = compareResult.improvements.length;
+  // Cost certification is separate from the quality verdict: an uncertified
+  // cost never disables a scorer comparison, and a certified cost never
+  // vouches for the scores. `certified` is absent on pre-0.24 server responses
+  // and absence is read as NOT certified — the conservative direction.
+  const certified = compareResult.cost?.certified === true;
+  const certificationReason =
+    compareResult.cost && !certified
+      ? (compareResult.cost.reason ?? 'costs are not comparable')
+      : undefined;
 
   return (
     <div className="space-y-6">
@@ -406,8 +422,15 @@ export function EvalCompareView({
         const candidateTokens = aggregateGroupTokens(cSources);
         const bTotal = baselineTokens.input + baselineTokens.output + baselineTokens.reasoning;
         const cTotal = candidateTokens.input + candidateTokens.output + candidateTokens.reasoning;
-        const bCost = aggregateGroupCost(bSources);
-        const cCost = aggregateGroupCost(cSources);
+        const bAccounting = aggregateGroupAccounting(bSources);
+        const cAccounting = aggregateGroupAccounting(cSources);
+        const bCost = bAccounting.knownCost;
+        const cCost = cAccounting.knownCost;
+        // A percentage between two figures is only meaningful when both are
+        // measured. One incomplete or legacy side makes the ratio a guess, and
+        // the strip says so instead of printing a confident "-30%".
+        const spendComparable =
+          bAccounting.completeness === 'complete' && cAccounting.completeness === 'complete';
 
         const hasWorkflow = baselineWorkflows.length > 0 || candidateWorkflows.length > 0;
         // "changed" = the two sets of workflow names differ. Any diff — added,
@@ -420,7 +443,10 @@ export function EvalCompareView({
 
         const hasModels = baselineModels.length > 0 || candidateModels.length > 0;
         const hasTokens = bTotal > 0 && cTotal > 0;
-        const hasCost = bCost > 0 || cCost > 0;
+        // Show the spend row even at $0 on both sides when either accounting is
+        // not complete — an unknown zero is a fact worth stating, not a reason
+        // to hide the row.
+        const hasCost = bCost > 0 || cCost > 0 || !spendComparable;
         if (!hasWorkflow && !hasModels && !hasTokens && !hasCost) return null;
         const baselineSet = new Set(baselineModels);
         const candidateSet = new Set(candidateModels);
@@ -559,10 +585,11 @@ export function EvalCompareView({
                 <span className="text-[hsl(var(--muted-foreground))] uppercase tracking-wider text-[10px] font-medium shrink-0">
                   Cost
                 </span>
-                <span className="font-mono">{formatCost(bCost)}</span>
+                <SpendBadge accounting={bAccounting} label="Baseline known spend" />
                 <span className="text-[hsl(var(--muted-foreground))]">{'\u2192'}</span>
-                <span className="font-mono">{formatCost(cCost)}</span>
-                {bCost > 0 &&
+                <SpendBadge accounting={cAccounting} label="Candidate known spend" />
+                {spendComparable &&
+                  bCost > 0 &&
                   cCost > 0 &&
                   (() => {
                     const costDeltaPct = ((cCost - bCost) / bCost) * 100;
@@ -580,6 +607,14 @@ export function EvalCompareView({
                       </span>
                     ) : null;
                   })()}
+                {!spendComparable && (
+                  <span
+                    className="text-[10px] font-medium text-amber-600 dark:text-amber-400"
+                    title="One or both sides have incomplete or unverified accounting, so the two spend figures are not comparable as a percentage."
+                  >
+                    not comparable
+                  </span>
+                )}
               </>
             )}
           </div>
@@ -628,15 +663,32 @@ export function EvalCompareView({
             <div
               className={cn(
                 'text-lg font-semibold mt-0.5',
-                compareResult.cost.delta > 0
-                  ? 'text-red-600 dark:text-red-400'
-                  : compareResult.cost.delta < 0
-                    ? 'text-emerald-600 dark:text-emerald-400'
-                    : '',
+                // An uncertified delta gets no verdict colouring. A partial or
+                // budget-truncated candidate is cheaper because it did less
+                // work; painting that green would read as a saving the run
+                // never achieved.
+                !certified
+                  ? 'text-[hsl(var(--muted-foreground))]'
+                  : compareResult.cost.delta > 0
+                    ? 'text-red-600 dark:text-red-400'
+                    : compareResult.cost.delta < 0
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : '',
               )}
             >
               {compareResult.cost.delta > 0 ? '+' : ''}
               {formatCost(Math.abs(compareResult.cost.delta))}
+            </div>
+            <div
+              className={cn(
+                'text-[10px] mt-0.5',
+                certified
+                  ? 'text-[hsl(var(--muted-foreground))]'
+                  : 'text-amber-600 dark:text-amber-400',
+              )}
+              title={certified ? undefined : certificationReason}
+            >
+              {certified ? 'certified' : 'not certified'}
             </div>
           </div>
         )}
@@ -853,7 +905,23 @@ export function EvalCompareView({
                 {compareResult.cost != null && (
                   <tr className="border-t border-[hsl(var(--border))]">
                     <td className="px-4 py-2.5 font-mono text-[hsl(var(--muted-foreground))]">
-                      Cost (total)
+                      <div>Known spend (total)</div>
+                      {/* The refusal reason is the whole point of the row when
+                          certification fails: "cheaper" and "did less work" look
+                          identical in the numbers, and only this line separates
+                          them. Quality comparison above is unaffected either way. */}
+                      <div
+                        className={cn(
+                          'text-[10px] font-sans normal-case mt-0.5',
+                          certified
+                            ? 'text-[hsl(var(--muted-foreground))]'
+                            : 'text-amber-600 dark:text-amber-400',
+                        )}
+                      >
+                        {certified
+                          ? 'certified — both sides complete and equally covered'
+                          : `not certified: ${certificationReason}`}
+                      </div>
                     </td>
                     <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">
                       {formatCost(compareResult.cost.baselineTotal)}
@@ -865,6 +933,7 @@ export function EvalCompareView({
                       value={compareResult.cost.delta}
                       percent={compareResult.cost.deltaPercent}
                       invert
+                      muted={!certified}
                       format={formatCost}
                     />
                   </tr>

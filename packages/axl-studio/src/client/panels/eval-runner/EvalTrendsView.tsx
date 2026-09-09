@@ -9,6 +9,7 @@ import { SparkLine } from '../../components/shared/charts/SparkLine';
 import { fetchEvalTrends } from '../../lib/api';
 import { useAggregate } from '../../hooks/use-aggregate';
 import { cn, formatCost, formatDuration } from '../../lib/utils';
+import type { EvalTrendCompleteness } from '../../lib/types';
 
 /** 3-tier score color: >=0.8 green, >=0.5 amber, <0.5 red */
 function scoreColor(score: number): string {
@@ -19,6 +20,19 @@ function scoreColor(score: number): string {
 
 function formatScore(score: number): string {
   return score.toFixed(3);
+}
+
+/**
+ * The completeness sentence that travels with every spend figure on this view.
+ *
+ * An absent flag means the payload came from a server that predates measured
+ * accounting, which is read as `'unverified'` — the conservative direction, and
+ * never silently as "complete".
+ */
+function completenessText(completeness: EvalTrendCompleteness | undefined): string {
+  if (completeness === 'complete') return 'complete';
+  if (completeness === 'incomplete') return 'incomplete (lower bound)';
+  return 'unverified (legacy)';
 }
 
 /** Deterministic color-per-scorer so the line colors are stable across renders. */
@@ -90,7 +104,19 @@ export function EvalTrendsView({
           value={String(evalNames.length)}
           subtitle={evalNames.length === 1 ? 'eval' : 'evals'}
         />
-        <StatCard label="Total Cost" value={formatCost(trends.totalCost)} subtitle="all evals" />
+        <StatCard
+          label="Known Spend"
+          value={formatCost(trends.totalCost)}
+          // A window that contains one legacy or unpriced run cannot present a
+          // precise total, and a chart implying otherwise is the exact defect
+          // the completeness flag exists to prevent.
+          subtitle={`all evals · ${completenessText(trends.totalCostCompleteness)}`}
+          subtitleColor={
+            (trends.totalCostCompleteness ?? 'unverified') === 'complete'
+              ? undefined
+              : 'text-amber-600 dark:text-amber-400'
+          }
+        />
       </div>
 
       {/* View toggle: Scorer | Model | Duration */}
@@ -295,7 +321,32 @@ export function EvalTrendsView({
                     />
                   </div>
                 )}
-                <CostBadge cost={entry.costTotal} />
+                {/* `unpriced` renders the figure as `≥ $X` with an explanatory
+                    tooltip — the same "this is a lower bound" statement the
+                    eval spend badges make, reusing the shared badge rather
+                    than inventing a second vocabulary for it. */}
+                <span
+                  className="inline-flex items-center gap-1"
+                  title={`Known spend across ${entry.runCount} run${entry.runCount === 1 ? '' : 's'} — ${completenessText(entry.costCompleteness)}`}
+                >
+                  <CostBadge
+                    cost={entry.costTotal}
+                    unpriced={entry.costCompleteness !== 'complete'}
+                  />
+                  {entry.costCompleteness !== 'complete' && (
+                    <span className="text-[9px] font-medium uppercase tracking-wide text-amber-600 dark:text-amber-400">
+                      {entry.costCompleteness === 'incomplete' ? 'incomplete' : 'unverified'}
+                    </span>
+                  )}
+                  {(entry.budgetStoppedRuns ?? 0) > 0 && (
+                    <span
+                      className="text-[9px] font-medium uppercase tracking-wide text-amber-600 dark:text-amber-400"
+                      title={`${entry.budgetStoppedRuns} run(s) in this window stopped on budget`}
+                    >
+                      budget stopped
+                    </span>
+                  )}
+                </span>
               </div>
             </div>
 

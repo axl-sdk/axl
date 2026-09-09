@@ -19,6 +19,7 @@ import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
 import type { InputContentPart, InputMediaSource } from '../input.js';
 import { UnsupportedModelInputError } from '../errors.js';
+import { firstRichPart, type RichModality } from './rich-input.js';
 
 function anthropicBase64(source: Extract<InputMediaSource, { type: 'bytes' | 'base64' }>): string {
   return source.type === 'base64'
@@ -28,19 +29,44 @@ function anthropicBase64(source: Extract<InputMediaSource, { type: 'bytes' | 'ba
       );
 }
 
-function anthropicImageBlocks(parts: readonly InputContentPart[]): AnthropicContentBlock[] {
+function anthropicImageBlocks(
+  parts: readonly InputContentPart[],
+  model: string,
+): AnthropicContentBlock[] {
   const blocks: AnthropicContentBlock[] = [];
   for (const part of parts) {
     if (part.type === 'text') {
       blocks.push({ type: 'text', text: part.text });
       continue;
     }
+    if (part.type === 'audio') {
+      // Unreachable through the runtime gate and `validateInput`; a builder-level
+      // guard keeps audio from silently rendering as an image block.
+      throw new UnsupportedModelInputError({
+        provider: 'anthropic',
+        model,
+        modality: 'audio',
+        source: part.source.type,
+        feature: 'audio input',
+      });
+    }
+    if (part.type !== 'image') {
+      // A future `InputContentPart` variant must fail loudly rather than fall
+      // through to the image mapping below and be billed as a mislabelled block.
+      const unmapped: never = part;
+      throw new UnsupportedModelInputError({
+        provider: 'anthropic',
+        model,
+        modality: (unmapped as { type: string }).type,
+        feature: 'this input modality',
+      });
+    }
     const { source } = part;
     if (source.type === 'provider-file') {
       if (source.provider !== 'anthropic') {
         throw new UnsupportedModelInputError({
           provider: 'anthropic',
-          model: 'unknown',
+          model,
           modality: 'image',
           source: 'provider-file',
         });
@@ -776,15 +802,25 @@ export class AnthropicProvider implements Provider {
   validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
     const modelOverride = request.providerOptions?.model;
     const effectiveModel = typeof modelOverride === 'string' ? modelOverride : request.model;
-    const fail = (source?: string, feature?: string): never => {
+    const failWith = (modality: RichModality, source?: string, feature?: string): never => {
       throw new UnsupportedModelInputError({
         provider: this.name,
         model: effectiveModel || request.model,
-        modality: 'image',
+        modality,
         ...(source ? { source } : {}),
         ...(feature ? { feature } : {}),
       });
     };
+    // Every audio-bearing request is already rejected below, so the only rich
+    // modality that can reach a later rejection here is `image`. Per-part
+    // rejections therefore report `'image'` because that is the offending
+    // part's own type, not because it is a historical default.
+    const fail = (source?: string, feature?: string): never => failWith('image', source, feature);
+    // This adapter maps no audio transport. The runtime gate already fails
+    // closed because `inputCapabilities` declares no `audio`; rejecting here
+    // too keeps the adapter authoritative on its own wire format.
+    const audioPart = firstRichPart(request.input, request.history, 'audio');
+    if (audioPart) failWith('audio', audioPart.source.type, 'audio input');
     if (
       request.providerOptions &&
       'model' in request.providerOptions &&
@@ -1010,7 +1046,7 @@ export class AnthropicProvider implements Provider {
 
     const body: Record<string, unknown> = {
       model: effectiveModel,
-      messages: this.mapMessages(nonSystemMessages),
+      messages: this.mapMessages(nonSystemMessages, effectiveModel),
       max_tokens: options.maxTokens ?? 4096,
       stream,
     };
@@ -1121,7 +1157,7 @@ export class AnthropicProvider implements Provider {
    * - assistant messages with tool_calls -> assistant with tool_use content blocks
    * - tool messages (tool results) -> user messages with tool_result content blocks
    */
-  private mapMessages(messages: ChatMessage[]): AnthropicMessage[] {
+  private mapMessages(messages: ChatMessage[], model: string): AnthropicMessage[] {
     const result: AnthropicMessage[] = [];
 
     for (const msg of messages) {
@@ -1180,7 +1216,9 @@ export class AnthropicProvider implements Provider {
         result.push({
           role: 'user',
           content:
-            typeof msg.content === 'string' ? msg.content : anthropicImageBlocks(msg.content),
+            typeof msg.content === 'string'
+              ? msg.content
+              : anthropicImageBlocks(msg.content, model),
         });
       }
       // system messages already handled at top level

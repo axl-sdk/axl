@@ -7,8 +7,10 @@ description: Create a living Axl plan or design doc grounded in developer journe
 
 Create the requested living plan. The root lead owns product decisions,
 architecture, acceptance criteria, and final synthesis. When model selection is
-available, use Sol/medium for the lead and raise effort only for consequential
-unresolved ambiguity.
+available, follow `CLAUDE.md` Agent routing: Sol/medium for settled synthesis,
+Astra/medium when unresolved architecture or contracts make the lead the primary
+reasoner. Preserve explicit user choices and verify host-resolved settings when
+available; these instructions do not switch the running model.
 
 Use `repo-explorer` (Luna/medium) for bounded read-only discovery with a precise
 question and file-backed evidence. Ask discovery questions rather than design

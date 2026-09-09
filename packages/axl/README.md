@@ -67,7 +67,7 @@ agent({ model: 'deepseek:deepseek-reasoner' });           // DEEPSEEK_API_KEY
 agent({ model: 'ollama:llama3' });                        // local — no key, $0
 ```
 
-Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, and self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them. OpenAI Responses, Anthropic, Google, and OpenRouter accept image input without hard-coding a model catalog; the selected upstream model remains authoritative. Completed-file transcription is a separate, narrower contract. Build your own compatible provider by cloning a `ProviderProfile`; see [provider details](../../docs/providers.md) and [multimodal input](../../docs/multimodal-input.md).
+Presets: `openrouter`, `azure`, `xai`, `deepseek`, `mistral`, `groq`, `bedrock`, and self-hosted `ollama` / `vllm` / `lmstudio` / `llamacpp` / `sglang`. The unified `effort` knob and per-call cost tracking work across them. OpenAI Responses, Anthropic, Google, and OpenRouter accept image input, and OpenAI Chat Completions, Google, and OpenRouter accept general recorded-audio input, without hard-coding a model catalog; the selected upstream model remains authoritative. Completed-file transcription is a separate, narrower contract. Build your own compatible provider by cloning a `ProviderProfile`; see [provider details](../../docs/providers.md) and [multimodal input](../../docs/multimodal-input.md).
 
 Each provider also accepts an opt-in `rateLimit` (`{ maxConcurrent?, minIntervalMs?, acquireTimeoutMs? }`) for proactive client-side pacing on top of the automatic 429/503/529 backoff — useful when a large fan-out (e.g. an eval) shares one API key. It caps in-flight request concurrency (not token throughput) for that provider's chat calls. See [Providers → Rate limiting](../../docs/providers.md#rate-limiting-opt-in).
 
@@ -817,6 +817,27 @@ google:gemini-3.1-pro-preview          # Google Gemini
 
 See [docs/providers.md](../../docs/providers.md) for the full model list including reasoning models.
 
+### General recorded-audio input
+
+An `InputAudioPart` puts a finite recording directly in front of a chat model so
+it can reason about speech *and* non-speech sound — the journey transcription
+cannot serve.
+
+```typescript
+await ctx.ask(listener, [
+  { type: 'audio', source: { type: 'bytes', data: wav, mediaType: 'audio/wav' } },
+  { type: 'text', text: 'What kind of sound is this?' },
+]);
+```
+
+Sources are `bytes | base64 | provider-file`; an audio URL is unrepresentable by
+construction. Audio is a per-provider opt-in: `openrouter:` is live-certified for
+a text answer, a tool continuation, and streaming; `openai:` (Chat Completions
+`input_audio`) and `google:` (Interactions) are implemented but not yet
+certified; `anthropic:`, `openai-responses:`, and every other compatible preset
+reject an audio part with zero requests and no transcription fallback. See
+[Multimodal input](../../docs/multimodal-input.md#general-recorded-audio-input).
+
 ### Completed-file transcription
 
 Use `ctx.transcribe()` for finite recordings, then explicitly pass
@@ -826,7 +847,9 @@ contracts; any nonblank `openrouter-transcription:<vendor/model>` URI can
 dispatch supported bytes/base64 to OpenRouter, where the selected model/route
 decides endpoint compatibility. See [Multimodal input](../../docs/multimodal-input.md)
 for the 25 MiB inline bound, source types, options, transcript redaction,
-temporary Gemini Files cleanup, and live-verification commands.
+temporary Gemini Files cleanup, and live-verification commands. Transcription and
+general audio input are separate products: neither is ever a hidden
+implementation of the other.
 
 ## License
 

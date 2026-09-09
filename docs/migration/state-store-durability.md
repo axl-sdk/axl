@@ -92,6 +92,12 @@ const tenantRuns = execs.filter((e) => e.metadata?.tenantId === 't-7');
 
 **Persistence:** All three built-in stores roundtrip the field. `SQLiteStore` schema v3 auto-adds an `execution_history.metadata` column on first open.
 
+**Rich session history.** All three stores round-trip application-constructed
+rich user turns (text, image, and audio parts) with base64 or provider-file
+sources. Inline `Uint8Array` media is rejected before it reaches a store with
+`Uint8Array media input cannot be persisted in session history` — one
+type-agnostic guard over every non-text part, not a per-modality branch.
+
 **Internal control-plane keys stripped.** `sessionHistory` and `sessionId` are filtered before lift. The runtime reads these directly from `options.metadata` for control purposes, but they don't bloat the persisted row. Callers using these as control channels see no behavior change; the persisted snapshot stays JSON-clean.
 
 **Isolation.** The snapshot is `structuredClone`'d so caller mutations to `options.metadata` after `execute()` returns don't surface mid-run through `getExecution(id)`. Non-cloneable values (functions, etc.) fall back to a sanitized shallow copy at the persist boundary — uncloneable keys are silently dropped, workflow execution is unaffected.

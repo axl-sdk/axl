@@ -362,17 +362,19 @@ All primitives are available on `ctx` inside workflow handlers.
 Invoke an agent. Runs the tool-call loop until the agent produces a final response or hits `maxTurns`.
 
 `prompt` is `ModelInput`: the legacy `string` shorthand or a non-empty ordered
-readonly array of `{ type: 'text', text }` and `{ type: 'image', source, label? }`
-parts. Image sources are URL, bytes, base64, or a provider-scoped file reference;
-see [Multimodal model input](./multimodal-input.md) for their exact shapes and
-the per-provider transport contract. For `openrouter:<vendor/model>`, URL,
-bytes, and base64 images are passed through without a catalog lookup; the
-selected OpenRouter model/route decides modality and composition support.
-Decoded inline image data is capped at 25 MiB total
-per logical input before copying/decoding; URL and provider-file contents are
-not loaded by Axl. The byte ceiling is exported as
-`MAX_INLINE_MODEL_INPUT_BYTES`; `inputText(prompt)` returns its deterministic text
-projection. Rich evidence survives retries, tool turns, handoffs, and the
+readonly array of `{ type: 'text', text }`, `{ type: 'image', source, label? }`,
+and `{ type: 'audio', source, label? }` parts. Exact shapes are in
+[Model Input](#model-input); the per-provider transport contract is in
+[Multimodal model input](./multimodal-input.md). For
+`openrouter:<vendor/model>`, URL, bytes, and base64 images and base64 audio are
+passed through without a catalog lookup; the selected OpenRouter model/route
+decides modality and composition support. Decoded inline media data is capped at
+25 MiB total per logical input before copying/decoding, shared across images and
+audio; URL and provider-file contents are not loaded by Axl. The byte ceiling is
+exported as `MAX_INLINE_MODEL_INPUT_BYTES`; `inputText(prompt)` returns its
+deterministic text projection (media parts are omitted), and
+`summarizeModelInput(prompt)` returns the placeholder projection used for
+context estimation. Rich evidence survives retries, tool turns, handoffs, and the
 selected delegate inside this ask, but is not automatically retained for later
 session turns.
 
@@ -520,7 +522,7 @@ Select the best agent from a list of candidates and invoke it. Creates a tempora
 | `options.validate` | `OutputValidator<T>` | Post-schema business rule validation. Forwarded to the final `ctx.ask()` call |
 | `options.validateRetries` | `number` | Maximum retries for validate failures (default: 2) |
 | `options.retryFeedback` | `RetryFeedbackHook` | Custom gate-retry feedback. Forwarded to the final `ctx.ask()` call on both the single-candidate and the routed path. See [Custom retry feedback](#custom-retry-feedback) |
-| `options.routerInput` | `'full' \| 'text'` | `'full'` (default) routes ordered evidence; `'text'` routes `inputText(prompt)` only |
+| `options.routerInput` | `'full' \| 'text'` | `'full'` (default) routes ordered evidence; `'text'` routes `inputText(prompt)` only — a media-only input has no text projection and throws `InvalidModelInputError` |
 
 **Returns:** `Promise<T>` — the selected agent's response.
 
@@ -1075,6 +1077,162 @@ No options beyond the event name and optional data payload.
 
 ---
 
+## Model Input
+
+`ModelInput` is the type every `prompt` argument accepts (`ctx.ask()`,
+`ctx.delegate()`, `agent.ask()`). Exported from `@axlsdk/axl`.
+
+```typescript
+type ModelInput = string | readonly InputContentPart[];
+type InputContentPart = InputTextPart | InputImagePart | InputAudioPart;
+```
+
+An array must be non-empty. Parts keep caller order on the wire; schema guidance
+is appended as a trailing text part.
+
+### Part types
+
+| Type | Shape | Notes |
+|------|-------|-------|
+| `InputTextPart` | `{ type: 'text', text: string }` | `text` must be a non-empty string |
+| `InputImagePart` | `{ type: 'image', source: InputMediaSource, label?: string }` | `label` must be a non-empty string when present |
+| `InputAudioPart` | `{ type: 'audio', source: RecordedAudioSource, label?: string }` | General recorded-audio input. See [Multimodal model input](./multimodal-input.md#general-recorded-audio-input) for the per-provider contract |
+
+> **Consumer note.** `InputContentPart` gained its `audio` member additively:
+> producers are unaffected, but a consumer that branches on `part.type` with a
+> non-exhaustive `else` will label audio as image. Switch exhaustively.
+
+### Source types
+
+`InputMediaSource` (images) is a closed four-variant union:
+
+| Variant | Shape |
+|---------|-------|
+| URL | `{ type: 'url', url: string, mediaType?: string }` — must be `http:`/`https:`; Axl validates but never fetches it |
+| Bytes | `{ type: 'bytes', data: Uint8Array, mediaType: string }` — copied on normalization, so later caller mutation cannot change the sent request |
+| Base64 | `{ type: 'base64', data: string, mediaType: string }` — canonical base64, no data URL |
+| Provider file | `{ type: 'provider-file', provider: string, reference: string, mediaType?: string }` — opaque and provider-scoped |
+
+`RecordedAudioSource` (audio) is the narrower `bytes | base64 | provider-file`
+union — the **same type** `ctx.transcribe()` accepts. It deliberately has no
+`url` variant, which makes an audio URL unrepresentable rather than merely
+rejected, and keeps one finite-audio vocabulary across both products.
+
+### `MAX_INLINE_MODEL_INPUT_BYTES`
+
+`25 * 1024 * 1024`. The maximum decoded inline bytes across **all** media in one
+logical input — images and audio share the single bound, checked before bytes are
+copied or base64 is decoded. URL and provider-file sources do not count toward
+it. The ordered input and each rich history message are *separate* logical
+inputs, so a request combining them can exceed the bound on the wire, where the
+provider's own request-size limit applies.
+
+`MAX_INLINE_TRANSCRIPTION_BYTES` (also `25 * 1024 * 1024`) is a **separate,
+independent** constant governing `ctx.transcribe()`; the two never share a
+budget.
+
+### `inputText(input)`
+
+`(input: ModelInput) => string`. Returns a string input unchanged, or the text
+parts joined by `\n`. Media parts are omitted entirely. Used for input
+guardrails and full-trace message snapshots.
+
+### `summarizeModelInput(input)`
+
+`(input: ModelInput) => string`. The context-safe projection: text parts
+verbatim, media parts as a deterministic placeholder, joined by `\n`.
+
+| Part | Rendering |
+|------|-----------|
+| text | the text |
+| image | `[image <mediaType>]`, or `[image media]` when the source declares none |
+| audio | `[audio <mediaType>]`, or `[audio media]` when the source declares none |
+
+It never emits bytes, base64, URLs, or provider-file references. This is why
+media is never counted as zero context, and it is the projection
+`MockProvider.echo()` returns — so `echo()` and context estimates cannot
+disagree.
+
+### `ModelInputDescriptor`
+
+The bounded, observation-safe view carried on `ask_start`,
+`agent_call_start`, completion callbacks, and Studio payloads. The type is
+exported; the runtime builds it internally and omits it entirely for a string
+input.
+
+```typescript
+type ModelInputDescriptor = {
+  readonly parts: readonly (
+    | { type: 'text'; characters: number }
+    | { type: 'image'; source: InputMediaSource['type']; mediaType?: string;
+        bytes?: number; locator?: string; label?: string }
+    | { type: 'audio'; source: RecordedAudioSource['type']; mediaType?: string;
+        bytes?: number; locator?: string; label?: string }
+  )[];
+};
+```
+
+`bytes` is the known inline size — the `Uint8Array` length, or the decoded
+length of base64 — and is absent for URL and provider-file sources. `locator` is
+the URL or the provider-file reference, so on the **audio** variant it can only
+ever come from a provider-file. `trace.redact` scrubs `locator` and `label`
+while retaining `type`, `source`, `mediaType`, `bytes`, and `characters`. No
+descriptor ever contains inline bytes or base64.
+
+### `Provider.inputCapabilities?(model)`
+
+`(model: string) => InputModalitySupport`. Optional. Declares which rich input
+modalities this provider accepts for a given model:
+
+```typescript
+type InputModalitySupport = {
+  image?: { sources: readonly InputMediaSource['type'][] };
+  audio?: { sources: readonly RecordedAudioSource['type'][] };
+};
+```
+
+Declaring `audio` is the **sole** audio opt-in. If any audio part is present in
+the input or the session history and the resolved provider does not return an
+`audio` key for the model, the runtime throws `UnsupportedModelInputError`
+(`modality: 'audio'`) **before** `validateInput`, before dynamic handoff
+resolution, before context summarization, before guardrails, and before any
+provider request — including the summary-provider request an oversized history
+would otherwise trigger. Audio capability is never inferred from provider
+family, image support, or transcription support, and there is no transcription
+fallback.
+
+Images layer differently, deliberately: `validateInput` remains the
+authoritative image gate, so a provider that predates `inputCapabilities`
+keeps working for images unchanged.
+
+The gate runs against the URI's model; if `validateInput` returns a different
+`effectiveModel` (a catalog alias, a `providerOptions.model` override), the audio
+capability is re-checked against that model before dispatch.
+
+### `Provider.validateInput?(request)`
+
+`(request: ProviderInputValidationRequest) => ProviderInputValidationResult`.
+Optional, but **required** for any rich input: a rich request to a provider that
+does not implement it is rejected. The adapter is authoritative for its own wire
+format — source kinds it cannot express, media types outside its closed format
+table, mismatched provider-file ownership, rich non-user history, raw
+input-container overrides, and a blank or non-string `providerOptions.model`.
+
+| Request field | Type | Description |
+|---------------|------|-------------|
+| `model` | `string` | The URI's model component |
+| `input` | `ModelInput` | An independently cloned copy of the caller's input |
+| `history` | `readonly ChatMessage[]` | Application-owned history accompanying this input; validators must cover rich parts here too, so a tool continuation cannot fail later than the first request |
+| `stream` | `boolean` | Whether the ask is streaming |
+| `hasTools` | `boolean` | Whether tools/MCP/handoffs are present |
+| `responseMode` | `'text' \| 'structured'` | Whether a `schema` was requested |
+| `providerOptions` | `Record<string, unknown>?` | Merged provider options for this call |
+
+It returns `{ effectiveModel: string }` — the model actually sent on the wire and
+reported through observability. A non-string or empty `effectiveModel` is itself
+a rejection.
+
+
 ## Guardrails
 
 User-defined validation functions that run at the agent boundary, before and after each LLM call.
@@ -1336,6 +1494,7 @@ const session = runtime.session('user-123', {
     summarize: true,
     summaryModel: 'openai-responses:gpt-5-mini',
   },
+  deduplicateInput: true,
   persist: true,
 });
 
@@ -1349,6 +1508,7 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 | `history.maxMessages` | `number` | — | Keep the last N messages. Older messages are trimmed (or summarized if `summarize` is `true`) |
 | `history.summarize` | `boolean` | `false` | When `true` and `maxMessages` is exceeded, summarize old messages instead of dropping them |
 | `history.summaryModel` | `string` | — | Model URI for summarization (e.g., `'openai:gpt-4o-mini'`). **Required** when `summarize` is `true` |
+| `deduplicateInput` | `boolean` | `true` | Send the current session input once when the workflow passes that same normalized input to `ctx.ask()`. Set to `false` to preserve the legacy duplicate request |
 | `persist` | `boolean` | `true` | Save session history to the state store. When `false`, history exists only in memory for the session lifetime |
 
 ### Session Methods
@@ -1364,7 +1524,9 @@ const result = await session.send('HandleSupport', { msg: 'Help me' });
 
 ### What's stored
 
-A session's persisted state is a flat `ChatMessage[]` of `user` and `assistant` turns, keyed by `sessionId` in the configured `StateStore`. Summarization caches and handoff history are stored alongside as session metadata. The `Session` object itself holds no message cache — every `send()`/`stream()` reads history from the store, mutates it during execution, and writes it back. Calling `runtime.session(id)` does not pre-load anything and does not check whether the id exists.
+A session's persisted state is a flat `ChatMessage[]` of `user` and `assistant` turns, keyed by `sessionId` in the configured `StateStore`. The persisted `user` turn is the workflow input: a string as-is, an ordered `ModelInput` as its context-safe text projection (`question\n[audio audio/wav]`, the same rendering `summarizeModelInput` produces), and any other application object as JSON. An array counts as `ModelInput` only when it is non-empty and every element carries a `type` of `text`, `image`, or `audio`; any other array (including `[]`) is an application value and is persisted as JSON. Media is per-call evidence, never session state, so inline base64 is never persisted or re-sent as text on later turns, and a malformed part fails with `InvalidModelInputError` before the workflow runs. Summarization caches and handoff history are stored alongside as session metadata. The `Session` object itself holds no message cache — every `send()`/`stream()` reads history from the store, mutates it during execution, and writes it back. Calling `runtime.session(id)` does not pre-load anything and does not check whether the id exists.
+
+By default, the request sent by `ctx.ask()` contains a matching current session input once. When the just-recorded current turn is still unchanged at the end of history and the ask input has the same normalized structure, `ctx.ask()` omits that one turn from its request-local history snapshot before appending the normal ask content. Rich inputs compare their ordered parts and media source data, not their lossy text projection. Application objects match only when the ask is exactly their `JSON.stringify(...)` string. Equal inputs on later `send()` calls remain distinct, as do a second sequential ask after an assistant reply, whitespace/case changes, and manually supplied `sessionHistory`. Child contexts still start with empty history. `deduplicateInput: false` restores the prior request shape without changing what the session persists.
 
 ### Sharing semantics
 
@@ -1741,21 +1903,38 @@ ollama/vllm/lmstudio/llamacpp/sglang) are profiles; build your own by cloning on
 | `parallelToolCalls` | `PerModel<boolean>` | off | Send `parallel_tool_calls: true` when tools are present |
 | `requestDefaults` | `Record<string,unknown>` | — | Static body fields merged before `providerOptions` |
 
-**`PricingSource`** — `{ kind: 'table'; table: PricingTable; match?: 'prefix' | 'exact' }` · `{ kind: 'from-response' }` (provider returns `usage.cost`) · `{ kind: 'zero' }` (local) · `{ kind: 'unknown' }`. Custom tables default to prefix matching for compatibility; built-in current catalogs use exact matching. A table miss yields `cost: undefined`, never `0`.
+**`PricingSource`** — `{ kind: 'table'; table: PricingTable; match?: 'prefix' | 'exact' }` · `{ kind: 'from-response' }` (provider returns `usage.cost`) · `{ kind: 'zero' }` (local) · `{ kind: 'unknown' }`. Custom tables default to prefix matching for compatibility; built-in current catalogs use exact matching. A table miss yields `cost: undefined`, never `0`. A `PricingTable` cannot express an audio rate, so a table-priced profile also yields `undefined` on a call whose usage reports a non-zero `audio_input_tokens` rather than billing those tokens at its text input rate.
 
 **Provider usage** — `ProviderResponse.usage` and terminal stream chunks expose
 `prompt_tokens`, `completion_tokens`, `total_tokens`, and optional `reasoning_tokens`,
-`cached_tokens`, and `cache_write_tokens`. Anthropic cache creation is included in
+`cached_tokens`, `cache_write_tokens`, `audio_input_tokens`, and `audio_output_tokens`.
+Anthropic cache creation is included in
 `cache_write_tokens`; when the response provides 5-minute and 1-hour TTL buckets, Axl prices
 each bucket at its actual multiplier. Aggregate-only cache-write usage remains observable but
 is deliberately unpriced.
+
+`audio_input_tokens` / `audio_output_tokens` are the audio share of
+`prompt_tokens` / `completion_tokens`, populated on every lane that reports the
+split — `openai:` and `openrouter:` from `prompt_tokens_details.audio_tokens` /
+`completion_tokens_details.audio_tokens`, `openai-responses:` from
+`input_tokens_details.audio_tokens` / `output_tokens_details.audio_tokens`, and
+`google:` Interactions from `input_tokens_by_modality`. Both fields are **absent, never `0`**, when the
+provider reported no split or reported an unusable count, so a consumer can
+distinguish "no audio" from "not reported"; `prompt_tokens` remains the folded
+total. Both usage shapes carry them identically, so a streaming consumer sees
+the same fields as `chat()`. `AxlEventBase.tokens` is deliberately NOT widened
+with a modality bucket. The public `PricingTable` type is unchanged: audio
+rates live on the built-in `openai:` and `google:` catalogs only, so a
+third-party profile cannot declare one.
 
 **`ReasoningProfile`** — `{ emit: ReasoningEmit; capture: ReasoningCapture; roundTrip?: ReasoningRoundTrip }`.
 - `capture`: `'none'` · `'reasoning_content'` · `'reasoning'` · `'reasoning_details'` · `'think_tags'` (inline `<think>`).
 - `roundTrip`: `'none'` (default) · `'on-tool-call-turns'` (echo captured reasoning only on assistant turns that carried `tool_calls`).
 - Helpers: `reasoningEffortEmit(map)` writes top-level `reasoning_effort`; `reasoningObjectEmit(mapEffort)` writes OpenRouter's `reasoning` object (effort XOR `max_tokens`).
 
-**`CapabilityFlags`** — `emitsMessageName?` (default `true`) · `forbiddenParams?: PerModel<string[]>` (strip engine-computed values, preserve user `providerOptions`) · `supportsJsonSchema?: PerModel<boolean>` (default `true`; falls back to `json_object`) · `supportsStreamUsage?` (default `true`).
+**`CapabilityFlags`** — `emitsMessageName?` (default `true`) · `forbiddenParams?: PerModel<string[]>` (strip engine-computed values, preserve user `providerOptions`) · `supportsJsonSchema?: PerModel<boolean>` (default `true`; falls back to `json_object`) · `supportsStreamUsage?` (default `true`) · `inputModalities?: ProfileInputModalities`.
+
+**`ProfileInputModalities`** — `{ image?: { sources }, audio?: { sources, formats } }`. Declaring a modality here is the **only** way an OpenAI-compatible profile opts in to rich input on that wire format: the engine derives `inputCapabilities`, `validateInput`, and its rich-part builder from this object, never from the provider's name. A profile that omits a modality rejects it locally with `UnsupportedModelInputError` before dispatch, and a blank effective model declares nothing. `sources` are the accepted source kinds (`InputMediaSource['type'][]` for image, `RecordedAudioSource['type'][]` for audio — audio has no `url`). `audio.formats` is the closed media type → `input_audio.format` table. The built-in OpenAI (`wav`/`mp3` only) and OpenRouter tables live in `packages/axl/src/providers/audio-format.ts` and are **not** on the public barrel, so a custom profile supplies its own literal table. A media type absent from the table is a local rejection, never a guessed format token. See [Multimodal model input](./multimodal-input.md#media-types-and-wire-formats).
 
 **`PerModel<T>`** = `T | ((model: string) => T)` — a value, or a function resolved per call against the model id (for providers whose constraints differ by model).
 
@@ -2154,7 +2333,7 @@ All errors extend `AxlError`.
 | `GuardrailError` | `ctx.ask()` | Guardrail blocked and retries exhausted. Includes `.guardrailType`, `.reason` |
 | `ProviderError` | provider adapters (via `ctx.ask()`) | Non-2xx HTTP response, or a normalized network failure (`status: 0`). `code: 'PROVIDER_ERROR'`. Includes `.provider`, `.status`, `.retryable`, `.retryAfterMs?`, `.requestId?`, `.body?`, `.timing?`. Message is the provider's text verbatim (no prefix). |
 | `InvalidModelInputError` | `ctx.ask()`, `ctx.delegate()`, `agent.ask()` | Malformed `ModelInput`. `code: 'INVALID_MODEL_INPUT'`. Invalid inputs fail before dispatch and the message never includes raw media. |
-| `UnsupportedModelInputError` | rich `ctx.ask()` / `ctx.delegate()` | Axl cannot safely map the provider/source/composition, or the effective model ID is empty. `code: 'UNSUPPORTED_MODEL_INPUT'`; includes safe `.provider`, `.model`, `.modality`, and optional source kind, never the raw locator or bytes. For catalog-capable image transports, an upstream model-capability rejection is instead a `ProviderError`. |
+| `UnsupportedModelInputError` | rich `ctx.ask()` / `ctx.delegate()` | Axl cannot safely map the provider/source/composition, or the effective model ID is empty. `code: 'UNSUPPORTED_MODEL_INPUT'`; includes safe `.provider`, `.model`, `.modality`, and optional `.source`, never the raw locator or bytes. `.modality` is typed `string` and is today `'image'` or `'audio'`, derived from the **offending part** — a mixed input whose audio part is rejected reports `'audio'`, and one whose image part is rejected reports `'image'`. The unsupported *feature* is named in `.message` only; it is not a retained field. For catalog-capable transports, an upstream model-capability rejection is instead a `ProviderError`. |
 | `TranscriptionOperationError` | `ctx.transcribe()` | Safe transcription boundary error. `code: 'TRANSCRIPTION_PROVIDER_ERROR'`; includes `.provider`, `.model`, accounting/cleanup fields, and provider-safe `.status?`, `.retryable?`, `.retryAfterMs?`, `.requestId?`. The original error remains available as a non-enumerable `.cause`; raw provider bodies never enter events. |
 | `AxlError` / `INVALID_HUMAN_DECISION` | approval handlers, `runtime.resolveDecision()` | Untyped decision is not the exact plain-object approval/denial union; rejected before resolver/store mutation |
 | `AxlError` / `PENDING_DECISION_NOT_FOUND` | `runtime.resolveDecision()` | No active or persisted pending request exists, or another concurrent resolution already won |

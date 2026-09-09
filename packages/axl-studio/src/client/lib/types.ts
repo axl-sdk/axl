@@ -77,6 +77,10 @@ export type {
   SchemaCheckData,
   ValidateData,
   ObservationStatus,
+  // Bounded, observation-safe rich-input projection. Its `parts` union is the
+  // core's (`text` | `image` | `audio` | …); renderers must stay exhaustive
+  // over it rather than treating "not text" as image.
+  ModelInputDescriptor,
 };
 
 declare global {

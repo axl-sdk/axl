@@ -736,6 +736,33 @@ describe('GeminiProvider', () => {
       expect(response.cost).toBeUndefined();
     });
 
+    it('prices a lowercase `standard` request tier — same vocabulary as the response check', async () => {
+      // The request-side and response-side tier checks must accept the same
+      // names: a value Axl reads as standard coming back would otherwise
+      // unprice going out, which is surprising rather than fail-safe.
+      const fetchMock = mockFetch({
+        json: () =>
+          Promise.resolve({
+            ...makeGeminiResponse('Hi'),
+            modelVersion: 'gemini-3.6-flash',
+            usageMetadata: {
+              promptTokenCount: 10,
+              candidatesTokenCount: 5,
+              totalTokenCount: 15,
+              serviceTier: 'standard',
+            },
+          }),
+      });
+
+      const response = await new GeminiProvider().chat([{ role: 'user', content: 'Hello' }], {
+        model: 'gemini-3.6-flash',
+        providerOptions: { serviceTier: 'standard' },
+      });
+
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body).serviceTier).toBe('standard');
+      expect(response.cost).toBeCloseTo(10 * 0.75e-6 + 5 * 3.75e-6, 12);
+    });
+
     it('leaves Flex and Priority calls unpriced', async () => {
       const fetchMock = mockFetch({
         json: () =>
@@ -3273,6 +3300,76 @@ describe('GeminiProvider', () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
+    it('pairs function results to calls by id — repeated names and out-of-order results resolve correctly', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve({ status: 'completed', steps: [] }),
+      });
+      await new GeminiProvider().chat(
+        [
+          { role: 'user', content: [geminiFileImage()] },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              { id: 'c1', type: 'function', function: { name: 'lookup', arguments: '{"n":1}' } },
+              { id: 'c2', type: 'function', function: { name: 'lookup', arguments: '{"n":2}' } },
+            ],
+          },
+          { role: 'tool', tool_call_id: 'c2', content: 'second' },
+          { role: 'tool', tool_call_id: 'c1', content: 'first' },
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              { id: 'c3', type: 'function', function: { name: 'other', arguments: '{}' } },
+            ],
+          },
+          { role: 'tool', tool_call_id: 'c3', content: 'third' },
+        ],
+        { model: 'gemini-3.7-flash' },
+      );
+      const results = JSON.parse(fetchMock.mock.calls[0][1].body).input.filter(
+        (step: { type: string }) => step.type === 'function_result',
+      );
+      expect(results).toEqual([
+        {
+          type: 'function_result',
+          name: 'lookup',
+          call_id: 'c2',
+          result: [{ type: 'text', text: 'second' }],
+        },
+        {
+          type: 'function_result',
+          name: 'lookup',
+          call_id: 'c1',
+          result: [{ type: 'text', text: 'first' }],
+        },
+        {
+          type: 'function_result',
+          name: 'other',
+          call_id: 'c3',
+          result: [{ type: 'text', text: 'third' }],
+        },
+      ]);
+    });
+
+    it('rejects a tool result whose function name cannot be resolved instead of sending an empty name', async () => {
+      const fetchMock = mockFetch({
+        json: () => Promise.resolve({ status: 'completed', steps: [] }),
+      });
+      await expect(
+        new GeminiProvider().chat(
+          [
+            { role: 'user', content: [geminiFileImage()] },
+            { role: 'assistant', content: 'calling' },
+            { role: 'tool', tool_call_id: 'call_orphan', content: '{"ok":true}' },
+          ],
+          { model: 'gemini-3.7-flash' },
+        ),
+      ).rejects.toThrow(/call 'call_orphan' has no function name/);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
     it('faithfully accumulates rich Interactions stream steps for tool continuation', async () => {
       const encoder = new TextEncoder();
       const events = [
@@ -3409,6 +3506,9 @@ describe('GeminiProvider', () => {
         ...done.providerMetadata.geminiInteractionSteps,
         {
           type: 'function_result',
+          // Interactions rejects a continuation whose function_result lacks the
+          // function name (live 400 "Invalid input received", 2026-09-08).
+          name: 'inspect',
           call_id: 'call_1',
           result: [{ type: 'text', text: '{"ok":true}' }],
         },
@@ -3738,11 +3838,14 @@ describe('GeminiProvider', () => {
         }),
       ).toEqual({ effectiveModel: 'future-gemini-model' });
       expect(() => provider.validateInput(request('  '))).toThrow('image input for this model');
+      // Interactions carries both modalities from the same three sources.
       expect(provider.inputCapabilities('gemini-3.8-flash')).toEqual({
         image: { sources: ['bytes', 'base64', 'provider-file'] },
+        audio: { sources: ['bytes', 'base64', 'provider-file'] },
       });
       expect(provider.inputCapabilities('future-gemini-model')).toEqual({
         image: { sources: ['bytes', 'base64', 'provider-file'] },
+        audio: { sources: ['bytes', 'base64', 'provider-file'] },
       });
       expect(provider.inputCapabilities('  ')).toEqual({});
     });

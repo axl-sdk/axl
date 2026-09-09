@@ -116,6 +116,36 @@ Axl does not silently fetch, upload, retain, or delete chat images. Applications
 that choose a Gemini Files workflow own URL retrieval controls, upload cleanup,
 and Google's temporary retention boundary.
 
+### General recorded-audio input
+
+An `InputAudioPart` is per-call evidence, handled exactly like an image and
+never as a hidden transcription. Its `label` and its provider-file `locator` are
+scrubbed by `trace.redact`; the structural fields (`type: 'audio'`, source kind,
+media type, inline byte count) survive redaction so observability stays useful.
+
+Model-input snapshots in `ask_start`, `agent_call_start`, and
+`onAgentCallComplete` omit inline audio bytes and base64. Full model-call traces
+replace rich message content with its safe text projection. Descriptors can
+retain provider-file locators and labels until `trace.redact` scrubs them.
+
+This guarantee does not cover arbitrary workflow input, results, or application
+logs. In particular, an unredacted `workflow_start.data.input` retains the raw
+workflow input, including media supplied there, and can reach trace consumers
+and Studio. Enable `trace.redact` to hide these lifecycle values at observability
+boundaries; it does not sanitize data at rest. See
+[Observability-Boundary Redaction](#observability-boundary-redaction).
+
+Inline `Uint8Array` audio in persisted session history is rejected
+(`Uint8Array media input cannot be persisted in session history`). That guard is
+type-agnostic over every non-text part rather than a per-modality list, so a
+future modality inherits it automatically. Base64 and provider-file audio in
+application-constructed history persists normally; treat a stored provider-file
+locator as sensitive application data.
+
+A provider that does not declare `audio` rejects an audio part before any
+network request — no target call, no summary-provider call, no upload, and no
+transcription fallback.
+
 ### Recorded-audio handling
 
 `ctx.transcribe()` accepts only finite caller-supplied bytes, canonical base64,

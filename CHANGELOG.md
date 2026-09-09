@@ -7,10 +7,193 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.3] - 2026-09-09
+
+### Added
+
+- **Modality-aware audio cost estimation.** Audio-bearing `openai:` Chat
+  Completions and `google:` Interactions calls are now **priced** instead of
+  unpriced, so `ctx.budget()` can enforce a cost limit on audio work and cost
+  dashboards show a published-rate estimate rather than a `≥ $X` lower bound. Audio
+  tokens bill from a per-model audio rate row, never from the text row: the
+  prompt splits into disjoint cached / cache-write / audio / text buckets and
+  each bills at its own published rate, with output plus (on Gemini) thought
+  tokens at the output rate. Rates are carried for `gpt-audio-1.5`,
+  `gpt-audio`, `gemini-2.5-flash`, and `gemini-3.7-flash` (reviewed 2026-09-08
+  against the first-party pricing pages; the announced 2027 Gemini increase is
+  deliberately not encoded). A call with any billed bucket lacking a
+  published rate — or whose reported counts do not reconcile — stays
+  `undefined`, never `0`: an audio-bearing call on a model without an audio
+  rate, a missing audio count on an audio-bearing request (missing is not
+  zero), an unknown Gemini modality,
+  server-side tool tokens, cached tokens co-occurring with audio tokens (the
+  providers do not document whether the two buckets overlap), a Gemini
+  `total_tokens` that does not reconcile with its parts, a non-text reply, a
+  non-Standard tier, a non-canonical base URL, or a long-context crossing that
+  carries audio. A custom `ProviderProfile` using `pricing: { kind: 'table' }`
+  is likewise unpriced on a call that billed audio tokens, since a
+  `PricingTable` cannot express an audio rate. `openrouter:` is unchanged
+  (`usage.cost` stays authoritative), images on `openai:` Chat Completions stay
+  unmodeled, and `MockProvider` is untouched. Text-only pricing is unchanged,
+  **with one exception**: a text call whose usage nonetheless reports audio
+  tokens, on a model with no published audio rate, is now unpriced rather than
+  billed at the text rate — usage is authoritative, so a reported audio bucket
+  means real audio billing at a price Axl does not know.
+  **This is not retroactive:** executions recorded before this release keep
+  `unpriced: true` for audio work, so anyone diffing historical against new
+  executions sees a step change at the release boundary.
+  Reconciled text- and image-only Gemini Interactions calls use ordinary
+  catalog rates, independent of audio-rate availability; see the pricing
+  expansion below and [`docs/providers.md`](docs/providers.md#rich-input-calls).
+- `ProviderResponse.usage` and terminal stream chunks gain optional
+  `audio_input_tokens` / `audio_output_tokens` — the audio share of
+  `prompt_tokens` / `completion_tokens`, populated on `openai:`,
+  `openrouter:` (observability only), and `google:` Interactions. Both fields
+  are **absent, never `0`**, when the provider reported no split or an
+  unusable count, and `prompt_tokens` remains the folded total. The two usage
+  shapes stay in field parity, so streaming consumers see the same fields as
+  `chat()`. `AxlEventBase.tokens` and the public `PricingTable` type are
+  deliberately unchanged.
+- **General recorded-audio input.** `InputContentPart` gains an audio member,
+  `InputAudioPart` (`{ type: 'audio', source: RecordedAudioSource, label? }`), so
+  a chat model can reason directly about a finite recording — speech *and*
+  non-speech sound. Sources are `bytes | base64 | provider-file`; an audio URL is
+  unrepresentable by construction because the part reuses the same
+  `RecordedAudioSource` union `ctx.transcribe()` accepts. This is usable in this
+  release: audio parts are reachable through the barrel-exported
+  `InputContentPart` and are accepted at runtime on the adapters below. The
+  `InputAudioPart` *name* is exported as documentation, not as an availability
+  gate.
+  Transport ships on `openai:` (Chat Completions `input_audio`, `wav | mp3`,
+  bytes/base64), `openrouter:` (`input_audio` with a wider closed format table,
+  bytes/base64), `google:` (Interactions `{ type: 'audio', data | uri,
+  mime_type }`, bytes/base64/provider-file), and `MockProvider`. Ordered audio
+  survives retries, schema and guardrail recovery, tool continuations, delegate,
+  handoff, and streaming, exactly like an image. `anthropic:`,
+  `openai-responses:`, and every other OpenAI-compatible preset reject an audio
+  part with a zero-request `UnsupportedModelInputError` (`modality: 'audio'`) and
+  never fall back to transcription.
+  **Live-certified compositions:** `google:` for a text answer from speech and
+  non-speech audio, a stateless tool continuation, structured output,
+  streaming, and an audio turn re-sent from application session history;
+  `openrouter:` for a text answer, a tool continuation, and streaming;
+  `openai:` for a single-turn text answer only — `gpt-audio-1.5` failed the
+  tool continuation provider-side (`500`) and rejects `response_format`
+  (`400`), so those compositions are recorded, not advertised. See
+  [`docs/verification/general-audio-lighthouse-2026-09-08.md`](docs/verification/general-audio-lighthouse-2026-09-08.md)
+  and [`docs/multimodal-input.md`](docs/multimodal-input.md#general-recorded-audio-input).
+- `InputModalitySupport.audio` on `Provider.inputCapabilities` — declaring it is
+  the sole audio opt-in. The runtime fails closed for audio *before*
+  `validateInput`, and re-checks the capability if a validator substitutes a
+  different effective model. Image preflight is unchanged.
+- `CapabilityFlags.inputModalities` and the `ProfileInputModalities` type on the
+  OpenAI-compatible engine, so a profile declares rich-input support explicitly
+  instead of the engine branching on the provider's name.
+- `summarizeModelInput` is exported from the core barrel: the context-safe
+  projection rendering media as `[image <mediaType>]` / `[audio <mediaType>]`.
+- `MockProvider.withInputModalities(['image' | 'audio'][])` — restrict the rich
+  modalities the mock declares, so a provider that does not support a modality
+  can be exercised offline. Both are declared by default.
+- `ModelInputDescriptor` gains an `audio` part variant; its `locator` can only
+  come from a provider-file reference.
+- `axl.input.audio` span attribute on the `axl.model_input` event.
+- Live certification rows `GA1`–`GA12` (plus `GA2-text`) in
+  `packages/axl/src/__tests__/integration-general-audio.test.ts`, double-gated
+  behind `AXL_MULTIMODAL_LIVE=1` + `AXL_GENERAL_AUDIO_LIVE=1` (`GA2` additionally
+  behind `AXL_GENERAL_AUDIO_OPENAI_TOOL_LIVE=1`).
+
+### Changed
+
+- Refined development-agent routing, added budget implementation and debugging roles, and made plan leads accountable for orchestration timing, rework, and evidence-backed process improvements.
+
+- **`InputContentPart` is widened with the audio member.** This is additive for
+  *producers* — no existing code can construct an audio part, and the runtime
+  guarantees audio never reaches a provider that did not opt in. It is **not**
+  compile-time safe for *consumers*: any code that branches over
+  `InputContentPart` or `ModelInputDescriptor` with a non-exhaustive `else`
+  (`if (part.type === 'text') … else /* image */ …`) will now silently label
+  audio as image. Switch exhaustively over `part.type`. Every in-repo projection,
+  including the three Studio sites, was made exhaustive with a `never` arm in
+  this change. Released as a patch under the 0.x rule.
+- **`MockProvider.echo()` projects media parts instead of dropping them.** It now
+  returns `summarizeModelInput(...)` rather than `inputText(...)`, so a prompt of
+  `['before', image, 'after']` echoes `'before\n[image image/png]\nafter'` where
+  it previously echoed `'before\nafter'`. Tests asserting on `echo()` output with
+  media in the prompt need updating. One projection is shared with the runtime's
+  context summarizer so echo and context estimates cannot disagree.
+- `inputCapabilities()` now returns an `audio` key on `google:`, `openai:`,
+  `openrouter:`, and `MockProvider`. A consumer asserting on that object with
+  `toEqual` will need the new key.
+- `UnsupportedModelInputError.modality` reports the **offending** part's modality
+  rather than a hardcoded value, so a mixed input whose audio part is rejected
+  reports `'audio'` and one whose image part is rejected reports `'image'`.
+- Three user-visible message strings changed:
+  `Inline image data must not exceed 25 MiB total; use a URL or provider-file
+  source where supported` → `Inline media data must not exceed 25 MiB total; use
+  a provider-file source, or a URL for images, where supported`;
+  `Uint8Array image input cannot be persisted in session history` →
+  `Uint8Array media input cannot be persisted in session history`; and
+  `part N.type must be 'text' or 'image'` →
+  `part N.type must be 'text', 'image', or 'audio'`.
+- The persisted-session-history bytes guard is now type-agnostic over every
+  non-text part instead of an image-specific branch.
+- `axl.input.source.*` and `axl.input.inline_bytes` span attributes now count
+  **all** non-text parts, so an audio-bearing ask is not reported as carrying
+  zero media bytes. `axl.input.images` stays image-only for existing consumers.
+- `estimateMessagesTokens` treats audio history as unmeasured media exactly like
+  images, so audio is never counted as zero context and the unmeasured-context
+  warning still fires.
+- **Gemini Interactions now prices known text/image usage on models without an
+  audio rate.** A verified audio rate is required only when audio tokens are
+  positive. Reconciled text/image calls, including cached and long-context
+  calls, use the existing catalog rates; positive audio without a rate and
+  all other unsupported billing cases remain unpriced. Previously recorded
+  executions are not rewritten.
+
+### Fixed
+
+- **Gemini Interactions now honors response service tiers when estimating cost.**
+  Top-level response tiers, the `x-gemini-service-tier` header, and streaming
+  lifecycle events are checked together. Any non-standard, unknown, or
+  conflicting evidence leaves cost unknown while preserving token usage.
+  Non-standard requests remain unpriced even when Google reports a Standard
+  downgrade. Standard calls keep their existing estimates.
+
+- **Session workflows no longer send the current user input twice by default.**
+  When a workflow passes the same current input to `ctx.ask()`, the model sees
+  it once while persisted history remains unchanged. Matching includes the
+  full ordered rich input, so media is preserved and later equal turns remain
+  distinct. Set `SessionOptions.deduplicateInput: false` to retain the legacy
+  duplicate provider request.
+
 ## [0.23.2] - 2026-09-07
 
 ### Fixed
 
+- **A Node `Buffer` passed as a `bytes` media source is now copied, not
+  aliased.** `Buffer.prototype.slice()` shares memory, so the ownership copy
+  the runtime takes on normalization (and the `MockProvider` call record) was a
+  view over the caller's buffer for the most common input path,
+  `readFileSync`. Both now allocate a fresh `Uint8Array`. Images and audio.
+- **`ctx.delegate({ routerInput: 'text' })` on a media-only input throws
+  `InvalidModelInputError`** instead of routing on an empty user turn.
+- **`Session.send()` / `stream()` no longer persist a rich `ModelInput` as
+  JSON.** A workflow input made of text/image/audio parts was recorded as a
+  JSON string — inline base64 included — which bypassed the inline media cap
+  and was re-sent to the model as *text* on every later turn. The `user` turn
+  is now the context-safe projection (`question\n[audio audio/wav]`); media
+  stays per-call evidence, and a malformed part fails with
+  `InvalidModelInputError` before the workflow runs. Application objects are
+  still recorded as JSON.
+- **Gemini Interactions tool continuations no longer fail with `400 Invalid
+  input received`.** The stateless (`store: false`) continuation omitted the
+  required `name` on each `function_result` step. The adapter now remembers
+  every `function_call`'s name by `call_id` and echoes it on the matching
+  result; a tool result whose name cannot be resolved (application history
+  with no matching call and no `name`) throws `InvalidModelInputError` naming
+  the call id instead of sending an empty name for the provider to reject.
+  Pre-existing; it affected every Interactions tool round-trip, not only
+  audio-bearing ones.
 - Eval item annotations now preserve omitted runtime accounting fields and their
   model/workflow roll-ups across direct, CLI, and registered evals. Metadata is
   collected independently of trace capture and shallow-merged with valid user
@@ -1461,7 +1644,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.23.2...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.23.3...HEAD
+[0.23.3]: https://github.com/axl-sdk/axl/compare/v0.23.2...v0.23.3
 [0.23.2]: https://github.com/axl-sdk/axl/compare/v0.23.1...v0.23.2
 [0.23.1]: https://github.com/axl-sdk/axl/compare/v0.23.0...v0.23.1
 [0.23.0]: https://github.com/axl-sdk/axl/compare/v0.22.3...v0.23.0

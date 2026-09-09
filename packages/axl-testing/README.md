@@ -57,7 +57,9 @@ const provider = MockProvider.sequence([
 const provider = MockProvider.chunked(['Hello world', 'Goodbye world']);
 const provider2 = MockProvider.chunked(['{"answer":42}'], 2); // 2-char chunks
 
-// Echo mode — return the user's prompt back
+// Echo mode — return the user's prompt back. Media parts are projected
+// through the core's `summarizeModelInput`, so they echo as
+// `[image image/png]` / `[audio audio/wav]` rather than disappearing.
 const provider = MockProvider.echo();
 
 // JSON mode — return data matching a Zod schema
@@ -87,6 +89,12 @@ const provider = MockProvider.echo().withEffortResolution({
   clamped: true,
   cause: 'this model cannot disable thinking',
 });
+
+// Restrict the rich input modalities the mock declares. Both `image` and
+// `audio` are on by default; narrowing is how a provider that does not
+// support a modality is exercised offline — the part is rejected with
+// `UnsupportedModelInputError` before the call is recorded.
+const imageOnly = MockProvider.echo().withInputModalities(['image']);
 ```
 
 MockProvider also supports tool call simulation:

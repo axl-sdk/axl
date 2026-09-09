@@ -1532,6 +1532,14 @@ export type ProviderResponse = {
     cached_tokens?: number;
     /** Tokens written to a provider prompt cache during this call, when reported. */
     cache_write_tokens?: number;
+    /**
+     * Audio tokens counted inside `prompt_tokens`, when the provider reports the
+     * per-modality split. Absent — never `0` — when the provider reports no
+     * split, so a consumer can tell "no audio" from "not reported".
+     */
+    audio_input_tokens?: number;
+    /** Audio tokens counted inside `completion_tokens`, when reported. */
+    audio_output_tokens?: number;
   };
   cost?: number;
   /** Provider-specific opaque metadata that needs to round-trip through conversation history. */

@@ -107,7 +107,7 @@ describe('MockProvider.echo()', () => {
     expect(r.cost).toBe(0);
   });
 
-  it('projects ordered rich user input to text without serializing media', async () => {
+  it('projects ordered rich user input to placeholders without serializing media', async () => {
     const provider = MockProvider.echo();
     const response = await provider.chat(
       [
@@ -127,8 +127,11 @@ describe('MockProvider.echo()', () => {
       {},
     );
 
-    expect(response.content).toBe('before\nafter');
+    // The media placeholder is `summarizeModelInput`'s, not a second format,
+    // and it carries the media type only — never the payload or the label.
+    expect(response.content).toBe('before\n[image image/png]\nafter');
     expect(response.content).not.toContain('AQID');
+    expect(response.content).not.toContain('receipt');
   });
 });
 

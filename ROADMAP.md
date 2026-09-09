@@ -17,14 +17,41 @@
   non-chat finite-recording operation with OpenAI, Gemini Interactions/Files,
   and catalog-capable OpenRouter STT adapters; paired safe lifecycle events,
   cleanup status, mock coverage, and an explicit transcript-to-agent recipe.
-  OpenRouter model/route capability remains authoritative; general audio
-  understanding and realtime voice remain separate work.
+  OpenRouter model/route capability remains authoritative; transcription is
+  never a hidden fallback for general audio understanding, and realtime voice
+  remains separate work.
+
+- **General recorded-audio input** — `InputAudioPart` puts a finite recording
+  directly in front of a chat model for speech *and* non-speech reasoning, with
+  ordered audio preserved through retries, tool continuations, delegate,
+  handoff, and streaming. Transport ships on `openai:` Chat Completions,
+  `openrouter:`, `google:` Interactions, and `MockProvider`; every other
+  provider fails closed with zero requests. Live-certified: `google:` for a
+  text answer, tool continuation, structured output, streaming, and history
+  re-send; `openrouter:` for a text answer, tool continuation, and streaming;
+  `openai:` for a single-turn text answer (its tool continuation and
+  structured output fail provider-side and are recorded, not advertised).
+
+- **Modality-aware audio cost estimation** — Audio-bearing `openai:` Chat
+  Completions and `google:` Interactions calls are priced from the
+  per-modality usage both providers report, with audio tokens billed from a
+  per-model audio rate row and never from the text row, so `ctx.budget()`
+  enforces on audio spend. A bucket without a published rate, or counts that
+  do not reconcile, keep the call `undefined` rather than reporting a
+  confidently wrong number. Normalized usage exposes
+  `audio_input_tokens` / `audio_output_tokens`.
 
 - **OpenTelemetry** — Automatic span emission for every `ctx.*` primitive with cost-per-span attribution
 - **Memory Primitives** — `ctx.remember()`, `ctx.recall()`, `ctx.forget()` with session/global scope and semantic vector search
 - **Agent Guardrails** — Input/output validation at the agent boundary with retry, throw, or custom policies
 - **Gate-Retry Feedback Control** — Guardrail, schema, and `validate` retries deliver the correction as a user turn after the rejected attempt (works on every provider, including Gemini models that reject a terminal model turn); a single `retryFeedback` hook on `AskOptions` / `DelegateOptions` lets callers rewrite that turn or stop retrying with the gate's typed error. See [api-reference.md#custom-retry-feedback](docs/api-reference.md#custom-retry-feedback).
 - **Session Options** — Configurable history limits, summarization, and persistence
+- **Session current-input deduplication** — `Session.send()` and `stream()`
+  recognize only the exact current user turn they just recorded, so a workflow
+  that forwards the same normalized input to `ctx.ask()` sends it once while
+  persisted history remains canonical. Rich inputs match by ordered structure,
+  repeated later turns remain distinct, and `deduplicateInput: false` preserves
+  the legacy request shape.
 - **Tool Middleware** — Approval gates (`requireApproval`) and lifecycle hooks (`before`/`after`)
 - **Model-Facing Tool Output Projection** — Opt-in synchronous `toModelOutput` allowlists the successful post-hook tool result sent to the model while preserving the complete host-observable result. Strict JSON-compatible validation fails closed, `sensitive` takes precedence, configured `AxlTestRuntime.mockTool()` overrides inherit projection policy, and direct/MCP/handoff paths remain unchanged.
 - **Agent Handoffs** — Oneway and roundtrip modes with descriptions, OTel spans, and session history
@@ -231,14 +258,18 @@ Items we're tracking but not actively planning. These would move to Planned base
 
 #### Multimodal Extensions
 
-Axl currently supports ordered image input and completed-file transcription.
-The following are intentionally tracked as separate future product surfaces,
-not implied by today's `ModelInput` or `ctx.transcribe()` contracts:
+Axl currently supports ordered image input, general recorded-audio input, and
+completed-file transcription. The following are intentionally tracked as
+separate future product surfaces, not implied by today's `ModelInput` or
+`ctx.transcribe()` contracts:
 
-- **General audio understanding** — Direct audio parts for speech and
-  non-speech reasoning, with independent proof for ordinary responses, tool
-  continuations, and structured output. Each provider/model combination must
-  be certified; transcription must never become a hidden fallback.
+- **Remaining audio surfaces** — Modality-aware audio cost estimation is
+  implemented (see Complete, above). Audio URLs, audio output as a product,
+  realtime voice, and a Studio audio picker stay out of scope. A long-context
+  audio rate and an OpenAI cached-audio rate are unpriced until first-party
+  prices are published; a modality token breakdown on `AxlEventBase.tokens`
+  (and the Studio cost bucketing it would enable) is a separate additive
+  observability decision.
 - **Documents, video, and generated media** — New input and output content
   types with their own limits, provider mappings, observation rules, and live
   evidence. Multimodal tool results belong here as an explicit output contract,

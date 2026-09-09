@@ -12,29 +12,30 @@ judgment.
 ## Pin scope
 
 Resolve the session base and head and define one concrete diff. Pass that exact
-range and relevant plan documents to every reviewer.
+range, raw requirements, and relevant plan documents to every reviewer. Avoid
+persuasive implementation rationale that could anchor independent judgment.
 
 ## Choose the review wave
 
 Use the smallest wave that covers the risk deeply. A comprehensive session
 review needs at least two independent perspectives; single-reviewer coverage is
-for low-risk milestone checks inside `$tackle-plan`.
+for ordinary milestone checks inside `$tackle-plan`.
 
 - **Small, low-risk:** two `pragmatic-code-reviewer` agents with disjoint
   correctness/journey and boundary/test/edge-case charters.
 - **Moderate:** two pragmatic reviewers covering correctness/lifecycle/journeys
   and architecture/types/boundaries/tests/silent failures.
-- **High-risk:** those two plus one focused `adversarial-code-reviewer` (Sol/high)
+- **High-risk:** those two plus one focused `adversarial-code-reviewer`
   for provider semantics, state/data loss, streaming/redaction, security,
   concurrency, usage/cost, lifecycle, performance, or compatibility.
 
-Add another Sol/high reviewer only in a later wave for a concrete unresolved
+Add another premium reviewer only in a later wave for a concrete unresolved
 high-consequence question. Assign reviewers read-only and avoid overlapping
 charters. Treat role `sandbox_mode` as defense in depth because the host may
 override it: reviewer instructions must prohibit edits and artifact-writing
 commands, and the lead must confirm the wave did not mutate the working tree.
 Each finding must include `REAL BUG`, `NOT A BUG`,
-`NEEDS-LIVE-API-VERIFICATION`, or `ESCALATE-SOL` with file-backed evidence.
+`NEEDS-LIVE-API-VERIFICATION`, or `ESCALATE-ADVERSARIAL` with file-backed evidence.
 
 ## Triage and close
 
@@ -47,8 +48,9 @@ Each finding must include `REAL BUG`, `NOT A BUG`,
    with `$live-api-verification`. If live verification changes code, rerun the
    affected targeted checks before continuing.
 5. Re-pin the final net diff and the review-fix delta, then run at least one
-   focused independent regression review. Use a premium reviewer when the fixes
-   touch a consequential seam. If that pass requires material fixes, repeat
+   focused independent regression review. Use a premium reviewer for new consequential behavior, changed invariants,
+   or unresolved consequential risk. Narrow fixes on an already premium-reviewed
+   seam may use a pragmatic re-check when behavior and invariants are unchanged. If that pass requires material fixes, repeat
    steps 4–5 on the new final diff.
 6. Commit only after the final-diff review is clean. Keep unrelated fixes in
    separate logical commits.

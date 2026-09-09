@@ -7,6 +7,7 @@ import type {
   Effort,
   ProviderInputValidationRequest,
   ProviderInputValidationResult,
+  InputModalitySupport,
 } from './types.js';
 import type { ChatRole } from '../types.js';
 import {
@@ -21,11 +22,35 @@ import { buildProviderError, ProviderError } from './errors.js';
 import { RateLimiter, type RateLimitConfig } from './rate-limiter.js';
 import { isBuiltinTablePricingEligible } from './builtin-table-pricing.js';
 import { assertSafeProviderBaseUrl } from '../http-transport.js';
-import type { InputContentPart, InputMediaSource } from '../input.js';
+import type { InputAudioPart, InputContentPart, InputMediaSource, ModelInput } from '../input.js';
+import type { RecordedAudioSource } from '../transcription.js';
 import { UnsupportedModelInputError } from '../errors.js';
+import { firstRichPart, richInputParts, type RichModality } from './rich-input.js';
+import { resolveAudioFormat } from './audio-format.js';
 
-function compatibleImageBase64(
-  source: Extract<InputMediaSource, { type: 'bytes' | 'base64' }>,
+/**
+ * Input modalities a profile declares for the OpenAI-compatible wire format.
+ * Declaring a modality is the ONLY way a profile opts in: the engine derives
+ * `inputCapabilities`, `validateInput`, and the rich-part builder from this,
+ * never from the provider's name.
+ */
+export type ProfileInputModalities = {
+  image?: { sources: readonly InputMediaSource['type'][] };
+  audio?: {
+    sources: readonly RecordedAudioSource['type'][];
+    /** Closed media type → `input_audio.format` table (see `audio-format.ts`). */
+    formats: Readonly<Record<string, string>>;
+  };
+};
+
+/** Feature text for a media type this profile's closed table cannot map.
+ * A missing media type is named as missing — never rendered as `'undefined'`. */
+function unmappableMediaTypeFeature(mediaType: string | undefined): string {
+  return mediaType === undefined ? 'audio media type (missing)' : `audio media type '${mediaType}'`;
+}
+
+function compatibleInlineBase64(
+  source: Extract<InputMediaSource | RecordedAudioSource, { type: 'bytes' | 'base64' }>,
 ): string {
   return source.type === 'base64'
     ? source.data
@@ -34,24 +59,72 @@ function compatibleImageBase64(
       );
 }
 
-function openRouterImageParts(
+/**
+ * Build the wire `content` array for one array-content message.
+ *
+ * Used for the caller's input AND for user history turns, so a continuation
+ * request reproduces a rich part byte-for-byte at the same ordinal index.
+ *
+ * Every rejection here is a builder-level guard, not the primary gate: the
+ * runtime capability check and `validateInput` reject the same shapes earlier.
+ * It exists so a preflight regression cannot silently render a part the
+ * effective profile never declared (e.g. images on `openai:`, fork F4).
+ */
+export function compatibleRichParts(
   parts: readonly InputContentPart[],
   model: string,
+  modalities: ProfileInputModalities,
+  provider: string,
 ): Array<Record<string, unknown>> {
+  const reject = (modality: RichModality, source: string, feature?: string) =>
+    new UnsupportedModelInputError({
+      provider,
+      model,
+      modality,
+      source,
+      ...(feature ? { feature } : {}),
+    });
   const content: Array<Record<string, unknown>> = [];
   for (const part of parts) {
     if (part.type === 'text') {
       content.push({ type: 'text', text: part.text });
       continue;
     }
-    const { source } = part;
-    if (source.type === 'provider-file') {
-      throw new UnsupportedModelInputError({
-        provider: 'openrouter',
-        model,
-        modality: 'image',
-        source: 'provider-file',
+    if (part.type === 'audio') {
+      const { source } = part;
+      const audio = modalities.audio;
+      if (!audio) throw reject('audio', source.type, 'audio input');
+      if (source.type === 'provider-file' || !audio.sources.includes(source.type)) {
+        throw reject('audio', source.type);
+      }
+      const format = resolveAudioFormat(audio.formats, source.mediaType);
+      if (format === undefined) {
+        throw reject('audio', source.type, unmappableMediaTypeFeature(source.mediaType));
+      }
+      content.push({
+        type: 'input_audio',
+        // Caller base64 passes through verbatim — never decoded and re-encoded.
+        input_audio: { data: compatibleInlineBase64(source), format },
       });
+      if (part.label) content.push({ type: 'text', text: `[Audio: ${part.label}]` });
+      continue;
+    }
+    if (part.type !== 'image') {
+      // A future `InputContentPart` variant must fail loudly rather than fall
+      // through to the image mapping below and be sent as a mislabelled block.
+      const unmapped: never = part;
+      throw new UnsupportedModelInputError({
+        provider,
+        model,
+        modality: (unmapped as { type: string }).type,
+        feature: 'this input modality',
+      });
+    }
+    const { source } = part;
+    const image = modalities.image;
+    if (!image) throw reject('image', source.type, 'image input for this model');
+    if (source.type === 'provider-file' || !image.sources.includes(source.type)) {
+      throw reject('image', source.type);
     }
     content.push({
       type: 'image_url',
@@ -59,12 +132,22 @@ function openRouterImageParts(
         url:
           source.type === 'url'
             ? source.url
-            : `data:${source.mediaType};base64,${compatibleImageBase64(source)}`,
+            : `data:${source.mediaType};base64,${compatibleInlineBase64(source)}`,
       },
     });
     if (part.label) content.push({ type: 'text', text: `[Image: ${part.label}]` });
   }
   return content;
+}
+
+/** Every audio part carried by one validation request, input first then history. */
+function requestAudioParts(
+  input: ModelInput,
+  history: readonly ChatMessage[],
+): readonly InputAudioPart[] {
+  return [input, ...history.map((message) => message.content)]
+    .flatMap((content) => richInputParts(content))
+    .filter((part): part is InputAudioPart => part.type === 'audio');
 }
 
 // ===========================================================================
@@ -192,6 +275,14 @@ export type CapabilityFlags = {
    * `stream_options.include_usage`. When false, don't request it.
    */
   supportsStreamUsage?: boolean;
+  /**
+   * Rich input modalities this provider carries on the Chat Completions wire.
+   * Absent (the default) means text only: the engine rejects every rich part,
+   * declares no capability to the runtime, and passes array content through
+   * untouched — byte-identical to the pre-audio engine. Adding a modality here
+   * is the single opt-in switch; the engine never infers one from the name.
+   */
+  inputModalities?: ProfileInputModalities;
 };
 
 /**
@@ -253,6 +344,16 @@ function sortedKeys(table: PricingTable): string[] {
     SORTED_KEYS_CACHE.set(table, keys);
   }
   return keys;
+}
+
+/**
+ * A provider-reported token count, or `undefined` when the wire value is not a
+ * usable one. JSON can carry anything here (`null`, `"80"`, `-1`, `12.5`,
+ * `1e18`), and a bad count must never reach pricing, `ctx.totalCost`, or a span
+ * attribute — so it is dropped rather than coerced.
+ */
+export function reportedTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 /**
@@ -462,24 +563,49 @@ export class OpenAICompatibleProvider implements Provider {
   readonly name: string;
   readonly reportsRequestLifecycle = true as const;
 
-  inputCapabilities(model: string): { image?: { sources: readonly InputMediaSource['type'][] } } {
-    return this.name === 'openrouter' && model.trim().length > 0
-      ? { image: { sources: ['url', 'bytes', 'base64'] } }
-      : {};
+  /**
+   * Modalities the effective profile declares for this model. A blank model
+   * declares nothing, so a rich request against one fails validation exactly
+   * as it did before any modality existed.
+   */
+  protected inputModalities(model: string): ProfileInputModalities {
+    return model.trim().length > 0 ? (this.profile.capabilities?.inputModalities ?? {}) : {};
+  }
+
+  inputCapabilities(model: string): InputModalitySupport {
+    const { image, audio } = this.inputModalities(model);
+    return {
+      ...(image ? { image: { sources: image.sources } } : {}),
+      // `formats` is engine-internal wire detail; the runtime contract is the
+      // accepted source kinds only.
+      ...(audio ? { audio: { sources: audio.sources } } : {}),
+    };
   }
 
   validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
     const modelOverride = request.providerOptions?.model;
     const effectiveModel = typeof modelOverride === 'string' ? modelOverride : request.model;
-    const fail = (source?: string, feature?: string): never => {
+    const failWith = (modality: RichModality, source?: string, feature?: string): never => {
       throw new UnsupportedModelInputError({
         provider: this.name,
         model: effectiveModel || request.model,
-        modality: 'image',
+        modality,
         ...(source ? { source } : {}),
         ...(feature ? { feature } : {}),
       });
     };
+    // The reported modality is derived from the offending part, never hardcoded.
+    const fail = (source?: string, feature?: string): never =>
+      failWith(firstRichPart(request.input, request.history)?.type ?? 'image', source, feature);
+    const modalities = this.inputModalities(effectiveModel);
+    // A profile that declares no audio transport rejects audio here as well as
+    // at the runtime gate, keeping the adapter authoritative on its own wire
+    // format. The runtime gate remains the fail-closed layer for providers that
+    // predate `validateInput`-level audio awareness.
+    const audioPart = firstRichPart(request.input, request.history, 'audio');
+    if (audioPart && !modalities.audio) {
+      failWith('audio', audioPart.source.type, 'audio input');
+    }
     if (
       request.providerOptions &&
       'model' in request.providerOptions &&
@@ -487,8 +613,15 @@ export class OpenAICompatibleProvider implements Provider {
     ) {
       fail(undefined, 'invalid model providerOptions');
     }
-    if (this.name !== 'openrouter' || effectiveModel.trim().length === 0) {
-      fail(undefined, 'image input for this model');
+    // Without declared image support the engine can carry exactly one rich
+    // shape: an audio-bearing request. Every other rich request — an image part
+    // (fork F4 keeps images off `openai:`), or a blank effective model — is
+    // rejected with the same triple the engine reported before audio existed.
+    const imagePart = firstRichPart(request.input, request.history, 'image');
+    if (!modalities.image && (!audioPart || imagePart)) {
+      // The offending part is an image (or, with no rich part reachable here,
+      // the historical image-era default for a blank effective model).
+      failWith('image', undefined, 'image input for this model');
     }
     if (request.providerOptions && 'messages' in request.providerOptions) {
       fail(undefined, 'raw messages providerOptions');
@@ -501,14 +634,28 @@ export class OpenAICompatibleProvider implements Provider {
           (part) => part.type === 'image' && part.source.type === 'provider-file',
         )
       ) {
-        fail('provider-file');
+        failWith('image', 'provider-file');
       }
     }
     if (
       Array.isArray(request.input) &&
       request.input.some((part) => part.type === 'image' && part.source.type === 'provider-file')
     ) {
-      fail('provider-file');
+      failWith('image', 'provider-file');
+    }
+    // Audio the profile declares but this wire cannot express faithfully:
+    // a source kind Chat Completions has no field for, or a media type outside
+    // the profile's closed format table. Covered for input AND user history so
+    // a continuation request cannot fail later than the first one.
+    const audio = modalities.audio;
+    if (audio) {
+      for (const part of requestAudioParts(request.input, request.history)) {
+        const source = part.source;
+        if (!audio.sources.includes(source.type)) failWith('audio', source.type);
+        if (resolveAudioFormat(audio.formats, source.mediaType) === undefined) {
+          failWith('audio', source.type, unmappableMediaTypeFeature(source.mediaType));
+        }
+      }
     }
     return { effectiveModel };
   }
@@ -746,12 +893,17 @@ export class OpenAICompatibleProvider implements Provider {
   }
 
   protected formatMessage(msg: ChatMessage, model: string): Record<string, unknown> {
+    const modalities = this.inputModalities(model);
     const out: Record<string, unknown> = {
       role: this.profile.roleFor ? this.profile.roleFor(msg.role, model) : msg.role,
-      content:
-        Array.isArray(msg.content) && this.name === 'openrouter'
-          ? openRouterImageParts(msg.content, model)
-          : msg.content,
+      // History user turns go through the same builder as the caller's input,
+      // so a rich part is reproduced identically in every continuation request.
+      // Array content is routed UNCONDITIONALLY: a profile that declares no
+      // modality has the builder reject every rich part (and pass text through)
+      // rather than emitting raw `InputContentPart` objects on the wire.
+      content: Array.isArray(msg.content)
+        ? compatibleRichParts(msg.content, model, modalities, this.name)
+        : msg.content,
     };
     if (msg.name && (this.profile.capabilities?.emitsMessageName ?? true)) out.name = msg.name;
     if (msg.tool_calls) out.tool_calls = msg.tool_calls;
@@ -813,6 +965,12 @@ export class OpenAICompatibleProvider implements Provider {
 
   private toUsage(raw: OpenAIUsage | undefined): ProviderResponse['usage'] {
     if (!raw) return undefined;
+    // The audio split is spread conditionally: a consumer must be able to tell
+    // "the provider reported no audio" (field absent) from "the provider
+    // reported zero audio tokens" (field present, `0`), and a malformed count
+    // is dropped rather than propagated into pricing or a span attribute.
+    const audioInput = reportedTokenCount(raw.prompt_tokens_details?.audio_tokens);
+    const audioOutput = reportedTokenCount(raw.completion_tokens_details?.audio_tokens);
     return {
       prompt_tokens: raw.prompt_tokens,
       completion_tokens: raw.completion_tokens,
@@ -823,6 +981,8 @@ export class OpenAICompatibleProvider implements Provider {
       // generic table estimator; its split is validated before pricing.
       cached_tokens: raw.prompt_cache_hit_tokens ?? raw.prompt_tokens_details?.cached_tokens,
       cache_write_tokens: raw.prompt_tokens_details?.cache_write_tokens,
+      ...(audioInput !== undefined ? { audio_input_tokens: audioInput } : {}),
+      ...(audioOutput !== undefined ? { audio_output_tokens: audioOutput } : {}),
     };
   }
 
@@ -863,6 +1023,22 @@ export class OpenAICompatibleProvider implements Provider {
           ? reportedCost
           : undefined;
       case 'table': {
+        // `PricingTable` cannot express an audio rate — the public tuple shape
+        // is deliberately unchanged — so a call that billed audio tokens is
+        // UNKNOWN, not cheap. Pricing `prompt_tokens` wholesale at the text
+        // input rate here would under-report an audio call by an order of
+        // magnitude, and `ctx.budget()` would then enforce confidently against
+        // it, which is strictly worse than the unpriced lower bound. The same
+        // holds for audio OUTPUT tokens against the table's text output rate.
+        // Reachable through a custom profile that declares audio alongside
+        // table pricing; a reported `0` still prices, and no built-in table
+        // profile declares audio today (`openrouter` is `from-response`).
+        if (
+          (typeof usage.audio_input_tokens === 'number' && usage.audio_input_tokens > 0) ||
+          (typeof usage.audio_output_tokens === 'number' && usage.audio_output_tokens > 0)
+        ) {
+          return undefined;
+        }
         if (
           !isBuiltinTablePricingEligible(this.profile, {
             baseUrl: this.baseUrl,
@@ -1236,8 +1412,12 @@ type OpenAIUsage = {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
-  completion_tokens_details?: { reasoning_tokens?: number };
-  prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
+  completion_tokens_details?: { reasoning_tokens?: number; audio_tokens?: unknown };
+  prompt_tokens_details?: {
+    cached_tokens?: number;
+    cache_write_tokens?: number;
+    audio_tokens?: unknown;
+  };
   /** OpenRouter / Vercel Gateway: per-call cost in USD. */
   cost?: number;
   /** xAI: exact billed USD cost in ten-billionths of a dollar. */

@@ -19,7 +19,7 @@ import { cn, formatCost } from '../../lib/utils';
 import { CostBadge } from './CostBadge';
 import { DurationBadge } from './DurationBadge';
 import { JsonViewer } from './JsonViewer';
-import type { HistoricalAxlEvent, ToolCallOutcome } from '../../lib/types';
+import type { HistoricalAxlEvent, ModelInputDescriptor, ToolCallOutcome } from '../../lib/types';
 import {
   getEventColor,
   getDepth,
@@ -406,6 +406,27 @@ export function GateCheckBody({ event }: { event: HistoricalAxlEvent }) {
   );
 }
 
+/** Exhaustive one-line summary of a bounded model-input descriptor part. The
+ * `never` assignment in the default arm makes the next modality a compile
+ * error rather than a silent "image" mislabel — audio used to fall into the
+ * image branch here. */
+function describeInputPart(part: ModelInputDescriptor['parts'][number]): string {
+  switch (part.type) {
+    case 'text':
+      return `text (${part.characters} characters)`;
+    case 'image':
+    case 'audio': {
+      const mediaType = part.mediaType ? `, ${part.mediaType}` : '';
+      const bytes = part.bytes !== undefined ? `, ${part.bytes} bytes` : '';
+      return `${part.type} (${part.source}${mediaType}${bytes})`;
+    }
+    default: {
+      const unreachable: never = part;
+      return `unknown (${String((unreachable as { type: unknown }).type)})`;
+    }
+  }
+}
+
 /** `ask_start` body — renders the user prompt at the top level of the
  *  event (not inside `event.data`, which is absent on this variant). */
 function AskStartBody({ event }: { event: HistoricalAxlEvent }) {
@@ -421,16 +442,7 @@ function AskStartBody({ event }: { event: HistoricalAxlEvent }) {
       )}
       {event.input && (
         <div className="mt-2 text-xs text-[hsl(var(--muted-foreground))]">
-          <strong>Model input:</strong>{' '}
-          {event.input.parts
-            .map((part) =>
-              part.type === 'text'
-                ? `text (${part.characters} characters)`
-                : `image (${part.source}${part.mediaType ? `, ${part.mediaType}` : ''}${
-                    part.bytes !== undefined ? `, ${part.bytes} bytes` : ''
-                  })`,
-            )
-            .join(', ')}
+          <strong>Model input:</strong> {event.input.parts.map(describeInputPart).join(', ')}
         </div>
       )}
     </>

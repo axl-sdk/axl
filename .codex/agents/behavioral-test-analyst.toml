@@ -1,6 +1,6 @@
 name = "behavioral-test-analyst"
-description = "Independent Terra/high analyst for deriving and freezing Axl developer journeys, behavioral scenarios, and a discriminating test matrix before implementation details can anchor coverage. Give it requirements, acceptance criteria, and public behavior—not the diff or implementation rationale. It does not edit tests; send frozen cases to routine-implementer or balanced-implementer."
-model = "gpt-5.6-terra"
+description = "Independent Sol/high analyst for deriving and freezing Axl developer journeys, behavioral scenarios, and a discriminating test matrix before implementation details can anchor coverage. Give it requirements, acceptance criteria, and public behavior—not the diff or implementation rationale. It does not edit tests; send frozen cases to routine-implementer or balanced-implementer."
+model = "gpt-5.6-sol"
 model_reasoning_effort = "high"
 sandbox_mode = "read-only"
 nickname_candidates = ["Analyst", "TestDesigner", "ScenarioMapper"]

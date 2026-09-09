@@ -1,0 +1,23 @@
+# Local services for Axl's integration gates. Nothing here is required for
+# `pnpm test`, which uses MockProvider and in-memory/SQLite stores.
+#
+#   docker compose up -d redis
+#   REDIS_URL=redis://localhost:6381 pnpm --filter @axlsdk/axl exec vitest run src/__tests__/redis-integration.test.ts
+#   docker compose down
+#
+# The project name and the 6381 host port are deliberately distinct from the
+# defaults so this never collides with another project's Redis on 6379/6380.
+name: axl
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: axl-redis
+    ports:
+      - '127.0.0.1:6381:6379'
+    command: ['redis-server', '--save', '', '--appendonly', 'no']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 2s
+      retries: 15

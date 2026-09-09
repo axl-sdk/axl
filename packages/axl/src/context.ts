@@ -57,6 +57,7 @@ import {
   summarizeModelInput,
 } from './input.js';
 import type { ModelInput } from './input.js';
+import { sessionHistoryForAsk } from './session-input.js';
 import type { Agent } from './agent.js';
 import { parsePartialJson } from './partial-json.js';
 import { StreamingWalker } from './streaming-walker.js';
@@ -71,6 +72,7 @@ import {
 } from './schema-diagnostics.js';
 import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js';
 import { ProviderError } from './providers/errors.js';
+import { firstRichPart } from './providers/rich-input.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import type { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
 import type { TranscriptionProviderRequest } from './providers/transcription-types.js';
@@ -590,7 +592,9 @@ function estimateMessagesTokens(messages: ChatMessage[]): { tokens: number; unme
     // placeholders are for summary prompts, never a synthetic media estimate.
     total += estimateTokens(inputText(msg.content));
     if (typeof msg.content !== 'string') {
-      unmeasured ||= msg.content.some((part) => part.type === 'image');
+      // Any non-text part is unmeasured media — audio has no portable token
+      // estimate either, so it must trigger the same warning images do.
+      unmeasured ||= msg.content.some((part) => part.type !== 'text');
     }
     if (msg.tool_calls) {
       for (const tc of msg.tool_calls) {
@@ -644,17 +648,6 @@ function normalizeSessionHistory(messages: ChatMessage[]): ChatMessage[] {
 
 function hasRichMessage(messages: readonly ChatMessage[]): boolean {
   return messages.some((message) => typeof message.content !== 'string');
-}
-
-function firstImageSource(
-  input: ModelInput,
-  history: readonly ChatMessage[],
-): 'bytes' | 'base64' | 'url' | 'provider-file' | undefined {
-  const find = (value: ModelInput) =>
-    typeof value === 'string'
-      ? undefined
-      : value.find((part) => part.type === 'image')?.source.type;
-  return find(input) ?? history.map((message) => find(message.content)).find(Boolean);
 }
 
 function appendHandoffInstruction(
@@ -1451,7 +1444,8 @@ export class WorkflowContext<TInput = unknown> {
     // Take ownership before any checkpoint/state work can await. Never derive a
     // descriptor or text projection from raw caller data.
     const normalizedInput = normalizeModelInput(prompt);
-    const normalizedHistory = normalizeSessionHistory(this.sessionHistory);
+    const sessionHistorySnapshot = sessionHistoryForAsk(this.sessionHistory, normalizedInput);
+    const normalizedHistory = normalizeSessionHistory(sessionHistorySnapshot);
     const delegateInputHolder = agent as Agent & { _delegateOriginalInput?: ModelInput };
     if (delegateInputHolder._delegateOriginalInput !== undefined) {
       delegateInputHolder._delegateOriginalInput = normalizeModelInput(
@@ -1779,20 +1773,39 @@ export class WorkflowContext<TInput = unknown> {
     // summarization, guardrail callback, diagnostics, or provider dispatch.
     const richRequest = typeof input !== 'string' || hasRichMessage(sessionHistory);
     if (richRequest) {
+      const richPart = firstRichPart(input, sessionHistory);
+      // A rich request always has a rich part; the fallback only satisfies the
+      // type and preserves the historical image-era default.
+      const modality = richPart?.type ?? 'image';
+      const source = richPart?.source.type;
       if (providerOptions && ('messages' in providerOptions || 'input' in providerOptions)) {
         throw new UnsupportedModelInputError({
           provider: provider.name ?? modelUri.split(':', 1)[0],
           model,
-          modality: 'image',
+          modality,
           feature: 'raw input-container providerOptions',
         });
       }
-      const source = firstImageSource(input, sessionHistory);
+      // Audio is opt-in per provider+model and is never inferred from provider
+      // family, image support, or transcription support. Unlike images,
+      // `validateInput` is not the authoritative audio gate: a provider that
+      // predates audio validates only images, so audio must fail closed here —
+      // before validation, handoff resolution, summarization, guardrails, or
+      // any provider request.
+      const audioPart = firstRichPart(input, sessionHistory, 'audio');
+      if (audioPart && !provider.inputCapabilities?.(model)?.audio) {
+        throw new UnsupportedModelInputError({
+          provider: provider.name ?? modelUri.split(':', 1)[0],
+          model,
+          modality: 'audio',
+          source: audioPart.source.type,
+        });
+      }
       if (!provider.validateInput) {
         throw new UnsupportedModelInputError({
           provider: provider.name ?? modelUri.split(':', 1)[0],
           model,
-          modality: 'image',
+          modality,
           ...(source ? { source } : {}),
         });
       }
@@ -1818,9 +1831,24 @@ export class WorkflowContext<TInput = unknown> {
         throw new UnsupportedModelInputError({
           provider: provider.name ?? modelUri.split(':', 1)[0],
           model,
-          modality: 'image',
+          modality,
           ...(source ? { source } : {}),
         });
+      }
+      // The capability gate above ran against the URI's model, but dispatch
+      // uses the validator's effective model. A validator that substitutes a
+      // different model (a catalog alias, a `providerOptions.model` override)
+      // can therefore land audio on a model that never declared it, so the
+      // audio capability is re-checked before anything is dispatched.
+      if (audioPart && validation.effectiveModel !== model) {
+        if (!provider.inputCapabilities?.(validation.effectiveModel)?.audio) {
+          throw new UnsupportedModelInputError({
+            provider: provider.name ?? modelUri.split(':', 1)[0],
+            model: validation.effectiveModel,
+            modality: 'audio',
+            source: audioPart.source.type,
+          });
+        }
       }
       model = validation.effectiveModel;
     }
@@ -1844,25 +1872,20 @@ export class WorkflowContext<TInput = unknown> {
         (descriptor): descriptor is NonNullable<typeof descriptor> => descriptor !== undefined,
       );
       const parts = descriptors.flatMap((descriptor) => descriptor.parts);
+      // `axl.input.images` stays image-only (existing consumers depend on it);
+      // the source breakdown and the inline-byte total count EVERY media part,
+      // so an audio-bearing ask is not reported as carrying zero media bytes.
+      const media = parts.filter((part) => part.type !== 'text');
+      const withSource = (source: string) => media.filter((part) => part.source === source).length;
       this.spanManager?.addEventToActiveSpan('axl.model_input', {
         'axl.input.parts': parts.length,
         'axl.input.images': parts.filter((part) => part.type === 'image').length,
-        'axl.input.source.bytes': parts.filter(
-          (part) => part.type === 'image' && part.source === 'bytes',
-        ).length,
-        'axl.input.source.base64': parts.filter(
-          (part) => part.type === 'image' && part.source === 'base64',
-        ).length,
-        'axl.input.source.url': parts.filter(
-          (part) => part.type === 'image' && part.source === 'url',
-        ).length,
-        'axl.input.source.provider_file': parts.filter(
-          (part) => part.type === 'image' && part.source === 'provider-file',
-        ).length,
-        'axl.input.inline_bytes': parts.reduce(
-          (sum, part) => sum + (part.type === 'image' ? (part.bytes ?? 0) : 0),
-          0,
-        ),
+        'axl.input.audio': parts.filter((part) => part.type === 'audio').length,
+        'axl.input.source.bytes': withSource('bytes'),
+        'axl.input.source.base64': withSource('base64'),
+        'axl.input.source.url': withSource('url'),
+        'axl.input.source.provider_file': withSource('provider-file'),
+        'axl.input.inline_bytes': media.reduce((sum, part) => sum + (part.bytes ?? 0), 0),
       });
     }
 
@@ -5326,6 +5349,13 @@ export class WorkflowContext<TInput = unknown> {
     });
 
     const routerInput = options?.routerInput === 'text' ? inputText(prompt) : prompt;
+    if (routerInput === '') {
+      // A media-only input has no text projection; routing on an empty user
+      // turn would be a blind pick (and some providers reject empty content).
+      throw new InvalidModelInputError(
+        "delegate routerInput 'text' requires at least one text part; the input is media-only — route on the full input or add a text part",
+      );
+    }
     (routerAgent as Agent & { _delegateOriginalInput?: ModelInput })._delegateOriginalInput =
       prompt;
     return this.ask(routerAgent, routerInput, {

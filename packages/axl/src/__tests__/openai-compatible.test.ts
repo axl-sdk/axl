@@ -1291,6 +1291,7 @@ describe('OpenRouter image transport capability', () => {
     ]);
     expect(provider.inputCapabilities('google/gemini-vision-example')).toEqual({
       image: { sources: ['url', 'bytes', 'base64'] },
+      audio: { sources: ['bytes', 'base64'] },
     });
     expect(() =>
       provider.validateInput({

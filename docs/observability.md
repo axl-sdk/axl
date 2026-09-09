@@ -174,7 +174,38 @@ for (const event of info.events) {
 
 `ask_end.cost` is the **per-ask rollup** of `agent_call_end.cost` + `tool_call_end.cost` emitted within that ask, **excluding nested asks** (nested asks contribute to their own `ask_end`). If you sum `event.cost` across every event you observe, you'll double-count.
 
-**Unknown cost (`ask_end.unpriced`).** When an ask used a model with no usable per-call price (a pricing-table miss, or a provider that doesn't report cost), or abandoned a dispatched stalled call without usage, the call's `cost` is `undefined` — it contributes nothing to the rollup, so `ask_end.cost` becomes a **lower bound** and `ask_end.unpriced` is `true`. An ordinary *failed* call (which carries no usage and was not abandoned at a stall boundary) is NOT flagged. Treat `unpriced` asks as "at least `cost`", not exact (Studio renders them `≥ $X`). `agent_call_end.cost` is `number | undefined` for the same reason.
+**Rich input descriptors.** `ask_start`, `agent_call_start`, and completion
+callbacks carry a bounded `ModelInputDescriptor` whose parts are `text`,
+`image`, or `audio`. An audio part is labelled as audio, carries its source kind,
+media type, and known inline byte count, and carries a `locator` only for a
+provider-file reference (audio has no URL source). Bytes and base64 never appear.
+`trace.redact` scrubs `locator` and `label` and keeps the structural fields.
+Span attributes on `axl.model_input` follow the same rule: `axl.input.images`
+stays image-only for existing consumers, `axl.input.audio` is the new audio
+count, and `axl.input.source.*` plus `axl.input.inline_bytes` count **every**
+media part — so an audio-bearing ask is never reported as carrying zero media
+bytes.
+
+These descriptors do not sanitize arbitrary workflow values. Full unredacted
+`workflow_start.data.input` retains the original input, including any media
+passed as workflow input. Use `trace.redact` to hide it at observability
+boundaries; see [security](security.md#general-recorded-audio-input).
+
+**Session request history.** With the default `deduplicateInput: true`, a
+matching current session input appears once in the model request and its
+`agent_call_start` message snapshot. Persisted session history still records
+one user turn and the assistant reply. Separate workflow and ask lifecycle
+events remain expected; their presence does not mean the provider received
+the input twice. See [session semantics](api-reference.md#session-methods).
+
+**Media is never zero context.** Context estimation projects rich input through
+`summarizeModelInput`, which renders media as `[image <mediaType>]` /
+`[audio <mediaType>]`. Duration is not measurable before dispatch, so history
+containing media marks the estimate as unmeasured and warns that the provider
+will enforce its own context limit — rather than silently counting the media as
+free.
+
+**Unknown cost (`ask_end.unpriced`).** When an ask used a model with no usable per-call price (a pricing-table miss, or a provider that doesn't report cost), or abandoned a dispatched stalled call without usage, the call's `cost` is `undefined` — it contributes nothing to the rollup, so `ask_end.cost` becomes a **lower bound** and `ask_end.unpriced` is `true`. An ordinary *failed* call (which carries no usage and was not abandoned at a stall boundary) is NOT flagged. Treat `unpriced` asks as "at least `cost`", not exact (Studio renders them `≥ $X`). `agent_call_end.cost` is `number | undefined` for the same reason. Audio-bearing `openai:` and `google:` calls are priced by a modality-aware estimator on models that carry a verified audio rate (audio tokens bill from their own row, never the text one); they fall back to unpriced when any billed bucket has no published rate or the reported counts do not reconcile — see `docs/providers.md` §Rich-input calls. `openrouter:` reports an authoritative `usage.cost` and stays priced. Estimates are not retroactive: executions recorded before the estimator landed keep `unpriced: true`.
 
 **Execution-level aggregate (`ExecutionInfo.unpriced`).** To answer "is this execution's `totalCost` exact?" without scanning the timeline, read `ExecutionInfo.unpriced` (from `runtime.execute()` / `getExecutions()` / recovered streams) — `true` when any cost-bearing call was unpriced. The same flag is on `runtime.trackExecution().unpriced` and `AxlTestRuntime.unpriced()`. All three derive from the exported `isUnpricedLeaf(event)` discriminator (the single source of truth shared with the per-ask rollup and Studio's `CostData.unpricedCalls`).
 
@@ -190,6 +221,13 @@ for (const event of info.events) {
 ```
 
 The whole-execution total is `ExecutionInfo.totalCost`. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, Studio's cost aggregator, and `AxlTestRuntime.totalCost()` all apply this guard via `eventCostContribution` internally.
+
+Gemini Interactions can price reconciled text/image usage even when the model
+has no audio rate; an audio rate is required only for positive audio tokens.
+Explicit non-standard or unknown service tiers remain unpriced. Consequently,
+new executions can have higher measured totals and start reaching budget limits
+where older executions only reported a lower bound. Historical totals are not
+rewritten. See [provider pricing rules](providers.md#rich-input-calls).
 
 ### Budget honesty
 

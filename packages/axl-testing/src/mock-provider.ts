@@ -6,6 +6,7 @@ import type {
   ChatOptions,
   InputContentPart,
   InputMediaSource,
+  InputModalitySupport,
   ModelInput,
   ToolCallMessage,
   ProviderResponse,
@@ -15,10 +16,23 @@ import type {
   ProviderInputValidationResult,
   EffortResolution,
 } from '@axlsdk/axl';
-import { inputText, UnsupportedModelInputError } from '@axlsdk/axl';
+import { summarizeModelInput, UnsupportedModelInputError } from '@axlsdk/axl';
+
+/** The rich modalities a `MockProvider` can be configured to accept. */
+type MockInputModality = 'image' | 'audio';
+
+const ALL_MOCK_INPUT_MODALITIES: readonly MockInputModality[] = ['image', 'audio'];
+
+/** Source kinds the mock declares per modality. Audio has no `url` form —
+ *  general recorded audio is not representable as a bare URL. */
+const MOCK_MODALITY_SOURCES = {
+  image: ['url', 'bytes', 'base64', 'provider-file'],
+  audio: ['bytes', 'base64', 'provider-file'],
+} as const;
 
 function cloneValue(value: unknown): unknown {
-  if (value instanceof Uint8Array) return value.slice();
+  // A Node Buffer's `slice()` aliases; `new Uint8Array` always copies.
+  if (value instanceof Uint8Array) return new Uint8Array(value);
   if (Array.isArray(value)) return value.map(cloneValue);
   if (value && typeof value === 'object') {
     return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneValue(item)]));
@@ -26,46 +40,37 @@ function cloneValue(value: unknown): unknown {
   return value;
 }
 
+function cloneMediaSource<S extends InputMediaSource>(source: S): S {
+  const media: InputMediaSource = source;
+  switch (media.type) {
+    case 'bytes':
+      return { type: 'bytes', data: new Uint8Array(media.data), mediaType: media.mediaType } as S;
+    case 'url':
+      return {
+        type: 'url',
+        url: media.url,
+        ...(media.mediaType ? { mediaType: media.mediaType } : {}),
+      } as S;
+    case 'base64':
+      return { type: 'base64', data: media.data, mediaType: media.mediaType } as S;
+    case 'provider-file':
+      return {
+        type: 'provider-file',
+        provider: media.provider,
+        reference: media.reference,
+        ...(media.mediaType ? { mediaType: media.mediaType } : {}),
+      } as S;
+  }
+}
+
 function cloneModelInput(input: ModelInput): ModelInput {
   if (typeof input === 'string') return input;
   return input.map((part): InputContentPart => {
     if (part.type === 'text') return { type: 'text', text: part.text };
-    const { source } = part;
-    switch (source.type) {
-      case 'bytes':
-        return {
-          type: 'image',
-          source: { type: 'bytes', data: source.data.slice(), mediaType: source.mediaType },
-          ...(part.label ? { label: part.label } : {}),
-        };
-      case 'url':
-        return {
-          type: 'image',
-          source: {
-            type: 'url',
-            url: source.url,
-            ...(source.mediaType ? { mediaType: source.mediaType } : {}),
-          },
-          ...(part.label ? { label: part.label } : {}),
-        };
-      case 'base64':
-        return {
-          type: 'image',
-          source: { type: 'base64', data: source.data, mediaType: source.mediaType },
-          ...(part.label ? { label: part.label } : {}),
-        };
-      case 'provider-file':
-        return {
-          type: 'image',
-          source: {
-            type: 'provider-file',
-            provider: source.provider,
-            reference: source.reference,
-            ...(source.mediaType ? { mediaType: source.mediaType } : {}),
-          },
-          ...(part.label ? { label: part.label } : {}),
-        };
-    }
+    const label = part.label ? { label: part.label } : {};
+    return part.type === 'audio'
+      ? { type: 'audio', source: cloneMediaSource(part.source), ...label }
+      : { type: 'image', source: cloneMediaSource(part.source), ...label };
   });
 }
 
@@ -160,6 +165,12 @@ async function abortableDelay(ms: number, signal: AbortSignal | undefined): Prom
 
 function richParts(input: ModelInput): readonly InputContentPart[] {
   return typeof input === 'string' ? [] : input;
+}
+
+type NonTextPart = Exclude<InputContentPart, { type: 'text' }>;
+
+function firstNonTextPart(input: ModelInput): NonTextPart | undefined {
+  return richParts(input).find((part): part is NonTextPart => part.type !== 'text');
 }
 
 function randomAlphanumeric(length: number): string {
@@ -263,6 +274,30 @@ export class MockProvider implements Provider {
     return this;
   }
 
+  /** Rich input modalities this mock accepts. Both are on by default so an
+   *  audio-bearing ask needs no configuration and offline audio tests keep
+   *  parity with image tests. Narrow it with
+   *  {@link MockProvider.withInputModalities} to exercise the runtime's
+   *  fail-closed path for an unsupported modality. */
+  private inputModalities: readonly MockInputModality[] = ALL_MOCK_INPUT_MODALITIES;
+
+  /**
+   * Restrict which rich input modalities this mock declares and accepts.
+   * A part whose modality is not listed is rejected with
+   * `UnsupportedModelInputError` before the call is recorded, so
+   * `provider.calls` stays empty — the offline stand-in for a provider that
+   * does not support that modality.
+   *
+   * ```ts
+   * const provider = MockProvider.sequence([{ content: 'ok' }])
+   *   .withInputModalities(['image']); // audio asks now fail closed
+   * ```
+   */
+  withInputModalities(modalities: readonly MockInputModality[]): this {
+    this.inputModalities = [...modalities];
+    return this;
+  }
+
   private constructor(
     private responseFn: (
       messages: ChatMessage[],
@@ -287,8 +322,15 @@ export class MockProvider implements Provider {
     return await awaitWithSignal(response, options.signal);
   }
 
-  inputCapabilities(_model: string): { image: { sources: readonly InputMediaSource['type'][] } } {
-    return { image: { sources: ['url', 'bytes', 'base64', 'provider-file'] } };
+  inputCapabilities(_model: string): InputModalitySupport {
+    return {
+      ...(this.inputModalities.includes('image')
+        ? { image: { sources: MOCK_MODALITY_SOURCES.image } }
+        : {}),
+      ...(this.inputModalities.includes('audio')
+        ? { audio: { sources: MOCK_MODALITY_SOURCES.audio } }
+        : {}),
+    };
   }
 
   validateInput(request: ProviderInputValidationRequest): ProviderInputValidationResult {
@@ -296,15 +338,39 @@ export class MockProvider implements Provider {
       typeof request.providerOptions?.model === 'string'
         ? request.providerOptions.model
         : request.model;
-    const fail = (source?: string, feature?: string): never => {
+    const failWith = (modality: string, source?: string, feature?: string): never => {
       throw new UnsupportedModelInputError({
         provider: this.name,
         model: effectiveModel || request.model,
-        modality: 'image',
+        modality,
         ...(source ? { source } : {}),
         ...(feature ? { feature } : {}),
       });
     };
+    // Request-level rejections are not about one part, so they report the
+    // request's leading rich modality. A rejection OF a part always reports
+    // that part's own type — see the provider-file checks below.
+    const offending =
+      firstNonTextPart(request.input) ??
+      request.history
+        .map((message) => firstNonTextPart(message.content))
+        .find((part) => part !== undefined);
+    const fail = (source?: string, feature?: string): never =>
+      failWith(offending?.type ?? 'image', source, feature);
+
+    // Configured-modality gate first: a modality this mock does not declare must
+    // be rejected on its own terms, reporting the offending part's own modality
+    // and source rather than whichever rich part happens to come first.
+    const unsupported = [
+      ...richParts(request.input),
+      ...request.history.flatMap((message) => richParts(message.content)),
+    ].find(
+      (part): part is NonTextPart =>
+        part.type !== 'text' && !this.inputModalities.includes(part.type),
+    );
+    if (unsupported) {
+      failWith(unsupported.type, unsupported.source.type, `${unsupported.type} input`);
+    }
 
     if (request.providerOptions && 'input' in request.providerOptions) {
       fail(undefined, 'raw input-container providerOptions');
@@ -314,21 +380,21 @@ export class MockProvider implements Provider {
       if (message.role !== 'user') fail(undefined, 'rich non-user history');
       for (const part of richParts(message.content)) {
         if (
-          part.type === 'image' &&
+          part.type !== 'text' &&
           part.source.type === 'provider-file' &&
           part.source.provider !== this.name
         ) {
-          fail('provider-file');
+          failWith(part.type, 'provider-file');
         }
       }
     }
     for (const part of richParts(request.input)) {
       if (
-        part.type === 'image' &&
+        part.type !== 'text' &&
         part.source.type === 'provider-file' &&
         part.source.provider !== this.name
       ) {
-        fail('provider-file');
+        failWith(part.type, 'provider-file');
       }
     }
     return { effectiveModel };
@@ -449,11 +515,19 @@ export class MockProvider implements Provider {
     return MockProvider.sequence(responses);
   }
 
+  /**
+   * Parrot mode: the response is the last user message projected back through
+   * `summarizeModelInput`, so media parts echo as their deterministic
+   * placeholder (`[image image/png]`, `[audio audio/wav]`) rather than
+   * disappearing. One projection, shared with the runtime's context
+   * summarizer — a second format would let echo and context estimates
+   * disagree.
+   */
   static echo(): MockProvider {
     return new MockProvider((messages) => {
       const lastUser = [...messages].reverse().find((m) => m.role === 'user');
       return {
-        content: lastUser ? inputText(lastUser.content) : '',
+        content: lastUser ? summarizeModelInput(lastUser.content) : '',
         usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
         cost: 0,
       };

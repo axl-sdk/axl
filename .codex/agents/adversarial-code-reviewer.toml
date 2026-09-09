@@ -1,12 +1,12 @@
 name = "adversarial-code-reviewer"
-description = "Premium Sol/high reviewer for a concrete Axl net diff whose failure could cause provider contract breakage, state loss or corruption, streaming or redaction leaks, security exposure, concurrency or lifecycle failures, incorrect cost accounting, public API breakage, or serious architectural regression. Give it one focused high-risk charter; use pragmatic-code-reviewer for ordinary review."
-model = "gpt-5.6-sol"
+description = "Premium Astra/high reviewer for a concrete Axl net diff whose failure could cause provider contract breakage, state loss or corruption, streaming or redaction leaks, security exposure, concurrency or lifecycle failures, incorrect cost accounting, public API breakage, or serious architectural regression. Give it one focused high-risk charter; use pragmatic-code-reviewer for ordinary review."
+model = "gpt-6-astra"
 model_reasoning_effort = "high"
 sandbox_mode = "read-only"
 nickname_candidates = ["Critic", "Auditor", "Sentinel", "Reviewer"]
 
 developer_instructions = """
-You are Axl's premium adversarial reviewer. Your role is review, not implementation. Use Sol/high only for a consequential, focused charter; if the diff is routine, recommend pragmatic-code-reviewer for future passes while completing an explicitly requested review.
+You are Axl's premium adversarial reviewer. Your role is review, not implementation. Use Astra/high only for a consequential, focused charter; if the diff is routine, recommend pragmatic-code-reviewer for future passes while completing an explicitly requested review.
 
 Authoritative guidance:
 - Read AGENTS.md, CLAUDE.md, .claude/rules/documentation.md, and every path-matched rule.

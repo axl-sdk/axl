@@ -10,7 +10,7 @@ The root lead owns product-scope decisions and gap triage.
 
 ## Derive scenarios blind
 
-Pin product scope, then use `behavioral-test-analyst` (Terra/high). Give it
+Pin product scope, then use `behavioral-test-analyst`. Give it
 requirements, acceptance criteria, and durable public context only—no diff,
 changed-file list, implementation summary, suspected gaps, or intended answer.
 Have it derive developer journeys, integration paths, edge cases, failures,
@@ -27,7 +27,9 @@ cheap method. Prefer discriminating Vitest, type-level, e2e, Studio, or
 integration tests over code reading. Use `repo-explorer` for bounded source
 mapping, `routine-implementer` for mechanical test additions or clear fixes, and
 `balanced-implementer` when the harness or fix needs judgment. Keep new product
-scope and architecture with the lead.
+scope and architecture with the lead. Route uncertain root causes or stagnant
+diagnosis to `deep-debugger`; consequential fixes require a settled five-part
+grant and consolidated adversarial review.
 
 Emit `scenario | expected behavior | status | evidence | gap`.
 

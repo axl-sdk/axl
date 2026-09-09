@@ -6,7 +6,12 @@ import { ResizableSplit } from '../../components/shared/ResizableSplit';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { JsonViewer } from '../../components/shared/JsonViewer';
 import { fetchSessions, fetchSession, deleteSession } from '../../lib/api';
-import type { SessionSummary, ChatMessage, HandoffRecord } from '../../lib/types';
+import type {
+  SessionSummary,
+  ChatMessage,
+  HandoffRecord,
+  ModelInputDescriptor,
+} from '../../lib/types';
 
 function safeParseJson(str: string): unknown {
   try {
@@ -16,22 +21,35 @@ function safeParseJson(str: string): unknown {
   }
 }
 
+/** Exhaustive over the descriptor part types. The `never` assignment in the
+ * default arm makes the next modality a compile error rather than a silent
+ * "Image" mislabel — audio used to fall into the image branch. */
+function describeInputPart(part: ModelInputDescriptor['parts'][number]): string {
+  switch (part.type) {
+    case 'text':
+      return `Text: ${part.characters} characters`;
+    case 'image':
+    case 'audio': {
+      const label = part.type === 'image' ? 'Image' : 'Audio';
+      const mediaType = part.mediaType ? ` (${part.mediaType})` : '';
+      const bytes = part.bytes !== undefined ? `, ${part.bytes} bytes` : '';
+      return `${label}: ${part.source}${mediaType}${bytes}`;
+    }
+    default: {
+      const unreachable: never = part;
+      return `Unknown part: ${String((unreachable as { type: unknown }).type)}`;
+    }
+  }
+}
+
 function renderContent(content: ChatMessage['content'], role: string) {
   if (typeof content !== 'string') {
     return (
       <div className="space-y-1 text-xs text-[hsl(var(--muted-foreground))]">
         <div>Rich model input</div>
-        {content.parts.map((part, index) =>
-          part.type === 'text' ? (
-            <div key={index}>Text: {part.characters} characters</div>
-          ) : (
-            <div key={index}>
-              Image: {part.source}
-              {part.mediaType ? ` (${part.mediaType})` : ''}
-              {part.bytes !== undefined ? `, ${part.bytes} bytes` : ''}
-            </div>
-          ),
-        )}
+        {content.parts.map((part, index) => (
+          <div key={index}>{describeInputPart(part)}</div>
+        ))}
       </div>
     );
   }

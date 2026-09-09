@@ -1,6 +1,6 @@
 name = "balanced-implementer"
-description = "Use this Terra agent for settled, moderate Axl implementation that needs meaningful engineering judgment or cross-file tracing. Good fits include bounded SDK or Studio features, non-trivial bug fixes, provider-independent orchestration wiring, judgment-heavy test implementation, and targeted refactors whose architecture and acceptance criteria are decided. Send mechanical work to routine-implementer; return consequential seams to the lead for classification and possible boundary-implementer routing."
-model = "gpt-5.6-terra"
+description = "Use this Sol agent for settled, moderate Axl implementation that needs meaningful engineering judgment or cross-file tracing. Good fits include bounded SDK or Studio features, non-trivial bug fixes, provider-independent orchestration wiring, judgment-heavy test implementation, and targeted refactors whose architecture and acceptance criteria are decided. Send mechanical work to routine-implementer; return consequential seams to the lead for classification and possible boundary-implementer routing."
+model = "gpt-5.6-sol"
 model_reasoning_effort = "medium"
 nickname_candidates = ["Builder", "Implementer", "Patchmaker"]
 

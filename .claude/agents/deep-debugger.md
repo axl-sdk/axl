@@ -1,6 +1,6 @@
 ---
 name: 'deep-debugger'
-description: 'Opus/high escalation agent for Axl bugs where uncertainty is the work: no clear reproduction, intermittent or environment-dependent failures, concurrency races, provider-specific discrepancies, cross-package lifecycle failures, or a chunk an implementer has failed twice. Not for settled implementation; keep unresolved architecture, product policy, and destructive operations with the lead.'
+description: 'Opus/high escalation agent for Axl bugs where uncertainty is the work: no clear reproduction, intermittent or environment-dependent failures, concurrency races, provider-specific discrepancies, cross-package lifecycle failures, or stagnant diagnosis (the same ineffective approach repeated twice without new evidence). Not for settled implementation; keep unresolved architecture, product policy, and destructive operations with the lead.'
 model: opus
 effort: high
 color: magenta

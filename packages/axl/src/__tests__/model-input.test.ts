@@ -22,6 +22,7 @@ import { MemoryStore } from '../state/memory.js';
 import type { AxlEvent, ChatMessage } from '../types.js';
 import type {
   ChatOptions,
+  InputModalitySupport,
   Provider,
   ProviderInputValidationRequest,
   ProviderResponse,
@@ -70,6 +71,17 @@ class SequencedInputProvider extends InputProvider {
       content: response.content ?? '',
       tool_calls: response.tool_calls,
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    };
+  }
+}
+
+/** `InputProvider`, plus the declared modalities the runtime gate requires
+ * before audio may reach `validateInput` at all. */
+class RichCapableInputProvider extends InputProvider {
+  inputCapabilities(): InputModalitySupport {
+    return {
+      image: { sources: ['bytes', 'base64'] },
+      audio: { sources: ['bytes', 'base64'] },
     };
   }
 }
@@ -772,6 +784,21 @@ describe('ModelInput', () => {
     expect(provider.calls).toHaveLength(0);
   });
 
+  it('rejects an audio part before the image-era validator that declares no audio capability', async () => {
+    const provider = new InputProvider();
+    const error = await context(provider)
+      .ask(agent({ model: 'input:vision', system: 'inspect' }), [
+        { type: 'audio', source: { type: 'base64', data: 'AQID', mediaType: 'audio/wav' } },
+      ])
+      .catch((err: unknown) => err);
+    // `validateInput` is authoritative for images only; audio is opt-in via
+    // `inputCapabilities`, which this pre-audio double does not implement.
+    expect(error).toBeInstanceOf(UnsupportedModelInputError);
+    expect((error as UnsupportedModelInputError).modality).toBe('audio');
+    expect(provider.validations).toHaveLength(0);
+    expect(provider.calls).toHaveLength(0);
+  });
+
   it('rejects unsupported oversized rich history before summary or target calls', async () => {
     let calls = 0;
     const provider: Provider = {
@@ -797,36 +824,47 @@ describe('ModelInput', () => {
     expect(traces.filter((event) => event.type === 'ask_end')).toHaveLength(1);
   });
 
-  it('marks rich history context contribution unmeasured and summarizes only safe placeholders', async () => {
-    const provider = new InputProvider();
-    const traces: AxlEvent[] = [];
-    const base64 = 'c2Vuc2l0aXZl';
-    await context(provider, traces, {
-      sessionHistory: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'image',
-              label: 'private',
-              source: { type: 'base64', data: base64, mediaType: 'image/png' },
-            },
-            { type: 'text', text: 'x'.repeat(500) },
-          ],
-        },
-      ],
-    }).ask(agent({ model: 'input:vision', system: 'inspect', maxContext: 1 }), 'continue');
-    const warnings = traces
-      .filter((event) => event.type === 'log' && event.data?.warning)
-      .map((event) => String(event.data?.warning));
-    // Assert the warning this test is about, not a bare count: `maxContext: 1`
-    // also (correctly) reports an unsatisfiable context budget.
-    expect(warnings.filter((w) => w.includes('media contribution is unmeasured'))).toHaveLength(1);
-    expect(provider.calls[0].messages[1].content).toContain('[image image/png]');
-    expect(String(provider.calls[0].messages[1].content)).not.toContain(base64);
-    expect(JSON.stringify(traces)).not.toContain(base64);
-    expect(JSON.stringify(traces)).not.toContain('[object Object]');
-  });
+  // Audio is media exactly as an image is: it has no portable token estimate,
+  // so it must raise the same unmeasured-contribution warning and summarize to
+  // the same kind of safe placeholder.
+  it.each([
+    ['image', 'image/png', '[image image/png]'],
+    ['audio', 'audio/wav', '[audio audio/wav]'],
+  ])(
+    'marks rich %s history context contribution unmeasured and summarizes only safe placeholders',
+    async (type, mediaType, placeholder) => {
+      const provider = new RichCapableInputProvider();
+      const traces: AxlEvent[] = [];
+      const base64 = 'c2Vuc2l0aXZl';
+      await context(provider, traces, {
+        sessionHistory: [
+          {
+            role: 'user',
+            content: [
+              {
+                type,
+                label: 'private',
+                source: { type: 'base64', data: base64, mediaType },
+              },
+              { type: 'text', text: 'x'.repeat(500) },
+            ] as Exclude<ModelInput, string>,
+          },
+        ],
+      }).ask(agent({ model: 'input:vision', system: 'inspect', maxContext: 1 }), 'continue');
+      const warnings = traces
+        .filter((event) => event.type === 'log' && event.data?.warning)
+        .map((event) => String(event.data?.warning));
+      // Assert the warning this test is about, not a bare count: `maxContext: 1`
+      // also (correctly) reports an unsatisfiable context budget.
+      expect(warnings.filter((w) => w.includes('media contribution is unmeasured'))).toHaveLength(
+        1,
+      );
+      expect(provider.calls[0].messages[1].content).toContain(placeholder);
+      expect(String(provider.calls[0].messages[1].content)).not.toContain(base64);
+      expect(JSON.stringify(traces)).not.toContain(base64);
+      expect(JSON.stringify(traces)).not.toContain('[object Object]');
+    },
+  );
 
   it('preserves rich evidence once and appends a changed roundtrip handoff instruction', async () => {
     const provider = new SequencedInputProvider([

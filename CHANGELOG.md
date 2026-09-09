@@ -7,12 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.3] - 2026-09-09
+
 ### Added
 
 - **Modality-aware audio cost estimation.** Audio-bearing `openai:` Chat
   Completions and `google:` Interactions calls are now **priced** instead of
   unpriced, so `ctx.budget()` can enforce a cost limit on audio work and cost
-  dashboards show an exact number rather than a `≥ $X` lower bound. Audio
+  dashboards show a published-rate estimate rather than a `≥ $X` lower bound. Audio
   tokens bill from a per-model audio rate row, never from the text row: the
   prompt splits into disjoint cached / cache-write / audio / text buckets and
   each bills at its own published rate, with output plus (on Gemini) thought
@@ -141,13 +143,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `estimateMessagesTokens` treats audio history as unmeasured media exactly like
   images, so audio is never counted as zero context and the unmeasured-context
   warning still fires.
-- Audio-bearing `openai:` and `google:` calls are **unpriced by design**: no
-  verified modality-aware estimator exists and text-table rates are never applied
-  to audio tokens. `openrouter:` continues to use its authoritative response
-  `usage.cost`.
-
-### Changed
-
 - **Gemini Interactions now prices known text/image usage on models without an
   audio rate.** A verified audio rate is required only when audio tokens are
   positive. Reconciled text/image calls, including cached and long-context
@@ -1649,7 +1644,8 @@ Initial public open-source release on npm under the `@axlsdk` scope. No new feat
 - `createServer()` factory, `ConnectionManager` for channel subscriptions, `CostAggregator` for cost tracking
 - Eight panels: Agent Playground, Workflow Runner, Trace Explorer, Cost Dashboard, Memory Browser, Session Manager, Tool Inspector, Eval Runner
 
-[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.23.2...HEAD
+[Unreleased]: https://github.com/axl-sdk/axl/compare/v0.23.3...HEAD
+[0.23.3]: https://github.com/axl-sdk/axl/compare/v0.23.2...v0.23.3
 [0.23.2]: https://github.com/axl-sdk/axl/compare/v0.23.1...v0.23.2
 [0.23.1]: https://github.com/axl-sdk/axl/compare/v0.23.0...v0.23.1
 [0.23.0]: https://github.com/axl-sdk/axl/compare/v0.22.3...v0.23.0

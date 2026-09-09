@@ -4,7 +4,100 @@
  * `main()` on import) — same reason as `cli-args.ts`.
  */
 
-import type { ModelTimingStats } from './types.js';
+import type { Accounting } from '@axlsdk/axl';
+
+import type { EvalAccounting, EvalResult, ModelTimingStats } from './types.js';
+import { readAccounting } from './accounting.js';
+
+/**
+ * Render known spend and say so when it is only a lower bound.
+ *
+ * Printing a bare `$0.00` for a run whose prices were unknown is the
+ * presentation defect this replaces: it reads as "this was free" when the
+ * honest statement is "we could not price N operations".
+ */
+export function formatKnownSpend(accounting: Accounting): string {
+  const cost = `$${accounting.knownCost.toFixed(2)}`;
+  if (accounting.completeness === 'complete') return cost;
+  if (accounting.completeness === 'unverified') return `${cost} (unverified)`;
+  const reasons = Object.entries(accounting.reasons)
+    .map(([reason, count]) => `${count} ${reason}`)
+    .join(', ');
+  return `${cost} (incomplete: ${reasons || 'unknown spend'})`;
+}
+
+/** The budget's outcome, when one was configured. */
+export function formatBudgetLine(accounting: EvalAccounting): string | undefined {
+  const budget = accounting.budget;
+  if (!budget) return undefined;
+  const limit = `$${budget.limit.toFixed(2)}`;
+  const spent = `$${budget.knownSpend.toFixed(2)}`;
+  if (budget.status === 'open') {
+    return `  Budget: ${spent} of ${limit} (open)`;
+  }
+  const by = budget.closedBy ? `, first observed by ${budget.closedBy}` : '';
+  return `  Budget: STOPPED — ${spent} known spend against a ${limit} limit, $${budget.knownOvershoot.toFixed(2)} over${by}`;
+}
+
+/** Item outcomes other than plain completion, so a truncated run cannot read as a clean one. */
+export function formatCoverageLine(result: EvalResult): string | undefined {
+  const items = result.summary.coverage?.items;
+  if (!items) return undefined;
+  const parts = (
+    [
+      ['failed', items.failed],
+      ['cancelled', items.cancelled],
+      ['budget-skipped', items.budget_skipped],
+      ['budget-interrupted', items.budget_interrupted],
+    ] as const
+  )
+    .filter(([, n]) => n > 0)
+    .map(([label, n]) => `${n} ${label}`);
+  if (parts.length === 0) return undefined;
+  return `  Items: ${items.completed} completed, ${parts.join(', ')}`;
+}
+
+/**
+ * The distinct, first-printed reason for a budget-stopped run, or `null`.
+ *
+ * "We stopped spending" is a different fact from "the model regressed" or "a
+ * judge is flaky", and it is the one that explains why the numbers cover less
+ * than the whole dataset. A caller exits non-zero on it WITHOUT counting it as
+ * a model failure.
+ */
+export function budgetStopMessage(result: EvalResult, label: string): string | null {
+  const budget = readAccounting(result).budget;
+  if (!budget || budget.status !== 'closed') return null;
+  const items = result.summary.coverage?.items;
+  const stopped = items
+    ? ` ${items.budget_skipped} case(s) never started, ${items.budget_interrupted} stopped mid-flight, ${items.completed} completed.`
+    : '';
+  return (
+    `[axl-eval] BUDGET STOPPED: ${label} — known spend $${budget.knownSpend.toFixed(2)} reached the ` +
+    `$${budget.limit.toFixed(2)} limit (over by $${budget.knownOvershoot.toFixed(2)}).${stopped} ` +
+    `The run is incomplete by design; this is NOT a model or scorer failure.`
+  );
+}
+
+/**
+ * `true` when the WORKFLOW failed on every item — a broken eval, not a
+ * truncated one.
+ *
+ * A budget stop is deliberately excluded: those items never ran, so calling
+ * them a total wipeout would report a working model as broken and hide the real
+ * reason the run is short.
+ */
+export function isTotalWipeout(result: EvalResult): boolean {
+  const { count, failures } = result.summary;
+  if (count === 0) return false;
+  const coverage = result.summary.coverage?.items;
+  if (coverage) {
+    const budgetStopped = coverage.budget_skipped + coverage.budget_interrupted;
+    if (coverage.completed > 0 || budgetStopped > 0) return false;
+    return coverage.failed === count;
+  }
+  return failures >= count;
+}
 
 /**
  * Render the per-model provider-latency rows that sit under the wall-clock

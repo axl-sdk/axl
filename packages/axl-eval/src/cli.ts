@@ -3,13 +3,13 @@
 import { readdirSync, statSync } from 'node:fs';
 import { readFile as readFileAsync, writeFile as writeFileAsync, mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
-import type { Accounting, AxlRuntime, EvalExecuteWorkflow } from '@axlsdk/axl';
+import type { AxlRuntime, EvalExecuteWorkflow } from '@axlsdk/axl';
 import { evalCompare, evaluateScorerErrorRateGate } from './compare.js';
 import { runEval } from './runner.js';
 import { rescore } from './rescore.js';
 import { aggregateRuns } from './multi-run.js';
 import type { MultiRunSummary } from './multi-run.js';
-import type { EvalAccounting, EvalConfig, EvalResult } from './types.js';
+import type { EvalConfig, EvalResult } from './types.js';
 import { readAccounting } from './accounting.js';
 import {
   findConfig,
@@ -23,7 +23,14 @@ import {
 } from './cli-utils.js';
 import { validateEvalConfig } from './cli-validate.js';
 import { parseEvalArgs, envInt } from './cli-args.js';
-import { formatModelTimingLines } from './cli-format.js';
+import {
+  budgetStopMessage,
+  formatBudgetLine,
+  formatCoverageLine,
+  formatKnownSpend,
+  formatModelTimingLines,
+  isTotalWipeout,
+} from './cli-format.js';
 import { scorerCounts } from './utils.js';
 
 /**
@@ -507,54 +514,6 @@ function formatWorkflows(workflows: unknown): string {
   return (workflows as unknown[]).filter((w): w is string => typeof w === 'string').join(', ');
 }
 
-/**
- * Render known spend and say so when it is only a lower bound.
- *
- * Printing a bare `$0.00` for a run whose prices were unknown is the
- * presentation defect this replaces: it reads as "this was free" when the
- * honest statement is "we could not price N operations".
- */
-function formatKnownSpend(accounting: Accounting): string {
-  const cost = `$${accounting.knownCost.toFixed(2)}`;
-  if (accounting.completeness === 'complete') return cost;
-  if (accounting.completeness === 'unverified') return `${cost} (unverified)`;
-  const reasons = Object.entries(accounting.reasons)
-    .map(([reason, count]) => `${count} ${reason}`)
-    .join(', ');
-  return `${cost} (incomplete: ${reasons || 'unknown spend'})`;
-}
-
-/** The budget's outcome, when one was configured. */
-function formatBudgetLine(accounting: EvalAccounting): string | undefined {
-  const budget = accounting.budget;
-  if (!budget) return undefined;
-  const limit = `$${budget.limit.toFixed(2)}`;
-  const spent = `$${budget.knownSpend.toFixed(2)}`;
-  if (budget.status === 'open') {
-    return `  Budget: ${spent} of ${limit} (open)`;
-  }
-  const by = budget.closedBy ? `, first observed by ${budget.closedBy}` : '';
-  return `  Budget: STOPPED — ${spent} known spend against a ${limit} limit, $${budget.knownOvershoot.toFixed(2)} over${by}`;
-}
-
-/** Item outcomes other than plain completion, so a truncated run cannot read as a clean one. */
-function formatCoverageLine(result: EvalResult): string | undefined {
-  const items = result.summary.coverage?.items;
-  if (!items) return undefined;
-  const parts = (
-    [
-      ['failed', items.failed],
-      ['cancelled', items.cancelled],
-      ['budget-skipped', items.budget_skipped],
-      ['budget-interrupted', items.budget_interrupted],
-    ] as const
-  )
-    .filter(([, n]) => n > 0)
-    .map(([label, n]) => `${n} ${label}`);
-  if (parts.length === 0) return undefined;
-  return `  Items: ${items.completed} completed, ${parts.join(', ')}`;
-}
-
 function formatTable(result: EvalResult): string {
   const lines: string[] = [];
   const scorerNames = Object.keys(result.summary.scorers);
@@ -742,47 +701,22 @@ function reportFullySkippedScorers(result: EvalResult, label: string): void {
  * loudly in the table either way.) Returns whether the run was a total wipeout.
  */
 /**
- * Report a run whose budget closed. Printed BEFORE every other failure reason
- * and distinctly labeled, because "we stopped spending" is a different fact
- * from "the model regressed" or "a judge is flaky" — and it is the one that
- * explains why the numbers below cover less than the whole dataset.
- *
- * Returns whether the run was budget-stopped, so the caller can exit non-zero
- * for incomplete execution without counting it as a model failure.
+ * Print the budget-stop reason, first and distinctly, and report whether the run
+ * was budget-stopped so the caller can exit non-zero for incomplete execution
+ * without counting it as a model failure.
  */
 function reportBudgetStop(result: EvalResult, label: string): boolean {
-  const budget = readAccounting(result).budget;
-  if (!budget || budget.status !== 'closed') return false;
-  const items = result.summary.coverage?.items;
-  const stopped = items
-    ? ` ${items.budget_skipped} case(s) never started, ${items.budget_interrupted} stopped mid-flight, ${items.completed} completed.`
-    : '';
-  console.error(
-    `[axl-eval] BUDGET STOPPED: ${label} — known spend $${budget.knownSpend.toFixed(2)} reached the ` +
-      `$${budget.limit.toFixed(2)} limit (over by $${budget.knownOvershoot.toFixed(2)}).${stopped} ` +
-      `The run is incomplete by design; this is NOT a model or scorer failure.`,
-  );
+  const message = budgetStopMessage(result, label);
+  if (!message) return false;
+  console.error(message);
   return true;
 }
 
-/**
- * Report a run in which the WORKFLOW failed on every item — a broken eval, not
- * a truncated one. A budget stop is deliberately excluded: those items never
- * ran, so calling them a total wipeout would report a working model as broken
- * (and hide the real reason the run is short).
- */
+/** Print the total-wipeout diagnostic when every item failed in the workflow. */
 function reportTotalWipeout(result: EvalResult, label: string): boolean {
-  const { count, failures } = result.summary;
-  if (count === 0) return false;
-  const coverage = result.summary.coverage?.items;
-  if (coverage) {
-    const budgetStopped = coverage.budget_skipped + coverage.budget_interrupted;
-    if (coverage.completed > 0 || budgetStopped > 0 || coverage.failed < count) return false;
-  } else if (failures < count) {
-    return false;
-  }
+  if (!isTotalWipeout(result)) return false;
   console.error(
-    `[axl-eval] FAILED: ${label} — all ${count} item(s) errored in the workflow ` +
+    `[axl-eval] FAILED: ${label} — all ${result.summary.count} item(s) errored in the workflow ` +
       `(0 succeeded); the eval produced no scorable output.`,
   );
   return true;

@@ -1876,6 +1876,7 @@ Storage for [captured requests](observability.md#captured-requests-opt-in), conf
 
 | Method | Returns | Description |
 |--------|---------|-------------|
+| `getEvalResult(id)` | `Promise<EvalHistoryEntry \| undefined>` | One history entry by id, without copying the whole history to find it |
 | `getDiagnosticArtifactStore()` | `DiagnosticArtifactStore \| undefined` | The configured store, or `undefined` when capture is not configured |
 | `stageDiagnosticArtifact(owner)` | `Promise<{ artifactId, sink }>` | Take a lease and open a bounded sink. Throws `AxlError('DIAGNOSTICS_UNAVAILABLE')` when capture is not configured |
 | `finalizeDiagnosticArtifact(id, status, reason?, redaction?)` | `Promise<ArtifactManifest>` | Declare what the writer managed to capture. `redaction` is what the WRITER applied — the store only ever sees already-scrubbed bytes and cannot infer it |

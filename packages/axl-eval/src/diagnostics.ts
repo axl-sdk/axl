@@ -116,6 +116,18 @@ export function unavailableManifest(artifactId: string, reason: string): Diagnos
 /** Default ceiling on an imported `.requests.jsonl` sidecar. */
 export const DEFAULT_SIDECAR_MAX_BYTES = 16 * 1024 * 1024;
 
+/**
+ * Per-record ceiling for an imported sidecar.
+ *
+ * A live capture stubs any record over `maxRecordBytes` (256 KiB by default),
+ * so no run this codebase produces emits a line near this. It is set well above
+ * that because a caller may raise their own bound, and generously rather than
+ * exactly because the point is not to police record size — it is that one
+ * 15 MiB line inside a 16 MiB budget is a shape a run cannot produce, and
+ * storing it means a single record the reader has to hold whole in memory.
+ */
+export const DEFAULT_SIDECAR_MAX_RECORD_BYTES = 4 * 1024 * 1024;
+
 export type SidecarValidation =
   | { ok: true; lines: string[]; bytes: number }
   | { ok: false; reason: string };
@@ -136,18 +148,29 @@ export type SidecarValidation =
  */
 export function validateRequestSidecar(
   text: unknown,
-  options?: { maxBytes?: number },
+  options?: { maxBytes?: number; maxRecordBytes?: number },
 ): SidecarValidation {
   if (typeof text !== 'string') {
     return { ok: false, reason: 'requests sidecar must be a JSONL string' };
   }
   const maxBytes = options?.maxBytes ?? DEFAULT_SIDECAR_MAX_BYTES;
+  const maxRecordBytes = options?.maxRecordBytes ?? DEFAULT_SIDECAR_MAX_RECORD_BYTES;
   const bytes = Buffer.byteLength(text, 'utf-8');
   if (bytes > maxBytes) {
     return { ok: false, reason: `requests sidecar exceeds ${maxBytes} bytes` };
   }
   const lines = text.split('\n').filter((line) => line.trim() !== '');
   for (let i = 0; i < lines.length; i++) {
+    // Bounded per record, not only in total: the whole-body limit alone lets a
+    // single 15 MiB line through, which no live capture can produce and which
+    // every reader downstream has to hold whole.
+    const lineBytes = Buffer.byteLength(lines[i], 'utf-8');
+    if (lineBytes > maxRecordBytes) {
+      return {
+        ok: false,
+        reason: `requests sidecar line ${i + 1} exceeds ${maxRecordBytes} bytes`,
+      };
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(lines[i]);

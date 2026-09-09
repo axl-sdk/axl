@@ -396,8 +396,10 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
     runtime: StudioEnv['Variables']['runtime'],
     id: string,
   ): Promise<{ artifactId: string } | undefined> {
-    const history = await runtime.getEvalHistory();
-    const entry = history.find((h) => h.id === id);
+    // By id: this runs on every diagnostics read, and materializing the whole
+    // history — every result's full `data` blob — to find one entry made the
+    // cost of reading one artifact proportional to the size of history.
+    const entry = await runtime.getEvalResult(id);
     const artifactId = (entry?.data as EvalResult | undefined)?.diagnostics?.artifactId;
     return typeof artifactId === 'string' && artifactId !== '' ? { artifactId } : undefined;
   }

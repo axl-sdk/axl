@@ -493,6 +493,16 @@ describe('the JSONL codec and its import guard', () => {
     expect((result as { reason: string }).reason).toContain('64');
   });
 
+  it('refuses one oversized record inside a sidecar that fits overall', () => {
+    const fat = serializeRequestRecords([record({ operationId: 'x'.repeat(5000) })]);
+    // Well under the whole-body ceiling, and still a record no live capture can
+    // produce — a run stubs anything over `maxRecordBytes`. Bounding only the
+    // total lets one enormous line through for every reader to hold whole.
+    const result = validateRequestSidecar(fat, { maxBytes: 1_000_000, maxRecordBytes: 1024 });
+    expect(result.ok).toBe(false);
+    expect((result as { reason: string }).reason).toContain('1024');
+  });
+
   it('normalizes the capture option into explicit limits', () => {
     expect(resolveCaptureLimits(undefined)).toBeUndefined();
     expect(resolveCaptureLimits(false)).toBeUndefined();

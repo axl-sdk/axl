@@ -2745,6 +2745,26 @@ export class AxlRuntime extends EventEmitter {
     return [...this.evalHistory];
   }
 
+  /**
+   * One eval history entry by id, or `undefined`.
+   *
+   * A read that wants one entry should not have to materialize the whole
+   * history to find it. Studio's diagnostics routes resolve an artifact through
+   * a history id on every request, and `getEvalHistory()` copies the entire
+   * array — every result's full `data` blob — before the caller discards all
+   * but one of them.
+   *
+   * The lazy first load is still whole-history (that is how the cache is
+   * populated); what this avoids is paying for a copy of it per request.
+   */
+  async getEvalResult(id: string): Promise<EvalHistoryEntry | undefined> {
+    const cached = this.evalHistory.find((entry) => entry.id === id);
+    if (cached) return cached;
+    // Not in memory yet: make sure the store has been read at least once.
+    await this.getEvalHistory();
+    return this.evalHistory.find((entry) => entry.id === id);
+  }
+
   /** List pending human decisions. */
   async getPendingDecisions(): Promise<PendingDecision[]> {
     return this.stateStore.getPendingDecisions();

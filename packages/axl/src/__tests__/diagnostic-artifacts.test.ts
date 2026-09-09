@@ -620,6 +620,21 @@ describe('a vanished artifact is reported, not published (M5)', () => {
   });
 });
 
+describe('one history entry can be read without the rest (L5)', () => {
+  it('returns the entry by id, and undefined for one that is not there', async () => {
+    const runtime = artifactRuntime();
+    const saved = await stagedResult(runtime, 'run-byid');
+    await runtime.saveEvalResult({ id: 'run-byid', eval: 'e', timestamp: 1, data: saved.data });
+    await runtime.saveEvalResult({ id: 'other', eval: 'e', timestamp: 2, data: { id: 'other' } });
+
+    const entry = await runtime.getEvalResult('run-byid');
+    expect(entry?.id).toBe('run-byid');
+    expect(entry?.data).toBe(saved.data);
+    expect(await runtime.getEvalResult('never-saved')).toBeUndefined();
+    await runtime.shutdown();
+  });
+});
+
 describe('only a committed artifact is readable through the runtime (L2)', () => {
   it('refuses a staged artifact', async () => {
     const runtime = artifactRuntime();

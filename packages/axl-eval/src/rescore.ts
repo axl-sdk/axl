@@ -231,8 +231,10 @@ export async function rescore(
 
   // Opened BEFORE any scoring: the judge calls a rescore makes are the work it
   // actually performs, and capturing them afterwards would capture nothing.
-  // Staging can throw (capture asked for on a runtime that cannot host it), and
-  // that surfaces before a single provider call, exactly as in `runEval`.
+  // Unlike `runEval`, a rescore whose runtime cannot host capture DEGRADES
+  // rather than throwing — that has been the behaviour since this option
+  // existed, and a rescore's value is the numbers it produces from outputs that
+  // already exist.
   const { capture, degraded } = await beginCapture(result, rescoredId, runtime, options);
 
   async function rescoreItem(original: EvalItem, itemIndex: number): Promise<void> {

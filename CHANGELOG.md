@@ -154,6 +154,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and Redis stores (the last from `PTTL`), and a custom store without it is
   refused **at configuration time** rather than mid-run. An interrupted writer's
   artifact reads back as `interrupted` with its records intact.
+- **`runtime.getEvalResult(id)`** returns one eval history entry without
+  materializing the whole history to find it. Studio's diagnostics routes
+  resolve an artifact through a history id on every request; the previous
+  `getEvalHistory()` scan copied every result's full `data` blob first.
 - **`axl-eval --capture-requests --output result.json`** writes a
   `result.requests.jsonl` sidecar alongside the result — codec version 1, one
   JSON record per line, validated on the way back in.
@@ -162,8 +166,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   records as NDJSON, both resolved through the eval history id and both redacted
   again at delivery. `POST /api/evals/:name/run` and `.../rescore` accept
   `captureRequests: true`, and `POST /api/evals/import` accepts an optional
-  `requests` sidecar, re-staged under a **new** artifact id owned by the new
-  history row — an imported bundle can never name a path, a URL, or storage in
+  `requests` sidecar — bounded per record as well as in total, so one enormous
+  line inside the overall ceiling is refused — re-staged under a **new**
+  artifact id owned by the new history row — an imported bundle can never name a path, a URL, or storage in
   the deployment it came from.
 
 ### Changed

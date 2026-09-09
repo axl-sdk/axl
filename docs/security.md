@@ -385,7 +385,9 @@ than an orphan nobody will ever look for.
 is ever dereferenced: the server does not open a path, fetch a URL, or reuse the
 exporter's artifact id. The sidecar must be JSONL that parses, declares codec
 `v: 1`, and carries an `operationId` and a known `phase` on every line, under a
-size ceiling — and it is validated in full before a single result is stored.
+size ceiling — per record as well as in total, so one enormous line inside the
+overall budget is refused — and it is validated in full before a single result
+is stored.
 Accepted records are re-staged under a **new** artifact id owned by the **new**
 history row, so an imported reference can only ever resolve to bytes this
 runtime wrote itself.

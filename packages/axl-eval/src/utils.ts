@@ -48,7 +48,7 @@ export function scorerCounts(
   items: readonly {
     error?: string;
     scores: Record<string, number | null>;
-    scoreDetails?: Record<string, { duration?: number; skipped?: boolean }>;
+    scoreDetails?: Record<string, { duration?: number; skipped?: boolean; outcome?: string }>;
   }[],
   name: string,
 ): { scored: number; failed: number; skipped: number } {
@@ -57,9 +57,27 @@ export function scorerCounts(
   let skipped = 0;
   for (const i of items) {
     if (i.error) continue;
+    const detail = i.scoreDetails?.[name];
+    // `outcome` is the authoritative classification, so prefer it wherever it
+    // exists. The duration heuristic below reconstructs the same taxonomy from
+    // the shape of a pre-0.24 artifact, and it is only ever a reconstruction:
+    // it reads "no score and no duration" as "never ran", which is right for a
+    // cancellation and wrong for a judge the budget stopped mid-flight. Keeping
+    // two independent classifiers in the codebase means a later change to
+    // either — say, recording the duration a stopped judge actually spent —
+    // silently starts counting budget stops as scorer failures and trips the
+    // degradation gate on a run with no scorer defect.
+    if (detail?.outcome !== undefined) {
+      if (detail.outcome === 'scored') scored++;
+      else if (detail.outcome === 'failed') failed++;
+      else if (detail.outcome === 'skipped') skipped++;
+      // 'cancelled' / 'budget_skipped' / 'budget_interrupted' are in no bucket:
+      // they are not a sample of the scorer's reliability.
+      continue;
+    }
     if (i.scores[name] != null) scored++;
-    else if (i.scoreDetails?.[name]?.skipped === true) skipped++;
-    else if (i.scoreDetails?.[name]?.duration != null) failed++;
+    else if (detail?.skipped === true) skipped++;
+    else if (detail?.duration != null) failed++;
   }
   return { scored, failed, skipped };
 }

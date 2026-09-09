@@ -433,6 +433,9 @@ async function runRescore(args: string[], signal: AbortSignal) {
   const results: EvalResult[] = Array.isArray(raw) ? raw : [raw];
 
   const runtime = await getRuntime(configArg, conditions);
+  // Set inside the try, acted on after `finally` has shut the runtime down —
+  // `process.exit` would otherwise abandon the shutdown mid-flight.
+  let exitCode = 0;
   try {
     const mod = await importModule(path.resolve(evalFilePath), import.meta.url);
     const evalConfig = pickDefault<EvalConfig>(mod);
@@ -449,33 +452,61 @@ async function runRescore(args: string[], signal: AbortSignal) {
     }
 
     const rescored: EvalResult[] = [];
-    for (const resultData of results) {
-      if (signal.aborted) break;
-      rescored.push(
-        await rescore(resultData, evalConfig.scorers, runtime, {
-          signal,
-          ...(itemConcurrency != null ? { concurrency: itemConcurrency } : {}),
-          // Gates the NEW judging spend only — the source run's cost is history
-          // and is not counted against this limit.
-          ...(budget != null ? { budget } : {}),
-        }),
-      );
+    // A rejected `--budget` skips the reporting below, but must NOT `return`:
+    // a return inside the outer try runs `finally` and then leaves the function,
+    // jumping over the `process.exit(exitCode)` that follows it — the CLI would
+    // print the error and still exit 0.
+    let budgetUsable = true;
+    try {
+      for (const resultData of results) {
+        if (signal.aborted) break;
+        rescored.push(
+          await rescore(resultData, evalConfig.scorers, runtime, {
+            signal,
+            ...(itemConcurrency != null ? { concurrency: itemConcurrency } : {}),
+            // Gates the NEW judging spend only — the source run's cost is history
+            // and is not counted against this limit.
+            ...(budget != null ? { budget } : {}),
+          }),
+        );
+      }
+    } catch (err) {
+      // An unusable `--budget` is a user error, not a crash: print it the way
+      // the run command does rather than letting a raw AxlError stack out of
+      // `main().catch`.
+      if ((err as { code?: string })?.code === 'INVALID_BUDGET') {
+        console.error(`[axl-eval] ${err instanceof Error ? err.message : String(err)}`);
+        exitCode = 1;
+        budgetUsable = false;
+      } else {
+        throw err;
+      }
     }
 
-    for (const r of rescored) {
-      console.log('\n' + formatTable(r) + '\n');
-    }
+    if (budgetUsable) {
+      for (const r of rescored) {
+        console.log('\n' + formatTable(r) + '\n');
+      }
 
-    if (outputPath) {
-      const output = Array.isArray(raw) ? rescored : rescored[0];
-      const outputDir = path.dirname(path.resolve(outputPath));
-      await mkdir(outputDir, { recursive: true });
-      await writeFileAsync(outputPath, JSON.stringify(output, null, 2), 'utf-8');
-      console.log(`Rescored results saved to ${outputPath}`);
+      if (outputPath) {
+        const output = Array.isArray(raw) ? rescored : rescored[0];
+        const outputDir = path.dirname(path.resolve(outputPath));
+        await mkdir(outputDir, { recursive: true });
+        await writeFileAsync(outputPath, JSON.stringify(output, null, 2), 'utf-8');
+        console.log(`Rescored results saved to ${outputPath}`);
+      }
+
+      // A rescore that exhausted its judging budget scored nothing on the items
+      // it skipped, and must fail the build for the same reason a run does.
+      // Reported AFTER the artifact is written, so partial scores are saved.
+      for (const r of rescored) {
+        if (reportBudgetStop(r, `rescore ${resultsPath}`)) exitCode = 1;
+      }
     }
   } finally {
     await runtime.shutdown().catch(() => {});
   }
+  if (exitCode !== 0) process.exit(exitCode);
 }
 
 /**

@@ -26,7 +26,14 @@ export type { RescoreOptions } from './rescore.js';
 export { aggregateRuns } from './multi-run.js';
 export type { MultiRunSummary } from './multi-run.js';
 
+export { readAccounting, aggregateAccounting } from './accounting.js';
+
 export type {
+  EvalAccounting,
+  EvalBudgetStatus,
+  EvalCoverage,
+  EvalItemOutcome,
+  ScorerOutcome,
   EvalConfig,
   EvalResult,
   EvalItem,

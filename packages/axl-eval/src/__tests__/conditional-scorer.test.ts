@@ -38,6 +38,16 @@ function mockContext(
   };
 }
 
+/**
+ * Options for a direct `scoreItem` call. These unit tests drive the scoring
+ * loop without a runtime, so they exercise the UNINSTRUMENTED path: no
+ * accounting is produced and a scorer-returned `cost` is what lands on
+ * `ScorerDetail.cost`.
+ */
+function scoreOpts(context: ScorerContext, scorerConcurrency = 5) {
+  return { runtime: mockRuntime, scorerContext: context, scorerConcurrency };
+}
+
 /** A scorable item with the minimal shape scoreItem reads + mutates. */
 function item(input: unknown, output: unknown, annotations?: unknown): EvalItem {
   return { input, output, annotations, scores: {} };
@@ -101,11 +111,11 @@ describe('applies predicate gates execution', () => {
     });
 
     const it0 = item({ q: 1 }, 'out');
-    await scoreItem(it0, [s], 1, mockContext({ chat: async () => ({ content: '{}' }) }));
+    await scoreItem(it0, [s], scoreOpts(mockContext({ chat: async () => ({ content: '{}' }) }), 1));
 
     expect(scoreSpy).not.toHaveBeenCalled();
     expect(it0.scores.gated).toBeNull();
-    expect(it0.scoreDetails!.gated).toEqual({ score: null, skipped: true });
+    expect(it0.scoreDetails!.gated).toEqual({ score: null, skipped: true, outcome: 'skipped' });
     // A skip leaves NO duration and records NO scorerErrors.
     expect(it0.scoreDetails!.gated.duration).toBeUndefined();
     expect(it0.scorerErrors).toBeUndefined();
@@ -123,7 +133,7 @@ describe('applies predicate gates execution', () => {
       },
     });
     const it0 = item({ q: 5 }, 'the-output', { gold: 'g' });
-    await scoreItem(it0, [s], 1, mockContext({ chat: async () => ({ content: '{}' }) }));
+    await scoreItem(it0, [s], scoreOpts(mockContext({ chat: async () => ({ content: '{}' }) }), 1));
     expect(seen).toEqual(['the-output', { q: 5 }, { gold: 'g' }]);
     expect(it0.scores.inspect).toBe(1);
   });
@@ -152,7 +162,11 @@ describe('partial application across a dataset', () => {
     expect(s.failed).toBe(0);
     expect(s.mean).toBe(0.5); // (1 + 0) / 2 — skipped items excluded
     // The skipped items carry the positive marker; applied ones don't.
-    expect(result.items[1].scoreDetails!['odd-only']).toEqual({ score: null, skipped: true });
+    expect(result.items[1].scoreDetails!['odd-only']).toEqual({
+      score: null,
+      skipped: true,
+      outcome: 'skipped',
+    });
     expect(result.items[0].scoreDetails!['odd-only'].skipped).toBeUndefined();
   });
 
@@ -320,11 +334,10 @@ describe('llmScorer applies skips the provider call', () => {
     });
 
     const it0 = item({ q: 1 }, 'out');
-    const cost = await scoreItem(it0, [judge], 1, mockContext({ chat }));
+    await scoreItem(it0, [judge], scoreOpts(mockContext({ chat }), 1));
 
     expect(chat).not.toHaveBeenCalled();
-    expect(cost).toBe(0);
-    expect(it0.scoreDetails!.judge).toEqual({ score: null, skipped: true });
+    expect(it0.scoreDetails!.judge).toEqual({ score: null, skipped: true, outcome: 'skipped' });
     expect(it0.scorerCost).toBeUndefined();
   });
 
@@ -342,10 +355,11 @@ describe('llmScorer applies skips the provider call', () => {
     });
 
     const it0 = item({ q: 1 }, 'out');
-    const cost = await scoreItem(it0, [judge], 1, mockContext({ chat }));
+    await scoreItem(it0, [judge], scoreOpts(mockContext({ chat }), 1));
 
     expect(chat).toHaveBeenCalledTimes(1);
-    expect(cost).toBe(0.02);
+    // No runtime here, so the judge's own reported cost is the compat view.
+    expect(it0.scoreDetails!.judge.cost).toBe(0.02);
     expect(it0.scores.judge).toBe(0.75);
     expect(it0.scoreDetails!.judge.skipped).toBeUndefined();
     expect(it0.scoreDetails!.judge.duration).toBeDefined();
@@ -395,7 +409,11 @@ describe('rescore parity', () => {
     expect(s.scored).toBe(2); // q=1, q=3
     expect(s.skipped).toBe(1); // q=2
     expect(s.failed).toBe(0);
-    expect(rescored.items[1].scoreDetails!.odd).toEqual({ score: null, skipped: true });
+    expect(rescored.items[1].scoreDetails!.odd).toEqual({
+      score: null,
+      skipped: true,
+      outcome: 'skipped',
+    });
     expect(rescored.items[0].scores.odd).toBe(1);
   });
 });
@@ -416,8 +434,7 @@ describe('mixed scorers on the same item', () => {
     await scoreItem(
       it0,
       [conditional, always],
-      5,
-      mockContext({ chat: async () => ({ content: '{}' }) }),
+      scoreOpts(mockContext({ chat: async () => ({ content: '{}' }) }), 5),
     );
 
     expect(it0.scores.always).toBe(0.6);
@@ -472,19 +489,18 @@ describe('abort vs skip remain distinguishable', () => {
     await scoreItem(
       it0,
       [aborts, skips],
-      5,
-      mockContext({ chat: async () => ({ content: '{}' }) }),
+      scoreOpts(mockContext({ chat: async () => ({ content: '{}' }) }), 5),
     );
 
     // Cancelled: pre-seeded null, NO duration, NO skipped marker, NO error.
     expect(it0.scores.aborts).toBeNull();
-    expect(it0.scoreDetails!.aborts).toEqual({ score: null });
+    expect(it0.scoreDetails!.aborts).toEqual({ score: null, outcome: 'cancelled' });
     expect(it0.scoreDetails!.aborts.skipped).toBeUndefined();
     expect(it0.scoreDetails!.aborts.duration).toBeUndefined();
     expect(it0.scorerErrors).toBeUndefined();
 
     // Skipped: positive marker, no duration.
-    expect(it0.scoreDetails!.skips).toEqual({ score: null, skipped: true });
+    expect(it0.scoreDetails!.skips).toEqual({ score: null, skipped: true, outcome: 'skipped' });
 
     // scorerCounts distinguishes them: abort → neither bucket; skip → skipped.
     expect(scorerCounts([it0], 'aborts')).toEqual({ scored: 0, failed: 0, skipped: 0 });
@@ -506,8 +522,12 @@ describe('edge cases & documented behaviors', () => {
         applies: (() => falsy) as unknown as () => boolean,
       });
       const it0 = item({ q: 1 }, 'out');
-      await scoreItem(it0, [s], 1, mockContext({ chat: async () => ({ content: '{}' }) }));
-      expect(it0.scoreDetails!.falsy).toEqual({ score: null, skipped: true });
+      await scoreItem(
+        it0,
+        [s],
+        scoreOpts(mockContext({ chat: async () => ({ content: '{}' }) }), 1),
+      );
+      expect(it0.scoreDetails!.falsy).toEqual({ score: null, skipped: true, outcome: 'skipped' });
     }
   });
 
@@ -521,7 +541,11 @@ describe('edge cases & documented behaviors', () => {
         applies: (() => truthy) as unknown as () => boolean,
       });
       const it0 = item({ q: 1 }, 'out');
-      await scoreItem(it0, [s], 1, mockContext({ chat: async () => ({ content: '{}' }) }));
+      await scoreItem(
+        it0,
+        [s],
+        scoreOpts(mockContext({ chat: async () => ({ content: '{}' }) }), 1),
+      );
       expect(scoreSpy).toHaveBeenCalledTimes(1);
       expect(it0.scores.truthy).toBe(1);
     }
@@ -551,11 +575,19 @@ describe('edge cases & documented behaviors', () => {
       }),
     );
     const it0 = item({ q: 1 }, 'out');
-    await scoreItem(it0, scorers, 10, mockContext({ chat: async () => ({ content: '{}' }) }));
+    await scoreItem(
+      it0,
+      scorers,
+      scoreOpts(mockContext({ chat: async () => ({ content: '{}' }) }), 10),
+    );
 
     for (let i = 0; i < 10; i++) {
       if (i % 2 === 0) {
-        expect(it0.scoreDetails![`s${i}`]).toEqual({ score: null, skipped: true });
+        expect(it0.scoreDetails![`s${i}`]).toEqual({
+          score: null,
+          skipped: true,
+          outcome: 'skipped',
+        });
         expect(it0.scores[`s${i}`]).toBeNull();
       } else {
         expect(it0.scores[`s${i}`]).toBe(1);

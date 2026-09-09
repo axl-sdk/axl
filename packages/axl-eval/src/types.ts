@@ -1,6 +1,88 @@
 import type { Dataset } from './dataset.js';
 import type { Scorer } from './scorer.js';
-import type { AxlEvent } from '@axlsdk/axl';
+import type { Accounting, AxlEvent } from '@axlsdk/axl';
+
+/**
+ * How one dataset item ended. Absent only on artifacts written before 0.24.
+ *
+ * The four non-`completed` values are deliberately NOT interchangeable: a
+ * model/workflow failure, a caller cancellation, a case never started because
+ * the budget had closed, and a case stopped mid-flight by a denied operation
+ * are four different facts about the run, and collapsing them makes a
+ * budget-truncated run look like a broken model.
+ */
+export type EvalItemOutcome =
+  /** Ran to completion (its scorers may still have been stopped). */
+  | 'completed'
+  /** The workflow threw — including a user `ctx.budget` block, which is user logic. */
+  | 'failed'
+  /** The caller's `AbortSignal` fired. */
+  | 'cancelled'
+  /** Never started: the run budget had already closed. No operations, no spend. */
+  | 'budget_skipped'
+  /** Started and charged, then a further operation was denied by the budget. */
+  | 'budget_interrupted';
+
+/** How one scorer ended for one item. See {@link EvalItemOutcome} for the rationale. */
+export type ScorerOutcome =
+  /** Produced a valid numeric score. */
+  | 'scored'
+  /** Ran and threw, or returned an out-of-range score. */
+  | 'failed'
+  /** Its `applies` predicate returned `false` — deliberately not run. */
+  | 'skipped'
+  /** The caller's `AbortSignal` fired before or during the call. */
+  | 'cancelled'
+  /** A paid judge that was never started because the budget had closed. */
+  | 'budget_skipped'
+  /** Started, then hit a denied operation. */
+  | 'budget_interrupted';
+
+/** The run budget's terminal state, persisted on {@link EvalAccounting}. */
+export type EvalBudgetStatus = {
+  /** The configured USD threshold. */
+  limit: number;
+  status: 'open' | 'closed';
+  /** Known spend observed under the controller — `accounting.knownCost`. */
+  knownSpend: number;
+  /**
+   * `max(0, knownSpend - limit)`. A threshold is not a reservation: work
+   * already dispatched when the limit was crossed still settles, so a run can
+   * legitimately end above its limit. This says by how much rather than
+   * clamping the reported total.
+   */
+  knownOvershoot: number;
+  /** Which scheduling decision first observed the closure. */
+  closedBy?: 'case' | 'scorer' | 'operation';
+};
+
+/**
+ * A run's authoritative accounting: the core {@link Accounting} record plus the
+ * eval-specific context needed to read it honestly.
+ */
+export type EvalAccounting = Accounting & {
+  /** `'run'` for `runEval`, `'rescore'` for `rescore` (judging-only spend). */
+  scope: 'run' | 'rescore';
+  /** Present exactly when a budget was configured. */
+  budget?: EvalBudgetStatus;
+  /**
+   * Rescore provenance: the source run and its UNMODIFIED generation
+   * accounting, or `null` when the source was a legacy artifact that carried
+   * none. The original spend is never added to the rescore's own total.
+   */
+  source?: { runId: string; generation: Accounting | null };
+  /**
+   * Legacy caller-reported values observed during the run. Inspection only —
+   * never summed into `knownCost`, which measures Axl-observed operations.
+   */
+  callerReported?: { costItems: number; costTotal: number; metadataItems: number };
+};
+
+/** Per-outcome counts for a run. Every key is present, including zeros. */
+export type EvalCoverage = {
+  items: Record<EvalItemOutcome, number>;
+  scorers: Record<string, Record<ScorerOutcome, number>>;
+};
 
 export type EvalConfig = {
   workflow: string;
@@ -15,6 +97,17 @@ export type EvalConfig = {
    * so lower `concurrency` if a rate-limited judge model needs a tighter ceiling.
    */
   scorerConcurrency?: number;
+  /**
+   * Known-spend threshold for the whole run, e.g. `'$1'`, `'1'`, `'0.50'`.
+   *
+   * Validated BEFORE the dataset is loaded — a malformed value throws
+   * `AxlError('INVALID_BUDGET')` before any item runs or any provider is
+   * called. Admission closes at `knownSpend >= limit` (so `'$0'` admits
+   * nothing), which stops new cases, new paid judges, and new instrumented
+   * operations inside cases that are already running. Work already dispatched
+   * settles and is still counted, so the final total can exceed the limit —
+   * `accounting.budget.knownOvershoot` says by how much.
+   */
   budget?: string;
   /**
    * Opt-in source-side trust gate. When set (0–1), `runEval` flags the run as
@@ -83,9 +176,21 @@ export type EvalResult = {
    */
   metadata: Record<string, unknown>;
   timestamp: string;
+  /**
+   * Compatibility view of `accounting.knownCost` — the sum of settled, disjoint
+   * charges Axl observed. A caller-reported `cost` is NEVER part of it (read
+   * `accounting.callerReported` for those). Lower bound when `unpriced` is set.
+   */
   totalCost: number;
-  /** True when `totalCost` is a lower bound because at least one item used unpriced work. */
+  /** True when `totalCost` is a lower bound — present iff `accounting.completeness !== 'complete'`. */
   unpriced?: boolean;
+  /**
+   * The authoritative record `totalCost` / `unpriced` are derived from.
+   * Required on results this version produces; optional so a pre-0.24 artifact
+   * still types. Read it through `readAccounting()`, which reports an absent
+   * record as `'unverified'` instead of silently treating it as complete.
+   */
+  accounting?: EvalAccounting;
   duration: number;
   items: EvalItem[];
   summary: EvalSummary;
@@ -95,7 +200,18 @@ export type ScorerDetail = {
   score: number | null;
   metadata?: Record<string, unknown>;
   duration?: number;
+  /**
+   * Compatibility view of `accounting.knownCost` for this scorer. Falls back to
+   * a scorer-returned `cost` ONLY when the runtime measured nothing at all
+   * (no `trackOutcome`); a caller value never overrides a measured one and is
+   * never summed into any total.
+   */
   cost?: number;
+  /** How this scorer ended for this item. Absent only on pre-0.24 artifacts. */
+  outcome?: ScorerOutcome;
+  /** This scorer's own operations for this item (judging spend, plus any
+   *  `externalOperation` it declared). Absent on pre-0.24 artifacts. */
+  accounting?: Accounting;
   /**
    * `true` when the scorer's `applies` predicate returned `false` for this item,
    * so the scorer was deliberately skipped (NOT run). Distinct from a `null`
@@ -198,12 +314,31 @@ export type EvalItem = {
   scorerErrors?: string[];
   scores: Record<string, number | null>;
   duration?: number;
+  /** Compatibility view of `accounting.breakdown.generation` — this item's
+   *  measured workflow spend. On a pre-0.24 artifact this is whatever the
+   *  caller reported instead. */
   cost?: number;
   /** True when `cost` is a lower bound because this item used unpriced work. */
   unpriced?: boolean;
+  /** Compatibility view of `accounting.breakdown.judging` — this item's judges. */
   scorerCost?: number;
   scoreDetails?: Record<string, ScorerDetail>;
-  /** Tracked metadata merged with user keys (user wins; list-only overrides clear paired counts). */
+  /** How this item ended. Absent only on pre-0.24 artifacts. */
+  outcome?: EvalItemOutcome;
+  /** Generation AND judging spend for this item; `breakdown` splits them.
+   *  Absent on pre-0.24 artifacts. */
+  accounting?: Accounting;
+  /**
+   * What the `executeWorkflow` callback claimed, kept for inspection and never
+   * used as a measurement. `cost` is the callback's own `cost` return;
+   * `metadata` holds the reserved keys (`models`, `modelCallCounts`,
+   * `workflows`, `workflowCallCounts`, `tokens`, `agentCalls`) that used to
+   * overwrite the measured ones. Non-reserved caller keys still merge into
+   * `metadata` below.
+   */
+  callerReport?: { cost?: number; metadata?: Record<string, unknown> };
+  /** Tracked metadata merged with the caller's NON-reserved keys (caller wins
+   *  on those). Reserved keys stay measured — see {@link EvalItem.callerReport}. */
   metadata?: Record<string, unknown>;
   /** Per-model provider-call latency for this item, rolled up from
    *  `agent_call_end.timing`. Absent when the item made no timed provider call
@@ -228,7 +363,18 @@ export type EvalItem = {
 
 export type EvalSummary = {
   count: number;
+  /**
+   * Items carrying an `error` string. UNCHANGED legacy meaning — it therefore
+   * still counts budget-stopped and cancelled items, which also carry one. Read
+   * {@link EvalSummary.coverage} to tell a model failure from a budget stop.
+   */
   failures: number;
+  /**
+   * Per-outcome counts for items and for each scorer. Every key of the outcome
+   * unions is present, including zeros, so a consumer can render "0 skipped"
+   * without inferring it from an absent key. Absent on pre-0.24 artifacts.
+   */
+  coverage?: EvalCoverage;
   scorers: Record<
     string,
     {
@@ -384,7 +530,20 @@ export type EvalComparison = {
     baselineTotal: number;
     candidateTotal: number;
     delta: number;
-    deltaPercent: number;
+    /** `null` when the baseline total is 0 — a percentage change from zero is
+     *  not a number, and reporting `0` or `Infinity` misleads. */
+    deltaPercent: number | null;
+    /**
+     * `true` only when the two sides are comparable as SPEND: both accountings
+     * `complete`, the same `scope`, and the same case/scorer coverage. A
+     * partial or budget-truncated run is cheaper because it did less work, so
+     * without this an incomplete candidate reads as a saving.
+     *
+     * Raw totals are reported either way, and quality comparison is unaffected.
+     */
+    certified: boolean;
+    /** Why certification was refused. Present exactly when `certified` is false. */
+    reason?: string;
   };
   regressions: EvalRegression[];
   improvements: EvalImprovement[];

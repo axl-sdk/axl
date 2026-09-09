@@ -7,6 +7,87 @@ import type {
 } from './types.js';
 import { pairedBootstrapCI } from './bootstrap.js';
 import { scorerCounts, evaluateScorerTolerance, round } from './utils.js';
+import { readAccounting } from './accounting.js';
+
+/**
+ * Decide whether two sides' costs are comparable AS SPEND. Returns `null` to
+ * certify, or a human-readable refusal reason.
+ *
+ * Cost certification is deliberately separate from the quality gates: a legacy
+ * baseline must not disable regression detection, it must only stop the tool
+ * from claiming the candidate is cheaper. The four refusals, in the order a
+ * reader would want to hear them:
+ *
+ * 1. **Not measured** — either side is `incomplete` (some operation had no
+ *    usable price) or `unverified` (a pre-0.24 artifact). The totals are lower
+ *    bounds, so their difference is not one.
+ * 2. **Different scope** — a `rescore` total covers judging only. Comparing it
+ *    against a full run's total and reporting a saving is the headline failure
+ *    this exists to prevent.
+ * 3. **Different case coverage** — one side skipped or failed cases the other
+ *    completed, so it spent less by doing less.
+ * 4. **Different scorer coverage** — the same, one judge at a time.
+ *
+ * Cases and scorers are matched BY INDEX, which is how the rest of `evalCompare`
+ * pairs them: two dataset items with identical inputs and different annotations
+ * stay two distinct items rather than collapsing into one key.
+ */
+function certifyCost(
+  baselineRuns: EvalResult[],
+  candidateRuns: EvalResult[],
+  scorerNames: readonly string[],
+): string | null {
+  for (const [side, runs] of [
+    ['baseline', baselineRuns],
+    ['candidate', candidateRuns],
+  ] as const) {
+    for (const run of runs) {
+      const accounting = readAccounting(run);
+      if (accounting.completeness === 'unverified') {
+        return `${side} run ${run.id} carries no accounting (unverified) — its total is not a measured figure.`;
+      }
+      if (accounting.completeness === 'incomplete') {
+        const reasons = Object.keys(accounting.reasons).join(', ') || 'unknown spend';
+        return `${side} run ${run.id} has incomplete accounting (${reasons}) — its total is a lower bound.`;
+      }
+    }
+  }
+
+  const baselineScope = readAccounting(baselineRuns[0]).scope;
+  const candidateScope = readAccounting(candidateRuns[0]).scope;
+  if (baselineScope !== candidateScope) {
+    return `accounting scope differs (baseline "${baselineScope}" vs candidate "${candidateScope}") — a rescore total covers judging only.`;
+  }
+
+  const runCount = Math.min(baselineRuns.length, candidateRuns.length);
+  for (let r = 0; r < runCount; r++) {
+    const bRun = baselineRuns[r];
+    const cRun = candidateRuns[r];
+    if (bRun.items.length !== cRun.items.length) {
+      return `item counts differ (baseline ${bRun.items.length} vs candidate ${cRun.items.length}) — the runs did different amounts of work.`;
+    }
+    for (let i = 0; i < bRun.items.length; i++) {
+      const bItem = bRun.items[i];
+      const cItem = cRun.items[i];
+      const bRan = !bItem.error;
+      const cRan = !cItem.error;
+      if (bRan !== cRan) {
+        const stopped = bRan ? cItem : bItem;
+        return `case coverage differs at item ${i}: ${bRan ? 'candidate' : 'baseline'} did not complete it (${stopped.outcome ?? stopped.error}) — the cheaper side did less work.`;
+      }
+      if (!bRan) continue;
+      for (const name of scorerNames) {
+        const bScored = bItem.scores[name] != null;
+        const cScored = cItem.scores[name] != null;
+        if (bScored !== cScored) {
+          return `scorer coverage differs for "${name}" at item ${i}: only ${bScored ? 'baseline' : 'candidate'} produced a score.`;
+        }
+      }
+    }
+  }
+
+  return null;
+}
 
 const DEFAULT_LLM_THRESHOLD = 0.05;
 const DEFAULT_DETERMINISTIC_THRESHOLD = 0;
@@ -258,21 +339,31 @@ export function evalCompare(
     timing = { baselineMean: round(bMean), candidateMean: round(cMean), delta, deltaPercent };
   }
 
-  // Cost comparison (per-run average for multi-run)
+  // Cost comparison (per-run average for multi-run).
+  //
+  // Raw numbers are always reported; what the `certified` flag adds is whether
+  // they are comparable AS SPEND. A run that stopped early is cheaper because
+  // it did less work, so an uncertified saving is not a saving at all.
   let cost: EvalComparison['cost'];
   const baselineAvgCost =
-    baselineRuns.reduce((sum, r) => sum + r.totalCost, 0) / baselineRuns.length;
+    baselineRuns.reduce((sum, r) => sum + readAccounting(r).knownCost, 0) / baselineRuns.length;
   const candidateAvgCost =
-    candidateRuns.reduce((sum, r) => sum + r.totalCost, 0) / candidateRuns.length;
+    candidateRuns.reduce((sum, r) => sum + readAccounting(r).knownCost, 0) / candidateRuns.length;
   if (baselineAvgCost > 0 || candidateAvgCost > 0) {
     const deltaRaw = candidateAvgCost - baselineAvgCost;
     const delta = round(deltaRaw);
-    const deltaPercent = baselineAvgCost > 0 ? round((deltaRaw / baselineAvgCost) * 100) : 0;
+    // A percentage change from a zero baseline is not a number. Reporting `0`
+    // (or `Infinity`) would read as "no change" for a run that went from free
+    // to paid, so the field is explicitly null and the absolute delta stands.
+    const deltaPercent = baselineAvgCost > 0 ? round((deltaRaw / baselineAvgCost) * 100) : null;
+    const verdict = certifyCost(baselineRuns, candidateRuns, baselineScorerNames);
     cost = {
       baselineTotal: round(baselineAvgCost),
       candidateTotal: round(candidateAvgCost),
       delta,
       deltaPercent,
+      certified: verdict === null,
+      ...(verdict !== null ? { reason: verdict } : {}),
     };
   }
 
@@ -294,7 +385,7 @@ export function evalCompare(
     const dir = timing.delta > 0 ? 'slower' : 'faster';
     parts.push(`${Math.abs(timing.deltaPercent).toFixed(0)}% ${dir}`);
   }
-  if (cost && Math.abs(cost.deltaPercent) > 1) {
+  if (cost && cost.deltaPercent !== null && Math.abs(cost.deltaPercent) > 1) {
     const dir = cost.delta > 0 ? 'more expensive' : 'cheaper';
     parts.push(`${Math.abs(cost.deltaPercent).toFixed(0)}% ${dir}`);
   }

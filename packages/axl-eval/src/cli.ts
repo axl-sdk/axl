@@ -3,13 +3,14 @@
 import { readdirSync, statSync } from 'node:fs';
 import { readFile as readFileAsync, writeFile as writeFileAsync, mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
-import type { AxlRuntime, EvalExecuteWorkflow } from '@axlsdk/axl';
+import type { Accounting, AxlRuntime, EvalExecuteWorkflow } from '@axlsdk/axl';
 import { evalCompare, evaluateScorerErrorRateGate } from './compare.js';
 import { runEval } from './runner.js';
 import { rescore } from './rescore.js';
 import { aggregateRuns } from './multi-run.js';
 import type { MultiRunSummary } from './multi-run.js';
-import type { EvalConfig, EvalResult } from './types.js';
+import type { EvalAccounting, EvalConfig, EvalResult } from './types.js';
+import { readAccounting } from './accounting.js';
 import {
   findConfig,
   resolveRuntime,
@@ -103,7 +104,16 @@ Usage:
                                           (success + failure). Adds memory
                                           overhead proportional to dataset size
                                           x turns x agents; off by default.
+  axl-eval <path> --budget <amount>       Stop admitting spend once known cost
+                                          reaches the limit (e.g. "$1", "0.50").
+                                          Overrides the eval file's budget and
+                                          applies PER RUN under --runs. A
+                                          budget-stopped run exits 1 with a
+                                          distinct BUDGET STOPPED line.
   axl-eval rescore <results> <eval-file>  Re-run scorers on saved outputs
+  axl-eval rescore <results> <eval-file> --budget <amount>  Limit the NEW judging
+                                          spend only; the source run's cost is
+                                          not counted against it.
   axl-eval compare <a> <b>                Compare two eval result files
   axl-eval compare <a> <b> --threshold <v>  Set regression threshold (global or per-scorer)
   axl-eval compare <a> <b> --fail-on-regression  Exit 1 if regressions
@@ -118,7 +128,8 @@ Config auto-detection (when --config is not specified):
   ${CONFIG_CANDIDATES.join(' -> ')}
 
 When a config is found, the exported AxlRuntime is passed to executeWorkflow
-and cost is tracked automatically via runtime.trackCost().
+and spend is measured by the runner's accounting scope (a "cost" your callback
+returns is recorded under item.callerReport, never used as the measurement).
 When no config is found, a bare AxlRuntime is created (providers from env vars).
 `);
     process.exit(0);
@@ -289,9 +300,20 @@ async function runCompare(args: string[]) {
   if (comparison.cost) {
     const c = comparison.cost;
     const sign = c.delta > 0 ? '+' : '';
+    // A null percentage means the baseline was free — print the absolute delta
+    // rather than a fabricated 0% or Infinity%.
+    const change =
+      c.deltaPercent === null
+        ? `${sign}$${Math.abs(c.delta).toFixed(2)}, no % from a $0 baseline`
+        : `${sign}${c.deltaPercent.toFixed(1)}%`;
     console.log(
-      `  Cost: baseline $${c.baselineTotal.toFixed(2)} -> candidate $${c.candidateTotal.toFixed(2)} (${sign}${c.deltaPercent.toFixed(1)}%)`,
+      `  Cost: baseline $${c.baselineTotal.toFixed(2)} -> candidate $${c.candidateTotal.toFixed(2)} (${change})`,
     );
+    // Say plainly when the two totals are not comparable as spend, so a
+    // truncated or legacy run is never read as a saving.
+    if (!c.certified) {
+      console.log(`        not certified: ${c.reason ?? 'costs are not comparable'}`);
+    }
   }
 
   const baselineRef = Array.isArray(baseline) ? baseline[0] : baseline;
@@ -377,7 +399,7 @@ async function runCompare(args: string[]) {
 }
 
 async function runRescore(args: string[], signal: AbortSignal) {
-  const { outputPath, configArg, conditions, concurrency, scorerNames, paths } =
+  const { outputPath, configArg, conditions, concurrency, scorerNames, budget, paths } =
     parseEvalArgs(args);
 
   if (paths.length < 2) {
@@ -426,6 +448,9 @@ async function runRescore(args: string[], signal: AbortSignal) {
         await rescore(resultData, evalConfig.scorers, runtime, {
           signal,
           ...(itemConcurrency != null ? { concurrency: itemConcurrency } : {}),
+          // Gates the NEW judging spend only — the source run's cost is history
+          // and is not counted against this limit.
+          ...(budget != null ? { budget } : {}),
         }),
       );
     }
@@ -480,6 +505,54 @@ function collectEvalFiles(p: string): string[] {
 function formatWorkflows(workflows: unknown): string {
   if (!Array.isArray(workflows) || workflows.length === 0) return '(unknown)';
   return (workflows as unknown[]).filter((w): w is string => typeof w === 'string').join(', ');
+}
+
+/**
+ * Render known spend and say so when it is only a lower bound.
+ *
+ * Printing a bare `$0.00` for a run whose prices were unknown is the
+ * presentation defect this replaces: it reads as "this was free" when the
+ * honest statement is "we could not price N operations".
+ */
+function formatKnownSpend(accounting: Accounting): string {
+  const cost = `$${accounting.knownCost.toFixed(2)}`;
+  if (accounting.completeness === 'complete') return cost;
+  if (accounting.completeness === 'unverified') return `${cost} (unverified)`;
+  const reasons = Object.entries(accounting.reasons)
+    .map(([reason, count]) => `${count} ${reason}`)
+    .join(', ');
+  return `${cost} (incomplete: ${reasons || 'unknown spend'})`;
+}
+
+/** The budget's outcome, when one was configured. */
+function formatBudgetLine(accounting: EvalAccounting): string | undefined {
+  const budget = accounting.budget;
+  if (!budget) return undefined;
+  const limit = `$${budget.limit.toFixed(2)}`;
+  const spent = `$${budget.knownSpend.toFixed(2)}`;
+  if (budget.status === 'open') {
+    return `  Budget: ${spent} of ${limit} (open)`;
+  }
+  const by = budget.closedBy ? `, first observed by ${budget.closedBy}` : '';
+  return `  Budget: STOPPED — ${spent} known spend against a ${limit} limit, $${budget.knownOvershoot.toFixed(2)} over${by}`;
+}
+
+/** Item outcomes other than plain completion, so a truncated run cannot read as a clean one. */
+function formatCoverageLine(result: EvalResult): string | undefined {
+  const items = result.summary.coverage?.items;
+  if (!items) return undefined;
+  const parts = (
+    [
+      ['failed', items.failed],
+      ['cancelled', items.cancelled],
+      ['budget-skipped', items.budget_skipped],
+      ['budget-interrupted', items.budget_interrupted],
+    ] as const
+  )
+    .filter(([, n]) => n > 0)
+    .map(([label, n]) => `${n} ${label}`);
+  if (parts.length === 0) return undefined;
+  return `  Items: ${items.completed} completed, ${parts.join(', ')}`;
 }
 
 function formatTable(result: EvalResult): string {
@@ -538,11 +611,15 @@ function formatTable(result: EvalResult): string {
   lines.push(...formatModelTimingLines(result.summary.modelTiming, maxNameLen));
 
   const durationSec = (result.duration / 1000).toFixed(1);
-  const costStr = result.totalCost > 0 ? `$${result.totalCost.toFixed(2)}` : '$0.00';
+  const accounting = readAccounting(result);
   lines.push('');
   lines.push(
-    `  Failures: ${result.summary.failures}/${result.summary.count} | Cost: ${costStr} | Duration: ${durationSec}s`,
+    `  Failures: ${result.summary.failures}/${result.summary.count} | Cost: ${formatKnownSpend(accounting)} | Duration: ${durationSec}s`,
   );
+  const budgetLine = formatBudgetLine(accounting);
+  if (budgetLine) lines.push(budgetLine);
+  const coverageLine = formatCoverageLine(result);
+  if (coverageLine) lines.push(coverageLine);
 
   const itemsWithErrors = result.items.filter((i) => i.scorerErrors?.length);
   if (itemsWithErrors.length > 0) {
@@ -596,10 +673,11 @@ function formatMultiRunTable(summary: MultiRunSummary): string {
     );
   }
 
-  const costStr = summary.totalCost > 0 ? `$${summary.totalCost.toFixed(2)}` : '$0.00';
   const durationStr = (summary.totalDuration / 1000).toFixed(1);
   lines.push('');
-  lines.push(`  Total Cost: ${costStr} | Total Duration: ${durationStr}s`);
+  lines.push(
+    `  Total Cost: ${formatKnownSpend(summary.accounting)} | Total Duration: ${durationStr}s`,
+  );
 
   return lines.join('\n');
 }
@@ -663,9 +741,46 @@ function reportFullySkippedScorers(result: EvalResult, label: string): void {
  * gating is a reasonable future opt-in; the per-item failure count is already shown
  * loudly in the table either way.) Returns whether the run was a total wipeout.
  */
+/**
+ * Report a run whose budget closed. Printed BEFORE every other failure reason
+ * and distinctly labeled, because "we stopped spending" is a different fact
+ * from "the model regressed" or "a judge is flaky" — and it is the one that
+ * explains why the numbers below cover less than the whole dataset.
+ *
+ * Returns whether the run was budget-stopped, so the caller can exit non-zero
+ * for incomplete execution without counting it as a model failure.
+ */
+function reportBudgetStop(result: EvalResult, label: string): boolean {
+  const budget = readAccounting(result).budget;
+  if (!budget || budget.status !== 'closed') return false;
+  const items = result.summary.coverage?.items;
+  const stopped = items
+    ? ` ${items.budget_skipped} case(s) never started, ${items.budget_interrupted} stopped mid-flight, ${items.completed} completed.`
+    : '';
+  console.error(
+    `[axl-eval] BUDGET STOPPED: ${label} — known spend $${budget.knownSpend.toFixed(2)} reached the ` +
+      `$${budget.limit.toFixed(2)} limit (over by $${budget.knownOvershoot.toFixed(2)}).${stopped} ` +
+      `The run is incomplete by design; this is NOT a model or scorer failure.`,
+  );
+  return true;
+}
+
+/**
+ * Report a run in which the WORKFLOW failed on every item — a broken eval, not
+ * a truncated one. A budget stop is deliberately excluded: those items never
+ * ran, so calling them a total wipeout would report a working model as broken
+ * (and hide the real reason the run is short).
+ */
 function reportTotalWipeout(result: EvalResult, label: string): boolean {
   const { count, failures } = result.summary;
-  if (count === 0 || failures < count) return false;
+  if (count === 0) return false;
+  const coverage = result.summary.coverage?.items;
+  if (coverage) {
+    const budgetStopped = coverage.budget_skipped + coverage.budget_interrupted;
+    if (coverage.completed > 0 || budgetStopped > 0 || coverage.failed < count) return false;
+  } else if (failures < count) {
+    return false;
+  }
   console.error(
     `[axl-eval] FAILED: ${label} — all ${count} item(s) errored in the workflow ` +
       `(0 succeeded); the eval produced no scorable output.`,
@@ -759,6 +874,7 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
     captureTraces,
     concurrency,
     scorerNames,
+    budget,
     paths,
   } = parseEvalArgs(args);
 
@@ -812,6 +928,12 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
         evalConfig.concurrency =
           concurrency ?? envInt('AXL_EVAL_CONCURRENCY') ?? evalConfig.concurrency ?? 5;
 
+        // `--budget` overrides the eval file's own limit. Each run in a
+        // `--runs N` batch builds its own controller from this value, so the
+        // limit is PER RUN — never divided across the batch and never shared,
+        // which would make run 2's items depend on run 1's spend.
+        if (budget != null) evalConfig.budget = budget;
+
         // --scorers: run a subset of scorers for a focused iteration loop.
         // (The single-file guard already ran before the loop.) Validate-then-
         // filter so the error lists every available name.
@@ -853,29 +975,16 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
         let executeWorkflow: EvalExecuteWorkflow;
 
         if (customExecute) {
-          // Wrap custom executeWorkflow with trackExecution for cost + metadata attribution
-          executeWorkflow = async (input, rt) => {
-            const {
-              result,
-              cost: trackedCost,
-              metadata,
-            } = await runtime.trackExecution(async () => {
-              return customExecute(input, rt);
-            });
-            return {
-              output: result.output,
-              cost: result.cost ?? trackedCost,
-              metadata: result.metadata ?? metadata,
-            };
-          };
+          // Forward the user's callback verbatim. `runEval` opens the per-item
+          // accounting scope, so wrapping here would only add a caller-reported
+          // cost competing with the measurement.
+          executeWorkflow = async (input, rt) => customExecute(input, rt);
         } else if (runtime.getWorkflow(evalConfig.workflow)) {
-          // No executeWorkflow exported but workflow is registered — use runtime.execute()
-          executeWorkflow = async (input) => {
-            const { result, cost, metadata } = await runtime.trackExecution(async () => {
-              return runtime.execute(evalConfig.workflow, input);
-            });
-            return { output: result, cost, metadata };
-          };
+          // No executeWorkflow exported but workflow is registered — use
+          // runtime.execute() inside the runner's scope, which measures it.
+          executeWorkflow = async (input) => ({
+            output: await runtime.execute(evalConfig.workflow, input),
+          });
         } else {
           // Fail loudly. The previous identity-passthrough fallback silently
           // produced all-zero scores in CI — exactly the kind of footgun the
@@ -1029,11 +1138,13 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
           // was already counted as a partial batch above (avoids double-count).
           let anyFailing = false;
           for (const r of runResults) {
-            // Call both (no short-circuit) so each prints its own diagnostic.
+            // Call each (no short-circuit) so every one prints its diagnostic,
+            // budget stop first.
+            const budgetStopped = reportBudgetStop(r, filePath);
             const wipeout = reportTotalWipeout(r, filePath);
             const degraded = reportDegraded(r, filePath);
             reportFullySkippedScorers(r, filePath); // advisory only
-            if (wipeout || degraded) anyFailing = true;
+            if (budgetStopped || wipeout || degraded) anyFailing = true;
           }
           if (anyFailing && !partial) failedFiles++;
         } else {
@@ -1042,13 +1153,14 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
           results.push(result);
 
           console.log('\n' + formatTable(result) + '\n');
-          // Total-wipeout guard (always) + scorer failure-rate gate (opt-in). They
-          // are mutually exclusive (a wipeout has no scored items, so no scorer can
-          // be degraded), but report both for clarity; either fails the file.
+          // Budget stop first and distinctly (contracts §11 Q10), then the
+          // total-wipeout guard (always) + scorer failure-rate gate (opt-in).
+          // Every failing reason is printed; any one of them exits non-zero.
+          const budgetStopped = reportBudgetStop(result, filePath);
           const wipeout = reportTotalWipeout(result, filePath);
           const degraded = reportDegraded(result, filePath);
           reportFullySkippedScorers(result, filePath); // advisory only
-          if (wipeout || degraded) failedFiles++;
+          if (budgetStopped || wipeout || degraded) failedFiles++;
         }
       } catch (err) {
         console.error(

@@ -249,7 +249,7 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
         async (_input, r) => {
           const ctx = r.createContext();
           await ctx.ask(agentA, 'one');
-          // A user-returned cost remains authoritative on this path.
+          // A user-returned cost is a CLAIM, kept separately from measurement.
           return { output: 'out', cost: 0.25 };
         },
         rt,
@@ -259,9 +259,16 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
     const item = result.items[0];
 
     expect(item.timing).toEqual({ [A]: { calls: 1, queuedMs: 10, retryMs: 0, wireMs: 30 } });
-    // Metadata tracking does not change cost fallback or trace capture.
-    expect(item.cost).toBe(0.25);
-    expect(result.totalCost).toBeCloseTo(0.25);
+    // Cost is MEASURED (the fixture provider reports $0), and the caller's
+    // $0.25 claim is recorded beside it rather than replacing it.
+    expect(item.cost).toBe(0);
+    expect(item.callerReport).toEqual({ cost: 0.25 });
+    expect(result.totalCost).toBe(0);
+    expect(result.accounting!.callerReported).toEqual({
+      costItems: 1,
+      costTotal: 0.25,
+      metadataItems: 0,
+    });
     expect('unpriced' in item).toBe(false);
     expect(item.metadata?.modelCallCounts).toEqual({ [A]: 1 });
     expect('traces' in item).toBe(false);
@@ -337,15 +344,19 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
       runtime,
     );
 
-    // The throw propagates out of the wrapped trackExecution, so there is no
-    // aggregate to read — the same shape `cost` and `metadata` already had on
-    // this path. The failed item must not contribute a partial sample.
+    // A case that failed AFTER a successful provider call keeps that call's
+    // measurement: `trackOutcome` reports the scope for a rejected function
+    // too, which is the same reason its spend is no longer lost. Only failed
+    // CALLS are excluded from the rollup, and there were none.
     expect(result.items[1].error).toBe('workflow blew up');
-    expect('timing' in result.items[1]).toBe(false);
+    expect(result.items[1].outcome).toBe('failed');
+    expect(result.items[1].timing).toEqual({
+      [A]: { calls: 1, queuedMs: 10, retryMs: 0, wireMs: 30 },
+    });
     expect(result.items[0].timing).toEqual({
       [A]: { calls: 1, queuedMs: 10, retryMs: 0, wireMs: 30 },
     });
-    expect(result.summary.modelTiming![A].calls).toBe(1);
+    expect(result.summary.modelTiming![A].calls).toBe(2);
   });
 
   it('does not let the plain path newly abort a budgeted run', async () => {
@@ -353,9 +364,9 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
       [BARE_A]: { queuedMs: 10, attempts: 1, retryMs: 0, ttfbMs: 3, wireMs: 30 },
     });
 
-    // Every real provider call costs money the runtime can see, but the plain
-    // path deliberately ignores tracked cost — so a budget of $0.01 with no
-    // user-returned cost must NOT trip, exactly as before the rollup.
+    // The fixture provider reports a known $0 per call, so known spend never
+    // reaches the $0.01 limit and no item is budget-stopped. (A provider that
+    // reported a real cost WOULD close it now — see the budget suite.)
     const result = await runEval(
       { workflow: 'w', dataset: oneItemDataset(3), scorers: [passScorer], budget: '$0.01' },
       async (_input, rt) => {
@@ -384,9 +395,19 @@ describe('runEval() — per-model timing rollup (R-T6)', () => {
     expect(result.items.every((i) => i.scores.pass === 1)).toBe(true);
     for (const item of result.items) {
       expect('timing' in item).toBe(false);
-      expect(item.cost).toBe(0.002);
+      // Nothing was measured, so the measured cost is 0 and the caller's claim
+      // stays a claim. Reporting 0.002 here would be inventing a measurement.
+      expect(item.cost).toBe(0);
+      expect(item.callerReport).toEqual({ cost: 0.002 });
+      expect(item.accounting!.completeness).toBe('incomplete');
+      expect(item.accounting!.reasons.uninstrumented).toBe(1);
       expect(item.metadata).toEqual({ note: 'mine' });
     }
+    // The run says plainly that it could not measure, rather than claiming $0.
+    expect(result.totalCost).toBe(0);
+    expect(result.unpriced).toBe(true);
+    expect(result.accounting!.completeness).toBe('incomplete');
+    expect(result.accounting!.reasons.uninstrumented).toBe(1);
     expect(result.summary.modelTiming).toBeUndefined();
   });
 

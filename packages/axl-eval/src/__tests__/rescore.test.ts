@@ -125,7 +125,7 @@ describe('rescore()', () => {
     expect(rescored.summary.failures).toBe(1);
   });
 
-  it('tracks only scorer cost (no workflow cost)', async () => {
+  it('reports no measured spend on an uninstrumented runtime, keeping the caller value per scorer', async () => {
     const costScorer: Scorer = {
       name: 'costly',
       description: 'Returns cost',
@@ -136,8 +136,22 @@ describe('rescore()', () => {
     const result = makeResult();
     const rescored = await rescore(result, [costScorer], mockRuntime);
 
-    // 3 items × $0.01 per scorer call = $0.03
-    expect(rescored.totalCost).toBeCloseTo(0.03, 4);
+    // This runtime has no measurement rail, so the honest total is $0 with an
+    // explicit `uninstrumented` reason — NOT the sum of what the scorer claimed.
+    expect(rescored.totalCost).toBe(0);
+    expect(rescored.accounting!.scope).toBe('rescore');
+    expect(rescored.accounting!.completeness).toBe('incomplete');
+    expect(rescored.accounting!.reasons.uninstrumented).toBe(1);
+    // The claim survives for inspection on each scorer detail.
+    for (const item of rescored.items) {
+      expect(item.scoreDetails!.costly.cost).toBe(0.01);
+      expect(item.scorerCost).toBe(0);
+    }
+    // The source run's generation spend is recorded, never added to the total.
+    expect(rescored.accounting!.source).toEqual({
+      runId: 'original-id',
+      generation: null,
+    });
   });
 
   it('stores rescored metadata with originalId', async () => {
@@ -245,12 +259,14 @@ describe('rescore()', () => {
     const result = makeResult();
     const rescored = await rescore(result, [costErrorScorer], mockRuntime);
 
-    // 3 items × $0.01 per error = $0.03
-    expect(rescored.totalCost).toBeCloseTo(0.03, 4);
+    // The cost attached to the thrown error is still surfaced per scorer; it is
+    // a caller report, so it does not become the run's measured total.
+    expect(rescored.totalCost).toBe(0);
     for (const item of rescored.items) {
       expect(item.scores['cost-err']).toBeNull();
-      expect(item.scorerCost).toBe(0.01);
+      expect(item.scorerCost).toBe(0);
       expect(item.scoreDetails!['cost-err'].cost).toBe(0.01);
+      expect(item.scoreDetails!['cost-err'].outcome).toBe('failed');
     }
   });
 
@@ -397,11 +413,14 @@ describe('rescore()', () => {
         },
       );
 
-      // 3 items × (0.01 + 0.02) = 0.09
-      expect(rescored.totalCost).toBeCloseTo(0.09, 10);
+      // Both judges ran concurrently and each reported its own claim; neither
+      // is summed into the measured total on an uninstrumented runtime.
+      expect(rescored.totalCost).toBe(0);
       for (const item of rescored.items) {
         expect(item.scores.a).toBe(1);
         expect(item.scores.b).toBe(1);
+        expect(item.scoreDetails!.a.cost).toBe(0.01);
+        expect(item.scoreDetails!.b.cost).toBe(0.02);
       }
     });
 

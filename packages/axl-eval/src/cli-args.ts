@@ -14,6 +14,7 @@ export const KNOWN_FLAGS = new Set([
   '--capture-traces',
   '--concurrency',
   '--scorers',
+  '--budget',
 ]);
 
 /**
@@ -31,6 +32,7 @@ export const VALUE_FLAGS = new Set([
   '--runs',
   '--concurrency',
   '--scorers',
+  '--budget',
 ]);
 
 export type ParsedEvalArgs = {
@@ -43,6 +45,12 @@ export type ParsedEvalArgs = {
   concurrency?: number;
   /** Scorer names from `--scorers` (deduped, in first-seen order). */
   scorerNames?: string[];
+  /**
+   * Raw `--budget` value, forwarded unparsed. Parsing and validation belong to
+   * `runEval`/`rescore`, which raise `AxlError('INVALID_BUDGET')` before any
+   * work — duplicating the parse here would let the two disagree.
+   */
+  budget?: string;
   paths: string[];
 };
 
@@ -67,6 +75,7 @@ export function parseEvalArgs(args: string[]): ParsedEvalArgs {
   let captureTraces = false;
   let concurrency: number | undefined;
   let scorerNames: string[] | undefined;
+  let budget: string | undefined;
   const paths: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -93,6 +102,8 @@ export function parseEvalArgs(args: string[]): ParsedEvalArgs {
         } else {
           concurrency = n;
         }
+      } else if (arg === '--budget') {
+        budget = value;
       } else if (arg === '--scorers') {
         scorerNames = [
           ...new Set(
@@ -129,6 +140,7 @@ export function parseEvalArgs(args: string[]): ParsedEvalArgs {
     captureTraces,
     concurrency,
     scorerNames,
+    budget,
     paths,
   };
 }

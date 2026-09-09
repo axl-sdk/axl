@@ -529,6 +529,8 @@ An imported result is the one eval in history Studio did not measure, and
 | Operations | `operations.total === settled + unknown`, with `denied` and `byKind` numeric |
 | Provenance | values sum to `knownCost` (float tolerance) |
 | Breakdown | `generation + judging + external` sums to `knownCost` |
+| Budget | when `accounting.budget` is present: finite non-negative `limit` / `knownSpend` / `knownOvershoot`, `status` in `open`/`closed`, `closedBy` in the enum, and `knownOvershoot === max(0, knownSpend - limit)` |
+| Coverage | when `summary.coverage` is present: every item-outcome key and every scorer-outcome key per scorer, each a non-negative integer |
 
 The two sum identities are checked only for `'complete'` and `'incomplete'`. An
 `'unverified'` record is by definition a synthesis with no operations,
@@ -537,6 +539,17 @@ provenance or breakdown behind it, so it is accepted as-is.
 Item-level and scorer-level `accounting` are held to the same rules, and the
 verdict is **all-or-nothing** across the result: a run total that adds up while
 its items are forged is not half-trustworthy.
+
+`accounting.budget` and `summary.coverage` are in the same verdict because
+together they are the whole "this run was stopped by its budget" claim, which
+three surfaces render (the CLI summary, the eval-trends aggregate and the run
+panel's badge) and which a reader treats as "the numbers are short for a known
+reason" rather than "the numbers are wrong". A failing record loses both along
+with its accounting, so nothing downstream can badge it budget-stopped. A
+coverage block that arrives without any accounting at all is validated on its
+own and dropped if malformed — `EvalCoverage` promises every key including
+zeros, and a partial block reads downstream as zeros, turning refused work into
+a clean run.
 
 A failing record is replaced with the `unverified` synthesis an artifact with no
 accounting receives — the numbers stay readable, the certification does not

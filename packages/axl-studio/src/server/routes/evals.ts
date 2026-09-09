@@ -10,7 +10,11 @@ import {
   redactErrorMessage,
   redactRecordLine,
 } from '../redact.js';
-import { importedAccountingIsTrustworthy, stripAccounting } from '../eval-import.js';
+import {
+  importedAccountingIsTrustworthy,
+  isValidImportedCoverage,
+  stripAccounting,
+} from '../eval-import.js';
 
 export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => Promise<void>) {
   const app = new Hono<StudioEnv>();
@@ -875,6 +879,15 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
       // certification does not survive. Which way it went is recorded rather
       // than left to be inferred.
       if (entry.accounting === undefined) {
+        // No accounting to certify, but `summary.coverage` is still an
+        // accounting-derived claim a reader turns into "N cases were never
+        // attempted". A malformed one reads as zeros, so it goes too.
+        if (
+          entry.summary?.coverage !== undefined &&
+          !isValidImportedCoverage(entry.summary.coverage)
+        ) {
+          delete entry.summary.coverage;
+        }
         if (readAccounting) {
           entry.accounting = readAccounting(entry) as EvalResult['accounting'];
         }
@@ -886,6 +899,10 @@ export function createEvalRoutes(connMgr: ConnectionManager, evalLoader?: () => 
           ? (readAccounting(stripped) as EvalResult['accounting'])
           : undefined;
         entry.items = stripped.items;
+        // `summary` carries `coverage`, the other half of the budget-stopped
+        // verdict. Leaving it behind would badge this run budget-stopped on the
+        // strength of a record that just failed validation.
+        entry.summary = stripped.summary;
         entry.metadata.importedAccounting = 'invalid';
       }
 

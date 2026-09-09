@@ -258,7 +258,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   known `completeness`, `operations.total === settled + unknown`, and (for
   `complete` / `incomplete`) provenance and breakdown splits that sum back to
   `knownCost`. Item-level and scorer-level records are held to the same rule,
-  all-or-nothing. A record that fails is replaced by the same `unverified`
+  all-or-nothing — and so are the two accounting-derived facts a reader turns
+  into a budget-stopped badge: `accounting.budget` (finite non-negative figures,
+  a known `status`, and `knownOvershoot === max(0, knownSpend - limit)`) and
+  `summary.coverage` (every outcome key present as a non-negative integer).
+  A failing result loses all three, so nothing downstream can excuse its missing
+  cases as a budget stop. A record that fails is replaced by the same `unverified`
   synthesis an artifact with no accounting receives, so `compare` refuses to
   certify a cost delta from a hand-edited "complete" file. Import never rejects
   a result over its accounting; `metadata.importedAccounting` records

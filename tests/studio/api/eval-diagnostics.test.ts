@@ -352,6 +352,140 @@ describe('imported accounting is validated before it is trusted', () => {
 
 // ── Redaction (M4 + A16.16 structural fields) ────────────────────────
 
+describe('budget and coverage are validated with the accounting (I2)', () => {
+  /** A result claiming a budget stop, with the numbers to back it — or not. */
+  function budgetStopped(over: {
+    budget?: Record<string, unknown>;
+    coverage?: Record<string, unknown>;
+  }) {
+    const base = resultWithAccounting();
+    return {
+      ...base,
+      accounting: {
+        ...base.accounting,
+        budget: over.budget ?? {
+          limit: 1,
+          status: 'closed',
+          knownSpend: 1.25,
+          knownOvershoot: 0.25,
+          closedBy: 'case',
+        },
+      },
+      summary: {
+        ...base.summary,
+        coverage: over.coverage ?? {
+          items: {
+            completed: 1,
+            failed: 0,
+            cancelled: 0,
+            budget_skipped: 3,
+            budget_interrupted: 0,
+          },
+          scorers: {
+            'always-pass': {
+              scored: 1,
+              failed: 0,
+              skipped: 0,
+              cancelled: 0,
+              budget_skipped: 3,
+              budget_interrupted: 0,
+            },
+          },
+        },
+      },
+    };
+  }
+
+  async function importAndRead(result: Record<string, unknown>) {
+    const { app } = createTestServer(undefined, { artifactsRoot: root });
+    const res = await importResult(app, { result });
+    const { data } = await readJson(res);
+    const histBody = await readJson(await app.request('/api/evals/history'));
+    return histBody.data.find((e: { id: string }) => e.id === data.id);
+  }
+
+  it('keeps a budget block whose overshoot identity holds', async () => {
+    const entry = await importAndRead(budgetStopped({}));
+
+    expect(entry.data.metadata.importedAccounting).toBe('declared');
+    expect(entry.data.accounting.budget.status).toBe('closed');
+    expect(entry.data.summary.coverage.items.budget_skipped).toBe(3);
+  });
+
+  it('refuses a forged budget block and strips the badge with it', async () => {
+    // `closed` with an overshoot that does not follow from the spend and the
+    // limit: the shape a hand-edited artifact takes when someone wants a run's
+    // missing cases excused as a budget stop rather than read as failures.
+    const entry = await importAndRead(
+      budgetStopped({
+        budget: { limit: 1, status: 'closed', knownSpend: 1.25, knownOvershoot: 0 },
+      }),
+    );
+
+    expect(entry.data.metadata.importedAccounting).toBe('invalid');
+    // Both halves of the verdict must go: keeping either would let a reader
+    // badge this run budget-stopped on a claim that just failed validation.
+    expect(entry.data.accounting?.budget).toBeUndefined();
+    expect(entry.data.summary?.coverage).toBeUndefined();
+  });
+
+  it('refuses a coverage block that is missing outcome keys', async () => {
+    // `EvalCoverage` promises every key, including zeros. A partial block reads
+    // as zeros downstream, turning refused work into a clean run.
+    const entry = await importAndRead(
+      budgetStopped({
+        coverage: {
+          items: { completed: 1, budget_skipped: 3 },
+          scorers: {},
+        },
+      }),
+    );
+
+    expect(entry.data.metadata.importedAccounting).toBe('invalid');
+    expect(entry.data.summary?.coverage).toBeUndefined();
+    expect(entry.data.accounting?.budget).toBeUndefined();
+  });
+
+  it('refuses coverage counts that are not counts', async () => {
+    const entry = await importAndRead(
+      budgetStopped({
+        coverage: {
+          items: {
+            completed: 1,
+            failed: 0,
+            cancelled: 0,
+            budget_skipped: 2.5,
+            budget_interrupted: 0,
+          },
+          scorers: {},
+        },
+      }),
+    );
+
+    expect(entry.data.metadata.importedAccounting).toBe('invalid');
+  });
+
+  it('refuses a scorer bucket that is missing outcome keys', async () => {
+    const entry = await importAndRead(
+      budgetStopped({
+        coverage: {
+          items: {
+            completed: 1,
+            failed: 0,
+            cancelled: 0,
+            budget_skipped: 3,
+            budget_interrupted: 0,
+          },
+          scorers: { 'always-pass': { scored: 1 } },
+        },
+      }),
+    );
+
+    expect(entry.data.metadata.importedAccounting).toBe('invalid');
+    expect(entry.data.summary?.coverage).toBeUndefined();
+  });
+});
+
 describe('what a delivered artifact says about itself (L1, L7)', () => {
   it("reports the imported records' own redaction, not this deployment's setting", async () => {
     // A bundle exported from a compliance-mode deployment, imported here where

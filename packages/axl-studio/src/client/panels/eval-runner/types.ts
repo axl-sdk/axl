@@ -703,8 +703,10 @@ export function getItemModels(item: EvalItem): string[] {
  *     (counts as none of the three),
  *   - items with a top-level `error` are excluded entirely.
  *
- * The `skipped` check precedes `duration` so a positive skip marker always wins
- * over the duration heuristic, matching the server. Returns the surviving
+ * When `scoreDetails.outcome` is present (0.24+ artifacts) it is authoritative
+ * and the markers above are ignored; cancelled and budget-stopped scorers fall
+ * in no bucket. The `skipped` check precedes `duration` so a positive skip
+ * marker always wins over the duration heuristic, matching the server. Returns the surviving
  * `scores[]` (for the strip chart) plus the `failed` and `skipped` counts so
  * callers never re-implement the discriminator. `getScorerSampleCounts` and
  * `ScoreDistribution` both read through this.
@@ -719,9 +721,22 @@ export function collectScorerScores(
   for (const i of items) {
     if (i.error) continue;
     const score = i.scores[name];
+    const detail = i.scoreDetails?.[name];
+    // `outcome` is authoritative (mirrors the server classifier in
+    // `@axlsdk/eval`'s `scorerCounts`). 0.24 artifacts record the duration a
+    // cancelled or budget-stopped judge actually spent, so the duration
+    // heuristic below would read those as "ran and failed"; it is only a
+    // reconstruction for pre-0.24 artifacts that carry no `outcome`.
+    if (detail?.outcome !== undefined) {
+      if (detail.outcome === 'scored' && score != null) scores.push(score);
+      else if (detail.outcome === 'failed') failed++;
+      else if (detail.outcome === 'skipped') skipped++;
+      // 'cancelled' / 'budget_skipped' / 'budget_interrupted' are in no bucket.
+      continue;
+    }
     if (score != null) scores.push(score);
-    else if (i.scoreDetails?.[name]?.skipped === true) skipped++;
-    else if (i.scoreDetails?.[name]?.duration != null) failed++;
+    else if (detail?.skipped === true) skipped++;
+    else if (detail?.duration != null) failed++;
   }
   return { scores, failed, skipped };
 }

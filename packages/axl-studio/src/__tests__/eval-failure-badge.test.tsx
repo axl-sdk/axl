@@ -13,7 +13,12 @@ import { EvalSummaryTable } from '../client/panels/eval-runner/EvalSummaryTable'
 import { ScoreDistribution } from '../client/panels/eval-runner/ScoreDistribution';
 import { ScorerSampleChips } from '../client/panels/eval-runner/ScorerSampleChips';
 import { collectScorerScores, getScorerSampleCounts } from '../client/panels/eval-runner/types';
-import type { EvalItem, EvalResultData } from '../client/panels/eval-runner/types';
+import type {
+  EvalItem,
+  EvalResultData,
+  ScorerDetail,
+  ScorerOutcome,
+} from '../client/panels/eval-runner/types';
 
 const okItem = (q: string, score: number): EvalItem => ({
   input: { q },
@@ -199,6 +204,32 @@ describe('collectScorerScores / getScorerSampleCounts skipped computation', () =
     const { scores, failed, skipped } = collectScorerScores(items, 'acc');
     expect(scores).toEqual([0.9]);
     expect(failed).toBe(1);
+    expect(skipped).toBe(1);
+  });
+
+  it('prefers the authoritative outcome over the duration heuristic (R1)', () => {
+    // 0.24 artifacts record the duration a budget-stopped or cancelled judge
+    // actually spent. That must not be read as "ran and failed": the
+    // `outcome` field is authoritative and those states are in no bucket.
+    const detail = (outcome: ScorerOutcome, extra: Partial<ScorerDetail> = {}): EvalItem => ({
+      input: { q: outcome },
+      output: 'x',
+      scores: { acc: null },
+      scoreDetails: { acc: { score: null, duration: 5, ...extra, outcome } },
+    });
+    const items = [
+      okItem('1', 0.9),
+      detail('budget_interrupted'),
+      detail('cancelled'),
+      detail('budget_skipped'),
+      detail('failed'),
+      // A legacy `skipped: true` marker with a contradictory outcome: outcome wins.
+      detail('failed', { skipped: true }),
+      detail('skipped', { duration: undefined }),
+    ];
+    const { scores, failed, skipped } = collectScorerScores(items, 'acc');
+    expect(scores).toEqual([0.9]);
+    expect(failed).toBe(2);
     expect(skipped).toBe(1);
   });
 

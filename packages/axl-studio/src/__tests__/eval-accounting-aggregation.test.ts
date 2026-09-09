@@ -31,7 +31,10 @@ import {
 import type {
   Accounting,
   EvalAccounting,
+  EvalCoverage,
+  EvalItemOutcome,
   EvalResultData,
+  ScorerOutcome,
 } from '../client/panels/eval-runner/types.js';
 
 function accounting(overrides: Partial<EvalAccounting> = {}): EvalAccounting {
@@ -73,6 +76,48 @@ function run(id: string, acc?: EvalAccounting, totalCost = 0): EvalResultData {
     metadata: { runGroupId: 'g1' },
     ...(acc ? { accounting: acc } : {}),
   };
+}
+
+function coverage(
+  items: Partial<Record<EvalItemOutcome, number>> = {},
+  scorers: Record<string, Partial<Record<ScorerOutcome, number>>> = {},
+): EvalCoverage {
+  return {
+    items: {
+      completed: 0,
+      failed: 0,
+      cancelled: 0,
+      budget_skipped: 0,
+      budget_interrupted: 0,
+      ...items,
+    },
+    scorers: Object.fromEntries(
+      Object.entries(scorers).map(([name, counts]) => [
+        name,
+        {
+          scored: 0,
+          failed: 0,
+          skipped: 0,
+          cancelled: 0,
+          budget_skipped: 0,
+          budget_interrupted: 0,
+          ...counts,
+        },
+      ]),
+    ),
+  };
+}
+
+/** A run whose budget closed, with the coverage it actually achieved. */
+function closedBudgetRun(id: string, cov: EvalCoverage): EvalResultData {
+  const base = run(
+    id,
+    accounting({
+      knownCost: 1.5,
+      budget: { limit: 1, status: 'closed', knownSpend: 1.5, knownOvershoot: 0.5 },
+    }),
+  );
+  return { ...base, summary: { ...base.summary, coverage: cov } };
 }
 
 // ── Reading rules ────────────────────────────────────────────────
@@ -156,13 +201,9 @@ describe('A16.18 — buildMultiRunResult unions accounting', () => {
   });
 
   it('counts budget-stopped runs on the aggregate instead of calling them failures', () => {
-    const stopped = accounting({
-      knownCost: 1.5,
-      budget: { limit: 1, status: 'closed', knownSpend: 1.5, knownOvershoot: 0.5 },
-    });
     const group = buildMultiRunResult([
       run('r0', accounting({ knownCost: 1 })),
-      run('r1', stopped),
+      closedBudgetRun('r1', coverage({ completed: 1, budget_skipped: 2 })),
     ])!;
     expect(group._multiRun!.aggregate.budgetStoppedRuns).toBe(1);
     expect(group.summary.failures).toBe(0);
@@ -205,6 +246,24 @@ describe('A16.18 — buildMultiRunResult unions accounting', () => {
   });
 });
 
+describe('buildMultiRunResult — budgetStoppedRuns counts refusals, not closures', () => {
+  it('counts only the runs whose budget actually refused work', () => {
+    const group = buildMultiRunResult([
+      closedBudgetRun('a', coverage({ completed: 3 }, { j: { scored: 3 } })),
+      closedBudgetRun('b', coverage({ completed: 1, budget_interrupted: 1 })),
+    ])!;
+    expect(group._multiRun!.aggregate.budgetStoppedRuns).toBe(1);
+  });
+
+  it('leaves the count off entirely when every closure refused nothing', () => {
+    const group = buildMultiRunResult([
+      closedBudgetRun('a', coverage({ completed: 3 }, { j: { scored: 3 } })),
+      closedBudgetRun('b', coverage({ completed: 3 }, { j: { scored: 3 } })),
+    ])!;
+    expect(group._multiRun!.aggregate.budgetStoppedRuns).toBeUndefined();
+  });
+});
+
 describe('aggregateGroupAccounting', () => {
   it('matches the same conservative rules as the shared fold', () => {
     const inputs: Accounting[] = [
@@ -221,8 +280,15 @@ describe('aggregateGroupAccounting', () => {
     expect(viaGroup.reasons).toEqual(folded.reasons);
   });
 
-  it('reports an empty group as complete at $0 — nothing contributed an unknown', () => {
-    expect(aggregateGroupAccounting([])).toMatchObject({ knownCost: 0, completeness: 'complete' });
+  it('refuses to certify a $0.00 for a group with no runs at all', () => {
+    // A missing side (an evicted history selection) reaches this helper as `[]`.
+    // Reporting `$0.00, complete` puts a certified zero on a side that was never
+    // loaded — `unionCoverage` already takes the same stance by returning
+    // `undefined` rather than a fabricated row of zeros.
+    expect(aggregateGroupAccounting([])).toMatchObject({
+      knownCost: 0,
+      completeness: 'unverified',
+    });
   });
 });
 
@@ -269,13 +335,61 @@ describe('A16.17 — reduceEvalTrends completeness', () => {
   });
 
   it('flags a budget-stopped run on its trend point and counts it for the window', () => {
-    const stopped = accounting({
-      knownCost: 1.5,
-      budget: { limit: 1, status: 'closed', knownSpend: 1.5, knownOvershoot: 0.5 },
-    });
-    const state = reduceEvalTrends(emptyEvalTrendData(), entry('a', run('a', stopped)));
+    const state = reduceEvalTrends(
+      emptyEvalTrendData(),
+      entry('a', closedBudgetRun('a', coverage({ completed: 1, budget_skipped: 2 }))),
+    );
     expect(state.byEval.e1.runs[0].budgetStopped).toBe(true);
     expect(state.byEval.e1.budgetStoppedRuns).toBe(1);
+  });
+
+  it('does NOT flag a run whose budget closed having refused nothing', () => {
+    // `--budget $expected` in CI closes the controller on the last settlement
+    // with every case completed. Four Studio surfaces read this flag; calling
+    // it a stop asserts the run "covers less than the whole dataset" about a
+    // run that covered all of it.
+    const state = reduceEvalTrends(
+      emptyEvalTrendData(),
+      entry('a', closedBudgetRun('a', coverage({ completed: 3 }, { j: { scored: 3 } }))),
+    );
+    expect(state.byEval.e1.runs[0].budgetStopped).toBeFalsy();
+    expect(state.byEval.e1.budgetStoppedRuns).toBe(0);
+  });
+
+  it('flags a run whose budget refused only a JUDGE, with every case completed', () => {
+    const state = reduceEvalTrends(
+      emptyEvalTrendData(),
+      entry(
+        'a',
+        closedBudgetRun('a', coverage({ completed: 3 }, { j: { scored: 1, budget_skipped: 2 } })),
+      ),
+    );
+    expect(state.byEval.e1.runs[0].budgetStopped).toBe(true);
+  });
+
+  it('does not flag a legacy run with a closed budget and no coverage block', () => {
+    // No recorded outcomes cannot be used to assert that work was refused.
+    const base = run(
+      'a',
+      accounting({
+        knownCost: 1.5,
+        budget: { limit: 1, status: 'closed', knownSpend: 1.5, knownOvershoot: 0.5 },
+      }),
+    );
+    const state = reduceEvalTrends(emptyEvalTrendData(), entry('a', base));
+    expect(state.byEval.e1.runs[0].budgetStopped).toBeFalsy();
+  });
+
+  // F7
+  it('clamps a corrupt negative knownCost at 0 rather than summing it', () => {
+    // The eval reader and the client mirror both require `>= 0`; a hand-edited
+    // artifact reporting `-5` would otherwise drag a whole window negative
+    // while still reporting `complete`.
+    const data = { ...run('a'), accounting: { ...accounting({ knownCost: -5 }) } };
+    const state = reduceEvalTrends(emptyEvalTrendData(), entry('a', data));
+    expect(state.byEval.e1.runs[0].cost).toBe(0);
+    expect(state.byEval.e1.costTotal).toBe(0);
+    expect(state.totalCost).toBe(0);
   });
 
   it('keeps the window flag conservative after the run cap evicts the bad run', () => {
@@ -319,8 +433,12 @@ describe('S1 tripwire — eval panels route cost through a completeness helper',
    *
    * `accounting.ts` is the one legitimate reader (it is the compat reader), and
    * `types.ts` declares the fields.
+   *
+   * `.cost` is in the list because the trends sparkline read `r.cost` for a
+   * whole release without tripping either scan: the field was not listed, and
+   * the value went to a chart rather than to `formatCost`.
    */
-  const COMPAT_FIELDS = /\.totalCost\b|\.scorerCost\b/g;
+  const COMPAT_FIELDS = /\.totalCost\b|\.scorerCost\b|\.cost\b/g;
   const READER_MODULES = new Set(['accounting.ts', 'types.ts']);
 
   /**
@@ -330,8 +448,20 @@ describe('S1 tripwire — eval panels route cost through a completeness helper',
    */
   const ALLOWED: Record<string, string[]> = {
     // The trend payload's own total, rendered beside
-    // `completenessText(trends.totalCostCompleteness)` in the same StatCard.
-    'EvalTrendsView.tsx': ['trends.totalCost'],
+    // `completenessText(trends.totalCostCompleteness)` in the same StatCard;
+    // and the per-point cost, which is paired with that point's own
+    // `completeness` before it reaches `CostSparkLine`.
+    'EvalTrendsView.tsx': ['trends.totalCost', 'cost: r.cost,'],
+    // `compare.cost` is the server-certified comparison block. Every render of
+    // it sits inside the row that also prints `certified` / the refusal
+    // reason, so the figure never travels without its certification.
+    'EvalCompareView.tsx': ['compareResult.cost'],
+    // Caller-reported spend, rendered explicitly as "caller-reported (not
+    // counted)", and a presence check for the pre-0.24 scorer cost field.
+    'EvalItemDetail.tsx': ['item.callerReport', 'detail?.cost != null'],
+    // `CostPoint.cost` cannot be read without its `completeness` — the type
+    // carries both, and the component's whole job is to draw the difference.
+    'CostSparkLine.tsx': ['p.cost'],
   };
 
   it('reads no eval compat spend field outside the reader module', () => {

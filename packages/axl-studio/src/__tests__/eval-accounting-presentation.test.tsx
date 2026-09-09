@@ -19,6 +19,7 @@ import { EvalItemList } from '../client/panels/eval-runner/EvalItemList';
 import { EvalItemDetail } from '../client/panels/eval-runner/EvalItemDetail';
 import { EvalHistoryTable } from '../client/panels/eval-runner/EvalHistoryTable';
 import { EvalCompareView } from '../client/panels/eval-runner/EvalCompareView';
+import { ScorerCoverageCaveat } from '../client/panels/eval-runner/ScorerCoverageCaveat';
 import type {
   Accounting,
   ComparisonResult,
@@ -296,6 +297,12 @@ describe('A15.9 — the five item outcomes render distinctly', () => {
             knownCost: 1.5,
             budget: { limit: 1, status: 'closed', knownSpend: 1.5, knownOvershoot: 0.5 },
           }),
+          summary: {
+            count: 3,
+            failures: 2,
+            coverage: coverage({ completed: 1, budget_skipped: 2 }),
+            scorers: {},
+          },
         }),
       },
     ];
@@ -310,6 +317,46 @@ describe('A15.9 — the five item outcomes render distinctly', () => {
       />,
     );
     expect(screen.getByLabelText('Budget stopped')).toBeInTheDocument();
+  });
+
+  // F1
+  it('does NOT badge a run whose budget closed having refused nothing', () => {
+    // `--budget $expected` as a CI threshold closes the controller on the last
+    // settlement with the whole dataset covered. The badge asserts the run is
+    // short by design; here that is simply false.
+    const history: EvalHistoryEntry[] = [
+      {
+        id: 'a',
+        eval: 'e1',
+        timestamp: 1,
+        data: result({
+          id: 'a',
+          totalCost: 1,
+          accounting: accounting({
+            knownCost: 1,
+            budget: { limit: 1, status: 'closed', knownSpend: 1, knownOvershoot: 0 },
+          }),
+          summary: {
+            count: 3,
+            failures: 0,
+            coverage: coverage({ completed: 3 }, { judge: { scored: 3 } }),
+            scorers: {},
+          },
+        }),
+      },
+    ];
+    render(
+      <EvalHistoryTable
+        history={history}
+        evalFilter=""
+        onEvalFilterChange={() => {}}
+        onSelect={() => {}}
+        expandedGroups={new Set()}
+        onToggleGroup={() => {}}
+      />,
+    );
+    expect(screen.queryByLabelText('Budget stopped')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Known spend $1.00, complete')).toBeInTheDocument();
   });
 });
 
@@ -437,6 +484,64 @@ describe('EvalCompareView — uncertified cost is descriptive, not a saving', ()
     expect(screen.getByText('not certified: costs are not comparable')).toBeInTheDocument();
   });
 
+  // F3
+  it('keeps the direction of an uncertified delta in the TEXT, not only in colour', () => {
+    // An uncertified card is deliberately uncoloured, so without an explicit
+    // `-` a $0.60 saving and a $0.60 increase render identically.
+    const { unmount } = render(
+      <EvalCompareView
+        compareResult={comparison({
+          baselineTotal: 1,
+          candidateTotal: 0.4,
+          delta: -0.6,
+          deltaPercent: -60,
+          certified: false,
+          reason: 'candidate accounting is incomplete',
+        })}
+        baseline={null}
+        candidate={null}
+      />,
+    );
+    expect(screen.getByText('-$0.60')).toBeInTheDocument();
+    unmount();
+
+    render(
+      <EvalCompareView
+        compareResult={comparison({
+          baselineTotal: 0.4,
+          candidateTotal: 1,
+          delta: 0.6,
+          deltaPercent: 150,
+          certified: false,
+          reason: 'candidate accounting is incomplete',
+        })}
+        baseline={null}
+        candidate={null}
+      />,
+    );
+    expect(screen.getByText('+$0.60')).toBeInTheDocument();
+  });
+
+  // F4
+  it('labels the compared spend as a per-run figure, not a group total', () => {
+    // `compare.ts` rounds the group AVERAGE into baselineTotal/candidateTotal.
+    render(
+      <EvalCompareView
+        compareResult={comparison({
+          baselineTotal: 0.15,
+          candidateTotal: 0.13,
+          delta: -0.02,
+          deltaPercent: -13.3,
+          certified: true,
+        })}
+        baseline={null}
+        candidate={null}
+      />,
+    );
+    expect(screen.getByText('Known spend (per run)')).toBeInTheDocument();
+    expect(screen.queryByText('Known spend (total)')).not.toBeInTheDocument();
+  });
+
   it('certifies only when the server says so', () => {
     render(
       <EvalCompareView
@@ -454,5 +559,48 @@ describe('EvalCompareView — uncertified cost is descriptive, not a saving', ()
     expect(
       screen.getByText('certified — both sides complete and equally covered'),
     ).toBeInTheDocument();
+  });
+});
+
+// ── G3 — a budget-thinned scorer mean says so ────────────────────
+
+describe('ScorerCoverageCaveat — a mean over a shrunken denominator', () => {
+  it('names each judge the budget stopped and how many items it missed', () => {
+    // The multi-run aggregate view renders no coverage block, so without this
+    // a group mean over 1 of 5 items reads as a mean over all of them.
+    render(
+      <ScorerCoverageCaveat
+        coverage={coverage(
+          { completed: 5 },
+          { judge: { scored: 1, budget_skipped: 3, budget_interrupted: 1 }, cheap: { scored: 5 } },
+        )}
+      />,
+    );
+    const note = screen.getByRole('status');
+    expect(note).toHaveTextContent('judge (4 of 5 not run)');
+    expect(note).not.toHaveTextContent('cheap');
+  });
+
+  it('says nothing when every judge ran on every item', () => {
+    render(
+      <ScorerCoverageCaveat coverage={coverage({ completed: 5 }, { judge: { scored: 5 } })} />,
+    );
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('says nothing for a pre-0.24 artifact that recorded no coverage', () => {
+    // No recorded outcomes cannot be used to claim anything about coverage.
+    render(<ScorerCoverageCaveat coverage={undefined} />);
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('does not fire for an ordinary scorer failure or a conditional skip', () => {
+    // Those already have chips of their own; only budget refusals are silent.
+    render(
+      <ScorerCoverageCaveat
+        coverage={coverage({ completed: 5 }, { judge: { scored: 3, failed: 1, skipped: 1 } })}
+      />,
+    );
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 });

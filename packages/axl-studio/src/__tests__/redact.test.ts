@@ -928,6 +928,74 @@ describe('redactEvalResult', () => {
     // ...while the judge's reasoning is still gone.
     expect(detail.metadata).toBeUndefined();
   });
+
+  // A16.16
+  it('survives the RUN-level accounting, budget and coverage blocks intact', () => {
+    // Studio reads these to say what a run cost and how much of the dataset it
+    // covered. Losing them under redaction would make every compliance-mode
+    // artifact read `unverified (legacy)` — a measured run indistinguishable
+    // from a pre-0.24 one, and a budget-truncated run indistinguishable from a
+    // complete one. None of these fields is user content.
+    const accounting = {
+      version: 1,
+      currency: 'USD',
+      knownCost: 1.5,
+      completeness: 'complete',
+      reasons: {},
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        reasoningTokens: 0,
+        cachedTokens: 0,
+        cacheWriteTokens: 0,
+        audioSeconds: 0,
+      },
+      operations: { total: 3, settled: 3, unknown: 0, denied: 2, byKind: { chat: 3 } },
+      breakdown: { generation: 1.2, judging: 0.3, external: 0 },
+      provenance: { adapter_reported: 1.5 },
+      scope: 'run',
+      budget: {
+        limit: 1,
+        status: 'closed',
+        knownSpend: 1.5,
+        knownOvershoot: 0.5,
+        closedBy: 'case',
+      },
+      callerReported: { costItems: 1, costTotal: 0.002, metadataItems: 1 },
+    };
+    const coverage = {
+      items: {
+        completed: 1,
+        failed: 0,
+        cancelled: 0,
+        budget_skipped: 1,
+        budget_interrupted: 1,
+      },
+      scorers: {
+        accuracy: {
+          scored: 1,
+          failed: 0,
+          skipped: 0,
+          cancelled: 0,
+          budget_skipped: 2,
+          budget_interrupted: 0,
+        },
+      },
+    };
+    const base = makeResult();
+    const result = {
+      ...base,
+      accounting,
+      unpriced: false,
+      summary: { ...base.summary, coverage },
+    } as unknown as EvalResult;
+
+    const out = redactEvalResult(result, true) as unknown as Record<string, unknown>;
+    expect(out.accounting).toEqual(accounting);
+    expect((out.summary as { coverage?: unknown }).coverage).toEqual(coverage);
+    // The item content around them is still scrubbed.
+    expect(JSON.stringify(out)).not.toContain('sensitive');
+  });
 });
 
 describe('redactEvalHistoryList', () => {

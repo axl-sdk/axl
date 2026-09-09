@@ -20,6 +20,7 @@ import type {
   Accounting,
   AccountingCompleteness,
   EvalAccounting,
+  EvalCoverage,
   EvalItem,
   EvalItemOutcome,
   EvalResultData,
@@ -244,9 +245,50 @@ export function formatBudgetLine(accounting: EvalAccounting): string | null {
   return `STOPPED — ${spent} known spend against a ${limit} limit, ${formatCost(budget.knownOvershoot)} over${by}`;
 }
 
-/** `true` when the run's budget closed — the run is short by design, not broken. */
-export function isBudgetStopped(accounting: EvalAccounting): boolean {
-  return accounting.budget?.status === 'closed';
+/**
+ * Work the budget actually refused: cases never started or stopped mid-flight,
+ * plus judges refused for the same reason. Missing coverage (a pre-0.24
+ * artifact) is `0` — no recorded outcomes cannot assert that work was refused.
+ *
+ * Mirrors `refusedWork()` in `@axlsdk/eval`.
+ */
+export function refusedWork(coverage: EvalCoverage | undefined): number {
+  if (!coverage) return 0;
+  const items = coverage.items;
+  return (
+    items.budget_skipped +
+    items.budget_interrupted +
+    Object.values(coverage.scorers).reduce((n, s) => n + s.budget_skipped + s.budget_interrupted, 0)
+  );
+}
+
+/**
+ * `true` when the run's budget both closed AND refused work — the run is short
+ * by design, not broken.
+ *
+ * A closed controller ALONE is not a stop: setting a budget to a run's
+ * expected spend is the obvious CI threshold, and the last settlement then
+ * closes the controller with every case completed and every judge scored. Each
+ * surface reading this flag asserts the run "covers less than the whole
+ * dataset", which would be false.
+ *
+ * Mirrors `isBudgetStopped()` in `@axlsdk/eval`, structurally identical so the
+ * drift tripwire can feed both the same inputs.
+ */
+export function isBudgetStopped(summary: {
+  budget?: { status?: string } | undefined;
+  coverage?: EvalCoverage | undefined;
+}): boolean {
+  if (summary.budget?.status !== 'closed') return false;
+  return refusedWork(summary.coverage) > 0;
+}
+
+/** {@link isBudgetStopped} for a whole run, reading its two inputs off the artifact. */
+export function isRunBudgetStopped(result: EvalResultData): boolean {
+  return isBudgetStopped({
+    budget: readAccounting(result).budget,
+    coverage: result.summary.coverage,
+  });
 }
 
 // ── Outcome vocabulary ───────────────────────────────────────────

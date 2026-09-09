@@ -32,8 +32,9 @@ import {
   buildMultiRunResult,
   aggregateGroupAccounting,
 } from './types';
-import { completenessLabel, isBudgetStopped, readAccounting } from './accounting';
+import { completenessLabel, isRunBudgetStopped, readAccounting } from './accounting';
 import { BudgetStoppedBadge } from './RunAccountingPanel';
+import { ScorerCoverageCaveat } from './ScorerCoverageCaveat';
 import { DroppedAnnotationKeysBanner } from './DroppedAnnotationKeysBanner';
 import { ScorerFilteredBanner } from './ScorerFilteredBanner';
 import { DegradedScorersBanner } from './DegradedScorersBanner';
@@ -988,6 +989,11 @@ export function EvalRunnerPanel() {
                           Per-Scorer Aggregate
                         </h3>
                       </div>
+                      {/* A budget-stopped judge lands in NO outcome bucket, by
+                          design, which shrinks each mean's denominator without
+                          saying so. This view renders no coverage block at all,
+                          so the caveat has to sit on the table itself. */}
+                      <ScorerCoverageCaveat coverage={currentResult?.summary.coverage} />
                       <div className="overflow-x-auto">
                         <table className="w-full text-xs">
                           <thead>
@@ -1253,9 +1259,9 @@ export function EvalRunnerPanel() {
                     <DroppedAnnotationKeysBanner result={displayResult} />
                     <ScorerFilteredBanner result={displayResult} />
                     <DegradedScorersBanner result={displayResult} />
-                    {isBudgetStopped(readAccounting(displayResult)) && (
+                    {isRunBudgetStopped(displayResult) && (
                       <div className="mb-3 flex items-center gap-2 px-3 py-2 rounded-lg text-xs bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900 text-amber-800 dark:text-amber-200">
-                        <BudgetStoppedBadge accounting={readAccounting(displayResult)} />
+                        <BudgetStoppedBadge result={displayResult} />
                         <span>
                           This run stopped admitting spend at its budget, so it covers less than the
                           whole dataset. That is not a model or scorer failure.

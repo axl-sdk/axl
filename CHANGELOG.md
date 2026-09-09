@@ -190,6 +190,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runtime's own and are kept under `callerReport.metadata`. An uninstrumented
   runtime (`{} as AxlRuntime`) now yields `incomplete` accounting with
   `reasons.uninstrumented` and a `totalCost` of `0`.
+- **Studio reads "budget stopped" the way the eval package does.** The run
+  banner, the run/group history badges, the multi-run `budgetStoppedRuns` count
+  and the trend-window chip all now require refused work, not merely a closed
+  controller — a run that set its budget to its expected spend and completed
+  every case no longer reads as truncated in four places at once. The compare
+  view keeps the sign of an uncertified cost delta in its text (it is
+  deliberately uncoloured), labels the compared figure "Known spend (per run)"
+  because `compare.ts` averages a group, and a compare side with no runs loaded
+  reports `unverified` rather than a certified `$0.00`. The trends cost
+  sparkline marks lower-bound and unverified points as hollow rings on dashed
+  segments, with the count in its accessible name, instead of drawing them as
+  part of one measured trend; the window spend figure states its own
+  completeness rather than borrowing the shared cost badge's "unpriced model"
+  wording. A budget-thinned scorer mean now carries a caveat in the multi-run
+  aggregate view, which renders no coverage block of its own.
 - **`refusedWork(coverage)` and `isBudgetStopped(summary)`** are exported from
   `@axlsdk/eval`. They own the one rule that separates "the budget closed" from
   "the budget truncated this run" — a stop requires refused cases or refused

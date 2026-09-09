@@ -3,12 +3,12 @@ import { cn } from '../../lib/utils';
 import {
   SCORER_OUTCOME_LABELS,
   formatBudgetLine,
-  isBudgetStopped,
+  isRunBudgetStopped,
   readAccounting,
 } from './accounting';
 import { ItemOutcomeBadge, ScorerOutcomeBadge } from './OutcomeBadge';
 import { SpendBadge } from './SpendBadge';
-import type { EvalAccounting, EvalCoverage, EvalItemOutcome, EvalResultData } from './types';
+import type { EvalCoverage, EvalItemOutcome, EvalResultData } from './types';
 
 const ITEM_OUTCOMES: EvalItemOutcome[] = [
   'completed',
@@ -27,14 +27,16 @@ const ITEM_OUTCOMES: EvalItemOutcome[] = [
  * first and labelling it "NOT a model or scorer failure".
  */
 export function BudgetStoppedBadge({
-  accounting,
+  result,
   className,
 }: {
-  accounting: EvalAccounting;
+  result: EvalResultData;
   className?: string;
 }) {
-  if (!isBudgetStopped(accounting)) return null;
-  const line = formatBudgetLine(accounting);
+  // Both inputs, not just the accounting: a controller that closed having
+  // refused nothing is a COMPLETE run whose spend landed on its limit.
+  if (!isRunBudgetStopped(result)) return null;
+  const line = formatBudgetLine(readAccounting(result));
   return (
     <span
       title={`Budget: ${line}. The run is incomplete by design; this is NOT a model or scorer failure.`}
@@ -149,7 +151,7 @@ export function RunAccountingPanel({ result }: { result: EvalResultData }) {
           <span
             className={cn(
               'font-mono text-[11px]',
-              isBudgetStopped(accounting)
+              isRunBudgetStopped(result)
                 ? 'text-amber-700 dark:text-amber-300'
                 : 'text-[hsl(var(--muted-foreground))]',
             )}

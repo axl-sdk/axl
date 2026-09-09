@@ -1,6 +1,5 @@
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import type { MultiRunAggregate } from './types';
-import { completenessLabel } from './accounting';
 import { SpendBadge } from './SpendBadge';
 
 type Props = {
@@ -53,10 +52,11 @@ export function EvalMultiRunSwitcher({ currentIndex, totalRuns, aggregate, onInd
                   {aggregate.accounting && (
                     <span className="ml-2 inline-flex items-center gap-1">
                       <span aria-hidden="true">·</span>
+                      {/* `SpendBadge` already renders the chip and carries the
+                          full completeness sentence in its accessible name;
+                          repeating it here printed "incomplete (incomplete:
+                          1 unpriced_model)" and a redundant "(complete)". */}
                       <SpendBadge accounting={aggregate.accounting} label="Group known spend" />
-                      <span className="text-[10px]">
-                        ({completenessLabel(aggregate.accounting)})
-                      </span>
                       {(aggregate.budgetStoppedRuns ?? 0) > 0 && (
                         <span
                           className="text-[10px] font-medium text-amber-600 dark:text-amber-400"

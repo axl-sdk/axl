@@ -286,20 +286,79 @@ function extractAccounting(data: unknown): {
     | { knownCost?: unknown; completeness?: unknown; budget?: { status?: unknown } }
     | undefined;
   if (!accounting || typeof accounting !== 'object') {
-    return { cost: extractCost(data), completeness: 'unverified', budgetStopped: false };
+    return { cost: usable(extractCost(data)), completeness: 'unverified', budgetStopped: false };
   }
   const completeness =
     accounting.completeness === 'complete' || accounting.completeness === 'incomplete'
       ? accounting.completeness
       : 'unverified';
   const knownCost = Number.isFinite(accounting.knownCost)
-    ? (accounting.knownCost as number)
-    : extractCost(data);
+    ? usable(accounting.knownCost)
+    : usable(extractCost(data));
+  const summary = result.summary as { coverage?: unknown } | undefined;
   return {
     cost: knownCost,
     completeness,
-    budgetStopped: accounting.budget?.status === 'closed',
+    budgetStopped: isBudgetStopped(accounting.budget?.status, summary?.coverage),
   };
+}
+
+/**
+ * Spend that may be SUMMED into a window total.
+ *
+ * These figures are folded, so they follow `@axlsdk/eval`'s `usableCost` (the
+ * rule behind `aggregateAccounting`) rather than the pass-through
+ * `readAccounting` gives a single run: a corrupt or hand-edited artifact
+ * reporting `-5` would otherwise drag a whole window negative while still
+ * reporting `complete`.
+ */
+function usable(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+/**
+ * Work the budget actually refused: cases never started or stopped mid-flight,
+ * plus judges refused for the same reason.
+ *
+ * Re-derived here rather than imported from `@axlsdk/eval`'s `refusedWork`
+ * because that package is an OPTIONAL peer dependency of Studio and this
+ * reducer runs on every server start, including for a user who never installed
+ * it (the server's other eval calls are all `await import(...)`, guarded). The
+ * duplication is covered instead by the drift tripwire in
+ * `eval-accounting-drift.test.ts`, which runs this predicate and the eval
+ * export over one shared fixture table.
+ *
+ * The input is the raw persisted blob, so every field is validated here.
+ */
+function refusedWork(coverage: unknown): number {
+  if (!coverage || typeof coverage !== 'object') return 0;
+  const { items, scorers } = coverage as { items?: unknown; scorers?: unknown };
+  let refused = count(items, 'budget_skipped') + count(items, 'budget_interrupted');
+  if (scorers && typeof scorers === 'object') {
+    for (const s of Object.values(scorers as Record<string, unknown>)) {
+      refused += count(s, 'budget_skipped') + count(s, 'budget_interrupted');
+    }
+  }
+  return refused;
+}
+
+function count(block: unknown, key: string): number {
+  if (!block || typeof block !== 'object') return 0;
+  const value = (block as Record<string, unknown>)[key];
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/**
+ * `true` only when a closed budget ALSO refused work.
+ *
+ * A closed controller alone is the normal end state of a run whose final
+ * settlement lands exactly on its limit — which is exactly how `--budget` is
+ * used as a CI threshold. Four Studio surfaces read this flag, and each of
+ * them asserts the run covers less than the whole dataset.
+ */
+function isBudgetStopped(status: unknown, coverage: unknown): boolean {
+  if (status !== 'closed') return false;
+  return refusedWork(coverage) > 0;
 }
 
 /** Extract per-scorer aggregate score from an EvalHistoryEntry's data blob.

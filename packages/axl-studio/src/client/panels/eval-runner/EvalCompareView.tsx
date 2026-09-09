@@ -676,7 +676,11 @@ export function EvalCompareView({
                       : '',
               )}
             >
-              {compareResult.cost.delta > 0 ? '+' : ''}
+              {/* The sign lives in the TEXT, not only in the colour. An
+                  uncertified card is deliberately uncoloured, and without an
+                  explicit `-` a $0.60 saving and a $0.60 increase render
+                  identically. Same rule `DeltaCell` uses. */}
+              {compareResult.cost.delta > 0 ? '+' : compareResult.cost.delta < 0 ? '-' : ''}
               {formatCost(Math.abs(compareResult.cost.delta))}
             </div>
             <div
@@ -905,7 +909,11 @@ export function EvalCompareView({
                 {compareResult.cost != null && (
                   <tr className="border-t border-[hsl(var(--border))]">
                     <td className="px-4 py-2.5 font-mono text-[hsl(var(--muted-foreground))]">
-                      <div>Known spend (total)</div>
+                      {/* `compare.ts` rounds the group AVERAGE into
+                          `baselineTotal`/`candidateTotal`, so on a multi-run
+                          group these are per-run figures, not group totals.
+                          The label has to say which. */}
+                      <div>Known spend (per run)</div>
                       {/* The refusal reason is the whole point of the row when
                           certification fails: "cheaper" and "did less work" look
                           identical in the numbers, and only this line separates

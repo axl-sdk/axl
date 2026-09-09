@@ -1,6 +1,6 @@
 // ── Types matching @axlsdk/eval's EvalResult shape ───────────────
 
-import { aggregateAccounting, readAccounting } from './accounting';
+import { aggregateAccounting, isRunBudgetStopped, readAccounting } from './accounting';
 
 /**
  * How complete a spend figure is. Mirrors `@axlsdk/axl`'s
@@ -501,9 +501,7 @@ export function buildMultiRunResult(allRuns: EvalResultData[]): EvalResultData |
   // as complete because its first run happened to be, and hiding a legacy or
   // budget-truncated sibling inside a confident-looking total.
   const groupAccounting = aggregateGroupAccounting(allRuns);
-  const budgetStoppedRuns = allRuns.filter(
-    (r) => readAccounting(r).budget?.status === 'closed',
-  ).length;
+  const budgetStoppedRuns = allRuns.filter(isRunBudgetStopped).length;
   const aggregate: MultiRunAggregate = {
     runGroupId: (first.metadata?.runGroupId as string) ?? '',
     runCount: allRuns.length,
@@ -970,5 +968,13 @@ export function aggregateGroupTokens(results: EvalResultData[]): TokenCounts {
 export function aggregateGroupAccounting(results: EvalResultData[]): EvalAccounting {
   const perRun = results.map(readAccounting);
   const scope = perRun.length > 0 && perRun.every((a) => a.scope === 'rescore') ? 'rescore' : 'run';
+  // NO runs is not the same fact as a group that spent nothing. A compare side
+  // whose history entry was evicted arrives here as `[]`, and `$0.00,
+  // complete` would put a certified zero on a side that was never loaded.
+  // `unionCoverage` takes the same stance by returning `undefined` rather than
+  // fabricating a row of zeros.
+  if (perRun.length === 0) {
+    return { ...aggregateAccounting([]), completeness: 'unverified', scope };
+  }
   return { ...aggregateAccounting(perRun), scope };
 }

@@ -105,7 +105,7 @@ type EvalTrendCompleteness = 'complete' | 'incomplete' | 'unverified';
       timestamp: number; id: string; scores: Record<string, number>;
       cost: number;                        // EvalResult.accounting.knownCost
       completeness: EvalTrendCompleteness; // how to read `cost`
-      budgetStopped?: boolean;             // this run's budget closed
+      budgetStopped?: boolean;             // budget closed AND refused work
       model?: string; duration?: number;
       runGroupId?: string; batchAttempted?: number;
     }>;
@@ -122,6 +122,17 @@ type EvalTrendCompleteness = 'complete' | 'incomplete' | 'unverified';
   totalCostCompleteness: EvalTrendCompleteness; // worst across every eval
 }
 ```
+
+`budgetStopped` (and the per-eval `budgetStoppedRuns` count) follows
+`@axlsdk/eval`'s `isBudgetStopped`: the run's budget must have closed **and**
+refused work — cases never started or stopped mid-flight, or judges refused for
+the same reason. A controller that closed on a final settlement landing exactly
+on its limit refused nothing and is not reported as stopped; a run whose
+artifact carries no `coverage` block (pre-0.24) is never reported as stopped
+either, because nothing recorded that work was refused. Spend folded into a
+window follows the same `usableCost` rule the eval package's
+`aggregateAccounting` uses: a negative or non-finite figure contributes `0`
+rather than dragging a window total.
 
 `completeness` mirrors core's `AccountingCompleteness`. A history entry with no
 `accounting` block predates measured spend: its `totalCost` is repeated as

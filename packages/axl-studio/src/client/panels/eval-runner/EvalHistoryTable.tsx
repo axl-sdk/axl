@@ -11,7 +11,7 @@ import {
   aggregateGroupModelCounts,
   aggregateGroupAccounting,
 } from './types';
-import { readAccounting } from './accounting';
+import { isRunBudgetStopped, readAccounting } from './accounting';
 import { SpendBadge } from './SpendBadge';
 import { BudgetStoppedBadge } from './RunAccountingPanel';
 import type { EvalResultData } from './types';
@@ -326,7 +326,7 @@ export function EvalHistoryTable({
           <td className="px-3 py-2.5 text-right font-mono text-[hsl(var(--muted-foreground))]">
             <span className="inline-flex items-center gap-1 justify-end">
               <SpendBadge accounting={readAccounting(data)} />
-              <BudgetStoppedBadge accounting={readAccounting(data)} />
+              <BudgetStoppedBadge result={data} />
             </span>
           </td>
           {(() => {
@@ -653,8 +653,8 @@ export function EvalHistoryTable({
                   const groupAccounting = aggregateGroupAccounting(
                     row.entries.map((e) => e.data as EvalResultData),
                   );
-                  const groupBudgetStopped = row.entries.some(
-                    (e) => readAccounting(e.data as EvalResultData).budget?.status === 'closed',
+                  const groupBudgetStopped = row.entries.some((e) =>
+                    isRunBudgetStopped(e.data as EvalResultData),
                   );
 
                   return (

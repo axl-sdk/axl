@@ -498,6 +498,41 @@ describe('reading accounting off an artifact', () => {
     expect(accounting.operations.total).toBe(0);
   });
 
+  // A13.11 — the same legacy artifact, but living in a state store, read back
+  // through the runtime's public history API.
+  it('keeps a stored legacy blob unverified and does not write an upgrade back', async () => {
+    const runtime = new AxlRuntime();
+    const legacy = {
+      id: 'legacy-1',
+      dataset: 'ds',
+      metadata: {},
+      timestamp: '',
+      totalCost: 3,
+      duration: 0,
+      items: [],
+      summary: { count: 0, failures: 0, scorers: {} },
+    };
+    await runtime.saveEvalResult({
+      id: 'legacy-1',
+      eval: 'ds',
+      timestamp: 1,
+      data: legacy,
+    });
+
+    const stored = (await runtime.getEvalHistory()).find((e) => e.id === 'legacy-1')!;
+    const readBack = stored.data as EvalResult;
+
+    // A read-time migration that mints `complete` here would certify a run
+    // nobody ever measured.
+    expect(readAccounting(readBack).completeness).toBe('unverified');
+    // And the stored blob itself stays exactly as written — no silent upgrade.
+    expect(readBack).toEqual(legacy);
+    expect('accounting' in readBack).toBe(false);
+
+    // Reading twice does not drift.
+    expect(readAccounting(readBack).knownCost).toBe(3);
+  });
+
   // A13.6
   it('returns a real record unchanged', async () => {
     const { runtime } = scriptedRuntime([{ cost: 0.25 }]);

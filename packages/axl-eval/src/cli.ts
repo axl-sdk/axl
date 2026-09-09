@@ -11,6 +11,7 @@ import { aggregateRuns } from './multi-run.js';
 import type { MultiRunSummary } from './multi-run.js';
 import type { EvalConfig, EvalResult } from './types.js';
 import { readAccounting } from './accounting.js';
+import { serializeRequestRecords, type RequestRecord } from './diagnostics.js';
 import {
   findConfig,
   resolveRuntime,
@@ -828,6 +829,56 @@ async function getRuntime(configArg?: string, conditions?: string[]): Promise<Ax
   return new AxlRuntime();
 }
 
+/**
+ * Write `<name>.requests.jsonl` beside `--output` when a run captured requests.
+ *
+ * The bundle is deliberately two files rather than one: the JSON result stays
+ * the compact, diffable, comparable artifact it has always been, and the
+ * evidence — which can be orders of magnitude larger — sits next to it and can
+ * be deleted independently. The sidecar is written from the runtime's own
+ * artifact, so it contains exactly the redacted, bounded records the run
+ * produced and nothing that was reconstructed after the fact.
+ *
+ * The artifact is read through the STORE, not `runtime.openDiagnosticArtifact`:
+ * a CLI run never saves an eval history row, so its artifact is legitimately
+ * staged-and-unowned and the owner-existence check would (correctly, for every
+ * other caller) refuse to serve it. This is the same staged bundle, published
+ * without claiming a history save happened.
+ *
+ * Best effort by design: a run's numbers are already on disk by the time this
+ * is called, and a missing or expired artifact must not turn a completed eval
+ * into a failed CLI invocation.
+ */
+async function writeRequestSidecar(
+  runtime: AxlRuntime,
+  outputPath: string,
+  results: readonly EvalResult[],
+): Promise<void> {
+  const artifactIds = results
+    .map((result) => result.diagnostics?.artifactId)
+    .filter((id): id is string => typeof id === 'string' && id !== '');
+  if (artifactIds.length === 0) return;
+  const store = runtime.getDiagnosticArtifactStore();
+  if (!store) return;
+  const records: RequestRecord[] = [];
+  for (const artifactId of artifactIds) {
+    const opened = await store.open(artifactId).catch(() => undefined);
+    if (!opened) continue;
+    for await (const line of opened.lines) {
+      try {
+        records.push(JSON.parse(line) as RequestRecord);
+      } catch {
+        // A partially-written final line (an interrupted capture) is skipped
+        // rather than failing the export: the rest of the evidence is valid.
+      }
+    }
+  }
+  if (records.length === 0) return;
+  const sidecarPath = outputPath.replace(/\.json$/i, '') + '.requests.jsonl';
+  await writeFileAsync(sidecarPath, serializeRequestRecords(records), 'utf-8');
+  console.log(`Captured requests saved to ${sidecarPath}`);
+}
+
 // ── Main eval command ──────────────────────────────────────────────
 
 async function runEvalCommand(args: string[], signal: AbortSignal) {
@@ -837,6 +888,7 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
     conditions,
     runs,
     captureTraces,
+    captureRequests,
     concurrency,
     scorerNames,
     budget,
@@ -998,7 +1050,11 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
         // cost/metadata correctly.
         // Always pass the SIGINT-driven signal so Ctrl+C aborts in-flight
         // workflows + scorer LLM calls instead of dropping the connection mid-request.
-        const runOptions = { signal, ...(captureTraces ? { captureTraces: true } : {}) };
+        const runOptions = {
+          signal,
+          ...(captureTraces ? { captureTraces: true } : {}),
+          ...(captureRequests ? { captureRequests: true } : {}),
+        };
 
         // Stamp filtered runs so a scorer-subset result can't be silently used
         // as a full baseline. `compare` warns (and refuses to gate) on it. Must
@@ -1141,6 +1197,7 @@ async function runEvalCommand(args: string[], signal: AbortSignal) {
       await mkdir(outputDir, { recursive: true });
       await writeFileAsync(outputPath, JSON.stringify(output, null, 2), 'utf-8');
       console.log(`Results saved to ${outputPath}`);
+      await writeRequestSidecar(runtime, outputPath, results);
     }
   } finally {
     await runtime.shutdown().catch(() => {});

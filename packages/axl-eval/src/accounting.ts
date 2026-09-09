@@ -18,7 +18,7 @@
  * Everything here is pure except `trackScope`, which only delegates.
  */
 
-import { AxlError } from '@axlsdk/axl';
+import { AxlError, isAdmissionDeniedError } from '@axlsdk/axl';
 import type {
   Accounting,
   AccountingReason,
@@ -173,14 +173,13 @@ function usableCost(value: unknown): number {
  * distinction the whole outcome taxonomy exists to preserve.
  *
  * The `code`/`name` pair is stable public surface, so it survives the copy
- * boundary. Both are checked: `code` is the contract, and `name` keeps an
- * unrelated `AxlError` that happens to reuse the code from being read as a
- * denial.
+ * boundary. Core owns that structural check (`isAdmissionDeniedError`) because
+ * the same hazard applies to any consumer; this re-export keeps eval's call
+ * sites on one predicate rather than a second copy of the rule that could drift
+ * from it.
  */
 export function isAdmissionDenied(err: unknown): boolean {
-  if (typeof err !== 'object' || err === null) return false;
-  const candidate = err as { code?: unknown; name?: unknown };
-  return candidate.code === 'ADMISSION_DENIED' && candidate.name === 'AdmissionDeniedError';
+  return isAdmissionDeniedError(err);
 }
 
 /**

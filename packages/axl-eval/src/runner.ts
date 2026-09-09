@@ -1,5 +1,5 @@
-import type { AxlRuntime, CallTiming, ModelTimingRollup } from '@axlsdk/axl';
-import { AdmissionController } from '@axlsdk/axl';
+import type { ArtifactManifest, AxlRuntime, CallTiming, ModelTimingRollup } from '@axlsdk/axl';
+import { AdmissionController, RequestCaptureChannel } from '@axlsdk/axl';
 import type {
   EvalAccounting,
   EvalConfig,
@@ -22,6 +22,12 @@ import {
 } from './utils.js';
 import { scoreItem } from './score-item.js';
 import { emptyAccounting, isAdmissionDenied, parseBudget, trackScope } from './accounting.js';
+import {
+  resolveCaptureLimits,
+  toDiagnosticManifest,
+  unavailableManifest,
+  type OperationRef,
+} from './diagnostics.js';
 import { randomUUID } from 'node:crypto';
 
 /**
@@ -134,6 +140,113 @@ function isAbortError(err: unknown): boolean {
   return (err as { name?: string } | undefined)?.name === 'AbortError';
 }
 
+/** A staged capture: the channel records go into, and the artifact holding them. */
+type StagedCapture = { channel: RequestCaptureChannel; artifactId: string };
+
+/**
+ * Reserve the run's diagnostic artifact and open a bounded channel into it.
+ *
+ * Returns `undefined` when capture is off — the overwhelmingly common case,
+ * which must add no artifact, no config requirement, and no field to the
+ * result. When capture IS on and the runtime cannot host it, this throws
+ * before any work, which is the whole reason it is called this early.
+ */
+async function stageCapture(
+  runtime: AxlRuntime,
+  ownerId: string,
+  option: RunEvalOptions['captureRequests'],
+): Promise<StagedCapture | undefined> {
+  const limits = resolveCaptureLimits(option);
+  if (!limits) return undefined;
+  const staged = await runtime.stageDiagnosticArtifact({ kind: 'eval', id: ownerId });
+  return {
+    artifactId: staged.artifactId,
+    channel: new RequestCaptureChannel({
+      sink: staged.sink,
+      ...limits,
+      // Redaction is the RUNTIME's policy, not the caller's: a run cannot opt
+      // out of compliance mode by asking for diagnostics.
+      redact: runtime.isRedactEnabled(),
+    }),
+  };
+}
+
+/**
+ * Close the channel, seal the manifest, and hand back what the result should
+ * say about its own capture.
+ *
+ * Every failure path here degrades to an `unavailable` manifest rather than
+ * throwing: a diagnostics problem must not destroy a run's measured results.
+ */
+async function finishCapture(
+  runtime: AxlRuntime,
+  capture: StagedCapture,
+): Promise<ArtifactManifest | undefined> {
+  const status = await capture.channel.close();
+  try {
+    return await runtime.finalizeDiagnosticArtifact(
+      capture.artifactId,
+      status.status,
+      status.reason,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Attach operation references to the items and judges that produced them.
+ *
+ * References only. Putting the records themselves on the result is exactly the
+ * "compact artifacts silently grow" regression this feature exists to avoid --
+ * the content lives in the artifact and is fetched deliberately.
+ *
+ * Grouping nests by case index THEN scorer name rather than using a joined
+ * string key: a scorer name may contain any separator, and a mis-split would
+ * silently attribute one judge's requests to another.
+ */
+export function attachOperationRefs(
+  items: readonly EvalItem[],
+  channel: RequestCaptureChannel,
+): void {
+  const byItem = new Map<number, OperationRef[]>();
+  const byScorer = new Map<number, Map<string, OperationRef[]>>();
+  for (const entry of channel.operations()) {
+    // An operation with no case index belongs to no item: a provider call made
+    // outside the runner's per-item scopes. It stays in the artifact; the
+    // result simply does not point at it.
+    if (entry.caseIndex === undefined) continue;
+    const ref: OperationRef = {
+      operationId: entry.operationId,
+      kind: entry.kind,
+      ...(entry.turn !== undefined ? { turn: entry.turn } : {}),
+      ...(entry.attempt !== undefined ? { attempt: entry.attempt } : {}),
+      status: entry.status,
+    };
+    if (entry.scorer !== undefined) {
+      const forItem = byScorer.get(entry.caseIndex) ?? new Map<string, OperationRef[]>();
+      const list = forItem.get(entry.scorer) ?? [];
+      list.push(ref);
+      forItem.set(entry.scorer, list);
+      byScorer.set(entry.caseIndex, forItem);
+    } else {
+      const list = byItem.get(entry.caseIndex) ?? [];
+      list.push(ref);
+      byItem.set(entry.caseIndex, list);
+    }
+  }
+  for (const [caseIndex, operations] of byItem) {
+    const item = items[caseIndex];
+    if (item) item.diagnostics = { operations };
+  }
+  for (const [caseIndex, forItem] of byScorer) {
+    for (const [scorer, operations] of forItem) {
+      const detail = items[caseIndex]?.scoreDetails?.[scorer];
+      if (detail) detail.diagnostics = { operations };
+    }
+  }
+}
+
 export async function runEval(
   config: EvalConfig,
   executeWorkflow: (
@@ -153,6 +266,13 @@ export async function runEval(
     config.budget != null
       ? new AdmissionController({ limit: parseBudget(config.budget) })
       : undefined;
+
+  // Capture SECOND, for the same reason: staging throws
+  // `DIAGNOSTICS_UNAVAILABLE` when the runtime has no artifact store, and the
+  // only useful time to learn that is before any money is spent. The artifact
+  // is owned by THIS run's id, which is also the eval history id the caller
+  // will save it under.
+  const capture = await stageCapture(runtime, id, options?.captureRequests);
 
   const items = await config.dataset.getItems();
   // Snapshot dataset-load diagnostics (e.g. annotation keys the schema dropped)
@@ -356,7 +476,13 @@ export async function runEval(
           onClosure: noteClosure,
         });
       },
-      { purpose: 'generation' },
+      {
+        purpose: 'generation',
+        // Every record produced anywhere under this item — workflow turns,
+        // nested asks, tool continuations, judges — is stamped with the case
+        // index, which is how the result can point an item at its own requests.
+        ...(capture ? { captureCorrelation: { caseIndex: itemIndex } } : {}),
+      },
     );
 
     if (itemOutcome.status === 'rejected') throw itemOutcome.error;
@@ -380,9 +506,24 @@ export async function runEval(
       // source of truth) and returns void — the pool's returned array is ignored.
       await mapWithConcurrency(items, concurrency, (item, i) => processItem(item, i));
     },
-    { admission },
+    // The capture channel is declared ONCE, at the run scope: its byte budget
+    // and pending queue are per RUN, and every nested item/scorer scope
+    // inherits it rather than opening a competing budget of its own.
+    { admission, ...(capture ? { capture: capture.channel } : {}) },
   );
   if (runOutcome.status === 'rejected') throw runOutcome.error;
+
+  // Capture is closed AFTER the tracked function has already settled, so a slow
+  // or hung sink can never have delayed a provider call — and the channel's own
+  // bounds mean `close()` cannot wait indefinitely either.
+  let diagnostics: EvalResult['diagnostics'];
+  if (capture) {
+    attachOperationRefs(evalItems, capture.channel);
+    const manifest = await finishCapture(runtime, capture);
+    diagnostics = manifest
+      ? toDiagnosticManifest(manifest)
+      : unavailableManifest(capture.artifactId, 'the diagnostic artifact could not be finalized');
+  }
 
   const accounting: EvalAccounting = {
     ...runOutcome.accounting,
@@ -550,6 +691,7 @@ export async function runEval(
     totalCost: accounting.knownCost,
     ...(accounting.completeness !== 'complete' ? { unpriced: true as const } : {}),
     accounting,
+    ...(diagnostics ? { diagnostics } : {}),
     duration: Date.now() - startTime,
     items: evalItems,
     summary: {

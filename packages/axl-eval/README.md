@@ -271,6 +271,7 @@ npx axl-eval ./evals/ --config ./axl.config.ts      # use a specific runtime con
 npx axl-eval ./evals/ --conditions development      # add Node.js import conditions (monorepo source exports)
 npx axl-eval ./evals/qa.eval.ts --concurrency 10    # override item concurrency for this run
 npx axl-eval ./evals/qa.eval.ts --scorers accuracy  # run only named scorer(s) (single file)
+npx axl-eval ./evals/qa.eval.ts --capture-requests  # also record the requests Axl submitted
 ```
 
 The CLI resolves a runtime automatically: `--config <path>` > auto-detect `axl.config.*` > bare `new AxlRuntime()` (providers from env vars). Use `--conditions` when your eval file imports from monorepo packages that use conditional exports (e.g., `"development"` condition for source TypeScript instead of compiled dist).
@@ -690,6 +691,39 @@ events. Judge costs are included and count toward the `budget` limit. Spend the 
 could not price is reported as unknown (`unpriced`, with `accounting.reasons`) rather
 than as zero — and because unknown spend cannot be enforced against, it does not consume
 a budget either.
+
+### Captured requests (opt-in)
+
+When a score looks wrong, the next question is what the model was actually
+asked. `captureRequests` records the request Axl submitted for every model call
+in the run — case turns, tool continuations, nested asks and LLM judges — beside
+the result rather than inside it:
+
+```typescript
+const runtime = new AxlRuntime({
+  diagnostics: { artifacts: { root: '.axl/artifacts' } },
+});
+
+const results = await runEval(config, executeWorkflow, runtime, {
+  captureRequests: true,
+});
+
+results.diagnostics;                                   // { status, records, bytes, redaction, … }
+results.items[0].diagnostics?.operations;              // the generation calls behind this item
+results.items[0].scoreDetails?.quality.diagnostics;    // the judge's own calls
+```
+
+```bash
+npx axl-eval ./evals/qa.eval.ts --capture-requests --output ./results/v1.json
+# also writes ./results/v1.requests.jsonl
+```
+
+Capture is **off** by default, requires a configured artifact store (a run that
+asks for it without one fails before the dataset loads), is bounded per record /
+per run / per pending queue, and never delays a provider call. It is on a
+different rail from accounting: a failing, truncated or redacted capture leaves
+the numbers byte-identical and reports the loss on `diagnostics.status`. See
+[observability.md](../../docs/observability.md#captured-requests-opt-in).
 
 A returned cost can no longer override that measurement — it would let a workflow
 understate what it spent. Report one anyway if it is useful to compare against:

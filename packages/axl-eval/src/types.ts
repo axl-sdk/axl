@@ -1,6 +1,7 @@
 import type { Dataset } from './dataset.js';
 import type { Scorer } from './scorer.js';
 import type { Accounting, AxlEvent } from '@axlsdk/axl';
+import type { CaptureRequestsOption, DiagnosticManifest, OperationRef } from './diagnostics.js';
 
 /**
  * How one dataset item ended. Absent only on artifacts written before 0.24.
@@ -191,6 +192,17 @@ export type EvalResult = {
    * record as `'unverified'` instead of silently treating it as complete.
    */
   accounting?: EvalAccounting;
+  /**
+   * What this run captured of the requests it submitted, when
+   * `captureRequests` was on. Present only for a capturing run — the default
+   * artifact carries no `diagnostics` key at all.
+   *
+   * It is a POINTER plus a self-assessment, never content: `artifactId` names
+   * bytes owned by the runtime that saved this result, and `status`/`reason`
+   * say whether those bytes are complete, truncated, interrupted or
+   * unavailable. Numeric results stay readable when the artifact is gone.
+   */
+  diagnostics?: DiagnosticManifest;
   duration: number;
   items: EvalItem[];
   summary: EvalSummary;
@@ -212,6 +224,10 @@ export type ScorerDetail = {
   /** This scorer's own operations for this item (judging spend, plus any
    *  `externalOperation` it declared). Absent on pre-0.24 artifacts. */
   accounting?: Accounting;
+  /** The captured operations this judge performed for this item. Present only
+   *  under `captureRequests`; references only, resolved through the run's
+   *  artifact. */
+  diagnostics?: { operations: OperationRef[] };
   /**
    * `true` when the scorer's `applies` predicate returned `false` for this item,
    * so the scorer was deliberately skipped (NOT run). Distinct from a `null`
@@ -358,6 +374,9 @@ export type EvalItem = {
    *  sums and per-model totals from `item.timing`, but not the distribution.
    *  (`rescore` already reports no timing stats at all, so nothing regresses.) */
   timing?: Record<string, ItemModelTiming>;
+  /** The captured operations this item's workflow performed. Present only under
+   *  `captureRequests`; references only, resolved through the run's artifact. */
+  diagnostics?: { operations: OperationRef[] };
   /** Trace events captured during this item's execution. Only populated when
    *  `runEval` was called with `{ captureTraces: true }`. Verbose-mode
    *  `agent_call_start.data.messages` snapshots are stripped to keep memory bounded;
@@ -607,4 +626,20 @@ export type RunEvalOptions = {
    * payload, subscribe to `runtime.on('trace', ...)` directly.
    */
   captureTraces?: boolean;
+  /**
+   * Capture the provider-neutral REQUESTS this run submits into a diagnostic
+   * artifact, so a failed case can be inspected after the process exits.
+   *
+   * Off by default and deliberately explicit to turn on: it requires
+   * `config.diagnostics.artifacts` on the runtime, and without it the run fails
+   * fast with `AxlError('DIAGNOSTICS_UNAVAILABLE')` BEFORE the dataset is
+   * loaded — a capture misconfiguration must never be discovered after the run
+   * has already spent money.
+   *
+   * Capture is diagnostics, never measurement: `accounting` is byte-identical
+   * with capture on, off, truncated, or failing outright. Pass an object to
+   * override the byte bounds (defaults 256 KiB per record, 16 MiB per run,
+   * 1 MiB pending queue).
+   */
+  captureRequests?: CaptureRequestsOption;
 };

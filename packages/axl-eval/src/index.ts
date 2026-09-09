@@ -28,6 +28,24 @@ export type { MultiRunSummary } from './multi-run.js';
 
 export { readAccounting, aggregateAccounting } from './accounting.js';
 
+export {
+  DEFAULT_COPY_MAX_BYTES,
+  DEFAULT_SIDECAR_MAX_BYTES,
+  parseRequestRecords,
+  resolveCaptureLimits,
+  serializeRequestRecords,
+  toDiagnosticManifest,
+  unavailableManifest,
+  validateRequestSidecar,
+} from './diagnostics.js';
+export type {
+  CaptureRequestsOption,
+  DiagnosticManifest,
+  OperationRef,
+  RequestRecord,
+  SidecarValidation,
+} from './diagnostics.js';
+
 export type {
   EvalAccounting,
   EvalBudgetStatus,

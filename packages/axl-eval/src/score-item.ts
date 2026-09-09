@@ -133,7 +133,11 @@ export async function scoreItem(
     const outcome = await trackScope(
       runtime,
       async () => scorer.score(item.output, item.input, item.annotations, scorerContext),
-      { purpose: 'judging' },
+      // The scorer stamp is merged OVER the enclosing item's correlation, so a
+      // judge's records keep the case index and add the judge's name -- which is
+      // what lets `scoreDetails[name].diagnostics` point at this judge's own
+      // calls rather than at the whole item's.
+      { purpose: 'judging', captureCorrelation: { scorer: scorer.name } },
     );
     const duration = Date.now() - scorerStart;
     const { accounting } = outcome;

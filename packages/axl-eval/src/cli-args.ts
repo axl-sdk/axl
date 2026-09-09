@@ -12,6 +12,7 @@ export const KNOWN_FLAGS = new Set([
   '--threshold',
   '--runs',
   '--capture-traces',
+  '--capture-requests',
   '--concurrency',
   '--scorers',
   '--budget',
@@ -41,6 +42,12 @@ export type ParsedEvalArgs = {
   conditions: string[];
   runs: number;
   captureTraces: boolean;
+  /**
+   * `--capture-requests`. Requires `config.diagnostics.artifacts` on the
+   * resolved runtime; `runEval` raises `DIAGNOSTICS_UNAVAILABLE` before any work
+   * when it is missing, rather than after the run has spent money.
+   */
+  captureRequests: boolean;
   /** Item-level concurrency override (flag value). Clamped to >= 1. */
   concurrency?: number;
   /** Scorer names from `--scorers` (deduped, in first-seen order). */
@@ -73,6 +80,7 @@ export function parseEvalArgs(args: string[]): ParsedEvalArgs {
   let conditions: string[] = [];
   let runs = 1;
   let captureTraces = false;
+  let captureRequests = false;
   let concurrency: number | undefined;
   let scorerNames: string[] | undefined;
   let budget: string | undefined;
@@ -122,6 +130,11 @@ export function parseEvalArgs(args: string[]): ParsedEvalArgs {
     } else if (arg === '--capture-traces') {
       // Boolean flag — no value consumed.
       captureTraces = true;
+    } else if (arg === '--capture-requests') {
+      // Boolean flag — no value consumed. Byte bounds are not exposed as flags;
+      // the defaults are product limits and a CLI user who needs to change them
+      // is already writing a config.
+      captureRequests = true;
     } else if (arg.startsWith('--')) {
       if (!KNOWN_FLAGS.has(arg)) {
         console.error(`Unknown flag: ${arg}`);
@@ -138,6 +151,7 @@ export function parseEvalArgs(args: string[]): ParsedEvalArgs {
     conditions,
     runs,
     captureTraces,
+    captureRequests,
     concurrency,
     scorerNames,
     budget,

@@ -6,6 +6,13 @@ import { computeStats, mapWithConcurrency, scorerCounts } from './utils.js';
 import { scoreItem } from './score-item.js';
 import { buildCoverage } from './runner.js';
 import { emptyAccounting, parseBudget, trackScope } from './accounting.js';
+import {
+  DEFAULT_COPY_MAX_BYTES,
+  resolveCaptureLimits,
+  toDiagnosticManifest,
+  unavailableManifest,
+  type CaptureRequestsOption,
+} from './diagnostics.js';
 import { randomUUID } from 'node:crypto';
 
 export type RescoreOptions = {
@@ -29,7 +36,77 @@ export type RescoreOptions = {
    * `EvalConfig.budget`.
    */
   budget?: string;
+  /**
+   * Carry the source run's captured requests forward into this rescore, and
+   * capture the judge calls this rescore makes.
+   *
+   * The source artifact is COPIED rather than referenced. Reference counting
+   * would make deleting the original run either impossible or silently
+   * destructive to every rescore of it; copying costs bytes once and makes each
+   * result independently deletable. The copy preserves the ORIGINAL operation
+   * ids as provenance, so a reader can still line a record up against the run
+   * that produced it — even after that run is gone.
+   *
+   * A copy that would exceed the run byte bound is partial and the manifest
+   * says `truncated`; a source artifact that no longer exists yields
+   * `unavailable`. Neither prevents the numeric rescore results from being read.
+   */
+  captureRequests?: CaptureRequestsOption;
 };
+
+/**
+ * Copy the source run's captured requests into the rescore's own ownership.
+ *
+ * "Provenance must survive deletion of the source" is the whole requirement:
+ * after this returns, deleting the original run leaves the rescore's evidence
+ * intact, and the copied records still carry the ORIGINAL operation ids so a
+ * reader can tell which run actually made each call. The manifest's
+ * `copiedFrom` (recorded by the store) carries the other half of the link.
+ *
+ * Every failure degrades to an `unavailable` manifest instead of throwing: a
+ * rescore's numbers must remain readable when its diagnostics are not.
+ */
+async function copySourceDiagnostics(
+  source: EvalResult,
+  ownerId: string,
+  runtime: AxlRuntime,
+  options: RescoreOptions | undefined,
+): Promise<EvalResult['diagnostics']> {
+  const limits = resolveCaptureLimits(options?.captureRequests);
+  if (!limits) return undefined;
+  const sourceId = source.diagnostics?.artifactId;
+  if (!sourceId) {
+    return unavailableManifest('', 'the source run carried no captured requests');
+  }
+  const maxBytes = limits.maxRunBytes ?? DEFAULT_COPY_MAX_BYTES;
+  let copied: { artifactId: string; truncated: boolean } | undefined;
+  try {
+    copied = await runtime.copyDiagnosticArtifact(
+      sourceId,
+      { kind: 'eval', id: ownerId },
+      {
+        maxBytes,
+      },
+    );
+  } catch (error) {
+    return unavailableManifest(
+      sourceId,
+      `the source artifact could not be copied: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!copied) {
+    return unavailableManifest(
+      sourceId,
+      "the source run's captured requests are no longer available",
+    );
+  }
+  const manifest = await runtime.finalizeDiagnosticArtifact(
+    copied.artifactId,
+    copied.truncated ? 'truncated' : 'complete',
+    copied.truncated ? `copy stopped at the ${maxBytes} byte limit` : undefined,
+  );
+  return toDiagnosticManifest(manifest);
+}
 
 /**
  * Re-run scorers on the saved outputs of an existing eval result.
@@ -52,6 +129,7 @@ export async function rescore(
   options?: RescoreOptions,
 ): Promise<EvalResult> {
   const startTime = Date.now();
+  const rescoredId = randomUUID();
   const concurrency = options?.concurrency ?? 5;
   const scorerConcurrency = options?.scorerConcurrency ?? 5;
   // Validated before any scoring work, exactly like `EvalConfig.budget`.
@@ -79,6 +157,7 @@ export async function rescore(
   };
 
   const rescored: EvalItem[] = new Array(result.items.length);
+  const carryDiagnostics = resolveCaptureLimits(options?.captureRequests) !== undefined;
 
   async function rescoreItem(original: EvalItem, itemIndex: number): Promise<void> {
     // Short-circuit if the rescore has been cancelled — matches runEval's
@@ -125,6 +204,12 @@ export async function rescore(
       metadata: original.metadata,
       traces: original.traces,
       outcome: 'completed',
+      // Carried forward VERBATIM, original operation ids included. The rescore
+      // did not re-run the workflow, so these still describe the calls that
+      // produced this output; reminting the ids would break the only link back
+      // to the run that made them. Only carried when the artifact behind them is
+      // being copied — a dangling reference is worse than none.
+      ...(carryDiagnostics && original.diagnostics ? { diagnostics: original.diagnostics } : {}),
       scores: {},
       scoreDetails: {},
     };
@@ -177,6 +262,8 @@ export async function rescore(
       ? (sourceAccounting.source?.generation ?? null)
       : (sourceAccounting ?? null);
 
+  const diagnostics = await copySourceDiagnostics(result, rescoredId, runtime, options);
+
   const accounting: EvalAccounting = {
     ...runOutcome.accounting,
     scope: 'rescore',
@@ -209,7 +296,7 @@ export async function rescore(
   }
 
   return {
-    id: randomUUID(),
+    id: rescoredId,
     dataset: result.dataset,
     metadata: (() => {
       // Strip run group membership — rescored results are independent evaluations.
@@ -249,6 +336,7 @@ export async function rescore(
     totalCost: accounting.knownCost,
     ...(accounting.completeness !== 'complete' ? { unpriced: true as const } : {}),
     accounting,
+    ...(diagnostics ? { diagnostics } : {}),
     duration: Date.now() - startTime,
     items: rescored,
     summary: {

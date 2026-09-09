@@ -618,6 +618,24 @@ in-test generated PCM WAV tone; no new binary asset was added.
 Dated results, including the two `openai:` provider rejections, are in
 [`docs/verification/general-audio-lighthouse-2026-09-08.md`](./verification/general-audio-lighthouse-2026-09-08.md).
 
+### Session input and Gemini billing follow-ups
+
+These narrowly scoped live checks require their explicit flag as well as the
+provider key. They are excluded from `pnpm test`; `AXL_DISABLE_LIVE_INTEGRATION=1`
+disables them even when armed. Each row makes one logical request, with at most
+three transport attempts. Run only the row whose evidence needs refreshing.
+
+| Check | Flag | Key | Evidence and exact command |
+| --- | --- | --- | --- |
+| Current session input appears once on the wire | `AXL_SESSION_INPUT_LIVE=1` | `OPENROUTER_API_KEY` | [Session verification](verification/session-input-deduplication-2026-09-08.md) |
+| V5 image usage / V3 actual response tier | `AXL_GEMINI_BILLING_LIVE=1` | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | [Gemini verification](verification/general-audio-lighthouse-2026-09-08.md#v5-image-billing-and-v3-service-tier-follow-up) |
+
+Session rich-input equality and failure cleanup, Gemini streaming tier evidence,
+and pricing on rows without audio rates have offline regression coverage. The
+three live rows certify their stated transport/accounting boundaries, not media
+quality, a measured before/after token saving, or provider invoice charges for
+Gemini.
+
 ### Redis store gate
 
 `RedisStore` has a `REDIS_URL`-gated suite (`redis-integration.test.ts`) that

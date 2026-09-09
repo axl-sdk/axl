@@ -123,10 +123,17 @@ never as a hidden transcription. Its `label` and its provider-file `locator` are
 scrubbed by `trace.redact`; the structural fields (`type: 'audio'`, source kind,
 media type, inline byte count) survive redaction so observability stays useful.
 
-No audio bytes, base64, or provider-file reference appears in events, traces,
-`onAgentCallComplete` payloads, Studio REST responses, or any WebSocket channel
-— including the `trace:*` firehose. Full traces replace rich message content
-with its text projection, which omits media parts entirely.
+Model-input snapshots in `ask_start`, `agent_call_start`, and
+`onAgentCallComplete` omit inline audio bytes and base64. Full model-call traces
+replace rich message content with its safe text projection. Descriptors can
+retain provider-file locators and labels until `trace.redact` scrubs them.
+
+This guarantee does not cover arbitrary workflow input, results, or application
+logs. In particular, an unredacted `workflow_start.data.input` retains the raw
+workflow input, including media supplied there, and can reach trace consumers
+and Studio. Enable `trace.redact` to hide these lifecycle values at observability
+boundaries; it does not sanitize data at rest. See
+[Observability-Boundary Redaction](#observability-boundary-redaction).
 
 Inline `Uint8Array` audio in persisted session history is rejected
 (`Uint8Array media input cannot be persisted in session history`). That guard is

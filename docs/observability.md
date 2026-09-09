@@ -186,6 +186,18 @@ count, and `axl.input.source.*` plus `axl.input.inline_bytes` count **every**
 media part — so an audio-bearing ask is never reported as carrying zero media
 bytes.
 
+These descriptors do not sanitize arbitrary workflow values. Full unredacted
+`workflow_start.data.input` retains the original input, including any media
+passed as workflow input. Use `trace.redact` to hide it at observability
+boundaries; see [security](security.md#general-recorded-audio-input).
+
+**Session request history.** With the default `deduplicateInput: true`, a
+matching current session input appears once in the model request and its
+`agent_call_start` message snapshot. Persisted session history still records
+one user turn and the assistant reply. Separate workflow and ask lifecycle
+events remain expected; their presence does not mean the provider received
+the input twice. See [session semantics](api-reference.md#session-methods).
+
 **Media is never zero context.** Context estimation projects rich input through
 `summarizeModelInput`, which renders media as `[image <mediaType>]` /
 `[audio <mediaType>]`. Duration is not measurable before dispatch, so history
@@ -209,6 +221,13 @@ for (const event of info.events) {
 ```
 
 The whole-execution total is `ExecutionInfo.totalCost`. Axl's built-in `runtime.trackExecution`, `ExecutionInfo.totalCost`, Studio's cost aggregator, and `AxlTestRuntime.totalCost()` all apply this guard via `eventCostContribution` internally.
+
+Gemini Interactions can price reconciled text/image usage even when the model
+has no audio rate; an audio rate is required only for positive audio tokens.
+Explicit non-standard or unknown service tiers remain unpriced. Consequently,
+new executions can have higher measured totals and start reaching budget limits
+where older executions only reported a lower bound. Historical totals are not
+rewritten. See [provider pricing rules](providers.md#rich-input-calls).
 
 ### Budget honesty
 

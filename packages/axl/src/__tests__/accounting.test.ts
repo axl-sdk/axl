@@ -551,6 +551,61 @@ describe('I12: the core package never depends on @axlsdk/eval', () => {
 });
 
 describe('I2/I9: abandonment is per scope, not a verdict forced onto ancestors', () => {
+  it('keeps total === settled + unknown in a grandparent above a finalized middle scope', async () => {
+    // G open → P finalized → C open. The open walk stopped at P, so G never
+    // counted this operation as opened; the settlement walk must stop there
+    // too instead of crediting G with a settled operation it never opened.
+    const gate = deferred();
+    const held: Provider = {
+      name: 'held3',
+      async chat(_messages: ChatMessage[], _options: ChatOptions) {
+        await gate.promise;
+        return {
+          content: 'ok',
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          cost: 0.25,
+        };
+      },
+      // eslint-disable-next-line require-yield
+      async *stream(): AsyncGenerator<StreamChunk> {
+        throw new Error('unused');
+      },
+    };
+    const runtime = new AxlRuntime({ defaultProvider: 'held3' });
+    runtime.registerProvider('held3', held);
+    const facade = runtime.resolveProvider('held3:m').provider;
+
+    let childOutcome!: Promise<{ accounting: Accounting }>;
+    const grandparent = await runtime.trackOutcome(async () => {
+      const opened = deferred();
+      const parent = await runtime.trackOutcome(async () => {
+        // Un-awaited child whose operation opens only after P has finalized.
+        childOutcome = runtime.trackOutcome(async () => {
+          await opened.promise;
+          return facade.chat([], { model: 'm' });
+        });
+        return 'parent-done';
+      });
+      expect(parent.accounting.operations.total).toBe(0);
+      opened.resolve();
+      // Let the child open its operation while P is finalized and G is open.
+      await new Promise((r) => setImmediate(r));
+      gate.resolve();
+      await childOutcome;
+      return 'grandparent-done';
+    });
+
+    const child = await childOutcome;
+    expect(child.accounting.knownCost).toBeCloseTo(0.25, 10);
+    expect(child.accounting.operations.total).toBe(1);
+    expectOperationIdentity(child.accounting);
+
+    // G never opened it, so G must not settle it either.
+    expect(grandparent.accounting.operations).toMatchObject({ total: 0, settled: 0, unknown: 0 });
+    expect(grandparent.accounting.knownCost).toBe(0);
+    expectOperationIdentity(grandparent.accounting);
+  });
+
   it('lets a still-open parent receive the settlement a finished child gave up on', async () => {
     // The eval shape: an item scope returns while one of its calls is still in
     // flight, inside a run scope that stays open long enough to see the real

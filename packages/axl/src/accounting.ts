@@ -498,10 +498,17 @@ function settleOperationUp(
   const chargedControllers = new Set<AdmissionController>();
   let scope: AccountingScope | undefined = start;
   while (scope) {
-    if (scope.isFinalized || scope.hasSeen(op.id)) {
+    // A scope that already holds a terminal for this operation (a child that
+    // recorded it `abandoned` at its own finalization) is skipped so the walk
+    // can still reach open ancestors. A finalized scope that never saw the
+    // operation ends the walk: the open walk stopped there too, so climbing
+    // past it would settle operations ancestors never counted as opened and
+    // break `total === settled + unknown`.
+    if (scope.hasSeen(op.id)) {
       scope = scope.parent;
       continue;
     }
+    if (scope.isFinalized) return;
     switch (outcome.outcome) {
       case 'settled':
         scope.recordSettled(op, outcome.cost, outcome.provenance, outcome.usage);

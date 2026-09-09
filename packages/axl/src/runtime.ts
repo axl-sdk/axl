@@ -62,8 +62,12 @@ import type { SpanManager, SpanHandle } from './telemetry/types.js';
  * `runtime.execute(workflow, input)` behavior. The runtime injects itself as
  * the second argument so user code can call `runtime.createContext()` etc.
  *
- * Returns `{ output, cost?, metadata? }` — cost and metadata are optional and
- * fall back to values derived from `runtime.trackExecution()` when omitted.
+ * Returns `{ output, cost?, metadata? }`. Both extras are optional and purely
+ * informational: since 0.24 the eval runner MEASURES spend on the accounting
+ * rail, so a `cost` reported here is recorded as a caller claim
+ * (`EvalItem.callerReport`) and never becomes a run total. Reserved diagnostic
+ * metadata keys (`models`, `tokens`, …) are likewise kept apart from the
+ * runtime's own.
  *
  * Single source of truth for the eval-execution contract; consumed by
  * `registerEval`, `getRegisteredEval`, the `axl-eval` CLI, and
@@ -1220,8 +1224,8 @@ export class AxlRuntime extends EventEmitter {
       signal?: AbortSignal;
       /**
        * When `true`, populate `EvalItem.traces` on every item (success + failure
-       * paths). Forwards to `runEval({ captureTraces: true })`, which wraps each
-       * item's execution in `runtime.trackExecution({ captureTraces: true })`.
+       * paths). Forwards to `runEval({ captureTraces: true })`, which opens each
+       * item's accounting scope with `trackOutcome({ captureTraces: true })`.
        * Verbose-mode `agent_call_start.data.messages` snapshots are stripped from
        * captured traces to keep memory bounded.
        */

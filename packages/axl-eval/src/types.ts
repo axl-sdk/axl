@@ -265,11 +265,15 @@ type TimingStats = { mean: number; min: number; max: number; p50: number; p95: n
 /**
  * Per-model latency stats across a run, on `EvalSummary.modelTiming`.
  *
- * Every field here is a distribution over **per-call** values, pooled across all
- * of the run's successful items — the same population `calls` counts. One
- * provider call is one sample, so an item that makes ten calls weighs ten times
- * an item that makes one. That is the right weighting for a model comparison:
- * these numbers describe the model's latency, not the item's.
+ * Every field here is a distribution over **per-call** values, pooled across
+ * every successful provider call the run made — the same population `calls`
+ * counts. Since 0.24 that includes the calls made by items that later FAILED or
+ * were stopped on budget: those calls really happened and really took that long,
+ * and dropping them would bias the latency of exactly the models whose slowness
+ * caused the timeouts. One provider call is one sample, so an item that makes
+ * ten calls weighs ten times an item that makes one. That is the right
+ * weighting for a model comparison: these numbers describe the model's latency,
+ * not the item's.
  *
  * This is deliberately a different weighting from the wall-clock
  * `EvalSummary.timing`, which samples once per item because it describes the

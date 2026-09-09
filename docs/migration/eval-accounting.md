@@ -116,3 +116,88 @@ sleeping in its own backoff. See
 
 `ctx.budget()`, `BudgetExceededError`, `ExecutionInfo.unpriced`, `event.cost` on trace
 events, `runtime.trackCost()`, and every provider wire format.
+
+---
+
+## Eval-side breaking changes
+
+> **Scope (eval):** Anyone reading `EvalResult.totalCost` / `EvalItem.cost`, returning a
+> `cost` from an eval `executeWorkflow` callback, gating CI on `summary.failures`, or
+> consuming stored eval artifacts.
+
+### 1. `totalCost` is measured, not reported
+
+`EvalResult.totalCost` is now a view of `EvalResult.accounting.knownCost` — what the
+runtime observed, on the same rail as every other Axl cost. Three consequences:
+
+- **A case that failed after paying now contributes its charge.** Previously a thrown
+  workflow contributed `$0`, so a run that broke halfway looked cheap. Expect totals on
+  failing runs to go **up** — they were under-reported before.
+- **The number no longer depends on tracing.** Trace level, `redact`, and
+  `captureTraces` do not change a single figure.
+- **`unpriced` is present exactly when `accounting.completeness !== 'complete'`**, and
+  `accounting.reasons` says why (`unpriced_model`, `usage_missing`, `uninstrumented`,
+  …). A total that could not be established fully is a lower bound, and now says so
+  instead of rounding to zero.
+
+`EvalItem.cost` and `EvalItem.scorerCost` are likewise views of
+`item.accounting.breakdown.generation` / `.judging`.
+
+### 2. A callback's `cost` is a claim, not a total
+
+Returning `{ output, cost }` from `executeWorkflow` no longer sets the item's cost or
+feeds the run total. The value is preserved verbatim on `EvalItem.callerReport.cost`,
+and summarized on `accounting.callerReported`, so it can still be inspected and
+compared against what was measured — it just cannot overstate or understate the run.
+
+```ts
+// Before: item.cost === 0.005, totalCost included it.
+// After:  item.cost is the MEASURED generation spend;
+//         item.callerReport.cost === 0.005.
+async () => ({ output: 'ok', cost: 0.005 });
+```
+
+The same applies to a scorer that returns `{ score, cost }`: it lands on
+`scoreDetails[name].cost` only when nothing was measured for that scorer on an
+uninstrumented runtime, and is never summed into a total.
+
+Reserved diagnostic metadata keys (`models`, `modelCallCounts`, `workflows`,
+`workflowCallCounts`, `tokens`, `agentCalls`) returned by a callback no longer override
+the runtime's own; they are kept under `EvalItem.callerReport.metadata`.
+
+**If your runtime is uninstrumented** — a hand-rolled `{} as AxlRuntime` in a test, say —
+the run is `incomplete` with `reasons.uninstrumented`, `totalCost` is `0`, and your
+callback's numbers live in `callerReport`. Use a real `AxlRuntime` to get measured costs.
+
+### 3. Items and scorers carry an outcome
+
+`EvalItem.outcome` distinguishes `completed`, `failed`, `cancelled`, `budget_skipped`
+(never started) and `budget_interrupted` (stopped mid-flight), with the same taxonomy
+per scorer on `ScorerDetail.outcome`. `EvalSummary.coverage` counts both populations.
+
+`EvalSummary.failures` keeps its old meaning — items that produced no output — so it now
+includes budget-stopped cases. **Gate CI on `summary.coverage` instead**: only it
+separates "the workflow broke" from "we stopped paying". The `axl-eval` CLI already
+does, and prints a distinct `[axl-eval] BUDGET STOPPED …` line before exiting non-zero.
+
+### 4. `budget` stops a run at a threshold
+
+`EvalConfig.budget` (and `--budget`, and `rescore`'s new option) closes admission once
+known spend reaches the limit: subsequent cases are `budget_skipped`, subsequent LLM
+scorers are skipped, deterministic scorers still run, and an in-flight case whose next
+call is denied becomes `budget_interrupted` with its earlier charge kept.
+
+It is a **threshold, not a reservation** — concurrent calls admitted before a sibling
+settles can carry the run past the limit, and `accounting.budget.knownOvershoot` reports
+by how much. An invalid limit throws `AxlError('INVALID_BUDGET')` before the dataset is
+even loaded.
+
+### 5. Reading older artifacts
+
+`readAccounting(result)` returns a result's accounting, or synthesizes an `unverified`
+record from `totalCost` for a pre-0.24 artifact. `unverified` propagates: through
+`aggregateRuns`, through a rescore, and through a JSON round trip. `evalCompare` refuses
+to certify a cost comparison whose inputs are unverified, incomplete, of differing scope,
+or which covered different amounts of work — `comparison.cost.certified` is `false` and
+`.reason` says why, while both raw totals are still shown. `deltaPercent` is `null`
+rather than `Infinity` when the baseline was free.

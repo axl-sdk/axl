@@ -417,6 +417,40 @@ Testing and [evaluation](../packages/axl-eval/README.md) are complementary but d
 
 Use testing to verify your workflow works correctly. Use evaluation to verify your prompts produce quality outputs — and to catch regressions when you change them.
 
+### What an eval run cost
+
+`EvalResult.totalCost` answers "what did this run spend?" from measurement, not from
+what a callback reported. It is a view of `EvalResult.accounting.knownCost`, so it is
+identical whether the run was traced, redacted, or captured — and a case that threw
+**after** a paid call still contributes that charge.
+
+```ts
+const result = await runEval(config, executeWorkflow, runtime);
+
+result.totalCost;                              // === accounting.knownCost
+result.accounting!.breakdown;                  // { generation, judging, external }
+result.items[0].accounting!.breakdown.judging; // what this item's judges cost
+result.summary.coverage!.items;                // completed / failed / cancelled / budget_*
+```
+
+Two consequences worth knowing before you assert on a number:
+
+- **A run whose spend could not be fully established says so.** `completeness` is
+  `'complete'` only when every operation settled with a usable charge — a genuinely free
+  call included. Otherwise `unpriced` is set and `accounting.reasons` counts why. `$0` and
+  "unknown" are different answers, and the runner never conflates them.
+- **An uninstrumented runtime measures nothing.** Passing a hand-rolled
+  `{} as AxlRuntime` yields `totalCost: 0` with `reasons.uninstrumented`, and any `cost`
+  your callback returned is preserved on `item.callerReport` rather than becoming a total.
+  Use a real `AxlRuntime` (with `MockProvider` registered) whenever a test asserts a cost.
+
+To stop a run at a spend threshold, set `EvalConfig.budget` (or pass `--budget`). It is a
+threshold, not a reservation: cases already in flight are allowed to settle, so
+`accounting.budget.knownOvershoot` reports how far past the limit they carried the run.
+Cases that never started are `budget_skipped` and cases stopped mid-flight are
+`budget_interrupted` — neither is a workflow failure, and `summary.coverage` is the field
+to gate CI on (`summary.failures` keeps its older, broader "produced no output" meaning).
+
 ### Comparing model latency in an eval
 
 Eval callback metadata is additive: returning `{ output, metadata: { category: 'billing' } }`

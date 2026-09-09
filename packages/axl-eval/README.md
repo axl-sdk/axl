@@ -381,7 +381,12 @@ const results = await runEval(
 );
 ```
 
-**Trust-boundary validation on workflow returns.** When your `executeWorkflow` callback returns `{ output, cost, metadata }`, the runner validates the untrusted fields before trusting them: `cost` must be a non-negative finite number, `metadata` must be a plain object (`Date`, `Map`, `Set`, class instances are rejected). Invalid values trigger a `console.warn` and fall back to trace-derived values from `runtime.trackExecution()`. A buggy workflow returning `{ cost: 'free' }` no longer silently NaN-poisons `totalCost`.
+**A returned `cost` is a claim, not a total.** Spend is measured by the runtime, so a
+`cost` your `executeWorkflow` callback returns never sets `item.cost` and never feeds
+`totalCost`. It is preserved verbatim on `item.callerReport.cost` (and summarized on
+`accounting.callerReported`) so you can still inspect it or compare it against what was
+actually measured. The value is still validated — a non-negative finite number, or it is
+dropped with a `console.warn` — so `{ cost: 'free' }` can poison nothing.
 
 **Additive item metadata.** Returning `{ output, metadata: { category: 'billing' } }`
 preserves tracked models, tokens, agent calls, and workflow attribution, with or without
@@ -436,7 +441,11 @@ console.log(results.summary.count);                     // 50 items
 console.log(results.summary.failures);                  // 2 workflow errors
 console.log(results.summary.timing);                    // { mean, min, max, p50, p95 } in ms — WORKFLOW wall clock
 console.log(results.summary.modelTiming);               // per model: { calls, wireMs, queuedMs, retryMs, firstTokenMs? } — PROVIDER latency, per-CALL distributions
-console.log(results.totalCost);                          // 0.42 (workflow + scorer LLM costs)
+console.log(results.totalCost);                          // 0.42 — MEASURED spend (workflow + judges)
+console.log(results.unpriced);                            // true when that total is only a lower bound
+console.log(results.accounting.completeness);             // 'complete' | 'incomplete' | 'unverified'
+console.log(results.accounting.breakdown);                // { generation, judging, external }
+console.log(results.summary.coverage.items);              // { completed, failed, cancelled, budget_skipped, budget_interrupted }
 console.log(results.metadata.models);                    // ["openai:gpt-4o"] (sorted by usage)
 console.log(results.metadata.modelCounts);               // { "openai:gpt-4o": 48, "openai:gpt-4o-mini": 2 } (total LLM calls per model)
 
@@ -447,7 +456,7 @@ for (const item of results.items) {
   // Timing and cost
   console.log(item.duration);                            // workflow execution ms (tools, gates, queue and all)
   console.log(item.timing);                              // per model: { calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? } sums — absent if nothing was timed
-  console.log(item.cost);                                // workflow LLM cost
+  console.log(item.cost);                                // measured generation spend (kept even if the case later threw)
   console.log(item.scorerCost);                          // total scorer cost for this item
 
   // Execution metadata (models, tokens, agent calls — captured by AxlRuntime)
@@ -675,13 +684,23 @@ export async function executeWorkflow(input: { raw: string }) {
 
 ### Cost tracking
 
-Cost is tracked automatically — the runner wraps each item with `runtime.trackCost()`. LLM scorer costs are also included in `totalCost` and count toward the `budget` limit.
+Cost is measured automatically: the runner opens an accounting scope per run, per item,
+and per scorer, so `totalCost` is what the runtime observed rather than a sum over trace
+events. Judge costs are included and count toward the `budget` limit. Spend the runtime
+could not price is reported as unknown (`unpriced`, with `accounting.reasons`) rather
+than as zero — and because unknown spend cannot be enforced against, it does not consume
+a budget either.
 
-To override (e.g., exclude setup calls), return cost explicitly:
+A returned cost can no longer override that measurement — it would let a workflow
+understate what it spent. Report one anyway if it is useful to compare against:
 
 ```typescript
+// Recorded on item.callerReport.cost; item.cost stays the measured figure.
 return { output, cost: ctx.totalCost };
 ```
+
+To genuinely exclude work from a run's spend, do it outside the eval — for example warm
+up a cache before calling `runEval` — rather than by subtracting after the fact.
 
 ### Common patterns
 
@@ -698,7 +717,17 @@ export default defineEval({
 });
 ```
 
-`scorerConcurrency` parallelizes the per-item judge phase — the dominant cost for evals with several `llmScorer`s. The worst-case number of simultaneous scorer calls is `concurrency × scorerConcurrency`, so a rate-limited judge model may need a lower value (set `scorerConcurrency: 1` for the old serial behavior). Because the per-item `budget` check runs once before an item's scorers, scorer-cost overshoot is bounded by `concurrency × scorerConcurrency × max-scorer-cost`.
+`scorerConcurrency` parallelizes the per-item judge phase — the dominant cost for evals with several `llmScorer`s. The worst-case number of simultaneous scorer calls is `concurrency × scorerConcurrency`, so a rate-limited judge model may need a lower value (set `scorerConcurrency: 1` for the old serial behavior).
+
+**`budget` is a threshold, not a reservation.** Admission closes once known spend reaches
+the limit: later cases become `budget_skipped`, later LLM scorers are skipped,
+deterministic scorers still run, and a case whose next call is refused becomes
+`budget_interrupted` while keeping the charge it already incurred. Calls already in
+flight are allowed to settle, so the run can end slightly over —
+`accounting.budget.knownOvershoot` says by how much, and the higher your `concurrency ×
+scorerConcurrency`, the larger that can be. An invalid limit throws before the dataset is
+even loaded. The CLI prints a distinct `[axl-eval] BUDGET STOPPED …` line and exits
+non-zero without counting the stop as a model failure.
 
 **Per-item budget** — cap cost for a single workflow execution:
 
@@ -755,7 +784,9 @@ const rescored = await rescore(originalResult, [updatedScorer, newScorer], runti
 
 console.log(rescored.metadata.rescored);    // true
 console.log(rescored.metadata.originalId);  // original result ID
-console.log(rescored.totalCost);            // scorer cost only
+console.log(rescored.totalCost);            // judging only — the original generation is not re-counted
+console.log(rescored.accounting.scope);     // 'rescore'
+console.log(rescored.accounting.source);    // { runId, generation } — the run this was scored from
 ```
 
 ## Multi-Run
@@ -837,6 +868,10 @@ const comparison = evalCompare(baselineRuns, candidateRuns);
 | Type | Description |
 |------|-------------|
 | `EvalConfig` | Eval definition (workflow, dataset, scorers, concurrency, scorerConcurrency, budget) |
+| `readAccounting(result)` | A result's accounting, or an `unverified` record synthesized from a pre-0.24 artifact's `totalCost` |
+| `aggregateAccounting(inputs)` | Fold several accounting records conservatively — sums known spend, unions reasons, worst completeness wins |
+| `EvalAccounting` / `EvalCoverage` | Run accounting (scope, budget, source, caller claims) and the item / scorer outcome counts |
+| `EvalItemOutcome` / `ScorerOutcome` | `completed \| failed \| cancelled \| budget_skipped \| budget_interrupted`, and the scorer equivalent with `scored` / `skipped` |
 | `EvalResult` | Full eval output (items, summary, cost, duration) |
 | `EvalItem` | Per-item result (input, output, scores, scoreDetails, metadata, traces?, `timing?`) |
 | `EvalSummary` | Aggregate statistics (count, failures, per-scorer stats incl. `scored`/`failed`/`skipped`, wall-clock `timing`, per-model `modelTiming?`) |

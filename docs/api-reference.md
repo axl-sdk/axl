@@ -2530,7 +2530,7 @@ Configuration for `runEval()` and `runtime.eval()`.
 | `scorers` | `Scorer[]` | required | Scoring functions to apply to each output |
 | `concurrency` | `number` | `5` | Maximum parallel item executions |
 | `scorerConcurrency` | `number` | `5` | Maximum parallel scorers **within a single item**. Worst-case concurrent scorer calls is `concurrency × scorerConcurrency`; set to `1` for a serial judge phase. Cost/timing/ordering are preserved deterministically |
-| `budget` | `string` | — | Cost limit (e.g., `"$10.00"`). Stops processing when exceeded. With concurrent scorers it is a **soft** ceiling — the per-item check runs once before an item's scorers, so overshoot is bounded by `concurrency × scorerConcurrency × max-scorer-cost` |
+| `budget` | `string` | — | Known-spend limit (e.g. `"$10.00"` or `"0.50"`). Admission closes at `knownSpend >= limit`: later cases become `budget_skipped`, later LLM scorers are skipped, deterministic scorers still run, and a case whose next call is denied becomes `budget_interrupted` keeping its earlier charge. A **threshold, not a reservation** — calls admitted before a sibling settles can carry the run past the limit, and `accounting.budget.knownOvershoot` reports by how much. Unknown spend cannot be enforced against, so an unpriced model does not count toward the limit. An invalid or non-finite limit throws `AxlError('INVALID_BUDGET')` **before** the dataset is loaded |
 | `failOnScorerErrorRate` | `number` (0–1) | — | Opt-in **source-side** trust gate. When set, `runEval` marks the run `summary.degraded` (and the CLI exits non-zero) if a scorer's failure rate exceeds tolerance. **Type-aware**: deterministic scorers tolerate **0** failures (a deterministic scorer that throws is a bug); LLM scorers use this rate. Failure rate = `failed / (scored + failed)`; `0` means "any LLM failure degrades". Items a scorer's `applies` predicate skipped are in neither `scored` nor `failed`, so they're excluded from the denominator — the supported way to scope a conditional scorer without polluting the gate (do NOT return `NaN` for inapplicable items; the gate treats a non-finite score as a real failure). `runEval` never throws on this — it flags and returns, so the (still-useful) result is persisted and the consumer decides. An out-of-range value is **rejected at config load** by the CLI (`validateEvalConfig`, fails loud like `--max-scorer-error-rate`); a programmatic `runEval()` caller that bypasses that validation gets a `console.warn` and the gate is skipped. Catches the silent-thinned-sample trap: a `--fail-on-regression` gate computed over surviving scores can look green when half the judges 429'd. Distinct from the gate-side `axl-eval compare --max-scorer-error-rate` (which refuses to certify an already-thinned baseline/candidate). |
 | `metadata` | `Record<string, unknown>` | — | Arbitrary metadata attached to the result (e.g., model version, prompt variant) |
 
@@ -2569,7 +2569,9 @@ Per-scorer data stored on each `EvalItem`, providing richer detail than the `sco
 | `score` | `number \| null` | Score value, or `null` if the scorer failed |
 | `metadata` | `Record<string, unknown>?` | Scorer metadata (e.g., reasoning from LLM scorers) |
 | `duration` | `number?` | Scorer execution time in ms. Absent on a skipped scorer (it never ran) |
-| `cost` | `number?` | LLM cost for this scorer invocation |
+| `cost` | `number?` | Known cost for this scorer invocation. When the scorer's accounting observed operations this is `accounting.knownCost`; on an uninstrumented runtime it falls back to a `cost` the scorer itself returned. **Never summed into a run total** |
+| `outcome` | `ScorerOutcome?` | `'scored'`, `'failed'`, `'skipped'` (`applies` returned `false`), `'cancelled'`, `'budget_skipped'` (an LLM judge the budget refused to start) or `'budget_interrupted'` (denied mid-flight). Absent on pre-0.24 artifacts |
+| `accounting` | `Accounting?` | This scorer's measured spend, present when its scope observed at least one operation. `purpose` is `'judging'` |
 | `skipped` | `boolean?` | `true` when the scorer's `applies` predicate returned `false` for this item, so it was deliberately **not run** (`score` is `null`, no `duration`). Distinct from a ran-and-failed scorer (`null` score WITH a `duration`) and from cancellation (no marker, no duration). A skipped scorer is excluded from the mean AND from the failure-rate denominator — see `EvalSummary.scorers[].skipped` and `failOnScorerErrorRate` |
 
 ### `EvalItem`
@@ -2585,8 +2587,11 @@ Per-item result from an eval run. `scores` provides quick numeric access; `score
 | `scorerErrors` | `string[]?` | Scorer-level error messages (thrown exceptions or out-of-range scores) |
 | `scores` | `Record<string, number \| null>` | Quick numeric access to scores. `null` = scorer error (see `scorerErrors`) **or** a scorer skipped by its `applies` predicate — disambiguate via `scoreDetails[name].skipped` |
 | `duration` | `number?` | Workflow execution time in ms (set even when workflow errors) |
-| `cost` | `number?` | Workflow LLM cost |
-| `scorerCost` | `number?` | Total scorer cost for this item (sum of all `scoreDetails[*].cost`) |
+| `cost` | `number?` | Measured generation spend for this item — a view of `accounting.breakdown.generation`. A case that threw **after** a paid call still carries that charge. Not a caller-reported figure (see `callerReport`) |
+| `scorerCost` | `number?` | Measured judging spend for this item — a view of `accounting.breakdown.judging` |
+| `outcome` | `EvalItemOutcome?` | `'completed'`, `'failed'`, `'cancelled'`, `'budget_skipped'` (never started) or `'budget_interrupted'` (stopped mid-flight when its next call was denied). Absent on pre-0.24 artifacts, where it can be derived as `error ? 'failed' : 'completed'` |
+| `accounting` | `Accounting?` | This item's measured spend across generation **and** judging, with `breakdown` splitting the two. A child scope that finalizes with an operation still in flight records it `abandoned` locally while the run scope still receives the real settlement, so an item and its run can disagree about one operation — **do not reconcile by subtraction**; the run-level `knownCost` is authoritative |
+| `callerReport` | `{ cost?, metadata? }?` | What the `executeWorkflow` callback claimed, kept for inspection and **never** folded into any total. `cost` is the callback's returned number (invalid values are dropped with a warning); `metadata` holds reserved diagnostic keys (`models`, `tokens`, …) that would otherwise have overridden the runtime's own |
 | `scoreDetails` | `Record<string, ScorerDetail>?` | Rich per-scorer data — includes `metadata` (e.g., LLM reasoning), per-scorer `duration`, and `cost` |
 | `metadata` | `Record<string, unknown>?` | Tracked execution metadata (e.g., `models`, `tokens`, `agentCalls`) merged with callback metadata, independently of `captureTraces`. User keys win; nested objects are replaced, not deep-merged. Explicit `models`/`workflows` lists without corresponding call counts remove the inherited count map so roll-ups use the list fallback. Invalid non-plain-object metadata is ignored with a warning. Without runtime tracking, only callback metadata is available. |
 | `timing` | `Record<string, ItemModelTiming>?` | Per-model provider-call latency for this item, keyed by the full model URI like `metadata.modelCallCounts`. `ItemModelTiming` is `{ calls, queuedMs, retryMs, wireMs, firstTokenMs?, firstTokenCalls? }` — ms sums across the item's **successful timed** calls; divide by `calls` (or `firstTokenCalls` for first token). **Absent** when the item made no such call. `duration` is unchanged workflow wall clock. Per-call percentiles live on [`summary.modelTiming`](#modeltimingstats), which is computed from the raw calls, not from these sums. Exported from `@axlsdk/eval` |
@@ -2602,7 +2607,9 @@ Full result from an eval run.
 | `dataset` | `string` | Dataset name. Definitional — `evalCompare` enforces matching datasets. |
 | `metadata` | `Record<string, unknown>` | User-provided metadata merged with runner-populated fields (see below) |
 | `timestamp` | `string` | ISO 8601 timestamp |
-| `totalCost` | `number` | Total LLM cost (workflow + LLM scorers) |
+| `totalCost` | `number` | **Compatibility view** of `accounting.knownCost` — the spend the runtime measured, workflow plus LLM scorers. Independent of trace level, redaction and `captureTraces` |
+| `unpriced` | `boolean?` | Present exactly when `accounting.completeness !== 'complete'`, i.e. `totalCost` is a lower bound. `accounting.reasons` says why |
+| `accounting` | `EvalAccounting?` | The authoritative record for the run (see below). Absent on pre-0.24 artifacts — use [`readAccounting`](#readaccountingresult) rather than reading the field directly |
 | `duration` | `number` | Wall-clock time in ms |
 | `items` | `EvalItem[]` | Per-item results |
 | `summary` | `EvalSummary` | Aggregate statistics |
@@ -2635,16 +2642,47 @@ Aggregate statistics across all items.
 | Field | Type | Description |
 |-------|------|-------------|
 | `count` | `number` | Total items |
-| `failures` | `number` | Items where the workflow threw an error |
+| `failures` | `number` | Items that produced no output. **Legacy meaning, unchanged**: it counts every item carrying an `error`, so since 0.24 it includes cancelled and budget-stopped cases. Gate CI on `coverage` instead — only it separates "the workflow broke" from "we stopped paying" |
+| `coverage` | `EvalCoverage?` | Counts per item outcome and per scorer outcome (see below). Absent on pre-0.24 artifacts |
 | `scorers` | `Record<string, { mean, min, max, p50, p95, scored?, failed?, skipped? }>` | Per-scorer aggregate stats (all score values 0-1). `scored` is the number of items that produced a valid numeric score — the sample size `mean` actually covers; `failed` is the number whose scorer **ran and failed** (threw / out-of-range); `skipped` is the number whose `applies` predicate returned `false` (deliberately not run). Neither a skipped nor a cancelled scorer is in `scored`/`failed`, so `scored + failed` is the honest "attempted" count and the failure rate excludes skips. A non-zero `failed` means `mean` rests on a thinned sample. All optional (absent on pre-0.18.0 artifacts → recompute from `items`) |
 | `timing` | `{ mean, min, max, p50, p95 }?` | Per-item **wall-clock** duration statistics in ms. Unchanged by the per-model rollup below — it still covers the whole workflow, queue and all |
 | `modelTiming` | `Record<string, ModelTimingStats>?` | Per-model provider-latency stats, present only when at least one item reported timing. Read alongside `timing`, never instead of it — they are weighted differently on purpose. `ModelTimingStats` is exported from `@axlsdk/eval` |
 | `degraded` | `DegradedScorer[]?` | Present only when `EvalConfig.failOnScorerErrorRate` is set **and** one or more scorers exceeded tolerance. Each entry is `{ scorer, rate, limit, type, scored, failed }`. `runEval` sets this and returns normally (it never throws); the CLI turns a non-empty `degraded` into a non-zero exit |
 | `DegradedScorer` | `{ scorer: string; rate: number; limit: number; type: 'llm' \| 'deterministic'; scored: number; failed: number }` | One scorer that tripped the failure-rate gate. `rate = failed / (scored + failed)`; `limit` is the tolerance exceeded (`0` for deterministic). Exported from `@axlsdk/eval` |
 
+#### `EvalCoverage`
+
+On `EvalSummary.coverage`. Counts every item and every scorer decision by outcome, so a run that was truncated cannot be read as a clean one.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `items` | `Record<EvalItemOutcome, number>` | Item counts. Sums to `summary.count` |
+| `scorers` | `Record<string, Record<ScorerOutcome, number>>` | Per-scorer decision counts. The population is the items that produced an output to score — a case that failed or was never started gives every scorer nothing to decide, and is reported under `items` instead |
+
+`EvalItemOutcome` is `'completed' | 'failed' | 'cancelled' | 'budget_skipped' | 'budget_interrupted'`. `ScorerOutcome` is `'scored' | 'failed' | 'skipped' | 'cancelled' | 'budget_skipped' | 'budget_interrupted'`. Both are exported from `@axlsdk/eval`.
+
+#### `EvalAccounting`
+
+On `EvalResult.accounting`. An [`Accounting`](#accounting) record plus the eval-specific fields below.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `scope` | `'run' \| 'rescore'` | What the record covers. A `'rescore'` record covers judging only |
+| `budget` | `{ limit, knownSpend, knownOvershoot, status, closedBy? }?` | Present when the run configured a budget. `status` is `'open'` or `'closed'`; `knownOvershoot` is how far concurrently in-flight calls carried spend past `limit`; `closedBy` (`'case' \| 'scorer' \| 'operation'`) is what caused the crossing |
+| `source` | `{ runId, generation }?` | Rescore only. The original run's id and its accounting (`null` for a pre-0.24 artifact) |
+| `callerReported` | `{ costItems, costTotal, metadataItems }?` | A summary of what `executeWorkflow` callbacks claimed, for inspection only. **Never** part of `knownCost` |
+
+#### `readAccounting(result)`
+
+Returns `result.accounting`, or synthesizes an `unverified` record from `totalCost` for a pre-0.24 artifact. Use it instead of reading the field directly, so a legacy artifact is treated as an unmeasured total rather than a measured one. `unverified` propagates through `aggregateRuns`, through a rescore, and through a JSON round trip.
+
+#### `aggregateAccounting(inputs)`
+
+Folds several `Accounting` records into one, conservatively: costs, usage and operation counts sum, reasons union, and the **worst** completeness wins (`unverified` > `incomplete` > `complete`). One unmeasured run therefore makes the whole group unverified, while its known spend still contributes as a lower bound. Backs `MultiRunSummary.accounting`.
+
 #### `ModelTimingStats`
 
-Per-model provider latency on `EvalSummary.modelTiming`. Every field is a distribution over **per-call** values pooled across the run's successful items, so one provider call is one sample and an item that makes ten calls weighs ten times an item that makes one.
+Per-model provider latency on `EvalSummary.modelTiming`. Every field is a distribution over **per-call** values pooled across every successful provider call the run made — including calls made by items that later failed or were stopped on budget, since those calls really happened and dropping them would bias exactly the models whose slowness caused the timeouts. One provider call is one sample, so an item that makes ten calls weighs ten times an item that makes one.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -2710,7 +2748,7 @@ Result from `evalCompare()` comparing a baseline and candidate eval run.
 | `candidate` | `{ id, metadata, runCount, partial? }` | Candidate run identity. Same shape as `baseline` |
 | `scorers` | `Record<string, { baselineMean, candidateMean, delta, deltaPercent, ci?, significant?, pRegression?, pImprovement?, n?, baselineScored?, baselineFailed?, candidateScored?, candidateFailed?, baselineSkipped?, candidateSkipped? }>` | Per-scorer mean comparison. `ci` is `{ lower: number; upper: number }` (95% bootstrap CI on paired differences). `significant` is `true` when the CI excludes zero and \|delta\| exceeds the threshold. `pRegression`/`pImprovement` are bootstrap probability estimates. `n` is the **paired sample size** — items scored on BOTH sides — always populated (incl. `0`/`1`); the CI/`significant` are computed only when `n >= 2`. Note the asymmetry: `delta` is the difference of the two **independent** per-side means (each over `{baseline,candidate}Scored` items), whereas the CI is paired over `n`, so when `n` is much smaller than the per-side scored counts the two rest on different samples (Studio's compare view surfaces a "paired n" note). `{baseline,candidate}{Scored,Failed}` are per-side success/failure counts over the **same truncated pool** the means/CI use (raw counts; consumer divides) — a non-zero `*Failed` means that side's mean rests on a thinned sample, and `axl-eval compare --max-scorer-error-rate` refuses to certify when over tolerance. `{baseline,candidate}Skipped` are per-side `applies`-skipped (N/A) counts — excluded from both the mean and the failure-rate denominator; when the two sides differ, the means cover different applicable subsets (the CLI prints an advisory `NOTE`) |
 | `timing` | `{ baselineMean, candidateMean, delta, deltaPercent }?` | Per-item duration comparison |
-| `cost` | `{ baselineTotal, candidateTotal, delta, deltaPercent }?` | Total cost comparison |
+| `cost` | `{ baselineTotal, candidateTotal, delta, deltaPercent, certified, reason? }?` | Total cost comparison. `deltaPercent` is `number \| null` — `null` when the baseline total was `0`, since a percentage change from zero is undefined. `certified` is `true` only when both sides are `complete`, share an accounting `scope`, and covered the same cases and scorers; otherwise it is `false` and `reason` says why (unverified or incomplete accounting, a rescore total compared against a run total, or one side that did less work — a budget-truncated run is cheaper because it skipped cases, not because it is more efficient). **Both raw totals are always shown**: refusing to certify is not refusing to report |
 | `regressions` | `EvalRegression[]` | Items that got worse |
 | `improvements` | `EvalImprovement[]` | Items that got better |
 | `summary` | `string` | Human-readable summary |
@@ -2808,11 +2846,14 @@ Options for `rescore()`.
 |-------|------|---------|-------------|
 | `concurrency` | `number` | `5` | Maximum parallel item rescores |
 | `scorerConcurrency` | `number` | `5` | Maximum parallel scorers within a single item (see `EvalConfig.scorerConcurrency`) |
+| `budget` | `string` | — | Known-spend limit for the **new judging only** (same semantics as `EvalConfig.budget`). The original run's generation spend is not re-counted and cannot consume it |
 | `signal` | `AbortSignal` | — | Cancels in-flight scorer LLM calls and short-circuits remaining items |
 
 ### `rescore(result, scorers, runtime, options?)`
 
-Re-run scorers on the saved outputs of an existing `EvalResult` without re-executing the workflow. Returns a new `EvalResult` with `rescored: true` and `originalId` set in metadata. Strips `runGroupId` and `runIndex` from inherited metadata (rescored results are independent evaluations). Only tracks scorer cost (no workflow cost).
+Re-run scorers on the saved outputs of an existing `EvalResult` without re-executing the workflow. Returns a new `EvalResult` with `rescored: true` and `originalId` set in metadata. Strips `runGroupId` and `runIndex` from inherited metadata (rescored results are independent evaluations).
+
+Its `accounting.scope` is `'rescore'` and covers **only the new judging** — the original generation spend is not re-counted. `accounting.source` records `{ runId, generation }`, where `generation` is the original run's accounting (or `null` for a pre-0.24 artifact, which keeps the whole chain `unverified`). Items that carry a pass-through error keep their original `outcome`. Because the scopes differ, `evalCompare` refuses to certify a rescore total against a full run total.
 
 ### `MultiRunSummary`
 

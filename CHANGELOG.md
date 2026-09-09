@@ -53,6 +53,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`price_table_estimate`). Every built-in adapter stamps it; it is optional for
   custom adapters, which are reported as `adapter_reported` rather than
   mislabeled.
+- **Eval runs report measured spend.** `EvalResult.accounting` carries the run's
+  `Accounting` record — known cost, completeness and reasons, a
+  `generation` / `judging` / `external` breakdown, per-scorer detail on
+  `ScorerDetail.accounting`, and per-item detail on `EvalItem.accounting`.
+  `totalCost`, `unpriced`, `item.cost`, `item.scorerCost` and
+  `scoreDetails[].cost` remain as views over it. Every eval entry point
+  (`runEval`, `runtime.eval()`, `runRegisteredEval()`, the `axl-eval` CLI
+  including `--runs` and `rescore`) reports the same figures for the same work.
+- **`EvalConfig.budget` (and `axl-eval --budget`) stops a run at a threshold.**
+  Once known spend reaches the limit, later cases are `budget_skipped` and later
+  LLM scorers are skipped, while deterministic scorers still run; a case whose
+  next call is denied becomes `budget_interrupted` and keeps its earlier charge.
+  `accounting.budget` reports `limit`, `knownSpend`, `knownOvershoot`, `status`
+  and `closedBy`. An invalid limit throws `AxlError('INVALID_BUDGET')` before the
+  dataset is loaded. `rescore` accepts its own budget, covering only new judging.
+- **Item and scorer outcomes.** `EvalItem.outcome` and `ScorerDetail.outcome`
+  distinguish `completed` / `scored`, `failed`, `cancelled`, `budget_skipped`
+  and `budget_interrupted`, and `EvalSummary.coverage` counts both populations —
+  so a truncated run can no longer be mistaken for a clean one. Scorer means and
+  failure-rate gates exclude judges that never ran.
+- **`readAccounting(result)` and `aggregateAccounting(inputs)`.** The first
+  returns a result's accounting or synthesizes an `unverified` record from a
+  pre-0.24 artifact's `totalCost`; the second folds several conservatively
+  (worst completeness wins). `MultiRunSummary.accounting` uses them, and
+  `EvalComparison.cost` gains `certified` plus a `reason` — a cost comparison is
+  refused when either side is unverified or incomplete, the scopes differ, or the
+  two sides covered different amounts of work, with both raw totals still shown.
+  `deltaPercent` is `null` rather than `Infinity` when the baseline was free.
 
 ### Changed
 
@@ -85,6 +113,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Code that catches broadly around `ctx.ask` or a tool call and translates
   errors into a model-visible message must rethrow it. `ctx.budget()`,
   `BudgetExceededError`, and `hard_stop` semantics are unchanged.
+- **Breaking: an eval's `totalCost` is measured, not reported.** It is now a
+  view of `accounting.knownCost`, so a case that threw **after** a paid call
+  contributes that charge instead of `$0` — totals on failing runs go up,
+  because they were under-reported before. The figure no longer varies with
+  trace level, redaction or `captureTraces`, and `unpriced` is present exactly
+  when completeness is not `complete`.
+- **Breaking: a callback's `cost` is a claim, not a total.** A `cost` returned
+  from an eval `executeWorkflow` no longer sets `item.cost` or feeds the run
+  total; it is preserved on `EvalItem.callerReport.cost` and summarized on
+  `accounting.callerReported`. A scorer-returned `cost` reaches
+  `scoreDetails[].cost` only when nothing was measured for that scorer on an
+  uninstrumented runtime, and is never summed. Reserved diagnostic metadata keys
+  returned by a callback (`models`, `tokens`, …) no longer override the
+  runtime's own and are kept under `callerReport.metadata`. An uninstrumented
+  runtime (`{} as AxlRuntime`) now yields `incomplete` accounting with
+  `reasons.uninstrumented` and a `totalCost` of `0`.
+- **Breaking: `axl-eval` exits non-zero on a budget stop**, printing a distinct
+  `[axl-eval] BUDGET STOPPED …` line first. A budget stop is deliberately not
+  counted as a model failure in the wipeout/degraded logic, and the summary
+  prints known spend with a completeness label (e.g.
+  `Cost: $1.50 (incomplete: 1 unpriced_model)`) plus budget and coverage rows.
+  `EvalSummary.failures` keeps its old meaning — items that produced no output,
+  budget-stopped cases included — so gate CI on `summary.coverage` instead.
+- **Studio: `callerReport.metadata` is scrubbed under redaction.** It is raw
+  callback output, so it is dropped like scorer metadata; item and scorer
+  `outcome` / `accounting` are preserved as structural, non-content fields. Eval
+  imports without accounting are stamped `unverified` on the way in.
 
 ## [0.23.3] - 2026-09-09
 

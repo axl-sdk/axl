@@ -24,7 +24,31 @@ export type { Workflow, WorkflowConfig, AnyWorkflow } from './workflow.js';
 
 // Runtime
 export { AxlRuntime } from './runtime.js';
-export type { CreateContextOptions, ExecuteOptions, EvalExecuteWorkflow } from './runtime.js';
+export type {
+  CreateContextOptions,
+  ExecuteOptions,
+  EvalExecuteWorkflow,
+  ModelTimingRollup,
+  TrackedOutcome,
+  TrackExecutionMetadata,
+  TrackExecutionResult,
+  TrackOutcomeOptions,
+} from './runtime.js';
+
+// Accounting — the authoritative spend rail, independent of tracing.
+export { AdmissionController, externalOperation } from './accounting.js';
+export type {
+  Accounting,
+  AccountingCompleteness,
+  AccountingReason,
+  AccountingUsage,
+  CostProvenance,
+  DispatchAdmission,
+  ExternalOperationDescriptor,
+  ExternalOperationReport,
+  OperationKind,
+  OperationPurpose,
+} from './accounting.js';
 
 // Module-resolution helpers — internal but exported so the eval CLI and
 // Studio middleware share one implementation of the ESM/CJS interop walk.
@@ -203,6 +227,7 @@ export {
   ToolFailure,
   InvalidModelInputError,
   UnsupportedModelInputError,
+  AdmissionDeniedError,
 } from './errors.js';
 export type { ToolFailureConstructor, TimeoutBreakdown } from './errors.js';
 export { ProviderError, isRetryableStatus } from './providers/errors.js';

@@ -29,6 +29,7 @@ import type {
   ObservationStatus,
 } from './types.js';
 import {
+  AdmissionDeniedError,
   AxlError,
   VerifyError,
   QuorumNotMet,
@@ -74,6 +75,14 @@ import type { Provider, ChatOptions, ToolDefinition } from './providers/types.js
 import { ProviderError } from './providers/errors.js';
 import { firstRichPart } from './providers/rich-input.js';
 import type { ProviderRegistry } from './providers/registry.js';
+import { createScopedProvider } from './providers/scoped-provider.js';
+import {
+  externalOperation,
+  openOperation,
+  type AccountingUsage,
+  type ExternalOperationDescriptor,
+  type ExternalOperationReport,
+} from './accounting.js';
 import type { TranscriptionProviderRegistry } from './providers/transcription-registry.js';
 import type { TranscriptionProviderRequest } from './providers/transcription-types.js';
 import {
@@ -729,12 +738,38 @@ export type DecisionCleanupFailedEvent = {
   error: unknown;
 };
 
+/**
+ * Project a normalized transcription accounting block onto the accounting
+ * usage buckets. Audio duration is the billable unit here; tokens ride along
+ * when the adapter reports them.
+ */
+function transcriptionUsage(accounting: {
+  usage?: { audioSeconds?: number; inputTokens?: number; outputTokens?: number };
+}): Partial<AccountingUsage> | undefined {
+  const usage = accounting.usage;
+  if (!usage) return undefined;
+  return {
+    ...(usage.audioSeconds !== undefined ? { audioSeconds: usage.audioSeconds } : {}),
+    ...(usage.inputTokens !== undefined ? { inputTokens: usage.inputTokens } : {}),
+    ...(usage.outputTokens !== undefined ? { outputTokens: usage.outputTokens } : {}),
+  };
+}
+
 export type WorkflowContextInit = {
   input: unknown;
   executionId: string;
   metadata?: Record<string, unknown>;
   config: AxlConfig;
   providerRegistry: ProviderRegistry;
+  /**
+   * Internal: resolve a `provider:model` URI to the runtime's SCOPED provider
+   * facade, so every model call the context makes joins the active accounting
+   * scope and honors its budget. Supplied by `AxlRuntime`; when omitted the
+   * context wraps the registry's raw adapter itself, so a directly constructed
+   * context is instrumented too. The registry stays available for everything
+   * else that needs it.
+   */
+  resolveProvider?: (uri: string) => { provider: Provider; model: string };
   transcriptionProviderRegistry?: TranscriptionProviderRegistry;
   sessionHistory?: ChatMessage[];
   onTrace?: (event: AxlEvent) => void;
@@ -841,6 +876,9 @@ export class WorkflowContext<TInput = unknown> {
 
   private config: AxlConfig;
   private providerRegistry: ProviderRegistry;
+  private readonly resolveProviderUri: (uri: string) => { provider: Provider; model: string };
+  /** Fallback facade cache, used only when no runtime resolver was supplied. */
+  private readonly ownScopedProviders = new WeakMap<Provider, Provider>();
   private transcriptionProviderRegistry?: TranscriptionProviderRegistry;
   private sessionHistory: ChatMessage[];
   private onTrace?: (event: AxlEvent) => void;
@@ -1012,6 +1050,17 @@ export class WorkflowContext<TInput = unknown> {
     this.metadata = init.metadata ?? {};
     this.config = init.config;
     this.providerRegistry = init.providerRegistry;
+    this.resolveProviderUri =
+      init.resolveProvider ??
+      ((uri: string) => {
+        const { provider, model } = this.providerRegistry.resolve(uri, this.config);
+        let facade = this.ownScopedProviders.get(provider);
+        if (!facade) {
+          facade = createScopedProvider(provider);
+          this.ownScopedProviders.set(provider, facade);
+        }
+        return { provider: facade, model };
+      });
     this.transcriptionProviderRegistry = init.transcriptionProviderRegistry;
     this.sessionHistory = init.sessionHistory ?? [];
     this.onTrace = init.onTrace;
@@ -1111,6 +1160,7 @@ export class WorkflowContext<TInput = unknown> {
       executionId: this.executionId,
       config: this.config,
       providerRegistry: this.providerRegistry,
+      resolveProvider: this.resolveProviderUri,
       transcriptionProviderRegistry: this.transcriptionProviderRegistry,
       metadata: { ...this.metadata },
       // Shared infrastructure
@@ -1764,7 +1814,7 @@ export class WorkflowContext<TInput = unknown> {
       : { metadata: this.metadata };
     const modelUri = agent.resolveModel(resolveCtx);
     const systemPrompt = agent.resolveSystem(resolveCtx);
-    const { provider, model: resolvedModel } = this.providerRegistry.resolve(modelUri, this.config);
+    const { provider, model: resolvedModel } = this.resolveProviderUri(modelUri);
     let model = resolvedModel;
     const prompt = inputText(input);
     const providerOptions = options?.providerOptions ?? agent._config.providerOptions;
@@ -3774,7 +3824,7 @@ export class WorkflowContext<TInput = unknown> {
     let summaryModel: string;
 
     if (summaryModelUri) {
-      const resolved = this.providerRegistry.resolve(summaryModelUri, this.config);
+      const resolved = this.resolveProviderUri(summaryModelUri);
       summaryProvider = resolved.provider;
       summaryModel = resolved.model;
     } else {
@@ -5370,6 +5420,35 @@ export class WorkflowContext<TInput = unknown> {
     });
   }
 
+  /**
+   * Declare a paid unit of work Axl cannot observe — a third-party API called
+   * from a tool, a vendor SDK, a scraper with per-request billing — so it joins
+   * the run's accounting and its budget.
+   *
+   * Admission is checked BEFORE `fn` runs, so a closed budget refuses the call
+   * with an `AdmissionDeniedError` instead of spending. The operation finalizes
+   * on return, throw or abort; a cost reported before a later throw is kept.
+   * Not reporting a cost marks the run's accounting `incomplete` with reason
+   * `'external_unreported'` — silence is never read as free.
+   *
+   * The amount must be DISJOINT: nested `ctx.ask` and other Axl operations
+   * account for themselves, so including them double-charges.
+   *
+   * ```ts
+   * const rows = await ctx.withExternalOperation({ name: 'vendor-search' }, async (report) => {
+   *   const res = await vendor.search(query);
+   *   report.setCost(res.billedUsd);
+   *   return res.rows;
+   * });
+   * ```
+   */
+  async withExternalOperation<T>(
+    descriptor: ExternalOperationDescriptor,
+    fn: (report: ExternalOperationReport) => Promise<T>,
+  ): Promise<T> {
+    return externalOperation(descriptor, fn);
+  }
+
   /** Transcribe recorded audio through the dedicated transcription registry.
    * This operation never enters the chat history or chat-provider path. */
   async transcribe(request: TranscriptionRequest): Promise<Transcript> {
@@ -5537,11 +5616,34 @@ export class WorkflowContext<TInput = unknown> {
         model: resolved.model,
         ...(signal ? { signal } : {}),
       };
+      // One `'transcription'` accounting operation around the adapter call.
+      // Opening it checks admission, and its dispatch hook is made ambient so
+      // the built-in transcription transports re-check the budget immediately
+      // before each fetch attempt.
+      const transcriptionOperation = openOperation({
+        kind: 'transcription',
+        model: resolved.model,
+        provider: resolved.providerName,
+      });
       let result;
       try {
-        result = await resolved.provider.transcribe(providerRequest);
+        result = await (transcriptionOperation
+          ? transcriptionOperation.run(() => resolved.provider.transcribe(providerRequest))
+          : resolved.provider.transcribe(providerRequest));
       } catch (error) {
+        // A budget stop is not a provider failure. Wrapping it in
+        // `TranscriptionOperationError` would erase the caller's ability to
+        // tell "we stopped spending" from "the vendor broke".
+        if (error instanceof AdmissionDeniedError) {
+          transcriptionOperation?.settleFailure();
+          throw error;
+        }
         const failure = safeProviderFailure(error, resolved.providerName, resolved.model);
+        transcriptionOperation?.settle({
+          cost: failure.accounting.cost,
+          provenance: 'adapter_reported',
+          usage: transcriptionUsage(failure.accounting),
+        });
         if (this.currentSignal?.aborted || signal?.aborted) {
           if (failure.accounting.cost !== undefined)
             this._accumulateBudgetCost(failure.accounting.cost);
@@ -5586,6 +5688,11 @@ export class WorkflowContext<TInput = unknown> {
         result.transcript?.usage,
         result.transcript?.pricingStatus,
       );
+      transcriptionOperation?.settle({
+        cost: accounting.cost,
+        provenance: 'adapter_reported',
+        usage: transcriptionUsage(accounting),
+      });
       if (accounting.cost !== undefined) this._accumulateBudgetCost(accounting.cost);
       if (this.currentSignal?.aborted || signal?.aborted) {
         emitTerminal({

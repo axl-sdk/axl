@@ -46,6 +46,13 @@ import {
   normalizeStoredExecution as normalizeHistoricalExecution,
 } from './event-schema.js';
 import { eventCostContribution, isUnpricedLeaf } from './event-utils.js';
+import {
+  runInAccountingScope,
+  type Accounting,
+  type AdmissionController,
+  type OperationPurpose,
+} from './accounting.js';
+import { createScopedProvider } from './providers/scoped-provider.js';
 import { NoopSpanManager } from './telemetry/noop.js';
 import { createSpanManager } from './telemetry/index.js';
 import type { SpanManager, SpanHandle } from './telemetry/types.js';
@@ -575,6 +582,147 @@ function forwardAbortSignal(
 }
 
 /**
+ * Event-derived execution metadata returned by {@link AxlRuntime.trackExecution}
+ * and {@link AxlRuntime.trackOutcome}.
+ *
+ * Derived from trace events, so it follows trace configuration — unlike
+ * `Accounting`, which is independent of it.
+ */
+export type TrackExecutionMetadata = {
+  /** Unique effective model URIs observed, in first-seen order. */
+  models: string[];
+  modelCallCounts?: Record<string, number>;
+  /**
+   * Agent token totals only — embedder tokens from semantic memory are a
+   * different category and are excluded. Read `Accounting.usage` for the
+   * folded, category-separated totals.
+   */
+  tokens: { input: number; output: number; reasoning: number };
+  agentCalls: number;
+  /**
+   * Unique workflow names observed during execution, ordered by first
+   * appearance (outermost first for nested calls). Captured automatically
+   * from `workflow_start` trace events — callers don't need to declare
+   * anything. Parallel mechanism to `models`.
+   */
+  workflows: string[];
+  /** Call counts per workflow, if workflows.length > 0. */
+  workflowCallCounts?: Record<string, number>;
+};
+
+/**
+ * Per-model sums of `agent_call_end.timing`, keyed by the same effective
+ * model URI as `TrackExecutionMetadata.modelCallCounts`. Present only when at
+ * least one tracked call reported timing, so absence means "nothing was
+ * instrumented" rather than "everything took zero ms".
+ *
+ * `calls` counts the SUCCESSFUL timed calls only — it can be lower than the
+ * same model's `modelCallCounts` entry when a provider omits `timing` or a
+ * call failed. Divide a sum by `calls`, never by `modelCallCounts`.
+ *
+ * Failed calls are excluded even though they now report timing: a non-2xx
+ * response is a measured round trip, but a rollup blending answers with
+ * failures describes neither, and a fast 429 would improve a model's
+ * apparent latency. The failures stay on the events themselves.
+ *
+ * `firstTokenMs` is streaming-only and is summed across the calls that
+ * reported it; it is omitted entirely when no call did, so a non-streaming
+ * model never reports a misleading `0`. Its denominator is `firstTokenCalls`,
+ * NOT `calls` — the two travel together and are present or absent together,
+ * so a mixed streaming/non-streaming model still yields an exact mean.
+ *
+ * Sums are per-call totals, so `wireMs` across concurrent calls can exceed
+ * the wall clock of the tracked function — that is expected under fan-out and
+ * is why nothing in the core sums timing at the ask level.
+ */
+export type ModelTimingRollup = Record<
+  string,
+  {
+    calls: number;
+    queuedMs: number;
+    retryMs: number;
+    wireMs: number;
+    firstTokenMs?: number;
+    /** Timed calls that reported a `firstTokenMs` — the denominator for it. */
+    firstTokenCalls?: number;
+    /**
+     * The per-call blocks the sums were built from, in event order.
+     * `length === calls`. Present only under `captureTimingSamples`, because
+     * retaining it is O(calls) in memory and the sums alone are O(models) — a
+     * caller that needs a real DISTRIBUTION (percentiles, min/max) cannot
+     * recover one from sums, and everyone else should not pay for it.
+     */
+    samples?: CallTiming[];
+  }
+>;
+
+/** Options for {@link AxlRuntime.trackOutcome}. */
+export type TrackOutcomeOptions = {
+  /**
+   * How this scope's operations are classified in `Accounting.breakdown`.
+   * Defaults to the enclosing scope's purpose, else `'generation'`.
+   */
+  purpose?: OperationPurpose;
+  /** Stop admitting new paid operations once known spend reaches its limit. */
+  admission?: AdmissionController;
+  /** Collect the raw `AxlEvent[]` observed during the call. */
+  captureTraces?: boolean;
+  /** Retain the per-call `CallTiming` blocks behind the `modelTiming` sums. */
+  captureTimingSamples?: boolean;
+};
+
+/** The result of {@link AxlRuntime.trackOutcome} — never a rejection. */
+export type TrackedOutcome<T> = (
+  | { status: 'fulfilled'; value: T }
+  /** The ORIGINAL thrown value: primitives and frozen objects are untouched. */
+  | { status: 'rejected'; error: unknown }
+) & {
+  /** Authoritative spend. Independent of trace level, capture and redaction. */
+  accounting: Accounting;
+  metadata: TrackExecutionMetadata;
+  modelTiming?: ModelTimingRollup;
+  traces?: AxlEvent[];
+};
+
+/** The result of {@link AxlRuntime.trackExecution}. */
+export type TrackExecutionResult<T> = {
+  result: T;
+  /** Compatibility view of `accounting.knownCost`. */
+  cost: number;
+  /** Compatibility view of `accounting.completeness !== 'complete'`. When true,
+   *  `cost` is a LOWER BOUND. */
+  unpriced: boolean;
+  /** The authoritative record `cost` and `unpriced` are derived from. */
+  accounting: Accounting;
+  modelTiming?: ModelTimingRollup;
+  traces?: AxlEvent[];
+  metadata: TrackExecutionMetadata;
+};
+
+/**
+ * Attach captured traces to a thrown value so `trackExecution` callers can
+ * recover the diagnostic trail on failure. Non-enumerable so it does not
+ * pollute JSON serialization or stack traces.
+ *
+ * Best effort by design: a frozen or sealed error must come back to the caller
+ * with its identity intact, so a failed attachment is swallowed rather than
+ * replacing the user's error with a `TypeError` about property definition.
+ */
+function attachCapturedTraces(error: unknown, traces: AxlEvent[]): void {
+  if (typeof error !== 'object' || error === null) return;
+  try {
+    Object.defineProperty(error, 'axlCapturedTraces', {
+      value: traces,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+  } catch {
+    // Frozen/sealed thrown value — the error identity matters more.
+  }
+}
+
+/**
  * The main entry point for executing Axl workflows.
  * Manages workflow registration, provider resolution, state storage, tracing, MCP servers,
  * and human-in-the-loop decision handling. Supports both synchronous (`execute`) and
@@ -586,6 +734,9 @@ export class AxlRuntime extends EventEmitter {
   private tools = new Map<string, Tool>();
   private agents = new Map<string, Agent>();
   private providerRegistry: ProviderRegistry;
+  /** Raw adapter → its scoped facade. Keyed weakly so a registry that drops an
+   *  adapter does not pin it here. */
+  private scopedProviders = new WeakMap<Provider, Provider>();
   private transcriptionProviderRegistry: TranscriptionProviderRegistry;
   private stateStore: StateStore;
   private executions = new Map<string, ExecutionInfo>();
@@ -1245,6 +1396,7 @@ export class AxlRuntime extends EventEmitter {
       metadata: options?.metadata,
       config: this.config,
       providerRegistry: this.providerRegistry,
+      resolveProvider: (uri) => this.resolveProvider(uri),
       transcriptionProviderRegistry: this.transcriptionProviderRegistry,
       stateStore: this.stateStore,
       mcpManager: this.mcpManager,
@@ -1286,9 +1438,32 @@ export class AxlRuntime extends EventEmitter {
     this.transcriptionProviderRegistry.registerInstance(name, provider);
   }
 
-  /** Resolve a provider:model URI to a Provider instance and model name. */
+  /**
+   * Resolve a `provider:model` URI to a provider and model name.
+   *
+   * **The returned provider is a scoped FACADE, not the registered instance.**
+   * It forwards everything to the adapter — custom properties and accessors,
+   * class private-field methods, property writes, capability methods, ordinary
+   * `instanceof` — while routing `chat`/`stream` through accounting and budget
+   * admission whenever a `trackOutcome` scope is active. Outside a scope it
+   * delegates verbatim.
+   *
+   * Identity is stable per runtime per adapter (repeated calls return the same
+   * facade), but `resolveProvider(uri).provider === registeredInstance` is now
+   * `false`. See `docs/migration/eval-accounting.md`.
+   */
   resolveProvider(uri: string): { provider: Provider; model: string } {
-    return this.providerRegistry.resolve(uri, this.config);
+    const { provider, model } = this.providerRegistry.resolve(uri, this.config);
+    return { provider: this.scopedProvider(provider), model };
+  }
+
+  /** One facade per raw adapter per runtime, so repeated resolution is stable. */
+  private scopedProvider(raw: Provider): Provider {
+    const existing = this.scopedProviders.get(raw);
+    if (existing) return existing;
+    const facade = createScopedProvider(raw);
+    this.scopedProviders.set(raw, facade);
+    return facade;
   }
 
   /** Execute a workflow and return the result. */
@@ -1355,6 +1530,7 @@ export class AxlRuntime extends EventEmitter {
       metadata: options?.metadata,
       config: this.config,
       providerRegistry: this.providerRegistry,
+      resolveProvider: (uri) => this.resolveProvider(uri),
       transcriptionProviderRegistry: this.transcriptionProviderRegistry,
       sessionHistory,
       signal: controller.signal,
@@ -1536,6 +1712,7 @@ export class AxlRuntime extends EventEmitter {
         metadata: options?.metadata,
         config: this.config,
         providerRegistry: this.providerRegistry,
+        resolveProvider: (uri) => this.resolveProvider(uri),
         transcriptionProviderRegistry: this.transcriptionProviderRegistry,
         sessionHistory,
         signal: controller.signal,
@@ -2246,7 +2423,10 @@ export class AxlRuntime extends EventEmitter {
    * Used by Session to summarize dropped messages when history.summarize is enabled.
    */
   async summarizeMessages(messages: ChatMessage[], modelUri: string): Promise<string> {
-    const { provider, model } = this.providerRegistry.resolve(modelUri, this.config);
+    // Through the facade: a session-history summary is a real paid call and
+    // belongs to whatever accounting scope is active, even though it runs
+    // before any workflow execution id exists.
+    const { provider, model } = this.resolveProvider(modelUri);
     const response = await provider.chat(
       [
         {
@@ -2352,119 +2532,32 @@ export class AxlRuntime extends EventEmitter {
   }
 
   /**
-   * Track cost and execution metadata across any runtime operations within the given function.
-   * Uses AsyncLocalStorage to scope attribution to specific execution IDs,
-   * making it correct with concurrent calls.
+   * Run `fn` and ALWAYS return its outcome plus the authoritative
+   * {@link Accounting} for everything paid that happened inside it.
    *
-   * Returns cost (same as `trackCost`) plus metadata extracted from trace events:
-   * models (unique URIs), tokens (input/output/reasoning sums), and agent call count.
+   * This is the accounting entry point. Unlike {@link trackExecution} it does
+   * not throw on failure — a workflow that threw after a paid call still
+   * returns that call's charge, which is what makes "what did the failed run
+   * cost?" answerable. The thrown value is handed back verbatim in `error`:
+   * primitives, frozen objects, `AbortError`, `ProviderError` and
+   * `BudgetExceededError` all come back `===` what was thrown.
    *
-   * ## Cost vs tokens semantics
+   * Scopes nest. An operation settled inside a child `trackOutcome` is counted
+   * exactly once in every enclosing scope, so a parent total is the sum of
+   * disjoint operations. Concurrent `trackOutcome` calls on one runtime are
+   * isolated: neither sees the other's operations, budget closure or spend.
    *
-   * - `cost` is the full aggregate across EVERY event with a top-level
-   *   `event.cost` set: agent calls, tool calls, semantic memory ops, etc.
-   *   This is the number to reconcile against your provider bill.
+   * Pass `{ admission: new AdmissionController({ limit }) }` to stop admitting
+   * new paid operations once known spend reaches the limit. Already-dispatched
+   * work still settles and is still counted.
    *
-   * - `metadata.tokens` is narrowly scoped to **agent** prompt/completion/
-   *   reasoning tokens. Embedder tokens from semantic `ctx.remember({embed:true})`
-   *   / `ctx.recall({query})` are deliberately NOT summed here — they're a
-   *   different category (input-only, different pricing, different model).
-   *   Conflating them would make "prompt tokens" misleading in the UI. If you
-   *   need embedder token counts, subscribe to `runtime.on('trace', ...)` and
-   *   read `data.usage.tokens` on `memory_remember` / `memory_recall` events.
-   *
-   * Pass `{ captureTraces: true }` to also collect the raw `AxlEvent[]` observed
-   * during `fn()`. This is opt-in because it keeps every event in memory for the
-   * duration of the call — useful for eval per-item capture, debugging, and test
-   * assertions, but overhead grows with trace volume. When enabled, verbose-mode
-   * `agent_call_start.data.messages` snapshots are omitted from captured events (still
-   * broadcast via onTrace) to keep memory bounded — callers who need the full
-   * verbose snapshot should subscribe to `runtime.on('trace', ...)` directly.
-   *
-   * Works with both `createContext()` and `execute()` calls inside `fn`.
+   * `metadata`, `modelTiming` and `traces` remain EVENT-derived and therefore
+   * depend on trace configuration; `accounting` never does.
    */
-  async trackExecution<T>(
+  async trackOutcome<T>(
     fn: () => Promise<T>,
-    options?: { captureTraces?: boolean; captureTimingSamples?: boolean },
-  ): Promise<{
-    result: T;
-    cost: number;
-    /** True when any tracked call was unpriced — `cost` is then a LOWER BOUND.
-     *  Aggregate counterpart of `ExecutionInfo.unpriced`, via `isUnpricedLeaf`. */
-    unpriced: boolean;
-    /**
-     * Per-model sums of `agent_call_end.timing`, keyed by the same effective
-     * model URI as `metadata.modelCallCounts`. Present only when at least one
-     * tracked call reported timing, so absence means "nothing was instrumented"
-     * rather than "everything took zero ms".
-     *
-     * `calls` counts the SUCCESSFUL timed calls only — it can be lower than the
-     * same model's `modelCallCounts` entry when a provider omits `timing` or a
-     * call failed. Divide a sum by `calls`, never by `modelCallCounts`.
-     *
-     * Failed calls are excluded even though they now report timing: a non-2xx
-     * response is a measured round trip, but a rollup blending answers with
-     * failures describes neither, and a fast 429 would improve a model's
-     * apparent latency. The failures stay on the events themselves.
-     *
-     * `firstTokenMs` is streaming-only and is summed across the calls that
-     * reported it; it is omitted entirely when no call did, so a non-streaming
-     * model never reports a misleading `0`. Its denominator is `firstTokenCalls`,
-     * NOT `calls` — the two travel together and are present or absent together,
-     * so a mixed streaming/non-streaming model still yields an exact mean.
-     *
-     * Sums are per-call totals, so `wireMs` across concurrent calls can exceed
-     * the wall clock of `fn` — that is expected under fan-out and is why
-     * nothing in the core sums timing at the ask level.
-     *
-     * `samples` carries the raw per-call `CallTiming` blocks behind the sums, in
-     * `agent_call_end` order, so a caller that needs a DISTRIBUTION (percentiles,
-     * min/max) rather than a mean can compute one over real per-call values. It
-     * is the same data the sums were built from — `samples.length === calls` —
-     * and is deliberately not something callers should persist per item: the
-     * sums are the compact form, `samples` is the working form.
-     *
-     * It is **opt-in** via `captureTimingSamples` and the key is absent
-     * otherwise. Retaining it is O(calls) in memory for the lifetime of `fn`,
-     * which no caller should pay for a figure it never reads — the sums alone
-     * are O(models).
-     */
-    modelTiming?: Record<
-      string,
-      {
-        calls: number;
-        queuedMs: number;
-        retryMs: number;
-        wireMs: number;
-        firstTokenMs?: number;
-        /** Timed calls that reported a `firstTokenMs` — the denominator for it. */
-        firstTokenCalls?: number;
-        /** The per-call blocks the sums were built from, in event order.
-         *  `length === calls`. Present only under `captureTimingSamples`. */
-        samples?: CallTiming[];
-      }
-    >;
-    traces?: AxlEvent[];
-    metadata: {
-      models: string[];
-      modelCallCounts?: Record<string, number>;
-      /**
-       * Agent token totals only — does not include embedder tokens from
-       * semantic memory operations. See the method-level JSDoc above.
-       */
-      tokens: { input: number; output: number; reasoning: number };
-      agentCalls: number;
-      /**
-       * Unique workflow names observed during execution, ordered by first
-       * appearance (outermost first for nested calls). Captured automatically
-       * from `workflow_start` trace events — callers don't need to declare
-       * anything. Parallel mechanism to `models`.
-       */
-      workflows: string[];
-      /** Call counts per workflow, if workflows.length > 0. */
-      workflowCallCounts?: Record<string, number>;
-    };
-  }> {
+    options?: TrackOutcomeOptions,
+  ): Promise<TrackedOutcome<T>> {
     const parentScope = costScopeStorage.getStore();
     const scope: CostScope = {
       totalCost: 0,
@@ -2495,16 +2588,15 @@ export class AxlRuntime extends EventEmitter {
     const workflowCalls = new Map<string, number>();
     const tokens = { input: 0, output: 0, reasoning: 0 };
     let agentCalls = 0;
-    let unpriced = false;
     const capturedTraces: AxlEvent[] | undefined = options?.captureTraces ? [] : undefined;
 
     const listener = (event: AxlEvent) => {
       if (!scope.trackedIds.has(event.executionId)) return;
       // Cost rollup via shared helper — one source of truth for the
-      // "skip ask_end, finite-check, leaf-only" invariant (spec §10).
+      // "skip ask_end, finite-check, leaf-only" invariant (spec §10). This
+      // total feeds `trackCost`-era consumers of the TRACE rail only; the
+      // authoritative figure is `accounting.knownCost`.
       scope.totalCost += eventCostContribution(event);
-      // Honest aggregate: one unpriced leaf makes `cost` a lower bound.
-      if (isUnpricedLeaf(event)) unpriced = true;
       if (event.type === 'agent_call_end') {
         if (event.model) modelCalls.set(event.model, (modelCalls.get(event.model) ?? 0) + 1);
         agentCalls++;
@@ -2517,9 +2609,9 @@ export class AxlRuntime extends EventEmitter {
         // bucket, so an uninstrumented provider adds nothing rather than
         // contributing zeros that would deflate a mean.
         //
-        // SUCCESSFUL calls only — see the `modelTiming` JSDoc for why. `data.error`
-        // is set on the error-path `agent_call_end` and never on the success
-        // path, so it is the discriminator.
+        // SUCCESSFUL calls only — see the `ModelTimingRollup` docs for why.
+        // `data.error` is set on the error-path `agent_call_end` and never on
+        // the success path, so it is the discriminator.
         const failed = event.data?.error != null;
         if (event.model && event.timing && !failed) {
           const t = event.timing;
@@ -2602,42 +2694,98 @@ export class AxlRuntime extends EventEmitter {
     // Temporarily increase maxListeners to avoid warnings at high concurrency
     this.setMaxListeners(this.getMaxListeners() + 1);
     this.on('trace', listener);
+    let outcome: { status: 'fulfilled'; value: T } | { status: 'rejected'; error: unknown };
+    let accounting: Accounting;
     try {
-      const result = await costScopeStorage.run(scope, fn);
-      return {
-        result,
-        cost: scope.totalCost,
-        unpriced,
-        ...(modelTiming.size > 0 ? { modelTiming: Object.fromEntries(modelTiming) } : {}),
-        ...(capturedTraces ? { traces: capturedTraces } : {}),
-        metadata: {
-          models: [...modelCalls.keys()],
-          modelCallCounts: modelCalls.size > 0 ? Object.fromEntries(modelCalls) : undefined,
-          tokens,
-          agentCalls,
-          workflows: [...workflowCalls.keys()],
-          workflowCallCounts:
-            workflowCalls.size > 0 ? Object.fromEntries(workflowCalls) : undefined,
-        },
-      };
-    } catch (err) {
-      // Attach captured traces to the thrown error so callers using
-      // `captureTraces: true` can recover the diagnostic trail on failure
-      // (e.g., eval runner per-item traces for failed items). Non-enumerable
-      // so the property doesn't pollute JSON serialization or stack traces.
-      if (capturedTraces && typeof err === 'object' && err !== null) {
-        Object.defineProperty(err, 'axlCapturedTraces', {
-          value: capturedTraces,
-          enumerable: false,
-          writable: true,
-          configurable: true,
-        });
-      }
-      throw err;
+      // The accounting scope wraps the cost scope, so both are active for `fn`
+      // and both are finalized on the same settlement — including the throwing
+      // path, which is exactly where the old trace-only rail lost charges.
+      ({ outcome, accounting } = await runInAccountingScope<T>(
+        { purpose: options?.purpose, admission: options?.admission },
+        () => costScopeStorage.run(scope, fn),
+      ));
     } finally {
       this.off('trace', listener);
       this.setMaxListeners(this.getMaxListeners() - 1);
     }
+
+    if (outcome.status === 'rejected' && capturedTraces) {
+      // Side channel for `trackExecution` callers, which only see the thrown
+      // value. Best-effort: a frozen or non-object thrown value keeps its
+      // identity rather than the attachment succeeding, because preserving the
+      // error is the stronger contract.
+      attachCapturedTraces(outcome.error, capturedTraces);
+    }
+
+    return {
+      ...outcome,
+      accounting,
+      ...(modelTiming.size > 0 ? { modelTiming: Object.fromEntries(modelTiming) } : {}),
+      ...(capturedTraces ? { traces: capturedTraces } : {}),
+      metadata: {
+        models: [...modelCalls.keys()],
+        modelCallCounts: modelCalls.size > 0 ? Object.fromEntries(modelCalls) : undefined,
+        tokens,
+        agentCalls,
+        workflows: [...workflowCalls.keys()],
+        workflowCallCounts: workflowCalls.size > 0 ? Object.fromEntries(workflowCalls) : undefined,
+      },
+    };
+  }
+
+  /**
+   * Throwing compatibility wrapper over {@link trackOutcome}.
+   *
+   * Returns the same shape it always has, now derived from the accounting rail
+   * rather than summed from trace events: `cost` is `accounting.knownCost` and
+   * `unpriced` is `accounting.completeness !== 'complete'`. For instrumented
+   * paths the numbers are identical; they differ only where the trace rail used
+   * to lose a charge (notably a leaf that never settled). `accounting` is
+   * exposed alongside them so callers can migrate incrementally.
+   *
+   * On failure it rethrows the ORIGINAL error and, under `captureTraces`,
+   * attaches the non-enumerable `axlCapturedTraces` side channel — prefer
+   * {@link trackOutcome}, which returns the accounting for a failed run too.
+   *
+   * ## Cost vs tokens semantics
+   *
+   * - `cost` covers EVERY settled operation: agent calls, tool calls, semantic
+   *   memory embeddings, transcriptions, declared external work. This is the
+   *   number to reconcile against your provider bill.
+   *
+   * - `metadata.tokens` is narrowly scoped to **agent** prompt/completion/
+   *   reasoning tokens. Embedder tokens from semantic `ctx.remember({embed:true})`
+   *   / `ctx.recall({query})` are deliberately NOT summed here — they're a
+   *   different category (input-only, different pricing, different model).
+   *   Conflating them would make "prompt tokens" misleading in the UI. Read
+   *   `accounting.usage` for the folded, category-separated totals.
+   *
+   * Pass `{ captureTraces: true }` to also collect the raw `AxlEvent[]` observed
+   * during `fn()`. This is opt-in because it keeps every event in memory for the
+   * duration of the call — useful for eval per-item capture, debugging, and test
+   * assertions, but overhead grows with trace volume. When enabled, verbose-mode
+   * `agent_call_start.data.messages` snapshots are omitted from captured events (still
+   * broadcast via onTrace) to keep memory bounded — callers who need the full
+   * verbose snapshot should subscribe to `runtime.on('trace', ...)` directly.
+   *
+   * Works with both `createContext()` and `execute()` calls inside `fn`.
+   */
+  async trackExecution<T>(
+    fn: () => Promise<T>,
+    options?: { captureTraces?: boolean; captureTimingSamples?: boolean },
+  ): Promise<TrackExecutionResult<T>> {
+    const outcome = await this.trackOutcome(fn, options);
+    if (outcome.status === 'rejected') throw outcome.error;
+    const { accounting, metadata, modelTiming, traces } = outcome;
+    return {
+      result: outcome.value,
+      cost: accounting.knownCost,
+      unpriced: accounting.completeness !== 'complete',
+      accounting,
+      metadata,
+      ...(modelTiming ? { modelTiming } : {}),
+      ...(traces ? { traces } : {}),
+    };
   }
 
   /** Register an execution ID with the active cost scope for trackCost() attribution. */

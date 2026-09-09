@@ -1,9 +1,11 @@
 import {
+  AdmissionDeniedError,
   isEventStreamOverflowError,
   rethrowEventStreamOverflow,
   ToolFailure,
   ToolModelOutputError,
 } from './errors.js';
+import { openOperation } from './accounting.js';
 import { serializeToolModelOutput } from './tool-model-output.js';
 import {
   executePreparedTool,
@@ -350,6 +352,22 @@ function safeMcpModelError(content: string): string {
 }
 
 /** Execute accepted phases without emitting events or constructing messages. */
+/**
+ * Open a `'tool'` accounting operation around a non-`tool()` handler (a
+ * `toolOverrides` entry or an MCP call), matching what `tool()` does for its
+ * own attempts. Settles at a known $0; paid work inside is reported through
+ * `ctx.withExternalOperation` or is a nested Axl operation with its own id.
+ */
+async function runToolOperation<T>(name: string, run: () => Promise<T>): Promise<T> {
+  const operation = openOperation({ kind: 'tool', name });
+  if (!operation) return run();
+  try {
+    return await operation.run(run);
+  } finally {
+    operation.settle({ cost: 0, provenance: 'caller_reported' });
+  }
+}
+
 export async function executeAcceptedTool(options: {
   invocation: PreparedToolInvocation;
   context: WorkflowContext;
@@ -403,7 +421,7 @@ export async function executeAcceptedTool(options: {
     switch (invocation.source.kind) {
       case 'override': {
         const executeOverride = invocation.source.execute;
-        result = await executeOverride(effectiveArgs);
+        result = await runToolOperation(invocation.toolName, () => executeOverride(effectiveArgs));
         break;
       }
       case 'local':
@@ -419,7 +437,11 @@ export async function executeAcceptedTool(options: {
         );
         break;
       case 'mcp': {
-        const mcpResult = await invocation.source.call(effectiveArgs);
+        const mcpResult = await runToolOperation(invocation.toolName, () =>
+          invocation.source.kind === 'mcp'
+            ? invocation.source.call(effectiveArgs)
+            : Promise.reject(new Error('unreachable')),
+        );
         if (signal?.aborted) return cancellation('after_handler', signal.reason, mcpResult);
         if (mcpResult.isError) {
           const content = mcpContent(mcpResult);
@@ -443,6 +465,10 @@ export async function executeAcceptedTool(options: {
     }
   } catch (error) {
     rethrowEventStreamOverflow(error);
+    // A budget stop is not a tool failure: it must escape the agent loop with
+    // its own identity rather than being fed back to the model as an error
+    // result and prompting yet another turn.
+    if (error instanceof AdmissionDeniedError) throw error;
     const abort = cancellationError(signal, error);
     if (abort !== undefined) return cancellation('handler', abort);
     return failed('handler', error, { attempts });

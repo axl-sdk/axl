@@ -875,13 +875,18 @@ describe('registerProvider()', () => {
 // ═════════════════════════════════════════════════════════════════════════
 
 describe('resolveProvider()', () => {
-  it('resolves a provider:model URI to provider instance and model name', () => {
+  it('resolves a provider:model URI to a stable scoped facade and model name', () => {
     const runtime = new AxlRuntime();
     const mockProvider = new TestProvider([{ content: 'echo' }]);
     runtime.registerProvider('mock', mockProvider as any);
 
     const result = runtime.resolveProvider('mock:test-model');
-    expect(result.provider).toBe(mockProvider);
+    // BREAKING (0.24): the resolver returns the accounting/admission facade,
+    // not the registered instance. See docs/migration/eval-accounting.md.
+    expect(result.provider).not.toBe(mockProvider);
+    expect(result.provider).toBeInstanceOf(TestProvider);
+    // Identity is stable per runtime, so caching a resolution still works.
+    expect(runtime.resolveProvider('mock:test-model').provider).toBe(result.provider);
     expect(result.model).toBe('test-model');
   });
 

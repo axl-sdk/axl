@@ -1,6 +1,7 @@
 import { ZodError, type z } from 'zod';
 import type { WorkflowContext } from './context.js';
-import { rethrowEventStreamOverflow } from './errors.js';
+import { AdmissionDeniedError, rethrowEventStreamOverflow } from './errors.js';
+import { openOperation } from './accounting.js';
 import type { ToolArgumentIssue } from './types.js';
 
 /** Retry policy for tool handlers */
@@ -567,16 +568,26 @@ export function tool<TInput extends z.ZodType, TOutput = unknown>(
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       options?.signal?.throwIfAborted();
       options?.onAttempt?.(attempt);
+      // Every attempt is its own admitted operation: a tool handler is user
+      // code that may spend, and a retry is new work, so a run whose budget
+      // closed mid-retry must not start another attempt. Handlers that are
+      // genuinely local settle at a known $0 — there is no local-tool
+      // exemption to guess at. `AdmissionDeniedError` propagates out of the
+      // retry loop unwrapped; it is a stop, not a tool failure.
+      const operation = openOperation({ kind: 'tool', name: config.name });
       try {
         // ctx is optional on _execute but required on handler. In practice, all runtime
         // call sites (agent tool loop, tool.run) always provide ctx. The undefined case
         // only occurs when _execute is called directly in tests or internal code.
-        const result = await config.handler(parsed, ctx as WorkflowContext);
+        const result = await (operation
+          ? operation.run(() => config.handler(parsed, ctx as WorkflowContext))
+          : config.handler(parsed, ctx as WorkflowContext));
         if (options?.checkAfterHandlerAbort !== false) options?.signal?.throwIfAborted();
         return result;
       } catch (err) {
         if (options?.signal?.aborted) options.signal.throwIfAborted();
         if (isAbortError(err)) throw err;
+        if (err instanceof AdmissionDeniedError) throw err;
         rethrowEventStreamOverflow(err);
         lastError = err instanceof Error ? err : new Error(String(err));
 
@@ -592,6 +603,12 @@ export function tool<TInput extends z.ZodType, TOutput = unknown>(
         if (backoffMs > 0) {
           await sleep(backoffMs, options?.signal);
         }
+      } finally {
+        // A tool invocation carries no measurable Axl charge of its own: it
+        // settles as a known $0 whether it returned or threw. Paid work inside
+        // the handler is reported through `ctx.withExternalOperation` or is a
+        // nested Axl operation with its own id.
+        operation?.settle({ cost: 0, provenance: 'caller_reported' });
       }
     }
 

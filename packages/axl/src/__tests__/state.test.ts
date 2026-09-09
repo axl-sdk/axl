@@ -1302,6 +1302,15 @@ describe('RedisStore', () => {
       // MULTI/EXEC is all-or-nothing, but our mock isn't simulating that
       // — it just guarantees the queued ops run together without other
       // mock interleaving (which is what callers actually care about).
+      // PTTL in milliseconds, with Redis's two sentinel values: -2 (no such
+      // key) and -1 (key exists, no TTL). The mock stores TTLs in seconds on a
+      // side map, so convert; `getEvalRetention` distinguishes all three.
+      pTTL: vi.fn(async (key: string) => {
+        const exists = data.has(key) || hashData.has(key) || listData.has(key);
+        if (!exists) return -2;
+        const seconds = ttls.get(key);
+        return seconds === undefined ? -1 : seconds * 1000;
+      }),
       multi: vi.fn(() => createMockMulti(data, hashData, setData, zsetData, ttls, listData)),
       quit: vi.fn(async () => undefined),
     };
@@ -1943,6 +1952,41 @@ describe('RedisStore', () => {
     it('deleteEvalResult returns false for unknown id', async () => {
       const { store } = createRedisStoreWithMockClient();
       expect(await store.deleteEvalResult('does-not-exist')).toBe(false);
+    });
+
+    /**
+     * `getEvalRetention` drives diagnostic-artifact reclamation: an artifact
+     * whose owning row has expired is deleted, so misreading PTTL either leaks
+     * bytes forever (-2 read as "alive") or destroys evidence the user still
+     * owns (-1 read as "expired now").
+     */
+    describe('getEvalRetention (A13.10)', () => {
+      it('reports a missing row as absent', async () => {
+        const { store } = createRedisStoreWithMockClient();
+        expect(await store.getEvalRetention('nope')).toEqual({ exists: false });
+      });
+
+      it('reports a row with no TTL as alive and never-expiring', async () => {
+        const { store } = createRedisStoreWithMockClient();
+        await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1, data: {} });
+        // PTTL -1: the row exists forever. An `expiresAt` here would schedule a
+        // deletion that must never happen.
+        expect(await store.getEvalRetention('ev1')).toEqual({ exists: true });
+      });
+
+      it('converts a live TTL into an absolute expiry', async () => {
+        const { store } = createRedisStoreWithMockClient('axl:', { evalHistory: 600 });
+        await store.saveEvalResult({ id: 'ev1', eval: 'test', timestamp: 1, data: {} });
+
+        const before = Date.now();
+        const retention = await store.getEvalRetention('ev1');
+
+        expect(retention.exists).toBe(true);
+        // Absolute, not relative: the artifact manifest is read by a sweep that
+        // may run in a different process at a much later time.
+        expect(retention.expiresAt!).toBeGreaterThanOrEqual(before + 600_000 - 50);
+        expect(retention.expiresAt!).toBeLessThanOrEqual(Date.now() + 600_000);
+      });
     });
   });
 

@@ -77,6 +77,11 @@ import { firstRichPart } from './providers/rich-input.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import { createScopedProvider } from './providers/scoped-provider.js';
 import {
+  runWithCaptureTurnSlot,
+  setCaptureTurn,
+  type CapturedCorrection,
+} from './diagnostics/capture.js';
+import {
   externalOperation,
   openOperation,
   type AccountingUsage,
@@ -1540,198 +1545,203 @@ export class WorkflowContext<TInput = unknown> {
             askUnpriced: false,
           };
 
-          return askStorage.run(frame, async () => {
-            const askStart = Date.now();
-            this.emitEvent({
-              type: 'ask_start',
-              prompt: promptText,
-              ...(inputDescriptor ? { input: inputDescriptor } : {}),
-            });
-
-            // `costBefore` snapshots the global budget so we can pass the per-ask
-            // cost delta to onAgentCallComplete (legacy callback that reports the
-            // whole-tree spend). `frame.askCost` is the spec-correct, this-ask-only
-            // figure used on `ask_end` (decision 10).
-            const costBefore = this.budgetContext?.totalCost ?? 0;
-            const unpricedCountBefore = this.budgetContext?.unpricedCount ?? 0;
-            const resolveCtx = options?.metadata
-              ? { metadata: { ...this.metadata, ...options.metadata } }
-              : { metadata: this.metadata };
-
-            // Use a mutable container to capture usage from executeAgentCall
-            // without relying on an instance property (which is racy under
-            // concurrent calls).
-            const usageCapture: {
-              value?: {
-                prompt_tokens: number;
-                completion_tokens: number;
-                total_tokens: number;
-                cached_tokens?: number;
-                cache_write_tokens?: number;
-              };
-              modelUri?: string;
-              /** Last completed turn's provider timing, for span attributes. */
-              timing?: CallTiming;
-            } = {};
-
-            const doCall = async () => {
-              const result = await this.executeAgentCall(
-                agent,
-                normalizedInput,
-                options as AskOptions<unknown>,
-                undefined,
-                usageCapture,
-                normalizedHistory,
-              );
-              return result as T;
-            };
-
-            // Spec decision 9 invariant: every `ask_start` has a matching
-            // `ask_end`. Capture either outcome, emit the terminal once, then
-            // rethrow the captured failure. Current catches (gate exhaustion,
-            // budget, abort) and future failure paths between `ask_start` and
-            // the success emit therefore surface as `ask_end`. The workflow-
-            // level `error` event is reserved for failures with no ask_end;
-            // consumers must never see both for the same failure.
-            let outcome: { ok: true; result: T } | { ok: false; error: string } | undefined;
-            let askFailure: unknown;
-            let askFailed = false;
-            let result: T | undefined;
-            try {
-              result = this.spanManager
-                ? await this.spanManager.withSpanAsync(
-                    'axl.agent.ask',
-                    {
-                      'axl.agent.name': agent._name,
-                      'axl.agent.model': agent.resolveModel(resolveCtx),
-                    },
-                    async (span) => {
-                      const r = await doCall();
-                      if (usageCapture.modelUri) {
-                        span.setAttribute('axl.agent.model', usageCapture.modelUri);
-                      }
-                      const costAfter = this.budgetContext?.totalCost ?? 0;
-                      span.setAttribute('axl.agent.cost', costAfter - costBefore);
-                      span.setAttribute('axl.agent.duration', Date.now() - askStart);
-                      // `axl.agent.duration` is ask wall clock; these split the
-                      // last provider call's share of it. Set only when the
-                      // provider instrumented the call — an uninstrumented
-                      // adapter must not look like a zero-latency one.
-                      if (usageCapture.timing) {
-                        const t = usageCapture.timing;
-                        span.setAttribute('axl.agent.queued_ms', t.queuedMs);
-                        span.setAttribute('axl.agent.retry_ms', t.retryMs);
-                        span.setAttribute('axl.agent.attempts', t.attempts);
-                        span.setAttribute('axl.agent.ttfb_ms', t.ttfbMs);
-                        span.setAttribute('axl.agent.wire_ms', t.wireMs);
-                        if (t.firstTokenMs !== undefined) {
-                          span.setAttribute('axl.agent.first_token_ms', t.firstTokenMs);
-                        }
-                      }
-                      if (usageCapture.value) {
-                        span.setAttribute(
-                          'axl.agent.prompt_tokens',
-                          usageCapture.value.prompt_tokens,
-                        );
-                        span.setAttribute(
-                          'axl.agent.completion_tokens',
-                          usageCapture.value.completion_tokens,
-                        );
-                        if (usageCapture.value.cached_tokens)
-                          span.setAttribute(
-                            'axl.agent.cached_tokens',
-                            usageCapture.value.cached_tokens,
-                          );
-                        if (usageCapture.value.cache_write_tokens)
-                          span.setAttribute(
-                            'axl.agent.cache_write_tokens',
-                            usageCapture.value.cache_write_tokens,
-                          );
-                      }
-                      return r;
-                    },
-                  )
-                : await doCall();
-              outcome = { ok: true, result };
-
-              // Success path: invoke the legacy onAgentCallComplete hook.
-              // Isolate consumer bugs (mirror the onTrace pattern at
-              // emitEvent): a hook throw is post-success observability —
-              // the agent's run already succeeded, so we must NOT
-              // overwrite the outcome to ok:false. Swallow + console.error
-              // so reliability dashboards keyed off ask_end.outcome aren't
-              // poisoned by hook bugs.
-              const costAfter = this.budgetContext?.totalCost ?? 0;
-              const unpricedCountAfter = this.budgetContext?.unpricedCount ?? 0;
-              if (this.onAgentCallComplete) {
-                try {
-                  this.onAgentCallComplete({
-                    agent: agent._name,
-                    prompt: promptText,
-                    ...(inputDescriptor ? { input: inputDescriptor } : {}),
-                    response: typeof result === 'string' ? result : JSON.stringify(result),
-                    model: usageCapture.modelUri ?? agent.resolveModel(resolveCtx),
-                    cost: costAfter - costBefore,
-                    unpriced: frame.askUnpriced || unpricedCountAfter > unpricedCountBefore,
-                    duration: Date.now() - askStart,
-                    promptVersion: agent._config.version,
-                    temperature: options?.temperature ?? agent._config.temperature,
-                    maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
-                    effort: options?.effort ?? agent._config.effort,
-                    thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
-                    includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
-                    toolChoice: options?.toolChoice ?? agent._config.toolChoice,
-                    stop: options?.stop ?? agent._config.stop,
-                    providerOptions: options?.providerOptions ?? agent._config.providerOptions,
-                  });
-                } catch (hookErr) {
-                  console.error(
-                    '[axl] onAgentCallComplete hook threw; ask outcome unchanged:',
-                    hookErr instanceof Error ? hookErr.message : String(hookErr),
-                  );
-                }
-              }
-            } catch (err) {
-              askFailed = true;
-              askFailure = err;
-              if (richAsk) this.recordRichFailure(err);
-              outcome = {
-                ok: false,
-                error: this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
-              };
-            }
-
-            // Defensive: `outcome` is always set by either the success or catch
-            // branch above. The fallback makes a future internal control-flow
-            // bug explicit without dropping ask_end.
-            let terminalFailure: unknown;
-            let terminalFailed = false;
-            try {
+          // The turn slot lives for the whole ask so every turn's provider call
+          // can stamp its own turn index / retry reason / correction onto the
+          // captured record without threading state through the adapters.
+          return askStorage.run(frame, async () =>
+            runWithCaptureTurnSlot(async () => {
+              const askStart = Date.now();
               this.emitEvent({
-                type: 'ask_end',
-                outcome:
-                  outcome ??
-                  ({
-                    ok: false,
-                    error: 'ask_end emitted without outcome — internal bug',
-                  } as const),
-                cost: frame.askCost.value,
-                ...(frame.askUnpriced ? { unpriced: true } : {}),
-                duration: Date.now() - askStart,
+                type: 'ask_start',
+                prompt: promptText,
+                ...(inputDescriptor ? { input: inputDescriptor } : {}),
               });
-            } catch (error) {
-              terminalFailed = true;
-              terminalFailure = isEventStreamOverflowError(error)
-                ? preserveErrorCause(error, askFailure)
-                : error;
-            }
 
-            // Strict overflow takes precedence over an in-flight ask failure so
-            // recovery boundaries cannot hide an incomplete terminal trace.
-            if (terminalFailed) throw terminalFailure;
-            if (askFailed) throw askFailure;
-            return result as T;
-          });
+              // `costBefore` snapshots the global budget so we can pass the per-ask
+              // cost delta to onAgentCallComplete (legacy callback that reports the
+              // whole-tree spend). `frame.askCost` is the spec-correct, this-ask-only
+              // figure used on `ask_end` (decision 10).
+              const costBefore = this.budgetContext?.totalCost ?? 0;
+              const unpricedCountBefore = this.budgetContext?.unpricedCount ?? 0;
+              const resolveCtx = options?.metadata
+                ? { metadata: { ...this.metadata, ...options.metadata } }
+                : { metadata: this.metadata };
+
+              // Use a mutable container to capture usage from executeAgentCall
+              // without relying on an instance property (which is racy under
+              // concurrent calls).
+              const usageCapture: {
+                value?: {
+                  prompt_tokens: number;
+                  completion_tokens: number;
+                  total_tokens: number;
+                  cached_tokens?: number;
+                  cache_write_tokens?: number;
+                };
+                modelUri?: string;
+                /** Last completed turn's provider timing, for span attributes. */
+                timing?: CallTiming;
+              } = {};
+
+              const doCall = async () => {
+                const result = await this.executeAgentCall(
+                  agent,
+                  normalizedInput,
+                  options as AskOptions<unknown>,
+                  undefined,
+                  usageCapture,
+                  normalizedHistory,
+                );
+                return result as T;
+              };
+
+              // Spec decision 9 invariant: every `ask_start` has a matching
+              // `ask_end`. Capture either outcome, emit the terminal once, then
+              // rethrow the captured failure. Current catches (gate exhaustion,
+              // budget, abort) and future failure paths between `ask_start` and
+              // the success emit therefore surface as `ask_end`. The workflow-
+              // level `error` event is reserved for failures with no ask_end;
+              // consumers must never see both for the same failure.
+              let outcome: { ok: true; result: T } | { ok: false; error: string } | undefined;
+              let askFailure: unknown;
+              let askFailed = false;
+              let result: T | undefined;
+              try {
+                result = this.spanManager
+                  ? await this.spanManager.withSpanAsync(
+                      'axl.agent.ask',
+                      {
+                        'axl.agent.name': agent._name,
+                        'axl.agent.model': agent.resolveModel(resolveCtx),
+                      },
+                      async (span) => {
+                        const r = await doCall();
+                        if (usageCapture.modelUri) {
+                          span.setAttribute('axl.agent.model', usageCapture.modelUri);
+                        }
+                        const costAfter = this.budgetContext?.totalCost ?? 0;
+                        span.setAttribute('axl.agent.cost', costAfter - costBefore);
+                        span.setAttribute('axl.agent.duration', Date.now() - askStart);
+                        // `axl.agent.duration` is ask wall clock; these split the
+                        // last provider call's share of it. Set only when the
+                        // provider instrumented the call — an uninstrumented
+                        // adapter must not look like a zero-latency one.
+                        if (usageCapture.timing) {
+                          const t = usageCapture.timing;
+                          span.setAttribute('axl.agent.queued_ms', t.queuedMs);
+                          span.setAttribute('axl.agent.retry_ms', t.retryMs);
+                          span.setAttribute('axl.agent.attempts', t.attempts);
+                          span.setAttribute('axl.agent.ttfb_ms', t.ttfbMs);
+                          span.setAttribute('axl.agent.wire_ms', t.wireMs);
+                          if (t.firstTokenMs !== undefined) {
+                            span.setAttribute('axl.agent.first_token_ms', t.firstTokenMs);
+                          }
+                        }
+                        if (usageCapture.value) {
+                          span.setAttribute(
+                            'axl.agent.prompt_tokens',
+                            usageCapture.value.prompt_tokens,
+                          );
+                          span.setAttribute(
+                            'axl.agent.completion_tokens',
+                            usageCapture.value.completion_tokens,
+                          );
+                          if (usageCapture.value.cached_tokens)
+                            span.setAttribute(
+                              'axl.agent.cached_tokens',
+                              usageCapture.value.cached_tokens,
+                            );
+                          if (usageCapture.value.cache_write_tokens)
+                            span.setAttribute(
+                              'axl.agent.cache_write_tokens',
+                              usageCapture.value.cache_write_tokens,
+                            );
+                        }
+                        return r;
+                      },
+                    )
+                  : await doCall();
+                outcome = { ok: true, result };
+
+                // Success path: invoke the legacy onAgentCallComplete hook.
+                // Isolate consumer bugs (mirror the onTrace pattern at
+                // emitEvent): a hook throw is post-success observability —
+                // the agent's run already succeeded, so we must NOT
+                // overwrite the outcome to ok:false. Swallow + console.error
+                // so reliability dashboards keyed off ask_end.outcome aren't
+                // poisoned by hook bugs.
+                const costAfter = this.budgetContext?.totalCost ?? 0;
+                const unpricedCountAfter = this.budgetContext?.unpricedCount ?? 0;
+                if (this.onAgentCallComplete) {
+                  try {
+                    this.onAgentCallComplete({
+                      agent: agent._name,
+                      prompt: promptText,
+                      ...(inputDescriptor ? { input: inputDescriptor } : {}),
+                      response: typeof result === 'string' ? result : JSON.stringify(result),
+                      model: usageCapture.modelUri ?? agent.resolveModel(resolveCtx),
+                      cost: costAfter - costBefore,
+                      unpriced: frame.askUnpriced || unpricedCountAfter > unpricedCountBefore,
+                      duration: Date.now() - askStart,
+                      promptVersion: agent._config.version,
+                      temperature: options?.temperature ?? agent._config.temperature,
+                      maxTokens: options?.maxTokens ?? agent._config.maxTokens ?? 4096,
+                      effort: options?.effort ?? agent._config.effort,
+                      thinkingBudget: options?.thinkingBudget ?? agent._config.thinkingBudget,
+                      includeThoughts: options?.includeThoughts ?? agent._config.includeThoughts,
+                      toolChoice: options?.toolChoice ?? agent._config.toolChoice,
+                      stop: options?.stop ?? agent._config.stop,
+                      providerOptions: options?.providerOptions ?? agent._config.providerOptions,
+                    });
+                  } catch (hookErr) {
+                    console.error(
+                      '[axl] onAgentCallComplete hook threw; ask outcome unchanged:',
+                      hookErr instanceof Error ? hookErr.message : String(hookErr),
+                    );
+                  }
+                }
+              } catch (err) {
+                askFailed = true;
+                askFailure = err;
+                if (richAsk) this.recordRichFailure(err);
+                outcome = {
+                  ok: false,
+                  error: this._observerErrorProjection(err)?.message ?? legacyErrorMessage(err),
+                };
+              }
+
+              // Defensive: `outcome` is always set by either the success or catch
+              // branch above. The fallback makes a future internal control-flow
+              // bug explicit without dropping ask_end.
+              let terminalFailure: unknown;
+              let terminalFailed = false;
+              try {
+                this.emitEvent({
+                  type: 'ask_end',
+                  outcome:
+                    outcome ??
+                    ({
+                      ok: false,
+                      error: 'ask_end emitted without outcome — internal bug',
+                    } as const),
+                  cost: frame.askCost.value,
+                  ...(frame.askUnpriced ? { unpriced: true } : {}),
+                  duration: Date.now() - askStart,
+                });
+              } catch (error) {
+                terminalFailed = true;
+                terminalFailure = isEventStreamOverflowError(error)
+                  ? preserveErrorCause(error, askFailure)
+                  : error;
+              }
+
+              // Strict overflow takes precedence over an in-flight ask failure so
+              // recovery boundaries cannot hide an incomplete terminal trace.
+              if (terminalFailed) throw terminalFailure;
+              if (askFailed) throw askFailure;
+              return result as T;
+            }),
+          );
         },
         { agent: agentName },
       );
@@ -2191,6 +2201,12 @@ export class WorkflowContext<TInput = unknown> {
     // Set before `continue`ing to a retry turn; read when emitting the next
     // agent_call so consumers can see *why* a given LLM call is a retry.
     let pendingRetryReason: 'schema' | 'validate' | 'guardrail' | undefined;
+    // The correction that will be visible in the NEXT turn's submitted
+    // conversation: which gate rejected the last output, why, and the exact
+    // feedback text appended for the model. Set beside `pendingRetryReason` on
+    // every gate retry path and consumed by request capture, so a captured
+    // record explains itself without the reader diffing two conversations.
+    let pendingCorrection: CapturedCorrection | undefined;
     // `trace.level === 'full'` opts into verbose traces: we include the full ChatMessage[]
     // snapshot on each agent_call so the trace explorer can reconstruct exactly what the
     // model saw (growing with tool results + retry feedback across turns).
@@ -2412,6 +2428,21 @@ export class WorkflowContext<TInput = unknown> {
       // end carry the same retryReason for this turn.
       const retryReason = pendingRetryReason;
       pendingRetryReason = undefined;
+      const correction = pendingCorrection;
+      pendingCorrection = undefined;
+
+      // Stamp this turn's identity for opt-in request capture. `currentMessages`
+      // at this point IS the conversation about to be submitted, so the record
+      // built by the facade and this correction describe the same turn.
+      const askFrame = askStorage.getStore();
+      setCaptureTurn({
+        executionId: this.executionId,
+        ...(askFrame?.askId !== undefined ? { askId: askFrame.askId } : {}),
+        ...(askFrame?.parentAskId !== undefined ? { parentAskId: askFrame.parentAskId } : {}),
+        turn: turns,
+        ...(retryReason ? { retryReason } : {}),
+        ...(correction ? { correction } : {}),
+      });
 
       this.emitEvent({
         type: 'agent_call_start',
@@ -3137,6 +3168,11 @@ export class WorkflowContext<TInput = unknown> {
                 response.providerMetadata,
               );
               pendingRetryReason = 'guardrail';
+              pendingCorrection = {
+                stage: 'guardrail',
+                reason: blockReason,
+                feedbackMessage: decision.message,
+              };
               continue; // Re-enter the while loop for another LLM turn
             }
             // `{ retry: false }`: same terminal error as retry exhaustion on this path.
@@ -3225,6 +3261,11 @@ export class WorkflowContext<TInput = unknown> {
                 response.providerMetadata,
               );
               pendingRetryReason = 'schema';
+              pendingCorrection = {
+                stage: 'schema',
+                ...(schemaReason !== undefined ? { reason: schemaReason } : {}),
+                feedbackMessage: decision.message,
+              };
               continue; // Re-enter the while loop for another LLM turn
             }
             // `{ retry: false }`: fall through to the same `VerifyError` as exhaustion.
@@ -3321,6 +3362,11 @@ export class WorkflowContext<TInput = unknown> {
                 response.providerMetadata,
               );
               pendingRetryReason = 'validate';
+              pendingCorrection = {
+                stage: 'validate',
+                reason: validateResult.reason ?? 'Validation failed',
+                feedbackMessage: decision.message,
+              };
               continue; // Re-enter the while loop — goes through all gates again
             }
             // `{ retry: false }`: fall through to the same `ValidationError` as exhaustion.

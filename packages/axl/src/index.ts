@@ -50,6 +50,37 @@ export type {
   OperationPurpose,
 } from './accounting.js';
 
+// Diagnostics — opt-in request capture and the artifacts it writes into.
+export { FileDiagnosticArtifactStore } from './diagnostics/artifact-store.js';
+export type {
+  ArtifactManifest,
+  ArtifactOwner,
+  ArtifactStatus,
+  DiagnosticArtifactStore,
+  OpenedArtifact,
+  StagedArtifact,
+} from './diagnostics/artifact-store.js';
+export {
+  RequestCaptureChannel,
+  DEFAULT_MAX_QUEUE_BYTES,
+  DEFAULT_MAX_RECORD_BYTES,
+  DEFAULT_MAX_RUN_BYTES,
+} from './diagnostics/capture.js';
+export type {
+  CaptureCorrelation,
+  CapturedCorrection,
+  CapturedError,
+  CapturedMessage,
+  CapturedOperationRef,
+  CapturedPhase,
+  CapturedRequest,
+  CapturedRequestRecord,
+  CapturedResponse,
+  RequestCaptureOptions,
+  RequestCaptureSink,
+  RequestCaptureStatus,
+} from './diagnostics/capture.js';
+
 // Module-resolution helpers — internal but exported so the eval CLI and
 // Studio middleware share one implementation of the ESM/CJS interop walk.
 // Not part of the stable public API.
@@ -68,7 +99,7 @@ export {
   registerConditions,
 } from './cli-internals.js';
 export { defineConfig } from './config.js';
-export type { AxlConfig } from './config.js';
+export type { AxlConfig, DiagnosticsConfig, DiagnosticArtifactsConfig } from './config.js';
 
 // Stream — carries `AxlEvent` directly. No `StreamEvent` shim — consumers
 // narrow on `event.type` from the `AxlEvent` union (spec/16 decision 8).
@@ -209,7 +240,13 @@ export type {
   AgentCallInfo,
 } from './types.js';
 export { AXL_EVENT_TYPES, AXL_EVENT_TYPES_V2, AXL_TOOL_LIFECYCLE_TYPES_V2 } from './types.js';
-export { REDACTED, REDACTION_RULES, redactEvent, redactHistoricalEvent } from './redaction.js';
+export {
+  REDACTED,
+  REDACTION_RULES,
+  redactCapturedRequest,
+  redactEvent,
+  redactHistoricalEvent,
+} from './redaction.js';
 
 // Errors
 export {
@@ -228,6 +265,7 @@ export {
   InvalidModelInputError,
   UnsupportedModelInputError,
   AdmissionDeniedError,
+  isAdmissionDeniedError,
 } from './errors.js';
 export type { ToolFailureConstructor, TimeoutBreakdown } from './errors.js';
 export { ProviderError, isRetryableStatus } from './providers/errors.js';

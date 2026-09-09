@@ -1,3 +1,4 @@
+import type { DiagnosticArtifactStore } from './diagnostics/artifact-store.js';
 import type { RateLimitConfig } from './providers/rate-limiter.js';
 import type { ApiKeySource } from './providers/types.js';
 import type { AuthHeader } from './providers/openai-compatible.js';
@@ -135,6 +136,37 @@ export type DiagnosticsConfig = {
    * `AXL_DIAGNOSTICS_SILENT=true`.
    */
   silent?: boolean;
+  /**
+   * Where opt-in captured-request artifacts are stored, and how their lifecycle
+   * is reclaimed. Managed capture (`runEval({ captureRequests: true })`) is
+   * UNAVAILABLE until this is configured — Axl never silently writes captured
+   * prompts to a process temp folder.
+   *
+   * Supply exactly one of `root` (use the built-in
+   * {@link DiagnosticArtifactStore} filesystem backend) or `store` (your own
+   * backend — required when eval history lives in Redis, whose server-side TTL
+   * cannot notify a local filesystem).
+   *
+   * The configured `StateStore` must implement `getEvalRetention` so an
+   * artifact's logical expiry can follow its owning history row; a custom store
+   * without it is rejected when the runtime is constructed, not after a run has
+   * already spent money.
+   */
+  artifacts?: DiagnosticArtifactsConfig;
+};
+
+/** Artifact storage + reclamation settings. See {@link DiagnosticsConfig.artifacts}. */
+export type DiagnosticArtifactsConfig = {
+  /** A host-supplied backend. Takes precedence over `root`. */
+  store?: DiagnosticArtifactStore;
+  /** Directory for the built-in filesystem backend. Ignored when `store` is set. */
+  root?: string;
+  /** Reconciliation sweep period in ms. Default `60_000`. The timer is unref'd
+   *  and cleared by `runtime.shutdown()`. */
+  sweepIntervalMs?: number;
+  /** How long a staged (actively written) artifact is protected from the
+   *  sweeper before it counts as abandoned. Default `300_000`. */
+  leaseMs?: number;
 };
 
 import type { TelemetryConfig } from './telemetry/types.js';

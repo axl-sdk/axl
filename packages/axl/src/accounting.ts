@@ -172,8 +172,18 @@ export type ExternalOperationDescriptor = { name: string };
 // Admission
 // ---------------------------------------------------------------------------
 
-/** @internal Module-private settlement channel into the controller. */
-const RECORD_SPEND: unique symbol = Symbol('axl.admission.recordSpend');
+/**
+ * @internal The settlement channel into a controller.
+ *
+ * `Symbol.for`, NOT `Symbol()`: this package legitimately loads twice in one
+ * process — an ESM consumer whose `runtime.eval()` dynamically imports
+ * `@axlsdk/eval`, which resolves its own copy of `@axlsdk/axl`, is the ordinary
+ * case, not a pathology. A module-private symbol would make the controller
+ * built by copy A invisible to the settlement walk in copy B, and spend would
+ * silently stop reaching the budget. The registry symbol is shared across
+ * realms, so both copies agree.
+ */
+const RECORD_SPEND: unique symbol = Symbol.for('axl.accounting.recordSpend');
 
 /**
  * A synchronous known-spend threshold for one invocation.
@@ -480,6 +490,34 @@ export function runWithDispatchAdmission<T>(
  * settlement. For those ancestors this walk is the operation's first terminal,
  * so nothing is replaced and nothing is double counted.
  */
+/**
+ * Charge a controller, failing loudly when the object cannot actually be
+ * charged.
+ *
+ * The registry symbol above makes two copies of this package interoperate, but
+ * it cannot make an object that never had the channel work. A plain object
+ * shaped like a controller, or one built by a package version predating this
+ * channel, would otherwise die as `TypeError: scope.admission[Symbol(...)] is
+ * not a function` — a stack trace that names nothing a user can act on, raised
+ * from the middle of a settlement walk. Naming the cause is the difference
+ * between "your budget silently stopped counting" and "you have two installs of
+ * @axlsdk/axl".
+ */
+function recordSpend(controller: AdmissionController, amountUsd: number): void {
+  const channel = (controller as { [RECORD_SPEND]?: unknown })[RECORD_SPEND];
+  if (typeof channel !== 'function') {
+    throw new AxlError(
+      'INCOMPATIBLE_ADMISSION_CONTROLLER',
+      'The attached AdmissionController does not expose the internal settlement channel, ' +
+        'so spend cannot be recorded against it. This normally means the controller came ' +
+        'from a DIFFERENT copy of @axlsdk/axl than the runtime settling the operation ' +
+        '(duplicated/mismatched installs — check `npm ls @axlsdk/axl`), or that a ' +
+        'hand-built object was passed where an AdmissionController instance is required.',
+    );
+  }
+  (channel as (amount: number) => void).call(controller, amountUsd);
+}
+
 function settleOperationUp(
   start: AccountingScope,
   op: OperationRecord,
@@ -514,7 +552,7 @@ function settleOperationUp(
         scope.recordSettled(op, outcome.cost, outcome.provenance, outcome.usage);
         if (scope.admission && !chargedControllers.has(scope.admission)) {
           chargedControllers.add(scope.admission);
-          scope.admission[RECORD_SPEND](outcome.cost);
+          recordSpend(scope.admission, outcome.cost);
         }
         break;
       case 'unknown':

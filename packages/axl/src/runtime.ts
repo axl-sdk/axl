@@ -53,6 +53,21 @@ import {
   type OperationPurpose,
 } from './accounting.js';
 import { createScopedProvider } from './providers/scoped-provider.js';
+import {
+  FileDiagnosticArtifactStore,
+  type ArtifactManifest,
+  type ArtifactOwner,
+  type ArtifactStatus,
+  type DiagnosticArtifactStore,
+  type OpenedArtifact,
+} from './diagnostics/artifact-store.js';
+import {
+  RequestCaptureChannel,
+  runWithCaptureChannel,
+  runWithCaptureCorrelation,
+  type CaptureCorrelation,
+  type RequestCaptureSink,
+} from './diagnostics/capture.js';
 import { NoopSpanManager } from './telemetry/noop.js';
 import { createSpanManager } from './telemetry/index.js';
 import type { SpanManager, SpanHandle } from './telemetry/types.js';
@@ -93,6 +108,10 @@ function hashInput(input: unknown): string {
 const DEFAULT_MAX_EVENTS_PER_EXECUTION = 50_000;
 const DEFAULT_STREAMING_BATCH_SIZE = 100;
 const DEFAULT_STREAMING_BATCH_INTERVAL = 1_000; // ms
+/** How often orphaned/expired diagnostic artifacts are reclaimed. */
+const DEFAULT_ARTIFACT_SWEEP_MS = 60_000;
+/** How long an actively-written (staged) artifact is protected from the sweep. */
+const DEFAULT_ARTIFACT_LEASE_MS = 300_000;
 
 /** Sentinel workflow name on synthesized ExecutionInfos when the streaming
  *  buffer doesn't include a `workflow_start` event. The `__axl/` prefix
@@ -673,6 +692,25 @@ export type TrackOutcomeOptions = {
   captureTraces?: boolean;
   /** Retain the per-call `CallTiming` blocks behind the `modelTiming` sums. */
   captureTimingSamples?: boolean;
+  /**
+   * Opt in to bounded, redaction-aware capture of the provider-neutral REQUESTS
+   * this scope submits, written into `sink` as JSONL.
+   *
+   * Diagnostics only: capture can be truncated, fail outright, or be turned off
+   * entirely and `accounting` is byte-identical either way. The sink is never
+   * awaited by a provider call. Nested scopes inherit the enclosing channel, so
+   * declare it once at the outermost scope of a run.
+   *
+   * The CALLER owns the channel because the caller is the one that has to
+   * `close()` it and read back its operation ledger after the run.
+   */
+  capture?: RequestCaptureChannel;
+  /**
+   * Stamp consumer-side identity onto every record captured inside this scope
+   * (an eval's `caseIndex`, a judge's `scorer` name). Merged over the enclosing
+   * scope's correlation, so a scorer scope keeps its item's case index.
+   */
+  captureCorrelation?: CaptureCorrelation;
 };
 
 /** The result of {@link AxlRuntime.trackOutcome} — never a rejection. */
@@ -796,6 +834,10 @@ export class AxlRuntime extends EventEmitter {
    *  The Set is mutated by the chain's own `.finally` so entries clear as
    *  soon as the work settles. */
   private persistInflight = new Set<Promise<void>>();
+  /** Resolved diagnostic artifact backend, when `diagnostics.artifacts` is set. */
+  private artifactStore?: DiagnosticArtifactStore;
+  private artifactLeaseMs = DEFAULT_ARTIFACT_LEASE_MS;
+  private artifactSweepTimer?: ReturnType<typeof setInterval>;
 
   constructor(config?: AxlConfig) {
     super();
@@ -851,6 +893,207 @@ export class AxlRuntime extends EventEmitter {
         );
       }
     }
+    this.setUpDiagnosticArtifacts();
+  }
+
+  // ── Diagnostic artifacts (opt-in request capture) ────────────────────
+
+  /**
+   * Resolve the artifact backend and arm reclamation.
+   *
+   * Two configuration errors are raised HERE rather than at capture time,
+   * because both mean "this deployment can never host managed capture" and the
+   * alternative is discovering it after an eval has already spent money:
+   * a `diagnostics.artifacts` block with neither `store` nor `root`, and a
+   * custom `StateStore` that cannot report eval retention.
+   */
+  private setUpDiagnosticArtifacts(): void {
+    const artifacts = this.config.diagnostics?.artifacts;
+    if (!artifacts) return;
+    if (artifacts.store) {
+      this.artifactStore = artifacts.store;
+    } else if (typeof artifacts.root === 'string' && artifacts.root.trim() !== '') {
+      this.artifactStore = new FileDiagnosticArtifactStore({ root: artifacts.root });
+    } else {
+      throw new AxlError(
+        'DIAGNOSTICS_UNAVAILABLE',
+        'config.diagnostics.artifacts requires either `root` (built-in filesystem store) ' +
+          'or `store` (a host-supplied DiagnosticArtifactStore). Axl will not write captured ' +
+          'requests to a process temp folder.',
+      );
+    }
+    if (typeof this.stateStore.getEvalRetention !== 'function') {
+      throw new AxlError(
+        'DIAGNOSTICS_UNAVAILABLE',
+        'config.diagnostics.artifacts requires a StateStore implementing getEvalRetention(id) ' +
+          'so artifact lifetime can follow the eval history row that owns it. The built-in ' +
+          'memory, SQLite and Redis stores implement it; add it to your custom store.',
+      );
+    }
+    this.artifactLeaseMs =
+      typeof artifacts.leaseMs === 'number' && artifacts.leaseMs > 0
+        ? artifacts.leaseMs
+        : DEFAULT_ARTIFACT_LEASE_MS;
+    const sweepMs =
+      typeof artifacts.sweepIntervalMs === 'number' && artifacts.sweepIntervalMs > 0
+        ? artifacts.sweepIntervalMs
+        : DEFAULT_ARTIFACT_SWEEP_MS;
+    // Startup reconciliation: a process that was down while a Redis TTL expired
+    // (or that died mid-run) has orphaned bytes on disk right now. Fire-and-
+    // forget so construction stays synchronous; failures are diagnostics-only.
+    void this.reconcileDiagnosticArtifacts().catch(() => undefined);
+    this.artifactSweepTimer = setInterval(() => {
+      void this.reconcileDiagnosticArtifacts().catch(() => undefined);
+    }, sweepMs);
+    // Never hold the event loop open for a diagnostics sweeper.
+    this.artifactSweepTimer.unref?.();
+  }
+
+  /** The configured artifact backend, or `undefined` when capture is off. */
+  getDiagnosticArtifactStore(): DiagnosticArtifactStore | undefined {
+    return this.artifactStore;
+  }
+
+  private requireArtifactStore(): DiagnosticArtifactStore {
+    if (!this.artifactStore) {
+      throw new AxlError(
+        'DIAGNOSTICS_UNAVAILABLE',
+        'Request capture was requested but no diagnostic artifact store is configured. ' +
+          'Set config.diagnostics.artifacts = { root: "<dir>" } (or supply your own `store`).',
+      );
+    }
+    return this.artifactStore;
+  }
+
+  /**
+   * Reserve an artifact for `owner` and hand back a sink to write records into.
+   *
+   * Throws `AxlError('DIAGNOSTICS_UNAVAILABLE')` BEFORE any work when capture is
+   * not configured, which is why `runEval` calls it ahead of loading the
+   * dataset. The returned sink renews the staging lease as it writes, so a long
+   * run is never swept out from under itself, while a run that dies leaves a
+   * lease that expires and is reclaimed.
+   */
+  async stageDiagnosticArtifact(owner: ArtifactOwner): Promise<{
+    artifactId: string;
+    sink: RequestCaptureSink;
+  }> {
+    const store = this.requireArtifactStore();
+    const leaseMs = this.artifactLeaseMs;
+    const staged = await store.stage(owner, { leaseMs });
+    let nextRenewal = Date.now() + leaseMs / 2;
+    return {
+      artifactId: staged.artifactId,
+      sink: {
+        append: async (line: string) => {
+          await store.append(staged.artifactId, line);
+          if (Date.now() >= nextRenewal) {
+            nextRenewal = Date.now() + leaseMs / 2;
+            await staged.renewLease();
+          }
+        },
+      },
+    };
+  }
+
+  /** Seal a staged artifact's manifest. Called before the history row is saved. */
+  async finalizeDiagnosticArtifact(
+    artifactId: string,
+    status: ArtifactStatus,
+    reason?: string,
+  ): Promise<ArtifactManifest> {
+    return this.requireArtifactStore().finalize(artifactId, status, reason);
+  }
+
+  /** Discard a staged artifact whose owner will never be written. */
+  async rollbackDiagnosticArtifact(artifactId: string): Promise<void> {
+    await this.requireArtifactStore().rollback(artifactId);
+  }
+
+  /**
+   * Copy a source run's artifact into a new owner (rescore provenance).
+   *
+   * Bounded by `maxBytes`; a partial copy reports `truncated` so the caller can
+   * finalize the new manifest honestly. Returns `undefined` when the source is
+   * gone — a rescore of a run whose artifact was deleted still produces numbers,
+   * it just reports its diagnostics as `unavailable`.
+   */
+  async copyDiagnosticArtifact(
+    sourceId: string,
+    owner: ArtifactOwner,
+    opts: { maxBytes: number },
+  ): Promise<{ artifactId: string; truncated: boolean } | undefined> {
+    return this.requireArtifactStore().copy(sourceId, owner, {
+      maxBytes: opts.maxBytes,
+      leaseMs: this.artifactLeaseMs,
+    });
+  }
+
+  /**
+   * Read a committed artifact's records, or `undefined`.
+   *
+   * Two logical checks stand between a caller and the bytes, because the bytes
+   * outlive the store that governs them: the owning history row must still
+   * exist, and the mirrored `expiresAt` must not have passed. A Redis row that
+   * aged out while this process was offline therefore reads as unavailable the
+   * moment it is asked for, not whenever the sweeper next runs.
+   */
+  async openDiagnosticArtifact(artifactId: string): Promise<OpenedArtifact | undefined> {
+    if (!this.artifactStore) return undefined;
+    const opened = await this.artifactStore.open(artifactId);
+    if (!opened) return undefined;
+    const { manifest } = opened;
+    if (manifest.state === 'delete_pending') return undefined;
+    if (manifest.expiresAt !== undefined && manifest.expiresAt <= Date.now()) return undefined;
+    const retention = await this.stateStore.getEvalRetention?.(manifest.owner.id);
+    if (retention && !retention.exists) return undefined;
+    return opened;
+  }
+
+  /**
+   * Reclaim artifacts nothing can legitimately read any more.
+   *
+   * Removed: everything marked `delete_pending` (a delete that did not finish),
+   * every `committed` artifact whose owner row is gone or whose expiry has
+   * passed, and every `staged` artifact whose lease ran out. A staged artifact
+   * with a LIVE lease is never touched — that is an active writer, and sweeping
+   * it would race a run that is still producing evidence.
+   */
+  async reconcileDiagnosticArtifacts(): Promise<{ removed: string[] }> {
+    const store = this.artifactStore;
+    if (!store) return { removed: [] };
+    const now = Date.now();
+    const removed: string[] = [];
+    for (const manifest of await store.list()) {
+      let reclaim = false;
+      if (manifest.state === 'delete_pending') {
+        reclaim = true;
+      } else if (manifest.state === 'staged') {
+        reclaim = manifest.leaseUntil === undefined || manifest.leaseUntil <= now;
+      } else {
+        if (manifest.expiresAt !== undefined && manifest.expiresAt <= now) reclaim = true;
+        else {
+          const retention = await this.stateStore.getEvalRetention?.(manifest.owner.id);
+          if (retention && !retention.exists) reclaim = true;
+        }
+      }
+      if (!reclaim) continue;
+      try {
+        await store.delete(manifest.artifactId);
+        removed.push(manifest.artifactId);
+      } catch {
+        // Leave it for the next sweep rather than aborting the whole pass —
+        // one undeletable artifact must not strand every other orphan.
+      }
+    }
+    return { removed };
+  }
+
+  /** The artifact id an eval result carries, when it carries one. */
+  private artifactIdOf(data: unknown): string | undefined {
+    const diagnostics = (data as { diagnostics?: { artifactId?: unknown } } | undefined)
+      ?.diagnostics;
+    return typeof diagnostics?.artifactId === 'string' ? diagnostics.artifactId : undefined;
   }
 
   /**
@@ -1230,6 +1473,14 @@ export class AxlRuntime extends EventEmitter {
        * captured traces to keep memory bounded.
        */
       captureTraces?: boolean;
+      /**
+       * Forwarded to `runEval({ captureRequests })`. Requires
+       * `config.diagnostics.artifacts`; without it the run fails fast with
+       * `AxlError('DIAGNOSTICS_UNAVAILABLE')` before any provider call.
+       */
+      captureRequests?:
+        | boolean
+        | { maxRecordBytes?: number; maxRunBytes?: number; maxQueueBytes?: number };
     },
   ): Promise<unknown> {
     const entry = this.registeredEvals.get(name);
@@ -1250,6 +1501,7 @@ export class AxlRuntime extends EventEmitter {
           onProgress?: (event: EvalProgressEventShape) => void;
           signal?: AbortSignal;
           captureTraces?: boolean;
+          captureRequests?: unknown;
         },
       ) => Promise<unknown>;
       try {
@@ -1277,6 +1529,7 @@ export class AxlRuntime extends EventEmitter {
         onProgress: options?.onProgress,
         signal: options?.signal,
         captureTraces: options?.captureTraces,
+        captureRequests: options?.captureRequests,
       });
     } else {
       // Default: use runtime.eval() which creates its own executeWorkflow.
@@ -1287,6 +1540,7 @@ export class AxlRuntime extends EventEmitter {
         onProgress: options?.onProgress,
         signal: options?.signal,
         captureTraces: options?.captureTraces,
+        captureRequests: options?.captureRequests,
       });
     }
 
@@ -1905,6 +2159,13 @@ export class AxlRuntime extends EventEmitter {
     }
     this.abortControllers.clear();
 
+    // Stop the artifact sweeper before anything else touches the state store —
+    // a sweep that fires mid-teardown would query a closing connection.
+    if (this.artifactSweepTimer) {
+      clearInterval(this.artifactSweepTimer);
+      this.artifactSweepTimer = undefined;
+    }
+
     // Drain in-flight per-session work before closing the state store —
     // otherwise a Session.send/stream that's mid-save will write to a
     // closed SQLite/Redis connection. The chain entries are void+swallowed
@@ -2132,12 +2393,35 @@ export class AxlRuntime extends EventEmitter {
 
   /** Save an eval result to history. */
   async saveEvalResult(entry: EvalHistoryEntry): Promise<void> {
+    const artifactId = this.artifactIdOf(entry.data);
+
     // Add to in-memory cache (newest first)
     this.evalHistory.unshift(entry);
 
     // Persist to store
     if (this.stateStore.saveEvalResult) {
-      await this.stateStore.saveEvalResult(entry);
+      try {
+        await this.stateStore.saveEvalResult(entry);
+      } catch (error) {
+        // The owner row does not exist, so the staged artifact must not survive
+        // as an orphan. Rollback is best effort; the SAVE failure is what the
+        // caller needs to see, not a cleanup failure layered over it.
+        if (artifactId && this.artifactStore) {
+          await this.artifactStore.rollback(artifactId).catch(() => undefined);
+        }
+        throw error;
+      }
+    }
+
+    // Ownership becomes real only now that the history row exists. Mirroring the
+    // store's own retention onto the manifest is what lets a Redis deployment —
+    // whose server-side TTL can never notify a filesystem — still expire the
+    // bytes it owns.
+    if (artifactId && this.artifactStore) {
+      const retention = await this.stateStore.getEvalRetention?.(entry.id);
+      await this.artifactStore.commit(artifactId, {
+        ...(retention?.expiresAt !== undefined ? { expiresAt: retention.expiresAt } : {}),
+      });
     }
 
     // Emit for live aggregation (e.g., Studio eval trends)
@@ -2271,6 +2555,16 @@ export class AxlRuntime extends EventEmitter {
     // was against an unknown id.
     const existing = this.evalHistory.find((e) => e.id === id);
     const evalName = existing?.eval;
+    const artifactId = this.artifactIdOf(existing?.data);
+
+    // Record the deletion intent BEFORE the history row goes away. Once the row
+    // is gone the artifact is unreachable through any public path, so if the
+    // process dies between the two steps the intent is the only thing that can
+    // tell reconciliation to finish the job — the caller is never asked to
+    // re-supply a blob it just deleted.
+    if (artifactId && this.artifactStore) {
+      await this.artifactStore.markDeletePending(artifactId);
+    }
 
     const beforeLength = this.evalHistory.length;
     this.evalHistory = this.evalHistory.filter((e) => e.id !== id);
@@ -2279,6 +2573,14 @@ export class AxlRuntime extends EventEmitter {
     let removedFromStore = false;
     if (this.stateStore.deleteEvalResult) {
       removedFromStore = await this.stateStore.deleteEvalResult(id);
+    }
+
+    // The bytes are part of the delete, not an afterthought: this method reports
+    // success only once they are gone. A failure here surfaces to the caller
+    // with the `delete_pending` intent still on disk, so a retry or the next
+    // reconciliation sweep completes it.
+    if (artifactId && this.artifactStore) {
+      await this.artifactStore.delete(artifactId);
     }
 
     const removed = removedFromMemory || removedFromStore;
@@ -2453,6 +2755,11 @@ export class AxlRuntime extends EventEmitter {
       onProgress?: (event: EvalProgressEventShape) => void;
       signal?: AbortSignal;
       captureTraces?: boolean;
+      /** Forwarded to `runEval({ captureRequests })`. See
+       *  {@link AxlRuntime.runRegisteredEval}. */
+      captureRequests?:
+        | boolean
+        | { maxRecordBytes?: number; maxRunBytes?: number; maxQueueBytes?: number };
     },
   ): Promise<unknown> {
     let runEvalFn: (
@@ -2466,6 +2773,7 @@ export class AxlRuntime extends EventEmitter {
         onProgress?: (event: EvalProgressEventShape) => void;
         signal?: AbortSignal;
         captureTraces?: boolean;
+        captureRequests?: unknown;
       },
     ) => Promise<unknown>;
     try {
@@ -2695,7 +3003,15 @@ export class AxlRuntime extends EventEmitter {
       // path, which is exactly where the old trace-only rail lost charges.
       ({ outcome, accounting } = await runInAccountingScope<T>(
         { purpose: options?.purpose, admission: options?.admission },
-        () => costScopeStorage.run(scope, fn),
+        () =>
+          // Capture wraps the cost scope rather than the other way round so a
+          // record can never be written for an operation the accounting scope
+          // did not see. Both are pure ALS frames; omitting either is a no-op.
+          runWithCaptureChannel(options?.capture, () =>
+            runWithCaptureCorrelation(options?.captureCorrelation, () =>
+              costScopeStorage.run(scope, fn),
+            ),
+          ),
       ));
     } finally {
       this.off('trace', listener);

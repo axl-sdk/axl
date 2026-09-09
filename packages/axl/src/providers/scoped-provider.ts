@@ -23,6 +23,17 @@
  */
 
 import { openOperation, type AccountingUsage, type OperationHandle } from '../accounting.js';
+import {
+  currentCaptureChannel,
+  currentCaptureCorrelation,
+  currentCaptureTurn,
+  snapshotError,
+  snapshotRequest,
+  snapshotResponse,
+  type CapturedRequestRecord,
+  type RequestCaptureChannel,
+} from '../diagnostics/capture.js';
+import { redactCapturedRequest } from '../redaction.js';
 import type { ProviderResponse } from '../types.js';
 import type { ChatMessage, ChatOptions, Provider, StreamChunk } from './types.js';
 
@@ -59,12 +70,136 @@ function composeLifecycle(
   };
 }
 
-function instrumentedOptions(options: ChatOptions, handle: OperationHandle): ChatOptions {
+function instrumentedOptions(
+  options: ChatOptions,
+  handle: OperationHandle,
+  recorder?: CaptureRecorder,
+): ChatOptions {
   return {
     ...options,
-    requestLifecycle: composeLifecycle(options.requestLifecycle, () => handle.markDispatched()),
+    requestLifecycle: composeLifecycle(options.requestLifecycle, () => {
+      handle.markDispatched();
+      recorder?.markDispatch();
+    }),
     dispatchAdmission: handle.dispatchAdmission,
   };
+}
+
+/**
+ * The capture side of one provider invocation.
+ *
+ * Created BEFORE the adapter is called, so `snapshotRequest` runs against the
+ * request as the runtime built it — after the adapter has had a chance to
+ * mutate the arrays, and after the caller has had a chance to mutate its own,
+ * the record would describe something that was never submitted.
+ *
+ * Returns `undefined` when nothing is capturing, which is the default and
+ * costs one `AsyncLocalStorage` read.
+ */
+function beginCapture(
+  raw: Provider,
+  kind: 'chat' | 'stream',
+  operationId: string,
+  messages: readonly ChatMessage[],
+  options: ChatOptions,
+): CaptureRecorder | undefined {
+  const channel = currentCaptureChannel();
+  if (!channel) return undefined;
+  return new CaptureRecorder(channel, raw.name ?? 'unknown', kind, operationId, messages, options);
+}
+
+class CaptureRecorder {
+  private attempts = 0;
+  private ended = false;
+  private readonly turn: ReturnType<typeof currentCaptureTurn>;
+  private readonly correlation: ReturnType<typeof currentCaptureCorrelation>;
+  private readonly omitted: string[];
+
+  constructor(
+    private readonly channel: RequestCaptureChannel,
+    private readonly provider: string,
+    private readonly kind: 'chat' | 'stream',
+    private readonly operationId: string,
+    messages: readonly ChatMessage[],
+    private readonly options: ChatOptions,
+  ) {
+    const turn = currentCaptureTurn();
+    const correlation = currentCaptureCorrelation();
+    this.turn = turn;
+    this.correlation = correlation;
+    const { request, omitted } = snapshotRequest(messages, options);
+    this.omitted = omitted;
+    channel.noteOperation({
+      operationId,
+      kind,
+      ...(turn?.turn !== undefined ? { turn: turn.turn } : {}),
+      status: 'start_only',
+      ...(correlation?.caseIndex !== undefined ? { caseIndex: correlation.caseIndex } : {}),
+      ...(correlation?.scorer !== undefined ? { scorer: correlation.scorer } : {}),
+    });
+    this.emit({ phase: 'start', transportAttempts: 1, request });
+  }
+
+  private emit(
+    partial: Pick<CapturedRequestRecord, 'phase' | 'transportAttempts'> &
+      Partial<CapturedRequestRecord>,
+  ): void {
+    const record: CapturedRequestRecord = {
+      v: 1,
+      operationId: this.operationId,
+      kind: this.kind,
+      provider: this.provider,
+      model: this.options.model,
+      ...(this.correlation?.caseIndex !== undefined
+        ? { caseIndex: this.correlation.caseIndex }
+        : {}),
+      ...(this.correlation?.scorer !== undefined ? { scorer: this.correlation.scorer } : {}),
+      ...(this.turn?.executionId !== undefined ? { executionId: this.turn.executionId } : {}),
+      ...(this.turn?.askId !== undefined ? { askId: this.turn.askId } : {}),
+      ...(this.turn?.parentAskId !== undefined ? { parentAskId: this.turn.parentAskId } : {}),
+      ...(this.turn?.turn !== undefined ? { turn: this.turn.turn } : {}),
+      ...(this.turn?.retryReason !== undefined ? { retryReason: this.turn.retryReason } : {}),
+      ...(this.turn?.correction !== undefined ? { correction: this.turn.correction } : {}),
+      captured: {
+        fidelity: 'runtime_request',
+        redacted: false,
+        truncated: false,
+        omitted: this.omitted,
+      },
+      ...partial,
+    };
+    this.channel.write(this.channel.redact ? redactCapturedRequest(record) : record);
+  }
+
+  /** A transport attempt beyond the first: the SAME operation, retried. */
+  markDispatch(): void {
+    this.attempts += 1;
+    if (this.attempts <= 1) return;
+    this.emit({ phase: 'attempt', transportAttempts: this.attempts });
+    this.channel.noteOperation({
+      operationId: this.operationId,
+      kind: this.kind,
+      attempt: this.attempts,
+      status: 'start_only',
+    });
+  }
+
+  end(outcome: { response?: ProviderResponse; error?: unknown }): void {
+    if (this.ended) return;
+    this.ended = true;
+    this.emit({
+      phase: 'end',
+      transportAttempts: Math.max(1, this.attempts),
+      ...(outcome.response ? { response: snapshotResponse(outcome.response) } : {}),
+      ...('error' in outcome ? { error: snapshotError(outcome.error) } : {}),
+    });
+    this.channel.noteOperation({
+      operationId: this.operationId,
+      kind: this.kind,
+      attempt: Math.max(1, this.attempts),
+      status: 'recorded',
+    });
+  }
 }
 
 function openProviderOperation(
@@ -93,21 +228,27 @@ export function createScopedProvider(raw: Provider): Provider {
   const chat = async (messages: ChatMessage[], options: ChatOptions): Promise<ProviderResponse> => {
     const handle = openProviderOperation(raw, 'chat', options);
     if (!handle) return raw.chat(messages, options);
+    // Snapshot BEFORE dispatch. `beginCapture` reads the request by value, so a
+    // caller (or the adapter) mutating `messages`/`options` afterwards cannot
+    // rewrite history.
+    const recorder = beginCapture(raw, 'chat', handle.id, messages, options);
     try {
       const response = await handle.run(() =>
-        raw.chat(messages, instrumentedOptions(options, handle)),
+        raw.chat(messages, instrumentedOptions(options, handle, recorder)),
       );
       handle.settle({
         cost: response.cost,
         provenance: response.costProvenance,
         usage: toAccountingUsage(response.usage),
       });
+      recorder?.end({ response });
       return response;
     } catch (error) {
       // Settlement first, then rethrow the ORIGINAL value untouched — an
       // AdmissionDeniedError raised by our own dispatch hook has already
       // retracted the operation, and `settleFailure` is a no-op after that.
       handle.settleFailure();
+      recorder?.end({ error });
       throw error;
     }
   };
@@ -125,6 +266,7 @@ export function createScopedProvider(raw: Provider): Provider {
   const stream = (messages: ChatMessage[], options: ChatOptions): AsyncGenerator<StreamChunk> => {
     let inner: AsyncGenerator<StreamChunk> | undefined;
     let handle: OperationHandle | undefined;
+    let recorder: CaptureRecorder | undefined;
     let started = false;
     let settled = false;
     let finished = false;
@@ -146,8 +288,11 @@ export function createScopedProvider(raw: Provider): Provider {
     const start = (): void => {
       started = true;
       handle = openProviderOperation(raw, 'stream', options);
+      // Capture opens at the first `next()`, in the scope that actually began
+      // iteration — the same rule the operation itself follows.
+      if (handle) recorder = beginCapture(raw, 'stream', handle.id, messages, options);
       const source = handle
-        ? handle.run(() => raw.stream(messages, instrumentedOptions(options, handle!)))
+        ? handle.run(() => raw.stream(messages, instrumentedOptions(options, handle!, recorder)))
         : raw.stream(messages, options);
       // An adapter may return a bare async-iterable rather than a generator, so
       // take its iterator explicitly instead of assuming `next` sits on the
@@ -176,6 +321,7 @@ export function createScopedProvider(raw: Provider): Provider {
             // here rather than letting the scope report it as `abandoned` at
             // finalization.
             settleUnresolved();
+            recorder?.end({ error });
             throw error;
           }
         }
@@ -193,11 +339,24 @@ export function createScopedProvider(raw: Provider): Provider {
               usage: toAccountingUsage(result.value.usage),
             });
             settled = true;
+            // The `done` chunk is a stream's response: link its usage/cost to
+            // the same operation id the start record opened.
+            recorder?.end({
+              response: {
+                content: '',
+                ...(result.value.usage ? { usage: result.value.usage } : {}),
+                ...(result.value.cost !== undefined ? { cost: result.value.cost } : {}),
+                ...(result.value.costProvenance !== undefined
+                  ? { costProvenance: result.value.costProvenance }
+                  : {}),
+              } as ProviderResponse,
+            });
           }
           return result;
         } catch (error) {
           finished = true;
           settleUnresolved();
+          recorder?.end({ error });
           throw error;
         }
       },

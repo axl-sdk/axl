@@ -34,6 +34,10 @@ interface RedisClient {
   // mGet bulk-fetches values for an array of keys. Used by listExecutions /
   // listEvalResults after the sorted-set returns an ordered ID list.
   mGet(keys: string[]): Promise<Array<string | null>>;
+  // PTTL reports a key's remaining TTL in ms: -1 = no TTL, -2 = no such key.
+  // Used by getEvalRetention to derive an eval artifact's absolute expiry from
+  // the server-side TTL that actually governs the history row.
+  pTTL(key: string): Promise<number>;
   del(key: string | string[]): Promise<number>;
   sAdd(key: string, member: string | string[]): Promise<number>;
   sRem(key: string, member: string | string[]): Promise<number>;
@@ -941,6 +945,26 @@ export class RedisStore implements StateStore {
       .exec();
     const deleted = typeof deletedCount === 'number' ? deletedCount : 0;
     return deleted > 0;
+  }
+
+  /**
+   * Existence + absolute expiry for one eval history row.
+   *
+   * `PTTL` is the authority here rather than the configured `ttls.evalHistory`:
+   * the row may have been written under a different configuration, re-saved, or
+   * had its TTL cleared out of band, and an artifact swept on a stale
+   * assumption is deleted diagnostic evidence the user still owns.
+   *
+   * Redis expires the row server-side without telling anyone, so the absolute
+   * `expiresAt` returned here is mirrored onto the artifact manifest and the
+   * physical bytes are reclaimed by the next sweep (or by startup reconciliation
+   * if the process was down when the key aged out) — eventual, not synchronous.
+   */
+  async getEvalRetention(id: string): Promise<{ exists: boolean; expiresAt?: number }> {
+    const ttl = await this.client.pTTL(this.evalHistoryKey(id));
+    if (ttl === -2) return { exists: false };
+    if (typeof ttl !== 'number' || ttl < 0) return { exists: true };
+    return { exists: true, expiresAt: Date.now() + ttl };
   }
 
   /**

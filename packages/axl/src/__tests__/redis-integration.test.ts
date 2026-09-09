@@ -177,6 +177,60 @@ describe.skipIf(!REDIS_URL)('RedisStore integration (real Redis)', () => {
       await ttlStore.close?.();
     });
 
+    /**
+     * A13.10 — eval-history durability plus the retention probe that diagnostic
+     * artifacts are reclaimed on. Real Redis is the only place PTTL's -1/-2
+     * sentinels and TTL drift between SET EX and EXPIRE are actually exercised.
+     */
+    it('round-trips an eval result and reports its real retention', async () => {
+      const id = `ev-ttl-${randomUUID()}`;
+      const data = {
+        id,
+        totalCost: 1.25,
+        accounting: { version: 1, currency: 'USD', knownCost: 1.25, completeness: 'complete' },
+        diagnostics: { artifactId: 'artifact-abc', status: 'complete' },
+      };
+
+      await ttlStore.saveEvalResult({ id, eval: 'suite', timestamp: Date.now(), data });
+
+      const listed = (await ttlStore.listEvalResults()).find((e) => e.id === id);
+      // Durability is the claim: never infer it from the Memory store.
+      expect(listed?.data).toEqual(data);
+
+      const retention = await ttlStore.getEvalRetention(id);
+      expect(retention.exists).toBe(true);
+      // This store configures no evalHistory TTL, so the row never expires and
+      // the artifact must not be scheduled for reclamation.
+      expect(retention.expiresAt).toBeUndefined();
+
+      await ttlStore.deleteEvalResult(id);
+      // After deletion PTTL returns -2, which must read as "owner gone" so the
+      // artifact bytes get reclaimed rather than leaked forever.
+      expect(await ttlStore.getEvalRetention(id)).toEqual({ exists: false });
+    });
+
+    it('reports an absolute expiry for an eval row written under a TTL', async () => {
+      const expiring = await RedisStore.create({
+        url: REDIS_URL!,
+        keyPrefix: `${TEST_PREFIX}evalttl-`,
+        skipMigration: true,
+        ttls: { evalHistory: 120 },
+      });
+      try {
+        const id = `ev-exp-${randomUUID()}`;
+        await expiring.saveEvalResult({ id, eval: 'suite', timestamp: Date.now(), data: {} });
+
+        const before = Date.now();
+        const retention = await expiring.getEvalRetention(id);
+
+        expect(retention.exists).toBe(true);
+        expect(retention.expiresAt!).toBeGreaterThan(before);
+        expect(retention.expiresAt!).toBeLessThanOrEqual(Date.now() + 120_000);
+      } finally {
+        await expiring.close?.();
+      }
+    });
+
     it('saveCheckpoint applies EXPIRE NX (fixed-from-first-write window)', async () => {
       const id = `ckpt-ttl-${randomUUID()}`;
       const client = (ttlStore as unknown as { client: { ttl: (key: string) => Promise<number> } })

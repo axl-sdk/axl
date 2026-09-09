@@ -223,6 +223,11 @@ export class MemoryStore implements StateStore {
     return this.evalHistory.delete(id);
   }
 
+  /** In-memory history never expires on its own — only existence is meaningful. */
+  async getEvalRetention(id: string): Promise<{ exists: boolean; expiresAt?: number }> {
+    return { exists: this.evalHistory.has(id) };
+  }
+
   // ── Sessions (Studio introspection) ─────────────────────────────────
 
   async listSessions(): Promise<string[]> {

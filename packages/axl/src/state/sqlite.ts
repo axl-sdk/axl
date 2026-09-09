@@ -529,6 +529,12 @@ export class SQLiteStore implements StateStore {
     return result.changes > 0;
   }
 
+  /** SQLite history has no automatic expiry — only existence is meaningful. */
+  async getEvalRetention(id: string): Promise<{ exists: boolean; expiresAt?: number }> {
+    const row = this.db.prepare('SELECT 1 FROM eval_history WHERE id = ?').get(id);
+    return { exists: row !== undefined };
+  }
+
   // ── Sessions (Studio introspection) ────────────────────────────────────
 
   async listSessions(): Promise<string[]> {

@@ -404,6 +404,28 @@ export class AdmissionDeniedError extends AxlError {
   }
 }
 
+/**
+ * Is this an admission denial, regardless of which copy of `@axlsdk/axl` threw it?
+ *
+ * `instanceof AdmissionDeniedError` is the natural check and it is the WRONG one
+ * across a module boundary: `runtime.eval()` dynamically imports `@axlsdk/eval`,
+ * which resolves its own `@axlsdk/axl`, and a dual ESM/CJS consumer can hold two
+ * copies at once. The classes are then structurally identical and referentially
+ * distinct, so `instanceof` returns false and a budget stop gets misreported as
+ * an ordinary workflow failure — the item reads `failed` instead of
+ * `budget_interrupted`, which is a lie about why the run stopped.
+ *
+ * Duck-typing on the stable public identity (`code` + `name`) is realm-proof.
+ * Prefer this over `instanceof` in any consumer that can be loaded separately
+ * from the runtime that threw.
+ */
+export function isAdmissionDeniedError(error: unknown): error is AdmissionDeniedError {
+  if (error instanceof AdmissionDeniedError) return true;
+  if (typeof error !== 'object' || error === null) return false;
+  const candidate = error as { code?: unknown; name?: unknown };
+  return candidate.code === 'ADMISSION_DENIED' && candidate.name === 'AdmissionDeniedError';
+}
+
 /** Thrown when an agent exceeds its maximum number of tool-calling turns */
 export class MaxTurnsError extends AxlError {
   readonly maxTurns: number;

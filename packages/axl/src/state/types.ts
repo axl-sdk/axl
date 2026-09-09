@@ -109,6 +109,25 @@ export interface StateStore {
   listEvalResults?(limit?: number): Promise<EvalHistoryEntry[]>;
   /** Delete an eval history entry by id. Returns true if an entry was deleted. */
   deleteEvalResult?(id: string): Promise<boolean>;
+  /**
+   * Retention capability: does this eval history row still exist, and when does
+   * the store itself expire it?
+   *
+   * Diagnostic artifacts (opt-in captured requests) live OUTSIDE the state store
+   * — typically on a filesystem — and their lifetime must follow the history row
+   * that owns them. A store with server-side expiry (Redis `PTTL`) cannot notify
+   * that filesystem when a key ages out, so the runtime mirrors the absolute
+   * `expiresAt` onto the artifact manifest at commit time and sweeps expired
+   * bytes on a timer and at startup. Physical deletion is therefore EVENTUAL,
+   * not synchronous with the store's expiry.
+   *
+   * Built-ins implement it: `MemoryStore` and `SqliteStore` never expire, so
+   * `expiresAt` is `undefined`; `RedisStore` reports existence and any live TTL.
+   * A custom store WITHOUT this method cannot host managed artifact capture —
+   * `AxlRuntime` rejects that configuration when it is constructed rather than
+   * after a run has spent money.
+   */
+  getEvalRetention?(id: string): Promise<{ exists: boolean; expiresAt?: number }>;
 
   // Sessions (Studio introspection)
   /** List all session IDs (used by Studio session browser). */

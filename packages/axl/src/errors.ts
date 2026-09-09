@@ -364,6 +364,46 @@ export class BudgetExceededError extends AxlError {
   }
 }
 
+/**
+ * Thrown when an `AdmissionController` refuses to admit a paid operation
+ * because known spend has reached its limit.
+ *
+ * This is a *stop*, not a failure of the provider: it is never wrapped in a
+ * `ProviderError`, never auto-retried by the transport, and never treated as
+ * an abort. It is raised either when the operation opens or at the transport's
+ * pre-dispatch check — in both cases before the request leaves the process, so
+ * it never accompanies a charge.
+ *
+ * Distinct from `BudgetExceededError`, which is `ctx.budget()`'s own
+ * workflow-scoped policy and keeps its existing semantics.
+ */
+export class AdmissionDeniedError extends AxlError {
+  /** The controller's configured USD threshold. */
+  readonly limit: number;
+  /** Known settled spend at the moment of refusal. Unknown spend is excluded. */
+  readonly knownSpend: number;
+  /** What was refused. */
+  readonly operation: { kind: string; model?: string };
+
+  constructor(options: {
+    limit: number;
+    knownSpend: number;
+    operation: { kind: string; model?: string };
+  }) {
+    super(
+      'ADMISSION_DENIED',
+      `Admission denied for ${options.operation.kind} operation` +
+        `${options.operation.model ? ` (${options.operation.model})` : ''}: ` +
+        `known spend ${formatBudgetCost(options.knownSpend)} reached the ` +
+        `${formatBudgetCost(options.limit)} limit`,
+    );
+    this.name = 'AdmissionDeniedError';
+    this.limit = options.limit;
+    this.knownSpend = options.knownSpend;
+    this.operation = options.operation;
+  }
+}
+
 /** Thrown when an agent exceeds its maximum number of tool-calling turns */
 export class MaxTurnsError extends AxlError {
   readonly maxTurns: number;

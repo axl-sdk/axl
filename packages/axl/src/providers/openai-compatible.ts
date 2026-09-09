@@ -740,7 +740,12 @@ export class OpenAICompatibleProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -775,7 +780,12 @@ export class OpenAICompatibleProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -1125,9 +1135,11 @@ export class OpenAICompatibleProvider implements Provider {
       request,
       response: json,
     });
+    const costProvenance = this.costProvenance(cost);
 
     return {
       content,
+      costProvenance,
       thinking_content: thinking || undefined,
       tool_calls: message.tool_calls?.map((tc) => ({
         id: tc.id,
@@ -1138,6 +1150,19 @@ export class OpenAICompatibleProvider implements Provider {
       cost,
       providerMetadata: this.roundTripMetadata(roundTrip),
     };
+  }
+
+  /**
+   * How this profile's `computeCost` derived its figure. `'from-response'`
+   * profiles (OpenRouter, xAI) echo a vendor-supplied USD amount and are
+   * authoritative; table and zero pricing are Axl estimates. Native subclasses
+   * that override `computeCost` override this alongside it.
+   */
+  protected costProvenance(cost: number | undefined): ProviderResponse['costProvenance'] {
+    if (cost === undefined) return undefined;
+    return this.profile.pricing.kind === 'from-response'
+      ? 'provider_reported'
+      : 'price_table_estimate';
   }
 
   private roundTripMetadata(
@@ -1230,18 +1255,20 @@ export class OpenAICompatibleProvider implements Provider {
           };
         }
       }
+      const cost = this.computeCost(
+        pricingResponse?.model ?? model,
+        usage,
+        this.reportedCost(usageData),
+        {
+          request,
+          response: pricingResponse,
+        },
+      );
       return {
         type: 'done',
         usage,
-        cost: this.computeCost(
-          pricingResponse?.model ?? model,
-          usage,
-          this.reportedCost(usageData),
-          {
-            request,
-            response: pricingResponse,
-          },
-        ),
+        cost,
+        costProvenance: this.costProvenance(cost),
         providerMetadata,
       };
     };

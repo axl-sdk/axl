@@ -1,6 +1,7 @@
 import type { CallTiming, ChatMessage, ProviderResponse, ToolCallMessage } from '../types.js';
 import type { InputMediaSource, ModelInput } from '../input.js';
 import type { RecordedAudioSource } from '../transcription.js';
+import type { DispatchAdmission } from '../accounting.js';
 
 // Re-export for convenience. `CallTiming` is defined in `../types.js` beside
 // `ProviderResponse` (which also carries it) — defining it here would make
@@ -84,6 +85,14 @@ export type ChatOptions = {
   responseFormat?: ResponseFormat;
   stop?: string[];
   signal?: AbortSignal;
+  /**
+   * @internal Runtime admission hook. Set by the scoped provider facade when an
+   * accounting scope with a budget is active. Built-in adapters forward it to
+   * `fetchWithRetry`, which calls it immediately before EVERY fetch attempt so a
+   * request queued behind the rate governor or sleeping in retry backoff is not
+   * dispatched after the budget closes. It is never sent to the vendor.
+   */
+  dispatchAdmission?: DispatchAdmission;
   /** @internal Runtime observer for the actual adapter transport lifecycle. */
   requestLifecycle?: {
     /** The request was actually dispatched, after limiter queue and retry backoff. */
@@ -154,6 +163,8 @@ export type StreamChunk =
       };
       /** Estimated cost in USD for this call, computed the same way as ProviderResponse.cost. */
       cost?: number;
+      /** How `cost` was derived. Field parity with `ProviderResponse.costProvenance`. */
+      costProvenance?: 'provider_reported' | 'price_table_estimate';
       /** Provider-specific opaque metadata (e.g. raw Gemini parts with thought signatures). */
       providerMetadata?: Record<string, unknown>;
       /**

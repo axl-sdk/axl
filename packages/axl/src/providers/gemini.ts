@@ -1,3 +1,4 @@
+import { tableEstimate } from './cost-provenance.js';
 import type {
   EffortResolution,
   Provider,
@@ -955,7 +956,12 @@ export class GeminiProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -998,7 +1004,12 @@ export class GeminiProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -1039,7 +1050,12 @@ export class GeminiProvider implements Provider {
     const res = await fetchWithRetry(
       `${this.baseUrl}/interactions`,
       { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
     if (!res.ok) {
       const errorBody = await res.text();
@@ -1074,7 +1090,12 @@ export class GeminiProvider implements Provider {
     const res = await fetchWithRetry(
       `${this.baseUrl}/interactions?alt=sse`,
       { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
     if (!res.ok) {
       const errorBody = await res.text();
@@ -1291,25 +1312,27 @@ export class GeminiProvider implements Provider {
     }
     this.assertInteractionTerminalStatus(json.status, toolCalls.length);
     const normalized = normalizeInteractionUsage(json.usage);
+    const interactionCost = this.interactionCost({
+      normalized,
+      steps: json.steps,
+      responseTierEvidence: geminiResponseTierEvidence(
+        responseHeaders,
+        json.service_tier,
+        json.usage?.service_tier,
+      ),
+      effectiveModel: typeof json.model === 'string' ? json.model : pricingContext.model,
+      pricingContext,
+      // The whole body is in hand: every part is on `json.steps`, so there
+      // is nothing this path could have failed to materialize.
+      unmodeledOutput: false,
+    });
     return {
       content,
       thinking_content: thinkingContent || undefined,
       tool_calls: toolCalls.length ? toolCalls : undefined,
       usage: normalized?.usage,
-      cost: this.interactionCost({
-        normalized,
-        steps: json.steps,
-        responseTierEvidence: geminiResponseTierEvidence(
-          responseHeaders,
-          json.service_tier,
-          json.usage?.service_tier,
-        ),
-        effectiveModel: typeof json.model === 'string' ? json.model : pricingContext.model,
-        pricingContext,
-        // The whole body is in hand: every part is on `json.steps`, so there
-        // is nothing this path could have failed to materialize.
-        unmodeledOutput: false,
-      }),
+      cost: interactionCost,
+      costProvenance: tableEstimate(interactionCost),
       providerMetadata: json.steps?.length
         ? { geminiInteractionSteps: json.steps.filter(isGeminiInteractionStep) }
         : undefined,
@@ -1555,20 +1578,22 @@ export class GeminiProvider implements Provider {
               .sort(([a], [b]) => a - b)
               .map(([, step]) => step);
             const normalized = normalizeInteractionUsage(event.interaction?.usage);
+            const streamInteractionCost = this.interactionCost({
+              normalized,
+              steps: orderedSteps,
+              responseTierEvidence,
+              effectiveModel:
+                typeof event.interaction?.model === 'string'
+                  ? event.interaction.model
+                  : pricingContext.model,
+              pricingContext,
+              unmodeledOutput,
+            });
             yield {
               type: 'done',
               usage: normalized?.usage,
-              cost: this.interactionCost({
-                normalized,
-                steps: orderedSteps,
-                responseTierEvidence,
-                effectiveModel:
-                  typeof event.interaction?.model === 'string'
-                    ? event.interaction.model
-                    : pricingContext.model,
-                pricingContext,
-                unmodeledOutput,
-              }),
+              cost: streamInteractionCost,
+              costProvenance: tableEstimate(streamInteractionCost),
               providerMetadata: steps.size ? { geminiInteractionSteps: orderedSteps } : undefined,
             };
             return;
@@ -2169,6 +2194,7 @@ export class GeminiProvider implements Provider {
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       usage: normalized?.usage,
       cost,
+      costProvenance: tableEstimate(cost),
       providerMetadata,
     };
   }
@@ -2272,20 +2298,22 @@ export class GeminiProvider implements Provider {
 
       const providerMetadata =
         accumulatedParts.length > 0 ? { geminiParts: accumulatedParts } : undefined;
+      const streamCost =
+        normalizedUsage?.pricingUsage &&
+        !normalizedUsage.hasUnmodeledBilledUsage &&
+        responseIsTextOnly &&
+        isEligibleGeminiPricing(
+          pricingContext,
+          hasDefinitiveStandardResponseTier,
+          hasInvalidResponseTier,
+        )
+          ? estimateGeminiCost(effectiveModel, normalizedUsage.pricingUsage)
+          : undefined;
       yield {
         type: 'done',
         usage: normalizedUsage?.usage,
-        cost:
-          normalizedUsage?.pricingUsage &&
-          !normalizedUsage.hasUnmodeledBilledUsage &&
-          responseIsTextOnly &&
-          isEligibleGeminiPricing(
-            pricingContext,
-            hasDefinitiveStandardResponseTier,
-            hasInvalidResponseTier,
-          )
-            ? estimateGeminiCost(effectiveModel, normalizedUsage.pricingUsage)
-            : undefined,
+        cost: streamCost,
+        costProvenance: tableEstimate(streamCost),
         providerMetadata,
       };
     } finally {

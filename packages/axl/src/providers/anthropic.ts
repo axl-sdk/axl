@@ -1,3 +1,4 @@
+import { tableEstimate } from './cost-provenance.js';
 import type {
   EffortResolution,
   Provider,
@@ -934,7 +935,12 @@ export class AnthropicProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -975,7 +981,12 @@ export class AnthropicProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -1367,6 +1378,7 @@ export class AnthropicProvider implements Provider {
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       usage: normalized?.usage,
       cost,
+      costProvenance: tableEstimate(cost),
       providerMetadata:
         thinkingBlocks.length > 0 && !hasFallbackBoundary
           ? { anthropicThinkingBlocks: thinkingBlocks }
@@ -1408,22 +1420,26 @@ export class AnthropicProvider implements Provider {
       pricingUsage = normalized?.pricingUsage;
     };
 
-    const doneChunk = (): Extract<StreamChunk, { type: 'done' }> => ({
-      type: 'done',
-      usage,
-      cost:
+    const doneChunk = (): Extract<StreamChunk, { type: 'done' }> => {
+      const cost =
         pricingUsage &&
         !pricingContext.hasRichInput &&
         !unpricedModifier &&
         !hasFallbackBoundary &&
         !refused
           ? estimateAnthropicCost(effectiveModel, pricingUsage)
-          : undefined,
-      providerMetadata:
-        thinkingBlocks.length > 0 && !hasFallbackBoundary && !hasFallbackIterationSignal
-          ? { anthropicThinkingBlocks: thinkingBlocks }
-          : undefined,
-    });
+          : undefined;
+      return {
+        type: 'done',
+        usage,
+        cost,
+        costProvenance: tableEstimate(cost),
+        providerMetadata:
+          thinkingBlocks.length > 0 && !hasFallbackBoundary && !hasFallbackIterationSignal
+            ? { anthropicThinkingBlocks: thinkingBlocks }
+            : undefined,
+      };
+    };
 
     try {
       while (true) {

@@ -1542,6 +1542,14 @@ export type ProviderResponse = {
     audio_output_tokens?: number;
   };
   cost?: number;
+  /**
+   * How `cost` was derived, when the adapter can say. `'provider_reported'`
+   * means the vendor supplied the USD figure itself; `'price_table_estimate'`
+   * means the adapter priced reported usage from a table. Built-in adapters set
+   * it whenever they return a `cost`; a cost with no provenance is recorded as
+   * `'adapter_reported'`.
+   */
+  costProvenance?: 'provider_reported' | 'price_table_estimate';
   /** Provider-specific opaque metadata that needs to round-trip through conversation history. */
   providerMetadata?: Record<string, unknown>;
   /** Per-call latency breakdown. Absent on providers that don't instrument it. */

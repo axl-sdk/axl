@@ -4,6 +4,7 @@
  * with exponential backoff, jitter, and Retry-After header support.
  */
 
+import type { DispatchAdmission } from '../accounting.js';
 import type { RateLimiter } from './rate-limiter.js';
 import { buildProviderError, parseRetryAfter } from './errors.js';
 
@@ -112,6 +113,21 @@ export type FetchWithRetryOptions = {
    * than swallowing is deliberate and matches this seam's existing stance;
    * observers own their own error handling.
    */
+  /**
+   * Optional budget admission gate. `beforeDispatch` is called AFTER the
+   * governor permit is acquired and immediately before EVERY `fetch` attempt —
+   * so a request that queued behind the governor, or slept through retry
+   * backoff, is re-checked against a budget that may have closed meanwhile.
+   *
+   * It is called OUTSIDE the network-error `try`, so throwing from it is not a
+   * transport failure: the error is never normalized into a `ProviderError`,
+   * never retried, and never mistaken for an abort. The permit is still
+   * released by the existing `finally`.
+   *
+   * This is deliberately separate from `timing`, whose callbacks must not
+   * throw and must not change behavior.
+   */
+  admission?: DispatchAdmission;
   timing?: {
     /**
      * Fired at each attempt's `fetch` start, `attempt` 1-indexed. A stall clock
@@ -200,6 +216,11 @@ export async function fetchWithRetry(
   try {
     for (let attempt = 0; ; attempt++) {
       let res: Response;
+      // Budget gate before anything else in the attempt: after the governor
+      // grant and after any backoff sleep, but before the request leaves. A
+      // throw here propagates verbatim through the `finally` that releases the
+      // permit — no retry, no ProviderError, no timing report.
+      opts?.admission?.beforeDispatch(attempt + 1);
       dispatchedAt = Date.now();
       if (attempt === 0) firstDispatchedAt = dispatchedAt;
       observer?.onDispatch?.(attempt + 1, dispatchedAt);

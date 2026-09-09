@@ -1,3 +1,4 @@
+import { currentDispatchAdmission } from '../accounting.js';
 import type { Embedder, EmbedResult } from './types.js';
 import { fetchWithRetry } from '../providers/retry.js';
 import { buildProviderError } from '../providers/errors.js';
@@ -89,7 +90,7 @@ export class OpenAIEmbedder implements Embedder {
       },
       // Participate in the same typed-error contract as the provider adapters: a
       // thrown network failure normalizes to ProviderError{status:0,provider:'openai'}.
-      { provider: 'openai' },
+      { provider: 'openai', admission: currentDispatchAdmission() },
     );
 
     if (!response.ok) {

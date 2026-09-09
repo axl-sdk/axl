@@ -1,3 +1,4 @@
+import { tableEstimate } from './cost-provenance.js';
 import type {
   EffortResolution,
   Provider,
@@ -278,7 +279,12 @@ export class OpenAIResponsesProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -318,7 +324,12 @@ export class OpenAIResponsesProvider implements Provider {
         body: JSON.stringify(body),
         signal: options.signal,
       },
-      { governor: this.governor, provider: this.name, timing: recorder.observer },
+      {
+        governor: this.governor,
+        provider: this.name,
+        timing: recorder.observer,
+        admission: options.dispatchAdmission,
+      },
     );
 
     if (!res.ok) {
@@ -586,6 +597,7 @@ export class OpenAIResponsesProvider implements Provider {
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
       usage,
       cost,
+      costProvenance: tableEstimate(cost),
       providerMetadata,
     };
   }
@@ -730,17 +742,19 @@ export class OpenAIResponsesProvider implements Provider {
         const providerMetadata =
           reasoningItems.length > 0 ? { openaiReasoningItems: reasoningItems } : undefined;
 
+        const cost =
+          usage && !this.requestContainsImages(request)
+            ? estimateDirectOpenAICost(response?.model ?? model, usage, {
+                baseUrl: this.baseUrl,
+                request,
+                response,
+              })
+            : undefined;
         return {
           type: 'done',
           usage,
-          cost:
-            usage && !this.requestContainsImages(request)
-              ? estimateDirectOpenAICost(response?.model ?? model, usage, {
-                  baseUrl: this.baseUrl,
-                  request,
-                  response,
-                })
-              : undefined,
+          cost,
+          costProvenance: tableEstimate(cost),
           providerMetadata,
         };
       }
